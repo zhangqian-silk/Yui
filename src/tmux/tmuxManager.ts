@@ -858,6 +858,18 @@ export class TmuxManager {
     ]).trim() === "1";
   }
 
+  async hasDeliveryReceiptAsync(
+    taskId: string,
+    roleName: string,
+    receiptId: string
+  ): Promise<boolean> {
+    safeValue(receiptId, "tmux delivery receipt id");
+    const option = deliveryReceiptOption(receiptId);
+    return (await this.runAsync([
+      "show-options", "-wqv", "-t", this.target(taskId, roleName), option
+    ])).trim() === "1";
+  }
+
   detachRole(taskId: string): void {
     this.run(["detach-client", "-s", this.sessionName(taskId)]);
   }

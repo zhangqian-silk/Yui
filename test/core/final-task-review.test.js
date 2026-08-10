@@ -956,7 +956,6 @@ test("independent Reviewer still dispatches across non-Integration merge boundar
   assert.equal(run.purpose, "review");
   assert.equal(run.reviewRoundId, round.id);
 });
-
 test("final policy queues one Task Review over all committed Project heads", (t) => {
   const { store, task, item, leaderOptions } = fixture(t);
   const first = runTaskCommand(
@@ -1556,7 +1555,6 @@ test("settling an obsolete final Review fails closed for later final Review hist
     "pending"
   );
 });
-
 test("stranded final Review retry fails closed for a nonmatching failed Run", (t) => {
   const fx = fixture(t);
   runTaskCommand(

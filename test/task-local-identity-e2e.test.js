@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -12,14 +12,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
-import { createConfiguredAgent } from "../dist/agent/agent.js";
 import {
   dispatchPreparedReviewRound,
   runTaskCommand
 } from "../dist/commands/taskCommands.js";
+import { runClaudeLifecycleHookCommand } from "../dist/controller/claudeLifecycleHook.js";
 import { FileSchedulerStoreAdapter } from "../dist/controller/fileSchedulerStoreAdapter.js";
 import { FileRuntimeEventInbox } from "../dist/controller/runtimeEventInbox.js";
-import { runSessionNotifyCommand } from "../dist/controller/sessionNotify.js";
+import { FileRuntimeEventProcessor } from "../dist/controller/runtimeEventProcessor.js";
 import { updateRoleAgentSessionStatus } from "../dist/executor/agentExecutor.js";
 import { createProject } from "../dist/repository/project.js";
 import { TaskWorkspaceCoordinator } from "../dist/repository/taskWorkspaceCoordinator.js";
@@ -36,6 +36,9 @@ import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
 import { FileTaskStore, STORAGE_STATE_FILE } from "../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../dist/task/task.js";
 import { createYuiWebServer } from "../dist/web/webServer.js";
+import { yuiTmuxServerName } from "../dist/tmux/tmuxManager.js";
+import { exactTaskCliInvocation } from "./helpers/exactTaskCli.js";
+import { createStartupReadyClaudeAgent } from "./helpers/mockClaudeAgent.js";
 
 const START = new Date("2026-08-02T08:00:00.000Z");
 
@@ -58,6 +61,15 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
         { env: isolatedCliEnvironment(home), stdio: "ignore" }
       );
     }
+    const stopped = spawnSync(
+      process.env.YUI_TMUX_BIN ?? "tmux",
+      ["-L", yuiTmuxServerName(home), "kill-server"],
+      { encoding: "utf8", env: isolatedCliEnvironment(home) }
+    );
+    if (stopped.status !== 0
+      && !/no server running|failed to connect|error connecting/i.test(stopped.stderr ?? "")) {
+      throw new Error(`Identity E2E tmux server did not stop: ${stopped.stderr}`);
+    }
     if (requestedRoot === undefined) rmSync(root, { recursive: true, force: true });
   });
   assert.notEqual(resolve(process.env.YUI_HOME ?? join(root, "unconfigured")), resolve(home));
@@ -65,7 +77,7 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   const secondaryRepository = initializeFixtureRepository(root, "secondary-repository");
   ensureStorageSchema(home, START);
   const store = new FileTaskStore(home);
-  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], START);
+  const agent = createStartupReadyClaudeAgent(home, START, "claude-identity");
   const binding = createRoleAgentBinding(agent);
   const primaryProject = createProject(
     "project-1",
@@ -264,14 +276,22 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
     );
   }
 
+  const resumedLeaderSession = store.getRoleSession(primaryTask.id, "leader");
+  assert.notEqual(resumedLeaderSession, null);
+  assert.notEqual(
+    store.getAgentRun(primaryTask.id, resumedLeaderRun.id).pushedAt,
+    undefined
+  );
+  assert.equal(
+    store.getAgentRun(primaryTask.id, resumedLeaderRun.id).deliveredAt,
+    undefined
+  );
   const hookPayload = JSON.stringify({
-    type: "agent-turn-complete",
-    "thread-id": store.getRoleSession(primaryTask.id, "leader").nativeSessionId,
-    "turn-id": "turn-e2e-qualified-1",
-    "input-messages": [resumedLeaderRun.input],
-    "last-assistant-message": "Qualified input applied."
+    hook_event_name: "UserPromptSubmit",
+    session_id: resumedLeaderSession.nativeSessionId,
+    prompt: resumedLeaderRun.input
   });
-  await runSessionNotifyCommand(
+  await runClaudeLifecycleHookCommand(
     hookPayload,
     {
       YUI_HOME: home,
@@ -279,15 +299,29 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
       YUI_TASK_ID: primaryTask.id,
       YUI_ROLE: "leader",
       YUI_AGENT_ID: agent.id,
-      YUI_ADAPTER_ID: "codex",
-      YUI_LAUNCH_ID: "launch-e2e-qualified-1"
+      YUI_ADAPTER_ID: "claude",
+      YUI_WORKSPACE: resumedLeaderRun.effective.workspace.root,
+      YUI_RUN_ID: resumedLeaderRun.id,
+      YUI_LAUNCH_ID: resumedLeaderSession.launchId,
+      YUI_NATIVE_SESSION_ID: resumedLeaderSession.nativeSessionId
     },
-    async () => ({}),
-    async () => {}
+    async () => ({})
   );
-  const [hookEvent] = new FileRuntimeEventInbox(home).list();
+  const inbox = new FileRuntimeEventInbox(home);
+  const hookEvent = inbox.list().find((event) => (
+    event.taskId === primaryTask.id
+    && event.runId === resumedLeaderRun.id
+    && event.type === "native-prompt-accepted"
+  ));
+  assert.notEqual(hookEvent, undefined);
   assert.equal(hookEvent.taskId, primaryTask.id);
   assert.equal(hookEvent.runId, resumedLeaderRun.id);
+  assert.equal(hookEvent.type, "native-prompt-accepted");
+  new FileRuntimeEventProcessor(inbox, scheduler).drain(postAnswerNow);
+  assert.notEqual(
+    store.getAgentRun(primaryTask.id, resumedLeaderRun.id).deliveredAt,
+    undefined
+  );
   runTaskCommand([
     "run", "yield", `${primaryTask.id}/${resumedLeaderRun.id}`,
     "--summary", "Qualified input applied."
@@ -380,14 +414,14 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
   ]).data;
   assert.equal(integrationResult.status, "committed");
   assert.equal(integrationResult.attempt.id, "integration-1");
-  const acceptResult = runCliJson(home, [
+  const acceptResult = runExactTaskCliJson(home, store, primaryTask.id, "leader", [
     "task", "work", "accept", `${primaryTask.id}/${primaryWork.id}`,
     "--summary", "Leader accepted reviewed and integrated output."
-  ], leaderCliEnvironment(home, primaryTask.id));
+  ]);
   assert.equal(acceptResult.data.workItem.status, "completed");
   assert.equal(store.getWorkItem(primaryTask.id, primaryWork.id).status, "completed");
   await coordinator.runtime.stopTaskRoleSessions(primaryTask.id, ["worker"]);
-  const cleanupResult = runCliJson(home, [
+  const cleanupResult = runExactTaskCliJson(home, store, primaryTask.id, "leader", [
     "task", "work", "cleanup", `${primaryTask.id}/${primaryWork.id}`, "--integrated"
   ]);
   const workItemCleanup = cleanupResult.data.worktree.removal;
@@ -652,6 +686,23 @@ function runCliJson(home, args, environment = isolatedCliEnvironment(home)) {
   return result;
 }
 
+function runExactTaskCliJson(home, store, taskId, roleName, args) {
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId,
+    roleName,
+    environment: isolatedCliEnvironment(home)
+  });
+  const result = JSON.parse(execFileSync(
+    process.execPath,
+    [invocation.cliEntry, ...invocation.prefix, "--json", ...args],
+    { encoding: "utf8", env: invocation.environment }
+  ));
+  assert.equal(result.ok, true);
+  return result;
+}
+
 function isolatedCliEnvironment(home) {
   const environment = { ...process.env, YUI_HOME: home };
   for (const name of [
@@ -664,15 +715,6 @@ function isolatedCliEnvironment(home) {
     "YUI_LAUNCH_ID"
   ]) delete environment[name];
   return environment;
-}
-
-function leaderCliEnvironment(home, taskId) {
-  return {
-    ...isolatedCliEnvironment(home),
-    YUI_SESSION_SCOPE: "task",
-    YUI_TASK_ID: taskId,
-    YUI_ROLE: "leader"
-  };
 }
 
 function operatorCliEnvironment(home) {

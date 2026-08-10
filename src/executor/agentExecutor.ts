@@ -313,20 +313,55 @@ export function retireTaskRoleSessionsForWorkspace(
     throw new Error("Cannot retire a Task Role session with unsettled Run state.");
   }
   const live = Object.values(set.sessions).find(
-    (session) => session.status !== "stopped" && session.status !== "broken"
+    ({ status }) => status !== "stopped" && status !== "broken"
   );
   if (live !== undefined) {
     throw new Error(
       `Task Role session must be stopped before workspace migration: ${live.agentId}.`
     );
   }
+  const timestamp = now.toISOString();
   return validateRoleSessionSet({
     ...set,
     // Native sessions may be scoped to their launch cwd. Every binding must
     // receive a fresh identity after the Role workspace changes.
     history: [...(set.history ?? []), ...Object.values(set.sessions)],
     sessions: {},
-    updatedAt: now.toISOString()
+    updatedAt: timestamp
+  });
+}
+
+/**
+ * Terminalizes only the aggregate-16 Claude placeholder shape after the
+ * caller has fenced the Task store and proved that the exact Role has no live
+ * native pane. All other nonterminal durable Sessions remain blockers for the
+ * ordinary workspace-retirement path above.
+ */
+export function retireConfirmedAbsentInactiveTaskRolePlaceholders(
+  set: TaskRoleSessionSet,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  if (set.inFlight !== null || set.pendingTurnCompletion !== null) {
+    throw new Error("Cannot retire a Task Role placeholder with unsettled Run state.");
+  }
+  const timestamp = now.toISOString();
+  let changed = false;
+  const sessions = Object.fromEntries(Object.entries(set.sessions).map(([agentId, session]) => {
+    const isNeverStartedInactiveClaude = agentId !== set.activeAgentId
+      && session.adapterId === "claude"
+      && (session.status === "reserved" || session.status === "ready")
+      && session.launchId === undefined
+      && session.recentCompletedTurnIds.length === 0;
+    if (!isNeverStartedInactiveClaude) return [agentId, session];
+    changed = true;
+    return [agentId, { ...session, status: "broken" as const, updatedAt: timestamp }];
+  }));
+  if (!changed) return set;
+  return validateRoleSessionSet({
+    ...set,
+    sessions,
+    updatedAt: timestamp
   });
 }
 

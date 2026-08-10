@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -8,7 +9,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
@@ -35,12 +36,74 @@ const now = new Date("2026-07-26T00:00:00.000Z");
 
 test("same-file WorkItems run in separate worktrees and a conflicting integration waits for Leader", async () => {
   const root = mkdtempSync(join(tmpdir(), "yui-integration-"));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ type: "module" }));
   const repositoryPath = join(root, "repository");
   git(["init", "-b", "master", repositoryPath]);
   git(["-C", repositoryPath, "config", "user.name", "Test"]);
   git(["-C", repositoryPath, "config", "user.email", "test@example.com"]);
   writeFileSync(join(repositoryPath, "shared.txt"), "base\n");
-  git(["-C", repositoryPath, "add", "shared.txt"]);
+  writeFileSync(join(repositoryPath, "check-environment.mjs"), `
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const serialized = process.env.YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR;
+if (serialized === undefined) throw new Error("missing Integration runtime descriptor");
+const descriptor = JSON.parse(serialized);
+if (descriptor.workspace.owner.type !== "integration-attempt") {
+  throw new Error("wrong Integration runtime owner");
+}
+const allowedYui = new Set([
+  "YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR",
+  "YUI_TASK_RUNTIME_SERVICE_NAMESPACE"
+]);
+for (const name of Object.keys(process.env)) {
+  if (name.startsWith("YUI_") && !allowedYui.has(name)) {
+    throw new Error("inherited control environment: " + name);
+  }
+}
+for (const name of ["CODEX_HOME", "CLAUDE_CONFIG_DIR"]) {
+  if (process.env[name] !== undefined) throw new Error("inherited Agent environment: " + name);
+}
+const expected = {
+  HOME: join(descriptor.roots.data, "home"),
+  TMPDIR: descriptor.roots.temporary,
+  TMP: descriptor.roots.temporary,
+  TEMP: descriptor.roots.temporary,
+  TMUX_TMPDIR: descriptor.roots.temporary,
+  XDG_CACHE_HOME: descriptor.roots.cache,
+  XDG_DATA_HOME: descriptor.roots.data,
+  XDG_STATE_HOME: join(descriptor.roots.data, "state"),
+  XDG_RUNTIME_DIR: join(descriptor.roots.temporary, "runtime"),
+  YUI_TASK_RUNTIME_SERVICE_NAMESPACE: descriptor.serviceNamespace
+};
+for (const [name, value] of Object.entries(expected)) {
+  if (process.env[name] !== value) {
+    throw new Error("wrong isolated environment: " + name);
+  }
+}
+const commonJsProbe = join(process.env.TMPDIR, "commonjs-probe");
+writeFileSync(
+  commonJsProbe,
+  'const fs = require("node:fs"); process.stdout.write(typeof fs.readFileSync);'
+);
+if (execFileSync(process.execPath, [commonJsProbe], { encoding: "utf8" }) !== "function") {
+  throw new Error("Integration TMPDIR did not isolate CommonJS package lookup");
+}
+if (process.platform === "linux") {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const socketPath = join(
+    process.env.TMPDIR,
+    "yui-" + uid,
+    "0".repeat(24) + ".sock"
+  );
+  if (Buffer.byteLength(socketPath) >= 100) {
+    throw new Error("Integration TMPDIR exceeds the Controller socket path budget");
+  }
+}
+console.log(JSON.stringify({ descriptor, environment: expected }));
+`);
+  git(["-C", repositoryPath, "add", "shared.txt", "check-environment.mjs"]);
   git(["-C", repositoryPath, "commit", "-m", "base"]);
   const baseCommit = git(["-C", repositoryPath, "rev-parse", "HEAD"]).trim();
 
@@ -131,7 +194,7 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
     expectedHead: baseCommit,
     changeSetIds: [firstResult.changeSet.id],
     checkCommands: [
-      "i=0; while [ \"$i\" -lt 5000 ]; do printf 'verbose-payload-%s\\n' \"$i\"; i=$((i + 1)); done; printf 'important failure\\n'; exit 7"
+      "printf '%s\\n' \"$YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR\"; i=0; while [ \"$i\" -lt 5000 ]; do printf 'verbose-payload-%s\\n' \"$i\"; i=$((i + 1)); done; printf 'important failure\\n'; exit 7"
     ]
   }, now);
   store.saveIntegrationAttempt(task.id, failedCheckIntegration);
@@ -144,6 +207,13 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   const failedCheckLog = join(home, failedCheck.attempt.checks[0].logPath);
   assert.match(readFileSync(failedCheckLog, "utf8"), /verbose-payload-0/);
   assert.match(readFileSync(failedCheckLog, "utf8"), /important failure/);
+  const failedRuntime = JSON.parse(readFileSync(failedCheckLog, "utf8").split("\n")[0]);
+  assert.deepEqual(failedRuntime.workspace.owner, {
+    type: "integration-attempt",
+    taskId: task.id,
+    integrationAttemptId: failedCheckIntegration.id
+  });
+  assert.equal(existsSync(failedRuntime.roots.generation), false);
   assert.doesNotMatch(readFileSync(join(home, "state.json"), "utf8"), /verbose-payload-0/);
   assert.equal(await failedCheckService.cleanup(failedCheck.attempt), "removed");
   assert.equal(existsSync(failedCheckLog), false);
@@ -155,9 +225,7 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
     targetRef: "master",
     expectedHead: baseCommit,
     changeSetIds: [firstResult.changeSet.id],
-    checkCommands: [
-      "printf 'successful-output-%s\\n' \"$$\"; printf 'successful-error-%s\\n' \"$$\" >&2"
-    ]
+    checkCommands: ["node check-environment.mjs"]
   }, now);
   store.saveIntegrationAttempt(task.id, firstIntegration);
   const preparationFailure = createIntegrationAttempt({
@@ -178,18 +246,72 @@ test("same-file WorkItems run in separate worktrees and a conflicting integratio
   assert.equal(failedPreparation.attempt.status, "failed");
   assert.equal(failedPreparation.workspace, undefined);
 
-  const firstIntegrated = await new GitIntegrationService(home, store, undefined, () => now)
+  const inheritedControlEnvironment = {
+    ...process.env,
+    HOME: join(root, "shared-native-home"),
+    TMPDIR: join(root, "shared-tmp"),
+    YUI_HOME: home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "leader",
+    YUI_AGENT_ID: "codex",
+    YUI_ADAPTER_ID: "codex",
+    YUI_WORKSPACE: repositoryPath,
+    YUI_RUN_ID: "agent-run-control",
+    YUI_LAUNCH_ID: "launch-control",
+    YUI_NATIVE_SESSION_ID: "native-control",
+    YUI_LEADER_ACTION_RUN_ID: "agent-run-control",
+    YUI_UNDECLARED_SECRET: "control-extra-secret",
+    YUI_CONTROL_PLANE_DESCRIPTOR: "control-secret",
+    YUI_TASK_RUNTIME_DESCRIPTOR: "leader-runtime-secret",
+    CODEX_HOME: join(root, "codex-secret"),
+    CLAUDE_CONFIG_DIR: join(root, "claude-secret")
+  };
+  const firstIntegrated = await new GitIntegrationService(
+    home,
+    store,
+    undefined,
+    () => now,
+    inheritedControlEnvironment
+  )
     .integrate(task.id, firstIntegration.id);
   assert.equal(firstIntegrated.status, "committed");
   assert.equal(firstIntegrated.attempt.checks[0].outcome, "passed");
   assert.equal(firstIntegrated.attempt.checks[0].details, undefined);
   const successfulCheckLog = join(home, firstIntegrated.attempt.checks[0].logPath);
-  const successfulOutput = readFileSync(successfulCheckLog, "utf8").trim().split("\n");
-  assert.match(successfulOutput[0], /^successful-output-\d+$/);
-  assert.match(successfulOutput[1], /^successful-error-\d+$/);
+  const successfulOutput = JSON.parse(readFileSync(successfulCheckLog, "utf8"));
+  assert.deepEqual(successfulOutput.descriptor.workspace.owner, {
+    type: "integration-attempt",
+    taskId: task.id,
+    integrationAttemptId: firstIntegration.id
+  });
+  assert.equal(
+    successfulOutput.descriptor.generation.launchId,
+    `${firstIntegration.id}-${createHash("sha256")
+      .update(home)
+      .digest("hex")}`
+  );
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const compactRuntimeRoot = join("/tmp", `yi-${uid.toString(36)}`);
+  assert.equal(
+    successfulOutput.descriptor.roots.generation.startsWith(`${compactRuntimeRoot}/`),
+    true
+  );
+  assert.deepEqual(
+    relative(
+      compactRuntimeRoot,
+      successfulOutput.descriptor.roots.generation
+    ).split("/").map((component) => component.length),
+    [20, 20]
+  );
+  assert.equal(
+    successfulOutput.environment.HOME,
+    join(successfulOutput.descriptor.roots.data, "home")
+  );
+  assert.equal(existsSync(successfulOutput.descriptor.roots.generation), false);
   assert.doesNotMatch(
     readFileSync(join(home, "state.json"), "utf8"),
-    new RegExp(successfulOutput.join("|"))
+    /control-secret|control-extra-secret|leader-runtime-secret|codex-secret|claude-secret/
   );
   assert.match(
     (await runTaskIntegrationCommand(

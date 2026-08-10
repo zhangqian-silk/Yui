@@ -118,6 +118,9 @@ export async function processActiveRoleRunDeliveries(
           adapterId: run.effective.adapterId,
           effective: run.effective,
           workspace: run.effective.workspace.root,
+          ...(run.workspace === undefined
+            ? {}
+            : { managedWorkspace: run.workspace }),
           mode: run.mode,
           runId: run.id,
           ...(nativeSessionId === undefined ? {} : { nativeSessionId })
