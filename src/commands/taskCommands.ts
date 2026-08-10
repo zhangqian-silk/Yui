@@ -128,6 +128,7 @@ import {
   type WorkItem,
   type WorkItemProjectBaseRef,
   type CandidateGitSnapshot,
+  type DirectTaskMainSnapshot,
   type WorkItemCandidate,
   type WorkItemStatus
 } from "../workItem/workItem.js";
@@ -269,6 +270,7 @@ export type TaskCommandOptions = Readonly<{
   yuiHome?: string;
   workItemIntegrationProof?: WorkItemIntegrationProof;
   candidateGitSnapshot?: CandidateGitSnapshot;
+  directTaskMainSnapshot?: DirectTaskMainSnapshot;
   reviewWorkspaceResult?: Readonly<{
     evidenceCommit?: string;
   }>;
@@ -1939,7 +1941,10 @@ function updateWork(
               : { workspace: developWorkspace }),
             ...(options.candidateGitSnapshot === undefined
               ? {}
-              : { gitSnapshot: options.candidateGitSnapshot })
+              : { gitSnapshot: options.candidateGitSnapshot }),
+            ...(options.directTaskMainSnapshot === undefined
+              ? {}
+              : { taskMainSnapshot: options.directTaskMainSnapshot })
           }, now)
         : current.status === "failed" && status === "running"
         ? retryFailedWorkItem(current, now)

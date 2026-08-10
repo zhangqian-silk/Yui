@@ -896,6 +896,13 @@ export async function main(): Promise<void> {
       process.env,
       taskFinalReviewContract
     );
+    const directTaskMainSnapshot = await directTaskMainSnapshotForTaskCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env,
+      taskFinalReviewContract
+    );
     const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
       resolved,
       store,
@@ -914,6 +921,7 @@ export async function main(): Promise<void> {
           : { taskFinalReviewContract }),
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
         ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
+        ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),
         ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
         ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
       }
@@ -1197,6 +1205,42 @@ async function candidateSnapshotForTaskCommand(
     return preparer.snapshotCandidateWorkspace(workspace);
   }
   return undefined;
+}
+
+async function directTaskMainSnapshotForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv,
+  taskFinalReviewContract?: TaskFinalReviewContract
+) {
+  if (taskFinalReviewContract === undefined
+    || args[0] !== "task"
+    || args[1] !== "work"
+    || args[2] !== "update"
+    || args[3] === undefined
+    || args[4] !== "done") {
+    return undefined;
+  }
+  const reference = cliWorkItemReference(args[3], environment);
+  const item = store.getWorkItem(reference.taskId, reference.localId);
+  if (item === null || item.writeProjectIds.length === 0
+    || store.getWorkItemWorkspace(reference.taskId, reference.localId) !== null) {
+    return undefined;
+  }
+  const workspace = store.getTaskWorkspace(reference.taskId);
+  // Exact Task-final Candidates may intentionally be metadata-only when no
+  // Task main exists. They remain review anchors, but are not eligible for the
+  // direct ChangeSet capture path.
+  if (workspace === null) return undefined;
+  if (workspace.owner.type !== "task") {
+    throw usageError(`Task has no authoritative main workspace: ${reference.taskId}.`);
+  }
+  try {
+    return await preparer.snapshotDirectTaskMain(workspace, item.writeProjectIds);
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
 }
 
 async function reviewWorkspaceResultForTaskCommand(

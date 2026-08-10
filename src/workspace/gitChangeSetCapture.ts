@@ -15,6 +15,7 @@ export async function captureManagedGitChanges(input: Readonly<{
   commitMessage: string;
   identity: string;
   requireClean?: boolean;
+  expectedHead?: string;
 }>): Promise<ManagedGitChange | null> {
   await assertManagedHead(input);
   const status = await git([
@@ -48,6 +49,7 @@ async function assertManagedHead(input: Readonly<{
   branch: string;
   baseCommit: string;
   identity: string;
+  expectedHead?: string;
 }>): Promise<string> {
   const currentBranch = (await git([
     "-C", input.path, "symbolic-ref", "--quiet", "--short", "HEAD"
@@ -60,6 +62,11 @@ async function assertManagedHead(input: Readonly<{
     );
   }
   const headCommit = await gitLine(["-C", input.path, "rev-parse", "HEAD^{commit}"]);
+  if (input.expectedHead !== undefined && headCommit !== input.expectedHead) {
+    throw new Error(
+      `Managed workspace HEAD no longer matches its Candidate snapshot: ${input.identity}.`
+    );
+  }
   if (!await gitSucceeds([
     "-C", input.path,
     "merge-base", "--is-ancestor",

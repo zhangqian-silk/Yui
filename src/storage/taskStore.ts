@@ -2734,6 +2734,25 @@ function assertWorkItemCandidateReferences(
         || candidate.workspace.owner.workItemId !== item.id)) {
       throw new StorageRecordError(`${label} must use the WorkItem-owned Develop workspace.`);
     }
+    if (candidate.taskMainSnapshot !== undefined) {
+      const expectedProjects = [...item.writeProjectIds].sort();
+      const actualProjects = candidate.taskMainSnapshot.projects
+        .map(({ projectId }) => projectId)
+        .sort();
+      if (!isDeepStrictEqual(actualProjects, expectedProjects)) {
+        throw new StorageRecordError(`${label} Task-main snapshot scope is stale.`);
+      }
+      for (const project of candidate.taskMainSnapshot.projects) {
+        const binding = aggregate.task.projectBindings.find(
+          ({ projectId }) => projectId === project.projectId
+        );
+        if (binding === undefined || binding.directory !== project.directory) {
+          throw new StorageRecordError(
+            `${label} Task-main snapshot Project is not bound: ${project.projectId}.`
+          );
+        }
+      }
+    }
     return;
   }
   const run = aggregate.agentRuns[candidate.source.runId];

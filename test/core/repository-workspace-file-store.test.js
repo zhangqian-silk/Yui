@@ -4169,16 +4169,37 @@ test("an exact direct Candidate captures clean Task main and records already-con
     reviewerRoleName: "reviewer",
     controlPlaneDigest: invocation.controlDigest
   });
-  store.saveWorkItem(task.id, submitWorkItemCandidate(item, {
-    summary: "Direct Task main is ready for provenance capture.",
-    source: { type: "direct" },
-    reviewPolicy: { roleName: "reviewer", trigger: "final" },
-    taskFinalReviewContract: contract
-  }, NOW));
+  store.saveWorkItem(task.id, item);
   writeFileSync(join(mainPath, "direct-main.txt"), "direct main delivery\n");
   git(["-C", mainPath, "add", "direct-main.txt"]);
   git(["-C", mainPath, "commit", "-qm", "direct main delivery"]);
   const head = git(["-C", mainPath, "rev-parse", "HEAD"]).trim();
+  const submitted = spawnSync(process.execPath, [
+    invocation.cliEntry,
+    ...invocation.prefix,
+    "task", "work", "update", item.id, "done",
+    "--summary", "Direct Task main is ready for provenance capture."
+  ], { encoding: "utf8", env: invocation.environment });
+  assert.equal(submitted.status, 0, submitted.stderr || submitted.stdout);
+  const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
+  assert.equal(candidate.source.type, "direct");
+  assert.deepEqual(candidate.taskMainSnapshot.projects, [{
+    projectId: project.id,
+    directory: taskEntry.directory,
+    branch: taskEntry.branch,
+    baseCommit: taskEntry.baseCommit,
+    headCommit: head
+  }]);
+
+  // A normal Controller preparation observes the physical HEAD and advances
+  // the mutable Task workspace record. Capture must still use the Candidate's
+  // frozen boundary rather than silently reporting an empty result.
+  await preparer.prepareTaskWorkspace(task.id);
+  assert.equal(
+    store.getTaskWorkspace(task.id).entries.find(({ projectId }) => projectId === project.id)
+      .baseCommit,
+    head
+  );
   const manager = new WorkItemChangeSetManager(store, () => new Date(NOW));
 
   await assert.rejects(
@@ -4202,11 +4223,18 @@ test("an exact direct Candidate captures clean Task main and records already-con
   );
   unlinkSync(join(mainPath, "dirty.txt"));
 
+  const captureInvocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
   const captured = spawnSync(process.execPath, [
-    invocation.cliEntry,
-    ...invocation.prefix,
+    captureInvocation.cliEntry,
+    ...captureInvocation.prefix,
     "task", "work", "capture", item.id
-  ], { encoding: "utf8", env: invocation.environment });
+  ], { encoding: "utf8", env: captureInvocation.environment });
   assert.equal(captured.status, 0, captured.stderr || captured.stdout);
   const [changeSet] = store.listChangeSets(task.id);
   assert.notEqual(changeSet, undefined);
