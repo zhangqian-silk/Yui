@@ -196,6 +196,9 @@ export class TaskFinalReviewDispatchDriftError extends CliError {
 
 /** Process-local command metadata; symbols never enter JSON output or durable state. */
 export const RESUMED_PENDING_FINAL_REVIEW = Symbol("resumed-pending-final-review");
+export const TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW = Symbol(
+  "terminalized-leader-before-final-review"
+);
 
 function taskFinalReviewDispatchDrift(error: unknown): TaskFinalReviewDispatchDriftError {
   return new TaskFinalReviewDispatchDriftError(
@@ -836,6 +839,7 @@ function completeTaskCommand(
       throw usageError(`Task ${task.id} has unsettled work: ${unsettledWork.id}.`);
     }
 
+    let terminalizedLeaderRun = false;
     const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
     if (leaderEntry !== undefined) {
       if (actor !== "leader") {
@@ -860,6 +864,7 @@ function completeTaskCommand(
           `Task Leader Run changed during completion: ${leaderEntry.run.id}/${terminal.reason}.`
         );
       }
+      terminalizedLeaderRun = true;
     }
 
     const pendingFinalReviewIds = new Set(tx.listReviewRounds(task.id)
@@ -880,7 +885,8 @@ function completeTaskCommand(
         changed: false,
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
         finalReview,
-        resumedPendingFinalReview: pendingFinalReviewIds.has(finalReview.id)
+        resumedPendingFinalReview: pendingFinalReviewIds.has(finalReview.id),
+        terminalizedLeaderRun
       } as const;
     }
 
@@ -919,7 +925,8 @@ function completeTaskCommand(
       changed: true,
       runtimeCleanupTargets,
       finalReview: undefined,
-      resumedPendingFinalReview: false
+      resumedPendingFinalReview: false,
+      terminalizedLeaderRun
     } as const;
   });
   if (result.changed) {
@@ -937,7 +944,8 @@ function completeTaskCommand(
     return output(`${status}\n`, {
       task: result.task,
       reviewRound: result.finalReview,
-      [RESUMED_PENDING_FINAL_REVIEW]: result.resumedPendingFinalReview
+      [RESUMED_PENDING_FINAL_REVIEW]: result.resumedPendingFinalReview,
+      [TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW]: result.terminalizedLeaderRun
     });
   }
   return output(result.changed

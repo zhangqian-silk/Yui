@@ -57,6 +57,7 @@ import {
   dispatchPreparedReviewRound,
   failPendingReviewRound,
   RESUMED_PENDING_FINAL_REVIEW,
+  TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
   TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
   runTaskCommand,
@@ -990,7 +991,11 @@ export async function main(): Promise<void> {
             requestedRound.taskId,
             requestedRound.id
           );
+          // A runless orphan recovery keeps its pending evidence on drift. If
+          // this command already yielded the exact Leader, fall through to the
+          // existing failed-Review wake so the next Leader owns recovery.
           if (requestedRound.resumedPendingFinalReview
+            && !requestedRound.terminalizedLeaderRun
             && (error instanceof ReviewRoundWorkspaceEvidenceError
               || error instanceof TaskFinalReviewDispatchDriftError)
             && (currentRound?.scope ?? "work-item") === "task") {
@@ -1403,6 +1408,7 @@ function reviewRoundFromCommandData(data: unknown): Readonly<{
   taskId: string;
   status: string;
   resumedPendingFinalReview: boolean;
+  terminalizedLeaderRun: boolean;
 }> | undefined {
   if (typeof data !== "object" || data === null || !("reviewRound" in data)) return undefined;
   const round = (data as { reviewRound?: unknown }).reviewRound;
@@ -1417,7 +1423,10 @@ function reviewRoundFromCommandData(data: unknown): Readonly<{
         status: value.status,
         resumedPendingFinalReview: (
           data as { [RESUMED_PENDING_FINAL_REVIEW]?: unknown }
-        )[RESUMED_PENDING_FINAL_REVIEW] === true
+        )[RESUMED_PENDING_FINAL_REVIEW] === true,
+        terminalizedLeaderRun: (
+          data as { [TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW]?: unknown }
+        )[TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW] === true
       }
     : undefined;
 }
