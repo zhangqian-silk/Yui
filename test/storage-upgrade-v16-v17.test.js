@@ -177,7 +177,13 @@ function seedDurableGraph(base, store) {
   runTaskCommand(
     ["complete", task.id, "--summary", "request final review"],
     store,
-    leaderOptions
+    {
+      ...leaderOptions,
+      actualTaskReviewCandidate: {
+        schemaVersion: 1,
+        projects: [{ projectId: "project-1", commit: "b".repeat(40) }]
+      }
+    }
   );
   const round = store.listReviewRounds(task.id)[0];
   const binding = task.projectBindings[0];
