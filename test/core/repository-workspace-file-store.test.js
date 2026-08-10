@@ -62,6 +62,7 @@ import {
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
+import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
@@ -3816,15 +3817,22 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
   const round = store.listReviewRounds(task.id)[0];
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   markDelivered(store, reviewRun);
-  const finished = spawnSync(
-    process.execPath,
-    [cli, "task", "run", "yield", reviewRun.id, "--summary", "Review complete"],
+  // The review result durably queues a Leader wake.  Quiesce this fixture's
+  // exact Controller before completing the terminal Task so its asynchronous
+  // scheduler cannot race archive preflight by creating the expected Leader
+  // Run.  The yield still folds the durable result; omitting the optional
+  // runtime signal here preserves the pending wake for the archive scanner.
+  await stopFileTaskController(home);
+  const finished = runTaskCommand(
+    ["run", "yield", `${task.id}/${reviewRun.id}`, "--summary", "Review complete"],
+    store,
     {
-      encoding: "utf8",
-      env: { ...leaderEnvironment, YUI_ROLE: "reviewer" }
+      environment: {},
+      yuiHome: home,
+      reviewWorkspaceResult: await preparer.snapshotReviewRoundResult(task.id, round.id)
     }
   );
-  assert.equal(finished.status, 0, finished.stderr || finished.stdout);
+  assert.equal(finished.kind, "output");
   const completedItem = updateWorkItemStatus(
     store.getWorkItem(task.id, item.id),
     "completed",

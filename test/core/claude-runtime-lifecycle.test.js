@@ -374,7 +374,7 @@ test("exact stdin yield preserves multiline UTF-8, rejects wrong or repeated Run
   );
   assert.deepEqual(
     Object.keys(resumeHooks.hooks).sort(),
-    ["SessionStart", "StopFailure", "UserPromptSubmit"]
+    ["PostToolUse", "SessionStart", "StopFailure", "UserPromptSubmit"]
   );
 
   const late = {
