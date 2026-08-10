@@ -9,6 +9,7 @@ import test from "node:test";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { bindExecution, claimPending } from "../../dist/coordination/workMailbox.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
+import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -28,7 +29,10 @@ const SECOND = new Date("2026-08-03T01:00:01.000Z");
 
 test("public Task Role reset derives identities from storage and preserves an auditable history", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-role-reset-cli-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(async () => {
+    await stopFileTaskController(home);
+    rmSync(home, { recursive: true, force: true });
+  });
   ensureStorageSchema(home, FIRST);
   const store = new FileTaskStore(home);
   const agent = createConfiguredAgent("codex-primary", "codex", "codex", [], [], FIRST);

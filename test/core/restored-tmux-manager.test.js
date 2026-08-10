@@ -776,6 +776,15 @@ test("real tmux delivery applies one receipt and one command", async (t) => {
   const ready = ({ dead, pid, currentCommand }) => (
     !dead && pid !== undefined && currentCommand === "bash"
   );
+  let paneReady = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (ready(await manager.inspectPaneAsync(taskId, roleName))) {
+      paneReady = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(paneReady, true);
   assert.equal(await manager.sendRoleInputOnceIfReadyAsync(
     taskId, roleName, receiptId, input, ready
   ), "sent");
