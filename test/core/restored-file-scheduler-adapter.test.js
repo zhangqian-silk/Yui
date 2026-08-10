@@ -437,7 +437,7 @@ test("stale stall persistence cannot cross a Session terminal transition", (t) =
   );
 });
 
-test("advisory resource suppression survives a Controller restart for one Run/progress point", async (t) => {
+test("advisory resource suppression survives restart but expires at the semantic progress bound", async (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const createdAt = new Date(now.getTime() - 60 * 60_000);
   const run = createAgentRun(
@@ -478,6 +478,7 @@ test("advisory resource suppression survives a Controller restart for one Run/pr
     ));
     tx.saveTaskRoleSessionSet(sessions);
   });
+  let observedAt = new Date(now.getTime() - 1_000).toISOString();
   const delivery = {
     async inspectRole() { return "present"; },
     async inspectRoles(inputs) {
@@ -486,7 +487,7 @@ test("advisory resource suppression survives a Controller restart for one Run/pr
         roleName: input.roleName,
         status: "present",
         resource: {
-          observedAt: new Date(now.getTime() - 1_000).toISOString(),
+          observedAt,
           progressAt: input.progressAt,
           identity: {
             taskId: input.taskId,
@@ -542,6 +543,30 @@ test("advisory resource suppression survives a Controller restart for one Run/pr
     new Set()
   );
   assert.deepEqual(second.failedRunRefs, []);
+  assert.equal(
+    restartedStore.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
+    1
+  );
+  assert.equal(
+    restartedStore.listEvents(task.id).filter((event) => event.type === "run.stalled").length,
+    0
+  );
+
+  const expired = new Date(now.getTime() + 31 * 60_000);
+  observedAt = new Date(expired.getTime() - 1_000).toISOString();
+  const third = await runControllerSchedulerPass(
+    restartedAdapter,
+    delivery,
+    expired,
+    undefined,
+    { kind: "full" },
+    true,
+    [],
+    undefined,
+    30 * 60_000,
+    new Set()
+  );
+  assert.deepEqual(third.failedRunRefs, []);
   assert.equal(
     restartedStore.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
     1
