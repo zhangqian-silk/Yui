@@ -9,6 +9,13 @@ Complete only the supplied bounded WorkItem. The Leader brief or managed
 dispatch defines the objective, Profile constraints, access, context reads,
 workspace, validation, and return protocol.
 
+Keep the context layers distinct: Yui Core owns durable identity, lifecycle,
+access, workspace, and exact handoff safety; this generic Skill owns portable
+Worker behavior; Project Policy and Knowledge own project-specific build,
+test, migration, release, and review rules; and the Task Contract owns the
+current objective, scope, acceptance, and evidence. Do not promote a Project
+command or convention into generic Worker policy.
+
 - Preserve supplied Task, WorkItem, Role, and Run identities.
 - Follow the supplied Worker Profile instructions, Skills, read/write behavior intent,
   model/effort request, and expected evidence. Report unsupported runtime hints
@@ -51,6 +58,16 @@ workspace, validation, and return protocol.
   Leader approves, continue only after a new dispatch names the expanded
   writable Project set.
 
+## Keep one coherent implementation round
+
+On a Leader-first fast path, keep investigation, implementation, the smallest
+targeted check, and ordinary finding fixes in the same WorkItem and workspace.
+Do not create phase handoffs or split out research and testing that have no
+independent result. Run the minimum check needed for the changed behavior and
+do not repeat an unchanged successful check. Unless the brief assigns it to
+this Worker, leave the Project Policy's complete delivery validation to the
+Leader's Integration candidate and report that it was intentionally skipped.
+
 ## Hand off the useful conclusion
 
 Your Task Message or Run yield is a collaboration summary, not a transcript.
@@ -77,9 +94,11 @@ A native subagent inherits the Leader Agent and ignores Task Role Agent
 bindings. Follow the explicit Worker Profile embedded in the child brief. Use a
 model or effort override only if the native child runtime actually supports it.
 
-Return outcome, changed paths, decisions, checks, residual risk, and blockers
-through the native child-result mechanism. Do not run Yui lifecycle commands,
-accept the WorkItem, or invent a child Session or Run record. The Leader reviews
+For each requested round, return one consolidated outcome, changed paths,
+decisions, checks, skipped validation, residual risk, and blockers through the
+native child-result mechanism. Do not run Yui lifecycle commands. Do not send
+routine progress handoffs, poll the Leader, accept the WorkItem, or invent a
+child Session or Run record. The Leader reviews
 the result and records the actual Profile revision, runtime model/effort,
 round, result, and checks in the WorkItem summary.
 
@@ -94,13 +113,16 @@ yui task run yield <current-run-id> --summary-file - <<'YUI_SUMMARY'
 YUI_SUMMARY
 ```
 
-Every review Run is bound to one frozen Candidate commit and a separate
-ReviewRound-owned writable worktree. Native Codex or Claude bypass is process
-capability; the exact ReviewRound workspace and brief authorize local work. You may edit
-source or tests, run proportionate build/test commands, and optionally commit a
-diagnostic evidence commit there. Never push, integrate, mutate Task records,
-touch the Candidate or Worker workspace, another Task/worktree, a stable
-checkout, or real YUI_HOME.
+Every review Run is bound to one exact frozen ReviewRound scope and a separate
+ReviewRound-owned writable worktree. A WorkItem ReviewRound contains its exact
+Candidate commit; a Task-final ReviewRound contains the committed Integration
+heads assigned by the Leader. Do not reinterpret one scope as the other. Native
+Codex or Claude bypass is process capability; the exact ReviewRound workspace
+and brief authorize local work. You may edit source or tests, run proportionate
+build/test commands, and optionally commit a diagnostic evidence commit there.
+Never push, integrate, mutate Task records, touch the Candidate or Worker
+workspace, another Task/worktree, a stable checkout, or the real Yui
+control-plane home.
 
 For a review Run, put the complete findings, evidence, checks actually run,
 uncertainty, and recommended next actions in the same `--summary-file -`
@@ -112,7 +134,7 @@ whole report is preserved. For example:
 {
   "summary": "Human review outcome and findings",
   "checks": [
-    {"name": "npm test", "outcome": "passed", "details": "exact result"}
+    {"name": "Project-specified check", "outcome": "passed", "details": "exact result"}
   ],
   "evidenceCommit": "optional exact diagnostic commit SHA"
 }
@@ -160,8 +182,12 @@ protocol.
 
 Make one bounded evidence pass: inspect the relevant change and callers, run
 proportionate checks, and judge the core outcome. Do not repeat successful
-checks or invent extra edge-case probes without concrete defect evidence. Once
-the requested evidence is sufficient, yield immediately. Invoke the exact
+checks, rerun an unchanged complete delivery suite, or invent extra edge-case
+probes without concrete defect evidence. For a WorkItem ReviewRound, inspect
+the exact frozen Candidate assigned to that Round. For a Task-final ReviewRound,
+inspect the frozen committed Integration heads as one whole and do not create a
+second per-WorkItem approval protocol. Once the requested evidence is
+sufficient, yield immediately. Invoke the exact
 `yui task run yield ...` command directly once; do not wrap it in `until`,
 `while`, `sh -c`, `cd ... &&`, or another compound command. A duplicate or late
 review yield is obsolete; do not retry it.
