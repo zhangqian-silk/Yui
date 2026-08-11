@@ -1182,6 +1182,153 @@ test("a Controller restart preserves an unacknowledged fresh Codex Run on its ru
   assert.notEqual(restartedStore.getAgentRun(fx.task.id, run.id).deliveredAt, undefined);
 });
 
+test("an already-running Codex resume host pushes once after the prepare-to-send restart window", async (t) => {
+  const fx = fixture(t, "codex");
+  const roleName = "worker";
+  const role = fx.roles.get(roleName);
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  const nativeSessionId = "codex-native-resume-restart";
+  const run = createAgentRun(
+    "agent-run-7",
+    fx.task.id,
+    roleName,
+    "resume",
+    "deliver through the existing Codex session",
+    NOW,
+    { effective }
+  );
+  fx.store.transaction((tx) => {
+    tx.saveRole(fx.task.id, updateRoleStatus(role, "running", NOW));
+    tx.saveActiveAgentRun(run);
+  });
+  fx.schedulerStore.recordRuntimeNativeSession({
+    taskId: fx.task.id,
+    roleName,
+    agentId: fx.agent.id,
+    adapterId: fx.agent.adapterId,
+    nativeSessionId,
+    effective
+  }, NOW);
+
+  let resumeCalls = 0;
+  let promptPushes = 0;
+  const host = {
+    async start() { throw new Error("new is not expected for a resume Run"); },
+    async resume(request, beforeHostStart) {
+      resumeCalls += 1;
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        nativeSessionId
+      });
+      return runtimeBinding(request, {
+        index: resumeCalls,
+        hostCreated: false,
+        nativeSessionId
+      });
+    },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+
+  const persistPrepared = (store) => (preflight) => {
+    store.saveRoleRunPrepared({
+      task: store.getTask(fx.task.id),
+      role: store.getRole(fx.task.id, roleName),
+      run,
+      session: {
+        agentId: preflight.agentId,
+        adapterId: preflight.adapterId,
+        nativeSessionId,
+        launchId: preflight.launchId,
+        status: "ready",
+        effective: preflight.effective
+      },
+      launchId: preflight.launchId,
+      now: NOW
+    });
+  };
+  const input = {
+    taskId: fx.task.id,
+    roleName,
+    agentId: fx.agent.id,
+    adapterId: fx.agent.adapterId,
+    effective,
+    workspace: fx.home,
+    mode: "resume",
+    nativeSessionId,
+    runId: run.id
+  };
+
+  // The first Controller disappears after preparation and before sendOnce.
+  // The running pane was never a new launch, so it must not be treated as
+  // carrying the Run prompt.
+  const firstStore = fx.schedulerStore;
+  const firstDelivery = registry(
+    new RuntimeLaunchCoordinator(firstStore, host, {
+      createGenerationId: () => "codex-resume-first",
+      now: () => NOW
+    }),
+    host
+  );
+  const firstPrepared = await firstDelivery.prepareRoleSession({
+    ...input,
+    beforeHostStart: persistPrepared(firstStore)
+  });
+  const firstReady = await firstDelivery.waitUntilReady(firstPrepared);
+  assert.equal(firstPrepared.sessionStarted, false);
+  assert.equal(firstPrepared.inputSubmittedAtLaunch, undefined);
+  assert.equal(firstReady.session.nativeSessionId, nativeSessionId);
+  assert.equal(fx.store.getAgentRun(fx.task.id, run.id).pushedAt, undefined);
+
+  const restartedStore = new FileTaskStore(fx.home);
+  const restartedSchedulerStore = new FileSchedulerStoreAdapter(restartedStore);
+  const restartedDelivery = registry(
+    new RuntimeLaunchCoordinator(restartedSchedulerStore, host, {
+      createGenerationId: () => "codex-resume-second",
+      now: () => NOW
+    }),
+    host,
+    async () => {
+      promptPushes += 1;
+      return "sent";
+    }
+  );
+  const recovered = await restartedDelivery.prepareRoleSession({
+    ...input,
+    beforeHostStart: persistPrepared(restartedSchedulerStore)
+  });
+  const recoveredReady = await restartedDelivery.waitUntilReady(recovered);
+  assert.equal(recovered.sessionStarted, false);
+  assert.equal(recovered.inputSubmittedAtLaunch, undefined);
+  assert.equal(promptPushes, 0);
+  assert.equal(restartedStore.getAgentRun(fx.task.id, run.id).pushedAt, undefined);
+
+  const outcome = await restartedDelivery.sendOnce({
+    delivery: recoveredReady,
+    receiptId: `agent-run:${fx.task.id}/${run.id}`,
+    text: run.input
+  });
+  assert.equal(outcome, "sent");
+  assert.equal(promptPushes, 1);
+  restartedSchedulerStore.saveRoleRunDelivery({
+    task: restartedSchedulerStore.getTask(fx.task.id),
+    role: restartedSchedulerStore.getRole(fx.task.id, roleName),
+    run,
+    session: recoveredReady.session,
+    launchId: recovered.launchId,
+    now: NOW
+  });
+  assert.notEqual(restartedStore.getAgentRun(fx.task.id, run.id).pushedAt, undefined);
+  assert.equal(resumeCalls, 2);
+});
+
 test("fresh Claude SessionStart sees the durable Run fence before readiness returns", async (t) => {
   const fx = fixture(t, "claude");
   const roleName = "worker";

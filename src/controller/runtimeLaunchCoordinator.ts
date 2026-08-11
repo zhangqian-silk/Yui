@@ -298,7 +298,12 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           );
         }
         reusedConfirmedRunningHost = true;
+        // Only a fresh Codex generation can carry the exact Run prompt in its
+        // launch argv. A resume request targets an existing native Session and
+        // must use the normal receipt-backed prompt push, even when the
+        // Controller is recovering the same launch reservation.
         launchPromptAcknowledgementRequired = sameRunReservation
+          && request.mode === "new"
           && request.adapterId === "codex";
         runtimeIsolation = this.#preflightRuntimeIsolation(
           request,
