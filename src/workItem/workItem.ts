@@ -106,7 +106,7 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  schemaVersion: 6;
+  schemaVersion: 7;
   id: string;
   taskId: string;
   title: string;
@@ -153,7 +153,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -427,7 +427,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 6) throw new Error("WorkItem must use schemaVersion 6.");
+  if (workItem.schemaVersion !== 7) throw new Error("WorkItem must use schemaVersion 7.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");

@@ -237,7 +237,7 @@ test("persisted high-water marks prevent reuse and reject counter rollback", (t)
 
   const rolledBack = JSON.parse(readFileSync(statePath, "utf8"));
   rolledBack.tasks["task-1"].workItems["work-item-2"] = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: "work-item-2",
     taskId: "task-1",
     title: "Second WorkItem",

@@ -33,7 +33,7 @@ function task(status = "active") {
 
 function run(roleName, overrides = {}) {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: `${roleName}-run-1`,
     taskId: "task-1",
     roleName,

@@ -112,7 +112,7 @@ export const STORAGE_STATE_FILE = "state.json";
 /** The root StorageState schema is the persisted aggregate document version. */
 export const CURRENT_STORAGE_STATE_SCHEMA_VERSION = CURRENT_AGGREGATE_SCHEMA_VERSION;
 export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
-export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 1 as const;
+export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 2 as const;
 /**
  * Persisted StorageState/StoredTask family versions owned by this boundary.
  *
@@ -130,8 +130,8 @@ export const CURRENT_TASK_SCHEMA_VERSION = 3 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 1 as const;
-export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 6 as const;
-export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 2 as const;
+export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 7 as const;
+export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 3 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 2 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 2 as const;
 export const CURRENT_MESSAGE_SCHEMA_VERSION = 2 as const;
@@ -203,7 +203,7 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 14 as const;
  * assert it is classifying the same bytes the store reads and writes.
  */
 export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
-export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 5 as const;
+export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 6 as const;
 
 type StoredTask = {
   schemaVersion: typeof CURRENT_STORED_TASK_SCHEMA_VERSION;

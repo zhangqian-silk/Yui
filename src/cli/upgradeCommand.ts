@@ -9,8 +9,8 @@
  * by the classified path, so a staged updater can run it while the old Controller
  * remains live without a false staged-output validation claim. Execute enters
  * fence/quiesce/switch only for the offline path. Only explicitly declared
- * production paths can run; the aggregate `16→17` transition remains an
- * offline migration.
+ * production paths can run; the aggregate `16→17` and execution record-family
+ * transitions remain offline migrations.
  *
  * Like `doctor`/`controller`, this command needs a Home but manages its own
  * schema check (it must run against a non-current Home), so it is dispatched

@@ -4,10 +4,18 @@ import type { HomeSnapshot } from "../upgrade/homeMigrationTarget.js";
 import { assertBaselineConsistency, baselineStorageVersionState } from "./baseline.js";
 import { planMigration } from "./planner.js";
 import { MigrationRegistry } from "./registry.js";
-import type { StorageVersionState } from "./types.js";
+import type { MigrationStep, StorageVersionState } from "./types.js";
 
 const FINAL_REVIEW_AGGREGATE_FROM_VERSION = 16;
 const FINAL_REVIEW_AGGREGATE_TO_VERSION = 17;
+const WORK_ITEM_FROM_VERSION = 6;
+const WORK_ITEM_TO_VERSION = 7;
+const AGENT_RUN_FROM_VERSION = 5;
+const AGENT_RUN_TO_VERSION = 6;
+const REVIEW_ROUND_FROM_VERSION = 2;
+const REVIEW_ROUND_TO_VERSION = 3;
+const ACTIVE_RUN_POINTER_FROM_VERSION = 1;
+const ACTIVE_RUN_POINTER_TO_VERSION = 2;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -23,10 +31,151 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     preconditions: requireAggregateV16Snapshot,
     transform: migrateAggregateV16ToV17,
     declaredEffects: []
-  });
+  })
+    .registerOfflineMigration(recordFamilyStep(
+      "workItem",
+      WORK_ITEM_FROM_VERSION,
+      WORK_ITEM_TO_VERSION,
+      "workItems"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
+      "agentRun",
+      AGENT_RUN_FROM_VERSION,
+      AGENT_RUN_TO_VERSION,
+      "agentRuns"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
+      "reviewRound",
+      REVIEW_ROUND_FROM_VERSION,
+      REVIEW_ROUND_TO_VERSION,
+      "reviewRounds"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
+      "activeRunPointer",
+      ACTIVE_RUN_POINTER_FROM_VERSION,
+      ACTIVE_RUN_POINTER_TO_VERSION,
+      "activeRuns"
+    ));
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
+}
+
+/**
+ * Upgrade one nested Task record family without guessing fields or repairing
+ * malformed state. The new execution lineage fields are optional, so legal
+ * old single-lane records retain their direct shape; the next dispatch creates
+ * the unified one-lane Group explicitly. The version transition is still
+ * durable and centralized, which keeps old Homes out of the strict current
+ * parser until this step has run.
+ */
+function recordFamilyStep(
+  recordKind: string,
+  fromVersion: number,
+  toVersion: number,
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind,
+    fromVersion,
+    toVersion,
+    preconditions: (snapshot) => requireRecordFamilyVersion(
+      snapshot,
+      recordKind,
+      fromVersion,
+      taskMapKey
+    ),
+    transform: (snapshot) => migrateRecordFamily(
+      snapshot,
+      recordKind,
+      fromVersion,
+      toVersion,
+      taskMapKey
+    ),
+    declaredEffects: []
+  };
+}
+
+function requireRecordFamilyVersion(
+  snapshot: HomeSnapshot,
+  recordKind: string,
+  fromVersion: number,
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+): void {
+  const manifestVersions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (manifestVersions[recordKind] !== fromVersion) {
+    throw new Error(
+      `Record ${recordKind} migration requires manifest version ${fromVersion}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const records = task[taskMapKey];
+    if (records === undefined) continue;
+    const map = asObject(records, `${recordKind} map ${taskId}`);
+    for (const [recordId, rawRecord] of Object.entries(map)) {
+      const record = asObject(rawRecord, `${recordKind} ${taskId}/${recordId}`);
+      if (record.schemaVersion !== fromVersion) {
+        throw new Error(
+          `Record ${recordKind} ${taskId}/${recordId} must use schemaVersion ${fromVersion}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateRecordFamily(
+  snapshot: HomeSnapshot,
+  recordKind: string,
+  fromVersion: number,
+  toVersion: number,
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+): HomeSnapshot {
+  // Keep the same source-shape checks in the transform so a direct caller
+  // cannot bypass the migration's precondition contract.
+  requireRecordFamilyVersion(snapshot, recordKind, fromVersion, taskMapKey);
+  const manifestVersions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      [recordKind]: toVersion
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const records = task[taskMapKey];
+    if (records === undefined) {
+      nextTasks[taskId] = { ...task };
+      continue;
+    }
+    const map = asObject(records, `${recordKind} map ${taskId}`);
+    const nextMap: Record<string, unknown> = {};
+    for (const [recordId, rawRecord] of Object.entries(map)) {
+      nextMap[recordId] = {
+        ...asObject(rawRecord, `${recordKind} ${taskId}/${recordId}`),
+        schemaVersion: toVersion
+      };
+    }
+    nextTasks[taskId] = { ...task, [taskMapKey]: nextMap };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+function asObject(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
 }
 
 /** Historical public spelling retained as an alias to the single graph. */

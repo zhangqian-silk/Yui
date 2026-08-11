@@ -12,8 +12,8 @@
  * the schema evolves (a new record family, a bumped family version), this map is
  * updated in lockstep, exactly like the scalar constants. It exists so
  * doctor/inspect and the migration planner can reason about record families.
- * The current production graph has no record-axis steps; adding one requires an
- * explicit adjacent registration and transform.
+ * Post-baseline record changes require an explicit adjacent registration and
+ * transform in the production migration graph.
  */
 
 import {

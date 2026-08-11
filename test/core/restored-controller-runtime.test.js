@@ -1170,7 +1170,7 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
     status: "running"
   };
   const run = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: "agent-run-1",
     taskId: task.id,
     roleName: role.name,
@@ -1329,7 +1329,7 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     (role) => role.taskId === taskId && role.name === roleName
   ) ?? null;
   store.getActiveAgentRun = (_taskId, roleName) => ({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: roleName === "worker" ? "agent-run-1" : "agent-run-2",
     taskId: task.id,
     roleName,
@@ -1443,7 +1443,7 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
     taskId: "task-1", name: "worker", activeAgentId: "codex", adapterId: "codex", status: "running"
   }];
   store.getActiveAgentRun = () => ({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: "agent-run-1",
     taskId: "task-1",
     roleName: "worker",
@@ -2338,7 +2338,7 @@ function deliveredRun(taskId, roleName) {
   const at = new Date(0).toISOString();
   const agentId = `codex-${roleName}`;
   return {
-    schemaVersion: 5, id: "agent-run-1", taskId, roleName,
+    schemaVersion: 6, id: "agent-run-1", taskId, roleName,
     mode: "new", input: "work", purpose: "execution", status: "active",
     pushedAt: at, deliveredAt: at,
     effective: testEffectiveLaunch({ agentId }),

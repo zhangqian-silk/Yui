@@ -13,7 +13,7 @@ export type AgentRunStatus = "active" | "yielded" | "failed";
 export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
-  schemaVersion: 5;
+  schemaVersion: 6;
   id: string;
   taskId: string;
   roleName: string;
@@ -70,7 +70,7 @@ export function createAgentRun(
   }
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: requireSafeIdentity(id, "Agent run id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -129,7 +129,7 @@ export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
-  if (run.schemaVersion !== 5) throw new Error("Agent run must use schemaVersion 5.");
+  if (run.schemaVersion !== 6) throw new Error("Agent run must use schemaVersion 6.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "agentRun");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {

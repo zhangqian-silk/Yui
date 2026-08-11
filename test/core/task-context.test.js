@@ -240,6 +240,7 @@ test("task context aggregates complete records and renders a compact recent summ
       }
     ],
     activeExecutorCount: 2,
+    executionGroups: [],
     attention: [],
     blockers: [],
     pendingWakeup: null,

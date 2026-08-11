@@ -44,7 +44,7 @@ export type ReviewYieldReport = Readonly<{
 }>;
 
 export type ReviewRound = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   taskId: string;
   workItemId: string;
@@ -87,7 +87,7 @@ export function createReviewRound(
   executionGroup?: ExecutionGroup
 ): ReviewRound {
   return validateReviewRound({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     workItemId: requireIdentity(workItemId, "Work Item id"),
@@ -115,7 +115,7 @@ export function createTaskReviewRound(
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     workItemId: requireIdentity(workItemId, "Work Item id"),
@@ -296,7 +296,7 @@ export function updateReviewExecutionGroup(
 }
 
 export function validateReviewRound(round: ReviewRound): ReviewRound {
-  if (round.schemaVersion !== 2) throw new Error("ReviewRound must use schemaVersion 2.");
+  if (round.schemaVersion !== 3) throw new Error("ReviewRound must use schemaVersion 3.");
   validateTaskRecordReference({ taskId: round.taskId, localId: round.id }, "reviewRound");
   validateTaskRecordReference({ taskId: round.taskId, localId: round.workItemId }, "workItem");
   if (!/^candidate-[1-9]\d*$/.test(round.candidateId)) {
