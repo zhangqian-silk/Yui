@@ -12,6 +12,7 @@ import {
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { CliIdentity } from "../cli/completion.js";
 import {
+  selectAgentPermission,
   selectAgentModelAndEffort
 } from "../cli/agentConfigurationPicker.js";
 import type { SelectionIo } from "../cli/interactiveSelection.js";
@@ -308,7 +309,8 @@ async function configureYui(
       existingReviewer,
       home,
       selectionIo,
-      catalogs
+      catalogs,
+      true
     );
   }
   const defaultAgent = prepared.find(({ id }) => id === defaultAgentId);
@@ -540,18 +542,20 @@ async function promptRoleAgentConfig(
   existingRole: GlobalRole | null,
   cwd: string,
   io: SelectionIo,
-  catalogs: AgentConfigurationCatalogService
+  catalogs: AgentConfigurationCatalogService,
+  selectPermission = false
 ): Promise<RoleAgentConfig> {
   const existing = existingRole?.activeAgentId === agent.id
     ? existingRole.agentBindings[agent.id]?.config
     : undefined;
   io.write(`\n${label} Agent configuration: ${agent.id}\n`);
-  const selection = await selectAgentModelAndEffort(
-    await catalogs.resolve({
+  const resolved = await catalogs.resolve({
       agent,
       cwd,
       ...(existing === undefined ? {} : { config: existing })
-    }),
+    });
+  const selection = await selectAgentModelAndEffort(
+    resolved,
     io,
     {
       currentModel: existing?.model,
@@ -568,6 +572,17 @@ async function promptRoleAgentConfig(
   else candidate.model = selection.model;
   if (selection.effort === undefined) delete candidate.effort;
   else candidate.effort = selection.effort;
+  if (selectPermission) {
+    const permission = await selectAgentPermission(
+      resolved,
+      io,
+      candidate.permission as RoleAgentConfig["permission"]
+    );
+    if (permission.kind === "cancelled") {
+      throw usageError(`${label} permission configuration was cancelled.`);
+    }
+    candidate.permission = permission.permission;
+  }
   try {
     return resolveAgentAdapter(agent.adapterId).canonicalizeConfig(
       candidate as RoleAgentConfig

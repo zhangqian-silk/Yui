@@ -3,6 +3,7 @@ import { isAbsolute, join } from "node:path";
 
 import {
   configuredAgentToDefinition,
+  resolveAgentEnvironment,
   type ConfiguredAgent
 } from "../agent/agent.js";
 import {
@@ -210,7 +211,7 @@ function inspectDoctor(
     checkExecutable("tmux", env.YUI_TMUX_BIN ?? "tmux", ["-V"], executor)
   ];
   const agentChecks = storage.agents.flatMap((agent) => checkAgent(agent, executor));
-  const review = inspectReview({ ...storage.review, home }, agentChecks);
+  const review = inspectReview({ ...storage.review, home }, agentChecks, env);
   return {
     checks: [
       homeCheck,
@@ -560,7 +561,8 @@ type ReviewInspection = Readonly<{
 
 function inspectReview(
   source: ReviewSource,
-  agentChecks: readonly DoctorCheck[]
+  agentChecks: readonly DoctorCheck[],
+  environment: NodeJS.ProcessEnv
 ): ReviewInspection {
   if (!source.storageReady) {
     const raw = source.home === undefined
@@ -690,7 +692,7 @@ function inspectReview(
       : capabilityCheck.detail
   });
 
-  const launch = checkReviewerLaunch(agent, role, binding, adapter);
+  const launch = checkReviewerLaunch(agent, role, binding, adapter, environment);
   checks.push(launch);
   const dispatch = checkReviewerDispatch(policy, role, binding, agent, launch, commandCheck, capabilityCheck);
   checks.push(dispatch);
@@ -879,7 +881,8 @@ function checkReviewerLaunch(
   agent: ConfiguredAgent,
   role: GlobalRole,
   binding: GlobalRole["agentBindings"][string],
-  adapter: ReturnType<typeof resolveAgentAdapter>
+  adapter: ReturnType<typeof resolveAgentAdapter>,
+  environment: NodeJS.ProcessEnv
 ): DoctorCheck {
   try {
     const workspace = role.workspace;
@@ -899,6 +902,7 @@ function checkReviewerLaunch(
       };
     }
     const definition = configuredAgentToDefinition(agent);
+    resolveAgentEnvironment(definition, environment);
     const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
     const compiled = adapter.compileNew({
       agent: definition,
