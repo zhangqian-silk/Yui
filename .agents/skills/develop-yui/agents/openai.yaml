@@ -1,0 +1,4 @@
+interface:
+  display_name: "Develop Yui"
+  short_description: "Develop and validate Yui with deterministic tests"
+  default_prompt: "Use $develop-yui to implement and validate this Yui repository change."

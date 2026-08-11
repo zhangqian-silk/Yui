@@ -25,10 +25,17 @@ export type RoleSessionOwner = Readonly<
   { scope: "global" } | { scope: "task"; taskId: string }
 >;
 
+export type RoleSessionContextOptions = Readonly<{
+  purpose?: "execution" | "review";
+}>;
+
+type RoleSessionKind = "operator" | "global" | "leader" | "worker" | "reviewer";
+
 const BUILTIN_YUI_SKILLS = new Set([
   "yui-operator",
   "yui-leader",
-  "yui-worker"
+  "yui-worker",
+  "yui-reviewer"
 ]);
 
 /**
@@ -38,15 +45,10 @@ const BUILTIN_YUI_SKILLS = new Set([
 export function compileRoleSessionContext(
   yuiHome: string | undefined,
   role: GlobalRole | TaskRole,
-  owner: RoleSessionOwner
+  owner: RoleSessionOwner,
+  options: RoleSessionContextOptions = {}
 ): RoleSessionContext {
-  const kind = role.name === SYSTEM_OPERATOR_ROLE && owner.scope === "global"
-    ? "operator"
-    : owner.scope === "global"
-      ? "global"
-      : role.name === SYSTEM_LEADER_ROLE
-      ? "leader"
-      : "worker";
+  const kind = roleSessionKind(role, owner, options.purpose ?? "execution");
   const builtInSkillId = kind === "global" ? undefined : `yui-${kind}`;
   const skillIds = unique([
     ...(builtInSkillId === undefined ? [] : [builtInSkillId]),
@@ -58,37 +60,16 @@ export function compileRoleSessionContext(
     skills,
     ...(yuiHome === undefined
       ? {}
-      : { managedContextFile: roleContextFile(yuiHome, role, owner) })
+      : { managedContextFile: roleContextFile(yuiHome, role, owner, kind) })
   };
 }
 
 function renderDeveloperInstructions(
-  kind: "operator" | "global" | "leader" | "worker",
+  kind: RoleSessionKind,
   role: GlobalRole | TaskRole,
   owner: RoleSessionOwner
 ): string {
-  const core = kind === "operator"
-    ? [
-        "You are the global Yui Operator and the user's CLI proxy.",
-        "Manage Yui through its CLI; do not perform Task implementation work.",
-        "Follow the injected yui-operator Skill when coordinating Yui."
-      ]
-    : kind === "global"
-      ? [
-          `You are global Yui Role ${role.name}.`,
-          "Follow the configured Role profile and the user's instructions."
-        ]
-    : kind === "leader"
-      ? [
-          `You are the Yui Leader for Task ${owner.scope === "task" ? owner.taskId : role.name}.`,
-          "Own Task stewardship and delegate bounded implementation work.",
-          "Follow the injected yui-leader Skill for Yui coordination."
-        ]
-      : [
-          `You are Yui Role ${role.name}${owner.scope === "task" ? ` for Task ${owner.taskId}` : ""}.`,
-          "Execute only the work delegated to this Role and report through Yui.",
-          "Follow the injected yui-worker Skill while handling Yui work."
-        ];
+  const core = renderRoleCore(kind, role, owner);
   const profile = [
     role.description === undefined ? null : `Role description: ${role.description}`,
     ...(role.responsibilities ?? []).map((value) => `Role responsibility: ${value}`),
@@ -97,6 +78,56 @@ function renderDeveloperInstructions(
     role.systemPrompt === undefined ? null : `Additional Role instructions:\n${role.systemPrompt}`
   ].filter((value): value is string => value !== null);
   return [...core, ...profile].join("\n");
+}
+
+function roleSessionKind(
+  role: GlobalRole | TaskRole,
+  owner: RoleSessionOwner,
+  purpose: "execution" | "review"
+): RoleSessionKind {
+  if (owner.scope === "global") {
+    return role.name === SYSTEM_OPERATOR_ROLE ? "operator" : "global";
+  }
+  if (purpose === "review") return "reviewer";
+  return role.name === SYSTEM_LEADER_ROLE ? "leader" : "worker";
+}
+
+function renderRoleCore(
+  kind: RoleSessionKind,
+  role: GlobalRole | TaskRole,
+  owner: RoleSessionOwner
+): string[] {
+  switch (kind) {
+    case "operator":
+      return [
+        "You are the global Yui Operator and the user's CLI proxy.",
+        "Manage Yui through its CLI; do not perform Task implementation work.",
+        "Follow the injected yui-operator Skill when coordinating Yui."
+      ];
+    case "global":
+      return [
+        `You are global Yui Role ${role.name}.`,
+        "Follow the configured Role profile and the user's instructions."
+      ];
+    case "leader":
+      return [
+        `You are the Yui Leader for Task ${owner.scope === "task" ? owner.taskId : role.name}.`,
+        "Own Task stewardship and delegate bounded implementation work.",
+        "Follow the injected yui-leader Skill for Yui coordination."
+      ];
+    case "reviewer":
+      return [
+        `You are Yui review Role ${role.name} for Task ${owner.scope === "task" ? owner.taskId : role.name}.`,
+        "Review only the exact frozen ReviewRound scope assigned to this Run.",
+        "Follow the injected yui-reviewer Skill while reviewing Yui work."
+      ];
+    case "worker":
+      return [
+        `You are Yui Role ${role.name}${owner.scope === "task" ? ` for Task ${owner.taskId}` : ""}.`,
+        "Execute only the work delegated to this Role and report through Yui.",
+        "Follow the injected yui-worker Skill while handling Yui work."
+      ];
+  }
 }
 
 export function loadYuiSkillContexts(
@@ -137,11 +168,13 @@ function unique(values: readonly string[]): string[] {
 function roleContextFile(
   yuiHome: string,
   role: GlobalRole | TaskRole,
-  owner: RoleSessionOwner
+  owner: RoleSessionOwner,
+  kind: RoleSessionKind
 ): string {
   const identity = createHash("sha256").update(JSON.stringify([
     owner.scope,
     ...(owner.scope === "task" ? [owner.taskId] : []),
+    kind,
     role.name,
     role.activeAgentId
   ])).digest("hex");

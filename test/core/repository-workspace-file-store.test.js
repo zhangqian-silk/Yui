@@ -1359,6 +1359,7 @@ test("a reviewer launches from the candidate Run workspace instead of its previo
     mode: "new"
   });
   assert.equal(plan.role.workspace, reviewWorkspace.root);
+  assert.equal(plan.role.cwd, reviewWorkspace.entries[0].path);
   assert.equal(plan.launch.env.YUI_WORKSPACE, reviewWorkspace.root);
 });
 
@@ -1635,6 +1636,17 @@ test("a multi-Project Task and WorkItem expose one root with per-Project access"
     mode: "new"
   });
   assert.equal(isolatedPlan.launch.command, "codex");
+  assert.equal(isolatedPlan.role.workspace, work.root);
+  assert.equal(isolatedPlan.role.cwd, undefined);
+  for (const entry of work.entries) {
+    assert.deepEqual(
+      isolatedPlan.launch.args.slice(
+        isolatedPlan.launch.args.indexOf(entry.path) - 1,
+        isolatedPlan.launch.args.indexOf(entry.path) + 1
+      ),
+      ["--add-dir", entry.path]
+    );
+  }
   assert.deepEqual(JSON.parse(isolatedPlan.launch.env.YUI_WRITABLE_PROJECT_IDS), [backend.id]);
   assert.deepEqual(JSON.parse(isolatedPlan.launch.env.YUI_CONTEXT_PROJECT_IDS), [frontend.id]);
   const directAgentPlan = new FileRoleLaunchPlanner(home, store, {
@@ -3411,7 +3423,7 @@ test("exact Task complete resumes one durably pending final Review after the pri
     .filter(({ purpose }) => purpose === "review");
   assert.equal(rounds.length, 1);
   assert.equal(rounds[0].id, fx.pending.id);
-  assert.equal(rounds[0].status, "running");
+  assert.equal(rounds[0].status, "running", rounds[0].summary);
   assert.equal(rounds[0].reviewerRunId, "agent-run-1");
   assert.equal(reviewRuns.length, 1);
   assert.equal(reviewRuns[0].reviewRoundId, fx.pending.id);
@@ -3760,8 +3772,21 @@ test("exact Task completion rejects Task-main drift after the latest Integration
   assert.equal(store.getTask(task.id).status, "active");
 });
 
-test("a reviewer launches from a fresh ReviewRound workspace frozen from the Candidate", async (t) => {
+test("a reviewer launches from a fresh ReviewRound workspace and leaves Project Skills to the Agent", async (t) => {
   const { home, workspace, repositoryPath, store } = fixture(t);
+  const projectSkillDirectory = join(
+    repositoryPath,
+    ".agents",
+    "skills",
+    "project-review"
+  );
+  mkdirSync(projectSkillDirectory, { recursive: true });
+  writeFileSync(
+    join(projectSkillDirectory, "SKILL.md"),
+    "# Project review\n\nUse the Project review workflow.\n"
+  );
+  execFileSync("git", ["-C", repositoryPath, "add", ".agents"]);
+  execFileSync("git", ["-C", repositoryPath, "commit", "-qm", "add project skill"]);
   const project = await addProject(store, repositoryPath);
   const task = activateTask(createTask("task-1", "Review an isolated candidate", NOW, {
     projectBindings: [{
@@ -3855,7 +3880,30 @@ test("a reviewer launches from a fresh ReviewRound workspace frozen from the Can
     mode: "new"
   });
   assert.equal(plan.role.workspace, reviewRun.workspace.root);
+  assert.equal(plan.role.cwd, reviewRun.workspace.entries[0].path);
   assert.equal(plan.launch.env.YUI_WORKSPACE, reviewRun.workspace.root);
+  assert.deepEqual(
+    plan.launch.args.slice(
+      plan.launch.args.indexOf(reviewRun.workspace.root) - 1,
+      plan.launch.args.indexOf(reviewRun.workspace.root) + 1
+    ),
+    ["--add-dir", reviewRun.workspace.root]
+  );
+  const developerInstructions = plan.launch.args.find((argument) => (
+    argument.startsWith("developer_instructions=")
+  ));
+  assert.ok(developerInstructions);
+  assert.match(developerInstructions, /injected yui-reviewer/u);
+  assert.match(developerInstructions, /skills\/yui-reviewer/u);
+  assert.doesNotMatch(developerInstructions, /skills\/yui-worker/u);
+  assert.equal(existsSync(join(
+    reviewRun.workspace.entries[0].path,
+    ".agents",
+    "skills",
+    "project-review",
+    "SKILL.md"
+  )), true);
+  assert.doesNotMatch(developerInstructions, /project-review|Project review workflow/u);
 });
 
 test("public review delivery binds the physical ReviewRound workspace before notification", async (t) => {

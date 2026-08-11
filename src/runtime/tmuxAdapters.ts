@@ -28,6 +28,7 @@ import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
 export type RuntimeTmuxRole = Readonly<{
   name: string;
   workspace: string;
+  cwd?: string;
   status?: string;
 }>;
 

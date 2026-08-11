@@ -328,7 +328,11 @@ own base ref. Yui exposes them under one Task workspace root:
 Git repository. Each Project child is the supported Git cwd (for example
 `<workspace>/tasks/<task-id>/main/yui`) and points to that Project's managed
 worktree at `<workspace>/worktree/<project>/<task-id>/main`. Run Git commands
-inside the relevant Project child. The Leader starts at the root and sees the complete Task context. Create all known
+inside the relevant Project child. With one bound Project, the native Agent
+starts in its managed worktree so Agent-native project configuration and Skills
+are discovered normally. With multiple Projects, it starts at the logical root
+and receives every Project worktree through the provider's native
+additional-directory mechanism. Create all known
 bindings together, or let the active Task Leader add one when the same outcome
 expands:
 
@@ -667,7 +671,9 @@ parses prompt glyphs, progress text, trust dialogs, or other Agent terminal
 output to infer readiness or success. `captureRole()` remains an explicit
 human-facing transcript read and has no lifecycle authority.
 
-Stable Role context is also launch metadata, never a bootstrap turn. Yui passes Role policy and `systemPrompt` through the Agent's native system/developer-instruction channel. Native Codex CLI has no per-launch extra-Skill-root option, so its developer instructions carry compact absolute Skill references and Codex reads each `SKILL.md` on demand. Because `developer_instructions` is one scalar setting, Yui inspects every supported Linux Codex layer—`/etc/codex/config.toml`, the user config, the selected `$CODEX_HOME/<name>.config.toml`, project configs, and `/etc/codex/managed_config.toml`—and refuses to replace a value found in any of them. Managed Codex sessions also require exclusive ownership of the structured `notify` callback that records native Turn completion; Yui refuses launch when any inspected layer already defines `notify`, so neither callback can silently replace the other. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the Role-specific path. Non-Operator global Roles stay neutral and receive no Task Leader or Worker Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
+Stable Role context is also launch metadata, never a bootstrap turn. Yui passes Role policy and `systemPrompt` through the Agent's native system/developer-instruction channel. Task execution Runs receive the generic Leader or Worker Skill, while review Runs receive the generic Reviewer Skill based on durable Run purpose rather than a configured Role name. These Yui-owned Role Skills define portable orchestration only. Project Skills remain ordinary versioned files in the Project and are discovered, selected, and loaded by the Agent through its native project mechanism; Yui does not scan, parse, copy, or inject them.
+
+Native Codex developer instructions carry compact absolute references only for Yui-owned Role Skills, which Codex reads on demand. Because `developer_instructions` is one scalar setting, Yui inspects every supported Linux Codex layer—`/etc/codex/config.toml`, the user config, the selected `$CODEX_HOME/<name>.config.toml`, project configs, and `/etc/codex/managed_config.toml`—and refuses to replace a value found in any of them. Managed Codex sessions also require exclusive ownership of the structured `notify` callback that records native Turn completion; Yui refuses launch when any inspected layer already defines `notify`, so neither callback can silently replace the other. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Yui-owned Role Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the purpose-specific Role path. Non-Operator global Roles stay neutral and receive no Task orchestration Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker or Reviewer Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
 
 ## Controller and failure handling
 
@@ -872,7 +878,9 @@ opt-in and mandatory isolation preflight path has been selected.
 Yui's tests are classified into five explicit, executable tiers so a reader
 never has to guess what a test actually exercised. Each tier declares whether it
 creates a Session, whether it calls a real model, and whether it stands up a
-disposable real runtime:
+disposable real runtime. Agent workflow for applying these tiers while developing
+Yui lives in [`.agents/skills/develop-yui/SKILL.md`](.agents/skills/develop-yui/SKILL.md); it is
+not part of the generic Leader, Worker, or Reviewer workflow:
 
 | Tier | Session | Real model | Disposable runtime | Preflight | Opt-in |
 | --- | --- | --- | --- | --- | --- |

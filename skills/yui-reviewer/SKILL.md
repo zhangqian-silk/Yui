@@ -18,9 +18,15 @@ WorkItem Develop workspace, and never become a ChangeSet source.
 
 Keep the context layers distinct. Yui Core owns ReviewRound identity,
 lifecycle, access, workspace, and exact-yield safety; this generic Skill owns
-portable review behavior; Project Policy and Knowledge own project-specific
-checks and review expectations; and the Task Contract owns the current outcome,
-scope, acceptance, and required evidence.
+portable review behavior; Agent-native Project Skills and Project Policy and
+Knowledge own project-specific checks and review expectations; and the Task
+Contract owns the current outcome, scope, acceptance, and required evidence.
+
+During ordinary review, do not run tests that invoke real Agents or models,
+paid services, shared infrastructure, production systems, or other
+non-disposable external resources. Prefer existing deterministic evidence,
+mocks, and isolated resources; if the user did not explicitly request
+real-resource validation, report the gap instead of running it.
 
 Report reachable material defects, verification gaps, checks actually run, and
 bounded next actions. A review result is evidence for Leader judgment; it does

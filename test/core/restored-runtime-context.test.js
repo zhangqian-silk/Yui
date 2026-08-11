@@ -193,9 +193,29 @@ test("non-Operator global Roles use neutral context without Task orchestration S
     }, { scope: "global" });
 
     assert.match(context.developerInstructions, new RegExp(`global Yui Role ${name}`));
-    assert.doesNotMatch(context.developerInstructions, /Task|yui-(?:leader|worker)/);
+    assert.doesNotMatch(
+      context.developerInstructions,
+      /Task|yui-(?:leader|worker|reviewer)/
+    );
     assert.deepEqual(context.skills, []);
   }
+});
+
+test("Task review Runs select reviewer policy by purpose instead of Role name", () => {
+  const configuredName = "quality-gate";
+  const execution = compileRoleSessionContext(undefined, {
+    ...role,
+    name: configuredName
+  }, { scope: "task", taskId: "task-1" });
+  const review = compileRoleSessionContext(undefined, {
+    ...role,
+    name: configuredName
+  }, { scope: "task", taskId: "task-1" }, { purpose: "review" });
+
+  assert.deepEqual(execution.skills.map(({ id }) => id), ["yui-worker"]);
+  assert.deepEqual(review.skills.map(({ id }) => id), ["yui-reviewer"]);
+  assert.match(review.developerInstructions, /injected yui-reviewer/u);
+  assert.doesNotMatch(review.developerInstructions, /injected yui-worker/u);
 });
 
 test("configured Role policy and Skills stay in native session context, not dispatch text", (t) => {

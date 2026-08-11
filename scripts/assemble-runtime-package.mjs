@@ -16,7 +16,8 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const RUNTIME_SKILLS = [
   "yui-leader",
   "yui-worker",
-  "yui-operator"
+  "yui-operator",
+  "yui-reviewer"
 ];
 const RUNTIME_DOCUMENTS = [
   "README.md",

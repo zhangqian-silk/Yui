@@ -29,6 +29,10 @@
 - Do not add legacy storage or workspace compatibility unless the user explicitly requests it.
 - Prefer the smallest workflow that satisfies the current product commitment. Avoid speculative states, background protocols, and duplicate sources of truth.
 
+## Keep Yui-specific workflow in its Project Skill
+
+- When developing this repository, read and follow [`.agents/skills/develop-yui/SKILL.md`](.agents/skills/develop-yui/SKILL.md). It owns Yui-specific implementation and validation workflow; do not copy those Project details into Yui's generic Leader, Worker, or Reviewer behavior.
+
 ## Run this checkout in isolation
 
 - To exercise Yui from this checkout, run `make install-local` once, then always invoke the launcher by absolute path: `<checkout>/output/dev/bin/yui ...`. This is the reliable per-checkout entry point for automation.
