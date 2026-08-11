@@ -213,7 +213,7 @@ function inspectDoctor(
     checkExecutable("git", env.YUI_GIT_BIN ?? "git", ["--version"], executor),
     checkExecutable("tmux", env.YUI_TMUX_BIN ?? "tmux", ["-V"], executor)
   ];
-  const agentChecks = storage.agents.flatMap((agent) => checkAgent(agent, executor));
+  const agentChecks = storage.agents.flatMap((agent) => checkAgent(agent, executor, env));
   const review = inspectReview({ ...storage.review, home }, agentChecks, env);
   return {
     checks: [
@@ -913,11 +913,7 @@ function checkReviewerLaunch(
       };
     }
     const definition = configuredAgentToDefinition(agent);
-    const resolvedAgentEnvironment = resolveAgentEnvironment(definition, environment);
-    const launchEnvironment = {
-      ...operationalAgentEnvironment(adapter.id, environment),
-      ...resolvedAgentEnvironment
-    };
+    const launchEnvironment = resolveDoctorAgentEnvironment(definition, environment);
     const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
     const agentWorkspace = effective.workspace.entries.length === 1
       ? effective.workspace.entries[0]!.path
@@ -1029,11 +1025,17 @@ function checkExecutable(
   }
 }
 
-function checkAgent(agent: ConfiguredAgent, executor: CommandExecutor): DoctorCheck[] {
+function checkAgent(
+  agent: ConfiguredAgent,
+  executor: CommandExecutor,
+  environment: NodeJS.ProcessEnv
+): DoctorCheck[] {
   let snapshot: CapabilitySnapshot;
   try {
-    snapshot = inspectAgentCapabilities(configuredAgentToDefinition(agent), {
-      run: (command, args) => runAgentProbe(executor, command, args)
+    const definition = configuredAgentToDefinition(agent);
+    const launchEnvironment = resolveDoctorAgentEnvironment(definition, environment);
+    snapshot = inspectAgentCapabilities(definition, {
+      run: (command, args) => runAgentProbe(executor, command, args, launchEnvironment)
     });
   } catch (error) {
     return [{
@@ -1076,10 +1078,15 @@ function checkAgent(agent: ConfiguredAgent, executor: CommandExecutor): DoctorCh
 function runAgentProbe(
   executor: CommandExecutor,
   command: string,
-  args: readonly string[]
+  args: readonly string[],
+  environment: Readonly<Record<string, string>>
 ): AgentProbeResult {
   try {
-    return { status: 0, stdout: executor.run(command, [...args]), stderr: "" };
+    return {
+      status: 0,
+      stdout: executor.run(command, [...args], { environment }),
+      stderr: ""
+    };
   } catch (error) {
     const missing = isMissingCommand(error);
     const probeError = Object.assign(new Error(errorMessage(error)), {
@@ -1092,6 +1099,22 @@ function runAgentProbe(
       error: probeError
     };
   }
+}
+
+/**
+ * Resolve the complete environment used by FileRoleLaunchPlanner for an Agent.
+ * Doctor probes must inspect the same command resolution context as a native
+ * launch; inheriting the Doctor process PATH would allow a shell-installed
+ * command to mask a missing configured binding.
+ */
+function resolveDoctorAgentEnvironment(
+  agent: Pick<ConfiguredAgent, "adapterId" | "environment">,
+  environment: NodeJS.ProcessEnv
+): Record<string, string> {
+  return {
+    ...operationalAgentEnvironment(agent.adapterId, environment),
+    ...resolveAgentEnvironment(agent, environment)
+  };
 }
 
 function isMissingCommand(error: unknown): boolean {
