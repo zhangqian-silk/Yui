@@ -2121,8 +2121,9 @@ test("a fresh Controller retries an undelivered Run in an existing busy pane", a
   });
 
   controller.signal("role:task-1/worker");
-  for (let attempt = 0; attempt < 100 && sends < 3; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 2));
+  const deadline = Date.now() + 250;
+  while (sends < 3 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
 
   assert.equal(sends, 3);
@@ -2179,7 +2180,10 @@ test("a resumed Role retries startup readiness when prepare created its missing 
   });
 
   controller.signal("role:task-1/worker");
-  await new Promise((resolve) => setTimeout(resolve, 25));
+  const deadline = Date.now() + 250;
+  while (sends < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 
   assert.equal(sends, 2);
   controller.stop();

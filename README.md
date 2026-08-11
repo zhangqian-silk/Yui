@@ -799,6 +799,77 @@ npm test
 npm run lint
 ```
 
+`npm test` (and `make test` / `make check`) runs the full **deterministic** test
+suite: it never launches a real model and never touches the global `yui`
+binary, a shared `YUI_HOME`, or a running production Session. It stays
+deterministic even when launched from inside a managed Yui Session, because it
+preloads `test/helpers/scrubSessionEnv.js` to strip every Yui-owned managed
+runtime value from the test process, including shared `YUI_HOME`, exact Leader
+action assertions, workspace projections, and Agent launch descriptors. Tests
+that touch Home/CLI/Controller/tmux explicitly supply a test-created isolated
+Home. The same preamble puts local refusal shims for bare `codex` and `claude`
+ahead of the caller's `PATH`; Session fixtures install observable Mock Agents
+inside their owned Home instead. Only a dedicated managed-identity child may
+opt out. The Provider E2E tier is exempt from the shims only after its explicit
+opt-in and mandatory isolation preflight path has been selected.
+
+### Test tiers
+
+Yui's tests are classified into five explicit, executable tiers so a reader
+never has to guess what a test actually exercised. Each tier declares whether it
+creates a Session, whether it calls a real model, and whether it stands up a
+disposable real runtime:
+
+| Tier | Session | Real model | Disposable runtime | Preflight | Opt-in |
+| --- | --- | --- | --- | --- | --- |
+| Unit | no | no | no | no | — |
+| Isolated Integration | yes | no | yes | no | — |
+| Mock Agent Session | yes | no | yes | no | — |
+| Provider E2E | yes | **yes** | yes | **required** | `YUI_ALLOW_PROVIDER_E2E=1` |
+| Release E2E | **no** | **no** | yes | **required** | `YUI_ALLOW_RELEASE_E2E=1` |
+
+```sh
+make test-tier T=unit          # or: npm run test:tier -- unit
+npm run test:tier -- unit -- --test-name-pattern "test name"
+node scripts/run-test-tier.mjs list
+```
+
+The supported tier entrypoint always runs the canonical `npm run build` first.
+It therefore works on a fresh checkout and cannot mistake a present but stale
+`dist/cli.js` for current code. The raw `node --test dist/...` path remains an
+unsupported bypass of that freshness boundary.
+
+**Provider E2E is the only tier that calls a real model.** Release E2E, on its
+normal path, creates no Session and calls no model — it exercises
+binary/install/update/upgrade release flows against real npm/home/namespace
+resources. Both tiers are **privileged and fail-closed**: they live only in
+nested privileged manifests excluded from the default test glob, refuse to run
+without their opt-in env var, and execute through one wrapper that registers
+cleanup before observation and does not even evaluate the scenario module until
+the blocking isolation preflight (`assertIsolationReady`) passes. Active-Session
+observation is runner-owned and uses an all-scope Yui runtime inventory;
+scenario code cannot replace it or manufacture an empty result. The preflight
+requires an absolute
+checkout-local launcher; a run root proven **temporary and creator-bound owned by
+this run** — created via `createOwnedRunRoot` (mkdtemp + a random-token
+ownership receipt) and re-proven by that exact token, with a symlink run root
+refused and every path canonicalized so a symlink escape cannot pass a lexical
+check; the disposable `YUI_HOME`, workspace, isolated npm prefix, and unique
+runtime namespace all derived *inside that exact owned root* and **physically
+fenced** against symlink escape; and an **explicit** observation that zero
+production Sessions are active (missing evidence fails closed — it is never
+assumed empty). No bare `yui`, `make link` symlink, shared home, arbitrary or
+pre-existing foreign run root, symlinked path, or unproven Session state is
+tolerated. Real-runtime teardown scans and cleans only the creator-owned Home,
+uses Yui's exact process/pane/artifact identity fences, verifies the Home-derived
+tmux server is absent, and refuses environment overrides that redirect
+`YUI_HOME`. The reusable annotated-resource selector separately requires an
+exact non-empty creator token plus matching `ephemeral-test` marker; a missing
+token touches nothing and is a failed cleanup outcome. **Mock Agent Session
+transport success does not prove
+provider-native acceptance** — only the Provider E2E tier can record that. See
+[docs/testing/test-tiers.md](./docs/testing/test-tiers.md) for the full contract.
+
 To make user terminals use this checkout, reversibly link the user-level `yui` command:
 
 ```sh

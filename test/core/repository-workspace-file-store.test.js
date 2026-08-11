@@ -4,14 +4,11 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   realpathSync,
-  rmSync,
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -90,8 +87,9 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
-import { yuiTmuxServerName } from "../../dist/tmux/tmuxManager.js";
 import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
+import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
+import { installMockProviderCommands } from "../helpers/mockProviderCommands.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
@@ -100,39 +98,8 @@ function git(args) {
 }
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), "yui-project-"));
-  const home = join(root, "home");
-  t.after(() => {
-    const discovery = join(home, "runtime", "controller.json");
-    if (existsSync(discovery)) {
-      const stopped = spawnSync(
-        process.execPath,
-        [join(process.cwd(), "dist", "cli.js"), "controller", "stop"],
-        {
-          encoding: "utf8",
-          env: { ...process.env, YUI_HOME: home },
-          timeout: 10_000
-        }
-      );
-      assert.equal(
-        stopped.status,
-        0,
-        `Fixture Controller cleanup failed: ${stopped.stderr || stopped.error?.message}`
-      );
-    }
-    const stoppedTmux = spawnSync(
-      process.env.YUI_TMUX_BIN ?? "tmux",
-      ["-L", yuiTmuxServerName(home), "kill-server"],
-      { encoding: "utf8", env: { ...process.env, YUI_HOME: home } }
-    );
-    assert.equal(
-      stoppedTmux.status === 0
-        || /no server running|failed to connect|error connecting/i.test(stoppedTmux.stderr ?? ""),
-      true,
-      `Fixture tmux cleanup failed: ${stoppedTmux.stderr || stoppedTmux.error?.message}`
-    );
-    rmSync(root, { recursive: true, force: true });
-  });
+  const { root, home } = createIsolatedRuntime(t);
+  installMockProviderCommands(home);
   const workspace = join(root, "workspace");
   const repositoryPath = join(workspace, "Yui");
   execFileSync("git", ["init", "-q", repositoryPath]);

@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+
+process.stderr.write(
+  "Blocked real Codex launch from an ordinary Yui test; install a test-owned Mock Agent instead.\n"
+);
+process.exit(86);

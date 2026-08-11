@@ -321,19 +321,22 @@ native transcript 是输入和沟通证据，不是 Task 状态 authority。
 
 ### 4.3 数据落点与保留
 
-每次运行必须先选择一个绝对的 `E2E_RUN_ROOT` 并写入报告。推荐使用当前
-checkout 已忽略的 `output/e2e-runs/<run-id>`；如果测试环境不允许写入
-checkout，则使用用户指定的外部绝对目录。目录布局统一为：
+每次 privileged 运行必须通过 `createOwnedRunRoot` 在规范化 OS 临时目录下创建
+唯一的 `E2E_RUN_ROOT`，并把 creator receipt/token 写入报告。任意预先存在的
+绝对目录、checkout 内的 `output/e2e-runs/`、共享 Home 或用户手工指定目录都
+不能证明本次 Run 的所有权，因而不得用于 Provider/Release E2E。所有资源创建
+前，按 [`test-tiers.md`](./test-tiers.md#provider--release-execution-recipe)
+执行 zero-active-Session 观察与 `assertIsolationReady`。目录布局统一为：
 
 ```text
 <E2E_RUN_ROOT>/
-  yui-home/
+  runtime-domain/yui-home/
   projects/
   workspace/
   evidence/
 ```
 
-其中 `YUI_HOME=<E2E_RUN_ROOT>/yui-home`，Yui 的
+其中 `YUI_HOME=<E2E_RUN_ROOT>/runtime-domain/yui-home`，Yui 的
 `config.defaultWorkspace=<E2E_RUN_ROOT>/workspace`。`projects/` 保存本次
 fixture 的稳定 Git checkout；它不能位于 `workspace/worktree/` 中。
 
@@ -341,10 +344,10 @@ fixture 的稳定 Git checkout；它不能位于 `workspace/worktree/` 中。
 
 | 数据 | 位置与含义 |
 |---|---|
-| Yui 权威状态 | `<E2E_RUN_ROOT>/yui-home/state.json`；包含配置、Project、Profile、Role、Task、WorkItem、AgentRun、Session 指针、mailbox、Decision、Milestone、InputRequest、ChangeSet 和 integration 记录 |
-| 存储版本 | `<E2E_RUN_ROOT>/yui-home/schema.json` |
-| Controller 临时文件 | `<E2E_RUN_ROOT>/yui-home/runtime/` 保存 discovery、managed `yui` launcher、Session context 和 runtime inbox；Unix socket 位于系统临时目录的 `yui-<uid>/<YUI_HOME-hash>.sock`，避免长 `YUI_HOME` 超出 socket 路径上限；它们都不是测试结论 authority |
-| integration 完整日志 | `<E2E_RUN_ROOT>/yui-home/artifacts/integration-checks/<task-id>/<integration-id>/` |
+| Yui 权威状态 | `<E2E_RUN_ROOT>/runtime-domain/yui-home/state.json`；包含配置、Project、Profile、Role、Task、WorkItem、AgentRun、Session 指针、mailbox、Decision、Milestone、InputRequest、ChangeSet 和 integration 记录 |
+| 存储版本 | `<E2E_RUN_ROOT>/runtime-domain/yui-home/schema.json` |
+| Controller 临时文件 | `<E2E_RUN_ROOT>/runtime-domain/yui-home/runtime/` 保存 discovery、managed `yui` launcher、Session context 和 runtime inbox；Unix socket 位于系统临时目录的 `yui-<uid>/<YUI_HOME-hash>.sock`，避免长 `YUI_HOME` 超出 socket 路径上限；它们都不是测试结论 authority |
+| integration 完整日志 | `<E2E_RUN_ROOT>/runtime-domain/yui-home/artifacts/integration-checks/<task-id>/<integration-id>/` |
 | fixture checkout | `<E2E_RUN_ROOT>/projects/<project>/` |
 | Task 逻辑根 | `<E2E_RUN_ROOT>/workspace/tasks/<task-id>/main/`；每个 Project directory 指向对应物理 worktree |
 | WorkItem 逻辑根 | `<E2E_RUN_ROOT>/workspace/tasks/<task-id>/work-items/<work-item-id>/`；保留相同 Project 相对布局 |
@@ -360,16 +363,19 @@ data/config home；不得复制凭据或完整 transcript 到 `evidence/`。删�
 `E2E_RUN_ROOT` 也不会删除 provider 原生会话历史。
 
 tmux socket 等进程资源位于系统临时目录，只是运行态资源，不作为结果保存。
-测试失败或出现 dirty/conflict workspace 时保留整个 `E2E_RUN_ROOT`。测试通过
-后也至少保留到报告完成；需要清理时先使用 Yui 支持的 cleanup/archive 和
-Controller stop，再按用户确认删除该 run root。不要删除 provider 原生数据。
+自动化 tier 在普通通过、断言失败以及进程仍可 unwind 的 cooperative
+timeout/cancellation/interruption 后都执行 exact teardown，并由外部 runner 保存
+最终 evidence；teardown 成功后删除 creator-owned `E2E_RUN_ROOT`。只有 exact
+cleanup 本身失败或 OS hard-kill/host loss 使进程内 hook 无法运行时，才保留
+root、receipt/token 和 dirty/conflict workspace 供外部 exact-domain recovery。
+不要删除 provider 原生数据，也不要用 PID/name/age 或 broad `/tmp` 扫描恢复。
 
 正常完整运行执行 integration cleanup、WorkItem cleanup 和 Task archive 后，
 clean managed worktree、integration candidate 及其完整检查日志会被 Yui 删除；
-`state.json` 中的 Task/WorkItem/Run/integration 历史、fixture checkout、
-`evidence/` 报告以及 provider 原生会话历史仍保留。若还要删除这些测试数据，
-删除目标应当是报告中记录的单个 `E2E_RUN_ROOT`，而不是活动的 `~/.yui` 或
-共享 workspace。
+在 outer teardown 前，外部 runner 从 `state.json`、fixture 和 `evidence/` 导出
+需要保留的审计报告。随后只删除报告中记录并由 creator receipt/token 证明的
+单个 `E2E_RUN_ROOT`，绝不删除活动的 `~/.yui` 或共享 workspace。provider
+原生会话历史不属于该 root，仍按 provider 自身策略保留。
 
 ## 5. 路由动作词汇
 

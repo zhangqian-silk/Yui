@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -10,7 +9,6 @@ import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { bindExecution, claimPending } from "../../dist/coordination/workMailbox.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
-import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
@@ -38,6 +36,8 @@ import {
   exactControlPlaneDigest,
   parseExactControlPlaneDescriptor
 } from "../../dist/runtime/exactControlPlane.js";
+import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
+import { installMockProviderCommands } from "../helpers/mockProviderCommands.js";
 
 function fixture(t) {
   const { home } = workflowFixture(t);
@@ -71,11 +71,8 @@ function currentClaudeHookCommon(hookEventName) {
 }
 
 function workflowFixture(t) {
-  const home = mkdtempSync(join(tmpdir(), "yui-claude-lifecycle-state-"));
-  t.after(async () => {
-    await stopFileTaskController(home);
-    rmSync(home, { recursive: true, force: true });
-  });
+  const { home } = createIsolatedRuntime(t);
+  installMockProviderCommands(home, ["claude"]);
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
   const first = new Date("2026-08-02T02:00:00.000Z");

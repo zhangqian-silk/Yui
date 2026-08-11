@@ -3,12 +3,9 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
@@ -36,7 +33,6 @@ import {
   createRole,
   createRoleAgentBinding
 } from "../dist/role/role.js";
-import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../dist/task/task.js";
 import {
@@ -45,29 +41,31 @@ import {
   updateWorkItemStatus
 } from "../dist/workItem/workItem.js";
 import { WorkItemChangeSetManager } from "../dist/workspace/workItemChangeSetManager.js";
+import { createIsolatedRuntime } from "./helpers/isolatedRuntime.js";
 import { exactTaskCliInvocation } from "./helpers/exactTaskCli.js";
 
 const START = new Date("2026-08-03T08:00:00.000Z");
 
 test("managed ReviewRound isolates writable diagnostic evidence from Candidate delivery", async (t) => {
   const requestedRoot = process.env.YUI_REVIEW_E2E_ROOT;
-  const root = requestedRoot === undefined
-    ? mkdtempSync(join(tmpdir(), "yui-review-isolation-e2e-"))
-    : resolve(requestedRoot);
-  if (requestedRoot !== undefined) {
-    assert.equal(existsSync(root), false, `E2E artifact root already exists: ${root}`);
-    mkdirSync(root, { recursive: true });
-  }
-  t.after(() => {
-    if (requestedRoot === undefined) rmSync(root, { recursive: true, force: true });
-  });
-
-  const home = join(root, "yui-home");
+  const isolated = createIsolatedRuntime(t, requestedRoot === undefined
+    ? {}
+    : { root: resolve(requestedRoot), retainRoot: true });
+  const { root, home } = isolated;
+  const mockCodex = createMockCodexExecutable(root);
   const sourceRepository = initializeFixtureRepository(root);
   assert.notEqual(resolve(process.env.YUI_HOME ?? join(root, "unconfigured")), resolve(home));
-  ensureStorageSchema(home, START);
   const store = new FileTaskStore(home);
-  const agent = createConfiguredAgent("codex-review", "codex", "codex", [], [], START);
+  const agent = createConfiguredAgent(
+    "codex-review",
+    "codex",
+    mockCodex.command,
+    [],
+    [],
+    START
+  );
+  assert.equal(agent.command, mockCodex.command);
+  assert.equal(agent.command.startsWith(`${root}/`), true);
   const binding = createRoleAgentBinding(agent, {
     adapterId: "codex",
     model: "gpt-review-e2e",
@@ -485,6 +483,10 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
       profileAccess: reviewRun.effective.profileAccess,
       permission: reviewRun.effective.permission
     },
+    mockProvider: {
+      command: mockCodex.command,
+      launchObserved: existsSync(mockCodex.observationPath)
+    },
     checks: completedRound.checks,
     dirtyNoCommit: {
       evidenceCommit: dirtyCompletedRound.evidenceCommit ?? null,
@@ -502,6 +504,30 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
     `${JSON.stringify(report, null, 2)}\n`
   );
 });
+
+function createMockCodexExecutable(root) {
+  const bin = join(root, "mock-bin");
+  const command = join(bin, "codex");
+  const observationPath = join(root, "mock-codex-launch.ndjson");
+  mkdirSync(bin, { recursive: true, mode: 0o700 });
+  writeFileSync(command, [
+    `#!${process.execPath}`,
+    'const { appendFileSync } = require("node:fs");',
+    `const observationPath = ${JSON.stringify(observationPath)};`,
+    "appendFileSync(observationPath, `${JSON.stringify({",
+    "  pid: process.pid,",
+    "  yuiHome: process.env.YUI_HOME ?? null,",
+    "  taskId: process.env.YUI_TASK_ID ?? null,",
+    "  role: process.env.YUI_ROLE ?? null",
+    "})}\\n`);",
+    "const stop = () => process.exit(0);",
+    'process.on("SIGINT", stop);',
+    'process.on("SIGTERM", stop);',
+    "setInterval(() => {}, 60_000);",
+    ""
+  ].join("\n"), { mode: 0o700 });
+  return { command, observationPath };
+}
 
 function initializeFixtureRepository(root) {
   const repository = join(root, "fixture-repository");

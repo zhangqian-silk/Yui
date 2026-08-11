@@ -7,6 +7,8 @@ import { homedir, tmpdir } from "node:os";
 import { dirname } from "node:path";
 import { usableInteractiveTerminal } from "../output/terminal.js";
 
+export { YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES } from "./managedRuntimeEnvironment.js";
+
 /**
  * Non-secret process context needed by native Agent CLIs after tmux starts
  * them with an empty environment. Keep this list explicit: arbitrary parent
@@ -64,24 +66,6 @@ export const AGENT_OPERATIONAL_ENVIRONMENT_NAMES = [
 export const NATIVE_AGENT_ENVIRONMENT_NAMES = [
   "CODEX_HOME",
   "CLAUDE_CONFIG_DIR"
-] as const;
-
-/** Control-plane values owned by Yui, never by user Agent source bindings. */
-export const YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES = [
-  "YUI_HOME",
-  "YUI_SESSION_SCOPE",
-  "YUI_TASK_ID",
-  "YUI_ROLE",
-  "YUI_AGENT_ID",
-  "YUI_ADAPTER_ID",
-  "YUI_WORKSPACE",
-  "YUI_RUN_ID",
-  "YUI_LAUNCH_ID",
-  "YUI_NATIVE_SESSION_ID",
-  "YUI_CONTROL_PLANE_DESCRIPTOR",
-  "YUI_TASK_RUNTIME_DESCRIPTOR",
-  "YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR",
-  "YUI_TASK_RUNTIME_SERVICE_NAMESPACE"
 ] as const;
 
 export function nativeAgentEnvironmentNames(

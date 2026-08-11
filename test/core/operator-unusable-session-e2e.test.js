@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -9,7 +7,6 @@ import test from "node:test";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { bindExecution, claimPending } from "../../dist/coordination/workMailbox.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
-import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -21,6 +18,8 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
+import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
+import { installMockProviderCommands } from "../helpers/mockProviderCommands.js";
 
 const execFileAsync = promisify(execFile);
 const CLI = join(process.cwd(), "dist", "cli.js");
@@ -28,11 +27,8 @@ const FIRST = new Date("2026-08-03T01:00:00.000Z");
 const SECOND = new Date("2026-08-03T01:00:01.000Z");
 
 test("public Task Role reset derives identities from storage and preserves an auditable history", async (t) => {
-  const home = mkdtempSync(join(tmpdir(), "yui-role-reset-cli-"));
-  t.after(async () => {
-    await stopFileTaskController(home);
-    rmSync(home, { recursive: true, force: true });
-  });
+  const { home } = createIsolatedRuntime(t);
+  installMockProviderCommands(home, ["codex"]);
   ensureStorageSchema(home, FIRST);
   const store = new FileTaskStore(home);
   const agent = createConfiguredAgent("codex-primary", "codex", "codex", [], [], FIRST);
