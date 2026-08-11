@@ -11,10 +11,12 @@ import { updateRoleStatus } from "../role/role.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import {
   finishReviewRound,
+  updateReviewExecutionGroup,
   type ReviewCheck,
   type ReviewRound
 } from "../review/reviewRound.js";
 import { failAgentRun, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
+import { recordExecutionLaneResult } from "../execution/executionGroup.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   isRuntimeLaunchReservation,
@@ -27,7 +29,10 @@ import {
   RUN_RECOVERY_REQUESTED_EVENT
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { updateWorkItemStatus } from "../workItem/workItem.js";
+import {
+  updateWorkItemExecutionGroup,
+  updateWorkItemStatus
+} from "../workItem/workItem.js";
 export type ExactReviewRoundTerminalizationResult = Readonly<{
   disposition: "applied" | "obsolete";
   round: ReviewRound | null;
@@ -154,8 +159,34 @@ export function terminalizeExactRunReviewRound(
     return validation;
   }
   const reviewRound = validation.round;
+  const groupedRound = input.run.executionGroupId !== undefined
+    && input.run.executionLaneId !== undefined
+    && reviewRound.executionGroup !== undefined
+    ? updateReviewExecutionGroup(
+        reviewRound,
+        recordExecutionLaneResult(
+          reviewRound.executionGroup,
+          input.run.executionLaneId,
+          {
+            summary: input.outcome.summary,
+            ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
+            ...(input.reviewResult?.checks === undefined
+              ? {}
+              : {
+                  checks: input.reviewResult.checks.map(({ name, outcome, details }) => ({
+                    name,
+                    outcome,
+                    ...(details === undefined ? {} : { details })
+                  }))
+                })
+          },
+          input.outcome.status === "yielded" ? "completed" : "failed",
+          now
+        )
+      )
+    : reviewRound;
   const terminal = finishReviewRound(
-    reviewRound,
+    groupedRound,
     input.outcome.status === "yielded" ? "completed" : "failed",
     input.outcome.summary,
     now,
@@ -245,7 +276,13 @@ export function terminalizeExactTaskRun(
   }
   const role = store.getRole(input.taskId, input.roleName);
   if (role === null) return obsolete(run, "role-missing");
-  const active = store.getActiveAgentRun(input.taskId, input.roleName);
+  const active = run.executionGroupId !== undefined && run.executionLaneId !== undefined
+    ? store.getActiveExecutionLaneRun(
+      input.taskId,
+      run.executionGroupId,
+      run.executionLaneId
+    )
+    : store.getActiveAgentRun(input.taskId, input.roleName);
   if (active?.id !== run.id) return obsolete(run, "active-run-mismatch");
 
   const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
@@ -317,8 +354,32 @@ export function terminalizeExactTaskRun(
   const terminal = input.outcome.status === "yielded"
     ? yieldAgentRun(run, input.outcome.summary, now)
     : failAgentRun(run, input.outcome.summary, now);
+  if (run.executionGroupId !== undefined
+    && run.executionLaneId !== undefined
+    && run.purpose === "execution"
+    && run.workItemId !== undefined) {
+    const item = store.getWorkItem(input.taskId, run.workItemId);
+    if (item?.executionGroup !== undefined) {
+      const grouped = recordExecutionLaneResult(
+        item.executionGroup,
+        run.executionLaneId,
+        { summary: input.outcome.summary },
+        input.outcome.status === "yielded" ? "completed" : "failed",
+        now
+      );
+      store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
+    }
+  }
   store.saveAgentRun(terminal);
-  store.clearActiveAgentRun(input.taskId, input.roleName);
+  if (terminal.executionGroupId !== undefined && terminal.executionLaneId !== undefined) {
+    store.clearActiveExecutionLaneRun(
+      input.taskId,
+      terminal.executionGroupId,
+      terminal.executionLaneId
+    );
+  } else {
+    store.clearActiveAgentRun(input.taskId, input.roleName);
+  }
   store.saveRole(input.taskId, updateRoleStatus(role, "idle", now));
   if (sessions !== null) {
     store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
@@ -381,7 +442,14 @@ function recoverExactAgentRunInTransaction(
   }
   const role = store.getRole(input.taskId, input.roleName);
   if (role === null) return stateChanged("role-missing");
-  if (store.getActiveAgentRun(input.taskId, input.roleName)?.id !== current.id) {
+  const active = current.executionGroupId !== undefined && current.executionLaneId !== undefined
+    ? store.getActiveExecutionLaneRun(
+      input.taskId,
+      current.executionGroupId,
+      current.executionLaneId
+    )
+    : store.getActiveAgentRun(input.taskId, input.roleName);
+  if (active?.id !== current.id) {
     return stateChanged("active-run-mismatch");
   }
   const progress = latestRunDurableProgressAt(

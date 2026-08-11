@@ -76,10 +76,12 @@ import {
 import {
   createReviewRound,
   createTaskReviewRound,
+  attachReviewExecutionGroup,
   finishReviewRound,
   parseReviewYieldReport,
   recordReviewWorkspaceDisposition,
   startReviewRound,
+  updateReviewExecutionGroup,
   validateTaskReviewCandidate,
   type ReviewRound,
   type TaskReviewCandidate,
@@ -127,6 +129,8 @@ import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   currentWorkItemCandidate,
   createWorkItem,
+  attachWorkItemExecutionGroup,
+  updateWorkItemExecutionGroup,
   retireWorkItem,
   retryFailedWorkItem,
   submitWorkItemCandidate,
@@ -139,6 +143,13 @@ import {
   type WorkItemCandidate,
   type WorkItemStatus
 } from "../workItem/workItem.js";
+import {
+  createExecutionGroup,
+  restartExecutionLane,
+  updateExecutionLane,
+  type ExecutionLaneWorkspace,
+  type ExecutionTarget
+} from "../execution/executionGroup.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import {
   sameTaskFinalReviewContract,
@@ -2185,25 +2196,149 @@ function dispatchWork(
       now,
       {
         workItemId: item.id,
+        ...(item.executionGroup === undefined ? {} : {
+          executionGroupId: item.executionGroup.id,
+          executionLaneId: item.executionGroup.lanes[0]!.id
+        }),
         ...(runWorkspace === undefined ? {} : { workspace: runWorkspace }),
         effective
       }
     );
-    tx.saveAgentRun(created);
-    tx.saveActiveAgentRun(created);
+    const currentGroup = item.executionGroup ?? createExecutionGroup(
+      `execution-group-${runId}`,
+      task.id,
+      {
+        purpose: "execution",
+        target: executionTargetForWorkItem(task.id, item.id, item.revision, item, workspace),
+        strategy: { mode: "fixed", count: 1 },
+        lanes: [{
+          roleName: role.name,
+          runId: created.id,
+          effective,
+          workspace: executionLaneWorkspace(runWorkspace, item.writeProjectIds)
+        }]
+      },
+      now
+    );
+    const groupLane = currentGroup.lanes[0]!;
+    const runningGroup = groupLane.status === "failed"
+      || groupLane.status === "yielded"
+      || groupLane.status === "completed"
+      ? restartExecutionLane(currentGroup, groupLane.id, {
+          runId: created.id,
+          effective,
+          workspace: executionLaneWorkspace(runWorkspace, item.writeProjectIds)
+        }, now)
+      : updateExecutionLane(currentGroup, groupLane.id, {
+          status: "running",
+          runId: created.id,
+          effective,
+          workspace: executionLaneWorkspace(runWorkspace, item.writeProjectIds)
+        }, now);
+    const workItemForDispatch = item.executionGroup === undefined
+      ? attachWorkItemExecutionGroup(item, runningGroup, now)
+      : updateWorkItemExecutionGroup(item, runningGroup, now);
+    const runWithLineage = item.executionGroup === undefined
+      ? createAgentRun(
+          runId,
+          task.id,
+          role.name,
+          dispatchMode,
+          input,
+          now,
+          {
+            workItemId: item.id,
+            executionGroupId: runningGroup.id,
+            executionLaneId: groupLane.id,
+            ...(runWorkspace === undefined ? {} : { workspace: runWorkspace }),
+            effective
+          }
+        )
+      : created;
+    tx.saveWorkItem(task.id, workItemForDispatch);
+    tx.saveAgentRun(runWithLineage);
+    tx.saveActiveAgentRun(runWithLineage);
     tx.saveWorkItem(task.id, item.status === "failed"
-      ? retryFailedWorkItem(item, now)
-      : updateWorkItemStatus(item, "running", now));
+      ? retryFailedWorkItem(workItemForDispatch, now)
+      : updateWorkItemStatus(workItemForDispatch, "running", now));
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     enqueueWork(tx, roleMailbox(task.id, role.name), "run-dispatched", now, [
-      runRef(task.id, created.id),
+      runRef(task.id, runWithLineage.id),
       workItemRef(task.id, item.id)
     ]);
-    recordTaskEvent(tx, task.id, "run.dispatched", runLaunchEventPayload(created), now);
-    return created;
+    recordTaskEvent(tx, task.id, "run.dispatched", runLaunchEventPayload(runWithLineage), now);
+    return runWithLineage;
   });
   notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
   return `Dispatch queued for ${run.taskId}/${run.roleName} (${run.id})\n`;
+}
+
+function executionTargetForWorkItem(
+  taskId: string,
+  workItemId: string,
+  revision: number,
+  item: WorkItem,
+  workspace: ReturnType<TaskWorkflowStore["getWorkItemWorkspace"]>
+): ExecutionTarget {
+  const projects = item.writeProjectIds.flatMap((projectId) => {
+    const entry = workspace?.entries.find((candidate) => candidate.projectId === projectId);
+    return entry === undefined ? [] : [{ projectId, commit: entry.baseCommit }];
+  });
+  const fingerprint = JSON.stringify({ taskId, workItemId, revision, projects });
+  return {
+    schemaVersion: 1,
+    kind: "work-item",
+    taskId,
+    workItemId,
+    revision,
+    projects,
+    fingerprint
+  };
+}
+
+function executionTargetForReviewRound(
+  task: Task,
+  round: ReviewRound,
+  item: WorkItem,
+  candidate: WorkItemCandidate
+): ExecutionTarget {
+  const taskScope = (round.scope ?? "work-item") === "task";
+  const projects = taskScope
+    ? round.taskCandidate?.projects ?? []
+    : candidate.gitSnapshot?.projects ?? [];
+  const fingerprint = JSON.stringify({
+    taskId: task.id,
+    reviewRoundId: round.id,
+    workItemId: item.id,
+    candidateId: candidate.id,
+    scope: taskScope ? "task" : "work-item",
+    projects,
+    contractDigest: round.taskFinalReviewContract?.digest
+  });
+  return {
+    schemaVersion: 1,
+    kind: taskScope ? "task-final-review" : "work-item",
+    taskId: task.id,
+    workItemId: item.id,
+    candidateId: candidate.id,
+    revision: candidate.workItemRevision,
+    projects,
+    ...(round.taskFinalReviewContract === undefined
+      ? {}
+      : { contractDigest: round.taskFinalReviewContract.digest }),
+    fingerprint
+  };
+}
+
+function executionLaneWorkspace(
+  workspace: ReturnType<TaskWorkflowStore["getWorkItemWorkspace"]> | undefined,
+  writableProjectIds: readonly string[]
+): ExecutionLaneWorkspace | undefined {
+  if (workspace === undefined || workspace === null) return undefined;
+  return {
+    root: workspace.root,
+    writableProjectIds: [...writableProjectIds]
+  };
 }
 
 function acceptWork(
@@ -3265,6 +3400,31 @@ function retryRun(
       ...(retryItem === null ? {} : { workItemWriteProjectIds: retryItem.writeProjectIds })
     });
     const runId = tx.nextAgentRunId(task.id);
+    const retryGroup = retryItem?.executionGroup;
+    const retryLane = previous.executionGroupId === undefined
+      && previous.executionLaneId === undefined
+      ? undefined
+      : retryGroup?.lanes.find(({ id }) => id === previous.executionLaneId);
+    if ((previous.executionGroupId === undefined) !== (previous.executionLaneId === undefined)
+      || (previous.executionGroupId !== undefined
+        && (retryGroup === undefined
+          || retryGroup.id !== previous.executionGroupId
+          || retryLane === undefined))) {
+      throw dataError(`Run ${previous.id} execution lineage no longer matches its Work Item.`);
+    }
+    const runningGroup = retryGroup === undefined || retryLane === undefined
+      ? undefined
+      : restartExecutionLane(retryGroup, retryLane.id, {
+          runId,
+          effective,
+          workspace: executionLaneWorkspace(runWorkspace, retryItem?.writeProjectIds ?? [])
+        }, now);
+    const retriedItem = retryItem === null
+      ? null
+      : retryFailedWorkItem(retryItem, now);
+    const retriedItemWithGroup = retriedItem === null || runningGroup === undefined
+      ? retriedItem
+      : updateWorkItemExecutionGroup(retriedItem, runningGroup, now);
     const retaggedInput = retagYuiRunInput(
       previous.input,
       runId,
@@ -3281,15 +3441,22 @@ function retryRun(
       now,
       {
         ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId }),
+        ...(runningGroup === undefined ? {} : {
+          executionGroupId: runningGroup.id,
+          executionLaneId: retryLane!.id
+        }),
         ...(runWorkspace === undefined ? {} : { workspace: runWorkspace }),
         effective
       }
     );
+    if (retriedItemWithGroup !== null) {
+      tx.saveWorkItem(task.id, retriedItemWithGroup);
+    }
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
-    if (previous.workItemId !== undefined) {
-      const item = retryItem!;
+    if (previous.workItemId !== undefined && retriedItemWithGroup !== null) {
+      const item = retriedItemWithGroup;
       const workspace = tx.getWorkItemWorkspace(task.id, item.id);
       if (workspace?.owner.type === "work-item"
         && workspace.owner.workItemId !== item.id) {
@@ -3298,7 +3465,6 @@ function retryRun(
           + `cannot retry ${item.id}.`
         );
       }
-      tx.saveWorkItem(task.id, retryFailedWorkItem(item, now));
     }
     enqueueWork(tx, roleMailbox(task.id, role.name), "run-retried", now, [runRef(task.id, created.id)]);
     recordTaskEvent(tx, task.id, "run.retried", {
@@ -4231,7 +4397,7 @@ function yieldRun(
     const task = requireTask(tx, active.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "yielding a run"));
     const role = requireRole(tx, task.id, active.roleName);
-    const pointer = tx.getActiveAgentRun(task.id, role.name);
+    const pointer = activeRunPointer(tx, active);
     if (pointer?.id !== active.id) throw usageError(`Run is not active for ${task.id}/${role.name}: ${active.id}.`);
     const taskFinalContract = active.purpose === "execution"
       && active.workItemId !== undefined
@@ -4262,6 +4428,12 @@ function yieldRun(
       agentId: active.effective.agentId,
       runId: active.id,
       receiptId: formatAgentRunReceiptId(task.id, active.id),
+      ...(active.purpose !== "review" || options.environment?.YUI_NATIVE_SESSION_ID === undefined
+        ? {}
+        : { nativeSessionId: options.environment.YUI_NATIVE_SESSION_ID }),
+      ...(active.purpose !== "review" || options.environment?.YUI_LAUNCH_ID === undefined
+        ? {}
+        : { launchId: options.environment.YUI_LAUNCH_ID }),
       outcome: { status: "yielded", summary },
       ...(reviewReport === undefined
         ? {}
@@ -4338,6 +4510,12 @@ function yieldRun(
             ...(taskFinalContract === undefined
               ? {}
               : { taskFinalReviewContract: taskFinalContract }),
+            ...(active.executionGroupId === undefined
+              ? {}
+              : {
+                  executionGroupId: active.executionGroupId,
+                  executionLaneId: active.executionLaneId
+                }),
             ...(active.workspace === undefined ? {} : { workspace: active.workspace }),
             ...(options.candidateGitSnapshot === undefined
               ? {}
@@ -4436,7 +4614,7 @@ function checkpointRun(
     }
     const task = requireTask(tx, run.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "checkpointing a run"));
-    const pointer = tx.getActiveAgentRun(task.id, run.roleName);
+    const pointer = activeRunPointer(tx, run);
     if (pointer?.id !== run.id) {
       throw usageError(`Run is not active for ${task.id}/${run.roleName}: ${run.id}.`);
     }
@@ -4754,6 +4932,39 @@ export function dispatchPreparedReviewRound(
       reviewBaseCommit: round.reviewBaseCommit
     });
     const sessions = tx.getTaskRoleSessionSet(taskId, reviewer.name);
+    const executionTarget = executionTargetForReviewRound(task, round, item, candidate);
+    const initialGroup = round.executionGroup ?? createExecutionGroup(
+      `execution-group-${round.id}`,
+      taskId,
+      {
+        purpose: "review",
+        target: executionTarget,
+        strategy: { mode: "fixed", count: 1 },
+        lanes: [{
+          roleName: reviewer.name,
+          reviewRoundId: round.id,
+          workspace: executionLaneWorkspace(
+            round.workspace,
+            round.workspace.entries.map(({ projectId }) => projectId)
+          )
+        }]
+      },
+      now
+    );
+    const groupLane = initialGroup.lanes[0]!;
+    const runningGroup = updateExecutionLane(initialGroup, groupLane.id, {
+      status: "running",
+      runId,
+      reviewRoundId: round.id,
+      effective,
+      workspace: executionLaneWorkspace(
+        round.workspace,
+        round.workspace.entries.map(({ projectId }) => projectId)
+      )
+    }, now);
+    const roundWithGroup = round.executionGroup === undefined
+      ? attachReviewExecutionGroup(round, runningGroup)
+      : updateReviewExecutionGroup(round, runningGroup);
     const created = createAgentRun(
       runId,
       taskId,
@@ -4765,12 +4976,14 @@ export function dispatchPreparedReviewRound(
         workItemId: item.id,
         purpose: "review",
         reviewRoundId: round.id,
+        executionGroupId: runningGroup.id,
+        executionLaneId: groupLane.id,
         workspace: round.workspace,
         effective
       }
     );
+    tx.saveReviewRound(taskId, startReviewRound(roundWithGroup, created.id));
     tx.saveAgentRun(created);
-    tx.saveReviewRound(taskId, startReviewRound(round, created.id));
     tx.saveActiveAgentRun(created);
     tx.saveRole(taskId, updateRoleStatus(reviewer, "running", now));
     enqueueWork(tx, roleMailbox(taskId, reviewer.name), "review-requested", now, [
@@ -4996,6 +5209,12 @@ function runLaunchEventPayload(run: AgentRun): TaskEventPayload {
     profileAccess: run.effective.profileAccess,
     effectivePermission: run.effective.permission.strategy,
     writeProjectIds: run.effective.writeProjectIds.join(",") || "none",
+    ...(run.executionGroupId === undefined
+      ? {}
+      : {
+          executionGroupId: run.executionGroupId,
+          executionLaneId: run.executionLaneId!
+        }),
     ...(run.reviewRoundId === undefined
       ? {}
       : {
@@ -5066,6 +5285,16 @@ function requireRun(
     throw usageError(`Agent Run not found: ${reference.taskId}/${reference.localId}.`);
   }
   return run;
+}
+
+function activeRunPointer(store: TaskWorkflowStore, run: AgentRun): AgentRun | null {
+  return run.executionGroupId !== undefined && run.executionLaneId !== undefined
+    ? store.getActiveExecutionLaneRun(
+      run.taskId,
+      run.executionGroupId,
+      run.executionLaneId
+    )
+    : store.getActiveAgentRun(run.taskId, run.roleName);
 }
 
 function requireReviewRound(

@@ -12,6 +12,10 @@ import {
   validateManagedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
+import {
+  validateExecutionGroup,
+  type ExecutionGroup
+} from "../execution/executionGroup.js";
 export type ReviewRoundStatus = "pending" | "running" | "completed" | "failed";
 export type ReviewRequestSource = "policy" | "leader";
 export type ReviewWorkspaceDisposition = "preserved" | "removed";
@@ -54,6 +58,8 @@ export type ReviewRound = {
   taskCandidate?: TaskReviewCandidate;
   /** Exact Task/control capability that established this Task-final gate. */
   taskFinalReviewContract?: TaskFinalReviewContract;
+  /** Optional reviewer panel Group; each lane still owns this Round. */
+  executionGroup?: ExecutionGroup;
   workspace?: ManagedWorkspace;
   requestedBy: ReviewRequestSource;
   status: ReviewRoundStatus;
@@ -77,7 +83,8 @@ export function createReviewRound(
   reviewerRoleName: string,
   requestedBy: ReviewRequestSource,
   reviewBaseCommit: string,
-  now: Date
+  now: Date,
+  executionGroup?: ExecutionGroup
 ): ReviewRound {
   return validateReviewRound({
     schemaVersion: 2,
@@ -89,6 +96,7 @@ export function createReviewRound(
     reviewBaseCommit: requireCommit(reviewBaseCommit, "Review base commit"),
     requestedBy: validateReviewRequestSource(requestedBy),
     status: "pending",
+    ...(executionGroup === undefined ? {} : { executionGroup }),
     createdAt: now.toISOString()
   });
 }
@@ -102,7 +110,8 @@ export function createTaskReviewRound(
   requestedBy: ReviewRequestSource,
   taskCandidate: TaskReviewCandidate,
   now: Date,
-  taskFinalReviewContract?: TaskFinalReviewContract
+  taskFinalReviewContract?: TaskFinalReviewContract,
+  executionGroup?: ExecutionGroup
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
@@ -120,6 +129,7 @@ export function createTaskReviewRound(
       : { taskFinalReviewContract }),
     requestedBy: validateReviewRequestSource(requestedBy),
     status: "pending",
+    ...(executionGroup === undefined ? {} : { executionGroup }),
     createdAt: now.toISOString()
   });
 }
@@ -245,6 +255,46 @@ export function recordReviewWorkspaceDisposition(
   });
 }
 
+/** Attach the common Reviewer panel Group while preserving the Round target. */
+export function attachReviewExecutionGroup(
+  round: ReviewRound,
+  executionGroup: ExecutionGroup
+): ReviewRound {
+  validateReviewRound(round);
+  validateReviewExecutionGroup(executionGroup, round);
+  if (round.status !== "pending") {
+    throw new Error(`ReviewRound ExecutionGroup cannot attach from ${round.status}: ${round.id}.`);
+  }
+  if (round.executionGroup !== undefined) {
+    if (JSON.stringify(round.executionGroup) !== JSON.stringify(executionGroup)) {
+      throw new Error(`ReviewRound ExecutionGroup is immutable: ${round.id}.`);
+    }
+    return round;
+  }
+  return validateReviewRound({ ...round, executionGroup });
+}
+
+/** Advance a Reviewer panel Group without changing the Round target. */
+export function updateReviewExecutionGroup(
+  round: ReviewRound,
+  executionGroup: ExecutionGroup
+): ReviewRound {
+  validateReviewRound(round);
+  validateReviewExecutionGroup(executionGroup, round);
+  if (round.executionGroup === undefined) {
+    if (round.status !== "pending") {
+      throw new Error(`ReviewRound ExecutionGroup cannot attach from ${round.status}: ${round.id}.`);
+    }
+    return validateReviewRound({ ...round, executionGroup });
+  }
+  if (round.executionGroup.id !== executionGroup.id
+    || JSON.stringify(round.executionGroup.target) !== JSON.stringify(executionGroup.target)) {
+    throw new Error(`ReviewRound ExecutionGroup target is immutable: ${round.id}.`);
+  }
+  if (JSON.stringify(round.executionGroup) === JSON.stringify(executionGroup)) return round;
+  return validateReviewRound({ ...round, executionGroup });
+}
+
 export function validateReviewRound(round: ReviewRound): ReviewRound {
   if (round.schemaVersion !== 2) throw new Error("ReviewRound must use schemaVersion 2.");
   validateTaskRecordReference({ taskId: round.taskId, localId: round.id }, "reviewRound");
@@ -279,6 +329,7 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     || round.taskFinalReviewContract !== undefined) {
     throw new Error(`WorkItem ReviewRound cannot carry a Task candidate or contract: ${round.id}.`);
   }
+  if (round.executionGroup !== undefined) validateReviewExecutionGroup(round.executionGroup, round);
   validateReviewRequestSource(round.requestedBy);
   if (!["pending", "running", "completed", "failed"].includes(round.status)) {
     throw new Error(`ReviewRound status is invalid: ${String(round.status)}.`);
@@ -325,6 +376,25 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     requireTimestamp(round.workspaceDisposition.recordedAt, "Review workspace disposition time");
   }
   return round;
+}
+
+function validateReviewExecutionGroup(group: ExecutionGroup, round: ReviewRound): ExecutionGroup {
+  validateExecutionGroup(group);
+  if (group.taskId !== round.taskId || group.purpose !== "review") {
+    throw new Error(`ReviewRound ExecutionGroup provenance is invalid: ${round.id}.`);
+  }
+  const expectedKind = (round.scope ?? "work-item") === "task"
+    ? "task-final-review"
+    : "work-item";
+  if (group.target.kind !== expectedKind
+    || group.target.taskId !== round.taskId
+    || group.target.candidateId !== round.candidateId) {
+    throw new Error(`ReviewRound ExecutionGroup target is invalid: ${round.id}.`);
+  }
+  if (expectedKind === "work-item" && group.target.workItemId !== round.workItemId) {
+    throw new Error(`ReviewRound ExecutionGroup WorkItem target is invalid: ${round.id}.`);
+  }
+  return group;
 }
 
 export function validateTaskReviewCandidate(

@@ -16,6 +16,10 @@ import {
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import {
+  validateExecutionGroup,
+  type ExecutionGroup
+} from "../execution/executionGroup.js";
 
 export type WorkItemStatus =
   | "pending"
@@ -89,6 +93,8 @@ export type WorkItemCandidate = Readonly<{
   source:
     | Readonly<{ type: "direct" }>
     | Readonly<{ type: "run"; runId: string }>;
+  executionGroupId?: string;
+  executionLaneId?: string;
   reviewPolicy?: ReviewConfig;
   taskFinalReviewContract?: TaskFinalReviewContract;
   /** Snapshot of the WorkItem-owned Develop workspace at candidate time. */
@@ -108,6 +114,8 @@ export type WorkItem = {
   acceptance: readonly string[];
   dependsOn: readonly string[];
   writeProjectIds: readonly string[];
+  /** Optional unified execution state; absent on legacy direct records. */
+  executionGroup?: ExecutionGroup;
   /** Explicit Git refs for the initial writable WorkItem worktree. */
   baseRefs?: readonly WorkItemProjectBaseRef[];
   revision: number;
@@ -139,6 +147,7 @@ export function createWorkItem(
     assignee?: string;
     writeProjectIds?: readonly string[];
     baseRefs?: readonly WorkItemProjectBaseRef[];
+    executionGroup?: ExecutionGroup;
   }>,
   now: Date
 ): WorkItem {
@@ -155,6 +164,9 @@ export function createWorkItem(
       input.writeProjectIds ?? [],
       "Work item writable Project"
     ),
+    ...(input.executionGroup === undefined
+      ? {}
+      : { executionGroup: validateWorkItemExecutionGroup(input.executionGroup, taskId, id) }),
     ...(input.baseRefs === undefined || input.baseRefs.length === 0
       ? {}
       : { baseRefs: normalizeProjectBaseRefs(input.baseRefs) }),
@@ -178,6 +190,8 @@ export function submitWorkItemCandidate(
       | Readonly<{ type: "run"; runId: string }>;
     reviewPolicy?: ReviewConfig;
     taskFinalReviewContract?: TaskFinalReviewContract;
+    executionGroupId?: string;
+    executionLaneId?: string;
     workspace?: ManagedWorkspace;
     gitSnapshot?: CandidateGitSnapshot;
     taskMainSnapshot?: DirectTaskMainSnapshot;
@@ -205,6 +219,12 @@ export function submitWorkItemCandidate(
     ...(input.taskFinalReviewContract === undefined
       ? {}
       : { taskFinalReviewContract: input.taskFinalReviewContract }),
+    ...(input.executionGroupId === undefined
+      ? {}
+      : { executionGroupId: requireIdentity(input.executionGroupId, "ExecutionGroup id") }),
+    ...(input.executionLaneId === undefined
+      ? {}
+      : { executionLaneId: requireIdentity(input.executionLaneId, "ExecutionLane id") }),
     ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
     ...(input.gitSnapshot === undefined ? {} : { gitSnapshot: input.gitSnapshot }),
     ...(input.taskMainSnapshot === undefined
@@ -271,6 +291,55 @@ export function updateWorkItemStatus(
       : {}),
     updatedAt: timestamp,
     ...(terminal ? { endedAt: timestamp } : {})
+  });
+}
+
+/** Attach the common execution Group without changing the WorkItem identity. */
+export function attachWorkItemExecutionGroup(
+  workItem: WorkItem,
+  executionGroup: ExecutionGroup,
+  now: Date
+): WorkItem {
+  validateWorkItem(workItem);
+  const checked = validateWorkItemExecutionGroup(executionGroup, workItem.taskId, workItem.id);
+  if (workItem.status === "completed" || workItem.status === "failed" || workItem.status === "retired") {
+    throw new Error(`A terminal Work Item cannot attach an ExecutionGroup: ${workItem.id}.`);
+  }
+  if (workItem.executionGroup !== undefined) {
+    if (JSON.stringify(workItem.executionGroup) !== JSON.stringify(checked)) {
+      throw new Error(`Work Item ExecutionGroup is immutable: ${workItem.id}.`);
+    }
+    return workItem;
+  }
+  return validateWorkItem({
+    ...workItem,
+    executionGroup: checked,
+    revision: workItem.revision + 1,
+    updatedAt: now.toISOString()
+  });
+}
+
+/** Advance a Group's lane state while keeping its frozen target immutable. */
+export function updateWorkItemExecutionGroup(
+  workItem: WorkItem,
+  executionGroup: ExecutionGroup,
+  now: Date
+): WorkItem {
+  validateWorkItem(workItem);
+  const checked = validateWorkItemExecutionGroup(executionGroup, workItem.taskId, workItem.id);
+  if (workItem.executionGroup === undefined) {
+    return attachWorkItemExecutionGroup(workItem, checked, now);
+  }
+  if (workItem.executionGroup.id !== checked.id
+    || JSON.stringify(workItem.executionGroup.target) !== JSON.stringify(checked.target)) {
+    throw new Error(`Work Item ExecutionGroup target is immutable: ${workItem.id}.`);
+  }
+  if (JSON.stringify(workItem.executionGroup) === JSON.stringify(checked)) return workItem;
+  return validateWorkItem({
+    ...workItem,
+    executionGroup: checked,
+    revision: workItem.revision + 1,
+    updatedAt: now.toISOString()
   });
 }
 
@@ -382,6 +451,9 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   if (workItem.assignee !== undefined) {
     requireIdentity(workItem.assignee, "Work item assignee");
   }
+  if (workItem.executionGroup !== undefined) {
+    validateWorkItemExecutionGroup(workItem.executionGroup, workItem.taskId, workItem.id);
+  }
   validateStatus(workItem.status);
   if (!Array.isArray(workItem.candidates)) {
     throw new Error("Work Item candidates are invalid.");
@@ -443,6 +515,23 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   return workItem;
 }
 
+function validateWorkItemExecutionGroup(
+  group: ExecutionGroup,
+  taskId: string,
+  workItemId: string
+): ExecutionGroup {
+  validateExecutionGroup(group);
+  if (group.taskId !== taskId || group.purpose !== "execution") {
+    throw new Error(`Work Item ExecutionGroup provenance is invalid: ${workItemId}.`);
+  }
+  if (group.target.kind !== "work-item"
+    || group.target.workItemId !== workItemId
+    || group.target.taskId !== taskId) {
+    throw new Error(`Work Item ExecutionGroup target is invalid: ${workItemId}.`);
+  }
+  return group;
+}
+
 export function validateWorkItemCandidate(
   candidate: WorkItemCandidate
 ): WorkItemCandidate {
@@ -479,6 +568,13 @@ export function validateWorkItemCandidate(
       taskId: candidate.taskId,
       localId: candidate.source.runId
     }, "agentRun");
+  }
+  if ((candidate.executionGroupId === undefined) !== (candidate.executionLaneId === undefined)) {
+    throw new Error("Work Item candidate execution lineage is incomplete.");
+  }
+  if (candidate.executionGroupId !== undefined) {
+    requireIdentity(candidate.executionGroupId, "ExecutionGroup id");
+    requireIdentity(candidate.executionLaneId!, "ExecutionLane id");
   }
   if (candidate.reviewPolicy !== undefined) validateReviewConfig(candidate.reviewPolicy);
   if (candidate.taskFinalReviewContract !== undefined) {

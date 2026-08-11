@@ -22,6 +22,9 @@ export type AgentRun = {
   purpose: AgentRunPurpose;
   workItemId?: string;
   reviewRoundId?: string;
+  /** Frozen lineage inside the unified execution Group. */
+  executionGroupId?: string;
+  executionLaneId?: string;
   workspace?: ManagedWorkspace;
   /** Immutable actual launch configuration and provenance. */
   effective: EffectiveLaunchSnapshot;
@@ -56,6 +59,8 @@ export function createAgentRun(
     workItemId?: string;
     purpose?: AgentRunPurpose;
     reviewRoundId?: string;
+    executionGroupId?: string;
+    executionLaneId?: string;
     workspace?: ManagedWorkspace;
     effective: EffectiveLaunchSnapshot;
   }
@@ -78,6 +83,12 @@ export function createAgentRun(
     ...(context.reviewRoundId === undefined
       ? {}
       : { reviewRoundId: requireSafeIdentity(context.reviewRoundId, "ReviewRound id") }),
+    ...(context.executionGroupId === undefined
+      ? {}
+      : { executionGroupId: requireSafeIdentity(context.executionGroupId, "ExecutionGroup id") }),
+    ...(context.executionLaneId === undefined
+      ? {}
+      : { executionLaneId: requireSafeIdentity(context.executionLaneId, "ExecutionLane id") }),
     ...(context.workspace === undefined
       ? {}
       : { workspace: validateManagedWorkspace(context.workspace) }),
@@ -133,6 +144,13 @@ export function validateAgentRun(run: AgentRun): AgentRun {
   }
   if (run.reviewRoundId !== undefined) {
     validateTaskRecordReference({ taskId: run.taskId, localId: run.reviewRoundId }, "reviewRound");
+  }
+  if ((run.executionGroupId === undefined) !== (run.executionLaneId === undefined)) {
+    throw new Error("Agent run execution lineage is incomplete.");
+  }
+  if (run.executionGroupId !== undefined) {
+    requireSafeIdentity(run.executionGroupId, "ExecutionGroup id");
+    requireSafeIdentity(run.executionLaneId!, "ExecutionLane id");
   }
   if (run.workspace !== undefined) {
     validateManagedWorkspace(run.workspace);

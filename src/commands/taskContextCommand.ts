@@ -7,6 +7,10 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
+import {
+  summarizeExecutionGroup,
+  type ExecutionGroup
+} from "../execution/executionGroup.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -226,6 +230,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
                 ? "none"
                 : item.writeProjectIds.join(", ")
             }`,
+            ...(item.executionGroup === undefined
+              ? []
+              : renderExecutionGroup(item.executionGroup)),
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
@@ -479,4 +486,20 @@ function managedWorkspaceLabel(
     case "integration-attempt":
       return `integration-attempt ${workspace.owner.integrationAttemptId}`;
   }
+}
+
+function renderExecutionGroup(group: ExecutionGroup): string[] {
+  const summary = summarizeExecutionGroup(group);
+  return [
+    `    Execution Group ${summary.groupId} [${summary.purpose}/${summary.strategy.mode}]: ${summary.activeLaneCount} active / ${summary.terminalLaneCount} terminal; ${summary.failedLaneCount} failed`,
+    ...summary.laneSummaries.map((lane) => (
+      `      Lane ${lane.laneId} [${lane.status}]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`
+    )),
+    ...(summary.openHighPriorityFindingIds.length === 0
+      ? []
+      : [`      Open high findings: ${summary.openHighPriorityFindingIds.join(", ")}`]),
+    ...(summary.resolution === undefined
+      ? []
+      : [`      Resolution: ${summary.resolution.decision} — ${compactText(summary.resolution.summary)}`])
+  ];
 }
