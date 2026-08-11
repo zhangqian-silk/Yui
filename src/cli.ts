@@ -60,6 +60,7 @@ import {
   TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
   TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
+  preflightTaskCompletion,
   runTaskCommand,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
@@ -900,12 +901,20 @@ export async function main(): Promise<void> {
       }
     }
     if (resolved[1] === "complete" && resolved[2] !== undefined) {
-      await reconcileTaskRemoteBaselines(
-        resolved[2],
-        store,
-        home,
-        { environment: process.env }
-      );
+      const completion = preflightTaskCompletion(resolved[2], store, {
+        environment: process.env,
+        ...(taskFinalReviewContract === undefined
+          ? {}
+          : { taskFinalReviewContract })
+      });
+      if (!completion.completed) {
+        await reconcileTaskRemoteBaselines(
+          resolved[2],
+          store,
+          home,
+          { environment: process.env }
+        );
+      }
     }
     const candidateGitSnapshot = await candidateSnapshotForTaskCommand(
       resolved,

@@ -42,27 +42,4 @@ jobs:
           rm -rf .release-stage package-smoke.json
           node scripts/assemble-runtime-package.mjs --output .release-stage
           npm pack ./.release-stage --dry-run --ignore-scripts --json > package-smoke.json
-          node --input-type=module <<'NODE'
-          import { readFileSync } from "node:fs";
-
-          const result = JSON.parse(readFileSync("package-smoke.json", "utf8"));
-          const files = new Set(result[0]?.files?.map(({ path }) => path) ?? []);
-          const required = [
-            "package/dist/cli.js",
-            "package/dist/cli/commandCatalog.js",
-            "package/ARCHITECTURE.md",
-            "package/skills/yui-leader/SKILL.md",
-            "package/skills/yui-worker/SKILL.md",
-            "package/skills/yui-operator/SKILL.md",
-            "package/skills/yui-reviewer/SKILL.md"
-          ];
-          for (const path of required) {
-            if (!files.has(path)) throw new Error(`runtime package is missing ${path}`);
-          }
-          for (const path of files) {
-            if (/^package\/(?:test|scripts|node_modules)\//u.test(path)) {
-              throw new Error(`runtime package contains forbidden path ${path}`);
-            }
-          }
-          console.log(`Package structure smoke passed (${files.size} files).`);
-          NODE
+          node scripts/check-runtime-package-structure.mjs package-smoke.json
