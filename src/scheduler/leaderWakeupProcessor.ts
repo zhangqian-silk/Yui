@@ -212,6 +212,12 @@ export async function processLeaderWakeups(
           preStartFencePersisted = true;
         }
       });
+      // A fresh Codex host may already carry the exact Run prompt in its
+      // launch argv. Once preparation returns that transport fact, any
+      // later readiness or aggregate-write failure is delivery uncertainty,
+      // not a launch failure: preserve the Run and its reservation for the
+      // matching provider Hook instead of terminalizing it.
+      deliveryAttempted = prepared.inputSubmittedAtLaunch === true;
       // Persist the exact preparation fence before waiting on provider
       // readiness. A pre-input lifecycle Hook may fire during that wait; it
       // must be able to resolve this Run/Session/launch generation from durable
@@ -237,6 +243,8 @@ export async function processLeaderWakeups(
         });
       }
       const ready = await delivery.waitUntilReady(prepared);
+      deliveryAttempted = deliveryAttempted
+        || ready.prepared.inputSubmittedAtLaunch === true;
       const latestTask = store.getTask(task.id);
       if (latestTask === null || latestTask.status !== "active") {
         delivery.forgetPrepared?.({
@@ -266,6 +274,33 @@ export async function processLeaderWakeups(
           : { launchId: ready.prepared.launchId }),
         now
       });
+      if (ready.prepared.inputSubmittedAtLaunch === true) {
+        // A fresh Codex command may carry the exact first prompt in its launch
+        // argv. That is transport evidence only: the matching Provider Hook
+        // still owns Run acceptance. Persist the push fence without writing a
+        // second terminal prompt, then leave the reservation for the async
+        // SessionStart/UserPromptSubmit fold.
+        store.saveRoleRunDelivery({
+          task,
+          role,
+          run,
+          session: effectiveSession,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId }),
+          now
+        });
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId })
+        });
+        results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
+        continue;
+      }
       deliveryAttempted = true;
       const outcome = await delivery.sendOnce({
         delivery: ready,

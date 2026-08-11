@@ -1,6 +1,9 @@
 import { dataError, roleNotFound, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
-import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
+import {
+  activeLiveRoleAgentSession,
+  type TaskRoleSessionSet
+} from "../executor/agentExecutor.js";
 import {
   answerInputRequest,
   cancelInputRequest,
@@ -293,10 +296,17 @@ function cancelRequest(
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "cancelling input"));
     const current = tx.getInputRequest(task.id, parsed.positionals[1]);
     if (current === null) throw dataError(`Input request not found: ${parsed.positionals[1]}.`);
-    assertInputCancelOrigin(current, options.environment);
+    const cancelledBy = assertInputCancelOrigin(tx, current, options.environment);
     const cancelled = cancelInputRequest(current, reason, now);
+    if (cancelled.status !== "cancelled") {
+      throw new Error(`Input request ${cancelled.id} did not enter the cancelled state.`);
+    }
     tx.saveInputRequest(task.id, cancelled);
-    recordTaskEvent(tx, task.id, "input.cancelled", { requestId: cancelled.id }, now);
+    recordTaskEvent(tx, task.id, "input.cancelled", {
+      requestId: cancelled.id,
+      cancelledBy,
+      reason: cancelled.cancellation.reason
+    }, now);
     enqueueWork(
       tx,
       { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
@@ -356,10 +366,14 @@ function requireLeaderInputOrigin(
 }
 
 function assertInputCancelOrigin(
+  store: Pick<TaskStore, "getGlobalRole" | "getGlobalRoleSessionSet">,
   request: InputRequest,
   environment: NodeJS.ProcessEnv | undefined
-): void {
+): "leader" | "operator" {
   const env = environment ?? {};
+  if (isCurrentGlobalOperator(store, env)) {
+    return "operator";
+  }
   if (
     env.YUI_SESSION_SCOPE !== "task"
     || env.YUI_TASK_ID !== request.taskId
@@ -370,6 +384,55 @@ function assertInputCancelOrigin(
   ) {
     throw usageError("Only the originating Leader may cancel this input request.");
   }
+  return "leader";
+}
+
+function isCurrentGlobalOperator(
+  store: Pick<TaskStore, "getGlobalRole" | "getGlobalRoleSessionSet">,
+  environment: NodeJS.ProcessEnv
+): boolean {
+  if (
+    environment.YUI_SESSION_SCOPE !== "global"
+    || environment.YUI_ROLE !== "operator"
+    || environment.YUI_TASK_ID !== undefined
+  ) return false;
+  const role = store.getGlobalRole("operator");
+  if (role === null) return false;
+  const sessions = store.getGlobalRoleSessionSet(role.name);
+  const session = activeLiveRoleAgentSession(sessions);
+  if (sessions === null || session === null || sessions.activeAgentId !== role.activeAgentId) {
+    return false;
+  }
+  const agentId = exactIdentity(environment.YUI_AGENT_ID);
+  const adapterId = exactIdentity(environment.YUI_ADAPTER_ID);
+  const launchId = exactIdentity(environment.YUI_LAUNCH_ID);
+  const nativeSessionId = exactIdentity(environment.YUI_NATIVE_SESSION_ID);
+  const binding = role.agentBindings[role.activeAgentId];
+  // A fresh Codex launch discovers its native Session asynchronously. Its
+  // launch envelope therefore cannot carry YUI_NATIVE_SESSION_ID, but the
+  // durable Session still binds that provider identity to the exact launch
+  // generation. Accept that one transport shape only when the current
+  // launch, Agent, and adapter all match; Claude and stale/unknown launches
+  // remain fail-closed on the native identity fence.
+  const nativeSessionMatches = binding !== undefined && (
+    nativeSessionId === session.nativeSessionId
+      || (nativeSessionId === undefined
+        && binding.adapterId === "codex"
+        && session.adapterId === "codex"
+        && session.launchId !== undefined
+        && session.launchId === launchId)
+  );
+  return agentId !== undefined
+    && adapterId !== undefined
+    && launchId !== undefined
+    && binding !== undefined
+    && binding.agentId === session.agentId
+    && binding.adapterId === session.adapterId
+    && session.agentId === agentId
+    && session.adapterId === adapterId
+    && session.launchId !== undefined
+    && session.launchId === launchId
+    && nativeSessionMatches;
 }
 
 function inputAnswerer(environment: NodeJS.ProcessEnv | undefined): "user" | "operator" {
@@ -544,6 +607,12 @@ function requiredText(value: string | undefined, label: string): string {
 function trimmed(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized === undefined || normalized.length === 0 ? undefined : normalized;
+}
+
+function exactIdentity(value: string | undefined): string | undefined {
+  if (value === undefined || value.includes("\0")) return undefined;
+  const normalized = value.trim();
+  return normalized.length === 0 || normalized !== value ? undefined : normalized;
 }
 
 function timeoutAfter(now: Date, value: string): string {
