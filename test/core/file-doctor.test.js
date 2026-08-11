@@ -204,6 +204,7 @@ test("doctor projects Reviewer readiness without launching a Session or model", 
     ...store.getConfig(),
     review: { roleName: "reviewer", trigger: "final" }
   });
+  const before = snapshot(home);
   const executor = {
     run(command, args) {
       if (command === "git") return "git version 2.45.1";
@@ -275,7 +276,6 @@ test("doctor blocks Reviewer readiness when a required Agent environment is abse
     ...store.getConfig(),
     review: { roleName: "reviewer", trigger: "final" }
   });
-  const before = snapshot(home);
   const executor = {
     run(command, args) {
       if (command === "git") return "git version 2.45.1";
