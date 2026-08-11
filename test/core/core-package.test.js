@@ -205,7 +205,10 @@ test("Yui-specific test workflow stays in its Project Skill", () => {
       "yui-operator": /skip it without\s+creating an InputRequest or soliciting authorization/iu
     }[name];
     assert.match(skill, noPromptBoundary);
-    assert.doesNotMatch(skill, /YUI_ALLOW_PROVIDER_E2E|Provider E2E|Mock Agent Session/u);
+    assert.doesNotMatch(
+      skill,
+      /YUI_ALLOW_PROVIDER_E2E|YUI_ALLOW_RELEASE_E2E|Provider E2E|Release E2E|Isolated Integration|Mock Agent Session/u
+    );
   }
 });
 
