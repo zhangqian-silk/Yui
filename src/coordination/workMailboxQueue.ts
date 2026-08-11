@@ -102,7 +102,7 @@ export function settleExactWorkExecution(
   const pending = mailbox.pending;
   if (pending === null) return "absent";
   const matches = pending.refs.some(
-    (ref) => ref.type === executionRef.type && ref.id === executionRef.id
+    (ref) => mailboxEntityRefKey(ref) === mailboxEntityRefKey(executionRef)
   );
   if (!matches) return "absent";
   if (pending.requestCount !== 1) {

@@ -373,7 +373,7 @@ test("managed Codex Task Run installs lifecycle hooks while native identity rema
   assert.ok(plan.launch.args.includes("--dangerously-bypass-hook-trust"));
   assert.equal(plan.launch.args.at(-2), "--");
   assert.equal(plan.launch.args.at(-1), "test hooks");
-  assert.equal("initialPromptRunId" in plan, false);
+  assert.equal(plan.initialPromptRunId, "agent-run-1");
   assert.ok(plan.launch.args.includes(
     `projects={${JSON.stringify(home)}={trust_level="trusted"}}`
   ));
@@ -422,7 +422,7 @@ test("managed Codex resume submits the exact first Run prompt after the native s
     plan.launch.args.slice(-4),
     ["resume", "codex-existing", "--", "-prompt that begins like an option"]
   );
-  assert.equal("initialPromptRunId" in plan, false);
+  assert.equal(plan.initialPromptRunId, "agent-run-1");
 });
 
 test("managed Codex launch refuses to replace an existing native notify callback", (t) => {

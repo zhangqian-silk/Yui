@@ -57,6 +57,7 @@ import {
   type DerivedStateSummary,
   type LiveRuntimeStatus,
   type MigrationTarget,
+  type RecordAxisEntry,
   type StorageVersionState,
   type SwitchOutcome,
   type ValidationSummary
@@ -494,17 +495,22 @@ export type SourceVersionInspection = Readonly<
 /**
  * Read a source Home's full three-axis {@link StorageVersionState} read-only.
  *
- * The scalar `layout`/`aggregate` versions come from `schema.json`; the `record`
- * axis is extracted structurally from the raw `state.json` (never through the
- * strict `parseState`, which would conflate an older record family with
- * corruption — see P1-1 / `recordVersionScan.ts`). This is the single seam that
- * makes the record axis genuinely independent of the scalar axes: a record-only-
- * older Home yields an older `record` map here, so the planner produces a
- * record-axis verdict instead of the loader falsely reporting `CORRUPTED`.
+ * The scalar `layout`/`aggregate` versions come from `schema.json`. The
+ * `record` axis is taken from the manifest's `recordVersions` field — that is
+ * the authoritative, persisted declaration of each record family's version.
+ * The raw `state.json` record versions are cross-checked against the manifest
+ * declaration: a disagreement means the Home is inconsistent (the manifest was
+ * not updated alongside the state, or vice versa) and is reported as
+ * `CORRUPTED`, never silently rounded to "current".
  *
- * Returns `corruption` when the manifest is invalid, storage is uninitialized, or
- * `state.json` is structurally damaged; callers map that to a hard error (engine)
- * or a `CORRUPTED` verdict (classifier).
+ * For a pre-baseline Home (no `recordVersions` field) every current record
+ * family is treated as version 0, so the planner reports `missing-step` and
+ * the Home is `NEEDS_NEW_VERSION` — no fabricated pre-baseline history.
+ *
+ * Returns `corruption` when the manifest is invalid, storage is uninitialized,
+ * `state.json` is structurally damaged, or the manifest/state record versions
+ * disagree; callers map that to a hard error (engine) or a `CORRUPTED` verdict
+ * (classifier).
  */
 export function inspectSourceVersionState(
   home: string,
@@ -528,20 +534,119 @@ export function inspectSourceVersionState(
     };
   }
 
-  // schema.status is "current" or "unsupported": scalar axes are known. Read the
-  // record axis structurally so an older/newer record family is a version fact,
-  // not a parse failure.
+  // schema.status is "current" or "unsupported": scalar axes are known.
+
+  // The manifest's recordVersions is the authoritative record-axis declaration.
+  // Read it directly (inspectStorageSchema validates its shape but does not
+  // return the full map).
+  const manifestRecordVersions = readManifestRecordVersions(home);
+
+  if (manifestRecordVersions === undefined) {
+    // Pre-baseline Home: schema.json has layout + aggregate but NO recordVersions
+    // field. The manifest does not declare any record family versions, so we must
+    // NOT infer them from state.json — that would let a pre-baseline Home
+    // masquerade as current and reach the strict FileTaskStore loader (which
+    // throws StorageSchemaError). Instead, treat every current record family as
+    // being at version 0 (before the baseline). The planner then looks for
+    // adjacent steps 0->1, 1->2, ... which do not exist (no fabricated
+    // pre-baseline history), so it returns missing-step -> NEEDS_NEW_VERSION.
+    // This preserves the no-history-migration contract: pre-baseline Homes are
+    // never migrated.
+    const record: Record<string, RecordAxisEntry> = {};
+    for (const [kind, entry] of Object.entries(latest.record)) {
+      record[kind] = { version: 0, path: entry.path };
+    }
+    return {
+      source: {
+        layout: schema.currentLayoutVersion,
+        aggregate: schema.currentAggregateSchemaVersion,
+        record: Object.freeze(record)
+      }
+    };
+  }
+
+  // Non-pre-baseline: the manifest declares the record families it already
+  // knows. A family absent from this map was introduced after the persisted
+  // baseline, so it starts at explicit version 0 and must traverse the
+  // registry's 0->1 introduction step. state.json's actual record versions are
+  // cross-checked below without allowing an undeclared family to masquerade as
+  // current.
+  const record: Record<string, RecordAxisEntry> = {};
+  const missingManifestFamilies = new Set<string>();
+  for (const [kind, latestEntry] of Object.entries(latest.record)) {
+    const version = manifestRecordVersions[kind];
+    if (version === undefined) {
+      missingManifestFamilies.add(kind);
+      record[kind] = { version: 0, path: latestEntry.path };
+    } else {
+      record[kind] = { version, path: latestEntry.path };
+    }
+  }
+
+  // Cross-check the manifest's declared record versions against the actual
+  // versions stored in state.json. A mismatch means the Home is internally
+  // inconsistent: either a migration updated the state without updating the
+  // manifest, or the manifest was edited without migrating the state. Either
+  // way the Home is CORRUPTED — we must not trust one side over the other and
+  // silently report USABLE.
   const scan = scanSourceRecordVersions(home, latest.record);
   if ("corruption" in scan) {
     return { corruption: scan.corruption };
+  }
+  for (const [kind, entry] of Object.entries(record)) {
+    const scanned = scan.record[kind];
+    if (scanned === undefined) continue;
+    if (missingManifestFamilies.has(kind)) {
+      // The manifest omission is the source-of-truth evidence that this family
+      // did not exist at the baseline. An empty/current-shaped state endpoint
+      // is tolerated here; the explicit introduction step owns adding the
+      // family to the manifest and transforming any data it introduces.
+      if (scanned.version > latest.record[kind]!.version) {
+        return {
+          corruption: {
+            corrupted: true,
+            detail:
+              `State contains future records for undeclared family '${kind}' at version ${scanned.version}.`
+          }
+        };
+      }
+      continue;
+    }
+    if (scanned.version !== entry.version) {
+      return {
+        corruption: {
+          corrupted: true,
+          detail:
+            `Manifest declares record family '${kind}' at version ${entry.version}, `
+            + `but state.json contains version ${scanned.version}.`
+        }
+      };
+    }
   }
   return {
     source: {
       layout: schema.currentLayoutVersion,
       aggregate: schema.currentAggregateSchemaVersion,
-      record: scan.record
+      record: Object.freeze(record)
     }
   };
+}
+
+/**
+ * Read the manifest's `recordVersions` map directly from `schema.json`.
+ * Returns `undefined` when the field is absent (a pre-baseline manifest).
+ * `inspectStorageSchema` already validates the field's shape when present, so
+ * this does not re-validate; it only extracts the already-validated map.
+ */
+function readManifestRecordVersions(
+  home: string
+): Readonly<Record<string, number>> | undefined {
+  const manifestPath = join(home, STORAGE_SCHEMA_FILE);
+  const raw = readFileSync(manifestPath, "utf8");
+  const manifest = JSON.parse(raw) as Record<string, unknown>;
+  const recordVersions = manifest.recordVersions;
+  if (recordVersions === undefined) return undefined;
+  return recordVersions as Readonly<Record<string, number>>;
 }
 
 /**

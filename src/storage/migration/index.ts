@@ -13,7 +13,7 @@
 import {
   CURRENT_AGGREGATE_SCHEMA_VERSION,
   CURRENT_STORAGE_LAYOUT_VERSION
-} from "../storageSchema.js";
+} from "../storageVersions.js";
 
 export * from "./types.js";
 export {
@@ -36,6 +36,17 @@ export {
   describeReport,
   toStepSummary
 } from "./report.js";
+export {
+  BASELINE_STORAGE_LAYOUT_VERSION,
+  BASELINE_AGGREGATE_SCHEMA_VERSION,
+  BASELINE_RECORD_VERSIONS,
+  BASELINE_STORAGE_VERSION_STATE,
+  assertBaselineConsistency
+} from "./baseline.js";
+export {
+  createProductionRegistry,
+  assertRegistryCoversBaselineToCurrent
+} from "./productionRegistry.js";
 
 /**
  * The current baseline scalar versions, sourced from the single authoritative

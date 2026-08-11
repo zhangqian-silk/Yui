@@ -47,18 +47,19 @@ export function planMigration<Snapshot>(
     ordered.push(...chain.steps);
   }
 
-  // 3) record families — nested inside the aggregate; visit kinds in sorted
-  // order so the plan is deterministic. Only families present in BOTH source and
-  // target are version-advanced here; introducing or removing a family is an
-  // aggregate-transform concern owned by the injected rebuild/validate boundary.
-  const sharedKinds = Object.keys(target.record)
-    .filter((kind) => Object.hasOwn(source.record, kind))
-    .sort();
-  for (const recordKind of sharedKinds) {
+  // 3) record families — nested inside the aggregate; visit target kinds in
+  // sorted order so the plan is deterministic. A target-only family starts at
+  // the explicit pre-introduction version 0 and therefore requires a registered
+  // `introduction` step. It is not an aggregate transform or an implicit
+  // no-op: the record family must pass the same fail-closed delivery gate as
+  // every later version transition.
+  const targetKinds = Object.keys(target.record).sort();
+  for (const recordKind of targetKinds) {
+    const sourceEntry = source.record[recordKind];
     const chain = planRecordFamily(
       registry,
       recordKind,
-      source.record[recordKind].version,
+      sourceEntry?.version ?? 0,
       target.record[recordKind].version
     );
     if (chain.kind === "blocked") return { kind: "blocked", blocker: chain.blocker };

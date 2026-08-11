@@ -52,7 +52,7 @@ export type HomeClassification = Readonly<{
   /** Latest supported aggregate version. */
   latestAggregateVersion: number;
   /** Which scalar component is incompatible, when a version blocks use. */
-  incompatibleComponent?: "layout" | "aggregate";
+  incompatibleComponent?: "layout" | "aggregate" | "record";
   /** Set when the Home has never been initialized (`yui setup` needed). */
   uninitialized?: true;
 }>;
@@ -115,7 +115,13 @@ export function classifyHome<Snapshot>(
   // already current (the plan would be a no-op); a throw there is genuine
   // structural/reference corruption, never a version mismatch. An older/newer
   // axis skips the loader and is decided purely by the planner below.
-  const corruption = isFullyCurrent(source, latest)
+  //
+  // Crucially, the strict loader is ONLY invoked when the manifest itself is
+  // `current`. An `unsupported` manifest (e.g. a pre-baseline Home with no
+  // recordVersions field) must never reach FileTaskStore: requireStorageSchema
+  // would throw StorageSchemaError, which doctor/upgrade must surface as a
+  // structured NEEDS_NEW_VERSION verdict, not as an invalid/corruption error.
+  const corruption = (schema.status === "current" && isFullyCurrent(source, latest))
     ? detectCurrentHomeCorruption(home)
     : undefined;
 
@@ -182,7 +188,7 @@ function isFullyCurrent(
 
 function incompatibleComponentOf(
   schema: StorageSchemaState
-): "layout" | "aggregate" | undefined {
+): "layout" | "aggregate" | "record" | undefined {
   return schema.status === "unsupported" ? schema.incompatibleComponent : undefined;
 }
 

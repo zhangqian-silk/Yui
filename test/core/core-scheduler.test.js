@@ -157,7 +157,7 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   assert.equal(store.pending.has("task-1"), false);
   assert.deepEqual(
     store.operations.slice(-3),
-    ["save-dispatch", "save-prepared", "save-delivery"]
+    ["save-prepared", "save-prepared", "save-delivery"]
   );
 });
 

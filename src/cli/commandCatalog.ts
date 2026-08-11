@@ -537,6 +537,24 @@ const taskChildren: readonly NodeInput[] = [
     ]
   },
   {
+    name: "review",
+    summary: "Control Task-final ReviewRounds.",
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "retry"] }],
+    children: [
+      {
+        name: "request",
+        summary: "Request one Task-local final ReviewRound from a Global Role.",
+        usage: "yui task review request <task> --role <global-role>",
+        options: ["--role"]
+      },
+      {
+        name: "retry",
+        summary: "Retry a failed Task-final ReviewRound without a Reviewer Run.",
+        usage: "yui task review retry <task>/<review-round>"
+      }
+    ]
+  },
+  {
     name: "integration",
     summary: "Safely integrate ChangeSets with Leader-owned conflict decisions.",
     sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "list", "show", "cleanup"] }],
@@ -892,7 +910,7 @@ export const ROOT_COMMAND = buildNode({
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "archive", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "integration", "role", "enter"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "review", "integration", "role", "enter"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren

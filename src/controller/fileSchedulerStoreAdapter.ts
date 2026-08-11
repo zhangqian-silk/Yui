@@ -1076,15 +1076,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ) {
         return "state-changed";
       }
-      const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
-      const mailbox = store.getWorkMailbox(target);
-      if (
-        mailbox?.processing?.executionRef?.type !== "run"
-        || mailbox.processing.executionRef.taskId !== task.id
-        || mailbox.processing.executionRef.id !== currentRun.id
-      ) {
-        return "state-changed";
-      }
+      // Review launch failure uses the aggregate exact-terminalization path.
+      // It owns mailbox settlement and ReviewRound convergence together, so a
+      // pending pre-delivery dispatch cannot be consumed before its Run and
+      // Round pass the same immutable identity fences.
       if (currentRun.purpose === "review") {
         if (
           input.run.taskId !== currentRun.taskId
@@ -1121,11 +1116,26 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         queueLeaderWakeup(store, task.id, "review-failed", input.now);
         return "failed";
       }
+      const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
+      const mailbox = store.getWorkMailbox(target);
+      const processing = mailbox?.processing;
+      if (mailbox !== null && processing !== null && processing !== undefined) {
+        if (
+          processing.executionRef === undefined
+          || processing.executionRef.type !== "run"
+          || processing.executionRef.taskId !== task.id
+          || processing.executionRef.id !== currentRun.id
+        ) {
+          return "state-changed";
+        }
+      }
       store.saveAgentRun(failAgentRun(currentRun, input.summary, input.now));
       clearMatchingLeaderStallAttention(store, task.id, currentRun.id);
       store.clearActiveAgentRun(task.id, role.name);
       clearTaskRoleRunInFlight(store, role, currentRun, input.now);
-      store.saveWorkMailbox(completeProcessing(mailbox, mailbox.processing.batchId));
+      if (mailbox !== null && processing !== null && processing !== undefined) {
+        store.saveWorkMailbox(completeProcessing(mailbox, processing.batchId));
+      }
       if (currentRun.purpose === "execution" && currentRun.workItemId !== undefined) {
         const workItem = store.getWorkItem(task.id, currentRun.workItemId);
         if (workItem !== null && !["completed", "failed", "retired"].includes(workItem.status)) {
@@ -1244,10 +1254,27 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   confirmRuntimeLaunchReservation(
     input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
     assertCurrent: () => void
-  ): void {
-    this.store.transaction((store) => {
+  ): "reserved" | "provider-bound" {
+    return this.store.transaction((store) => {
       assertCurrent();
-      requireRuntimeLaunchReservation(store, input.owner, input.launchId);
+      const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(input.owner));
+      if (isRuntimeLaunchReservation(mailbox?.processing, input.launchId)) {
+        return "reserved" as const;
+      }
+      if (hasRuntimeCleanupObligation(mailbox)) {
+        throw new Error("Runtime cleanup is still pending.");
+      }
+      // A synchronous provider lifecycle Hook may bind a fresh native Session
+      // and complete the reservation while the host start call is still
+      // unwinding. Preserve that exact hook-won generation instead of treating
+      // the already-settled reservation as a launch failure.
+      const sessions = runtimeOwnerSessionSet(store, input.owner);
+      const active = sessions?.sessions[sessions.activeAgentId];
+      if (
+        active?.status === "running"
+        && active.launchId === input.launchId
+      ) return "provider-bound" as const;
+      throw new Error("Runtime launch reservation no longer matches the launch.");
     });
   }
 
@@ -2156,6 +2183,25 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               effective: run.effective
             }, now);
             store.saveTaskRoleSessionSet(bound);
+            // Codex 0.145 emits SessionStart from inside run_turn(input), so a
+            // runtime-discovered bind is durable evidence that this Run's
+            // initial transport input already crossed the provider boundary.
+            // Preserve that truth before clearing the launch reservation: a
+            // restarted Controller must not allocate a second generation or
+            // push the same first input again. UserPromptSubmit remains the
+            // sole acceptance/delivered transition.
+            if (input.adapterId === "codex" && run.pushedAt === undefined) {
+              const pushed = markAgentRunPushed(run, now);
+              store.saveAgentRun(pushed);
+              markTaskRoleRunPushedInFlight(store, role, pushed, now);
+              store.saveEvent(input.taskId, createTaskEvent(
+                store.nextEventId(input.taskId),
+                input.taskId,
+                "run.pushed",
+                runLaunchEventPayload(pushed),
+                now
+              ));
+            }
             completeRuntimeHookReservation(
               store,
               { scope: "task", taskId: input.taskId, roleName: input.roleName },

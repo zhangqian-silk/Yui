@@ -11,6 +11,7 @@ import {
   inspectStorageSchema,
   requireStorageSchema
 } from "../dist/storage/storageSchema.js";
+import { currentRecordVersions } from "../dist/storage/upgrade/recordVersions.js";
 import {
   FileTaskStore,
   STORAGE_STATE_FILE
@@ -56,10 +57,15 @@ test("storage schema initializes layout v6 with aggregate v17 and rejects non-cu
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
+  const expectedRecordVersions = {};
+  for (const [kind, entry] of Object.entries(currentRecordVersions())) {
+    expectedRecordVersions[kind] = entry.version;
+  }
   assert.deepEqual(JSON.parse(readFileSync(join(home, "schema.json"), "utf8")), {
     schemaVersion: 1,
     storageVersion: 6,
     aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
+    recordVersions: expectedRecordVersions,
     updatedAt: "2026-07-19T00:00:00.000Z"
   });
   assert.equal(inspectStorageSchema(home).status, "current");

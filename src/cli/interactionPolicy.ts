@@ -507,6 +507,25 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       : {})
   })),
   {
+    commandPath: ["task", "review", "request"],
+    selectors: [
+      {
+        argumentIndex: 3,
+        entity: "task",
+        provider: "tasks",
+        actionTarget: true,
+        statuses: ["active"]
+      },
+      {
+        option: "--role",
+        entity: "global-role",
+        provider: "global-roles",
+        actionTarget: false
+      }
+    ],
+    trailingOptions: { "--role": "value" }
+  },
+  {
     commandPath: ["task", "integration", "start"],
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
