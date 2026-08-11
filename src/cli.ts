@@ -60,6 +60,7 @@ import {
   TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
   TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
+  parseTaskCompletionRequest,
   preflightTaskCompletion,
   runTaskCommand,
   validateTaskArchiveRequest
@@ -900,14 +901,17 @@ export async function main(): Promise<void> {
         }
       }
     }
+    let completionSummary: string | undefined;
     if (resolved[1] === "complete" && resolved[2] !== undefined) {
+      const completionRequest = parseTaskCompletionRequest(resolved.slice(2));
+      completionSummary = completionRequest.summary;
       const completion = preflightTaskCompletion(resolved[2], store, {
         environment: process.env,
         ...(taskFinalReviewContract === undefined
           ? {}
           : { taskFinalReviewContract })
       });
-      if (!completion.completed) {
+      if (!completion.completed && !completion.activeTaskReview) {
         await reconcileTaskRemoteBaselines(
           resolved[2],
           store,
@@ -953,6 +957,7 @@ export async function main(): Promise<void> {
         ...(taskFinalReviewContract === undefined
           ? {}
           : { taskFinalReviewContract }),
+        ...(completionSummary === undefined ? {} : { completionSummary }),
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
         ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
         ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),

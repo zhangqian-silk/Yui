@@ -14,15 +14,25 @@ import {
 } from "../../dist/integration/integrationAttempt.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import {
+  attachReviewRoundWorkspace,
+  createTaskReviewRound,
+  startReviewRound
+} from "../../dist/review/reviewRound.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createProject } from "../../dist/repository/project.js";
 import { NodeGitWorkspace } from "../../dist/repository/gitWorkspace.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
-import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
+import {
+  createWorkItem,
+  submitWorkItemCandidate,
+  updateWorkItemStatus
+} from "../../dist/workItem/workItem.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { createAgentRun } from "../helpers/effectiveLaunch.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 
 const NOW = new Date("2026-08-12T00:00:00.000Z");
 
@@ -83,7 +93,11 @@ async function seedCommittedIntegration(fx) {
     title: "Integrated change",
     writeProjectIds: [fx.project.id]
   }, NOW), "running", NOW);
-  fx.store.saveWorkItem(fx.task.id, updateWorkItemStatus(item, "completed", NOW, "Accepted"));
+  const candidate = submitWorkItemCandidate(item, {
+    summary: "Accepted candidate",
+    source: { type: "direct" }
+  }, NOW);
+  fx.store.saveWorkItem(fx.task.id, updateWorkItemStatus(candidate, "completed", NOW, "Accepted"));
   const changeSet = createWorkItemChangeSet({
     id: "change-set-1",
     taskId: fx.task.id,
@@ -115,19 +129,72 @@ function advanceRemote(fx) {
   git(fx.seed, ["add", "remote.txt"]);
   git(fx.seed, ["commit", "-qm", "Remote change"]);
   git(fx.seed, ["push", "-q", "origin", "main"]);
+  return git(fx.seed, ["rev-parse", "HEAD"]);
 }
 
-function runCompletionCli(fx) {
+function runCompletionCli(fx, completionArgs = ["--summary", "repeat completion"]) {
   return execFileSync(
     process.execPath,
-    [join(process.cwd(), "dist", "cli.js"), "task", "complete", fx.task.id,
-      "--summary", "repeat completion"],
+    [join(process.cwd(), "dist", "cli.js"), "task", "complete", fx.task.id, ...completionArgs],
     {
       cwd: process.cwd(),
       encoding: "utf8",
       env: { ...process.env, YUI_HOME: fx.home }
     }
   );
+}
+
+async function seedCommittedIntegrationWithDistinctSource(fx) {
+  await fx.preparer.prepareTaskWorkspace(fx.task.id);
+  const main = fx.store.getTaskWorkspace(fx.task.id);
+  const entry = main.entries[0];
+  writeFileSync(join(entry.path, "task.txt"), "Task change\n");
+  git(entry.path, ["add", "task.txt"]);
+  git(entry.path, ["commit", "-qm", "Task change in Task workspace"]);
+  const taskHead = git(entry.path, ["rev-parse", "HEAD"]);
+
+  // The ChangeSet comes from a normal isolated WorkItem clone. Its source
+  // commit has the same tree change but a different hash from the commit
+  // produced when the first Integration cherry-picks it into Task main.
+  const source = join(fx.root, "work-item-source");
+  execFileSync("git", ["-C", fx.checkout, "worktree", "add", "--detach", "-q", source, fx.base]);
+  git(source, ["config", "user.name", "Yui Test"]);
+  git(source, ["config", "user.email", "yui@example.invalid"]);
+  writeFileSync(join(source, "task.txt"), "Task change\n");
+  git(source, ["add", "task.txt"]);
+  git(source, ["commit", "-qm", "Task change from WorkItem"]);
+  const sourceHead = git(source, ["rev-parse", "HEAD"]);
+  assert.notEqual(sourceHead, taskHead);
+
+  const item = updateWorkItemStatus(createWorkItem("work-item-1", fx.task.id, {
+    title: "Integrated change",
+    writeProjectIds: [fx.project.id]
+  }, NOW), "running", NOW);
+  fx.store.saveWorkItem(fx.task.id, updateWorkItemStatus(item, "completed", NOW, "Accepted"));
+  const changeSet = createWorkItemChangeSet({
+    id: "change-set-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    workItemId: item.id,
+    baseCommit: fx.base,
+    headCommit: sourceHead,
+    branch: entry.branch,
+    changedPaths: ["task.txt"]
+  }, NOW);
+  const previous = updateIntegrationAttempt(createIntegrationAttempt({
+    id: "integration-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    targetRef: entry.branch,
+    expectedHead: fx.base,
+    changeSetIds: [changeSet.id],
+    checkCommands: []
+  }, NOW), { status: "committed", candidateCommit: taskHead }, NOW);
+  fx.store.transaction((tx) => {
+    tx.saveChangeSet(fx.task.id, changeSet);
+    tx.saveIntegrationAttempt(fx.task.id, previous);
+  });
+  return { entry, taskHead, sourceHead };
 }
 
 test("completion reconciliation merges a moved remote only in managed Integration state", async (t) => {
@@ -194,6 +261,27 @@ test("completion reconciliation merges a moved remote only in managed Integratio
     ""
   );
   assert.equal(fx.store.getIntegrationAttempt(fx.task.id, reconciled[0].integrationId).status, "committed");
+});
+
+test("remote-only reconciliation does not replay a distinct isolated WorkItem source commit", async (t) => {
+  const fx = fixture(t);
+  const { entry, taskHead, sourceHead } = await seedCommittedIntegrationWithDistinctSource(fx);
+  const remoteHead = advanceRemote(fx);
+
+  const reconciled = await reconcileTaskRemoteBaselines(
+    fx.task.id,
+    fx.store,
+    fx.home,
+    { git: new NodeGitWorkspace(), now: () => new Date(NOW) }
+  );
+
+  assert.equal(reconciled.length, 1);
+  assert.equal(reconciled[0].remote.commit, remoteHead);
+  assert.notEqual(sourceHead, taskHead);
+  assert.equal(fx.store.getIntegrationAttempt(fx.task.id, reconciled[0].integrationId).status, "committed");
+  assert.equal(git(entry.path, ["show", "HEAD:task.txt"]), "Task change");
+  assert.equal(git(entry.path, ["show", "HEAD:remote.txt"]), "Remote change");
+  assert.equal(fx.store.listIntegrationAttempts(fx.task.id).length, 2);
 });
 
 test("completion reconciliation fails closed when a configured remote cannot be resolved", async (t) => {
@@ -281,6 +369,95 @@ test("CLI completion preflight blocks remote writes for open inputs, active revi
       )
     );
     assert.equal(fx.store.listIntegrationAttempts(fx.task.id).length, blocker === "integration" ? 2 : 1);
+    assert.equal(
+      git(fx.store.getTaskWorkspace(fx.task.id).entries[0].path, ["rev-parse", "HEAD"]),
+      taskHead
+    );
+  }
+});
+
+test("CLI completion skips remote reconciliation for a pending Task-final ReviewRound", async (t) => {
+  const fx = fixture(t);
+  const { taskHead } = await seedCommittedIntegration(fx);
+  fx.store.saveReviewRound(fx.task.id, createTaskReviewRound(
+    "review-round-1",
+    fx.task.id,
+    "work-item-1",
+    "candidate-1",
+    "reviewer",
+    "leader",
+    { schemaVersion: 1, projects: [{ projectId: fx.project.id, commit: taskHead }] },
+    NOW
+  ));
+  const beforeHead = git(fx.store.getTaskWorkspace(fx.task.id).entries[0].path, ["rev-parse", "HEAD"]);
+  const beforeIntegrations = fx.store.listIntegrationAttempts(fx.task.id).length;
+  advanceRemote(fx);
+
+  assert.throws(() => runCompletionCli(fx), /Final Task Review is still active/u);
+  assert.equal(fx.store.listIntegrationAttempts(fx.task.id).length, beforeIntegrations);
+  assert.equal(
+    git(fx.store.getTaskWorkspace(fx.task.id).entries[0].path, ["rev-parse", "HEAD"]),
+    beforeHead
+  );
+});
+
+test("completion preflight marks a runless running Task-final ReviewRound for the same skip path", async (t) => {
+  const fx = fixture(t);
+  const { entry, taskHead } = await seedCommittedIntegration(fx);
+  let round = createTaskReviewRound(
+    "review-round-1",
+    fx.task.id,
+    "work-item-1",
+    "candidate-1",
+    "reviewer",
+    "leader",
+    { schemaVersion: 1, projects: [{ projectId: fx.project.id, commit: taskHead }] },
+    NOW
+  );
+  const workspace = createManagedWorkspace({
+    owner: { type: "review-round", taskId: fx.task.id, reviewRoundId: round.id },
+    root: fx.root,
+    entries: [{
+      projectId: fx.project.id,
+      directory: fx.project.name,
+      access: "write",
+      path: entry.path,
+      branch: entry.branch,
+      baseRef: entry.baseRef,
+      baseCommit: taskHead
+    }]
+  }, NOW);
+  const pendingRound = attachReviewRoundWorkspace(round, workspace);
+  fx.store.saveReviewRound(fx.task.id, pendingRound);
+  fx.store.saveAgentRun(yieldAgentRun(
+    createAgentRun("agent-run-1", fx.task.id, "reviewer", "new", "Review", NOW, {
+      workItemId: "work-item-1",
+      purpose: "review",
+      reviewRoundId: round.id,
+      workspace
+    }),
+    "Review paused",
+    NOW
+  ));
+  round = startReviewRound(pendingRound, "agent-run-1");
+  fx.store.saveReviewRound(fx.task.id, round);
+
+  const result = preflightTaskCompletion(fx.task.id, fx.store);
+  assert.equal(result.activeTaskReview, true);
+});
+
+test("CLI completion validates summary before any remote reconciliation", async (t) => {
+  for (const completionArgs of [
+    [],
+    ["--summary-file", join("/tmp", "yui-task-21-missing-summary.txt")]
+  ]) {
+    const fx = fixture(t);
+    const { taskHead } = await seedCommittedIntegration(fx);
+    const beforeIntegrations = fx.store.listIntegrationAttempts(fx.task.id).length;
+    advanceRemote(fx);
+
+    assert.throws(() => runCompletionCli(fx, completionArgs));
+    assert.equal(fx.store.listIntegrationAttempts(fx.task.id).length, beforeIntegrations);
     assert.equal(
       git(fx.store.getTaskWorkspace(fx.task.id).entries[0].path, ["rev-parse", "HEAD"]),
       taskHead

@@ -177,13 +177,23 @@ export class GitIntegrationService {
           branch: options.remoteBaseline.branch
         });
       }
-      const plan = await integrationCommitPlan(
-        this.store,
-        task.id,
-        project.path,
-        current.changeSetIds,
-        current.expectedHead
-      );
+      // A remote-baseline Attempt starts from the exact previously committed
+      // Task head, so its ChangeSets are already represented by that tree.
+      // Keep their IDs as provenance/check evidence, but never cherry-pick the
+      // source commits again. A manual continuation of a remote merge carries
+      // the same semantic marker in its conflict report.
+      const remoteOnly = options.remoteBaseline !== undefined
+        || (current.resolution?.action === "manual-resolution"
+          && current.conflict?.summary.startsWith(REMOTE_BASELINE_CONFLICT_PREFIX));
+      const plan = remoteOnly
+        ? []
+        : await integrationCommitPlan(
+            this.store,
+            task.id,
+            project.path,
+            current.changeSetIds,
+            current.expectedHead
+          );
       let remaining = plan;
       if (current.resolution?.action === "manual-resolution"
         && current.conflict?.summary.startsWith(REMOTE_BASELINE_CONFLICT_PREFIX)) {

@@ -302,6 +302,8 @@ export type TaskCommandOptions = Readonly<{
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
   yuiHome?: string;
+  /** Completion CLI parsing may read stdin/files before remote reconciliation. */
+  completionSummary?: string;
   workItemIntegrationProof?: WorkItemIntegrationProof;
   candidateGitSnapshot?: CandidateGitSnapshot;
   directTaskMainSnapshot?: DirectTaskMainSnapshot;
@@ -319,8 +321,31 @@ export type TaskCompletionPreflight = Readonly<{
   task: Task;
   actor: TaskCompletedBy;
   completed: boolean;
+  /** Existing Task-final ReviewRound must use the normal resume/block path. */
+  activeTaskReview: boolean;
   taskFinalReviewContract?: TaskFinalReviewContract;
 }>;
+
+export function parseTaskCompletionRequest(
+  args: string[],
+  summaryOverride?: string
+): Readonly<{ taskId: string; summary: string }> {
+  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
+  const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const inlineSummary = parsed.options.get("--summary");
+  const summaryFile = parsed.options.get("--summary-file");
+  if ((inlineSummary === undefined) === (summaryFile === undefined)) {
+    throw usageError(`Specify exactly one of --summary or --summary-file.`, usage);
+  }
+  const summary = summaryOverride ?? readCommandText(
+    inlineSummary,
+    summaryFile,
+    "--summary",
+    usage
+  );
+  return { taskId: parsed.positionals[0]!, summary };
+}
 
 /**
  * Check every read-only completion blocker before a caller resolves remote
@@ -337,7 +362,7 @@ export function preflightTaskCompletion(
   const task = requireTask(store, taskId);
   const actor = taskActor(options, task.id);
   if (task.status === "completed") {
-    return { task, actor, completed: true };
+    return { task, actor, completed: true, activeTaskReview: false };
   }
   if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
   if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
@@ -346,6 +371,10 @@ export function preflightTaskCompletion(
   // fetch or Integration write.  All checks below mirror the transactional
   // completion path, which remains the final CAS fence after reconciliation.
   const taskFinalReviewContract = taskFinalReviewContractForMutation(store, task.id, options);
+  const activeTaskReview = store.listReviewRounds(task.id).some((round) => (
+    (round.scope ?? "work-item") === "task"
+    && (round.status === "pending" || round.status === "running")
+  ));
   assertNoOpenInputRequests(store, task.id, "completing the Task");
   const incompleteWork = store.listWorkItems(task.id).find((item) => (
     item.status !== "completed"
@@ -415,6 +444,7 @@ export function preflightTaskCompletion(
     task,
     actor,
     completed: false,
+    activeTaskReview,
     ...(taskFinalReviewContract === undefined ? {} : { taskFinalReviewContract })
   };
 }
@@ -872,18 +902,11 @@ function completeTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
-  const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
-  exactPositionals(parsed.positionals, 1, usage);
-  const summary = readCommandText(
-    parsed.options.get("--summary"),
-    parsed.options.get("--summary-file"),
-    "--summary",
-    usage
-  );
+  const request = parseTaskCompletionRequest(args, options.completionSummary);
+  const summary = request.summary;
   const now = clock(options);
   const result = store.transaction((tx) => {
-    const preflight = preflightTaskCompletion(parsed.positionals[0], tx, options);
+    const preflight = preflightTaskCompletion(request.taskId, tx, options);
     const { task, actor } = preflight;
     if (preflight.completed) {
       return {
