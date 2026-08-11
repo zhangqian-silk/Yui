@@ -204,7 +204,6 @@ test("doctor projects Reviewer readiness without launching a Session or model", 
     ...store.getConfig(),
     review: { roleName: "reviewer", trigger: "final" }
   });
-  const before = snapshot(home);
   const executor = {
     run(command, args) {
       if (command === "git") return "git version 2.45.1";
@@ -276,6 +275,7 @@ test("doctor blocks Reviewer readiness when a required Agent environment is abse
     ...store.getConfig(),
     review: { roleName: "reviewer", trigger: "final" }
   });
+  const before = snapshot(home);
   const executor = {
     run(command, args) {
       if (command === "git") return "git version 2.45.1";
@@ -299,6 +299,108 @@ test("doctor blocks Reviewer readiness when a required Agent environment is abse
   assert.match(launch.detail, /Required Agent environment is missing: TASK20_REQUIRED_REVIEWER_TOKEN_ABSENT/);
   assert.equal(report.checks.find(({ name }) => name === "reviewer dispatch").status, "invalid");
   assert.match(runDoctorCommand([], { YUI_HOME: home }, executor), /Reviewer: misconfigured/);
+});
+
+test("doctor blocks Reviewer readiness when Codex native notify is configured", (t) => {
+  const root = temporaryRoot(t, "yui-file-doctor-reviewer-codex-notify-");
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const codexHome = join(root, "codex-home");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(join(codexHome, "config.toml"), 'notify = ["native-notifier"]\n');
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(createGlobalRole(
+    "reviewer",
+    [createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId })],
+    agent.id,
+    workspace,
+    now,
+    { description: "review" },
+    "write"
+  ));
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const before = snapshot(home);
+  const executor = {
+    run(command, args) {
+      if (command === "git") return "git version 2.45.1";
+      if (command === "tmux") return "tmux 3.4";
+      if (command === "codex" && args[0] === "--version") return "codex 0.144.4";
+      if (command === "codex" && args[0] === "--help") {
+        return "Usage: codex [OPTIONS]\n"
+          + "  -c, --config <key=value>\n"
+          + "  resume [SESSION_ID]\n"
+          + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+          + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
+      }
+      throw new CommandExecutionError("COMMAND_NOT_FOUND");
+    }
+  };
+
+  const report = buildDoctorReport({ YUI_HOME: home, CODEX_HOME: codexHome }, executor);
+  assert.equal(report.review.status, "misconfigured");
+  const launch = report.checks.find(({ name }) => name === "reviewer launch");
+  assert.equal(launch.status, "invalid");
+  assert.match(launch.detail, /Codex notify is already configured/);
+  assert.equal(report.checks.find(({ name }) => name === "reviewer dispatch").status, "invalid");
+  assert.deepEqual(snapshot(home), before);
+});
+
+test("doctor blocks Reviewer readiness when Codex native developer instructions conflict", (t) => {
+  const root = temporaryRoot(t, "yui-file-doctor-reviewer-codex-instructions-");
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const codexHome = join(root, "codex-home");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(join(codexHome, "config.toml"), 'developer_instructions = "native"\n');
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(createGlobalRole(
+    "reviewer",
+    [createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId })],
+    agent.id,
+    workspace,
+    now,
+    { description: "review" },
+    "write"
+  ));
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const executor = {
+    run(command, args) {
+      if (command === "git") return "git version 2.45.1";
+      if (command === "tmux") return "tmux 3.4";
+      if (command === "codex" && args[0] === "--version") return "codex 0.144.4";
+      if (command === "codex" && args[0] === "--help") {
+        return "Usage: codex [OPTIONS]\n"
+          + "  -c, --config <key=value>\n"
+          + "  resume [SESSION_ID]\n"
+          + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+          + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
+      }
+      throw new CommandExecutionError("COMMAND_NOT_FOUND");
+    }
+  };
+
+  const report = buildDoctorReport({ YUI_HOME: home, CODEX_HOME: codexHome }, executor);
+  assert.equal(report.review.status, "misconfigured");
+  const launch = report.checks.find(({ name }) => name === "reviewer launch");
+  assert.equal(launch.status, "invalid");
+  assert.match(launch.detail, /Codex developer_instructions is already configured/);
+  assert.equal(report.checks.find(({ name }) => name === "reviewer dispatch").status, "invalid");
 });
 
 test("doctor reports compatible-old storage as fully healthy without rewriting it", (t) => {

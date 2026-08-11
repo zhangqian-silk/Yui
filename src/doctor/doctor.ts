@@ -6,13 +6,16 @@ import {
   resolveAgentEnvironment,
   type ConfiguredAgent
 } from "../agent/agent.js";
+import { operationalAgentEnvironment } from "../agent/launchEnvironment.js";
 import {
   inspectAgentCapabilities,
   resolveAgentAdapter,
   type AgentProbeResult,
   type CapabilitySnapshot
 } from "../executor/agentAdapter.js";
+import { inspectCodexLaunchConfig } from "../executor/codexConfigConflict.js";
 import { resolveEffectiveLaunch } from "../executor/effectiveLaunch.js";
+import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
@@ -692,7 +695,14 @@ function inspectReview(
       : capabilityCheck.detail
   });
 
-  const launch = checkReviewerLaunch(agent, role, binding, adapter, environment);
+  const launch = checkReviewerLaunch(
+    agent,
+    role,
+    binding,
+    adapter,
+    environment,
+    source.home
+  );
   checks.push(launch);
   const dispatch = checkReviewerDispatch(policy, role, binding, agent, launch, commandCheck, capabilityCheck);
   checks.push(dispatch);
@@ -882,7 +892,8 @@ function checkReviewerLaunch(
   role: GlobalRole,
   binding: GlobalRole["agentBindings"][string],
   adapter: ReturnType<typeof resolveAgentAdapter>,
-  environment: NodeJS.ProcessEnv
+  environment: NodeJS.ProcessEnv,
+  home: string | undefined
 ): DoctorCheck {
   try {
     const workspace = role.workspace;
@@ -902,13 +913,47 @@ function checkReviewerLaunch(
       };
     }
     const definition = configuredAgentToDefinition(agent);
-    resolveAgentEnvironment(definition, environment);
+    const resolvedAgentEnvironment = resolveAgentEnvironment(definition, environment);
+    const launchEnvironment = {
+      ...operationalAgentEnvironment(adapter.id, environment),
+      ...resolvedAgentEnvironment
+    };
     const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+    const agentWorkspace = effective.workspace.entries.length === 1
+      ? effective.workspace.entries[0]!.path
+      : effective.workspace.root;
+    const codexConfig = adapter.id === "codex"
+      ? inspectCodexLaunchConfig({
+          environment: launchEnvironment,
+          workspace: agentWorkspace,
+          profile: binding.config.adapterId === "codex" ? binding.config.profile : undefined,
+          trustWorkspace: true
+        })
+      : undefined;
+    if (codexConfig?.notify.status === "configured") {
+      return {
+        name: "reviewer launch",
+        status: "invalid",
+        detail: "Codex notify is already configured by "
+          + `${codexConfig.notify.source}; Yui requires exclusive ownership of the structured `
+          + "notify callback and refuses to replace or be replaced by native configuration."
+      };
+    }
+    const reviewerContext = adapter.id === "codex"
+      ? compileRoleSessionContext(home, role, { scope: "global" }, { purpose: "review" })
+      : undefined;
     const compiled = adapter.compileNew({
       agent: definition,
       config: binding.config,
-      workspace: effective.workspace.root,
-      sessionTitle: "reviewer"
+      workspace: agentWorkspace,
+      sessionTitle: "reviewer",
+      ...(reviewerContext === undefined
+        ? {}
+        : {
+            developerInstructions: reviewerContext.developerInstructions,
+            skills: reviewerContext.skills,
+            codexDeveloperInstructions: codexConfig?.developerInstructions
+          })
     });
     if (compiled.argv.length === 0) throw new Error("compiled launch argv is empty");
     return {

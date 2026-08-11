@@ -115,7 +115,7 @@ export async function selectAgentPermission(
   }
 
   if (resolved.catalog.adapterId === "codex") {
-    const codex = current.strategy === "configured" && "sandbox" in current
+    const codex = current.strategy === "configured"
       ? current as Extract<CodexPermissionConfig, { strategy: "configured" }>
       : undefined;
     const sandbox = await selectPermissionField(
@@ -134,19 +134,20 @@ export async function selectAgentPermission(
       codex === undefined ? "on-request" : OMIT
     );
     if (approval.kind === "cancelled") return approval;
-    const permission: CodexPermissionConfig = {
-      strategy: "configured",
-      ...(sandbox.value === undefined ? {} : {
-        sandbox: sandbox.value as Extract<CodexPermissionConfig, { strategy: "configured" }>["sandbox"]
-      }),
-      ...(approval.value === undefined ? {} : {
-        approval: approval.value as Extract<CodexPermissionConfig, { strategy: "configured" }>["approval"]
-      })
+    const permission: Record<string, unknown> = {
+      ...(codex ?? { strategy: "configured" })
     };
-    return { kind: "selected", permission };
+    if (sandbox.value === undefined) delete permission.sandbox;
+    else permission.sandbox = sandbox.value;
+    if (approval.value === undefined) delete permission.approval;
+    else permission.approval = approval.value;
+    return {
+      kind: "selected",
+      permission: permission as CodexPermissionConfig
+    };
   }
 
-  const claude = current.strategy === "configured" && "mode" in current
+  const claude = current.strategy === "configured"
     ? current as Extract<ClaudePermissionConfig, { strategy: "configured" }>
     : undefined;
   const mode = await selectPermissionField(
@@ -157,11 +158,15 @@ export async function selectAgentPermission(
     claude === undefined ? undefined : OMIT
   );
   if (mode.kind === "cancelled") return mode;
-  const permission: ClaudePermissionConfig = {
-    strategy: "configured",
-    ...(mode.value === undefined ? {} : { mode: mode.value })
+  const permission: Record<string, unknown> = {
+    ...(claude ?? { strategy: "configured" })
   };
-  return { kind: "selected", permission };
+  if (mode.value === undefined) delete permission.mode;
+  else permission.mode = mode.value;
+  return {
+    kind: "selected",
+    permission: permission as ClaudePermissionConfig
+  };
 }
 
 export function renderAgentConfigurationResolutionNotice(

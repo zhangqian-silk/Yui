@@ -452,6 +452,7 @@ test("setup can configure Worker separately from Leader", async (t) => {
 test("setup independently persists configured Reviewer permission", async (t) => {
   const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
   const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  const { createRoleAgentBinding } = await import("../../dist/role/role.js");
   const root = mkdtempSync(join(tmpdir(), "yui-reviewer-permission-setup-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const home = join(root, "yui-home");
@@ -495,6 +496,69 @@ test("setup independently persists configured Reviewer permission", async (t) =>
     permission: { strategy: "bypass" }
   });
   assert.match(result, /Reviewer permission: configured/);
+
+  // A valid approval-only Codex configuration is a supported current shape.
+  // Rerunning setup with blank field answers must preserve that shape rather
+  // than rebuilding it from only the picker fields that happen to be shown.
+  const reviewer = store.getGlobalRole("reviewer");
+  reviewer.agentBindings.codex.config.permission = {
+    strategy: "configured",
+    approval: "never"
+  };
+  store.saveGlobalRole(reviewer);
+  const rerunInput = new PassThrough();
+  rerunInput.end([
+    "all", ...Array(14).fill(""), "skip"
+  ].join("\n") + "\n");
+  await runSetupCommand([], {
+    YUI_HOME: home,
+    HOME: join(root, "user"),
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  }, {
+    run: () => "tmux 3.4"
+  }, {
+    input: rerunInput,
+    output: new PassThrough(),
+    forceInteractive: true
+  });
+  assert.deepEqual(
+    new FileTaskStore(home).getGlobalRole("reviewer").agentBindings.codex.config.permission,
+    { strategy: "configured", approval: "never" }
+  );
+
+  // The Claude picker must likewise retain a tools-only canonical shape when
+  // the reviewer switches back to that Agent during a setup rerun.
+  const claudeRole = new FileTaskStore(home).getGlobalRole("reviewer");
+  claudeRole.activeAgentId = "claude";
+  claudeRole.agentBindings.claude = createRoleAgentBinding(
+    { id: "claude", adapterId: "claude" },
+    {
+      adapterId: "claude",
+      permission: { strategy: "configured", allowedTools: ["Read"] }
+    }
+  );
+  new FileTaskStore(home).saveGlobalRole(claudeRole);
+  const claudeRerunInput = new PassThrough();
+  claudeRerunInput.end([
+    "all", "", "", "claude", ...Array(11).fill(""), "skip"
+  ].join("\n") + "\n");
+  await runSetupCommand([], {
+    YUI_HOME: home,
+    HOME: join(root, "user"),
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  }, {
+    run: () => "tmux 3.4"
+  }, {
+    input: claudeRerunInput,
+    output: new PassThrough(),
+    forceInteractive: true
+  });
+  assert.deepEqual(
+    new FileTaskStore(home).getGlobalRole("reviewer").agentBindings.claude.config.permission,
+    { strategy: "configured", allowedTools: ["Read"] }
+  );
 });
 
 test("setup supports Claude defaults for Leader, Operator, and Worker Profiles", async (t) => {
