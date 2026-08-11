@@ -33,7 +33,7 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
   const planner = {
     plan(input) {
       calls.push(["plan", input]);
-      return fakePlan();
+      return { ...fakePlan(), initialPromptRunId: input.runId };
     },
     planGlobalRole() {
       throw new Error("unexpected global plan");
@@ -93,7 +93,8 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
       runId: "agent-run-1",
       agentId: "codex-personal",
       adapterId: "codex",
-      effective: effective()
+      effective: effective(),
+      initialPromptRunId: "agent-run-1"
     }],
     ["ensure-async", "task-1", fakePlan().role, fakePlan().launch]
   ]);
@@ -101,6 +102,7 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
   assert.equal(binding.launchId, "launch-1");
   assert.equal(binding.hostRef.startsWith("yui-tmux:v1:"), true);
   assert.equal("initialPromptReceipt" in binding, false);
+  assert.equal(binding.initialPromptRunId, "agent-run-1");
   assert.equal("nativeSessionId" in binding, false);
   assert.deepEqual(await host.inspect(binding), { state: "running" });
   assert.deepEqual(calls.at(-1), ["probe-async", "task-1", "leader"]);
@@ -140,6 +142,32 @@ test("planner metadata cannot inject a launch prompt acknowledgement into a runt
   assert.equal(queried, false);
   assert.equal(binding.hostCreated, true);
   assert.equal("initialPromptReceipt" in binding, false);
+});
+
+test("an existing tmux host cannot claim that a newly planned prompt was carried at launch", async () => {
+  const host = new TmuxSessionHost({
+    plan(input) {
+      return { ...fakePlan(), initialPromptRunId: input.runId };
+    },
+    planGlobalRole() { throw new Error("unexpected global plan"); }
+  }, {
+    async ensureRoleWindowAsync() { return false; },
+    probeRoleStatus() { return "running"; },
+    killRole() {}
+  });
+  const binding = await host.start(createSessionLaunchRequest({
+    mode: "new",
+    launchId: "launch-existing",
+    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+    agentId: "codex-personal",
+    adapterId: "codex",
+    effective: effective(),
+    workspace: "/repo",
+    runId: "agent-run-existing"
+  }));
+
+  assert.equal(binding.hostCreated, false);
+  assert.equal("initialPromptRunId" in binding, false);
 });
 
 test("TmuxSessionHost serializes first Role windows that share one Task host", async () => {

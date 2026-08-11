@@ -236,7 +236,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       ...(
         sessionStarted
         && input.runId !== undefined
-        && planned?.initialPromptRunId === input.runId
+        && (planned?.initialPromptRunId ?? binding?.initialPromptRunId) === input.runId
           ? { inputSubmittedAtLaunch: true }
           : {}
       )

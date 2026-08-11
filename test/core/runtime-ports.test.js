@@ -39,6 +39,30 @@ test("runtime values retain only portable identities and an opaque host referenc
   assert.notEqual(binding.owner, owner);
 });
 
+test("runtime bindings retain an exact launch-carried Run only for a newly created host", () => {
+  assert.equal(createRuntimeBinding({
+    id: "binding-1",
+    launchId: "launch-1",
+    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+    agentId: "codex-personal",
+    adapterId: "codex",
+    hostRef: "host-1",
+    hostCreated: true,
+    initialPromptRunId: " agent-run-1 "
+  }).initialPromptRunId, "agent-run-1");
+
+  assert.throws(() => createRuntimeBinding({
+    id: "binding-2",
+    launchId: "launch-2",
+    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+    agentId: "codex-personal",
+    adapterId: "codex",
+    hostRef: "host-2",
+    hostCreated: false,
+    initialPromptRunId: "agent-run-1"
+  }), /requires a newly-created runtime host/u);
+});
+
 test("session launch requests distinguish fresh and resumable native sessions without a bootstrap prompt", () => {
   const fresh = createSessionLaunchRequest({
     mode: "new",

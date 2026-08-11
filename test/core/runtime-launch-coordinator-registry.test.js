@@ -688,6 +688,131 @@ test("a synchronous fresh Codex SessionStart binds transport without claiming de
   assert.equal(transported.deliveredAt, undefined);
 });
 
+test("a fresh Codex launch-carried prompt waits asynchronously for provider acceptance without a duplicate push", async (t) => {
+  const fx = fixture(t, "codex");
+  const roleName = "worker";
+  const role = fx.roles.get(roleName);
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  const run = createAgentRun(
+    "agent-run-4",
+    fx.task.id,
+    roleName,
+    "new",
+    "deliver through the Codex launch argument",
+    NOW,
+    { effective }
+  );
+  const target = { kind: "role", taskId: fx.task.id, roleName };
+  fx.store.transaction((tx) => {
+    tx.saveRole(fx.task.id, updateRoleStatus(role, "running", NOW));
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, target, "run-dispatched", NOW, [
+      { type: "run", taskId: fx.task.id, id: run.id }
+    ]);
+  });
+  let promptPushes = 0;
+  let launchId;
+  const host = {
+    async start(request, beforeHostStart) {
+      launchId = request.launchId;
+      assertReservation(fx, roleName, request.launchId, run.id);
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        initialPromptRunId: run.id
+      });
+      return runtimeBinding(request, {
+        hostCreated: true,
+        initialPromptRunId: run.id
+      });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  const coordinator = new RuntimeLaunchCoordinator(
+    fx.schedulerStore,
+    host,
+    {
+      createGenerationId: () => "codex-asynchronous-provider-generation",
+      now: () => NOW
+    }
+  );
+  const delivery = registry(coordinator, host, async () => {
+    promptPushes += 1;
+    return "delivered";
+  });
+
+  const [result] = await processActiveRoleRunDeliveries(
+    fx.schedulerStore,
+    delivery,
+    NOW
+  );
+
+  assert.equal(result.status, "delivered", result.error);
+  assert.equal(promptPushes, 0);
+  const transported = fx.store.getAgentRun(fx.task.id, run.id);
+  assert.equal(transported.status, "active");
+  assert.notEqual(transported.pushedAt, undefined);
+  assert.equal(transported.deliveredAt, undefined);
+  const mailbox = assertReservation(
+    fx,
+    roleName,
+    launchId,
+    run.id
+  );
+  assert.equal(mailbox.pending, null);
+
+  const nativeSessionId = "codex-native-asynchronous-provider";
+  const environment = {
+    YUI_HOME: fx.home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_WORKSPACE: fx.home,
+    YUI_ADAPTER_ID: "codex",
+    YUI_TASK_ID: fx.task.id,
+    YUI_ROLE: roleName,
+    YUI_AGENT_ID: fx.agent.id,
+    YUI_LAUNCH_ID: launchId,
+    YUI_RUN_ID: run.id
+  };
+  const processor = new FileRuntimeEventProcessor(
+    new FileRuntimeEventInbox(fx.home),
+    fx.schedulerStore
+  );
+  await runCodexLifecycleHookCommand(
+    JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: nativeSessionId
+    }),
+    environment,
+    async () => ({})
+  );
+  assert.deepEqual(processor.drain(NOW).failed, []);
+  assert.equal(reservationMailbox(fx, roleName), null);
+  assert.equal(
+    fx.store.getRoleSession(fx.task.id, roleName)?.nativeSessionId,
+    nativeSessionId
+  );
+
+  await runCodexLifecycleHookCommand(
+    JSON.stringify({
+      hook_event_name: "UserPromptSubmit",
+      session_id: nativeSessionId,
+      prompt: run.input
+    }),
+    environment,
+    async () => ({})
+  );
+  assert.deepEqual(processor.drain(NOW).failed, []);
+  assert.notEqual(fx.store.getAgentRun(fx.task.id, run.id).deliveredAt, undefined);
+});
+
 test("a restart after synchronous fresh Codex SessionStart reuses the original launch", async (t) => {
   const fx = fixture(t, "codex");
   const roleName = "worker";
@@ -1055,6 +1180,47 @@ test("a fresh Codex argv prompt without provider acknowledgement retains the res
     0
   );
   assert.equal(fx.store.getWorkItem(fx.task.id, item.id).candidates.length, 0);
+});
+
+test("a launch-carried Codex prompt for another Run is fenced into cleanup", async (t) => {
+  const fx = fixture(t, "codex");
+  const host = {
+    async start(request, beforeHostStart) {
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        initialPromptRunId: request.runId
+      });
+      return runtimeBinding(request, {
+        hostCreated: true,
+        initialPromptRunId: "agent-run-other"
+      });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { throw new Error("a mismatched binding must not be trusted"); },
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  const delivery = registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "wrong-prompt-run-generation",
+      now: () => NOW
+    }),
+    host
+  );
+
+  await assert.rejects(
+    delivery.prepareRoleSession(prepareInput(fx, "worker", "agent-run-1")),
+    /launch-carried prompt for another Run/u
+  );
+  const mailbox = reservationMailbox(fx, "worker");
+  assert.ok(mailbox);
+  assert.deepEqual(mailbox.pending.reasons, [RUNTIME_CLEANUP_REQUIRED_REASON]);
 });
 
 test("a busy retry for one delivery reuses the prepared binding without starting twice", async (t) => {

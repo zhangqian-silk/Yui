@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -2502,6 +2502,34 @@ test("background FileTask controller exposes status, scan and stop on one privat
   );
   assert.deepEqual(await callController(home, "controller.stop", {}), { stopped: true });
   await controller.closed;
+});
+
+test("a Task-isolated client follows its Home Controller discovery across TMPDIR boundaries", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-controller-cross-tmp-"));
+  const serverTmp = join(root, "server-tmp");
+  const clientTmp = join(root, "client-tmp");
+  const home = join(root, "home");
+  mkdirSync(serverTmp);
+  mkdirSync(clientTmp);
+  const originalTmpdir = process.env.TMPDIR;
+  let controller;
+  try {
+    process.env.TMPDIR = serverTmp;
+    controller = await startFileTaskController(home, emptyStore(), noTmux, undefined, {
+      intervalMs: 60_000
+    });
+
+    process.env.TMPDIR = clientTmp;
+    const status = await callController(home, "controller.status", {});
+    assert.equal(status.running, true);
+    assert.equal(status.pid, process.pid);
+  } finally {
+    process.env.TMPDIR = serverTmp;
+    await controller?.close();
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Controller stop keeps discovery owned until in-flight work has drained", async (t) => {

@@ -447,11 +447,13 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       && request.runId !== undefined
       && binding.hostCreated !== false
       && reservationConfirmation !== "provider-bound"
+      && binding.initialPromptRunId !== request.runId
     ) {
-      // A host-created Codex process may have carried the first prompt in
-      // argv, but only a matching synchronous provider lifecycle Hook can
-      // prove that this exact generation crossed the provider boundary. Keep
-      // the generation fenced and require owner-addressed cleanup otherwise.
+      // Fresh Codex has no pre-input Provider event. It may return before its
+      // matching lifecycle Hook, but only an exact launch-carried Run marker
+      // can bridge that asynchronous interval. This is transport evidence,
+      // never Provider acceptance; the reservation remains fenced until the
+      // matching Hook binds the native Session.
       this.#requireCleanup(request.owner);
       throw new RuntimeBindingContractError(
         `Session host cannot acknowledge the exact launch-carried prompt: ${
@@ -676,7 +678,20 @@ function requireMatchingRuntimeBinding(
         && binding.owner.taskId === request.owner.taskId
       )
     );
-  if (launchPromptAcknowledgementRequired) {
+  if (
+    binding.initialPromptRunId !== undefined
+    && binding.initialPromptRunId !== request.runId
+  ) {
+    throw new RuntimeBindingContractError(
+      `Session host returned a launch-carried prompt for another Run: ${
+        request.owner.roleName
+      }.`
+    );
+  }
+  if (
+    launchPromptAcknowledgementRequired
+    && binding.initialPromptRunId !== request.runId
+  ) {
     throw new RuntimeBindingContractError(
       `Session host cannot acknowledge the exact launch-carried prompt: ${
         request.owner.roleName
