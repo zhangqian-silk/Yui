@@ -118,9 +118,13 @@ containing a managed main worktree for each binding. The
 Git repository. Each Project child (for example
 `<workspace>/tasks/<task>/main/yui`) is the supported Git cwd and points to
 `<workspace>/worktree/<project>/<task>/main`; Git commands run in that child.
-The Leader runs from this root and sees every Project as a peer directory. The active Leader may append a
-Project when the same outcome expands; replacing an existing binding is not a
-scope-repair mechanism.
+For a single-Project workspace, the native Agent starts in that Project's
+managed worktree so its project configuration and Skills are discovered
+natively. For a multi-Project workspace, the Agent starts at this root and Yui
+registers every Project worktree through the provider's native
+additional-directory mechanism. The active Leader may append a Project when the
+same outcome expands; replacing an existing binding is not a scope-repair
+mechanism.
 
 A WorkItem can read the full Task workspace but has an explicit Project write
 scope. Isolation creates a second root with independent worktrees for writable
@@ -153,8 +157,12 @@ An isolated result is handled in this order:
 
 The context contract is layered: Yui Core owns durable identity, lifecycle,
 access, and workspace safety; generic role Skills own portable orchestration;
-Project Policy/Knowledge owns project-specific engineering rules; and the Task
-Contract owns the requested outcome. A Reviewer finding routes to the original
+Project Policy/Knowledge and Agent-native Skills versioned in each Project own
+project-specific engineering rules; and the Task Contract owns the requested
+outcome. Yui injects only its own generic Role Skills. It never scans or copies
+Project Skills into managed context; the selected Agent discovers them through
+its native project mechanism. Execution and review select their generic Skill
+by durable Run purpose. A Reviewer finding routes to the original
 Worker while open, a small Repair WorkItem when closed, Leader/Integration for
 merge or local fixes, and an architecture WorkItem only for a genuinely
 cross-cutting design change.

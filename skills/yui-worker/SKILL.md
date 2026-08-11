@@ -11,10 +11,16 @@ workspace, validation, and return protocol.
 
 Keep the context layers distinct: Yui Core owns durable identity, lifecycle,
 access, workspace, and exact handoff safety; this generic Skill owns portable
-Worker behavior; Project Policy and Knowledge own project-specific build,
-test, migration, release, and review rules; and the Task Contract owns the
-current objective, scope, acceptance, and evidence. Do not promote a Project
-command or convention into generic Worker policy.
+Worker behavior; Agent-native Project Skills and Project Policy and Knowledge own
+project-specific build, test, migration, release, and review rules; and the
+Task Contract owns the current objective, scope, acceptance, and evidence. Do
+not promote a Project command or convention into generic Worker policy.
+
+During ordinary work, do not run tests that invoke real Agents or models, paid
+services, shared infrastructure, production systems, or other non-disposable
+external resources. Prefer deterministic mocks and isolated resources; if the
+user did not explicitly request real-resource validation, report the gap
+instead of running it.
 
 - Preserve supplied Task, WorkItem, Role, and Run identities.
 - Follow the supplied Worker Profile instructions, Skills, read/write behavior intent,

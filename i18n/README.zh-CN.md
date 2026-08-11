@@ -156,8 +156,7 @@ Project 都有 committed Integration 后排队一次 Task 级 Review。冻结的
 查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Run、最近的 Message、Open/Resolved InputRequest 和 Event。终端输出会精简历史和长文本；`yui --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
 Task identity 由一个有界交付目标决定，而不是由涉及几个仓库决定。带仓库的
-Task 可以绑定多个 Project，并为每个 Project 记录独立 base ref。Leader 从
-同一个 Task workspace 根目录工作：
+Task 可以绑定多个 Project，并为每个 Project 记录独立 base ref：
 
 ```text
 <workspace>/tasks/<task-id>/main/
@@ -170,7 +169,11 @@ Task 可以绑定多个 Project，并为每个 Project 记录独立 base ref。L
 每个 Project 子目录才是受支持的 Git cwd（例如
 `<workspace>/tasks/<task-id>/main/yui`），并指向该 Project 的受管 worktree：
 `<workspace>/worktree/<project>/<task-id>/main`。Git 命令必须在对应的
-Project 子目录中运行。创建时应一次绑定已知 Project；如果同一目标在执行中
+Project 子目录中运行。只绑定一个 Project 时，原生 Agent 直接从该 Project
+的受管 worktree 启动，因此会按 Agent 自身机制发现项目配置和 Skills。
+绑定多个 Project 时，Agent
+从逻辑根目录启动，Yui 通过 Provider 原生的 additional-directory 机制声明
+每个 Project worktree。创建时应一次绑定已知 Project；如果同一目标在执行中
 确认还需要另一个仓库，只能由 active Task 的 Leader 追加：
 
 ```sh
@@ -458,7 +461,7 @@ state、receipt 与 pane fence。Yui 不会解析 prompt glyph、进度文本、
 或其他 Agent 终端输出来推断 ready 或 success。`captureRole()` 只用于显式的人类
 transcript 查看，不具备生命周期权威。
 
-稳定的 Role 上下文也属于启动元数据，而不是 bootstrap turn。Yui 通过 Agent 原生的 system/developer instruction 通道传入 Role 策略和 `systemPrompt`。原生 Codex CLI 没有按会话追加 Skill root 的参数，因此 developer instructions 只携带精简的 Skill 绝对路径，由 Codex 按需读取 `SKILL.md`。由于 `developer_instructions` 是单一标量配置，Yui 会检查当前支持的全部 Linux Codex 配置层：`/etc/codex/config.toml`、用户配置、选中的 `$CODEX_HOME/<name>.config.toml`、项目配置以及 `/etc/codex/managed_config.toml`；任意一层已经设置该值时都会明确拒绝覆盖。受管理的 Codex 会话还必须独占用于记录原生 Turn 完成状态的结构化 `notify` 回调；任意受检配置层已经定义 `notify` 时，Yui 都会拒绝启动，避免两个回调互相静默覆盖。`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 从 Yui 管理的私有 `0600` context 文件读取同一份 Skill 内容，不再把大段或敏感文本放进 argv；重试和 resume 会复用该 Role 的稳定路径。非 Operator 的 global Role 保持中性，不会注入 Task Leader 或 Worker Skill。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake 和 Worker Run assignment 仍是邮箱投递的真实工作消息。不具备原生指令通道的 adapter 必须拒绝这类上下文，不能静默降级为首轮 user prompt。
+稳定的 Role 上下文也属于启动元数据，而不是 bootstrap turn。Yui 通过 Agent 原生的 system/developer instruction 通道传入 Role 策略和 `systemPrompt`。Task execution Run 按角色接收通用 Leader 或 Worker Skill，review Run 则按持久 Run purpose 接收通用 Reviewer Skill；这些都只是 Yui 自己拥有的可移植编排规则。Project Skills 始终是 Project 中正常版本化的文件，由 Agent 通过自身项目机制发现、选择并按需加载；Yui 不扫描、不解析、不复制，也不注入 Project Skills。Codex developer instructions 只携带 Yui 自有 Role Skill 的精简绝对路径。由于 `developer_instructions` 是单一标量配置，Yui 会检查当前支持的全部 Linux Codex 配置层：`/etc/codex/config.toml`、用户配置、选中的 `$CODEX_HOME/<name>.config.toml`、项目配置以及 `/etc/codex/managed_config.toml`；任意一层已经设置该值时都会明确拒绝覆盖。受管理的 Codex 会话还必须独占用于记录原生 Turn 完成状态的结构化 `notify` 回调；任意受检配置层已经定义 `notify` 时，Yui 都会拒绝启动，避免两个回调互相静默覆盖。`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 从 Yui 管理的私有 `0600` context 文件读取同一份 Yui Role Skill 内容，不再把大段或敏感文本放进 argv；重试和 resume 会复用按 purpose 区分的稳定路径。非 Operator 的 global Role 保持中性，不会注入 Task 编排 Skill。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake、Worker 和 Reviewer Run assignment 仍是邮箱投递的真实工作消息。不具备原生指令通道的 adapter 必须拒绝这类上下文，不能静默降级为首轮 user prompt。
 
 ## Controller 与失败处理
 

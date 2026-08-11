@@ -23,7 +23,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
 import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
-import type { ClaudeAgentConfig } from "./agentAdapter.js";
+import type { ClaudeAgentConfig, RoleAgentConfig } from "./agentAdapter.js";
 import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
 import type {
@@ -256,7 +256,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       taskRoleSessionTitle(task, role.name),
       compatibleExisting ? existing.nativeSessionId : undefined,
       runWorkspace,
-      effective
+      effective,
+      {
+        purpose: activeRun?.purpose ?? "execution"
+      }
     );
   }
 
@@ -284,7 +287,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       undefined,
       compatibleExisting ? existing.nativeSessionId : undefined,
       undefined,
-      effective
+      effective,
+      { purpose: "execution" }
     );
   }
 
@@ -305,7 +309,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     sessionTitle: string | undefined,
     knownNativeSessionId: string | undefined,
     workspaceOverride: ManagedWorkspace | undefined,
-    effective: EffectiveLaunchSnapshot
+    effective: EffectiveLaunchSnapshot,
+    sessionPolicy: Readonly<{ purpose: "execution" | "review" }>
   ): PlannedRoleSession {
     const launchRole = effectiveRoleForLaunch(role, effective);
     const binding = activeRoleAgentBinding(launchRole);
@@ -332,6 +337,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const launchEnvironment = { ...inheritedLaunchEnvironment };
     const adapter = resolveAgentAdapter(binding.adapterId);
     const effectiveWorkspace = effective.workspace.root;
+    const agentWorkspace = nativeAgentWorkspace(effective.workspace);
     const runtimeIsolation = input.runtimeIsolation === undefined
       ? undefined
       : parseTaskRuntimeIsolationDescriptor(JSON.stringify(input.runtimeIsolation));
@@ -350,7 +356,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ? {}
         : taskRuntimeIsolationEnvironment(runtimeIsolation)
     );
-    const baseSessionContext = compileRoleSessionContext(this.home, launchRole, owner);
+    const baseSessionContext = compileRoleSessionContext(
+      this.home,
+      launchRole,
+      owner,
+      sessionPolicy
+    );
     const sessionContext = owner.scope === "task"
       ? {
           ...baseSessionContext,
@@ -367,7 +378,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             ...agentSourceEnvironment,
             ...launchEnvironment
           },
-          workspace: effectiveWorkspace,
+          workspace: agentWorkspace,
           profile: binding.config.profile,
           trustWorkspace: true
         })
@@ -382,7 +393,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const managedRun = owner.scope === "task" && input.runId !== undefined
       ? this.store.getAgentRun(owner.taskId, input.runId)
       : null;
-    const effectiveConfig = binding.config.adapterId === "claude"
+    const roleConfig = binding.config.adapterId === "claude"
       && owner.scope === "task"
       && input.runId !== undefined
       ? managedClaudeControlPlaneConfig(
@@ -393,10 +404,14 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           this.#controlPlane
         )
       : binding.config;
+    const effectiveConfig = withNativeProjectDirectories(
+      roleConfig,
+      nativeAdditionalDirectories(effective.workspace, agentWorkspace)
+    );
     const compileInput = {
       agent,
       config: effectiveConfig,
-      workspace: effectiveWorkspace,
+      workspace: agentWorkspace,
       ...(sessionTitle === undefined ? {} : { sessionTitle }),
       ...sessionContext,
       ...(codexConfig === undefined
@@ -549,6 +564,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       role: {
         name: role.name,
         workspace: effectiveWorkspace,
+        ...(agentWorkspace === effectiveWorkspace ? {} : { cwd: agentWorkspace }),
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
       launch: scopedLaunch,
@@ -611,6 +627,36 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     )));
     return selectEnvironment(source, names);
   }
+}
+
+function nativeAgentWorkspace(
+  workspace: EffectiveLaunchSnapshot["workspace"]
+): string {
+  return workspace.entries.length === 1
+    ? workspace.entries[0].path
+    : workspace.root;
+}
+
+function nativeAdditionalDirectories(
+  workspace: EffectiveLaunchSnapshot["workspace"],
+  agentWorkspace: string
+): string[] {
+  return [workspace.root, ...workspace.entries.map(({ path }) => path)]
+    .filter((path) => path !== agentWorkspace);
+}
+
+function withNativeProjectDirectories<T extends RoleAgentConfig>(
+  config: T,
+  projectDirectories: readonly string[]
+): T {
+  if (projectDirectories.length === 0) return config;
+  return {
+    ...config,
+    additionalDirectories: [...new Set([
+      ...(config.additionalDirectories ?? []),
+      ...projectDirectories
+    ])]
+  } as T;
 }
 
 function resolveTaskRoleEffectiveLaunch(

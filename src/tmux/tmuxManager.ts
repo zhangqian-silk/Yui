@@ -19,6 +19,8 @@ const PANE_STATE_MARKER = "__YUI_PANE_STATE__";
 export type TmuxRole = Readonly<{
   name: string;
   workspace: string;
+  /** Native process cwd; workspace remains the durable Yui scope root. */
+  cwd?: string;
   status?: string;
 }>;
 
@@ -189,7 +191,7 @@ export class TmuxManager {
         "-y", String(this.#initialRows),
         "-s", this.sessionName(taskId),
         "-n", role.name,
-        "-c", safeValue(role.workspace, "Role workspace"),
+        "-c", safeValue(role.cwd ?? role.workspace, "Role cwd"),
         "--",
         ...launchCommand(launch)
       ]);
@@ -199,7 +201,7 @@ export class TmuxManager {
         "new-window",
         "-t", this.sessionName(taskId),
         "-n", role.name,
-        "-c", safeValue(role.workspace, "Role workspace"),
+        "-c", safeValue(role.cwd ?? role.workspace, "Role cwd"),
         "--",
         ...launchCommand(launch)
       ]);
@@ -235,7 +237,7 @@ export class TmuxManager {
         "-y", String(this.#initialRows),
         "-s", this.sessionName(taskId),
         "-n", role.name,
-        "-c", safeValue(role.workspace, "Role workspace"),
+        "-c", safeValue(role.cwd ?? role.workspace, "Role cwd"),
         "--",
         ...launchCommand(launch)
       ]);
@@ -245,7 +247,7 @@ export class TmuxManager {
         "new-window",
         "-t", this.sessionName(taskId),
         "-n", role.name,
-        "-c", safeValue(role.workspace, "Role workspace"),
+        "-c", safeValue(role.cwd ?? role.workspace, "Role cwd"),
         "--",
         ...launchCommand(launch)
       ]);

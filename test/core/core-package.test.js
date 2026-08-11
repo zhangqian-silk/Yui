@@ -53,7 +53,7 @@ test("the source package keeps one TypeScript build and declares its Web runtime
   assert.deepEqual(tsconfig.include, ["src/**/*.ts"]);
 });
 
-test("runtime assembly contains only the built CLI, docs, and three skills", (t) => {
+test("runtime assembly contains only the built CLI, docs, and four generic skills", (t) => {
   const sandbox = mkdtempSync(join(root, ".core-package-test-"));
   const output = join(sandbox, "runtime");
   const legacy = join(root, "dist", "core", "legacy.js");
@@ -82,8 +82,9 @@ test("runtime assembly contains only the built CLI, docs, and three skills", (t)
   assert.deepEqual(readdirSync(join(output, "i18n")), ["README.zh-CN.md"]);
   assert.deepEqual(
     readdirSync(join(output, "skills")).sort(),
-    ["yui-leader", "yui-operator", "yui-worker"]
+    ["yui-leader", "yui-operator", "yui-reviewer", "yui-worker"]
   );
+  assert.equal(existsSync(join(output, "skills", "develop-yui")), false);
   const expectedRuntime = listFiles(join(root, "src"))
     .filter((name) => name.endsWith(".ts"))
     .map((name) => name.replace(/\.ts$/u, ".js"))
@@ -170,6 +171,28 @@ test("Leader and Operator keep native subagent creation inside the Leader conver
     worker,
     /managed Codex or\s+Claude Run[\s\S]*--summary-file -[\s\S]*final\s+response[\s\S]*does not deliver/u
   );
+});
+
+test("Yui-specific test workflow stays in its Project Skill", () => {
+  const projectSkill = readFileSync(join(
+    root,
+    ".agents",
+    "skills",
+    "develop-yui",
+    "SKILL.md"
+  ), "utf8");
+  const genericSkills = ["yui-leader", "yui-worker", "yui-reviewer"].map((name) => (
+    readFileSync(join(root, "skills", name, "SKILL.md"), "utf8")
+  ));
+
+  assert.match(projectSkill, /Apply this Skill only to development of the Yui repository itself/u);
+  assert.match(projectSkill, /Unit, Isolated Integration, and Mock Agent\s+Session coverage/u);
+  assert.match(projectSkill, /Run Provider E2E only when the user explicitly asks/u);
+  for (const skill of genericSkills) {
+    assert.match(skill, /do not run tests that invoke real Agents or models/iu);
+    assert.match(skill, /report the gap\s+instead of running it/iu);
+    assert.doesNotMatch(skill, /YUI_ALLOW_PROVIDER_E2E|Provider E2E|Mock Agent Session/u);
+  }
 });
 
 test("Operator archives only after explicit user authorization for the exact Task", () => {

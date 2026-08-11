@@ -257,7 +257,11 @@ test("Role launches clear inherited process environment and use only the complet
     }
   }, { yuiHome: "/tmp/yui-home" });
 
-  manager.ensureRoleWindow("task-1", { name: "worker", workspace: "/tmp/work" }, {
+  manager.ensureRoleWindow("task-1", {
+    name: "worker",
+    workspace: "/tmp/workspace-scope",
+    cwd: "/tmp/project-worktree"
+  }, {
     command: "codex",
     args: ["--model", "gpt-5.6-sol"],
     env: {
@@ -274,6 +278,7 @@ test("Role launches clear inherited process environment and use only the complet
     "set-option", "-g", "history-limit", "100000"
   ]);
   assert.ok(launch.args.indexOf("history-limit") < launch.args.indexOf("new-session"));
+  assert.equal(launch.args[launch.args.indexOf("-c") + 1], "/tmp/project-worktree");
   const commandIndex = launch.args.indexOf("--");
   assert.deepEqual(launch.args.slice(commandIndex + 1), [
     "env",

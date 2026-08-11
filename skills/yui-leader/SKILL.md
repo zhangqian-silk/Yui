@@ -90,14 +90,21 @@ unavailable external fact that blocks progress.
 
 - Keep the context layers distinct in every handoff: Yui Core supplies durable
   identity, lifecycle, access, workspace, and exact-yield safety; this generic
-  role Skill supplies portable collaboration behavior; the bound Project
-  supplies its own Policy and Knowledge; and the Task Contract supplies the
-  current objective, scope, acceptance, and evidence. Do not turn a Project
-  convention into a generic role requirement.
-- For a Project-backed Task, follow the Project's existing Policy and Knowledge
-  through the context pointers (`yui project show`, then the relevant
-  `yui project knowledge` records). Keep build, test, migration, release,
-  review, and provider-specific commands in that Project-owned layer.
+  role Skill supplies portable collaboration behavior; the bound Project's
+  Agent-native Skills and its Policy and Knowledge supply project-specific
+  behavior; and the Task Contract supplies the current objective, scope,
+  acceptance, and evidence. Do not turn a Project convention into a generic
+  role requirement.
+- For a Project-backed Task, use the Project Skills discovered by the Agent's
+  native project mechanism and follow existing Policy and Knowledge through the
+  context pointers (`yui project show`, then the relevant `yui project knowledge`
+  records). Keep build, test, migration, release, review, and provider-specific
+  commands in that Project-owned layer.
+- During ordinary work, do not run tests that invoke real Agents or models,
+  paid services, shared infrastructure, production systems, or other
+  non-disposable external resources. Prefer deterministic mocks and isolated
+  resources; if the user did not explicitly request real-resource validation,
+  report the gap instead of running it.
 - Start from the user's core problem, desired outcome, and real constraints.
   Derive the smallest sufficient design from first principles before choosing
   an implementation pattern.
