@@ -161,6 +161,22 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
   );
 });
 
+test("a launch-carried Codex Leader prompt records transport without a duplicate push", async () => {
+  const store = fakeStore();
+  const delivery = fakeDelivery({ session: null, inputSubmittedAtLaunch: true });
+
+  const [result] = await processLeaderWakeups(store, delivery, NOW);
+
+  assert.deepEqual(result, {
+    taskId: "task-1",
+    runId: "agent-run-1",
+    status: "dispatched"
+  });
+  assert.deepEqual(delivery.calls.map(({ type }) => type), ["prepare", "ready", "forget"]);
+  assert.equal(store.operations.at(-1), "save-delivery");
+  assert.equal(store.pending.has("task-1"), false);
+});
+
 test("a Leader send or post-send persistence uncertainty preserves the claimed Run and receipt", async () => {
   for (const failAt of ["send", "persist"]) {
     const store = fakeStore();
@@ -881,7 +897,10 @@ function fakeDelivery(options = {}) {
         roleName: input.roleName,
         agentId: input.agentId,
         adapterId: input.adapterId,
-        mode: input.mode
+        mode: input.mode,
+        ...(options.inputSubmittedAtLaunch === undefined
+          ? {}
+          : { inputSubmittedAtLaunch: options.inputSubmittedAtLaunch })
       };
     },
     waitUntilReady: async (prepared) => {

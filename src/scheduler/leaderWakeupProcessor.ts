@@ -266,6 +266,33 @@ export async function processLeaderWakeups(
           : { launchId: ready.prepared.launchId }),
         now
       });
+      if (ready.prepared.inputSubmittedAtLaunch === true) {
+        // A fresh Codex command may carry the exact first prompt in its launch
+        // argv. That is transport evidence only: the matching Provider Hook
+        // still owns Run acceptance. Persist the push fence without writing a
+        // second terminal prompt, then leave the reservation for the async
+        // SessionStart/UserPromptSubmit fold.
+        store.saveRoleRunDelivery({
+          task,
+          role,
+          run,
+          session: effectiveSession,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId }),
+          now
+        });
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId })
+        });
+        results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
+        continue;
+      }
       deliveryAttempted = true;
       const outcome = await delivery.sendOnce({
         delivery: ready,
