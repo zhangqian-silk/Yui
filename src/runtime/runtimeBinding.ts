@@ -11,10 +11,23 @@ export type RuntimeBinding = Readonly<{
   hostRef: string;
   /** True only when this lifecycle request created the external Role host. */
   hostCreated?: boolean;
+  /** Exact Task Run whose prompt was carried by the newly-created host command. */
+  initialPromptRunId?: string;
   nativeSessionId?: string;
 }>;
 
 export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
+  const hostCreated = input.hostCreated === undefined
+    ? undefined
+    : requireBoolean(input.hostCreated, "Runtime host-created flag");
+  const initialPromptRunId = input.initialPromptRunId === undefined
+    ? undefined
+    : requireSafeIdentity(input.initialPromptRunId, "Initial prompt Run id");
+  if (initialPromptRunId !== undefined && hostCreated !== true) {
+    throw new TypeError(
+      "An initial prompt Run id requires a newly-created runtime host."
+    );
+  }
   return {
     id: requireSafeIdentity(input.id, "Runtime binding id"),
     launchId: requireSafeIdentity(input.launchId, "Launch id"),
@@ -22,9 +35,8 @@ export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
     agentId: requireSafeIdentity(input.agentId, "Agent id"),
     adapterId: requireSafeIdentity(input.adapterId, "Agent adapter id"),
     hostRef: requireText(input.hostRef, "Session host reference"),
-    ...(input.hostCreated === undefined
-      ? {}
-      : { hostCreated: requireBoolean(input.hostCreated, "Runtime host-created flag") }),
+    ...(hostCreated === undefined ? {} : { hostCreated }),
+    ...(initialPromptRunId === undefined ? {} : { initialPromptRunId }),
     ...(input.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: requireText(input.nativeSessionId, "Native session id") })

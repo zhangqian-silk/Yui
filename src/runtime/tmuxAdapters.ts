@@ -395,6 +395,9 @@ export class TmuxSessionHost implements SessionHostPort {
         roleName: request.owner.roleName
       }),
       hostCreated,
+      ...(hostCreated && planned.initialPromptRunId !== undefined
+        ? { initialPromptRunId: planned.initialPromptRunId }
+        : {}),
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
   }

@@ -193,6 +193,37 @@ export async function processActiveRoleRunDeliveries(
             : { launchId: ready.prepared.launchId }),
           now
         });
+        if (ready.prepared.inputSubmittedAtLaunch === true) {
+          // The exact Run prompt was already carried by the newly-created
+          // Provider command. Persist transport success without writing any
+          // terminal bytes; only the later matching Provider Hook may mark
+          // the Run delivered/accepted.
+          store.saveRoleRunDelivery({
+            task,
+            role,
+            run,
+            session,
+            ...(ready.prepared.launchId === undefined
+              ? {}
+              : { launchId: ready.prepared.launchId }),
+            now
+          });
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            ...(ready.prepared.launchId === undefined
+              ? {}
+              : { launchId: ready.prepared.launchId })
+          });
+          results.push({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            status: "delivered"
+          });
+          continue;
+        }
         // Pre-input readiness gate. For an adapter whose capability proves a
         // native event fires before the first prompt (e.g. Claude SessionStart),
         // a freshly-started host must not be pushed until that provider-ready
