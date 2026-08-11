@@ -13,7 +13,7 @@ import {
   type ControllerDiscovery,
   type JsonValue
 } from "./protocol.js";
-import { controllerSocketPath } from "./controllerEndpoint.js";
+import { isControllerSocketPathForHome } from "./controllerEndpoint.js";
 
 export class ControllerClientError extends Error {
   constructor(readonly code: string, message: string) {
@@ -29,18 +29,20 @@ export type ControllerCallOptions = Readonly<{
 
 export async function readControllerDiscovery(home: string): Promise<ControllerDiscovery> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
-  const expectedSocketPath = controllerSocketPath(home);
   try {
     const metadata = await lstat(discoveryPath);
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
     if (
       !metadata.isFile()
       || (metadata.mode & 0o077) !== 0
       || metadata.size > 4_096
+      || (uid !== undefined && metadata.uid !== uid)
     ) {
       throw invalidDiscovery();
     }
     const value: unknown = JSON.parse(await readFile(discoveryPath, "utf8"));
-    return parseControllerDiscovery(value, expectedSocketPath);
+    const socketPath = discoverySocketPath(home, value);
+    return parseControllerDiscovery(value, socketPath);
   } catch (error) {
     if (error instanceof ControllerClientError) throw error;
     if (isNodeError(error) && error.code === "ENOENT") {
@@ -51,6 +53,20 @@ export async function readControllerDiscovery(home: string): Promise<ControllerD
     }
     throw invalidDiscovery();
   }
+}
+
+function discoverySocketPath(home: string, value: unknown): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw invalidDiscovery();
+  }
+  const socketPath = Reflect.get(value, "socketPath");
+  if (
+    typeof socketPath !== "string"
+    || !isControllerSocketPathForHome(home, socketPath)
+  ) {
+    throw invalidDiscovery();
+  }
+  return socketPath;
 }
 
 export async function callController(
