@@ -119,6 +119,46 @@ async function assertRefreshRejected(fixture, expected) {
   assert.deepEqual(fixture.store.getProject("project-1"), projectBefore);
 }
 
+test("a new default Project Task fetches and pins the remote development commit", async (t) => {
+  const fixture = projectFixture(t);
+  await registerProject(fixture);
+  const checkoutBefore = git(fixture.checkout, ["rev-parse", "HEAD"]);
+  const remoteCommit = advanceRemote(fixture, "remote baseline\n");
+
+  const created = await createAndPrepareTask(fixture, "Remote baseline Task");
+  assert.equal(fixture.store.getTask(created.task.id).projectBindings[0].baseRef, remoteCommit);
+  assert.equal(created.entry.baseRef, remoteCommit);
+  assert.equal(created.entry.baseCommit, remoteCommit);
+  assert.equal(git(created.entry.path, ["rev-parse", "HEAD"]), remoteCommit);
+  assert.equal(git(fixture.checkout, ["rev-parse", "HEAD"]), checkoutBefore);
+  assert.equal(git(fixture.checkout, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+});
+
+test("an explicit Task base skips remote resolution and keeps its existing semantics", async (t) => {
+  const fixture = projectFixture(t);
+  await registerProject(fixture);
+  const checkoutBefore = git(fixture.checkout, ["rev-parse", "HEAD"]);
+  advanceRemote(fixture, "remote baseline\n");
+
+  const created = runTaskCommand([
+    "create", "Explicit base Task", "--project", "Yui", "--base", "HEAD"
+  ], fixture.store, { now: () => new Date(NOW) });
+  const task = created.data.task;
+  const preparer = new FileTaskWorkspacePreparer(
+    fixture.home,
+    fixture.store,
+    undefined,
+    () => new Date(NOW)
+  );
+  await preparer.prepareTaskWorkspace(task.id);
+  const entry = fixture.store.getTaskWorkspace(task.id).entries[0];
+  assert.equal(entry.baseRef, "HEAD");
+  assert.equal(entry.baseCommit, checkoutBefore);
+  assert.equal(git(entry.path, ["rev-parse", "HEAD"]), checkoutBefore);
+  assert.equal(fixture.store.getTask(task.id).projectBindings[0].baseRef, "HEAD");
+  assert.equal(git(fixture.checkout, ["rev-parse", "HEAD"]), checkoutBefore);
+});
+
 for (const stableRef of ["main", "refs/heads/main"]) {
   test(`Project refresh advances ${stableRef} while preserving old Task pins`, async (t) => {
     const fixture = projectFixture(t, stableRef);
