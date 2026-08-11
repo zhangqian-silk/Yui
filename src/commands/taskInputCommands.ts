@@ -293,10 +293,17 @@ function cancelRequest(
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "cancelling input"));
     const current = tx.getInputRequest(task.id, parsed.positionals[1]);
     if (current === null) throw dataError(`Input request not found: ${parsed.positionals[1]}.`);
-    assertInputCancelOrigin(current, options.environment);
+    const cancelledBy = assertInputCancelOrigin(tx, current, options.environment);
     const cancelled = cancelInputRequest(current, reason, now);
+    if (cancelled.status !== "cancelled") {
+      throw new Error(`Input request ${cancelled.id} did not enter the cancelled state.`);
+    }
     tx.saveInputRequest(task.id, cancelled);
-    recordTaskEvent(tx, task.id, "input.cancelled", { requestId: cancelled.id }, now);
+    recordTaskEvent(tx, task.id, "input.cancelled", {
+      requestId: cancelled.id,
+      cancelledBy,
+      reason: cancelled.cancellation.reason
+    }, now);
     enqueueWork(
       tx,
       { kind: "role", taskId: task.id, roleName: LEADER_ROLE },
@@ -356,10 +363,15 @@ function requireLeaderInputOrigin(
 }
 
 function assertInputCancelOrigin(
+  store: Pick<TaskStore, "getGlobalRole">,
   request: InputRequest,
   environment: NodeJS.ProcessEnv | undefined
-): void {
+): "leader" | "operator" {
   const env = environment ?? {};
+  if (env.YUI_SESSION_SCOPE === "global" && env.YUI_ROLE === "operator"
+    && store.getGlobalRole("operator") !== null) {
+    return "operator";
+  }
   if (
     env.YUI_SESSION_SCOPE !== "task"
     || env.YUI_TASK_ID !== request.taskId
@@ -370,6 +382,7 @@ function assertInputCancelOrigin(
   ) {
     throw usageError("Only the originating Leader may cancel this input request.");
   }
+  return "leader";
 }
 
 function inputAnswerer(environment: NodeJS.ProcessEnv | undefined): "user" | "operator" {

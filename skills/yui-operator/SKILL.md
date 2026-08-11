@@ -217,8 +217,15 @@ ChangeSet is integrated.
   Role with `yui task enter <task-id> <role>`.
 - Relay explicit Task information with
   `yui task message send <task-id> "<body>"`.
-- Present InputRequest questions, choices, recommendations, and deadlines
-  exactly. Submit only the user's answer with `task input answer`.
+- Inspect each InputRequest before presenting it. Present questions, choices,
+  recommendations, and deadlines exactly only when the request is a user-owned
+  boundary (a real choice, authorization, credential, unavailable external
+  fact, or irreversible operation). Submit only the user's exact answer with
+  `task input answer`; never choose or interpret on the user's behalf.
+- If an InputRequest asks for an implementation, scheduling, review, or
+  recoverable runtime choice, do not present it as a user question. Return it
+  to the originating Leader with the supported minimal cancellation, preserving
+  the reason: `yui task input cancel <task> <input> --reason "..."`.
 - Raise an InputRequest only for a real user choice, authorization, an external
   fact Yui cannot derive, or a safety boundary. For Yui-observable conditions
   such as a Run's terminal state, a committed Integration, or a runtime version,

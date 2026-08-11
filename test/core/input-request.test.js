@@ -760,6 +760,35 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
   assert.equal(store.getAgentRun(task.id, active.id).status, "yielded");
 });
 
+test("Operator can return a non-user InputRequest without fabricating an answer", (t) => {
+  const { store, task, options } = fixture(t);
+  run(["input", "request", task.id, "--question", "Choose an internal retry strategy"], store, options);
+  const request = store.listInputRequests(task.id)[0];
+
+  const cancelled = run([
+    "input", "cancel", task.id, request.id, "--reason", "Operator returned: implementation choice"
+  ], store, {
+    ...options,
+    now: () => new Date(SECOND),
+    environment: { YUI_SESSION_SCOPE: "global", YUI_ROLE: "operator" }
+  });
+
+  assert.equal(cancelled.data.request.status, "cancelled");
+  assert.equal(cancelled.data.request.cancellation.reason, "Operator returned: implementation choice");
+  assert.ok(store.getPendingWakeup(task.id).reasons.includes(`input-cancelled:${request.id}`));
+  assert.deepEqual(store.listEvents(task.id).at(-1).payload, {
+    requestId: request.id,
+    cancelledBy: "operator",
+    reason: "Operator returned: implementation choice"
+  });
+  assert.throws(() => runTaskCommand([
+    "input", "cancel", task.id, request.id, "--reason", "Forged"
+  ], store, {
+    ...options,
+    environment: { YUI_SESSION_SCOPE: "global", YUI_ROLE: "worker" }
+  }), /originating Leader/i);
+});
+
 test("Task details expose open InputRequest counts and storage rejects unknown fields", (t) => {
   const { root, store, task, options } = fixture(t);
   run(["input", "request", task.id, "--question", "Visible?"], store, options);
