@@ -4,6 +4,7 @@ import type {
   SchedulerAgentRun,
   RoleRunDeliveryFailurePersistence,
   SchedulerRole,
+  SchedulerTask,
   SchedulerRoleSession,
   SchedulerStorePort,
   TmuxDeliveryPort
@@ -20,6 +21,7 @@ import {
   isPreInputReadinessSupported
 } from "../lifecycle/canonicalLifecycleEvent.js";
 import { preInputReadinessCapability } from "../lifecycle/providerLifecycleMapping.js";
+import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
@@ -106,6 +108,7 @@ export async function processActiveRoleRunDeliveries(
       }
       let prepared: PreparedRoleDelivery | undefined;
       let preparedSession: SchedulerRoleSession | null = existingSession;
+      let preStartFencePersisted = false;
       let deliveryAttempted = false;
       try {
         const nativeSessionId = run.mode === "resume"
@@ -123,8 +126,54 @@ export async function processActiveRoleRunDeliveries(
             : { managedWorkspace: run.workspace }),
           mode: run.mode,
           runId: run.id,
-          ...(nativeSessionId === undefined ? {} : { nativeSessionId })
+          ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
+          beforeHostStart: (preflight) => {
+            persistPreStartFence(
+              store,
+              task,
+              role,
+              run,
+              existingSession,
+              preflight,
+              now
+            );
+            preparedSession = preflightSession(
+              role,
+              run.effective,
+              existingSession,
+              run.mode,
+              preflight
+            );
+            preStartFencePersisted = true;
+          }
         });
+        // Preparation may already have an exact native Session identity while
+        // the provider is still starting. Persist that Session + the Run fence
+        // before awaiting readiness so a pre-input provider Hook can validate
+        // the complete generation (including receipt) instead of racing an
+        // in-memory boundary. A delivery adapter that cannot expose a
+        // pre-readiness Session falls back to the existing durable Session;
+        // fresh runtime-discovered providers intentionally persist `null`.
+        if (!preStartFencePersisted) {
+          const preparedFenceSession = prepared.session === undefined
+            ? existingSession
+            : validateReadySession(
+                role,
+                run.effective,
+                existingSession,
+                run.mode,
+                { prepared, session: prepared.session }
+              );
+          preparedSession = preparedFenceSession;
+          store.saveRoleRunPrepared({
+            task,
+            role,
+            run,
+            session: preparedFenceSession,
+            ...(prepared.launchId === undefined ? {} : { launchId: prepared.launchId }),
+            now
+          });
+        }
         const ready = await delivery.waitUntilReady(prepared);
         const session = validateReadySession(
           role,
@@ -337,6 +386,61 @@ function requireResumeSession(
   return session.nativeSessionId;
 }
 
+function persistPreStartFence(
+  store: SchedulerStorePort,
+  task: SchedulerTask,
+  role: SchedulerRole,
+  run: SchedulerAgentRun,
+  existingSession: SchedulerRoleSession | null,
+  preflight: RuntimeLaunchPreflight,
+  now: Date
+): void {
+  if (
+    preflight.owner.scope !== "task"
+    || preflight.owner.taskId !== task.id
+    || preflight.owner.roleName !== role.name
+    || preflight.runId !== run.id
+    || preflight.launchId.trim().length === 0
+  ) {
+    throw new Error(`Pre-start launch fence changed the active Role Run: ${task.id}/${role.name}.`);
+  }
+  const session = preflightSession(
+    role,
+    run.effective,
+    existingSession,
+    run.mode,
+    preflight
+  );
+  store.saveRoleRunPrepared({
+    task,
+    role,
+    run,
+    session,
+    launchId: preflight.launchId,
+    now
+  });
+}
+
+function preflightSession(
+  role: SchedulerRole,
+  effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
+  existing: SchedulerRoleSession | null,
+  mode: "new" | "resume",
+  preflight: RuntimeLaunchPreflight
+): SchedulerRoleSession | null {
+  const session = preflight.nativeSessionId === undefined
+    ? null
+    : {
+        agentId: preflight.agentId,
+        adapterId: preflight.adapterId,
+        nativeSessionId: preflight.nativeSessionId,
+        launchId: preflight.launchId,
+        status: "ready" as const,
+        effective: preflight.effective
+      };
+  return validateRoleSession(role, effective, existing, mode, session);
+}
+
 function validateReadySession(
   role: SchedulerRole,
   effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
@@ -344,7 +448,16 @@ function validateReadySession(
   mode: "new" | "resume",
   ready: ReadyRoleDelivery
 ): SchedulerRoleSession | null {
-  const session = ready.session;
+  return validateRoleSession(role, effective, existing, mode, ready.session);
+}
+
+function validateRoleSession(
+  role: SchedulerRole,
+  effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
+  existing: SchedulerRoleSession | null,
+  mode: "new" | "resume",
+  session: SchedulerRoleSession | null
+): SchedulerRoleSession | null {
   if (mode === "new" && session === null) return null;
   if (session === null || !hasText(session.nativeSessionId)) {
     throw new Error(`Ready Role session has no native session id: ${role.taskId}/${role.name}.`);

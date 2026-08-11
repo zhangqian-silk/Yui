@@ -160,6 +160,13 @@ function editState(home, mutate) {
   writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
+/** Update a single record family's declared version in schema.json. */
+function setManifestRecordVersion(home, kind, version) {
+  const schemaPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(schemaPath, "utf8"));
+  manifest.recordVersions[kind] = version;
+  writeFileSync(schemaPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
 /** Install a syntactically-valid ConfiguredAgent record at a chosen version. */
 function setConfiguredAgent(home, schemaVersion) {
   editState(home, (state) => {
@@ -176,6 +183,9 @@ function setConfiguredAgent(home, schemaVersion) {
       }
     };
   });
+  // Keep the manifest's recordVersions in sync with the state so the
+  // manifest/state consistency check does not flag this as CORRUPTED.
+  setManifestRecordVersion(home, "configuredAgent", schemaVersion);
 }
 
 const EMPTY = () => createEmptyRegistry();
@@ -407,6 +417,7 @@ test("P2 map guard: future config and active-run pointer versions are future-ver
   editState(futureConfig.home, (state) => {
     state.config.schemaVersion = CURRENT_CONFIG_SCHEMA_VERSION + 1;
   });
+  setManifestRecordVersion(futureConfig.home, "config", CURRENT_CONFIG_SCHEMA_VERSION + 1);
   const configResult = classifyHome({
     home: futureConfig.home,
     registry: EMPTY(),
@@ -423,6 +434,11 @@ test("P2 map guard: future config and active-run pointer versions are future-ver
     state.tasks[futurePointer.taskId].activeRuns[futurePointer.roleName].schemaVersion =
       CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION + 1;
   });
+  setManifestRecordVersion(
+    futurePointer.home,
+    "activeRunPointer",
+    CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION + 1
+  );
   const pointerResult = classifyHome({
     home: futurePointer.home,
     registry: EMPTY(),
@@ -508,6 +524,11 @@ test("P1-1 map guard preserves older/future/corrupt record outcomes", () => {
     state.tasks[older.taskId].roleSessionSets[older.roleName].schemaVersion =
       CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION - 1;
   });
+  setManifestRecordVersion(
+    older.home,
+    "taskRoleSessionSet",
+    CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION - 1
+  );
   const oldResult = classifyHome({ home: older.home, registry: EMPTY(), latest: LATEST() });
   assert.equal(oldResult.classification.verdict, "NEEDS_NEW_VERSION");
   assert.equal(oldResult.classification.blocker.reason, "missing-step");
@@ -520,6 +541,7 @@ test("P1-1 map guard preserves older/future/corrupt record outcomes", () => {
     state.tasks[future.taskId].agentRuns[future.runId].schemaVersion =
       CURRENT_AGENT_RUN_SCHEMA_VERSION + 1;
   });
+  setManifestRecordVersion(future.home, "agentRun", CURRENT_AGENT_RUN_SCHEMA_VERSION + 1);
   const futureResult = classifyHome({ home: future.home, registry: EMPTY(), latest: LATEST() });
   assert.equal(futureResult.classification.verdict, "NEEDS_NEW_VERSION");
   assert.equal(futureResult.classification.blocker.reason, "future-version");
@@ -542,6 +564,7 @@ test("P1-1 aggregate family: StoredTask 14->13 is a record missing-step, not cor
   editState(home, (state) => {
     state.tasks["task-1"].schemaVersion = 13;
   });
+  setManifestRecordVersion(home, "storedTask", 13);
 
   const scan = scanSourceRecordVersions(home, currentRecordVersions());
   assert.ok("record" in scan);

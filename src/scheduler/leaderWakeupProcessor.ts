@@ -11,11 +11,14 @@ import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
   PreparedRoleDelivery,
+  SchedulerRole,
   SchedulerRoleSession,
   SchedulerReconcileSelection,
+  SchedulerTask,
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "./ports.js";
+import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
@@ -81,6 +84,7 @@ export async function processLeaderWakeups(
     let deliveryAttempted = false;
     let run: ReturnType<typeof createAgentRun> | null = null;
     let prepared: PreparedRoleDelivery | undefined;
+    let preStartFencePersisted = false;
     try {
       if (existingSession !== null && !hasNativeSession(existingSession)) {
         const sessionIsTerminal = existingSession.status === "stopped"
@@ -187,8 +191,51 @@ export async function processLeaderWakeups(
           : { managedWorkspace: run.workspace }),
         mode,
         runId: run.id,
-        ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {})
+        ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {}),
+        beforeHostStart: (preflight) => {
+          persistPreStartFence(
+            store,
+            task,
+            role,
+            run!,
+            existingSession,
+            mode,
+            preflight,
+            now
+          );
+          effectiveSession = preflightSession(
+            run!.effective,
+            existingSession,
+            mode,
+            preflight
+          );
+          preStartFencePersisted = true;
+        }
       });
+      // Persist the exact preparation fence before waiting on provider
+      // readiness. A pre-input lifecycle Hook may fire during that wait; it
+      // must be able to resolve this Run/Session/launch generation from durable
+      // state rather than an in-memory delivery object. Fresh providers that
+      // discover their native Session later intentionally persist `null`.
+      if (!preStartFencePersisted) {
+        const preparedFenceSession = prepared.session === undefined
+          ? existingSession
+          : validateReadySession(
+              run.effective,
+              existingSession,
+              mode,
+              prepared.session
+            );
+        effectiveSession = preparedFenceSession;
+        store.saveRoleRunPrepared({
+          task,
+          role,
+          run,
+          session: preparedFenceSession,
+          ...(prepared.launchId === undefined ? {} : { launchId: prepared.launchId }),
+          now
+        });
+      }
       const ready = await delivery.waitUntilReady(prepared);
       const latestTask = store.getTask(task.id);
       if (latestTask === null || latestTask.status !== "active") {
@@ -331,6 +378,55 @@ function validateReadySession(
     throw new Error("Leader resume changed the fixed native session id.");
   }
   return { ...session, status: "running" };
+}
+
+function persistPreStartFence(
+  store: SchedulerStorePort,
+  task: SchedulerTask,
+  role: SchedulerRole,
+  run: ReturnType<typeof createAgentRun>,
+  existingSession: SchedulerRoleSession | null,
+  mode: "new" | "resume",
+  preflight: RuntimeLaunchPreflight,
+  now: Date
+): void {
+  if (
+    preflight.owner.scope !== "task"
+    || preflight.owner.taskId !== task.id
+    || preflight.owner.roleName !== role.name
+    || preflight.runId !== run.id
+    || preflight.launchId.trim().length === 0
+  ) {
+    throw new Error(`Pre-start launch fence changed the Leader Run: ${task.id}/${role.name}.`);
+  }
+  const session = preflightSession(run.effective, existingSession, mode, preflight);
+  store.saveRoleRunPrepared({
+    task,
+    role,
+    run,
+    session,
+    launchId: preflight.launchId,
+    now
+  });
+}
+
+function preflightSession(
+  effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
+  existing: SchedulerRoleSession | null,
+  mode: "new" | "resume",
+  preflight: RuntimeLaunchPreflight
+): SchedulerRoleSession | null {
+  const session = preflight.nativeSessionId === undefined
+    ? null
+    : {
+        agentId: preflight.agentId,
+        adapterId: preflight.adapterId,
+        nativeSessionId: preflight.nativeSessionId,
+        launchId: preflight.launchId,
+        status: "ready" as const,
+        effective: preflight.effective
+      };
+  return validateReadySession(effective, existing, mode, session);
 }
 
 function hasNativeSession(

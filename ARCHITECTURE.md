@@ -224,12 +224,14 @@ record family versions on its own. A centralized migration framework
 (registry → planner → engine) is generic and domain-free: the engine is
 parameterized over an injected `MigrationTarget` and never hardcodes a Yui
 record list. Compatibility is decided **only** by explicit registered step
-paths, never by version magnitude or semver. The registry ships **empty** in
-this release — there are no historical steps — so every strictly-older home is
-fail-closed. `doctor`/`upgrade` classify a home as USABLE, MIGRATABLE,
+paths, never by version magnitude or semver. The production registry now ships
+the first post-baseline step, aggregate `16 -> 17`; older states are migratable
+only when every adjacent transition to the current state is registered, and
+all other gaps remain fail-closed. `doctor`/`upgrade` classify a home as USABLE,
+MIGRATABLE,
 NEEDS_NEW_VERSION (with a `future-version` or `missing-step` reason plus the
-incompatible layout/aggregate component), or CORRUPTED — the last only for real
-structural/reference damage, never inferred from a version number.
+incompatible layout/aggregate/record component), or CORRUPTED — the last only
+for real structural/reference damage, never inferred from a version number.
 
 The three axes are genuinely independent, including the record axis. The
 scalar `layout`/`aggregate` versions come from `schema.json`; the per-family
@@ -241,7 +243,7 @@ on the first older family — which would misreport a home whose only difference
 an older record family as CORRUPTED and block it from ever migrating. Reading the
 record axis structurally keeps a record-only-older home on its version axis: it
 plans as MIGRATABLE (with a step path) or NEEDS_NEW_VERSION (fail-closed under the
-empty registry), exactly like an older scalar axis. The strict loader is used
+explicit registry), exactly like an older scalar axis. The strict loader is used
 only to detect a broken reference graph, and only once **every** axis is already
 current (a no-op plan) — the one case where a load failure is genuine corruption
 rather than a version mismatch. CORRUPTED is otherwise reserved for real

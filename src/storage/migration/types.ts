@@ -53,6 +53,12 @@ export type MigrationStep<Snapshot = unknown> = Readonly<{
   fromVersion: number;
   /** Must equal `fromVersion + 1`: steps are strictly adjacent and one-way. */
   toVersion: number;
+  /**
+   * Marks the one explicit boundary that introduces a record family after the
+   * persisted baseline. Introduction is the only legal `0 -> 1` transition;
+   * ordinary record migrations remain positive-version adjacent steps.
+   */
+  introduction?: boolean;
   preconditions: (input: Snapshot) => void;
   transform: (input: Snapshot) => Snapshot;
   declaredEffects: readonly string[];

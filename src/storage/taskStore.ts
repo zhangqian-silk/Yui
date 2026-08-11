@@ -97,10 +97,8 @@ import {
 } from "../worktree/managedWorkspace.js";
 import { writeTextFileAtomically } from "./durableFile.js";
 import { assertHomeWritable } from "./upgradeFence.js";
-import {
-  CURRENT_AGGREGATE_SCHEMA_VERSION,
-  requireStorageSchema
-} from "./storageSchema.js";
+import { CURRENT_AGGREGATE_SCHEMA_VERSION } from "./storageVersions.js";
+import { requireStorageSchema } from "./storageSchema.js";
 
 export const STORAGE_STATE_FILE = "state.json";
 /** The root StorageState schema is the persisted aggregate document version. */
@@ -2541,24 +2539,29 @@ function assertManagedWorkspaceReferences(
       }
       const item = aggregate.workItems[round.workItemId];
       const candidate = item?.candidates.find(({ id }) => id === round.candidateId);
-      const frozenProjects = (round.scope ?? "work-item") === "task"
-        ? round.taskCandidate?.projects ?? []
-        : candidate?.gitSnapshot?.projects ?? [];
-      if (frozenProjects.length > 0) {
-        if (workspace.entries.length !== frozenProjects.length) {
+      const frozenProjects = round.scope === "task"
+        ? round.taskCandidate?.projects
+        : candidate?.gitSnapshot?.projects;
+      if (frozenProjects !== undefined) {
+        const expected = [...frozenProjects]
+          .map(({ projectId, commit }) => ({ projectId, commit }))
+          .sort((left, right) => left.projectId.localeCompare(right.projectId));
+        const actual = workspace.entries
+          .map(({ projectId, baseCommit }) => ({ projectId, commit: baseCommit }))
+          .sort((left, right) => left.projectId.localeCompare(right.projectId));
+        const matches = expected.length === actual.length
+          && expected.every((frozen, index) => {
+            const reviewEntry = actual[index];
+            return reviewEntry?.projectId === frozen.projectId
+              && reviewEntry.commit === frozen.commit;
+          });
+        if (!matches) {
+          const provenance = round.scope === "task"
+            ? "Task frozen project set"
+            : "Candidate frozen commit";
           throw new StorageRecordError(
-            `${label} ReviewRound Project scope does not match its frozen candidate: ${taskId}/${round.id}.`
+            `${label} ReviewRound does not use the ${provenance}: ${taskId}/${round.id}.`
           );
-        }
-        for (const frozen of frozenProjects) {
-          const reviewEntry = workspace.entries.find(({ projectId }) => (
-            projectId === frozen.projectId
-          ));
-          if (reviewEntry === undefined || reviewEntry.baseCommit !== frozen.commit) {
-            throw new StorageRecordError(
-              `${label} ReviewRound does not use the Candidate frozen commit: ${taskId}/${round.id}.`
-            );
-          }
         }
       }
       return;

@@ -17,6 +17,7 @@ import type {
   ActivePromptPushPort,
   ActivePromptPushRequest,
   PromptPushResult,
+  RuntimeLaunchPreStart,
   SessionHostPort,
   SessionInspection
 } from "./ports.js";
@@ -40,6 +41,8 @@ export type RuntimePlannedSession = Readonly<{
   role: RuntimeTmuxRole;
   launch: RuntimeTmuxLaunchPlan;
   session: Readonly<{ nativeSessionId?: string }> | null;
+  /** Exact Run whose first prompt is carried by a fresh Codex launch argv. */
+  initialPromptRunId?: string;
 }>;
 
 /** Narrow structural boundary implemented by FileRoleLaunchPlanner. */
@@ -165,12 +168,18 @@ export class TmuxSessionHost implements SessionHostPort {
     this.#createBindingId = options.createBindingId ?? randomUUID;
   }
 
-  async start(request: NewSessionLaunchRequest): Promise<RuntimeBinding> {
-    return this.#launch(request);
+  async start(
+    request: NewSessionLaunchRequest,
+    beforeHostStart?: RuntimeLaunchPreStart
+  ): Promise<RuntimeBinding> {
+    return this.#launch(request, beforeHostStart);
   }
 
-  async resume(request: ResumeSessionLaunchRequest): Promise<RuntimeBinding> {
-    return this.#launch(request);
+  async resume(
+    request: ResumeSessionLaunchRequest,
+    beforeHostStart?: RuntimeLaunchPreStart
+  ): Promise<RuntimeBinding> {
+    return this.#launch(request, beforeHostStart);
   }
 
   async stop(binding: RuntimeBinding): Promise<void> {
@@ -287,7 +296,10 @@ export class TmuxSessionHost implements SessionHostPort {
     }
   }
 
-  async #launch(request: SessionLaunchRequest): Promise<RuntimeBinding> {
+  async #launch(
+    request: SessionLaunchRequest,
+    beforeHostStart?: RuntimeLaunchPreStart
+  ): Promise<RuntimeBinding> {
     const hostId = request.owner.scope === "task"
       ? request.owner.taskId
       : this.#globalHostId;
@@ -302,7 +314,7 @@ export class TmuxSessionHost implements SessionHostPort {
     this.#launchTails.set(key, tail);
     await previous;
     try {
-      return await this.#launchUnlocked(request, hostId);
+      return await this.#launchUnlocked(request, hostId, beforeHostStart);
     } finally {
       release();
       if (this.#launchTails.get(key) === tail) this.#launchTails.delete(key);
@@ -311,7 +323,8 @@ export class TmuxSessionHost implements SessionHostPort {
 
   async #launchUnlocked(
     request: SessionLaunchRequest,
-    hostId: string
+    hostId: string,
+    beforeHostStart?: RuntimeLaunchPreStart
   ): Promise<RuntimeBinding> {
     // Validate generated identity before starting an external process.
     const bindingId = requireSafeIdentity(this.#createBindingId(), "Runtime binding id");
@@ -350,6 +363,18 @@ export class TmuxSessionHost implements SessionHostPort {
     }
     const nativeSessionId = plannedNativeSessionId
       ?? (request.mode === "resume" ? request.nativeSessionId : undefined);
+    beforeHostStart?.({
+      owner: request.owner,
+      launchId: request.launchId,
+      ...(request.runId === undefined ? {} : { runId: request.runId }),
+      agentId: request.agentId,
+      adapterId: request.adapterId,
+      effective: request.effective,
+      ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
+      ...(planned.initialPromptRunId === undefined
+        ? {}
+        : { initialPromptRunId: planned.initialPromptRunId })
+    });
     // Process creation is last: every local invariant has already passed.
     const hostCreated = await ensureRoleWindow(
       this.tmux,

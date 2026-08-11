@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { completeProcessing } from "../coordination/workMailbox.js";
 import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import { settleExactWorkExecution } from "../coordination/workMailboxQueue.js";
@@ -7,7 +9,11 @@ import {
 } from "../executor/agentExecutor.js";
 import { updateRoleStatus } from "../role/role.js";
 import { createTaskEvent } from "../event/taskEvent.js";
-import { finishReviewRound, type ReviewCheck } from "../review/reviewRound.js";
+import {
+  finishReviewRound,
+  type ReviewCheck,
+  type ReviewRound
+} from "../review/reviewRound.js";
 import { failAgentRun, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
@@ -22,6 +28,142 @@ import {
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { updateWorkItemStatus } from "../workItem/workItem.js";
+export type ExactReviewRoundTerminalizationResult = Readonly<{
+  disposition: "applied" | "obsolete";
+  round: ReviewRound | null;
+  reason?: string;
+}>;
+
+/**
+ * Validate every immutable identity and frozen Project head needed before a
+ * review Run can settle any mailbox or Round state.  This is deliberately
+ * read-only: callers use it as the compare-and-swap fence immediately before
+ * their aggregate mutation.
+ */
+export function validateExactRunReviewRound(
+  store: TaskStore,
+  run: AgentRun,
+  options: Readonly<{ allowTerminal?: boolean }> = {}
+): ExactReviewRoundTerminalizationResult {
+  if (run.purpose !== "review") return { disposition: "applied", round: null };
+  if (run.reviewRoundId === undefined) {
+    return { disposition: "obsolete", round: null, reason: "review-round-missing" };
+  }
+  const round = store.getReviewRound(run.taskId, run.reviewRoundId);
+  if (round === null) {
+    return { disposition: "obsolete", round: null, reason: "review-round-missing" };
+  }
+  if (!options.allowTerminal
+    && round.status !== "pending" && round.status !== "running") {
+    return { disposition: "obsolete", round, reason: "review-round-terminal" };
+  }
+  if (
+    round.reviewerRunId !== run.id
+    || round.reviewerRoleName !== run.roleName
+    || round.workItemId !== run.workItemId
+    || round.reviewBaseCommit !== run.effective.reviewBaseCommit
+  ) {
+    return { disposition: "obsolete", round, reason: "review-round-mismatch" };
+  }
+  if (run.workspace === undefined || round.workspace === undefined
+    || !isDeepStrictEqual(run.workspace, round.workspace)) {
+    return { disposition: "obsolete", round, reason: "review-workspace-mismatch" };
+  }
+  const storedWorkspace = store.getReviewRoundWorkspace(run.taskId, round.id);
+  if (storedWorkspace === null || !isDeepStrictEqual(storedWorkspace, round.workspace)) {
+    return { disposition: "obsolete", round, reason: "review-workspace-drift" };
+  }
+  if (storedWorkspace.owner.type !== "review-round"
+    || storedWorkspace.owner.taskId !== run.taskId
+    || storedWorkspace.owner.reviewRoundId !== round.id) {
+    return { disposition: "obsolete", round, reason: "review-workspace-owner-mismatch" };
+  }
+  const item = store.getWorkItem(run.taskId, round.workItemId);
+  if (item === null) {
+    return { disposition: "obsolete", round, reason: "review-work-item-missing" };
+  }
+  const candidate = item.candidates.find(({ id }) => id === round.candidateId);
+  if (candidate === undefined) {
+    return { disposition: "obsolete", round, reason: "review-candidate-missing" };
+  }
+
+  const task = store.getTask(run.taskId);
+  const taskScope = (round.scope ?? "work-item") === "task";
+  const frozenProjects = taskScope
+    ? round.taskCandidate?.projects
+    : candidate.gitSnapshot?.projects;
+  if (taskScope) {
+    if (task === null || round.taskCandidate === undefined) {
+      return { disposition: "obsolete", round, reason: "review-task-candidate-missing" };
+    }
+    if (frozenProjects === undefined
+      || new Set(frozenProjects.map(({ projectId }) => projectId)).size
+        !== task.projectBindings.length
+      || task.projectBindings.some(({ projectId }) => (
+        !frozenProjects.some((project) => project.projectId === projectId)
+      ))) {
+      return { disposition: "obsolete", round, reason: "review-frozen-project-scope-drift" };
+    }
+  } else if (candidate.gitSnapshot !== undefined
+    && candidate.gitSnapshot.reviewBaseCommit !== round.reviewBaseCommit) {
+    return { disposition: "obsolete", round, reason: "review-candidate-snapshot-drift" };
+  }
+  if (!taskScope && frozenProjects === undefined) {
+    return { disposition: "applied", round };
+  }
+  if (frozenProjects === undefined
+    || storedWorkspace.entries.length !== frozenProjects.length) {
+    return { disposition: "obsolete", round, reason: "review-frozen-project-scope-drift" };
+  }
+  const frozenByProject = new Map(
+    frozenProjects.map(({ projectId, commit }) => [projectId, commit])
+  );
+  if (storedWorkspace.entries.some((entry) => (
+    entry.access !== "write"
+    || frozenByProject.get(entry.projectId) !== entry.baseCommit
+    || entry.baseRef !== entry.baseCommit
+  ))) {
+    return { disposition: "obsolete", round, reason: "review-frozen-head-drift" };
+  }
+  return { disposition: "applied", round };
+}
+
+/**
+ * Atomically terminalizes the exact ReviewRound bound to a review AgentRun.
+ * The round must still be pending/running and its reviewer identity must match
+ * the Run exactly. This is the sole review-round convergence primitive shared
+ * by the exact Run terminalization path and the pre-delivery launch-failure
+ * path: a failed review Run must never leave its Round stranded.
+ */
+export function terminalizeExactRunReviewRound(
+  store: TaskStore,
+  input: Readonly<{
+    taskId: string;
+    run: AgentRun;
+    outcome: Readonly<{ status: "yielded" | "failed"; summary: string }>;
+    reviewResult?: Readonly<{
+      report?: string;
+      checks?: readonly ReviewCheck[];
+      evidenceCommit?: string;
+    }>;
+  }>,
+  now: Date
+): ExactReviewRoundTerminalizationResult {
+  const validation = validateExactRunReviewRound(store, input.run);
+  if (validation.disposition !== "applied" || validation.round === null) {
+    return validation;
+  }
+  const reviewRound = validation.round;
+  const terminal = finishReviewRound(
+    reviewRound,
+    input.outcome.status === "yielded" ? "completed" : "failed",
+    input.outcome.summary,
+    now,
+    input.reviewResult
+  );
+  store.saveReviewRound(input.taskId, terminal);
+  return { disposition: "applied", round: terminal };
+}
 
 export type ExactRunTerminalizationInput = Readonly<{
   taskId: string;
@@ -106,23 +248,19 @@ export function terminalizeExactTaskRun(
   const active = store.getActiveAgentRun(input.taskId, input.roleName);
   if (active?.id !== run.id) return obsolete(run, "active-run-mismatch");
 
-  const reviewRound = run.purpose === "review" && run.reviewRoundId !== undefined
-    ? store.getReviewRound(input.taskId, run.reviewRoundId)
-    : null;
-  if (run.purpose === "review" && (
-    reviewRound === null
-    || reviewRound.status !== "running"
-    || reviewRound.reviewerRunId !== run.id
-    || reviewRound.reviewerRoleName !== run.roleName
-    || reviewRound.workItemId !== run.workItemId
-  )) return obsolete(run, "review-round-mismatch");
-
   const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
   if (!matchesSessionFence(sessions, input)) {
     return obsolete(run, "session-fence-mismatch");
   }
   if (!matchesLaunchFence(store, sessions, input)) {
     return obsolete(run, "launch-fence-mismatch");
+  }
+
+  // Validate the exact ReviewRound, Candidate, stored workspace, and frozen
+  // Project heads before any mailbox or Round write.
+  const reviewValidation = validateExactRunReviewRound(store, run);
+  if (reviewValidation.disposition !== "applied") {
+    return obsolete(run, reviewValidation.reason ?? "review-round-mismatch");
   }
 
   const roleTarget = {
@@ -133,29 +271,53 @@ export function terminalizeExactTaskRun(
   if (input.mailboxDisposition === "discard") {
     store.removeWorkMailbox(roleTarget);
   } else {
-    const mailboxSettlement = settleExactWorkExecution(
-      store,
-      roleTarget,
-      { type: "run", taskId: run.taskId, id: run.id }
-    );
-    if (mailboxSettlement === "absent") {
-      throw new Error(`Run mailbox execution is missing: ${run.id}.`);
+    // For review Runs the mailbox must carry an exact pending or processing
+    // entry for this Run: an absent or unrelated mailbox means the review
+    // dispatch was never recorded and the terminalization must fail closed.
+    // Execution/Leader Runs keep the historical absent-is-clean behavior so
+    // direct Leader completion and normal execution are unaffected.
+    const isReview = run.purpose === "review";
+    const mailbox = store.getWorkMailbox(roleTarget);
+    const processing = mailbox?.processing;
+    if (mailbox !== null && processing !== null && processing !== undefined) {
+      if (
+        processing.executionRef === undefined
+        || processing.executionRef.type !== "run"
+        || processing.executionRef.taskId !== run.taskId
+        || processing.executionRef.id !== run.id
+      ) {
+        return obsolete(run, "mailbox-busy");
+      }
+      store.saveWorkMailbox(completeProcessing(mailbox, processing.batchId));
+    } else {
+      const mailboxSettlement = settleExactWorkExecution(
+        store,
+        roleTarget,
+        { type: "run", taskId: run.taskId, id: run.id }
+      );
+      if (mailboxSettlement === "absent" && isReview) {
+        return obsolete(run, "review-mailbox-missing");
+      }
     }
+  }
+
+  // All Run, active-pointer, Session, launch, and mailbox fences have passed.
+  // Only now may the exact ReviewRound be terminalized alongside the Run so a
+  // stale fence never leaves a Round written while the Run stays active.
+  const reviewRoundTerminalization = terminalizeExactRunReviewRound(store, {
+    taskId: input.taskId,
+    run,
+    outcome: input.outcome,
+    reviewResult: input.reviewResult
+  }, now);
+  if (reviewRoundTerminalization.disposition !== "applied") {
+    return obsolete(run, reviewRoundTerminalization.reason ?? "review-round-mismatch");
   }
 
   const terminal = input.outcome.status === "yielded"
     ? yieldAgentRun(run, input.outcome.summary, now)
     : failAgentRun(run, input.outcome.summary, now);
   store.saveAgentRun(terminal);
-  if (reviewRound !== null) {
-    store.saveReviewRound(input.taskId, finishReviewRound(
-      reviewRound,
-      input.outcome.status === "yielded" ? "completed" : "failed",
-      input.outcome.summary,
-      now,
-      input.reviewResult
-    ));
-  }
   store.clearActiveAgentRun(input.taskId, input.roleName);
   store.saveRole(input.taskId, updateRoleStatus(role, "idle", now));
   if (sessions !== null) {

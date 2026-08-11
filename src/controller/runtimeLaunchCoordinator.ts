@@ -9,11 +9,16 @@ import {
   RuntimeLaunchError,
   type RuntimeBinding,
   type RuntimeLaunchPersistence as RuntimeLaunchPersistencePort,
+  type RuntimeLaunchPreflight,
+  type RuntimeLaunchPreStart,
   type RuntimeLaunchPreparationPort,
   type RuntimeLaunchPreparationRequest,
   type SessionHostPort
 } from "../runtime/index.js";
-import { validateEffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import {
+  effectiveLaunchSnapshotsCompatible,
+  validateEffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
 import type {
   TaskRuntimeIsolationPort,
   TaskRuntimeIsolationPreparation,
@@ -35,7 +40,7 @@ export type RuntimeLaunchReservationPort = Readonly<{
   confirmRuntimeLaunchReservation(
     input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
     assertCurrent: () => void
-  ): void;
+  ): "reserved" | "provider-bound";
   recordReservedRuntimeNativeSession(input: Readonly<{
     owner: RuntimeRoleOwner;
     launchId: string;
@@ -118,7 +123,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
   async prepare(
     request: CoordinatedRuntimeLaunchRequest,
     persistence: RuntimeLaunchPersistence,
-    assertCurrent?: () => void
+    assertCurrent?: () => void,
+    beforeHostStart?: RuntimeLaunchPreStart
   ): Promise<RuntimeBinding> {
     const ownerKey = request.owner.scope === "task"
       ? `task\0${request.owner.taskId}\0${request.owner.roleName}`
@@ -130,7 +136,12 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     this.#launchTails.set(ownerKey, tail);
     await previous;
     try {
-      return await this.#prepareUnlocked(request, persistence, assertCurrent);
+      return await this.#prepareUnlocked(
+        request,
+        persistence,
+        assertCurrent,
+        beforeHostStart
+      );
     } finally {
       release();
       if (this.#launchTails.get(ownerKey) === tail) {
@@ -144,7 +155,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
   async #prepareUnlocked(
     request: CoordinatedRuntimeLaunchRequest,
     persistence: RuntimeLaunchPersistence,
-    assertCurrent?: () => void
+    assertCurrent?: () => void,
+    beforeHostStart?: RuntimeLaunchPreStart
   ): Promise<RuntimeBinding> {
     const effective = validateEffectiveLaunchSnapshot(request.effective);
     if (
@@ -299,6 +311,15 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     }
 
     const launchId = reservation.launchId;
+    let preflightObserved = beforeHostStart === undefined;
+    const observePreflight = (preflight: RuntimeLaunchPreflight): void => {
+      if (preflightObserved) {
+        throw new Error("Runtime host reported its pre-start launch fence more than once.");
+      }
+      validateRuntimeLaunchPreflight(preflight, request, launchId);
+      preflightObserved = true;
+      beforeHostStart?.(preflight);
+    };
     let binding: RuntimeBinding;
     try {
       if (!reusedConfirmedRunningHost && runtimeIsolation !== undefined) {
@@ -323,7 +344,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment })
-          })
+          }, beforeHostStart === undefined ? undefined : observePreflight)
         : await this.host.resume({
             mode: "resume",
             launchId,
@@ -343,7 +364,10 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
               request.nativeSessionId,
               "Native session id"
             )
-          });
+          }, beforeHostStart === undefined ? undefined : observePreflight);
+      if (!preflightObserved) {
+        throw new Error("Runtime session host did not expose a pre-host-start launch fence.");
+      }
       binding = requireMatchingRuntimeBinding(
         rawBinding,
         request,
@@ -387,6 +411,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       );
     }
 
+    let reservationConfirmation: "reserved" | "provider-bound" | undefined;
     try {
       assertLaunchCurrent();
       if (persistence === "immediate" && binding.nativeSessionId !== undefined) {
@@ -402,7 +427,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         // Deferred scheduler persistence records a known native identity while
         // retaining the reservation until exact Run delivery. Fresh Codex has
         // no identity yet and keeps it until its matching generation Hook.
-        this.reservations.confirmRuntimeLaunchReservation({
+        reservationConfirmation = this.reservations.confirmRuntimeLaunchReservation({
           owner: request.owner,
           launchId
         }, assertLaunchCurrent);
@@ -414,6 +439,24 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         launchId,
         runtimeIsolation,
         error
+      );
+    }
+    if (
+      request.owner.scope === "task"
+      && request.adapterId === "codex"
+      && request.runId !== undefined
+      && binding.hostCreated !== false
+      && reservationConfirmation !== "provider-bound"
+    ) {
+      // A host-created Codex process may have carried the first prompt in
+      // argv, but only a matching synchronous provider lifecycle Hook can
+      // prove that this exact generation crossed the provider boundary. Keep
+      // the generation fenced and require owner-addressed cleanup otherwise.
+      this.#requireCleanup(request.owner);
+      throw new RuntimeBindingContractError(
+        `Session host cannot acknowledge the exact launch-carried prompt: ${
+          request.owner.roleName
+        }.`
       );
     }
     return binding;
@@ -571,6 +614,44 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
   }
 }
 
+function validateRuntimeLaunchPreflight(
+  preflight: RuntimeLaunchPreflight,
+  request: CoordinatedRuntimeLaunchRequest,
+  launchId: string
+): void {
+  const ownerMatches = preflight.owner.scope === request.owner.scope
+    && preflight.owner.roleName === request.owner.roleName
+    && (
+      preflight.owner.scope === "global"
+      || (
+        request.owner.scope === "task"
+        && preflight.owner.taskId === request.owner.taskId
+      )
+    );
+  if (
+    preflight.launchId !== launchId
+    || !ownerMatches
+    || preflight.runId !== request.runId
+    || preflight.agentId !== request.agentId
+    || preflight.adapterId !== request.adapterId
+    || !effectiveLaunchSnapshotsCompatible(preflight.effective, request.effective)
+    || (
+      request.mode === "resume"
+      && preflight.nativeSessionId !== request.nativeSessionId
+    )
+    || (
+      preflight.initialPromptRunId !== undefined
+      && preflight.initialPromptRunId !== request.runId
+    )
+  ) {
+    throw new Error(
+      `Session host pre-start launch fence does not match the requested runtime: ${
+        request.owner.roleName
+      }.`
+    );
+  }
+}
+
 function requireMatchingRuntimeBinding(
   raw: RuntimeBinding,
   request: CoordinatedRuntimeLaunchRequest,
@@ -595,17 +676,7 @@ function requireMatchingRuntimeBinding(
         && binding.owner.taskId === request.owner.taskId
       )
     );
-  const launchCarriedPromptAcknowledgementRequired = request.owner.scope === "task"
-    && request.adapterId === "codex"
-    && request.runId !== undefined
-    // An explicit reused-host result may take the receipt-backed active-push
-    // path. A new or ambiguous host may have carried the prompt in argv, but
-    // Yui has no provider acknowledgement for that transport.
-    && binding.hostCreated !== false;
-  if (
-    launchPromptAcknowledgementRequired
-    || launchCarriedPromptAcknowledgementRequired
-  ) {
+  if (launchPromptAcknowledgementRequired) {
     throw new RuntimeBindingContractError(
       `Session host cannot acknowledge the exact launch-carried prompt: ${
         request.owner.roleName

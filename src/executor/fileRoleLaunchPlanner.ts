@@ -552,7 +552,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
       launch: scopedLaunch,
-      session
+      session,
+      ...(binding.adapterId === "codex" && input.runId !== undefined
+        ? { initialPromptRunId: input.runId }
+        : {})
     };
   }
 

@@ -45,8 +45,10 @@ import { activateTask, createTask } from "../../dist/task/task.js";
 import { createProject } from "../../dist/repository/project.js";
 import {
   createWorkItem,
+  submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
+import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { yuiVersionIdentity } from "../../dist/version.js";
 import {
   TASK_FINAL_REVIEW_ARGUMENT,
@@ -55,7 +57,10 @@ import {
 
 function fixture(t, roleName = "worker", { projectBacked = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), "yui-exact-control-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(async () => {
+    await stopFileTaskController(home);
+    rmSync(home, { recursive: true, force: true });
+  });
   ensureStorageSchema(home, new Date("2026-08-09T00:00:00.000Z"));
   const cliEntry = join(process.cwd(), "dist", "cli.js");
   const control = createExactControlPlaneDescriptor({
@@ -233,12 +238,20 @@ test("Task-final contract prefix is bound to the verified exact Leader Task and 
   assert.equal(readFileSync(statePath, "utf8"), stateBefore);
 });
 
-test("exact Task-final CLI submits and accepts a metadata-only Project Candidate", (t) => {
-  const { home, cliEntry, control, digest, runtime, store } = fixture(
+test("exact Task-final CLI submits and accepts a metadata-only Project Candidate", async (t) => {
+  const submittedFixture = fixture(
     t,
     "leader",
     { projectBacked: true }
   );
+  const {
+    home,
+    cliEntry,
+    control,
+    digest,
+    runtime,
+    store
+  } = submittedFixture;
   const environment = {
     ...process.env,
     YUI_HOME: home,
@@ -273,24 +286,68 @@ test("exact Task-final CLI submits and accepts a metadata-only Project Candidate
   assert.equal(candidate.workspace, undefined);
   assert.equal(candidate.taskFinalReviewContract.controlPlaneDigest, digest);
 
+  await stopFileTaskController(home);
+
+  // The first write legitimately wakes the Controller, which may settle its
+  // exact Run before another process starts. Exercise acceptance against a
+  // separately current runtime instead of reusing a stale descriptor.
+  const acceptedFixture = fixture(t, "leader", { projectBacked: true });
+  const acceptedContract = createTaskFinalReviewContract({
+    taskId: acceptedFixture.runtime.taskId,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: acceptedFixture.digest
+  });
+  acceptedFixture.store.transaction((tx) => {
+    const running = tx.getWorkItem(
+      acceptedFixture.runtime.taskId,
+      "work-item-1"
+    );
+    tx.saveWorkItem(acceptedFixture.runtime.taskId, submitWorkItemCandidate(running, {
+      summary: "metadata-only Candidate",
+      source: { type: "direct" },
+      reviewPolicy: { roleName: "reviewer", trigger: "final" },
+      taskFinalReviewContract: acceptedContract
+    }, new Date("2026-08-09T00:00:00.000Z")));
+  });
+  const acceptedEnvironment = {
+    ...process.env,
+    YUI_HOME: acceptedFixture.home,
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: acceptedFixture.runtime.taskId,
+    YUI_ROLE: acceptedFixture.runtime.roleName,
+    YUI_AGENT_ID: acceptedFixture.runtime.agentId,
+    YUI_ADAPTER_ID: acceptedFixture.runtime.adapterId,
+    YUI_WORKSPACE: acceptedFixture.runtime.workspace,
+    YUI_RUN_ID: acceptedFixture.runtime.runId,
+    YUI_LAUNCH_ID: acceptedFixture.runtime.launchId,
+    YUI_NATIVE_SESSION_ID: acceptedFixture.runtime.nativeSessionId,
+    [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(acceptedFixture.control),
+    [YUI_TASK_RUNTIME_DESCRIPTOR]: serializeExactDescriptor(acceptedFixture.runtime)
+  };
+  const acceptedPrefix = [
+    acceptedFixture.cliEntry,
+    EXACT_CONTROL_ARGUMENT,
+    acceptedFixture.digest,
+    TASK_FINAL_REVIEW_ARGUMENT,
+    acceptedFixture.runtime.taskId,
+    "reviewer"
+  ];
+
   const accepted = spawnSync(process.execPath, [
-    ...prefix,
+    ...acceptedPrefix,
     "task", "work", "accept", "work-item-1",
     "--summary", "exact metadata accepted"
-  ], { encoding: "utf8", env: environment });
+  ], { encoding: "utf8", env: acceptedEnvironment });
   assert.equal(accepted.status, 0, accepted.stderr);
   assert.match(accepted.stdout, /Accepted Work Item/u);
-  assert.equal(store.getWorkItem(runtime.taskId, "work-item-1").status, "completed");
-
-  // Both writes signal the isolated Home's Controller. Settle that owned
-  // process through the same frozen control plane before the fixture removes
-  // the Home; deleting a live Controller's files would hide a process leak.
-  const stopped = spawnSync(process.execPath, [
-    ...prefix,
-    "controller", "stop"
-  ], { encoding: "utf8", env: environment });
-  assert.equal(stopped.status, 0, stopped.stderr);
-  assert.match(stopped.stdout, /stopped|already stopped/i);
+  assert.equal(
+    acceptedFixture.store.getWorkItem(
+      acceptedFixture.runtime.taskId,
+      "work-item-1"
+    ).status,
+    "completed"
+  );
+  await stopFileTaskController(acceptedFixture.home);
 });
 
 test("control-plane and Task runtime descriptors are tagged and never interchangeable", (t) => {

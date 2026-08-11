@@ -1229,7 +1229,17 @@ async function candidateSnapshotForTaskCommand(
   environment: NodeJS.ProcessEnv,
   taskFinalReviewContract?: TaskFinalReviewContract
 ) {
-  if (args[0] !== "task" || store.getReviewConfig() === null) return undefined;
+  if (args[0] !== "task") return undefined;
+  const reviewableCandidateCommand = (
+    args[1] === "run" && args[2] === "yield" && args[3] !== undefined
+  ) || (
+    args[1] === "work" && args[2] === "update"
+    && args[3] !== undefined && args[4] === "done"
+  );
+  // Explicit Task-final review requests must remain independent of the
+  // mutable global review trigger. Only the existing Candidate snapshot
+  // paths need to consult review configuration.
+  if (!reviewableCandidateCommand || store.getReviewConfig() === null) return undefined;
   if (args[1] === "run" && args[2] === "yield" && args[3] !== undefined) {
     const reference = cliTaskRecordReference(args[3], "agentRun", environment);
     const run = store.getAgentRun(reference.taskId, reference.localId);
@@ -1318,6 +1328,18 @@ async function actualTaskReviewCandidateForTaskCommand(
       return undefined;
     }
     taskId = task.id;
+  } else if (args[1] === "review"
+    && args[2] === "request"
+    && args[3] !== undefined) {
+    taskId = store.getTask(args[3])?.id;
+  } else if (args[1] === "review"
+    && args[2] === "retry"
+    && args[3] !== undefined) {
+    const reference = cliTaskRecordReference(args[3], "reviewRound", environment);
+    const round = store.getReviewRound(reference.taskId, reference.localId);
+    if (round !== null && (round.scope ?? "work-item") === "task") {
+      taskId = reference.taskId;
+    }
   } else if (args[1] === "work"
     && args[2] === "review"
     && args[3] === "retry"

@@ -46,12 +46,34 @@ export type RuntimeLaunchPreparationRequest = Readonly<{
 
 export type RuntimeLaunchPersistence = "deferred" | "immediate";
 
+/**
+ * Exact launch facts available after reservation/planning but before the
+ * session host is allowed to create the external Provider process.
+ */
+export type RuntimeLaunchPreflight = Readonly<{
+  owner: RuntimeOwner;
+  launchId: string;
+  runId?: string;
+  agentId: string;
+  adapterId: string;
+  effective: EffectiveLaunchSnapshot;
+  nativeSessionId?: string;
+  initialPromptRunId?: string;
+}>;
+
+export type RuntimeLaunchPreStart = (preflight: RuntimeLaunchPreflight) => void;
+
 /** Runtime-side seam implemented by reservation, Hook, or hybrid launch policy. */
 export interface RuntimeLaunchPreparationPort {
+  /**
+   * When supplied, the host must invoke `beforeHostStart` before creating any
+   * external Provider process; callers use it to persist the exact Run fence.
+   */
   prepare(
     request: RuntimeLaunchPreparationRequest,
     persistence: RuntimeLaunchPersistence,
-    assertCurrent?: () => void
+    assertCurrent?: () => void,
+    beforeHostStart?: RuntimeLaunchPreStart
   ): Promise<RuntimeBinding>;
 }
 
@@ -68,8 +90,15 @@ export interface AgentEnvironmentRefreshPort {
 }
 
 export interface SessionHostPort {
-  start(request: NewSessionLaunchRequest): Promise<RuntimeBinding>;
-  resume(request: ResumeSessionLaunchRequest): Promise<RuntimeBinding>;
+  /** The callback must run after planning but before any Provider process starts. */
+  start(
+    request: NewSessionLaunchRequest,
+    beforeHostStart?: RuntimeLaunchPreStart
+  ): Promise<RuntimeBinding>;
+  resume(
+    request: ResumeSessionLaunchRequest,
+    beforeHostStart?: RuntimeLaunchPreStart
+  ): Promise<RuntimeBinding>;
   stop(binding: RuntimeBinding): Promise<void>;
   inspect(binding: RuntimeBinding): Promise<SessionInspection>;
   /** Owner-level probe used to resolve an interrupted pre-binding launch. */

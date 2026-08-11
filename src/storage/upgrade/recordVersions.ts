@@ -19,7 +19,7 @@
 import {
   CURRENT_AGGREGATE_SCHEMA_VERSION,
   CURRENT_STORAGE_LAYOUT_VERSION
-} from "../storageSchema.js";
+} from "../storageVersions.js";
 import {
   CURRENT_AGENT_RUN_SCHEMA_VERSION,
   CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
@@ -96,67 +96,79 @@ const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object
  * engine treats it as opaque. Update this table whenever a family is added or
  * its `schemaVersion` changes — it tracks the live schema, it does not freeze
  * it.
+ *
+ * Lazy-initialized to avoid a circular-dependency TDZ: `recordVersions.ts`
+ * imports the `CURRENT_*_SCHEMA_VERSION` constants from `taskStore.ts`, which
+ * imports `requireStorageSchema` from `storageSchema.ts`, which (via the
+ * provider pattern) depends on this module. Building the descriptors lazily
+ * means the constants are only read at runtime, after every module has loaded.
  */
-const CURRENT_RECORD_DESCRIPTORS: Readonly<Record<string, RecordAxisEntry>> = Object.freeze({
-  config: descriptor(CURRENT_CONFIG_SCHEMA_VERSION, "state.json#/config"),
-  configuredAgent: descriptor(CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION, "state.json#/configuredAgents"),
-  project: descriptor(CURRENT_PROJECT_SCHEMA_VERSION, "state.json#/projects"),
-  agentProfile: descriptor(CURRENT_AGENT_PROFILE_SCHEMA_VERSION, "state.json#/agentProfiles"),
-  globalRole: descriptor(CURRENT_GLOBAL_ROLE_SCHEMA_VERSION, "state.json#/globalRoles"),
-  globalRoleSessionSet: descriptor(
-    CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION,
-    "state.json#/globalRoleSessionSets"
-  ),
-  // The task aggregate is itself a versioned record family. Keep this family
-  // alongside (and distinct from) the nested `task` record family: an older
-  // aggregate wrapper must be classified on the record axis before the strict
-  // loader is asked to parse its nested members.
-  storedTask: descriptor(CURRENT_STORED_TASK_SCHEMA_VERSION, "state.json#/tasks/*"),
-  task: descriptor(CURRENT_TASK_SCHEMA_VERSION, "state.json#/tasks/*/task"),
-  taskBrief: descriptor(CURRENT_TASK_BRIEF_SCHEMA_VERSION, "state.json#/tasks/*/brief"),
-  taskRole: descriptor(CURRENT_TASK_ROLE_SCHEMA_VERSION, "state.json#/tasks/*/roles"),
-  managedWorkspace: descriptor(
-    CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION,
-    "state.json#/tasks/*/managedWorkspaces"
-  ),
-  taskRoleSessionSet: descriptor(
-    CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
-    "state.json#/tasks/*/roleSessionSets"
-  ),
-  workItem: descriptor(CURRENT_WORK_ITEM_SCHEMA_VERSION, "state.json#/tasks/*/workItems"),
-  agentRun: descriptor(CURRENT_AGENT_RUN_SCHEMA_VERSION, "state.json#/tasks/*/agentRuns"),
-  reviewRound: descriptor(CURRENT_REVIEW_ROUND_SCHEMA_VERSION, "state.json#/tasks/*/reviewRounds"),
-  changeSet: descriptor(CURRENT_CHANGE_SET_SCHEMA_VERSION, "state.json#/tasks/*/changeSets"),
-  integrationAttempt: descriptor(
-    CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
-    "state.json#/tasks/*/integrationAttempts"
-  ),
-  activeRunPointer: descriptor(
-    CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
-    "state.json#/tasks/*/activeRuns"
-  ),
-  message: descriptor(CURRENT_MESSAGE_SCHEMA_VERSION, "state.json#/tasks/*/messages"),
-  inputRequest: descriptor(CURRENT_INPUT_REQUEST_SCHEMA_VERSION, "state.json#/tasks/*/inputRequests"),
-  decision: descriptor(CURRENT_DECISION_SCHEMA_VERSION, "state.json#/tasks/*/decisions"),
-  milestone: descriptor(CURRENT_MILESTONE_SCHEMA_VERSION, "state.json#/tasks/*/milestones"),
-  event: descriptor(CURRENT_EVENT_SCHEMA_VERSION, "state.json#/tasks/*/events"),
-  leaderFailure: descriptor(
-    CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
-    "state.json#/tasks/*/leaderFailure"
-  ),
-  operatorNotification: descriptor(
-    CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
-    "state.json#/tasks/*/operatorNotification"
-  ),
-  workMailbox: descriptor(CURRENT_WORK_MAILBOX_SCHEMA_VERSION, "state.json#/mailboxes")
-});
+let currentRecordDescriptors: Readonly<Record<string, RecordAxisEntry>> | null = null;
+function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>> {
+  if (currentRecordDescriptors === null) {
+    currentRecordDescriptors = Object.freeze({
+      config: descriptor(CURRENT_CONFIG_SCHEMA_VERSION, "state.json#/config"),
+      configuredAgent: descriptor(CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION, "state.json#/configuredAgents"),
+      project: descriptor(CURRENT_PROJECT_SCHEMA_VERSION, "state.json#/projects"),
+      agentProfile: descriptor(CURRENT_AGENT_PROFILE_SCHEMA_VERSION, "state.json#/agentProfiles"),
+      globalRole: descriptor(CURRENT_GLOBAL_ROLE_SCHEMA_VERSION, "state.json#/globalRoles"),
+      globalRoleSessionSet: descriptor(
+        CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION,
+        "state.json#/globalRoleSessionSets"
+      ),
+      // The task aggregate is itself a versioned record family. Keep this family
+      // alongside (and distinct from) the nested `task` record family: an older
+      // aggregate wrapper must be classified on the record axis before the strict
+      // loader is asked to parse its nested members.
+      storedTask: descriptor(CURRENT_STORED_TASK_SCHEMA_VERSION, "state.json#/tasks/*"),
+      task: descriptor(CURRENT_TASK_SCHEMA_VERSION, "state.json#/tasks/*/task"),
+      taskBrief: descriptor(CURRENT_TASK_BRIEF_SCHEMA_VERSION, "state.json#/tasks/*/brief"),
+      taskRole: descriptor(CURRENT_TASK_ROLE_SCHEMA_VERSION, "state.json#/tasks/*/roles"),
+      managedWorkspace: descriptor(
+        CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION,
+        "state.json#/tasks/*/managedWorkspaces"
+      ),
+      taskRoleSessionSet: descriptor(
+        CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION,
+        "state.json#/tasks/*/roleSessionSets"
+      ),
+      workItem: descriptor(CURRENT_WORK_ITEM_SCHEMA_VERSION, "state.json#/tasks/*/workItems"),
+      agentRun: descriptor(CURRENT_AGENT_RUN_SCHEMA_VERSION, "state.json#/tasks/*/agentRuns"),
+      reviewRound: descriptor(CURRENT_REVIEW_ROUND_SCHEMA_VERSION, "state.json#/tasks/*/reviewRounds"),
+      changeSet: descriptor(CURRENT_CHANGE_SET_SCHEMA_VERSION, "state.json#/tasks/*/changeSets"),
+      integrationAttempt: descriptor(
+        CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
+        "state.json#/tasks/*/integrationAttempts"
+      ),
+      activeRunPointer: descriptor(
+        CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+        "state.json#/tasks/*/activeRuns"
+      ),
+      message: descriptor(CURRENT_MESSAGE_SCHEMA_VERSION, "state.json#/tasks/*/messages"),
+      inputRequest: descriptor(CURRENT_INPUT_REQUEST_SCHEMA_VERSION, "state.json#/tasks/*/inputRequests"),
+      decision: descriptor(CURRENT_DECISION_SCHEMA_VERSION, "state.json#/tasks/*/decisions"),
+      milestone: descriptor(CURRENT_MILESTONE_SCHEMA_VERSION, "state.json#/tasks/*/milestones"),
+      event: descriptor(CURRENT_EVENT_SCHEMA_VERSION, "state.json#/tasks/*/events"),
+      leaderFailure: descriptor(
+        CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
+        "state.json#/tasks/*/leaderFailure"
+      ),
+      operatorNotification: descriptor(
+        CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
+        "state.json#/tasks/*/operatorNotification"
+      ),
+      workMailbox: descriptor(CURRENT_WORK_MAILBOX_SCHEMA_VERSION, "state.json#/mailboxes")
+    });
+  }
+  return currentRecordDescriptors;
+}
 
 /** Kept as the public-facing name used by upgrade callers and tests. */
-const CURRENT_RECORD_VERSIONS = CURRENT_RECORD_DESCRIPTORS;
+const CURRENT_RECORD_VERSIONS = getCurrentRecordDescriptors;
 
 /** The record-axis map for the current baseline (a defensive shallow copy). */
 export function currentRecordVersions(
-  candidate: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS
+  candidate: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS()
 ): Readonly<Record<string, RecordAxisEntry>> {
   assertRecordVersionDescriptors(candidate);
   return { ...candidate };
@@ -169,7 +181,7 @@ export function currentRecordVersions(
  * use the default current descriptor table.
  */
 export function assertRecordVersionDescriptors(
-  candidate: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS
+  candidate: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS()
 ): void {
   const expectedKinds = Object.keys(EXPECTED_DIRECT_RECORD_LOCATORS);
   const mappedKinds = Object.keys(candidate);
@@ -182,8 +194,9 @@ export function assertRecordVersionDescriptors(
     );
   }
 
+  const descriptors = getCurrentRecordDescriptors();
   for (const kind of expectedKinds) {
-    const expected = CURRENT_RECORD_DESCRIPTORS[kind];
+    const expected = descriptors[kind];
     const expectedPath = EXPECTED_DIRECT_RECORD_LOCATORS[kind]!;
     const mapped = candidate[kind];
     if (expected === undefined
@@ -205,7 +218,7 @@ export function assertRecordVersionDescriptors(
  * and classifier compare a source against this to decide the four-state verdict.
  */
 export function latestStorageVersionState(
-  recordDescriptors: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS
+  recordDescriptors: Readonly<Record<string, RecordAxisEntry>> = CURRENT_RECORD_VERSIONS()
 ): StorageVersionState {
   return {
     layout: CURRENT_STORAGE_LAYOUT_VERSION,

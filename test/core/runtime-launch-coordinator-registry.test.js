@@ -8,6 +8,10 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { FileTaskController } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { RuntimeLaunchCoordinator } from "../../dist/controller/runtimeLaunchCoordinator.js";
+import { runClaudeLifecycleHookCommand } from "../../dist/controller/claudeLifecycleHook.js";
+import { runCodexLifecycleHookCommand } from "../../dist/controller/codexLifecycleHook.js";
+import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
+import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { ExecutorRegistry } from "../../dist/executor/executorRegistry.js";
 import {
@@ -112,6 +116,9 @@ function runtimeBinding(request, options = {}) {
     adapterId: request.adapterId,
     hostRef: `host-${request.owner.roleName}`,
     hostCreated,
+    ...(options.initialPromptRunId === undefined
+      ? {}
+      : { initialPromptRunId: options.initialPromptRunId }),
     ...(options.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: options.nativeSessionId })
@@ -253,11 +260,20 @@ async function controllerRecoveryFixture(t, persistPrepared) {
     stoppedOwners: []
   };
   const host = {
-    async start(request) {
+    async start(request, beforeHostStart) {
       const hostCreated = persistPrepared && (
         controls.starts.length === 0 || controls.recreateNextStart
       );
       controls.recreateNextStart = false;
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        ...(request.runId === undefined ? {} : { runId: request.runId }),
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        ...(persistPrepared ? { nativeSessionId: "claude-native-recovery" } : {})
+      });
       controls.state = "running";
       controls.starts.push(request);
       if (hostCreated) controls.hostCreations += 1;
@@ -465,6 +481,513 @@ test("fresh Claude Leader and Worker reserve before start and their first matchi
   );
 });
 
+test("fresh Claude SessionStart inside host start sees a durable pre-host fence", async (t) => {
+  const fx = fixture(t, "claude");
+  const roleName = "worker";
+  const role = fx.roles.get(roleName);
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  const run = createAgentRun(
+    "agent-run-2",
+    fx.task.id,
+    roleName,
+    "new",
+    "deliver before provider process start",
+    NOW,
+    { effective }
+  );
+  const target = { kind: "role", taskId: fx.task.id, roleName };
+  fx.store.transaction((tx) => {
+    tx.saveRole(fx.task.id, updateRoleStatus(role, "running", NOW));
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, target, "run-dispatched", NOW, [
+      { type: "run", taskId: fx.task.id, id: run.id }
+    ]);
+  });
+  const nativeSessionId = "claude-native-pre-host-start";
+  const inbox = new FileRuntimeEventInbox(fx.home, () => NOW);
+  const processor = new FileRuntimeEventProcessor(inbox, fx.schedulerStore);
+  let hookError;
+  let drainResult;
+  let hostStarts = 0;
+  const host = {
+    async start(request, beforeHostStart) {
+      hostStarts += 1;
+      assertReservation(fx, roleName, request.launchId, run.id);
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        ...(request.runId === undefined ? {} : { runId: request.runId }),
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        nativeSessionId
+      });
+      try {
+        await runClaudeLifecycleHookCommand(
+          JSON.stringify({
+            hook_event_name: "SessionStart",
+            session_id: nativeSessionId,
+            source: "startup"
+          }),
+          {
+            YUI_HOME: fx.home,
+            YUI_SESSION_SCOPE: "task",
+            YUI_WORKSPACE: fx.home,
+            YUI_ADAPTER_ID: "claude",
+            YUI_TASK_ID: fx.task.id,
+            YUI_ROLE: roleName,
+            YUI_AGENT_ID: fx.agent.id,
+            YUI_LAUNCH_ID: request.launchId,
+            YUI_RUN_ID: run.id,
+            YUI_NATIVE_SESSION_ID: nativeSessionId
+          },
+          async () => {
+            drainResult = processor.drain(NOW);
+            return {};
+          }
+        );
+      } catch (error) {
+        hookError = error;
+      }
+      return runtimeBinding(request, { nativeSessionId, hostCreated: true });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  const coordinator = new RuntimeLaunchCoordinator(
+    fx.schedulerStore,
+    host,
+    {
+      createGenerationId: () => "pre-host-generation",
+      now: () => NOW
+    }
+  );
+  const delivery = registry(coordinator, host, async () => "delivered");
+
+  const [result] = await processActiveRoleRunDeliveries(
+    fx.schedulerStore,
+    delivery,
+    NOW
+  );
+
+  assert.equal(hostStarts, 1);
+  assert.equal(hookError, undefined, hookError?.message);
+  assert.deepEqual(drainResult?.failed, [], JSON.stringify(drainResult));
+  assert.equal(
+    fx.store.getTaskRoleSessionSet(fx.task.id, roleName)?.inFlight?.runId,
+    run.id
+  );
+  assert.equal(
+    fx.store.getRoleSession(fx.task.id, roleName)?.nativeSessionId,
+    nativeSessionId
+  );
+  assert.equal(result.status, "delivered", result.error);
+  assert.equal(fx.store.getAgentRun(fx.task.id, run.id).deliveredAt, undefined);
+});
+
+test("a synchronous fresh Codex SessionStart binds transport without claiming delivery", async (t) => {
+  const fx = fixture(t, "codex");
+  const roleName = "worker";
+  const role = fx.roles.get(roleName);
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  const run = createAgentRun(
+    "agent-run-3",
+    fx.task.id,
+    roleName,
+    "new",
+    "deliver through Codex launch",
+    NOW,
+    { effective }
+  );
+  const target = { kind: "role", taskId: fx.task.id, roleName };
+  fx.store.transaction((tx) => {
+    tx.saveRole(fx.task.id, updateRoleStatus(role, "running", NOW));
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, target, "run-dispatched", NOW, [
+      { type: "run", taskId: fx.task.id, id: run.id }
+    ]);
+  });
+  const nativeSessionId = "codex-native-pre-host-start";
+  const inbox = new FileRuntimeEventInbox(fx.home, () => NOW);
+  const processor = new FileRuntimeEventProcessor(inbox, fx.schedulerStore);
+  let hookError;
+  let drainResult;
+  const host = {
+    async start(request, beforeHostStart) {
+      assertReservation(fx, roleName, request.launchId, run.id);
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective
+      });
+      try {
+        await runCodexLifecycleHookCommand(
+          JSON.stringify({
+            hook_event_name: "SessionStart",
+            session_id: nativeSessionId
+          }),
+          {
+            YUI_HOME: fx.home,
+            YUI_SESSION_SCOPE: "task",
+            YUI_WORKSPACE: fx.home,
+            YUI_ADAPTER_ID: "codex",
+            YUI_TASK_ID: fx.task.id,
+            YUI_ROLE: roleName,
+            YUI_AGENT_ID: fx.agent.id,
+            YUI_LAUNCH_ID: request.launchId
+          },
+          async () => {
+            drainResult = processor.drain(NOW);
+            return {};
+          }
+        );
+      } catch (error) {
+        hookError = error;
+      }
+      return runtimeBinding(request, { hostCreated: true });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  const coordinator = new RuntimeLaunchCoordinator(
+    fx.schedulerStore,
+    host,
+    {
+      createGenerationId: () => "codex-pre-host-generation",
+      now: () => NOW
+    }
+  );
+  const delivery = registry(coordinator, host, async () => "delivered");
+
+  const [result] = await processActiveRoleRunDeliveries(
+    fx.schedulerStore,
+    delivery,
+    NOW
+  );
+
+  assert.equal(hookError, undefined, hookError?.message);
+  assert.deepEqual(drainResult?.failed, [], JSON.stringify(drainResult));
+  assert.equal(reservationMailbox(fx, roleName), null);
+  assert.equal(
+    fx.store.getRoleSession(fx.task.id, roleName)?.nativeSessionId,
+    nativeSessionId
+  );
+  assert.equal(result.status, "delivered", result.error);
+  const transported = fx.store.getAgentRun(fx.task.id, run.id);
+  assert.equal(transported.status, "active");
+  assert.notEqual(transported.pushedAt, undefined);
+  assert.equal(transported.deliveredAt, undefined);
+});
+
+test("a restart after synchronous fresh Codex SessionStart reuses the original launch", async (t) => {
+  const fx = fixture(t, "codex");
+  const roleName = "worker";
+  const role = fx.roles.get(roleName);
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  const run = createAgentRun(
+    "agent-run-4",
+    fx.task.id,
+    roleName,
+    "new",
+    "deliver exactly once after restart",
+    NOW,
+    { effective }
+  );
+  const target = { kind: "role", taskId: fx.task.id, roleName };
+  fx.store.transaction((tx) => {
+    tx.saveRole(fx.task.id, updateRoleStatus(role, "running", NOW));
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, target, "run-dispatched", NOW, [
+      { type: "run", taskId: fx.task.id, id: run.id }
+    ]);
+  });
+  const nativeSessionId = "codex-native-restart";
+  const inbox = new FileRuntimeEventInbox(fx.home, () => NOW);
+  const processor = new FileRuntimeEventProcessor(inbox, fx.schedulerStore);
+  let firstLaunchId;
+  let promptPushes = 0;
+  let hookError;
+  let starts = 0;
+  const persistPreStartFence = (store, preflight) => {
+    store.saveRoleRunPrepared({
+      task: store.getTask(fx.task.id),
+      role: store.getRole(fx.task.id, roleName),
+      run,
+      session: preflight.nativeSessionId === undefined
+        ? null
+        : {
+            agentId: preflight.agentId,
+            adapterId: preflight.adapterId,
+            nativeSessionId: preflight.nativeSessionId,
+            launchId: preflight.launchId,
+            status: "ready",
+            effective: preflight.effective
+          },
+      launchId: preflight.launchId,
+      now: NOW
+    });
+  };
+  const host = {
+    async start(request, beforeHostStart) {
+      starts += 1;
+      const restarted = starts > 1;
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        ...(restarted ? { nativeSessionId } : { initialPromptRunId: run.id })
+      });
+      if (!restarted) {
+        firstLaunchId = request.launchId;
+        try {
+          await runCodexLifecycleHookCommand(
+            JSON.stringify({
+              hook_event_name: "SessionStart",
+              session_id: nativeSessionId
+            }),
+            {
+              YUI_HOME: fx.home,
+              YUI_SESSION_SCOPE: "task",
+              YUI_WORKSPACE: fx.home,
+              YUI_ADAPTER_ID: "codex",
+              YUI_TASK_ID: fx.task.id,
+              YUI_ROLE: roleName,
+              YUI_AGENT_ID: fx.agent.id,
+              YUI_LAUNCH_ID: request.launchId
+            },
+            async () => {
+              processor.drain(NOW);
+              return {};
+            }
+          );
+        } catch (error) {
+          hookError = error;
+        }
+      } else {
+        throw new Error("A pushed Run must not launch a second Provider generation.");
+      }
+      return runtimeBinding(request, {
+        nativeSessionId: restarted ? nativeSessionId : undefined,
+        hostCreated: !restarted,
+        ...(restarted ? {} : { initialPromptRunId: run.id })
+      });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  const firstStore = fx.schedulerStore;
+  const firstDelivery = registry(
+    new RuntimeLaunchCoordinator(firstStore, host, {
+      createGenerationId: () => "codex-restart-first",
+      now: () => NOW
+    }),
+    host
+  );
+  const input = prepareInput(fx, roleName, run.id);
+  const firstPrepared = await firstDelivery.prepareRoleSession({
+    ...input,
+    beforeHostStart: (preflight) => persistPreStartFence(firstStore, preflight)
+  });
+  assert.equal(firstPrepared.session, null);
+  assert.equal(hookError, undefined, hookError?.message);
+  assert.equal(
+    fx.store.getRoleSession(fx.task.id, roleName)?.launchId,
+    firstLaunchId
+  );
+  assert.notEqual(fx.store.getAgentRun(fx.task.id, run.id).pushedAt, undefined);
+
+  const restartedStore = new FileTaskStore(fx.home);
+  const restartedSchedulerStore = new FileSchedulerStoreAdapter(restartedStore);
+  const restartedDelivery = registry(
+    new RuntimeLaunchCoordinator(restartedSchedulerStore, host, {
+      createGenerationId: () => "codex-restart-second",
+      now: () => NOW
+    }),
+    host,
+    async () => {
+      promptPushes += 1;
+      return "delivered";
+    }
+  );
+  const recovered = await processActiveRoleRunDeliveries(
+    restartedSchedulerStore,
+    restartedDelivery,
+    NOW
+  );
+  assert.deepEqual(recovered, []);
+  assert.equal(starts, 1);
+  assert.equal(
+    restartedSchedulerStore.getRoleSession(fx.task.id, roleName).launchId,
+    firstLaunchId
+  );
+  assert.equal(promptPushes, 0);
+  assert.notEqual(restartedStore.getAgentRun(fx.task.id, run.id).pushedAt, undefined);
+  assert.equal(restartedStore.getAgentRun(fx.task.id, run.id).deliveredAt, undefined);
+  await assert.rejects(
+    runCodexLifecycleHookCommand(
+      JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: nativeSessionId
+      }),
+      {
+        YUI_HOME: fx.home,
+        YUI_SESSION_SCOPE: "task",
+        YUI_WORKSPACE: fx.home,
+        YUI_ADAPTER_ID: "codex",
+        YUI_TASK_ID: fx.task.id,
+        YUI_ROLE: roleName,
+        YUI_AGENT_ID: fx.agent.id,
+        YUI_LAUNCH_ID: "stale-codex-launch"
+      },
+      async () => ({})
+    ),
+    /Session does not match its durable generation/i
+  );
+  await runCodexLifecycleHookCommand(
+    JSON.stringify({
+      hook_event_name: "UserPromptSubmit",
+      session_id: nativeSessionId
+    }),
+    {
+      YUI_HOME: fx.home,
+      YUI_SESSION_SCOPE: "task",
+      YUI_WORKSPACE: fx.home,
+      YUI_ADAPTER_ID: "codex",
+      YUI_TASK_ID: fx.task.id,
+      YUI_ROLE: roleName,
+      YUI_AGENT_ID: fx.agent.id,
+      YUI_LAUNCH_ID: firstLaunchId
+    },
+    async () => ({})
+  );
+  const accepted = new FileRuntimeEventProcessor(
+    new FileRuntimeEventInbox(fx.home),
+    restartedSchedulerStore
+  ).drain(NOW);
+  assert.deepEqual(accepted.failed, []);
+  assert.notEqual(restartedStore.getAgentRun(fx.task.id, run.id).deliveredAt, undefined);
+});
+
+test("fresh Claude SessionStart sees the durable Run fence before readiness returns", async (t) => {
+  const fx = fixture(t, "claude");
+  const roleName = "worker";
+  const role = fx.roles.get(roleName);
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  const run = createAgentRun(
+    "agent-run-1",
+    fx.task.id,
+    roleName,
+    "new",
+    "deliver before Claude readiness",
+    NOW,
+    { effective }
+  );
+  const target = { kind: "role", taskId: fx.task.id, roleName };
+  fx.store.transaction((tx) => {
+    tx.saveRole(fx.task.id, updateRoleStatus(role, "running", NOW));
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, target, "run-dispatched", NOW, [
+      { type: "run", taskId: fx.task.id, id: run.id }
+    ]);
+  });
+  const launchId = "runtime-test:generation:claude-pre-input";
+  fx.schedulerStore.reserveRuntimeLaunch({
+    owner: owner(fx, roleName),
+    launchId,
+    runId: run.id
+  }, () => {}, NOW);
+  const nativeSessionId = "claude-native-pre-input";
+  const preparedSession = {
+    agentId: fx.agent.id,
+    adapterId: fx.agent.adapterId,
+    nativeSessionId,
+    status: "ready",
+    effective: run.effective
+  };
+  const inbox = new FileRuntimeEventInbox(fx.home, () => NOW);
+  const processor = new FileRuntimeEventProcessor(inbox, fx.schedulerStore);
+  let persistedBeforeReadiness = false;
+  let hookError;
+  const delivery = {
+    async prepareRoleSession() {
+      return {
+        deliveryId: "delivery-claude-pre-input",
+        taskId: fx.task.id,
+        roleName,
+        agentId: fx.agent.id,
+        adapterId: fx.agent.adapterId,
+        mode: "new",
+        runId: run.id,
+        launchId,
+        sessionStarted: true,
+        session: preparedSession
+      };
+    },
+    async waitUntilReady(prepared) {
+      const sessions = fx.store.getTaskRoleSessionSet(fx.task.id, roleName);
+      persistedBeforeReadiness = sessions?.inFlight?.runId === run.id
+        && fx.store.getRoleSession(fx.task.id, roleName)?.nativeSessionId === nativeSessionId;
+      try {
+        await runClaudeLifecycleHookCommand(
+          JSON.stringify({
+            hook_event_name: "SessionStart",
+            session_id: nativeSessionId,
+            source: "startup"
+          }),
+          {
+            YUI_HOME: fx.home,
+            YUI_SESSION_SCOPE: "task",
+            YUI_WORKSPACE: fx.home,
+            YUI_ADAPTER_ID: "claude",
+            YUI_TASK_ID: fx.task.id,
+            YUI_ROLE: roleName,
+            YUI_AGENT_ID: fx.agent.id,
+            YUI_LAUNCH_ID: launchId,
+            YUI_RUN_ID: run.id,
+            YUI_NATIVE_SESSION_ID: nativeSessionId
+          },
+          async () => {
+            processor.drain(NOW);
+            return {};
+          }
+        );
+      } catch (error) {
+        hookError = error;
+      }
+      return { prepared, session: preparedSession };
+    },
+    async sendOnce() { return "sent"; },
+    async inspectRole() { return "present"; },
+    forgetPrepared() {}
+  };
+
+  const [result] = await processActiveRoleRunDeliveries(
+    fx.schedulerStore,
+    delivery,
+    NOW
+  );
+
+  assert.equal(persistedBeforeReadiness, true);
+  assert.equal(hookError, undefined, hookError?.message);
+  assert.equal(result.status, "delivered", result.error);
+  assert.equal(fx.store.getAgentRun(fx.task.id, run.id).deliveredAt, undefined);
+});
+
 test("a fresh Codex argv prompt without provider acknowledgement retains the reservation and never falls back to push", async (t) => {
   const fx = fixture(t);
   const item = updateWorkItemStatus(createWorkItem(
@@ -624,6 +1147,7 @@ test("a known Claude preparation retains its exact Run reservation until deliver
   });
 
   const prepared = await delivery.prepareRoleSession(input);
+  assert.equal(prepared.session.nativeSessionId, "claude-native-1");
   const ready = await delivery.waitUntilReady(prepared);
   assert.equal(ready.session.nativeSessionId, "claude-native-1");
   assertReservation(fx, input.roleName, prepared.launchId);
@@ -1215,7 +1739,14 @@ for (const recoveryLoss of ["stopped", "recreated"]) {
       "failed"
     );
     assert.equal(recovery.store.getActiveAgentRun(fx.task.id, fx.roleName), null);
-    assert.equal(recovery.store.getTaskRoleSessionSet(fx.task.id, fx.roleName), null);
+    if (recoveryLoss === "recreated") {
+      const settledSessions = recovery.store.getTaskRoleSessionSet(fx.task.id, fx.roleName);
+      assert.ok(settledSessions);
+      assert.deepEqual(settledSessions.sessions, {});
+      assert.equal(settledSessions.inFlight, null);
+    } else {
+      assert.equal(recovery.store.getTaskRoleSessionSet(fx.task.id, fx.roleName), null);
+    }
     assert.equal(
       hasRuntimeCleanupObligation(reservationMailbox(fx, fx.roleName)),
       true
@@ -1274,7 +1805,10 @@ for (const initialState of ["starting", "unavailable"]) {
     const failed = recovery.store.getAgentRun(fx.task.id, fx.run.id);
     assert.equal(failed.pushedAt, undefined);
     assert.equal(failed.deliveredAt, undefined);
-    assert.equal(recovery.store.getTaskRoleSessionSet(fx.task.id, fx.roleName), null);
+    const settledSessions = recovery.store.getTaskRoleSessionSet(fx.task.id, fx.roleName);
+    assert.ok(settledSessions);
+    assert.deepEqual(settledSessions.sessions, {});
+    assert.equal(settledSessions.inFlight, null);
     const workerStarts = fx.controls.starts.filter(
       (request) => request.owner.roleName === fx.roleName
     );

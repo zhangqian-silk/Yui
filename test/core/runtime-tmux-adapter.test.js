@@ -72,9 +72,11 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
     runId: "agent-run-1"
   });
 
-  const binding = await host.start(request);
+  const binding = await host.start(request, (preflight) => {
+    calls.push(["preflight", preflight]);
+  });
 
-  assert.deepEqual(calls.slice(0, 2), [
+  assert.deepEqual(calls.slice(0, 3), [
     ["plan", {
       taskId: "task-1",
       roleName: "leader",
@@ -84,6 +86,14 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
       launchId: "launch-1",
       mode: "new",
       runId: "agent-run-1"
+    }],
+    ["preflight", {
+      owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+      launchId: "launch-1",
+      runId: "agent-run-1",
+      agentId: "codex-personal",
+      adapterId: "codex",
+      effective: effective()
     }],
     ["ensure-async", "task-1", fakePlan().role, fakePlan().launch]
   ]);

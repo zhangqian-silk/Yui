@@ -24,6 +24,7 @@ import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import type { RuntimeLaunchPreStart } from "../runtime/ports.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { TaskRuntimeLaunchPolicy } from "../runtime/taskRuntimeIsolation.js";
 
@@ -437,6 +438,15 @@ export type PreparedRoleDelivery = Readonly<{
   mode: RoleSessionLaunchMode;
   /** The prepare request created a new external Role window/process. */
   sessionStarted: boolean;
+  /**
+   * Exact native Session reserved by preparation, when the provider exposes it
+   * before readiness. `null` is meaningful for a fresh runtime-discovered
+   * Session (for example Codex); omission preserves older delivery adapters
+   * that do not expose a pre-readiness Session fact.
+   */
+  session?: SchedulerRoleSession | null;
+  /** Provider launch argv carried this Run's first prompt atomically. */
+  inputSubmittedAtLaunch?: boolean;
 }>;
 
 export type ReadyRoleDelivery = Readonly<{
@@ -463,6 +473,7 @@ export interface TmuxDeliveryPort {
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;
+    beforeHostStart?: RuntimeLaunchPreStart;
   }>): Promise<PreparedRoleDelivery>;
   waitUntilReady(delivery: PreparedRoleDelivery): Promise<ReadyRoleDelivery>;
   sendOnce(input: Readonly<{

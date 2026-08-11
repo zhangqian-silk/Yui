@@ -193,8 +193,16 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
   });
   const starts = [];
   const sessionHost = {
-    async start(request) {
+    async start(request, beforeHostStart) {
       starts.push(request);
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        ...(request.runId === undefined ? {} : { runId: request.runId }),
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective
+      });
       return {
         id: "binding-workspace",
         launchId: request.launchId,

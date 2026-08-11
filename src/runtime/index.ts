@@ -36,6 +36,8 @@ export {
   type PromptPushResult,
   RuntimeLaunchError,
   type RuntimeLaunchPersistence,
+  type RuntimeLaunchPreflight,
+  type RuntimeLaunchPreStart,
   type RuntimeLaunchPreparationPort,
   type RuntimeLaunchPreparationRequest,
   type SessionHostPort,

@@ -21,6 +21,7 @@ import {
   createSessionLaunchRequest,
   type ActivePromptPushPort,
   type RuntimeBinding,
+  type RuntimeLaunchPreStart,
   type RuntimeLaunchPreparationPort,
   type SessionHostPort
 } from "../runtime/index.js";
@@ -35,6 +36,8 @@ export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
   launch: TmuxLaunchPlan;
   session: SchedulerRoleSession | null;
+  /** Exact Run whose first prompt is carried by a fresh Codex launch argv. */
+  initialPromptRunId?: string;
 }>;
 
 export interface RoleLaunchPlanner {
@@ -141,6 +144,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;
+    beforeHostStart?: RuntimeLaunchPreStart;
   }>): Promise<PreparedRoleDelivery> {
     if (input.mode === "resume" && !hasText(input.nativeSessionId)) {
       throw new Error("Role session resume requires a native session id.");
@@ -192,7 +196,9 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
                 mode: "resume",
                 nativeSessionId: input.nativeSessionId!
               },
-          "deferred"
+          "deferred",
+          undefined,
+          input.beforeHostStart
         );
       } else {
         const request = input.mode === "new"
@@ -208,8 +214,8 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
               nativeSessionId: input.nativeSessionId!
             });
         binding = request.mode === "new"
-          ? await this.runtimePorts.sessionHost.start(request)
-          : await this.runtimePorts.sessionHost.resume(request);
+          ? await this.runtimePorts.sessionHost.start(request, input.beforeHostStart)
+          : await this.runtimePorts.sessionHost.resume(request, input.beforeHostStart);
       }
       sessionStarted = binding.hostCreated === true;
       session = binding.nativeSessionId === undefined
@@ -225,7 +231,15 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     const delivery: PreparedRoleDelivery = {
       ...deliveryBase,
       ...(binding === undefined ? {} : { launchId: binding.launchId }),
-      sessionStarted
+      sessionStarted,
+      session,
+      ...(
+        sessionStarted
+        && input.runId !== undefined
+        && planned?.initialPromptRunId === input.runId
+          ? { inputSubmittedAtLaunch: true }
+          : {}
+      )
     };
     this.#prepared.set(delivery.deliveryId, {
       delivery,

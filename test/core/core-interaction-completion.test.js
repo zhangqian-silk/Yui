@@ -145,6 +145,9 @@ const PUBLIC_PATHS = [
   "task run settle",
   "task run recover",
   "task run yield",
+  "task review",
+  "task review request",
+  "task review retry",
   "task integration",
   "task integration start",
   "task integration continue",
@@ -319,6 +322,7 @@ test("interaction policies cover missing task, work, Integration, and job identi
     [["role", "show"], 2, "global-roles"],
     [["task", "role", "show"], 4, "task-roles"],
     [["task", "work", "accept"], 3, "work-items"],
+    [["task", "review", "request"], 3, "tasks"],
     [["task", "integration", "list"], 3, "tasks"],
     [["task", "integration", "resolve"], 3, "integration-attempts"],
     [["jobs", "retry"], 2, "jobs"]
@@ -336,6 +340,15 @@ test("interaction policies cover missing task, work, Integration, and job identi
       `${path.join(" ")} does not select ${provider}`
     );
   }
+
+  const reviewRequest = findInteractionPolicy(findCommandNode(["task", "review", "request"]));
+  assert.ok(reviewRequest);
+  assert.deepEqual(reviewRequest.selectors.find(({ option }) => option === "--role"), {
+    option: "--role",
+    entity: "global-role",
+    provider: "global-roles",
+    actionTarget: false
+  });
 
   const archive = findInteractionPolicy(findCommandNode(["task", "archive"]));
   assert.deepEqual(archive.confirmation, {

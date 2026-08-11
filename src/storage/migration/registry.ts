@@ -64,9 +64,20 @@ export class MigrationRegistry<Snapshot = unknown> {
         `A ${step.axis}-axis migration step must not declare a recordKind.`
       );
     }
-    if (!Number.isSafeInteger(step.fromVersion) || step.fromVersion < 1) {
+    if (!Number.isSafeInteger(step.fromVersion) || step.fromVersion < 0) {
       throw new MigrationRegistryError(
-        `Migration step fromVersion must be a positive integer: ${String(step.fromVersion)}.`
+        `Migration step fromVersion must be a non-negative integer: ${String(step.fromVersion)}.`
+      );
+    }
+    if (step.fromVersion === 0) {
+      if (step.axis !== "record" || step.introduction !== true || step.toVersion !== 1) {
+        throw new MigrationRegistryError(
+          "Only an explicit record-family introduction may use the 0->1 transition."
+        );
+      }
+    } else if (step.introduction === true) {
+      throw new MigrationRegistryError(
+        "A record-family introduction must be the explicit 0->1 transition."
       );
     }
     if (step.toVersion !== step.fromVersion + 1) {
