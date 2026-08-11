@@ -181,9 +181,10 @@ test("Yui-specific test workflow stays in its Project Skill", () => {
     "develop-yui",
     "SKILL.md"
   ), "utf8");
-  const genericSkills = ["yui-leader", "yui-worker", "yui-reviewer", "yui-operator"].map((name) => (
-    readFileSync(join(root, "skills", name, "SKILL.md"), "utf8")
-  ));
+  const genericSkills = ["yui-leader", "yui-worker", "yui-reviewer", "yui-operator"].map((name) => ({
+    name,
+    contents: readFileSync(join(root, "skills", name, "SKILL.md"), "utf8")
+  }));
 
   assert.match(projectSkill, /Apply this Skill only to development of the Yui repository itself/u);
   assert.match(projectSkill, /Unit, Isolated Integration, and Mock Agent\s+Session coverage/u);
@@ -191,12 +192,19 @@ test("Yui-specific test workflow stays in its Project Skill", () => {
   assert.match(projectSkill, /skip it without creating an InputRequest/u);
   assert.match(projectSkill, /compatibility only through explicit migrations/u);
   assert.match(projectSkill, /tier names[\s\S]*belong to the Yui Project[\s\S]*must not become generic Yui CLI/u);
-  for (const skill of genericSkills) {
+  for (const { name, contents: skill } of genericSkills) {
     assert.match(skill, /real models, paid APIs, shared infrastructure, production systems,\s+real\s+account\s+quota/iu);
     assert.match(skill, /generic request to implement, test, validate, run\s+E2E, or\s+complete work does not grant/iu);
     assert.match(skill, /available\s+credentials,\s+an installed provider CLI, a Project Policy, or a test label/iu);
     assert.match(skill, /Unless the user\s+proactively names the concrete real-resource validation[\s\S]*skip it without\s+creating an InputRequest/iu);
     assert.match(skill, /(?:explicit request|explicitly name)[\s\S]*resource,\s+effect,\s+and\s+isolation boundary/iu);
+    const noPromptBoundary = {
+      "yui-leader": /skip it without\s+creating an InputRequest or blocking the Task/iu,
+      "yui-worker": /skip it without\s+creating an InputRequest or blocking the WorkItem/iu,
+      "yui-reviewer": /skip it without\s+creating an InputRequest or blocking the ReviewRound/iu,
+      "yui-operator": /skip it without\s+creating an InputRequest or soliciting authorization/iu
+    }[name];
+    assert.match(skill, noPromptBoundary);
     assert.doesNotMatch(skill, /YUI_ALLOW_PROVIDER_E2E|Provider E2E|Mock Agent Session/u);
   }
 });
