@@ -27,6 +27,23 @@ export type GitWorkspaceRefresh = Readonly<{
   changed: boolean;
 }>;
 
+/** A remote branch resolved without changing the caller's checkout. */
+export type GitRemoteHead = Readonly<{
+  branch: string;
+  commit: string;
+}>;
+
+/** A remote baseline merge stopped for an explicit Leader resolution. */
+export class RemoteBaselineConflictError extends Error {
+  readonly affectedPaths: readonly string[];
+
+  constructor(affectedPaths: readonly string[], message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RemoteBaselineConflictError";
+    this.affectedPaths = [...affectedPaths];
+  }
+}
+
 export interface GitWorkspacePort {
   inspect(repositoryPath: string, baseRef?: string): Promise<GitRepositoryInspection>;
   isAncestor(
@@ -41,6 +58,18 @@ export interface GitWorkspacePort {
     remoteUrl: string;
     stableRef: string;
   }>): Promise<GitWorkspaceRefresh>;
+  /** Optional because older test doubles and non-delivery callers do not
+   * participate in Task completion remote reconciliation. */
+  mergeRemoteIntoWorktree?(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    branch: string;
+  }>): Promise<GitWorkspaceRefresh>;
+  fetchRemoteHeadIntoWorktree?(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    branch: string;
+  }>): Promise<GitRemoteHead>;
   clone(input: Readonly<{
     remoteUrl: string;
     destination: string;
@@ -87,6 +116,104 @@ export interface GitWorkspacePort {
 
 /** The small Git boundary used by project registration and Task workspaces. */
 export class NodeGitWorkspace implements GitWorkspacePort {
+  /**
+   * Resolve the configured Project branch directly from its remote.  This is
+   * deliberately read-only: unlike `refresh`, it never advances the stable
+   * Project checkout or changes its refs.
+   */
+  async resolveRemoteHead(input: Readonly<{
+    remoteUrl: string;
+    branch: string;
+  }>): Promise<GitRemoteHead> {
+    const remote = safeRemote(input.remoteUrl);
+    const configuredBranch = await safeFetchBranch(input.branch);
+    const branch = configuredBranch === "HEAD"
+      ? await resolveRemoteHeadBranch(remote)
+      : configuredBranch;
+    const commit = await resolveRemoteBranchCommit(remote, branch);
+    return { branch, commit };
+  }
+
+  /**
+   * Merge a remote Project baseline into a clean, managed worktree.  The
+   * fetch is performed from that worktree and the stable checkout is never
+   * touched.  Fast-forward updates are preferred; a diverged baseline gets a
+   * deterministic merge commit so the caller can run its normal Integration
+   * checks and CAS the target ref.
+   */
+  async mergeRemoteIntoWorktree(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    branch: string;
+  }>): Promise<GitWorkspaceRefresh> {
+    const initial = await this.inspect(input.repositoryPath, "HEAD");
+    if (!await this.isClean(initial.root)) {
+      throw new Error("Managed Task/Integration worktree must be clean before remote merge.");
+    }
+    const fetched = await this.fetchRemoteHeadIntoWorktree(input);
+    const fetchedCommit = fetched.commit;
+    if (fetchedCommit === initial.baseCommit) {
+      return { fromCommit: initial.baseCommit, toCommit: fetchedCommit, changed: false };
+    }
+    if (await gitSucceeds([
+      "-C", initial.root,
+      "merge-base", "--is-ancestor", fetchedCommit, initial.baseCommit
+    ])) {
+      // The Task already contains the current remote baseline.
+      return { fromCommit: initial.baseCommit, toCommit: initial.baseCommit, changed: false };
+    }
+    if (await gitSucceeds([
+      "-C", initial.root,
+      "merge-base", "--is-ancestor", initial.baseCommit, fetchedCommit
+    ])) {
+      await git(["-C", initial.root, "merge", "--ff-only", "--no-edit", "FETCH_HEAD"]);
+    } else {
+      try {
+        await git([
+          "-C", initial.root,
+          "-c", "user.name=Yui",
+          "-c", "user.email=yui@local",
+          "merge", "--no-edit", "--no-ff", "FETCH_HEAD"
+        ]);
+      } catch (error) {
+        const affected = (await git([
+          "-C", initial.root,
+          "diff", "--name-only", "--diff-filter=U"
+        ])).trim().split("\n").filter(Boolean);
+        const suffix = affected.length === 0 ? "" : ` (${affected.join(", ")})`;
+        throw new RemoteBaselineConflictError(
+          affected,
+          `Remote baseline merge conflicts in managed worktree${suffix}; resolve it in the Integration workspace.`,
+          { cause: error }
+        );
+      }
+    }
+    const mergedCommit = (await gitLine([
+      "-C", initial.root,
+      "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"
+    ])).toLowerCase();
+    if (!await this.isClean(initial.root)) {
+      throw new Error("Remote baseline merge left the managed worktree dirty.");
+    }
+    return { fromCommit: initial.baseCommit, toCommit: mergedCommit, changed: true };
+  }
+
+  /** Fetch a remote branch into a managed worktree without changing HEAD. */
+  async fetchRemoteHeadIntoWorktree(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    branch: string;
+  }>): Promise<GitRemoteHead> {
+    const repositoryPath = (await this.inspect(input.repositoryPath, "HEAD")).root;
+    const remote = safeRemote(input.remoteUrl);
+    const configuredBranch = await safeFetchBranch(input.branch);
+    const branch = configuredBranch === "HEAD"
+      ? await resolveRemoteHeadBranch(remote)
+      : configuredBranch;
+    await git(["-C", repositoryPath, "fetch", "--no-tags", remote, `refs/heads/${branch}`]);
+    return { branch, commit: await resolveFetchedCommit(repositoryPath) };
+  }
+
   async refresh(input: Readonly<{
     repositoryPath: string;
     remoteUrl: string;
@@ -642,6 +769,33 @@ async function resolveRemoteHeadBranch(remote: string): Promise<string> {
   } catch {
     throw invalidRemoteHead();
   }
+}
+
+async function resolveRemoteBranchCommit(remote: string, branch: string): Promise<string> {
+  let output: string;
+  try {
+    output = await git(["ls-remote", remote, `refs/heads/${branch}`]);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Git command failed.";
+    throw new Error(`Project remote branch could not be resolved: ${detail}`, { cause: error });
+  }
+  const line = output.split("\n").find((entry) => entry.trim().length > 0);
+  const commit = line?.trim().split(/\s+/u)[0] ?? "";
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/iu.test(commit)) {
+    throw new Error(`Project remote branch could not be resolved: ${branch}.`);
+  }
+  return commit.toLowerCase();
+}
+
+async function resolveFetchedCommit(repositoryPath: string): Promise<string> {
+  const commit = (await gitLine([
+    "-C", repositoryPath,
+    "rev-parse", "--verify", "--end-of-options", "FETCH_HEAD^{commit}"
+  ])).toLowerCase();
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(commit)) {
+    throw new Error("Git returned an invalid fetched remote commit.");
+  }
+  return commit;
 }
 
 function invalidRemoteHead(): Error {

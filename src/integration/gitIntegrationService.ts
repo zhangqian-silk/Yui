@@ -7,7 +7,11 @@ import { promisify } from "node:util";
 import { selectEnvironment } from "../agent/launchEnvironment.js";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import type { CheckResult } from "./checkResult.js";
-import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
+import {
+  NodeGitWorkspace,
+  RemoteBaselineConflictError,
+  type GitWorkspacePort
+} from "../repository/gitWorkspace.js";
 import type { GitWorkspaceRemoval } from "../repository/gitWorkspace.js";
 import { resolveWorktreeRoot } from "../repository/taskWorkspacePreparer.js";
 import {
@@ -65,11 +69,17 @@ export type IntegrationResult =
   | Readonly<{ status: "failed"; attempt: IntegrationAttempt; workspace?: IntegrationWorkspace }>;
 
 type PlannedCommit = Readonly<{ changeSetId: string; commit: string }>;
+export const REMOTE_BASELINE_CONFLICT_PREFIX = "Remote baseline merge conflicts";
 export type IntegrationWorkspace = Readonly<{
   projectId: string;
   path: string;
   branch: string;
   baseCommit: string;
+}>;
+
+export type RemoteBaseline = Readonly<{
+  remoteUrl: string;
+  branch: string;
 }>;
 
 export class GitIntegrationService {
@@ -92,7 +102,11 @@ export class GitIntegrationService {
     this.runtimeIsolation = runtimeIsolation;
   }
 
-  async integrate(taskId: string, integrationId: string): Promise<IntegrationResult> {
+  async integrate(
+    taskId: string,
+    integrationId: string,
+    options: Readonly<{ remoteBaseline?: RemoteBaseline }> = {}
+  ): Promise<IntegrationResult> {
     const initial = requireIntegration(this.store, taskId, integrationId);
     const task = this.store.getTask(initial.taskId);
     if (task === null || !task.projectBindings.some(
@@ -150,6 +164,19 @@ export class GitIntegrationService {
     let current = initial;
 
     try {
+      if (options.remoteBaseline !== undefined) {
+        const mergeRemote = this.git.mergeRemoteIntoWorktree;
+        if (mergeRemote === undefined) {
+          throw new Error(
+            "Integration Git workspace does not support remote baseline reconciliation."
+          );
+        }
+        await mergeRemote.call(this.git, {
+          repositoryPath: prepared.path,
+          remoteUrl: options.remoteBaseline.remoteUrl,
+          branch: options.remoteBaseline.branch
+        });
+      }
       const plan = await integrationCommitPlan(
         this.store,
         task.id,
@@ -158,7 +185,10 @@ export class GitIntegrationService {
         current.expectedHead
       );
       let remaining = plan;
-      if (current.resolution?.action === "manual-resolution") {
+      if (current.resolution?.action === "manual-resolution"
+        && current.conflict?.summary.startsWith(REMOTE_BASELINE_CONFLICT_PREFIX)) {
+        await completeRemoteBaselineResolution(prepared.path);
+      } else if (current.resolution?.action === "manual-resolution") {
         const resolvedCommit = await completeManualResolution(prepared.path);
         const resolvedIndex = plan.findIndex(({ commit }) => commit === resolvedCommit);
         if (resolvedIndex < 0) {
@@ -199,6 +229,14 @@ export class GitIntegrationService {
       this.store.saveIntegrationAttempt(task.id, committed);
       return this.#terminalResult("committed", committed, workspace);
     } catch (error) {
+      if (error instanceof RemoteBaselineConflictError) {
+        const pending = requireLeaderDecision(current, {
+          affectedPaths: error.affectedPaths,
+          summary: error.message
+        }, this.now());
+        this.store.saveIntegrationAttempt(task.id, pending);
+        return { status: "blocked", attempt: pending, workspace };
+      }
       if (current.status === "validating" && current.candidateCommit !== undefined) {
         const target = await resolveRef(project.path, current.targetRef);
         if (target === current.candidateCommit) {
@@ -448,6 +486,24 @@ async function completeManualResolution(path: string): Promise<string> {
       "cherry-pick", "--continue"]);
   }
   return cherryPickHead;
+}
+
+async function completeRemoteBaselineResolution(path: string): Promise<void> {
+  const unmerged = (await git(["-C", path, "diff", "--name-only", "--diff-filter=U"])).trim();
+  if (unmerged.length > 0) {
+    throw new Error(`Manual remote baseline resolution is incomplete: ${unmerged.split("\n").join(", ")}.`);
+  }
+  try {
+    await gitLine(["-C", path, "rev-parse", "--verify", "MERGE_HEAD"]);
+  } catch {
+    throw new Error("Manual remote baseline resolution has no active merge.");
+  }
+  await git([
+    "-C", path,
+    "-c", "user.name=Yui",
+    "-c", "user.email=yui@local",
+    "commit", "--no-edit"
+  ]);
 }
 
 async function runChecks(

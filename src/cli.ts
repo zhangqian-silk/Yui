@@ -65,6 +65,7 @@ import {
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
+import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
   assertFileTaskControllerStorageCompatible,
@@ -897,6 +898,14 @@ export async function main(): Promise<void> {
           throw usageError(error instanceof Error ? error.message : String(error));
         }
       }
+    }
+    if (resolved[1] === "complete" && resolved[2] !== undefined) {
+      await reconcileTaskRemoteBaselines(
+        resolved[2],
+        store,
+        home,
+        { environment: process.env }
+      );
     }
     const candidateGitSnapshot = await candidateSnapshotForTaskCommand(
       resolved,
