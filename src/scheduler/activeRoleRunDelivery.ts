@@ -181,6 +181,8 @@ export async function processActiveRoleRunDeliveries(
           });
         }
         const ready = await delivery.waitUntilReady(prepared);
+        deliveryAttempted = deliveryAttempted
+          || ready.prepared.inputSubmittedAtLaunch === true;
         const session = validateReadySession(
           role,
           run.effective,

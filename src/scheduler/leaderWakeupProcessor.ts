@@ -243,6 +243,8 @@ export async function processLeaderWakeups(
         });
       }
       const ready = await delivery.waitUntilReady(prepared);
+      deliveryAttempted = deliveryAttempted
+        || ready.prepared.inputSubmittedAtLaunch === true;
       const latestTask = store.getTask(task.id);
       if (latestTask === null || latestTask.status !== "active") {
         delivery.forgetPrepared?.({
