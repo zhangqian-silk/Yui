@@ -207,7 +207,7 @@ test("Yui-specific test workflow stays in its Project Skill", () => {
     assert.match(skill, noPromptBoundary);
     assert.doesNotMatch(
       skill,
-      /YUI_ALLOW_PROVIDER_E2E|YUI_ALLOW_RELEASE_E2E|Provider E2E|Release E2E|Isolated Integration|Mock Agent Session/u
+      /YUI_ALLOW_PROVIDER_E2E|YUI_ALLOW_RELEASE_E2E|Provider\s+E2E|Release\s+E2E|Isolated\s+Integration|Mock\s+Agent\s+Session/u
     );
   }
 });
