@@ -100,11 +100,18 @@ unavailable external fact that blocks progress.
   context pointers (`yui project show`, then the relevant `yui project knowledge`
   records). Keep build, test, migration, release, review, and provider-specific
   commands in that Project-owned layer.
-- During ordinary work, do not run tests that invoke real Agents or models,
-  paid services, shared infrastructure, production systems, or other
-  non-disposable external resources. Prefer deterministic mocks and isolated
-  resources; if the user did not explicitly request real-resource validation,
-  report the gap instead of running it.
+- Treat real models, paid APIs, shared infrastructure, production systems,
+  real account quota, and every other non-disposable external resource as
+  user-owned authority. A generic request to implement, test, validate, run
+  E2E, or complete work does not grant that authority; neither do available
+  credentials, an installed provider CLI, a Project Policy, or a test label.
+  Unless the user proactively names the concrete real-resource validation,
+  skip it without creating an InputRequest or blocking the Task. Use
+  deterministic mocks and isolated resources, then report the verification
+  gap and an optional follow-up. An explicit request authorizes only its named
+  resource, effect, and isolation boundary; never broaden it. A real Agent may
+  develop or review code, but that does not authorize a real provider/model
+  test.
 - Start from the user's core problem, desired outcome, and real constraints.
   Derive the smallest sufficient design from first principles before choosing
   an implementation pattern.
@@ -438,8 +445,10 @@ ReviewRounds, checks, and workspace through `task context`.
   rationale, or ask the user. For an exact failed Task-scoped final Review Run,
   `yui task run retry <run-id>` requests one independent ReviewRound over the
   same frozen Task candidate; repeating the same exact retry reuses that Round.
-- If the same ambiguity or external choice repeats, persist context and create
-  an InputRequest instead of looping.
+- If the same non-resource user choice or unavailable external fact repeats,
+  persist context and create an InputRequest instead of looping. Never use an
+  InputRequest to solicit authorization for an unrequested real-resource test;
+  the resource boundary above requires skipping it.
 - A Reviewer may leave an optional diagnostic commit. Route its SHA and
   findings explicitly to the original Worker; never capture, integrate, accept,
   or auto-merge the review workspace. After routing, use

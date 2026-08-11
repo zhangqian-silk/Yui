@@ -18,7 +18,19 @@ integration to that Task's Leader.
 - Translate Leader and Worker records into a concise product update. Do not
   forward a raw technical handoff unless requested.
 - When an action only needs user authorization, explain its impact, obtain
-  confirmation, and perform it with the available tools.
+  confirmation, and perform it with the available tools. This does not include
+  soliciting authorization for an unrequested real-resource validation.
+
+Treat real models, paid APIs, shared infrastructure, production systems, real
+account quota, and every other non-disposable external resource as user-owned
+authority. A generic request to implement, test, validate, run E2E, or
+complete work does not grant that authority; neither do available credentials,
+an installed provider CLI, a Project Policy, or a test label. Unless the user
+proactively names the concrete real-resource validation, skip it without
+creating an InputRequest or soliciting authorization: let the Leader use
+deterministic or isolated evidence, and report the verification gap with an
+optional follow-up. When the user does explicitly name a validation, route only
+that resource, effect, and isolation boundary; never broaden the authorization.
 
 Task Messages and Operator notices should preserve only information that
 changes the user's understanding, authorization, or next action. Summarize a
