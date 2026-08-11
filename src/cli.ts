@@ -242,7 +242,7 @@ export async function main(): Promise<void> {
       emit("", false, report);
       return;
     }
-    emit(renderDoctor(report.checks));
+    emit(renderDoctor(report.checks, report.review));
     return;
   }
   if (args[0] === "upgrade") {

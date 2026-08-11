@@ -14,6 +14,10 @@ import { join, relative } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import {
+  createGlobalRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
 import { createUpdatePorts } from "../../dist/cli/updatePorts.js";
 import { buildDoctorReport, runDoctorCommand } from "../../dist/doctor/doctor.js";
 import { CliError } from "../../dist/errors/cliError.js";
@@ -175,6 +179,66 @@ test("FileTaskStore doctor reports schema, state, tools, and configured Agent ca
     ["codex-custom", ["--help"]]
   ]);
   assert.deepEqual(snapshot(home), before);
+});
+
+test("doctor projects Reviewer readiness without launching a Session or model", (t) => {
+  const root = temporaryRoot(t, "yui-file-doctor-reviewer-");
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(createGlobalRole(
+    "reviewer",
+    [createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId })],
+    agent.id,
+    workspace,
+    now,
+    { description: "review" },
+    "write"
+  ));
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const before = snapshot(home);
+  const executor = {
+    run(command, args) {
+      if (command === "git") return "git version 2.45.1";
+      if (command === "tmux") return "tmux 3.4";
+      if (command === "codex" && args[0] === "--version") return "codex 0.144.4";
+      if (command === "codex" && args[0] === "--help") {
+        return "Usage: codex [OPTIONS]\n"
+          + "  -c, --config <key=value>\n"
+          + "  resume [SESSION_ID]\n"
+          + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+          + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
+      }
+      throw new CommandExecutionError("COMMAND_NOT_FOUND");
+    }
+  };
+
+  const report = buildDoctorReport({ YUI_HOME: home }, executor);
+  assert.equal(report.review.status, "ready");
+  assert.equal(report.review.providerNative, "unverified");
+  assert.equal(report.review.roleName, "reviewer");
+  assert.equal(report.checks.find(({ name }) => name === "reviewer dispatch").status, "ok");
+  assert.match(runDoctorCommand([], { YUI_HOME: home }, executor), /Reviewer: ready/);
+  assert.deepEqual(snapshot(home), before);
+
+  const { review: _review, ...withoutReview } = store.getConfig();
+  store.saveConfig(withoutReview);
+  const disabled = buildDoctorReport({ YUI_HOME: home }, executor);
+  assert.equal(disabled.review.status, "disabled");
+  assert.match(runDoctorCommand([], { YUI_HOME: home }, executor), /Reviewer: disabled/);
+
+  store.saveConfig({ ...store.getConfig(), review: { roleName: "missing-reviewer", trigger: "final" } });
+  const missingRole = buildDoctorReport({ YUI_HOME: home }, executor);
+  assert.equal(missingRole.review.status, "misconfigured");
+  assert.equal(missingRole.checks.find(({ name }) => name === "reviewer role").status, "missing");
 });
 
 test("doctor reports compatible-old storage as fully healthy without rewriting it", (t) => {
