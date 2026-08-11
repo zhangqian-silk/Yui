@@ -10,8 +10,11 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
-import { inspectStorageSchema } from "../storage/storageSchema.js";
-import { FileTaskStore } from "../storage/taskStore.js";
+import {
+  inspectStorageSchema,
+  type StorageSchemaState
+} from "../storage/storageSchema.js";
+import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import {
   TmuxManager,
@@ -49,6 +52,10 @@ export type ControllerInventoryScanOptions = Readonly<{
   now?: () => Date;
   /** Reuse the caller's one full pane inventory when already available. */
   panes?: readonly RuntimePaneFact[];
+  inspectStorage?: (home: string) => StorageSchemaState;
+  openCompatibleStore?: (
+    home: string
+  ) => ReturnType<typeof openCompatibleFileTaskStore>;
 }>;
 
 type LinuxProcessStat = Readonly<{
@@ -91,7 +98,7 @@ export async function scanControllerResourceInventory(
   const associatedArtifacts = new Set<string>();
   for (const home of [...homes].sort()) {
     const matchingProcesses = processes.filter(({ yuiHome }) => yuiHome === home);
-    const state = loadHomeState(home, warnings);
+    const state = loadHomeState(home, warnings, options);
     const domain = inspectRuntimeDomain(
       home,
       matchingProcesses,
@@ -630,20 +637,26 @@ function inspectRuntimeDomain(
 
 function loadHomeState(
   home: string,
-  warnings: string[]
+  warnings: string[],
+  options: Pick<ControllerInventoryScanOptions, "inspectStorage" | "openCompatibleStore">
 ): Readonly<{
   storageStatus: RuntimeHomeFact["storageStatus"];
   roles: RuntimeRoleFact[];
 }> {
-  const schema = inspectStorageSchema(home);
-  if (schema.status !== "current") {
+  const schema = (options.inspectStorage ?? inspectStorageSchema)(home);
+  const recordOnlyOlder = schema.status === "unsupported"
+    && schema.incompatibleComponent === "record"
+    && schema.direction === "older"
+    && schema.currentLayoutVersion === schema.latestLayoutVersion
+    && schema.currentAggregateSchemaVersion === schema.latestAggregateSchemaVersion;
+  if (schema.status !== "current" && !recordOnlyOlder) {
     return {
       storageStatus: schema.status,
       roles: []
     };
   }
   try {
-    const store = new FileTaskStore(home);
+    const store = (options.openCompatibleStore ?? openCompatibleFileTaskStore)(home);
     const roles: RuntimeRoleFact[] = store.listGlobalRoles().map((role) => {
       const session = activeLiveRoleAgentSession(store.getGlobalRoleSessionSet(role.name));
       const binding = role.agentBindings[role.activeAgentId];
@@ -679,7 +692,7 @@ function loadHomeState(
         });
       }
     }
-    return { storageStatus: "current", roles };
+    return { storageStatus: schema.status, roles };
   } catch (error) {
     warnings.push(`Cannot load runtime ownership for ${home}: ${message(error)}`);
     return { storageStatus: "invalid", roles: [] };

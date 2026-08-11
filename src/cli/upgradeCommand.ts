@@ -1,21 +1,24 @@
 /**
  * `yui upgrade` — the diagnostic/manual storage upgrade entry point.
  *
- * `yui upgrade --dry-run` runs a read-only preflight + plan, validates through
- * the staged loader gate, prints the {@link MigrationReport}, and discards the
- * staged output without ever switching. `yui upgrade` (execute) runs the full
- * fence + quiesce/drain + re-pin + snapshot/switch + post-verify flow, and on any
- * failure reports the precise blocker stage and recovery action without
- * switching. Only paths in the explicit production registry can run; every
- * missing or future path fails closed as `NEEDS_NEW_VERSION`.
+ * `yui upgrade --dry-run` first classifies read-only. Compatible-old validates
+ * through the in-memory current-model gate and returns without staging a Home;
+ * migration-required also proves the offline runtime inventory before it stages
+ * and validates a fresh copy. The hidden `--update-preflight` contract stops at
+ * classification, compatible-source validation, or offline inventory as required
+ * by the classified path, so a staged updater can run it while the old Controller
+ * remains live without a false staged-output validation claim. Execute enters
+ * fence/quiesce/switch only for the offline path. Only explicitly declared
+ * production paths can run; the aggregate `16→17` transition remains an
+ * offline migration.
  *
  * Like `doctor`/`controller`, this command needs a Home but manages its own
  * schema check (it must run against a non-current Home), so it is dispatched
  * before the unconditional `requireStorageSchema` gate in `cli.ts`.
  */
 
+import { createProductionStorageRegistry } from "../storage/compatibleTaskStore.js";
 import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
-import { createProductionMigrationRegistry } from "../storage/upgrade/productionMigrationRegistry.js";
 import {
   runStorageUpgrade,
   type UpgradeResult
@@ -29,9 +32,9 @@ export type UpgradeCommandResult = Readonly<{
 }>;
 
 /**
- * Run the upgrade command. Parses `[--dry-run]`, runs the orchestrator against
- * the resolved Home, and returns rendered text + structured data + an exit code
- * (0 for success/already-current/dry-run, 5 for a blocked upgrade).
+ * Run the upgrade command. Parses the public `[--dry-run]` form plus the staged
+ * updater's internal `--update-preflight` form, then returns rendered text,
+ * structured data, and an exit code (0 for a safe result, 5 for a blocker).
  */
 export async function runUpgradeCommand(
   args: readonly string[],
@@ -44,7 +47,7 @@ export async function runUpgradeCommand(
   const mode = parseUpgradeArgs(args);
   const result = await runStorageUpgrade({
     home,
-    registry: createProductionMigrationRegistry(),
+    registry: createProductionStorageRegistry(),
     latest: latestStorageVersionState(),
     mode,
     ...(options.controllerLifecycle === undefined
@@ -59,21 +62,39 @@ export async function runUpgradeCommand(
   };
 }
 
-function parseUpgradeArgs(args: readonly string[]): "dry-run" | "execute" {
+export type UpgradeCommandMode = "dry-run" | "execute" | "update-preflight";
+
+function parseUpgradeArgs(args: readonly string[]): UpgradeCommandMode {
   if (args.length === 0) return "execute";
   if (args.length === 1 && args[0] === "--dry-run") return "dry-run";
+  // Intentionally omitted from public command help: this is the machine contract
+  // used by a staged `yui update`, not a replacement for user-facing dry-run.
+  if (args.length === 1 && args[0] === "--update-preflight") return "update-preflight";
   throw usageError("Upgrade usage: yui upgrade [--dry-run]");
 }
 
 /** Render an {@link UpgradeResult} as concise, CLI-style text. */
 export function renderUpgradeResult(
   result: UpgradeResult,
-  mode: "dry-run" | "execute"
+  mode: UpgradeCommandMode
 ): string {
   const header = versionHeader(result);
   switch (result.outcome) {
     case "already-current":
       return `${header}\nStorage is already at the current version; nothing to upgrade.`;
+    case "compatible":
+      return `${header}\nStorage is compatible-old and can be opened by the current loader. `
+        + "No Home migration, backup, or switch is required.";
+    case "update-preflight": {
+      const evidence = result.status === "already-current"
+        ? "four-state classification"
+        : result.status === "compatible"
+          ? "four-state classification plus compatible-source validation"
+          : "four-state classification plus a clear offline runtime inventory";
+      return `${header}\nUpdate preflight: ${result.status} (${result.stepCount} step(s)); `
+        + `${evidence}. No staged Home was created, `
+        + "no staged-output loader validation was performed, and storage was not switched.";
+    }
     case "dry-run": {
       const steps = result.report.outcome === "dry-run" ? result.report.steps.length : 0;
       return `${header}\nDry run: validated ${steps} migration step(s) through the loader gate. `
@@ -93,7 +114,7 @@ export function renderUpgradeResult(
           : "Storage was not switched; the authoritative Home is unchanged.";
       return [
         header,
-        `${mode === "dry-run" ? "Dry run" : "Upgrade"} blocked at ${result.stage}: ${result.message}`,
+        `${mode === "dry-run" ? "Dry run" : mode === "update-preflight" ? "Update preflight" : "Upgrade"} blocked at ${result.stage}: ${result.message}`,
         `Action: ${result.action}`,
         unchangedNote
       ].join("\n");

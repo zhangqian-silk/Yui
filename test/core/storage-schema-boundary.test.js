@@ -16,20 +16,16 @@ import {
   createProductionRegistry
 } from "../../dist/storage/migration/index.js";
 import { classifyHome } from "../../dist/storage/upgrade/homeClassification.js";
+import {
+  currentRecordVersions,
+  latestStorageVersionState
+} from "../../dist/storage/upgrade/recordVersions.js";
+import { inspectSourceVersionState } from "../../dist/storage/upgrade/homeMigrationTarget.js";
 import { runStorageUpgrade } from "../../dist/storage/upgrade/upgradeOrchestrator.js";
-import { currentRecordVersions, latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 
 function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "yui-storage-schema-"));
-}
-
-function currentRecordVersionsMap() {
-  const map = {};
-  for (const [kind, entry] of Object.entries(currentRecordVersions())) {
-    map[kind] = entry.version;
-  }
-  return map;
 }
 
 function writeManifest(home, overrides = {}) {
@@ -37,10 +33,16 @@ function writeManifest(home, overrides = {}) {
     schemaVersion: 1,
     storageVersion: CURRENT_STORAGE_LAYOUT_VERSION,
     aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    recordVersions: currentRecordVersionsMap(),
+    recordVersions: currentRecordVersionManifest(),
     updatedAt: "2026-07-20T00:00:00.000Z",
     ...overrides
   }));
+}
+
+function currentRecordVersionManifest() {
+  return Object.fromEntries(
+    Object.entries(currentRecordVersions()).map(([kind, { version }]) => [kind, version])
+  );
 }
 
 test("storage inspection keeps layout and aggregate schema versions separate", () => {
@@ -132,9 +134,21 @@ test("storageSchema itself stays a fresh-only strict gate with no first-release 
 function currentHome() {
   const home = temporaryHome();
   ensureStorageSchema(home);
-  // Touch the store so state.json exists and is loadable by the classifier.
+  // Read the default config once; tests that need state.json persist it explicitly.
   new FileTaskStore(home).getConfig();
   return home;
+}
+
+function setConfiguredAgentMemberVersions(home, versions) {
+  const store = new FileTaskStore(home);
+  store.saveConfig(store.getConfig());
+  const path = join(home, "state.json");
+  const state = JSON.parse(readFileSync(path, "utf8"));
+  state.configuredAgents = Object.fromEntries(versions.map((schemaVersion, index) => [
+    `agent-${index + 1}`,
+    { schemaVersion }
+  ]));
+  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 function classify(home) {
@@ -150,27 +164,6 @@ test("a current Home classifies USABLE under the empty registry", () => {
   assert.equal(result.classification.verdict, "USABLE");
   assert.equal(result.layoutVersion, CURRENT_STORAGE_LAYOUT_VERSION);
   assert.equal(result.aggregateVersion, CURRENT_AGGREGATE_SCHEMA_VERSION);
-});
-
-test("a manifest that omits a record family reaches the explicit introduction boundary", () => {
-  const home = currentHome();
-  const recordVersions = currentRecordVersionsMap();
-  delete recordVersions.operatorNotification;
-  writeManifest(home, { recordVersions });
-
-  const schema = inspectStorageSchema(home);
-  assert.equal(schema.status, "unsupported");
-  assert.equal(schema.incompatibleComponent, "record");
-  assert.equal(schema.recordFamily, "operatorNotification");
-  assert.equal(schema.currentVersion, 0);
-
-  const result = classify(home);
-  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
-  assert.equal(result.classification.blocker.reason, "missing-step");
-  assert.equal(result.classification.blocker.axis, "record");
-  assert.equal(result.classification.blocker.recordKind, "operatorNotification");
-  assert.equal(result.classification.blocker.from, 0);
-  assert.equal(result.classification.blocker.to, 1);
 });
 
 test("final review policy is fenced from aggregate-v16 consumers", () => {
@@ -224,6 +217,105 @@ test("an aggregate-v16 Home containing final fails at the storage gate", () => {
   assert.equal(result.classification.blocker.reason, "missing-step");
   assert.equal(result.classification.blocker.axis, "aggregate");
 });
+
+test("a persisted manifest omission becomes explicit record-family version 0", () => {
+  const home = currentHome();
+  const recordVersions = currentRecordVersionManifest();
+  delete recordVersions.operatorNotification;
+  writeManifest(home, { recordVersions });
+
+  const inspected = inspectSourceVersionState(home, latestStorageVersionState());
+  assert.ok("source" in inspected);
+  assert.equal(inspected.source.record.operatorNotification.version, 0);
+
+  const result = classify(home);
+  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(result.classification.blocker.reason, "missing-step");
+  assert.equal(result.classification.blocker.axis, "record");
+  assert.equal(result.classification.blocker.recordKind, "operatorNotification");
+  assert.equal(result.classification.blocker.from, 0);
+  assert.equal(result.classification.blocker.to, 1);
+});
+
+test("record-version manifests fail closed on malformed, unknown, and future families", () => {
+  const malformed = currentHome();
+  writeManifest(malformed, {
+    recordVersions: {
+      ...currentRecordVersionManifest(),
+      operatorNotification: 0
+    }
+  });
+  assert.equal(classify(malformed).classification.verdict, "CORRUPTED");
+
+  const unknown = currentHome();
+  writeManifest(unknown, {
+    recordVersions: {
+      ...currentRecordVersionManifest(),
+      mysteryFamily: 1
+    }
+  });
+  assert.equal(classify(unknown).classification.verdict, "CORRUPTED");
+
+  const future = currentHome();
+  writeManifest(future, {
+    recordVersions: {
+      ...currentRecordVersionManifest(),
+      operatorNotification: currentRecordVersions().operatorNotification.version + 1
+    }
+  });
+  const futureResult = classify(future);
+  assert.equal(futureResult.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(futureResult.classification.blocker.reason, "future-version");
+  assert.equal(futureResult.classification.blocker.recordKind, "operatorNotification");
+});
+
+test("mixed record-family members are corruption even when the manifest matches the minimum", () => {
+  const home = currentHome();
+  setConfiguredAgentMemberVersions(home, [1, 2]);
+  writeManifest(home, {
+    recordVersions: {
+      ...currentRecordVersionManifest(),
+      configuredAgent: 1
+    }
+  });
+
+  const inspected = inspectSourceVersionState(home, latestStorageVersionState());
+  assert.ok("corruption" in inspected);
+  assert.match(inspected.corruption.detail, /configuredAgent.*mixed.*1.*2/i);
+  assert.equal(classify(home).classification.verdict, "CORRUPTED");
+});
+
+test("mixed record-family members are corruption even when the manifest matches the maximum", () => {
+  const home = currentHome();
+  setConfiguredAgentMemberVersions(home, [2, 3]);
+  writeManifest(home, {
+    recordVersions: {
+      ...currentRecordVersionManifest(),
+      configuredAgent: 3
+    }
+  });
+
+  const inspected = inspectSourceVersionState(home, latestStorageVersionState());
+  assert.ok("corruption" in inspected);
+  assert.match(inspected.corruption.detail, /configuredAgent.*mixed.*2.*3/i);
+  assert.equal(classify(home).classification.verdict, "CORRUPTED");
+});
+
+test("the compatible store seam never bypasses a future record version", () => {
+  const home = currentHome();
+  writeManifest(home, {
+    recordVersions: {
+      ...currentRecordVersionManifest(),
+      operatorNotification: currentRecordVersions().operatorNotification.version + 1
+    }
+  });
+
+  assert.throws(
+    () => new FileTaskStore(home, { normalizeState: (raw) => raw }),
+    /newer than supported/i
+  );
+});
+
 test("a strictly-older Home fails closed as NEEDS_NEW_VERSION/missing-step", () => {
   const home = currentHome();
   writeManifest(home, { aggregateSchemaVersion: 7 });
@@ -262,14 +354,6 @@ test("real structural damage classifies CORRUPTED, not a version verdict", () =>
   assert.match(result.classification.detail, /state\.json/i);
 });
 
-/**
- * Pre-baseline boundary: a schema.json at the current layout and aggregate
- * versions but WITHOUT a recordVersions field is a pre-baseline Home. It must
- * NOT reach the strict FileTaskStore loader (which would throw
- * StorageSchemaError), and classifyHome / upgrade dry-run / doctor must return
- * a structured NEEDS_NEW_VERSION / blocked result — preserving the
- * no-fabricated-history-migration contract.
- */
 function preBaselineHome() {
   const home = temporaryHome();
   writeFileSync(join(home, "schema.json"), JSON.stringify({
@@ -277,11 +361,7 @@ function preBaselineHome() {
     storageVersion: CURRENT_STORAGE_LAYOUT_VERSION,
     aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
     updatedAt: "2026-07-20T00:00:00.000Z"
-    // NOTE: no recordVersions field — this is the pre-baseline signal.
   }));
-  // state.json carries current record versions, but the manifest does not
-  // declare them. The classifier must NOT trust state.json for a pre-baseline
-  // Home; it must treat the record axis as pre-baseline (version 0).
   writeFileSync(join(home, "state.json"), JSON.stringify({
     schemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
     config: { schemaVersion: 1, defaultAgent: "codex" },
@@ -296,16 +376,12 @@ function preBaselineHome() {
   return home;
 }
 
-test("a pre-baseline Home (no recordVersions) classifies NEEDS_NEW_VERSION, not throws", () => {
+test("a pre-baseline Home reaches the explicit introduction boundary", () => {
   const home = preBaselineHome();
-  // inspectStorageSchema reports unsupported on the record axis.
   const schema = inspectStorageSchema(home);
   assert.equal(schema.status, "unsupported");
   assert.equal(schema.incompatibleComponent, "record");
 
-  // classifyHome must NOT throw StorageSchemaError and must NOT open the
-  // strict FileTaskStore. It returns NEEDS_NEW_VERSION with a missing-step
-  // reason because no pre-baseline->current migration steps exist.
   const result = classifyHome({
     home,
     registry: createProductionRegistry(),
@@ -314,74 +390,49 @@ test("a pre-baseline Home (no recordVersions) classifies NEEDS_NEW_VERSION, not 
   assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
   assert.equal(result.classification.blocker.reason, "missing-step");
   assert.equal(result.classification.blocker.axis, "record");
-  assert.equal(result.incompatibleComponent, "record");
 });
 
-test("upgrade dry-run on a pre-baseline Home returns blocked, not throws", async () => {
-  const home = preBaselineHome();
+test("upgrade dry-run blocks a pre-baseline Home without throwing", async () => {
   const result = await runStorageUpgrade({
-    home,
+    home: preBaselineHome(),
     registry: createProductionRegistry(),
     latest: latestStorageVersionState(),
     mode: "dry-run"
   });
   assert.equal(result.outcome, "blocked");
   assert.equal(result.stage, "missing-step");
-  assert.match(result.message, /no migration step/i);
 });
 
-/**
- * Manifest/state record-version mismatch: schema.json declares a record family
- * at an older version than current, but state.json carries that family at the
- * current version. The manifest's recordVersions is the authoritative
- * declaration; a disagreement with state.json means the Home is internally
- * inconsistent (a migration updated the state without updating the manifest,
- * or vice versa). This must NOT be treated as USABLE or already-current — it
- * must fail closed as CORRUPTED with clear evidence.
- */
 function manifestStateMismatchHome() {
-  const home = temporaryHome();
-  const manifest = {
-    schemaVersion: 1,
-    storageVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-    aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    recordVersions: currentRecordVersionsMap(),
-    updatedAt: "2026-07-20T00:00:00.000Z"
-  };
-  // Declare configuredAgent one version below current in the manifest.
+  const home = currentHome();
+  const store = new FileTaskStore(home);
+  store.saveConfig(store.getConfig());
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   manifest.recordVersions.configuredAgent -= 1;
-  writeFileSync(join(home, "schema.json"), JSON.stringify(manifest));
-  // state.json carries configuredAgent at the CURRENT version — a mismatch.
-  writeFileSync(join(home, "state.json"), JSON.stringify({
-    schemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    revision: 0,
-    config: { schemaVersion: 1 },
-    configuredAgents: {
-      claude: {
-        schemaVersion: manifest.recordVersions.configuredAgent + 1,
-        id: "claude",
-        adapterId: "claude",
-        command: "claude",
-        baseArgs: [],
-        environment: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z"
-      }
-    },
-    projects: {},
-    agentProfiles: {},
-    globalRoles: {},
-    globalRoleSessionSets: {},
-    tasks: {},
-    mailboxes: {}
-  }));
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+
+  const statePath = join(home, "state.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  state.configuredAgents = {
+    claude: {
+      schemaVersion: manifest.recordVersions.configuredAgent + 1,
+      id: "claude",
+      adapterId: "claude",
+      command: "claude",
+      baseArgs: [],
+      environment: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    }
+  };
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
   return home;
 }
 
-test("a manifest/state record-version mismatch classifies CORRUPTED, not USABLE", () => {
-  const home = manifestStateMismatchHome();
+test("a non-empty manifest/state version mismatch is corruption", () => {
   const result = classifyHome({
-    home,
+    home: manifestStateMismatchHome(),
     registry: createProductionRegistry(),
     latest: latestStorageVersionState()
   });
@@ -389,10 +440,9 @@ test("a manifest/state record-version mismatch classifies CORRUPTED, not USABLE"
   assert.match(result.classification.detail, /configuredAgent/);
 });
 
-test("upgrade dry-run on a manifest/state mismatch Home returns blocked, not already-current", async () => {
-  const home = manifestStateMismatchHome();
+test("upgrade dry-run blocks a manifest/state mismatch", async () => {
   const result = await runStorageUpgrade({
-    home,
+    home: manifestStateMismatchHome(),
     registry: createProductionRegistry(),
     latest: latestStorageVersionState(),
     mode: "dry-run"

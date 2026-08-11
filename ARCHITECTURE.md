@@ -220,41 +220,88 @@ machine.
 Storage compatibility is modeled on three independent, monotonic version axes:
 `layout` (on-disk `schema.json`, `state.json`, locks), `aggregate` (the
 authoritative document), and `record` — a `recordKind -> version` map so each
-record family versions on its own. A centralized migration framework
-(registry → planner → engine) is generic and domain-free: the engine is
-parameterized over an injected `MigrationTarget` and never hardcodes a Yui
-record list. Compatibility is decided **only** by explicit registered step
-paths, never by version magnitude or semver. The production registry now ships
-the first post-baseline step, aggregate `16 -> 17`; older states are migratable
-only when every adjacent transition to the current state is registered, and
-all other gaps remain fail-closed. `doctor`/`upgrade` classify a home as USABLE,
-MIGRATABLE,
-NEEDS_NEW_VERSION (with a `future-version` or `missing-step` reason plus the
-incompatible layout/aggregate/record component), or CORRUPTED — the last only
-for real structural/reference damage, never inferred from a version number.
+record family versions on its own. A centralized compatibility framework
+(registry → planner → compatible loader or migration engine) is generic and
+domain-free: the engine is parameterized over an injected `MigrationTarget` and
+never hardcodes a Yui record list. Compatibility is decided **only** by explicit
+adjacent transition declarations, never by version magnitude or semver.
+
+The registry separates transition intent from executable transformation. A
+`compatible` declaration is legal only on a single `record` axis and carries
+three obligations: deterministic named defaults, `validateSource` for the exact
+old shape (including rejection of unknown fields), and a normalizer that returns
+a fresh value in the next/current domain model. Layout, aggregate, identity or
+reference meaning, record splits/merges, and transactional semantic changes must
+be declared `offline-migration`; that declaration is runnable only when the
+matching adjacent migration step is registered. A transform without a
+declaration is `missing-declaration`; an offline declaration without a step is
+`missing-step`. Both fail closed. The planner chooses `compatible` only if every
+hop on every changed axis is compatible; one offline hop selects the migration
+engine. Future versions and damaged structures remain unsupported. The
+production registry contains the explicit aggregate `16→17` offline transition;
+no historical record-family normalization is implicitly authorized. A frozen
+post-baseline descriptor snapshot (versions and locators) plus the shared planner
+form the delivery gate: any current-axis advance, locator drift, or new target
+family must have its full declared path before the registry can be constructed.
+
+`doctor`, staged `update` preflight, ordinary store opening, and `upgrade` share
+the same classification: **current** (`USABLE`), **compatible-old**
+(`COMPATIBLE`), **migration-required** (`MIGRATABLE`), or **unsupported**
+(`NEEDS_NEW_VERSION`/`CORRUPTED`). The legacy uppercase verdict remains an
+internal/result compatibility label; the product meaning is the four-state
+vocabulary above.
+
+The staged updater uses a dedicated internal preflight contract, not the user's
+`upgrade --dry-run`. It stops after four-state classification for current Homes,
+strict source/current-model validation for compatible-old Homes, or the
+authoritative offline inventory for migration-required Homes. It does not create
+a migration target, copy or back up the Home, place a fence, touch Controller
+lifecycle, or claim staged-output validation, so the exact old Controller may
+still be running. After this preflight is clear, the update parent captures and
+stops that exact Controller PID; only then does staged activation run the full
+stage, loader validation, and atomic switch. Machine results carry one explicit
+`update-preflight` outcome plus a consistent current/compatible/migration-required
+status; malformed or contradictory combinations fail closed.
 
 The three axes are genuinely independent, including the record axis. The
-scalar `layout`/`aggregate` versions come from `schema.json`; the per-family
-`record` versions are extracted **structurally** from the raw `state.json`
-(read-only JSON traversal following each family's `recordKind -> {version,path}`
-locator), *never* through the strict `FileTaskStore` loader. This matters
-because the loader validates every record against the current release and throws
-on the first older family — which would misreport a home whose only difference is
-an older record family as CORRUPTED and block it from ever migrating. Reading the
-record axis structurally keeps a record-only-older home on its version axis: it
-plans as MIGRATABLE (with a step path) or NEEDS_NEW_VERSION (fail-closed under the
-explicit registry), exactly like an older scalar axis. The strict loader is used
-only to detect a broken reference graph, and only once **every** axis is already
-current (a no-op plan) — the one case where a load failure is genuine corruption
-rather than a version mismatch. CORRUPTED is otherwise reserved for real
+durable `schema.json#/recordVersions` map is authoritative for each persisted
+family version; a family absent from that map is explicit pre-introduction
+version `0`, even when its `state.json` locator is empty. Raw `state.json` is
+traversed only to cross-check the manifest against persisted records, never to
+infer that a missing target family is current. The planner can advance version
+`0` only through an explicitly marked record-family `0->1` introduction; a
+missing declaration or offline transform fails closed. For compatible-old,
+`openCompatibleFileTaskStore` normalizes a fresh
+in-memory snapshot hop by hop, validates the resulting current state with the
+same strict graph gate, and exposes only the current domain model. Commits use
+the existing current `FileTaskStore` writer, so the first write emits only
+current records and advances the durable manifest to the same current versions;
+there is no dual write, no preservation of unknown old fields, and no old writer
+permitted against a newly written Home. For current Homes the
+ordinary strict loader remains the direct path. CORRUPTED is reserved for real
 structural JSON damage: an unparseable `state.json`, a container whose shape does
-not match its locator, or a record with a missing/invalid `schemaVersion`.
+not match its locator, a record with a missing/invalid `schemaVersion`, or a
+reference graph that fails the appropriate strict gate.
 
-`yui upgrade` is the transactional storage-migration entry point. Execute mode
-places an **admission fence** honored at every authoritative write choke point,
-so baseline CLI writers and the Controller (which mutate through the same store)
-refuse to begin a new write while an upgrade owns the Home; the fencing process
-itself is exempt. Durable runtime-inbox `publish` participates in a separate,
+`yui upgrade` is the transactional entry point only for
+**migration-required** Homes. Before constructing a migration target or touching
+the Controller, fence, binary, staging directory, or Home, both dry-run and
+execute re-read an authoritative offline inventory. The blocking facts are an
+active AgentRun, an in-flight Run, a live native Session, a native Session whose
+health cannot be determined, pending turn-completion ownership, a lifecycle
+mailbox, or a durable inbox event. Stopped/history-only Sessions, an idle Role
+with no native process, and an open Input alone are non-blocking. Every blocker
+returns the count plus the available Task/Role/Run/native-session/launch identity
+and reason, asserts the scene is unchanged, and names `yui update` as the user
+re-run boundary. The inspection never kills, resets, rebinds, retries, or drains
+anything. An unreadable inventory is unknown activity and fails closed.
+
+Once that inventory is clear (including on the user's later re-run after a
+block), execute mode places an **admission fence** honored at every authoritative
+write choke point, so baseline CLI writers and the Controller (which mutate
+through the same store) refuse to begin a new write while an upgrade owns the
+Home; the fencing process itself is exempt. Durable runtime-inbox `publish`
+participates in a separate,
 shared sibling coordination boundary: `<home>.upgrade-coordination.lock` lives
 outside the Home and serializes the complete inbox write with the final
 snapshot/copy/two-step switch. A publish acquires that lock, then checks the
@@ -322,9 +369,12 @@ through the real `FileTaskStore` loader gate (record parse + reference graph),
 then atomically switches into place with a timestamped backup and a post-switch
 health check. Any blocked or failed step leaves the authoritative home
 byte-for-byte unchanged and reports the exact stage and recovery action;
-`--dry-run` runs through the validation gate and discards the
-staged output without switching. This release never migrates a real home (the
-registry is empty); the machinery is future-facing.
+User-facing `--dry-run` runs through the validation gate and reports success only
+when the migration engine itself returns its exact `dry-run` evidence. A live
+runtime or any other earlier engine result remains a blocker; it is never wrapped
+as validated. Successful dry-run discards the staged output without switching.
+The aggregate `16→17` transition is the only production offline path in this
+release; compatible record-family normalization remains explicitly declaration-gated.
 
 **Uninitialized home is an actionable blocker, not a no-op.** An
 uninitialized home (never `yui setup`) has no storage to migrate. The classifier
@@ -403,12 +453,39 @@ controller". A lock or discovery file that is provably absent is the only "no
 runtime" case.
 
 `yui update` stages the published package side by side (never replacing the live
-install first), runs the staged binary's read-only preflight against the home,
-and only then migrates storage and promotes the binary, with a new-binary health
-check last. **Same-artifact promotion:** the version resolved at stage time is
-pinned, and binary activation installs that exact `@zq-silk/yui@<version>` — never
-a second bare `@latest` that could resolve to a different build than the one that
-passed preflight. **Only a CONCRETE version is accepted** (R3-F1): the resolver
+install first) and runs that staged binary's read-only classification against the
+Home. Current and compatible-old Homes take the **fast path**: no Home target is
+constructed, copied, backed up, renamed, or replayed, and no Provider Session is
+waited on. The parent captures the exact executable/argv/version identity of the
+old Controller, stops it once with authenticated lifecycle control, promotes the
+same staged artifact, validates the activated binary and compatible loader, then
+starts and authenticates the replacement Controller. Existing managed Sessions
+retain their frozen executable/CLI path, Home, control digest, and exact
+Task/Run/launch/native-Session fence; neither binary promotion nor Controller
+replacement retargets them through PATH. The managed continuity preflight treats
+package-version drift alone as expected for that in-place path, but keeps
+protocol, layout, aggregate, path, Home, digest, and runtime identity strict.
+This lets the old Session record progress and yield through the replacement
+Controller. It does not authorize migration-required storage: that path still
+requires the offline inventory to prove zero live Sessions. A compatible Home
+remains byte-for-byte old until an ordinary new-CLI commit; that first
+current-only write is also the no-auto-downgrade boundary.
+
+Migration-required Homes take the **offline path**. Staged preflight applies the
+offline inventory before the parent stops the Controller, and storage activation
+rechecks it before the child may fence, stage, or mutate the Home. Execute then
+closes pre-admitted writers through `.state.lock` while the fence is held and
+rechecks the same inventory once more before staging. A newly active Run or
+native Session therefore blocks the race window and the parent restores the exact
+captured Controller identity on a clean pre-switch refusal. Only a clear user
+invocation proceeds through the existing complete-Home migration, backup,
+validation, and switch. Neither path writes Task Messages as a heartbeat or
+performs background automatic upgrades.
+
+**Same-artifact promotion:** the version resolved at stage time is pinned, and
+binary activation installs that exact `@zq-silk/yui@<version>` — never a second
+bare `@latest` that could resolve to a different build than the one that passed
+preflight. **Only a CONCRETE version is accepted** (R3-F1): the resolver
 requires a semver-shaped `X.Y.Z` (optional pre-release/build suffix) — a dist-tag
 sentinel like `latest`, an empty/malformed value, or a version probe that does
 not come back in a valid `{ ok:true, data }` envelope at exit 0 all yield "no
@@ -433,8 +510,8 @@ transport error is unresolved — preflight treats it as **blocked**, activation
 also wraps the preflight/activation port calls so an unexpected throw becomes a
 blocked preflight / ambiguous activation, never an uncaught error that could hide
 a committed switch. Only then does the outcome/exit consistency rule apply: a
-*success-class* outcome (`upgraded`, `already-current`, or a
-`dry-run`/`already-current` preflight) is trusted **only when the process also
+*success-class* outcome (`upgraded`, `compatible`, `already-current`, or a
+`dry-run` preflight) is trusted **only when the process also
 exited 0**. A contradiction — stdout says `upgraded` but the process exited
 non-zero — means the child's own contract was violated mid-flight, so it is
 treated as **ambiguous** (activation) or **blocked** (preflight), never a false
@@ -489,16 +566,19 @@ backup is **absent or not a real directory** (already restored or cleaned). A
 non-corresponding receipt reads as "not switched" so recovery advice is never
 derived from stale, legacy, or unrelated evidence.
 
-**Rollback boundary (narrowed):** this release introduces no
-versioned binary pointer or stable launcher and therefore makes no binary+home
-dual-resource atomicity claim. It guarantees isolated staging (a
-stage/preflight failure leaves binary and home unchanged), a recoverable atomic
-storage switch (timestamped backup, restorable until the new version resumes
-writes), and no auto-downgrade after writes resume. The single non-atomic window
-— storage switched, binary promotion then failing — is surfaced with the exact
-backup-restore recovery, and the version-gated axes make the old binary
-fail-close on the new home rather than misread it. task-5 delivers this code and
-its isolated tests only; it never runs an upgrade against a real home.
+**Rollback boundary (narrowed):** the managed Session launcher is an in-place
+forwarder to the currently activated CLI, not a versioned package pointer, so
+this release still makes no binary+Home dual-resource atomicity claim. It
+guarantees isolated staging (a stage/preflight failure leaves binary and Home
+unchanged), a no-Home-mutation fast path, a recoverable atomic storage switch on
+the offline path (timestamped backup, restorable until the new version resumes
+writes), and no auto-downgrade after writes resume. The offline path's single
+non-atomic window — storage switched, binary promotion then failing — is surfaced
+with the exact backup-restore recovery, and the version-gated axes make the old
+binary fail-close on the new Home rather than misread it. This release exercises
+the contracts only against isolated synthetic Homes; the production registry
+contains the aggregate `16→17` offline transition, but this Task does not run a
+migration against any real Home.
 
 **Cross-Task schema scheduling.** Storage schema work is not globally serialized.
 Any module or Task may advance a storage version axis (`layout`, `aggregate`, or
@@ -512,10 +592,11 @@ re-validating the real wiring, and fully re-running the isolated migration/upgra
 E2E and its documentation. This rework-and-reconcile duty belongs to the later
 integrator; it is a deliberate scheduling trade-off (authorized by the user) that
 avoids cross-Task blocking rather than an accident to be repaired ad hoc.
-Concretely, this release's record-version map is a snapshot of the record
-families on the current baseline, not a frozen set: if another Task later lands a
-record-schema change, the integrating branch re-derives the map against the
-newest head and re-tests to convergence under the same strategy.
+Concretely, the current manifest descriptor map is re-derived against the newest
+head, while the post-baseline descriptor snapshot remains frozen. If another
+Task lands a record-schema change, the integrating branch must reconcile both:
+existing-family advances need a complete adjacent path, and a new target family
+needs an explicit `0->1` introduction before re-testing to convergence.
 
 The Web control room is loopback-only and never receives Controller socket
 credentials. It presents durable records and native terminal access without

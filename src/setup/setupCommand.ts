@@ -49,10 +49,9 @@ import {
 import { assertRoleRuntimeMutationAllowed } from "../commands/roleRuntimeGuard.js";
 import {
   ensureYuiHome,
-  FileTaskStore,
   resolveYuiHome
 } from "../storage/taskStore.js";
-import { ensureStorageSchema } from "../storage/storageSchema.js";
+import { initializeCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import type { CommandExecutor } from "../tmux/commandExecutor.js";
 
 export type SetupDependency = "tmux";
@@ -127,8 +126,7 @@ export async function runSetupCommand(
     const question = createSetupQuestion(readline, io);
     const home = resolveYuiHome(env);
     ensureYuiHome(home);
-    ensureStorageSchema(home);
-    const store = new FileTaskStore(home);
+    const store = initializeCompatibleFileTaskStore(home);
     const catalogs = new AgentConfigurationCatalogService(home, { environment: env });
     const result = await configureYui(
       store,
@@ -158,7 +156,7 @@ export async function runSetupCommand(
       `Worker reasoning effort: ${result.workerConfig.effort ?? "CLI default"}.`,
       `Worker permission: ${result.workerConfig.permission.strategy}.`,
       `Project workspace: ${result.workspace}.`,
-      `Time zone: ${resolveTimeZone(new FileTaskStore(home).getConfig().timeZone)}.`
+      `Time zone: ${resolveTimeZone(store.getConfig().timeZone)}.`
     ];
     if (dependency === undefined || dependency === "tmux") {
       lines.push(...await setupTmux(env, executor, question));

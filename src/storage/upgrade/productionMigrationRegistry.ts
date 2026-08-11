@@ -1,15 +1,8 @@
-import { createProductionRegistry } from "../migration/index.js";
-import type { MigrationRegistry } from "../migration/index.js";
-import type { HomeSnapshot } from "./homeMigrationTarget.js";
-
 /**
- * Build the explicit migration graph shipped by this release.
- *
- * This is the single production registry used by both doctor classification and
- * the upgrade command. It is deliberately a factory: callers receive an
- * isolated immutable-in-practice graph and cannot leak test registrations into
- * another command.
+ * Backward-compatible import path for the one production storage registry.
+ * Compatible loading and offline migration share the declaration graph owned by
+ * `storage/migration/productionRegistry.ts`.
  */
-export function createProductionMigrationRegistry(): MigrationRegistry<HomeSnapshot> {
-  return createProductionRegistry();
-}
+export {
+  createProductionStorageRegistry as createProductionMigrationRegistry
+} from "../migration/productionRegistry.js";

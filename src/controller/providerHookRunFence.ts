@@ -1,5 +1,5 @@
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
-import { FileTaskStore } from "../storage/taskStore.js";
+import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import {
   hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
@@ -55,7 +55,7 @@ export function resolveProviderHookRunFence(
     throw new Error("Provider lifecycle hook native session does not match its launch envelope.");
   }
 
-  const store = new FileTaskStore(home);
+  const store = openCompatibleFileTaskStore(home);
   const task = store.getTask(taskId);
   if (task === null || task.status !== "active") {
     throw new Error("Provider lifecycle hook Task is not current and active.");

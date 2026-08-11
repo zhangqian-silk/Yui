@@ -1,4 +1,12 @@
 import assert from "node:assert/strict";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -7,8 +15,26 @@ import {
 } from "../../dist/controller/resourceInventory.js";
 import {
   classifyRuntimeProcess,
-  parseLinuxProcessStat
+  parseLinuxProcessStat,
+  scanControllerResourceInventory
 } from "../../dist/controller/resourceInventoryLinux.js";
+import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import {
+  bindTaskRoleRun,
+  createRoleSessionSet
+} from "../../dist/executor/agentExecutor.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
+import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import { openCompatibleFileTaskStore } from "../../dist/storage/compatibleTaskStore.js";
+import { MigrationRegistry } from "../../dist/storage/migration/index.js";
+import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
+import { activateTask, createTask } from "../../dist/task/task.js";
+import {
+  createAgentRun,
+  recordRoleAgentSession
+} from "../helpers/effectiveLaunch.js";
 
 const HOME = "/tmp/yui-inventory-home";
 const NOW = "2026-07-28T00:00:00.000Z";
@@ -271,6 +297,225 @@ test("inventory attributes live Controller and Role resources", () => {
     nativeSessionId: "thread-role"
   });
 
+});
+
+test("Linux inventory loads exact Role ownership from record-only older storage", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-compatible-inventory-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  ensureStorageSchema(home, now);
+  const agent = createConfiguredAgent("agent-1", "codex", "codex", [], [], now);
+  const task = activateTask(createTask("task-1", "Compatible inventory", now), now);
+  const role = createRole(
+    task.id,
+    "worker",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    home,
+    now
+  );
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  const run = createAgentRun(
+    "agent-run-1",
+    task.id,
+    role.name,
+    "new",
+    "compatible inventory",
+    now,
+    { effective }
+  );
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: role.name },
+    agent.id,
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: "codex",
+    nativeSessionId: "native-1",
+    launchId: "launch-1",
+    policy: "fixed",
+    status: "running",
+    effective
+  }, now);
+  sessions = bindTaskRoleRun(sessions, {
+    agentId: agent.id,
+    runId: run.id,
+    receiptId: `agent-run:${task.id}/${run.id}`
+  }, now);
+  const store = new FileTaskStore(home);
+  store.transaction((tx) => {
+    tx.saveConfiguredAgent(agent);
+    tx.saveTask(task);
+    tx.saveRole(task.id, role);
+    tx.saveActiveAgentRun(run);
+    tx.saveTaskRoleSessionSet(sessions);
+  });
+
+  const statePath = join(home, "state.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  state.configuredAgents[agent.id].schemaVersion = 1;
+  delete state.configuredAgents[agent.id].environment;
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.recordVersions.configuredAgent = 1;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const registry = new MigrationRegistry();
+  registry.registerCompatible({
+    axis: "record",
+    recordKind: "configuredAgent",
+    fromVersion: 1,
+    toVersion: 2,
+    defaults: ["environment=[]"],
+    validateSource: (snapshot) => {
+      assert.equal(snapshot.state.configuredAgents[agent.id].schemaVersion, 1);
+      assert.equal(snapshot.state.configuredAgents[agent.id].environment, undefined);
+    },
+    normalize: (snapshot) => ({
+      ...snapshot,
+      schemaManifest: {
+        ...snapshot.schemaManifest,
+        recordVersions: {
+          ...snapshot.schemaManifest.recordVersions,
+          configuredAgent: 2
+        }
+      },
+      state: {
+        ...snapshot.state,
+        configuredAgents: Object.fromEntries(
+          Object.entries(snapshot.state.configuredAgents).map(([id, configured]) => [
+            id,
+            { ...configured, schemaVersion: 2, environment: [] }
+          ])
+        )
+      }
+    })
+  });
+
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "current",
+    panes: [{
+      taskId: task.id,
+      roleName: role.name,
+      target: "yui-task-1:worker",
+      dead: false,
+      currentCommand: "codex"
+    }],
+    openCompatibleStore: (candidateHome) => {
+      assert.equal(candidateHome, home);
+      return openCompatibleFileTaskStore(candidateHome, {
+        registry,
+        latest: latestStorageVersionState()
+      });
+    }
+  });
+  const resource = snapshot.resources.find(({ kind }) => kind === "agent-session");
+  assert.deepEqual(resource.owner, {
+    kind: "task-role",
+    taskId: task.id,
+    taskTitle: task.title,
+    taskStatus: task.status,
+    roleName: role.name,
+    runId: "agent-run-1",
+    agentId: agent.id,
+    adapterId: "codex",
+    nativeSessionId: "native-1",
+    launchId: "launch-1"
+  });
+});
+
+test("Linux inventory keeps non-compatible and corrupted storage ownership closed", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-closed-inventory-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const panes = [{
+    taskId: "task-1",
+    roleName: "worker",
+    target: "yui-task-1:worker",
+    dead: false,
+    currentCommand: "codex"
+  }];
+  const blocked = [
+    { status: "uninitialized" },
+    { status: "invalid" },
+    {
+      status: "unsupported",
+      incompatibleComponent: "layout",
+      direction: "older",
+      currentLayoutVersion: 5,
+      latestLayoutVersion: 6,
+      currentAggregateSchemaVersion: 17,
+      latestAggregateSchemaVersion: 17
+    },
+    {
+      status: "unsupported",
+      incompatibleComponent: "aggregate",
+      direction: "older",
+      currentLayoutVersion: 6,
+      latestLayoutVersion: 6,
+      currentAggregateSchemaVersion: 16,
+      latestAggregateSchemaVersion: 17
+    },
+    {
+      status: "unsupported",
+      incompatibleComponent: "record",
+      direction: "newer",
+      currentLayoutVersion: 6,
+      latestLayoutVersion: 6,
+      currentAggregateSchemaVersion: 17,
+      latestAggregateSchemaVersion: 17
+    },
+    {
+      status: "unsupported",
+      incompatibleComponent: "record",
+      direction: "older",
+      currentLayoutVersion: 5,
+      latestLayoutVersion: 6,
+      currentAggregateSchemaVersion: 17,
+      latestAggregateSchemaVersion: 17
+    }
+  ];
+  let openCount = 0;
+  for (const storage of blocked) {
+    const snapshot = await scanControllerResourceInventory({
+      currentHome: home,
+      scope: "current",
+      panes,
+      inspectStorage: () => storage,
+      openCompatibleStore: () => {
+        openCount += 1;
+        throw new Error("unexpected compatible open");
+      }
+    });
+    const resource = snapshot.resources.find(({ kind }) => kind === "agent-session");
+    assert.deepEqual(resource.owner, { kind: "none" });
+  }
+  assert.equal(openCount, 0);
+
+  const corrupted = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "current",
+    panes,
+    inspectStorage: () => ({
+      status: "unsupported",
+      incompatibleComponent: "record",
+      direction: "older",
+      currentLayoutVersion: 6,
+      latestLayoutVersion: 6,
+      currentAggregateSchemaVersion: 17,
+      latestAggregateSchemaVersion: 17
+    }),
+    openCompatibleStore: () => {
+      openCount += 1;
+      throw new Error("compatible source is corrupted");
+    }
+  });
+  const resource = corrupted.resources.find(({ kind }) => kind === "agent-session");
+  assert.deepEqual(resource.owner, { kind: "none" });
+  assert.equal(openCount, 1);
+  assert.match(corrupted.warnings.join("\n"), /compatible source is corrupted/i);
+  assert.equal(corrupted.domains[0].storageStatus, "invalid");
 });
 
 test("inventory separates orphaned, unattributed, and stale resources by cleanup safety", () => {

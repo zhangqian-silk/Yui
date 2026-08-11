@@ -250,7 +250,10 @@ test("planner blocks when a nested record family has a broken chain even if scal
 test("classifier: USABLE when every axis equals the current version", () => {
   const registry = createEmptyRegistry();
   const state = versionState({ layout: 2, aggregate: 3 });
-  assert.deepEqual(classifyStorage(registry, state, state), { verdict: "USABLE" });
+  assert.deepEqual(classifyStorage(registry, state, state), {
+    verdict: "USABLE",
+    status: "current"
+  });
 });
 
 test("classifier: MIGRATABLE when strictly older with a complete step path", () => {

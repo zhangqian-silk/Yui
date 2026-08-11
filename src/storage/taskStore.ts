@@ -97,8 +97,12 @@ import {
 } from "../worktree/managedWorkspace.js";
 import { writeTextFileAtomically } from "./durableFile.js";
 import { assertHomeWritable } from "./upgradeFence.js";
-import { CURRENT_AGGREGATE_SCHEMA_VERSION } from "./storageVersions.js";
-import { requireStorageSchema } from "./storageSchema.js";
+import {
+  CURRENT_AGGREGATE_SCHEMA_VERSION,
+  requireCompatibleStorageSchema,
+  requireStorageSchema,
+  writeCurrentStorageManifest
+} from "./storageSchema.js";
 
 export const STORAGE_STATE_FILE = "state.json";
 /** The root StorageState schema is the persisted aggregate document version. */
@@ -143,6 +147,10 @@ export type CompletionShell = typeof COMPLETION_SHELLS[number];
 export type CompletionInstallation = Readonly<{
   scriptPath: string;
   activationPath: string;
+}>;
+export type FileTaskStoreOptions = Readonly<{
+  /** Read-only compatible-old -> current-model normalization before strict parse. */
+  normalizeState?: (raw: string) => string;
 }>;
 export type YuiConfig = Readonly<{
   schemaVersion: typeof CURRENT_CONFIG_SCHEMA_VERSION;
@@ -340,9 +348,11 @@ export type TaskStore = {
 export class FileTaskStore implements TaskStore {
   #transaction: { state: StorageState; baseRevision: number; dirty: boolean } | null = null;
   #readCache: { fingerprint: string; state: StorageState } | null = null;
+  #normalizeState: ((raw: string) => string) | undefined;
 
-  constructor(private readonly rootDir: string) {
-    requireStorageSchema(rootDir);
+  constructor(private readonly rootDir: string, options: FileTaskStoreOptions = {}) {
+    this.#normalizeState = options.normalizeState;
+    this.#requireReadableSchema();
   }
 
   rootDirectory(): string { return this.rootDir; }
@@ -1357,13 +1367,13 @@ export class FileTaskStore implements TaskStore {
   }
 
   #readState(): StorageState {
-    requireStorageSchema(this.rootDir);
+    this.#requireReadableSchema();
     const path = join(this.rootDir, STORAGE_STATE_FILE);
     if (!existsSync(path)) return emptyState();
-    return parseState(readFileSync(path, "utf8"));
+    return this.#parseState(readFileSync(path, "utf8"));
   }
   #readCachedState(): StorageState {
-    requireStorageSchema(this.rootDir);
+    this.#requireReadableSchema();
     const path = join(this.rootDir, STORAGE_STATE_FILE);
     if (!existsSync(path)) {
       if (this.#readCache?.fingerprint === "missing") return this.#readCache.state;
@@ -1373,7 +1383,7 @@ export class FileTaskStore implements TaskStore {
     }
     const fingerprint = stateFileFingerprint(path);
     if (this.#readCache?.fingerprint === fingerprint) return this.#readCache.state;
-    const state = parseState(readFileSync(path, "utf8"));
+    const state = this.#parseState(readFileSync(path, "utf8"));
     this.#readCache = { fingerprint, state };
     return state;
   }
@@ -1392,11 +1402,27 @@ export class FileTaskStore implements TaskStore {
     const content = `${JSON.stringify(state, null, 2)}\n`;
     parseState(content);
     writeTextFileAtomically(join(this.rootDir, STORAGE_STATE_FILE), content);
+    if (this.#normalizeState !== undefined) {
+      // A compatible read never rewrites the Home. Its first actual mutation
+      // emits current-only state, then advances the durable manifest to the
+      // same current family versions under the existing storage write lock.
+      // A crash between the two atomic files is detected as manifest/state
+      // inconsistency on the next open; it is never silently accepted.
+      writeCurrentStorageManifest(this.rootDir);
+      this.#normalizeState = undefined;
+    }
     this.#readCache = null;
+  }
+  #parseState(raw: string): StorageState {
+    return parseState(this.#normalizeState?.(raw) ?? raw);
   }
   #withWriteLock<T>(execute: () => T): T {
     const release = acquireStorageLock(this.rootDir);
     try { return execute(); } finally { release(); }
+  }
+  #requireReadableSchema(): void {
+    if (this.#normalizeState === undefined) requireStorageSchema(this.rootDir);
+    else requireCompatibleStorageSchema(this.rootDir);
   }
 }
 
@@ -1635,6 +1661,11 @@ function parseState(raw: string): StorageState {
   }
   for (const mailbox of Object.values(result.mailboxes)) validateMailboxReferences(result, mailbox);
   return result;
+}
+
+/** Strict current-model gate used by the compatible loader before any writer opens. */
+export function validateCurrentStorageStateSnapshot(value: unknown): void {
+  parseState(`${JSON.stringify(value)}\n`);
 }
 function parseStoredTask(value: unknown, taskId: string): StoredTask {
   const aggregate = object(value, `Task aggregate ${taskId}`) as unknown as StoredTask;

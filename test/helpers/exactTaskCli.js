@@ -36,6 +36,7 @@ export function exactTaskCliInvocation({
   taskId,
   roleName,
   taskFinalReviewerRole,
+  controlIdentity,
   environment = process.env,
   cliEntry = join(process.cwd(), "dist", "cli.js")
 }) {
@@ -134,7 +135,8 @@ export function exactTaskCliInvocation({
   const control = createExactControlPlaneDescriptor({
     executable: process.execPath,
     cliEntry,
-    yuiHome: home
+    yuiHome: home,
+    identity: controlIdentity
   });
   const digest = exactControlPlaneDigest(control);
   const runtime = createExactTaskRuntimeDescriptor({
@@ -195,6 +197,9 @@ export function exactTaskCliInvocation({
         launchId,
         reservedRunId
       );
+    },
+    stopFixtureController() {
+      stopFixtureController(home, cliEntry, environment);
     }
   };
 }

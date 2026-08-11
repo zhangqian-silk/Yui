@@ -7,7 +7,9 @@
  *
  *   preflight (classify, read-only)
  *     -> plan (delegated to the engine; missing/future step = fail-closed)
+ *     -> [offline only] authoritative active Run/Session/lifecycle inventory
  *     -> [execute] admission fence  (new writers refused)
+ *          -> close pre-admitted writers + final offline inventory
  *     -> [execute] coordination lock (outside Home; shared with inbox publish)
  *          -> quiesce (record/stop prior Controller; verify no foreign writer /
  *             unfinished lifecycle)
@@ -17,9 +19,13 @@
  *     -> restore old Controller on pre-switch block, or start the replacement
  *        only after a committed switch and successful verification
  *
- * `--dry-run` runs preflight + plan + the staged validation gate, then discards
- * the staged output and never switches. Every failure reports a precise blocker
- * stage and a recovery action, and never leaves the authoritative Home switched.
+ * Compatible-old returns before constructing a migration target. The internal
+ * update preflight returns after classification, compatible-source validation,
+ * or the authoritative offline inventory appropriate to the classified path, so
+ * it remains safe while the exact old Controller is still running and never
+ * claims staged-output validation. User-facing
+ * `--dry-run` runs the staged validation gate and succeeds only when the engine
+ * itself returns `dry-run`; every other engine outcome is preserved as a blocker.
  *
  * Quiesce uses only explicit, deterministic signals — the public
  * `controller.stop`/shutdownAndDrain, the real `.state.lock`, unfinished runtime
@@ -39,6 +45,7 @@ import {
   type MigrationReport,
   type StorageVersionState
 } from "../migration/index.js";
+import { validateCompatibleFileTaskStore } from "../compatibleTaskStore.js";
 import {
   stopFileTaskController,
   ensureFileTaskController,
@@ -72,6 +79,11 @@ import {
   type HomeSnapshot,
   type SwitchStep
 } from "./homeMigrationTarget.js";
+import {
+  inspectOfflineUpgradeInventory,
+  type OfflineUpgradeBlocker,
+  type OfflineUpgradeInventory
+} from "./offlineUpgradeInventory.js";
 
 /** The precise stage at which an upgrade was blocked or failed. */
 export type UpgradeBlockerStage =
@@ -79,6 +91,7 @@ export type UpgradeBlockerStage =
   | "missing-step"
   | "future-version"
   | "corruption"
+  | "active-sessions"
   | "active-runtime"
   | "drain-incomplete"
   | "coordination"
@@ -93,6 +106,9 @@ type UpgradeBlocker = Readonly<{
   stage: UpgradeBlockerStage;
   message: string;
   action: string;
+  blockers?: readonly OfflineUpgradeBlocker[];
+  retryCommand?: "yui update";
+  sceneUnchanged?: true;
   /** True once the atomic Home switch committed; never restore the old Controller. */
   switchCommitted?: true;
   /** The exact backup retained for explicit recovery after a committed switch. */
@@ -111,6 +127,17 @@ export type UpgradeResult = Readonly<
       outcome: "already-current";
       classification: HomeClassification;
       report: MigrationReport;
+    }
+  | {
+      outcome: "compatible";
+      classification: HomeClassification;
+    }
+  | {
+      /** Internal update contract; never a staged-output validation result. */
+      outcome: "update-preflight";
+      status: "already-current" | "compatible" | "migration-required";
+      stepCount: number;
+      classification: HomeClassification;
     }
   | {
       outcome: "dry-run";
@@ -133,7 +160,7 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
   home: string;
   registry: MigrationRegistry<Snapshot>;
   latest: StorageVersionState;
-  mode: "dry-run" | "execute";
+  mode: "dry-run" | "execute" | "update-preflight";
   /**
    * The normal upgrade owns Controller capture/stop/start. The update parent
    * may instead externally quiesce the Home and ask this staged child to run
@@ -152,7 +179,10 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
    */
   controllerStatus?: (home: string) => Promise<ControllerLifecycleStatus>;
   /** Test seam: stop+drain the Controller. Defaults to the real client. */
-  stopController?: (home: string) => Promise<void | ControllerStopResult>;
+  stopController?: (
+    home: string,
+    expectedPid: number
+  ) => Promise<void | ControllerStopResult>;
   /**
    * Test seam: start a Controller after a verified switch, or restore the old
    * Controller after a blocked pre-switch attempt. Defaults to the real client.
@@ -176,6 +206,8 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
   switchFaultHook?: (step: SwitchStep) => void;
   /** Test-only injection for failures after the atomic switch commits. */
   postSwitchFaultHook?: (step: PostSwitchFaultStep) => void;
+  /** Read-only authoritative offline blocker inventory; tests inject facts. */
+  inspectOfflineInventory?: (home: string) => Promise<OfflineUpgradeInventory>;
 }>;
 
 /** Deterministic post-switch failure seams used by regression tests. */
@@ -265,6 +297,85 @@ export async function runStorageUpgrade(
     );
   }
 
+  // An all-compatible chain is an online-load contract, not a migration plan.
+  // Validate the declared old source shape and its in-memory normalization before
+  // ANY mode reports compatible, including the internal update preflight. This is
+  // read-only and safe while the exact old Controller is still running; it creates
+  // no migration target or staged Home and touches no lifecycle state.
+  if (verdict === "COMPATIBLE") {
+    try {
+      validateCompatibleFileTaskStore(home, { registry, latest });
+      if (mode === "update-preflight") {
+        return {
+          outcome: "update-preflight",
+          status: "compatible",
+          stepCount: classification.classification.stepCount,
+          classification
+        };
+      }
+      return { outcome: "compatible", classification };
+    } catch (error) {
+      const detail = `Compatible source validation failed: ${messageOf(error)}`;
+      const invalid: HomeClassification = {
+        ...classification,
+        classification: {
+          verdict: "CORRUPTED",
+          status: "unsupported",
+          detail
+        }
+      };
+      return withClassification(
+        {
+          outcome: "blocked",
+          stage: "corruption",
+          message: detail,
+          action:
+            "Do not activate the new binary. The declared old shape did not pass its strict read-only validator."
+        },
+        invalid
+      );
+    }
+  }
+
+  // `yui update` invokes this explicit internal contract while the exact old
+  // Controller is still running. It performs classification for a current Home,
+  // compatible-source validation above for a compatible Home, and classification
+  // plus the authoritative offline inventory for a migration path. It never
+  // constructs a migration target, so there is no staging copy, backup, fence,
+  // runtime/Controller lifecycle probe, staged-output loader validation, or switch.
+  if (mode === "update-preflight") {
+    if (verdict === "USABLE") {
+      return {
+        outcome: "update-preflight",
+        status: "already-current",
+        stepCount: 0,
+        classification
+      };
+    }
+    // verdict === MIGRATABLE: a parent update may stop the old Controller only
+    // after this authoritative offline inventory is clear.
+    const inventory = await readOfflineInventory(options, home);
+    if (inventory.total > 0) {
+      return withClassification(offlineInventoryBlocker(inventory, true), classification);
+    }
+    return {
+      outcome: "update-preflight",
+      status: "migration-required",
+      stepCount: classification.classification.stepCount,
+      classification
+    };
+  }
+
+  if (verdict === "MIGRATABLE") {
+    const inventory = await readOfflineInventory(options, home);
+    if (inventory.total > 0) {
+      return withClassification(
+        offlineInventoryBlocker(inventory, true),
+        classification
+      );
+    }
+  }
+
   const target = createHomeMigrationTarget({
     home,
     latest,
@@ -297,11 +408,72 @@ export async function runStorageUpgrade(
     };
   }
 
-  // verdict === "MIGRATABLE": a complete step path exists.
+  // verdict === "MIGRATABLE": a complete offline step path exists and the
+  // authoritative inventory was re-read clear before any lifecycle mutation.
   if (mode === "dry-run") {
     return dryRun(options, classification, target);
   }
   return execute(options, classification, target, callerPid, now);
+}
+
+function describeOfflineBlockers(inventory: OfflineUpgradeInventory): string {
+  const lines = inventory.blockers.map((blocker, index) => {
+    const identity = [
+      blocker.taskId === undefined ? undefined : `task=${blocker.taskId}`,
+      blocker.roleName === undefined ? undefined : `role=${blocker.roleName}`,
+      blocker.runId === undefined ? undefined : `run=${blocker.runId}`,
+      blocker.nativeSessionId === undefined
+        ? undefined
+        : `nativeSession=${blocker.nativeSessionId}`,
+      blocker.launchId === undefined ? undefined : `launch=${blocker.launchId}`
+    ].filter((value): value is string => value !== undefined).join(" ");
+    const reason = blocker.reason === "pending-inbox"
+      ? "pending durable inbox"
+      : blocker.reason === "pending-mailbox"
+        ? "pending lifecycle mailbox"
+        : blocker.reason;
+    return `${index + 1}. ${identity.length === 0 ? "identity=unknown" : identity} ` +
+      `reason=${reason}`;
+  });
+  return `Offline migration blocked by ${inventory.total} active runtime item(s). ` +
+    lines.join("; ");
+}
+
+async function readOfflineInventory(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  home: string
+): Promise<OfflineUpgradeInventory> {
+  try {
+    return await (options.inspectOfflineInventory
+      ?? ((targetHome: string) => inspectOfflineUpgradeInventory(targetHome)))(home);
+  } catch {
+    return {
+      total: 1,
+      blockers: [{ reason: "native-session-unknown" }]
+    };
+  }
+}
+
+function offlineInventoryBlocker(
+  inventory: OfflineUpgradeInventory,
+  sceneUnchanged: boolean
+): UpgradeBlocker {
+  const lifecycleOnly = inventory.blockers.every(({ reason }) => (
+    reason === "pending-mailbox" || reason === "pending-inbox"
+  ));
+  return {
+    outcome: "blocked",
+    stage: lifecycleOnly ? "drain-incomplete" : "active-sessions",
+    message: describeOfflineBlockers(inventory),
+    action: sceneUnchanged
+      ? "No binary, Controller, fence, or Home change was made. Keep working; when every " +
+        "listed runtime obligation is clear, re-run `yui update` so preflight is repeated."
+      : "The Home was not switched. Let every listed runtime obligation settle, then re-run " +
+        "`yui update`; do not kill, reset, rebind, or retry the blocked runtime blindly.",
+    blockers: inventory.blockers,
+    retryCommand: "yui update",
+    ...(sceneUnchanged ? { sceneUnchanged: true } : {})
+  };
 }
 
 /** Dry run: validate through the staged gate, then discard; never switch. */
@@ -319,10 +491,17 @@ function dryRun(
     mode: "dry-run"
   });
   target.discardFreshOutput();
+  if (report.outcome === "dry-run") {
+    return { outcome: "dry-run", classification, report };
+  }
   if (report.outcome === "failed") {
     return { ...blockedFromFailedReport(report, classification), report };
   }
-  return { outcome: "dry-run", classification, report };
+  // A dry-run success is proven only by the engine's exact `dry-run` variant,
+  // which carries staged-output and loader-gate evidence. In particular, a live
+  // runtime returns before read/transform/write/validate; preserve that outcome
+  // as a blocker instead of wrapping it in a false outer success.
+  return { ...blockedFromEngineReport(report, classification), report };
 }
 
 /** Execute: fence -> coordination/quiesce -> re-pin -> switch -> post-verify. */
@@ -406,6 +585,15 @@ async function execute(
           classification
         );
       }
+      if (result === undefined && status!.running && !isPositivePid(status!.pid)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller PID could not be authenticated",
+            new Error("a positive status PID is unavailable for fenced stop")
+          ),
+          classification
+        );
+      }
       if (result === undefined) {
         controllerWasRunning = status!.running;
         controllerIdentity = status!.running ? status!.identity : undefined;
@@ -418,15 +606,20 @@ async function execute(
       // request is issued at most once; timeout/rejection is a structured blocker,
       // never a retry loop.
       const stopController = options.stopController
-        ?? ((h: string) => defaultStopController(h, options.controllerOptions));
+        ?? ((h: string, expectedPid: number) => defaultStopController(
+          h,
+          expectedPid,
+          options.controllerOptions
+        ));
       if (result === undefined && controllerWasRunning) {
         try {
-          const stopped = await stopController(home);
-          if (!confirmedControllerStopped(stopped)) {
+          const expectedPid = status!.pid!;
+          const stopped = await stopController(home, expectedPid);
+          if (!confirmedControllerStopped(stopped, expectedPid)) {
             result = withClassification(
               controllerLifecycleBlocker(
                 "Controller stop did not confirm a drained process",
-                new Error("stop returned without stopped:true")
+                new Error(`stop did not confirm captured PID ${expectedPid} with stopped:true`)
               ),
               classification
             );
@@ -444,6 +637,40 @@ async function execute(
       // The parent update already captured and drained the old Controller. This
       // staged child must not inspect or start one from its temporary install.
       controllerStopConfirmed = true;
+    }
+
+    if (result === undefined) {
+      // Close the only admission race left by the read-only preflight. A writer
+      // which acquired `.state.lock` before the fence must finish before this
+      // pin; every later commit sees the fence and fails. Re-read the complete
+      // offline inventory only after that boundary and before staging/switching.
+      try {
+        repinRevision(home);
+      } catch (error) {
+        result = withClassification(
+          {
+            outcome: "blocked",
+            stage: "active-runtime",
+            message:
+              `The pre-fence writer window is undeterminable and could not be closed safely: ` +
+              `${messageOf(error)}.`,
+            action:
+              "The Home was not switched. Inspect the exact storage-lock owner and retry only " +
+              "after it is settled; do not remove a live lock or retry blindly."
+          },
+          classification
+        );
+      }
+    }
+
+    if (result === undefined) {
+      const inventory = await readOfflineInventory(options, home);
+      if (inventory.total > 0) {
+        result = withClassification(
+          offlineInventoryBlocker(inventory, false),
+          classification
+        );
+      }
     }
 
     if (result === undefined) {
@@ -855,7 +1082,7 @@ function postSwitchHealthCheck(home: string): UpgradeBlocker | null {
 function blockedFromFailedReport(
   report: Extract<MigrationReport, { outcome: "failed" }>,
   classification: HomeClassification
-): UpgradeResult {
+): Extract<UpgradeResult, { outcome: "blocked" }> {
   const stage: UpgradeBlockerStage = report.stage === "switch" ? "switch" : "validate";
   return withClassification(
     {
@@ -933,7 +1160,7 @@ function postSwitchAmbiguity(
 function blockedFromEngineReport(
   report: MigrationReport,
   classification: HomeClassification
-): UpgradeResult {
+): Extract<UpgradeResult, { outcome: "blocked" }> {
   return withClassification(
     {
       outcome: "blocked",
@@ -954,9 +1181,13 @@ function withClassification(
 
 async function defaultStopController(
   home: string,
+  expectedPid: number,
   controllerOptions: FileControllerClientOptions | undefined
 ): Promise<ControllerStopResult> {
-  return stopFileTaskController(home, controllerOptions ?? {});
+  return stopFileTaskController(home, {
+    ...(controllerOptions ?? {}),
+    expectedPid
+  });
 }
 
 async function defaultStartController(
@@ -1019,12 +1250,17 @@ function controllerStatusFromRuntime(
 }
 
 function confirmedControllerStopped(
-  value: void | ControllerStopResult
+  value: void | ControllerStopResult,
+  expectedPid: number
 ): boolean {
   // Existing test seams historically returned void after a successful drain;
   // retain that narrow compatibility while requiring explicit confirmation for
   // any structured result.
-  return value === undefined || (isRecord(value) && value.stopped === true);
+  return value === undefined || (
+    isRecord(value)
+    && value.stopped === true
+    && value.pid === expectedPid
+  );
 }
 
 function isControllerLifecycleStatus(value: unknown): value is ControllerLifecycleStatus {

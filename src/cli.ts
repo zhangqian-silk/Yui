@@ -94,8 +94,12 @@ import {
   FileTaskWorkspacePreparer,
   ReviewRoundWorkspaceEvidenceError
 } from "./repository/taskWorkspacePreparer.js";
-import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
-import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
+import { inspectStorageSchema } from "./storage/storageSchema.js";
+import { type FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
+import {
+  openCompatibleFileTaskStore,
+  validateCompatibleFileTaskStore
+} from "./storage/compatibleTaskStore.js";
 import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
@@ -214,7 +218,7 @@ export async function main(): Promise<void> {
     );
     const refresh = await refreshRunningFileTaskControllerEnvironment(
       home,
-      new FileTaskStore(home),
+      openCompatibleFileTaskStore(home),
       process.env
     );
     emit(withControllerRefreshWarning(output, refresh, "Agent environment"));
@@ -243,8 +247,7 @@ export async function main(): Promise<void> {
   }
   if (args[0] === "upgrade") {
     // Mirror doctor/controller: needs a Home but self-manages the schema check,
-    // because upgrade must run against a non-current Home. Dispatched before the
-    // unconditional requireStorageSchema gate below.
+    // because upgrade must run against a non-current Home.
     const result = await runUpgradeCommand(
       args.slice(1),
       home,
@@ -353,7 +356,7 @@ export async function main(): Promise<void> {
           + "cleanup [--all] | stop | restart."
       );
     }
-    requireStorageSchema(home);
+    validateCompatibleFileTaskStore(home);
     const controllerMethod: "stop" | "restart" = method;
     const result = controllerMethod === "restart"
       ? await restartFileTaskController(home, { environment: process.env })
@@ -369,9 +372,8 @@ export async function main(): Promise<void> {
     return;
   }
 
-  requireStorageSchema(home);
   await assertFileTaskControllerStorageCompatible(home);
-  const store = new FileTaskStore(home);
+  const store = openCompatibleFileTaskStore(home);
   const catalogs = new AgentConfigurationCatalogService(home, {
     environment: process.env
   });
@@ -1136,7 +1138,7 @@ async function preflightManagedTaskControlPlane(): Promise<
     && args[1] === "claude-hook";
   assertExactTaskRuntimeState(
     runtime,
-    new FileTaskStore(control.yuiHome),
+    openCompatibleFileTaskStore(control.yuiHome),
     preallocatedClaudeCallback
       ? { preallocatedNativeSessionReservation: { yuiHome: control.yuiHome } }
       : {}
@@ -1611,8 +1613,7 @@ async function completionCommand(
   if (args.length > (shell === undefined ? 1 : 2)) {
     throw usageError("Completion usage: yui completion [bash|zsh|fish]");
   }
-  requireStorageSchema(home);
-  const store = new FileTaskStore(home);
+  const store = openCompatibleFileTaskStore(home);
   const ioHandle = terminalIo();
   try {
     const manager = new FileCompletionManager(store, process.env, resolveCliIdentity(process.env));
@@ -1841,8 +1842,7 @@ function callOptional(
 }
 
 function readableStore(home: string): FileTaskStore {
-  requireStorageSchema(home);
-  return new FileTaskStore(home);
+  return openCompatibleFileTaskStore(home);
 }
 
 function completionSelectionPorts(home: string): SelectionPorts {

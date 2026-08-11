@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -13,10 +14,13 @@ import { join, relative } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
-import { runDoctorCommand } from "../../dist/doctor/doctor.js";
+import { createUpdatePorts } from "../../dist/cli/updatePorts.js";
+import { buildDoctorReport, runDoctorCommand } from "../../dist/doctor/doctor.js";
 import { CliError } from "../../dist/errors/cliError.js";
+import { MigrationRegistry } from "../../dist/storage/migration/index.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { CommandExecutionError } from "../../dist/tmux/commandExecutor.js";
 
 function temporaryRoot(t, prefix) {
@@ -37,6 +41,82 @@ function snapshot(root) {
       content: metadata.isFile() ? readFileSync(path, "utf8") : undefined
     };
   });
+}
+
+function compatibleRegistry() {
+  const registry = new MigrationRegistry();
+  registry.registerCompatible({
+    axis: "record",
+    recordKind: "configuredAgent",
+    fromVersion: 1,
+    toVersion: 2,
+    defaults: ["environment=[]"],
+    validateSource: (snapshot) => {
+      for (const agent of Object.values(snapshot.state.configuredAgents)) {
+        assert.deepEqual(Object.keys(agent).sort(), [
+          "adapterId", "baseArgs", "command", "createdAt", "id", "schemaVersion", "updatedAt"
+        ]);
+        assert.equal(agent.schemaVersion, 1);
+      }
+    },
+    normalize: (snapshot) => ({
+      ...snapshot,
+      schemaManifest: {
+        ...snapshot.schemaManifest,
+        recordVersions: {
+          ...snapshot.schemaManifest.recordVersions,
+          configuredAgent: 2
+        }
+      },
+      state: {
+        ...snapshot.state,
+        configuredAgents: Object.fromEntries(
+          Object.entries(snapshot.state.configuredAgents).map(([id, agent]) => [
+            id,
+            { ...agent, schemaVersion: 2, environment: [] }
+          ])
+        )
+      }
+    })
+  });
+  return registry;
+}
+
+function compatibleDoctorFixture(t) {
+  const root = temporaryRoot(t, "yui-file-doctor-compatible-");
+  const home = join(root, "home");
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  store.saveConfiguredAgent(createConfiguredAgent(
+    "codex", "codex", "codex", [], [], new Date("2026-08-11T00:00:00.000Z")
+  ));
+  const statePath = join(home, "state.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  state.configuredAgents.codex.schemaVersion = 1;
+  delete state.configuredAgents.codex.environment;
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.recordVersions.configuredAgent = 1;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const before = snapshot(home);
+  const report = buildDoctorReport(
+    { YUI_HOME: home },
+    { run() { throw new CommandExecutionError("COMMAND_NOT_FOUND"); } },
+    { registry: compatibleRegistry(), latest: latestStorageVersionState() }
+  );
+  return { root, home, before, report };
+}
+
+function spawnResponse(stdout, status = 0) {
+  return {
+    pid: 1,
+    output: [],
+    stdout: Buffer.from(stdout),
+    stderr: Buffer.from(""),
+    status,
+    signal: null
+  };
 }
 
 test("FileTaskStore doctor reports schema, state, tools, and configured Agent capabilities without writes", (t) => {
@@ -95,6 +175,43 @@ test("FileTaskStore doctor reports schema, state, tools, and configured Agent ca
     ["codex-custom", ["--help"]]
   ]);
   assert.deepEqual(snapshot(home), before);
+});
+
+test("doctor reports compatible-old storage as fully healthy without rewriting it", (t) => {
+  const { home, before, report } = compatibleDoctorFixture(t);
+
+  assert.equal(report.storage.healthy, true);
+  assert.deepEqual(report.storage.blocking, []);
+  for (const name of ["storage schema", "storage compatibility", "storage state"]) {
+    assert.equal(report.checks.find((check) => check.name === name)?.status, "ok");
+  }
+  assert.deepEqual(snapshot(home), before);
+});
+
+test("real update-port verification accepts a compatible-old doctor report", (t) => {
+  const { root, home, report } = compatibleDoctorFixture(t);
+  const globalPrefix = join(root, "global");
+  const activeBinary = join(globalPrefix, "bin", "yui");
+  mkdirSync(join(globalPrefix, "bin"), { recursive: true });
+  writeFileSync(activeBinary, "#!/bin/sh\n");
+  const spawn = (command, args) => {
+    if (command === "npm" && args.join(" ") === "prefix --global") {
+      return spawnResponse(`${globalPrefix}\n`);
+    }
+    if (command === activeBinary && args.join(" ") === "--json doctor") {
+      return spawnResponse(JSON.stringify({ ok: true, data: report }));
+    }
+    if (command === activeBinary && args.join(" ") === "--json version") {
+      return spawnResponse(JSON.stringify({ ok: true, data: { version: "9.9.9" } }));
+    }
+    throw new Error(`Unexpected spawn: ${command} ${args.join(" ")}`);
+  };
+  const ports = createUpdatePorts({}, spawn);
+
+  assert.doesNotThrow(() => ports.verify(
+    { binaryPath: "/staged/yui", version: "9.9.9" },
+    home
+  ));
 });
 
 test("doctor reports a missing home without creating it", (t) => {

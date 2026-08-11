@@ -88,10 +88,14 @@ test("parent update stops a running Controller on an old aggregate Home through 
     [join(process.cwd(), "dist/cli.js"), "--json", "controller", "stop"],
     { cwd: process.cwd(), env: { ...environment, YUI_HOME: fixture.home }, shell: false }
   );
-  assert.notEqual(publicStop.status, 0, "public controller stop must retain the schema gate");
+  assert.notEqual(
+    publicStop.status,
+    0,
+    "public controller stop must reject storage that requires offline migration"
+  );
   assert.match(
     `${publicStop.stdout.toString("utf8")}\n${publicStop.stderr.toString("utf8")}`,
-    /Aggregate schema 16 is older than required aggregate version 17/
+    /requires an offline migration/i
   );
 
   const realPorts = createUpdatePorts(environment, spawnSync);
@@ -110,9 +114,9 @@ test("parent update stops a running Controller on an old aggregate Home through 
       events.push("status");
       return realPorts.controllerStatus(home);
     },
-    stopController: (home) => {
+    stopController: (home, expectedPid) => {
       events.push("stop");
-      return realPorts.stopController(home);
+      return realPorts.stopController(home, expectedPid);
     },
     activateStorage: (_staged, home) => {
       events.push("activate-storage");

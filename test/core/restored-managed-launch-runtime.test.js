@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   existsSync,
@@ -328,6 +327,45 @@ test("managed Task launch freezes the exact CLI/Home identity without writing a 
       && argument.includes(command)
       && argument.includes("Bare `yui`")
   )));
+});
+
+test("a replacement Controller cannot retarget an existing Task's exact control plane", (t) => {
+  const { home, store, task, role, agent } = fixture(t);
+  const oldCli = join(home, "old-cli.js");
+  const newCli = join(home, "new-cli.js");
+  writeFileSync(oldCli, "process.stdout.write('old');\n", { mode: 0o600 });
+  writeFileSync(newCli, "process.stdout.write('new');\n", { mode: 0o600 });
+
+  const input = {
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new"
+  };
+  const oldPlan = new FileRoleLaunchPlanner(home, store, { cliPath: oldCli }).plan(input);
+  const oldControl = parseExactControlPlaneDescriptor(
+    oldPlan.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR]
+  );
+
+  const newPlan = new FileRoleLaunchPlanner(home, store, { cliPath: newCli }).plan(input);
+  const newControl = parseExactControlPlaneDescriptor(
+    newPlan.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR]
+  );
+
+  assert.equal(oldControl.cliEntry, oldCli);
+  assert.equal(newControl.cliEntry, newCli);
+  assert.notEqual(
+    exactControlPlaneCommandPrefix(oldControl),
+    exactControlPlaneCommandPrefix(newControl)
+  );
+  assert.equal(
+    parseExactControlPlaneDescriptor(
+      oldPlan.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR]
+    ).cliEntry,
+    oldCli
+  );
+  assert.equal(existsSync(join(home, "runtime", "bin", "yui")), false);
 });
 
 test("managed Codex Task Run installs lifecycle hooks while native identity remains provider-discovered", (t) => {

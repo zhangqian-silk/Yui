@@ -47,7 +47,7 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. Runtime storage is exact and fresh-only: it never dual-reads an older schema or guesses an old identifier.
+The home contains `schema.json`, the authoritative `state.json`, Project Catalog and knowledge, and Controller discovery files. Stable Project checkouts and managed worktrees live under the configured workspace, outside Yui home. Runtime storage is strict and its writer is current-only. A specifically declared, record-only older shape may be normalized into the current domain model in memory; Yui never dual-writes formats, preserves unknown old fields, or guesses an old identifier.
 
 Every Task-owned record family allocates a monotonically increasing local ID
 inside its Task. Different Tasks may therefore both contain `work-item-1`,
@@ -63,37 +63,79 @@ Yui models three independent, monotonic storage version axes: the on-disk
 `layout` (`schema.json`, `state.json`, locks), the authoritative `aggregate`
 document, and the `record` axis — a `recordKind -> version` map where every
 record family (WorkItem, AgentRun, ReviewRound, …) versions on its own. A
-centralized, future-facing migration framework (registry → planner → engine)
-covers all three. The production registry contains only explicit adjacent
-steps — currently aggregate `16→17`; any older version without a complete path
-is fail-closed. The record axis is genuinely independent: a home's per-family
-record versions are read
-**structurally** from the raw `state.json` (never through the strict loader), so
-a home whose *only* difference is an older record family is a version verdict
-(MIGRATABLE / NEEDS_NEW_VERSION) — not a false CORRUPTED.
+centralized compatibility framework (registry → planner → loader/engine)
+covers all three. Every adjacent version transition must be declared explicitly:
+a `compatible` declaration is permitted only for one record family and must
+provide deterministic defaults, a strict validator for the exact old shape, and
+a fresh-object normalizer into the current model; an `offline-migration`
+declaration owns layout, aggregate, identity/reference, record-split, and other
+semantic changes and must also have an executable migration step. A transform
+without a declaration, a declaration without its required step, a future version,
+or structural damage fails closed. Multi-hop is compatible only when every hop
+is compatible; one offline hop selects the complete offline path. The production
+registry contains the explicit aggregate `16→17` offline transition; no
+historical record-family normalization is implicitly authorized. A frozen
+post-baseline descriptor snapshot (versions and locators) is checked against the
+current descriptor map through the same planner, so a version bump, locator
+drift, or new target family cannot ship without its complete declared path.
 
-`yui doctor` and `yui upgrade` present one of four compatibility states:
+The record axis is genuinely independent: `schema.json#/recordVersions` is the
+durable per-family source of truth and raw `state.json` is structurally
+cross-checked against it before the strict current loader. A target family that
+the persisted manifest does not yet name is explicit version `0`; it is usable
+only through a declared record-family `0->1` introduction. Absence of records in
+`state.json` never promotes that family to current by itself.
+`yui doctor`, staged `yui update` preflight, and `yui upgrade` therefore share
+four product states:
 
-- **USABLE** — every axis is at the current version; nothing to do.
-- **MIGRATABLE** — strictly older on any axis (scalar or a single record family),
-  and a complete deterministic step path exists (currently aggregate `16→17`).
-- **NEEDS_NEW_VERSION** — a version this release cannot migrate: either newer
-  than supported (`future-version`) or older with no registered step
-  (`missing-step`), on any axis including a record family. Every unsupported
-  path lands here with a precise reason and the incompatible component (layout
-  vs aggregate).
-- **CORRUPTED** — real structural or reference-graph damage only (unparseable
-  `state.json`, a container that doesn't match its record locator, a record with
-  a missing/invalid `schemaVersion`, or a broken reference graph found once every
-  axis is already current), never inferred from a version number.
+- **current** (`USABLE`) — every axis is current.
+- **compatible-old** (`COMPATIBLE`) — every older hop is an explicitly declared
+  record-only normalization; ordinary commands load the current domain model and
+  the first write emits current records plus the matching current manifest only.
+- **migration-required** (`MIGRATABLE`) — at least one declared offline hop has
+  a complete deterministic step path.
+- **unsupported** (`NEEDS_NEW_VERSION` or `CORRUPTED`) — a future version,
+  missing declaration/step, invalid old shape, or real structural/reference
+  damage. The result names the incompatible component and reason.
 
-`yui upgrade` is the diagnostic/manual entry point. `yui upgrade --dry-run`
-runs a read-only preflight and plan, validates through the real loader gate on a
-staged copy, prints the report, and discards it without switching. `yui upgrade`
-(execute) places an admission fence (new writers, CLI and Controller alike,
-refuse to start), drains the Controller with the public `controller.stop`, then
-enters one shared sibling coordination boundary. Inside it, both the
-runtime-lifecycle mailboxes AND the durable runtime inbox (`runtime/inbox/*`) are
+`yui update` stages and pins the new package side by side, then lets that exact
+artifact run an internal path-specific read-only preflight against the target
+Home: classification for current, strict compatible-source/current-model
+validation for compatible-old, and classification plus authoritative offline
+inventory for migration-required. This is deliberately distinct from user-facing
+`upgrade --dry-run`: it creates no migration target or staged Home and claims no
+staged-output validation, so it remains usable while the exact old Controller is
+running. Current and compatible-old Homes
+take the fast path: Yui captures and stops the exact old Controller, promotes the
+same staged artifact, authenticates and starts the replacement Controller, and
+post-verifies through the compatible loader. It does not copy, back up, rename,
+or replay the Home and does not wait for Provider Sessions. Existing managed
+Task Sessions keep their frozen exact executable/CLI path, Home, control digest,
+Task/Run/launch/native-Session fence; replacement never retargets them through
+PATH. At that managed continuity gate, package-version drift alone is accepted
+because the same path now runs the activated CLI, while protocol, layout,
+aggregate, path, Home, digest, and runtime-identity drift still fail closed. The
+existing Session can therefore record progress and yield through the replacement
+Controller without weakening the offline path's zero-Session requirement.
+The first successful new write is the downgrade boundary because it is current-only.
+
+Migration-required Homes take the offline path. Before binary activation,
+Controller stop, admission fence, staging, or Home mutation, Yui re-reads an
+authoritative inventory and blocks on active or in-flight Runs, live or unknown
+native Sessions, pending turn completion, lifecycle mailboxes, or durable inbox
+events. Stopped/history-only Sessions, a Role with no native process, and an open
+Input by itself do not block. A blocker reports the total and exact available
+Task/Role/Run/native-session/launch identities and reason, leaves the scene
+unchanged, and tells the user to re-run `yui update` after the listed work clears;
+it never kills, resets, rebinds, retries, or drains on the user's behalf.
+
+Only that user re-run may enter the existing full migration. Once its preflight
+is clear, the update parent captures and stops the exact old Controller PID. The
+staged activation then runs the full migration: it places an admission fence (new
+writers, CLI and Controller alike, refuse to start), waits for any writer already
+admitted through `.state.lock`, and rechecks the offline inventory before staging,
+validation, and switch. It then enters one shared sibling coordination boundary.
+Inside it, both the runtime-lifecycle mailboxes AND the durable runtime inbox (`runtime/inbox/*`) are
 checked (either non-empty blocks at `drain-incomplete`, so authoritative
 not-yet-applied events are never dropped by a switch), followed by the revision
 pin, complete-home copy, validation, and two-step switch.
@@ -153,7 +195,8 @@ exact backup restore rather than a generic retry. Any other failed or blocked st
 leaves the authoritative home byte-for-byte unchanged and reports the exact
 blocker stage and recovery action. Only explicitly registered adjacent steps
 can convert a real home; Yui never dual-reads an older schema or guesses an old
-identifier. See
+identifier. Compatible loading remains an explicit normalization contract, not
+a permissive old-schema reader. See
 [Task-local identity](docs/task-local-identity.md) for the current reference
 contract.
 
@@ -165,9 +208,11 @@ and code conflicts, re-advancing the schema versions and record-version-map
 entries the rebase requires, rebuilding and re-validating the wiring, and
 re-running the isolated E2E and docs. This is a deliberate scheduling trade-off
 that avoids cross-Task blocking, not an accident to repair ad hoc. The
-record-version map above is a current-baseline snapshot, so if another Task later
-lands a record-schema change, the integrating branch re-derives it against the
-newest head and re-tests to convergence.
+current manifest descriptor map is re-derived against the newest head, while the
+post-baseline descriptor snapshot remains frozen. If another Task later lands a
+record-schema change, the integrating branch must supply the complete adjacent
+path (including an explicit `0->1` introduction for a new family) and re-test to
+convergence.
 
 Setup also seeds four reusable Worker Profiles:
 
@@ -727,10 +772,18 @@ yui project add|clone|refresh|update|discover|list|show|knowledge
 ```
 
 `yui update` stages the newly published package **side by side** — it never
-replaces the current global install first — then uses the staged binary to run a
-read-only preflight against the home. Only when that is safe does it migrate
-storage (atomically, with a timestamped backup) and promote the binary, running
-a new-binary health check last. It promotes the **same artifact it staged**
+replaces the current global install first — then uses the staged binary to run an
+internal path-specific read-only preflight against the Home. It classifies current
+Homes, validates compatible-old sources into the current model in memory, and
+checks the authoritative offline inventory for migration-required Homes. This
+preflight does not create or validate a staged Home and is not
+`upgrade --dry-run`; a full stage/validation/switch occurs only after the parent
+stops the exact old Controller PID. Current and compatible-old Homes use the
+no-Home-mutation fast path; migration-required Homes first require a clear
+offline Run/Session/lifecycle inventory, then use the timestamped-backup switch.
+Both paths promote the binary only after an exact PID-fenced old-Controller stop
+and run a new-binary health check before the authenticated replacement starts.
+Yui promotes the **same artifact it staged**
 (binary activation pins the exact staged version, never a second bare `@latest`);
 the staged version must be a **concrete semver** — a `latest`/dist-tag sentinel,
 a malformed value, or a probe without a valid `{ ok:true }` envelope at exit 0 is
@@ -749,7 +802,7 @@ self-contradictory envelope; only a valid success envelope with all storage chec
 `ok` and exit 0 is healthy. On any failure it reports the exact phase and a
 recovery action.
 
-If the storage-activation step cannot be resolved — the spawned staged binary was
+On the offline path, if storage activation cannot be resolved — the spawned staged binary was
 killed or crashed after switching but before reporting — `yui update` reports a
 distinct **ambiguous** result (a dedicated non-zero exit), never a false
 "unchanged/recoverable". A durable completion receipt written the instant the
@@ -762,13 +815,14 @@ without those fields, or one whose backup is unrelated / missing / not a
 directory** is not trusted as proof of this attempt's switch — the
 tool re-probes the real on-disk state instead.
 
-Rollback boundary (precise): this release does **not** introduce a versioned
-binary pointer or stable launcher, so it does **not** claim binary+home
+Rollback boundary (precise): the managed Session launcher is an in-place
+forwarder, not a versioned package pointer, so Yui does **not** claim binary+Home
 dual-resource atomicity. It guarantees: (1) staging is isolated — a
-stage/preflight failure leaves the old binary and home byte-for-byte unchanged;
-(2) the storage switch is atomic with a timestamped backup and is recoverable by
-restoring that backup until the new version resumes writes; (3) no auto-downgrade
-once the new version has written. The one non-atomic window — storage already
+stage/preflight failure leaves the old binary and Home byte-for-byte unchanged;
+(2) the compatible fast path does not switch the Home; (3) the offline storage
+switch is atomic with a timestamped backup and is recoverable by restoring that
+backup until the new version resumes writes; (4) no auto-downgrade once the new
+version has written. The offline path's non-atomic window — storage already
 switched, binary promotion then fails — is reported with the exact
 `mv <backup> <home>` recovery, and because the axes are version-gated the old
 binary fail-closes on the new home rather than misreading it.

@@ -20,6 +20,7 @@ export function toStepSummary<Snapshot>(
     ...(planned.recordKind ? { recordKind: planned.recordKind } : {}),
     fromVersion: planned.fromVersion,
     toVersion: planned.toVersion,
+    transition: planned.transition,
     declaredEffects: planned.step.declaredEffects
   };
 }

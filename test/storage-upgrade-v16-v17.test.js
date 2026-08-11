@@ -259,6 +259,7 @@ test("production doctor and dry-run recognize an aggregate-v16 final policy Home
     axis: "aggregate",
     fromVersion: 16,
     toVersion: 17,
+    transition: "offline-migration",
     declaredEffects: []
   }]);
   assert.equal(existsSync(`${home}.upgrade-staging`), false);
@@ -275,7 +276,7 @@ test("normal commands refuse raw v16 while execute preserves the durable graph",
   assert.equal(refused.status, 5);
   assert.match(
     `${refused.stdout}${refused.stderr}`,
-    /Aggregate schema 16 is older than required aggregate version 17/
+    /Storage requires an offline migration/
   );
 
   const upgraded = runCli(home, ["--json", "upgrade"]);

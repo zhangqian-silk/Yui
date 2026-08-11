@@ -15,7 +15,8 @@ import {
   selectEnvironment,
   YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
 } from "../agent/launchEnvironment.js";
-import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import type { TmuxManager } from "../tmux/tmuxManager.js";
 import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
@@ -375,7 +376,7 @@ function controllerSpawnEnvironment(
 ): NodeJS.ProcessEnv {
   const allowed = new Set<string>(CONTROLLER_OPERATIONAL_ENVIRONMENT);
   try {
-    for (const agent of new FileTaskStore(home).listConfiguredAgents()) {
+    for (const agent of openCompatibleFileTaskStore(home).listConfiguredAgents()) {
       for (const name of nativeAgentEnvironmentNames(agent.adapterId)) allowed.add(name);
       for (const binding of agent.environment) allowed.add(binding.sourceName);
     }

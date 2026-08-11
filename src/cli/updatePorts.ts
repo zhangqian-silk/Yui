@@ -1,13 +1,16 @@
 /**
  * Real {@link UpdatePorts} for `yui update`: side-by-side npm staging plus a
- * staged-binary read-only preflight, wired into the recoverable orchestration in
- * {@link runUpdate}.
+ * staged-binary path-specific read-only preflight, wired into the recoverable
+ * orchestration in {@link runUpdate}.
  *
  * Staging installs the latest package into a throwaway prefix with
  * `npm install --global --prefix <tmp>`, so the live global install is never
- * touched until the binary-activation step. Preflight and post-verify invoke the
- * STAGED binary (`yui upgrade --dry-run`) so the new version — not the running
- * one — decides whether the target Home is safe.
+ * touched until the binary-activation step. Preflight invokes the STAGED binary's
+ * internal `yui upgrade --update-preflight` contract so the target version
+ * classifies the Home, validates a compatible source in memory, or reads the
+ * authoritative offline inventory as required by that path. After the parent
+ * stops the exact old Controller, storage activation performs the full staged
+ * validation/switch. Post-verify invokes the actually activated global binary.
  *
  * Two hardening guarantees this module enforces:
  *
@@ -45,6 +48,7 @@ import type {
   StorageStateProbe,
   UpdateControllerLifecycleStatus,
   UpdateControllerStopResult,
+  UpdateBlockerIdentity,
   UpdatePorts,
   UpdatePreflight
 } from "./updateOrchestrator.js";
@@ -109,7 +113,7 @@ export function createUpdatePorts(
     preflight(staged: StagedPackage, home: string): UpdatePreflight {
       const result = spawn(
         staged.binaryPath,
-        ["--json", "upgrade", "--dry-run"],
+        ["--json", "upgrade", "--update-preflight"],
         { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
       );
       return interpretPreflight(result);
@@ -267,8 +271,8 @@ export function createUpdatePorts(
     controllerStatus(home: string): UpdateControllerLifecycleStatus {
       return readControllerLifecycle(home, environment, spawn);
     },
-    stopController(home: string): UpdateControllerStopResult {
-      return stopControllerForUpdate(home, environment, spawn);
+    stopController(home: string, expectedPid: number): UpdateControllerStopResult {
+      return stopControllerForUpdate(home, expectedPid, environment, spawn);
     },
     stopReplacementController,
     startController(home: string): void {
@@ -401,6 +405,7 @@ function proveControllerAbsent(
 
 function stopControllerForUpdate(
   home: string,
+  expectedPid: number,
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner
 ): UpdateControllerStopResult {
@@ -409,7 +414,10 @@ function stopControllerForUpdate(
   // forced through the public `controller stop` command's current-schema gate.
   // The public command remains gated; this helper is reachable only from the
   // update-owned port and returns the runtime's structured confirmation.
-  const result = runSchemaIndependentControllerStop(home, environment, spawn);
+  if (!isPositivePid(expectedPid)) {
+    throw new Error("Controller stop requires the exact positive PID captured by status.");
+  }
+  const result = runSchemaIndependentControllerStop(home, environment, spawn, expectedPid);
   if (typeof result.stopped !== "boolean") {
     throw new Error("Controller stop returned no structured stopped confirmation.");
   }
@@ -418,6 +426,11 @@ function stopControllerForUpdate(
   }
   if (result.pid !== undefined && !isPositivePid(result.pid)) {
     throw new Error("Controller stop returned an invalid PID confirmation.");
+  }
+  if (result.stopped !== true || result.pid !== expectedPid) {
+    throw new Error(
+      `Controller stop did not confirm the captured PID ${expectedPid}; refusing an unfenced handoff.`
+    );
   }
   return result;
 }
@@ -901,10 +914,10 @@ function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
     };
   }
   const outcome = typeof data.outcome === "string" ? data.outcome : undefined;
-  // EXIT/OUTCOME CONSISTENCY (P1-2): preflight is read-only, but a success-class
-  // outcome paired with a non-zero exit is still a violated contract. Treat it as
-  // blocked (do NOT proceed to a switch on an inconsistent green preflight).
-  if ((outcome === "already-current" || outcome === "dry-run") && result.status !== 0) {
+  // EXIT/OUTCOME CONSISTENCY (P1-2): the one success-class internal preflight
+  // outcome must exit 0. A user dry-run, legacy direct classification outcome,
+  // or any other spelling is not this contract and is never promoted to green.
+  if (outcome === "update-preflight" && result.status !== 0) {
     return {
       status: "blocked",
       stage: "preflight",
@@ -914,18 +927,104 @@ function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
       action: "Investigate the staged binary; do not force an update on an inconsistent preflight."
     };
   }
-  if (outcome === "already-current") return { status: "already-current" };
-  if (outcome === "dry-run") {
-    return { status: "migratable", summary: describe(data) };
+  if (outcome === "update-preflight") {
+    const parsed = parseUpdatePreflightResult(data);
+    if (parsed !== null) return parsed;
+    return {
+      status: "blocked",
+      stage: "preflight",
+      message: "The staged binary returned a malformed update-preflight result; refusing to infer a storage path.",
+      action: "Investigate the staged binary; do not force an update on a malformed preflight."
+    };
   }
+  if (outcome !== "blocked") {
+    return {
+      status: "blocked",
+      stage: "preflight",
+      message:
+        `The staged binary returned unexpected outcome=${outcome ?? "missing"}; the internal `
+        + "update-preflight contract was not satisfied.",
+      action: "Use a staged binary that supports the update-preflight contract; do not force the update."
+    };
+  }
+  const blockers = parseUpdateBlockers(data.blockers);
   return {
     status: "blocked",
     stage: typeof data.stage === "string" ? data.stage : "preflight",
     message: typeof data.message === "string" ? data.message : "Preflight was not safe.",
     action: typeof data.action === "string"
       ? data.action
-      : "Resolve the reported condition and retry."
+      : "Resolve the reported condition and retry.",
+    ...(blockers === undefined ? {} : { blockers }),
+    ...(typeof data.retryCommand === "string" ? { retryCommand: data.retryCommand } : {}),
+    ...(data.sceneUnchanged === true ? { sceneUnchanged: true } : {})
   };
+}
+
+/** Strictly parse the three green states of the internal update preflight. */
+function parseUpdatePreflightResult(data: Record<string, unknown>): UpdatePreflight | null {
+  const status = data.status;
+  const stepCount = data.stepCount;
+  if (
+    (status !== "already-current" && status !== "compatible" && status !== "migration-required")
+    || !Number.isSafeInteger(stepCount)
+    || (stepCount as number) < 0
+  ) {
+    return null;
+  }
+  const homeClassification = data.classification;
+  if (!isRecord(homeClassification) || !isRecord(homeClassification.classification)) return null;
+  const classification = homeClassification.classification;
+  const expected = status === "already-current"
+    ? { verdict: "USABLE", classificationStatus: "current" }
+    : status === "compatible"
+      ? { verdict: "COMPATIBLE", classificationStatus: "compatible-old" }
+      : { verdict: "MIGRATABLE", classificationStatus: "migration-required" };
+  if (
+    classification.verdict !== expected.verdict
+    || classification.status !== expected.classificationStatus
+    || (status === "already-current"
+      ? stepCount !== 0
+      : classification.stepCount !== stepCount || (stepCount as number) < 1)
+  ) {
+    return null;
+  }
+  if (status === "already-current") return { status };
+  const evidence = status === "compatible"
+    ? `${stepCount as number} compatible step(s) classified and the compatible source validated in memory`
+    : `${stepCount as number} offline migration step(s) classified and the offline runtime inventory confirmed clear`;
+  return {
+    status,
+    summary:
+      `${evidence}. `
+      + "No staged Home or staged-output loader validation was performed during update preflight."
+  };
+}
+
+function parseUpdateBlockers(value: unknown): readonly UpdateBlockerIdentity[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return undefined;
+  const parsed: UpdateBlockerIdentity[] = [];
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.reason !== "string" || item.reason.length === 0) {
+      return undefined;
+    }
+    const optional = ["taskId", "roleName", "runId", "nativeSessionId", "launchId"] as const;
+    if (optional.some((key) => item[key] !== undefined && typeof item[key] !== "string")) {
+      return undefined;
+    }
+    parsed.push({
+      ...(typeof item.taskId === "string" ? { taskId: item.taskId } : {}),
+      ...(typeof item.roleName === "string" ? { roleName: item.roleName } : {}),
+      ...(typeof item.runId === "string" ? { runId: item.runId } : {}),
+      ...(typeof item.nativeSessionId === "string"
+        ? { nativeSessionId: item.nativeSessionId }
+        : {}),
+      ...(typeof item.launchId === "string" ? { launchId: item.launchId } : {}),
+      reason: item.reason
+    });
+  }
+  return parsed;
 }
 
 function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivation {
@@ -1016,13 +1115,17 @@ function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivatio
           : "storage switched but post-switch verification did not complete"
       };
     }
+    const blockers = parseUpdateBlockers(data.blockers);
     return {
       status: "blocked",
       stage,
       message: typeof data?.message === "string" ? data.message : "Storage activation was refused.",
       action: typeof data?.action === "string"
         ? data.action
-        : "Resolve the reported condition and retry."
+        : "Resolve the reported condition and retry.",
+      ...(blockers === undefined ? {} : { blockers }),
+      ...(typeof data.retryCommand === "string" ? { retryCommand: data.retryCommand } : {}),
+      ...(data.sceneUnchanged === true ? { sceneUnchanged: true } : {})
     };
   }
   // Parseable JSON but an unrecognized outcome: we cannot classify it, so it is
@@ -1157,12 +1260,6 @@ function resolveGlobalBinary(
   const prefix = result.stdout.toString("utf8").trim();
   if (prefix.length === 0) return null;
   return join(prefix, "bin", "yui");
-}
-
-function describe(data: Record<string, unknown> | undefined): string {
-  const report = data?.report as Record<string, unknown> | undefined;
-  const steps = Array.isArray(report?.steps) ? report?.steps.length : 0;
-  return `${steps} migration step(s) validated`;
 }
 
 /**
