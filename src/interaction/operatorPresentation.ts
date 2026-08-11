@@ -61,9 +61,7 @@ export function createInputRequestOperatorPresentation(
     text: [
       "A Task Leader is waiting for a boundary decision. Inspect it before involving the user.",
       "Present it only when it is a user-owned choice, authorization, credential, unavailable external fact, or irreversible operation.",
-      `If it is an implementation, scheduling, review, or recoverable runtime choice, do not present it to the user; return it to the Leader with: yui task input cancel ${formatTaskRecordReference(
-        request.taskId, request.id, "inputRequest"
-      )} --reason \"Operator returned: not a user-owned boundary\"`,
+      `If it is an implementation, scheduling, review, or recoverable runtime choice, do not present it to the user; return it to the Leader with: yui task input cancel ${request.taskId} ${request.id} --reason \"Operator returned: not a user-owned boundary\"`,
       "For a user-owned boundary, do not answer it yourself; do not answer or choose on the user's behalf; relay the user's exact response only.",
       `Task: ${request.taskId}`,
       `Input: ${request.id}`,
