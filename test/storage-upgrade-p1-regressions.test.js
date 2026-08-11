@@ -160,13 +160,14 @@ function editState(home, mutate) {
   writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
-/** Update a single record family's declared version in schema.json. */
-function setManifestRecordVersion(home, kind, version) {
-  const schemaPath = join(home, "schema.json");
-  const manifest = JSON.parse(readFileSync(schemaPath, "utf8"));
-  manifest.recordVersions[kind] = version;
-  writeFileSync(schemaPath, `${JSON.stringify(manifest, null, 2)}\n`);
+/** Keep a valid fixture's durable record-version declaration in sync. */
+function setManifestRecordVersion(home, recordKind, schemaVersion) {
+  const path = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(path, "utf8"));
+  manifest.recordVersions[recordKind] = schemaVersion;
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
 }
+
 /** Install a syntactically-valid ConfiguredAgent record at a chosen version. */
 function setConfiguredAgent(home, schemaVersion) {
   editState(home, (state) => {
@@ -183,8 +184,6 @@ function setConfiguredAgent(home, schemaVersion) {
       }
     };
   });
-  // Keep the manifest's recordVersions in sync with the state so the
-  // manifest/state consistency check does not flag this as CORRUPTED.
   setManifestRecordVersion(home, "configuredAgent", schemaVersion);
 }
 
@@ -417,7 +416,11 @@ test("P2 map guard: future config and active-run pointer versions are future-ver
   editState(futureConfig.home, (state) => {
     state.config.schemaVersion = CURRENT_CONFIG_SCHEMA_VERSION + 1;
   });
-  setManifestRecordVersion(futureConfig.home, "config", CURRENT_CONFIG_SCHEMA_VERSION + 1);
+  setManifestRecordVersion(
+    futureConfig.home,
+    "config",
+    CURRENT_CONFIG_SCHEMA_VERSION + 1
+  );
   const configResult = classifyHome({
     home: futureConfig.home,
     registry: EMPTY(),
@@ -541,7 +544,11 @@ test("P1-1 map guard preserves older/future/corrupt record outcomes", () => {
     state.tasks[future.taskId].agentRuns[future.runId].schemaVersion =
       CURRENT_AGENT_RUN_SCHEMA_VERSION + 1;
   });
-  setManifestRecordVersion(future.home, "agentRun", CURRENT_AGENT_RUN_SCHEMA_VERSION + 1);
+  setManifestRecordVersion(
+    future.home,
+    "agentRun",
+    CURRENT_AGENT_RUN_SCHEMA_VERSION + 1
+  );
   const futureResult = classifyHome({ home: future.home, registry: EMPTY(), latest: LATEST() });
   assert.equal(futureResult.classification.verdict, "NEEDS_NEW_VERSION");
   assert.equal(futureResult.classification.blocker.reason, "future-version");
@@ -598,8 +605,12 @@ function binaryOnlyPorts(events, overrides = {}) {
     activateBinary: () => { events.push("activate-binary"); },
     verify: () => { events.push("verify"); },
     cleanup: () => { events.push("cleanup"); },
-    controllerStatus: () => { events.push("status"); return { running: true, identity }; },
-    stopController: () => { events.push("stop"); return { stopped: true, pid: 41 }; },
+    controllerStatus: () => { events.push("status"); return { running: true, pid: 41, identity }; },
+    stopController: (_home, expectedPid) => {
+      events.push("stop");
+      assert.equal(expectedPid, 41);
+      return { stopped: true, pid: 41 };
+    },
     startController: () => { events.push("start"); },
     restoreController: (_home, captured) => {
       events.push("restore");
@@ -874,6 +885,7 @@ test("exact-identity readiness accepts the captured executable, argv, and versio
         if (method === "controller.status") {
           return {
             running: true,
+            pid: 41,
             protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
             version: identity.version
           };
@@ -914,6 +926,7 @@ test("storage upgrade default restore rejects same-version wrong Controller iden
         if (method === "controller.status") {
           return {
             running: true,
+            pid: 41,
             protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
             version: identity.version
           };
@@ -923,7 +936,10 @@ test("storage upgrade default restore rejects same-version wrong Controller iden
       },
       spawnController: () => { spawnCalls += 1; }
     },
-    stopController: async () => ({ stopped: true })
+    stopController: async (_home, expectedPid) => {
+      assert.equal(expectedPid, 41);
+      return { stopped: true, pid: 41 };
+    }
   });
   assert.equal(result.outcome, "blocked");
   assert.equal(result.stage, "active-runtime");
@@ -952,6 +968,7 @@ test("storage upgrade default restore accepts the captured Controller identity",
         if (method === "controller.status") {
           return {
             running: true,
+            pid: 41,
             protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
             version: identity.version
           };
@@ -961,7 +978,10 @@ test("storage upgrade default restore accepts the captured Controller identity",
       },
       spawnController: () => { throw new Error("must not spawn for an already-running exact identity"); }
     },
-    stopController: async () => ({ stopped: true })
+    stopController: async (_home, expectedPid) => {
+      assert.equal(expectedPid, 41);
+      return { stopped: true, pid: 41 };
+    }
   });
   assert.equal(result.outcome, "blocked");
   assert.equal(result.stage, "active-runtime");

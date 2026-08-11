@@ -9,11 +9,12 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
+import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import {
   yuiVersionIdentity,
   type YuiVersionIdentity
 } from "../version.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { FileTaskStore, TaskStore } from "../storage/taskStore.js";
 import {
   hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
@@ -64,7 +65,12 @@ export type ExactControlPlanePreflightOptions = Readonly<{
     status: string;
     currentLayoutVersion?: number;
     currentAggregateSchemaVersion?: number;
+    incompatibleComponent?: "layout" | "aggregate" | "record";
+    direction?: "older" | "newer";
   }>;
+  openCompatibleStore?: (
+    home: string
+  ) => Pick<FileTaskStore, "getConfig">;
   callController?: (
     home: string,
     method: string,
@@ -232,8 +238,10 @@ export function extractExactControlArgument(args: readonly string[]): Readonly<{
 
 /**
  * One read-only gate shared by every managed Task control command. It verifies
- * the frozen executable/CLI/Home/build identity, on-disk schema, and any live
- * Controller before command routing may construct a writable store.
+ * the frozen executable/CLI/Home/digest, protocol and scalar-storage identity,
+ * on-disk schema, and any live Controller before command routing may construct
+ * a writable store. Package version alone may advance at the same managed path
+ * so an existing Session can cross an explicitly compatible in-place update.
  */
 export async function assertExactControlPlanePreflight(
   input: ExactControlPlanePreflightInput,
@@ -252,10 +260,18 @@ export async function assertExactControlPlanePreflight(
   assertSamePath(descriptor.yuiHome, input.actualHome, "Control-plane YUI_HOME");
 
   const localIdentity = validateVersionIdentity(options.identity ?? yuiVersionIdentity());
-  assertVersionIdentity("Local CLI", descriptor.identity, localIdentity);
+  assertContinuityIdentity("Local CLI", descriptor.identity, localIdentity);
   const storage = (options.inspectStorage ?? inspectStorageSchema)(descriptor.yuiHome);
   if (storage.status !== "current") {
-    throw new Error(`Exact control-plane storage is not current: ${storage.status}.`);
+    const exactRecordOnlyOlder = storage.status === "unsupported"
+      && storage.incompatibleComponent === "record"
+      && storage.direction === "older"
+      && storage.currentLayoutVersion === descriptor.identity.storageLayoutVersion
+      && storage.currentAggregateSchemaVersion === descriptor.identity.aggregateSchemaVersion;
+    if (!exactRecordOnlyOlder) {
+      throw new Error(`Exact control-plane storage is not current: ${storage.status}.`);
+    }
+    (options.openCompatibleStore ?? openCompatibleFileTaskStore)(descriptor.yuiHome).getConfig();
   }
   if (storage.currentLayoutVersion !== descriptor.identity.storageLayoutVersion) {
     throw new Error(
@@ -276,7 +292,7 @@ export async function assertExactControlPlanePreflight(
     const call = options.callController ?? defaultCallController;
     try {
       const status = await call(descriptor.yuiHome, "controller.status", {});
-      assertControllerStatusIdentity(status, descriptor.identity);
+      assertControllerContinuityIdentity(status, descriptor.identity);
     } catch (error) {
       if (!isDefinitelyNotRunning(error)) throw error;
     }
@@ -538,13 +554,13 @@ function validateVersionIdentity(value: unknown): YuiVersionIdentity {
   };
 }
 
-function assertVersionIdentity(
+/** Managed continuity is a protocol/storage contract, not a package pin. */
+function assertContinuityIdentity(
   label: string,
   expected: YuiVersionIdentity,
   actual: YuiVersionIdentity
 ): void {
   for (const field of [
-    "version",
     "controllerProtocolVersion",
     "storageLayoutVersion",
     "aggregateSchemaVersion"
@@ -556,6 +572,33 @@ function assertVersionIdentity(
       );
     }
   }
+}
+
+function assertControllerContinuityIdentity(
+  status: JsonValue,
+  expected: YuiVersionIdentity
+): void {
+  if (!isRecord(status) || status.running !== true) {
+    throw new Error("Controller status does not describe a running Controller.");
+  }
+  if (typeof status.version !== "string" || status.version.trim().length === 0) {
+    throw new Error("Controller version is invalid at the managed continuity gate.");
+  }
+  assertControllerField(
+    status.protocolVersion,
+    expected.controllerProtocolVersion,
+    "protocol"
+  );
+  assertControllerField(
+    status.storageLayoutVersion,
+    expected.storageLayoutVersion,
+    "storage layout"
+  );
+  assertControllerField(
+    status.aggregateSchemaVersion,
+    expected.aggregateSchemaVersion,
+    "aggregate schema"
+  );
 }
 
 function assertControllerField(

@@ -10,7 +10,7 @@ import {
   setCodexThreadName,
   type CodexThreadNameRequest
 } from "../execution/codexThreadNaming.js";
-import { FileTaskStore } from "../storage/taskStore.js";
+import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 
 export type CodexSessionNotification = Readonly<{
   scope: "task" | "global";
@@ -186,7 +186,7 @@ function shouldSetThreadName(
     || params.runId === undefined
   ) return false;
   try {
-    const store = new FileTaskStore(home);
+    const store = openCompatibleFileTaskStore(home);
     return store.getAgentRun(params.taskId!, params.runId)?.mode === "new";
   } catch {
     return false;

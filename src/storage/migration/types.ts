@@ -18,6 +18,9 @@
  */
 export type MigrationAxis = "layout" | "aggregate" | "record";
 
+/** Explicit operational class for one adjacent schema change. */
+export type StorageTransitionKind = "compatible" | "offline-migration";
+
 /** Per record-family version + where that family's data lives. */
 export type RecordAxisEntry = Readonly<{
   version: number;
@@ -64,12 +67,49 @@ export type MigrationStep<Snapshot = unknown> = Readonly<{
   declaredEffects: readonly string[];
 }>;
 
+/**
+ * One explicitly-compatible adjacent change. The normalizer is the online
+ * loader step: it must use only the declared deterministic defaults and return
+ * a fresh current-model snapshot. Layout changes are never compatible.
+ */
+export type CompatibleStep<Snapshot = unknown> = Readonly<{
+  kind?: "compatible";
+  axis: "record";
+  recordKind?: string;
+  fromVersion: number;
+  toVersion: number;
+  /** Explicitly marks the only legal pre-family transition: record 0->1. */
+  introduction?: boolean;
+  /** Human-readable defaults/rebuild rules which make the load unambiguous. */
+  defaults: readonly string[];
+  /** Strict parser for the declared old shape; unknown fields must be rejected. */
+  validateSource: (input: Snapshot) => void;
+  normalize: (input: Snapshot) => Snapshot;
+}>;
+
+/** A declaration which requires a separately-registered offline transform. */
+export type OfflineMigrationDeclaration = Readonly<{
+  kind?: "offline-migration";
+  axis: MigrationAxis;
+  recordKind?: string;
+  fromVersion: number;
+  toVersion: number;
+  /** Explicitly marks the only legal pre-family transition: record 0->1. */
+  introduction?: boolean;
+}>;
+
+export type StorageTransitionDeclaration<Snapshot = unknown> = Readonly<
+  | (CompatibleStep<Snapshot> & { kind: "compatible" })
+  | (OfflineMigrationDeclaration & { kind: "offline-migration" })
+>;
+
 /** A resolved step the planner scheduled, in deterministic execution order. */
 export type PlannedStep<Snapshot = unknown> = Readonly<{
   axis: MigrationAxis;
   recordKind?: string;
   fromVersion: number;
   toVersion: number;
+  transition: StorageTransitionKind;
   step: MigrationStep<Snapshot>;
 }>;
 
@@ -84,6 +124,15 @@ export type MigrationBlocker = Readonly<
       recordKind?: string;
       found: number;
       supported: number;
+      message: string;
+      action: string;
+    }
+  | {
+      reason: "missing-declaration";
+      axis: MigrationAxis;
+      recordKind?: string;
+      from: number;
+      to: number;
       message: string;
       action: string;
     }
@@ -106,7 +155,12 @@ export type MigrationBlocker = Readonly<
  */
 export type MigrationPlan<Snapshot = unknown> = Readonly<
   | { kind: "no-op" }
-  | { kind: "runnable"; steps: readonly PlannedStep<Snapshot>[] }
+  | {
+      kind: "runnable";
+      /** All-compatible is online; any offline transition selects migration. */
+      path: "compatible" | "offline-migration";
+      steps: readonly PlannedStep<Snapshot>[];
+    }
   | { kind: "blocked"; blocker: MigrationBlocker }
 >;
 
@@ -237,6 +291,7 @@ export type StepSummary = Readonly<{
   recordKind?: string;
   fromVersion: number;
   toVersion: number;
+  transition: StorageTransitionKind;
   declaredEffects: readonly string[];
 }>;
 

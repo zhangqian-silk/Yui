@@ -136,7 +136,16 @@ test("R4-F1 end-to-end: runUpdate on a null-activation child resolves ambiguous 
       });
     }
     if (args.includes("version")) return okData({ version: "9.9.9" });
-    if (args.includes("upgrade") && args.includes("--dry-run")) return okData({ outcome: "dry-run", report: { steps: [{}] } });
+    if (args.includes("upgrade") && args.includes("--update-preflight")) {
+      return okData({
+        outcome: "update-preflight",
+        status: "migration-required",
+        stepCount: 1,
+        classification: {
+          classification: { verdict: "MIGRATABLE", status: "migration-required", stepCount: 1 }
+        }
+      });
+    }
     if (args.includes("upgrade")) return rawOut("null", 0); // activation prints null
     if (args.includes("doctor")) return okData(healthyDoctorData());
     return spawnResult({});

@@ -7,9 +7,7 @@ import {
 } from "./storageVersions.js";
 import { currentRecordVersions } from "./upgrade/recordVersions.js";
 
-// Re-export for backward compatibility with existing imports.
 export { CURRENT_STORAGE_LAYOUT_VERSION, CURRENT_AGGREGATE_SCHEMA_VERSION };
-
 export const STORAGE_SCHEMA_FILE = "schema.json";
 
 export type StorageSchemaManifest = Readonly<{
@@ -18,14 +16,7 @@ export type StorageSchemaManifest = Readonly<{
   /** On-disk layout version. This is not a domain-record schema version. */
   storageVersion: number;
   aggregateSchemaVersion: number;
-  /**
-   * Per-record-family schema versions. The authoritative record of which record
-   * families exist on disk and at what version. A map may omit a family that
-   * was introduced after the persisted baseline; that omission is an older
-   * record-axis state which the migration planner handles through an explicit
-   * 0->1 introduction step. Unknown families or non-positive-integer versions
-   * are rejected.
-   */
+  /** Authoritative persisted version for each record family known to this Home. */
   recordVersions: Readonly<Record<string, number>>;
   updatedAt: string;
 }>;
@@ -58,7 +49,6 @@ export type StorageSchemaState =
       latestLayoutVersion: number;
       currentAggregateSchemaVersion: number;
       latestAggregateSchemaVersion: number;
-      /** The record family that is incompatible, when `incompatibleComponent === "record"`. */
       recordFamily?: string;
       manifestPath: string;
     }>
@@ -146,69 +136,52 @@ export function inspectStorageSchema(rootDir: string): StorageSchemaState {
     };
   }
 
-  // Record-axis check: every current record family must be at the current
-  // version. A pre-baseline manifest (no recordVersions field) is
-  // treated as an older, unsupported Home — there are no fabricated historical
-  // steps. A missing/unknown/invalid family inside recordVersions is a
-  // structural "invalid" error (caught by the parser); an older/newer version
-  // is a version "unsupported" verdict that the classifier/doctor/upgrade flow
-  // maps to NEEDS_NEW_VERSION.
   const currentRecords = currentRecordVersions();
   if (manifest.recordVersions === undefined) {
-    // Pre-baseline manifest: written before the recordVersions field existed.
-    // Only report this when the scalar axes are already current; otherwise the
-    // scalar mismatch takes precedence (it carries a more precise reason).
-    if (manifest.storageVersion === CURRENT_STORAGE_LAYOUT_VERSION
-      && manifest.aggregateSchemaVersion === CURRENT_AGGREGATE_SCHEMA_VERSION) {
+    return {
+      status: "unsupported",
+      incompatibleComponent: "record",
+      direction: "older",
+      currentVersion: 0,
+      latestVersion: 1,
+      currentLayoutVersion: manifest.storageVersion,
+      latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
+      currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
+      latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
+      manifestPath
+    };
+  }
+  for (const [kind, currentEntry] of Object.entries(currentRecords)) {
+    const persisted = manifest.recordVersions[kind];
+    if (persisted === undefined) {
       return {
         status: "unsupported",
         incompatibleComponent: "record",
         direction: "older",
         currentVersion: 0,
-        latestVersion: 1,
+        latestVersion: currentEntry.version,
         currentLayoutVersion: manifest.storageVersion,
         latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
         currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
         latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
+        recordFamily: kind,
         manifestPath
       };
     }
-  } else {
-    for (const [kind, currentEntry] of Object.entries(currentRecords)) {
-      const onDisk = manifest.recordVersions[kind];
-      if (onDisk === undefined) {
-        // A current family absent from the manifest's recordVersions map means
-        // the Home predates that family. The persisted record axis is version 0
-        // until an explicit family-introduction migration supplies it.
-        return {
-          status: "unsupported",
-          incompatibleComponent: "record",
-          direction: "older",
-          currentVersion: 0,
-          latestVersion: currentEntry.version,
-          currentLayoutVersion: manifest.storageVersion,
-          latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-          currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
-          latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-          recordFamily: kind,
-          manifestPath
-        };
-      }
-      if (onDisk !== currentEntry.version) {
-        return {
-          status: "unsupported",
-          incompatibleComponent: "record",
-          direction: onDisk < currentEntry.version ? "older" : "newer",
-          currentVersion: onDisk,
-          latestVersion: currentEntry.version,
-          currentLayoutVersion: manifest.storageVersion,
-          latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-          currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
-          latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-          recordFamily: kind,
-          manifestPath
-        };
-      }
+    if (persisted !== currentEntry.version) {
+      return {
+        status: "unsupported",
+        incompatibleComponent: "record",
+        direction: persisted < currentEntry.version ? "older" : "newer",
+        currentVersion: persisted,
+        latestVersion: currentEntry.version,
+        currentLayoutVersion: manifest.storageVersion,
+        latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
+        currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
+        latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
+        recordFamily: kind,
+        manifestPath
+      };
     }
   }
 
@@ -227,7 +200,7 @@ export function inspectStorageSchema(rootDir: string): StorageSchemaState {
 export function ensureStorageSchema(rootDir: string, now = new Date()): void {
   const state = inspectStorageSchema(rootDir);
   if (state.status === "uninitialized") {
-    writeStorageManifest(rootDir, now);
+    writeCurrentStorageManifest(rootDir, now);
     return;
   }
   requireInspectedSchema(state);
@@ -237,7 +210,21 @@ export function requireStorageSchema(rootDir: string): void {
   requireInspectedSchema(inspectStorageSchema(rootDir));
 }
 
-function writeStorageManifest(rootDir: string, now: Date): void {
+/**
+ * Compatible readers may bypass only a record-axis mismatch. Layout,
+ * aggregate, syntax, and initialization remain strict.
+ */
+export function requireCompatibleStorageSchema(rootDir: string): void {
+  const state = inspectStorageSchema(rootDir);
+  if (state.status === "current") return;
+  if (state.status === "unsupported"
+    && state.incompatibleComponent === "record"
+    && state.direction === "older") return;
+  requireInspectedSchema(state);
+}
+
+/** Persist the current three-axis manifest through the existing atomic-file seam. */
+export function writeCurrentStorageManifest(rootDir: string, now = new Date()): void {
   const recordVersions: Record<string, number> = {};
   for (const [kind, entry] of Object.entries(currentRecordVersions())) {
     recordVersions[kind] = entry.version;
@@ -286,13 +273,9 @@ function unsupportedVersion(
   recordFamily?: string
 ): StorageSchemaError {
   if (component === "record" && recordFamily === undefined) {
-    // Pre-baseline manifest: the recordVersions field is absent, meaning this
-    // Home was written before the migration baseline existed. No historical
-    // steps are fabricated; the user must reset or use a compatible release.
     return new StorageSchemaError(
       "STORAGE_SCHEMA_UNSUPPORTED",
-      "This Home was created before the Yui migration baseline and cannot be migrated by this release. "
-        + "Reset your Home (yui setup) or use a Yui release that supports this Home's version."
+      "This Home predates the durable record-version manifest and cannot be opened without explicit introduction migrations."
     );
   }
   const label = component === "layout"
@@ -312,21 +295,22 @@ function unsupportedVersion(
   );
 }
 
-type ParsedStorageManifest = Readonly<{
+export type ParsedStorageManifest = Readonly<{
   schemaVersion: 1;
   storageVersion: number;
   aggregateSchemaVersion: number;
-  /**
-   * The per-family record version map. Absent in pre-baseline manifests
-   * (written before the record-versions manifest field existed); callers treat
-   * an absent map as a pre-baseline, unsupported Home.
-   */
   recordVersions?: Readonly<Record<string, number>>;
   updatedAt: string;
 }>;
 
 function parseStorageManifest(raw: string): ParsedStorageManifest {
   const value = parseJsonObject(raw, "Storage schema manifest");
+  return parseStorageSchemaManifest(value);
+}
+
+/** Strictly parse one already-decoded manifest object through the shared contract. */
+export function parseStorageSchemaManifest(value: unknown): ParsedStorageManifest {
+  if (!isRecord(value)) throw new Error("Storage schema manifest must be an object");
   assertKeys(
     value,
     ["schemaVersion", "storageVersion", "aggregateSchemaVersion", "updatedAt"],
@@ -344,25 +328,18 @@ function parseStorageManifest(raw: string): ParsedStorageManifest {
   if (typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))) {
     throw new Error("updatedAt must be an ISO timestamp");
   }
-
-  // recordVersions is optional: a pre-baseline manifest omits it. When present,
-  // validate it strictly (known families, positive-integer versions). When
-  // absent, the caller treats the Home as pre-baseline / unsupported.
   let recordVersions: Readonly<Record<string, number>> | undefined;
   if (Object.hasOwn(value, "recordVersions")) {
-    const recordVersionsRaw = value.recordVersions;
-    if (!isRecord(recordVersionsRaw)) {
-      throw new Error("recordVersions must be an object");
-    }
-    const currentRecords = currentRecordVersions();
-    const actualKinds = Object.keys(recordVersionsRaw);
-    const unknown = actualKinds.filter((kind) => !Object.hasOwn(currentRecords, kind));
+    if (!isRecord(value.recordVersions)) throw new Error("recordVersions must be an object");
+    const known = currentRecordVersions();
+    const kinds = Object.keys(value.recordVersions);
+    const unknown = kinds.filter((kind) => !Object.hasOwn(known, kind));
     if (unknown.length > 0) {
       throw new Error(`recordVersions has unknown family: ${unknown[0]}`);
     }
     const parsed: Record<string, number> = {};
-    for (const kind of actualKinds) {
-      const version = recordVersionsRaw[kind];
+    for (const kind of kinds) {
+      const version = value.recordVersions[kind];
       if (!Number.isInteger(version) || (version as number) < 1) {
         throw new Error(`recordVersions['${kind}'] must be a positive integer`);
       }
@@ -370,7 +347,6 @@ function parseStorageManifest(raw: string): ParsedStorageManifest {
     }
     recordVersions = Object.freeze(parsed);
   }
-
   return {
     schemaVersion: 1,
     storageVersion: value.storageVersion as number,
@@ -378,6 +354,11 @@ function parseStorageManifest(raw: string): ParsedStorageManifest {
     ...(recordVersions === undefined ? {} : { recordVersions }),
     updatedAt: value.updatedAt
   };
+}
+
+/** Read and strictly parse the durable manifest through the same contract. */
+export function readStorageSchemaManifest(rootDir: string): ParsedStorageManifest {
+  return parseStorageManifest(readFileSync(join(rootDir, STORAGE_SCHEMA_FILE), "utf8"));
 }
 
 function parseJsonObject(raw: string, label: string): Record<string, unknown> {

@@ -108,7 +108,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
   if (currentRecordDescriptors === null) {
     currentRecordDescriptors = Object.freeze({
       config: descriptor(CURRENT_CONFIG_SCHEMA_VERSION, "state.json#/config"),
-      configuredAgent: descriptor(CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION, "state.json#/configuredAgents"),
+      configuredAgent: descriptor(
+        CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION,
+        "state.json#/configuredAgents"
+      ),
       project: descriptor(CURRENT_PROJECT_SCHEMA_VERSION, "state.json#/projects"),
       agentProfile: descriptor(CURRENT_AGENT_PROFILE_SCHEMA_VERSION, "state.json#/agentProfiles"),
       globalRole: descriptor(CURRENT_GLOBAL_ROLE_SCHEMA_VERSION, "state.json#/globalRoles"),
@@ -134,7 +137,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
       ),
       workItem: descriptor(CURRENT_WORK_ITEM_SCHEMA_VERSION, "state.json#/tasks/*/workItems"),
       agentRun: descriptor(CURRENT_AGENT_RUN_SCHEMA_VERSION, "state.json#/tasks/*/agentRuns"),
-      reviewRound: descriptor(CURRENT_REVIEW_ROUND_SCHEMA_VERSION, "state.json#/tasks/*/reviewRounds"),
+      reviewRound: descriptor(
+        CURRENT_REVIEW_ROUND_SCHEMA_VERSION,
+        "state.json#/tasks/*/reviewRounds"
+      ),
       changeSet: descriptor(CURRENT_CHANGE_SET_SCHEMA_VERSION, "state.json#/tasks/*/changeSets"),
       integrationAttempt: descriptor(
         CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
@@ -145,7 +151,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
         "state.json#/tasks/*/activeRuns"
       ),
       message: descriptor(CURRENT_MESSAGE_SCHEMA_VERSION, "state.json#/tasks/*/messages"),
-      inputRequest: descriptor(CURRENT_INPUT_REQUEST_SCHEMA_VERSION, "state.json#/tasks/*/inputRequests"),
+      inputRequest: descriptor(
+        CURRENT_INPUT_REQUEST_SCHEMA_VERSION,
+        "state.json#/tasks/*/inputRequests"
+      ),
       decision: descriptor(CURRENT_DECISION_SCHEMA_VERSION, "state.json#/tasks/*/decisions"),
       milestone: descriptor(CURRENT_MILESTONE_SCHEMA_VERSION, "state.json#/tasks/*/milestones"),
       event: descriptor(CURRENT_EVENT_SCHEMA_VERSION, "state.json#/tasks/*/events"),

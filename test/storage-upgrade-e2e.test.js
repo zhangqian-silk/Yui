@@ -24,6 +24,7 @@ import { latestStorageVersionState, currentRecordVersions }
   from "../dist/storage/upgrade/recordVersions.js";
 import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
 import { createHomeMigrationTarget } from "../dist/storage/upgrade/homeMigrationTarget.js";
+import { renderUpgradeResult } from "../dist/cli/upgradeCommand.js";
 import {
   placeUpgradeFence,
   readUpgradeFence,
@@ -164,6 +165,95 @@ test("upgrade --dry-run never writes output and never switches", async () => {
   // Source manifest still at the current (pre-synthetic) aggregate version.
   const manifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
   assert.equal(manifest.aggregateSchemaVersion, CURRENT_AGGREGATE_SCHEMA_VERSION);
+});
+
+test("upgrade --dry-run preserves an active-runtime engine result as a truthful blocker", async () => {
+  const { base, home } = currentHome();
+  const { latest, registry } = migratableSetup();
+  mkdirSync(join(home, "runtime"), { recursive: true });
+  writeFileSync(
+    join(home, "runtime", "controller.json"),
+    `${JSON.stringify({ pid: process.pid })}\n`
+  );
+  const before = readdirSync(base).sort();
+
+  const result = await runStorageUpgrade({
+    home,
+    registry,
+    latest,
+    mode: "dry-run",
+    inspectOfflineInventory: async () => ({ total: 0, blockers: [] })
+  });
+
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.stage, "active-runtime");
+  assert.equal(result.report?.outcome, "active-runtime");
+  assert.deepEqual(readdirSync(base).sort(), before);
+  assert.equal(existsSync(`${home}.upgrade-staging`), false);
+  const rendered = renderUpgradeResult(result, "dry-run");
+  assert.match(rendered, /Dry run blocked at active-runtime/i);
+  assert.doesNotMatch(rendered, /validated|loader gate/i);
+});
+
+test("internal update preflight classifies a migratable Home while its old Controller is live", async () => {
+  const { base, home } = currentHome();
+  const { latest, registry } = migratableSetup();
+  mkdirSync(join(home, "runtime"), { recursive: true });
+  writeFileSync(
+    join(home, "runtime", "controller.json"),
+    `${JSON.stringify({ pid: process.pid })}\n`
+  );
+  const before = readdirSync(base).sort();
+  let lifecycleProbeCount = 0;
+
+  const result = await runStorageUpgrade({
+    home,
+    registry,
+    latest,
+    mode: "update-preflight",
+    inspectOfflineInventory: async () => ({ total: 0, blockers: [] }),
+    controllerStatus: async () => {
+      lifecycleProbeCount += 1;
+      throw new Error("update preflight must not inspect or mutate Controller lifecycle");
+    }
+  });
+
+  assert.equal(result.outcome, "update-preflight");
+  assert.equal(result.status, "migration-required");
+  assert.equal(result.stepCount, 1);
+  assert.equal(lifecycleProbeCount, 0);
+  assert.deepEqual(readdirSync(base).sort(), before);
+  assert.equal(existsSync(`${home}.upgrade-staging`), false);
+  assert.equal(readUpgradeFence(home), null);
+  assert.equal(
+    readFileSync(join(home, "runtime", "controller.json"), "utf8"),
+    `${JSON.stringify({ pid: process.pid })}\n`
+  );
+  const rendered = renderUpgradeResult(result, "update-preflight");
+  assert.match(rendered, /classification plus a clear offline runtime inventory/i);
+  assert.doesNotMatch(rendered, /validated|loader gate/i);
+});
+
+test("the staged updater's internal CLI flag emits its distinct machine contract", () => {
+  const { base, home } = currentHome();
+  mkdirSync(join(home, "runtime"), { recursive: true });
+  writeFileSync(
+    join(home, "runtime", "controller.json"),
+    `${JSON.stringify({ pid: process.pid })}\n`
+  );
+  const before = readdirSync(base).sort();
+
+  const command = runCli(home, ["--json", "upgrade", "--update-preflight"]);
+
+  assert.equal(command.status, 0);
+  const envelope = JSON.parse(command.stdout);
+  assert.equal(envelope.ok, true);
+  assert.equal(envelope.data.outcome, "update-preflight");
+  assert.equal(envelope.data.status, "already-current");
+  assert.equal(envelope.data.stepCount, 0);
+  assert.deepEqual(readdirSync(base).sort(), before);
+  assert.equal(readUpgradeFence(home), null);
+  assert.equal(existsSync(`${home}.upgrade-staging`), false);
 });
 
 test("the admission fence blocks new writers and exempts its owner", () => {

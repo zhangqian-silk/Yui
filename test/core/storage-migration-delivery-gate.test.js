@@ -228,3 +228,102 @@ test("the production delivery gate checks target-only families instead of skippi
   });
   assert.doesNotThrow(() => assertRegistryCoversBaselineToCurrent(registry, baseline, target));
 });
+
+test("the frozen baseline rejects record locator drift without a scalar migration boundary", () => {
+  const baseline = BASELINE_STORAGE_VERSION_STATE;
+  const drifted = {
+    ...baseline,
+    record: {
+      ...baseline.record,
+      configuredAgent: {
+        ...baseline.record.configuredAgent,
+        path: "state.json#/renamedConfiguredAgents"
+      }
+    }
+  };
+
+  assert.throws(() => assertBaselineConsistency(drifted), /configuredAgent.*path drift/i);
+});
+
+test("record locator drift requires a complete offline scalar migration path", () => {
+  const baseline = BASELINE_STORAGE_VERSION_STATE;
+
+  for (const axis of ["layout", "aggregate"]) {
+    const target = {
+      ...baseline,
+      [axis]: baseline[axis] + 1,
+      record: {
+        ...baseline.record,
+        configuredAgent: {
+          ...baseline.record.configuredAgent,
+          path: "state.json#/renamedConfiguredAgents"
+        }
+      }
+    };
+
+    assert.doesNotThrow(() => assertBaselineConsistency(target));
+
+    const declarationOnly = createEmptyRegistry();
+    declarationOnly.declareOfflineMigration({
+      axis,
+      fromVersion: baseline[axis],
+      toVersion: target[axis]
+    });
+    assert.throws(
+      () => assertRegistryCoversBaselineToCurrent(declarationOnly, baseline, target),
+      new RegExp(`${axis}.*no migration step`, "i")
+    );
+
+    const complete = createEmptyRegistry();
+    complete.registerOfflineMigration({
+      axis,
+      fromVersion: baseline[axis],
+      toVersion: target[axis],
+      preconditions: () => {},
+      transform: (snapshot) => ({ ...snapshot }),
+      declaredEffects: []
+    });
+    assert.doesNotThrow(
+      () => assertRegistryCoversBaselineToCurrent(complete, baseline, target)
+    );
+  }
+});
+
+test("a target-family introduction must be declared and executable", () => {
+  const baseline = BASELINE_STORAGE_VERSION_STATE;
+  const target = {
+    ...baseline,
+    record: {
+      ...baseline.record,
+      postBaselineRecord: { version: 1, path: "state.json#/postBaselineRecords" }
+    }
+  };
+
+  const compatible = createEmptyRegistry();
+  compatible.registerCompatible({
+    axis: "record",
+    recordKind: "postBaselineRecord",
+    fromVersion: 0,
+    toVersion: 1,
+    introduction: true,
+    defaults: ["postBaselineRecords={}"],
+    validateSource: () => {},
+    normalize: (snapshot) => ({ ...snapshot })
+  });
+  assert.doesNotThrow(
+    () => assertRegistryCoversBaselineToCurrent(compatible, baseline, target)
+  );
+
+  const declarationOnly = createEmptyRegistry();
+  declarationOnly.declareOfflineMigration({
+    axis: "record",
+    recordKind: "postBaselineRecord",
+    fromVersion: 0,
+    toVersion: 1,
+    introduction: true
+  });
+  assert.throws(
+    () => assertRegistryCoversBaselineToCurrent(declarationOnly, baseline, target),
+    /no migration step/i
+  );
+});

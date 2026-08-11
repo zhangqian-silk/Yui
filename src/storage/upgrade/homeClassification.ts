@@ -2,8 +2,8 @@
  * Four-state classification of a real Yui Home.
  *
  * This layers real, I/O-based corruption detection onto the pure WI-3
- * classifier. It reports exactly one verdict —
- * `USABLE` / `MIGRATABLE` / `NEEDS_NEW_VERSION` / `CORRUPTED` — together with the
+ * classifier. It reports exactly one shared product state — current,
+ * compatible-old, migration-required, or unsupported — together with the
  * on-disk layout and aggregate versions and, when the store cannot be used, the
  * incompatible component (layout vs aggregate).
  *
@@ -13,14 +13,15 @@
  * graph (detected by the strict loader once every axis is already current), or a
  * `schema.json` manifest that is not valid. It is never inferred from version
  * magnitude. An older or newer version — on ANY axis, including a single older
- * record family — is a version verdict (`MIGRATABLE` when a complete step path
- * exists, else `NEEDS_NEW_VERSION`), never `CORRUPTED`. A strictly-older Home
- * without a complete registered path receives a precise `missing-step` reason.
+ * record family — is a version verdict (`COMPATIBLE` for an all-compatible path,
+ * `MIGRATABLE` for an offline path, otherwise `NEEDS_NEW_VERSION`), never
+ * `CORRUPTED`. An older Home without a complete declared path fails closed with
+ * a precise missing declaration/step reason.
  *
- * The three axes are independent: the record axis is read structurally from the
- * raw `state.json` (see `inspectSourceVersionState` / `recordVersionScan.ts`), so
- * a record-only-older Home is classified on its version axis rather than being
- * misreported as corrupted by the strict loader.
+ * The three axes are independent: record versions come from the durable
+ * manifest and raw `state.json` is traversed structurally only to verify that
+ * non-empty families agree. This keeps a record-only-older Home on its version
+ * axis without letting an empty target family masquerade as current.
  */
 
 import {
@@ -78,7 +79,11 @@ export function classifyHome<Snapshot>(
   } as const;
 
   if (schema.status === "uninitialized") {
-    return { ...base, classification: { verdict: "USABLE" }, uninitialized: true };
+    return {
+      ...base,
+      classification: { verdict: "USABLE", status: "current" },
+      uninitialized: true
+    };
   }
 
   if (schema.status === "invalid") {
@@ -87,20 +92,24 @@ export function classifyHome<Snapshot>(
       ...base,
       classification: {
         verdict: "CORRUPTED",
+        status: "unsupported",
         detail: `Storage schema manifest is invalid: ${schema.detail}`
       }
     };
   }
 
-  // Read all three axes read-only. The record axis is extracted structurally from
-  // the raw state.json (never through the strict loader), so an older/newer
-  // record family is a version fact — not a false corruption. Structural JSON
-  // damage surfaces here as a corruption signal.
+  // Read all three durable axes read-only, then structurally cross-check raw
+  // state.json without invoking the strict current loader. Version differences
+  // remain version facts; manifest/state contradictions surface as corruption.
   const inspected = inspectSourceVersionState(home, latest);
   if ("corruption" in inspected) {
     return {
       ...base,
-      classification: { verdict: "CORRUPTED", detail: inspected.corruption.detail },
+      classification: {
+        verdict: "CORRUPTED",
+        status: "unsupported",
+        detail: inspected.corruption.detail
+      },
       layoutVersion: schema.currentLayoutVersion,
       aggregateVersion: schema.currentAggregateSchemaVersion,
       ...(incompatibleComponentOf(schema) === undefined

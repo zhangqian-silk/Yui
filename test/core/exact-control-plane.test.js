@@ -54,6 +54,9 @@ import {
   TASK_FINAL_REVIEW_ARGUMENT,
   createTaskFinalReviewContract
 } from "../../dist/review/taskFinalReviewContract.js";
+import { exactTaskCliInvocation } from "../helpers/exactTaskCli.js";
+import { bindExecution, claimPending } from "../../dist/coordination/workMailbox.js";
+import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 
 function fixture(t, roleName = "worker", { projectBacked = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), "yui-exact-control-"));
@@ -638,4 +641,224 @@ test("central preflight fences digest, Home, storage, and running Controller ide
       throw new ControllerClientError("CONTROLLER_NOT_RUNNING", "not running");
     }
   }));
+});
+
+test("managed compatible continuity ignores only package-version drift", async (t) => {
+  const { home, cliEntry, control, digest } = fixture(t);
+  const current = yuiVersionIdentity();
+  const replacement = { ...current, version: `${current.version}-replacement` };
+  const status = {
+    running: true,
+    protocolVersion: current.controllerProtocolVersion,
+    version: replacement.version,
+    storageLayoutVersion: current.storageLayoutVersion,
+    aggregateSchemaVersion: current.aggregateSchemaVersion
+  };
+  const input = {
+    serializedDescriptor: serializeExactDescriptor(control),
+    digest,
+    actualExecutable: process.execPath,
+    actualCliEntry: cliEntry,
+    actualHome: home
+  };
+  const preflight = (identity, controller = status) => assertExactControlPlanePreflight(input, {
+    identity,
+    callController: async () => controller
+  });
+
+  await assert.doesNotReject(preflight(replacement));
+  for (const [field, value] of [
+    ["controllerProtocolVersion", current.controllerProtocolVersion + 1],
+    ["storageLayoutVersion", current.storageLayoutVersion + 1],
+    ["aggregateSchemaVersion", current.aggregateSchemaVersion + 1]
+  ]) {
+    await assert.rejects(
+      preflight({ ...replacement, [field]: value }),
+      new RegExp(field, "i")
+    );
+  }
+  for (const [field, value, label] of [
+    ["protocolVersion", current.controllerProtocolVersion + 1, "protocol"],
+    ["storageLayoutVersion", current.storageLayoutVersion + 1, "storage layout"],
+    ["aggregateSchemaVersion", current.aggregateSchemaVersion + 1, "aggregate schema"]
+  ]) {
+    await assert.rejects(
+      preflight(replacement, { ...status, [field]: value }),
+      new RegExp(`Controller ${label}.*incompatible`, "i")
+    );
+  }
+  await assert.rejects(
+    preflight(replacement, { ...status, version: null }),
+    /Controller version is invalid/i
+  );
+});
+
+test("an existing exact managed Session can yield after a compatible package replacement", (t) => {
+  const { home, runtime, store } = fixture(t, "leader");
+  const run = store.getAgentRun(runtime.taskId, runtime.runId);
+  assert.notEqual(run, null);
+  store.saveAgentRun({
+    ...run,
+    pushedAt: "2026-08-09T00:00:01.000Z"
+  });
+  store.transaction((tx) => {
+    const target = {
+      kind: "role",
+      taskId: runtime.taskId,
+      roleName: runtime.roleName
+    };
+    const now = new Date("2026-08-09T00:00:00.000Z");
+    enqueueWork(tx, target, "run-dispatched", now, [{
+      type: "run",
+      taskId: runtime.taskId,
+      id: runtime.runId
+    }]);
+    const pending = tx.getWorkMailbox(target);
+    tx.saveWorkMailbox(bindExecution(claimPending(pending, {
+      batchId: "delivery-1",
+      owner: "fixture-delivery",
+      startedAt: now.toISOString()
+    }), "delivery-1", {
+      type: "run",
+      taskId: runtime.taskId,
+      id: runtime.runId
+    }));
+  });
+  const current = yuiVersionIdentity();
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: runtime.taskId,
+    roleName: runtime.roleName,
+    controlIdentity: { ...current, version: `${current.version}-previous` }
+  });
+  try {
+    const result = spawnSync(process.execPath, [
+      invocation.cliEntry,
+      ...invocation.prefix,
+      "task", "run", "yield", runtime.runId,
+      "--summary", "continued after compatible package replacement"
+    ], {
+      encoding: "utf8",
+      env: invocation.environment,
+      timeout: 10_000
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(store.getAgentRun(runtime.taskId, runtime.runId)?.status, "yielded");
+    assert.equal(
+      store.getAgentRun(runtime.taskId, runtime.runId)?.summary,
+      "continued after compatible package replacement"
+    );
+  } finally {
+    invocation.stopFixtureController();
+  }
+});
+
+test("central preflight delegates record-only older storage to the compatible opener", async (t) => {
+  const { home, cliEntry, control, digest } = fixture(t);
+  const current = yuiVersionIdentity();
+  const input = {
+    serializedDescriptor: serializeExactDescriptor(control),
+    digest,
+    actualExecutable: process.execPath,
+    actualCliEntry: cliEntry,
+    actualHome: home
+  };
+  let openedHome;
+  let validated = false;
+
+  await assert.doesNotReject(assertExactControlPlanePreflight(input, {
+    inspectStorage: () => ({
+      status: "unsupported",
+      incompatibleComponent: "record",
+      direction: "older",
+      currentLayoutVersion: current.storageLayoutVersion,
+      currentAggregateSchemaVersion: current.aggregateSchemaVersion
+    }),
+    openCompatibleStore: (candidateHome) => {
+      openedHome = candidateHome;
+      return {
+        getConfig() {
+          validated = true;
+          return {};
+        }
+      };
+    },
+    checkController: false
+  }));
+  assert.equal(openedHome, home);
+  assert.equal(validated, true);
+});
+
+test("central preflight keeps every non-compatible storage state fail-closed", async (t) => {
+  const { home, cliEntry, control, digest } = fixture(t);
+  const current = yuiVersionIdentity();
+  const input = {
+    serializedDescriptor: serializeExactDescriptor(control),
+    digest,
+    actualExecutable: process.execPath,
+    actualCliEntry: cliEntry,
+    actualHome: home
+  };
+  const blocked = [
+    { status: "uninitialized" },
+    { status: "invalid" },
+    {
+      status: "unsupported",
+      incompatibleComponent: "layout",
+      direction: "older",
+      currentLayoutVersion: current.storageLayoutVersion - 1,
+      currentAggregateSchemaVersion: current.aggregateSchemaVersion
+    },
+    {
+      status: "unsupported",
+      incompatibleComponent: "aggregate",
+      direction: "older",
+      currentLayoutVersion: current.storageLayoutVersion,
+      currentAggregateSchemaVersion: current.aggregateSchemaVersion - 1
+    },
+    {
+      status: "unsupported",
+      incompatibleComponent: "record",
+      direction: "newer",
+      currentLayoutVersion: current.storageLayoutVersion,
+      currentAggregateSchemaVersion: current.aggregateSchemaVersion
+    },
+    {
+      status: "unsupported",
+      incompatibleComponent: "record",
+      direction: "older",
+      currentLayoutVersion: current.storageLayoutVersion - 1,
+      currentAggregateSchemaVersion: current.aggregateSchemaVersion
+    }
+  ];
+  let openCount = 0;
+  for (const storage of blocked) {
+    await assert.rejects(assertExactControlPlanePreflight(input, {
+      inspectStorage: () => storage,
+      openCompatibleStore: () => {
+        openCount += 1;
+        return { getConfig: () => ({}) };
+      },
+      checkController: false
+    }), /storage is not current/i);
+  }
+  assert.equal(openCount, 0);
+
+  await assert.rejects(assertExactControlPlanePreflight(input, {
+    inspectStorage: () => ({
+      status: "unsupported",
+      incompatibleComponent: "record",
+      direction: "older",
+      currentLayoutVersion: current.storageLayoutVersion,
+      currentAggregateSchemaVersion: current.aggregateSchemaVersion
+    }),
+    openCompatibleStore: () => {
+      openCount += 1;
+      throw new Error("compatible source declaration or shape is corrupted");
+    },
+    checkController: false
+  }), /compatible source declaration or shape is corrupted/i);
+  assert.equal(openCount, 1);
 });

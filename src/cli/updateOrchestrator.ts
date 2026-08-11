@@ -7,21 +7,24 @@
  * orchestrator replaces that with a side-by-side staging flow:
  *
  *   stage (side-by-side, never touches the live install)
- *     -> preflight  (the STAGED new binary inspects the target Home read-only)
- *     -> [only if safe] activate storage  (recoverable: backup + no auto-downgrade
- *                                           once the new version resumes writes)
- *     -> activate binary  (promote the staged package to the live install)
- *     -> post-verify  (the new binary's real loader + reference-graph health check)
+ *     -> preflight  (the STAGED new binary classifies the target Home read-only)
+ *     -> current/compatible: exact Controller stop -> activate the same binary
+ *     -> migration-required: authoritative offline inventory -> recoverable
+ *        storage switch -> activate the same binary
+ *     -> post-verify through the activated binary, then replacement Controller
  *
  * ## Rollback boundary (NARROWED — no versioned binary pointer is introduced)
  *
- * This release deliberately does NOT introduce a stable launcher or a versioned
- * binary pointer, so it does NOT claim binary+Home dual-resource atomicity. The
- * guarantees it DOES make, precisely:
+ * The managed Session launcher is an in-place forwarder, not a versioned package
+ * pointer, so this release does NOT claim binary+Home dual-resource atomicity.
+ * The guarantees it DOES make, precisely:
  *
  *  - **Staging is isolated.** `stage` installs side-by-side and never mutates the
  *    live global install, so a stage/preflight failure leaves the old binary and
  *    the Home byte-for-byte unchanged.
+ *  - **Compatible activation does not switch the Home.** The fast path stops the
+ *    exact Controller, promotes the staged artifact, and verifies a compatible
+ *    current-model loader without copy, backup, rename, or Session wait.
  *  - **Storage activation is recoverable until writes resume.** The Home switch is
  *    atomic with a timestamped backup (see the migration engine). Before the new
  *    version resumes writes, recovery is a single restore of that backup.
@@ -52,18 +55,51 @@ export type StagedPackage = Readonly<{
   stagingPath?: string;
 }>;
 
-/** Read-only preflight verdict produced by the staged binary against the Home. */
+/**
+ * Read-only classification plus path-specific compatible-source validation or
+ * offline inventory produced by the staged binary. It is not a user dry-run and
+ * carries no staged-output validation claim.
+ */
 export type UpdatePreflight = Readonly<
   | { status: "already-current" }
+  | { status: "compatible"; summary: string }
+  | { status: "migration-required"; summary: string }
+  /** Legacy staged binaries reported this spelling; it remains offline. */
   | { status: "migratable"; summary: string }
-  | { status: "blocked"; stage: string; message: string; action: string }
+  | {
+      status: "blocked";
+      stage: string;
+      message: string;
+      action: string;
+      blockers?: readonly UpdateBlockerIdentity[];
+      retryCommand?: string;
+      sceneUnchanged?: true;
+    }
 >;
+
+/** Exact identity and reason for one offline-upgrade blocker. */
+export type UpdateBlockerIdentity = Readonly<{
+  taskId?: string;
+  roleName?: string;
+  runId?: string;
+  nativeSessionId?: string;
+  launchId?: string;
+  reason: string;
+}>;
 
 /** The result of promoting the staged storage into place (recoverable step). */
 export type StorageActivation = Readonly<
   | { status: "already-current" }
   | { status: "migrated"; backupPath?: string }
-  | { status: "blocked"; stage: string; message: string; action: string }
+  | {
+      status: "blocked";
+      stage: string;
+      message: string;
+      action: string;
+      blockers?: readonly UpdateBlockerIdentity[];
+      retryCommand?: string;
+      sceneUnchanged?: true;
+    }
   /**
    * The activation child did not return a parseable success/failure receipt
    * (e.g. killed by SIGTERM/OOM after the atomic switch, or crashed before
@@ -129,7 +165,7 @@ export type StorageStateProbe = Readonly<{
 export type UpdatePorts = Readonly<{
   /** Install the latest package side-by-side; never touch the live install. */
   stage: () => StagedPackage;
-  /** Run the staged binary's read-only preflight against the target Home. */
+  /** Run the staged binary's path-specific read-only update preflight. */
   preflight: (staged: StagedPackage, home: string) => UpdatePreflight;
   /** Promote the staged storage into place (atomic switch + backup). */
   activateStorage: (staged: StagedPackage, home: string) => StorageActivation;
@@ -154,7 +190,8 @@ export type UpdatePorts = Readonly<{
    * failed pre-switch update never falls back to a staged/new Controller.
    */
   controllerStatus?: (home: string) => UpdateControllerLifecycleStatus;
-  stopController?: (home: string) => UpdateControllerStopResult;
+  /** Stop only the Controller PID captured by `controllerStatus`. */
+  stopController?: (home: string, expectedPid: number) => UpdateControllerStopResult;
   /**
    * Stop only a replacement Controller whose PID was authenticated against the
    * restart/readiness result for this update attempt.  This is intentionally a
@@ -172,7 +209,12 @@ export type UpdatePorts = Readonly<{
 export type UpdateResult = Readonly<
   (
     | { outcome: "already-current"; version: string }
-    | { outcome: "updated"; version: string; storageBackupPath?: string }
+    | {
+        outcome: "updated";
+        version: string;
+        path: "current-fast" | "compatible-fast" | "offline-migration";
+        storageBackupPath?: string;
+      }
     | {
         outcome: "aborted";
         phase: UpdatePhase;
@@ -182,6 +224,9 @@ export type UpdateResult = Readonly<
         recoverable: boolean;
         version?: string;
         storageBackupPath?: string;
+        blockers?: readonly UpdateBlockerIdentity[];
+        retryCommand?: string;
+        sceneUnchanged?: true;
       }
     /**
      * The storage activation's outcome could not be determined: the switch may or
@@ -294,7 +339,12 @@ function runStagedUpdate(
       message: preflight.message,
       action: preflight.action,
       recoverable: true,
-      version: staged.version
+      version: staged.version,
+      ...(preflight.blockers === undefined ? {} : { blockers: preflight.blockers }),
+      ...(preflight.retryCommand === undefined
+        ? {}
+        : { retryCommand: preflight.retryCommand }),
+      ...(preflight.sceneUnchanged === true ? { sceneUnchanged: true } : {})
     };
   }
 
@@ -305,9 +355,18 @@ function runStagedUpdate(
   const lifecycle = captureControllerLifecycle(ports, staged.version, home);
   if ("outcome" in lifecycle) return lifecycle;
 
-  if (preflight.status === "already-current") {
-    // Nothing to migrate; promote the binary and verify. Storage is untouched.
-    return activateAndVerify(ports, staged, home, undefined, lifecycle.lifecycle);
+  if (preflight.status === "already-current" || preflight.status === "compatible") {
+    // Current and all-compatible chains share the lean path: no Home copy,
+    // backup, rename, or command replay. The exact Controller handoff prevents
+    // old/new writers from overlapping while the same staged artifact activates.
+    return activateAndVerify(
+      ports,
+      staged,
+      home,
+      undefined,
+      lifecycle.lifecycle,
+      preflight.status === "compatible" ? "compatible-fast" : "current-fast"
+    );
   }
 
   // 3) Activate storage — recoverable: atomic switch + timestamped backup. An
@@ -335,7 +394,12 @@ function runStagedUpdate(
       // The engine guarantees the source Home is unchanged on a blocked/failed
       // migration, and the binary has not been promoted, so this is recoverable.
       recoverable: true,
-      version: staged.version
+      version: staged.version,
+      ...(activation.blockers === undefined ? {} : { blockers: activation.blockers }),
+      ...(activation.retryCommand === undefined
+        ? {}
+        : { retryCommand: activation.retryCommand }),
+      ...(activation.sceneUnchanged === true ? { sceneUnchanged: true } : {})
     };
     // The child was externally quiesced by this parent. A clean pre-switch
     // refusal therefore restores the exact captured identity; an ambiguous
@@ -369,7 +433,14 @@ function runStagedUpdate(
   const backupPath = activation.status === "migrated" ? activation.backupPath : undefined;
 
   // 4/5) Promote the binary, then post-verify with the new binary's loader.
-  return activateAndVerify(ports, staged, home, backupPath, lifecycle.lifecycle);
+  return activateAndVerify(
+    ports,
+    staged,
+    home,
+    backupPath,
+    lifecycle.lifecycle,
+    "offline-migration"
+  );
 }
 
 /**
@@ -383,7 +454,8 @@ function activateAndVerify(
   staged: StagedPackage,
   home: string,
   storageBackupPath: string | undefined,
-  lifecycle?: UpdateControllerLifecycle
+  lifecycle: UpdateControllerLifecycle | undefined,
+  path: "current-fast" | "compatible-fast" | "offline-migration"
 ): UpdateResult {
   try {
     ports.activateBinary(staged);
@@ -453,8 +525,8 @@ function activateAndVerify(
   }
 
   return storageBackupPath === undefined
-    ? { outcome: "updated", version: staged.version }
-    : { outcome: "updated", version: staged.version, storageBackupPath };
+    ? { outcome: "updated", version: staged.version, path }
+    : { outcome: "updated", version: staged.version, path, storageBackupPath };
 }
 
 /**
@@ -516,6 +588,17 @@ function captureControllerLifecycle(
     };
   }
   if (!status.running) return { lifecycle: { wasRunning: false, stopped: false } };
+  if (!isPositivePid(status.pid)) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: "The Controller is running but its exact PID could not be captured.",
+      action:
+        "Refusing an unfenced stop; inspect Controller ownership and retry only after its PID is authenticated.",
+      recoverable: true,
+      version
+    };
+  }
   if (!isControllerIdentity(status.identity)) {
     return {
       outcome: "aborted",
@@ -531,7 +614,7 @@ function captureControllerLifecycle(
 
   let stopped: UpdateControllerStopResult;
   try {
-    stopped = ports.stopController(home);
+    stopped = ports.stopController(home, status.pid);
   } catch (error) {
     return {
       outcome: "aborted",
@@ -543,11 +626,16 @@ function captureControllerLifecycle(
       version
     };
   }
-  if (!isControllerStopResult(stopped) || stopped.stopped !== true) {
+  if (
+    !isControllerStopResult(stopped)
+    || stopped.stopped !== true
+    || stopped.pid !== status.pid
+  ) {
     return {
       outcome: "aborted",
       phase: "preflight",
-      message: "Controller stop did not return the required stopped:true confirmation.",
+      message:
+        `Controller stop did not confirm the captured PID ${status.pid} with stopped:true.`,
       action:
         "Keep the Home quiesced and inspect the Controller; no binary activation was attempted and no stop retry was issued.",
       recoverable: true,
@@ -632,6 +720,10 @@ function isControllerLifecycleStatus(value: unknown): value is UpdateControllerL
 
 function isControllerStopResult(value: unknown): value is UpdateControllerStopResult {
   return isRecord(value) && typeof value.stopped === "boolean";
+}
+
+function isPositivePid(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 function isControllerIdentity(value: unknown): value is ControllerIdentity {

@@ -68,7 +68,13 @@ export function planMigration<Snapshot>(
 
   return ordered.length === 0
     ? { kind: "no-op" }
-    : { kind: "runnable", steps: ordered };
+    : {
+        kind: "runnable",
+        path: ordered.some(({ transition }) => transition === "offline-migration")
+          ? "offline-migration"
+          : "compatible",
+        steps: ordered
+      };
 }
 
 function planScalarAxis<Snapshot>(
@@ -118,8 +124,26 @@ function planChain<Snapshot>(
   }
   const steps: PlannedStep<Snapshot>[] = [];
   for (let version = from; version < to; version += 1) {
-    const step = registry.lookup(axis, recordKind, version);
-    if (step === undefined) {
+    const declaration = registry.lookupDeclaration(axis, recordKind, version);
+    const registeredStep = registry.lookup(axis, recordKind, version);
+    if (declaration === undefined && registeredStep !== undefined) {
+      return {
+        kind: "blocked",
+        blocker: {
+          reason: "missing-declaration",
+          axis,
+          ...(recordKind ? { recordKind } : {}),
+          from: version,
+          to: version + 1,
+          message:
+            `No compatible/offline-migration declaration is registered for ` +
+            `${label} ${version}->${version + 1}.`,
+          action:
+            "Declare the adjacent change explicitly; do not infer compatibility from its version."
+        }
+      };
+    }
+    if (declaration === undefined) {
       return {
         kind: "blocked",
         blocker: {
@@ -134,11 +158,38 @@ function planChain<Snapshot>(
         }
       };
     }
+    const step = declaration.kind === "compatible"
+      ? {
+          axis,
+          ...(recordKind ? { recordKind } : {}),
+          fromVersion: version,
+          toVersion: version + 1,
+          preconditions: declaration.validateSource,
+          transform: declaration.normalize,
+          declaredEffects: []
+        }
+      : registeredStep;
+    if (step === undefined) {
+      return {
+        kind: "blocked",
+        blocker: {
+          reason: "missing-step",
+          axis,
+          ...(recordKind ? { recordKind } : {}),
+          from: version,
+          to: version + 1,
+          message: `No migration step is registered for ${label} ${version}->${version + 1}.`,
+          action:
+            "This offline transition cannot run until this release provides its migration step."
+        }
+      };
+    }
     steps.push({
       axis,
       ...(recordKind ? { recordKind } : {}),
       fromVersion: version,
       toVersion: version + 1,
+      transition: declaration.kind,
       step
     });
   }

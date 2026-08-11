@@ -32,7 +32,8 @@ import {
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
-import { FileTaskStore, type TaskStore } from "../storage/taskStore.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import {
   FileTaskWorkspacePreparer,
   type TaskWorkspacePreparer
@@ -104,7 +105,7 @@ export async function startFileTaskControllerRuntime(
   home: string,
   options: FileTaskControllerFactoryOptions = {}
 ): Promise<RunningFileTaskControllerRuntime> {
-  const store = options.store ?? new FileTaskStore(home);
+  const store = options.store ?? openCompatibleFileTaskStore(home);
   const schedulerStore = options.schedulerStore ?? new FileSchedulerStoreAdapter(store);
   const domainIdentity = options.domainIdentity
     ?? ephemeralDomainFromEnvironment(options.environment ?? process.env);

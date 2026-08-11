@@ -41,12 +41,21 @@ export {
   BASELINE_AGGREGATE_SCHEMA_VERSION,
   BASELINE_RECORD_VERSIONS,
   BASELINE_STORAGE_VERSION_STATE,
+  baselineStorageVersionState,
   assertBaselineConsistency
 } from "./baseline.js";
 export {
   createProductionRegistry,
+  createProductionStorageRegistry,
   assertRegistryCoversBaselineToCurrent
 } from "./productionRegistry.js";
+export {
+  loadCompatibleSnapshot,
+  writeCurrentSnapshot,
+  StorageCompatibilityError,
+  type CompatibleLoadOptions,
+  type CurrentWriteOptions
+} from "./compatibleCodec.js";
 
 /**
  * The current baseline scalar versions, sourced from the single authoritative

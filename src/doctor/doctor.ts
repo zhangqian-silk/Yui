@@ -10,17 +10,21 @@ import {
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
-  FileTaskStore,
   resolveYuiHome,
   STORAGE_STATE_FILE
 } from "../storage/taskStore.js";
+import {
+  createProductionStorageRegistry,
+  openCompatibleFileTaskStore,
+  validateCompatibleFileTaskStore,
+  type OpenCompatibleFileTaskStoreOptions
+} from "../storage/compatibleTaskStore.js";
 import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
 import { classifyHome } from "../storage/upgrade/homeClassification.js";
 import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
-import { createProductionMigrationRegistry } from "../storage/upgrade/productionMigrationRegistry.js";
 import {
   CommandExecutionError,
   type CommandExecutor
@@ -86,9 +90,10 @@ export function summarizeStorageHealth(
 /** Build the full machine-readable doctor report (checks + storage health). */
 export function buildDoctorReport(
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor
+  executor: CommandExecutor,
+  storageOptions: OpenCompatibleFileTaskStoreOptions = {}
 ): DoctorReport {
-  const checks = getDoctorChecks(env, executor);
+  const checks = getDoctorChecks(env, executor, storageOptions);
   return { checks, storage: summarizeStorageHealth(checks) };
 }
 
@@ -102,30 +107,57 @@ type SchemaInspection = StorageSchemaState | Readonly<{
   detail: string;
 }>;
 
+type StorageCompatibilityStatus =
+  | "current"
+  | "compatible-old"
+  | "migration-required"
+  | "unsupported";
+
+type ResolvedStorageOptions = Required<OpenCompatibleFileTaskStoreOptions>;
+
+type CompatibilityInspection = Readonly<{
+  check: DoctorCheck;
+  storageStatus?: StorageCompatibilityStatus;
+  storageOptions?: ResolvedStorageOptions;
+}>;
+
 /** Runs the read-only FileTaskStore diagnostics used by `yui doctor`. */
 export function runDoctorCommand(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor
+  executor: CommandExecutor,
+  storageOptions: OpenCompatibleFileTaskStoreOptions = {}
 ): string {
   if (args.length !== 0) throw usageError("Doctor usage: yui doctor");
-  return renderDoctor(getDoctorChecks(env, executor));
+  return renderDoctor(getDoctorChecks(env, executor, storageOptions));
 }
 
 export function getDoctorChecks(
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor
+  executor: CommandExecutor,
+  storageOptions: OpenCompatibleFileTaskStoreOptions = {}
 ): DoctorCheck[] {
   const home = resolveYuiHome(env);
   const homeCheck = checkHome(home);
   const schema = readSchema(home);
-  const schemaCheck = checkSchema(schema);
-  const storage = inspectState(home, homeCheck, schema);
+  const compatibility = inspectCompatibility(
+    home,
+    homeCheck,
+    schema,
+    storageOptions
+  );
+  const schemaCheck = checkSchema(schema, compatibility);
+  const storage = inspectState(
+    home,
+    homeCheck,
+    schema,
+    compatibility
+  );
   const domain = checkEphemeralDomain(home);
   return [
     homeCheck,
     schemaCheck,
-    checkCompatibility(home, homeCheck, schema),
+    compatibility.check,
     storage.check,
     ...(domain === undefined ? [] : [domain]),
     checkExecutable("git", env.YUI_GIT_BIN ?? "git", ["--version"], executor),
@@ -210,7 +242,10 @@ function readSchema(home: string): SchemaInspection {
   }
 }
 
-function checkSchema(state: SchemaInspection): DoctorCheck {
+function checkSchema(
+  state: SchemaInspection,
+  compatibility: CompatibilityInspection
+): DoctorCheck {
   switch (state.status) {
     case "uninitialized":
       return { name: "storage schema", status: "missing", detail: "run yui setup" };
@@ -221,6 +256,18 @@ function checkSchema(state: SchemaInspection): DoctorCheck {
         detail: `current=${state.currentVersion} latest=${state.latestVersion}`
       };
     case "unsupported":
+      if (
+        compatibility.storageStatus === "compatible-old"
+        && compatibility.check.status === "ok"
+      ) {
+        return {
+          name: "storage schema",
+          status: "ok",
+          detail:
+            `current=${state.currentVersion} latest=${state.latestVersion} `
+            + `direction=${state.direction}; compatible-old validated`
+        };
+      }
       return {
         name: "storage schema",
         status: "unsupported",
@@ -238,67 +285,119 @@ function checkSchema(state: SchemaInspection): DoctorCheck {
  * NEEDS_NEW_VERSION / CORRUPTED. This complements the raw "storage schema" check
  * with the migration framework's verdict, so a user sees whether a Home can be
  * used as-is, upgraded with `yui upgrade`, needs a newer release, or is damaged.
- * Doctor uses the same explicit production registry as `yui upgrade`, so a
- * complete supported path reads as MIGRATABLE and every missing path fails
- * closed. CORRUPTED is only ever a real structural/reference failure — never
- * inferred from a version number.
+ * Doctor uses the same explicit production registry as `yui upgrade`; tests
+ * may inject a synthetic registry so the same classification and validation
+ * path proves compatible-old behavior. Missing paths fail closed, and
+ * CORRUPTED is reserved for structural or reference failure.
  */
-function checkCompatibility(
+function inspectCompatibility(
   home: string,
   homeCheck: DoctorCheck,
-  schema: SchemaInspection
-): DoctorCheck {
+  schema: SchemaInspection,
+  storageOptions: OpenCompatibleFileTaskStoreOptions
+): CompatibilityInspection {
   const name = "storage compatibility";
   if (homeCheck.status !== "ok") {
-    return { name, status: homeCheck.status, detail: homeCheck.detail };
+    return { check: { name, status: homeCheck.status, detail: homeCheck.detail } };
   }
   if (schema.status === "uninitialized") {
-    return { name, status: "missing", detail: "run yui setup" };
+    return { check: { name, status: "missing", detail: "run yui setup" } };
   }
   if (schema.status === "read-error") {
-    return { name, status: "invalid", detail: schema.detail };
+    return { check: { name, status: "invalid", detail: schema.detail } };
   }
   let classification;
+  let resolvedStorageOptions: ResolvedStorageOptions;
   try {
+    resolvedStorageOptions = {
+      registry: storageOptions.registry ?? createProductionStorageRegistry(),
+      latest: storageOptions.latest ?? latestStorageVersionState()
+    };
     classification = classifyHome({
       home,
-      registry: createProductionMigrationRegistry(),
-      latest: latestStorageVersionState()
+      registry: resolvedStorageOptions.registry,
+      latest: resolvedStorageOptions.latest
     });
   } catch (error) {
-    return { name, status: "invalid", detail: errorMessage(error) };
+    return { check: { name, status: "invalid", detail: errorMessage(error) } };
   }
-  const verdict = classification.classification.verdict;
+  const storageStatus = classification.classification.status;
+  if (storageStatus === "compatible-old") {
+    try {
+      validateCompatibleFileTaskStore(home, resolvedStorageOptions);
+    } catch (error) {
+      return {
+        storageStatus,
+        storageOptions: resolvedStorageOptions,
+        check: {
+          name,
+          status: "invalid",
+          detail: `unsupported compatible-old shape: ${errorMessage(error)}`
+        }
+      };
+    }
+  }
   const versions =
     `layout=${classification.layoutVersion ?? "?"}/${classification.latestLayoutVersion}`
     + ` aggregate=${classification.aggregateVersion ?? "?"}/${classification.latestAggregateVersion}`;
   const incompatible = classification.incompatibleComponent === undefined
     ? ""
     : ` incompatibleComponent=${classification.incompatibleComponent}`;
-  switch (verdict) {
-    case "USABLE":
-      return { name, status: "ok", detail: `USABLE ${versions}` };
-    case "MIGRATABLE":
-      return { name, status: "ok", detail: `MIGRATABLE ${versions}; run yui upgrade` };
-    case "NEEDS_NEW_VERSION":
+  switch (storageStatus) {
+    case "current":
       return {
-        name,
-        status: "unsupported",
-        detail: `NEEDS_NEW_VERSION ${versions}${incompatible}; ${classification.classification.blocker.reason}`
+        storageStatus,
+        storageOptions: resolvedStorageOptions,
+        check: { name, status: "ok", detail: `current (USABLE) ${versions}` }
       };
-    case "CORRUPTED":
+    case "compatible-old":
       return {
-        name,
-        status: "invalid",
-        detail: `CORRUPTED: ${classification.classification.detail}`
+        storageStatus,
+        storageOptions: resolvedStorageOptions,
+        check: {
+          name,
+          status: "ok",
+          detail: `compatible-old (COMPATIBLE) ${versions}; ordinary commands are supported`
+        }
       };
+    case "migration-required":
+      return {
+        storageStatus,
+        storageOptions: resolvedStorageOptions,
+        check: {
+          name,
+          status: "ok",
+          detail: `migration-required (MIGRATABLE) ${versions}; run yui update when Sessions are clear`
+        }
+      };
+    case "unsupported": {
+      const unsupported = classification.classification;
+      return {
+        storageStatus,
+        storageOptions: resolvedStorageOptions,
+        check: unsupported.verdict === "CORRUPTED"
+          ? {
+              name,
+              status: "invalid",
+              detail: `unsupported (CORRUPTED): ${unsupported.detail}`
+            }
+          : {
+              name,
+              status: "unsupported",
+              detail:
+                `unsupported (NEEDS_NEW_VERSION) ${versions}${incompatible}; ` +
+                `${unsupported.blocker.reason}`
+            }
+      };
+    }
   }
 }
 
 function inspectState(
   home: string,
   homeCheck: DoctorCheck,
-  schema: SchemaInspection
+  schema: SchemaInspection,
+  compatibility: CompatibilityInspection
 ): StorageInspection {
   if (homeCheck.status !== "ok") {
     return blockedStorage(homeCheck.status, homeCheck.detail);
@@ -306,14 +405,23 @@ function inspectState(
   if (schema.status === "uninitialized") {
     return blockedStorage("missing", "run yui setup");
   }
-  if (schema.status === "unsupported") {
-    return blockedStorage(
-      "unsupported",
-      `current=${schema.currentVersion} latest=${schema.latestVersion}`
-    );
-  }
   if (schema.status === "invalid") return blockedStorage("invalid", schema.detail);
   if (schema.status === "read-error") return blockedStorage("invalid", schema.detail);
+  if (compatibility.check.status !== "ok") {
+    return blockedStorage(
+      compatibility.check.status,
+      storageBlockerDetail(compatibility.check)
+    );
+  }
+  if (
+    compatibility.storageStatus !== "current"
+    && compatibility.storageStatus !== "compatible-old"
+  ) {
+    return blockedStorage("unsupported", compatibility.check.detail);
+  }
+  if (compatibility.storageOptions === undefined) {
+    return blockedStorage("invalid", "Storage compatibility options were not resolved.");
+  }
 
   const statePath = join(home, STORAGE_STATE_FILE);
   if (!existsSync(statePath)) return blockedStorage("missing", "run yui setup");
@@ -323,7 +431,7 @@ function inspectState(
       return blockedStorage("invalid", `${STORAGE_STATE_FILE} must be a regular file.`);
     }
     accessSync(statePath, constants.R_OK);
-    const store = new FileTaskStore(home);
+    const store = openCompatibleFileTaskStore(home, compatibility.storageOptions);
     const config = store.getConfig();
     const agents = store.listConfiguredAgents();
     const tasks = store.listTasks();
@@ -343,6 +451,13 @@ function inspectState(
   } catch (error) {
     return blockedStorage("invalid", errorMessage(error));
   }
+}
+
+function storageBlockerDetail(check: DoctorCheck): string {
+  const corruptionPrefix = "unsupported (CORRUPTED): ";
+  return check.status === "invalid" && check.detail.startsWith(corruptionPrefix)
+    ? `Invalid state.json: ${check.detail.slice(corruptionPrefix.length)}`
+    : check.detail;
 }
 
 function blockedStorage(status: Exclude<DoctorStatus, "ok">, detail: string): StorageInspection {

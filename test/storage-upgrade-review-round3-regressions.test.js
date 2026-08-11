@@ -234,17 +234,26 @@ test("R3-F3 red/green activation: an ok:false envelope with outcome=upgraded is 
   assert.equal(activation.status, "ambiguous", "an ok:false success outcome must never read as migrated");
 });
 
-test("R3-F3 positive: a proper ok:true dry-run envelope is migratable", () => {
+test("R3-F3 positive: a proper ok:true update-preflight envelope is migratable", () => {
   const spawn = (command, args) => {
     if (command === "npm" && args[0] === "install") return spawnResult({});
     if (args.includes("version")) return okData({ version: "9.9.9" });
-    if (args.includes("upgrade")) return okData({ outcome: "dry-run", report: { steps: [{}] } });
+    if (args.includes("upgrade")) {
+      return okData({
+        outcome: "update-preflight",
+        status: "migration-required",
+        stepCount: 1,
+        classification: {
+          classification: { verdict: "MIGRATABLE", status: "migration-required", stepCount: 1 }
+        }
+      });
+    }
     return spawnResult({});
   };
   const ports = createUpdatePorts(process.env, spawn);
   const staged = ports.stage();
   const preflight = ports.preflight(staged, "/home");
-  assert.equal(preflight.status, "migratable");
+  assert.equal(preflight.status, "migration-required");
 });
 
 // ===========================================================================

@@ -8,10 +8,10 @@ export type { UpdateSpawner } from "./updatePorts.js";
  * Run `yui update` as a side-by-side, recoverable orchestration.
  *
  * The new package is staged beside the live install and used to run a read-only
- * preflight against the target Home; only when that is safe does the flow migrate
- * storage (atomically, with a timestamped backup) and then promote the binary.
- * On any failure it reports the precise phase and a recovery action, and — until
- * the new version resumes writes — the old binary and Home remain usable. See
+ * preflight against the target Home. Current/compatible-old storage promotes the
+ * binary through the exact Controller handoff without a Home switch; only a
+ * migration-required verdict enters the offline backup/switch path. On failure
+ * it reports the precise phase and recovery boundary. See
  * {@link runUpdate} for the exact, narrowed rollback boundary (this release does
  * not introduce a versioned binary pointer, so it does not claim binary+Home
  * dual-resource atomicity).
@@ -43,7 +43,9 @@ export function renderUpdateResult(result: UpdateResult): string {
         return "Yui is already up to date; nothing to install.";
       case "updated":
         return result.storageBackupPath === undefined
-          ? `Updated Yui to ${result.version}.`
+          ? result.path === "compatible-fast"
+            ? `Updated Yui to ${result.version} via the compatible fast path; the Home was not migrated.`
+            : `Updated Yui to ${result.version}; storage was already current.`
           : `Updated Yui to ${result.version}. Storage was migrated; original Home backed up at `
             + `${result.storageBackupPath}.`;
       case "aborted":

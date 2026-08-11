@@ -6,12 +6,14 @@
  * returns exactly one verdict:
  *
  * - `USABLE`            — every axis is already at the current version.
- * - `MIGRATABLE`        — strictly older, and every axis has a complete
- *   deterministic adjacent step path.
+ * - `COMPATIBLE`        — strictly older record axes whose complete adjacent
+ *   path consists only of compatible normalizations.
+ * - `MIGRATABLE`        — at least one adjacent hop requires offline migration,
+ *   and every axis has a complete deterministic path.
  * - `NEEDS_NEW_VERSION` — any axis is newer than supported (`future-version`),
  *   or older with a broken/absent step path (`missing-step`). Carries a precise
  *   reason + action. Under an EMPTY registry, any strictly-older version lands
- *   here via `missing-step` — matching the existing fail-closed behavior.
+ *   here via a missing transition contract.
  * - `CORRUPTED`         — only when the caller reports real JSON/structural/
  *   reference-invariant damage. The classifier never infers corruption from
  *   version numbers.
@@ -34,10 +36,11 @@ export type CorruptionSignal = Readonly<{
 }>;
 
 export type Classification = Readonly<
-  | { verdict: "USABLE" }
-  | { verdict: "MIGRATABLE"; stepCount: number }
-  | { verdict: "NEEDS_NEW_VERSION"; blocker: MigrationBlocker }
-  | { verdict: "CORRUPTED"; detail: string }
+  | { verdict: "USABLE"; status: "current" }
+  | { verdict: "COMPATIBLE"; status: "compatible-old"; stepCount: number }
+  | { verdict: "MIGRATABLE"; status: "migration-required"; stepCount: number }
+  | { verdict: "NEEDS_NEW_VERSION"; status: "unsupported"; blocker: MigrationBlocker }
+  | { verdict: "CORRUPTED"; status: "unsupported"; detail: string }
 >;
 
 /**
@@ -54,16 +57,22 @@ export function classifyStorage<Snapshot>(
   corruption?: CorruptionSignal
 ): Classification {
   if (corruption?.corrupted === true) {
-    return { verdict: "CORRUPTED", detail: corruption.detail };
+    return { verdict: "CORRUPTED", status: "unsupported", detail: corruption.detail };
   }
 
   const plan = planMigration(registry, source, target);
   switch (plan.kind) {
     case "no-op":
-      return { verdict: "USABLE" };
+      return { verdict: "USABLE", status: "current" };
     case "runnable":
-      return { verdict: "MIGRATABLE", stepCount: plan.steps.length };
+      return plan.path === "compatible"
+        ? { verdict: "COMPATIBLE", status: "compatible-old", stepCount: plan.steps.length }
+        : { verdict: "MIGRATABLE", status: "migration-required", stepCount: plan.steps.length };
     case "blocked":
-      return { verdict: "NEEDS_NEW_VERSION", blocker: plan.blocker };
+      return {
+        verdict: "NEEDS_NEW_VERSION",
+        status: "unsupported",
+        blocker: plan.blocker
+      };
   }
 }

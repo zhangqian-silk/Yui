@@ -1,27 +1,11 @@
 /**
- * Pure, read-only extraction of a source Home's per-record-family schema
- * versions, taken straight from the raw `state.json` — never through the strict
- * `parseState`/`FileTaskStore` gate.
- *
- * ## Why this exists (the record-axis wiring)
- *
- * The three storage axes are independent: `layout` and `aggregate` are scalars
- * from `schema.json`, while `record` is a `recordKind -> {version, path}` map
- * because every record family versions on its own axis. The strict loader
- * validates every record against the *current* release's versions, so it throws
- * the moment any record family is even one version behind. Using that loader to
- * decide compatibility conflates "this family is on an older axis" (a version
- * verdict) with "this data is structurally damaged" (`CORRUPTED`) — a real Home
- * whose only difference is an older record family would be misreported as
- * corrupted and blocked from ever migrating.
- *
- * This scanner keeps the record axis genuinely independent: it reads the source
- * versions structurally (JSON only), so a record-only-older Home flows into the
- * planner and is classified `MIGRATABLE` (when a step path exists) or
- * `NEEDS_NEW_VERSION` (when no applicable path exists) — never `CORRUPTED`.
- * `CORRUPTED` is reserved for genuine JSON/structural damage (unparseable
- * `state.json`, a non-object root, a container whose shape is not what the path
- * describes, or a record with a missing/invalid `schemaVersion`).
+ * Pure, read-only structural scan of raw `state.json`, never through the strict
+ * `parseState`/`FileTaskStore` gate. The durable manifest remains authoritative;
+ * this scanner supplies member versions and counts so callers can detect
+ * manifest/state contradictions without treating an empty locator as current.
+ * Older member versions remain version evidence rather than a strict-loader
+ * parse failure, while malformed JSON/containers/schemaVersion fields are real
+ * `CORRUPTED` evidence.
  *
  * The `path` for each family (from `recordVersions.ts`) is a small locator into
  * `state.json`: segments are `/`-separated after the `state.json#/` prefix, and a
@@ -39,26 +23,28 @@ import type { RecordAxisEntry } from "../migration/index.js";
 /** A structural-damage fact discovered while scanning (maps to `CORRUPTED`). */
 export type RecordScanCorruption = Readonly<{ corrupted: true; detail: string }>;
 
-/** The scan result: either the extracted source record map, or a corruption. */
+/** Structural member scan plus counts, or a corruption. */
 export type RecordVersionScan = Readonly<
   | { corruption: RecordScanCorruption }
-  | { record: Readonly<Record<string, RecordAxisEntry>> }
+  | {
+      record: Readonly<Record<string, RecordAxisEntry>>;
+      /** Persisted member count per family; zero distinguishes absence from latest data. */
+      counts: Readonly<Record<string, number>>;
+    }
 >;
 
 /**
- * Extract the source Home's per-family record versions from the raw `state.json`.
+ * Scan per-family member versions and counts from raw `state.json`.
  *
  * Rules, per family, evaluated purely (no strict parser):
- *  - family absent or empty on disk  -> already at the latest version (nothing to
- *    migrate for that family);
- *  - every member exactly at latest  -> current;
- *  - any member NEWER than latest     -> report the max (surfaces `future-version`);
- *  - otherwise (some member older)    -> report the min (the oldest member drives
- *    migration; consistent families collapse to that single version).
+ *  - family absent or empty on disk  -> latest as an internal scan sentinel,
+ *    with count zero so the manifest combiner never infers source currency;
+ *  - every member at one older/current/newer version -> report that version;
+ *  - members carrying different versions             -> corruption.
  *
- * The min/newer-wins rule is deliberately fail-closed: an inconsistent family is
- * never rounded up to "already current", so it always lands on a version verdict
- * the planner can act on rather than being silently skipped.
+ * A family is one durable schema boundary, so a manifest cannot make a mixed
+ * member set trustworthy by matching either its minimum or maximum. Mixed
+ * members are partial-write/corruption evidence, not a migration source version.
  *
  * Returns a `corruption` instead when the JSON is unparseable, the root is not an
  * object, a path container is not the shape the locator describes, or a record is
@@ -70,9 +56,12 @@ export function scanSourceRecordVersions(
 ): RecordVersionScan {
   const statePath = join(home, STORAGE_STATE_FILE);
   if (!existsSync(statePath)) {
-    // No state.json yet is an empty, current Home (matches the store's
-    // emptyState()): there are no records, so every family is trivially latest.
-    return { record: cloneRecord(latestRecord) };
+    // No state.json means zero persisted members. The latest-valued scan entry
+    // is only a sentinel; counts preserve absence for the manifest combiner.
+    return {
+      record: cloneRecord(latestRecord),
+      counts: Object.fromEntries(Object.keys(latestRecord).map((kind) => [kind, 0]))
+    };
   }
 
   let root: unknown;
@@ -85,18 +74,30 @@ export function scanSourceRecordVersions(
     return corruption("state.json is not a JSON object.");
   }
 
+  return scanRecordVersionsFromState(root, latestRecord);
+}
+
+/** Extract record versions from an already-parsed state snapshot, read-only. */
+export function scanRecordVersionsFromState(
+  root: unknown,
+  latestRecord: Readonly<Record<string, RecordAxisEntry>>
+): RecordVersionScan {
+  if (!isObject(root)) return corruption("state snapshot is not a JSON object.");
+
   const record: Record<string, RecordAxisEntry> = {};
+  const counts: Record<string, number> = {};
   for (const [kind, entry] of Object.entries(latestRecord)) {
     const scan = scanFamily(root, entry.path, entry.version);
     if ("corruption" in scan) {
       return corruption(`record family '${kind}' (${entry.path}): ${scan.corruption}`);
     }
     record[kind] = { version: scan.version, path: entry.path };
+    counts[kind] = scan.count;
   }
-  return { record };
+  return { record, counts };
 }
 
-type FamilyScan = { version: number } | { corruption: string };
+type FamilyScan = { version: number; count: number } | { corruption: string };
 
 /** Resolve one family's source version from `root` following `path`. */
 function scanFamily(
@@ -157,9 +158,13 @@ function scanFamily(
     }
   }
 
-  if (count === 0) return { version: latestVersion }; // absent/empty => already latest
-  if (max > latestVersion) return { version: max }; // a future member wins (fail-closed)
-  return { version: min }; // the oldest member drives migration; consistent => single value
+  if (count === 0) return { version: latestVersion, count }; // zero-count sentinel only
+  if (min !== max) {
+    return {
+      corruption: `family contains mixed schemaVersion values ${min} and ${max}`
+    };
+  }
+  return { version: min, count };
 }
 
 /** Parse a `state.json#/`-prefixed locator into path segments, or `null`. */
