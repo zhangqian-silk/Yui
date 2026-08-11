@@ -815,6 +815,26 @@ test("Operator can return a non-user InputRequest without fabricating an answer"
   }), /originating Leader/i);
 });
 
+test("Fresh Codex Operator launch may omit provider-discovered native identity", (t) => {
+  const { store, task, options, operatorEnvironment } = fixture(t);
+  run(["input", "request", task.id, "--question", "Return this internal choice?"], store, options);
+  const request = store.listInputRequests(task.id)[0];
+  const launchEnvironment = { ...operatorEnvironment };
+  delete launchEnvironment.YUI_NATIVE_SESSION_ID;
+
+  const cancelled = run([
+    "input", "cancel", task.id, request.id, "--reason", "Return to Leader"
+  ], store, {
+    ...options,
+    now: () => new Date(SECOND),
+    environment: launchEnvironment
+  });
+
+  assert.equal(cancelled.data.request.status, "cancelled");
+  assert.equal(cancelled.data.request.cancellation.reason, "Return to Leader");
+  assert.equal(store.listEvents(task.id).at(-1).payload.cancelledBy, "operator");
+});
+
 test("Operator Input cancellation requires the current Session identity", (t) => {
   const cases = [
     ["missing identity", null],

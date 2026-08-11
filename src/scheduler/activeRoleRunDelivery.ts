@@ -147,6 +147,12 @@ export async function processActiveRoleRunDeliveries(
             preStartFencePersisted = true;
           }
         });
+        // A fresh Codex host may already carry the exact Run prompt in its
+        // launch argv. Once preparation returns that transport fact, any
+        // later readiness or aggregate-write failure is delivery uncertainty,
+        // not a launch failure: preserve the Run and its reservation for the
+        // matching provider Hook instead of terminalizing it.
+        deliveryAttempted = prepared.inputSubmittedAtLaunch === true;
         // Preparation may already have an exact native Session identity while
         // the provider is still starting. Persist that Session + the Run fence
         // before awaiting readiness so a pre-input provider Hook can validate

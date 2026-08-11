@@ -408,10 +408,23 @@ function isCurrentGlobalOperator(
   const launchId = exactIdentity(environment.YUI_LAUNCH_ID);
   const nativeSessionId = exactIdentity(environment.YUI_NATIVE_SESSION_ID);
   const binding = role.agentBindings[role.activeAgentId];
+  // A fresh Codex launch discovers its native Session asynchronously. Its
+  // launch envelope therefore cannot carry YUI_NATIVE_SESSION_ID, but the
+  // durable Session still binds that provider identity to the exact launch
+  // generation. Accept that one transport shape only when the current
+  // launch, Agent, and adapter all match; Claude and stale/unknown launches
+  // remain fail-closed on the native identity fence.
+  const nativeSessionMatches = binding !== undefined && (
+    nativeSessionId === session.nativeSessionId
+      || (nativeSessionId === undefined
+        && binding.adapterId === "codex"
+        && session.adapterId === "codex"
+        && session.launchId !== undefined
+        && session.launchId === launchId)
+  );
   return agentId !== undefined
     && adapterId !== undefined
     && launchId !== undefined
-    && nativeSessionId !== undefined
     && binding !== undefined
     && binding.agentId === session.agentId
     && binding.adapterId === session.adapterId
@@ -419,7 +432,7 @@ function isCurrentGlobalOperator(
     && session.adapterId === adapterId
     && session.launchId !== undefined
     && session.launchId === launchId
-    && session.nativeSessionId === nativeSessionId;
+    && nativeSessionMatches;
 }
 
 function inputAnswerer(environment: NodeJS.ProcessEnv | undefined): "user" | "operator" {

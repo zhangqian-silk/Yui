@@ -212,6 +212,12 @@ export async function processLeaderWakeups(
           preStartFencePersisted = true;
         }
       });
+      // A fresh Codex host may already carry the exact Run prompt in its
+      // launch argv. Once preparation returns that transport fact, any
+      // later readiness or aggregate-write failure is delivery uncertainty,
+      // not a launch failure: preserve the Run and its reservation for the
+      // matching provider Hook instead of terminalizing it.
+      deliveryAttempted = prepared.inputSubmittedAtLaunch === true;
       // Persist the exact preparation fence before waiting on provider
       // readiness. A pre-input lifecycle Hook may fire during that wait; it
       // must be able to resolve this Run/Session/launch generation from durable
