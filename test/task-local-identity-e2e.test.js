@@ -1,14 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
   readFileSync,
-  rmSync,
   writeFileSync
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
@@ -36,7 +31,7 @@ import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
 import { FileTaskStore, STORAGE_STATE_FILE } from "../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../dist/task/task.js";
 import { createYuiWebServer } from "../dist/web/webServer.js";
-import { yuiTmuxServerName } from "../dist/tmux/tmuxManager.js";
+import { createIsolatedRuntime } from "./helpers/isolatedRuntime.js";
 import { exactTaskCliInvocation } from "./helpers/exactTaskCli.js";
 import { createStartupReadyClaudeAgent } from "./helpers/mockClaudeAgent.js";
 
@@ -44,34 +39,11 @@ const START = new Date("2026-08-02T08:00:00.000Z");
 
 test("isolated multi-Task identity workflow keeps local ids qualified end to end", async (t) => {
   const requestedRoot = process.env.YUI_IDENTITY_E2E_ROOT;
-  const root = requestedRoot === undefined
-    ? mkdtempSync(join(tmpdir(), "yui-task-identity-e2e-"))
-    : resolve(requestedRoot);
-  if (requestedRoot !== undefined) {
-    assert.equal(existsSync(root), false, `E2E artifact root already exists: ${root}`);
-    mkdirSync(root, { recursive: true });
-  }
-
-  const home = join(root, "yui-home");
-  t.after(() => {
-    if (existsSync(join(home, "runtime", "controller.json"))) {
-      execFileSync(
-        process.execPath,
-        [join(process.cwd(), "dist", "cli.js"), "controller", "stop"],
-        { env: isolatedCliEnvironment(home), stdio: "ignore" }
-      );
-    }
-    const stopped = spawnSync(
-      process.env.YUI_TMUX_BIN ?? "tmux",
-      ["-L", yuiTmuxServerName(home), "kill-server"],
-      { encoding: "utf8", env: isolatedCliEnvironment(home) }
-    );
-    if (stopped.status !== 0
-      && !/no server running|failed to connect|error connecting/i.test(stopped.stderr ?? "")) {
-      throw new Error(`Identity E2E tmux server did not stop: ${stopped.stderr}`);
-    }
-    if (requestedRoot === undefined) rmSync(root, { recursive: true, force: true });
+  const runtimeDomain = createIsolatedRuntime(t, requestedRoot === undefined ? {} : {
+    root: resolve(requestedRoot),
+    retainRoot: true
   });
+  const { root, home } = runtimeDomain;
   assert.notEqual(resolve(process.env.YUI_HOME ?? join(root, "unconfigured")), resolve(home));
   const primaryRepository = initializeFixtureRepository(root, "primary-repository");
   const secondaryRepository = initializeFixtureRepository(root, "secondary-repository");

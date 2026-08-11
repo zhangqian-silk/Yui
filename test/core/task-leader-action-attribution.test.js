@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
@@ -11,7 +10,6 @@ import { bindExecution, claimPending } from "../../dist/coordination/workMailbox
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
-import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -40,6 +38,8 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createAgentRun, recordRoleAgentSession } from "../helpers/effectiveLaunch.js";
+import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
+import { installMockProviderCommands } from "../helpers/mockProviderCommands.js";
 
 const START = new Date("2026-08-05T00:00:00.000Z");
 const PROGRESS = new Date("2026-08-05T00:20:00.000Z");
@@ -47,11 +47,8 @@ const FIRST_RECONCILE = new Date("2026-08-05T00:40:00.000Z");
 const EXPIRED_RECONCILE = new Date("2026-08-05T00:50:00.000Z");
 
 function fixture(t) {
-  const home = mkdtempSync(join(tmpdir(), "yui-leader-action-"));
-  t.after(async () => {
-    await stopFileTaskController(home);
-    rmSync(home, { recursive: true, force: true });
-  });
+  const { home } = createIsolatedRuntime(t);
+  installMockProviderCommands(home, ["codex"]);
   ensureStorageSchema(home, START);
   const store = new FileTaskStore(home);
   const agent = createConfiguredAgent("codex", "codex", "codex", [], [], START);

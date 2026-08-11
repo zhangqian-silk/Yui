@@ -25,13 +25,9 @@ test("the source package keeps one TypeScript build and declares its Web runtime
   assert.equal(sourcePackage.scripts.pretest, "npm run build");
   assert.equal(
     sourcePackage.scripts.test,
-    "env -u FORCE_COLOR -u YUI_HOME -u YUI_SESSION_SCOPE -u YUI_TASK_ID -u YUI_ROLE "
-      + "-u YUI_AGENT_ID -u YUI_ADAPTER_ID -u YUI_WORKSPACE -u YUI_RUN_ID -u YUI_LAUNCH_ID "
-      + "-u YUI_NATIVE_SESSION_ID -u YUI_CONTROL_PLANE_DESCRIPTOR -u YUI_TASK_RUNTIME_DESCRIPTOR "
-      + "-u YUI_SESSION_TITLE -u YUI_AGENT_COMMAND -u YUI_AGENT_BASE_ARGS "
-      + "-u YUI_WRITABLE_PROJECT_IDS -u YUI_CONTEXT_PROJECT_IDS -u YUI_WORKSPACE_PROJECTS "
-      + "NO_COLOR=1 node --test test/*.test.js test/core/*.test.js"
+    "env -u FORCE_COLOR -u YUI_TEST_KEEP_SESSION_ENV -u YUI_TEST_TIER -u YUI_TEST_PRIVILEGED_MANIFEST NO_COLOR=1 node --import ./test/helpers/scrubSessionEnv.js --test test/*.test.js test/core/*.test.js"
   );
+  assert.equal(sourcePackage.scripts["test:tier"], "node scripts/run-test-tier.mjs");
   assert.equal(sourcePackage.scripts.lint, "tsc -p tsconfig.json --noEmit");
   assert.equal("build:native" in sourcePackage.scripts, false);
   assert.equal("prebuild" in sourcePackage.scripts, false);
