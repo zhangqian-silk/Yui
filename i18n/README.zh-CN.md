@@ -127,6 +127,14 @@ yui config review show
 yui config review clear
 ```
 
+对带 Project 的软件交付，可使用 `--trigger final`：WorkItem 验收与
+Integration 保持独立，在 Task 完成前只对所有已集成 Project 的冻结候选做
+一次 Task 级 ReviewRound：
+
+```sh
+yui config review set --role reviewer --trigger final
+```
+
 每个进入 Leader 验收阶段的结果，都会成为原 WorkItem 上一个明确的候选。
 当前全局规则对所有新旧 Task 的下一个候选生效，并在候选提交时形成快照；
 后续 `set`/`clear` 不会改变已经在途的判断。
@@ -138,6 +146,10 @@ AgentRun 不创建新 WorkItem，也不会递归触发审查。审查以自然�
 唤醒 Leader；Leader 决定验收、reject 后在原 Role 与原 Session 中修复、
 再次审查，或通过 InputRequest 询问用户。审查失败会保留为可见证据并
 唤醒 Leader，但不会取代 Leader 的最终判断。
+`final` 不为每个 WorkItem 创建完整 ReviewRound；`task complete` 会在每个绑定
+Project 都有 committed Integration 后排队一次 Task 级 Review。冻结的集成头
+发生变化时才会重新排队，旧报告仍保留为证据。Reviewer 按 Project Policy/Knowledge
+检查整个 Task，并只报告有直接证据的可达、重要、可行动问题或有限验证缺口。
 所有候选、ReviewRound 和 Leader 决策都集中在原 WorkItem 下；reject
 后的下一轮会复用原执行 Role、Session 与 workspace，并追加新候选。
 

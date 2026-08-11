@@ -27,7 +27,8 @@ bounded next actions. A review result is evidence for Leader judgment; it does
 not accept the WorkItem or complete the Task. Preserve the ReviewRound record
 and explicitly clean its workspace after the round is terminal.
 
-For normal software delivery, the Leader's default policy schedules one
+For normal software delivery, follow the applicable Project Policy. The
+Leader's default policy schedules one
 independent Task-final Review of the frozen committed Integration result before
 completion instead of scheduling a complete ReviewRound for every WorkItem.
 That scheduling policy does not authorize a Reviewer to decline or reinterpret

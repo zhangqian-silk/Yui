@@ -23,6 +23,7 @@ import {
 import {
   attachReviewRoundWorkspace,
   createReviewRound,
+  createTaskReviewRound,
   finishReviewRound,
   startReviewRound
 } from "../../dist/review/reviewRound.js";
@@ -100,6 +101,16 @@ function fixture(t, { projectTask = true, projectWork = true } = {}) {
     reviewerRoleName: "reviewer",
     controlPlaneDigest: "a".repeat(64)
   });
+  const exact = {
+    ...leader,
+    taskFinalReviewContract: contract,
+    actualTaskReviewCandidate: projectTask
+      ? {
+          schemaVersion: 1,
+          projects: [{ projectId: "project-1", commit: "c".repeat(40) }]
+        }
+      : undefined
+  };
   return {
     home,
     store,
@@ -107,7 +118,7 @@ function fixture(t, { projectTask = true, projectWork = true } = {}) {
     item,
     leader,
     contract,
-    exact: { ...leader, taskFinalReviewContract: contract }
+    exact
   };
 }
 
@@ -164,6 +175,10 @@ function advanceIntegratedHead(fx) {
     { status: "committed", candidateCommit: "d".repeat(40) },
     NOW
   ));
+  fx.exact.actualTaskReviewCandidate = {
+    schemaVersion: 1,
+    projects: [{ projectId: "project-1", commit: "d".repeat(40) }]
+  };
 }
 
 function completeReview(fx, round) {
@@ -279,9 +294,12 @@ test("exact Task contract creates a metadata-only Candidate and one final Task R
   assert.deepEqual(rounds[0].taskFinalReviewContract, fx.contract);
   assert.equal(fx.store.getTask(fx.task.id).status, "active");
 
-  assert.throws(() => runTaskCommand([
-    "complete", fx.task.id, "--summary", "must not duplicate"
-  ], fx.store, fx.exact), /Final Task Review is still active/);
+  const repeated = runTaskCommand([
+    "complete", fx.task.id, "--summary", "resume the exact pending Review"
+  ], fx.store, fx.exact);
+  assert.match(repeated.output, /Final Task Review requested/);
+  assert.equal(repeated.data.reviewRound.id, rounds[0].id);
+  assert.deepEqual(repeated.data.reviewRound, rounds[0]);
   assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
 
   completeReview(fx, rounds[0]);
@@ -289,6 +307,86 @@ test("exact Task contract creates a metadata-only Candidate and one final Task R
     "complete", fx.task.id, "--summary", "complete reviewed head"
   ], fx.store, fx.exact);
   assert.equal(fx.store.getTask(fx.task.id).status, "completed");
+});
+
+test("pending exact Task Review recovery rejects identity and head drift without writes", (t) => {
+  for (const drift of ["contract", "reviewer", "reviewer-run", "head"]) {
+    const fx = fixture(t);
+    submitAndAccept(fx);
+    runTaskCommand([
+      "complete", fx.task.id, "--summary", "establish exact pending Review"
+    ], fx.store, fx.exact);
+    const round = structuredClone(fx.store.listReviewRounds(fx.task.id)[0]);
+    if (drift === "reviewer-run") {
+      assert.throws(() => fx.store.saveReviewRound(fx.task.id, {
+        ...round,
+        reviewerRunId: "agent-run-99"
+      }), /transition is invalid/i);
+      assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), round);
+      continue;
+    }
+    const options = drift === "head"
+      ? {
+          ...fx.exact,
+          actualTaskReviewCandidate: {
+            schemaVersion: 1,
+            projects: [{ projectId: "project-1", commit: "d".repeat(40) }]
+          }
+        }
+      : {
+          ...fx.exact,
+          taskFinalReviewContract: createTaskFinalReviewContract({
+            taskId: fx.task.id,
+            reviewerRoleName: drift === "reviewer" ? "replacement-reviewer" : "reviewer",
+            controlPlaneDigest: drift === "contract"
+              ? "b".repeat(64)
+              : fx.contract.controlPlaneDigest
+          })
+        };
+
+    assert.throws(
+      () => runTaskCommand([
+        "complete", fx.task.id, "--summary", `reject ${drift} drift`
+      ], fx.store, options),
+      /contract|control-plane digest|actual Task head|Reviewer/i
+    );
+    assert.deepEqual(fx.store.getReviewRound(fx.task.id, round.id), round);
+    assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
+    assert.equal(
+      fx.store.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length,
+      0
+    );
+  }
+});
+
+test("exact Task contract is preserved by a no-Run final Review retry", (t) => {
+  const fx = fixture(t);
+  submitAndAccept(fx);
+  const candidate = fx.store.getWorkItem(fx.task.id, fx.item.id).candidates.at(-1);
+  const failed = finishReviewRound(createTaskReviewRound(
+    fx.store.nextReviewRoundId(fx.task.id),
+    fx.task.id,
+    fx.item.id,
+    candidate.id,
+    "reviewer",
+    "policy",
+    fx.exact.actualTaskReviewCandidate,
+    NOW,
+    fx.contract
+  ), "failed", "reviewer unavailable before dispatch", NOW);
+  fx.store.saveReviewRound(fx.task.id, failed);
+
+  const retried = runTaskCommand(
+    ["work", "review", "retry", failed.id],
+    fx.store,
+    fx.exact
+  );
+
+  assert.match(retried.output, /Task-final Review retry requested/);
+  const rounds = fx.store.listReviewRounds(fx.task.id);
+  assert.equal(rounds.length, 2);
+  assert.deepEqual(rounds[1].taskFinalReviewContract, fx.contract);
+  assert.deepEqual(rounds[1].taskCandidate, failed.taskCandidate);
 });
 
 test("completed non-Task-scoped evidence cannot satisfy the exact Task contract", (t) => {

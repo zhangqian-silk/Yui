@@ -75,6 +75,14 @@ export class WorkspaceCleanupBlockedError extends Error {
   }
 }
 
+/** Existing ReviewRound workspace evidence must never be replaced during recovery. */
+export class ReviewRoundWorkspaceEvidenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReviewRoundWorkspaceEvidenceError";
+  }
+}
+
 export interface TaskWorkspacePreparer {
   prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation>;
 }
@@ -513,25 +521,41 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const missing = new Set<string>();
     const adopted = existing?.root === reviewRoot;
     if (existing !== null) {
+      if (!adopted) {
+        throw new ReviewRoundWorkspaceEvidenceError(
+          `ReviewRound workspace root changed: ${round.id}.`
+        );
+      }
+      if (round.workspace !== undefined && !isDeepStrictEqual(round.workspace, existing)) {
+        throw new ReviewRoundWorkspaceEvidenceError(
+          `ReviewRound workspace record diverged: ${round.id}.`
+        );
+      }
       if (existing.entries.length !== expectedEntries.size) {
-        throw new Error(
+        throw new ReviewRoundWorkspaceEvidenceError(
           `ReviewRound workspace Project scope changed: ${round.id}.`
         );
       }
       for (const entry of existing.entries) {
         const source = expectedEntries.get(entry.projectId);
         if (source === undefined) {
-          throw new Error(
+          throw new ReviewRoundWorkspaceEvidenceError(
             `ReviewRound workspace Project scope changed: ${round.id}/${entry.projectId}.`
           );
         }
         if (!sameCommit(entry.baseCommit, source.baseCommit)) {
-          throw new Error(
+          throw new ReviewRoundWorkspaceEvidenceError(
             `ReviewRound workspace baseCommit record mismatch for ${round.id}/${entry.projectId}: `
             + `expected ${source.baseCommit}, recorded ${entry.baseCommit}.`
           );
         }
-        if (!adopted) continue;
+        if (entry.directory !== source.directory
+          || entry.access !== "write"
+          || !sameCommit(entry.baseRef, source.baseCommit)) {
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound workspace metadata changed for ${round.id}/${entry.projectId}.`
+          );
+        }
         const project = requireProject(this.store, entry.projectId);
         const identity = worktreeIdentity(task.id, round.id);
         const expectedPath = join(
@@ -539,7 +563,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           identity.directory
         );
         if (entry.path !== expectedPath || entry.branch !== identity.branch) {
-          throw new Error(
+          throw new ReviewRoundWorkspaceEvidenceError(
             `ReviewRound workspace managed identity mismatch for ${round.id}/${entry.projectId}.`
           );
         }
@@ -555,28 +579,54 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
               continue;
             }
           }
-          throw error;
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound workspace cannot be inspected for ${round.id}/${entry.projectId}: `
+            + `${error instanceof Error ? error.message : String(error)}`
+          );
         }
         if (physical.root !== entry.path) {
-          throw new Error(
+          throw new ReviewRoundWorkspaceEvidenceError(
             `ReviewRound workspace managed path mismatch for ${round.id}/${entry.projectId}.`
           );
         }
         const projectRoot = await this.git.inspect(project.path, "HEAD");
         if (physical.gitDirectory !== projectRoot.gitDirectory) {
-          throw new Error(
+          throw new ReviewRoundWorkspaceEvidenceError(
             `ReviewRound workspace managed Project mismatch for ${round.id}/${entry.projectId}.`
           );
         }
-        const branch = await this.git.headRef(entry.path);
+        let branch: string | null;
+        try {
+          branch = await this.git.headRef(entry.path);
+        } catch (error) {
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound workspace branch cannot be verified for `
+            + `${round.id}/${entry.projectId}: `
+            + `${error instanceof Error ? error.message : String(error)}`
+          );
+        }
         if (branch !== identity.branch) {
-          throw new Error(
+          throw new ReviewRoundWorkspaceEvidenceError(
             `ReviewRound workspace managed branch mismatch for ${round.id}/${entry.projectId}: `
             + `expected ${identity.branch}, physical ${branch}.`
           );
         }
-        if (!await this.git.isAncestor(project.path, entry.baseCommit, physical.baseCommit)) {
-          throw new Error(
+        let descendsFromBase: boolean;
+        try {
+          descendsFromBase = await this.git.isAncestor(
+            project.path,
+            entry.baseCommit,
+            physical.baseCommit
+          );
+        } catch (error) {
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound workspace ancestry cannot be verified for `
+            + `${round.id}/${entry.projectId}: `
+            + `${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+        if (!descendsFromBase) {
+          throw new ReviewRoundWorkspaceEvidenceError(
             `ReviewRound workspace HEAD does not descend from its frozen base for `
             + `${round.id}/${entry.projectId}: expected ancestor ${entry.baseCommit}, `
             + `physical HEAD ${physical.baseCommit}.`
@@ -585,8 +635,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         retained.set(entry.projectId, { project, entry });
       }
       if (adopted && missing.size === 0) {
-        if (round.workspace !== undefined && !isDeepStrictEqual(round.workspace, existing)) {
-          throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
+        try {
+          await ensureWorkspaceView(reviewRoot, existing.entries);
+        } catch (error) {
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound workspace view cannot be reused for ${round.id}: `
+            + `${error instanceof Error ? error.message : String(error)}`
+          );
         }
         if (round.workspace === undefined) {
           this.store.saveReviewRound(task.id, attachReviewRoundWorkspace(round, existing));
@@ -622,10 +677,33 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         };
         prepared.push({ project, entry });
         if (!sameCommit(physical.baseCommit, source.baseCommit)) {
-          throw new Error(
-            `ReviewRound workspace baseCommit mismatch for ${round.id}/${source.projectId}: `
-            + `expected ${source.baseCommit}, physical HEAD ${physical.baseCommit}.`
-          );
+          if (existing === null) {
+            throw new Error(
+              `ReviewRound workspace baseCommit mismatch for ${round.id}/${source.projectId}: `
+              + `expected ${source.baseCommit}, physical HEAD ${physical.baseCommit}.`
+            );
+          }
+          let descendsFromBase: boolean;
+          try {
+            descendsFromBase = await this.git.isAncestor(
+              project.path,
+              source.baseCommit,
+              physical.baseCommit
+            );
+          } catch (error) {
+            throw new ReviewRoundWorkspaceEvidenceError(
+              `ReviewRound workspace ancestry cannot be verified for `
+              + `${round.id}/${source.projectId}: `
+              + `${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+          if (!descendsFromBase) {
+            throw new ReviewRoundWorkspaceEvidenceError(
+              `ReviewRound workspace HEAD does not descend from its frozen base for `
+              + `${round.id}/${source.projectId}: expected ancestor ${source.baseCommit}, `
+              + `physical HEAD ${physical.baseCommit}.`
+            );
+          }
         }
       }
       const preparedByProject = new Map(
@@ -645,13 +723,22 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           return preparedEntry;
         })
         : prepared.map(({ entry }) => entry);
-      await ensureWorkspaceView(reviewRoot, entries);
-      const workspace = createManagedWorkspace({
+      try {
+        await ensureWorkspaceView(reviewRoot, entries);
+      } catch (error) {
+        if (existing !== null) {
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound workspace view cannot be reused for ${round.id}: `
+            + `${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+        throw error;
+      }
+      const stored = existing ?? createManagedWorkspace({
         owner: { type: "review-round", taskId: task.id, reviewRoundId: round.id },
         root: reviewRoot,
         entries
       }, this.now());
-      const stored = preserveWorkspaceCreatedAt(workspace, existing);
       return this.store.transaction((tx) => {
         const currentRound = tx.getReviewRound(task.id, round.id);
         const currentItem = tx.getWorkItem(task.id, item.id);
@@ -661,23 +748,40 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             currentItem.candidates.find(({ id }) => id === candidate.id),
             candidate
           )) {
-          throw new Error(`ReviewRound changed while preparing its workspace: ${round.id}.`);
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound changed while preparing its workspace: ${round.id}.`
+          );
         }
         if (tx.getActiveAgentRun(task.id, reviewer.name) !== null) {
-          throw new Error(`Reviewer Role has an active Run: ${task.id}/${reviewer.name}.`);
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `Reviewer Role has an active Run: ${task.id}/${reviewer.name}.`
+          );
         }
         const currentWorkspace = tx.getReviewRoundWorkspace(task.id, round.id);
-        if (currentWorkspace !== null
-          && !sameManagedWorkspace(currentWorkspace, existing ?? stored)) {
-          throw new Error(`ReviewRound workspace changed: ${task.id}/${round.id}.`);
+        if (existing !== null
+          ? currentWorkspace === null || !sameManagedWorkspace(currentWorkspace, existing)
+          : currentWorkspace !== null && !sameManagedWorkspace(currentWorkspace, stored)) {
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound workspace changed: ${task.id}/${round.id}.`
+          );
         }
         const latestReviewer = tx.getRole(task.id, reviewer.name);
         if (latestReviewer === null) {
-          throw new Error(`Reviewer Role not found: ${task.id}/${reviewer.name}.`);
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `Reviewer Role not found: ${task.id}/${reviewer.name}.`
+          );
+        }
+        if (currentRound.workspace !== undefined
+          && !sameManagedWorkspace(currentRound.workspace, stored)) {
+          throw new ReviewRoundWorkspaceEvidenceError(
+            `ReviewRound workspace record diverged: ${round.id}.`
+          );
         }
         const timestamp = this.now();
-        tx.saveManagedWorkspace(stored);
-        tx.saveReviewRound(task.id, attachReviewRoundWorkspace(currentRound, stored));
+        if (currentWorkspace === null) tx.saveManagedWorkspace(stored);
+        if (currentRound.workspace === undefined) {
+          tx.saveReviewRound(task.id, attachReviewRoundWorkspace(currentRound, stored));
+        }
         if (latestReviewer.workspace !== stored.root) {
           retireWorkspaceBoundSession(tx, task.id, latestReviewer.name, timestamp);
           tx.saveRole(task.id, updateRole(
@@ -693,7 +797,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         task,
         prepared,
         round.id,
-        true,
+        existing === null,
         new Set([...retained.values()].map(({ entry }) => entry.path))
       );
       throw error;

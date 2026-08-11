@@ -97,8 +97,8 @@ function migratableSetup() {
     preconditions: () => {},
     // Keep the on-disk aggregate at the real current version so the switched
     // Home still passes the real loader gate (which only knows the current
-    // version). This is a synthetic step exercising the switch machinery; the
-    // production registry ships empty and never runs against a real Home.
+    // version). This is a synthetic future step exercising the switch machinery;
+    // it is intentionally unrelated to the production historical graph.
     transform: (snapshot) => ({
       schemaManifest: {
         ...snapshot.schemaManifest,

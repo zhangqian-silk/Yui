@@ -95,8 +95,9 @@ unavailable external fact that blocks progress.
   current objective, scope, acceptance, and evidence. Do not turn a Project
   convention into a generic role requirement.
 - For a Project-backed Task, follow the Project's existing Policy and Knowledge
-  through the context pointers. Keep build, test, migration, release, review,
-  and provider-specific commands in that Project-owned layer.
+  through the context pointers (`yui project show`, then the relevant
+  `yui project knowledge` records). Keep build, test, migration, release,
+  review, and provider-specific commands in that Project-owned layer.
 - Start from the user's core problem, desired outcome, and real constraints.
   Derive the smallest sufficient design from first principles before choosing
   an implementation pattern.
@@ -412,10 +413,24 @@ ReviewRounds, checks, and workspace through `task context`.
   terminal. Never bypass an active round.
 - `leader`: decide whether the existing evidence is sufficient. Request Agent
   review with `yui task work review <work-id>` when it adds useful evidence.
+- `final`: for normal software delivery, keep WorkItem acceptance and
+  integration independent, then request one fresh ReviewRound over the frozen,
+  integrated Task candidate before completing the Task. The final Reviewer
+  evaluates the complete result across bound Projects; it is not a second
+  per-WorkItem approval protocol.
 - A completed review is advice. Decide whether to accept, reject, review again,
   or ask the user.
-- A failed review is terminal evidence, not an automatic retry. Retry with a
-  new `task work review`, accept with an explicit rationale, or ask the user.
+- Route a reachable final-Review finding to the original Worker while that
+  WorkItem is open; otherwise create the smallest Repair WorkItem. Resolve
+  cross-WorkItem repairs in a bounded Repair WorkItem, use Leader/Integration
+  for merge or small local fixes, and create an architecture WorkItem only for
+  a genuinely cross-cutting design issue. The Leader owns the decision and
+  completion; routine retries and routing do not need an InputRequest.
+- A failed review is terminal evidence, not an automatic retry. Retry a
+  WorkItem review with a new `task work review`, accept with an explicit
+  rationale, or ask the user. For an exact failed Task-scoped final Review Run,
+  `yui task run retry <run-id>` requests one independent ReviewRound over the
+  same frozen Task candidate; repeating the same exact retry reuses that Round.
 - If the same ambiguity or external choice repeats, persist context and create
   an InputRequest instead of looping.
 - A Reviewer may leave an optional diagnostic commit. Route its SHA and

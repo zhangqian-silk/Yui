@@ -17,7 +17,7 @@ import {
 // ---------------------------------------------------------------------------
 // Synthetic, fully isolated version fixtures. These use hand-made version
 // numbers and record families with NO relationship to any real historical
-// on-disk format — the framework is future-facing and the registry ships empty.
+// on-disk format. Each test constructs its own isolated registry.
 // ---------------------------------------------------------------------------
 
 function versionState({ layout = 1, aggregate = 1, record = {} } = {}) {

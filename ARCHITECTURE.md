@@ -78,12 +78,17 @@ then accepts or rejects with bounded feedback. A rejected isolated WorkItem
 keeps its workspace so the next Run can repair the same result.
 
 An optional global review rule names one existing Global Role and chooses
-`always` or `leader`. It is a live default for every Task; each Candidate
-snapshots the effective two-field rule when submitted.
+`always`, `leader`, or `final`. It is a live default for every Task; each
+WorkItem Candidate snapshots the effective legacy rule when submitted.
 Every result awaiting acceptance is stored as an explicit WorkItem candidate.
 `always` dispatches a review AgentRun for every candidate, whether it comes
 from a yielded execution Run or a Leader-managed direct result; `leader`
 leaves every candidate for the Leader to accept directly or review explicitly.
+`final` keeps WorkItem acceptance and Integration independent, then `task
+complete` queues one fresh Task-scoped ReviewRound over the frozen committed
+heads of every bound Project. A changed integrated head queues a new round;
+the previous report remains evidence. This final Reviewer evaluates the whole
+Task, so normal delivery does not pay for a complete review of every WorkItem.
 Review Runs complete only their exact ReviewRound, leave the WorkItem awaiting
 acceptance, and never trigger another review or append a Candidate. Successful
 and failed review attempts both wake the Leader and remain evidence for
@@ -145,6 +150,14 @@ An isolated result is handled in this order:
 7. the Leader accepts the WorkItem;
 8. clean Integration, ReviewRound, and WorkItem resources are explicitly
    removed.
+
+The context contract is layered: Yui Core owns durable identity, lifecycle,
+access, and workspace safety; generic role Skills own portable orchestration;
+Project Policy/Knowledge owns project-specific engineering rules; and the Task
+Contract owns the requested outcome. A Reviewer finding routes to the original
+Worker while open, a small Repair WorkItem when closed, Leader/Integration for
+merge or local fixes, and an architecture WorkItem only for a genuinely
+cross-cutting design change.
 
 Capture at the same HEAD reuses the existing ChangeSet. A repaired HEAD creates
 a new candidate; only the latest reviewed candidate may satisfy acceptance.

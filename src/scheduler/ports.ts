@@ -385,7 +385,7 @@ export interface SchedulerStorePort {
   ): "failed" | "state-changed";
   /** Persist LeaderFailure, OperatorNotification and failed/broken runtime state. */
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
-  /** Fail the run and running WorkItem, clear active-run, and stop the Role session. */
+  /** Fail the exact Run and its WorkItem or ReviewRound, clear active-run, and stop the Role session. */
   saveExitedRoleRun(input: ExitedRoleRunPersistence): "failed" | "state-changed";
 }
 

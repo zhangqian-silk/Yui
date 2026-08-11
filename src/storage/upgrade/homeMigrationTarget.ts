@@ -14,7 +14,7 @@
  *    directory and REFUSES to overwrite an existing staged output.
  *  - `rebuildDerivedState`  is the canonical derived-state rebuild; Yui's
  *    authoritative state is self-contained in `state.json`, so it rebuilds only
- *    the effects a step declared (none, while the registry is empty).
+ *    the effects a step declared (none for the current production step).
  *  - `validateCurrentState` constructs `new FileTaskStore(outputHome)` and reads
  *    it once, which forces the strict `parseState` gate (record validation,
  *    id counters, and the full reference graph). Any failure throws and the
@@ -23,9 +23,9 @@
  *    Home path, backing up the original under a timestamped sibling, using the
  *    durable temp+rename+fsync discipline.
  *
- * The registry ships EMPTY, so against a real current Home the engine is a
- * no-op and none of the write paths run; they are exercised by tests that inject
- * a synthetic registry, and are ready for the first real historical step.
+ * The production registry authorizes only explicit adjacent steps. Aggregate
+ * 16→17 exercises this target against a real historical Home; all other missing
+ * paths remain fail-closed.
  */
 
 import {
@@ -324,7 +324,7 @@ export function createHomeMigrationTarget(
       // Yui's authoritative data is fully contained in state.json; id counters
       // and the reference graph are validated by parseState in the next step.
       // There is no separate on-disk derived index to rebuild, so this echoes
-      // the effects a step declared (none while the registry is empty). New
+      // the effects a step declared (none for the current production step). New
       // record families that introduce out-of-band derived state extend here.
       return { rebuiltEffects: [...effects] };
     },

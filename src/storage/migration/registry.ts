@@ -3,9 +3,8 @@
  *
  * Steps are discoverable strictly by `axis + (recordKind) + fromVersion`. There
  * is no version-magnitude or semver guessing: only an explicitly registered
- * chain of adjacent steps counts as migratable. A fresh registry is EMPTY — it
- * carries no real historical steps, so any strictly-older real version is
- * fail-closed until an explicit step is registered.
+ * chain of adjacent steps counts as migratable. A fresh registry is EMPTY, so
+ * callers must explicitly register every step they intend to authorize.
  */
 
 import type { MigrationAxis, MigrationStep } from "./types.js";
@@ -109,9 +108,9 @@ export class MigrationRegistry<Snapshot = unknown> {
 }
 
 /**
- * Create a fresh, EMPTY registry. This ships with no real historical steps: the
- * production wiring keeps it empty on purpose so every strictly-older real
- * version is fail-closed (NEEDS_NEW_VERSION) until a step is explicitly added.
+ * Create a fresh, deliberately EMPTY registry for isolated planning or callers
+ * that authorize no migrations. Production wiring builds its explicit graph in
+ * `upgrade/productionMigrationRegistry.ts`.
  */
 export function createEmptyRegistry<
   Snapshot = unknown

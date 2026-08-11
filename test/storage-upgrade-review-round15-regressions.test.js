@@ -69,7 +69,7 @@ async function startIsolatedController(home, t) {
 }
 
 test("parent update stops a running Controller on an old aggregate Home through its internal path", async (t) => {
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 16);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 17);
   const fixture = tempHome();
   t.after(() => rmSync(fixture.base, { recursive: true, force: true }));
   await startIsolatedController(fixture.home, t);
@@ -80,7 +80,7 @@ test("parent update stops a running Controller on an old aggregate Home through 
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   const schema = inspectStorageSchema(fixture.home);
   assert.equal(schema.status, "unsupported");
-  assert.equal(schema.currentAggregateSchemaVersion, 15);
+  assert.equal(schema.currentAggregateSchemaVersion, 16);
 
   const environment = isolatedEnvironment();
   const publicStop = spawnSync(
@@ -91,7 +91,7 @@ test("parent update stops a running Controller on an old aggregate Home through 
   assert.notEqual(publicStop.status, 0, "public controller stop must retain the schema gate");
   assert.match(
     `${publicStop.stdout.toString("utf8")}\n${publicStop.stderr.toString("utf8")}`,
-    /Aggregate schema 15 is older than required aggregate version 16/
+    /Aggregate schema 16 is older than required aggregate version 17/
   );
 
   const realPorts = createUpdatePorts(environment, spawnSync);
@@ -104,7 +104,7 @@ test("parent update stops a running Controller on an old aggregate Home through 
     },
     preflight: () => {
       events.push("preflight");
-      return { status: "migratable", summary: "aggregate 15 -> 16" };
+      return { status: "migratable", summary: "aggregate 16 -> 17" };
     },
     controllerStatus: (home) => {
       events.push("status");

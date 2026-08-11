@@ -6,18 +6,16 @@
  * staged output without ever switching. `yui upgrade` (execute) runs the full
  * fence + quiesce/drain + re-pin + snapshot/switch + post-verify flow, and on any
  * failure reports the precise blocker stage and recovery action without
- * switching. The registry ships EMPTY, so against a current Home this is a
- * no-op and against any strictly-older Home it is a fail-closed
- * `NEEDS_NEW_VERSION`.
+ * switching. Only paths in the explicit production registry can run; every
+ * missing or future path fails closed as `NEEDS_NEW_VERSION`.
  *
  * Like `doctor`/`controller`, this command needs a Home but manages its own
  * schema check (it must run against a non-current Home), so it is dispatched
  * before the unconditional `requireStorageSchema` gate in `cli.ts`.
  */
 
-import { createEmptyRegistry } from "../storage/migration/index.js";
-import type { HomeSnapshot } from "../storage/upgrade/homeMigrationTarget.js";
 import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
+import { createProductionMigrationRegistry } from "../storage/upgrade/productionMigrationRegistry.js";
 import {
   runStorageUpgrade,
   type UpgradeResult
@@ -46,7 +44,7 @@ export async function runUpgradeCommand(
   const mode = parseUpgradeArgs(args);
   const result = await runStorageUpgrade({
     home,
-    registry: createEmptyRegistry<HomeSnapshot>(),
+    registry: createProductionMigrationRegistry(),
     latest: latestStorageVersionState(),
     mode,
     ...(options.controllerLifecycle === undefined

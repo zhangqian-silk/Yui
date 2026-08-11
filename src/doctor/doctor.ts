@@ -18,10 +18,9 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
-import { createEmptyRegistry } from "../storage/migration/index.js";
 import { classifyHome } from "../storage/upgrade/homeClassification.js";
 import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
-import type { HomeSnapshot } from "../storage/upgrade/homeMigrationTarget.js";
+import { createProductionMigrationRegistry } from "../storage/upgrade/productionMigrationRegistry.js";
 import {
   CommandExecutionError,
   type CommandExecutor
@@ -239,9 +238,10 @@ function checkSchema(state: SchemaInspection): DoctorCheck {
  * NEEDS_NEW_VERSION / CORRUPTED. This complements the raw "storage schema" check
  * with the migration framework's verdict, so a user sees whether a Home can be
  * used as-is, upgraded with `yui upgrade`, needs a newer release, or is damaged.
- * The registry ships EMPTY, so any strictly-older Home reads as NEEDS_NEW_VERSION
- * with a precise missing-step reason, and CORRUPTED is only ever a real
- * structural/reference failure — never inferred from a version number.
+ * Doctor uses the same explicit production registry as `yui upgrade`, so a
+ * complete supported path reads as MIGRATABLE and every missing path fails
+ * closed. CORRUPTED is only ever a real structural/reference failure — never
+ * inferred from a version number.
  */
 function checkCompatibility(
   home: string,
@@ -262,7 +262,7 @@ function checkCompatibility(
   try {
     classification = classifyHome({
       home,
-      registry: createEmptyRegistry<HomeSnapshot>(),
+      registry: createProductionMigrationRegistry(),
       latest: latestStorageVersionState()
     });
   } catch (error) {

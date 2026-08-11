@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -32,7 +32,7 @@ function writeManifest(home, overrides = {}) {
 
 test("storage inspection keeps layout and aggregate schema versions separate", () => {
   const home = temporaryHome();
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 16);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 17);
 
   writeManifest(home);
   assert.deepEqual(inspectStorageSchema(home), {
@@ -70,7 +70,7 @@ test("the previous aggregate schema is rejected without migration", () => {
 
   assert.throws(
     () => requireStorageSchema(home),
-    /aggregate schema 7 is older than required.*version 16.*no migration/i
+    /aggregate schema 7 is older than required.*version 17.*no migration/i
   );
 });
 
@@ -137,6 +137,58 @@ test("a current Home classifies USABLE under the empty registry", () => {
   assert.equal(result.classification.verdict, "USABLE");
   assert.equal(result.layoutVersion, CURRENT_STORAGE_LAYOUT_VERSION);
   assert.equal(result.aggregateVersion, CURRENT_AGGREGATE_SCHEMA_VERSION);
+});
+
+test("final review policy is fenced from aggregate-v16 consumers", () => {
+  const home = temporaryHome();
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+
+  const current = latestStorageVersionState();
+  const legacyV16 = { ...current, aggregate: 16 };
+  const result = classifyHome({
+    home,
+    registry: createEmptyRegistry(),
+    latest: legacyV16
+  });
+
+  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(result.classification.blocker.reason, "future-version");
+  assert.equal(result.classification.blocker.axis, "aggregate");
+  assert.equal(result.classification.blocker.found, 17);
+  assert.equal(result.classification.blocker.supported, 16);
+});
+
+test("an aggregate-v16 Home containing final fails at the storage gate", () => {
+  const home = temporaryHome();
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.aggregateSchemaVersion = 16;
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const statePath = join(home, "state.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  state.schemaVersion = 16;
+  writeFileSync(statePath, JSON.stringify(state));
+
+  assert.throws(
+    () => new FileTaskStore(home),
+    /Aggregate schema 16 is older than required aggregate version 17/
+  );
+  const result = classify(home);
+  assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(result.classification.blocker.reason, "missing-step");
+  assert.equal(result.classification.blocker.axis, "aggregate");
 });
 
 test("a strictly-older Home fails closed as NEEDS_NEW_VERSION/missing-step", () => {

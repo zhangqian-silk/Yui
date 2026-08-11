@@ -64,9 +64,10 @@ Yui models three independent, monotonic storage version axes: the on-disk
 document, and the `record` axis — a `recordKind -> version` map where every
 record family (WorkItem, AgentRun, ReviewRound, …) versions on its own. A
 centralized, future-facing migration framework (registry → planner → engine)
-covers all three; the registry ships **empty** in this release, so no historical
-migration step exists yet and any strictly-older home is fail-closed. The record
-axis is genuinely independent: a home's per-family record versions are read
+covers all three. The production registry contains only explicit adjacent
+steps — currently aggregate `16→17`; any older version without a complete path
+is fail-closed. The record axis is genuinely independent: a home's per-family
+record versions are read
 **structurally** from the raw `state.json` (never through the strict loader), so
 a home whose *only* difference is an older record family is a version verdict
 (MIGRATABLE / NEEDS_NEW_VERSION) — not a false CORRUPTED.
@@ -75,13 +76,12 @@ a home whose *only* difference is an older record family is a version verdict
 
 - **USABLE** — every axis is at the current version; nothing to do.
 - **MIGRATABLE** — strictly older on any axis (scalar or a single record family),
-  and a complete deterministic step path exists (none today, since the registry
-  is empty).
+  and a complete deterministic step path exists (currently aggregate `16→17`).
 - **NEEDS_NEW_VERSION** — a version this release cannot migrate: either newer
   than supported (`future-version`) or older with no registered step
-  (`missing-step`), on any axis including a record family. Under the empty
-  registry, every strictly-older home lands here with a precise reason and the
-  incompatible component (layout vs aggregate).
+  (`missing-step`), on any axis including a record family. Every unsupported
+  path lands here with a precise reason and the incompatible component (layout
+  vs aggregate).
 - **CORRUPTED** — real structural or reference-graph damage only (unparseable
   `state.json`, a container that doesn't match its record locator, a record with
   a missing/invalid `schemaVersion`, or a broken reference graph found once every
@@ -151,9 +151,9 @@ unchanged. A crash mid-switch leaves a durable marker; `yui update` recovery rea
 that marker plus filesystem evidence (backup present, home missing) to name the
 exact backup restore rather than a generic retry. Any other failed or blocked step
 leaves the authoritative home byte-for-byte unchanged and reports the exact
-blocker stage and recovery action. It never converts a real home in this release
-(the registry is empty), and Yui never
-dual-reads an older schema or guesses an old identifier. See
+blocker stage and recovery action. Only explicitly registered adjacent steps
+can convert a real home; Yui never dual-reads an older schema or guesses an old
+identifier. See
 [Task-local identity](docs/task-local-identity.md) for the current reference
 contract.
 
@@ -223,6 +223,14 @@ yui config review show
 yui config review clear
 ```
 
+For Project-backed software delivery, use `--trigger final` to keep WorkItem
+acceptance and Integration independent and run one fresh ReviewRound over the
+complete frozen integrated Task candidate before completion:
+
+```sh
+yui config review set --role reviewer --trigger final
+```
+
 Every result entering Leader acceptance is one explicit candidate on its
 existing WorkItem. The current global rule applies to the next candidate in
 every existing or new Task; that candidate snapshots the rule, so later
@@ -232,6 +240,11 @@ or a Leader-managed direct result; `leader` leaves the candidate awaiting
 acceptance so the Leader can accept it directly or run
 `yui task work review <task-id>/<work-item-id>`. A configured review rule therefore keeps
 Leader-managed candidates awaiting a decision instead of marking them done.
+`final` does not create WorkItem ReviewRounds; `task complete` queues one
+Task-scoped ReviewRound after every bound Project has a committed Integration,
+and re-queues a new round only when those frozen heads change. The final
+Reviewer follows Project Policy/Knowledge and reports reachable, material,
+actionable findings across the complete Task.
 A ReviewRound freezes the Candidate's exact Git commit and creates a fresh,
 ReviewRound-owned writable worktree on a unique branch. Its AgentRun may edit,
 test, and optionally commit diagnostic evidence there, but never changes the
@@ -246,7 +259,11 @@ under the original WorkItem. A rejected result creates a new Candidate on the
 next dispatch while reusing the original execution Role, Session, and
 workspace.
 
-Project-backed Workers commit and leave the Develop workspace clean before
+Yui Core supplies lifecycle and exact-scope safety; generic role Skills supply
+portable collaboration behavior; Project Policy/Knowledge supplies
+project-specific build, test, migration, release, and review rules; the Task
+Contract supplies the current objective and acceptance. Project-backed Workers
+commit and leave the Develop workspace clean before
 yielding a Candidate. Yui freezes each writable Project's HEAD in the Candidate
 snapshot; ReviewRound worktrees are recreated from those exact commits even if
 Develop later advances during repair.
@@ -652,9 +669,15 @@ yui jobs list
 yui jobs retry leader-recovery:<task-id>
 yui task reconcile <task-id>
 yui task run retry <failed-run-id>
+yui task run settle <obsolete-failed-review-run-id>
 ```
 
 `jobs` is not a restored generic queue: it presents durable pending Leader wakes and Leader recovery failures only.
+
+`task run settle` is a Leader-only repair for one exact failed Reviewer Run whose
+matching Task-final ReviewRound was stranded running by an older lifecycle. It
+closes only an obsolete frozen candidate, preserves the Run, Round, workspace,
+and evidence, and never creates a retry Round.
 
 Completion is the reversible execution fence. Archiving is terminal and is accepted only after active work is settled: it stops the Task's tmux session and removes clean managed worktrees. Dirty worktrees keep the Task completed and are preserved for deliberate resolution.
 

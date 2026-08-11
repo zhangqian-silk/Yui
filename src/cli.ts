@@ -56,6 +56,9 @@ import { runProfileCommand } from "./commands/profileCommands.js";
 import {
   dispatchPreparedReviewRound,
   failPendingReviewRound,
+  RESUMED_PENDING_FINAL_REVIEW,
+  TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
+  TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
   runTaskCommand,
   validateTaskArchiveRequest
@@ -87,7 +90,10 @@ import {
   TaskWorkspaceCoordinator,
   WorkspaceCleanupBlockedError
 } from "./repository/taskWorkspaceCoordinator.js";
-import { FileTaskWorkspacePreparer } from "./repository/taskWorkspacePreparer.js";
+import {
+  FileTaskWorkspacePreparer,
+  ReviewRoundWorkspaceEvidenceError
+} from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema, requireStorageSchema } from "./storage/storageSchema.js";
 import { FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
@@ -121,6 +127,7 @@ import {
   extractTaskFinalReviewRequest,
   type TaskFinalReviewContract
 } from "./review/taskFinalReviewContract.js";
+import type { TaskReviewCandidate } from "./review/reviewRound.js";
 
 const VERSION = YUI_VERSION;
 const exactControlInvocation = extractExactControlArgument(process.argv.slice(2));
@@ -903,6 +910,13 @@ export async function main(): Promise<void> {
       process.env,
       taskFinalReviewContract
     );
+    const actualTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env,
+      taskFinalReviewContract
+    );
     const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
       resolved,
       store,
@@ -922,6 +936,9 @@ export async function main(): Promise<void> {
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
         ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
         ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),
+        ...(actualTaskReviewCandidate === undefined
+          ? {}
+          : { actualTaskReviewCandidate }),
         ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
         ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
       }
@@ -936,11 +953,32 @@ export async function main(): Promise<void> {
             requestedRound.taskId,
             requestedRound.id
           );
+          const storedRound = store.getReviewRound(
+            requestedRound.taskId,
+            requestedRound.id
+          );
+          const freshTaskCandidate = (storedRound?.scope ?? "work-item") === "task"
+            ? await snapshotActualTaskReviewCandidate(
+              requestedRound.taskId,
+              store,
+              workspacePreparer
+            )
+            : undefined;
           const run = dispatchPreparedReviewRound(
             requestedRound.taskId,
             requestedRound.id,
             store,
-            { runtime, environment: process.env, yuiHome: home }
+            {
+              runtime,
+              environment: process.env,
+              yuiHome: home,
+              ...(taskFinalReviewContract === undefined
+                ? {}
+                : { taskFinalReviewContract }),
+              ...(freshTaskCandidate === undefined
+                ? {}
+                : { actualTaskReviewCandidate: freshTaskCandidate })
+            }
           );
           reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
           reviewData = {
@@ -949,6 +987,20 @@ export async function main(): Promise<void> {
             workspace
           };
         } catch (error) {
+          const currentRound = store.getReviewRound(
+            requestedRound.taskId,
+            requestedRound.id
+          );
+          // A runless orphan recovery keeps its pending evidence on drift. If
+          // this command already yielded the exact Leader, fall through to the
+          // existing failed-Review wake so the next Leader owns recovery.
+          if (requestedRound.resumedPendingFinalReview
+            && !requestedRound.terminalizedLeaderRun
+            && (error instanceof ReviewRoundWorkspaceEvidenceError
+              || error instanceof TaskFinalReviewDispatchDriftError)
+            && (currentRound?.scope ?? "work-item") === "task") {
+            throw error;
+          }
           const message = error instanceof Error ? error.message : String(error);
           const failed = failPendingReviewRound(
             requestedRound.taskId,
@@ -1243,6 +1295,98 @@ async function directTaskMainSnapshotForTaskCommand(
   }
 }
 
+async function actualTaskReviewCandidateForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv,
+  taskFinalReviewContract?: TaskFinalReviewContract
+): Promise<TaskReviewCandidate | undefined> {
+  if (args[0] !== "task") return undefined;
+  let taskId: string | undefined;
+  if (args[1] === "complete" && args[2] !== undefined) {
+    const task = store.getTask(args[2]);
+    if (task === null || task.status !== "active" || task.projectBindings.length === 0) {
+      return undefined;
+    }
+    const establishedFinalRound = store.listReviewRounds(task.id).some((round) => (
+      (round.scope ?? "work-item") === "task"
+    ));
+    if (taskFinalReviewContract === undefined
+      && store.getReviewConfig()?.trigger !== "final"
+      && !establishedFinalRound) {
+      return undefined;
+    }
+    taskId = task.id;
+  } else if (args[1] === "work"
+    && args[2] === "review"
+    && args[3] === "retry"
+    && args[4] !== undefined) {
+    const reference = cliTaskRecordReference(args[4], "reviewRound", environment);
+    const round = store.getReviewRound(reference.taskId, reference.localId);
+    if (round !== null && (round.scope ?? "work-item") === "task") {
+      taskId = reference.taskId;
+    }
+  } else if (args[1] === "run"
+    && (args[2] === "retry" || args[2] === "settle")
+    && args[3] !== undefined) {
+    const reference = cliTaskRecordReference(args[3], "agentRun", environment);
+    const run = store.getAgentRun(reference.taskId, reference.localId);
+    const round = run?.reviewRoundId === undefined
+      ? null
+      : store.getReviewRound(reference.taskId, run.reviewRoundId);
+    if (run?.purpose === "review"
+      && round !== null
+      && (round.scope ?? "work-item") === "task") {
+      taskId = reference.taskId;
+    }
+  }
+  if (taskId === undefined || store.getTask(taskId)?.status !== "active") return undefined;
+  return snapshotActualTaskReviewCandidate(taskId, store, preparer);
+}
+
+async function snapshotActualTaskReviewCandidate(
+  taskId: string,
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer
+): Promise<TaskReviewCandidate> {
+  const task = store.getTask(taskId);
+  if (task === null) throw usageError(`Task not found: ${taskId}.`);
+  if (task.projectBindings.length === 0) {
+    throw usageError(`Final Task Review requires a Project-backed Task: ${task.id}.`);
+  }
+  const workspace = store.getTaskWorkspace(task.id);
+  if (workspace === null
+    || workspace.owner.type !== "task"
+    || workspace.owner.taskId !== task.id) {
+    throw usageError(`Task has no authoritative main workspace: ${task.id}.`);
+  }
+  try {
+    const snapshot = await preparer.snapshotDirectTaskMain(
+      workspace,
+      task.projectBindings.map(({ projectId }) => projectId)
+    );
+    const heads = new Map(snapshot.projects.map(({ projectId, headCommit }) => (
+      [projectId, headCommit]
+    )));
+    return {
+      schemaVersion: 1,
+      projects: task.projectBindings.map(({ projectId }) => {
+        const commit = heads.get(projectId);
+        if (commit === undefined) {
+          throw new Error(`Task main snapshot omitted Project ${projectId}.`);
+        }
+        return { projectId, commit };
+      })
+    };
+  } catch (error) {
+    throw usageError(
+      `Actual Task Project head verification failed for ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
 async function reviewWorkspaceResultForTaskCommand(
   args: readonly string[],
   store: FileTaskStore,
@@ -1263,6 +1407,8 @@ function reviewRoundFromCommandData(data: unknown): Readonly<{
   id: string;
   taskId: string;
   status: string;
+  resumedPendingFinalReview: boolean;
+  terminalizedLeaderRun: boolean;
 }> | undefined {
   if (typeof data !== "object" || data === null || !("reviewRound" in data)) return undefined;
   const round = (data as { reviewRound?: unknown }).reviewRound;
@@ -1271,7 +1417,17 @@ function reviewRoundFromCommandData(data: unknown): Readonly<{
   return typeof value.id === "string"
     && typeof value.taskId === "string"
     && typeof value.status === "string"
-    ? { id: value.id, taskId: value.taskId, status: value.status }
+    ? {
+        id: value.id,
+        taskId: value.taskId,
+        status: value.status,
+        resumedPendingFinalReview: (
+          data as { [RESUMED_PENDING_FINAL_REVIEW]?: unknown }
+        )[RESUMED_PENDING_FINAL_REVIEW] === true,
+        terminalizedLeaderRun: (
+          data as { [TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW]?: unknown }
+        )[TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW] === true
+      }
     : undefined;
 }
 

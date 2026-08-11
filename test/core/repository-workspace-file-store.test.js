@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -28,6 +29,7 @@ import {
   roleAgentSessionResumeMode,
   updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
 import {
@@ -39,7 +41,8 @@ import {
   createGlobalRole,
   createRole,
   createRoleAgentBinding,
-  updateRole
+  updateRole,
+  updateRoleStatus
 } from "../../dist/role/role.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createStartupReadyClaudeAgent } from "../helpers/mockClaudeAgent.js";
@@ -3226,7 +3229,13 @@ test("a Task-final ReviewRound worktree starts at its frozen integrated head", a
       baseRef: project.developmentBranch
     }]
   }), NOW);
-  addTaskRoles(store, task, repositoryPath, ["leader", "reviewer"]);
+  addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "reviewer"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-pending-final")
+  );
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   await preparer.prepareTaskWorkspace(task.id);
   const taskWorkspace = store.getTaskWorkspace(task.id);
@@ -3286,6 +3295,502 @@ test("a Task-final ReviewRound worktree starts at its frozen integrated head", a
     git(["-C", taskMainEntry.path, "rev-parse", "HEAD"]).trim(),
     taskMainCommit
   );
+});
+
+async function pendingExactTaskReviewFixture(t, title) {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", title, NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "reviewer"]);
+  store.saveConfig({
+    ...store.getConfig(),
+    defaultWorkspace: workspace,
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const taskEntry = store.getTaskWorkspace(task.id).entries[0];
+  const taskHead = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  const firstInvocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: firstInvocation.controlDigest
+  });
+  const item = updateWorkItemStatus(createWorkItem("work-item-1", task.id, {
+    title: "Accepted delivery awaiting final Review",
+    writeProjectIds: [project.id]
+  }, NOW), "running", NOW);
+  const submitted = submitWorkItemCandidate(item, {
+    summary: "Accepted delivery",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "reviewer", trigger: "final" },
+    taskFinalReviewContract: contract
+  }, NOW);
+  store.saveWorkItem(task.id, updateWorkItemStatus(
+    submitted,
+    "completed",
+    NOW,
+    "Accepted before final Review."
+  ));
+
+  // Simulate the first exact CLI process ending immediately after its command
+  // transaction commits the pending Round, before workspace preparation or
+  // Reviewer dispatch runs in the outer CLI layer.
+  const first = runTaskCommand([
+    "complete", task.id, "--summary", "Request the final Review."
+  ], store, {
+    now: () => new Date(NOW),
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    },
+    taskFinalReviewContract: contract,
+    actualTaskReviewCandidate: {
+      schemaVersion: 1,
+      projects: [{ projectId: project.id, commit: taskHead }]
+    }
+  });
+  assert.match(first.output, /Final Task Review requested as review-round-1/);
+  const pending = store.getReviewRound(task.id, "review-round-1");
+  assert.equal(pending.status, "pending");
+  assert.equal(pending.reviewerRunId, undefined);
+  assert.equal(pending.workspace, undefined);
+  assert.equal(store.getReviewRoundWorkspace(task.id, pending.id), null);
+  assert.equal(store.listAgentRuns(task.id).filter(({ purpose }) => purpose === "review").length, 0);
+
+  return {
+    home,
+    workspace,
+    repositoryPath,
+    store,
+    project,
+    task,
+    preparer,
+    pending
+  };
+}
+
+function spawnExactFinalTaskComplete(fx, summary) {
+  const store = new FileTaskStore(fx.home);
+  const invocation = exactTaskCliInvocation({
+    home: fx.home,
+    store,
+    taskId: fx.task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
+  return spawnSync(process.execPath, [
+    invocation.cliEntry,
+    ...invocation.prefix,
+    "task", "complete", fx.task.id, "--summary", summary
+  ], { encoding: "utf8", env: invocation.environment });
+}
+
+function saveDeliveredLeaderControlRun(fx) {
+  const leader = fx.store.getRole(fx.task.id, "leader");
+  const workspace = fx.store.getTaskWorkspace(fx.task.id);
+  const run = createAgentRun(
+    fx.store.nextAgentRunId(fx.task.id),
+    fx.task.id,
+    leader.name,
+    "resume",
+    "Resume exact Task-final Review recovery.",
+    NOW,
+    {
+      workspace,
+      effective: resolveEffectiveLaunch({
+        role: leader,
+        purpose: "execution",
+        workspace
+      })
+    }
+  );
+  fx.store.transaction((tx) => {
+    tx.saveAgentRun(run);
+    tx.saveActiveAgentRun(run);
+    tx.saveRole(fx.task.id, updateRoleStatus(leader, "running", NOW));
+  });
+  markDelivered(fx.store, run);
+  return fx.store.getAgentRun(fx.task.id, run.id);
+}
+
+test("exact Task complete resumes one durably pending final Review after the prior process exits", async (t) => {
+  const fx = await pendingExactTaskReviewFixture(t, "Resume the interrupted final Review");
+
+  // A new process and store instance must resume that exact durable Round.
+  const reopened = new FileTaskStore(fx.home);
+  assert.deepEqual(reopened.getReviewRound(fx.task.id, fx.pending.id), fx.pending);
+  const recovered = spawnExactFinalTaskComplete(fx, "Resume the interrupted final Review.");
+  assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+  assert.match(recovered.stdout, /Review queued as review-round-1 \(agent-run-1\)/);
+
+  const afterRecovery = new FileTaskStore(fx.home);
+  const rounds = afterRecovery.listReviewRounds(fx.task.id);
+  const reviewRuns = afterRecovery.listAgentRuns(fx.task.id)
+    .filter(({ purpose }) => purpose === "review");
+  assert.equal(rounds.length, 1);
+  assert.equal(rounds[0].id, fx.pending.id);
+  assert.equal(rounds[0].status, "running");
+  assert.equal(rounds[0].reviewerRunId, "agent-run-1");
+  assert.equal(reviewRuns.length, 1);
+  assert.equal(reviewRuns[0].reviewRoundId, fx.pending.id);
+
+  const repeated = spawnExactFinalTaskComplete(fx, "Do not duplicate the recovered Review.");
+  assert.equal(repeated.error, undefined);
+  const afterRepeated = new FileTaskStore(fx.home);
+  assert.equal(afterRepeated.listReviewRounds(fx.task.id).length, 1);
+  assert.equal(
+    afterRepeated.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length,
+    1
+  );
+});
+
+test("resumed pending Task-final Review preserves history when the dispatch HEAD fence drifts", async (t) => {
+  const fx = await pendingExactTaskReviewFixture(t, "Reject a late Task HEAD drift");
+  const taskEntry = fx.store.getTaskWorkspace(fx.task.id).entries[0];
+  const trigger = join(fx.repositoryPath, ".git", "hooks", "late-head-drift.trigger");
+  const hook = join(fx.repositoryPath, ".git", "hooks", "post-checkout");
+  writeFileSync(trigger, "advance Task main during Review workspace preparation\n");
+  writeFileSync(hook, [
+    "#!/bin/sh",
+    `if [ -f ${JSON.stringify(trigger)} ]; then`,
+    `  rm ${JSON.stringify(trigger)}`,
+    `  printf 'late drift\\n' > ${JSON.stringify(join(taskEntry.path, "late-drift.txt"))}`,
+    `  git -C ${JSON.stringify(taskEntry.path)} add late-drift.txt`,
+    `  git -C ${JSON.stringify(taskEntry.path)} commit -qm 'late Task head drift'`,
+    "fi",
+    ""
+  ].join("\n"));
+  chmodSync(hook, 0o755);
+
+  const rejected = spawnExactFinalTaskComplete(
+    fx,
+    "Reject the Task head that moved after workspace preparation."
+  );
+  assert.notEqual(rejected.status, 0, rejected.stderr || rejected.stdout);
+  assert.match(
+    rejected.stderr,
+    /freezes a candidate that is no longer the current Task candidate/i
+  );
+
+  const stored = new FileTaskStore(fx.home);
+  const round = stored.getReviewRound(fx.task.id, fx.pending.id);
+  assert.equal(round.status, "pending");
+  assert.equal(round.reviewerRunId, undefined);
+  assert.deepEqual(round.taskCandidate, fx.pending.taskCandidate);
+  assert.deepEqual(round.taskFinalReviewContract, fx.pending.taskFinalReviewContract);
+  assert.notEqual(round.workspace, undefined);
+  assert.equal(stored.listReviewRounds(fx.task.id).length, 1);
+  assert.equal(stored.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length, 0);
+});
+
+test("Task-final recovery head mismatch rolls back exact Leader terminalization", async (t) => {
+  const fx = await pendingExactTaskReviewFixture(
+    t,
+    "Keep the exact Leader fence on an earlier Task head mismatch"
+  );
+  const leaderRun = saveDeliveredLeaderControlRun(fx);
+  const taskEntry = fx.store.getTaskWorkspace(fx.task.id).entries[0];
+  writeFileSync(join(taskEntry.path, "earlier-head-drift.txt"), "earlier head drift\n");
+  git(["-C", taskEntry.path, "add", "earlier-head-drift.txt"]);
+  git(["-C", taskEntry.path, "commit", "-qm", "earlier Task head drift"]);
+
+  const rejected = spawnExactFinalTaskComplete(
+    fx,
+    "Reject the mismatched head before committing Leader terminalization."
+  );
+  assert.notEqual(rejected.status, 0, rejected.stderr || rejected.stdout);
+  assert.match(
+    rejected.stderr,
+    /freezes a candidate that is no longer the current Task candidate/i
+  );
+
+  const stored = new FileTaskStore(fx.home);
+  assert.equal(stored.getTask(fx.task.id).status, "active");
+  assert.equal(stored.getAgentRun(fx.task.id, leaderRun.id).status, "active");
+  assert.equal(stored.getActiveAgentRun(fx.task.id, "leader").id, leaderRun.id);
+  assert.deepEqual(stored.getReviewRound(fx.task.id, fx.pending.id), fx.pending);
+  assert.equal(
+    stored.getWorkMailbox({
+      kind: "role",
+      taskId: fx.task.id,
+      roleName: "leader"
+    }).pending,
+    null
+  );
+  assert.equal(stored.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length, 0);
+});
+
+test("late drift after exact Leader terminalization fails the resumed final Review and wakes one Leader", async (t) => {
+  const fx = await pendingExactTaskReviewFixture(
+    t,
+    "Retain a durable owner after late final Review drift"
+  );
+  const leaderRun = saveDeliveredLeaderControlRun(fx);
+  assert.equal(leaderRun.status, "active");
+  assert.notEqual(leaderRun.pushedAt, undefined);
+  assert.notEqual(leaderRun.deliveredAt, undefined);
+
+  const taskEntry = fx.store.getTaskWorkspace(fx.task.id).entries[0];
+  const trigger = join(fx.repositoryPath, ".git", "hooks", "late-leader-drift.trigger");
+  const hook = join(fx.repositoryPath, ".git", "hooks", "post-checkout");
+  writeFileSync(trigger, "advance Task main after exact Leader terminalization\n");
+  writeFileSync(hook, [
+    "#!/bin/sh",
+    `if [ -f ${JSON.stringify(trigger)} ]; then`,
+    `  rm ${JSON.stringify(trigger)}`,
+    `  printf 'late Leader drift\\n' > ${JSON.stringify(join(taskEntry.path, "late-leader-drift.txt"))}`,
+    `  git -C ${JSON.stringify(taskEntry.path)} add late-leader-drift.txt`,
+    `  git -C ${JSON.stringify(taskEntry.path)} commit -qm 'late Leader Task head drift'`,
+    "fi",
+    ""
+  ].join("\n"));
+  chmodSync(hook, 0o755);
+
+  const completed = spawnExactFinalTaskComplete(
+    fx,
+    "Terminalize the exact Leader before the late Review drift."
+  );
+  const stored = new FileTaskStore(fx.home);
+  const round = stored.getReviewRound(fx.task.id, fx.pending.id);
+  const terminalLeader = stored.getAgentRun(fx.task.id, leaderRun.id);
+  const leaderMailbox = stored.getWorkMailbox({
+    kind: "role",
+    taskId: fx.task.id,
+    roleName: "leader"
+  });
+  const observed = {
+    taskStatus: stored.getTask(fx.task.id).status,
+    leaderStatus: terminalLeader.status,
+    activeLeaderRunId: stored.getActiveAgentRun(fx.task.id, "leader")?.id ?? null,
+    roundStatus: round.status,
+    reviewerRunId: round.reviewerRunId,
+    reviewRunCount: stored.listAgentRuns(fx.task.id)
+      .filter(({ purpose }) => purpose === "review").length,
+    leaderWakeReasons: leaderMailbox?.pending?.reasons ?? []
+  };
+  assert.deepEqual(observed, {
+    taskStatus: "active",
+    leaderStatus: "yielded",
+    activeLeaderRunId: null,
+    roundStatus: "failed",
+    reviewerRunId: undefined,
+    reviewRunCount: 0,
+    leaderWakeReasons: ["review-failed"]
+  }, `reachable stranded lifecycle state: ${JSON.stringify(observed)}`);
+  assert.equal(completed.status, 0, completed.stderr || completed.stdout);
+  assert.match(completed.stdout, /Review could not start/);
+  assert.match(round.summary, /no longer the current Task candidate/i);
+  assert.deepEqual(round.taskCandidate, fx.pending.taskCandidate);
+  assert.deepEqual(round.taskFinalReviewContract, fx.pending.taskFinalReviewContract);
+  assert.notEqual(round.workspace, undefined);
+  assert.deepEqual(stored.getReviewRoundWorkspace(fx.task.id, round.id), round.workspace);
+  assert.equal(stored.listReviewRounds(fx.task.id).length, 1);
+  assert.deepEqual(leaderMailbox.pending?.refs, [{
+    type: "work-item",
+    taskId: fx.task.id,
+    id: fx.pending.workItemId
+  }]);
+  assert.equal(leaderMailbox.pending?.requestCount, 1);
+});
+
+test("pending Task-final recovery safely reuses a retained diagnostic branch", async (t) => {
+  const fx = await pendingExactTaskReviewFixture(t, "Reuse retained Review diagnostics");
+  const workspace = await fx.preparer.prepareReviewRoundWorkspace(
+    fx.task.id,
+    fx.pending.id
+  );
+  const entry = workspace.entries[0];
+  writeFileSync(join(entry.path, "retained-diagnostic.txt"), "retained diagnostic\n");
+  git(["-C", entry.path, "add", "retained-diagnostic.txt"]);
+  git(["-C", entry.path, "commit", "-qm", "retained Review diagnostic"]);
+  const diagnosticHead = git(["-C", entry.path, "rev-parse", "HEAD"]).trim();
+  assert.equal(await new NodeGitWorkspace().removeWorktree({
+    repositoryPath: fx.project.path,
+    container: join(fx.workspace, "worktree", fx.project.name),
+    taskId: fx.task.id,
+    roleName: fx.pending.id
+  }), "removed");
+  assert.equal(existsSync(entry.path), false);
+
+  const recovered = spawnExactFinalTaskComplete(
+    fx,
+    "Resume from the retained diagnostic branch."
+  );
+  assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+  const stored = new FileTaskStore(fx.home);
+  const round = stored.getReviewRound(fx.task.id, fx.pending.id);
+  assert.equal(
+    round.status,
+    "running",
+    recovered.stderr || recovered.stdout || round.summary
+  );
+  assert.equal(git(["-C", entry.path, "rev-parse", "HEAD"]).trim(), diagnosticHead);
+  assert.equal(stored.listReviewRounds(fx.task.id).length, 1);
+  assert.equal(stored.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length, 1);
+});
+
+test("pending Task-final recovery preserves incompatible physical workspace evidence", async (t) => {
+  const fx = await pendingExactTaskReviewFixture(t, "Reject drifted Review workspace evidence");
+  const workspace = await fx.preparer.prepareReviewRoundWorkspace(
+    fx.task.id,
+    fx.pending.id
+  );
+  const entry = workspace.entries[0];
+  git(["-C", entry.path, "checkout", "--detach"]);
+  const frozenRound = structuredClone(
+    new FileTaskStore(fx.home).getReviewRound(fx.task.id, fx.pending.id)
+  );
+
+  const rejected = spawnExactFinalTaskComplete(fx, "Do not adopt drifted workspace evidence.");
+  assert.notEqual(rejected.status, 0, rejected.stderr || rejected.stdout);
+  assert.match(rejected.stderr, /ReviewRound workspace managed branch mismatch/i);
+  let stored = new FileTaskStore(fx.home);
+  assert.deepEqual(stored.getReviewRound(fx.task.id, fx.pending.id), frozenRound);
+  assert.equal(stored.listReviewRounds(fx.task.id).length, 1);
+  assert.equal(stored.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length, 0);
+
+  git(["-C", entry.path, "checkout", "-q", entry.branch]);
+  const recovered = spawnExactFinalTaskComplete(fx, "Resume after restoring exact workspace evidence.");
+  assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+  stored = new FileTaskStore(fx.home);
+  assert.equal(stored.listReviewRounds(fx.task.id).length, 1);
+  assert.equal(stored.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length, 1);
+});
+
+test("ordinary pending Task-final workspace preparation failure records the Round as failed", async (t) => {
+  const fx = await pendingExactTaskReviewFixture(t, "Fail an ordinary Review preparation");
+  writeFileSync(join(fx.repositoryPath, "stale-review.txt"), "stale branch\n");
+  git(["-C", fx.repositoryPath, "add", "stale-review.txt"]);
+  git(["-C", fx.repositoryPath, "commit", "-qm", "stale review branch"]);
+  const identity = worktreeIdentity(fx.task.id, fx.pending.id);
+  const stalePath = join(fx.workspace, "worktree", fx.project.name, identity.directory);
+  mkdirSync(join(stalePath, ".."), { recursive: true });
+  execFileSync("git", [
+    "-C", fx.repositoryPath,
+    "worktree", "add", "-b", identity.branch,
+    stalePath,
+    "HEAD"
+  ], { stdio: "ignore" });
+
+  const failed = spawnExactFinalTaskComplete(fx, "Record the ordinary preparation failure.");
+  assert.equal(failed.status, 0, failed.stderr || failed.stdout);
+  assert.match(failed.stdout, /Review could not start:.*baseCommit mismatch/is);
+  const stored = new FileTaskStore(fx.home);
+  const round = stored.getReviewRound(fx.task.id, fx.pending.id);
+  assert.equal(round.status, "failed");
+  assert.match(round.summary, /baseCommit mismatch/i);
+  assert.equal(stored.listReviewRounds(fx.task.id).length, 1);
+  assert.equal(stored.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length, 0);
+});
+
+test("exact Task completion rejects Task-main drift after the latest Integration", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Review the actual Task head", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }],
+    requireIntegration: true
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "reviewer"]);
+  store.saveConfig({
+    ...store.getConfig(),
+    defaultWorkspace: workspace,
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const taskEntry = store.getTaskWorkspace(task.id).entries[0];
+  const baseCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  const invocation = exactTaskCliInvocation({
+    home,
+    store,
+    taskId: task.id,
+    roleName: "leader",
+    taskFinalReviewerRole: "reviewer"
+  });
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: invocation.controlDigest
+  });
+  const item = updateWorkItemStatus(createWorkItem("work-item-1", task.id, {
+    title: "Integrated delivery",
+    writeProjectIds: [project.id]
+  }, NOW), "running", NOW);
+  const submitted = submitWorkItemCandidate(item, {
+    summary: "Integrated delivery",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "reviewer", trigger: "final" },
+    taskFinalReviewContract: contract
+  }, NOW);
+  store.saveWorkItem(task.id, updateWorkItemStatus(
+    submitted,
+    "completed",
+    NOW,
+    "Accepted for final Review."
+  ));
+
+  writeFileSync(join(taskEntry.path, "integrated.txt"), "integrated\n");
+  git(["-C", taskEntry.path, "add", "integrated.txt"]);
+  git(["-C", taskEntry.path, "commit", "-qm", "integrated"]);
+  const integratedCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  const changeSet = createWorkItemChangeSet({
+    id: "change-set-1",
+    taskId: task.id,
+    projectId: project.id,
+    workItemId: item.id,
+    baseCommit,
+    headCommit: integratedCommit,
+    branch: taskEntry.branch,
+    changedPaths: ["integrated.txt"]
+  }, NOW);
+  const integration = updateIntegrationAttempt(createIntegrationAttempt({
+    id: "integration-1",
+    taskId: task.id,
+    projectId: project.id,
+    targetRef: taskEntry.branch,
+    expectedHead: baseCommit,
+    changeSetIds: [changeSet.id],
+    checkCommands: []
+  }, NOW), { status: "committed", candidateCommit: integratedCommit }, NOW);
+  store.transaction((tx) => {
+    tx.saveChangeSet(task.id, changeSet);
+    tx.saveIntegrationAttempt(task.id, integration);
+  });
+
+  writeFileSync(join(taskEntry.path, "drift.txt"), "unintegrated drift\n");
+  git(["-C", taskEntry.path, "add", "drift.txt"]);
+  git(["-C", taskEntry.path, "commit", "-qm", "post-integration drift"]);
+  const actualCommit = git(["-C", taskEntry.path, "rev-parse", "HEAD"]).trim();
+  assert.notEqual(actualCommit, integratedCommit);
+
+  const result = spawnSync(process.execPath, [
+    invocation.cliEntry,
+    ...invocation.prefix,
+    "task", "complete", task.id, "--summary", "Request exact final Review."
+  ], { encoding: "utf8", env: invocation.environment });
+  assert.notEqual(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /actual Task head.*latest committed Integration/i);
+  assert.equal(store.listReviewRounds(task.id).length, 0);
+  assert.equal(store.getTask(task.id).status, "active");
 });
 
 test("a reviewer launches from a fresh ReviewRound workspace frozen from the Candidate", async (t) => {
@@ -3396,7 +3901,13 @@ test("public review delivery binds the physical ReviewRound workspace before not
       baseRef: project.developmentBranch
     }]
   }), NOW);
-  const agent = addTaskRoles(store, task, repositoryPath);
+  const agent = addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-review-delivery")
+  );
   store.transaction((tx) => {
     tx.saveGlobalRole(createGlobalRole(
       "reviewer",
@@ -3446,6 +3957,10 @@ test("public review delivery binds the physical ReviewRound workspace before not
     ["task", "work", "review", item.id]
   );
   assert.equal(result.status, 0, result.stderr || result.stdout);
+  // The CLI has durably queued the Review. Quiesce the fixture Controller
+  // before reading that handoff so a real local adapter cannot terminalize
+  // the Run during this deterministic workspace test.
+  await stopFileTaskController(home);
 
   const round = store.listReviewRounds(task.id)[0];
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
