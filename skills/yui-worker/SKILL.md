@@ -16,11 +16,17 @@ project-specific build, test, migration, release, and review rules; and the
 Task Contract owns the current objective, scope, acceptance, and evidence. Do
 not promote a Project command or convention into generic Worker policy.
 
-During ordinary work, do not run tests that invoke real Agents or models, paid
-services, shared infrastructure, production systems, or other non-disposable
-external resources. Prefer deterministic mocks and isolated resources; if the
-user did not explicitly request real-resource validation, report the gap
-instead of running it.
+Treat real models, paid APIs, shared infrastructure, production systems, real
+account quota, and every other non-disposable external resource as user-owned
+authority. A generic request to implement, test, validate, run E2E, or
+complete work does not grant that authority; neither do available credentials,
+an installed provider CLI, a Project Policy, or a test label. Unless the user
+proactively names the concrete real-resource validation, skip it without
+creating an InputRequest or blocking the WorkItem. Prefer deterministic mocks
+and isolated resources, then report the verification gap and an optional
+follow-up. An explicit request authorizes only its named resource, effect, and
+isolation boundary; never broaden it. A real Agent may develop or review code,
+but that does not authorize a real provider/model test.
 
 - Preserve supplied Task, WorkItem, Role, and Run identities.
 - Follow the supplied Worker Profile instructions, Skills, read/write behavior intent,
