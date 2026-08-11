@@ -188,6 +188,9 @@ test("Yui-specific test workflow stays in its Project Skill", () => {
   assert.match(projectSkill, /Apply this Skill only to development of the Yui repository itself/u);
   assert.match(projectSkill, /Unit, Isolated Integration, and Mock Agent\s+Session coverage/u);
   assert.match(projectSkill, /Run Provider E2E only when the user explicitly asks/u);
+  assert.match(projectSkill, /skip it without creating an InputRequest/u);
+  assert.match(projectSkill, /compatibility only through explicit migrations/u);
+  assert.match(projectSkill, /tier names[\s\S]*belong to the Yui Project[\s\S]*must not become generic Yui CLI/u);
   for (const skill of genericSkills) {
     assert.match(skill, /do not run tests that invoke real Agents or models/iu);
     assert.match(skill, /report the gap\s+instead of running it/iu);

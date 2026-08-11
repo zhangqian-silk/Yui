@@ -20,17 +20,27 @@
 
 - Treat Yui CLI reads as the context API. Launch and wake messages should guide an Agent to the relevant Project, Task, WorkItem, message, or input records instead of embedding the full source content.
 - Persist Project Knowledge in YUI_HOME. Repository files may be evidence or reading material, but they are not the authority for Yui's maintained knowledge.
+- Keep Yui CLI behavior project-neutral: its Task, Role, review, recovery, and resource-authorization rules must work for any Project. Put Yui-repository build, test, CI, release, and validation policy in this repository's guidance and Project Skill instead of generic CLI Roles.
 - Treat stable Project checkouts as read-only reference workspaces. Perform Task and WorkItem changes in managed worktrees.
 - A Project-backed Task receives its main worktree when it is created. During execution, the Leader may create an isolated WorkItem worktree directly when concurrent work warrants it; do not introduce an approval workflow.
 - Archive only after active work is settled, results are integrated or deliberately abandoned, and managed worktrees are clean and removable. Worktree cleanup must not delete the Task record.
 
+## Do not solicit real-resource validation
+
+- When the user has not proactively requested a specific validation that consumes a real model, paid API, shared infrastructure, production system, real account quota, or another non-disposable external resource, do not run it and do not create an InputRequest merely to ask whether it should be run.
+- A generic request to implement, test, validate, run E2E, or complete a Task is not authorization for real-resource validation. A test tier name, repository document, or Project Policy can describe a test but cannot grant that authorization.
+- Complete the bounded work with deterministic and isolated evidence. In the final Task summary, state any material real-resource validation that was not run and, when useful, recommend it as a separate follow-up without turning the recommendation into a blocker or user prompt.
+- When the user proactively and explicitly requests a specific real-resource E2E, it may run only within that exact resource and effect boundary and with the Project's isolation safeguards. A real Agent may also act normally as the developer or reviewer of Yui code.
+
 ## Keep the main path lean
 
-- Do not add legacy storage or workspace compatibility unless the user explicitly requests it.
+- Provide migration code only for valid earlier versions of persistent Yui data. Any change to a persistent layout, aggregate, record, or configuration schema must declare its version transition and use the centralized migration mechanism.
+- For every other change, implement the current contract directly. Do not add transitional adapters, dual behavior, legacy fallbacks, or automatic repair for malformed, partially written, manually modified, or historically leaked Homes, Sessions, worktrees, configuration, or runtime artifacts. Such anomalous state must fail closed with a bounded diagnosis or cleanup recommendation; it is not a supported old data version.
 - Prefer the smallest workflow that satisfies the current product commitment. Avoid speculative states, background protocols, and duplicate sources of truth.
 
 ## Keep Yui-specific workflow in its Project Skill
 
+- These repository constraints apply whenever Yui is the Project being changed, independent of which human, Agent, orchestrator, CI system, or other tool performs the work.
 - When developing this repository, read and follow [`.agents/skills/develop-yui/SKILL.md`](.agents/skills/develop-yui/SKILL.md). It owns Yui-specific implementation and validation workflow; do not copy those Project details into Yui's generic Leader, Worker, or Reviewer behavior.
 
 ## Run this checkout in isolation
