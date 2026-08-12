@@ -4996,6 +4996,10 @@ test("public terminal ReviewRound cleanup removes its clean workspace", async (t
     ["task", "work", "review", item.id]
   );
   assert.equal(queued.status, 0, queued.stderr || queued.stdout);
+  // This test drives the Mock review result explicitly.  The public CLI may
+  // have started the fixture Controller to deliver the queued wake, so stop
+  // that exact Controller before reading and mutating the Run deterministically.
+  await stopFileTaskController(home);
   const round = store.listReviewRounds(task.id)[0];
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   markDelivered(store, reviewRun);
@@ -5069,6 +5073,9 @@ test("public dispatch prepares a WorkItem-owned read-only Develop workspace befo
     ["task", "work", "dispatch", item.id]
   );
   assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
+  // Keep this deterministic workspace assertion independent of the fixture
+  // Controller's asynchronous Mock delivery and terminalization path.
+  await stopFileTaskController(home);
 
   const workspaceRecord = store.getWorkItemWorkspace(task.id, item.id);
   assert.deepEqual(workspaceRecord.owner, {
@@ -5610,15 +5617,15 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
     ["task", "work", "review", item.id]
   );
   assert.equal(queued.status, 0, queued.stderr || queued.stdout);
+  // The review result durably queues a Leader wake.  Quiesce this fixture's
+  // exact Controller before reading or completing the review so its
+  // asynchronous scheduler cannot race the test's explicit state driver.
+  await stopFileTaskController(home);
   const round = store.listReviewRounds(task.id)[0];
   const reviewRun = store.getActiveAgentRun(task.id, "reviewer");
   markDelivered(store, reviewRun);
-  // The review result durably queues a Leader wake.  Quiesce this fixture's
-  // exact Controller before completing the terminal Task so its asynchronous
-  // scheduler cannot race archive preflight by creating the expected Leader
-  // Run.  The yield still folds the durable result; omitting the optional
+  // The direct yield still folds the durable result; omitting the optional
   // runtime signal here preserves the pending wake for the archive scanner.
-  await stopFileTaskController(home);
   const finished = runTaskCommand(
     ["run", "yield", `${task.id}/${reviewRun.id}`, "--summary", "Review complete"],
     store,
