@@ -42,6 +42,8 @@ import {
   updateRoleStatus
 } from "../../dist/role/role.js";
 import { failAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
+import { terminalizeExactTaskRun } from "../../dist/lifecycle/exactRunTerminalization.js";
+import { formatAgentRunReceiptId } from "../../dist/task/taskRecordReference.js";
 import { createStartupReadyClaudeAgent } from "../helpers/mockClaudeAgent.js";
 import {
   createReviewRound,
@@ -5106,24 +5108,21 @@ test("public multi-Lane retry reuses the failed Lane workspace", async (t) => {
   assert.notEqual(survivor, undefined);
   const originalRoot = failed.workspace.root;
   markDelivered(store, failed);
+  const failedAt = new Date(Math.max(Date.now(), Date.parse(
+    store.getWorkItem(task.id, item.id).updatedAt
+  )));
   store.transaction((tx) => {
-    const current = tx.getWorkItem(task.id, item.id);
-    const failureAt = new Date(Math.max(Date.now(), Date.parse(current.updatedAt)));
-    tx.saveAgentRun(failAgentRun(failed, "transient lane failure", failureAt));
-    tx.clearActiveAgentRun(task.id, failed.roleName);
-    tx.saveRole(task.id, updateRoleStatus(tx.getRole(task.id, failed.roleName), "idle", failureAt));
-    const laneFailed = updateWorkItemExecutionGroup(
-      current,
-      recordExecutionLaneResult(
-        current.executionGroup,
-        failed.executionLaneId,
-        { summary: "transient lane failure" },
-        "failed",
-        failureAt
-      ),
-      failureAt
-    );
-    tx.saveWorkItem(task.id, laneFailed);
+    const result = terminalizeExactTaskRun(tx, {
+      taskId: task.id,
+      roleName: failed.roleName,
+      agentId: failed.effective.agentId,
+      runId: failed.id,
+      receiptId: formatAgentRunReceiptId(task.id, failed.id),
+      nativeSessionId: tx.getTaskRoleSessionSet(task.id, failed.roleName)
+        ?.sessions[failed.effective.agentId]?.nativeSessionId,
+      outcome: { status: "failed", summary: "transient lane failure" }
+    }, failedAt);
+    assert.equal(result.disposition, "applied");
   });
   const retried = spawnExactTaskCli(home, store, task.id, failed.roleName, [
     "task", "run", "retry", failed.id

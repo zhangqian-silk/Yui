@@ -145,7 +145,13 @@ export function exactTaskCliInvocation({
     roleName,
     agentId: role.activeAgentId,
     adapterId: binding.adapterId,
-    workspace: run?.effective.workspace.root ?? role.workspace,
+    // A failed Lane Run can leave its native Session ready at the Lane
+    // workspace after the active Run pointer is cleared.  Reconstruct the
+    // exact fixture envelope from that durable Session snapshot rather than
+    // falling back to the Role's shared cwd hint.
+    workspace: run?.effective.workspace.root
+      ?? sessions?.sessions[role.activeAgentId]?.effective.workspace.root
+      ?? role.workspace,
     ...(run === null ? {} : { runId: run.id }),
     launchId,
     ...(nativeSessionId === undefined ? {} : { nativeSessionId })
