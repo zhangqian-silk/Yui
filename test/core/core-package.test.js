@@ -345,6 +345,8 @@ test("publish builds once and smokes the same package on Node 20, 22, and 24", (
   assert.match(workflow, /dist\/cli\/commandCatalog\.js/u);
   assert.match(workflow, /dist\/controller\/controllerMain\.js/u);
   assert.match(workflow, /dist\/output\/terminal\.js/u);
+  assert.match(workflow, /skills\/yui-reviewer\/SKILL\.md/u);
+  assert.match(workflow, /grep -Ec '\^package\/skills\/' package-files\.txt\)" -ne 4/u);
   assert.doesNotMatch(workflow, /native-prebuild|prebuilds\/|smoke-native|build:native/u);
   assert.match(smoke, /nested help/u);
   assert.match(smoke, /Draft Task/u);
