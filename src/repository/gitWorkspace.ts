@@ -27,6 +27,11 @@ export type GitWorkspaceRefresh = Readonly<{
   changed: boolean;
 }>;
 
+export type GitRemoteBaseline = Readonly<{
+  branch: string;
+  commit: string;
+}>;
+
 export interface GitWorkspacePort {
   inspect(repositoryPath: string, baseRef?: string): Promise<GitRepositoryInspection>;
   isAncestor(
@@ -41,6 +46,11 @@ export interface GitWorkspacePort {
     remoteUrl: string;
     stableRef: string;
   }>): Promise<GitWorkspaceRefresh>;
+  resolveRemoteBaseline(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    developmentRef: string;
+  }>): Promise<GitRemoteBaseline>;
   clone(input: Readonly<{
     remoteUrl: string;
     destination: string;
@@ -141,6 +151,55 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       toCommit: fetchedCommit,
       changed: true
     };
+  }
+
+  /**
+   * Fetch a Project's configured development branch into a temporary ref and
+   * return the commit confirmed by that fetch.  The stable checkout is only
+   * inspected; it is never checked out, reset, rebased, or fast-forwarded.
+   */
+  async resolveRemoteBaseline(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    developmentRef: string;
+  }>): Promise<GitRemoteBaseline> {
+    const remote = safeRemote(input.remoteUrl);
+    const configuredRef = await safeFetchBranch(input.developmentRef);
+    const branch = configuredRef === "HEAD"
+      ? await resolveRemoteHeadBranch(remote)
+      : configuredRef;
+    const repository = await this.inspect(input.repositoryPath, "HEAD");
+    const temporaryRef = remoteBaselineRef(remote, branch);
+    try {
+      await git([
+        "-C", repository.root,
+        "fetch", "--no-tags", "--no-write-fetch-head",
+        remote,
+        `refs/heads/${branch}:${temporaryRef}`
+      ]);
+      const fetchedCommit = await gitLine([
+        "-C", repository.root,
+        "rev-parse", "--verify", "--end-of-options", `${temporaryRef}^{commit}`
+      ]);
+      const advertisedCommit = await resolveRemoteBranchCommit(remote, branch);
+      if (fetchedCommit.toLowerCase() !== advertisedCommit) {
+        throw new Error(
+          `Project remote development branch changed while it was fetched: ${branch}.`
+        );
+      }
+      return {
+        branch,
+        commit: fetchedCommit.toLowerCase()
+      };
+    } finally {
+      // A temporary namespace keeps the fetch independent from the stable
+      // branch and FETCH_HEAD.  Cleanup is best effort so the original fetch
+      // or consistency error remains the actionable diagnosis.
+      await gitSucceeds([
+        "-C", repository.root,
+        "update-ref", "-d", temporaryRef
+      ]);
+    }
   }
 
   async clone(input: Readonly<{
@@ -644,10 +703,52 @@ async function resolveRemoteHeadBranch(remote: string): Promise<string> {
   }
 }
 
+async function resolveRemoteBranchCommit(remote: string, branch: string): Promise<string> {
+  const target = `refs/heads/${branch}`;
+  let output: string;
+  try {
+    output = await git(["ls-remote", "--refs", remote, target]);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Git command failed.";
+    throw new Error(
+      `Project remote development branch could not be resolved: ${branch}: ${detail}`,
+      { cause: error }
+    );
+  }
+  const matches = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => line.split(/\s+/u))
+    .filter(([commit, ref]) => ref === target && commit !== undefined);
+  if (matches.length !== 1) {
+    throw new Error(
+      `Project remote development branch could not be resolved: ${branch}.`
+    );
+  }
+  const commit = matches[0]![0]!;
+  if (!isCommit(commit)) {
+    throw new Error(
+      `Project remote development branch returned an invalid commit: ${branch}.`
+    );
+  }
+  return commit.toLowerCase();
+}
+
+function remoteBaselineRef(remote: string, branch: string): string {
+  const identity = `${remote}\0${branch}\0${process.pid}\0${Date.now()}\0${Math.random()}`;
+  const digest = createHash("sha256").update(identity).digest("hex");
+  return `refs/yui/task-baselines/${digest}`;
+}
+
 function invalidRemoteHead(): Error {
   return new Error(
     "Project remote HEAD must identify a valid symbolic branch under refs/heads/."
   );
+}
+
+function isCommit(value: string): boolean {
+  return /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/iu.test(value);
 }
 
 function safeRemote(value: string): string {

@@ -13,6 +13,8 @@ export type RuntimeBinding = Readonly<{
   hostCreated?: boolean;
   /** Exact Task Run whose prompt was carried by the newly-created host command. */
   initialPromptRunId?: string;
+  /** Controller-derived recovery fence for a reused running Codex host. */
+  launchPromptUncertainRunId?: string;
   nativeSessionId?: string;
 }>;
 

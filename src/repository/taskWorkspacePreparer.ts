@@ -46,6 +46,13 @@ import type { Project } from "./project.js";
 const MAIN_WORKTREE = "main";
 const LEADER_ROLE = "leader";
 
+type TaskWorkspaceBaseline = Readonly<{
+  baseRef: string;
+  recordedBaseRef: string;
+  expectedCommit?: string;
+  pinTask?: boolean;
+}>;
+
 export type TaskWorkspacePreparation = Readonly<{
   taskId: string;
   status: "ready" | "failed";
@@ -119,17 +126,77 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
 
     const root = this.#taskWorkspaceRoot(task.id);
     const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
+    const defaultProjects = remoteDefaultProjects(this.store, task.id);
+    const baselines = new Map<string, TaskWorkspaceBaseline>();
     try {
+      // Resolve every first-use baseline before creating any managed worktree.
+      // A later Project failure therefore cannot leave an earlier Project's
+      // workspace behind, and the Task can only be pinned after all evidence
+      // has been gathered successfully.
       for (const binding of task.projectBindings) {
         const project = requireProject(this.store, binding.projectId);
         const previous = existing?.entries.find(({ projectId }) => projectId === project.id);
+        if (previous !== undefined) {
+          baselines.set(project.id, {
+            baseRef: previous.baseCommit,
+            recordedBaseRef: previous.baseRef
+          });
+          continue;
+        }
+        const useRemoteDefault = defaultProjects.has(project.id)
+          && project.remoteUrl !== undefined
+          && !looksLikeCommit(binding.baseRef);
+        if (useRemoteDefault) {
+          const resolver = this.git.resolveRemoteBaseline;
+          if (typeof resolver !== "function") {
+            throw new Error(
+              `Git workspace cannot resolve the remote baseline for Project: ${project.id}.`
+            );
+          }
+          const remote = await resolver.call(this.git, {
+            repositoryPath: project.path,
+            remoteUrl: project.remoteUrl,
+            // The binding captured the configured development ref at Task
+            // creation; use that snapshot even if the Project catalog was
+            // edited before this first workspace preparation.
+            developmentRef: binding.baseRef
+          });
+          baselines.set(project.id, {
+            baseRef: remote.commit,
+            recordedBaseRef: remote.commit,
+            expectedCommit: remote.commit,
+            pinTask: true
+          });
+          continue;
+        }
+        // Validate local and explicit refs in the same preflight phase.  This
+        // preserves the fail-closed boundary before any worktree is created.
+        await this.git.inspect(project.path, binding.baseRef);
+        baselines.set(project.id, {
+          baseRef: binding.baseRef,
+          recordedBaseRef: binding.baseRef
+        });
+      }
+      for (const binding of task.projectBindings) {
+        const project = requireProject(this.store, binding.projectId);
+        const previous = existing?.entries.find(({ projectId }) => projectId === project.id);
+        const baseline = baselines.get(project.id);
+        if (baseline === undefined) {
+          throw new Error(`Task Project baseline was not resolved: ${project.id}.`);
+        }
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
           taskId: task.id,
           roleName: MAIN_WORKTREE,
-          baseRef: previous?.baseCommit ?? binding.baseRef
+          baseRef: previous?.baseCommit ?? baseline.baseRef
         });
+        if (baseline.expectedCommit !== undefined
+          && physical.baseCommit !== baseline.expectedCommit) {
+          throw new Error(
+            `Task Project workspace did not start at the fetched remote baseline: ${project.id}.`
+          );
+        }
         prepared.push({
           project,
           entry: {
@@ -138,7 +205,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             access: "write",
             path: physical.path,
             branch: physical.branch,
-            baseRef: binding.baseRef,
+            baseRef: previous?.baseRef ?? baseline.recordedBaseRef,
             baseCommit: physical.baseCommit
           }
         });
@@ -161,8 +228,23 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         if (current !== null && current.owner.type !== "task") {
           throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
         }
-        tx.saveManagedWorkspace(preserveWorkspaceCreatedAt(workspace, current));
+        const pinnedBindings = latest.projectBindings.map((binding) => {
+          const baseline = baselines.get(binding.projectId);
+          return baseline?.pinTask === true
+            ? { ...binding, baseRef: baseline.baseRef }
+            : binding;
+        });
         const timestamp = this.now();
+        let persistedTask = isDeepStrictEqual(pinnedBindings, latest.projectBindings)
+          ? latest
+          : { ...latest, projectBindings: pinnedBindings, updatedAt: timestamp.toISOString() };
+        if (persistedTask.cwd !== root) {
+          persistedTask = { ...persistedTask, cwd: root, updatedAt: timestamp.toISOString() };
+        }
+        if (!isDeepStrictEqual(persistedTask, latest)) {
+          tx.saveTask(persistedTask);
+        }
+        tx.saveManagedWorkspace(preserveWorkspaceCreatedAt(workspace, current));
         for (const role of tx.listRoles(task.id)) {
           // The Role field is only a cwd/snapshot hint.  Preserve the hint for
           // an active WorkItem assignment; the durable owner is the WorkItem,
@@ -180,9 +262,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
             tx.saveRole(task.id, updateRole(role, { workspace: target }, timestamp));
           }
-        }
-        if (latest.cwd !== root) {
-          tx.saveTask({ ...latest, cwd: root, updatedAt: timestamp.toISOString() });
         }
       });
       return { taskId, status: "ready", path: root };
@@ -1380,6 +1459,23 @@ function safePathSegment(value: string): string {
 
 function sameCommit(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function remoteDefaultProjects(store: TaskStore, taskId: string): Set<string> {
+  const projectIds = new Set<string>();
+  for (const event of store.listEvents(taskId)) {
+    if (event.type === "task.created") {
+      for (const projectId of (event.payload.defaultProjectIds ?? "").split(",")) {
+        const normalized = projectId.trim();
+        if (normalized.length > 0) projectIds.add(normalized);
+      }
+    }
+  }
+  return projectIds;
+}
+
+function looksLikeCommit(value: string): boolean {
+  return /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/iu.test(value);
 }
 
 export function resolveWorktreeRoot(home: string, workspace: string | undefined): string {

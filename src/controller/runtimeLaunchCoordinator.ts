@@ -298,7 +298,12 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           );
         }
         reusedConfirmedRunningHost = true;
+        // Only a fresh Codex generation can carry the exact Run prompt in its
+        // launch argv. A resume request targets an existing native Session and
+        // must use the normal receipt-backed prompt push, even when the
+        // Controller is recovering the same launch reservation.
         launchPromptAcknowledgementRequired = sameRunReservation
+          && request.mode === "new"
           && request.adapterId === "codex";
         runtimeIsolation = this.#preflightRuntimeIsolation(
           request,
@@ -372,7 +377,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         rawBinding,
         request,
         launchId,
-        launchPromptAcknowledgementRequired
+        launchPromptAcknowledgementRequired,
+        reusedConfirmedRunningHost
       );
     } catch (error) {
       if (error instanceof RuntimeBindingContractError) {
@@ -658,7 +664,8 @@ function requireMatchingRuntimeBinding(
   raw: RuntimeBinding,
   request: CoordinatedRuntimeLaunchRequest,
   launchId: string,
-  launchPromptAcknowledgementRequired: boolean
+  launchPromptAcknowledgementRequired: boolean,
+  launchPromptUncertaintyAllowed: boolean
 ): RuntimeBinding {
   let binding: RuntimeBinding;
   try {
@@ -691,6 +698,7 @@ function requireMatchingRuntimeBinding(
   if (
     launchPromptAcknowledgementRequired
     && binding.initialPromptRunId !== request.runId
+    && !(launchPromptUncertaintyAllowed && binding.hostCreated === false)
   ) {
     throw new RuntimeBindingContractError(
       `Session host cannot acknowledge the exact launch-carried prompt: ${
@@ -713,6 +721,22 @@ function requireMatchingRuntimeBinding(
         request.owner.roleName
       }.`
     );
+  }
+  if (
+    launchPromptAcknowledgementRequired
+    && launchPromptUncertaintyAllowed
+    && binding.hostCreated === false
+    && request.runId !== undefined
+    && binding.initialPromptRunId !== request.runId
+  ) {
+    // A Controller restart can lose only the in-memory fact that a still-
+    // running Codex generation carried this Run in its launch argv. Keep the
+    // uncertainty explicitly tied to the exact reservation/Run; the matching
+    // Provider Hook remains the sole acceptance authority.
+    return {
+      ...binding,
+      launchPromptUncertainRunId: request.runId
+    };
   }
   return binding;
 }
