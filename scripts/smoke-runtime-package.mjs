@@ -21,7 +21,8 @@ let controllerStarted = false;
 const skills = [
   ["yui-leader", "# Yui Leader"],
   ["yui-worker", "# Yui Worker"],
-  ["yui-operator", "# Yui Operator"]
+  ["yui-operator", "# Yui Operator"],
+  ["yui-reviewer", "# Yui Reviewer"]
 ];
 
 try {

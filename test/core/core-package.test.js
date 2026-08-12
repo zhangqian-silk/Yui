@@ -6,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync
 } from "node:fs";
 import { join, resolve } from "node:path";
@@ -91,6 +92,11 @@ test("runtime assembly contains only the built CLI, docs, and four generic skill
     .sort();
   assert.deepEqual(listFiles(join(output, "dist")), expectedRuntime);
   assert.equal(existsSync(join(output, "dist", "core", "legacy.js")), false);
+  assert.equal(statSync(join(output, "dist", "cli.js")).mode & 0o777, 0o755);
+  assert.equal(
+    statSync(join(output, "dist", "cli", "commandCatalog.js")).mode & 0o777,
+    0o644
+  );
   assert.match(
     execFileSync(process.execPath, [join(output, "dist", "cli.js"), "help"], {
       cwd: output,
@@ -130,7 +136,11 @@ test("CI package smoke consumes npm JSON paths relative to the package root", (t
   ];
   t.after(() => rmSync(sandbox, { recursive: true, force: true }));
 
-  writeFileSync(manifest, JSON.stringify([{ files: required.map((path) => ({ path })) }]));
+  const entries = required.map((path) => ({
+    path,
+    mode: path === "dist/cli.js" ? 0o755 : 0o644
+  }));
+  writeFileSync(manifest, JSON.stringify([{ files: entries }]));
   assert.match(
     execFileSync(
       process.execPath,
@@ -142,7 +152,26 @@ test("CI package smoke consumes npm JSON paths relative to the package root", (t
 
   writeFileSync(
     manifest,
-    JSON.stringify([{ files: required.map((path) => ({ path: `package/${path}` })) }])
+    JSON.stringify([{
+      files: entries.map((entry) => (
+        entry.path === "dist/cli.js" ? { ...entry, mode: 0o644 } : entry
+      ))
+    }])
+  );
+  assert.throws(
+    () => execFileSync(
+      process.execPath,
+      [join(root, "scripts", "check-runtime-package-structure.mjs"), manifest],
+      { cwd: root, encoding: "utf8", stdio: "pipe" }
+    ),
+    /dist\/cli\.js must be executable \(0755\), received 0644/u
+  );
+
+  writeFileSync(
+    manifest,
+    JSON.stringify([{
+      files: entries.map((entry) => ({ ...entry, path: `package/${entry.path}` }))
+    }])
   );
   assert.throws(
     () => execFileSync(
@@ -347,6 +376,10 @@ test("publish builds once and smokes the same package on Node 20, 22, and 24", (
   assert.match(workflow, /dist\/output\/terminal\.js/u);
   assert.match(workflow, /skills\/yui-reviewer\/SKILL\.md/u);
   assert.match(workflow, /grep -Ec '\^package\/skills\/' package-files\.txt\)" -ne 4/u);
+  assert.match(
+    workflow,
+    /check-runtime-package-structure\.mjs pack-result\.json/u
+  );
   assert.doesNotMatch(workflow, /native-prebuild|prebuilds\/|smoke-native|build:native/u);
   assert.match(smoke, /nested help/u);
   assert.match(smoke, /Draft Task/u);

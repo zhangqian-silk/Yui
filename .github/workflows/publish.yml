@@ -51,6 +51,7 @@ jobs:
 
       - name: Verify package contents
         run: |
+          node scripts/check-runtime-package-structure.mjs pack-result.json
           tar -tf yui-runtime.tgz > package-files.txt
           node -e 'const {execFileSync}=require("node:child_process"); const pkg=JSON.parse(execFileSync("tar",["-xOf","yui-runtime.tgz","package/package.json"],{encoding:"utf8"})); if (pkg.private !== false || "scripts" in pkg || "devDependencies" in pkg) throw new Error("runtime manifest must be publishable and lifecycle-free");'
           grep -qx 'package/dist/cli.js' package-files.txt
