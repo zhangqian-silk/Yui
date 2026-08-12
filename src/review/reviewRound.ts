@@ -14,6 +14,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import {
   validateExecutionGroup,
+  type ExecutionFinding,
   type ExecutionGroup
 } from "../execution/executionGroup.js";
 export type ReviewRoundStatus = "pending" | "running" | "completed" | "failed";
@@ -40,6 +41,8 @@ export type ReviewYieldReport = Readonly<{
   summary: string;
   report: string;
   checks: readonly ReviewCheck[];
+  findings?: readonly ExecutionFinding[];
+  evidence?: readonly string[];
   evidenceCommit?: string;
 }>;
 
@@ -215,10 +218,14 @@ export function parseReviewYieldReport(value: string): ReviewYieldReport {
     ? requireText(record.summary, "Review summary")
     : report;
   const checks = extractChecks(record.checks);
+  const findings = extractFindings(record.findings);
+  const evidence = extractEvidence(record.evidence);
   return {
     summary,
     report,
     checks,
+    ...(findings.length === 0 ? {} : { findings }),
+    ...(evidence.length === 0 ? {} : { evidence }),
     ...(typeof record.evidenceCommit !== "string"
       ? {}
       : {
@@ -228,6 +235,36 @@ export function parseReviewYieldReport(value: string): ReviewYieldReport {
           )
         })
   };
+}
+
+function extractFindings(value: unknown): readonly ExecutionFinding[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return [];
+    }
+    const finding = entry as Record<string, unknown>;
+    if (typeof finding.id !== "string"
+      || (finding.severity !== "low" && finding.severity !== "medium"
+        && finding.severity !== "high" && finding.severity !== "critical")
+      || (finding.status !== "open" && finding.status !== "resolved")
+      || typeof finding.summary !== "string") {
+      return [];
+    }
+    return [{
+      id: requireIdentity(finding.id, "Review finding id"),
+      severity: finding.severity,
+      status: finding.status,
+      summary: requireText(finding.summary, "Review finding summary")
+    } as ExecutionFinding];
+  });
+}
+
+function extractEvidence(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => (
+    typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []
+  ));
 }
 
 export function recordReviewWorkspaceDisposition(

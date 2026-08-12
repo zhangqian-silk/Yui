@@ -16,6 +16,8 @@ const REVIEW_ROUND_FROM_VERSION = 2;
 const REVIEW_ROUND_TO_VERSION = 3;
 const ACTIVE_RUN_POINTER_FROM_VERSION = 1;
 const ACTIVE_RUN_POINTER_TO_VERSION = 2;
+const ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION = 2;
+const ACTIVE_RUN_POINTER_NAMESPACE_TO_VERSION = 3;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -55,10 +57,146 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       ACTIVE_RUN_POINTER_FROM_VERSION,
       ACTIVE_RUN_POINTER_TO_VERSION,
       "activeRuns"
-    ));
+    ))
+    .registerOfflineMigration(activeRunPointerNamespaceStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
+}
+
+/**
+ * Move the legacy `lane:<group>:<lane>` keys into a namespace that cannot be
+ * mistaken for a legal Role identity.  A legacy key is only rewritten when
+ * its pointed Run proves the lane lineage; otherwise a legal Role with that
+ * exact name is retained.  Ambiguous or malformed lane-looking records fail
+ * closed instead of guessing which active Run the old bytes meant.
+ */
+function activeRunPointerNamespaceStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "activeRunPointer",
+    fromVersion: ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION,
+    toVersion: ACTIVE_RUN_POINTER_NAMESPACE_TO_VERSION,
+    preconditions: (snapshot) => requireActiveRunPointerNamespaceVersion(snapshot),
+    transform: (snapshot) => migrateActiveRunPointerNamespace(snapshot),
+    declaredEffects: []
+  };
+}
+
+function requireActiveRunPointerNamespaceVersion(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.activeRunPointer !== ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION) {
+    throw new Error(
+      `Record activeRunPointer migration requires manifest version ${ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const activeRuns = task.activeRuns;
+    if (activeRuns === undefined) continue;
+    const pointers = asObject(activeRuns, `activeRunPointer map ${taskId}`);
+    for (const [key, rawPointer] of Object.entries(pointers)) {
+      const pointer = asObject(rawPointer, `Active run ${taskId}/${key}`);
+      if (pointer.schemaVersion !== ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION) {
+        throw new Error(
+          `Active run ${taskId}/${key} must use schemaVersion ${ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION}.`
+        );
+      }
+      if (typeof pointer.runId !== "string" || pointer.runId.trim().length === 0) {
+        throw new Error(`Active run ${taskId}/${key} has an invalid runId.`);
+      }
+    }
+  }
+}
+
+function migrateActiveRunPointerNamespace(snapshot: HomeSnapshot): HomeSnapshot {
+  requireActiveRunPointerNamespaceVersion(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      activeRunPointer: ACTIVE_RUN_POINTER_NAMESPACE_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const rawActiveRuns = task.activeRuns;
+    if (rawActiveRuns === undefined) {
+      nextTasks[taskId] = { ...task };
+      continue;
+    }
+    const activeRuns = asObject(rawActiveRuns, `activeRunPointer map ${taskId}`);
+    const rawAgentRuns = asObject(task.agentRuns, `agentRun map ${taskId}`);
+    const nextActiveRuns: Record<string, unknown> = {};
+    for (const [key, rawPointer] of Object.entries(activeRuns)) {
+      const pointer = asObject(rawPointer, `Active run ${taskId}/${key}`);
+      const runId = typeof pointer.runId === "string" ? pointer.runId : "";
+      const run = asObject(rawAgentRuns[runId], `Agent run ${taskId}/${runId}`);
+      const lane = legacyLaneKeyParts(key);
+      let nextKey = key;
+      if (lane !== null) {
+        const laneBacked = run.executionGroupId === lane.executionGroupId
+          && run.executionLaneId === lane.executionLaneId;
+        const roleBacked = run.roleName === key
+          && run.executionGroupId === undefined
+          && run.executionLaneId === undefined;
+        if (laneBacked && roleBacked) {
+          throw new Error(`Active run pointer is ambiguous: ${taskId}/${key}.`);
+        }
+        if (!laneBacked && !roleBacked) {
+          throw new Error(`Active run pointer lineage is invalid: ${taskId}/${key}.`);
+        }
+        if (laneBacked) nextKey = executionLaneNamespaceKey(lane.executionGroupId, lane.executionLaneId);
+      } else if (key.startsWith("lane:")) {
+        // A malformed lane-looking key is allowed only when it is a legal
+        // legacy Role pointer.  It must not be silently reinterpreted.
+        if (run.roleName !== key || run.executionGroupId !== undefined || run.executionLaneId !== undefined) {
+          throw new Error(`Active run pointer key is malformed: ${taskId}/${key}.`);
+        }
+      } else if (run.roleName !== key || run.executionGroupId !== undefined || run.executionLaneId !== undefined) {
+        throw new Error(`Active run Role pointer is invalid: ${taskId}/${key}.`);
+      }
+      if (nextActiveRuns[nextKey] !== undefined) {
+        throw new Error(`Active run pointer key collides after migration: ${taskId}/${nextKey}.`);
+      }
+      nextActiveRuns[nextKey] = {
+        ...pointer,
+        schemaVersion: ACTIVE_RUN_POINTER_NAMESPACE_TO_VERSION
+      };
+    }
+    nextTasks[taskId] = { ...task, activeRuns: nextActiveRuns };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+function legacyLaneKeyParts(key: string):
+  { executionGroupId: string; executionLaneId: string } | null {
+  const match = /^lane:([^:]+):([^:]+)$/u.exec(key);
+  if (match === null) return null;
+  return { executionGroupId: match[1], executionLaneId: match[2] };
+}
+
+function executionLaneNamespaceKey(executionGroupId: string, executionLaneId: string): string {
+  return `/execution-lane/${encodeLaneKeyPart(executionGroupId)}:${encodeLaneKeyPart(executionLaneId)}`;
+}
+
+function encodeLaneKeyPart(value: string): string {
+  return encodeURIComponent(value).replace(/:/gu, "%3A");
 }
 
 /**

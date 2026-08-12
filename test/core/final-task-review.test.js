@@ -21,11 +21,13 @@ import {
 } from "../../dist/role/role.js";
 import { createAgentRun, failAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import {
+  attachReviewExecutionGroup,
   attachReviewRoundWorkspace,
   createReviewRound,
   createTaskReviewRound,
   finishReviewRound
 } from "../../dist/review/reviewRound.js";
+import { createExecutionGroup } from "../../dist/execution/executionGroup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { formatAgentRunReceiptId } from "../../dist/task/taskRecordReference.js";
@@ -1197,6 +1199,49 @@ test("final policy queues one Task Review over all committed Project heads", (t)
     () => runTaskCommand(["complete", task.id, "--summary", "finish"], store, leaderOptions),
     /Final Task Review is still active/
   );
+});
+
+test("Reviewer panels retain each Lane until Leader resolution", (t) => {
+  const fx = fixture(t);
+  const { store, task, leaderOptions } = fx;
+  runTaskCommand(
+    ["role", "add", task.id, "reviewer-2", "--agent", "codex"],
+    store,
+    leaderOptions
+  );
+  const requested = runTaskCommand([
+    "review", "request", task.id,
+    "--role", "reviewer",
+    "--strategy", "fixed:2",
+    "--lane-role", "reviewer",
+    "--lane-role", "reviewer-2"
+  ], store, leaderOptions);
+  assert.equal(requested.kind, "output");
+  const round = store.listReviewRounds(task.id)[0];
+  assert.equal(round.executionGroup.strategy.count, 2);
+  const firstRun = dispatchFinalReview(fx, round);
+  const secondRun = store.listAgentRuns(task.id).find(({ id }) => id !== firstRun.id && id.startsWith("agent-run-"));
+  assert.ok(secondRun);
+  finishFinalReviewRun(fx, firstRun, "yielded", "first perspective", {
+    report: "first report",
+    checks: [{ name: "first-check", outcome: "passed" }]
+  });
+  assert.equal(store.getReviewRound(task.id, round.id).status, "running");
+  finishFinalReviewRun(fx, secondRun, "yielded", "second perspective", {
+    report: "second report",
+    checks: [{ name: "second-check", outcome: "passed" }]
+  });
+  assert.equal(store.getReviewRound(task.id, round.id).status, "running");
+  const resolved = runTaskCommand([
+    "review", "group", "resolve", round.id,
+    "--decision", "accept",
+    "--summary", "Leader accepted both perspectives"
+  ], store, leaderOptions);
+  assert.equal(resolved.kind, "output");
+  const completed = store.getReviewRound(task.id, round.id);
+  assert.equal(completed.status, "completed");
+  assert.match(completed.report, /first report/);
+  assert.match(completed.report, /second report/);
 });
 
 test("a changed integrated head creates a fresh final ReviewRound and keeps prior evidence", (t) => {

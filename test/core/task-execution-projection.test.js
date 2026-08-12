@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { projectTaskExecution } from "../../dist/scheduler/taskExecutionProjection.js";
+import {
+  createExecutionGroup,
+  recordExecutionLaneResult,
+  resolveExecutionGroup
+} from "../../dist/execution/executionGroup.js";
 
 const NOW = new Date("2026-08-09T12:00:00.000Z");
 const EFFECTIVE = {
@@ -247,6 +252,74 @@ test("completed Tasks stop monitoring without archiving or mutation", () => {
   assert.equal(result.status, "completed");
   assert.equal(result.monitoring, "stopped");
   assert.equal(result.action, "none");
+});
+
+test("Leader projection preserves each Lane's report, checks, findings, evidence, and decision", () => {
+  const target = {
+    schemaVersion: 1,
+    kind: "work-item",
+    taskId: "task-1",
+    workItemId: "work-item-1",
+    revision: 1,
+    projects: [],
+    fingerprint: "projection-group"
+  };
+  let group = createExecutionGroup("group-1", "task-1", {
+    purpose: "execution",
+    strategy: { mode: "fixed", count: 2 },
+    target,
+    lanes: [{ roleName: "worker" }, { roleName: "worker-2" }]
+  }, NOW);
+  group = recordExecutionLaneResult(group, group.lanes[0].id, {
+    summary: "first lane",
+    report: "full first report",
+    checks: [{ name: "unit", outcome: "passed", details: "ok" }],
+    findings: [{ id: "finding-1", severity: "low", status: "resolved", summary: "minor" }],
+    evidence: ["commit:a", "test:unit"]
+  }, "completed", NOW);
+  group = recordExecutionLaneResult(group, group.lanes[1].id, {
+    summary: "second lane",
+    report: "full second report",
+    checks: [{ name: "integration", outcome: "passed" }],
+    findings: [],
+    evidence: ["commit:b"]
+  }, "completed", NOW);
+  group = resolveExecutionGroup(group, {
+    decision: "accept",
+    summary: "Leader accepted both lanes"
+  }, NOW);
+  const result = projectTaskExecution({
+    task: task(),
+    roles: [],
+    runs: [],
+    executionGroups: [group]
+  });
+  assert.deepEqual(result.executionGroups[0].laneSummaries, [
+    {
+      laneId: group.lanes[0].id,
+      roleName: "worker",
+      ordinal: 1,
+      status: "completed",
+      summary: "first lane",
+      report: "full first report",
+      checks: [{ name: "unit", outcome: "passed", details: "ok" }],
+      findings: [{ id: "finding-1", severity: "low", status: "resolved", summary: "minor" }],
+      evidence: ["commit:a", "test:unit"],
+      decision: "accept"
+    },
+    {
+      laneId: group.lanes[1].id,
+      roleName: "worker-2",
+      ordinal: 2,
+      status: "completed",
+      summary: "second lane",
+      report: "full second report",
+      checks: [{ name: "integration", outcome: "passed" }],
+      findings: [],
+      evidence: ["commit:b"],
+      decision: "accept"
+    }
+  ]);
 });
 
 test("retired and archived Tasks expose their exact stopped disposition", () => {

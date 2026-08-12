@@ -112,7 +112,7 @@ export const STORAGE_STATE_FILE = "state.json";
 /** The root StorageState schema is the persisted aggregate document version. */
 export const CURRENT_STORAGE_STATE_SCHEMA_VERSION = CURRENT_AGGREGATE_SCHEMA_VERSION;
 export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
-export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 2 as const;
+export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 3 as const;
 /**
  * Persisted StorageState/StoredTask family versions owned by this boundary.
  *
@@ -181,15 +181,34 @@ type ActiveRunPointer = Readonly<{
 }>;
 
 /**
- * Lane-scoped active pointers live beside the legacy role pointers.  Keeping
- * the old role key intact lets old Tasks and scheduler readers continue to
- * work while a panel can own more than one active Run for the same Role.
+ * Lane-scoped active pointers live beside the legacy role pointers.  The
+ * namespace starts with a slash because Role identities reject slashes; this
+ * makes the two key spaces disjoint even for legal Role names such as
+ * `lane:worker:1`.
  */
 export function executionLaneActiveRunKey(
   executionGroupId: string,
   executionLaneId: string
 ): string {
-  return `lane:${executionGroupId}:${executionLaneId}`;
+  return `/execution-lane/${encodeLaneKeyPart(executionGroupId)}:${encodeLaneKeyPart(executionLaneId)}`;
+}
+
+function encodeLaneKeyPart(value: string): string {
+  return encodeURIComponent(value).replace(/:/gu, "%3A");
+}
+
+function executionLaneActiveRunKeyParts(key: string):
+  { executionGroupId: string; executionLaneId: string } | null {
+  const match = /^\/execution-lane\/([^:]+):([^:]+)$/u.exec(key);
+  if (match === null) return null;
+  try {
+    return {
+      executionGroupId: decodeURIComponent(match[1]),
+      executionLaneId: decodeURIComponent(match[2])
+    };
+  } catch {
+    return null;
+  }
 }
 
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
@@ -998,7 +1017,9 @@ export class FileTaskStore implements TaskStore {
       if (round === undefined) {
         throw new StorageRecordError(`Agent run ReviewRound not found: ${stored.reviewRoundId}.`);
       }
-      if (round.workItemId !== stored.workItemId || round.reviewerRoleName !== stored.roleName) {
+      const laneRole = round.executionGroup?.lanes.find(({ id }) => id === stored.executionLaneId)?.roleName;
+      if (round.workItemId !== stored.workItemId
+        || (round.reviewerRoleName !== stored.roleName && laneRole !== stored.roleName)) {
         throw new StorageRecordError(`Agent run does not match ReviewRound: ${stored.id}.`);
       }
     }
@@ -1111,7 +1132,7 @@ export class FileTaskStore implements TaskStore {
       // every other lane for the same Role in a multi-lane group.
       if (rolePointer === undefined) return;
       for (const [key, pointer] of Object.entries(task.activeRuns)) {
-        if (key.startsWith("lane:") && pointer.runId === rolePointer.runId) {
+        if (executionLaneActiveRunKeyParts(key) !== null && pointer.runId === rolePointer.runId) {
           delete task.activeRuns[key];
         }
       }
@@ -1192,7 +1213,7 @@ export class FileTaskStore implements TaskStore {
       delete task.activeRuns[key];
       const runId = pointer?.runId;
       for (const [roleName, rolePointer] of Object.entries(task.activeRuns)) {
-        if (roleName.startsWith("lane:")) continue;
+        if (executionLaneActiveRunKeyParts(roleName) !== null) continue;
         const roleRun = task.agentRuns[rolePointer.runId];
         const matches = runId !== undefined
           ? rolePointer.runId === runId
@@ -1941,11 +1962,11 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
       `Active run ${key}`
     );
     const run = typeof pointer.runId === "string" ? aggregate.agentRuns[pointer.runId] : undefined;
-    const laneMatch = /^lane:([^:]+):([^:]+)$/u.exec(key);
+    const laneMatch = executionLaneActiveRunKeyParts(key);
     const validLanePointer = laneMatch !== null
       && run !== undefined
-      && run.executionGroupId === laneMatch[1]
-      && run.executionLaneId === laneMatch[2];
+      && run.executionGroupId === laneMatch.executionGroupId
+      && run.executionLaneId === laneMatch.executionLaneId;
     const validRolePointer = laneMatch === null
       && run !== undefined
       && run.roleName === key;
@@ -2948,11 +2969,12 @@ function assertWorkItemCandidateReferences(
     return;
   }
   const run = aggregate.agentRuns[candidate.source.runId];
+  const resolvedGroupSummary = item.executionGroup?.resolution?.summary;
   if (run === undefined
     || run.workItemId !== item.id
     || run.purpose !== "execution"
     || run.status !== "yielded"
-    || run.summary !== candidate.summary) {
+    || (run.summary !== candidate.summary && resolvedGroupSummary !== candidate.summary)) {
     throw new StorageRecordError(`${label} Run is invalid: ${candidate.source.runId}.`);
   }
   if (candidate.executionGroupId !== run.executionGroupId
@@ -3076,8 +3098,13 @@ function validReviewRoundTransition(
   ) return false;
   if (existing.status === "pending") {
     if (candidate.status === "pending") {
-      return existing.workspace === undefined
+      return (existing.workspace === undefined
         && candidate.workspace !== undefined
+        || existing.executionGroup === undefined
+        && candidate.executionGroup !== undefined
+        || existing.executionGroup !== undefined
+        && candidate.executionGroup !== undefined
+        && !isDeepStrictEqual(existing.executionGroup, candidate.executionGroup))
         && candidate.reviewerRunId === undefined
         && candidate.summary === undefined
         && candidate.checks === undefined
@@ -3090,6 +3117,19 @@ function validReviewRoundTransition(
         || isDeepStrictEqual(existing.workspace, candidate.workspace));
   }
   if (existing.status === "running") {
+    if (candidate.status === "running") {
+      return existing.reviewerRunId === candidate.reviewerRunId
+        && isDeepStrictEqual(existing.workspace, candidate.workspace)
+        && existing.executionGroup !== undefined
+        && candidate.executionGroup !== undefined
+        && !isDeepStrictEqual(existing.executionGroup, candidate.executionGroup)
+        && candidate.summary === undefined
+        && candidate.report === undefined
+        && candidate.checks === undefined
+        && candidate.evidenceCommit === undefined
+        && candidate.endedAt === undefined
+        && candidate.workspaceDisposition === undefined;
+    }
     return ["completed", "failed"].includes(candidate.status)
       && existing.reviewerRunId === candidate.reviewerRunId
       && isDeepStrictEqual(existing.workspace, candidate.workspace);

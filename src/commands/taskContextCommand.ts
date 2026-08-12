@@ -492,9 +492,20 @@ function renderExecutionGroup(group: ExecutionGroup): string[] {
   const summary = summarizeExecutionGroup(group);
   return [
     `    Execution Group ${summary.groupId} [${summary.purpose}/${summary.strategy.mode}]: ${summary.activeLaneCount} active / ${summary.terminalLaneCount} terminal; ${summary.failedLaneCount} failed`,
-    ...summary.laneSummaries.map((lane) => (
-      `      Lane ${lane.laneId} [${lane.status}]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`
-    )),
+    ...summary.laneSummaries.flatMap((lane) => [
+      `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}) [${lane.status}]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,
+      ...(lane.report === undefined ? [] : [`        Report: ${compactText(lane.report)}`]),
+      ...(lane.checks === undefined || lane.checks.length === 0
+        ? []
+        : [`        Checks: ${lane.checks.map(({ name, outcome }) => `${name}:${outcome}`).join(", ")}`]),
+      ...(lane.findings === undefined || lane.findings.length === 0
+        ? []
+        : [`        Findings: ${lane.findings.map(({ id, severity, status }) => `${id}:${severity}/${status}`).join(", ")}`]),
+      ...(lane.evidence === undefined || lane.evidence.length === 0
+        ? []
+        : [`        Evidence: ${lane.evidence.length} item(s)`]),
+      ...(lane.decision === undefined ? [] : [`        Decision: ${lane.decision}`])
+    ]),
     ...(summary.openHighPriorityFindingIds.length === 0
       ? []
       : [`      Open high findings: ${summary.openHighPriorityFindingIds.join(", ")}`]),

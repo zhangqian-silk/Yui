@@ -118,8 +118,16 @@ export type ExecutionGroupSummary = Readonly<{
   openHighPriorityFindingIds: readonly string[];
   laneSummaries: readonly Readonly<{
     laneId: string;
+    roleName: string;
+    ordinal: number;
     status: ExecutionLaneStatus;
     summary?: string;
+    report?: string;
+    checks?: readonly ExecutionCheck[];
+    findings?: readonly ExecutionFinding[];
+    evidence?: readonly string[];
+    /** The Leader's group decision, when this Lane was selected. */
+    decision?: ExecutionResolution["decision"];
   }>[];
   resolution?: ExecutionResolution;
 }>;
@@ -411,8 +419,20 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
     openHighPriorityFindingIds: openHighPriorityFindingIds(group),
     laneSummaries: group.lanes.map((lane) => ({
       laneId: lane.id,
+      roleName: lane.roleName,
+      ordinal: lane.ordinal,
       status: lane.status,
-      ...(lane.result === undefined ? {} : { summary: lane.result.summary })
+      ...(lane.result === undefined ? {} : {
+        summary: lane.result.summary,
+        ...(lane.result.report === undefined ? {} : { report: lane.result.report }),
+        ...(lane.result.checks === undefined ? {} : { checks: lane.result.checks }),
+        ...(lane.result.findings === undefined ? {} : { findings: lane.result.findings }),
+        ...(lane.result.evidence === undefined ? {} : { evidence: lane.result.evidence })
+      }),
+      ...(group.resolution === undefined
+        || !group.resolution.selectedLaneIds.includes(lane.id)
+        ? {}
+        : { decision: group.resolution.decision })
     })),
     ...(group.resolution === undefined ? {} : { resolution: group.resolution })
   };

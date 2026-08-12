@@ -62,12 +62,13 @@ export function validateExactRunReviewRound(
     && round.status !== "pending" && round.status !== "running") {
     return { disposition: "obsolete", round, reason: "review-round-terminal" };
   }
-  if (
-    round.reviewerRunId !== run.id
-    || round.reviewerRoleName !== run.roleName
+  const lane = round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
+  const exactReviewerRun = round.reviewerRunId === run.id || lane?.runId === run.id;
+  const exactReviewerRole = round.reviewerRoleName === run.roleName || lane?.roleName === run.roleName;
+  if (!exactReviewerRun
+    || !exactReviewerRole
     || round.workItemId !== run.workItemId
-    || round.reviewBaseCommit !== run.effective.reviewBaseCommit
-  ) {
+    || round.reviewBaseCommit !== run.effective.reviewBaseCommit) {
     return { disposition: "obsolete", round, reason: "review-round-mismatch" };
   }
   if (run.workspace === undefined || round.workspace === undefined
@@ -149,6 +150,8 @@ export function terminalizeExactRunReviewRound(
     reviewResult?: Readonly<{
       report?: string;
       checks?: readonly ReviewCheck[];
+      findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
+      evidence?: readonly string[];
       evidenceCommit?: string;
     }>;
   }>,
@@ -178,13 +181,28 @@ export function terminalizeExactRunReviewRound(
                     outcome,
                     ...(details === undefined ? {} : { details })
                   }))
-                })
+                }),
+            ...(input.reviewResult?.findings === undefined
+              ? {}
+              : { findings: input.reviewResult.findings }),
+            ...(input.reviewResult?.evidence === undefined
+              ? {}
+              : { evidence: input.reviewResult.evidence })
           },
           input.outcome.status === "yielded" ? "completed" : "failed",
           now
         )
       )
     : reviewRound;
+  const groupedMultiLane = groupedRound.executionGroup !== undefined
+    && groupedRound.executionGroup.lanes.length > 1;
+  if (groupedMultiLane && groupedRound.executionGroup !== undefined) {
+    // A panel Lane only contributes evidence.  The Leader must see every
+    // terminal Lane and explicitly resolve the Group before this ReviewRound
+    // can become terminal.
+    store.saveReviewRound(input.taskId, groupedRound);
+    return { disposition: "applied", round: groupedRound };
+  }
   const terminal = finishReviewRound(
     groupedRound,
     input.outcome.status === "yielded" ? "completed" : "failed",
@@ -213,6 +231,8 @@ export type ExactRunTerminalizationInput = Readonly<{
   reviewResult?: Readonly<{
     report?: string;
     checks?: readonly ReviewCheck[];
+    findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
+    evidence?: readonly string[];
     evidenceCommit?: string;
   }>;
 }>;
