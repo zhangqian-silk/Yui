@@ -16,7 +16,9 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
-import { createIntegrationAttempt } from "../../dist/integration/integrationAttempt.js";
+import {
+  createIntegrationAttempt
+} from "../../dist/integration/integrationAttempt.js";
 import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
@@ -431,6 +433,36 @@ console.log(JSON.stringify({ descriptor, environment: expected }));
     "-C", repositoryPath, "show-ref", "--verify",
     `refs/heads/${conflicted.workspace.branch}`
   ]));
+
+  const abandoned = createIntegrationAttempt({
+    id: store.nextIntegrationAttemptId(task.id),
+    taskId: task.id,
+    projectId: project.id,
+    targetRef: "master",
+    expectedHead: advancedHead,
+    changeSetIds: [secondResult.changeSet.id]
+  }, now);
+  store.saveIntegrationAttempt(task.id, abandoned);
+  const abandonedResult = await new GitIntegrationService(home, store, undefined, () => now)
+    .integrate(task.id, abandoned.id);
+  assert.equal(abandonedResult.status, "blocked");
+  await assert.rejects(
+    runTaskIntegrationCommand([
+      "cleanup", `${task.id}/${abandoned.id}`
+    ], store, home),
+    /Integration is not terminal/
+  );
+  await runTaskIntegrationCommand([
+    "abort", `${task.id}/${abandoned.id}`, "--reason", "Superseded."
+  ], store, home);
+  const aborted = store.getIntegrationAttempt(task.id, abandoned.id);
+  assert.match(
+    (await runTaskIntegrationCommand([
+      "cleanup", `${task.id}/${aborted.id}`
+    ], store, home)).output,
+    /Cleaned Integration worktree/
+  );
+  assert.equal(existsSync(abandonedResult.workspace.path), false);
 
   writeFileSync(join(conflicted.workspace.path, "shared.txt"), "resolved\n");
   git(["-C", conflicted.workspace.path, "add", "shared.txt"]);
