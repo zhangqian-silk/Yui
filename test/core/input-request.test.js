@@ -18,7 +18,8 @@ import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { runControllerSchedulerPass } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import {
-  createRoleSessionSet
+  createRoleSessionSet,
+  updateRoleAgentSessionStatus
 } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
@@ -38,6 +39,7 @@ import { createLeaderStallNotification } from "../../dist/scheduler/operatorNoti
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { createInputRequestOperatorPresentation } from "../../dist/interaction/operatorPresentation.js";
 import { createWorkItem } from "../../dist/workItem/workItem.js";
 
 const FIRST = new Date("2026-07-21T01:00:00.000Z");
@@ -231,6 +233,7 @@ function fixture(t) {
     agentId: operator.activeAgentId,
     adapterId: operator.agentBindings[operator.activeAgentId].adapterId,
     nativeSessionId: "operator-native-1",
+    launchId: "operator-launch-1",
     policy: "fixed",
     status: "ready",
     effective: resolveEffectiveLaunch({ role: operator, purpose: "execution" })
@@ -312,7 +315,25 @@ function fixture(t) {
     YUI_RUN_ID: active.id,
     YUI_NATIVE_SESSION_ID: "native-1"
   };
-  return { root, store, task, role, active, changed, options: { ...options, environment } };
+  const operatorSession = operatorSessions.sessions[operatorSessions.activeAgentId];
+  const operatorEnvironment = {
+    YUI_SESSION_SCOPE: "global",
+    YUI_ROLE: "operator",
+    YUI_AGENT_ID: operatorSession.agentId,
+    YUI_ADAPTER_ID: operatorSession.adapterId,
+    YUI_LAUNCH_ID: operatorSession.launchId,
+    YUI_NATIVE_SESSION_ID: operatorSession.nativeSessionId
+  };
+  return {
+    root,
+    store,
+    task,
+    role,
+    active,
+    changed,
+    operatorEnvironment,
+    options: { ...options, environment }
+  };
 }
 
 function run(args, store, options) {
@@ -758,6 +779,102 @@ test("request provenance, blocked ownership, lifecycle, and origin-only cancel a
   ], store, { ...options, environment: {} });
   assert.match(completed.output, /Completed task/);
   assert.equal(store.getAgentRun(task.id, active.id).status, "yielded");
+});
+
+test("Operator can return a non-user InputRequest without fabricating an answer", (t) => {
+  const { store, task, options, operatorEnvironment } = fixture(t);
+  run(["input", "request", task.id, "--question", "Choose an internal retry strategy"], store, options);
+  const request = store.listInputRequests(task.id)[0];
+  const presentation = createInputRequestOperatorPresentation(request, {});
+  assert.match(
+    presentation.text,
+    new RegExp(`yui task input cancel ${task.id} ${request.id} --reason`)
+  );
+
+  const cancelled = run([
+    "input", "cancel", task.id, request.id, "--reason", "Operator returned: implementation choice"
+  ], store, {
+    ...options,
+    now: () => new Date(SECOND),
+    environment: operatorEnvironment
+  });
+
+  assert.equal(cancelled.data.request.status, "cancelled");
+  assert.equal(cancelled.data.request.cancellation.reason, "Operator returned: implementation choice");
+  assert.ok(store.getPendingWakeup(task.id).reasons.includes(`input-cancelled:${request.id}`));
+  assert.deepEqual(store.listEvents(task.id).at(-1).payload, {
+    requestId: request.id,
+    cancelledBy: "operator",
+    reason: "Operator returned: implementation choice"
+  });
+  assert.throws(() => runTaskCommand([
+    "input", "cancel", task.id, request.id, "--reason", "Forged"
+  ], store, {
+    ...options,
+    environment: { YUI_SESSION_SCOPE: "global", YUI_ROLE: "worker" }
+  }), /originating Leader/i);
+});
+
+test("Fresh Codex Operator launch may omit provider-discovered native identity", (t) => {
+  const { store, task, options, operatorEnvironment } = fixture(t);
+  run(["input", "request", task.id, "--question", "Return this internal choice?"], store, options);
+  const request = store.listInputRequests(task.id)[0];
+  const launchEnvironment = { ...operatorEnvironment };
+  delete launchEnvironment.YUI_NATIVE_SESSION_ID;
+
+  const cancelled = run([
+    "input", "cancel", task.id, request.id, "--reason", "Return to Leader"
+  ], store, {
+    ...options,
+    now: () => new Date(SECOND),
+    environment: launchEnvironment
+  });
+
+  assert.equal(cancelled.data.request.status, "cancelled");
+  assert.equal(cancelled.data.request.cancellation.reason, "Return to Leader");
+  assert.equal(store.listEvents(task.id).at(-1).payload.cancelledBy, "operator");
+});
+
+test("Operator Input cancellation requires the current Session identity", (t) => {
+  const cases = [
+    ["missing identity", null],
+    ["wrong Agent", { YUI_AGENT_ID: "agent-forged" }],
+    ["wrong adapter", { YUI_ADAPTER_ID: "claude" }],
+    ["stale launch", { YUI_LAUNCH_ID: "operator-launch-stale" }],
+    ["wrong native Session", { YUI_NATIVE_SESSION_ID: "operator-native-stale" }]
+  ];
+  for (const [label, patch] of cases) {
+    const { store, task, options, operatorEnvironment } = fixture(t);
+    run(["input", "request", task.id, "--question", `Reject ${label}?`], store, options);
+    const request = store.listInputRequests(task.id)[0];
+    assert.throws(() => runTaskCommand([
+      "input", "cancel", task.id, request.id, "--reason", "Forged"
+    ], store, {
+      ...options,
+      environment: patch === null
+        ? { YUI_SESSION_SCOPE: "global", YUI_ROLE: "operator" }
+        : { ...operatorEnvironment, ...patch }
+    }), /originating Leader/i, label);
+  }
+
+  const { store, task, options, operatorEnvironment } = fixture(t);
+  run(["input", "request", task.id, "--question", "Stopped session?"], store, options);
+  const request = store.listInputRequests(task.id)[0];
+  store.transaction((tx) => {
+    const sessions = tx.getGlobalRoleSessionSet("operator");
+    tx.saveGlobalRoleSessionSet(updateRoleAgentSessionStatus(
+      sessions,
+      sessions.activeAgentId,
+      "stopped",
+      SECOND
+    ));
+  });
+  assert.throws(() => runTaskCommand([
+    "input", "cancel", task.id, request.id, "--reason", "Expired"
+  ], store, {
+    ...options,
+    environment: operatorEnvironment
+  }), /originating Leader/i, "stopped Session");
 });
 
 test("Task details expose open InputRequest counts and storage rejects unknown fields", (t) => {

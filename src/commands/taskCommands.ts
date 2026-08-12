@@ -696,7 +696,7 @@ function createTaskCommand(
   const created = store.transaction((tx) => createTaskAggregate(tx, parsed.title, {
     projectBindings: parsed.projectBindings,
     ...(parsed.requireIntegration ? { requireIntegration: true } : {})
-  }, now));
+  }, now, parsed.defaultProjectIds));
   notifyMailbox(options.runtime, taskMailbox(created.task.id), created.task.id);
   return output(
     `Created Draft task ${created.task.id}: ${created.task.title}\n`
@@ -714,6 +714,7 @@ function parseTaskCreation(
 ): Readonly<{
   title: string;
   projectBindings: readonly TaskProjectBinding[];
+  defaultProjectIds: readonly string[];
   requireIntegration: boolean;
 }> {
   const usage = "Task create usage: yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--require-integration].";
@@ -755,6 +756,9 @@ function parseTaskCreation(
     if (bases.has(project.id)) throw usageError(`Project base may only be specified once: ${reference}.`);
     bases.set(project.id, baseRef);
   }
+  const defaultProjectIds = projects
+    .filter((project) => !bases.has(project.id))
+    .map(({ id }) => id);
   return {
     title: parsed.positionals[0],
     projectBindings: projects.map((project) => ({
@@ -762,6 +766,7 @@ function parseTaskCreation(
       directory: project.name,
       baseRef: bases.get(project.id) ?? project.developmentBranch
     })),
+    defaultProjectIds,
     requireIntegration: parsed.options.has("--require-integration")
   };
 }
@@ -770,13 +775,19 @@ function createTaskAggregate(
   store: TaskWorkflowStore,
   title: string,
   metadata: TaskMetadata,
-  now: Date
+  now: Date,
+  defaultProjectIds: readonly string[] = []
 ): Readonly<{ task: Task; leader: Role }> {
   const task = createTask(store.nextTaskId(), title, now, metadata);
   const leader = createTaskRole(store, task, LEADER_ROLE, undefined, now);
   store.saveTask(task);
   store.saveRole(task.id, leader);
-  recordTaskEvent(store, task.id, "task.created", { status: task.status }, now);
+  recordTaskEvent(store, task.id, "task.created", {
+    status: task.status,
+    ...(defaultProjectIds.length === 0
+      ? {}
+      : { defaultProjectIds: defaultProjectIds.join(",") })
+  }, now);
   enqueueWork(store, taskMailbox(task.id), "task-created", now, [taskRef(task.id)]);
   return { task, leader };
 }
