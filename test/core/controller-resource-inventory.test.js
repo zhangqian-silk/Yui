@@ -15,6 +15,7 @@ import {
 } from "../../dist/controller/resourceInventory.js";
 import {
   classifyRuntimeProcess,
+  linuxProcessEntryPid,
   parseLinuxProcessStat,
   scanControllerResourceInventory
 } from "../../dist/controller/resourceInventoryLinux.js";
@@ -38,6 +39,13 @@ import {
 
 const HOME = "/tmp/yui-inventory-home";
 const NOW = "2026-07-28T00:00:00.000Z";
+
+test("Linux process inventory accepts only numeric /proc entry names", () => {
+  assert.equal(linuxProcessEntryPid("self"), undefined);
+  assert.equal(linuxProcessEntryPid("4916 (deleted)"), undefined);
+  assert.equal(linuxProcessEntryPid("0"), undefined);
+  assert.equal(linuxProcessEntryPid("42"), 42);
+});
 
 function roleResource(overrides = {}) {
   return {
