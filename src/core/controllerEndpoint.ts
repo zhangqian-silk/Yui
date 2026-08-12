@@ -2,9 +2,25 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+const LINUX_UNIX_SOCKET_PATH_BUDGET = 100;
+
 export function controllerSocketPath(home: string): string {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  return join(tmpdir(), `yui-${uid}`, `${controllerSocketIdentity(home)}.sock`);
+  const socketName = `${controllerSocketIdentity(home)}.sock`;
+  const isolatedPath = join(tmpdir(), `yui-${uid}`, socketName);
+  if (
+    process.platform !== "linux"
+    || Buffer.byteLength(isolatedPath) < LINUX_UNIX_SOCKET_PATH_BUDGET
+  ) {
+    return isolatedPath;
+  }
+
+  // Linux limits Unix-socket paths to a small fixed budget. Managed Task
+  // runtimes intentionally use isolated TMPDIR roots, which may themselves
+  // be nested deeply enough to exhaust that budget. Keep the Home/uid/name
+  // fence while using the compact system temporary root only for this
+  // exceptional path; clients follow the Home-owned discovery record.
+  return join("/tmp", `yui-${uid}`, socketName);
 }
 
 /**

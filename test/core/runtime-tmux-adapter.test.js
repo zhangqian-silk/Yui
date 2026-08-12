@@ -298,6 +298,77 @@ test("TmuxSessionHost resumes global owners and stops only the referenced role",
   assert.equal(calls.filter(([kind]) => kind === "kill").length, 1);
 });
 
+test("TmuxSessionHost accepts a kill error only when the exact role is proven stopped", async () => {
+  const planner = { plan: () => fakePlan(), planGlobalRole: () => fakePlan() };
+  let status = "running";
+  const tmux = {
+    ensureRoleWindow: () => true,
+    probeRoleStatus: () => status,
+    killRole() {
+      status = "exited";
+      throw new Error("server exited unexpectedly");
+    }
+  };
+  const host = new TmuxSessionHost(planner, tmux);
+  const binding = createRuntimeBinding({
+    id: "binding-1",
+    launchId: "launch-1",
+    owner: { scope: "task", taskId: "task-1", roleName: "worker" },
+    agentId: "codex",
+    adapterId: "codex",
+    hostRef: "yui-tmux:v1:eyJzY29wZSI6InRhc2siLCJob3N0SWQiOiJ0YXNrLTEiLCJyb2xlTmFtZSI6IndvcmtlciJ9"
+  });
+
+  await host.stop(binding);
+});
+
+test("TmuxSessionHost preserves a kill error while the exact role remains live", async () => {
+  const planner = { plan: () => fakePlan(), planGlobalRole: () => fakePlan() };
+  const failure = new Error("kill failed");
+  const tmux = {
+    ensureRoleWindow: () => true,
+    probeRoleStatus: () => "running",
+    killRole() { throw failure; }
+  };
+  const host = new TmuxSessionHost(planner, tmux);
+  const binding = createRuntimeBinding({
+    id: "binding-1",
+    launchId: "launch-1",
+    owner: { scope: "task", taskId: "task-1", roleName: "worker" },
+    agentId: "codex",
+    adapterId: "codex",
+    hostRef: "yui-tmux:v1:eyJzY29wZSI6InRhc2siLCJob3N0SWQiOiJ0YXNrLTEiLCJyb2xlTmFtZSI6IndvcmtlciJ9"
+  });
+
+  await assert.rejects(host.stop(binding), (error) => error === failure);
+});
+
+test("TmuxSessionHost preserves a kill error when the stop postcondition is unavailable", async () => {
+  const planner = { plan: () => fakePlan(), planGlobalRole: () => fakePlan() };
+  const failure = new Error("kill failed");
+  let probes = 0;
+  const tmux = {
+    ensureRoleWindow: () => true,
+    probeRoleStatus() {
+      probes += 1;
+      if (probes === 1) return "running";
+      throw new Error("tmux unavailable");
+    },
+    killRole() { throw failure; }
+  };
+  const host = new TmuxSessionHost(planner, tmux);
+  const binding = createRuntimeBinding({
+    id: "binding-1",
+    launchId: "launch-1",
+    owner: { scope: "task", taskId: "task-1", roleName: "worker" },
+    agentId: "codex",
+    adapterId: "codex",
+    hostRef: "yui-tmux:v1:eyJzY29wZSI6InRhc2siLCJob3N0SWQiOiJ0YXNrLTEiLCJyb2xlTmFtZSI6IndvcmtlciJ9"
+  });
+
+  await assert.rejects(host.stop(binding), (error) => error === failure);
+});
+
 test("TmuxSessionHost rejects a host reference copied to a different owner", async () => {
   const planner = { plan: () => fakePlan(), planGlobalRole: () => fakePlan() };
   const tmux = {

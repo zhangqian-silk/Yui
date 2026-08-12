@@ -116,6 +116,48 @@ test("runtime assembly contains only the built CLI, docs, and four generic skill
   assert.equal("devDependencies" in runtimePackage, false);
 });
 
+test("CI package smoke consumes npm JSON paths relative to the package root", (t) => {
+  const sandbox = mkdtempSync(join(root, ".core-package-smoke-test-"));
+  const manifest = join(sandbox, "package-smoke.json");
+  const required = [
+    "dist/cli.js",
+    "dist/cli/commandCatalog.js",
+    "ARCHITECTURE.md",
+    "skills/yui-leader/SKILL.md",
+    "skills/yui-worker/SKILL.md",
+    "skills/yui-operator/SKILL.md",
+    "skills/yui-reviewer/SKILL.md"
+  ];
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+
+  writeFileSync(manifest, JSON.stringify([{ files: required.map((path) => ({ path })) }]));
+  assert.match(
+    execFileSync(
+      process.execPath,
+      [join(root, "scripts", "check-runtime-package-structure.mjs"), manifest],
+      { cwd: root, encoding: "utf8" }
+    ),
+    /Package structure smoke passed \(7 files\)/u
+  );
+
+  writeFileSync(
+    manifest,
+    JSON.stringify([{ files: required.map((path) => ({ path: `package/${path}` })) }])
+  );
+  assert.throws(
+    () => execFileSync(
+      process.execPath,
+      [join(root, "scripts", "check-runtime-package-structure.mjs"), manifest],
+      { cwd: root, encoding: "utf8", stdio: "pipe" }
+    ),
+    /runtime package is missing dist\/cli\.js/u
+  );
+
+  const workflow = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+  assert.match(workflow, /check-runtime-package-structure\.mjs package-smoke\.json/u);
+  assert.doesNotMatch(workflow, /package\/dist\/cli\.js/u);
+});
+
 test("Leader and Operator keep native subagent creation inside the Leader conversation", () => {
   const leader = readFileSync(join(root, "skills", "yui-leader", "SKILL.md"), "utf8");
   const operator = readFileSync(join(root, "skills", "yui-operator", "SKILL.md"), "utf8");

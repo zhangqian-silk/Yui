@@ -60,11 +60,14 @@ import {
   TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
   TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
+  parseTaskCompletionRequest,
+  preflightTaskCompletion,
   runTaskCommand,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
+import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
   assertFileTaskControllerStorageCompatible,
@@ -898,6 +901,25 @@ export async function main(): Promise<void> {
         }
       }
     }
+    let completionSummary: string | undefined;
+    if (resolved[1] === "complete" && resolved[2] !== undefined) {
+      const completionRequest = parseTaskCompletionRequest(resolved.slice(2));
+      completionSummary = completionRequest.summary;
+      const completion = preflightTaskCompletion(resolved[2], store, {
+        environment: process.env,
+        ...(taskFinalReviewContract === undefined
+          ? {}
+          : { taskFinalReviewContract })
+      });
+      if (!completion.completed && !completion.activeTaskReview) {
+        await reconcileTaskRemoteBaselines(
+          resolved[2],
+          store,
+          home,
+          { environment: process.env }
+        );
+      }
+    }
     const candidateGitSnapshot = await candidateSnapshotForTaskCommand(
       resolved,
       store,
@@ -935,6 +957,7 @@ export async function main(): Promise<void> {
         ...(taskFinalReviewContract === undefined
           ? {}
           : { taskFinalReviewContract }),
+        ...(completionSummary === undefined ? {} : { completionSummary }),
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
         ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
         ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),
