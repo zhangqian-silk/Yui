@@ -301,6 +301,36 @@ const taskChildren: readonly NodeInput[] = [
   },
   { name: "reconcile", summary: "Run one immediate Controller reconciliation.", usage: "yui task reconcile <id>" },
   {
+    name: "rebuild",
+    summary: "Rebuild a legacy Task workspace under its canonical identity.",
+    usage: "yui task rebuild <task>",
+    options: []
+  },
+  {
+    name: "history",
+    summary: "Inspect and archive legacy Task refs in the Home repository.",
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "archive"] }],
+    children: [
+      {
+        name: "list",
+        summary: "List legacy Task refs and their live owners.",
+        usage: "yui task history list [--task <task>]"
+      },
+      {
+        name: "archive",
+        summary: "Archive legacy Task refs without a live owner.",
+        usage: "yui task history archive [<task>] [--force]",
+        options: ["--force"]
+      }
+    ]
+  },
+  {
+    name: "replace",
+    summary: "Create a draft successor for a terminal Task.",
+    usage: "yui task replace <task> [--title <text>]",
+    options: ["--title"]
+  },
+  {
     name: "message",
     summary: "Manage durable Task messages.",
     sections: [{ id: "manage", title: "Commands", entries: ["send", "list"] }],
@@ -935,7 +965,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "archive", "reconcile"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "archive", "rebuild", "history", "replace", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "review", "integration", "role", "enter"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],

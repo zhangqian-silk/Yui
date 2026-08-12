@@ -10,4 +10,4 @@
 export const CURRENT_STORAGE_LAYOUT_VERSION = 6;
 
 /** Version of the authoritative aggregate stored in `state.json`. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 17;
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 18;

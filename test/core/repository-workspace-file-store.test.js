@@ -71,6 +71,7 @@ import {
 } from "../../dist/repository/gitWorkspace.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
+import { taskWorkspaceRefSegment } from "../../dist/repository/taskWorkspaceIdentity.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -748,11 +749,12 @@ test("Project Catalog persists aliases, remote, branches, and Yui-owned knowledg
   assert.match(output.name, /Yui/);
   const project = store.listProjects()[0];
   assert.deepEqual(project, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "project-1",
     name: "Yui",
     aliases: ["yui-cli"],
     path: realpathSync(repositoryPath),
+    ownership: "external",
     remoteUrl: "git@example.invalid:yui.git",
     stableBranch: "HEAD",
     developmentBranch: "HEAD",
@@ -889,8 +891,8 @@ test("Project Catalog validation precedes local branch creation", async (t) => {
   assert.equal(branchCreations, 0);
 });
 
-test("Operator can clone and bind a remote Project into the configured workspace", async (t) => {
-  const { root, workspace, store } = fixture(t);
+test("Operator can clone and bind a remote Project into the Home-managed catalog", async (t) => {
+  const { root, home, workspace, store } = fixture(t);
   const remote = join(root, "remote");
   execFileSync("git", ["init", "-q", remote]);
   execFileSync("git", ["-C", remote, "config", "user.name", "Yui Test"]);
@@ -904,12 +906,24 @@ test("Operator can clone and bind a remote Project into the configured workspace
   ], store, { now: () => new Date(NOW) });
   assert.match(result.output, /Added project project-1/);
   assert.equal(result.data.project.id, "project-1");
-  assert.equal(store.listProjects()[0].path, realpathSync(join(workspace, "RemoteProject")));
+  // A remote URL-only clone defaults to Home-managed ownership: the canonical
+  // checkout lives with the Home, not in the configured workspace.
+  assert.equal(store.listProjects()[0].path, realpathSync(join(home, "projects", "project-1")));
+  assert.equal(store.listProjects()[0].ownership, "managed");
   assert.equal(store.listProjects()[0].remoteUrl, remote);
+  assert.equal(existsSync(join(workspace, "RemoteProject")), false);
+  assert.equal(
+    execFileSync(
+      "git",
+      ["-C", join(home, "projects", "project-1"), "rev-parse", "HEAD"],
+      { encoding: "utf8" }
+    ).trim(),
+    execFileSync("git", ["-C", remote, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()
+  );
 });
 
 test("Project clone stays inside workspace and removes an unbound checkout", async (t) => {
-  const { root, workspace, store } = fixture(t);
+  const { root, home, workspace, store } = fixture(t);
   let cloneCalls = 0;
   const git = {
     async clone() {
@@ -927,8 +941,10 @@ test("Project clone stays inside workspace and removes an unbound checkout", asy
   assert.equal(cloneCalls, 0);
   assert.equal(existsSync(join(root, "outside")), false);
 
+  // The reserved-worktree guard only applies to the explicit external checkout
+  // mode; a managed clone never targets the workspace.
   await assert.rejects(
-    runProjectCommand(["clone", "worktree", "git@example.invalid:yui.git"], store, { git }),
+    runProjectCommand(["clone", "worktree", "git@example.invalid:yui.git", "--external"], store, { git }),
     /managed worktree|reserved/i
   );
   assert.equal(cloneCalls, 0);
@@ -963,7 +979,7 @@ test("Project clone stays inside workspace and removes an unbound checkout", asy
     ], store),
     /single revision|unknown revision|not a valid object name/i
   );
-  assert.equal(existsSync(join(workspace, "Unbound")), false);
+  assert.equal(existsSync(join(home, "projects", "project-1")), false);
   assert.equal(store.listProjects().length, 0);
 });
 
@@ -1070,7 +1086,7 @@ test("Project ids, names, and aliases share one reference namespace", async (t) 
 });
 
 test("Project clone keeps the stable checkout on stable while resolving development", async (t) => {
-  const { root, workspace, store } = fixture(t);
+  const { root, home, store } = fixture(t);
   const remote = join(root, "remote-branches");
   execFileSync("git", ["init", "-q", "-b", "main", remote]);
   execFileSync("git", ["-C", remote, "config", "user.name", "Yui Test"]);
@@ -1085,7 +1101,7 @@ test("Project clone keeps the stable checkout on stable while resolving developm
   await runProjectCommand([
     "clone", "Branched", remote, "--stable", "main", "--development", "develop"
   ], store);
-  const checkout = join(workspace, "Branched");
+  const checkout = join(home, "projects", "project-1");
   assert.equal(
     execFileSync("git", ["-C", checkout, "branch", "--show-current"], { encoding: "utf8" }).trim(),
     "main"
@@ -1153,12 +1169,15 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
 
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   const main = join(workspace, "tasks", task.id, "main");
-  const mainProject = join(workspace, "worktree", "Yui", task.id, "main");
   assert.deepEqual(await preparer.prepareTaskWorkspace(task.id), {
     taskId: task.id,
     status: "ready",
     path: main
   });
+  const preparedTask = store.getTask(task.id);
+  const segment = taskWorkspaceRefSegment(preparedTask);
+  assert.match(segment, new RegExp(`^${task.id}-[a-f0-9]{8}$`));
+  const mainProject = join(workspace, "worktree", "Yui", segment, "main");
   assert.equal(store.getTask(task.id).cwd, main);
   assert.deepEqual(store.listRoles(task.id).map(({ workspace: path }) => path), [main, main, main]);
   assert.deepEqual(store.listManagedWorkspaces(task.id).map((entry) => ({
@@ -1169,6 +1188,10 @@ test("a Project-backed Task owns one main worktree shared by Roles", async (t) =
     root: main
   }]);
   assert.equal(existsSync(join(mainProject, ".git")), true);
+  assert.equal(
+    execFileSync("git", ["-C", mainProject, "branch", "--show-current"], { encoding: "utf8" }).trim(),
+    `yui/${segment}/main`
+  );
   const reviewerRun = savePlannerRun(store, task.id, "reviewer", {
     workspace: store.getTaskWorkspace(task.id)
   });
@@ -2294,7 +2317,7 @@ test("failed public multi-Lane dispatch compensates unadopted Lane workspaces", 
   ));
 });
 
-test("a new Task reuses its managed branch after interrupted preparation", async (t) => {
+test("a new Task never adopts a stale legacy branch and keeps its own token branch", async (t) => {
   const { home, repositoryPath, store } = fixture(t);
   const baseCommit = execFileSync(
     "git", ["-C", repositoryPath, "rev-parse", "HEAD"], { encoding: "utf8" }
@@ -2305,6 +2328,8 @@ test("a new Task reuses its managed branch after interrupted preparation", async
   const collisionCommit = execFileSync(
     "git", ["-C", repositoryPath, "rev-parse", "HEAD"], { encoding: "utf8" }
   ).trim();
+  // A stale branch from a crashed pre-identity attempt: the legacy bare-id
+  // segment must never be adopted as the Task's managed branch.
   execFileSync("git", [
     "-C", repositoryPath, "branch", "yui/task-1/main", collisionCommit
   ]);
@@ -2318,9 +2343,24 @@ test("a new Task reuses its managed branch after interrupted preparation", async
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
 
   const prepared = await preparer.prepareTaskWorkspace(task.id);
+  const segment = taskWorkspaceRefSegment(store.getTask(task.id));
+  assert.match(segment, new RegExp(`^${task.id}-[a-f0-9]{8}$`));
   const preparedEntry = store.getTaskWorkspace(task.id).entries[0];
   assert.equal(
     execFileSync("git", ["-C", preparedEntry.path, "rev-parse", "HEAD"], {
+      encoding: "utf8"
+    }).trim(),
+    baseCommit
+  );
+  assert.equal(
+    execFileSync("git", ["-C", preparedEntry.path, "branch", "--show-current"], {
+      encoding: "utf8"
+    }).trim(),
+    `yui/${segment}/main`
+  );
+  // The stale legacy branch is preserved untouched for the history cleanup.
+  assert.equal(
+    execFileSync("git", ["-C", repositoryPath, "rev-parse", "yui/task-1/main"], {
       encoding: "utf8"
     }).trim(),
     collisionCommit
@@ -2373,6 +2413,7 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   store.saveWorkItem(task.id, item);
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   const main = (await preparer.prepareTaskWorkspace(task.id)).path;
+  const segment = taskWorkspaceRefSegment(store.getTask(task.id));
   const isolated = await preparer.prepareWorkItemWorkspace(item.taskId, item.id);
   const isolatedEntry = isolated.entries[0];
   assert.deepEqual(isolated.owner, {
@@ -2382,7 +2423,7 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   });
   assert.equal(
     isolatedEntry.path,
-    join(workspace, "worktree", "Yui", task.id, item.id)
+    join(workspace, "worktree", "Yui", segment, item.id)
   );
   assert.equal(store.getRole(task.id, "worker").workspace, isolated.root);
   assert.equal(store.getTask(task.id).cwd, main);
@@ -2433,7 +2474,7 @@ test("Leader can directly create and clean a WorkItem-owned isolated worktree", 
   assert.equal(store.getWorkItem(task.id, item.id).workspaceDisposition, "integrated");
   assert.throws(() => execFileSync(
     "git",
-    ["-C", repositoryPath, "show-ref", "--verify", "refs/heads/yui/task-1/work-item-1"],
+    ["-C", repositoryPath, "show-ref", "--verify", `refs/heads/yui/${segment}/work-item-1`],
     { stdio: "ignore" }
   ));
 });
@@ -4130,10 +4171,11 @@ test("pending Task-final recovery safely reuses a retained diagnostic branch", a
   git(["-C", entry.path, "add", "retained-diagnostic.txt"]);
   git(["-C", entry.path, "commit", "-qm", "retained Review diagnostic"]);
   const diagnosticHead = git(["-C", entry.path, "rev-parse", "HEAD"]).trim();
+  const reviewSegment = taskWorkspaceRefSegment(fx.store.getTask(fx.task.id));
   assert.equal(await new NodeGitWorkspace().removeWorktree({
     repositoryPath: fx.project.path,
     container: join(fx.workspace, "worktree", fx.project.name),
-    taskId: fx.task.id,
+    taskSegment: reviewSegment,
     roleName: fx.pending.id
   }), "removed");
   assert.equal(existsSync(entry.path), false);
@@ -4188,7 +4230,10 @@ test("ordinary pending Task-final workspace preparation failure records the Roun
   writeFileSync(join(fx.repositoryPath, "stale-review.txt"), "stale branch\n");
   git(["-C", fx.repositoryPath, "add", "stale-review.txt"]);
   git(["-C", fx.repositoryPath, "commit", "-qm", "stale review branch"]);
-  const identity = worktreeIdentity(fx.task.id, fx.pending.id);
+  const identity = worktreeIdentity(
+    taskWorkspaceRefSegment(fx.store.getTask(fx.task.id)),
+    fx.pending.id
+  );
   const stalePath = join(fx.workspace, "worktree", fx.project.name, identity.directory);
   mkdirSync(join(stalePath, ".."), { recursive: true });
   execFileSync("git", [
@@ -4580,7 +4625,7 @@ test("public review delivery binds the physical ReviewRound workspace before not
     "-C", reviewRun.workspace.entries[0].path,
     "commit", "-qm", "unrelated review rewrite"
   ]);
-  const identity = worktreeIdentity(task.id, round.id);
+  const identity = worktreeIdentity(taskWorkspaceRefSegment(store.getTask(task.id)), round.id);
   execFileSync("git", [
     "-C", reviewRun.workspace.entries[0].path,
     "branch", "-f", identity.branch, "HEAD"
@@ -4659,7 +4704,7 @@ test("ReviewRound preparation rejects a stale deterministic branch instead of re
   writeFileSync(join(repositoryPath, "stale-review.txt"), "stale branch\n");
   execFileSync("git", ["-C", repositoryPath, "add", "stale-review.txt"]);
   execFileSync("git", ["-C", repositoryPath, "commit", "-qm", "stale review branch"]);
-  const identity = worktreeIdentity(task.id, round.id);
+  const identity = worktreeIdentity(taskWorkspaceRefSegment(store.getTask(task.id)), round.id);
   const stalePath = join(workspace, "worktree", project.name, identity.directory);
   mkdirSync(join(stalePath, ".."), { recursive: true });
   execFileSync("git", [
@@ -4914,7 +4959,7 @@ test("multi-Project ReviewRound recovery preserves diagnostic descendants while 
   const removed = await new NodeGitWorkspace().removeWorktree({
     repositoryPath: secondProject.path,
     container: join(workspace, "worktree", secondProject.name),
-    taskId: task.id,
+    taskSegment: taskWorkspaceRefSegment(store.getTask(task.id)),
     roleName: round.id
   });
   assert.equal(removed, "removed");
@@ -5793,7 +5838,10 @@ test("explicit base mismatch does not retain an unadopted WorkItem worktree", as
   ], store, { now: () => new Date(NOW) });
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   await preparer.prepareTaskWorkspace(task.id);
-  const identity = worktreeIdentity(task.id, result.data.workItem.id);
+  const identity = worktreeIdentity(
+    taskWorkspaceRefSegment(store.getTask(task.id)),
+    result.data.workItem.id
+  );
   execFileSync("git", [
     "-C", repositoryPath, "branch", identity.branch, staleBranchCommit
   ]);

@@ -74,11 +74,20 @@ test("frozen baseline passes: consistency and production registry coverage", () 
 test("the production registry registers every adjacent post-baseline step", () => {
   const registry = createProductionRegistry();
   assert.equal(BASELINE_AGGREGATE_SCHEMA_VERSION, 16);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 17);
-  assert.equal(registry.size, 10);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
+  assert.equal(registry.size, 13);
   const step = registry.lookup("aggregate", undefined, 16);
   assert.notEqual(step, undefined);
   assert.equal(step.toVersion, 17);
+  const homeIdentityStep = registry.lookup("aggregate", undefined, 17);
+  assert.notEqual(homeIdentityStep, undefined);
+  assert.equal(homeIdentityStep.toVersion, 18);
+  const projectOwnershipStep = registry.lookup("record", "project", 2);
+  assert.notEqual(projectOwnershipStep, undefined);
+  assert.equal(projectOwnershipStep.toVersion, 3);
+  const taskWorkspaceIdentityStep = registry.lookup("record", "task", 3);
+  assert.notEqual(taskWorkspaceIdentityStep, undefined);
+  assert.equal(taskWorkspaceIdentityStep.toVersion, 4);
 });
 
 test("a synthetic current above baseline fails closed when an adjacent step is missing", () => {

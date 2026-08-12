@@ -69,7 +69,7 @@ async function startIsolatedController(home, t) {
 }
 
 test("parent update stops a running Controller on an old aggregate Home through its internal path", async (t) => {
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 17);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
   const fixture = tempHome();
   t.after(() => rmSync(fixture.base, { recursive: true, force: true }));
   await startIsolatedController(fixture.home, t);
@@ -80,7 +80,7 @@ test("parent update stops a running Controller on an old aggregate Home through 
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   const schema = inspectStorageSchema(fixture.home);
   assert.equal(schema.status, "unsupported");
-  assert.equal(schema.currentAggregateSchemaVersion, 16);
+  assert.equal(schema.currentAggregateSchemaVersion, CURRENT_AGGREGATE_SCHEMA_VERSION - 1);
 
   const environment = isolatedEnvironment();
   const publicStop = spawnSync(

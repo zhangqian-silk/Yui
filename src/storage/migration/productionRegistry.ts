@@ -1,4 +1,5 @@
 /** The one production transition registry and its baseline-to-current delivery gate. */
+import { generateHomeIdentity } from "../../repository/homeIdentity.js";
 import { latestStorageVersionState } from "../upgrade/recordVersions.js";
 import type { HomeSnapshot } from "../upgrade/homeMigrationTarget.js";
 import { assertBaselineConsistency, baselineStorageVersionState } from "./baseline.js";
@@ -8,6 +9,12 @@ import type { MigrationStep, StorageVersionState } from "./types.js";
 
 const FINAL_REVIEW_AGGREGATE_FROM_VERSION = 16;
 const FINAL_REVIEW_AGGREGATE_TO_VERSION = 17;
+const HOME_IDENTITY_AGGREGATE_FROM_VERSION = 17;
+const HOME_IDENTITY_AGGREGATE_TO_VERSION = 18;
+const PROJECT_FROM_VERSION = 2;
+const PROJECT_TO_VERSION = 3;
+const TASK_FROM_VERSION = 3;
+const TASK_TO_VERSION = 4;
 const WORK_ITEM_FROM_VERSION = 6;
 const WORK_ITEM_TO_VERSION = 7;
 const WORK_ITEM_GIT_SNAPSHOT_FROM_VERSION = 7;
@@ -42,6 +49,16 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     transform: migrateAggregateV16ToV17,
     declaredEffects: []
   })
+    .registerOfflineMigration({
+      axis: "aggregate",
+      fromVersion: HOME_IDENTITY_AGGREGATE_FROM_VERSION,
+      toVersion: HOME_IDENTITY_AGGREGATE_TO_VERSION,
+      preconditions: requireAggregateV17Snapshot,
+      transform: migrateAggregateV17ToV18,
+      declaredEffects: []
+    })
+    .registerOfflineMigration(projectOwnershipStep())
+    .registerOfflineMigration(taskWorkspaceIdentityStep())
     .registerOfflineMigration(recordFamilyStep(
       "workItem",
       WORK_ITEM_FROM_VERSION,
@@ -620,6 +637,192 @@ function requireAggregateV16Snapshot(snapshot: HomeSnapshot): void {
       "Aggregate 16->17 migration requires state.json schemaVersion 16 to match schema.json."
     );
   }
+}
+
+/**
+ * Introduce the durable Home identity. A v18 aggregate always carries one; a
+ * Home with no state.json yet gets its identity when its first state is
+ * written, so this step only mints one when state.json already exists.
+ */
+function migrateAggregateV17ToV18(snapshot: HomeSnapshot): HomeSnapshot {
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    aggregateSchemaVersion: HOME_IDENTITY_AGGREGATE_TO_VERSION
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const state = snapshot.state;
+  if (state.homeIdentity !== undefined) {
+    throw new Error("Aggregate 17->18 migration found an unexpected homeIdentity.");
+  }
+  return {
+    schemaManifest,
+    state: {
+      ...state,
+      schemaVersion: HOME_IDENTITY_AGGREGATE_TO_VERSION,
+      homeIdentity: generateHomeIdentity(new Date())
+    }
+  };
+}
+
+function requireAggregateV17Snapshot(snapshot: HomeSnapshot): void {
+  if (snapshot.schemaManifest.aggregateSchemaVersion
+    !== HOME_IDENTITY_AGGREGATE_FROM_VERSION) {
+    throw new Error(
+      "Aggregate 17->18 migration requires schema.json aggregateSchemaVersion 17."
+    );
+  }
+  if (snapshot.state !== null
+    && snapshot.state.schemaVersion !== HOME_IDENTITY_AGGREGATE_FROM_VERSION) {
+    throw new Error(
+      "Aggregate 17->18 migration requires state.json schemaVersion 17 to match schema.json."
+    );
+  }
+}
+
+/**
+ * Project ownership is a new required field. Every pre-v3 Project is a
+ * user-registered checkout, so the historical binding is `external`; a managed
+ * Home-owned repository is only ever created explicitly by the new binding
+ * path. The version transition is durable and centralized.
+ */
+function projectOwnershipStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "project",
+    fromVersion: PROJECT_FROM_VERSION,
+    toVersion: PROJECT_TO_VERSION,
+    preconditions: requireProjectV2Family,
+    transform: migrateProjectV2ToV3,
+    declaredEffects: []
+  };
+}
+
+function requireProjectV2Family(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.project !== PROJECT_FROM_VERSION) {
+    throw new Error(
+      `Record project migration requires manifest version ${PROJECT_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const projects = snapshot.state.projects;
+  if (projects === undefined) return;
+  const map = asObject(projects, "project map");
+  for (const [projectId, rawProject] of Object.entries(map)) {
+    const project = asObject(rawProject, `Project ${projectId}`);
+    if (project.schemaVersion !== PROJECT_FROM_VERSION) {
+      throw new Error(
+        `Project ${projectId} must use schemaVersion ${PROJECT_FROM_VERSION}.`
+      );
+    }
+  }
+}
+
+function migrateProjectV2ToV3(snapshot: HomeSnapshot): HomeSnapshot {
+  requireProjectV2Family(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...manifestVersions, project: PROJECT_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const projects = snapshot.state.projects;
+  if (projects === undefined) {
+    return { schemaManifest, state: { ...snapshot.state } };
+  }
+  const map = asObject(projects, "project map");
+  const nextProjects: Record<string, unknown> = {};
+  for (const [projectId, rawProject] of Object.entries(map)) {
+    const project = asObject(rawProject, `Project ${projectId}`);
+    nextProjects[projectId] = {
+      ...project,
+      schemaVersion: PROJECT_TO_VERSION,
+      ownership: "external"
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, projects: nextProjects }
+  };
+}
+
+/**
+ * Task v4 adds the optional durable workspace identity. Historical Tasks have
+ * no identity; they keep working against their existing (legacy) refs until the
+ * controlled rebuild mints one. This adjacent step performs no field rewrite,
+ * preserving old records while keeping a pre-v4 Task out of the strict current
+ * parser.
+ */
+function taskWorkspaceIdentityStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "task",
+    fromVersion: TASK_FROM_VERSION,
+    toVersion: TASK_TO_VERSION,
+    preconditions: requireTaskV3Family,
+    transform: migrateTaskV3ToV4,
+    declaredEffects: []
+  };
+}
+
+function requireTaskV3Family(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.task !== TASK_FROM_VERSION) {
+    throw new Error(
+      `Record task migration requires manifest version ${TASK_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const aggregate = asObject(rawTask, `Task aggregate ${taskId}`);
+    const task = aggregate.task;
+    if (task === undefined) continue;
+    const record = asObject(task, `Task ${taskId}`);
+    if (record.schemaVersion !== TASK_FROM_VERSION) {
+      throw new Error(`Task ${taskId} must use schemaVersion ${TASK_FROM_VERSION}.`);
+    }
+  }
+}
+
+function migrateTaskV3ToV4(snapshot: HomeSnapshot): HomeSnapshot {
+  requireTaskV3Family(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...manifestVersions, task: TASK_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const aggregate = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (aggregate.task === undefined) {
+      nextTasks[taskId] = { ...aggregate };
+      continue;
+    }
+    const task = asObject(aggregate.task, `Task ${taskId}`);
+    nextTasks[taskId] = {
+      ...aggregate,
+      task: { ...task, schemaVersion: TASK_TO_VERSION }
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
 }
 
 /**

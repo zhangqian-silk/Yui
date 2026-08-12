@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 export type ProjectKnowledge = Readonly<{
   schemaVersion: 1;
@@ -10,13 +10,24 @@ export type ProjectKnowledge = Readonly<{
   updatedAt: string;
 }>;
 
+/**
+ * Who owns the Project's Git repository.
+ *
+ * - `managed`: Yui owns a canonical repository + stable view inside
+ *   `$YUI_HOME/projects/<projectId>`. The runtime never depends on a
+ *   user-controlled checkout path.
+ * - `external`: a user-owned checkout registered by path. Explicit opt-in only.
+ */
+export type ProjectOwnership = "managed" | "external";
+
 /** A durable Project Catalog entry maintained by Yui. */
 export type Project = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   name: string;
   aliases: readonly string[];
   path: string;
+  ownership: ProjectOwnership;
   remoteUrl?: string;
   stableBranch: string;
   developmentBranch: string;
@@ -25,21 +36,32 @@ export type Project = Readonly<{
   updatedAt: string;
 }>;
 
+/** The Yui-owned directory holding a managed Project's canonical repository. */
+export function managedProjectPath(home: string, projectId: string): string {
+  const id = requireIdentity(projectId, "Project id");
+  return join(resolve(home), "projects", id);
+}
+
 export function createProject(
   id: string,
   name: string,
   path: string,
   branches: Readonly<{ stable: string; development: string }>,
   now: Date,
-  metadata: Readonly<{ aliases?: readonly string[]; remoteUrl?: string }> = {}
+  metadata: Readonly<{
+    aliases?: readonly string[];
+    remoteUrl?: string;
+    ownership?: ProjectOwnership;
+  }> = {}
 ): Project {
   const timestamp = now.toISOString();
   return validateProject({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireIdentity(id, "Project id"),
     name: validateProjectName(name),
     aliases: normalizeAliases(metadata.aliases ?? [], name),
     path: resolve(requireText(path, "Project path")),
+    ownership: metadata.ownership ?? "external",
     ...(metadata.remoteUrl === undefined
       ? {}
       : { remoteUrl: requireText(metadata.remoteUrl, "Project remote URL") }),
@@ -199,12 +221,15 @@ export function assertProjectCatalog(
 }
 
 export function validateProject(project: Project): Project {
-  if (project.schemaVersion !== 2) {
-    throw new Error("Project must use schemaVersion 2.");
+  if (project.schemaVersion !== 3) {
+    throw new Error("Project must use schemaVersion 3.");
   }
   requireIdentity(project.id, "Project id");
   requireIdentity(project.name, "Project name");
   normalizeAliases(project.aliases, project.name);
+  if (project.ownership !== "managed" && project.ownership !== "external") {
+    throw new Error(`Project ownership is invalid: ${String(project.ownership)}.`);
+  }
   const references = new Set<string>();
   for (const reference of [project.id, project.name, ...project.aliases]) {
     const folded = reference.toLocaleLowerCase();

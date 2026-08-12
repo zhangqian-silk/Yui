@@ -51,6 +51,11 @@ import {
   type Project
 } from "../repository/project.js";
 import {
+  generateHomeIdentity,
+  validateHomeIdentity,
+  type HomeIdentity
+} from "../repository/homeIdentity.js";
+import {
   validateAgentProfile,
   type AgentProfile
 } from "../profile/agentProfile.js";
@@ -114,6 +119,7 @@ export const STORAGE_STATE_FILE = "state.json";
 /** The root StorageState schema is the persisted aggregate document version. */
 export const CURRENT_STORAGE_STATE_SCHEMA_VERSION = CURRENT_AGGREGATE_SCHEMA_VERSION;
 export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
+export const CURRENT_HOME_IDENTITY_SCHEMA_VERSION = 1 as const;
 export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 3 as const;
 /**
  * Persisted StorageState/StoredTask family versions owned by this boundary.
@@ -124,11 +130,11 @@ export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 3 as const;
  * below, but are not independent record-axis families.
  */
 export const CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION = 2 as const;
-export const CURRENT_PROJECT_SCHEMA_VERSION = 2 as const;
+export const CURRENT_PROJECT_SCHEMA_VERSION = 3 as const;
 export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
-export const CURRENT_TASK_SCHEMA_VERSION = 3 as const;
+export const CURRENT_TASK_SCHEMA_VERSION = 4 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
@@ -252,6 +258,8 @@ type StoredTask = {
 type StorageState = {
   schemaVersion: typeof CURRENT_STORAGE_STATE_SCHEMA_VERSION;
   revision: number;
+  /** The durable cross-Home-unique identity of this Home. */
+  homeIdentity: HomeIdentity;
   config: YuiConfig;
   configuredAgents: Record<string, ConfiguredAgent>;
   projects: Record<string, Project>;
@@ -266,6 +274,8 @@ export type TaskStore = {
   rootDirectory(): string;
   transaction<T>(execute: (store: TaskStore) => T): T;
   getConfig(): YuiConfig;
+  /** The durable Home identity minted once for this store. */
+  getHomeIdentity(): HomeIdentity;
   saveConfig(config: YuiConfig): void;
   saveConfiguredAgent(agent: ConfiguredAgent): void;
   createConfiguredAgentIfAbsent(agent: ConfiguredAgent): ConfiguredAgent | null;
@@ -424,6 +434,7 @@ export class FileTaskStore implements TaskStore {
   }
 
   getConfig(): YuiConfig { return clone(this.#state().config); }
+  getHomeIdentity(): HomeIdentity { return clone(this.#state().homeIdentity); }
   saveConfig(config: YuiConfig): void {
     const stored = versioned<YuiConfig>(
       config,
@@ -1628,6 +1639,7 @@ function emptyState(): StorageState {
   return {
     schemaVersion: CURRENT_STORAGE_STATE_SCHEMA_VERSION,
     revision: 0,
+    homeIdentity: generateHomeIdentity(new Date()),
     config: { schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION },
     configuredAgents: {},
     projects: {},
@@ -1710,6 +1722,7 @@ function parseState(raw: string): StorageState {
   exact(state, [
     "schemaVersion",
     "revision",
+    "homeIdentity",
     "config",
     "configuredAgents",
     "projects",
@@ -1721,6 +1734,15 @@ function parseState(raw: string): StorageState {
   ], "Storage state");
   if (state.schemaVersion !== CURRENT_STORAGE_STATE_SCHEMA_VERSION || !Number.isInteger(state.revision) || (state.revision as number) < 0) throw new StorageRecordError("Storage state schemaVersion/revision is invalid.");
   const result = clone(state) as unknown as StorageState;
+  try {
+    result.homeIdentity = validateHomeIdentity(versioned(
+      result.homeIdentity,
+      CURRENT_HOME_IDENTITY_SCHEMA_VERSION,
+      "Home identity"
+    ));
+  } catch (error) {
+    throw new StorageRecordError(error instanceof Error ? error.message : String(error));
+  }
   result.config = versioned(
     result.config,
     CURRENT_CONFIG_SCHEMA_VERSION,

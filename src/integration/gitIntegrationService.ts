@@ -14,6 +14,7 @@ import {
 } from "../repository/gitWorkspace.js";
 import type { GitWorkspaceRemoval } from "../repository/gitWorkspace.js";
 import { resolveWorktreeRoot } from "../repository/taskWorkspacePreparer.js";
+import { taskWorkspaceRefSegment } from "../repository/taskWorkspaceIdentity.js";
 import {
   FileTaskRuntimeIsolation,
   type TaskRuntimeIsolationPort,
@@ -126,7 +127,7 @@ export class GitIntegrationService {
       prepared = await this.git.ensureIntegrationWorktree({
         repositoryPath: project.path,
         container: join(this.worktreeRoot, project.name),
-        taskId: task.id,
+        taskSegment: taskWorkspaceRefSegment(task),
         integrationId: initial.id,
         baseRef: initial.expectedHead
       });
@@ -286,7 +287,7 @@ export class GitIntegrationService {
     const result = await this.git.removeIntegrationWorktree({
       repositoryPath: project.path,
       container: join(this.worktreeRoot, project.name),
-      taskId: task.id,
+      taskSegment: taskWorkspaceRefSegment(task),
       integrationId: integration.id,
       discardChanges: integration.status === "failed"
     });
