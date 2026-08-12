@@ -67,6 +67,7 @@ for (const sourceName of runtimeSources) {
   const destination = resolve(output, "dist", builtName);
   mkdirSync(dirname(destination), { recursive: true, mode: 0o755 });
   cpSync(source, destination);
+  chmodSync(destination, builtName === "cli.js" ? 0o755 : 0o644);
 }
 for (const name of RUNTIME_DOCUMENTS) {
   const source = resolve(root, name);

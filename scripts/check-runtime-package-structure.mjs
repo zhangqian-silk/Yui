@@ -6,7 +6,8 @@ if (manifestPath === undefined || process.argv.length !== 3) {
 }
 
 const result = JSON.parse(readFileSync(manifestPath, "utf8"));
-const files = new Set(result[0]?.files?.map(({ path }) => path) ?? []);
+const entries = result[0]?.files ?? [];
+const files = new Set(entries.map(({ path }) => path));
 const required = [
   "dist/cli.js",
   "dist/cli/commandCatalog.js",
@@ -24,5 +25,15 @@ for (const path of files) {
     throw new Error(`runtime package contains forbidden path ${path}`);
   }
 }
+const cli = entries.find(({ path }) => path === "dist/cli.js");
+if (cli?.mode !== 0o755) {
+  throw new Error(
+    `runtime package dist/cli.js must be executable (0755), received ${formatMode(cli?.mode)}`
+  );
+}
 
 console.log(`Package structure smoke passed (${files.size} files).`);
+
+function formatMode(mode) {
+  return typeof mode === "number" ? mode.toString(8).padStart(4, "0") : "missing";
+}
