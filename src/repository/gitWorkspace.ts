@@ -134,6 +134,7 @@ export interface GitWorkspacePort {
     container: string;
     taskId: string;
     integrationId: string;
+    discardChanges?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
 }
 
@@ -720,11 +721,13 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     container: string;
     taskId: string;
     integrationId: string;
+    discardChanges?: boolean;
   }>): Promise<GitWorkspaceRemoval> {
     return this.#removeManagedWorktree({
       repositoryPath: input.repositoryPath,
       container: input.container,
-      identity: integrationWorktreeIdentity(input.taskId, input.integrationId)
+      identity: integrationWorktreeIdentity(input.taskId, input.integrationId),
+      discardChanges: input.discardChanges
     });
   }
 
@@ -734,6 +737,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     identity: Readonly<{ directory: string; branch: string }>;
     expectedBaseCommit?: string;
     allowCommittedChanges?: boolean;
+    discardChanges?: boolean;
   }>): Promise<GitWorkspaceRemoval> {
     const container = resolve(input.container);
     const path = managedPath(container, input.identity.directory);
@@ -744,20 +748,24 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       const canonicalContainerPath = await canonicalContainer(container, false);
       await assertOwnedWorktree(repository, canonicalContainerPath, path);
       await assertExpectedBranch(path, input.identity.branch);
-      const porcelain = await git([
-        "-C", path, "status", "--porcelain=v1", "--untracked-files=all"
-      ]);
-      if (porcelain.length > 0) return "dirty";
-      if (
-        input.expectedBaseCommit !== undefined
-        && input.allowCommittedChanges !== true
-      ) {
-        const head = await gitLine([
-          "-C", path, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"
+      if (input.discardChanges === true) {
+        await git(["-C", repository.root, "worktree", "remove", "--force", "--", path]);
+      } else {
+        const porcelain = await git([
+          "-C", path, "status", "--porcelain=v1", "--untracked-files=all"
         ]);
-        if (head.toLowerCase() !== input.expectedBaseCommit.toLowerCase()) return "dirty";
+        if (porcelain.length > 0) return "dirty";
+        if (
+          input.expectedBaseCommit !== undefined
+          && input.allowCommittedChanges !== true
+        ) {
+          const head = await gitLine([
+            "-C", path, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"
+          ]);
+          if (head.toLowerCase() !== input.expectedBaseCommit.toLowerCase()) return "dirty";
+        }
+        await git(["-C", repository.root, "worktree", "remove", "--", path]);
       }
-      await git(["-C", repository.root, "worktree", "remove", "--", path]);
     }
     const branchRef = `refs/heads/${input.identity.branch}`;
     if (await gitSucceeds([

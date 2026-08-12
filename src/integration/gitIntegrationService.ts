@@ -287,7 +287,8 @@ export class GitIntegrationService {
       repositoryPath: project.path,
       container: join(this.worktreeRoot, project.name),
       taskId: task.id,
-      integrationId: integration.id
+      integrationId: integration.id,
+      discardChanges: integration.status === "failed"
     });
     if (result !== "dirty") {
       await rm(integrationCheckDirectory(this.home, task.id, integration.id), {
