@@ -84,6 +84,18 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     }]
   },
   {
+    commandPath: ["project", "migrate"],
+    selectors: [{
+      argumentIndex: 2,
+      entity: "project",
+      provider: "projects",
+      actionTarget: true
+    }],
+    trailingOptions: {
+      "--preflight": "flag"
+    }
+  },
+  {
     commandPath: ["project", "update"],
     selectors: [{
       argumentIndex: 2,

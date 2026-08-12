@@ -860,7 +860,7 @@ export const ROOT_COMMAND = buildNode({
     {
       name: "project",
       summary: "Manage Projects, stable checkouts, branches, and Yui knowledge.",
-      sections: [{ id: "manage", title: "Commands", entries: ["add", "clone", "refresh", "update", "discover", "list", "show", "knowledge"] }],
+      sections: [{ id: "manage", title: "Commands", entries: ["add", "clone", "refresh", "migrate", "update", "discover", "list", "show", "knowledge"] }],
       children: [
         {
           name: "add",
@@ -879,6 +879,12 @@ export const ROOT_COMMAND = buildNode({
           name: "refresh",
           summary: "Fast-forward a clean stable checkout from its configured remote.",
           usage: "yui project refresh <project>"
+        },
+        {
+          name: "migrate",
+          summary: "Move an external Project into a Home-managed repository.",
+          usage: "yui project migrate <project> [--preflight]",
+          options: ["--preflight"]
         },
         {
           name: "update",
