@@ -278,15 +278,18 @@ function listLinuxProcesses(warnings: string[]): RuntimeProcessFact[] {
   const uptimeMs = readSystemUptimeMs();
   let entries;
   try {
-    entries = readdirSync("/proc", { withFileTypes: true });
+    // Request names only. On some Node/filesystem combinations, Dirent
+    // construction may lstat unknown /proc entries while readdir is still in
+    // progress; a process exiting in that window aborts the whole inventory.
+    entries = readdirSync("/proc", { encoding: "utf8" });
   } catch (error) {
     warnings.push(`Cannot enumerate Linux processes: ${message(error)}`);
     return [];
   }
-  return entries.flatMap((entry): RuntimeProcessFact[] => {
-    if (!entry.isDirectory() || !/^[1-9][0-9]*$/u.test(entry.name)) return [];
-    const pid = Number(entry.name);
+  return entries.flatMap((entryName): RuntimeProcessFact[] => {
     try {
+      const pid = linuxProcessEntryPid(entryName);
+      if (pid === undefined) return [];
       const status = readFileSync(`/proc/${pid}/status`, "utf8");
       const processUid = parseStatusNumber(status, "Uid");
       if (processUid !== uid) return [];
@@ -319,6 +322,19 @@ function listLinuxProcesses(warnings: string[]): RuntimeProcessFact[] {
       return [];
     }
   });
+}
+
+/**
+ * Resolve one numeric /proc entry name without asking the filesystem for
+ * entry metadata. Its process files are then read inside the per-PID race
+ * boundary above.
+ */
+export function linuxProcessEntryPid(
+  entryName: string
+): number | undefined {
+  if (!/^[1-9][0-9]*$/u.test(entryName)) return undefined;
+  const pid = Number(entryName);
+  return Number.isSafeInteger(pid) ? pid : undefined;
 }
 
 function readYuiHome(pid: number): string | undefined {
