@@ -314,20 +314,24 @@ function effectiveWriteProjects(
       throw new Error("Review launch requires exact ReviewRound provenance.");
     }
     commit(input.reviewBaseCommit, "Review base commit");
-    if (input.workspace === undefined || input.workspace.owner.type !== "review-round") {
+    const reviewWorkspace = input.workspace;
+    if (reviewWorkspace === undefined
+      || (reviewWorkspace.owner.type !== "review-round"
+        && (reviewWorkspace.owner.type !== "execution-lane"
+          || reviewWorkspace.owner.purpose !== "review"))) {
       throw new Error("Review launch requires a ReviewRound-owned workspace.");
     }
-    if (input.workspace.owner.reviewRoundId !== input.reviewRoundId) {
+    if (reviewWorkspace.owner.reviewRoundId !== input.reviewRoundId) {
       throw new Error(
         `ReviewRound workspace owner does not match ${input.reviewRoundId}.`
       );
     }
-    if (input.workspace.entries.length === 0
-      || input.workspace.entries.some(({ access }) => access !== "write")) {
+    if (reviewWorkspace.entries.length === 0
+      || reviewWorkspace.entries.some(({ access }) => access !== "write")) {
       throw new Error("Every ReviewRound workspace Project must be an isolated writable entry.");
     }
     return uniqueIdentities(
-      workspace.entries.map(({ projectId }) => projectId),
+      reviewWorkspace.entries.map(({ projectId }) => projectId),
       "Review workspace Project"
     );
   }

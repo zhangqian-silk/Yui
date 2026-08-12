@@ -21,6 +21,8 @@ import type { Task } from "../task/task.js";
 import {
   createCandidateGitSnapshot,
   createDirectTaskMainSnapshot,
+  workItemExecutionGroupById,
+  currentWorkItemExecutionGroup,
   recordWorkItemWorkspaceDisposition,
   type CandidateGitSnapshot,
   type DirectTaskMainSnapshot,
@@ -35,6 +37,7 @@ import {
   type WorkspaceProjectEntry
 } from "../worktree/managedWorkspace.js";
 import type { ExecutionLaneGitSnapshot } from "../execution/executionGroup.js";
+import type { AgentRun } from "../run/agentRun.js";
 import {
   NodeGitWorkspace,
   worktreeIdentity,
@@ -155,7 +158,10 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           throw new Error(`Task changed while preparing its Gitless workspace: ${task.id}.`);
         }
         const current = tx.getTaskWorkspace(task.id);
-        if (current !== null && !isDeepStrictEqual(current, preserveWorkspaceCreatedAt(workspace, current))) {
+        // `createManagedWorkspace` stamps a fresh updatedAt on every call.
+        // Gitless preparation is idempotent, so compare only stable identity
+        // and retain the existing durable record verbatim.
+        if (current !== null && !sameManagedWorkspaceIdentity(current, workspace)) {
           throw new Error(`Gitless Task workspace changed during preparation: ${task.id}.`);
         }
         const timestamp = this.now();
@@ -702,8 +708,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         entries: prepared.map(({ entry }) => entry)
       }, this.now());
       const durableLane = this.store.listWorkItems(taskId).some((item) => (
-        item.executionGroup?.id === executionGroupId
-          && item.executionGroup.lanes.some(({ id }) => id === executionLaneId)
+        workItemExecutionGroupById(item, executionGroupId)?.lanes.some(({ id }) => id === executionLaneId)
       )) || this.store.listReviewRounds(taskId).some((round) => (
         round.executionGroup?.id === executionGroupId
           && round.executionGroup.lanes.some(({ id }) => id === executionLaneId)
@@ -753,7 +758,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   ): Promise<ExecutionGroupCandidateMaterialization> {
     const item = requireWorkItem(this.store, taskId, workItemId);
     const task = requireTask(this.store, taskId);
-    const group = item.executionGroup;
+    const group = workItemExecutionGroupById(item, executionGroupId);
     if (group === undefined || group.id !== executionGroupId) {
       throw new Error(`ExecutionGroup is not attached to Work Item: ${executionGroupId}.`);
     }
@@ -921,8 +926,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   ): Promise<GitWorkspaceRemoval> {
     const task = requireTask(this.store, taskId);
     const lineage = executionLaneLineage(this.store, task, executionGroupId, executionLaneId);
+    const item = lineage.purpose === "execution"
+      ? this.store.getWorkItem(taskId, lineage.workItemId)
+      : null;
     const group = lineage.purpose === "execution"
-      ? this.store.getWorkItem(taskId, lineage.workItemId)?.executionGroup
+      ? (item === null ? undefined : workItemExecutionGroupById(item, executionGroupId))
       : this.store.getReviewRound(taskId, lineage.reviewRoundId)?.executionGroup;
     const lane = group?.lanes.find(({ id }) => id === executionLaneId);
     if (group === undefined
@@ -987,7 +995,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async cleanupExecutionLaneWorkspacesForWorkItem(taskId: string, workItemId: string): Promise<GitWorkspaceRemoval> {
     let result: GitWorkspaceRemoval = "missing";
     const item = this.store.getWorkItem(taskId, workItemId);
-    for (const lane of item?.executionGroup?.lanes ?? []) {
+    for (const group of item?.executionGroups ?? []) for (const lane of group.lanes) {
       const owner = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
         owner.type === "execution-lane" && owner.purpose === "execution"
           && owner.workItemId === workItemId && owner.executionLaneId === lane.id
@@ -1424,30 +1432,87 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (round.workspace === undefined || !isDeepStrictEqual(round.workspace, workspace)) {
       throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
     }
-    const changed: string[] = [];
-    for (const entry of workspace.entries) {
-      if (await this.git.headRef(entry.path) !== entry.branch) {
-        throw new Error(
-          `Review Project workspace left its managed branch: ${round.id}/${entry.projectId}.`
-        );
-      }
-      const head = (await this.git.inspect(entry.path, "HEAD")).baseCommit;
-      const project = requireProject(this.store, entry.projectId);
-      if (!await this.git.isAncestor(project.path, entry.baseCommit, head)) {
-        throw new Error(
-          `ReviewRound workspace HEAD does not descend from its frozen base for `
-          + `${round.id}/${entry.projectId}: expected ancestor ${entry.baseCommit}, `
-          + `physical HEAD ${head}.`
-        );
-      }
-      if (head !== entry.baseCommit) changed.push(head);
+    return this.#snapshotReviewWorkspaceEntries(round.id, workspace);
+  }
+
+  /**
+   * Snapshot the exact workspace recorded on one Reviewer Run.  Panel Lanes
+   * own separate durable workspaces; the ReviewRound's shared workspace is
+   * not a valid substitute for a Lane's branch/head evidence.
+   */
+  async snapshotReviewRunResult(
+    taskId: string,
+    run: AgentRun
+  ): Promise<Readonly<{ evidenceCommit?: string }>> {
+    if (run.taskId !== taskId || run.purpose !== "review" || run.reviewRoundId === undefined) {
+      throw new Error(`Run is not an exact ReviewRound Run: ${run.id}.`);
     }
-    if (changed.length > 1) {
-      throw new Error(
-        `ReviewRound has diagnostic commits in multiple Projects; preserve it for Leader routing: ${round.id}.`
-      );
+    if (run.workspace === undefined) {
+      throw new Error(`Review Run has no managed workspace: ${run.id}.`);
     }
-    return changed.length === 0 ? {} : { evidenceCommit: changed[0]! };
+    const round = this.store.getReviewRound(taskId, run.reviewRoundId);
+    if (round === null || round.status !== "running") {
+      throw new Error(`ReviewRound is not running for Review Run: ${run.id}.`);
+    }
+    const stored = this.store.getManagedWorkspace(run.workspace.owner);
+    if (stored === null || !isDeepStrictEqual(stored, run.workspace)) {
+      throw new Error(`Review Run workspace is not the durable owner: ${run.id}.`);
+    }
+    if (run.workspace.owner.type === "review-round") {
+      if (run.workspace.owner.taskId !== taskId
+        || run.workspace.owner.reviewRoundId !== round.id
+        || round.workspace === undefined
+        || !isDeepStrictEqual(round.workspace, run.workspace)) {
+        throw new Error(`Review Run workspace owner does not match its ReviewRound: ${run.id}.`);
+      }
+      return this.#snapshotReviewWorkspaceEntries(round.id, run.workspace);
+    }
+    if (run.workspace.owner.type !== "execution-lane"
+      || run.workspace.owner.taskId !== taskId
+      || run.workspace.owner.purpose !== "review"
+      || run.workspace.owner.reviewRoundId !== round.id
+      || run.workspace.owner.executionGroupId !== run.executionGroupId
+      || run.workspace.owner.executionLaneId !== run.executionLaneId) {
+      throw new Error(`Review Run workspace owner does not match its Lane lineage: ${run.id}.`);
+    }
+    const lane = round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
+    const writableProjectIds = run.workspace.entries
+      .filter(({ access }) => access === "write")
+      .map(({ projectId }) => projectId)
+      .sort();
+    if (lane === undefined
+      || lane.runId !== run.id
+      || lane.roleName !== run.roleName
+      || lane.reviewRoundId !== round.id
+      || lane.workspace?.root !== run.workspace.root
+      || !isDeepStrictEqual(
+        [...lane.workspace.writableProjectIds].sort(),
+        writableProjectIds
+      )
+      || run.workspace.entries.length === 0
+      || run.workspace.entries.some(({ access }) => access !== "write")) {
+      throw new Error(`Review Run Lane workspace lineage is not exact: ${run.id}.`);
+    }
+    return this.#snapshotReviewWorkspaceEntries(round.id, run.workspace);
+  }
+
+  async inspectExecutionLaneWorkspace(
+    taskId: string,
+    executionGroupId: string,
+    executionLaneId: string
+  ): Promise<GitWorkspaceState> {
+    requireTask(this.store, taskId);
+    const workspace = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
+      owner.type === "execution-lane"
+        && owner.executionGroupId === executionGroupId
+        && owner.executionLaneId === executionLaneId
+    ));
+    if (workspace === undefined) return "missing";
+    return this.#inspectEntries(
+      taskId,
+      managedWorktreeName(workspace.owner),
+      workspace.entries.filter(({ access }) => access === "write")
+    );
   }
 
   async cleanupReviewRoundWorkspace(
@@ -1475,6 +1540,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       round.reviewerRoleName,
       this.now()
     );
+    for (const lane of round.executionGroup?.lanes ?? []) {
+      assertWorkspaceSessionsRetirable(this.store, task.id, lane.roleName, this.now());
+    }
     if (await this.#inspectEntries(
       task.id,
       managedWorktreeName(workspace.owner),
@@ -1545,6 +1613,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     assertWorkItemOwnsWorkspace(item, workspace);
     if (item.assignee !== undefined) {
       assertWorkspaceSessionsRetirable(this.store, task.id, item.assignee, this.now());
+    }
+    for (const group of item.executionGroups) for (const lane of group.lanes) {
+      assertWorkspaceSessionsRetirable(this.store, task.id, lane.roleName, this.now());
     }
     const writable = workspace.entries.filter(({ access }) => access === "write");
     if (await this.#inspectEntries(
@@ -1660,6 +1731,36 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       found ||= state === "clean";
     }
     return found ? "clean" : "missing";
+  }
+
+  async #snapshotReviewWorkspaceEntries(
+    reviewRoundId: string,
+    workspace: ManagedWorkspace
+  ): Promise<Readonly<{ evidenceCommit?: string }>> {
+    const changed: string[] = [];
+    for (const entry of workspace.entries) {
+      if (await this.git.headRef(entry.path) !== entry.branch) {
+        throw new Error(
+          `Review Project workspace left its managed branch: ${reviewRoundId}/${entry.projectId}.`
+        );
+      }
+      const head = (await this.git.inspect(entry.path, "HEAD")).baseCommit;
+      const project = requireProject(this.store, entry.projectId);
+      if (!await this.git.isAncestor(project.path, entry.baseCommit, head)) {
+        throw new Error(
+          `Review workspace HEAD does not descend from its frozen base for `
+          + `${reviewRoundId}/${entry.projectId}: expected ancestor ${entry.baseCommit}, `
+          + `physical HEAD ${head}.`
+        );
+      }
+      if (head !== entry.baseCommit) changed.push(head);
+    }
+    if (changed.length > 1) {
+      throw new Error(
+        `Review workspace has diagnostic commits in multiple Projects; preserve it for Leader routing: ${reviewRoundId}.`
+      );
+    }
+    return changed.length === 0 ? {} : { evidenceCommit: changed[0]! };
   }
 
   #projectContainer(projectName: string): string {
@@ -1849,8 +1950,7 @@ function executionLaneLineage(
     return { purpose: "review", workItemId: round.workItemId, reviewRoundId: round.id };
   }
   for (const item of store.listWorkItems(task.id)) {
-    if (item.executionGroup?.id === executionGroupId
-      && item.executionGroup.lanes.some(({ id }) => id === executionLaneId)) {
+    if (workItemExecutionGroupById(item, executionGroupId)?.lanes.some(({ id }) => id === executionLaneId)) {
       return { purpose: "execution", workItemId: item.id, reviewRoundId: "" };
     }
   }
@@ -1937,6 +2037,13 @@ function retireWorkspaceBoundSession(
 
 function sameManagedWorkspace(left: ManagedWorkspace, right: ManagedWorkspace): boolean {
   return isDeepStrictEqual(left, right);
+}
+
+function sameManagedWorkspaceIdentity(left: ManagedWorkspace, right: ManagedWorkspace): boolean {
+  return isDeepStrictEqual(
+    { owner: left.owner, root: left.root, entries: left.entries },
+    { owner: right.owner, root: right.root, entries: right.entries }
+  );
 }
 
 function isMissingPath(error: unknown): boolean {

@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
   addExecutionLane,
+  assertExecutionGroupTransition,
   assertExecutionTargetUnchanged,
   createExecutionGroup,
   recordExecutionLaneResult,
+  restartExecutionLane,
   resolveExecutionGroup,
   summarizeExecutionGroup,
   updateExecutionLane
@@ -115,4 +117,87 @@ test("lane status can be advanced before its terminal result is recorded", () =>
   const done = recordExecutionLaneResult(running, running.lanes[0].id, { summary: "done" }, "yielded", NOW);
   assert.equal(done.lanes[0].status, "yielded");
   assert.equal(done.lanes[0].result.summary, "done");
+});
+
+test("durable group transitions preserve prior lane output and final resolution", () => {
+  const created = createExecutionGroup("execution-group-1", "task-23", {
+    purpose: "execution",
+    target: target()
+  }, NOW);
+  const running = updateExecutionLane(
+    created,
+    created.lanes[0].id,
+    { status: "running", runId: "agent-run-1" },
+    new Date("2026-08-12T00:01:00.000Z")
+  );
+  const yielded = recordExecutionLaneResult(
+    running,
+    running.lanes[0].id,
+    { summary: "first result" },
+    "yielded",
+    new Date("2026-08-12T00:02:00.000Z")
+  );
+  const resolved = resolveExecutionGroup(
+    yielded,
+    { decision: "accept", summary: "use the first result" },
+    new Date("2026-08-12T00:03:00.000Z")
+  );
+
+  assert.doesNotThrow(() => assertExecutionGroupTransition(created, running));
+  assert.doesNotThrow(() => assertExecutionGroupTransition(running, yielded));
+  assert.doesNotThrow(() => assertExecutionGroupTransition(yielded, resolved));
+  assert.throws(
+    () => assertExecutionGroupTransition(resolved, {
+      ...resolved,
+      resolution: { ...resolved.resolution, summary: "rewritten" }
+    }),
+    /immutable/
+  );
+  assert.throws(
+    () => assertExecutionGroupTransition(yielded, {
+      ...yielded,
+      lanes: [{
+        ...yielded.lanes[0],
+        result: { summary: "rewritten result" }
+      }]
+    }),
+    /fresh retry Run/
+  );
+});
+
+test("an explicit retry may reopen a terminal lane only with a fresh Run", () => {
+  const created = createExecutionGroup("execution-group-1", "task-23", {
+    purpose: "execution",
+    target: target()
+  }, NOW);
+  const firstRun = updateExecutionLane(
+    created,
+    created.lanes[0].id,
+    { status: "running", runId: "agent-run-1" },
+    new Date("2026-08-12T00:01:00.000Z")
+  );
+  const failed = recordExecutionLaneResult(
+    firstRun,
+    firstRun.lanes[0].id,
+    { summary: "retryable failure" },
+    "failed",
+    new Date("2026-08-12T00:02:00.000Z")
+  );
+  const retry = restartExecutionLane(
+    failed,
+    failed.lanes[0].id,
+    { runId: "agent-run-2" },
+    new Date("2026-08-12T00:03:00.000Z")
+  );
+
+  assert.doesNotThrow(() => assertExecutionGroupTransition(failed, retry));
+  assert.equal(retry.lanes[0].status, "running");
+  assert.equal(retry.lanes[0].result, undefined);
+  assert.throws(
+    () => assertExecutionGroupTransition(failed, {
+      ...retry,
+      lanes: [{ ...retry.lanes[0], runId: "agent-run-1" }]
+    }),
+    /fresh retry Run/
+  );
 });

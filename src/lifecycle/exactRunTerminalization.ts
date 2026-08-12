@@ -33,6 +33,7 @@ import {
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
+  workItemExecutionGroupById,
   updateWorkItemExecutionGroup,
   updateWorkItemStatus
 } from "../workItem/workItem.js";
@@ -80,8 +81,13 @@ export function validateExactRunReviewRound(
     || (laneWorkspaceRoot !== undefined && run.workspace.root !== laneWorkspaceRoot)) {
     return { disposition: "obsolete", round, reason: "review-workspace-mismatch" };
   }
-  const storedWorkspace = store.getReviewRoundWorkspace(run.taskId, round.id);
-  if (storedWorkspace === null || !isDeepStrictEqual(storedWorkspace, round.workspace)) {
+  const storedWorkspace = run.workspace.owner.type === "execution-lane"
+    ? store.getManagedWorkspace(run.workspace.owner)
+    : store.getReviewRoundWorkspace(run.taskId, round.id);
+  if (storedWorkspace === null
+    || (run.workspace.owner.type !== "execution-lane"
+      && !isDeepStrictEqual(storedWorkspace, round.workspace))
+    || !isDeepStrictEqual(storedWorkspace, run.workspace)) {
     return { disposition: "obsolete", round, reason: "review-workspace-drift" };
   }
   if (run.workspace.owner.type !== "execution-lane") {
@@ -97,6 +103,19 @@ export function validateExactRunReviewRound(
       || run.workspace.owner.executionLaneId !== run.executionLaneId
       || run.workspace.owner.reviewRoundId !== round.id)) {
     return { disposition: "obsolete", round, reason: "review-lane-workspace-owner-mismatch" };
+  }
+  if (run.workspace.owner.type === "execution-lane") {
+    if (lane === undefined
+      || lane.runId !== run.id
+      || lane.roleName !== run.roleName
+      || lane.workspace?.root !== run.workspace.root
+      || lane.workspace.writableProjectIds.length !== run.workspace.entries.length
+      || run.workspace.entries.some((entry) => (
+        entry.access !== "write"
+        || !lane.workspace!.writableProjectIds.includes(entry.projectId)
+      ))) {
+      return { disposition: "obsolete", round, reason: "review-lane-workspace-lineage-mismatch" };
+    }
   }
   const item = store.getWorkItem(run.taskId, round.workItemId);
   if (item === null) {
@@ -402,9 +421,12 @@ export function terminalizeExactTaskRun(
     && run.purpose === "execution"
     && run.workItemId !== undefined) {
     const item = store.getWorkItem(input.taskId, run.workItemId);
-    if (item?.executionGroup !== undefined) {
+    const group = item === null
+      ? undefined
+      : workItemExecutionGroupById(item, run.executionGroupId);
+    if (item !== null && group !== undefined) {
       const grouped = recordExecutionLaneResult(
-        item.executionGroup,
+        group,
         run.executionLaneId,
       {
         summary: input.outcome.summary,

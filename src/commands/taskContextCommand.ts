@@ -11,6 +11,7 @@ import {
   summarizeExecutionGroup,
   type ExecutionGroup
 } from "../execution/executionGroup.js";
+import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -230,9 +231,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
                 ? "none"
                 : item.writeProjectIds.join(", ")
             }`,
-            ...(item.executionGroup === undefined
+            ...(currentWorkItemExecutionGroup(item) === undefined
               ? []
-              : renderExecutionGroup(item.executionGroup)),
+              : renderExecutionGroup(currentWorkItemExecutionGroup(item)!)),
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),

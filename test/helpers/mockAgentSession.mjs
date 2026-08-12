@@ -39,6 +39,7 @@ import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workIt
 import { createOwnedRunRoot } from "./isolationPreflight.js";
 import { createIsolatedRuntime } from "./isolatedRuntime.js";
 import { createEvidenceRecorder } from "./testEvidence.js";
+import { taskOwnedWorkspace } from "./taskWorkspace.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MOCK_EXECUTABLE = join(HERE, "mockClaudeAgent.mjs");
@@ -188,7 +189,9 @@ export async function createMockAgentSession(
     [],
     START
   );
-  const task = activateTask(createTask("task-mock", "Mock Agent Session", START), START);
+  const task = activateTask(createTask("task-mock", "Mock Agent Session", START, {
+    cwd: runtime.root
+  }), START);
   const role = createRole(
     task.id,
     "worker",
@@ -238,6 +241,7 @@ export async function createMockAgentSession(
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, START));
     tx.saveRole(task.id, leader);
     tx.saveRole(task.id, role);
     tx.saveWorkItem(task.id, item);

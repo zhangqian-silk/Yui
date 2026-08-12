@@ -17,6 +17,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 import {
+  assertExecutionGroupTransition,
   validateExecutionGroup,
   type ExecutionGroup
 } from "../execution/executionGroup.js";
@@ -106,8 +107,8 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  /** v8 adds the persisted ExecutionLane Git snapshot boundary. */
-  schemaVersion: 8;
+  /** v9 persists every WorkItem ExecutionGroup and the current-group pointer. */
+  schemaVersion: 9;
   id: string;
   taskId: string;
   title: string;
@@ -115,8 +116,10 @@ export type WorkItem = {
   acceptance: readonly string[];
   dependsOn: readonly string[];
   writeProjectIds: readonly string[];
-  /** Optional unified execution state; absent on legacy direct records. */
-  executionGroup?: ExecutionGroup;
+  /** Immutable execution history for this WorkItem. */
+  executionGroups: readonly ExecutionGroup[];
+  /** Current iteration Group; historical Groups remain addressable by id. */
+  currentExecutionGroupId?: string;
   /** Explicit Git refs for the initial writable WorkItem worktree. */
   baseRefs?: readonly WorkItemProjectBaseRef[];
   revision: number;
@@ -148,13 +151,14 @@ export function createWorkItem(
     assignee?: string;
     writeProjectIds?: readonly string[];
     baseRefs?: readonly WorkItemProjectBaseRef[];
-    executionGroup?: ExecutionGroup;
+    executionGroups?: readonly ExecutionGroup[];
+    currentExecutionGroupId?: string;
   }>,
   now: Date
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 8,
+    schemaVersion: 9,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -165,9 +169,12 @@ export function createWorkItem(
       input.writeProjectIds ?? [],
       "Work item writable Project"
     ),
-    ...(input.executionGroup === undefined
+    executionGroups: (input.executionGroups ?? []).map((group) =>
+      validateWorkItemExecutionGroup(group, taskId, id)
+    ),
+    ...(input.currentExecutionGroupId === undefined
       ? {}
-      : { executionGroup: validateWorkItemExecutionGroup(input.executionGroup, taskId, id) }),
+      : { currentExecutionGroupId: requireIdentity(input.currentExecutionGroupId, "ExecutionGroup id") }),
     ...(input.baseRefs === undefined || input.baseRefs.length === 0
       ? {}
       : { baseRefs: normalizeProjectBaseRefs(input.baseRefs) }),
@@ -306,15 +313,22 @@ export function attachWorkItemExecutionGroup(
   if (workItem.status === "completed" || workItem.status === "failed" || workItem.status === "retired") {
     throw new Error(`A terminal Work Item cannot attach an ExecutionGroup: ${workItem.id}.`);
   }
-  if (workItem.executionGroup !== undefined) {
-    if (JSON.stringify(workItem.executionGroup) !== JSON.stringify(checked)) {
-      throw new Error(`Work Item ExecutionGroup is immutable: ${workItem.id}.`);
+  const existing = workItemExecutionGroupById(workItem, checked.id);
+  if (existing !== undefined) {
+    if (JSON.stringify(existing) !== JSON.stringify(checked)) {
+      throw new Error(`Work Item ExecutionGroup is immutable: ${workItem.id}/${checked.id}.`);
     }
-    return workItem;
+    if (workItem.currentExecutionGroupId === checked.id) return workItem;
+    throw new Error(`Work Item historical ExecutionGroup is immutable: ${workItem.id}/${checked.id}.`);
+  }
+  const current = currentWorkItemExecutionGroup(workItem);
+  if (current !== undefined && current.resolution === undefined) {
+    throw new Error(`Work Item already has an unresolved ExecutionGroup: ${workItem.id}/${current.id}.`);
   }
   return validateWorkItem({
     ...workItem,
-    executionGroup: checked,
+    executionGroups: [...workItem.executionGroups, checked],
+    currentExecutionGroupId: checked.id,
     revision: workItem.revision + 1,
     updatedAt: now.toISOString()
   });
@@ -328,17 +342,23 @@ export function updateWorkItemExecutionGroup(
 ): WorkItem {
   validateWorkItem(workItem);
   const checked = validateWorkItemExecutionGroup(executionGroup, workItem.taskId, workItem.id);
-  if (workItem.executionGroup === undefined) {
+  const existing = workItemExecutionGroupById(workItem, checked.id);
+  if (existing === undefined) {
     return attachWorkItemExecutionGroup(workItem, checked, now);
   }
-  if (workItem.executionGroup.id !== checked.id
-    || JSON.stringify(workItem.executionGroup.target) !== JSON.stringify(checked.target)) {
-    throw new Error(`Work Item ExecutionGroup target is immutable: ${workItem.id}.`);
+  if (workItem.currentExecutionGroupId !== checked.id) {
+    throw new Error(`Work Item historical ExecutionGroup is immutable: ${workItem.id}/${checked.id}.`);
   }
-  if (JSON.stringify(workItem.executionGroup) === JSON.stringify(checked)) return workItem;
+  if (JSON.stringify(existing.target) !== JSON.stringify(checked.target)) {
+    throw new Error(`Work Item ExecutionGroup target is immutable: ${workItem.id}/${checked.id}.`);
+  }
+  if (JSON.stringify(existing) === JSON.stringify(checked)) return workItem;
+  assertExecutionGroupTransition(existing, checked);
   return validateWorkItem({
     ...workItem,
-    executionGroup: checked,
+    executionGroups: workItem.executionGroups.map((group) =>
+      group.id === checked.id ? checked : group
+    ),
     revision: workItem.revision + 1,
     updatedAt: now.toISOString()
   });
@@ -394,8 +414,14 @@ export function retryFailedWorkItem(workItem: WorkItem, now: Date): WorkItem {
     throw new Error(`Work item workspace is already settled: ${workItem.id}.`);
   }
   const { outcome: _outcome, endedAt: _endedAt, ...base } = workItem;
+  // Keep every historical Group. A resolved current Group is cleared only as
+  // the current pointer; dispatch appends a fresh immutable Group.
+  const current = currentWorkItemExecutionGroup(workItem);
+  const retryBase = current?.resolution === undefined
+    ? base
+    : (({ currentExecutionGroupId: _currentExecutionGroupId, ...history }) => history)(base);
   return validateWorkItem({
-    ...base,
+    ...retryBase,
     status: "running",
     revision: workItem.revision + 1,
     updatedAt: now.toISOString()
@@ -428,7 +454,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 8) throw new Error("WorkItem must use schemaVersion 8.");
+  if (workItem.schemaVersion !== 9) throw new Error("WorkItem must use schemaVersion 9.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
@@ -452,8 +478,22 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   if (workItem.assignee !== undefined) {
     requireIdentity(workItem.assignee, "Work item assignee");
   }
-  if (workItem.executionGroup !== undefined) {
-    validateWorkItemExecutionGroup(workItem.executionGroup, workItem.taskId, workItem.id);
+  if (!Array.isArray(workItem.executionGroups)) {
+    throw new Error("Work Item executionGroups are invalid.");
+  }
+  const groupIds = new Set<string>();
+  for (const group of workItem.executionGroups) {
+    validateWorkItemExecutionGroup(group, workItem.taskId, workItem.id);
+    if (groupIds.has(group.id)) {
+      throw new Error(`Work Item ExecutionGroup is duplicated: ${group.id}.`);
+    }
+    groupIds.add(group.id);
+  }
+  if (workItem.currentExecutionGroupId !== undefined) {
+    requireIdentity(workItem.currentExecutionGroupId, "ExecutionGroup id");
+    if (!groupIds.has(workItem.currentExecutionGroupId)) {
+      throw new Error(`Work Item current ExecutionGroup is not in history: ${workItem.id}.`);
+    }
   }
   validateStatus(workItem.status);
   if (!Array.isArray(workItem.candidates)) {
@@ -514,6 +554,23 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     }
   }
   return workItem;
+}
+
+/** Resolve the WorkItem's current execution iteration. */
+export function currentWorkItemExecutionGroup(
+  workItem: WorkItem
+): ExecutionGroup | undefined {
+  return workItem.currentExecutionGroupId === undefined
+    ? undefined
+    : workItemExecutionGroupById(workItem, workItem.currentExecutionGroupId);
+}
+
+/** Resolve any historical or current WorkItem Group by its immutable id. */
+export function workItemExecutionGroupById(
+  workItem: WorkItem,
+  executionGroupId: string
+): ExecutionGroup | undefined {
+  return workItem.executionGroups.find(({ id }) => id === executionGroupId);
 }
 
 function validateWorkItemExecutionGroup(

@@ -109,10 +109,11 @@ export class TaskWorkspaceCoordinator {
     const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
     if (state === "dirty") return "dirty";
     this.#assertWorkItemRuntimeQuiescent(item);
-    if (item.assignee !== undefined) await this.#stopLiveRoles(item.taskId, [item.assignee]);
-    const laneCleanup = typeof this.preparer.cleanupExecutionLaneWorkspacesForWorkItem === "function"
-      ? await this.preparer.cleanupExecutionLaneWorkspacesForWorkItem(item.taskId, item.id)
-      : "missing";
+    await this.#stopLiveRoles(item.taskId, this.#workItemRoleNames(item));
+    const laneCleanup = await this.preparer.cleanupExecutionLaneWorkspacesForWorkItem(
+      item.taskId,
+      item.id
+    );
     if (laneCleanup === "dirty") return "dirty";
     return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
   }
@@ -124,9 +125,7 @@ export class TaskWorkspaceCoordinator {
     const item = this.store.getWorkItem(taskId, workItemId);
     if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     this.#assertWorkItemRuntimeQuiescent(item);
-    if (item.assignee !== undefined) {
-      await this.#stopLiveRoles(item.taskId, [item.assignee]);
-    }
+    await this.#stopLiveRoles(item.taskId, this.#workItemRoleNames(item));
     return "released";
   }
 
@@ -141,10 +140,11 @@ export class TaskWorkspaceCoordinator {
     }
     const state = await this.preparer.inspectReviewRoundWorkspace(taskId, reviewRoundId);
     if (state === "dirty") return "dirty";
-    await this.#stopLiveRoles(taskId, [round.reviewerRoleName]);
-    const laneCleanup = typeof this.preparer.cleanupExecutionLaneWorkspacesForReviewRound === "function"
-      ? await this.preparer.cleanupExecutionLaneWorkspacesForReviewRound(taskId, reviewRoundId)
-      : "missing";
+    await this.#stopLiveRoles(taskId, this.#reviewRoundRoleNames(round));
+    const laneCleanup = await this.preparer.cleanupExecutionLaneWorkspacesForReviewRound(
+      taskId,
+      reviewRoundId
+    );
     if (laneCleanup === "dirty") return "dirty";
     return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
   }
@@ -162,6 +162,7 @@ export class TaskWorkspaceCoordinator {
       const managedWorkspaces = [...this.store.listManagedWorkspaces(task.id)]
         .sort((left, right) => managedWorkspaceKey(left.owner)
           .localeCompare(managedWorkspaceKey(right.owner)));
+      const laneWorkspaces = managedWorkspaces.filter(({ owner }) => owner.type === "execution-lane");
       const workspaces = managedWorkspaces
         .filter(({ owner }) => owner.type === "work-item");
       const workItems = workspaces.map((workspace) => {
@@ -217,6 +218,24 @@ export class TaskWorkspaceCoordinator {
           };
         }
       }
+      for (const workspace of laneWorkspaces) {
+        if (workspace.owner.type !== "execution-lane") continue;
+        if (await this.preparer.inspectExecutionLaneWorkspace(
+          task.id,
+          workspace.owner.executionGroupId,
+          workspace.owner.executionLaneId
+        ) === "dirty") {
+          return {
+            taskId,
+            status: "retained-dirty",
+            ...(task.cwd === undefined ? {} : { path: task.cwd }),
+            error: `Execution Lane worktree is dirty: ${managedWorkspaceKey(workspace.owner)}.`,
+            reason: "dirty-worktree",
+            resource: managedWorkspaceKey(workspace.owner),
+            retryable: true
+          };
+        }
+      }
       const state = await this.preparer.inspectTaskMainWorkspace(taskId);
       if (state === "dirty") {
         return {
@@ -244,6 +263,16 @@ export class TaskWorkspaceCoordinator {
         await this.runtime.stopTaskRoleSessions(taskId, roleNames);
       }
       this.#assertTaskArchiveSnapshot(snapshot);
+      for (const workspace of laneWorkspaces) {
+        this.#assertTaskArchiveLifecycle(task);
+        if (workspace.owner.type === "execution-lane") {
+          await this.preparer.cleanupExecutionLaneWorkspace(
+            task.id,
+            workspace.owner.executionGroupId,
+            workspace.owner.executionLaneId
+          );
+        }
+      }
       for (const round of reviewRounds) {
         this.#assertTaskArchiveLifecycle(task);
         await this.preparer.cleanupReviewRoundWorkspace(task.id, round.id);
@@ -324,6 +353,20 @@ export class TaskWorkspaceCoordinator {
         `Work item still has an active Run: ${item.taskId}/${item.id}.`
       );
     }
+  }
+
+  #workItemRoleNames(item: WorkItem): readonly string[] {
+    return [
+      ...(item.assignee === undefined ? [] : [item.assignee]),
+      ...(item.executionGroups.flatMap((group) => group.lanes.map(({ roleName }) => roleName)))
+    ];
+  }
+
+  #reviewRoundRoleNames(round: ReviewRound): readonly string[] {
+    return [
+      round.reviewerRoleName,
+      ...(round.executionGroup?.lanes.map(({ roleName }) => roleName) ?? [])
+    ];
   }
 
   async #stopLiveRoles(taskId: string, roleNames: readonly string[]): Promise<void> {

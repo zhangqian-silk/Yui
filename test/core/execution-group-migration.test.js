@@ -70,7 +70,8 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
       { recordKind: "reviewRound", fromVersion: 2, toVersion: 3 },
       { recordKind: "reviewRound", fromVersion: 3, toVersion: 4 },
       { recordKind: "workItem", fromVersion: 6, toVersion: 7 },
-      { recordKind: "workItem", fromVersion: 7, toVersion: 8 }
+      { recordKind: "workItem", fromVersion: 7, toVersion: 8 },
+      { recordKind: "workItem", fromVersion: 8, toVersion: 9 }
     ]
   );
 
@@ -79,17 +80,87 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
     planned.step.preconditions(migrated);
     migrated = planned.step.transform(migrated);
   }
-  assert.equal(migrated.schemaManifest.recordVersions.workItem, 8);
+  assert.equal(migrated.schemaManifest.recordVersions.workItem, 9);
   assert.equal(migrated.schemaManifest.recordVersions.agentRun, 6);
   assert.equal(migrated.schemaManifest.recordVersions.reviewRound, 4);
   assert.equal(migrated.schemaManifest.recordVersions.activeRunPointer, 3);
   assert.equal(migrated.schemaManifest.recordVersions.managedWorkspace, 2);
   const task = migrated.state.tasks["task-1"];
-  assert.equal(task.workItems["work-item-1"].schemaVersion, 8);
+  assert.equal(task.workItems["work-item-1"].schemaVersion, 9);
+  assert.deepEqual(task.workItems["work-item-1"].executionGroups, []);
+  assert.equal(task.workItems["work-item-1"].currentExecutionGroupId, undefined);
   assert.equal(task.agentRuns["agent-run-1"].schemaVersion, 6);
   assert.equal(task.reviewRounds["review-round-1"].schemaVersion, 4);
   assert.equal(task.activeRuns.leader.schemaVersion, 3);
   assert.equal(source.state.tasks["task-1"].workItems["work-item-1"].schemaVersion, 6);
+});
+
+test("workItem v8 migration preserves its current ExecutionGroup as immutable history", () => {
+  const current = currentRecordVersions();
+  const sourceRecord = Object.fromEntries(
+    Object.entries(current).map(([kind, entry]) => [kind, { ...entry }])
+  );
+  sourceRecord.workItem = { ...sourceRecord.workItem, version: 8 };
+  const legacyGroup = {
+    schemaVersion: 1,
+    id: "execution-group-1",
+    taskId: "task-1",
+    purpose: "execution",
+    target: {
+      schemaVersion: 1,
+      kind: "work-item",
+      taskId: "task-1",
+      workItemId: "work-item-1",
+      revision: 2,
+      projects: [],
+      fingerprint: "legacy-group"
+    },
+    strategy: { mode: "fixed", count: 1 },
+    lanes: [],
+    createdAt: "2026-07-19T00:00:00.000Z",
+    updatedAt: "2026-07-19T00:00:00.000Z"
+  };
+  const source = {
+    schemaManifest: {
+      schemaVersion: 1,
+      storageVersion: 6,
+      aggregateSchemaVersion: 17,
+      recordVersions: Object.fromEntries(
+        Object.entries(sourceRecord).map(([kind, entry]) => [kind, entry.version])
+      )
+    },
+    state: {
+      schemaVersion: 17,
+      tasks: {
+        "task-1": {
+          workItems: {
+            "work-item-1": {
+              schemaVersion: 8,
+              executionGroup: legacyGroup
+            }
+          }
+        }
+      }
+    }
+  };
+  const plan = planMigration(
+    createProductionRegistry(),
+    { layout: 6, aggregate: 17, record: sourceRecord },
+    latestStorageVersionState()
+  );
+  assert.equal(plan.kind, "runnable");
+  const step = plan.steps.find(({ recordKind, fromVersion }) => (
+    recordKind === "workItem" && fromVersion === 8
+  ));
+  assert.ok(step);
+  step.step.preconditions(source);
+  const migrated = step.step.transform(source);
+  const item = migrated.state.tasks["task-1"].workItems["work-item-1"];
+  assert.equal(item.schemaVersion, 9);
+  assert.equal("executionGroup" in item, false);
+  assert.deepEqual(item.executionGroups, [legacyGroup]);
+  assert.equal(item.currentExecutionGroupId, legacyGroup.id);
+  assert.equal(source.state.tasks["task-1"].workItems["work-item-1"].executionGroup, legacyGroup);
 });
 
 test("active-lane pointer migration separates a legal Role containing colons", () => {

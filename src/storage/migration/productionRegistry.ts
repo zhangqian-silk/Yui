@@ -12,6 +12,8 @@ const WORK_ITEM_FROM_VERSION = 6;
 const WORK_ITEM_TO_VERSION = 7;
 const WORK_ITEM_GIT_SNAPSHOT_FROM_VERSION = 7;
 const WORK_ITEM_GIT_SNAPSHOT_TO_VERSION = 8;
+const WORK_ITEM_GROUP_HISTORY_FROM_VERSION = 8;
+const WORK_ITEM_GROUP_HISTORY_TO_VERSION = 9;
 const AGENT_RUN_FROM_VERSION = 5;
 const AGENT_RUN_TO_VERSION = 6;
 const REVIEW_ROUND_FROM_VERSION = 2;
@@ -52,6 +54,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       WORK_ITEM_GIT_SNAPSHOT_TO_VERSION,
       "workItems"
     ))
+    .registerOfflineMigration(workItemExecutionGroupHistoryStep())
     .registerOfflineMigration(recordFamilyStep(
       "agentRun",
       AGENT_RUN_FROM_VERSION,
@@ -86,6 +89,77 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
+}
+
+function workItemExecutionGroupHistoryStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "workItem",
+    fromVersion: WORK_ITEM_GROUP_HISTORY_FROM_VERSION,
+    toVersion: WORK_ITEM_GROUP_HISTORY_TO_VERSION,
+    preconditions: (snapshot) => requireRecordFamilyVersion(
+      snapshot,
+      "workItem",
+      WORK_ITEM_GROUP_HISTORY_FROM_VERSION,
+      "workItems"
+    ),
+    transform: migrateWorkItemExecutionGroupHistory,
+    declaredEffects: []
+  };
+}
+
+function migrateWorkItemExecutionGroupHistory(snapshot: HomeSnapshot): HomeSnapshot {
+  requireRecordFamilyVersion(
+    snapshot,
+    "workItem",
+    WORK_ITEM_GROUP_HISTORY_FROM_VERSION,
+    "workItems"
+  );
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...manifestVersions, workItem: WORK_ITEM_GROUP_HISTORY_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.workItems === undefined) {
+      nextTasks[taskId] = { ...task };
+      continue;
+    }
+    const workItems = asObject(task.workItems, `workItem map ${taskId}`);
+    const nextWorkItems: Record<string, unknown> = {};
+    for (const [recordId, rawRecord] of Object.entries(workItems)) {
+      const record = asObject(rawRecord, `workItem ${taskId}/${recordId}`);
+      const { executionGroup, ...rest } = record;
+      if (executionGroup !== undefined
+        && (executionGroup === null || typeof executionGroup !== "object" || Array.isArray(executionGroup))) {
+        throw new Error(`workItem ${taskId}/${recordId} executionGroup must be an object.`);
+      }
+      const groupId = executionGroup === undefined
+        ? undefined
+        : asObject(executionGroup, `ExecutionGroup ${taskId}/${recordId}`).id;
+      if (groupId !== undefined && (typeof groupId !== "string" || groupId.trim().length === 0)) {
+        throw new Error(`workItem ${taskId}/${recordId} executionGroup id is invalid.`);
+      }
+      nextWorkItems[recordId] = {
+        ...rest,
+        schemaVersion: WORK_ITEM_GROUP_HISTORY_TO_VERSION,
+        executionGroups: executionGroup === undefined ? [] : [executionGroup],
+        ...(groupId === undefined ? {} : { currentExecutionGroupId: groupId })
+      };
+    }
+    nextTasks[taskId] = { ...task, workItems: nextWorkItems };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
 }
 
 /**

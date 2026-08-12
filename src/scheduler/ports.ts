@@ -25,7 +25,10 @@ import type { Task } from "../task/task.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { RuntimeLaunchPreStart } from "../runtime/ports.js";
-import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import {
+  isTaskOwnedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 import type { TaskRuntimeLaunchPolicy } from "../runtime/taskRuntimeIsolation.js";
 
 export type SchedulerTask = Readonly<Pick<
@@ -261,6 +264,8 @@ export interface SchedulerStorePort {
   getPresentationContext(): Readonly<{ timeZone?: unknown }>;
   listTasks(): readonly SchedulerTask[];
   getTask(taskId: string): SchedulerTask | null;
+  /** Durable Task-owned main workspace used to fence every active launch. */
+  getTaskWorkspace(taskId: string): ManagedWorkspace | null;
   listRoles(taskId: string): readonly SchedulerRole[];
   getRole(taskId: string, roleName: string): SchedulerRole | null;
   getActiveAgentRun(taskId: string, roleName: string): SchedulerAgentRun | null;
@@ -388,6 +393,18 @@ export interface SchedulerStorePort {
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
   /** Fail the exact Run and its WorkItem or ReviewRound, clear active-run, and stop the Role session. */
   saveExitedRoleRun(input: ExitedRoleRunPersistence): "failed" | "state-changed";
+}
+
+export function isSchedulerTaskWorkspaceReady(
+  task: SchedulerTask,
+  workspace: ManagedWorkspace | null | undefined
+): workspace is ManagedWorkspace {
+  return isTaskOwnedWorkspace(
+    workspace,
+    task.id,
+    task.cwd,
+    task.projectBindings.map(({ projectId, directory }) => ({ projectId, directory }))
+  );
 }
 
 /** Resolves Tasks without a global scan for a dirty reconciliation pass. */

@@ -23,6 +23,7 @@ import {
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
+import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 const NOW = new Date("2026-07-24T00:00:00.000Z");
 
@@ -49,7 +50,9 @@ function fixture(t) {
     }],
     NOW
   );
-  const task = activateTask(createTask("task-1", "Environment refresh", NOW), NOW);
+  const task = activateTask(createTask("task-1", "Environment refresh", NOW, {
+    cwd: home
+  }), NOW);
   const role = createRole(
     task.id,
     "leader",
@@ -61,6 +64,7 @@ function fixture(t) {
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, NOW));
     tx.saveRole(task.id, role);
   });
   return { home, store, agent, task, role };

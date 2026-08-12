@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 /** The durable owner of a managed workspace.  Ownership is deliberately
  * independent from the Role which happens to execute in the workspace. */
@@ -46,6 +47,35 @@ export type ManagedWorkspaceIdentity = Readonly<Pick<
   ManagedWorkspace,
   "owner" | "root" | "entries"
 >>;
+
+/** Stable Project identity required for a Task-owned runtime workspace. */
+export type TaskWorkspaceBindingIdentity = Readonly<{
+  projectId: string;
+  directory: string;
+}>;
+
+/** Every active Task launch is fenced by this durable owner. */
+export function isTaskOwnedWorkspace(
+  workspace: ManagedWorkspace | null | undefined,
+  taskId: string,
+  taskRoot: string | undefined,
+  bindings: readonly TaskWorkspaceBindingIdentity[]
+): workspace is ManagedWorkspace {
+  if (workspace === null || workspace === undefined
+    || workspace.owner.type !== "task"
+    || workspace.owner.taskId !== taskId
+    || taskRoot === undefined
+    || workspace.root !== taskRoot) {
+    return false;
+  }
+  const expected = bindings
+    .map(({ projectId, directory }) => `${projectId}\u0000${directory}\u0000write`)
+    .sort();
+  const actual = workspace.entries
+    .map(({ projectId, directory, access }) => `${projectId}\u0000${directory}\u0000${access}`)
+    .sort();
+  return isDeepStrictEqual(actual, expected);
+}
 
 export function createManagedWorkspace(
   input: ManagedWorkspaceIdentity,
@@ -203,8 +233,14 @@ function validateOwner(owner: ManagedWorkspaceOwner): ManagedWorkspaceOwner {
     if (purpose === "execution" && workItemId === undefined) {
       throw new Error("Managed execution-lane workspace requires a Work Item.");
     }
+    if (purpose === "execution" && reviewRoundId !== undefined) {
+      throw new Error("Managed execution-lane workspace cannot also own a ReviewRound.");
+    }
     if (purpose === "review" && reviewRoundId === undefined) {
       throw new Error("Managed execution-lane workspace requires a ReviewRound.");
+    }
+    if (purpose === "review" && workItemId !== undefined) {
+      throw new Error("Managed review-lane workspace cannot also own a Work Item.");
     }
     return {
       type: "execution-lane",

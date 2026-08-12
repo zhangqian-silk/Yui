@@ -97,7 +97,14 @@ export function exactTaskCliInvocation({
     nativeSessionId = liveSession.nativeSessionId;
   } else {
     if (liveSession !== undefined) {
-      throw new Error(`Fixture Session is terminal but not retired: ${taskId}/${roleName}.`);
+      sessions = {
+        ...sessions,
+        history: [...(sessions.history ?? []), liveSession],
+        sessions: Object.fromEntries(Object.entries(sessions.sessions)
+          .filter(([agentId]) => agentId !== role.activeAgentId)),
+        updatedAt: new Date().toISOString()
+      };
+      store.saveTaskRoleSessionSet(sessions);
     }
     const owner = { scope: "task", taskId, roleName };
     const scheduler = new FileSchedulerStoreAdapter(store);

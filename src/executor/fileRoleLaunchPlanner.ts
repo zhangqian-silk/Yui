@@ -32,7 +32,10 @@ import type {
 } from "../runtime/ports.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
-import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import {
+  isTaskOwnedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
   effectiveLaunchSnapshotsCompatible,
@@ -182,23 +185,43 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       throw new Error(`Role Run is no longer current: ${input.runId}.`);
     }
     const runWorkspace = activeRun?.workspace;
-    if (task.projectBindings.length > 0) {
-      const main = this.store.getTaskWorkspace(task.id);
-      const assignedWorkItem = this.store.listWorkItems(task.id).find((item) =>
-        item.assignee === role.name
-        && !["completed", "failed", "retired"].includes(item.status)
-      );
-      // A Run snapshot is authoritative for the live launch.  In particular,
-      // a reviewer Run must launch from its ReviewRound-owned workspace rather
-      // than falling back to the WorkItem Develop workspace.  Without an
-      // active snapshot, resolve the normal Role/WorkItem assignment.
-      const workspace = runWorkspace !== undefined
-        ? runWorkspace
+    const main = this.store.getTaskWorkspace(task.id);
+    if (!isTaskOwnedWorkspace(
+      main,
+      task.id,
+      task.cwd,
+      task.projectBindings.map(({ projectId, directory }) => ({ projectId, directory }))
+    )) {
+      throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
+    }
+    if (runWorkspace !== undefined) {
+      const durableRunWorkspace = this.store.getManagedWorkspace(runWorkspace.owner);
+      if (durableRunWorkspace === null || !isDeepStrictEqual(durableRunWorkspace, runWorkspace)) {
+        throw new Error(`Role Run workspace is not the durable owner: ${input.taskId}/${input.roleName}.`);
+      }
+    }
+    const assignedWorkItem = this.store.listWorkItems(task.id).find((item) =>
+      item.assignee === role.name
+      && !["completed", "failed", "retired"].includes(item.status)
+    );
+    // A Run snapshot is authoritative for the live launch.  In particular,
+    // a reviewer Run must launch from its ReviewRound-owned workspace rather
+    // than falling back to the WorkItem Develop workspace.  Without an
+    // active snapshot, resolve the normal Role/WorkItem assignment.
+    const workspace = runWorkspace !== undefined
+      ? runWorkspace
+      : task.projectBindings.length === 0
+        ? main
         : assignedWorkItem === undefined
           ? main
           : this.store.getWorkItemWorkspace(task.id, assignedWorkItem.id);
-      const sharedMain = (workspace === null || workspace.owner.type === "task")
-        && main?.owner.type === "task"
+    if (task.projectBindings.length === 0) {
+      if (workspace === null || !isDeepStrictEqual(workspace, main)) {
+        throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
+      }
+    } else {
+      const sharedMain = main !== null
+        && (workspace === null || workspace.owner.type === "task")
         && sameWorkspaceProjects(main, task.projectBindings.map(({ projectId }) => projectId))
         && (role.name === "leader" || role.workspace === main.root);
       const isolatedWorkItem = workspace?.owner.type === "work-item"
@@ -230,7 +253,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             && runWorkspace.owner.executionLaneId === activeRun?.executionLaneId
             && ((runWorkspace.owner.purpose === "review" && activeRun?.purpose === "review")
               || (runWorkspace.owner.purpose === "execution" && activeRun?.purpose === "execution"))));
-      if (task.cwd === undefined || main === null || (!runScoped && !sharedMain && !isolated)) {
+      if (!runScoped && !sharedMain && !isolated) {
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }
     }

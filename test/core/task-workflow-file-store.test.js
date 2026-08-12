@@ -52,6 +52,7 @@ import { completeTask } from "../../dist/task/task.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import {
   createCandidateGitSnapshot,
+  currentWorkItemExecutionGroup,
   recordWorkItemWorkspaceDisposition,
   submitWorkItemCandidate,
   updateWorkItemExecutionGroup,
@@ -1060,8 +1061,8 @@ test("fixed multi-Lane Worker execution waits for explicit Leader group resoluti
   assert.equal(activeRuns.length, 2);
   const running = store.getWorkItem(task.id, item.id);
   assert.equal(running.status, "running");
-  assert.equal(running.executionGroup.lanes.length, 2);
-  assert.notEqual(running.executionGroup.lanes[0].roleName, running.executionGroup.lanes[1].roleName);
+  assert.equal(currentWorkItemExecutionGroup(running).lanes.length, 2);
+  assert.notEqual(currentWorkItemExecutionGroup(running).lanes[0].roleName, currentWorkItemExecutionGroup(running).lanes[1].roleName);
 
   for (const active of activeRuns) {
     markDelivered(store, active);
@@ -1070,7 +1071,7 @@ test("fixed multi-Lane Worker execution waits for explicit Leader group resoluti
     assert.equal(after.status, "running");
     assert.equal(after.candidates.length, 0);
   }
-  const completeGroup = store.getWorkItem(task.id, item.id).executionGroup;
+  const completeGroup = currentWorkItemExecutionGroup(store.getWorkItem(task.id, item.id));
   assert.ok(completeGroup.lanes.every(({ status }) => status === "completed"));
   const leaderOptions = {
     ...options,
@@ -1087,7 +1088,7 @@ test("fixed multi-Lane Worker execution waits for explicit Leader group resoluti
   ], store, leaderOptions);
   const accepted = store.getWorkItem(task.id, item.id);
   assert.equal(accepted.status, "awaiting_acceptance");
-  assert.equal(accepted.executionGroup.resolution.decision, "accept");
+  assert.equal(currentWorkItemExecutionGroup(accepted).resolution.decision, "accept");
   assert.equal(accepted.candidates.length, 1);
   assert.match(accepted.candidates[0].summary, /Leader accepted the combined evidence/);
   assert.match(accepted.candidates[0].summary, /worker result/);
@@ -1116,9 +1117,9 @@ test("adaptive Worker execution can append a bounded Lane before resolution", (t
     "--lane-role", "worker-2"
   ], store, leaderOptions);
   const running = store.getWorkItem(task.id, item.id);
-  assert.equal(running.executionGroup.strategy.mode, "adaptive");
-  assert.equal(running.executionGroup.strategy.max, 3);
-  assert.equal(running.executionGroup.lanes.length, 2);
+  assert.equal(currentWorkItemExecutionGroup(running).strategy.mode, "adaptive");
+  assert.equal(currentWorkItemExecutionGroup(running).strategy.max, 3);
+  assert.equal(currentWorkItemExecutionGroup(running).lanes.length, 2);
   assert.equal(store.listAgentRuns(task.id).filter(({ status }) => status === "active").length, 2);
 });
 
@@ -1152,7 +1153,7 @@ test("accept defaults to usable terminal Lanes when one panel Lane failed", (t) 
     tx.saveWorkItem(task.id, updateWorkItemExecutionGroup(
       tx.getWorkItem(task.id, item.id),
       recordExecutionLaneResult(
-        tx.getWorkItem(task.id, item.id).executionGroup,
+        currentWorkItemExecutionGroup(tx.getWorkItem(task.id, item.id)),
         failed.executionLaneId,
         { summary: "lane failed" },
         "failed",
@@ -1170,7 +1171,7 @@ test("accept defaults to usable terminal Lanes when one panel Lane failed", (t) 
     }
   };
   run(["work", "group", "resolve", item.id, "--decision", "accept", "--summary", "accept usable lane"], store, leaderOptions);
-  const resolved = store.getWorkItem(task.id, item.id).executionGroup;
+  const resolved = currentWorkItemExecutionGroup(store.getWorkItem(task.id, item.id));
   assert.deepEqual(
     resolved.resolution.selectedLaneIds,
     [resolved.lanes.find(({ roleName }) => roleName === "worker").id]
@@ -1766,18 +1767,18 @@ test("Leader rejection preserves a Worker WorkItem for another dispatch round", 
     }
   };
   run(["work", "reject", item.id, "--summary", "Fix the review findings."], store, leaderOptions);
-  assert.throws(
-    () => run(["work", "dispatch", item.id, "--input", "Apply the review findings."], store, options),
-    /repair requires the original Worker native Session/i
-  );
-  recordReadyNativeSession(store, task.id, "worker", "native-worker-history");
   run(["work", "dispatch", item.id, "--input", "Apply the review findings."], store, options);
 
   const second = store.getActiveAgentRun(task.id, "worker");
   assert.notEqual(second.id, first.id);
-  assert.equal(second.mode, "resume");
+  assert.equal(second.mode, "new");
   assert.equal(second.workItemId, item.id);
-  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
+  const iterated = store.getWorkItem(item.taskId, item.id);
+  assert.equal(iterated.status, "running");
+  assert.equal(iterated.executionGroups.length, 2);
+  assert.notEqual(iterated.executionGroups[0].id, iterated.executionGroups[1].id);
+  assert.equal(iterated.currentExecutionGroupId, iterated.executionGroups[1].id);
+  assert.equal(iterated.candidates[0].executionGroupId, iterated.executionGroups[0].id);
 });
 
 test("retry replaces the old causal Run marker instead of reusing it", (t) => {
@@ -1839,7 +1840,7 @@ test("a failed Worker Run can retry its failed WorkItem", (t) => {
     tx.saveWorkItem(task.id, updateWorkItemExecutionGroup(
       failedItem,
       recordExecutionLaneResult(
-        failedItem.executionGroup,
+        currentWorkItemExecutionGroup(failedItem),
         active.executionLaneId,
         { summary: "transient failure" },
         "failed",
@@ -2419,6 +2420,16 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
   const item = store.listWorkItems(task.id).at(-1);
   run(["work", "dispatch", item.id], store, options);
   assert.equal(store.getRole(task.id, "worker")?.activeAgentId, "claude");
+  store.saveTask({
+    ...store.getTask(task.id),
+    cwd: root
+  });
+  const taskWorkspace = createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
+    root,
+    entries: []
+  }, NOW);
+  store.saveManagedWorkspace(taskWorkspace);
 
   const plan = new FileRoleLaunchPlanner(root, store, {
     createNativeSessionId: () => "claude-worker-session"

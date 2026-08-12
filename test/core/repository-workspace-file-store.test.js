@@ -84,6 +84,7 @@ import {
   createWorkItem,
   createCandidateGitSnapshot,
   attachWorkItemExecutionGroup,
+  currentWorkItemExecutionGroup,
   recordWorkItemWorkspaceDisposition,
   submitWorkItemCandidate,
   updateWorkItemExecutionGroup,
@@ -252,6 +253,7 @@ function placeholderIsolationStore(initialSessions) {
     taskId: "task-1",
     assignee: "worker",
     writeProjectIds: ["project-1"],
+    executionGroups: [],
     status: "pending"
   };
   const store = {
@@ -381,6 +383,7 @@ test("workspace coordination stops a live Role only after a clean preflight", as
     taskId: "task-1",
     assignee: "worker",
     writeProjectIds: ["project-1"],
+    executionGroups: [],
     status: "pending"
   };
   const store = {
@@ -419,6 +422,9 @@ test("workspace coordination stops a live Role only after a clean preflight", as
     async cleanupWorkItemWorkspace(_taskId, _id, disposition) {
       events.push(["cleanup", disposition]);
       return "removed";
+    },
+    async cleanupExecutionLaneWorkspacesForWorkItem() {
+      return "missing";
     }
   };
   const coordinator = new TaskWorkspaceCoordinator(store, preparer, runtime);
@@ -447,6 +453,7 @@ test("workspace cleanup stops a restored Role before converging a missing worktr
     taskId: "task-1",
     assignee: "worker",
     writeProjectIds: ["project-1"],
+    executionGroups: [],
     status: "completed"
   };
   const coordinator = new TaskWorkspaceCoordinator({
@@ -461,6 +468,9 @@ test("workspace cleanup stops a restored Role before converging a missing worktr
     },
     async cleanupWorkItemWorkspace(_taskId, _id, disposition) {
       events.push(["cleanup", disposition]);
+      return "missing";
+    },
+    async cleanupExecutionLaneWorkspacesForWorkItem() {
       return "missing";
     }
   }, {
@@ -582,6 +592,7 @@ test("runtime-only WorkItem cleanup stops the host but preserves its resumable w
     id: "work-item-1",
     taskId: "task-1",
     assignee: "worker",
+    executionGroups: [],
     status: "running"
   };
   const effective = testEffectiveLaunch({
@@ -634,6 +645,7 @@ test("runtime-only WorkItem cleanup does not disturb a Role serving another Work
     id: "work-item-1",
     taskId: "task-1",
     assignee: "worker",
+    executionGroups: [],
     status: "running"
   };
   let stopped = false;
@@ -1842,12 +1854,11 @@ test("execution Lane workspaces are managed, retry-reused, merged into Candidate
     summary: "accepted",
     selectedLaneIds: group.lanes.map(({ id }) => id)
   }, NOW);
-  store.saveWorkItem(task.id, {
-    ...store.getWorkItem(task.id, item.id),
-    executionGroup: group,
-    revision: store.getWorkItem(task.id, item.id).revision + 1,
-    updatedAt: NOW.toISOString()
-  });
+  store.saveWorkItem(task.id, updateWorkItemExecutionGroup(
+    store.getWorkItem(task.id, item.id),
+    group,
+    NOW
+  ));
   execFileSync("git", ["-C", lane1.entries[0].path, "checkout", "-qb", "wrong-after-yield"]);
   await assert.rejects(
     preparer.materializeExecutionGroupCandidate(
@@ -2001,6 +2012,78 @@ test("public fixed multi-Lane dispatch yields isolated roots and resolves one ag
   assert.equal(readFileSync(join(candidateWorkspace.entries[0].path, "worker.txt"), "utf8"), "worker\n");
   assert.equal(readFileSync(join(candidateWorkspace.entries[0].path, "worker-2.txt"), "utf8"), "worker-2\n");
   assert.equal(existsSync(join(workspace, "tasks", task.id, "execution-lanes")), true);
+
+  const firstIteration = store.getWorkItem(task.id, item.id);
+  const firstGroup = structuredClone(currentWorkItemExecutionGroup(firstIteration));
+  const firstCandidate = structuredClone(firstIteration.candidates[0]);
+  const rejected = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "reject", item.id,
+    "--summary", "Apply one more bounded revision"
+  ]);
+  assert.equal(rejected.status, 0, rejected.stderr || rejected.stdout);
+  const redispatched = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "dispatch", item.id,
+    "--strategy", "fixed:2",
+    "--lane-role", "worker-2"
+  ]);
+  assert.equal(redispatched.status, 0, redispatched.stderr || redispatched.stdout);
+  await stopFileTaskController(home);
+
+  const secondRuns = store.listAgentRuns(task.id).filter(({ purpose, status }) => (
+    purpose === "execution" && status === "active"
+  ));
+  assert.equal(secondRuns.length, 2);
+  const iterating = store.getWorkItem(task.id, item.id);
+  assert.equal(iterating.executionGroups.length, 2);
+  assert.deepEqual(iterating.executionGroups[0], firstGroup);
+  assert.equal(iterating.candidates[0].id, firstCandidate.id);
+  assert.equal(iterating.candidates[0].executionGroupId, firstGroup.id);
+  assert.equal(iterating.currentExecutionGroupId, iterating.executionGroups[1].id);
+
+  for (const run of secondRuns) {
+    const entry = run.workspace.entries.find(({ access }) => access === "write");
+    const name = `round-2-${run.roleName}.txt`;
+    writeFileSync(join(entry.path, name), `${run.roleName} round two\n`);
+    execFileSync("git", ["-C", entry.path, "add", name]);
+    execFileSync("git", ["-C", entry.path, "commit", "-qm", `${run.roleName} round two`]);
+    markDelivered(store, run);
+    const yielded = spawnExactTaskCli(home, store, task.id, run.roleName, [
+      "task", "run", "yield", run.id, "--summary", `${run.roleName} round two`
+    ]);
+    assert.equal(yielded.status, 0, yielded.stderr || yielded.stdout);
+  }
+  const resolvedAgain = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "group", "resolve", item.id,
+    "--decision", "accept",
+    "--summary", "Leader accepted the second public panel"
+  ]);
+  assert.equal(resolvedAgain.status, 0, resolvedAgain.stderr || resolvedAgain.stdout);
+  const secondIteration = store.getWorkItem(task.id, item.id);
+  assert.equal(secondIteration.executionGroups.length, 2);
+  assert.deepEqual(secondIteration.executionGroups[0], firstGroup);
+  assert.equal(secondIteration.candidates.length, 2);
+  assert.equal(secondIteration.candidates[1].executionGroupId, secondIteration.executionGroups[1].id);
+
+  const reloaded = new FileTaskStore(home).getWorkItem(task.id, item.id);
+  assert.deepEqual(reloaded.executionGroups, secondIteration.executionGroups);
+  assert.deepEqual(reloaded.candidates, secondIteration.candidates);
+
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  for (const group of secondIteration.executionGroups) {
+    for (const lane of group.lanes) {
+      assert.equal(
+        await preparer.cleanupExecutionLaneWorkspace(task.id, group.id, lane.id),
+        "removed"
+      );
+    }
+  }
+  assert.equal(store.listManagedWorkspaces(task.id).some(({ owner }) => (
+    owner.type === "execution-lane" && owner.workItemId === item.id
+  )), false);
+  assert.deepEqual(
+    new FileTaskStore(home).getWorkItem(task.id, item.id).executionGroups,
+    secondIteration.executionGroups
+  );
 });
 
 test("execution Lane snapshots freeze every writable Project before aggregate materialization", async (t) => {
@@ -2071,12 +2154,11 @@ test("execution Lane snapshots freeze every writable Project before aggregate ma
   assert.deepEqual(snapshots.map(({ projects }) => projects.length), [2, 2]);
   group = recordExecutionLaneResult(group, group.lanes[0].id, { summary: "one", gitSnapshot: snapshots[0] }, "completed", NOW);
   group = recordExecutionLaneResult(group, group.lanes[1].id, { summary: "two", gitSnapshot: snapshots[1] }, "completed", NOW);
-  store.saveWorkItem(task.id, {
-    ...store.getWorkItem(task.id, item.id),
-    executionGroup: group,
-    revision: store.getWorkItem(task.id, item.id).revision + 1,
-    updatedAt: NOW.toISOString()
-  });
+  store.saveWorkItem(task.id, updateWorkItemExecutionGroup(
+    store.getWorkItem(task.id, item.id),
+    group,
+    NOW
+  ));
   const materialized = await preparer.materializeExecutionGroupCandidate(
     task.id, item.id, group.id, group.lanes.map(({ id }) => id)
   );
@@ -2133,8 +2215,8 @@ test("public adaptive singleton yields, appends one Lane, and resolves frozen ou
   ]);
   assert.equal(firstYield.status, 0, firstYield.stderr || firstYield.stdout);
   assert.equal(store.getWorkItem(task.id, item.id).status, "running");
-  assert.equal(store.getWorkItem(task.id, item.id).executionGroup.lanes.length, 1);
-  assert.equal(store.getWorkItem(task.id, item.id).executionGroup.lanes[0].result.gitSnapshot.projects.length, 1);
+  assert.equal(currentWorkItemExecutionGroup(store.getWorkItem(task.id, item.id)).lanes.length, 1);
+  assert.equal(currentWorkItemExecutionGroup(store.getWorkItem(task.id, item.id)).lanes[0].result.gitSnapshot.projects.length, 1);
 
   const append = spawnExactTaskCli(home, store, task.id, "leader", [
     "task", "work", "dispatch", item.id,
@@ -2164,7 +2246,7 @@ test("public adaptive singleton yields, appends one Lane, and resolves frozen ou
   assert.equal(resolved.status, 0, resolved.stderr || resolved.stdout);
   const accepted = store.getWorkItem(task.id, item.id);
   assert.equal(accepted.status, "awaiting_acceptance");
-  assert.equal(accepted.executionGroup.lanes.length, 2);
+  assert.equal(currentWorkItemExecutionGroup(accepted).lanes.length, 2);
   assert.equal(accepted.candidates.length, 1);
   const candidateWorkspace = store.getWorkItemWorkspace(task.id, item.id);
   assert.equal(readFileSync(join(candidateWorkspace.entries[0].path, "first-lane.txt"), "utf8"), "first\n");
@@ -5113,6 +5195,31 @@ test("public Gitless Worker yield completes without inventing Git output", async
   assert.equal(candidate.gitSnapshot, undefined);
 });
 
+test("Gitless Task workspace preparation is idempotent and archive cleanup removes its owner", async (t) => {
+  const { home, workspace, store, repositoryPath } = fixture(t);
+  const task = activateTask(createTask("task-1", "Gitless lifecycle", NOW), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader"]);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+
+  await preparer.prepareTaskWorkspace(task.id);
+  const first = store.getTaskWorkspace(task.id);
+  assert.notEqual(first, null);
+  const firstRecord = structuredClone(first);
+  await preparer.prepareTaskWorkspace(task.id);
+  assert.deepEqual(store.getTaskWorkspace(task.id), firstRecord);
+
+  store.saveTask(completeTask(store.getTask(task.id), NOW, {
+    summary: "Gitless lifecycle complete",
+    by: "leader"
+  }));
+  const cleaned = await preparer.cleanupTaskForArchive(task.id);
+  assert.equal(cleaned.status, "removed");
+  assert.equal(store.getTaskWorkspace(task.id), null);
+  assert.equal(existsSync(join(workspace, "tasks", task.id, "main")), false);
+  runTaskCommand(["archive", task.id, "--integrated"], store, { now: () => new Date(NOW) });
+  assert.equal(store.getTask(task.id).status, "archived");
+});
+
 test("public multi-Lane retry reuses the failed Lane workspace", async (t) => {
   const { home, workspace, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
@@ -5177,7 +5284,7 @@ test("public multi-Lane retry reuses the failed Lane workspace", async (t) => {
   assert.equal(retryRun.executionLaneId, failed.executionLaneId);
   assert.equal(retryRun.workspace.root, originalRoot);
   assert.equal(store.getWorkItem(task.id, item.id).status, "running");
-  assert.equal(store.getWorkItem(task.id, item.id).executionGroup.lanes.length, 2);
+  assert.equal(currentWorkItemExecutionGroup(store.getWorkItem(task.id, item.id)).lanes.length, 2);
   assert.equal(store.getActiveAgentRun(task.id, survivor.roleName).id, survivor.id);
   assert.equal(existsSync(join(workspace, "tasks", task.id, "execution-lanes")), true);
 });
@@ -5235,7 +5342,8 @@ test("a roleless Project WorkItem follows isolate, Candidate, Integration, accep
   const candidate = candidateItem.candidates.at(-1);
   assert.deepEqual(candidate.source, { type: "direct" });
   assert.deepEqual(candidate.workspace.owner, develop.owner);
-  assert.equal(candidate.gitSnapshot, undefined);
+  assert.notEqual(candidate.gitSnapshot, undefined);
+  assert.equal(candidate.gitSnapshot.projects[0].projectId, project.id);
   assert.notEqual(
     execFileSync("git", ["-C", isolatedPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
     candidate.workspace.entries[0].baseCommit
@@ -5517,7 +5625,8 @@ test("public Task archive cleans terminal ReviewRound workspaces before archivin
     {
       environment: {},
       yuiHome: home,
-      reviewWorkspaceResult: await preparer.snapshotReviewRoundResult(task.id, round.id)
+      reviewWorkspaceResult: await preparer.snapshotReviewRunResult(task.id, reviewRun),
+      executionLaneGitSnapshot: await preparer.snapshotExecutionLaneWorkspace(reviewRun.workspace)
     }
   );
   assert.equal(finished.kind, "output");

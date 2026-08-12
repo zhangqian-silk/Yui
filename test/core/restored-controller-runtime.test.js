@@ -49,6 +49,7 @@ function emptyStore(events = []) {
     getPresentationContext() { return { timeZone: "Asia/Shanghai" }; },
     listTasks() { events.push("list-tasks"); return []; },
     getTask() { return null; },
+    getTaskWorkspace() { return null; },
     listRoles() { return []; },
     getRole() { return null; },
     getActiveAgentRun() { return null; },
@@ -299,7 +300,7 @@ test("periodic recovery skips active workspace scans without durable Task work",
     workspacePreparer
   );
   assert.deepEqual(events, [
-    "list-tasks", "list-tasks", "list-tasks", "list-wakeups"
+    "list-tasks", "list-tasks", "list-tasks", "list-tasks", "list-wakeups"
   ]);
 });
 
@@ -558,8 +559,8 @@ test("failed stale Role cleanup is released and retried before normal scheduling
 
 test("one stale Role cleanup failure does not block another Role delivery", async () => {
   const tasks = new Map([
-    ["task-cleanup", { id: "task-cleanup", status: "active", projectBindings: [] }],
-    ["task-delivery", { id: "task-delivery", status: "active", projectBindings: [] }]
+    ["task-cleanup", gitlessTask("task-cleanup")],
+    ["task-delivery", gitlessTask("task-delivery")]
   ]);
   const roles = new Map([
     ["task-cleanup\0worker", role("task-cleanup", "worker")],
@@ -602,6 +603,7 @@ test("one stale Role cleanup failure does not block another Role delivery", asyn
   const events = [];
   const store = emptyStore();
   store.getTask = (taskId) => tasks.get(taskId) ?? null;
+  store.getTaskWorkspace = (taskId) => taskOwnedWorkspace(tasks.get(taskId));
   store.getRole = (taskId, roleName) => roles.get(`${taskId}\0${roleName}`) ?? null;
   store.getActiveAgentRun = (taskId) => (
     taskId === "task-delivery" ? run : null
@@ -989,7 +991,7 @@ test("global Role cleanup retries on its own key without consuming Operator work
 });
 
 test("stale Role cleanup finishes before a concurrently queued Run may launch", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const task = gitlessTask("task-1");
   const roleValue = role(task.id, "worker");
   const cleanupTarget = {
     kind: "role-runtime", taskId: task.id, roleName: roleValue.name
@@ -1023,6 +1025,7 @@ test("stale Role cleanup finishes before a concurrently queued Run may launch", 
   const events = [];
   const store = emptyStore();
   store.getTask = () => task;
+  store.getTaskWorkspace = () => taskOwnedWorkspace(task);
   store.getRole = () => roleValue;
   store.getActiveAgentRun = () => run;
   store.getWorkMailbox = (mailboxTarget) => {
@@ -1133,6 +1136,11 @@ test("full recovery releases only Task mailboxes whose isolated workspace work f
   }]));
   const settled = [];
   const store = emptyStore();
+  store.listTasks = () => targets.map(({ taskId }) => ({
+    id: taskId,
+    status: "active",
+    projectBindings: []
+  }));
   store.listWorkMailboxes = () => [...mailboxes.values()];
   store.getTask = (taskId) => ({ id: taskId, status: "active" });
   store.getWorkMailbox = (target) => mailboxes.get(target.taskId) ?? null;
@@ -1159,7 +1167,7 @@ test("full recovery releases only Task mailboxes whose isolated workspace work f
 
 test("controller delivers a queued Work AgentRun through tmux before liveness", async () => {
   const events = [];
-  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const task = gitlessTask("task-1");
   const role = {
     taskId: task.id,
     name: "worker",
@@ -1186,6 +1194,7 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
   const store = emptyStore();
   store.listTasks = () => [task];
   store.getTask = (taskId) => taskId === task.id ? task : null;
+  store.getTaskWorkspace = () => taskOwnedWorkspace(task);
   store.listRoles = () => [role];
   store.getActiveAgentRun = () => run;
   store.claimWorkMailbox = () => ({
@@ -1579,11 +1588,11 @@ test("foreground enter asks the Controller to own session creation", async () =>
   const calls = [];
   const runtime = new FileTaskWorkflowRuntime(
     "/tmp/yui-controller-owned-session",
-    {},
+    { getTask: () => ({ id: "task-1", status: "active", projectBindings: [] }) },
     {},
     { plan() { throw new Error("CLI planner must not run"); } },
     { ensureRoleWindow() { throw new Error("CLI tmux creator must not run"); } },
-    undefined,
+    { async prepareTaskWorkspace() { calls.push(["prepare-task-workspace"]); } },
     {
       call: async (_home, method, params) => {
         calls.push([method, params]);
@@ -1596,6 +1605,7 @@ test("foreground enter asks the Controller to own session creation", async () =>
   await runtime.prepareGlobalRoleEnter("operator");
 
   assert.deepEqual(calls, [
+    ["prepare-task-workspace"],
     ["runtime.ensure-role-session", {
       scope: "task",
       taskId: "task-1",
@@ -1609,6 +1619,31 @@ test("foreground enter asks the Controller to own session creation", async () =>
       key: "operator"
     }]
   ]);
+});
+
+test("Gitless reconciliation prepares its Task owner before the Controller scan", async () => {
+  const events = [];
+  let scanCompleted;
+  const scanned = new Promise((resolve) => { scanCompleted = resolve; });
+  const runtime = new FileTaskWorkflowRuntime(
+    "/tmp/yui-gitless-reconcile",
+    { getTask: () => ({ id: "task-1", status: "active", projectBindings: [] }) },
+    {}, {}, {},
+    { async prepareTaskWorkspace() { events.push("prepare"); } },
+    {
+      call: async (_home, method) => {
+        events.push(method);
+        if (method === "controller.status") {
+          return { running: true, protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION };
+        }
+        scanCompleted();
+        return {};
+      }
+    }
+  );
+  runtime.reconcileTask("task-1");
+  await scanCompleted;
+  assert.deepEqual(events, ["prepare", "scheduler.scan"]);
 });
 
 test("workspace transitions stop the existing Role runtime before changing cwd", async () => {
@@ -1920,7 +1955,7 @@ test("a dirty Hook fold signals Operator work created after scheduler phases", a
 });
 
 test("a non-ready Role delivery uses bounded queued retries instead of blocking readiness polling", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const task = gitlessTask("task-1");
   const roleValue = role(task.id, "worker");
   let run = deliveredRun(task.id, roleValue.name);
   delete run.pushedAt;
@@ -1928,6 +1963,7 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
   let sends = 0;
   const store = emptyStore();
   store.getTask = () => task;
+  store.getTaskWorkspace = () => taskOwnedWorkspace(task);
   store.getRole = () => roleValue;
   store.getActiveAgentRun = () => run;
   store.claimWorkMailbox = () => ({
@@ -1968,7 +2004,7 @@ test("a non-ready Role delivery uses bounded queued retries instead of blocking 
 });
 
 test("exhausting Role delivery retries terminalizes the exact prepared Run before forgetting it", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const task = gitlessTask("task-1");
   const roleValue = role(task.id, "worker");
   let run = deliveredRun(task.id, roleValue.name);
   delete run.pushedAt;
@@ -1984,6 +2020,7 @@ test("exhausting Role delivery retries terminalizes the exact prepared Run befor
   const now = new Date("2025-01-02T03:04:05.000Z");
   const store = emptyStore();
   store.getTask = () => task;
+  store.getTaskWorkspace = () => taskOwnedWorkspace(task);
   store.getRole = () => roleValue;
   store.getActiveAgentRun = () => run;
   store.getRoleSession = () => session;
@@ -2070,7 +2107,7 @@ test("exhausting Role delivery retries terminalizes the exact prepared Run befor
 });
 
 test("a fresh Controller retries an undelivered Run in an existing busy pane", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const task = gitlessTask("task-1");
   const roleValue = role(task.id, "worker");
   const run = {
     ...deliveredRun(task.id, roleValue.name),
@@ -2081,6 +2118,7 @@ test("a fresh Controller retries an undelivered Run in an existing busy pane", a
   let sends = 0;
   const store = emptyStore();
   store.getTask = () => task;
+  store.getTaskWorkspace = () => taskOwnedWorkspace(task);
   store.getRole = () => roleValue;
   store.getActiveAgentRun = () => run;
   store.getRoleSession = () => ({
@@ -2131,7 +2169,7 @@ test("a fresh Controller retries an undelivered Run in an existing busy pane", a
 });
 
 test("a resumed Role retries startup readiness when prepare created its missing pane", async () => {
-  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const task = gitlessTask("task-1");
   const roleValue = role(task.id, "worker");
   const run = { ...deliveredRun(task.id, roleValue.name), mode: "resume" };
   delete run.pushedAt;
@@ -2139,6 +2177,7 @@ test("a resumed Role retries startup readiness when prepare created its missing 
   let sends = 0;
   const store = emptyStore();
   store.getTask = () => task;
+  store.getTaskWorkspace = () => taskOwnedWorkspace(task);
   store.getRole = () => roleValue;
   store.getActiveAgentRun = () => run;
   store.getRoleSession = () => ({
@@ -2331,6 +2370,29 @@ function role(taskId, name) {
     effective: testEffectiveLaunch({ agentId }),
     workspace: "/fixture/workspace",
     status: "running"
+  };
+}
+
+function gitlessTask(id) {
+  return {
+    id,
+    title: id,
+    status: "active",
+    projectBindings: [],
+    cwd: "/fixture/workspace"
+  };
+}
+
+function taskOwnedWorkspace(task) {
+  if (task === undefined || task === null) return null;
+  const at = new Date(0).toISOString();
+  return {
+    schemaVersion: 2,
+    owner: { type: "task", taskId: task.id },
+    root: task.cwd,
+    entries: [],
+    createdAt: at,
+    updatedAt: at
   };
 }
 

@@ -739,13 +739,10 @@ async function prepareActiveWorkspaces(
 ): Promise<Set<string>> {
   if (workspace === undefined) return new Set();
   const taskIds = selection.full
-    ? new Set(store.listWorkMailboxes().flatMap((mailbox) => (
-        mailbox.target.kind === "task"
-        && (mailbox.pending !== null || mailbox.processing !== null)
-          ? [mailbox.target.taskId]
-          : []
-      )))
-    : selection.allRoleTaskIds;
+    ? new Set(store.listTasks()
+      .filter((task) => task.status === "active")
+      .map((task) => task.id))
+    : new Set([...selection.taskIds, ...selection.allRoleTaskIds]);
   const failed = new Set<string>();
   for (const taskId of taskIds) {
     if (store.getTask(taskId)?.status === "active") {

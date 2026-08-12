@@ -136,6 +136,10 @@ import {
   type TaskFinalReviewContract
 } from "./review/taskFinalReviewContract.js";
 import type { TaskReviewCandidate } from "./review/reviewRound.js";
+import {
+  currentWorkItemExecutionGroup,
+  workItemExecutionGroupById
+} from "./workItem/workItem.js";
 
 const VERSION = YUI_VERSION;
 const exactControlInvocation = extractExactControlArgument(process.argv.slice(2));
@@ -611,7 +615,7 @@ export async function main(): Promise<void> {
       await ensureFileTaskController(home, { environment: process.env });
       const taskId = resolved[1] === "enter" ? resolved[2] : resolved[3];
       const task = taskId === undefined ? null : store.getTask(taskId);
-      if (task?.status === "active" && task.projectBindings.length > 0) {
+      if (task?.status === "active") {
         await workspacePreparer.prepareTaskWorkspace(task.id);
       }
     }
@@ -877,11 +881,17 @@ export async function main(): Promise<void> {
         ? null
         : store.getWorkItem(reference.taskId, reference.localId);
       const task = item === null ? null : store.getTask(item.taskId);
+      // A rejected Candidate starts a new execution iteration. Release every
+      // terminal Lane Role runtime before preparing the new Lane workspaces;
+      // durable Runs, Groups, Candidates, and workspace owners remain intact.
+      if (item?.status === "failed"
+        && currentWorkItemExecutionGroup(item)?.resolution !== undefined) {
+        await workspaceCoordinator.cleanupWorkItemRuntime(item.taskId, item.id);
+      }
       // Every Task needs an authoritative runtime owner before dispatch. A
       // Gitless Task uses an empty Task-owned view; Project-backed WorkItems
       // additionally receive their isolated Develop owner below.
-      if (item !== null && task !== null
-        && store.getTaskWorkspace(task.id) === null) {
+      if (item !== null && task !== null) {
         await workspacePreparer.prepareTaskWorkspace(task.id);
       }
       // Every Project-backed WorkItem needs its own Develop owner before a
@@ -1113,8 +1123,7 @@ export async function main(): Promise<void> {
           const created = result.data as {
             task?: { id?: string; projectBindings?: readonly unknown[] }
           } | undefined;
-          if (created?.task?.id !== undefined
-            && (created.task.projectBindings?.length ?? 0) > 0) {
+          if (created?.task?.id !== undefined) {
             let workspace;
             try {
               workspace = await workspacePreparer.prepareTaskWorkspace(created.task.id);
@@ -1141,6 +1150,20 @@ export async function main(): Promise<void> {
               });
               return;
             }
+          }
+        }
+        if (resolved[1] === "activate") {
+          const taskId = resolved[2];
+          const task = taskId === undefined ? null : store.getTask(taskId);
+          if (task?.status === "active") {
+            await workspacePreparer.prepareTaskWorkspace(task.id);
+          }
+        }
+        if (resolved[1] === "project" && resolved[2] === "add") {
+          const taskId = resolved[3];
+          const task = taskId === undefined ? null : store.getTask(taskId);
+          if (task?.status === "active") {
+            await workspacePreparer.prepareTaskWorkspace(task.id);
           }
         }
         emit(`${result.output}${reviewOutput}`, false, reviewData === undefined
@@ -1370,9 +1393,12 @@ async function candidateSnapshotForTaskCommand(
     // outputs have been materialized into the WorkItem workspace.
     if (run.executionGroupId !== undefined || run.workspace.owner.type === "execution-lane") {
       const item = store.getWorkItem(run.taskId, run.workItemId);
-      const fixedSingleLane = item?.executionGroup?.strategy.mode === "fixed"
-        && item.executionGroup.strategy.count === 1
-        && item.executionGroup.lanes.length === 1
+      const group = item === null || run.executionGroupId === undefined
+        ? undefined
+        : workItemExecutionGroupById(item, run.executionGroupId);
+      const fixedSingleLane = group?.strategy.mode === "fixed"
+        && group.strategy.count === 1
+        && group.lanes.length === 1
         && run.workspace.owner.type === "work-item";
       if (fixedSingleLane) return preparer.snapshotCandidateWorkspace(run.workspace);
       return undefined;
@@ -1416,7 +1442,9 @@ async function candidateMaterializationForTaskCommand(
     || args[args.indexOf("--decision") + 1] !== "accept") return undefined;
   const reference = cliWorkItemReference(args[4], environment);
   const item = store.getWorkItem(reference.taskId, reference.localId);
-  const group = item?.executionGroup;
+  const group = item === null || item === undefined
+    ? undefined
+    : currentWorkItemExecutionGroup(item);
   if (item === null || item === undefined || group === undefined) return undefined;
   const selected = args.flatMap((value, index) => value === "--lane" && args[index + 1] !== undefined ? [args[index + 1]!] : []);
   try {
@@ -1451,7 +1479,13 @@ async function prepareExecutionLaneWorkspacesForCommand(
       })()
     : store.getWorkItem(itemRef.taskId, itemRef.localId);
   if (item === null) return undefined;
-  const group = item.executionGroup;
+  const retryRun = isRetry
+    ? store.getAgentRun(item.taskId, cliTaskRecordReference(args[3]!, "agentRun", environment).localId)
+    : null;
+  const currentGroup = currentWorkItemExecutionGroup(item);
+  const group = retryRun?.executionGroupId === undefined
+    ? (isDispatch && currentGroup?.resolution !== undefined ? undefined : currentGroup)
+    : workItemExecutionGroupById(item, retryRun.executionGroupId);
   const roles = args.flatMap((value, index) => (
     value === "--lane-role" && args[index + 1] !== undefined
       ? [args[index + 1]!]
@@ -1691,7 +1725,7 @@ async function reviewWorkspaceResultForTaskCommand(
   if (run === null || run.purpose !== "review" || run.reviewRoundId === undefined) {
     return undefined;
   }
-  return preparer.snapshotReviewRoundResult(reference.taskId, run.reviewRoundId);
+  return preparer.snapshotReviewRunResult(reference.taskId, run);
 }
 
 async function executionLaneGitSnapshotForTaskCommand(
@@ -1705,7 +1739,12 @@ async function executionLaneGitSnapshotForTaskCommand(
   const reference = cliTaskRecordReference(args[3], "agentRun", environment);
   const run = store.getAgentRun(reference.taskId, reference.localId);
   if (run === null || run.executionGroupId === undefined
-    || run.executionLaneId === undefined) {
+    || run.executionLaneId === undefined
+    // Review output has a distinct evidence contract: diagnostic work may
+    // remain uncommitted, and snapshotReviewRunResult validates its exact
+    // ReviewRound/Lane owner. It must not also pass the Develop Candidate
+    // snapshot preflight, which requires a clean committed worktree.
+    || run.purpose === "review") {
     return undefined;
   }
   if (run.workspace === undefined) return null;

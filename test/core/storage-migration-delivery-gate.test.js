@@ -75,7 +75,7 @@ test("the production registry registers every adjacent post-baseline step", () =
   const registry = createProductionRegistry();
   assert.equal(BASELINE_AGGREGATE_SCHEMA_VERSION, 16);
   assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 17);
-  assert.equal(registry.size, 9);
+  assert.equal(registry.size, 10);
   const step = registry.lookup("aggregate", undefined, 16);
   assert.notEqual(step, undefined);
   assert.equal(step.toVersion, 17);

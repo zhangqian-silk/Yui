@@ -12,6 +12,7 @@ import { queueLeaderWakeup } from "../../dist/scheduler/wakeupQueue.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
+import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 const NOW = new Date("2026-07-20T10:00:00.000Z");
 
@@ -20,7 +21,9 @@ function fixture(t) {
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home, NOW);
   const store = new FileTaskStore(home);
-  const task = activateTask(createTask("task-1", "Completion race", NOW), NOW);
+  const task = activateTask(createTask("task-1", "Completion race", NOW, {
+    cwd: home
+  }), NOW);
   const role = createRole(
     task.id,
     "leader",
@@ -31,6 +34,7 @@ function fixture(t) {
   );
   store.transaction((tx) => {
     tx.saveTask(task);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, NOW));
     tx.saveRole(task.id, role);
     queueLeaderWakeup(tx, task.id, "user-message", NOW);
   });

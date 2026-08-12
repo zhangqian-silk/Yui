@@ -15,6 +15,18 @@ WorkItem. Choose one of three execution paths for each WorkItem:
 
 Do not invent another execution entity or a `yui ... subagent` command.
 
+## Use one Lane strategy for every managed execution
+
+Treat single- and multi-Lane work as the same ExecutionGroup contract. A
+fixed one-Lane dispatch may use the WorkItem/ReviewRound owner directly; every
+panel or adaptive Lane gets its own durable execution-Lane workspace and exact
+Run snapshot. Accept defaults to all usable terminal Lane outputs (or the
+explicit selection), and the Candidate/Review result aggregates each selected
+Lane's summary, checks, findings, evidence, and Git snapshot. Rejecting an
+already-resolved Group always creates a fresh Group on redispatch; retry an
+unresolved failed Lane in its existing Group. Never fall back to a shared Role
+workspace or infer a Lane result from a non-durable checkout.
+
 ## Default to the Leader-first fast path
 
 For ordinary, continuous, single-Project development, create one roleless

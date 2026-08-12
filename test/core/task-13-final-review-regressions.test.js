@@ -1710,6 +1710,8 @@ test("review terminalization fences a pending Run ref from another Task", (t) =>
       reviewRoundId: _reviewRoundId,
       workspace: _workspace,
       workItemId: _workItemId,
+      executionGroupId: _executionGroupId,
+      executionLaneId: _executionLaneId,
       ...runWithoutReview
     } = run;
     const {

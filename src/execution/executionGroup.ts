@@ -266,6 +266,57 @@ export function assertExecutionTargetUnchanged(
   }
 }
 
+/**
+ * Enforce the only durable Group/Lane evolution accepted by both domain
+ * helpers and storage. Identity, target, prior results, and a final Leader
+ * resolution never move backwards. A terminal Lane may only reopen as an
+ * explicit retry with a fresh Run identity.
+ */
+export function assertExecutionGroupTransition(
+  existing: ExecutionGroup,
+  candidate: ExecutionGroup
+): void {
+  validateExecutionGroup(existing);
+  validateExecutionGroup(candidate);
+  if (isDeepStrictEqual(existing, candidate)) return;
+  if (existing.id !== candidate.id
+    || existing.taskId !== candidate.taskId
+    || existing.purpose !== candidate.purpose
+    || !isDeepStrictEqual(existing.strategy, candidate.strategy)
+    || !isDeepStrictEqual(existing.target, candidate.target)
+    || existing.createdAt !== candidate.createdAt) {
+    throw new Error(`ExecutionGroup identity or target changed: ${existing.id}.`);
+  }
+  if (Date.parse(candidate.updatedAt) < Date.parse(existing.updatedAt)) {
+    throw new Error(`ExecutionGroup time moved backwards: ${existing.id}.`);
+  }
+  if (existing.resolution !== undefined) {
+    throw new Error(`Resolved ExecutionGroup is immutable: ${existing.id}.`);
+  }
+  if (candidate.lanes.length < existing.lanes.length) {
+    throw new Error(`ExecutionGroup cannot remove Lanes: ${existing.id}.`);
+  }
+  for (const [index, lane] of existing.lanes.entries()) {
+    const next = candidate.lanes[index];
+    if (next === undefined) {
+      throw new Error(`ExecutionGroup cannot remove Lane: ${lane.id}.`);
+    }
+    assertExecutionLaneTransition(lane, next, existing.id);
+  }
+}
+
+export function isExecutionGroupTransition(
+  existing: ExecutionGroup,
+  candidate: ExecutionGroup
+): boolean {
+  try {
+    assertExecutionGroupTransition(existing, candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function updateExecutionLane(
   group: ExecutionGroup,
   laneId: string,
@@ -461,8 +512,8 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
         ...(lane.result.report === undefined ? {} : { report: lane.result.report }),
         ...(lane.result.checks === undefined ? {} : { checks: lane.result.checks }),
         ...(lane.result.findings === undefined ? {} : { findings: lane.result.findings }),
-        ...(lane.result.evidence === undefined ? {} : { evidence: lane.result.evidence })
-        ,...(lane.result.evidenceCommit === undefined ? {} : { evidenceCommit: lane.result.evidenceCommit }),
+        ...(lane.result.evidence === undefined ? {} : { evidence: lane.result.evidence }),
+        ...(lane.result.evidenceCommit === undefined ? {} : { evidenceCommit: lane.result.evidenceCommit }),
         ...(lane.result.gitSnapshot === undefined ? {} : { gitSnapshot: lane.result.gitSnapshot })
       }),
       ...(group.resolution === undefined
@@ -504,7 +555,12 @@ export function validateExecutionGroup(group: ExecutionGroup): ExecutionGroup {
   }
   const expectedMax = group.strategy.mode === "fixed" ? group.strategy.count : group.strategy.max;
   if (group.lanes.length > expectedMax) throw new Error("ExecutionGroup has too many Lanes.");
-  if (group.resolution !== undefined) validateResolution(group.resolution, group);
+  if (group.resolution !== undefined) {
+    if (group.lanes.some(({ status }) => !isTerminalLane(status))) {
+      throw new Error(`Resolved ExecutionGroup has active Lanes: ${group.id}.`);
+    }
+    validateResolution(group.resolution, group);
+  }
   requireTimestamp(group.createdAt, "ExecutionGroup createdAt");
   requireTimestamp(group.updatedAt, "ExecutionGroup updatedAt");
   return group;
@@ -545,8 +601,8 @@ export function validateExecutionLane(
   if (isTerminalLane(lane.status)) {
     requireTimestamp(lane.endedAt ?? "", "ExecutionLane endedAt");
     if (lane.result === undefined) throw new Error(`Terminal ExecutionLane requires a result: ${lane.id}.`);
-  } else if (lane.endedAt !== undefined) {
-    throw new Error(`Active ExecutionLane cannot have endedAt: ${lane.id}.`);
+  } else if (lane.endedAt !== undefined || lane.result !== undefined) {
+    throw new Error(`Active ExecutionLane cannot have terminal output: ${lane.id}.`);
   }
   return lane;
 }
@@ -668,10 +724,61 @@ function validateResolution(resolution: ExecutionResolution, group: ExecutionGro
     || resolution.selectedLaneIds.some((id) => !laneIds.has(id))) {
     throw new Error("Execution resolution Lane selection is invalid.");
   }
+  if (resolution.decision === "accept"
+    && (resolution.selectedLaneIds.length === 0
+      || resolution.selectedLaneIds.some((id) => {
+        const lane = group.lanes.find((candidate) => candidate.id === id);
+        return lane?.status !== "yielded" && lane?.status !== "completed";
+      }))) {
+    throw new Error("Execution accept resolution must select usable Lane output.");
+  }
   requireTimestamp(resolution.decidedAt, "Execution resolution time");
-  const findings = new Set(openHighPriorityFindingIds(group));
-  if (resolution.unresolvedFindingIds.some((id) => !findings.has(id))) {
-    throw new Error("Execution resolution finding references are invalid.");
+  const findings = openHighPriorityFindingIds(group);
+  if (!isDeepStrictEqual(
+    [...resolution.unresolvedFindingIds].sort(),
+    [...findings].sort()
+  )) {
+    throw new Error("Execution resolution findings do not match the unresolved high-priority findings.");
+  }
+  if (resolution.decision === "accept" && findings.length > 0) {
+    throw new Error("Execution accept resolution cannot retain high-priority findings.");
+  }
+}
+
+function assertExecutionLaneTransition(
+  existing: ExecutionLane,
+  candidate: ExecutionLane,
+  groupId: string
+): void {
+  if (existing.id !== candidate.id
+    || existing.groupId !== candidate.groupId
+    || existing.groupId !== groupId
+    || existing.ordinal !== candidate.ordinal
+    || existing.roleName !== candidate.roleName
+    || existing.createdAt !== candidate.createdAt
+    || existing.reviewRoundId !== candidate.reviewRoundId) {
+    throw new Error(`ExecutionLane identity changed: ${existing.id}.`);
+  }
+  if (Date.parse(candidate.updatedAt) < Date.parse(existing.updatedAt)) {
+    throw new Error(`ExecutionLane time moved backwards: ${existing.id}.`);
+  }
+  if (isTerminalLane(existing.status)) {
+    if (isDeepStrictEqual(existing, candidate)) return;
+    if (candidate.status !== "running"
+      || candidate.runId === undefined
+      || candidate.runId === existing.runId) {
+      throw new Error(`Terminal ExecutionLane is immutable without a fresh retry Run: ${existing.id}.`);
+    }
+    return;
+  }
+  if (existing.status === "running" && candidate.status === "pending") {
+    throw new Error(`Running ExecutionLane cannot return to pending: ${existing.id}.`);
+  }
+  for (const key of ["effective", "runId", "sessionId", "workspace"] as const) {
+    if (existing[key] !== undefined
+      && !isDeepStrictEqual(existing[key], candidate[key])) {
+      throw new Error(`ExecutionLane ${key} changed without retry: ${existing.id}.`);
+    }
   }
 }
 

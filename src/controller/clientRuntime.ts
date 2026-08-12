@@ -555,6 +555,10 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   async prepareTaskRoleEnter(
     input: Readonly<{ taskId: string; roleName: string }>
   ): Promise<void> {
+    const task = this.store.getTask(input.taskId);
+    if (task?.status === "active" && this.workspacePreparer !== undefined) {
+      await this.workspacePreparer.prepareTaskWorkspace(task.id);
+    }
     const environment = foregroundRoleEnvironment(
       this.store,
       { scope: "task", taskId: input.taskId, roleName: input.roleName },
@@ -667,7 +671,6 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     const task = this.store.getTask(taskId);
     if (
       task !== null
-      && task.projectBindings.length > 0
       && (task.status === "draft" || task.status === "active")
       && this.workspacePreparer !== undefined
     ) {

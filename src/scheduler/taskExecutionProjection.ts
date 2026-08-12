@@ -7,7 +7,7 @@ import type { TaskBrief } from "../brief/taskBrief.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { LeaderFailure } from "./leaderFailure.js";
 import type { OperatorNotification } from "./operatorNotification.js";
-import type { WorkItem } from "../workItem/workItem.js";
+import { currentWorkItemExecutionGroup, type WorkItem } from "../workItem/workItem.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
@@ -550,7 +550,10 @@ function collectExecutionGroups(
   reviewRounds: readonly ReviewRound[]
 ): ExecutionGroup[] {
   const groups = [
-    ...workItems.flatMap((item) => item.executionGroup === undefined ? [] : [item.executionGroup]),
+    ...workItems.flatMap((item) => {
+      const group = currentWorkItemExecutionGroup(item);
+      return group === undefined ? [] : [group];
+    }),
     ...reviewRounds.flatMap((round) => round.executionGroup === undefined ? [] : [round.executionGroup])
   ];
   const seen = new Set<string>();
@@ -740,7 +743,7 @@ function collectBlockers(
       summary: request.question
     });
   }
-  if (task.status === "active" && (task.projectBindings ?? []).length > 0 && task.cwd === undefined) {
+  if (task.status === "active" && task.cwd === undefined) {
     blockers.push({
       kind: "identity",
       id: `workspace:${task.id}`,

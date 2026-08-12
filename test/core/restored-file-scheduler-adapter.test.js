@@ -55,6 +55,7 @@ import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js"
 import { createProject } from "../../dist/repository/project.js";
 import {
   createWorkItem,
+  currentWorkItemExecutionGroup,
   submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
@@ -93,6 +94,19 @@ function fixture(t) {
       now
     ));
     tx.saveTask(task);
+    tx.saveManagedWorkspace(createManagedWorkspace({
+      owner: { type: "task", taskId: task.id },
+      root: home,
+      entries: [{
+        projectId: "project-1",
+        directory: "Yui",
+        access: "write",
+        path: home,
+        branch: "main",
+        baseRef: "main",
+        baseCommit: "0".repeat(40)
+      }]
+    }, now));
     tx.saveRole(task.id, role);
     queueLeaderWakeup(tx, task.id, "task-created", now);
   });
@@ -2480,7 +2494,11 @@ test("exited execution work terminalizes its bound lane so a retry is accepted",
   const item = updateWorkItemStatus(createWorkItem(
     "work-item-1",
     task.id,
-    { title: "Implement", executionGroup },
+    {
+      title: "Implement",
+      executionGroups: [executionGroup],
+      currentExecutionGroupId: executionGroup.id
+    },
     now
   ), "running", now);
   const run = createAgentRun(adapter,
@@ -2524,7 +2542,7 @@ test("exited execution work terminalizes its bound lane so a retry is accepted",
 
   const failedItem = store.getWorkItem(task.id, item.id);
   assert.equal(failedItem.status, "failed");
-  const failedLane = failedItem.executionGroup.lanes.find(({ id }) => id === laneId);
+  const failedLane = currentWorkItemExecutionGroup(failedItem).lanes.find(({ id }) => id === laneId);
   // The lane must reach a terminal result in the same failure, otherwise a
   // later `yui task run retry` cannot restart it.
   assert.equal(failedLane.status, "failed");
@@ -3110,7 +3128,11 @@ test("an exact fresh-launch reservation replaces and archives a stopped incompat
     }
   }, new Date(now.getTime() + 2));
   store.saveRole(task.id, desired);
-  const effective = resolveEffectiveLaunch({ role: desired, purpose: "execution" });
+  const effective = resolveEffectiveLaunch({
+    role: desired,
+    purpose: "execution",
+    workspace: store.getTaskWorkspace(task.id)
+  });
   adapter.reserveRuntimeLaunch(
     { owner, launchId: "launch-fresh-effective" },
     () => {},

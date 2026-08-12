@@ -85,11 +85,13 @@ import {
   type TaskRecordKind
 } from "../task/taskRecordReference.js";
 import {
+  workItemExecutionGroupById,
   validateWorkItem,
   type WorkItem,
   type WorkItemCandidate
 } from "../workItem/workItem.js";
 import {
+  isExecutionGroupTransition,
   validateExecutionGroup,
   type ExecutionGroup
 } from "../execution/executionGroup.js";
@@ -130,7 +132,7 @@ export const CURRENT_TASK_SCHEMA_VERSION = 3 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
-export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 8 as const;
+export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 9 as const;
 export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 4 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 2 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 2 as const;
@@ -863,8 +865,11 @@ export class FileTaskStore implements TaskStore {
         const item = groupOwner.workItemId === undefined
           ? undefined
           : aggregate.workItems[groupOwner.workItemId];
-        if (item === undefined || item.executionGroup?.id !== groupOwner.executionGroupId
-          || !item.executionGroup.lanes.some(({ id }) => id === groupOwner.executionLaneId)) {
+        if (item === undefined
+          || workItemExecutionGroupById(item, groupOwner.executionGroupId) === undefined
+          || !workItemExecutionGroupById(item, groupOwner.executionGroupId)!.lanes.some(
+            ({ id }) => id === groupOwner.executionLaneId
+          )) {
           throw new StorageRecordError(
             `Managed execution Lane WorkItem lineage is invalid: ${taskId}/${groupOwner.executionGroupId}/${groupOwner.executionLaneId}.`
           );
@@ -1836,8 +1841,13 @@ function parseState(raw: string): StorageState {
       }
       if (workspace.owner.type === "execution-lane") {
         const laneOwner = workspace.owner;
+        const laneItem = laneOwner.purpose === "execution"
+          ? aggregate.workItems[laneOwner.workItemId ?? ""]
+          : undefined;
         const group = laneOwner.purpose === "execution"
-          ? aggregate.workItems[laneOwner.workItemId ?? ""]?.executionGroup
+          ? (laneItem === undefined
+            ? undefined
+            : workItemExecutionGroupById(laneItem, laneOwner.executionGroupId))
           : aggregate.reviewRounds[laneOwner.reviewRoundId ?? ""]?.executionGroup;
         if (group?.id !== laneOwner.executionGroupId
           || !group.lanes.some(({ id }) => id === laneOwner.executionLaneId)) {
@@ -2813,8 +2823,13 @@ function assertManagedWorkspaceReferences(
     }
     case "execution-lane": {
       const owner = workspace.owner;
+      const laneItem = owner.purpose === "execution"
+        ? aggregate.workItems[owner.workItemId ?? ""]
+        : undefined;
       const group = owner.purpose === "execution"
-        ? aggregate.workItems[owner.workItemId ?? ""]?.executionGroup
+        ? (laneItem === undefined
+          ? undefined
+          : workItemExecutionGroupById(laneItem, owner.executionGroupId))
         : aggregate.reviewRounds[owner.reviewRoundId ?? ""]?.executionGroup;
       if (group === undefined || group.id !== owner.executionGroupId
         || !group.lanes.some(({ id }) => id === owner.executionLaneId)) {
@@ -2913,9 +2928,7 @@ function validWorkItemTransition(existing: WorkItem, candidate: WorkItem): boole
     || candidate.revision !== existing.revision + 1
     || Date.parse(candidate.updatedAt) < Date.parse(existing.updatedAt)
   ) return false;
-  if (!compatibleExecutionGroups(existing.executionGroup, candidate.executionGroup)) {
-    return false;
-  }
+  if (!compatibleWorkItemExecutionGroups(existing, candidate)) return false;
   if (
     existing.status !== candidate.status
     && (
@@ -2963,6 +2976,44 @@ function validWorkItemTransition(existing: WorkItem, candidate: WorkItem): boole
   return allowed[existing.status].includes(candidate.status);
 }
 
+function compatibleWorkItemExecutionGroups(
+  existing: WorkItem,
+  candidate: WorkItem
+): boolean {
+  if (candidate.executionGroups.length < existing.executionGroups.length) return false;
+  for (const [index, historical] of existing.executionGroups.entries()) {
+    const next = candidate.executionGroups[index];
+    if (next === undefined || next.id !== historical.id) return false;
+    const isCurrent = existing.currentExecutionGroupId === historical.id;
+    const mutableCurrent = isCurrent && historical.resolution === undefined;
+    if (!mutableCurrent && !isDeepStrictEqual(historical, next)) return false;
+    if (mutableCurrent && !compatibleExecutionGroups(historical, next)) return false;
+  }
+  const appended = candidate.executionGroups.slice(existing.executionGroups.length);
+  if (appended.length > 1) return false;
+  if (appended.length === 1) {
+    const priorCurrent = existing.currentExecutionGroupId === undefined
+      ? undefined
+      : workItemExecutionGroupById(existing, existing.currentExecutionGroupId);
+    if (priorCurrent !== undefined && priorCurrent.resolution === undefined) return false;
+    if (candidate.currentExecutionGroupId !== appended[0]!.id) return false;
+  } else if (candidate.currentExecutionGroupId !== existing.currentExecutionGroupId) {
+    const priorCurrent = existing.currentExecutionGroupId === undefined
+      ? undefined
+      : workItemExecutionGroupById(existing, existing.currentExecutionGroupId);
+    const clearingResolvedRetry = existing.status === "failed"
+      && candidate.status === "running"
+      && candidate.currentExecutionGroupId === undefined
+      && priorCurrent?.resolution !== undefined;
+    if (!clearingResolvedRetry) return false;
+  }
+  if (candidate.currentExecutionGroupId !== undefined
+    && workItemExecutionGroupById(candidate, candidate.currentExecutionGroupId) === undefined) {
+    return false;
+  }
+  return true;
+}
+
 function assertWorkItemCandidateReferences(
   aggregate: StoredTask,
   item: WorkItem,
@@ -2976,12 +3027,15 @@ function assertWorkItemCandidateReferences(
     throw new StorageRecordError(`${label} execution lineage is incomplete.`);
   }
   if (candidate.executionGroupId !== undefined) {
-    const group = item.executionGroup;
+    const group = workItemExecutionGroupById(item, candidate.executionGroupId!);
     const lane = group?.lanes.find(({ id }) => id === candidate.executionLaneId);
     if (group === undefined
       || group.id !== candidate.executionGroupId
       || lane === undefined) {
-      throw new StorageRecordError(`${label} execution lineage is invalid.`);
+      throw new StorageRecordError(
+        `${label} execution lineage is invalid: candidate=${candidate.executionGroupId}/${candidate.executionLaneId}; `
+        + `item=${group?.id ?? "none"}/${lane?.id ?? "none"}.`
+      );
     }
   }
   if (candidate.workspace !== undefined) {
@@ -3029,7 +3083,9 @@ function assertWorkItemCandidateReferences(
     return;
   }
   const run = aggregate.agentRuns[candidate.source.runId];
-  const resolvedGroupSummary = item.executionGroup?.resolution?.summary;
+  const resolvedGroupSummary = candidate.executionGroupId === undefined
+    ? undefined
+    : workItemExecutionGroupById(item, candidate.executionGroupId)?.resolution?.summary;
   if (run === undefined
     || run.workItemId !== item.id
     || run.purpose !== "execution"
@@ -3046,7 +3102,13 @@ function assertWorkItemCandidateReferences(
   // workspace or Git snapshot. This is the only source/run workspace
   // mismatch permitted at the storage boundary.
   const gitlessRunWorkspace = run.workspace?.owner.type === "task"
-    && run.workspace.entries.length === 0;
+    && run.workspace.owner.taskId === item.taskId
+    && aggregate.task.projectBindings.length === 0
+    && run.workspace.entries.length === 0
+    && (() => {
+      const durable = aggregate.managedWorkspaces[managedWorkspaceKey(run.workspace!.owner)];
+      return durable !== undefined && isDeepStrictEqual(durable, run.workspace);
+    })();
   if (!gitlessRunWorkspace
     && (candidate.workspace === undefined) !== (run.workspace === undefined)) {
     throw new StorageRecordError(`${label} workspace does not match its source Run.`);
@@ -3075,18 +3137,14 @@ function assertAgentRunExecutionReferences(
     ? (run.reviewRoundId === undefined
       ? undefined
       : aggregate.reviewRounds[run.reviewRoundId]?.executionGroup)
-    : (run.workItemId === undefined
+    : (run.workItemId === undefined || run.executionGroupId === undefined
       ? undefined
-      : aggregate.workItems[run.workItemId]?.executionGroup);
-  // A few historical/diagnostic paths persist a detached execution Run after
-  // removing its WorkItem or ReviewRound reference (for example, a
-  // cross-Task mailbox-fence fixture).  The pair is still validated by the
-  // Run model, but there is no owner aggregate against which a lane can be
-  // checked.  Leave that legacy shape readable; new dispatched Runs always
-  // carry their owner reference and take the strict branch below.
-  if (ownerGroup === undefined
-    && run.purpose === "execution"
-    && run.workItemId === undefined) return;
+      : (() => {
+          const item = aggregate.workItems[run.workItemId];
+          return item === undefined
+            ? undefined
+            : workItemExecutionGroupById(item, run.executionGroupId!);
+        })());
   if (ownerGroup === undefined) {
     throw new StorageRecordError(`Agent Run ExecutionGroup not found: ${run.id}.`);
   }
@@ -3106,8 +3164,7 @@ function compatibleExecutionGroups(
 ): boolean {
   if (existing === undefined) return true;
   if (candidate === undefined) return false;
-  return existing.id === candidate.id
-    && isDeepStrictEqual(existing.target, candidate.target);
+  return isExecutionGroupTransition(existing, candidate);
 }
 
 /** Candidate freezes Git commits at yield time, so timestamp/baseCommit fields

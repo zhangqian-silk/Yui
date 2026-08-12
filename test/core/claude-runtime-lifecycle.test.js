@@ -38,6 +38,7 @@ import {
 } from "../../dist/runtime/exactControlPlane.js";
 import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
 import { installMockProviderCommands } from "../helpers/mockProviderCommands.js";
+import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 function fixture(t) {
   const { home } = workflowFixture(t);
@@ -78,7 +79,9 @@ function workflowFixture(t) {
   const first = new Date("2026-08-02T02:00:00.000Z");
   const second = new Date("2026-08-02T02:00:01.000Z");
   const agent = createConfiguredAgent("claude-primary", "claude", "claude", [], [], first);
-  const task = activateTask(createTask("task-1", "Claude lifecycle", first), first);
+  const task = activateTask(createTask("task-1", "Claude lifecycle", first, {
+    cwd: home
+  }), first);
   const binding = createRoleAgentBinding(agent);
   const leader = createRole(task.id, "leader", [binding], agent.id, home, first);
   const worker = createRole(task.id, "worker", [binding], agent.id, home, first);
@@ -105,6 +108,7 @@ function workflowFixture(t) {
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, first));
     tx.saveRole(task.id, leader);
     tx.saveRole(task.id, updateRoleStatus(worker, "running", first));
     tx.saveWorkItem(task.id, item);

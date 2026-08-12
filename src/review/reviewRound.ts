@@ -13,6 +13,7 @@ import {
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
 import {
+  assertExecutionGroupTransition,
   validateExecutionGroup,
   type ExecutionFinding,
   type ExecutionGroup
@@ -338,6 +339,7 @@ export function updateReviewExecutionGroup(
     throw new Error(`ReviewRound ExecutionGroup target is immutable: ${round.id}.`);
   }
   if (JSON.stringify(round.executionGroup) === JSON.stringify(executionGroup)) return round;
+  assertExecutionGroupTransition(round.executionGroup, executionGroup);
   return validateReviewRound({ ...round, executionGroup });
 }
 

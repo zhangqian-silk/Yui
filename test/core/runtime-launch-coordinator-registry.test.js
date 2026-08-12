@@ -44,6 +44,7 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 const NOW = new Date("2026-07-24T00:00:00.000Z");
 
@@ -61,7 +62,9 @@ function fixture(t, adapterId = "codex") {
     [],
     NOW
   );
-  const task = activateTask(createTask("task-1", "Runtime launch", NOW), NOW);
+  const task = activateTask(createTask("task-1", "Runtime launch", NOW, {
+    cwd: home
+  }), NOW);
   const binding = createRoleAgentBinding(agent);
   const roles = ["leader", "worker"].map((roleName) => (
     createRole(task.id, roleName, [binding], agent.id, home, NOW)
@@ -69,6 +72,7 @@ function fixture(t, adapterId = "codex") {
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, NOW));
     for (const role of roles) tx.saveRole(task.id, role);
   });
   return {

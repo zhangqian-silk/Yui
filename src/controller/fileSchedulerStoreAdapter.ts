@@ -92,6 +92,7 @@ import {
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
+  currentWorkItemExecutionGroup,
   updateWorkItemExecutionGroup,
   updateWorkItemStatus
 } from "../workItem/workItem.js";
@@ -132,6 +133,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
   listTasks() { return this.store.listTasks(); }
   getTask(taskId: string) { return this.store.getTask(taskId); }
+  getTaskWorkspace(taskId: string) { return this.store.getTaskWorkspace(taskId); }
   getTaskBrief(taskId: string) { return this.store.getTaskBrief(taskId); }
   listDecisions(taskId: string) { return this.store.listDecisions(taskId); }
   listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
@@ -934,9 +936,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (item !== null && ![
           "completed", "failed", "retired"
         ].includes(item.status)) {
-          const groupedPanel = item.executionGroup !== undefined
-            && item.executionGroup.lanes.length > 1
-            && item.executionGroup.resolution === undefined;
+          const group = currentWorkItemExecutionGroup(item);
+          const groupedPanel = group !== undefined
+            && group.lanes.length > 1
+            && group.resolution === undefined;
           if (!groupedPanel) {
             store.saveWorkItem(
               input.taskId,
@@ -1156,11 +1159,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           // record revisions, matching the aggregate terminalization path.
           if (currentRun.executionGroupId !== undefined
             && currentRun.executionLaneId !== undefined
-            && workItem.executionGroup !== undefined) {
+            && currentWorkItemExecutionGroup(workItem) !== undefined) {
+            const group = currentWorkItemExecutionGroup(workItem)!;
             store.saveWorkItem(task.id, updateWorkItemExecutionGroup(
               workItem,
               recordExecutionLaneResult(
-                workItem.executionGroup,
+                group,
                 currentRun.executionLaneId,
                 { summary: input.summary },
                 "failed",
@@ -1170,9 +1174,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             ));
           }
           const laneUpdated = store.getWorkItem(task.id, currentRun.workItemId)!;
-          const groupedPanel = laneUpdated.executionGroup !== undefined
-            && laneUpdated.executionGroup.lanes.length > 1
-            && laneUpdated.executionGroup.resolution === undefined;
+          const laneGroup = currentWorkItemExecutionGroup(laneUpdated);
+          const groupedPanel = laneGroup !== undefined
+            && laneGroup.lanes.length > 1
+            && laneGroup.resolution === undefined;
           if (!groupedPanel) {
             store.saveWorkItem(
               task.id,
