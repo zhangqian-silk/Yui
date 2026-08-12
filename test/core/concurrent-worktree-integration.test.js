@@ -613,6 +613,77 @@ test("ChangeSet capture rejects a branch escape and a HEAD unrelated to the reco
   );
 });
 
+test("Task retirement accepts a clean WorkItem tree published in remote history", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-retirement-publication-"));
+  const repositoryPath = join(root, "repository");
+  const remotePath = join(root, "remote.git");
+  git(["init", "--bare", remotePath]);
+  git(["init", "-b", "master", repositoryPath]);
+  git(["-C", repositoryPath, "config", "user.name", "Test"]);
+  git(["-C", repositoryPath, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repositoryPath, "published.txt"), "base\n");
+  git(["-C", repositoryPath, "add", "published.txt"]);
+  git(["-C", repositoryPath, "commit", "-m", "base"]);
+  git(["-C", repositoryPath, "remote", "add", "origin", remotePath]);
+  git(["-C", repositoryPath, "push", "-u", "origin", "master"]);
+
+  const home = join(root, "home");
+  mkdirSync(home);
+  ensureStorageSchema(home, now);
+  const store = new FileTaskStore(home);
+  const workspaceRoot = join(root, "workspace");
+  mkdirSync(workspaceRoot);
+  store.saveConfig({ schemaVersion: 1, defaultWorkspace: workspaceRoot });
+  const project = createProject(
+    store.nextProjectId(),
+    "fixture",
+    repositoryPath,
+    { stable: "master", development: "master" },
+    now,
+    { remoteUrl: remotePath }
+  );
+  store.saveProject(project);
+  const task = activateTask(createTask(store.nextTaskId(), "Published retirement", now, {
+    projectBindings: [{ projectId: project.id, directory: project.name, baseRef: "master" }]
+  }), now);
+  store.saveTask(task);
+  const workItem = createWorkItem(store.nextWorkItemId(task.id), task.id, {
+    title: "Operator-delivered fix",
+    acceptance: [],
+    dependsOn: [],
+    writeProjectIds: [project.id]
+  }, now);
+  store.saveWorkItem(task.id, workItem);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => now);
+  await preparer.prepareTaskWorkspace(task.id);
+  const workspace = await preparer.prepareWorkItemWorkspace(task.id, workItem.id);
+  const entry = workspace.entries[0];
+  writeFileSync(join(entry.path, "published.txt"), "delivered\n");
+  git(["-C", entry.path, "add", "published.txt"]);
+  git(["-C", entry.path, "commit", "-m", "worktree delivery"]);
+
+  writeFileSync(join(repositoryPath, "published.txt"), "delivered\n");
+  git(["-C", repositoryPath, "add", "published.txt"]);
+  git(["-C", repositoryPath, "commit", "-m", "squash-published delivery"]);
+  const publishedCommit = git(["-C", repositoryPath, "rev-parse", "HEAD"]).trim();
+  git(["-C", repositoryPath, "push", "origin", "master"]);
+
+  const proof = await new WorkItemChangeSetManager(store, () => now)
+    .assertRetirable(task.id);
+  const workItemProof = proof.workspaces.find(
+    ({ ownerKey }) => ownerKey === `work-item:${task.id}:${workItem.id}`
+  );
+  assert.equal(workItemProof.projects[0].publishedCommit, publishedCommit);
+
+  writeFileSync(join(entry.path, "unpublished.txt"), "not remote\n");
+  git(["-C", entry.path, "add", "unpublished.txt"]);
+  git(["-C", entry.path, "commit", "-m", "unpublished follow-up"]);
+  await assert.rejects(
+    new WorkItemChangeSetManager(store, () => now).assertRetirable(task.id),
+    /uncaptured WorkItem commits/
+  );
+});
+
 async function createWriteResult(
   store,
   preparer,

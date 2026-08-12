@@ -139,6 +139,37 @@ export interface GitWorkspacePort {
 
 /** The small Git boundary used by project registration and Task workspaces. */
 export class NodeGitWorkspace implements GitWorkspacePort {
+  async findCommitWithSameTreeInHistory(input: Readonly<{
+    repositoryPath: string;
+    sourceCommit: string;
+    historyHead: string;
+  }>): Promise<string | null> {
+    const source = (await this.inspect(input.repositoryPath, input.sourceCommit)).baseCommit;
+    const history = (await this.inspect(input.repositoryPath, input.historyHead)).baseCommit;
+    if (await this.isAncestor(input.repositoryPath, source, history)) return source;
+    const sourceTree = await gitLine([
+      "-C", input.repositoryPath,
+      "rev-parse", "--verify", "--end-of-options", `${source}^{tree}`
+    ]);
+    const pageSize = 1000;
+    for (let skip = 0; ; skip += pageSize) {
+      const output = await git([
+        "-C", input.repositoryPath,
+        "log", `--max-count=${pageSize}`, `--skip=${skip}`,
+        "--format=%H%x09%T", history
+      ]);
+      const lines = output.trimEnd().split("\n").filter(Boolean);
+      for (const line of lines) {
+        const [commit, tree, ...extra] = line.split("\t");
+        if (extra.length > 0 || commit === undefined || tree === undefined) {
+          throw new Error("Git returned invalid publication history.");
+        }
+        if (tree === sourceTree) return commit;
+      }
+      if (lines.length < pageSize) return null;
+    }
+  }
+
   /**
    * Resolve the configured Project branch directly from its remote.  This is
    * deliberately read-only: unlike `refresh`, it never advances the stable

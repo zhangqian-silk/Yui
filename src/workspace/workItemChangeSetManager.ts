@@ -30,6 +30,7 @@ export type ProjectIntegrationProof = Readonly<{
   baseCommit: string;
   headCommit: string;
   changeSetId?: string;
+  publishedCommit?: string;
 }>;
 
 export type WorkItemIntegrationProof = Readonly<{
@@ -200,6 +201,28 @@ export class WorkItemChangeSetManager {
       );
     }
     const git = new NodeGitWorkspace();
+    const remoteHeads = new Map<string, string>();
+    const findPublishedCommit = async (
+      entry: WorkspaceProjectEntry,
+      headCommit: string
+    ): Promise<string | null> => {
+      const project = this.store.getProject(entry.projectId);
+      if (project?.remoteUrl === undefined) return null;
+      let remoteHead = remoteHeads.get(project.id);
+      if (remoteHead === undefined) {
+        remoteHead = (await git.fetchRemoteHeadIntoWorktree({
+          repositoryPath: entry.path,
+          remoteUrl: project.remoteUrl,
+          branch: project.developmentBranch
+        })).commit;
+        remoteHeads.set(project.id, remoteHead);
+      }
+      return git.findCommitWithSameTreeInHistory({
+        repositoryPath: entry.path,
+        sourceCommit: headCommit,
+        historyHead: remoteHead
+      });
+    };
     const workspaces: TaskRetirementWorkspaceProof[] = [];
     for (const workspace of this.store.listManagedWorkspaces(task.id)) {
       const projects: ProjectIntegrationProof[] = [];
@@ -224,10 +247,20 @@ export class WorkItemChangeSetManager {
               || latest.headCommit !== headCommit
               || latest.branch !== entry.branch
             ) {
-              throw new Error(
-                `Task retirement would hide uncaptured WorkItem commits: `
-                + `${workspace.owner.workItemId}/${entry.projectId}.`
-              );
+              const publishedCommit = await findPublishedCommit(entry, headCommit);
+              if (publishedCommit === null) {
+                throw new Error(
+                  `Task retirement would hide uncaptured WorkItem commits: `
+                  + `${workspace.owner.workItemId}/${entry.projectId}.`
+                );
+              }
+              projects.push({
+                projectId: entry.projectId,
+                baseCommit: entry.baseCommit,
+                headCommit,
+                publishedCommit
+              });
+              continue;
             }
             projects.push({
               projectId: entry.projectId,
@@ -243,10 +276,20 @@ export class WorkItemChangeSetManager {
             && attempt.candidateCommit === headCommit
           ));
           if (committed === undefined) {
-            throw new Error(
-              `Task retirement would hide uncaptured Task workspace commits: `
-              + `${task.id}/${entry.projectId}.`
-            );
+            const publishedCommit = await findPublishedCommit(entry, headCommit);
+            if (publishedCommit === null) {
+              throw new Error(
+                `Task retirement would hide uncaptured Task workspace commits: `
+                + `${task.id}/${entry.projectId}.`
+              );
+            }
+            projects.push({
+              projectId: entry.projectId,
+              baseCommit: entry.baseCommit,
+              headCommit,
+              publishedCommit
+            });
+            continue;
           }
         }
         projects.push({
