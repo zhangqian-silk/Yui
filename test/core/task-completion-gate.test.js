@@ -266,10 +266,14 @@ test("completion reconciliation merges a moved remote only in managed Integratio
 test("remote completion fetch and merge do not depend on shared FETCH_HEAD", async (t) => {
   const fx = fixture(t);
   const { entry } = await seedCommittedIntegration(fx);
+  // Seed the pseudo-ref through the supported Git transport while the remote
+  // still points at the original base. Newer Git versions reject update-ref
+  // against FETCH_HEAD directly.
+  git(entry.path, ["fetch", "--no-tags", fx.remote, "refs/heads/main"]);
+  assert.equal(git(entry.path, ["rev-parse", "FETCH_HEAD"]), fx.base);
   const remoteHead = advanceRemote(fx);
   const gitWorkspace = new NodeGitWorkspace();
 
-  git(entry.path, ["update-ref", "FETCH_HEAD", fx.base]);
   const fetched = await gitWorkspace.fetchRemoteHeadIntoWorktree({
     repositoryPath: entry.path,
     remoteUrl: fx.remote,
