@@ -263,6 +263,43 @@ test("completion reconciliation merges a moved remote only in managed Integratio
   assert.equal(fx.store.getIntegrationAttempt(fx.task.id, reconciled[0].integrationId).status, "committed");
 });
 
+test("remote completion fetch and merge do not depend on shared FETCH_HEAD", async (t) => {
+  const fx = fixture(t);
+  const { entry } = await seedCommittedIntegration(fx);
+  const remoteHead = advanceRemote(fx);
+  const gitWorkspace = new NodeGitWorkspace();
+
+  git(entry.path, ["update-ref", "FETCH_HEAD", fx.base]);
+  const fetched = await gitWorkspace.fetchRemoteHeadIntoWorktree({
+    repositoryPath: entry.path,
+    remoteUrl: fx.remote,
+    branch: "main"
+  });
+  assert.equal(fetched.commit, remoteHead);
+  assert.equal(git(entry.path, ["rev-parse", "FETCH_HEAD"]), fx.base);
+  assert.equal(
+    git(entry.path, ["for-each-ref", "--format=%(refname)", "refs/yui/task-baselines"]),
+    ""
+  );
+
+  // The managed Integration merge must consume its own fetched commit rather
+  // than the repository-global FETCH_HEAD left by another operation.
+  const result = await gitWorkspace.mergeRemoteIntoWorktree({
+    repositoryPath: entry.path,
+    remoteUrl: fx.remote,
+    branch: "main"
+  });
+  assert.equal(result.changed, true);
+  assert.equal(
+    git(entry.path, ["merge-base", "--is-ancestor", remoteHead, "HEAD"]),
+    ""
+  );
+  assert.equal(
+    git(entry.path, ["for-each-ref", "--format=%(refname)", "refs/yui/task-baselines"]),
+    ""
+  );
+});
+
 test("remote-only reconciliation does not replay a distinct isolated WorkItem source commit", async (t) => {
   const fx = fixture(t);
   const { entry, taskHead, sourceHead } = await seedCommittedIntegrationWithDistinctSource(fx);
