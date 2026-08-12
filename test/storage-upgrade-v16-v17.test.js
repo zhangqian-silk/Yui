@@ -21,6 +21,7 @@ import {
   recordRoleAgentSession
 } from "../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../dist/executor/effectiveLaunch.js";
+import { createAgentRun, yieldAgentRun } from "../dist/run/agentRun.js";
 import { createWorkItemChangeSet } from "../dist/integration/changeSet.js";
 import {
   createIntegrationAttempt,
@@ -61,10 +62,32 @@ function aggregateV16Home(t, { durableGraph = false } = {}) {
   const manifestPath = join(home, "schema.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   manifest.aggregateSchemaVersion = 16;
+  if (durableGraph) manifest.recordVersions.managedWorkspace = 1;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   const statePath = join(home, "state.json");
   const state = JSON.parse(readFileSync(statePath, "utf8"));
   state.schemaVersion = 16;
+  if (durableGraph) downgradeManagedWorkspaceFamily(state);
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  return { base, home, durable };
+}
+
+function managedWorkspaceV1Home(t) {
+  const base = mkdtempSync(join(tmpdir(), "yui-managed-workspace-v1-v2-"));
+  const home = join(base, "home");
+  assert.ok(home.startsWith(tmpdir()), `test Home must be under the temp dir: ${home}`);
+  mkdirSync(home, { recursive: true });
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  ensureStorageSchema(home, NOW);
+  const durable = seedDurableGraph(base, new FileTaskStore(home));
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.recordVersions.managedWorkspace = 1;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const statePath = join(home, "state.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  downgradeManagedWorkspaceFamily(state);
   writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
   return { base, home, durable };
 }
@@ -204,6 +227,29 @@ function seedDurableGraph(base, store) {
   store.transaction((tx) => {
     tx.saveManagedWorkspace(workspace);
     tx.saveReviewRound(task.id, attachReviewRoundWorkspace(round, workspace));
+    const reviewer = tx.getRole(task.id, "reviewer");
+    const effectiveReview = resolveEffectiveLaunch({
+      role: reviewer,
+      purpose: "review",
+      workspace,
+      reviewRoundId: round.id,
+      reviewBaseCommit: round.reviewBaseCommit
+    });
+    tx.saveAgentRun(yieldAgentRun(createAgentRun(
+      "agent-run-1",
+      task.id,
+      reviewer.name,
+      "new",
+      "Review the frozen Candidate.",
+      NOW,
+      {
+        purpose: "review",
+        workItemId: item.id,
+        reviewRoundId: round.id,
+        workspace,
+        effective: effectiveReview
+      }
+    ), "Review complete.", NOW));
   });
   return {
     taskId: task.id,
@@ -212,6 +258,21 @@ function seedDurableGraph(base, store) {
     integrationAttemptId: "integration-1",
     sessionRoleName: leader.name
   };
+}
+
+function downgradeManagedWorkspaceFamily(state) {
+  const visit = (value) => {
+    if (value && typeof value === "object" && !Array.isArray(value)
+      && value.owner && value.root && value.entries && value.schemaVersion === 2) {
+      value.schemaVersion = 1;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+    } else if (value && typeof value === "object") {
+      Object.values(value).forEach(visit);
+    }
+  };
+  visit(state.tasks);
 }
 
 function runCli(home, args) {
@@ -285,10 +346,14 @@ test("normal commands refuse raw v16 while execute preserves the durable graph",
   assert.ok(upgraded.json.data.backupPath);
   const afterManifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
   const afterState = JSON.parse(readFileSync(join(home, "state.json"), "utf8"));
-  const expectedState = structuredClone(beforeState);
-  expectedState.schemaVersion = 17;
   assert.equal(afterManifest.aggregateSchemaVersion, 17);
-  assert.deepEqual(afterState, expectedState);
+  assert.equal(afterManifest.recordVersions.managedWorkspace, 2);
+  assert.equal(afterState.schemaVersion, 17);
+  const beforeWithoutWorkspaceVersions = structuredClone(beforeState);
+  const afterWithoutWorkspaceVersions = structuredClone(afterState);
+  downgradeManagedWorkspaceFamily(afterWithoutWorkspaceVersions);
+  afterWithoutWorkspaceVersions.schemaVersion = 16;
+  assert.deepEqual(afterWithoutWorkspaceVersions, beforeWithoutWorkspaceVersions);
 
   assert.ok(afterState.tasks[durable.taskId]);
   assert.ok(afterState.tasks[durable.taskId].workItems[durable.workItemId]);
@@ -300,6 +365,13 @@ test("normal commands refuse raw v16 while execute preserves the durable graph",
     ({ owner }) => owner.type === "review-round"
       && owner.reviewRoundId === durable.reviewRoundId
   ));
+  const migratedTask = afterState.tasks[durable.taskId];
+  assert.equal(
+    Object.values(migratedTask.managedWorkspaces)[0].schemaVersion,
+    2
+  );
+  assert.equal(migratedTask.reviewRounds[durable.reviewRoundId].workspace.schemaVersion, 2);
+  assert.equal(migratedTask.agentRuns["agent-run-1"].workspace.schemaVersion, 2);
   assert.ok(afterState.globalRoleSessionSets[durable.sessionRoleName]);
 
   assert.equal(
@@ -310,6 +382,33 @@ test("normal commands refuse raw v16 while execute preserves the durable graph",
     readFileSync(join(upgraded.json.data.backupPath, "state.json"), "utf8"),
     beforeStateText
   );
+  assert.doesNotThrow(() => new FileTaskStore(home).listTasks());
+});
+
+test("record-only managedWorkspace upgrade preserves embedded lifecycle snapshots", (t) => {
+  const { base, home, durable } = managedWorkspaceV1Home(t);
+  const before = sourceSnapshot(base, home);
+  const dryRun = runCli(home, ["--json", "upgrade", "--dry-run"]);
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  assert.equal(dryRun.json.data.outcome, "dry-run");
+  assert.deepEqual(dryRun.json.data.report.steps, [{
+    axis: "record",
+    recordKind: "managedWorkspace",
+    fromVersion: 1,
+    toVersion: 2,
+    transition: "offline-migration",
+    declaredEffects: []
+  }]);
+  assert.equal(existsSync(`${home}.upgrade-staging`), false);
+  assert.deepEqual(sourceSnapshot(base, home), before);
+
+  const upgraded = runCli(home, ["--json", "upgrade"]);
+  assert.equal(upgraded.status, 0, upgraded.stderr);
+  const after = JSON.parse(readFileSync(join(home, "state.json"), "utf8"));
+  const task = after.tasks[durable.taskId];
+  assert.equal(task.reviewRounds[durable.reviewRoundId].workspace.schemaVersion, 2);
+  assert.equal(task.agentRuns["agent-run-1"].workspace.schemaVersion, 2);
+  assert.ok(Object.values(task.managedWorkspaces).every(({ schemaVersion }) => schemaVersion === 2));
   assert.doesNotThrow(() => new FileTaskStore(home).listTasks());
 });
 
