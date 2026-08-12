@@ -356,6 +356,11 @@ export class GitIntegrationService {
         const affectedPaths = (await git([
           "-C", candidatePath, "diff", "--name-only", "--diff-filter=U"
         ])).trim().split("\n").filter(Boolean);
+        if (affectedPaths.length === 0
+          && await isEmptyCherryPick(candidatePath, commit)) {
+          await git(["-C", candidatePath, "cherry-pick", "--skip"]);
+          continue;
+        }
         const pending = requireLeaderDecision(attempt, {
           affectedPaths,
           summary: `ChangeSet ${changeSetId} conflicts with ${attempt.targetRef}.`
@@ -443,6 +448,19 @@ export class GitIntegrationService {
       ...(workspace === undefined ? {} : { workspace })
     };
   }
+}
+
+async function isEmptyCherryPick(path: string, commit: string): Promise<boolean> {
+  let cherryPickHead: string;
+  try {
+    cherryPickHead = await gitLine([
+      "-C", path, "rev-parse", "--verify", "CHERRY_PICK_HEAD^{commit}"
+    ]);
+  } catch {
+    return false;
+  }
+  return cherryPickHead === commit
+    && await gitSucceeds(["-C", path, "diff", "--cached", "--quiet"]);
 }
 
 async function integrationCommitPlan(

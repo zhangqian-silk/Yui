@@ -15,6 +15,7 @@ import test from "node:test";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
+import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { createIntegrationAttempt } from "../../dist/integration/integrationAttempt.js";
 import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
@@ -326,6 +327,54 @@ console.log(JSON.stringify({ descriptor, environment: expected }));
   assert.notEqual(advancedHead, baseCommit);
   assert.equal(readFileSync(join(repositoryPath, "shared.txt"), "utf8"), "first\n");
   assert.equal(git(["-C", repositoryPath, "status", "--porcelain"]), "");
+
+  const equivalentTree = git([
+    "-C", repositoryPath, "rev-parse", `${advancedHead}^{tree}`
+  ]).trim();
+  const equivalentCommit = git([
+    "-C", repositoryPath,
+    "-c", "user.name=Test",
+    "-c", "user.email=test@example.com",
+    "commit-tree", equivalentTree,
+    "-p", baseCommit,
+    "-m", "equivalent independently published change"
+  ]).trim();
+  const equivalentChangeSet = createWorkItemChangeSet({
+    id: store.nextChangeSetId(task.id),
+    taskId: task.id,
+    workItemId: first.id,
+    projectId: project.id,
+    baseCommit,
+    headCommit: equivalentCommit,
+    branch: firstResult.changeSet.branch,
+    changedPaths: ["shared.txt"]
+  }, now);
+  store.saveChangeSet(task.id, equivalentChangeSet);
+  const equivalentIntegration = createIntegrationAttempt({
+    id: store.nextIntegrationAttemptId(task.id),
+    taskId: task.id,
+    projectId: project.id,
+    targetRef: "master",
+    expectedHead: advancedHead,
+    changeSetIds: [equivalentChangeSet.id]
+  }, now);
+  store.saveIntegrationAttempt(task.id, equivalentIntegration);
+  const equivalentResult = await new GitIntegrationService(
+    home,
+    store,
+    undefined,
+    () => now
+  ).integrate(task.id, equivalentIntegration.id);
+  assert.equal(equivalentResult.status, "committed");
+  assert.equal(equivalentResult.attempt.candidateCommit, advancedHead);
+  assert.equal(git(["-C", repositoryPath, "rev-parse", "master"]).trim(), advancedHead);
+  assert.match(
+    (await runTaskIntegrationCommand([
+      "cleanup", `${task.id}/${equivalentIntegration.id}`
+    ], store, home)).output,
+    /Cleaned Integration worktree/
+  );
+
   store.saveWorkItem(task.id, updateWorkItemStatus(
     store.getWorkItem(task.id, first.id),
     "completed",
