@@ -51,6 +51,7 @@ const PUBLIC_PATHS = [
   "project add",
   "project clone",
   "project refresh",
+  "project migrate",
   "project update",
   "project discover",
   "project list",
