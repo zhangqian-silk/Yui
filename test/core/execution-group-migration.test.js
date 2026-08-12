@@ -66,6 +66,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
       toVersion
     })),
     [
+      { recordKind: undefined, fromVersion: 17, toVersion: 18 },
       { recordKind: "activeRunPointer", fromVersion: 1, toVersion: 2 },
       { recordKind: "activeRunPointer", fromVersion: 2, toVersion: 3 },
       { recordKind: "agentRun", fromVersion: 5, toVersion: 6 },

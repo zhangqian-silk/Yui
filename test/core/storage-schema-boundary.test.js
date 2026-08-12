@@ -47,7 +47,7 @@ function currentRecordVersionManifest() {
 
 test("storage inspection keeps layout and aggregate schema versions separate", () => {
   const home = temporaryHome();
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 17);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
 
   writeManifest(home);
   assert.deepEqual(inspectStorageSchema(home), {
@@ -85,7 +85,7 @@ test("the previous aggregate schema is rejected without migration", () => {
 
   assert.throws(
     () => requireStorageSchema(home),
-    /aggregate schema 7 is older than required.*version 17.*no migration/i
+    /aggregate schema 7 is older than required.*version 18.*no migration/i
   );
 });
 
@@ -186,7 +186,7 @@ test("final review policy is fenced from aggregate-v16 consumers", () => {
   assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
   assert.equal(result.classification.blocker.reason, "future-version");
   assert.equal(result.classification.blocker.axis, "aggregate");
-  assert.equal(result.classification.blocker.found, 17);
+  assert.equal(result.classification.blocker.found, 18);
   assert.equal(result.classification.blocker.supported, 16);
 });
 
@@ -210,7 +210,7 @@ test("an aggregate-v16 Home containing final fails at the storage gate", () => {
 
   assert.throws(
     () => new FileTaskStore(home),
-    /Aggregate schema 16 is older than required aggregate version 17/
+    /Aggregate schema 16 is older than required aggregate version 18/
   );
   const result = classify(home);
   assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");

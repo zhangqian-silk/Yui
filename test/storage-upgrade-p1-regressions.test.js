@@ -576,7 +576,7 @@ test("P1-1 aggregate family: StoredTask 14->13 is a record missing-step, not cor
   const scan = scanSourceRecordVersions(home, currentRecordVersions());
   assert.ok("record" in scan);
   assert.equal(scan.record.storedTask.version, 13);
-  assert.equal(scan.record.task.version, 3, "nested task family remains independently scanned");
+  assert.equal(scan.record.task.version, 4, "nested task family remains independently scanned");
 
   const result = classifyHome({ home, registry: EMPTY(), latest: LATEST() });
   assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
