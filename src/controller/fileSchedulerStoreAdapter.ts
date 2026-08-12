@@ -938,7 +938,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ].includes(item.status)) {
           const group = currentWorkItemExecutionGroup(item);
           const groupedPanel = group !== undefined
-            && group.lanes.length > 1
+            && (group.lanes.length > 1 || group.strategy.mode === "adaptive")
             && group.resolution === undefined;
           if (!groupedPanel) {
             store.saveWorkItem(
@@ -1176,7 +1176,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           const laneUpdated = store.getWorkItem(task.id, currentRun.workItemId)!;
           const laneGroup = currentWorkItemExecutionGroup(laneUpdated);
           const groupedPanel = laneGroup !== undefined
-            && laneGroup.lanes.length > 1
+            && (laneGroup.lanes.length > 1 || laneGroup.strategy.mode === "adaptive")
             && laneGroup.resolution === undefined;
           if (!groupedPanel) {
             store.saveWorkItem(
