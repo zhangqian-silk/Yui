@@ -129,7 +129,7 @@ export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
 export const CURRENT_TASK_SCHEMA_VERSION = 3 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
-export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 1 as const;
+export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 7 as const;
 export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 3 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 2 as const;
@@ -856,6 +856,30 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(
         `Managed workspace Integration Attempt not found: ${taskId}/${stored.owner.integrationAttemptId}.`
       );
+    }
+    if (stored.owner.type === "execution-lane") {
+      const groupOwner = stored.owner;
+      if (groupOwner.purpose === "execution") {
+        const item = groupOwner.workItemId === undefined
+          ? undefined
+          : aggregate.workItems[groupOwner.workItemId];
+        if (item === undefined || item.executionGroup?.id !== groupOwner.executionGroupId
+          || !item.executionGroup.lanes.some(({ id }) => id === groupOwner.executionLaneId)) {
+          throw new StorageRecordError(
+            `Managed execution Lane WorkItem lineage is invalid: ${taskId}/${groupOwner.executionGroupId}/${groupOwner.executionLaneId}.`
+          );
+        }
+      } else {
+        const round = groupOwner.reviewRoundId === undefined
+          ? undefined
+          : aggregate.reviewRounds[groupOwner.reviewRoundId];
+        if (round === undefined || round.executionGroup?.id !== groupOwner.executionGroupId
+          || !round.executionGroup.lanes.some(({ id }) => id === groupOwner.executionLaneId)) {
+          throw new StorageRecordError(
+            `Managed review Lane ReviewRound lineage is invalid: ${taskId}/${groupOwner.executionGroupId}/${groupOwner.executionLaneId}.`
+          );
+        }
+      }
     }
     assertManagedWorkspaceReferences(aggregate, stored, "Managed workspace");
     const boundProjects = new Set(
@@ -1809,6 +1833,16 @@ function parseState(raw: string): StorageState {
       if (workspace.owner.type === "integration-attempt"
         && aggregate.integrationAttempts[workspace.owner.integrationAttemptId] === undefined) {
         throw new StorageRecordError(`Managed workspace Integration Attempt not found: ${aggregate.task.id}/${workspace.owner.integrationAttemptId}`);
+      }
+      if (workspace.owner.type === "execution-lane") {
+        const laneOwner = workspace.owner;
+        const group = laneOwner.purpose === "execution"
+          ? aggregate.workItems[laneOwner.workItemId ?? ""]?.executionGroup
+          : aggregate.reviewRounds[laneOwner.reviewRoundId ?? ""]?.executionGroup;
+        if (group?.id !== laneOwner.executionGroupId
+          || !group.lanes.some(({ id }) => id === laneOwner.executionLaneId)) {
+          throw new StorageRecordError(`Managed workspace Execution Lane not found: ${aggregate.task.id}/${key}`);
+        }
       }
     }
     validateCanonicalTaskReferences(result, aggregate);
@@ -2777,6 +2811,32 @@ function assertManagedWorkspaceReferences(
       }
       return;
     }
+    case "execution-lane": {
+      const owner = workspace.owner;
+      const group = owner.purpose === "execution"
+        ? aggregate.workItems[owner.workItemId ?? ""]?.executionGroup
+        : aggregate.reviewRounds[owner.reviewRoundId ?? ""]?.executionGroup;
+      if (group === undefined || group.id !== owner.executionGroupId
+        || !group.lanes.some(({ id }) => id === owner.executionLaneId)) {
+        throw new StorageRecordError(
+          `${label} Execution Lane lineage is invalid: ${taskId}/${owner.executionGroupId}/${owner.executionLaneId}.`
+        );
+      }
+      requireVisibleTaskScope();
+      const writable = workspace.entries
+        .filter(({ access }) => access === "write")
+        .map(({ projectId }) => projectId)
+        .sort();
+      const expectedWritable = owner.purpose === "execution"
+        ? [...(aggregate.workItems[owner.workItemId ?? ""]?.writeProjectIds ?? [])].sort()
+        : boundProjects;
+      if (!isDeepStrictEqual(writable, expectedWritable)) {
+        throw new StorageRecordError(
+          `${label} Execution Lane write scope does not match: ${taskId}/${owner.executionLaneId}.`
+        );
+      }
+      return;
+    }
   }
 }
 
@@ -3051,6 +3111,21 @@ function assertCandidateWorkspaceMatchesRun(
   run: ManagedWorkspace,
   label: string
 ): void {
+  if (candidate.owner.type === "work-item" && run.owner.type === "execution-lane") {
+    if (candidate.owner.taskId !== run.owner.taskId
+      || run.owner.purpose !== "execution"
+      || candidate.owner.workItemId !== run.owner.workItemId
+      || candidate.entries.length !== run.entries.length) {
+      throw new StorageRecordError(`${label} workspace lineage does not match its source Lane.`);
+    }
+    for (const source of run.entries) {
+      const target = candidate.entries.find(({ projectId }) => projectId === source.projectId);
+      if (target === undefined || target.directory !== source.directory || target.access !== source.access) {
+        throw new StorageRecordError(`${label} workspace Project scope does not match its source Lane.`);
+      }
+    }
+    return;
+  }
   if (
     candidate.owner.type !== run.owner.type
     || candidate.owner.taskId !== run.owner.taskId

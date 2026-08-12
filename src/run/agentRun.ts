@@ -170,6 +170,20 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     if (run.workspace.owner.type === "integration-attempt") {
       throw new Error("An IntegrationAttempt workspace cannot be used by an Agent run.");
     }
+    if (run.workspace.owner.type === "execution-lane") {
+      if (run.workspace.owner.executionGroupId !== run.executionGroupId
+        || run.workspace.owner.executionLaneId !== run.executionLaneId) {
+        throw new Error("Agent run Execution Lane workspace lineage does not match the Run.");
+      }
+      if (run.workspace.owner.purpose === "execution"
+        && run.workspace.owner.workItemId !== run.workItemId) {
+        throw new Error("Agent run Execution Lane workspace WorkItem does not match the Run.");
+      }
+      if (run.workspace.owner.purpose === "review"
+        && run.workspace.owner.reviewRoundId !== run.reviewRoundId) {
+        throw new Error("Agent run review Lane workspace ReviewRound does not match the Run.");
+      }
+    }
     if (run.workspace.owner.type === "review-round"
       && run.workspace.owner.reviewRoundId !== run.reviewRoundId) {
       throw new Error(
@@ -182,8 +196,11 @@ export function validateAgentRun(run: AgentRun): AgentRun {
       throw new Error("A review Agent run requires WorkItem and ReviewRound references.");
     }
     if (run.workspace === undefined
-      || run.workspace.owner.type !== "review-round"
-      || run.workspace.owner.reviewRoundId !== run.reviewRoundId) {
+      || !((run.workspace.owner.type === "review-round"
+        && run.workspace.owner.reviewRoundId === run.reviewRoundId)
+        || (run.workspace.owner.type === "execution-lane"
+          && run.workspace.owner.purpose === "review"
+          && run.workspace.owner.reviewRoundId === run.reviewRoundId))) {
       throw new Error(
         `A review Agent run requires its exact ReviewRound workspace owner: ${run.reviewRoundId}.`
       );
@@ -198,6 +215,9 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     }
     if (run.workspace?.owner.type === "review-round") {
       throw new Error("An execution Agent run cannot use a ReviewRound-owned workspace.");
+    }
+    if (run.workspace?.owner.type === "execution-lane" && run.workspace.owner.purpose !== "execution") {
+      throw new Error("An execution Agent run cannot use a review Lane workspace.");
     }
   }
   validateEffectiveLaunchSnapshot(run.effective);

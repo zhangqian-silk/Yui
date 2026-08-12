@@ -507,6 +507,20 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       : {})
   })),
   {
+    commandPath: ["task", "work", "group", "resolve"],
+    selectors: [{
+      argumentIndex: 4,
+      entity: "work-item",
+      provider: "work-items",
+      actionTarget: true
+    }],
+    trailingOptions: {
+      "--decision": "value",
+      "--summary": "value",
+      "--lane": "value"
+    }
+  },
+  {
     commandPath: ["task", "review", "request"],
     selectors: [
       {
@@ -523,7 +537,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
         actionTarget: false
       }
     ],
-    trailingOptions: { "--role": "value" }
+    trailingOptions: { "--role": "value", "--strategy": "value", "--lane-role": "value" }
   },
   {
     commandPath: ["task", "integration", "start"],

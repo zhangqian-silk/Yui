@@ -10,6 +10,15 @@ export type ManagedWorkspaceOwner =
       type: "integration-attempt";
       taskId: string;
       integrationAttemptId: string;
+    }>
+  | Readonly<{
+      type: "execution-lane";
+      taskId: string;
+      executionGroupId: string;
+      executionLaneId: string;
+      purpose: "execution" | "review";
+      workItemId?: string;
+      reviewRoundId?: string;
     }>;
 
 export type WorkspaceProjectAccess = "read" | "write";
@@ -25,7 +34,7 @@ export type WorkspaceProjectEntry = Readonly<{
 }>;
 
 export type ManagedWorkspace = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   owner: ManagedWorkspaceOwner;
   root: string;
   entries: readonly WorkspaceProjectEntry[];
@@ -44,7 +53,7 @@ export function createManagedWorkspace(
 ): ManagedWorkspace {
   const timestamp = now.toISOString();
   return validateManagedWorkspace({
-    schemaVersion: 1,
+    schemaVersion: 2,
     owner: validateOwner(input.owner),
     root: resolve(requireText(input.root, "Managed workspace root")),
     entries: normalizeEntries(input.entries),
@@ -56,8 +65,8 @@ export function createManagedWorkspace(
 export function validateManagedWorkspace(
   workspace: ManagedWorkspace
 ): ManagedWorkspace {
-  if (workspace.schemaVersion !== 1) {
-    throw new Error("Managed workspace must use schemaVersion 1.");
+  if (workspace.schemaVersion !== 2) {
+    throw new Error("Managed workspace must use schemaVersion 2.");
   }
   validateOwner(workspace.owner);
   if (
@@ -91,6 +100,8 @@ export function managedWorkspaceKey(owner: ManagedWorkspaceOwner): string {
       return `review-round:${valid.taskId}:${valid.reviewRoundId}`;
     case "integration-attempt":
       return `integration-attempt:${valid.taskId}:${valid.integrationAttemptId}`;
+    case "execution-lane":
+      return `execution-lane:${valid.taskId}:${valid.executionGroupId}:${valid.executionLaneId}`;
   }
 }
 
@@ -105,6 +116,8 @@ export function managedWorktreeName(owner: ManagedWorkspaceOwner): string {
       return owner.reviewRoundId;
     case "integration-attempt":
       return `integration-${owner.integrationAttemptId}`;
+    case "execution-lane":
+      return `execution-lane-${owner.executionGroupId}-${owner.executionLaneId}`;
   }
 }
 
@@ -174,6 +187,33 @@ function validateOwner(owner: ManagedWorkspaceOwner): ManagedWorkspaceOwner {
         owner.integrationAttemptId,
         "Integration Attempt id"
       )
+    };
+  }
+  if (owner.type === "execution-lane") {
+    const purpose = owner.purpose;
+    if (purpose !== "execution" && purpose !== "review") {
+      throw new Error("Managed execution-lane workspace purpose is invalid.");
+    }
+    const workItemId = owner.workItemId === undefined
+      ? undefined
+      : requireIdentity(owner.workItemId, "Work item id");
+    const reviewRoundId = owner.reviewRoundId === undefined
+      ? undefined
+      : requireIdentity(owner.reviewRoundId, "ReviewRound id");
+    if (purpose === "execution" && workItemId === undefined) {
+      throw new Error("Managed execution-lane workspace requires a Work Item.");
+    }
+    if (purpose === "review" && reviewRoundId === undefined) {
+      throw new Error("Managed execution-lane workspace requires a ReviewRound.");
+    }
+    return {
+      type: "execution-lane",
+      taskId: requireIdentity(owner.taskId, "Task id"),
+      executionGroupId: requireIdentity(owner.executionGroupId, "ExecutionGroup id"),
+      executionLaneId: requireIdentity(owner.executionLaneId, "ExecutionLane id"),
+      purpose,
+      ...(workItemId === undefined ? {} : { workItemId }),
+      ...(reviewRoundId === undefined ? {} : { reviewRoundId })
     };
   }
   throw new Error("Managed workspace owner is invalid.");

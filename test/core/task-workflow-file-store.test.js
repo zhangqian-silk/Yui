@@ -1089,7 +1089,9 @@ test("fixed multi-Lane Worker execution waits for explicit Leader group resoluti
   assert.equal(accepted.status, "awaiting_acceptance");
   assert.equal(accepted.executionGroup.resolution.decision, "accept");
   assert.equal(accepted.candidates.length, 1);
-  assert.equal(accepted.candidates[0].summary, "Leader accepted the combined evidence");
+  assert.match(accepted.candidates[0].summary, /Leader accepted the combined evidence/);
+  assert.match(accepted.candidates[0].summary, /worker result/);
+  assert.match(accepted.candidates[0].summary, /worker-2 result/);
 });
 
 test("adaptive Worker execution can append a bounded Lane before resolution", (t) => {

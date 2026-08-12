@@ -60,6 +60,8 @@ export type ExecutionLaneResult = Readonly<{
   checks?: readonly ExecutionCheck[];
   findings?: readonly ExecutionFinding[];
   evidence?: readonly string[];
+  /** Commit containing durable evidence produced by this Lane. */
+  evidenceCommit?: string;
 }>;
 
 export type ExecutionLaneWorkspace = Readonly<{
@@ -126,6 +128,7 @@ export type ExecutionGroupSummary = Readonly<{
     checks?: readonly ExecutionCheck[];
     findings?: readonly ExecutionFinding[];
     evidence?: readonly string[];
+    evidenceCommit?: string;
     /** The Leader's group decision, when this Lane was selected. */
     decision?: ExecutionResolution["decision"];
   }>[];
@@ -428,6 +431,7 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
         ...(lane.result.checks === undefined ? {} : { checks: lane.result.checks }),
         ...(lane.result.findings === undefined ? {} : { findings: lane.result.findings }),
         ...(lane.result.evidence === undefined ? {} : { evidence: lane.result.evidence })
+        ,...(lane.result.evidenceCommit === undefined ? {} : { evidenceCommit: lane.result.evidenceCommit })
       }),
       ...(group.resolution === undefined
         || !group.resolution.selectedLaneIds.includes(lane.id)
@@ -599,7 +603,9 @@ function validateLaneResult(result: ExecutionLaneResult): ExecutionLaneResult {
     }
   }
   if (result.evidence !== undefined) result.evidence.forEach((value) => requireText(value, "Execution evidence"));
-  return result;
+  return result.evidenceCommit === undefined
+    ? result
+    : { ...result, evidenceCommit: requireCommit(result.evidenceCommit, "Execution evidence commit") };
 }
 
 function validateResolution(resolution: ExecutionResolution, group: ExecutionGroup): void {

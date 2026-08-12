@@ -224,7 +224,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             && runWorkspace.owner.workItemId === activeRun?.workItemId)
           || (runWorkspace.owner.type === "review-round"
             && activeRun?.purpose === "review"
-            && runWorkspace.owner.reviewRoundId === activeRun.reviewRoundId));
+            && runWorkspace.owner.reviewRoundId === activeRun.reviewRoundId)
+          || (runWorkspace.owner.type === "execution-lane"
+            && runWorkspace.owner.executionGroupId === activeRun?.executionGroupId
+            && runWorkspace.owner.executionLaneId === activeRun?.executionLaneId
+            && ((runWorkspace.owner.purpose === "review" && activeRun?.purpose === "review")
+              || (runWorkspace.owner.purpose === "execution" && activeRun?.purpose === "execution"))));
       if (task.cwd === undefined || main === null || (!runScoped && !sharedMain && !isolated)) {
         throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
       }

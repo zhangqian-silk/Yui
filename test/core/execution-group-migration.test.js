@@ -19,6 +19,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
   sourceRecord.agentRun = { ...sourceRecord.agentRun, version: 5 };
   sourceRecord.reviewRound = { ...sourceRecord.reviewRound, version: 2 };
   sourceRecord.activeRunPointer = { ...sourceRecord.activeRunPointer, version: 1 };
+  sourceRecord.managedWorkspace = { ...sourceRecord.managedWorkspace, version: 1 };
 
   const source = {
     schemaManifest: {
@@ -65,6 +66,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
       { recordKind: "activeRunPointer", fromVersion: 1, toVersion: 2 },
       { recordKind: "activeRunPointer", fromVersion: 2, toVersion: 3 },
       { recordKind: "agentRun", fromVersion: 5, toVersion: 6 },
+      { recordKind: "managedWorkspace", fromVersion: 1, toVersion: 2 },
       { recordKind: "reviewRound", fromVersion: 2, toVersion: 3 },
       { recordKind: "workItem", fromVersion: 6, toVersion: 7 }
     ]
@@ -79,6 +81,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
   assert.equal(migrated.schemaManifest.recordVersions.agentRun, 6);
   assert.equal(migrated.schemaManifest.recordVersions.reviewRound, 3);
   assert.equal(migrated.schemaManifest.recordVersions.activeRunPointer, 3);
+  assert.equal(migrated.schemaManifest.recordVersions.managedWorkspace, 2);
   const task = migrated.state.tasks["task-1"];
   assert.equal(task.workItems["work-item-1"].schemaVersion, 7);
   assert.equal(task.agentRuns["agent-run-1"].schemaVersion, 6);

@@ -63,6 +63,11 @@ export type TaskWorkspaceCleanup = Readonly<{
   retryable?: boolean;
 }>;
 
+export type PreparedExecutionLane = Readonly<{
+  workspace: ManagedWorkspace;
+  persisted: boolean;
+}>;
+
 export class WorkspaceCleanupBlockedError extends Error {
   constructor(
     readonly reason: string,
@@ -427,6 +432,291 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       await this.#discardUnadoptedEntries(task, prepared, item.id);
       throw error;
     }
+  }
+
+  /**
+   * Prepare/reuse a durable physical workspace for an ExecutionGroup Lane.
+   * Git identity, ownership, and cleanup are delegated to this preparer; the
+   * command layer only consumes the resulting managed record.
+   */
+  async prepareExecutionLaneWorkspace(
+    taskId: string,
+    executionGroupId: string,
+    executionLaneId: string,
+    hint?: Readonly<{
+      purpose: "execution" | "review";
+      workItemId?: string;
+      reviewRoundId?: string;
+    }>
+  ): Promise<ManagedWorkspace> {
+    const task = requireTask(this.store, taskId);
+    const lineage = executionLaneLineage(this.store, task, executionGroupId, executionLaneId, hint);
+    const source = lineage.purpose === "execution"
+      ? this.store.getWorkItemWorkspace(taskId, lineage.workItemId)
+      : this.store.getReviewRoundWorkspace(taskId, lineage.reviewRoundId);
+    if (source === null) {
+      throw new Error(`Execution Lane source workspace is not ready: ${executionLaneId}.`);
+    }
+    const owner = lineage.purpose === "execution"
+      ? {
+          type: "execution-lane" as const,
+          taskId,
+          executionGroupId,
+          executionLaneId,
+          purpose: "execution" as const,
+          workItemId: lineage.workItemId
+        }
+      : {
+          type: "execution-lane" as const,
+          taskId,
+          executionGroupId,
+          executionLaneId,
+          purpose: "review" as const,
+          reviewRoundId: lineage.reviewRoundId
+        };
+    const existing = this.store.getManagedWorkspace(owner);
+    if (existing !== null) {
+      if (existing.owner.type !== "execution-lane" || existing.root !== this.#executionLaneWorkspaceRoot(taskId, executionGroupId, executionLaneId)) {
+        throw new Error(`Execution Lane managed workspace identity changed: ${taskId}/${executionLaneId}.`);
+      }
+      await ensureWorkspaceView(existing.root, existing.entries);
+      for (const entry of existing.entries.filter(({ access }) => access === "write")) {
+        const project = requireProject(this.store, entry.projectId);
+        const physical = await this.git.ensureWorktree({
+          repositoryPath: project.path,
+          container: this.#projectContainer(project.name),
+          taskId,
+          roleName: managedWorktreeName(owner),
+          baseRef: entry.baseCommit
+        });
+        if (physical.path !== entry.path || physical.branch !== entry.branch) {
+          throw new Error(`Execution Lane physical identity changed: ${taskId}/${executionLaneId}/${entry.projectId}.`);
+        }
+      }
+      return existing;
+    }
+    const item = lineage.purpose === "execution"
+      ? this.store.getWorkItem(taskId, lineage.workItemId)
+      : null;
+    const writable = new Set(lineage.purpose === "execution"
+      ? item?.writeProjectIds ?? []
+      : task.projectBindings.map(({ projectId }) => projectId));
+    const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
+    try {
+      for (const binding of task.projectBindings) {
+        const project = requireProject(this.store, binding.projectId);
+        const sourceEntry = requireWorkspaceEntry(source, project.id);
+        if (!writable.has(project.id)) {
+          prepared.push({ project, entry: { ...sourceEntry, access: "read" } });
+          continue;
+        }
+        const physical = await this.git.ensureWorktree({
+          repositoryPath: project.path,
+          container: this.#projectContainer(project.name),
+          taskId,
+          roleName: managedWorktreeName(owner),
+          baseRef: sourceEntry.baseCommit
+        });
+        prepared.push({
+          project,
+          entry: {
+            ...sourceEntry,
+            access: "write",
+            path: physical.path,
+            branch: physical.branch,
+            baseRef: sourceEntry.baseCommit,
+            baseCommit: sourceEntry.baseCommit
+          }
+        });
+      }
+      const root = this.#executionLaneWorkspaceRoot(taskId, executionGroupId, executionLaneId);
+      await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
+      const workspace = createManagedWorkspace({
+        owner,
+        root,
+        entries: prepared.map(({ entry }) => entry)
+      }, this.now());
+      if (this.store.listWorkItems(taskId).some((item) => item.executionGroup?.id === executionGroupId)
+        || this.store.listReviewRounds(taskId).some((round) => round.executionGroup?.id === executionGroupId)) {
+        return this.store.transaction((tx) => {
+          const current = tx.getManagedWorkspace(owner);
+          if (current !== null && !isDeepStrictEqual(current, workspace)) {
+            throw new Error(`Execution Lane workspace changed before adoption: ${executionLaneId}.`);
+          }
+          tx.saveManagedWorkspace(current ?? workspace);
+          return current ?? workspace;
+        });
+      }
+      return workspace;
+    } catch (error) {
+      await this.#discardUnadoptedEntries(task, prepared, managedWorktreeName(owner), true);
+      throw error;
+    }
+  }
+
+  /** Merge every selected lane's committed output into the WorkItem owner. */
+  async materializeExecutionGroupCandidate(
+    taskId: string,
+    workItemId: string,
+    executionGroupId: string,
+    selectedLaneIds: readonly string[]
+  ): Promise<Readonly<{ workspace: ManagedWorkspace; snapshot: CandidateGitSnapshot }>> {
+    const item = requireWorkItem(this.store, taskId, workItemId);
+    const group = item.executionGroup;
+    if (group === undefined || group.id !== executionGroupId) {
+      throw new Error(`ExecutionGroup is not attached to Work Item: ${executionGroupId}.`);
+    }
+    const workspace = this.store.getWorkItemWorkspace(taskId, workItemId);
+    if (workspace === null || workspace.owner.type !== "work-item") {
+      throw new Error(`Work Item workspace is not ready for Candidate materialization: ${workItemId}.`);
+    }
+    const selected = (selectedLaneIds.length === 0
+      ? group.lanes.filter((lane) => lane.status === "yielded" || lane.status === "completed")
+      : group.lanes.filter((lane) => selectedLaneIds.includes(lane.id)));
+    if (selected.length === 0) throw new Error(`ExecutionGroup has no selected Lane outputs: ${executionGroupId}.`);
+    const pendingMerges = new Map<string, string[]>();
+    for (const lane of selected) {
+      const laneWorkspace = this.store.getManagedWorkspace({
+        type: "execution-lane",
+        taskId,
+        executionGroupId,
+        executionLaneId: lane.id,
+        purpose: "execution",
+        workItemId
+      });
+      if (laneWorkspace === null) {
+        // fixed(1) retains the WorkItem owner as its single normal-path workspace.
+        if (group.lanes.length === 1) continue;
+        throw new Error(`Selected Execution Lane workspace is not adopted: ${lane.id}.`);
+      }
+      for (const target of workspace.entries.filter(({ access }) => access === "write")) {
+        const source = laneWorkspace.entries.find(({ projectId }) => projectId === target.projectId);
+        if (source === undefined) throw new Error(`Selected Lane omits Project: ${lane.id}/${target.projectId}.`);
+        if (await this.git.headRef(source.path) !== source.branch) {
+          throw new Error(`Selected Lane left its managed branch: ${lane.id}/${target.projectId}.`);
+        }
+        if (!await this.git.isClean(source.path)) {
+          throw new Error(`Selected Lane has uncommitted output: ${lane.id}/${target.projectId}.`);
+        }
+        const sourceHead = (await this.git.inspect(source.path, "HEAD")).baseCommit;
+        const targetHead = (await this.git.inspect(target.path, "HEAD")).baseCommit;
+        if (sourceHead !== targetHead && !await this.git.isAncestor(target.path, sourceHead, targetHead)) {
+          const pending = pendingMerges.get(target.path) ?? [];
+          pending.push(source.branch);
+          pendingMerges.set(target.path, pending);
+        }
+      }
+    }
+    for (const [targetPath, sourceRefs] of pendingMerges) {
+      await this.git.mergeWorktree({ targetPath, sourceRefs });
+    }
+    return { workspace, snapshot: await this.snapshotCandidateWorkspace(workspace) };
+  }
+
+  async cleanupExecutionLaneWorkspace(
+    taskId: string,
+    executionGroupId: string,
+    executionLaneId: string
+  ): Promise<GitWorkspaceRemoval> {
+    const task = requireTask(this.store, taskId);
+    const lineage = executionLaneLineage(this.store, task, executionGroupId, executionLaneId);
+    const group = lineage.purpose === "execution"
+      ? this.store.getWorkItem(taskId, lineage.workItemId)?.executionGroup
+      : this.store.getReviewRound(taskId, lineage.reviewRoundId)?.executionGroup;
+    const lane = group?.lanes.find(({ id }) => id === executionLaneId);
+    if (group === undefined
+      || lane === undefined || !["completed", "failed", "yielded"].includes(lane.status)) {
+      throw new Error(`Execution Lane is not terminally resolved: ${taskId}/${executionLaneId}.`);
+    }
+    const workspace = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
+      owner.type === "execution-lane"
+      && owner.executionGroupId === executionGroupId
+      && owner.executionLaneId === executionLaneId
+    ));
+    if (workspace === undefined) return "missing";
+    const state = await this.#inspectEntries(taskId, managedWorktreeName(workspace.owner), workspace.entries.filter(({ access }) => access === "write"));
+    if (state === "dirty") return "dirty";
+    let removed = false;
+    for (const entry of workspace.entries.filter(({ access }) => access === "write")) {
+      const project = requireProject(this.store, entry.projectId);
+      const result = await this.git.removeWorktree({
+        repositoryPath: project.path,
+        container: this.#projectContainer(project.name),
+        taskId,
+        roleName: managedWorktreeName(workspace.owner),
+        deleteBranch: true
+      });
+      if (result === "dirty") return "dirty";
+      removed ||= result === "removed";
+    }
+    await removeWorkspaceView(workspace.root);
+    this.store.removeManagedWorkspace(workspace.owner);
+    return removed ? "removed" : "missing";
+  }
+
+  /** Remove a physical lane that was prepared but never adopted into a Group. */
+  async discardUnadoptedExecutionLaneWorkspace(workspace: ManagedWorkspace): Promise<GitWorkspaceRemoval> {
+    if (workspace.owner.type !== "execution-lane") {
+      throw new Error("Only an execution-lane workspace can be discarded here.");
+    }
+    if (this.store.getManagedWorkspace(workspace.owner) !== null) return "missing";
+    const state = await this.#inspectEntries(
+      workspace.owner.taskId,
+      managedWorktreeName(workspace.owner),
+      workspace.entries.filter(({ access }) => access === "write")
+    );
+    if (state === "dirty") return "dirty";
+    let removed = false;
+    for (const entry of workspace.entries.filter(({ access }) => access === "write")) {
+      const project = requireProject(this.store, entry.projectId);
+      const result = await this.git.removeWorktree({
+        repositoryPath: project.path,
+        container: this.#projectContainer(project.name),
+        taskId: workspace.owner.taskId,
+        roleName: managedWorktreeName(workspace.owner),
+        deleteBranch: true
+      });
+      if (result === "dirty") return "dirty";
+      removed ||= result === "removed";
+    }
+    await removeWorkspaceView(workspace.root);
+    return removed ? "removed" : "missing";
+  }
+
+  async cleanupExecutionLaneWorkspacesForWorkItem(taskId: string, workItemId: string): Promise<GitWorkspaceRemoval> {
+    let result: GitWorkspaceRemoval = "missing";
+    const item = this.store.getWorkItem(taskId, workItemId);
+    for (const lane of item?.executionGroup?.lanes ?? []) {
+      const owner = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
+        owner.type === "execution-lane" && owner.purpose === "execution"
+          && owner.workItemId === workItemId && owner.executionLaneId === lane.id
+      ));
+      if (owner !== undefined) {
+        if (owner.owner.type !== "execution-lane") continue;
+        const cleaned = await this.cleanupExecutionLaneWorkspace(taskId, owner.owner.executionGroupId, lane.id);
+        if (cleaned === "dirty") return cleaned;
+        if (cleaned === "removed") result = cleaned;
+      }
+    }
+    return result;
+  }
+
+  async cleanupExecutionLaneWorkspacesForReviewRound(taskId: string, reviewRoundId: string): Promise<GitWorkspaceRemoval> {
+    let result: GitWorkspaceRemoval = "missing";
+    const round = this.store.getReviewRound(taskId, reviewRoundId);
+    for (const lane of round?.executionGroup?.lanes ?? []) {
+      const owner = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
+        owner.type === "execution-lane" && owner.purpose === "review"
+          && owner.reviewRoundId === reviewRoundId && owner.executionLaneId === lane.id
+      ));
+      if (owner !== undefined) {
+        if (owner.owner.type !== "execution-lane") continue;
+        const cleaned = await this.cleanupExecutionLaneWorkspace(taskId, owner.owner.executionGroupId, lane.id);
+        if (cleaned === "dirty") return cleaned;
+        if (cleaned === "removed") result = cleaned;
+      }
+    }
+    return result;
   }
 
   async inspectWorkItemWorkspace(
@@ -1091,6 +1381,16 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       safePathSegment(taskId), "reviews", safePathSegment(reviewRoundId));
   }
 
+  #executionLaneWorkspaceRoot(taskId: string, groupId: string, laneId: string): string {
+    return join(
+      resolveTaskRoot(this.home, this.store.getConfig().defaultWorkspace),
+      safePathSegment(taskId),
+      "execution-lanes",
+      safePathSegment(groupId),
+      safePathSegment(laneId)
+    );
+  }
+
   #fallbackWorkspace(): string {
     return this.store.getConfig().defaultWorkspace ?? process.cwd();
   }
@@ -1224,6 +1524,42 @@ function requireWorkspaceEntry(
   const entry = workspace.entries.find((candidate) => candidate.projectId === projectId);
   if (entry === undefined) throw new Error(`Workspace Project not found: ${projectId}.`);
   return entry;
+}
+
+type ExecutionLaneLineage = Readonly<{
+  purpose: "execution" | "review";
+  workItemId: string;
+  reviewRoundId: string;
+}>;
+
+function executionLaneLineage(
+  store: TaskStore,
+  task: Task,
+  executionGroupId: string,
+  executionLaneId: string,
+  hint?: Readonly<{ purpose: "execution" | "review"; workItemId?: string; reviewRoundId?: string }>
+): ExecutionLaneLineage {
+  if (hint?.purpose === "execution" && hint.workItemId !== undefined) {
+    return { purpose: "execution", workItemId: hint.workItemId, reviewRoundId: "" };
+  }
+  if (hint?.purpose === "review" && hint.reviewRoundId !== undefined) {
+    const round = store.getReviewRound(task.id, hint.reviewRoundId);
+    if (round === null) throw new Error(`ReviewRound not found: ${hint.reviewRoundId}.`);
+    return { purpose: "review", workItemId: round.workItemId, reviewRoundId: round.id };
+  }
+  for (const item of store.listWorkItems(task.id)) {
+    if (item.executionGroup?.id === executionGroupId
+      && item.executionGroup.lanes.some(({ id }) => id === executionLaneId)) {
+      return { purpose: "execution", workItemId: item.id, reviewRoundId: "" };
+    }
+  }
+  for (const round of store.listReviewRounds(task.id)) {
+    if (round.executionGroup?.id === executionGroupId
+      && round.executionGroup.lanes.some(({ id }) => id === executionLaneId)) {
+      return { purpose: "review", workItemId: round.workItemId, reviewRoundId: round.id };
+    }
+  }
+  throw new Error(`Execution Lane lineage not found: ${task.id}/${executionGroupId}/${executionLaneId}.`);
 }
 
 function assertWorkItemWorkspaceEligible(

@@ -246,14 +246,22 @@ function extractFindings(value: unknown): readonly ExecutionFinding[] {
     const finding = entry as Record<string, unknown>;
     if (typeof finding.id !== "string"
       || (finding.severity !== "low" && finding.severity !== "medium"
-        && finding.severity !== "high" && finding.severity !== "critical")
+        && finding.severity !== "high" && finding.severity !== "critical"
+        && finding.severity !== "p1" && finding.severity !== "p2")
       || (finding.status !== "open" && finding.status !== "resolved")
       || typeof finding.summary !== "string") {
       return [];
     }
     return [{
       id: requireIdentity(finding.id, "Review finding id"),
-      severity: finding.severity,
+      // Reviewers may use the product-level P1/P2 vocabulary. Execution
+      // groups keep one canonical severity scale so resolution gates remain
+      // stable across Worker and Reviewer reports.
+      severity: finding.severity === "p1"
+        ? "critical"
+        : finding.severity === "p2"
+          ? "high"
+          : finding.severity,
       status: finding.status,
       summary: requireText(finding.summary, "Review finding summary")
     } as ExecutionFinding];

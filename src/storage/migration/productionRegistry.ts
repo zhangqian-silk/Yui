@@ -18,6 +18,8 @@ const ACTIVE_RUN_POINTER_FROM_VERSION = 1;
 const ACTIVE_RUN_POINTER_TO_VERSION = 2;
 const ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION = 2;
 const ACTIVE_RUN_POINTER_NAMESPACE_TO_VERSION = 3;
+const MANAGED_WORKSPACE_FROM_VERSION = 1;
+const MANAGED_WORKSPACE_TO_VERSION = 2;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -57,6 +59,12 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       ACTIVE_RUN_POINTER_FROM_VERSION,
       ACTIVE_RUN_POINTER_TO_VERSION,
       "activeRuns"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
+      "managedWorkspace",
+      MANAGED_WORKSPACE_FROM_VERSION,
+      MANAGED_WORKSPACE_TO_VERSION,
+      "managedWorkspaces"
     ))
     .registerOfflineMigration(activeRunPointerNamespaceStep());
 
@@ -145,36 +153,47 @@ function migrateActiveRunPointerNamespace(snapshot: HomeSnapshot): HomeSnapshot 
       const runId = typeof pointer.runId === "string" ? pointer.runId : "";
       const run = asObject(rawAgentRuns[runId], `Agent run ${taskId}/${runId}`);
       const lane = legacyLaneKeyParts(key);
-      let nextKey = key;
-      if (lane !== null) {
-        const laneBacked = run.executionGroupId === lane.executionGroupId
-          && run.executionLaneId === lane.executionLaneId;
-        const roleBacked = run.roleName === key
-          && run.executionGroupId === undefined
-          && run.executionLaneId === undefined;
-        if (laneBacked && roleBacked) {
-          throw new Error(`Active run pointer is ambiguous: ${taskId}/${key}.`);
-        }
-        if (!laneBacked && !roleBacked) {
-          throw new Error(`Active run pointer lineage is invalid: ${taskId}/${key}.`);
-        }
-        if (laneBacked) nextKey = executionLaneNamespaceKey(lane.executionGroupId, lane.executionLaneId);
-      } else if (key.startsWith("lane:")) {
-        // A malformed lane-looking key is allowed only when it is a legal
-        // legacy Role pointer.  It must not be silently reinterpreted.
-        if (run.roleName !== key || run.executionGroupId !== undefined || run.executionLaneId !== undefined) {
-          throw new Error(`Active run pointer key is malformed: ${taskId}/${key}.`);
-        }
-      } else if (run.roleName !== key || run.executionGroupId !== undefined || run.executionLaneId !== undefined) {
-        throw new Error(`Active run Role pointer is invalid: ${taskId}/${key}.`);
-      }
-      if (nextActiveRuns[nextKey] !== undefined) {
-        throw new Error(`Active run pointer key collides after migration: ${taskId}/${nextKey}.`);
-      }
-      nextActiveRuns[nextKey] = {
+      const migratedPointer = {
         ...pointer,
         schemaVersion: ACTIVE_RUN_POINTER_NAMESPACE_TO_VERSION
       };
+      const addPointer = (nextKey: string): void => {
+        if (nextActiveRuns[nextKey] !== undefined) {
+          throw new Error(`Active run pointer key collides after migration: ${taskId}/${nextKey}.`);
+        }
+        nextActiveRuns[nextKey] = migratedPointer;
+      };
+      if (lane !== null) {
+        const laneBacked = run.executionGroupId === lane.executionGroupId
+          && run.executionLaneId === lane.executionLaneId;
+        // The prior writer used the same map key for a legal Role and a Lane
+        // when the Role itself happened to contain the `lane:g:l` shape.  The
+        // v3 namespace must retain both identities instead of rejecting the
+        // record or silently dropping the Role pointer.
+        const roleBacked = run.roleName === key;
+        if (!laneBacked && !roleBacked) {
+          throw new Error(`Active run pointer lineage is invalid: ${taskId}/${key}.`);
+        }
+        if (roleBacked) addPointer(key);
+        if (laneBacked) {
+          addPointer(executionLaneNamespaceKey(lane.executionGroupId, lane.executionLaneId));
+        }
+      } else if (key.startsWith("lane:")) {
+        // A malformed lane-looking key is allowed only when it is a legal
+        // legacy Role pointer. It must not be silently reinterpreted.
+        if (run.roleName !== key) {
+          throw new Error(`Active run pointer key is malformed: ${taskId}/${key}.`);
+        }
+        addPointer(key);
+      } else {
+        // Role pointers remain keyed by the Role even when the pointed Run
+        // also carries execution lineage (a shape emitted by the prior
+        // writer).  The lane namespace above preserves that second identity.
+        if (run.roleName !== key) {
+          throw new Error(`Active run Role pointer is invalid: ${taskId}/${key}.`);
+        }
+        addPointer(key);
+      }
     }
     nextTasks[taskId] = { ...task, activeRuns: nextActiveRuns };
   }
@@ -211,7 +230,7 @@ function recordFamilyStep(
   recordKind: string,
   fromVersion: number,
   toVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces"
 ): MigrationStep<HomeSnapshot> {
   return {
     axis: "record",
@@ -239,7 +258,7 @@ function requireRecordFamilyVersion(
   snapshot: HomeSnapshot,
   recordKind: string,
   fromVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces"
 ): void {
   const manifestVersions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
   if (manifestVersions[recordKind] !== fromVersion) {
@@ -270,7 +289,7 @@ function migrateRecordFamily(
   recordKind: string,
   fromVersion: number,
   toVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces"
 ): HomeSnapshot {
   // Keep the same source-shape checks in the transform so a direct caller
   // cannot bypass the migration's precondition contract.

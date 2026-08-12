@@ -36,6 +36,10 @@ export interface GitWorkspacePort {
   ): Promise<boolean>;
   headRef(repositoryPath: string): Promise<string>;
   isClean(repositoryPath: string): Promise<boolean>;
+  mergeWorktree(input: Readonly<{
+    targetPath: string;
+    sourceRefs: readonly string[];
+  }>): Promise<void>;
   refresh(input: Readonly<{
     repositoryPath: string;
     remoteUrl: string;
@@ -241,6 +245,39 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       "-C", root, "status", "--porcelain=v1", "--untracked-files=all"
     ]);
     return status.length === 0;
+  }
+
+  async mergeWorktree(input: Readonly<{
+    targetPath: string;
+    sourceRefs: readonly string[];
+  }>): Promise<void> {
+    const target = await canonicalDirectory(input.targetPath, "Merge target");
+    const sources = input.sourceRefs.map((source) => safeRef(source));
+    if (sources.length === 0) {
+      throw new Error(`Git merge requires at least one source ref: ${target}.`);
+    }
+    if (!await this.isClean(target)) {
+      throw new Error(`Git merge target must be clean: ${target}.`);
+    }
+    try {
+      // Merge all selected Lane heads in one Git transaction.  A conflict in
+      // any Lane therefore aborts the complete Candidate materialization
+      // instead of leaving an earlier Lane merged into the WorkItem target.
+      await git(["-C", target, "merge", "--no-edit", "--no-ff", ...sources]);
+    } catch (error) {
+      try {
+        await git(["-C", target, "merge", "--abort"]);
+      } catch (abortError) {
+        throw new Error(
+          `Git merge failed and conflict cleanup could not be completed for ${target}.`,
+          { cause: abortError }
+        );
+      }
+      throw new Error(
+        `Git merge failed for ${target} from ${sources.join(", ")}; Candidate materialization was not completed.`,
+        { cause: error }
+      );
+    }
   }
 
   async #assertRefreshCheckout(

@@ -71,18 +71,29 @@ export function validateExactRunReviewRound(
     || round.reviewBaseCommit !== run.effective.reviewBaseCommit) {
     return { disposition: "obsolete", round, reason: "review-round-mismatch" };
   }
+  const laneWorkspaceRoot = lane?.workspace?.root;
   if (run.workspace === undefined || round.workspace === undefined
-    || !isDeepStrictEqual(run.workspace, round.workspace)) {
+    || (laneWorkspaceRoot === undefined && !isDeepStrictEqual(run.workspace, round.workspace))
+    || (laneWorkspaceRoot !== undefined && run.workspace.root !== laneWorkspaceRoot)) {
     return { disposition: "obsolete", round, reason: "review-workspace-mismatch" };
   }
   const storedWorkspace = store.getReviewRoundWorkspace(run.taskId, round.id);
   if (storedWorkspace === null || !isDeepStrictEqual(storedWorkspace, round.workspace)) {
     return { disposition: "obsolete", round, reason: "review-workspace-drift" };
   }
-  if (storedWorkspace.owner.type !== "review-round"
-    || storedWorkspace.owner.taskId !== run.taskId
-    || storedWorkspace.owner.reviewRoundId !== round.id) {
-    return { disposition: "obsolete", round, reason: "review-workspace-owner-mismatch" };
+  if (run.workspace.owner.type !== "execution-lane") {
+    if (storedWorkspace.owner.type !== "review-round"
+      || storedWorkspace.owner.taskId !== run.taskId
+      || storedWorkspace.owner.reviewRoundId !== round.id) {
+      return { disposition: "obsolete", round, reason: "review-workspace-owner-mismatch" };
+    }
+  }
+  if (run.workspace.owner.type === "execution-lane"
+    && (run.workspace.owner.purpose !== "review"
+      || run.workspace.owner.executionGroupId !== run.executionGroupId
+      || run.workspace.owner.executionLaneId !== run.executionLaneId
+      || run.workspace.owner.reviewRoundId !== round.id)) {
+    return { disposition: "obsolete", round, reason: "review-lane-workspace-owner-mismatch" };
   }
   const item = store.getWorkItem(run.taskId, round.workItemId);
   if (item === null) {
@@ -187,7 +198,10 @@ export function terminalizeExactRunReviewRound(
               : { findings: input.reviewResult.findings }),
             ...(input.reviewResult?.evidence === undefined
               ? {}
-              : { evidence: input.reviewResult.evidence })
+              : { evidence: input.reviewResult.evidence }),
+            ...(input.reviewResult?.evidenceCommit === undefined
+              ? {}
+              : { evidenceCommit: input.reviewResult.evidenceCommit })
           },
           input.outcome.status === "yielded" ? "completed" : "failed",
           now
@@ -195,7 +209,8 @@ export function terminalizeExactRunReviewRound(
       )
     : reviewRound;
   const groupedMultiLane = groupedRound.executionGroup !== undefined
-    && groupedRound.executionGroup.lanes.length > 1;
+    && (groupedRound.executionGroup.lanes.length > 1
+      || groupedRound.executionGroup.strategy.mode === "adaptive");
   if (groupedMultiLane && groupedRound.executionGroup !== undefined) {
     // A panel Lane only contributes evidence.  The Leader must see every
     // terminal Lane and explicitly resolve the Group before this ReviewRound
@@ -383,7 +398,14 @@ export function terminalizeExactTaskRun(
       const grouped = recordExecutionLaneResult(
         item.executionGroup,
         run.executionLaneId,
-        { summary: input.outcome.summary },
+      {
+        summary: input.outcome.summary,
+        ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
+        ...(input.reviewResult?.checks === undefined ? {} : { checks: input.reviewResult.checks }),
+        ...(input.reviewResult?.findings === undefined ? {} : { findings: input.reviewResult.findings }),
+        ...(input.reviewResult?.evidence === undefined ? {} : { evidence: input.reviewResult.evidence }),
+        ...(input.reviewResult?.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit })
+      },
         input.outcome.status === "yielded" ? "completed" : "failed",
         now
       );

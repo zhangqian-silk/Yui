@@ -381,7 +381,10 @@ function renderWorkItemReviews(
       : latest.checks.map(({ name, outcome }) => `${name}=${outcome}`).join(", ")}`,
     ...(latest.summary === undefined
       ? []
-      : [`      Review summary: ${compactText(latest.summary)}`])
+      : [`      Review summary: ${compactText(latest.summary)}`]),
+    ...(latest.executionGroup === undefined
+      ? []
+      : renderExecutionGroup(latest.executionGroup).map((line) => `    ${line.trimStart()}`))
   ];
 }
 
@@ -485,6 +488,8 @@ function managedWorkspaceLabel(
       return `review-round ${workspace.owner.reviewRoundId}`;
     case "integration-attempt":
       return `integration-attempt ${workspace.owner.integrationAttemptId}`;
+    case "execution-lane":
+      return `execution-lane ${workspace.owner.executionGroupId}/${workspace.owner.executionLaneId}`;
   }
 }
 
@@ -504,6 +509,9 @@ function renderExecutionGroup(group: ExecutionGroup): string[] {
       ...(lane.evidence === undefined || lane.evidence.length === 0
         ? []
         : [`        Evidence: ${lane.evidence.length} item(s)`]),
+      ...(lane.evidenceCommit === undefined
+        ? []
+        : [`        Evidence commit: ${lane.evidenceCommit}`]),
       ...(lane.decision === undefined ? [] : [`        Decision: ${lane.decision}`])
     ]),
     ...(summary.openHighPriorityFindingIds.length === 0

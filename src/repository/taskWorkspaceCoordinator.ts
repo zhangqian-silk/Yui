@@ -110,6 +110,10 @@ export class TaskWorkspaceCoordinator {
     if (state === "dirty") return "dirty";
     this.#assertWorkItemRuntimeQuiescent(item);
     if (item.assignee !== undefined) await this.#stopLiveRoles(item.taskId, [item.assignee]);
+    const laneCleanup = typeof this.preparer.cleanupExecutionLaneWorkspacesForWorkItem === "function"
+      ? await this.preparer.cleanupExecutionLaneWorkspacesForWorkItem(item.taskId, item.id)
+      : "missing";
+    if (laneCleanup === "dirty") return "dirty";
     return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
   }
 
@@ -138,6 +142,10 @@ export class TaskWorkspaceCoordinator {
     const state = await this.preparer.inspectReviewRoundWorkspace(taskId, reviewRoundId);
     if (state === "dirty") return "dirty";
     await this.#stopLiveRoles(taskId, [round.reviewerRoleName]);
+    const laneCleanup = typeof this.preparer.cleanupExecutionLaneWorkspacesForReviewRound === "function"
+      ? await this.preparer.cleanupExecutionLaneWorkspacesForReviewRound(taskId, reviewRoundId)
+      : "missing";
+    if (laneCleanup === "dirty") return "dirty";
     return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
   }
 

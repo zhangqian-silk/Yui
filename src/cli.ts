@@ -873,18 +873,27 @@ export async function main(): Promise<void> {
         ? null
         : store.getWorkItem(reference.taskId, reference.localId);
       const task = item === null ? null : store.getTask(item.taskId);
-      // A read-only Project WorkItem still needs its own Develop owner.  The
-      // physical preparer creates the symlink view and stores the exact
-      // WorkItem owner before dispatch creates the Run.  Writable scopes keep
-      // the explicit isolate-before-dispatch fence.
+      // Every Project-backed WorkItem needs its own Develop owner before a
+      // Lane can be prepared.  The physical preparer creates the symlink view
+      // and stores the exact WorkItem owner before dispatch creates the Run.
       if (item !== null
         && task !== null
         && task.projectBindings.length > 0
-        && item.writeProjectIds.length === 0
         && store.getWorkItemWorkspace(task.id, item.id) === null) {
         await workspaceCoordinator.isolateWorkItem(item.taskId, item.id);
       }
+      if (item !== null && task !== null) {
+        // For a new Group the preparer has already created deterministic
+        // worktrees, but the owner record is adopted by dispatch's aggregate
+        // transaction once its exact Lane ids exist.
+      }
     }
+    let executionLaneWorkspaces = await prepareExecutionLaneWorkspacesForCommand(
+      resolved,
+      store,
+      workspacePreparer,
+      process.env
+    );
     let workItemIntegrationProof;
     if (resolved[1] === "work" && resolved[2] === "accept") {
       const workItemId = resolved[3];
@@ -898,13 +907,21 @@ export async function main(): Promise<void> {
         }
       }
     }
-    const candidateGitSnapshot = await candidateSnapshotForTaskCommand(
+    const candidateMaterialization = await candidateMaterializationForTaskCommand(
       resolved,
       store,
       workspacePreparer,
       process.env,
       taskFinalReviewContract
     );
+    const candidateGitSnapshot = candidateMaterialization?.snapshot
+      ?? await candidateSnapshotForTaskCommand(
+        resolved,
+        store,
+        workspacePreparer,
+        process.env,
+        taskFinalReviewContract
+      );
     const directTaskMainSnapshot = await directTaskMainSnapshotForTaskCommand(
       resolved,
       store,
@@ -937,6 +954,10 @@ export async function main(): Promise<void> {
           : { taskFinalReviewContract }),
         ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
         ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
+        ...(candidateMaterialization?.workspace === undefined
+          ? {}
+          : { candidateWorkspace: candidateMaterialization.workspace }),
+        ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
         ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),
         ...(actualTaskReviewCandidate === undefined
           ? {}
@@ -947,14 +968,38 @@ export async function main(): Promise<void> {
     );
     if (result.kind === "output") {
       const requestedRound = reviewRoundFromCommandData(result.data);
+      const persistedRequestedRound = requestedRound === undefined
+        ? null
+        : store.getReviewRound(requestedRound.taskId, requestedRound.id);
       let reviewOutput = "";
       let reviewData: unknown;
-      if (requestedRound?.status === "pending") {
+      const reviewDispatchNeeded = requestedRound?.status === "pending"
+        || (requestedRound?.status === "running"
+          && resolved[1] === "review"
+          && resolved[2] === "request"
+          && persistedRequestedRound?.executionGroup?.lanes.some((lane) => (
+            lane.status === "pending" && lane.runId === undefined
+          )) === true);
+      if (reviewDispatchNeeded) {
         try {
-          const workspace = await workspacePreparer.prepareReviewRoundWorkspace(
+          const workspace = requestedRound.status === "running"
+            ? store.getReviewRoundWorkspace(requestedRound.taskId, requestedRound.id)
+            : await workspacePreparer.prepareReviewRoundWorkspace(
+              requestedRound.taskId,
+              requestedRound.id
+            );
+          if (workspace === null) {
+            throw new Error(`ReviewRound workspace is not ready: ${requestedRound.id}.`);
+          }
+          const reviewLaneWorkspaces = await prepareReviewLaneWorkspaces(
             requestedRound.taskId,
-            requestedRound.id
+            requestedRound.id,
+            store,
+            workspacePreparer
           );
+          if (reviewLaneWorkspaces !== undefined) {
+            executionLaneWorkspaces = reviewLaneWorkspaces;
+          }
           const storedRound = store.getReviewRound(
             requestedRound.taskId,
             requestedRound.id
@@ -979,7 +1024,8 @@ export async function main(): Promise<void> {
                 : { taskFinalReviewContract }),
               ...(freshTaskCandidate === undefined
                 ? {}
-                : { actualTaskReviewCandidate: freshTaskCandidate })
+                : { actualTaskReviewCandidate: freshTaskCandidate }),
+              ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces })
             }
           );
           reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
@@ -1237,11 +1283,19 @@ async function candidateSnapshotForTaskCommand(
   ) || (
     args[1] === "work" && args[2] === "update"
     && args[3] !== undefined && args[4] === "done"
+  ) || (
+    args[1] === "work" && args[2] === "group" && args[3] === "resolve"
+    && args[4] !== undefined
   );
   // Explicit Task-final review requests must remain independent of the
   // mutable global review trigger. Only the existing Candidate snapshot
   // paths need to consult review configuration.
-  if (!reviewableCandidateCommand || store.getReviewConfig() === null) return undefined;
+  const groupResolve = args[1] === "work" && args[2] === "group" && args[3] === "resolve";
+  if (!reviewableCandidateCommand
+    || (store.getReviewConfig() === null && taskFinalReviewContract === undefined)
+    || (groupResolve && args.includes("--decision") && args[args.indexOf("--decision") + 1] !== "accept")) {
+    return undefined;
+  }
   if (args[1] === "run" && args[2] === "yield" && args[3] !== undefined) {
     const reference = cliTaskRecordReference(args[3], "agentRun", environment);
     const run = store.getAgentRun(reference.taskId, reference.localId);
@@ -1250,6 +1304,12 @@ async function candidateSnapshotForTaskCommand(
     }
     if (run.workspace === undefined) {
       throw usageError(`Reviewable Run has no managed Candidate workspace: ${run.id}.`);
+    }
+    // Group-backed Runs yield Lane evidence first; the Leader's later group
+    // resolution performs the one Candidate snapshot after selected Lane
+    // outputs have been materialized into the WorkItem workspace.
+    if (run.executionGroupId !== undefined || run.workspace.owner.type === "execution-lane") {
+      return undefined;
     }
     return preparer.snapshotCandidateWorkspace(run.workspace);
   }
@@ -1268,7 +1328,126 @@ async function candidateSnapshotForTaskCommand(
     }
     return preparer.snapshotCandidateWorkspace(workspace);
   }
+  if (args[1] === "work" && args[2] === "group" && args[3] === "resolve"
+    && args[4] !== undefined) {
+    const reference = cliWorkItemReference(args[4], environment);
+    const item = store.getWorkItem(reference.taskId, reference.localId);
+    const group = item?.executionGroup;
+    if (item === null || item === undefined || group === undefined) return undefined;
+    const selected = new Set<string>();
+    for (let index = 5; index < args.length; index += 1) {
+      if (args[index] === "--lane" && args[index + 1] !== undefined) selected.add(args[index + 1]!);
+    }
+    const run = group.lanes
+      .filter((lane) => selected.size === 0 || selected.has(lane.id))
+      .map((lane) => lane.runId === undefined ? null : store.getAgentRun(item.taskId, lane.runId))
+      .find((candidate): candidate is NonNullable<typeof candidate> => (
+        candidate !== null && candidate !== undefined
+        && candidate.purpose === "execution"
+        && candidate.status === "yielded"
+        && candidate.workspace !== undefined
+      ));
+    if (run === undefined) {
+      throw usageError(`ExecutionGroup ${group.id} has no yielded selected Lane workspace.`);
+    }
+    return preparer.snapshotCandidateWorkspace(store.getWorkItemWorkspace(item.taskId, item.id)!);
+  }
   return undefined;
+}
+
+async function candidateMaterializationForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv,
+  taskFinalReviewContract?: TaskFinalReviewContract
+): Promise<Readonly<{ workspace: import("./worktree/managedWorkspace.js").ManagedWorkspace; snapshot: import("./workItem/workItem.js").CandidateGitSnapshot }> | undefined> {
+  if (args[0] !== "task" || args[1] !== "work" || args[2] !== "group"
+    || args[3] !== "resolve" || args[4] === undefined
+    || !args.includes("--decision")
+    || args[args.indexOf("--decision") + 1] !== "accept") return undefined;
+  const reference = cliWorkItemReference(args[4], environment);
+  const item = store.getWorkItem(reference.taskId, reference.localId);
+  const group = item?.executionGroup;
+  if (item === null || item === undefined || group === undefined) return undefined;
+  const selected = args.flatMap((value, index) => value === "--lane" && args[index + 1] !== undefined ? [args[index + 1]!] : []);
+  try {
+    return await preparer.materializeExecutionGroupCandidate(
+      item.taskId,
+      item.id,
+      group.id,
+      selected
+    );
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function prepareExecutionLaneWorkspacesForCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv
+): Promise<ReadonlyMap<string, import("./worktree/managedWorkspace.js").ManagedWorkspace> | undefined> {
+  const isDispatch = args[0] === "task" && args[1] === "work" && args[2] === "dispatch" && args[3] !== undefined;
+  const isRetry = args[0] === "task" && args[1] === "run" && args[2] === "retry" && args[3] !== undefined;
+  if (!isDispatch && !isRetry) return undefined;
+  const itemRef = isDispatch
+    ? cliWorkItemReference(args[3]!, environment)
+    : null;
+  const item = itemRef === null
+    ? (() => {
+        const runRef = cliTaskRecordReference(args[3]!, "agentRun", environment);
+        const run = store.getAgentRun(runRef.taskId, runRef.localId);
+        return run?.workItemId === undefined ? null : store.getWorkItem(run.taskId, run.workItemId);
+      })()
+    : store.getWorkItem(itemRef.taskId, itemRef.localId);
+  if (item === null) return undefined;
+  const group = item.executionGroup;
+  const roles = args.flatMap((value, index) => (
+    value === "--lane-role" && args[index + 1] !== undefined
+      ? [args[index + 1]!]
+      : []
+  ));
+  const laneCount = roles.length === 0 ? 1 : (item.status === "running" ? (group?.lanes.length ?? 0) + roles.length : roles.length);
+  const strategyArg = args.find((value) => value.startsWith("adaptive:"));
+  const adaptive = strategyArg !== undefined || group?.strategy.mode === "adaptive";
+  const needsIsolation = adaptive || laneCount > 1 || (group?.lanes.length ?? 0) > 1;
+  if (!needsIsolation) return undefined;
+  const groupId = group?.id ?? `execution-group-${store.peekNextAgentRunId(item.taskId)}`;
+  const laneIds = group === undefined
+    ? Array.from({ length: laneCount }, (_, index) => `${groupId}-lane-${index + 1}`)
+    : isRetry
+      ? [store.getAgentRun(item.taskId, cliTaskRecordReference(args[3]!, "agentRun", environment).localId)?.executionLaneId ?? ""]
+      : Array.from({ length: roles.length }, (_, index) => `${groupId}-lane-${group.lanes.length + index + 1}`);
+  const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
+  for (const laneId of laneIds.filter((value) => value.length > 0)) {
+    map.set(laneId, await preparer.prepareExecutionLaneWorkspace(item.taskId, groupId, laneId, {
+      purpose: "execution",
+      workItemId: item.id
+    }));
+  }
+  return map;
+}
+
+async function prepareReviewLaneWorkspaces(
+  taskId: string,
+  reviewRoundId: string,
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer
+): Promise<ReadonlyMap<string, import("./worktree/managedWorkspace.js").ManagedWorkspace> | undefined> {
+  const round = store.getReviewRound(taskId, reviewRoundId);
+  const group = round?.executionGroup;
+  if (round === null || round === undefined || group === undefined) return undefined;
+  if (group.lanes.length < 2 && group.strategy.mode !== "adaptive") return undefined;
+  const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
+  for (const lane of group.lanes.filter((candidate) => candidate.status === "pending" || candidate.status === "running")) {
+    map.set(lane.id, await preparer.prepareExecutionLaneWorkspace(taskId, group.id, lane.id, {
+      purpose: "review",
+      reviewRoundId
+    }));
+  }
+  return map;
 }
 
 async function directTaskMainSnapshotForTaskCommand(
