@@ -5044,8 +5044,10 @@ test("public fixed(1) Worker yield freezes a Candidate Git snapshot", async (t) 
   ]);
   assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
   await stopFileTaskController(home);
-  const active = store.getActiveAgentRun(task.id, "worker");
-  assert.notEqual(active, null);
+  const active = store.listAgentRuns(task.id).find(({ purpose, status, roleName }) => (
+    purpose === "execution" && status === "active" && roleName === "worker"
+  ));
+  assert.notEqual(active, undefined);
   const entry = active.workspace.entries.find(({ access }) => access === "write");
   writeFileSync(join(entry.path, "fixed-one.txt"), "fixed one\n");
   execFileSync("git", ["-C", entry.path, "add", "fixed-one.txt"]);
@@ -5138,6 +5140,7 @@ test("public multi-Lane retry reuses the failed Lane workspace", async (t) => {
   assert.notEqual(failed, undefined);
   assert.notEqual(survivor, undefined);
   const originalRoot = failed.workspace.root;
+  markDelivered(store, failed);
   store.transaction((tx) => {
     const current = tx.getWorkItem(task.id, item.id);
     const failureAt = new Date(Math.max(Date.now(), Date.parse(current.updatedAt)));
