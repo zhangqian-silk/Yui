@@ -76,6 +76,11 @@ async function rebuildFixture(t, { remote = false } = {}) {
     const seed = join(root, "seed");
     execFileSync("git", ["init", "-q", "--bare", "--initial-branch=main", bare]);
     execFileSync("git", ["clone", "-q", repositoryPath, seed]);
+    // A clone never inherits the source repository's local identity, so the
+    // seed must carry its own before any commit (a scrubbed Integration
+    // environment provides no global user.name/user.email fallback).
+    git(seed, ["config", "user.name", "Yui Test"]);
+    git(seed, ["config", "user.email", "yui@example.invalid"]);
     git(seed, ["remote", "add", "fixture", bare]);
     git(seed, ["push", "-q", "fixture", "main"]);
     remoteUrl = bare;
