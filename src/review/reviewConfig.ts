@@ -3,6 +3,9 @@ import { requireIdentity } from "../domain/validation.js";
 export const REVIEW_TRIGGERS = ["always", "leader", "final"] as const;
 export type ReviewTrigger = typeof REVIEW_TRIGGERS[number];
 
+/** The Reviewer Role seeded in a new Home by `yui setup`. */
+export const DEFAULT_REVIEWER_ROLE = "reviewer";
+
 export type ReviewConfig = Readonly<{
   roleName: string;
   trigger: ReviewTrigger;

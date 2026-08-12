@@ -12,6 +12,7 @@ import {
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { CliIdentity } from "../cli/completion.js";
 import {
+  selectAgentPermission,
   selectAgentModelAndEffort
 } from "../cli/agentConfigurationPicker.js";
 import type { SelectionIo } from "../cli/interactiveSelection.js";
@@ -33,6 +34,7 @@ import {
   createRoleAgentBinding,
   updateGlobalRole,
   type GlobalRole,
+  type RoleProfile,
   type RoleAgentConfig
 } from "../role/role.js";
 import {
@@ -40,6 +42,10 @@ import {
   SYSTEM_OPERATOR_ROLE,
   SYSTEM_WORKER_ROLE
 } from "../role/systemRoles.js";
+import {
+  DEFAULT_REVIEWER_ROLE,
+  type ReviewConfig
+} from "../review/reviewConfig.js";
 import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
 import {
   builtinAgentProfileInputs,
@@ -51,6 +57,7 @@ import {
   ensureYuiHome,
   resolveYuiHome
 } from "../storage/taskStore.js";
+import type { YuiConfig } from "../storage/taskStore.js";
 import { initializeCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import type { CommandExecutor } from "../tmux/commandExecutor.js";
 
@@ -65,11 +72,14 @@ export type SetupIo = Readonly<{
 type InteractiveSetupIo = SetupIo & Required<Pick<SetupIo, "input" | "output">>;
 type SetupQuestion = (prompt: string) => Promise<string>;
 
-type SetupStore = Omit<CompletionStore, "transaction"> & Readonly<{
+type SetupStore = Omit<CompletionStore, "transaction" | "getConfig" | "saveConfig"> & Readonly<{
   transaction<T>(execute: (store: SetupStore) => T): T;
+  getConfig(): YuiConfig;
+  saveConfig(config: YuiConfig): void;
   listConfiguredAgents(): ConfiguredAgent[];
   getConfiguredAgent(id: string): ConfiguredAgent | null;
   saveConfiguredAgent(agent: ConfiguredAgent): void;
+  listGlobalRoles(): GlobalRole[];
   getGlobalRole(name: string): GlobalRole | null;
   saveGlobalRole(role: GlobalRole): void;
   saveGlobalRoleWithSessionSet(role: GlobalRole, sessions: GlobalRoleSessionSet | null): void;
@@ -155,6 +165,17 @@ export async function runSetupCommand(
       `Worker model: ${result.workerConfig.model ?? "CLI default"}.`,
       `Worker reasoning effort: ${result.workerConfig.effort ?? "CLI default"}.`,
       `Worker permission: ${result.workerConfig.permission.strategy}.`,
+      ...(result.reviewerInitialized
+        ? [
+            `Reviewer Agent: ${result.reviewerAgentId}.`,
+            `Reviewer model: ${result.reviewerConfig?.model ?? "CLI default"}.`,
+            `Reviewer reasoning effort: ${result.reviewerConfig?.effort ?? "CLI default"}.`,
+            `Reviewer permission: ${result.reviewerConfig?.permission.strategy}.`,
+            ...(result.reviewPolicy === undefined
+              ? ["Review policy: disabled."]
+              : [`Review policy: ${result.reviewPolicy.roleName} (${result.reviewPolicy.trigger}).`])
+          ]
+        : []),
       `Project workspace: ${result.workspace}.`,
       `Time zone: ${resolveTimeZone(store.getConfig().timeZone)}.`
     ];
@@ -199,8 +220,18 @@ async function configureYui(
   workerAgentId: string;
   workerConfig: RoleAgentConfig;
   workerReusesLeader: boolean;
+  reviewerInitialized: boolean;
+  reviewerAgentId?: string;
+  reviewerConfig?: RoleAgentConfig;
+  reviewPolicy?: ReviewConfig;
   workspace: string;
 }>> {
+  const initialConfig = store.getConfig();
+  const freshHome = store.listGlobalRoles().length === 0
+    && store.listConfiguredAgents().length === 0
+    && initialConfig.defaultAgent === undefined
+    && initialConfig.defaultWorkspace === undefined
+    && initialConfig.review === undefined;
   const candidates = availableAgentChoices(store, env);
   if (candidates.length === 0) {
     throw usageError(
@@ -255,6 +286,33 @@ async function configureYui(
     prepared,
     operatorFallback
   );
+  const existingReviewer = store.getGlobalRole(DEFAULT_REVIEWER_ROLE);
+  const reviewerInitialized = freshHome || existingReviewer !== null;
+  let reviewerAgentId: string | undefined;
+  let reviewerConfig: RoleAgentConfig | undefined;
+  if (reviewerInitialized) {
+    const reviewerFallback = configuredIds.has(existingReviewer?.activeAgentId ?? "")
+      ? existingReviewer!.activeAgentId
+      : defaultAgentId;
+    reviewerAgentId = parseSingleAgentSelection(
+      await question(`Choose Reviewer Agent [${reviewerFallback}]: `),
+      prepared,
+      reviewerFallback
+    );
+    const reviewerAgent = prepared.find(({ id }) => id === reviewerAgentId);
+    if (reviewerAgent === undefined) {
+      throw usageError("Selected Reviewer Agent is no longer available.");
+    }
+    reviewerConfig = await promptRoleAgentConfig(
+      "Reviewer",
+      reviewerAgent,
+      existingReviewer,
+      home,
+      selectionIo,
+      catalogs,
+      true
+    );
+  }
   const defaultAgent = prepared.find(({ id }) => id === defaultAgentId);
   const operatorAgent = prepared.find(({ id }) => id === operatorAgentId);
   if (defaultAgent === undefined || operatorAgent === undefined) {
@@ -360,16 +418,33 @@ async function configureYui(
       now,
       workerConfig
     );
+    const reviewerRole = reviewerInitialized
+      && reviewerAgentId !== undefined
+      && reviewerConfig !== undefined
+      ? prepareSystemRole(
+          tx,
+          DEFAULT_REVIEWER_ROLE,
+          requireSetupAgent(tx, reviewerAgentId),
+          workspace,
+          now,
+          reviewerConfig,
+          freshHome ? reviewerRoleProfile() : undefined
+        )
+      : null;
     const latest = tx.getConfig();
     tx.saveConfig({
       ...latest,
       defaultAgent: defaultAgentId,
       defaultWorkspace: workspace,
-      timeZone: resolveTimeZone(latest.timeZone)
+      timeZone: resolveTimeZone(latest.timeZone),
+      ...(freshHome
+        ? { review: { roleName: DEFAULT_REVIEWER_ROLE, trigger: "final" as const } }
+        : {})
     });
     if (operatorRole !== null) savePreparedSystemRole(tx, operatorRole, now);
     if (leaderRole !== null) savePreparedSystemRole(tx, leaderRole, now);
     if (workerRole !== null) savePreparedSystemRole(tx, workerRole, now);
+    if (reviewerRole !== null) savePreparedSystemRole(tx, reviewerRole, now);
     seedBuiltinProfiles(tx, now);
   });
 
@@ -382,7 +457,23 @@ async function configureYui(
     workerAgentId,
     workerConfig,
     workerReusesLeader,
+    reviewerInitialized,
+    ...(reviewerAgentId === undefined ? {} : { reviewerAgentId }),
+    ...(reviewerConfig === undefined ? {} : { reviewerConfig }),
+    ...(freshHome
+      ? { reviewPolicy: { roleName: DEFAULT_REVIEWER_ROLE, trigger: "final" as const } }
+      : initialConfig.review === undefined ? {} : { reviewPolicy: initialConfig.review }),
     workspace
+  };
+}
+
+function reviewerRoleProfile(): RoleProfile {
+  const reviewer = builtinAgentProfileInputs().find(({ id }) => id === "reviewer");
+  if (reviewer === undefined) return {};
+  return {
+    ...(reviewer.description === undefined ? {} : { description: reviewer.description }),
+    ...(reviewer.instructions === undefined ? {} : { systemPrompt: reviewer.instructions }),
+    ...(reviewer.skills === undefined ? {} : { skills: [...reviewer.skills] })
   };
 }
 
@@ -451,18 +542,20 @@ async function promptRoleAgentConfig(
   existingRole: GlobalRole | null,
   cwd: string,
   io: SelectionIo,
-  catalogs: AgentConfigurationCatalogService
+  catalogs: AgentConfigurationCatalogService,
+  selectPermission = false
 ): Promise<RoleAgentConfig> {
   const existing = existingRole?.activeAgentId === agent.id
     ? existingRole.agentBindings[agent.id]?.config
     : undefined;
   io.write(`\n${label} Agent configuration: ${agent.id}\n`);
-  const selection = await selectAgentModelAndEffort(
-    await catalogs.resolve({
+  const resolved = await catalogs.resolve({
       agent,
       cwd,
       ...(existing === undefined ? {} : { config: existing })
-    }),
+    });
+  const selection = await selectAgentModelAndEffort(
+    resolved,
     io,
     {
       currentModel: existing?.model,
@@ -479,6 +572,17 @@ async function promptRoleAgentConfig(
   else candidate.model = selection.model;
   if (selection.effort === undefined) delete candidate.effort;
   else candidate.effort = selection.effort;
+  if (selectPermission) {
+    const permission = await selectAgentPermission(
+      resolved,
+      io,
+      candidate.permission as RoleAgentConfig["permission"]
+    );
+    if (permission.kind === "cancelled") {
+      throw usageError(`${label} permission configuration was cancelled.`);
+    }
+    candidate.permission = permission.permission;
+  }
   try {
     return resolveAgentAdapter(agent.adapterId).canonicalizeConfig(
       candidate as RoleAgentConfig
@@ -557,7 +661,8 @@ function prepareSystemRole(
   agent: ConfiguredAgent,
   workspace: string,
   now: Date,
-  config: RoleAgentConfig
+  config: RoleAgentConfig,
+  profile?: RoleProfile
 ): GlobalRole | null {
   const existing = store.getGlobalRole(name);
   if (existing !== null) {
@@ -589,7 +694,8 @@ function prepareSystemRole(
     return updateGlobalRole(existing, {
       activeAgentId: agent.id,
       workspace,
-      agentBindings: { ...existing.agentBindings, [agent.id]: binding }
+      agentBindings: { ...existing.agentBindings, [agent.id]: binding },
+      ...(profile === undefined ? {} : profile)
     }, now);
   }
   assertRoleRuntimeMutationAllowed(store, {
@@ -602,7 +708,8 @@ function prepareSystemRole(
     [createRoleAgentBinding(definition, config)],
     definition.id,
     workspace,
-    now
+    now,
+    profile
   );
 }
 

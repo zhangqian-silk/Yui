@@ -1,10 +1,16 @@
 import {
+  configurationField,
   defaultModel,
   modelChoice,
   type AgentConfigurationChoice,
   type AgentModelChoice,
   type ResolvedAgentConfigurationCatalog
 } from "../executor/agentConfigurationCatalog.js";
+import type {
+  ClaudePermissionConfig,
+  CodexPermissionConfig,
+  RoleAgentConfig
+} from "../executor/agentAdapter.js";
 import { renderTable, type TableColumn } from "../output/table.js";
 import type { SelectionIo } from "./interactiveSelection.js";
 
@@ -16,6 +22,10 @@ export type AgentEffortSelection =
   | Readonly<{ kind: "cancelled" }>
   | Readonly<{ kind: "selected"; effort: string | undefined }>;
 
+export type AgentPermissionSelection =
+  | Readonly<{ kind: "cancelled" }>
+  | Readonly<{ kind: "selected"; permission: RoleAgentConfig["permission"] }>;
+
 type PickerChoice = Readonly<{
   value: string;
   label: string;
@@ -25,6 +35,7 @@ type PickerChoice = Readonly<{
 
 const DEFAULT = "\0yui:cli-default";
 const CUSTOM = "\0yui:custom";
+const OMIT = "\0yui:omit";
 const COLUMNS: readonly TableColumn[] = [
   { header: "Value", minWidth: 12, maxWidth: 34 },
   { header: "Details", minWidth: 16, maxWidth: 52 }
@@ -70,6 +81,92 @@ export async function selectAgentEffort(
   return effort.cancelled
     ? { kind: "cancelled" }
     : { kind: "selected", effort: effort.value };
+}
+
+/** Select provider-native permission settings in the adapter's canonical shape. */
+export async function selectAgentPermission(
+  resolved: ResolvedAgentConfigurationCatalog,
+  io: SelectionIo,
+  current: RoleAgentConfig["permission"]
+): Promise<AgentPermissionSelection> {
+  const strategyField = configurationField(resolved.catalog, "permission.strategy");
+  const strategyChoices = uniqueChoices(
+    strategyField?.choices ?? [
+      { value: "default", label: "default" },
+      { value: "bypass", label: "bypass" },
+      { value: "configured", label: "configured" }
+    ],
+    current.strategy
+  );
+  const strategy = await choose(
+    "Select permission strategy",
+    strategyChoices.map(({ value, label, description }) => ({
+      value,
+      label,
+      detail: description ?? value
+    })),
+    io,
+    current.strategy,
+    "permission strategy"
+  );
+  if (strategy === undefined) return { kind: "cancelled" };
+  if (strategy === "default" || strategy === "bypass") {
+    return { kind: "selected", permission: { strategy } };
+  }
+
+  if (resolved.catalog.adapterId === "codex") {
+    const codex = current.strategy === "configured"
+      ? current as Extract<CodexPermissionConfig, { strategy: "configured" }>
+      : undefined;
+    const sandbox = await selectPermissionField(
+      resolved,
+      io,
+      "permission.sandbox",
+      codex?.sandbox,
+      codex === undefined ? "workspace-write" : OMIT
+    );
+    if (sandbox.kind === "cancelled") return sandbox;
+    const approval = await selectPermissionField(
+      resolved,
+      io,
+      "permission.approval",
+      codex?.approval,
+      codex === undefined ? "on-request" : OMIT
+    );
+    if (approval.kind === "cancelled") return approval;
+    const permission: Record<string, unknown> = {
+      ...(codex ?? { strategy: "configured" })
+    };
+    if (sandbox.value === undefined) delete permission.sandbox;
+    else permission.sandbox = sandbox.value;
+    if (approval.value === undefined) delete permission.approval;
+    else permission.approval = approval.value;
+    return {
+      kind: "selected",
+      permission: permission as CodexPermissionConfig
+    };
+  }
+
+  const claude = current.strategy === "configured"
+    ? current as Extract<ClaudePermissionConfig, { strategy: "configured" }>
+    : undefined;
+  const mode = await selectPermissionField(
+    resolved,
+    io,
+    "permission.mode",
+    claude?.mode,
+    claude === undefined ? undefined : OMIT
+  );
+  if (mode.kind === "cancelled") return mode;
+  const permission: Record<string, unknown> = {
+    ...(claude ?? { strategy: "configured" })
+  };
+  if (mode.value === undefined) delete permission.mode;
+  else permission.mode = mode.value;
+  return {
+    kind: "selected",
+    permission: permission as ClaudePermissionConfig
+  };
 }
 
 export function renderAgentConfigurationResolutionNotice(
@@ -204,6 +301,82 @@ function observedEfforts(models: readonly AgentModelChoice[]): AgentConfiguratio
     if (!observed.has(effort.value)) observed.set(effort.value, effort);
   }
   return [...observed.values()];
+}
+
+type PermissionFieldSelection =
+  | Readonly<{ kind: "cancelled" }>
+  | Readonly<{ kind: "selected"; value: string | undefined }>;
+
+async function selectPermissionField(
+  resolved: ResolvedAgentConfigurationCatalog,
+  io: SelectionIo,
+  key: string,
+  current: string | undefined,
+  defaultValue: string | typeof OMIT | undefined
+): Promise<PermissionFieldSelection> {
+  const field = configurationField(resolved.catalog, key);
+  const fallback = key === "permission.sandbox"
+    ? ["read-only", "workspace-write", "danger-full-access"]
+    : key === "permission.approval"
+      ? ["untrusted", "on-request", "never"]
+      : ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"];
+  const choices = uniqueChoices(
+    field === undefined
+      ? fallback.map((value) => ({ value, label: value }))
+      : field.choices,
+    current
+  );
+  const includeOmit = defaultValue === OMIT || current !== undefined;
+  const pickerChoices: PickerChoice[] = [
+    ...(includeOmit
+      ? [{ value: OMIT, label: "Omit", detail: "Do not pass this provider option" }]
+      : []),
+    ...choices.map(({ value, label, description }) => ({
+      value,
+      label,
+      detail: description ?? value
+    })),
+    ...(field?.allowCustom === true
+      ? [{ value: CUSTOM, label: "Custom…", detail: "Enter another provider value" }]
+      : [])
+  ];
+  const selected = await choose(
+    `Select ${key}`,
+    pickerChoices,
+    io,
+    current ?? defaultValue ?? pickerChoices[0]?.value ?? OMIT,
+    key
+  );
+  if (selected === undefined) return { kind: "cancelled" };
+  if (selected === OMIT) return { kind: "selected", value: undefined };
+  if (selected === CUSTOM) {
+    const custom = (await io.question(`Custom ${key}: `))?.trim();
+    return custom === undefined || custom.length === 0
+      ? { kind: "cancelled" }
+      : { kind: "selected", value: custom };
+  }
+  return { kind: "selected", value: selected };
+}
+
+function uniqueChoices(
+  choices: readonly AgentConfigurationChoice[],
+  current: string | undefined
+): AgentConfigurationChoice[] {
+  const seen = new Set<string>();
+  const result: AgentConfigurationChoice[] = [];
+  for (const choice of choices) {
+    if (seen.has(choice.value)) continue;
+    seen.add(choice.value);
+    result.push(choice);
+  }
+  if (current !== undefined && !seen.has(current)) {
+    result.push({
+      value: current,
+      label: current,
+      description: "Current value; not reported by this catalog"
+    });
+  }
+  return result;
 }
 
 function renderResolutionNotice(

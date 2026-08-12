@@ -148,9 +148,10 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   };
   const executor = { run: (command) => command === "tmux" ? "tmux 3.4" : "" };
 
-  input.end(
-    `all\ncodex\ncodex\ngpt-5.6-sol\nxhigh\ngpt-5.6-sol\nxhigh\n\n${workspace}\nskip\n`
-  );
+  input.end([
+    "all", "codex", "codex", "codex", "", "", "",
+    "gpt-5.6-sol", "xhigh", "gpt-5.6-sol", "xhigh", "", workspace, "skip"
+  ].join("\n") + "\n");
   const result = await runSetupCommand(
     [], env, executor,
     { input, output, forceInteractive: true }
@@ -164,6 +165,14 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   assert.equal(store.getGlobalRole("operator").activeAgentId, "codex");
   assert.equal(store.getGlobalRole("leader").activeAgentId, "codex");
   assert.equal(store.getGlobalRole("worker").activeAgentId, "codex");
+  assert.deepEqual(store.getConfig().review, { roleName: "reviewer", trigger: "final" });
+  assert.equal(store.getGlobalRole("reviewer").activeAgentId, "codex");
+  assert.deepEqual(
+    store.getGlobalRole("reviewer").agentBindings.codex.config,
+    { adapterId: "codex", permission: { strategy: "bypass" } }
+  );
+  assert.equal(store.getGlobalRole("reviewer").defaultAccess, "write");
+  assert.match(store.getGlobalRole("reviewer").systemPrompt, /Start from user intent/);
   assert.deepEqual(
     store.getGlobalRole("worker").agentBindings.codex.config,
     store.getGlobalRole("leader").agentBindings.codex.config
@@ -208,6 +217,8 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   assert.match(result, /Worker configuration: Reused Leader configuration/);
   assert.match(result, /Worker model: gpt-5\.6-sol/);
   assert.match(result, /Worker permission: bypass/);
+  assert.match(result, /Reviewer Agent: codex/);
+  assert.match(result, /Review policy: reviewer \(final\)/);
   assert.match(result, /Project workspace:/);
   assert.match(result, /Completion install skipped/);
 
@@ -240,7 +251,7 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
 
   const repeatInput = new PassThrough();
   const repeatOutput = new PassThrough();
-  repeatInput.end("all\n\n\n\n\n\n\n\n\nskip\n");
+  repeatInput.end(["all", ...Array(12).fill(""), "skip"].join("\n") + "\n");
   await assert.doesNotReject(runSetupCommand(
     [], env, executor,
     { input: repeatInput, output: repeatOutput, forceInteractive: true }
@@ -272,7 +283,7 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   const changedInput = new PassThrough();
   const changedOutput = new PassThrough();
   changedInput.end([
-    "all", "", "", "", "", "", "", "", changedWorkspace
+    "all", ...Array(11).fill(""), changedWorkspace
   ].join("\n") + "\n");
   await assert.rejects(
     runSetupCommand(
@@ -285,7 +296,9 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
 
   const clearInput = new PassThrough();
   const clearOutput = new PassThrough();
-  clearInput.end("all\n\n\n\n\ndefault\ndefault\n\n\nskip\n");
+  clearInput.end([
+    "all", "", "", "", "", "", "", "", "", "default", "default", "", "", "skip"
+  ].join("\n") + "\n");
   await assert.doesNotReject(runSetupCommand(
     [], env, executor,
     { input: clearInput, output: clearOutput, forceInteractive: true }
@@ -305,7 +318,9 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
 
   const switchOperatorInput = new PassThrough();
   const switchOperatorOutput = new PassThrough();
-  switchOperatorInput.end("all\n\nclaude\n\n\n\n\n\n\nskip\n");
+  switchOperatorInput.end([
+    "all", "", "claude", "", "", "", "", "", "", "", "", "", "", "skip"
+  ].join("\n") + "\n");
   await assert.doesNotReject(runSetupCommand(
     [], env, executor,
     { input: switchOperatorInput, output: switchOperatorOutput, forceInteractive: true }
@@ -321,7 +336,9 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
 
   const restoreOperatorInput = new PassThrough();
   const restoreOperatorOutput = new PassThrough();
-  restoreOperatorInput.end("all\n\ncodex\n\n\n\n\n\n\nskip\n");
+  restoreOperatorInput.end([
+    "all", "", "codex", "", "", "", "", "", "", "", "", "", "", "skip"
+  ].join("\n") + "\n");
   await assert.doesNotReject(runSetupCommand(
     [], env, executor,
     { input: restoreOperatorInput, output: restoreOperatorOutput, forceInteractive: true }
@@ -353,7 +370,9 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   ));
   const runningInput = new PassThrough();
   const runningOutput = new PassThrough();
-  runningInput.end("all\n\n\n\n\ngpt-new\n\n\n");
+  runningInput.end([
+    "all", "", "", "", "", "", "", "", "", "gpt-new", "", "", ""
+  ].join("\n") + "\n");
   const runningEffective = structuredClone(
     store.getGlobalRoleSessionSet("operator").sessions.codex.effective
   );
@@ -389,6 +408,10 @@ test("setup can configure Worker separately from Leader", async (t) => {
     "all",
     "codex",
     "codex",
+    "codex",
+    "",
+    "",
+    "",
     "gpt-5.6-sol",
     "medium",
     "gpt-5.6-sol",
@@ -426,6 +449,118 @@ test("setup can configure Worker separately from Leader", async (t) => {
   assert.match(result, /Worker Agent: claude/);
 });
 
+test("setup independently persists configured Reviewer permission", async (t) => {
+  const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
+  const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
+  const { createRoleAgentBinding } = await import("../../dist/role/role.js");
+  const root = mkdtempSync(join(tmpdir(), "yui-reviewer-permission-setup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "yui-home");
+  const bin = join(root, "bin");
+  const workspace = join(root, "workspace");
+  mkdirSync(bin);
+  for (const command of ["codex", "claude"]) {
+    writeFileSync(join(bin, command), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(join(bin, command), 0o755);
+  }
+  const input = new PassThrough();
+  input.end([
+    "all", "codex", "codex", "codex", "", "", "configured",
+    "workspace-write", "never", "", "", "", "", "", workspace, "skip"
+  ].join("\n") + "\n");
+
+  const result = await runSetupCommand([], {
+    YUI_HOME: home,
+    HOME: join(root, "user"),
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  }, {
+    run: () => "tmux 3.4"
+  }, {
+    input,
+    output: new PassThrough(),
+    forceInteractive: true
+  });
+
+  const store = new FileTaskStore(home);
+  assert.deepEqual(store.getGlobalRole("reviewer").agentBindings.codex.config, {
+    adapterId: "codex",
+    permission: {
+      strategy: "configured",
+      sandbox: "workspace-write",
+      approval: "never"
+    }
+  });
+  assert.deepEqual(store.getGlobalRole("leader").agentBindings.codex.config, {
+    adapterId: "codex",
+    permission: { strategy: "bypass" }
+  });
+  assert.match(result, /Reviewer permission: configured/);
+
+  // A valid approval-only Codex configuration is a supported current shape.
+  // Rerunning setup with blank field answers must preserve that shape rather
+  // than rebuilding it from only the picker fields that happen to be shown.
+  const reviewer = store.getGlobalRole("reviewer");
+  reviewer.agentBindings.codex.config.permission = {
+    strategy: "configured",
+    approval: "never"
+  };
+  store.saveGlobalRole(reviewer);
+  const rerunInput = new PassThrough();
+  rerunInput.end([
+    "all", ...Array(14).fill(""), "skip"
+  ].join("\n") + "\n");
+  await runSetupCommand([], {
+    YUI_HOME: home,
+    HOME: join(root, "user"),
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  }, {
+    run: () => "tmux 3.4"
+  }, {
+    input: rerunInput,
+    output: new PassThrough(),
+    forceInteractive: true
+  });
+  assert.deepEqual(
+    new FileTaskStore(home).getGlobalRole("reviewer").agentBindings.codex.config.permission,
+    { strategy: "configured", approval: "never" }
+  );
+
+  // The Claude picker must likewise retain a tools-only canonical shape when
+  // the reviewer switches back to that Agent during a setup rerun.
+  const claudeRole = new FileTaskStore(home).getGlobalRole("reviewer");
+  claudeRole.activeAgentId = "claude";
+  claudeRole.agentBindings.claude = createRoleAgentBinding(
+    { id: "claude", adapterId: "claude" },
+    {
+      adapterId: "claude",
+      permission: { strategy: "configured", allowedTools: ["Read"] }
+    }
+  );
+  new FileTaskStore(home).saveGlobalRole(claudeRole);
+  const claudeRerunInput = new PassThrough();
+  claudeRerunInput.end([
+    "all", "", "", "claude", ...Array(11).fill(""), "skip"
+  ].join("\n") + "\n");
+  await runSetupCommand([], {
+    YUI_HOME: home,
+    HOME: join(root, "user"),
+    PATH: bin,
+    SHELL: "/bin/zsh"
+  }, {
+    run: () => "tmux 3.4"
+  }, {
+    input: claudeRerunInput,
+    output: new PassThrough(),
+    forceInteractive: true
+  });
+  assert.deepEqual(
+    new FileTaskStore(home).getGlobalRole("reviewer").agentBindings.claude.config.permission,
+    { strategy: "configured", allowedTools: ["Read"] }
+  );
+});
+
 test("setup supports Claude defaults for Leader, Operator, and Worker Profiles", async (t) => {
   const { runSetupCommand } = await import("../../dist/setup/setupCommand.js");
   const { FileTaskStore } = await import("../../dist/storage/taskStore.js");
@@ -439,7 +574,9 @@ test("setup supports Claude defaults for Leader, Operator, and Worker Profiles",
   chmodSync(join(bin, "claude"), 0o755);
   const input = new PassThrough();
   const output = new PassThrough();
-  input.end(`all\n\n\n\n\n\n\n\n${workspace}\nskip\n`);
+  input.end([
+    "all", "", "", "", "", "", "default", "", "", "", "", "", workspace, "skip"
+  ].join("\n") + "\n");
 
   await runSetupCommand(
     [],
@@ -460,6 +597,10 @@ test("setup supports Claude defaults for Leader, Operator, and Worker Profiles",
   assert.deepEqual(
     store.getGlobalRole("leader").agentBindings.claude.config,
     { adapterId: "claude", permission: { strategy: "bypass" } }
+  );
+  assert.deepEqual(
+    store.getGlobalRole("reviewer").agentBindings.claude.config,
+    { adapterId: "claude", permission: { strategy: "default" } }
   );
   assert.equal("agentId" in store.getAgentProfile("worker"), false);
   assert.equal("agentId" in store.getAgentProfile("implementer"), false);
@@ -484,7 +625,7 @@ test("setup persists the canonical Project workspace behind a symbolic-link path
   chmodSync(codex, 0o755);
   const input = new PassThrough();
   input.end([
-    "all", "", "", "", "", "", "", "", workspace, "skip"
+    "all", ...Array(11).fill(""), workspace, "skip"
   ].join("\n") + "\n");
 
   await runSetupCommand([], {
@@ -527,7 +668,7 @@ test("rejected workspace change does not persist newly discovered Agents", async
   };
   const first = new PassThrough();
   first.end([
-    "codex", "", "", "", "", "", "", "", workspace, "skip"
+    "codex", ...Array(11).fill(""), workspace, "skip"
   ].join("\n") + "\n");
   await runSetupCommand([], baseEnv, { run: () => "tmux 3.4" }, {
     input: first,
@@ -540,7 +681,7 @@ test("rejected workspace change does not persist newly discovered Agents", async
   chmodSync(claude, 0o755);
   const changed = new PassThrough();
   changed.end([
-    "all", "", "", "", "", "", "", "", join(root, "other-workspace")
+    "all", ...Array(11).fill(""), join(root, "other-workspace")
   ].join("\n") + "\n");
   await assert.rejects(
     runSetupCommand([], baseEnv, { run: () => "tmux 3.4" }, {
@@ -573,7 +714,7 @@ test("fresh setup keeps the Project workspace outside YUI_HOME by default", asyn
   let rendered = "";
   output.on("data", (chunk) => { rendered += chunk.toString(); });
   input.end([
-    "codex", "", "", "", "", "", "", "", "", "skip"
+    "codex", ...Array(12).fill(""), "skip"
   ].join("\n") + "\n");
 
   await runSetupCommand([], {
@@ -626,7 +767,7 @@ test("setup rolls back config and every system Role when one lifecycle gate reje
   const input = new PassThrough();
   const output = new PassThrough();
   input.end([
-    "codex", "", "", "", "", "", "", "", workspace
+    "codex", ...Array(11).fill(""), workspace
   ].join("\n") + "\n");
   const env = {
     YUI_HOME: home,

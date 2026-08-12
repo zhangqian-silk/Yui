@@ -14,6 +14,10 @@ import { join, relative } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import {
+  createGlobalRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
 import { createUpdatePorts } from "../../dist/cli/updatePorts.js";
 import { buildDoctorReport, runDoctorCommand } from "../../dist/doctor/doctor.js";
 import { CliError } from "../../dist/errors/cliError.js";
@@ -175,6 +179,314 @@ test("FileTaskStore doctor reports schema, state, tools, and configured Agent ca
     ["codex-custom", ["--help"]]
   ]);
   assert.deepEqual(snapshot(home), before);
+});
+
+test("doctor projects Reviewer readiness without launching a Session or model", (t) => {
+  const root = temporaryRoot(t, "yui-file-doctor-reviewer-");
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(createGlobalRole(
+    "reviewer",
+    [createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId })],
+    agent.id,
+    workspace,
+    now,
+    { description: "review" },
+    "write"
+  ));
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const before = snapshot(home);
+  const executor = {
+    run(command, args) {
+      if (command === "git") return "git version 2.45.1";
+      if (command === "tmux") return "tmux 3.4";
+      if (command === "codex" && args[0] === "--version") return "codex 0.144.4";
+      if (command === "codex" && args[0] === "--help") {
+        return "Usage: codex [OPTIONS]\n"
+          + "  -c, --config <key=value>\n"
+          + "  resume [SESSION_ID]\n"
+          + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+          + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
+      }
+      throw new CommandExecutionError("COMMAND_NOT_FOUND");
+    }
+  };
+
+  const report = buildDoctorReport({ YUI_HOME: home }, executor);
+  assert.equal(report.review.status, "ready");
+  assert.equal(report.review.providerNative, "unverified");
+  assert.equal(report.review.roleName, "reviewer");
+  assert.equal(report.checks.find(({ name }) => name === "reviewer dispatch").status, "ok");
+  assert.match(runDoctorCommand([], { YUI_HOME: home }, executor), /Reviewer: ready/);
+  assert.deepEqual(snapshot(home), before);
+
+  const { review: _review, ...withoutReview } = store.getConfig();
+  store.saveConfig(withoutReview);
+  const disabled = buildDoctorReport({ YUI_HOME: home }, executor);
+  assert.equal(disabled.review.status, "disabled");
+  assert.match(runDoctorCommand([], { YUI_HOME: home }, executor), /Reviewer: disabled/);
+
+  store.saveConfig({ ...store.getConfig(), review: { roleName: "missing-reviewer", trigger: "final" } });
+  const missingRole = buildDoctorReport({ YUI_HOME: home }, executor);
+  assert.equal(missingRole.review.status, "misconfigured");
+  assert.equal(missingRole.checks.find(({ name }) => name === "reviewer role").status, "missing");
+});
+
+test("doctor Reviewer probes use the configured Agent PATH instead of shell PATH", (t) => {
+  const root = temporaryRoot(t, "yui-file-doctor-reviewer-path-");
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const shellPath = join(root, "shell-bin");
+  const boundPath = join(root, "bound-bin");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(shellPath, { recursive: true });
+  mkdirSync(boundPath, { recursive: true });
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  const agent = createConfiguredAgent(
+    "codex",
+    "codex",
+    "codex",
+    [],
+    [{
+      target: "PATH",
+      source: "process",
+      sourceName: "TASK20_BOUND_REVIEWER_PATH",
+      required: true
+    }],
+    now
+  );
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(createGlobalRole(
+    "reviewer",
+    [createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId })],
+    agent.id,
+    workspace,
+    now,
+    { description: "review" },
+    "write"
+  ));
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+
+  function executor(boundCommandAvailable) {
+    const probePaths = [];
+    return {
+      probePaths,
+      run(command, args, options) {
+        if (command === "git") return "git version 2.45.1";
+        if (command === "tmux") return "tmux 3.4";
+        if (command !== "codex") throw new CommandExecutionError("COMMAND_NOT_FOUND");
+        const probePath = options?.environment?.PATH ?? shellPath;
+        probePaths.push(probePath);
+        if (!boundCommandAvailable && probePath === boundPath) {
+          throw new CommandExecutionError("COMMAND_NOT_FOUND");
+        }
+        if (args[0] === "--version") return "codex 0.144.4";
+        if (args[0] === "--help") {
+          return "Usage: codex [OPTIONS]\n"
+            + "  -c, --config <key=value>\n"
+            + "  resume [SESSION_ID]\n"
+            + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+            + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
+        }
+        throw new Error(`Unexpected codex probe: ${args.join(" ")}`);
+      }
+    };
+  }
+
+  const environment = {
+    YUI_HOME: home,
+    PATH: shellPath,
+    TASK20_BOUND_REVIEWER_PATH: boundPath
+  };
+  const missingExecutor = executor(false);
+  const missing = buildDoctorReport(environment, missingExecutor);
+  assert.equal(missing.review.status, "misconfigured");
+  assert.equal(missing.checks.find(({ name }) => name === "agent:codex:command").status, "missing");
+  assert.equal(missing.checks.find(({ name }) => name === "agent:codex:capability").status, "missing");
+  assert.equal(missing.checks.find(({ name }) => name === "reviewer dispatch").status, "invalid");
+  assert.deepEqual(missingExecutor.probePaths, [boundPath]);
+
+  const readyExecutor = executor(true);
+  const ready = buildDoctorReport(environment, readyExecutor);
+  assert.equal(ready.review.status, "ready");
+  assert.equal(ready.checks.find(({ name }) => name === "reviewer dispatch").status, "ok");
+  assert.deepEqual(readyExecutor.probePaths, [boundPath, boundPath]);
+});
+
+test("doctor blocks Reviewer readiness when a required Agent environment is absent", (t) => {
+  const root = temporaryRoot(t, "yui-file-doctor-reviewer-environment-");
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  const agent = createConfiguredAgent(
+    "codex",
+    "codex",
+    "codex",
+    [],
+    [{
+      target: "TASK20_REVIEWER_TOKEN",
+      source: "process",
+      sourceName: "TASK20_REQUIRED_REVIEWER_TOKEN_ABSENT",
+      required: true
+    }],
+    now
+  );
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(createGlobalRole(
+    "reviewer",
+    [createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId })],
+    agent.id,
+    workspace,
+    now,
+    { description: "review" },
+    "write"
+  ));
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const executor = {
+    run(command, args) {
+      if (command === "git") return "git version 2.45.1";
+      if (command === "tmux") return "tmux 3.4";
+      if (command === "codex" && args[0] === "--version") return "codex 0.144.4";
+      if (command === "codex" && args[0] === "--help") {
+        return "Usage: codex [OPTIONS]\n"
+          + "  -c, --config <key=value>\n"
+          + "  resume [SESSION_ID]\n"
+          + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+          + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
+      }
+      throw new CommandExecutionError("COMMAND_NOT_FOUND");
+    }
+  };
+
+  const report = buildDoctorReport({ YUI_HOME: home }, executor);
+  assert.equal(report.review.status, "misconfigured");
+  const launch = report.checks.find(({ name }) => name === "reviewer launch");
+  assert.equal(launch.status, "invalid");
+  assert.match(launch.detail, /Required Agent environment is missing: TASK20_REQUIRED_REVIEWER_TOKEN_ABSENT/);
+  assert.equal(report.checks.find(({ name }) => name === "reviewer dispatch").status, "invalid");
+  assert.match(runDoctorCommand([], { YUI_HOME: home }, executor), /Reviewer: misconfigured/);
+});
+
+test("doctor blocks Reviewer readiness when Codex native notify is configured", (t) => {
+  const root = temporaryRoot(t, "yui-file-doctor-reviewer-codex-notify-");
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const codexHome = join(root, "codex-home");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(join(codexHome, "config.toml"), 'notify = ["native-notifier"]\n');
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(createGlobalRole(
+    "reviewer",
+    [createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId })],
+    agent.id,
+    workspace,
+    now,
+    { description: "review" },
+    "write"
+  ));
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const before = snapshot(home);
+  const executor = {
+    run(command, args) {
+      if (command === "git") return "git version 2.45.1";
+      if (command === "tmux") return "tmux 3.4";
+      if (command === "codex" && args[0] === "--version") return "codex 0.144.4";
+      if (command === "codex" && args[0] === "--help") {
+        return "Usage: codex [OPTIONS]\n"
+          + "  -c, --config <key=value>\n"
+          + "  resume [SESSION_ID]\n"
+          + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+          + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
+      }
+      throw new CommandExecutionError("COMMAND_NOT_FOUND");
+    }
+  };
+
+  const report = buildDoctorReport({ YUI_HOME: home, CODEX_HOME: codexHome }, executor);
+  assert.equal(report.review.status, "misconfigured");
+  const launch = report.checks.find(({ name }) => name === "reviewer launch");
+  assert.equal(launch.status, "invalid");
+  assert.match(launch.detail, /Codex notify is already configured/);
+  assert.equal(report.checks.find(({ name }) => name === "reviewer dispatch").status, "invalid");
+  assert.deepEqual(snapshot(home), before);
+});
+
+test("doctor blocks Reviewer readiness when Codex native developer instructions conflict", (t) => {
+  const root = temporaryRoot(t, "yui-file-doctor-reviewer-codex-instructions-");
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const codexHome = join(root, "codex-home");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(join(codexHome, "config.toml"), 'developer_instructions = "native"\n');
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const now = new Date("2026-08-11T00:00:00.000Z");
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(createGlobalRole(
+    "reviewer",
+    [createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId })],
+    agent.id,
+    workspace,
+    now,
+    { description: "review" },
+    "write"
+  ));
+  store.saveConfig({
+    ...store.getConfig(),
+    review: { roleName: "reviewer", trigger: "final" }
+  });
+  const executor = {
+    run(command, args) {
+      if (command === "git") return "git version 2.45.1";
+      if (command === "tmux") return "tmux 3.4";
+      if (command === "codex" && args[0] === "--version") return "codex 0.144.4";
+      if (command === "codex" && args[0] === "--help") {
+        return "Usage: codex [OPTIONS]\n"
+          + "  -c, --config <key=value>\n"
+          + "  resume [SESSION_ID]\n"
+          + "  --sandbox [possible values: read-only, workspace-write, danger-full-access]\n"
+          + "  --ask-for-approval [possible values: untrusted, on-request, never]\n";
+      }
+      throw new CommandExecutionError("COMMAND_NOT_FOUND");
+    }
+  };
+
+  const report = buildDoctorReport({ YUI_HOME: home, CODEX_HOME: codexHome }, executor);
+  assert.equal(report.review.status, "misconfigured");
+  const launch = report.checks.find(({ name }) => name === "reviewer launch");
+  assert.equal(launch.status, "invalid");
+  assert.match(launch.detail, /Codex developer_instructions is already configured/);
+  assert.equal(report.checks.find(({ name }) => name === "reviewer dispatch").status, "invalid");
 });
 
 test("doctor reports compatible-old storage as fully healthy without rewriting it", (t) => {
