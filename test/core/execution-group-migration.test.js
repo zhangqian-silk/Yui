@@ -45,6 +45,9 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
             }
           },
           reviewRounds: { "review-round-1": { schemaVersion: 2 } },
+          managedWorkspaces: {
+            "work-item:task-1:work-item-1": legacyWorkspace("work-item-map")
+          },
           activeRuns: { leader: { schemaVersion: 1, runId: "agent-run-1" } }
         }
       }
@@ -92,8 +95,76 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
   assert.equal(task.agentRuns["agent-run-1"].schemaVersion, 6);
   assert.equal(task.reviewRounds["review-round-1"].schemaVersion, 4);
   assert.equal(task.activeRuns.leader.schemaVersion, 3);
+  assert.equal(task.managedWorkspaces["work-item:task-1:work-item-1"].schemaVersion, 2);
   assert.equal(source.state.tasks["task-1"].workItems["work-item-1"].schemaVersion, 6);
 });
+
+test("managedWorkspace migration advances every embedded lifecycle snapshot", () => {
+  const current = currentRecordVersions();
+  const sourceRecord = Object.fromEntries(
+    Object.entries(current).map(([kind, entry]) => [kind, { ...entry }])
+  );
+  sourceRecord.managedWorkspace = { ...sourceRecord.managedWorkspace, version: 1 };
+  const source = {
+    schemaManifest: {
+      schemaVersion: 1,
+      storageVersion: 6,
+      aggregateSchemaVersion: 17,
+      recordVersions: Object.fromEntries(
+        Object.entries(sourceRecord).map(([kind, entry]) => [kind, entry.version])
+      )
+    },
+    state: {
+      schemaVersion: 17,
+      tasks: {
+        "task-1": {
+          managedWorkspaces: { direct: legacyWorkspace("direct") },
+          workItems: {
+            "work-item-1": {
+              candidates: [{ workspace: legacyWorkspace("candidate") }]
+            }
+          },
+          agentRuns: { "agent-run-1": { workspace: legacyWorkspace("run") } },
+          reviewRounds: { "review-round-1": { workspace: legacyWorkspace("review") } }
+        }
+      }
+    }
+  };
+  const plan = planMigration(
+    createProductionRegistry(),
+    { layout: 6, aggregate: 17, record: sourceRecord },
+    latestStorageVersionState()
+  );
+  assert.equal(plan.kind, "runnable");
+  const step = plan.steps.find(({ recordKind }) => recordKind === "managedWorkspace");
+  assert.notEqual(step, undefined);
+  step.step.preconditions(source);
+  const migrated = step.step.transform(source);
+  const task = migrated.state.tasks["task-1"];
+  assert.equal(task.managedWorkspaces.direct.schemaVersion, 2);
+  assert.equal(task.workItems["work-item-1"].candidates[0].workspace.schemaVersion, 2);
+  assert.equal(task.agentRuns["agent-run-1"].workspace.schemaVersion, 2);
+  assert.equal(task.reviewRounds["review-round-1"].workspace.schemaVersion, 2);
+  assert.equal(source.state.tasks["task-1"].agentRuns["agent-run-1"].workspace.schemaVersion, 1);
+
+  const mixed = structuredClone(source);
+  mixed.state.tasks["task-1"].agentRuns["agent-run-1"].workspace.schemaVersion = 2;
+  assert.throws(
+    () => step.step.preconditions(mixed),
+    /agentRuns task-1\/agent-run-1 workspace must use schemaVersion 1/
+  );
+});
+
+function legacyWorkspace(label) {
+  return {
+    schemaVersion: 1,
+    owner: { type: "work-item", taskId: "task-1", workItemId: "work-item-1" },
+    root: `/tmp/${label}`,
+    entries: [],
+    createdAt: "2026-08-09T00:00:00.000Z",
+    updatedAt: "2026-08-09T00:00:00.000Z"
+  };
+}
 
 test("workItem v8 migration preserves its current ExecutionGroup as immutable history", () => {
   const current = currentRecordVersions();

@@ -79,12 +79,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       ACTIVE_RUN_POINTER_TO_VERSION,
       "activeRuns"
     ))
-    .registerOfflineMigration(recordFamilyStep(
-      "managedWorkspace",
-      MANAGED_WORKSPACE_FROM_VERSION,
-      MANAGED_WORKSPACE_TO_VERSION,
-      "managedWorkspaces"
-    ))
+    .registerOfflineMigration(managedWorkspaceFamilyStep())
     .registerOfflineMigration(activeRunPointerNamespaceStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
@@ -106,6 +101,166 @@ function workItemExecutionGroupHistoryStep(): MigrationStep<HomeSnapshot> {
     transform: migrateWorkItemExecutionGroupHistory,
     declaredEffects: []
   };
+}
+
+/**
+ * ManagedWorkspace is stored once in the owner-keyed workspace map and copied
+ * into Candidates, AgentRuns, and ReviewRounds as immutable lifecycle
+ * evidence.  Those copies are the same record family, not independent parent
+ * records: advancing only the map leaves an otherwise legal historical Home
+ * unreadable by the strict current parser.
+ */
+function managedWorkspaceFamilyStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "managedWorkspace",
+    fromVersion: MANAGED_WORKSPACE_FROM_VERSION,
+    toVersion: MANAGED_WORKSPACE_TO_VERSION,
+    preconditions: requireLegacyManagedWorkspaceFamily,
+    transform: migrateManagedWorkspaceFamily,
+    declaredEffects: []
+  };
+}
+
+function requireLegacyManagedWorkspaceFamily(snapshot: HomeSnapshot): void {
+  requireRecordFamilyVersion(
+    snapshot,
+    "managedWorkspace",
+    MANAGED_WORKSPACE_FROM_VERSION,
+    "managedWorkspaces"
+  );
+  visitEmbeddedManagedWorkspaces(snapshot, (workspace, label) => {
+    requireManagedWorkspaceVersion(workspace, MANAGED_WORKSPACE_FROM_VERSION, label);
+    return workspace;
+  });
+}
+
+function migrateManagedWorkspaceFamily(snapshot: HomeSnapshot): HomeSnapshot {
+  requireLegacyManagedWorkspaceFamily(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      managedWorkspace: MANAGED_WORKSPACE_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const migrated = visitEmbeddedManagedWorkspaces(
+    snapshot,
+    (workspace) => ({ ...workspace, schemaVersion: MANAGED_WORKSPACE_TO_VERSION })
+  );
+  return { schemaManifest, state: migrated.state };
+}
+
+/**
+ * Rewrite every persisted ManagedWorkspace occurrence while preserving the
+ * surrounding record bytes.  The direct map is handled by the ordinary
+ * record-family migration; this traversal covers the immutable embedded
+ * snapshots which the strict validators also treat as ManagedWorkspace.
+ */
+function visitEmbeddedManagedWorkspaces(
+  snapshot: HomeSnapshot,
+  visit: (
+    workspace: Readonly<Record<string, unknown>>,
+    label: string
+  ) => Readonly<Record<string, unknown>>
+): HomeSnapshot {
+  if (snapshot.state === null) return snapshot;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const nextTask: Record<string, unknown> = { ...task };
+
+    if (task.managedWorkspaces !== undefined) {
+      const workspaces = asObject(task.managedWorkspaces, `managedWorkspace map ${taskId}`);
+      nextTask.managedWorkspaces = Object.fromEntries(
+        Object.entries(workspaces).map(([recordId, rawWorkspace]) => [
+          recordId,
+          visit(
+            asObject(rawWorkspace, `managedWorkspace ${taskId}/${recordId}`),
+            `managedWorkspace ${taskId}/${recordId}`
+          )
+        ])
+      );
+    }
+
+    if (task.workItems !== undefined) {
+      const workItems = asObject(task.workItems, `workItem map ${taskId}`);
+      nextTask.workItems = Object.fromEntries(
+        Object.entries(workItems).map(([workItemId, rawWorkItem]) => {
+          const workItem = asObject(rawWorkItem, `workItem ${taskId}/${workItemId}`);
+          if (workItem.candidates === undefined) return [workItemId, { ...workItem }];
+          if (!Array.isArray(workItem.candidates)) {
+            throw new Error(`workItem ${taskId}/${workItemId} candidates must be an array.`);
+          }
+          return [workItemId, {
+            ...workItem,
+            candidates: workItem.candidates.map((rawCandidate, index) => {
+              const candidate = asObject(
+                rawCandidate,
+                `Candidate ${taskId}/${workItemId}/${index}`
+              );
+              return migrateOptionalManagedWorkspace(
+                candidate,
+                `Candidate ${taskId}/${workItemId}/${index}`,
+                visit
+              );
+            })
+          }];
+        })
+      );
+    }
+
+    for (const mapKey of ["agentRuns", "reviewRounds"] as const) {
+      if (task[mapKey] === undefined) continue;
+      const records = asObject(task[mapKey], `${mapKey} map ${taskId}`);
+      nextTask[mapKey] = Object.fromEntries(
+        Object.entries(records).map(([recordId, rawRecord]) => [
+          recordId,
+          migrateOptionalManagedWorkspace(
+            asObject(rawRecord, `${mapKey} ${taskId}/${recordId}`),
+            `${mapKey} ${taskId}/${recordId}`,
+            visit
+          )
+        ])
+      );
+    }
+    nextTasks[taskId] = nextTask;
+  }
+  return {
+    schemaManifest: snapshot.schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+function migrateOptionalManagedWorkspace(
+  record: Readonly<Record<string, unknown>>,
+  label: string,
+  visit: (
+    workspace: Readonly<Record<string, unknown>>,
+    label: string
+  ) => Readonly<Record<string, unknown>>
+): Readonly<Record<string, unknown>> {
+  if (record.workspace === undefined) return { ...record };
+  return {
+    ...record,
+    workspace: visit(asObject(record.workspace, `${label} workspace`), `${label} workspace`)
+  };
+}
+
+function requireManagedWorkspaceVersion(
+  workspace: Readonly<Record<string, unknown>>,
+  version: number,
+  label: string
+): void {
+  if (workspace.schemaVersion !== version) {
+    throw new Error(`${label} must use schemaVersion ${version}.`);
+  }
 }
 
 function migrateWorkItemExecutionGroupHistory(snapshot: HomeSnapshot): HomeSnapshot {
