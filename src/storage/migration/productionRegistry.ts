@@ -10,10 +10,14 @@ const FINAL_REVIEW_AGGREGATE_FROM_VERSION = 16;
 const FINAL_REVIEW_AGGREGATE_TO_VERSION = 17;
 const WORK_ITEM_FROM_VERSION = 6;
 const WORK_ITEM_TO_VERSION = 7;
+const WORK_ITEM_GIT_SNAPSHOT_FROM_VERSION = 7;
+const WORK_ITEM_GIT_SNAPSHOT_TO_VERSION = 8;
 const AGENT_RUN_FROM_VERSION = 5;
 const AGENT_RUN_TO_VERSION = 6;
 const REVIEW_ROUND_FROM_VERSION = 2;
 const REVIEW_ROUND_TO_VERSION = 3;
+const REVIEW_ROUND_GIT_SNAPSHOT_FROM_VERSION = 3;
+const REVIEW_ROUND_GIT_SNAPSHOT_TO_VERSION = 4;
 const ACTIVE_RUN_POINTER_FROM_VERSION = 1;
 const ACTIVE_RUN_POINTER_TO_VERSION = 2;
 const ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION = 2;
@@ -43,6 +47,12 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       "workItems"
     ))
     .registerOfflineMigration(recordFamilyStep(
+      "workItem",
+      WORK_ITEM_GIT_SNAPSHOT_FROM_VERSION,
+      WORK_ITEM_GIT_SNAPSHOT_TO_VERSION,
+      "workItems"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
       "agentRun",
       AGENT_RUN_FROM_VERSION,
       AGENT_RUN_TO_VERSION,
@@ -52,6 +62,12 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       "reviewRound",
       REVIEW_ROUND_FROM_VERSION,
       REVIEW_ROUND_TO_VERSION,
+      "reviewRounds"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
+      "reviewRound",
+      REVIEW_ROUND_GIT_SNAPSHOT_FROM_VERSION,
+      REVIEW_ROUND_GIT_SNAPSHOT_TO_VERSION,
       "reviewRounds"
     ))
     .registerOfflineMigration(recordFamilyStep(
@@ -253,6 +269,14 @@ function recordFamilyStep(
     declaredEffects: []
   };
 }
+
+/**
+ * The snapshot boundary is nested inside WorkItem/ReviewRound ExecutionGroup
+ * results.  The parent record versions make that persisted shape explicit;
+ * this adjacent step intentionally performs no field rewrite, preserving old
+ * records while preventing a pre-v8/pre-v4 Home from entering the strict
+ * current parser without the declared transition.
+ */
 
 function requireRecordFamilyVersion(
   snapshot: HomeSnapshot,

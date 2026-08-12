@@ -161,7 +161,7 @@ function fixtureStore() {
     },
     listReviewRounds(taskId) {
       return taskId === "task-1" ? [{
-        schemaVersion: 3,
+        schemaVersion: 4,
         id: "review-round-1",
         taskId,
         workItemId: "work-1",

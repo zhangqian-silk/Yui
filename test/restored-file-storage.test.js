@@ -162,7 +162,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     }
   };
   const item = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     id: "work-item-1",
     taskId: task.id,
     title: "Implement",
@@ -498,7 +498,7 @@ test("record versions and aggregate shape are validated without silently repairi
     updatedAt: timestamp
   };
   const item = {
-    schemaVersion: 7,
+    schemaVersion: 8,
     id: "work-item-1",
     taskId: task.id,
     title: "Implement",

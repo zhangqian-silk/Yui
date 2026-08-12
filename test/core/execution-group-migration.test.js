@@ -68,7 +68,9 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
       { recordKind: "agentRun", fromVersion: 5, toVersion: 6 },
       { recordKind: "managedWorkspace", fromVersion: 1, toVersion: 2 },
       { recordKind: "reviewRound", fromVersion: 2, toVersion: 3 },
-      { recordKind: "workItem", fromVersion: 6, toVersion: 7 }
+      { recordKind: "reviewRound", fromVersion: 3, toVersion: 4 },
+      { recordKind: "workItem", fromVersion: 6, toVersion: 7 },
+      { recordKind: "workItem", fromVersion: 7, toVersion: 8 }
     ]
   );
 
@@ -77,15 +79,15 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
     planned.step.preconditions(migrated);
     migrated = planned.step.transform(migrated);
   }
-  assert.equal(migrated.schemaManifest.recordVersions.workItem, 7);
+  assert.equal(migrated.schemaManifest.recordVersions.workItem, 8);
   assert.equal(migrated.schemaManifest.recordVersions.agentRun, 6);
-  assert.equal(migrated.schemaManifest.recordVersions.reviewRound, 3);
+  assert.equal(migrated.schemaManifest.recordVersions.reviewRound, 4);
   assert.equal(migrated.schemaManifest.recordVersions.activeRunPointer, 3);
   assert.equal(migrated.schemaManifest.recordVersions.managedWorkspace, 2);
   const task = migrated.state.tasks["task-1"];
-  assert.equal(task.workItems["work-item-1"].schemaVersion, 7);
+  assert.equal(task.workItems["work-item-1"].schemaVersion, 8);
   assert.equal(task.agentRuns["agent-run-1"].schemaVersion, 6);
-  assert.equal(task.reviewRounds["review-round-1"].schemaVersion, 3);
+  assert.equal(task.reviewRounds["review-round-1"].schemaVersion, 4);
   assert.equal(task.activeRuns.leader.schemaVersion, 3);
   assert.equal(source.state.tasks["task-1"].workItems["work-item-1"].schemaVersion, 6);
 });

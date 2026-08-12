@@ -61,6 +61,7 @@ import {
   TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
   runTaskCommand,
+  normalizedExecutionLanePlan,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
@@ -907,206 +908,234 @@ export async function main(): Promise<void> {
         }
       }
     }
-    const candidateMaterialization = await candidateMaterializationForTaskCommand(
-      resolved,
-      store,
-      workspacePreparer,
-      process.env,
-      taskFinalReviewContract
-    );
-    const candidateGitSnapshot = candidateMaterialization?.snapshot
-      ?? await candidateSnapshotForTaskCommand(
+    let candidateMaterialization: Awaited<ReturnType<typeof candidateMaterializationForTaskCommand>>;
+    let candidateMaterializationCommitted = false;
+    try {
+      candidateMaterialization = await candidateMaterializationForTaskCommand(
         resolved,
         store,
         workspacePreparer,
         process.env,
         taskFinalReviewContract
       );
-    const directTaskMainSnapshot = await directTaskMainSnapshotForTaskCommand(
-      resolved,
-      store,
-      workspacePreparer,
-      process.env,
-      taskFinalReviewContract
-    );
-    const actualTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
-      resolved,
-      store,
-      workspacePreparer,
-      process.env,
-      taskFinalReviewContract
-    );
-    const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
-      resolved,
-      store,
-      workspacePreparer,
-      process.env
-    );
-    const result = runTaskCommand(
-      resolved.slice(1),
-      store,
-      {
-        runtime,
-        environment: process.env,
-        yuiHome: home,
-        ...(taskFinalReviewContract === undefined
-          ? {}
-          : { taskFinalReviewContract }),
-        ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
-        ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
-        ...(candidateMaterialization?.workspace === undefined
-          ? {}
-          : { candidateWorkspace: candidateMaterialization.workspace }),
-        ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
-        ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),
-        ...(actualTaskReviewCandidate === undefined
-          ? {}
-          : { actualTaskReviewCandidate }),
-        ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
-        ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
-      }
-    );
-    if (result.kind === "output") {
-      const requestedRound = reviewRoundFromCommandData(result.data);
-      const persistedRequestedRound = requestedRound === undefined
-        ? null
-        : store.getReviewRound(requestedRound.taskId, requestedRound.id);
-      let reviewOutput = "";
-      let reviewData: unknown;
-      const reviewDispatchNeeded = requestedRound?.status === "pending"
-        || (requestedRound?.status === "running"
-          && resolved[1] === "review"
-          && resolved[2] === "request"
-          && persistedRequestedRound?.executionGroup?.lanes.some((lane) => (
-            lane.status === "pending" && lane.runId === undefined
-          )) === true);
-      if (reviewDispatchNeeded) {
-        try {
-          const workspace = requestedRound.status === "running"
-            ? store.getReviewRoundWorkspace(requestedRound.taskId, requestedRound.id)
-            : await workspacePreparer.prepareReviewRoundWorkspace(
+      const candidateGitSnapshot = candidateMaterialization === undefined
+        ? await candidateSnapshotForTaskCommand(
+          resolved,
+          store,
+          workspacePreparer,
+          process.env,
+          taskFinalReviewContract
+        )
+        : candidateMaterialization.snapshot;
+      const directTaskMainSnapshot = await directTaskMainSnapshotForTaskCommand(
+        resolved,
+        store,
+        workspacePreparer,
+        process.env,
+        taskFinalReviewContract
+      );
+      const actualTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
+        resolved,
+        store,
+        workspacePreparer,
+        process.env,
+        taskFinalReviewContract
+      );
+      const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
+        resolved,
+        store,
+        workspacePreparer,
+        process.env
+      );
+      const executionLaneGitSnapshot = await executionLaneGitSnapshotForTaskCommand(
+        resolved,
+        store,
+        workspacePreparer,
+        process.env
+      );
+      const laneSnapshotPreflight = executionLaneGitSnapshot === undefined
+        ? undefined
+        : executionLaneGitSnapshot;
+      const result = runTaskCommand(
+        resolved.slice(1),
+        store,
+        {
+          runtime,
+          environment: process.env,
+          yuiHome: home,
+          ...(taskFinalReviewContract === undefined
+            ? {}
+            : { taskFinalReviewContract }),
+          ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
+          ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
+          ...(candidateMaterialization === undefined
+            ? {}
+            : { candidateWorkspace: candidateMaterialization.workspace ?? null }),
+          ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
+          ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),
+          ...(actualTaskReviewCandidate === undefined
+            ? {}
+            : { actualTaskReviewCandidate }),
+          ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
+          ...(laneSnapshotPreflight === undefined ? {} : { executionLaneGitSnapshot: laneSnapshotPreflight }),
+          ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
+        }
+      );
+      // The command transaction has now durably submitted the Candidate. Any
+      // later output/review handling must not roll back its Git snapshot.
+      candidateMaterializationCommitted = candidateMaterialization !== undefined;
+      if (result.kind === "output") {
+        const requestedRound = reviewRoundFromCommandData(result.data);
+        const persistedRequestedRound = requestedRound === undefined
+          ? null
+          : store.getReviewRound(requestedRound.taskId, requestedRound.id);
+        let reviewOutput = "";
+        let reviewData: unknown;
+        const reviewDispatchNeeded = requestedRound?.status === "pending"
+          || (requestedRound?.status === "running"
+            && resolved[1] === "review"
+            && resolved[2] === "request"
+            && persistedRequestedRound?.executionGroup?.lanes.some((lane) => (
+              lane.status === "pending" && lane.runId === undefined
+            )) === true);
+        if (reviewDispatchNeeded) {
+          try {
+            const workspace = requestedRound.status === "running"
+              ? store.getReviewRoundWorkspace(requestedRound.taskId, requestedRound.id)
+              : await workspacePreparer.prepareReviewRoundWorkspace(
+                requestedRound.taskId,
+                requestedRound.id
+              );
+            if (workspace === null) {
+              throw new Error(`ReviewRound workspace is not ready: ${requestedRound.id}.`);
+            }
+            const reviewLaneWorkspaces = await prepareReviewLaneWorkspaces(
+              requestedRound.taskId,
+              requestedRound.id,
+              store,
+              workspacePreparer
+            );
+            if (reviewLaneWorkspaces !== undefined) {
+              executionLaneWorkspaces = reviewLaneWorkspaces;
+            }
+            const storedRound = store.getReviewRound(
               requestedRound.taskId,
               requestedRound.id
             );
-          if (workspace === null) {
-            throw new Error(`ReviewRound workspace is not ready: ${requestedRound.id}.`);
-          }
-          const reviewLaneWorkspaces = await prepareReviewLaneWorkspaces(
-            requestedRound.taskId,
-            requestedRound.id,
-            store,
-            workspacePreparer
-          );
-          if (reviewLaneWorkspaces !== undefined) {
-            executionLaneWorkspaces = reviewLaneWorkspaces;
-          }
-          const storedRound = store.getReviewRound(
-            requestedRound.taskId,
-            requestedRound.id
-          );
-          const freshTaskCandidate = (storedRound?.scope ?? "work-item") === "task"
-            ? await snapshotActualTaskReviewCandidate(
+            const freshTaskCandidate = (storedRound?.scope ?? "work-item") === "task"
+              ? await snapshotActualTaskReviewCandidate(
+                requestedRound.taskId,
+                store,
+                workspacePreparer
+              )
+              : undefined;
+            const run = dispatchPreparedReviewRound(
               requestedRound.taskId,
+              requestedRound.id,
               store,
-              workspacePreparer
-            )
-            : undefined;
-          const run = dispatchPreparedReviewRound(
-            requestedRound.taskId,
-            requestedRound.id,
-            store,
-            {
-              runtime,
-              environment: process.env,
-              yuiHome: home,
-              ...(taskFinalReviewContract === undefined
-                ? {}
-                : { taskFinalReviewContract }),
-              ...(freshTaskCandidate === undefined
-                ? {}
-                : { actualTaskReviewCandidate: freshTaskCandidate }),
-              ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces })
-            }
-          );
-          reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
-          reviewData = {
-            reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
-            reviewRun: run,
-            workspace
-          };
-        } catch (error) {
-          const currentRound = store.getReviewRound(
-            requestedRound.taskId,
-            requestedRound.id
-          );
-          // A runless orphan recovery keeps its pending evidence on drift. If
-          // this command already yielded the exact Leader, fall through to the
-          // existing failed-Review wake so the next Leader owns recovery.
-          if (requestedRound.resumedPendingFinalReview
-            && !requestedRound.terminalizedLeaderRun
-            && (error instanceof ReviewRoundWorkspaceEvidenceError
-              || error instanceof TaskFinalReviewDispatchDriftError)
-            && (currentRound?.scope ?? "work-item") === "task") {
-            throw error;
-          }
-          const message = error instanceof Error ? error.message : String(error);
-          const failed = failPendingReviewRound(
-            requestedRound.taskId,
-            requestedRound.id,
-            message,
-            store,
-            { runtime, environment: process.env, yuiHome: home }
-          );
-          reviewOutput = `Review could not start: ${message}\n`;
-          reviewData = { reviewRound: failed };
-        }
-      }
-      if (resolved[1] === "create") {
-        const created = result.data as {
-          task?: { id?: string; projectBindings?: readonly unknown[] }
-        } | undefined;
-        if (created?.task?.id !== undefined
-          && (created.task.projectBindings?.length ?? 0) > 0) {
-          let workspace;
-          try {
-            workspace = await workspacePreparer.prepareTaskWorkspace(created.task.id);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            workspace = {
-              taskId: created.task.id,
-              status: "failed" as const,
-              error: message
-            };
-          }
-          const latest = store.getTask(created.task.id);
-          const leader = store.getRole(created.task.id, "leader");
-          if (latest !== null && leader !== null) {
-            const warning = workspace.status === "failed"
-              ? `Main worktree is not ready: ${workspace.error ?? "unknown error"}.\n`
-                + `After correcting the Git problem, run yui task reconcile ${created.task.id}.\n`
-              : "";
-            emit(`${result.output}${warning}`, false, {
-              ...created,
-              task: latest,
-              leader,
+              {
+                runtime,
+                environment: process.env,
+                yuiHome: home,
+                ...(taskFinalReviewContract === undefined
+                  ? {}
+                  : { taskFinalReviewContract }),
+                ...(freshTaskCandidate === undefined
+                  ? {}
+                  : { actualTaskReviewCandidate: freshTaskCandidate }),
+                ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces })
+              }
+            );
+            reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
+            reviewData = {
+              reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
+              reviewRun: run,
               workspace
-            });
-            return;
+            };
+          } catch (error) {
+            const currentRound = store.getReviewRound(
+              requestedRound.taskId,
+              requestedRound.id
+            );
+            if (requestedRound.resumedPendingFinalReview
+              && !requestedRound.terminalizedLeaderRun
+              && (error instanceof ReviewRoundWorkspaceEvidenceError
+                || error instanceof TaskFinalReviewDispatchDriftError)
+              && (currentRound?.scope ?? "work-item") === "task") {
+              throw error;
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(
+              executionLaneWorkspaces
+            );
+            const failed = failPendingReviewRound(
+              requestedRound.taskId,
+              requestedRound.id,
+              message,
+              store,
+              { runtime, environment: process.env, yuiHome: home }
+            );
+            reviewOutput = `Review could not start: ${message}\n`;
+            reviewData = { reviewRound: failed };
           }
         }
+        if (resolved[1] === "create") {
+          const created = result.data as {
+            task?: { id?: string; projectBindings?: readonly unknown[] }
+          } | undefined;
+          if (created?.task?.id !== undefined
+            && (created.task.projectBindings?.length ?? 0) > 0) {
+            let workspace;
+            try {
+              workspace = await workspacePreparer.prepareTaskWorkspace(created.task.id);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              workspace = {
+                taskId: created.task.id,
+                status: "failed" as const,
+                error: message
+              };
+            }
+            const latest = store.getTask(created.task.id);
+            const leader = store.getRole(created.task.id, "leader");
+            if (latest !== null && leader !== null) {
+              const warning = workspace.status === "failed"
+                ? `Main worktree is not ready: ${workspace.error ?? "unknown error"}.\n`
+                  + `After correcting the Git problem, run yui task reconcile ${created.task.id}.\n`
+                : "";
+              emit(`${result.output}${warning}`, false, {
+                ...created,
+                task: latest,
+                leader,
+                workspace
+              });
+              return;
+            }
+          }
+        }
+        emit(`${result.output}${reviewOutput}`, false, reviewData === undefined
+          ? result.data
+          : { command: result.data, ...reviewData as object });
+        return;
       }
-      emit(`${result.output}${reviewOutput}`, false, reviewData === undefined
-        ? result.data
-        : { command: result.data, ...reviewData as object });
+      await runtime.prepareTaskRoleEnter({
+        taskId: result.taskId,
+        roleName: result.roleName
+      });
+      if (result.output !== undefined) emit(result.output);
+      tmux.attachRole(result.taskId, result.roleName);
       return;
+    } catch (error) {
+      if (candidateMaterialization !== undefined && !candidateMaterializationCommitted) {
+        await workspacePreparer.restoreExecutionGroupCandidateMaterialization(
+          candidateMaterialization
+        );
+      }
+      if (!candidateMaterializationCommitted) {
+        await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(executionLaneWorkspaces);
+      }
+      throw error;
     }
-    await runtime.prepareTaskRoleEnter({
-      taskId: result.taskId,
-      roleName: result.roleName
-    });
-    if (result.output !== undefined) emit(result.output);
-    tmux.attachRole(result.taskId, result.roleName);
-    return;
   }
   if (resolved[0] === "jobs") {
     emit(runJobCommand(resolved.slice(1), store, { runtime }));
@@ -1288,11 +1317,10 @@ async function candidateSnapshotForTaskCommand(
     && args[4] !== undefined
   );
   // Explicit Task-final review requests must remain independent of the
-  // mutable global review trigger. Only the existing Candidate snapshot
-  // paths need to consult review configuration.
+  // mutable global review trigger. Candidate snapshots are a delivery
+  // boundary for every writable WorkItem, not only review-configured Tasks.
   const groupResolve = args[1] === "work" && args[2] === "group" && args[3] === "resolve";
   if (!reviewableCandidateCommand
-    || (store.getReviewConfig() === null && taskFinalReviewContract === undefined)
     || (groupResolve && args.includes("--decision") && args[args.indexOf("--decision") + 1] !== "accept")) {
     return undefined;
   }
@@ -1303,12 +1331,20 @@ async function candidateSnapshotForTaskCommand(
       return undefined;
     }
     if (run.workspace === undefined) {
-      throw usageError(`Reviewable Run has no managed Candidate workspace: ${run.id}.`);
+      // Gitless execution has no workspace or Git snapshot to capture. The
+      // command layer still records the yielded Lane/Candidate evidence.
+      return undefined;
     }
     // Group-backed Runs yield Lane evidence first; the Leader's later group
     // resolution performs the one Candidate snapshot after selected Lane
     // outputs have been materialized into the WorkItem workspace.
     if (run.executionGroupId !== undefined || run.workspace.owner.type === "execution-lane") {
+      const item = store.getWorkItem(run.taskId, run.workItemId);
+      const fixedSingleLane = item?.executionGroup?.strategy.mode === "fixed"
+        && item.executionGroup.strategy.count === 1
+        && item.executionGroup.lanes.length === 1
+        && run.workspace.owner.type === "work-item";
+      if (fixedSingleLane) return preparer.snapshotCandidateWorkspace(run.workspace);
       return undefined;
     }
     return preparer.snapshotCandidateWorkspace(run.workspace);
@@ -1330,27 +1366,9 @@ async function candidateSnapshotForTaskCommand(
   }
   if (args[1] === "work" && args[2] === "group" && args[3] === "resolve"
     && args[4] !== undefined) {
-    const reference = cliWorkItemReference(args[4], environment);
-    const item = store.getWorkItem(reference.taskId, reference.localId);
-    const group = item?.executionGroup;
-    if (item === null || item === undefined || group === undefined) return undefined;
-    const selected = new Set<string>();
-    for (let index = 5; index < args.length; index += 1) {
-      if (args[index] === "--lane" && args[index + 1] !== undefined) selected.add(args[index + 1]!);
-    }
-    const run = group.lanes
-      .filter((lane) => selected.size === 0 || selected.has(lane.id))
-      .map((lane) => lane.runId === undefined ? null : store.getAgentRun(item.taskId, lane.runId))
-      .find((candidate): candidate is NonNullable<typeof candidate> => (
-        candidate !== null && candidate !== undefined
-        && candidate.purpose === "execution"
-        && candidate.status === "yielded"
-        && candidate.workspace !== undefined
-      ));
-    if (run === undefined) {
-      throw usageError(`ExecutionGroup ${group.id} has no yielded selected Lane workspace.`);
-    }
-    return preparer.snapshotCandidateWorkspace(store.getWorkItemWorkspace(item.taskId, item.id)!);
+    // The grouped accept path snapshots only after all selected Lane outputs
+    // have been merged by candidateMaterializationForTaskCommand.
+    return undefined;
   }
   return undefined;
 }
@@ -1361,7 +1379,7 @@ async function candidateMaterializationForTaskCommand(
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv,
   taskFinalReviewContract?: TaskFinalReviewContract
-): Promise<Readonly<{ workspace: import("./worktree/managedWorkspace.js").ManagedWorkspace; snapshot: import("./workItem/workItem.js").CandidateGitSnapshot }> | undefined> {
+): Promise<Awaited<ReturnType<FileTaskWorkspacePreparer["materializeExecutionGroupCandidate"]>> | undefined> {
   if (args[0] !== "task" || args[1] !== "work" || args[2] !== "group"
     || args[3] !== "resolve" || args[4] === undefined
     || !args.includes("--decision")
@@ -1409,23 +1427,58 @@ async function prepareExecutionLaneWorkspacesForCommand(
       ? [args[index + 1]!]
       : []
   ));
-  const laneCount = roles.length === 0 ? 1 : (item.status === "running" ? (group?.lanes.length ?? 0) + roles.length : roles.length);
-  const strategyArg = args.find((value) => value.startsWith("adaptive:"));
-  const adaptive = strategyArg !== undefined || group?.strategy.mode === "adaptive";
+  const requestedStrategy = (() => {
+    const index = args.indexOf("--strategy");
+    const value = index < 0 ? undefined : args[index + 1];
+    if (value === undefined) return undefined;
+    const fixed = /^fixed:([1-9]\d*)$/u.exec(value);
+    if (fixed !== null) return { mode: "fixed" as const, count: Number(fixed[1]) };
+    const adaptive = /^adaptive:([1-9]\d*)$/u.exec(value);
+    if (adaptive !== null) return { mode: "adaptive" as const, max: Number(adaptive[1]) };
+    throw usageError(`Invalid execution strategy: ${value}.`);
+  })();
+  const retryLaneId = isRetry
+    ? store.getAgentRun(item.taskId, cliTaskRecordReference(args[3]!, "agentRun", environment).localId)?.executionLaneId
+    : undefined;
+  const plan = normalizedExecutionLanePlan({
+    assignee: item.assignee ?? "",
+    requestedRoles: roles,
+    requestedStrategy,
+    existingGroup: group === undefined ? undefined : group,
+    status: item.status,
+    nextGroupId: `execution-group-${store.peekNextAgentRunId(item.taskId)}`,
+    retryLaneId,
+    phase: isRetry ? "retry" : "dispatch"
+  });
+  const laneRoles = plan.roles;
+  if (!isRetry && laneRoles.length === 0) {
+    throw usageError("At least one --lane-role is required when expanding an ExecutionGroup.");
+  }
+  if (group !== undefined && requestedStrategy !== undefined) {
+    const same = group.strategy.mode === requestedStrategy.mode
+      && (group.strategy.mode === "fixed"
+        ? requestedStrategy.mode === "fixed" && group.strategy.count === requestedStrategy.count
+        : requestedStrategy.mode === "adaptive" && group.strategy.max === requestedStrategy.max);
+    if (!same) throw usageError(`ExecutionGroup strategy is frozen: ${group.id}.`);
+  }
+  const laneCount = plan.requestedCount;
+  const strategyArg = args.find((value) => value.startsWith("adaptive:") || value.startsWith("fixed:"));
+  const adaptive = strategyArg?.startsWith("adaptive:") === true || group?.strategy.mode === "adaptive";
   const needsIsolation = adaptive || laneCount > 1 || (group?.lanes.length ?? 0) > 1;
   if (!needsIsolation) return undefined;
   const groupId = group?.id ?? `execution-group-${store.peekNextAgentRunId(item.taskId)}`;
-  const laneIds = group === undefined
-    ? Array.from({ length: laneCount }, (_, index) => `${groupId}-lane-${index + 1}`)
-    : isRetry
-      ? [store.getAgentRun(item.taskId, cliTaskRecordReference(args[3]!, "agentRun", environment).localId)?.executionLaneId ?? ""]
-      : Array.from({ length: roles.length }, (_, index) => `${groupId}-lane-${group.lanes.length + index + 1}`);
+  const laneIds = plan.laneIds;
   const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
-  for (const laneId of laneIds.filter((value) => value.length > 0)) {
-    map.set(laneId, await preparer.prepareExecutionLaneWorkspace(item.taskId, groupId, laneId, {
-      purpose: "execution",
-      workItemId: item.id
-    }));
+  try {
+    for (const laneId of laneIds.filter((value) => value.length > 0)) {
+      map.set(laneId, await preparer.prepareExecutionLaneWorkspace(item.taskId, groupId, laneId, {
+        purpose: "execution",
+        workItemId: item.id
+      }));
+    }
+  } catch (error) {
+    await preparer.discardUnadoptedExecutionLaneWorkspaces(map);
+    throw error;
   }
   return map;
 }
@@ -1441,11 +1494,16 @@ async function prepareReviewLaneWorkspaces(
   if (round === null || round === undefined || group === undefined) return undefined;
   if (group.lanes.length < 2 && group.strategy.mode !== "adaptive") return undefined;
   const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
-  for (const lane of group.lanes.filter((candidate) => candidate.status === "pending" || candidate.status === "running")) {
-    map.set(lane.id, await preparer.prepareExecutionLaneWorkspace(taskId, group.id, lane.id, {
-      purpose: "review",
-      reviewRoundId
-    }));
+  try {
+    for (const lane of group.lanes.filter((candidate) => candidate.status === "pending" || candidate.status === "running")) {
+      map.set(lane.id, await preparer.prepareExecutionLaneWorkspace(taskId, group.id, lane.id, {
+        purpose: "review",
+        reviewRoundId
+      }));
+    }
+  } catch (error) {
+    await preparer.discardUnadoptedExecutionLaneWorkspaces(map);
+    throw error;
   }
   return map;
 }
@@ -1604,6 +1662,35 @@ async function reviewWorkspaceResultForTaskCommand(
     return undefined;
   }
   return preparer.snapshotReviewRoundResult(reference.taskId, run.reviewRoundId);
+}
+
+async function executionLaneGitSnapshotForTaskCommand(
+  args: readonly string[],
+  store: FileTaskStore,
+  preparer: FileTaskWorkspacePreparer,
+  environment: NodeJS.ProcessEnv
+) {
+  if (args[0] !== "task" || args[1] !== "run" || args[2] !== "yield"
+    || args[3] === undefined) return undefined;
+  const reference = cliTaskRecordReference(args[3], "agentRun", environment);
+  const run = store.getAgentRun(reference.taskId, reference.localId);
+  if (run === null || run.executionGroupId === undefined
+    || run.executionLaneId === undefined) {
+    return undefined;
+  }
+  if (run.workspace === undefined) return null;
+  const stored = store.getManagedWorkspace(run.workspace.owner);
+  if (stored === null || !isDeepStrictEqual(stored, run.workspace)) {
+    throw usageError(`Execution Lane managed workspace changed before yield: ${run.id}.`);
+  }
+  try {
+    return (await preparer.snapshotExecutionLaneWorkspace(run.workspace)) ?? null;
+  } catch (error) {
+    throw usageError(
+      `Execution Lane Git snapshot preflight failed for ${run.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 function reviewRoundFromCommandData(data: unknown): Readonly<{

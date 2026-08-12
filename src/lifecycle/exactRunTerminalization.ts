@@ -16,7 +16,10 @@ import {
   type ReviewRound
 } from "../review/reviewRound.js";
 import { failAgentRun, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
-import { recordExecutionLaneResult } from "../execution/executionGroup.js";
+import {
+  recordExecutionLaneResult,
+  type ExecutionLaneGitSnapshot
+} from "../execution/executionGroup.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   isRuntimeLaunchReservation,
@@ -164,6 +167,7 @@ export function terminalizeExactRunReviewRound(
       findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
       evidence?: readonly string[];
       evidenceCommit?: string;
+      gitSnapshot?: ExecutionLaneGitSnapshot;
     }>;
   }>,
   now: Date
@@ -201,7 +205,10 @@ export function terminalizeExactRunReviewRound(
               : { evidence: input.reviewResult.evidence }),
             ...(input.reviewResult?.evidenceCommit === undefined
               ? {}
-              : { evidenceCommit: input.reviewResult.evidenceCommit })
+              : { evidenceCommit: input.reviewResult.evidenceCommit }),
+            ...(input.reviewResult?.gitSnapshot === undefined
+              ? {}
+              : { gitSnapshot: input.reviewResult.gitSnapshot })
           },
           input.outcome.status === "yielded" ? "completed" : "failed",
           now
@@ -249,6 +256,7 @@ export type ExactRunTerminalizationInput = Readonly<{
     findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
     evidence?: readonly string[];
     evidenceCommit?: string;
+    gitSnapshot?: ExecutionLaneGitSnapshot;
   }>;
 }>;
 
@@ -404,7 +412,8 @@ export function terminalizeExactTaskRun(
         ...(input.reviewResult?.checks === undefined ? {} : { checks: input.reviewResult.checks }),
         ...(input.reviewResult?.findings === undefined ? {} : { findings: input.reviewResult.findings }),
         ...(input.reviewResult?.evidence === undefined ? {} : { evidence: input.reviewResult.evidence }),
-        ...(input.reviewResult?.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit })
+        ...(input.reviewResult?.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit }),
+        ...(input.reviewResult?.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot })
       },
         input.outcome.status === "yielded" ? "completed" : "failed",
         now

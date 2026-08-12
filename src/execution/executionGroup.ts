@@ -54,6 +54,20 @@ export type ExecutionFinding = Readonly<{
   status: "open" | "resolved";
 }>;
 
+/**
+ * The immutable Git output of one Lane at the moment it yields.  Resolution
+ * must consume these exact commits; a later branch advance is never silently
+ * folded into the Candidate.
+ */
+export type ExecutionLaneGitSnapshot = Readonly<{
+  schemaVersion: 1;
+  projects: readonly Readonly<{
+    projectId: string;
+    headCommit: string;
+    branch: string;
+  }>[];
+}>;
+
 export type ExecutionLaneResult = Readonly<{
   summary: string;
   report?: string;
@@ -62,6 +76,8 @@ export type ExecutionLaneResult = Readonly<{
   evidence?: readonly string[];
   /** Commit containing durable evidence produced by this Lane. */
   evidenceCommit?: string;
+  /** Managed workspace heads frozen automatically when this Lane yields. */
+  gitSnapshot?: ExecutionLaneGitSnapshot;
 }>;
 
 export type ExecutionLaneWorkspace = Readonly<{
@@ -129,6 +145,7 @@ export type ExecutionGroupSummary = Readonly<{
     findings?: readonly ExecutionFinding[];
     evidence?: readonly string[];
     evidenceCommit?: string;
+    gitSnapshot?: ExecutionLaneGitSnapshot;
     /** The Leader's group decision, when this Lane was selected. */
     decision?: ExecutionResolution["decision"];
   }>[];
@@ -380,8 +397,22 @@ export function resolveExecutionGroup(
     throw new Error(`ExecutionGroup has active Lanes: ${group.id}.`);
   }
   const summary = requireText(input.summary, "Execution resolution summary");
-  const selected = [...new Set((input.selectedLaneIds ?? group.lanes.map(({ id }) => id))
+  const defaultSelectedLaneIds = input.decision === "accept"
+    ? group.lanes
+      .filter((lane) => lane.status === "yielded" || lane.status === "completed")
+      .map(({ id }) => id)
+    : group.lanes.map(({ id }) => id);
+  const selected = [...new Set((input.selectedLaneIds ?? defaultSelectedLaneIds)
     .map((id) => requireIdentity(id, "Selected ExecutionLane id")))];
+  if (input.decision === "accept" && selected.length === 0) {
+    throw new Error(`ExecutionGroup has no usable terminal Lane outputs: ${group.id}.`);
+  }
+  if (input.decision === "accept" && selected.some((id) => {
+    const lane = group.lanes.find((candidate) => candidate.id === id);
+    return lane?.status !== "yielded" && lane?.status !== "completed";
+  })) {
+    throw new Error(`ExecutionGroup accept selects a Lane without usable terminal output: ${group.id}.`);
+  }
   if (selected.some((id) => !group.lanes.some((lane) => lane.id === id))) {
     throw new Error(`Execution resolution selects an unknown Lane: ${group.id}.`);
   }
@@ -431,7 +462,8 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
         ...(lane.result.checks === undefined ? {} : { checks: lane.result.checks }),
         ...(lane.result.findings === undefined ? {} : { findings: lane.result.findings }),
         ...(lane.result.evidence === undefined ? {} : { evidence: lane.result.evidence })
-        ,...(lane.result.evidenceCommit === undefined ? {} : { evidenceCommit: lane.result.evidenceCommit })
+        ,...(lane.result.evidenceCommit === undefined ? {} : { evidenceCommit: lane.result.evidenceCommit }),
+        ...(lane.result.gitSnapshot === undefined ? {} : { gitSnapshot: lane.result.gitSnapshot })
       }),
       ...(group.resolution === undefined
         || !group.resolution.selectedLaneIds.includes(lane.id)
@@ -603,9 +635,29 @@ function validateLaneResult(result: ExecutionLaneResult): ExecutionLaneResult {
     }
   }
   if (result.evidence !== undefined) result.evidence.forEach((value) => requireText(value, "Execution evidence"));
-  return result.evidenceCommit === undefined
-    ? result
-    : { ...result, evidenceCommit: requireCommit(result.evidenceCommit, "Execution evidence commit") };
+  if (result.evidenceCommit !== undefined) {
+    requireCommit(result.evidenceCommit, "Execution evidence commit");
+  }
+  if (result.gitSnapshot !== undefined) validateExecutionLaneGitSnapshot(result.gitSnapshot);
+  return result;
+}
+
+function validateExecutionLaneGitSnapshot(snapshot: ExecutionLaneGitSnapshot): ExecutionLaneGitSnapshot {
+  if (snapshot === null || typeof snapshot !== "object" || snapshot.schemaVersion !== 1) {
+    throw new Error("Execution Lane Git snapshot must use schemaVersion 1.");
+  }
+  if (!Array.isArray(snapshot.projects) || snapshot.projects.length === 0) {
+    throw new Error("Execution Lane Git snapshot requires Projects.");
+  }
+  const ids = new Set<string>();
+  for (const project of snapshot.projects) {
+    const projectId = requireIdentity(project.projectId, "Execution Lane snapshot Project");
+    if (ids.has(projectId)) throw new Error(`Execution Lane snapshot Project is duplicated: ${projectId}.`);
+    ids.add(projectId);
+    requireCommit(project.headCommit, "Execution Lane snapshot head commit");
+    requireText(project.branch, "Execution Lane snapshot branch");
+  }
+  return snapshot;
 }
 
 function validateResolution(resolution: ExecutionResolution, group: ExecutionGroup): void {

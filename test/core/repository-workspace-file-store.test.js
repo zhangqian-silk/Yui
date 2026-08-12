@@ -41,7 +41,7 @@ import {
   updateRole,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { yieldAgentRun } from "../../dist/run/agentRun.js";
+import { failAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createStartupReadyClaudeAgent } from "../helpers/mockClaudeAgent.js";
 import {
   createReviewRound,
@@ -84,6 +84,7 @@ import {
   attachWorkItemExecutionGroup,
   recordWorkItemWorkspaceDisposition,
   submitWorkItemCandidate,
+  updateWorkItemExecutionGroup,
   updateWorkItemWriteProjects,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
@@ -1817,8 +1818,23 @@ test("execution Lane workspaces are managed, retry-reused, merged into Candidate
   writeFileSync(join(lane2.entries[0].path, "lane-two.txt"), "two\n");
   execFileSync("git", ["-C", lane2.entries[0].path, "add", "lane-two.txt"]);
   execFileSync("git", ["-C", lane2.entries[0].path, "commit", "-qm", "lane two"]);
-  group = recordExecutionLaneResult(group, group.lanes[0].id, { summary: "one" }, "completed", NOW);
-  group = recordExecutionLaneResult(group, group.lanes[1].id, { summary: "two" }, "completed", NOW);
+  writeFileSync(join(lane1.entries[0].path, "dirty-lane.txt"), "dirty\n");
+  await assert.rejects(
+    preparer.snapshotExecutionLaneWorkspace(lane1),
+    /workspace is dirty/i
+  );
+  unlinkSync(join(lane1.entries[0].path, "dirty-lane.txt"));
+  const lane1Branch = lane1.entries[0].branch;
+  execFileSync("git", ["-C", lane1.entries[0].path, "checkout", "-qb", "wrong-lane-branch"]);
+  await assert.rejects(
+    preparer.snapshotExecutionLaneWorkspace(lane1),
+    /left its managed branch/i
+  );
+  execFileSync("git", ["-C", lane1.entries[0].path, "checkout", "-q", lane1Branch]);
+  const lane1Snapshot = await preparer.snapshotExecutionLaneWorkspace(lane1);
+  const lane2Snapshot = await preparer.snapshotExecutionLaneWorkspace(lane2);
+  group = recordExecutionLaneResult(group, group.lanes[0].id, { summary: "one", gitSnapshot: lane1Snapshot }, "completed", NOW);
+  group = recordExecutionLaneResult(group, group.lanes[1].id, { summary: "two", gitSnapshot: lane2Snapshot }, "completed", NOW);
   group = resolveExecutionGroup(group, {
     decision: "accept",
     summary: "accepted",
@@ -1830,6 +1846,14 @@ test("execution Lane workspaces are managed, retry-reused, merged into Candidate
     revision: store.getWorkItem(task.id, item.id).revision + 1,
     updatedAt: NOW.toISOString()
   });
+  execFileSync("git", ["-C", lane1.entries[0].path, "checkout", "-qb", "wrong-after-yield"]);
+  await assert.rejects(
+    preparer.materializeExecutionGroupCandidate(
+      task.id, item.id, group.id, group.lanes.map(({ id }) => id)
+    ),
+    /left its managed branch/i
+  );
+  execFileSync("git", ["-C", lane1.entries[0].path, "checkout", "-q", lane1Branch]);
   const materialized = await preparer.materializeExecutionGroupCandidate(
     task.id,
     item.id,
@@ -1838,9 +1862,31 @@ test("execution Lane workspaces are managed, retry-reused, merged into Candidate
   );
   assert.match(readFileSync(join(materialized.workspace.entries[0].path, "lane-one.txt"), "utf8"), /one/);
   assert.match(readFileSync(join(materialized.workspace.entries[0].path, "lane-two.txt"), "utf8"), /two/);
-  // A conflicting pair is one Candidate materialization transaction: the
-  // repository boundary must abort the whole multi-ref merge and leave the
-  // WorkItem target clean and unchanged for a bounded retry.
+  const materializedHead = execFileSync(
+    "git", ["-C", materialized.workspace.entries[0].path, "rev-parse", "HEAD"], { encoding: "utf8" }
+  ).trim();
+  assert.notEqual(materializedHead, develop.entries[0].baseCommit);
+  await preparer.restoreExecutionGroupCandidateMaterialization(materialized);
+  assert.equal(
+    execFileSync("git", ["-C", materialized.workspace.entries[0].path, "rev-parse", "HEAD"], {
+      encoding: "utf8"
+    }).trim(),
+    develop.entries[0].baseCommit
+  );
+  assert.equal(execFileSync(
+    "git", ["-C", materialized.workspace.entries[0].path, "status", "--porcelain"], { encoding: "utf8" }
+  ).trim(), "");
+  // A later Leader transaction failure must compensate the exact materialized
+  // Git heads before the caller retries resolution.
+  const rematerialized = await preparer.materializeExecutionGroupCandidate(
+    task.id,
+    item.id,
+    group.id,
+    group.lanes.map(({ id }) => id)
+  );
+  await preparer.restoreExecutionGroupCandidateMaterialization(rematerialized);
+  // A post-yield branch advance is not a new Lane output: materialization
+  // must reject it rather than silently reading the live branch.
   writeFileSync(join(lane1.entries[0].path, "lane-conflict.txt"), "lane one\n");
   execFileSync("git", ["-C", lane1.entries[0].path, "add", "lane-conflict.txt"]);
   execFileSync("git", ["-C", lane1.entries[0].path, "commit", "-qm", "lane one conflict"]);
@@ -1858,7 +1904,7 @@ test("execution Lane workspaces are managed, retry-reused, merged into Candidate
       group.id,
       group.lanes.map(({ id }) => id)
     ),
-    /Candidate materialization was not completed|merge failed/i
+    /advanced after yield/i
   );
   assert.equal(
     execFileSync("git", ["-C", targetPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
@@ -1871,6 +1917,17 @@ test("execution Lane workspaces are managed, retry-reused, merged into Candidate
   assert.deepEqual(cleaned, ["removed", "removed"]);
   assert.equal(store.listManagedWorkspaces(task.id).some(({ owner }) => owner.type === "execution-lane"), false);
   assert.equal(existsSync(join(workspace, "worktree", project.name, task.id, `execution-lane-${group.id}-${group.lanes[0].id}`)), false);
+  const unadopted = await preparer.prepareExecutionLaneWorkspace(
+    task.id,
+    "execution-group-unadopted",
+    "execution-group-unadopted-lane-1",
+    { purpose: "execution", workItemId: item.id }
+  );
+  assert.equal(store.getManagedWorkspace(unadopted.owner), null);
+  await preparer.discardUnadoptedExecutionLaneWorkspaces(
+    new Map([["execution-group-unadopted-lane-1", unadopted]])
+  );
+  assert.equal(existsSync(unadopted.entries[0].path), false);
 });
 
 test("public fixed multi-Lane dispatch yields isolated roots and resolves one aggregate Candidate", async (t) => {
@@ -1900,7 +1957,6 @@ test("public fixed multi-Lane dispatch yields isolated roots and resolves one ag
   const dispatched = spawnExactTaskCli(home, store, task.id, "leader", [
     "task", "work", "dispatch", item.id,
     "--strategy", "fixed:2",
-    "--lane-role", "worker",
     "--lane-role", "worker-2"
   ]);
   assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
@@ -1943,6 +1999,215 @@ test("public fixed multi-Lane dispatch yields isolated roots and resolves one ag
   assert.equal(readFileSync(join(candidateWorkspace.entries[0].path, "worker.txt"), "utf8"), "worker\n");
   assert.equal(readFileSync(join(candidateWorkspace.entries[0].path, "worker-2.txt"), "utf8"), "worker-2\n");
   assert.equal(existsSync(join(workspace, "tasks", task.id, "execution-lanes")), true);
+});
+
+test("execution Lane snapshots freeze every writable Project before aggregate materialization", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const secondRepositoryPath = join(workspace, "Second");
+  execFileSync("git", ["init", "-q", secondRepositoryPath]);
+  execFileSync("git", ["-C", secondRepositoryPath, "config", "user.name", "Yui Test"]);
+  execFileSync("git", ["-C", secondRepositoryPath, "config", "user.email", "yui@example.invalid"]);
+  writeFileSync(join(secondRepositoryPath, "tracked.txt"), "second initial\n");
+  execFileSync("git", ["-C", secondRepositoryPath, "add", "tracked.txt"]);
+  execFileSync("git", ["-C", secondRepositoryPath, "commit", "-qm", "second initial"]);
+  const firstProject = await addProject(store, repositoryPath);
+  await runProjectCommand([
+    "add", "Second", secondRepositoryPath,
+    "--alias", "second-cli",
+    "--remote", "git@example.invalid:second.git",
+    "--stable", "HEAD", "--development", "HEAD"
+  ], store, { now: () => new Date(NOW) });
+  const secondProject = store.listProjects().find(({ name }) => name === "Second");
+  assert.notEqual(secondProject, undefined);
+  const task = activateTask(createTask("task-1", "Multi-project Lane snapshot", NOW, {
+    projectBindings: [firstProject, secondProject].map((project) => ({
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }))
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "worker", "worker-2"]);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Multi-project outputs",
+    assignee: "worker",
+    writeProjectIds: [firstProject.id, secondProject.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const develop = await preparer.prepareWorkItemWorkspace(task.id, item.id);
+  const target = {
+    schemaVersion: 1,
+    kind: "work-item",
+    taskId: task.id,
+    workItemId: item.id,
+    revision: item.revision,
+    projects: develop.entries.filter(({ access }) => access === "write")
+      .map(({ projectId, baseCommit }) => ({ projectId, commit: baseCommit })),
+    fingerprint: "multi-project-lane-snapshot"
+  };
+  let group = createExecutionGroup("execution-group-1", task.id, {
+    purpose: "execution",
+    target,
+    strategy: { mode: "fixed", count: 2 },
+    lanes: [{ roleName: "worker" }, { roleName: "worker-2" }]
+  }, NOW);
+  store.saveWorkItem(task.id, attachWorkItemExecutionGroup(item, group, NOW));
+  const lanes = await Promise.all(group.lanes.map(({ id }) => (
+    preparer.prepareExecutionLaneWorkspace(task.id, group.id, id)
+  )));
+  for (let laneIndex = 0; laneIndex < lanes.length; laneIndex += 1) {
+    const lane = lanes[laneIndex];
+    for (const entry of lane.entries.filter(({ access }) => access === "write")) {
+      const name = `${entry.projectId}-lane-${laneIndex + 1}.txt`;
+      writeFileSync(join(entry.path, name), `${entry.projectId}-${laneIndex + 1}\n`);
+      execFileSync("git", ["-C", entry.path, "add", name]);
+      execFileSync("git", ["-C", entry.path, "commit", "-qm", name]);
+    }
+  }
+  const snapshots = await Promise.all(lanes.map((lane) => preparer.snapshotExecutionLaneWorkspace(lane)));
+  assert.deepEqual(snapshots.map(({ projects }) => projects.length), [2, 2]);
+  group = recordExecutionLaneResult(group, group.lanes[0].id, { summary: "one", gitSnapshot: snapshots[0] }, "completed", NOW);
+  group = recordExecutionLaneResult(group, group.lanes[1].id, { summary: "two", gitSnapshot: snapshots[1] }, "completed", NOW);
+  store.saveWorkItem(task.id, {
+    ...store.getWorkItem(task.id, item.id),
+    executionGroup: group,
+    revision: store.getWorkItem(task.id, item.id).revision + 1,
+    updatedAt: NOW.toISOString()
+  });
+  const materialized = await preparer.materializeExecutionGroupCandidate(
+    task.id, item.id, group.id, group.lanes.map(({ id }) => id)
+  );
+  for (const entry of materialized.workspace.entries.filter(({ access }) => access === "write")) {
+    assert.match(readFileSync(join(entry.path, `${entry.projectId}-lane-1.txt`), "utf8"), /-1$/m);
+    assert.match(readFileSync(join(entry.path, `${entry.projectId}-lane-2.txt`), "utf8"), /-2$/m);
+  }
+  await preparer.restoreExecutionGroupCandidateMaterialization(materialized);
+  await Promise.all(group.lanes.map(({ id }) => preparer.cleanupExecutionLaneWorkspace(task.id, group.id, id)));
+});
+
+test("public adaptive singleton yields, appends one Lane, and resolves frozen outputs", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Public adaptive expansion", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker", "worker-2"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Adaptive singleton",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+
+  const firstDispatch = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "dispatch", item.id,
+    "--strategy", "adaptive:2"
+  ]);
+  assert.equal(firstDispatch.status, 0, firstDispatch.stderr || firstDispatch.stdout);
+  await stopFileTaskController(home);
+  let active = store.listAgentRuns(task.id).find(({ purpose, status }) => (
+    purpose === "execution" && status === "active"
+  ));
+  assert.notEqual(active, undefined);
+  assert.equal(active.workspace.owner.type, "execution-lane");
+  let entry = active.workspace.entries.find(({ access }) => access === "write");
+  writeFileSync(join(entry.path, "first-lane.txt"), "first\n");
+  execFileSync("git", ["-C", entry.path, "add", "first-lane.txt"]);
+  execFileSync("git", ["-C", entry.path, "commit", "-qm", "first lane"]);
+  markDelivered(store, active);
+  const firstYield = spawnExactTaskCli(home, store, task.id, active.roleName, [
+    "task", "run", "yield", active.id, "--summary", "first lane"
+  ]);
+  assert.equal(firstYield.status, 0, firstYield.stderr || firstYield.stdout);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "running");
+  assert.equal(store.getWorkItem(task.id, item.id).executionGroup.lanes.length, 1);
+  assert.equal(store.getWorkItem(task.id, item.id).executionGroup.lanes[0].result.gitSnapshot.projects.length, 1);
+
+  const append = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "dispatch", item.id,
+    "--lane-role", "worker-2"
+  ]);
+  assert.equal(append.status, 0, append.stderr || append.stdout);
+  await stopFileTaskController(home);
+  active = store.listAgentRuns(task.id).find(({ purpose, status, roleName }) => (
+    purpose === "execution" && status === "active" && roleName === "worker-2"
+  ));
+  assert.notEqual(active, undefined);
+  assert.notEqual(active.workspace.root, store.getWorkItemWorkspace(task.id, item.id).root);
+  entry = active.workspace.entries.find(({ access }) => access === "write");
+  writeFileSync(join(entry.path, "second-lane.txt"), "second\n");
+  execFileSync("git", ["-C", entry.path, "add", "second-lane.txt"]);
+  execFileSync("git", ["-C", entry.path, "commit", "-qm", "second lane"]);
+  markDelivered(store, active);
+  const secondYield = spawnExactTaskCli(home, store, task.id, active.roleName, [
+    "task", "run", "yield", active.id, "--summary", "second lane"
+  ]);
+  assert.equal(secondYield.status, 0, secondYield.stderr || secondYield.stdout);
+
+  const resolved = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "group", "resolve", item.id,
+    "--decision", "accept", "--summary", "adaptive outputs accepted"
+  ]);
+  assert.equal(resolved.status, 0, resolved.stderr || resolved.stdout);
+  const accepted = store.getWorkItem(task.id, item.id);
+  assert.equal(accepted.status, "awaiting_acceptance");
+  assert.equal(accepted.executionGroup.lanes.length, 2);
+  assert.equal(accepted.candidates.length, 1);
+  const candidateWorkspace = store.getWorkItemWorkspace(task.id, item.id);
+  assert.equal(readFileSync(join(candidateWorkspace.entries[0].path, "first-lane.txt"), "utf8"), "first\n");
+  assert.equal(readFileSync(join(candidateWorkspace.entries[0].path, "second-lane.txt"), "utf8"), "second\n");
+  assert.equal(existsSync(join(workspace, "tasks", task.id, "execution-lanes")), true);
+});
+
+test("failed public multi-Lane dispatch compensates unadopted Lane workspaces", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Compensated Lane dispatch", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "worker"]);
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Dispatch rollback",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+
+  const failed = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "dispatch", item.id,
+    "--strategy", "fixed:2",
+    "--lane-role", "worker",
+    "--lane-role", "missing-role"
+  ]);
+  assert.notEqual(failed.status, 0);
+  assert.match(`${failed.stderr}${failed.stdout}`, /Role not found|Task Role|missing-role/);
+  assert.equal(
+    store.listManagedWorkspaces(task.id).some(({ owner }) => owner.type === "execution-lane"),
+    false
+  );
+  const laneBranch = "yui/task-1/execution-lane-execution-group-agent-run-1-execution-group-agent-run-1-lane-1";
+  assert.equal(
+    existsSync(join(workspace, "worktree", project.name, task.id, "execution-lane-execution-group-agent-run-1-execution-group-agent-run-1-lane-1")),
+    false
+  );
+  assert.throws(() => execFileSync(
+    "git", ["-C", repositoryPath, "show-ref", "--verify", `refs/heads/${laneBranch}`], { stdio: "ignore" }
+  ));
 });
 
 test("a new Task reuses its managed branch after interrupted preparation", async (t) => {
@@ -4747,6 +5012,164 @@ test("public dispatch prepares a WorkItem-owned read-only Develop workspace befo
   const candidate = candidateItem.candidates.at(-1);
   assert.deepEqual(candidate.source, { type: "run", runId: active.id });
   assert.deepEqual(candidate.workspace.owner, workspaceRecord.owner);
+  assert.notEqual(candidate.gitSnapshot, undefined);
+  assert.equal(candidate.gitSnapshot.projects.length, 1);
+});
+
+test("public fixed(1) Worker yield freezes a Candidate Git snapshot", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Fixed one snapshot", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "One Lane output",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const dispatched = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "dispatch", item.id
+  ]);
+  assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
+  await stopFileTaskController(home);
+  const active = store.getActiveAgentRun(task.id, "worker");
+  assert.notEqual(active, null);
+  const entry = active.workspace.entries.find(({ access }) => access === "write");
+  writeFileSync(join(entry.path, "fixed-one.txt"), "fixed one\n");
+  execFileSync("git", ["-C", entry.path, "add", "fixed-one.txt"]);
+  execFileSync("git", ["-C", entry.path, "commit", "-qm", "fixed one"]);
+  const commit = execFileSync("git", ["-C", entry.path, "rev-parse", "HEAD"], {
+    encoding: "utf8"
+  }).trim();
+  markDelivered(store, active);
+  const yielded = spawnExactTaskCli(home, store, task.id, "worker", [
+    "task", "run", "yield", active.id, "--summary", "fixed one result"
+  ]);
+  assert.equal(yielded.status, 0, yielded.stderr || yielded.stdout);
+  const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
+  assert.notEqual(candidate, undefined);
+  assert.equal(candidate.gitSnapshot.projects.length, 1);
+  assert.equal(candidate.gitSnapshot.projects[0].projectId, project.id);
+  assert.equal(candidate.gitSnapshot.projects[0].commit, commit);
+  assert.equal(candidate.workspace.root, join(workspace, "tasks", task.id, "work-items", item.id));
+});
+
+test("public Gitless Worker yield completes without inventing Git output", async (t) => {
+  const { home, store, repositoryPath } = fixture(t);
+  const task = activateTask(createTask("task-1", "Gitless execution", NOW), NOW);
+  addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Report-only output",
+    assignee: "worker",
+    writeProjectIds: []
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const dispatched = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "dispatch", item.id
+  ]);
+  assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
+  await stopFileTaskController(home);
+  const active = store.getActiveAgentRun(task.id, "worker");
+  assert.notEqual(active, null);
+  assert.equal(active.workspace, undefined);
+  markDelivered(store, active);
+  const yielded = spawnExactTaskCli(home, store, task.id, "worker", [
+    "task", "run", "yield", active.id, "--summary", "report-only result"
+  ]);
+  assert.equal(yielded.status, 0, yielded.stderr || yielded.stdout);
+  const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "awaiting_acceptance");
+  assert.equal(candidate.workspace, undefined);
+  assert.equal(candidate.gitSnapshot, undefined);
+});
+
+test("public multi-Lane retry reuses the failed Lane workspace", async (t) => {
+  const { home, workspace, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Retry one Lane", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker", "worker-2"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Retry a failed panel Lane",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const dispatched = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "dispatch", item.id,
+    "--strategy", "fixed:2", "--lane-role", "worker-2"
+  ]);
+  assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
+  await stopFileTaskController(home);
+  const activeRuns = store.listAgentRuns(task.id).filter(({ purpose, status }) => (
+    purpose === "execution" && status === "active"
+  ));
+  const failed = activeRuns.find(({ roleName }) => roleName === "worker-2");
+  const survivor = activeRuns.find(({ roleName }) => roleName === "worker");
+  assert.notEqual(failed, undefined);
+  assert.notEqual(survivor, undefined);
+  const originalRoot = failed.workspace.root;
+  store.transaction((tx) => {
+    const current = tx.getWorkItem(task.id, item.id);
+    const failureAt = new Date(Math.max(Date.now(), Date.parse(current.updatedAt)));
+    tx.saveAgentRun(failAgentRun(failed, "transient lane failure", failureAt));
+    tx.clearActiveAgentRun(task.id, failed.roleName);
+    tx.saveRole(task.id, updateRoleStatus(tx.getRole(task.id, failed.roleName), "idle", failureAt));
+    const laneFailed = updateWorkItemExecutionGroup(
+      current,
+      recordExecutionLaneResult(
+        current.executionGroup,
+        failed.executionLaneId,
+        { summary: "transient lane failure" },
+        "failed",
+        failureAt
+      ),
+      failureAt
+    );
+    tx.saveWorkItem(task.id, laneFailed);
+  });
+  const retried = spawnExactTaskCli(home, store, task.id, failed.roleName, [
+    "task", "run", "retry", failed.id
+  ]);
+  assert.equal(retried.status, 0, retried.stderr || retried.stdout);
+  await stopFileTaskController(home);
+  const retryRun = store.getActiveAgentRun(task.id, failed.roleName);
+  assert.notEqual(retryRun, null);
+  assert.equal(retryRun.executionLaneId, failed.executionLaneId);
+  assert.equal(retryRun.workspace.root, originalRoot);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "running");
+  assert.equal(store.getWorkItem(task.id, item.id).executionGroup.lanes.length, 2);
+  assert.equal(store.getActiveAgentRun(task.id, survivor.roleName).id, survivor.id);
+  assert.equal(existsSync(join(workspace, "tasks", task.id, "execution-lanes")), true);
 });
 
 test("a roleless Project WorkItem follows isolate, Candidate, Integration, acceptance, and cleanup", async (t) => {

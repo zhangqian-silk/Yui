@@ -40,6 +40,11 @@ export interface GitWorkspacePort {
     targetPath: string;
     sourceRefs: readonly string[];
   }>): Promise<void>;
+  resetWorktree(input: Readonly<{
+    targetPath: string;
+    expectedHead: string;
+    restoreHead: string;
+  }>): Promise<void>;
   refresh(input: Readonly<{
     repositoryPath: string;
     remoteUrl: string;
@@ -275,6 +280,37 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       }
       throw new Error(
         `Git merge failed for ${target} from ${sources.join(", ")}; Candidate materialization was not completed.`,
+        { cause: error }
+      );
+    }
+  }
+
+  async resetWorktree(input: Readonly<{
+    targetPath: string;
+    expectedHead: string;
+    restoreHead: string;
+  }>): Promise<void> {
+    const target = await canonicalDirectory(input.targetPath, "Reset target");
+    const expectedHead = safeRef(input.expectedHead);
+    const restoreHead = safeRef(input.restoreHead);
+    if (!await this.isClean(target)) {
+      throw new Error(`Git reset target must be clean: ${target}.`);
+    }
+    const currentHead = (await this.inspect(target, "HEAD")).baseCommit;
+    if (currentHead !== expectedHead) {
+      throw new Error(
+        `Git reset target changed before compensation: ${target} (${currentHead}).`
+      );
+    }
+    try {
+      await git(["-C", target, "reset", "--hard", restoreHead]);
+      const restoredHead = (await this.inspect(target, "HEAD")).baseCommit;
+      if (restoredHead !== restoreHead || !await this.isClean(target)) {
+        throw new Error(`Git reset target did not restore its exact head: ${target}.`);
+      }
+    } catch (error) {
+      throw new Error(
+        `Git reset compensation failed for ${target}; Candidate materialization remains retained for diagnosis.`,
         { cause: error }
       );
     }

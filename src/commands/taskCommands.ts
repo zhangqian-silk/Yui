@@ -149,6 +149,7 @@ import {
   restartExecutionLane,
   updateExecutionLane,
   type ExecutionGroup,
+  type ExecutionLaneGitSnapshot,
   type ExecutionStrategy,
   type ExecutionLaneWorkspace,
   type ExecutionTarget
@@ -320,10 +321,14 @@ export type TaskCommandOptions = Readonly<{
   yuiHome?: string;
   workItemIntegrationProof?: WorkItemIntegrationProof;
   candidateGitSnapshot?: CandidateGitSnapshot;
-  candidateWorkspace?: ManagedWorkspace;
+  /** Managed Candidate workspace; null is an explicit Gitless/no-workspace preflight. */
+  candidateWorkspace?: ManagedWorkspace | null;
   directTaskMainSnapshot?: DirectTaskMainSnapshot;
   /** Prepared by the repository/workspace lifecycle before command mutation. */
   executionLaneWorkspaces?: ReadonlyMap<string, ManagedWorkspace>;
+  /** Frozen managed workspace heads captured immediately before Lane yield. A
+   * null value is an explicit preflight result for a Gitless/read-only Lane. */
+  executionLaneGitSnapshot?: ExecutionLaneGitSnapshot | null;
   reviewWorkspaceResult?: Readonly<{
     evidenceCommit?: string;
   }>;
@@ -369,6 +374,68 @@ export function runTaskCommand(
         ? "Task command is required."
         : `Unknown command: task ${command}`);
   }
+}
+
+/**
+ * The single Lane-role plan shared by CLI preflight and dispatch mutation.
+ * For a new Group the WorkItem assignee is the implicit first Lane unless it
+ * was already supplied. During adaptive expansion the explicit roles are the
+ * new Lanes; the existing assignee is not re-added.
+ */
+export function normalizedExecutionLaneRoles(
+  assignee: string,
+  requestedRoles: readonly string[],
+  expanding = false
+): readonly string[] {
+  if (expanding) return [...requestedRoles];
+  if (requestedRoles.length === 0) return [assignee];
+  return requestedRoles[0] === assignee
+    ? [...requestedRoles]
+    : [assignee, ...requestedRoles];
+}
+
+export type NormalizedExecutionLanePlan = Readonly<{
+  expanding: boolean;
+  roles: readonly string[];
+  strategy: ExecutionStrategy;
+  capacity: number;
+  requestedCount: number;
+  laneIds: readonly string[];
+}>;
+
+/** Derive the complete Worker Lane plan once for both preflight and mutation. */
+export function normalizedExecutionLanePlan(input: Readonly<{
+  assignee: string;
+  requestedRoles: readonly string[];
+  requestedStrategy?: ExecutionStrategy;
+  existingGroup?: Pick<ExecutionGroup, "id" | "lanes" | "strategy">;
+  status: WorkItemStatus;
+  nextGroupId: string;
+  retryLaneId?: string;
+  phase?: "dispatch" | "retry";
+}>): NormalizedExecutionLanePlan {
+  const retry = input.phase === "retry" || input.retryLaneId !== undefined;
+  const expanding = !retry && input.status === "running" && input.existingGroup !== undefined;
+  const roles = retry
+    ? []
+    : normalizedExecutionLaneRoles(input.assignee, input.requestedRoles, expanding);
+  const strategy = input.existingGroup?.strategy
+    ?? input.requestedStrategy
+    ?? { mode: "fixed", count: roles.length };
+  const capacity = strategy.mode === "fixed" ? strategy.count : strategy.max;
+  const requestedCount = retry
+    ? input.existingGroup?.lanes.length ?? 0
+    : expanding
+      ? input.existingGroup!.lanes.length + roles.length
+      : roles.length;
+  const laneIds = input.retryLaneId !== undefined
+    ? [input.retryLaneId]
+    : retry
+      ? []
+      : input.existingGroup === undefined
+      ? roles.map((_, index) => `${input.nextGroupId}-lane-${index + 1}`)
+      : roles.map((_, index) => `${input.existingGroup!.id}-lane-${input.existingGroup!.lanes.length + index + 1}`);
+  return { expanding, roles, strategy, capacity, requestedCount, laneIds };
 }
 
 function taskProjectCommand(
@@ -2172,30 +2239,30 @@ function dispatchWork(
     }
     const rawInput = trimmed(parsed.options.get("--input")) ?? item.objective;
     const runWorkspace = workspace ?? tx.getTaskWorkspace(task.id) ?? undefined;
-    const laneRoles = expanding
-      ? requestedLaneRoles
-      : requestedLaneRoles.length === 0
-        ? [item.assignee]
-        : requestedLaneRoles[0] === item.assignee
-          ? requestedLaneRoles
-          : [item.assignee, ...requestedLaneRoles];
+    const lanePlan = normalizedExecutionLanePlan({
+      assignee: item.assignee,
+      requestedRoles: requestedLaneRoles,
+      requestedStrategy,
+      existingGroup,
+      status: item.status,
+      nextGroupId: `execution-group-${tx.peekNextAgentRunId(task.id)}`,
+      retryLaneId: undefined,
+      phase: "dispatch"
+    });
+    const laneRoles = lanePlan.roles;
     if (laneRoles.length === 0) {
       throw usageError("At least one --lane-role is required when expanding an ExecutionGroup.");
     }
     if (new Set(laneRoles).size !== laneRoles.length) {
       throw usageError("Each ExecutionGroup Lane must use a distinct Task Role.");
     }
-    const strategy = existingGroup?.strategy
-      ?? requestedStrategy
-      ?? { mode: "fixed", count: laneRoles.length };
+    const strategy = lanePlan.strategy;
     if (existingGroup !== undefined && requestedStrategy !== undefined
       && !sameExecutionStrategy(existingGroup.strategy, requestedStrategy)) {
       throw usageError(`ExecutionGroup strategy is frozen: ${existingGroup.id}.`);
     }
-    const available = strategy.mode === "fixed" ? strategy.count : strategy.max;
-    const requestedCount = expanding
-      ? existingGroup!.lanes.length + laneRoles.length
-      : laneRoles.length;
+    const available = lanePlan.capacity;
+    const requestedCount = lanePlan.requestedCount;
     if (requestedCount > available) {
       throw usageError(`ExecutionGroup Lane count ${requestedCount} exceeds its ${strategy.mode} capacity ${available}.`);
     }
@@ -2402,13 +2469,20 @@ function resolveWorkExecutionGroup(
     if (item.status !== "running") {
       throw usageError(`Work Item ${item.id} cannot resolve from ${item.status}.`);
     }
-    const resolutionSummary = decision === "accept"
-      ? aggregateExecutionLaneSummary(summary, group, selectedLaneIds)
-      : summary;
+    const acceptedLaneIds = decision === "accept"
+      ? selectedLaneIds ?? group.lanes
+        .filter((lane) => lane.status === "yielded" || lane.status === "completed")
+        .map(({ id }) => id)
+      : undefined;
+    const resolutionSummary = acceptedLaneIds === undefined
+      ? summary
+      : aggregateExecutionLaneSummary(summary, group, acceptedLaneIds);
     const resolved = resolveExecutionGroup(group, {
       decision,
       summary: resolutionSummary,
-      ...(selectedLaneIds === undefined ? {} : { selectedLaneIds })
+      ...(decision === "accept"
+        ? { selectedLaneIds: acceptedLaneIds }
+        : selectedLaneIds === undefined ? {} : { selectedLaneIds })
     }, now);
     const groupedItem = updateWorkItemExecutionGroup(item, resolved, now);
     tx.saveWorkItem(task.id, groupedItem);
@@ -2443,9 +2517,11 @@ function resolveWorkExecutionGroup(
       executionLaneId: eligible.executionLaneId,
       ...(candidatePolicy === null ? {} : { reviewPolicy: candidatePolicy }),
       ...(taskFinalContract === undefined ? {} : { taskFinalReviewContract: taskFinalContract }),
-      ...(candidateWorkspace === undefined
-        ? (eligible.workspace === undefined ? {} : { workspace: eligible.workspace })
-        : { workspace: candidateWorkspace }),
+      ...(candidateWorkspace === null
+        ? {}
+        : candidateWorkspace === undefined
+          ? (eligible.workspace === undefined ? {} : { workspace: eligible.workspace })
+          : { workspace: candidateWorkspace }),
       ...(options.candidateGitSnapshot === undefined ? {} : { gitSnapshot: options.candidateGitSnapshot })
     }, now);
     tx.saveWorkItem(task.id, candidate);
@@ -3004,7 +3080,13 @@ function resolveReviewExecutionGroup(
     const resolved = resolveExecutionGroup(group, {
       decision,
       summary,
-      ...(selectedLaneIds === undefined ? {} : { selectedLaneIds })
+      ...(decision === "accept"
+        ? {
+            selectedLaneIds: selectedLaneIds ?? group.lanes
+              .filter((lane) => lane.status === "yielded" || lane.status === "completed")
+              .map(({ id }) => id)
+          }
+        : selectedLaneIds === undefined ? {} : { selectedLaneIds })
     }, now);
     const withGroup = updateReviewExecutionGroup(round, resolved);
     const laneReports = resolved.lanes
@@ -3117,9 +3199,9 @@ function requestTaskReviewRound(
         || exact.executionGroup.resolution !== undefined) {
         throw usageError(`ReviewRound ${exact.id} cannot append Reviewer Lanes from ${exact.status}.`);
       }
-      const laneRoles = requestedLaneRoles[0] === reviewerRoleName
-        ? requestedLaneRoles
-        : [reviewerRoleName, ...requestedLaneRoles];
+      // Expansion receives only the newly requested Roles; the existing
+      // reviewer Role is already represented by its persisted first Lane.
+      const laneRoles = requestedLaneRoles;
       if (new Set(laneRoles).size !== laneRoles.length) {
         throw usageError("Each Reviewer Lane must use a distinct Task Role.");
       }
@@ -4847,6 +4929,15 @@ function yieldRun(
         throw usageError(error instanceof Error ? error.message : String(error));
       }
     }
+    const groupedLaneRun = active.executionGroupId !== undefined
+      && active.executionLaneId !== undefined;
+    if (groupedLaneRun
+      && options.yuiHome !== undefined
+      && options.executionLaneGitSnapshot === undefined) {
+      throw usageError(
+        `Managed Execution Lane Git snapshot preflight is missing: ${active.id}.`
+      );
+    }
     if (active.purpose === "review") {
       if (options.reviewWorkspaceResult === undefined) {
         throw usageError(`Review Run requires managed workspace preflight: ${active.id}.`);
@@ -4887,7 +4978,11 @@ function yieldRun(
                   ? { evidenceCommit: options.reviewWorkspaceResult!.evidenceCommit }
                   : yieldedReport.evidenceCommit === undefined
                     ? {}
-                    : { evidenceCommit: yieldedReport.evidenceCommit })
+                    : { evidenceCommit: yieldedReport.evidenceCommit }),
+              ...(options.executionLaneGitSnapshot === undefined
+                || options.executionLaneGitSnapshot === null
+                ? {}
+                : { gitSnapshot: options.executionLaneGitSnapshot })
             }
           })
     }, now);

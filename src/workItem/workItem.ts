@@ -106,7 +106,8 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  schemaVersion: 7;
+  /** v8 adds the persisted ExecutionLane Git snapshot boundary. */
+  schemaVersion: 8;
   id: string;
   taskId: string;
   title: string;
@@ -153,7 +154,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 7,
+    schemaVersion: 8,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -427,7 +428,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 7) throw new Error("WorkItem must use schemaVersion 7.");
+  if (workItem.schemaVersion !== 8) throw new Error("WorkItem must use schemaVersion 8.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");

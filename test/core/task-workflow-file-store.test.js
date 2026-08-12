@@ -1122,6 +1122,62 @@ test("adaptive Worker execution can append a bounded Lane before resolution", (t
   assert.equal(store.listAgentRuns(task.id).filter(({ status }) => status === "active").length, 2);
 });
 
+test("accept defaults to usable terminal Lanes when one panel Lane failed", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Partial panel resolution");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["role", "add", task.id, "worker-2"], store, options);
+  run(["work", "create", task.id, "partial panel", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run([
+    "work", "dispatch", item.id,
+    "--strategy", "fixed:2",
+    "--lane-role", "worker",
+    "--lane-role", "worker-2"
+  ], store, options);
+  const activeRuns = store.listAgentRuns(task.id).filter(({ purpose, status }) => (
+    purpose === "execution" && status === "active"
+  ));
+  const failed = activeRuns.find(({ roleName }) => roleName === "worker-2");
+  const yielded = activeRuns.find(({ roleName }) => roleName === "worker");
+  markDelivered(store, failed);
+  markDelivered(store, yielded);
+  run(["run", "yield", yielded.id, "--summary", "lane yielded"], store, options);
+  store.transaction((tx) => {
+    const failedRun = tx.getAgentRun(task.id, failed.id);
+    tx.saveAgentRun(failAgentRun(failedRun, "lane failed", NOW));
+    tx.clearActiveAgentRun(task.id, failed.roleName);
+    tx.saveRole(task.id, updateRoleStatus(tx.getRole(task.id, failed.roleName), "idle", NOW));
+    tx.saveWorkItem(task.id, updateWorkItemExecutionGroup(
+      tx.getWorkItem(task.id, item.id),
+      recordExecutionLaneResult(
+        tx.getWorkItem(task.id, item.id).executionGroup,
+        failed.executionLaneId,
+        { summary: "lane failed" },
+        "failed",
+        NOW
+      ),
+      NOW
+    ));
+  });
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  run(["work", "group", "resolve", item.id, "--decision", "accept", "--summary", "accept usable lane"], store, leaderOptions);
+  const resolved = store.getWorkItem(task.id, item.id).executionGroup;
+  assert.deepEqual(
+    resolved.resolution.selectedLaneIds,
+    [resolved.lanes.find(({ roleName }) => roleName === "worker").id]
+  );
+  assert.match(store.getWorkItem(task.id, item.id).candidates[0].summary, /worker result|lane yielded/);
+});
+
 test("desired Agent drift preserves the in-flight Run's exact yield authority", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Immutable yield identity");
