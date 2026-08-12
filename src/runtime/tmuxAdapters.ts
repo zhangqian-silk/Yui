@@ -185,9 +185,7 @@ export class TmuxSessionHost implements SessionHostPort {
 
   async stop(binding: RuntimeBinding): Promise<void> {
     const ref = requireMatchingHostRef(binding);
-    if (await probeRoleStatus(this.tmux, ref.hostId, ref.roleName) === "running") {
-      await killRole(this.tmux, ref.hostId, ref.roleName);
-    }
+    await stopExactRole(this.tmux, ref.hostId, ref.roleName);
   }
 
   async inspect(binding: RuntimeBinding): Promise<SessionInspection> {
@@ -284,12 +282,7 @@ export class TmuxSessionHost implements SessionHostPort {
       ? normalized.taskId
       : this.#globalHostId;
     try {
-      if (
-        await probeRoleStatus(this.tmux, hostId, normalized.roleName)
-        === "running"
-      ) {
-        await killRole(this.tmux, hostId, normalized.roleName);
-      }
+      await stopExactRole(this.tmux, hostId, normalized.roleName);
       return await probeRoleStatus(this.tmux, hostId, normalized.roleName)
         === "exited";
     } catch {
@@ -467,6 +460,29 @@ async function killRole(
     return;
   }
   await tmux.killRoleAsync(hostId, roleName);
+}
+
+async function stopExactRole(
+  tmux: RuntimeTmuxHostPort,
+  hostId: string,
+  roleName: string
+): Promise<void> {
+  if (await probeRoleStatus(tmux, hostId, roleName) !== "running") return;
+  try {
+    await killRole(tmux, hostId, roleName);
+  } catch (error) {
+    // Killing the final window may make the tmux server exit before the
+    // client observes a clean command status. The authoritative outcome is
+    // the exact Role's postcondition. Preserve the original error unless the
+    // Role is positively proven stopped.
+    try {
+      if (await probeRoleStatus(tmux, hostId, roleName) === "exited") return;
+    } catch {
+      // Fall through to the original kill error; an unavailable postcondition
+      // is not evidence that cleanup succeeded.
+    }
+    throw error;
+  }
 }
 
 type TmuxHostRef = Readonly<{

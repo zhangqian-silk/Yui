@@ -1,12 +1,21 @@
-import { accessSync, constants, existsSync, lstatSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, existsSync, lstatSync, readFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 
-import { configuredAgentToDefinition, type ConfiguredAgent } from "../agent/agent.js";
+import {
+  configuredAgentToDefinition,
+  resolveAgentEnvironment,
+  type ConfiguredAgent
+} from "../agent/agent.js";
+import { operationalAgentEnvironment } from "../agent/launchEnvironment.js";
 import {
   inspectAgentCapabilities,
+  resolveAgentAdapter,
   type AgentProbeResult,
   type CapabilitySnapshot
 } from "../executor/agentAdapter.js";
+import { inspectCodexLaunchConfig } from "../executor/codexConfigConflict.js";
+import { resolveEffectiveLaunch } from "../executor/effectiveLaunch.js";
+import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
@@ -34,12 +43,29 @@ import {
   readEphemeralDomainIdentity,
   readLinuxProcessStartIdentity
 } from "../controller/domainIdentity.js";
+import type { GlobalRole } from "../role/role.js";
+import type { ReviewConfig } from "../review/reviewConfig.js";
 
 export type DoctorStatus = "ok" | "missing" | "unsupported" | "invalid";
 
 export type DoctorCheck = Readonly<{
   name: string;
   status: DoctorStatus;
+  detail: string;
+}>;
+
+export type DoctorReviewStatus = "ready" | "disabled" | "misconfigured";
+
+/** Static Review configuration health. Provider-native acceptance is never inferred here. */
+export type DoctorReviewReport = Readonly<{
+  status: DoctorReviewStatus;
+  policy?: ReviewConfig;
+  roleName?: string;
+  activeAgentId?: string;
+  adapterId?: string;
+  command?: string;
+  /** Always unverified: doctor never creates a Reviewer Session or calls a model. */
+  providerNative: "unverified";
   detail: string;
 }>;
 
@@ -67,6 +93,7 @@ export type StorageHealthSummary = Readonly<{
 export type DoctorReport = Readonly<{
   checks: readonly DoctorCheck[];
   storage: StorageHealthSummary;
+  review: DoctorReviewReport;
 }>;
 
 /**
@@ -93,13 +120,27 @@ export function buildDoctorReport(
   executor: CommandExecutor,
   storageOptions: OpenCompatibleFileTaskStoreOptions = {}
 ): DoctorReport {
-  const checks = getDoctorChecks(env, executor, storageOptions);
-  return { checks, storage: summarizeStorageHealth(checks) };
+  const inspection = inspectDoctor(env, executor, storageOptions);
+  return {
+    checks: inspection.checks,
+    storage: summarizeStorageHealth(inspection.checks),
+    review: inspection.review
+  };
 }
 
 type StorageInspection = Readonly<{
   check: DoctorCheck;
   agents: readonly ConfiguredAgent[];
+  review: ReviewSource;
+}>;
+
+type ReviewSource = Readonly<{
+  storageReady: boolean;
+  storageDetail: string;
+  home?: string;
+  policy?: ReviewConfig;
+  role?: GlobalRole | null;
+  agent?: ConfiguredAgent | null;
 }>;
 
 type SchemaInspection = StorageSchemaState | Readonly<{
@@ -129,7 +170,8 @@ export function runDoctorCommand(
   storageOptions: OpenCompatibleFileTaskStoreOptions = {}
 ): string {
   if (args.length !== 0) throw usageError("Doctor usage: yui doctor");
-  return renderDoctor(getDoctorChecks(env, executor, storageOptions));
+  const inspection = inspectDoctor(env, executor, storageOptions);
+  return renderDoctor(inspection.checks, inspection.review);
 }
 
 export function getDoctorChecks(
@@ -137,6 +179,19 @@ export function getDoctorChecks(
   executor: CommandExecutor,
   storageOptions: OpenCompatibleFileTaskStoreOptions = {}
 ): DoctorCheck[] {
+  return inspectDoctor(env, executor, storageOptions).checks;
+}
+
+type DoctorInspection = Readonly<{
+  checks: DoctorCheck[];
+  review: DoctorReviewReport;
+}>;
+
+function inspectDoctor(
+  env: NodeJS.ProcessEnv,
+  executor: CommandExecutor,
+  storageOptions: OpenCompatibleFileTaskStoreOptions = {}
+): DoctorInspection {
   const home = resolveYuiHome(env);
   const homeCheck = checkHome(home);
   const schema = readSchema(home);
@@ -154,16 +209,25 @@ export function getDoctorChecks(
     compatibility
   );
   const domain = checkEphemeralDomain(home);
-  return [
-    homeCheck,
-    schemaCheck,
-    compatibility.check,
-    storage.check,
-    ...(domain === undefined ? [] : [domain]),
+  const toolChecks = [
     checkExecutable("git", env.YUI_GIT_BIN ?? "git", ["--version"], executor),
-    checkExecutable("tmux", env.YUI_TMUX_BIN ?? "tmux", ["-V"], executor),
-    ...storage.agents.flatMap((agent) => checkAgent(agent, executor))
+    checkExecutable("tmux", env.YUI_TMUX_BIN ?? "tmux", ["-V"], executor)
   ];
+  const agentChecks = storage.agents.flatMap((agent) => checkAgent(agent, executor, env));
+  const review = inspectReview({ ...storage.review, home }, agentChecks, env);
+  return {
+    checks: [
+      homeCheck,
+      schemaCheck,
+      compatibility.check,
+      storage.check,
+      ...(domain === undefined ? [] : [domain]),
+      ...toolChecks,
+      ...agentChecks,
+      ...review.checks
+    ],
+    review: review.report
+  };
 }
 
 function checkEphemeralDomain(home: string): DoctorCheck | undefined {
@@ -201,8 +265,14 @@ function checkEphemeralDomain(home: string): DoctorCheck | undefined {
   };
 }
 
-export function renderDoctor(checks: readonly DoctorCheck[]): string {
-  return `Yui doctor\n${renderTable(
+export function renderDoctor(
+  checks: readonly DoctorCheck[],
+  review?: DoctorReviewReport
+): string {
+  const reviewLine = review === undefined
+    ? ""
+    : `Reviewer: ${review.status} (${review.detail})\n`;
+  return `Yui doctor\n${reviewLine}${renderTable(
     "Checks",
     [
       { header: "Check", minWidth: 8, maxWidth: 28 },
@@ -446,7 +516,23 @@ function inspectState(
         status: "ok",
         detail: `readable agents=${agents.length} tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoles.length} defaultAgent=${config.defaultAgent ?? "none"}`
       },
-      agents
+      agents,
+      review: {
+        storageReady: true,
+        storageDetail: "state.json is readable",
+        ...(config.review === undefined ? {} : { policy: config.review }),
+        ...(config.review === undefined
+          ? {}
+          : {
+              role: store.getGlobalRole(config.review.roleName),
+              agent: (() => {
+                const role = store.getGlobalRole(config.review.roleName);
+                return role === null
+                  ? null
+                  : store.getConfiguredAgent(role.activeAgentId);
+              })()
+            })
+      }
     };
   } catch (error) {
     return blockedStorage("invalid", errorMessage(error));
@@ -463,7 +549,457 @@ function storageBlockerDetail(check: DoctorCheck): string {
 function blockedStorage(status: Exclude<DoctorStatus, "ok">, detail: string): StorageInspection {
   return {
     check: { name: "storage state", status, detail },
-    agents: []
+    agents: [],
+    review: {
+      storageReady: false,
+      storageDetail: detail
+    }
+  };
+}
+
+type ReviewInspection = Readonly<{
+  report: DoctorReviewReport;
+  checks: readonly DoctorCheck[];
+}>;
+
+function inspectReview(
+  source: ReviewSource,
+  agentChecks: readonly DoctorCheck[],
+  environment: NodeJS.ProcessEnv
+): ReviewInspection {
+  if (!source.storageReady) {
+    const raw = source.home === undefined
+      ? null
+      : inspectRawReview(source.home, source.storageDetail);
+    if (raw !== null) return raw;
+    return {
+      report: {
+        status: "misconfigured",
+        providerNative: "unverified",
+        detail: `Review configuration unavailable: ${source.storageDetail}`
+      },
+      checks: [{
+        name: "review policy",
+        status: "invalid",
+        detail: `unavailable: ${source.storageDetail}`
+      }]
+    };
+  }
+
+  const policy = source.policy;
+  if (policy === undefined) {
+    return {
+      report: {
+        status: "disabled",
+        providerNative: "unverified",
+        detail: "Review policy is disabled; no Reviewer dispatch is scheduled."
+      },
+      checks: [{
+        name: "review policy",
+        status: "ok",
+        detail: "disabled"
+      }]
+    };
+  }
+
+  const checks: DoctorCheck[] = [{
+    name: "review policy",
+    status: "ok",
+    detail: `role=${policy.roleName} trigger=${policy.trigger}`
+  }];
+  const role = source.role ?? null;
+  if (role === null) {
+    checks.push({
+      name: "reviewer role",
+      status: "missing",
+      detail: `Global Role not found: ${policy.roleName}.`
+    });
+    return reviewMisconfigured(policy, checks, `Reviewer Role is missing: ${policy.roleName}.`);
+  }
+  checks.push({
+    name: "reviewer role",
+    status: "ok",
+    detail: `name=${role.name} activeAgent=${role.activeAgentId}`
+  });
+
+  const binding = role.agentBindings[role.activeAgentId];
+  if (binding === undefined) {
+    checks.push({
+      name: "reviewer binding",
+      status: "missing",
+      detail: `active Agent binding is missing: ${role.activeAgentId}.`
+    });
+    return reviewMisconfigured(policy, checks, "Reviewer active Agent binding is missing.", role);
+  }
+  checks.push({
+    name: "reviewer binding",
+    status: "ok",
+    detail: `agent=${binding.agentId} adapter=${binding.adapterId}`
+  });
+
+  const agent = source.agent ?? null;
+  if (agent === null) {
+    checks.push({
+      name: "reviewer agent",
+      status: "missing",
+      detail: `Configured Agent not found: ${binding.agentId}.`
+    });
+    return reviewMisconfigured(policy, checks, `Reviewer Agent is missing: ${binding.agentId}.`, role, binding.agentId, binding.adapterId);
+  }
+  checks.push({
+    name: "reviewer agent",
+    status: "ok",
+    detail: `id=${agent.id} adapter=${agent.adapterId} command=${agent.command}`
+  });
+
+  if (agent.adapterId !== binding.adapterId) {
+    checks.push({
+      name: "reviewer adapter",
+      status: "invalid",
+      detail: `binding adapter=${binding.adapterId} does not match Agent adapter=${agent.adapterId}.`
+    });
+    return reviewMisconfigured(policy, checks, "Reviewer adapter identity does not match its Agent binding.", role, agent.id, agent.adapterId, agent.command);
+  }
+  let adapter;
+  try {
+    adapter = resolveAgentAdapter(agent.adapterId);
+    checks.push({
+      name: "reviewer adapter",
+      status: "ok",
+      detail: `adapter=${adapter.id} nativeSession=${adapter.capabilities.nativeSessionDiscovery}`
+    });
+  } catch (error) {
+    checks.push({
+      name: "reviewer adapter",
+      status: "unsupported",
+      detail: errorMessage(error)
+    });
+    return reviewMisconfigured(policy, checks, `Reviewer adapter is unavailable: ${errorMessage(error)}`,
+      role, agent.id, agent.adapterId, agent.command);
+  }
+
+  const commandCheck = agentChecks.find((check) => check.name === `agent:${agent.id}:command`);
+  const capabilityCheck = agentChecks.find((check) => check.name === `agent:${agent.id}:capability`);
+  checks.push({
+    name: "reviewer command",
+    status: commandCheck?.status ?? "invalid",
+    detail: commandCheck === undefined
+      ? `No command inspection was recorded for ${agent.id}.`
+      : commandCheck.detail
+  });
+  checks.push({
+    name: "reviewer capability",
+    status: capabilityCheck?.status ?? "invalid",
+    detail: capabilityCheck === undefined
+      ? `No capability inspection was recorded for ${agent.id}.`
+      : capabilityCheck.detail
+  });
+
+  const launch = checkReviewerLaunch(
+    agent,
+    role,
+    binding,
+    adapter,
+    environment,
+    source.home
+  );
+  checks.push(launch);
+  const dispatch = checkReviewerDispatch(policy, role, binding, agent, launch, commandCheck, capabilityCheck);
+  checks.push(dispatch);
+  const failedCheck = checks.find((check) => check.status !== "ok");
+  if (failedCheck !== undefined) {
+    return reviewMisconfigured(
+      policy,
+      checks,
+      `${failedCheck.name}: ${failedCheck.detail}`,
+      role,
+      agent.id,
+      agent.adapterId,
+      agent.command
+    );
+  }
+  return {
+    report: {
+      status: "ready",
+      policy,
+      roleName: role.name,
+      activeAgentId: agent.id,
+      adapterId: agent.adapterId,
+      command: agent.command,
+      providerNative: "unverified",
+      detail: "Static Reviewer configuration and exact dispatch prerequisites are ready; provider-native acceptance is unverified."
+    },
+    checks
+  };
+}
+
+/**
+ * Preserve a bounded Reviewer diagnosis when another malformed record prevents
+ * FileTaskStore from opening. This is read-only evidence, never a compatibility
+ * path: the storage check remains invalid and the review projection cannot be
+ * reported as ready from unvalidated bytes.
+ */
+function inspectRawReview(home: string, storageDetail: string): ReviewInspection | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
+    if (!isRecord(parsed) || !isRecord(parsed.config)) return null;
+    const rawPolicy = parsed.config.review;
+    if (!isRecord(rawPolicy)
+      || typeof rawPolicy.roleName !== "string"
+      || typeof rawPolicy.trigger !== "string") {
+      return {
+        report: {
+          status: "misconfigured",
+          providerNative: "unverified",
+          detail: `Storage state is invalid; Review policy is unavailable: ${storageDetail}`
+        },
+        checks: [{
+          name: "review policy",
+          status: "invalid",
+          detail: `storage state invalid: ${storageDetail}`
+        }]
+      };
+    }
+    const policy = {
+      roleName: rawPolicy.roleName,
+      trigger: rawPolicy.trigger
+    } as ReviewConfig;
+    const roles = isRecord(parsed.globalRoles) ? parsed.globalRoles : {};
+    const roleValue = roles[policy.roleName];
+    if (!isRecord(roleValue)) {
+      return rawReviewMisconfigured(policy, storageDetail, [{
+        name: "review policy",
+        status: "ok",
+        detail: `role=${policy.roleName} trigger=${policy.trigger}`
+      }, {
+        name: "reviewer role",
+        status: "missing",
+        detail: `Global Role not found: ${policy.roleName}.`
+      }]);
+    }
+    const roleName = typeof roleValue.name === "string" ? roleValue.name : policy.roleName;
+    const activeAgentId = typeof roleValue.activeAgentId === "string"
+      ? roleValue.activeAgentId
+      : "";
+    const checks: DoctorCheck[] = [{
+      name: "review policy",
+      status: "ok",
+      detail: `role=${policy.roleName} trigger=${policy.trigger}`
+    }, {
+      name: "reviewer role",
+      status: "ok",
+      detail: `name=${roleName} activeAgent=${activeAgentId || "missing"}`
+    }];
+    const bindings = isRecord(roleValue.agentBindings) ? roleValue.agentBindings : {};
+    const bindingValue = activeAgentId.length === 0 ? undefined : bindings[activeAgentId];
+    if (!isRecord(bindingValue)) {
+      checks.push({
+        name: "reviewer binding",
+        status: "missing",
+        detail: `active Agent binding is missing: ${activeAgentId || "unknown"}.`
+      });
+      return rawReviewMisconfigured(policy, storageDetail, checks, roleName, activeAgentId || undefined);
+    }
+    const bindingAgentId = typeof bindingValue.agentId === "string"
+      ? bindingValue.agentId
+      : activeAgentId;
+    const adapterId = typeof bindingValue.adapterId === "string"
+      ? bindingValue.adapterId
+      : "unknown";
+    checks.push({
+      name: "reviewer binding",
+      status: "ok",
+      detail: `agent=${bindingAgentId} adapter=${adapterId}`
+    });
+    const configuredAgents = isRecord(parsed.configuredAgents)
+      ? parsed.configuredAgents
+      : {};
+    const agentValue = configuredAgents[bindingAgentId];
+    if (!isRecord(agentValue)) {
+      checks.push({
+        name: "reviewer agent",
+        status: "missing",
+        detail: `Configured Agent not found: ${bindingAgentId}.`
+      });
+      return rawReviewMisconfigured(policy, storageDetail, checks, roleName, bindingAgentId, adapterId);
+    }
+    checks.push({
+      name: "reviewer agent",
+      status: "invalid",
+      detail: `Storage state is invalid; configured Agent ${bindingAgentId} cannot be validated.`
+    });
+    return rawReviewMisconfigured(policy, storageDetail, checks, roleName, bindingAgentId, adapterId,
+      typeof agentValue.command === "string" ? agentValue.command : undefined);
+  } catch {
+    return null;
+  }
+}
+
+function rawReviewMisconfigured(
+  policy: ReviewConfig,
+  storageDetail: string,
+  checks: readonly DoctorCheck[],
+  roleName?: string,
+  activeAgentId?: string,
+  adapterId?: string,
+  command?: string
+): ReviewInspection {
+  return {
+    report: {
+      status: "misconfigured",
+      policy,
+      ...(roleName === undefined ? {} : { roleName }),
+      ...(activeAgentId === undefined ? {} : { activeAgentId }),
+      ...(adapterId === undefined ? {} : { adapterId }),
+      ...(command === undefined ? {} : { command }),
+      providerNative: "unverified",
+      detail: `Storage state is invalid; ${checks.at(-1)?.detail ?? storageDetail}`
+    },
+    checks
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function reviewMisconfigured(
+  policy: ReviewConfig,
+  checks: readonly DoctorCheck[],
+  detail: string,
+  role?: GlobalRole,
+  activeAgentId?: string,
+  adapterId?: string,
+  command?: string
+): ReviewInspection {
+  return {
+    report: {
+      status: "misconfigured",
+      policy,
+      roleName: role?.name ?? policy.roleName,
+      ...(activeAgentId === undefined ? {} : { activeAgentId }),
+      ...(adapterId === undefined ? {} : { adapterId }),
+      ...(command === undefined ? {} : { command }),
+      providerNative: "unverified",
+      detail
+    },
+    checks
+  };
+}
+
+function checkReviewerLaunch(
+  agent: ConfiguredAgent,
+  role: GlobalRole,
+  binding: GlobalRole["agentBindings"][string],
+  adapter: ReturnType<typeof resolveAgentAdapter>,
+  environment: NodeJS.ProcessEnv,
+  home: string | undefined
+): DoctorCheck {
+  try {
+    const workspace = role.workspace;
+    if (!isAbsolute(workspace)) {
+      return {
+        name: "reviewer launch",
+        status: "invalid",
+        detail: "Reviewer Role workspace must be absolute."
+      };
+    }
+    const metadata = lstatSync(workspace);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      return {
+        name: "reviewer launch",
+        status: "invalid",
+        detail: "Reviewer Role workspace must be an existing real directory."
+      };
+    }
+    const definition = configuredAgentToDefinition(agent);
+    const launchEnvironment = resolveDoctorAgentEnvironment(definition, environment);
+    const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+    const agentWorkspace = effective.workspace.entries.length === 1
+      ? effective.workspace.entries[0]!.path
+      : effective.workspace.root;
+    const codexConfig = adapter.id === "codex"
+      ? inspectCodexLaunchConfig({
+          environment: launchEnvironment,
+          workspace: agentWorkspace,
+          profile: binding.config.adapterId === "codex" ? binding.config.profile : undefined,
+          trustWorkspace: true
+        })
+      : undefined;
+    if (codexConfig?.notify.status === "configured") {
+      return {
+        name: "reviewer launch",
+        status: "invalid",
+        detail: "Codex notify is already configured by "
+          + `${codexConfig.notify.source}; Yui requires exclusive ownership of the structured `
+          + "notify callback and refuses to replace or be replaced by native configuration."
+      };
+    }
+    const reviewerContext = adapter.id === "codex"
+      ? compileRoleSessionContext(home, role, { scope: "global" }, { purpose: "review" })
+      : undefined;
+    const compiled = adapter.compileNew({
+      agent: definition,
+      config: binding.config,
+      workspace: agentWorkspace,
+      sessionTitle: "reviewer",
+      ...(reviewerContext === undefined
+        ? {}
+        : {
+            developerInstructions: reviewerContext.developerInstructions,
+            skills: reviewerContext.skills,
+            codexDeveloperInstructions: codexConfig?.developerInstructions
+          })
+    });
+    if (compiled.argv.length === 0) throw new Error("compiled launch argv is empty");
+    return {
+      name: "reviewer launch",
+      status: "ok",
+      detail: `adapter=${adapter.id} strategy=${compiled.sessionStrategy} command=${agent.command}`
+    };
+  } catch (error) {
+    return {
+      name: "reviewer launch",
+      status: "invalid",
+      detail: errorMessage(error)
+    };
+  }
+}
+
+function checkReviewerDispatch(
+  _policy: ReviewConfig,
+  role: GlobalRole,
+  binding: GlobalRole["agentBindings"][string],
+  agent: ConfiguredAgent,
+  launch: DoctorCheck,
+  command: DoctorCheck | undefined,
+  capability: DoctorCheck | undefined
+): DoctorCheck {
+  if (role.defaultAccess !== "write") {
+    return {
+      name: "reviewer dispatch",
+      status: "invalid",
+      detail: "Reviewer Role must retain write access for an isolated ReviewRound workspace."
+    };
+  }
+  if (binding.agentId !== agent.id) {
+    return {
+      name: "reviewer dispatch",
+      status: "invalid",
+      detail: `active binding Agent id does not match configured Agent: ${binding.agentId}/${agent.id}.`
+    };
+  }
+  if (launch.status !== "ok" || command?.status !== "ok" || capability?.status !== "ok") {
+    return {
+      name: "reviewer dispatch",
+      status: "invalid",
+      detail: "Reviewer exact dispatch is blocked until command, capability, and launch checks are ok."
+    };
+  }
+  return {
+    name: "reviewer dispatch",
+    status: "ok",
+    detail: "static exact dispatch prerequisites confirmed; no Session or model was launched."
   };
 }
 
@@ -489,11 +1025,17 @@ function checkExecutable(
   }
 }
 
-function checkAgent(agent: ConfiguredAgent, executor: CommandExecutor): DoctorCheck[] {
+function checkAgent(
+  agent: ConfiguredAgent,
+  executor: CommandExecutor,
+  environment: NodeJS.ProcessEnv
+): DoctorCheck[] {
   let snapshot: CapabilitySnapshot;
   try {
-    snapshot = inspectAgentCapabilities(configuredAgentToDefinition(agent), {
-      run: (command, args) => runAgentProbe(executor, command, args)
+    const definition = configuredAgentToDefinition(agent);
+    const launchEnvironment = resolveDoctorAgentEnvironment(definition, environment);
+    snapshot = inspectAgentCapabilities(definition, {
+      run: (command, args) => runAgentProbe(executor, command, args, launchEnvironment)
     });
   } catch (error) {
     return [{
@@ -536,10 +1078,15 @@ function checkAgent(agent: ConfiguredAgent, executor: CommandExecutor): DoctorCh
 function runAgentProbe(
   executor: CommandExecutor,
   command: string,
-  args: readonly string[]
+  args: readonly string[],
+  environment: Readonly<Record<string, string>>
 ): AgentProbeResult {
   try {
-    return { status: 0, stdout: executor.run(command, [...args]), stderr: "" };
+    return {
+      status: 0,
+      stdout: executor.run(command, [...args], { environment }),
+      stderr: ""
+    };
   } catch (error) {
     const missing = isMissingCommand(error);
     const probeError = Object.assign(new Error(errorMessage(error)), {
@@ -552,6 +1099,22 @@ function runAgentProbe(
       error: probeError
     };
   }
+}
+
+/**
+ * Resolve the complete environment used by FileRoleLaunchPlanner for an Agent.
+ * Doctor probes must inspect the same command resolution context as a native
+ * launch; inheriting the Doctor process PATH would allow a shell-installed
+ * command to mask a missing configured binding.
+ */
+function resolveDoctorAgentEnvironment(
+  agent: Pick<ConfiguredAgent, "adapterId" | "environment">,
+  environment: NodeJS.ProcessEnv
+): Record<string, string> {
+  return {
+    ...operationalAgentEnvironment(agent.adapterId, environment),
+    ...resolveAgentEnvironment(agent, environment)
+  };
 }
 
 function isMissingCommand(error: unknown): boolean {

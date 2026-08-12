@@ -17,7 +17,10 @@ import {
   recordEphemeralTmuxTarget,
   writeEphemeralDomainIdentity
 } from "../../dist/controller/domainIdentity.js";
-import { NodeCommandExecutor } from "../../dist/tmux/commandExecutor.js";
+import {
+  CommandExecutionError,
+  NodeCommandExecutor
+} from "../../dist/tmux/commandExecutor.js";
 import {
   TmuxDeliveryPump,
   TmuxManager,
@@ -90,6 +93,29 @@ test("all tmux lifecycle operations use the dedicated YUI_HOME server", () => {
   assert.ok(operations.includes("rename-window"));
   assert.ok(operations.includes("kill-session"));
   assert.equal(new Set(calls.map(({ args }) => args[1])).size, 1);
+});
+
+test("Role status treats a tmux server exiting during inspection as stopped", async () => {
+  const syncManager = new TmuxManager("tmux-test", {
+    run(_command, args) {
+      if (tmuxCommand(args) === "has-session") return "";
+      assert.equal(tmuxCommand(args), "list-windows");
+      throw new CommandExecutionError("COMMAND_FAILED", 1, "server exited unexpectedly\n");
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+  assert.equal(syncManager.probeRoleStatus("task-1", "worker"), "exited");
+
+  const asyncManager = new TmuxManager("tmux-test", {
+    run() {
+      throw new Error("sync executor path must not be used");
+    },
+    async runAsync(_command, args) {
+      assert.equal(tmuxCommand(args), "list-windows");
+      throw new CommandExecutionError("COMMAND_FAILED", 1, "server exited unexpectedly\n");
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+
+  assert.equal(await asyncManager.probeRoleStatusAsync("task-1", "worker"), "exited");
 });
 
 test("target recorder failure blocks sync and async pane mutation", async () => {

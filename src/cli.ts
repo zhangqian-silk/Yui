@@ -60,12 +60,15 @@ import {
   TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
   TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
+  parseTaskCompletionRequest,
+  preflightTaskCompletion,
   runTaskCommand,
   normalizedExecutionLanePlan,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
+import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
   assertFileTaskControllerStorageCompatible,
@@ -243,7 +246,7 @@ export async function main(): Promise<void> {
       emit("", false, report);
       return;
     }
-    emit(renderDoctor(report.checks));
+    emit(renderDoctor(report.checks, report.review));
     return;
   }
   if (args[0] === "upgrade") {
@@ -908,6 +911,25 @@ export async function main(): Promise<void> {
         }
       }
     }
+    let completionSummary: string | undefined;
+    if (resolved[1] === "complete" && resolved[2] !== undefined) {
+      const completionRequest = parseTaskCompletionRequest(resolved.slice(2));
+      completionSummary = completionRequest.summary;
+      const completion = preflightTaskCompletion(resolved[2], store, {
+        environment: process.env,
+        ...(taskFinalReviewContract === undefined
+          ? {}
+          : { taskFinalReviewContract })
+      });
+      if (!completion.completed && !completion.activeTaskReview) {
+        await reconcileTaskRemoteBaselines(
+          resolved[2],
+          store,
+          home,
+          { environment: process.env }
+        );
+      }
+    }
     let candidateMaterialization: Awaited<ReturnType<typeof candidateMaterializationForTaskCommand>>;
     let candidateMaterializationCommitted = false;
     try {
@@ -966,6 +988,7 @@ export async function main(): Promise<void> {
           ...(taskFinalReviewContract === undefined
             ? {}
             : { taskFinalReviewContract }),
+          ...(completionSummary === undefined ? {} : { completionSummary }),
           ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
           ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
           ...(candidateMaterialization === undefined

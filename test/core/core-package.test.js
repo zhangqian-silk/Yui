@@ -116,6 +116,48 @@ test("runtime assembly contains only the built CLI, docs, and four generic skill
   assert.equal("devDependencies" in runtimePackage, false);
 });
 
+test("CI package smoke consumes npm JSON paths relative to the package root", (t) => {
+  const sandbox = mkdtempSync(join(root, ".core-package-smoke-test-"));
+  const manifest = join(sandbox, "package-smoke.json");
+  const required = [
+    "dist/cli.js",
+    "dist/cli/commandCatalog.js",
+    "ARCHITECTURE.md",
+    "skills/yui-leader/SKILL.md",
+    "skills/yui-worker/SKILL.md",
+    "skills/yui-operator/SKILL.md",
+    "skills/yui-reviewer/SKILL.md"
+  ];
+  t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+
+  writeFileSync(manifest, JSON.stringify([{ files: required.map((path) => ({ path })) }]));
+  assert.match(
+    execFileSync(
+      process.execPath,
+      [join(root, "scripts", "check-runtime-package-structure.mjs"), manifest],
+      { cwd: root, encoding: "utf8" }
+    ),
+    /Package structure smoke passed \(7 files\)/u
+  );
+
+  writeFileSync(
+    manifest,
+    JSON.stringify([{ files: required.map((path) => ({ path: `package/${path}` })) }])
+  );
+  assert.throws(
+    () => execFileSync(
+      process.execPath,
+      [join(root, "scripts", "check-runtime-package-structure.mjs"), manifest],
+      { cwd: root, encoding: "utf8", stdio: "pipe" }
+    ),
+    /runtime package is missing dist\/cli\.js/u
+  );
+
+  const workflow = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+  assert.match(workflow, /check-runtime-package-structure\.mjs package-smoke\.json/u);
+  assert.doesNotMatch(workflow, /package\/dist\/cli\.js/u);
+});
+
 test("Leader and Operator keep native subagent creation inside the Leader conversation", () => {
   const leader = readFileSync(join(root, "skills", "yui-leader", "SKILL.md"), "utf8");
   const operator = readFileSync(join(root, "skills", "yui-operator", "SKILL.md"), "utf8");
@@ -181,9 +223,10 @@ test("Yui-specific test workflow stays in its Project Skill", () => {
     "develop-yui",
     "SKILL.md"
   ), "utf8");
-  const genericSkills = ["yui-leader", "yui-worker", "yui-reviewer"].map((name) => (
-    readFileSync(join(root, "skills", name, "SKILL.md"), "utf8")
-  ));
+  const genericSkills = ["yui-leader", "yui-worker", "yui-reviewer", "yui-operator"].map((name) => ({
+    name,
+    contents: readFileSync(join(root, "skills", name, "SKILL.md"), "utf8")
+  }));
 
   assert.match(projectSkill, /Apply this Skill only to development of the Yui repository itself/u);
   assert.match(projectSkill, /Unit, Isolated Integration, and Mock Agent\s+Session coverage/u);
@@ -191,10 +234,23 @@ test("Yui-specific test workflow stays in its Project Skill", () => {
   assert.match(projectSkill, /skip it without creating an InputRequest/u);
   assert.match(projectSkill, /compatibility only through explicit migrations/u);
   assert.match(projectSkill, /tier names[\s\S]*belong to the Yui Project[\s\S]*must not become generic Yui CLI/u);
-  for (const skill of genericSkills) {
-    assert.match(skill, /do not run tests that invoke real Agents or models/iu);
-    assert.match(skill, /report the gap\s+instead of running it/iu);
-    assert.doesNotMatch(skill, /YUI_ALLOW_PROVIDER_E2E|Provider E2E|Mock Agent Session/u);
+  for (const { name, contents: skill } of genericSkills) {
+    assert.match(skill, /real models, paid APIs, shared infrastructure, production systems,\s+real\s+account\s+quota/iu);
+    assert.match(skill, /generic request to implement, test, validate, run\s+E2E, or\s+complete work does not grant/iu);
+    assert.match(skill, /available\s+credentials,\s+an installed provider CLI, a Project Policy, or a test label/iu);
+    assert.match(skill, /Unless the user\s+proactively names the concrete real-resource validation[\s\S]*skip it without\s+creating an InputRequest/iu);
+    assert.match(skill, /(?:explicit request|explicitly name)[\s\S]*resource,\s+effect,\s+and\s+isolation boundary/iu);
+    const noPromptBoundary = {
+      "yui-leader": /skip it without\s+creating an InputRequest or blocking the Task/iu,
+      "yui-worker": /skip it without\s+creating an InputRequest or blocking the WorkItem/iu,
+      "yui-reviewer": /skip it without\s+creating an InputRequest or blocking the ReviewRound/iu,
+      "yui-operator": /skip it without\s+creating an InputRequest or soliciting authorization/iu
+    }[name];
+    assert.match(skill, noPromptBoundary);
+    assert.doesNotMatch(
+      skill,
+      /YUI_ALLOW_PROVIDER_E2E|YUI_ALLOW_RELEASE_E2E|Provider\s+E2E|Release\s+E2E|Isolated\s+Integration|Mock\s+Agent\s+Session/u
+    );
   }
 });
 

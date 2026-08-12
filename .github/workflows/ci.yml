@@ -1,0 +1,45 @@
+name: Deterministic CI
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Safe deterministic tests
+        run: npm test
+
+      - name: Package structure smoke
+        shell: bash
+        run: |
+          rm -rf .release-stage package-smoke.json
+          node scripts/assemble-runtime-package.mjs --output .release-stage
+          npm pack ./.release-stage --dry-run --ignore-scripts --json > package-smoke.json
+          node scripts/check-runtime-package-structure.mjs package-smoke.json

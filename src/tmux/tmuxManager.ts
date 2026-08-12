@@ -993,9 +993,14 @@ export class TmuxManager {
 
   private windowNames(taskId: string): string[] {
     if (!this.hasSession(taskId)) return [];
-    return this.run([
-      "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
-    ]).split("\n").map((name) => name.trim()).filter(Boolean);
+    try {
+      return this.run([
+        "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
+      ]).split("\n").map((name) => name.trim()).filter(Boolean);
+    } catch (error) {
+      if (isUnavailableTmuxStatus(error)) return [];
+      throw error;
+    }
   }
 
   private async sessionWindowNamesAsync(
@@ -1007,7 +1012,7 @@ export class TmuxManager {
       ])).split("\n").map((name) => name.trim()).filter(Boolean);
       return { exists: true, names };
     } catch (error) {
-      if (isExplicitlyAbsentTmuxSession(error)) return { exists: false, names: [] };
+      if (isUnavailableTmuxStatus(error)) return { exists: false, names: [] };
       throw error;
     }
   }
@@ -1274,6 +1279,12 @@ function isExplicitlyAbsentTmuxSession(error: unknown): boolean {
   if (!(error instanceof CommandExecutionError)) return false;
   return /can't find (?:session|window|pane)|no server running|error connecting to .+ \(No such file or directory\)/i
     .test(error.stderr);
+}
+
+function isUnavailableTmuxStatus(error: unknown): boolean {
+  return isExplicitlyAbsentTmuxSession(error)
+    || (error instanceof CommandExecutionError
+      && /server exited unexpectedly/i.test(error.stderr));
 }
 
 function tmuxWord(value: string): string {

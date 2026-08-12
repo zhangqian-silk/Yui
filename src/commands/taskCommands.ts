@@ -110,6 +110,7 @@ import {
   retireTask,
   reopenTask,
   updateTaskMetadata,
+  type TaskCompletedBy,
   type Task,
   type TaskMetadata,
   type TaskProjectBinding,
@@ -319,6 +320,8 @@ export type TaskCommandOptions = Readonly<{
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
   yuiHome?: string;
+  /** Completion CLI parsing may read stdin/files before remote reconciliation. */
+  completionSummary?: string;
   workItemIntegrationProof?: WorkItemIntegrationProof;
   candidateGitSnapshot?: CandidateGitSnapshot;
   /** Managed Candidate workspace; null is an explicit Gitless/no-workspace preflight. */
@@ -338,6 +341,138 @@ export type TaskCommandOptions = Readonly<{
   /** Physical Task-main heads verified by the CLI immediately before mutation. */
   actualTaskReviewCandidate?: TaskReviewCandidate;
 }>;
+
+export type TaskCompletionPreflight = Readonly<{
+  task: Task;
+  actor: TaskCompletedBy;
+  completed: boolean;
+  /** Existing Task-final ReviewRound must use the normal resume/block path. */
+  activeTaskReview: boolean;
+  taskFinalReviewContract?: TaskFinalReviewContract;
+}>;
+
+export function parseTaskCompletionRequest(
+  args: string[],
+  summaryOverride?: string
+): Readonly<{ taskId: string; summary: string }> {
+  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
+  const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const inlineSummary = parsed.options.get("--summary");
+  const summaryFile = parsed.options.get("--summary-file");
+  if ((inlineSummary === undefined) === (summaryFile === undefined)) {
+    throw usageError(`Specify exactly one of --summary or --summary-file.`, usage);
+  }
+  const summary = summaryOverride ?? readCommandText(
+    inlineSummary,
+    summaryFile,
+    "--summary",
+    usage
+  );
+  return { taskId: parsed.positionals[0]!, summary };
+}
+
+/**
+ * Check every read-only completion blocker before a caller resolves remote
+ * baselines or creates an Integration Attempt.  The transactional completion
+ * path invokes this same preflight and then repeats its checks while holding
+ * the store write fence, so remote reconciliation can never get ahead of the
+ * local lifecycle/readiness gate.
+ */
+export function preflightTaskCompletion(
+  taskId: string,
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions = {}
+): TaskCompletionPreflight {
+  const task = requireTask(store, taskId);
+  const actor = taskActor(options, task.id);
+  if (task.status === "completed") {
+    return { task, actor, completed: true, activeTaskReview: false };
+  }
+  if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+  if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+
+  // Resolve and authenticate the durable Task-local gate before any remote
+  // fetch or Integration write.  All checks below mirror the transactional
+  // completion path, which remains the final CAS fence after reconciliation.
+  const taskFinalReviewContract = taskFinalReviewContractForMutation(store, task.id, options);
+  const activeTaskReview = store.listReviewRounds(task.id).some((round) => (
+    (round.scope ?? "work-item") === "task"
+    && (round.status === "pending" || round.status === "running")
+  ));
+  assertNoOpenInputRequests(store, task.id, "completing the Task");
+  const incompleteWork = store.listWorkItems(task.id).find((item) => (
+    item.status !== "completed"
+    && item.status !== "retired"
+  ));
+  if (incompleteWork !== undefined) {
+    throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
+  }
+  if (task.requireIntegration) {
+    if (store.listWorkItems(task.id).length === 0) {
+      throw usageError(`Task ${task.id} requires at least one WorkItem before completion.`);
+    }
+    if (store.listChangeSets(task.id).length === 0) {
+      throw usageError(`Task ${task.id} requires at least one ChangeSet before completion.`);
+    }
+    if (!store.listIntegrationAttempts(task.id).some(({ status }) => status === "committed")) {
+      throw usageError(`Task ${task.id} requires a committed Integration Attempt before completion.`);
+    }
+  }
+  const unresolvedIntegration = store.listIntegrationAttempts(task.id).find((integration) => (
+    integration.status === "running"
+    || integration.status === "blocked"
+    || integration.status === "validating"
+  ));
+  if (unresolvedIntegration !== undefined) {
+    throw usageError(
+      `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
+    );
+  }
+  const isolatedWorkspace = store.listManagedWorkspaces(task.id)
+    .find(({ owner }) => owner.type === "work-item");
+  if (isolatedWorkspace?.owner.type === "work-item") {
+    throw usageError(
+      `Task ${task.id} has an isolated WorkItem workspace: `
+      + `${isolatedWorkspace.owner.workItemId}. Capture, integrate or abandon it, then clean it up.`
+    );
+  }
+
+  const roles = store.listRoles(task.id);
+  const activeRuns = roles
+    .map((role) => ({ role, run: store.getActiveAgentRun(task.id, role.name) }))
+    .filter((entry): entry is { role: Role; run: AgentRun } => entry.run !== null);
+  const workerRun = activeRuns.find(({ role }) => role.name !== LEADER_ROLE);
+  if (workerRun !== undefined) {
+    throw usageError(`Task ${task.id} has an active run for Role ${workerRun.role.name}.`);
+  }
+  const unsettledWork = store.listWorkItems(task.id)
+    .find((item) => item.status === "pending" || item.status === "running");
+  if (unsettledWork !== undefined) {
+    throw usageError(`Task ${task.id} has unsettled work: ${unsettledWork.id}.`);
+  }
+
+  const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
+  if (leaderEntry !== undefined) {
+    if (actor !== "leader") {
+      throw usageError(`Task ${task.id} has an active Leader run.`);
+    }
+    if (leaderEntry.run.workItemId !== undefined) {
+      throw usageError(`Task ${task.id} has running work: ${leaderEntry.run.workItemId}.`);
+    }
+    if (leaderEntry.run.pushedAt === undefined) {
+      throw usageError(`Task ${task.id} Leader delivery is still pending.`);
+    }
+  }
+
+  return {
+    task,
+    actor,
+    completed: false,
+    activeTaskReview,
+    ...(taskFinalReviewContract === undefined ? {} : { taskFinalReviewContract })
+  };
+}
 
 export function runTaskCommand(
   args: string[],
@@ -648,7 +783,7 @@ function createTaskCommand(
   const created = store.transaction((tx) => createTaskAggregate(tx, parsed.title, {
     projectBindings: parsed.projectBindings,
     ...(parsed.requireIntegration ? { requireIntegration: true } : {})
-  }, now));
+  }, now, parsed.defaultProjectIds));
   notifyMailbox(options.runtime, taskMailbox(created.task.id), created.task.id);
   return output(
     `Created Draft task ${created.task.id}: ${created.task.title}\n`
@@ -666,6 +801,7 @@ function parseTaskCreation(
 ): Readonly<{
   title: string;
   projectBindings: readonly TaskProjectBinding[];
+  defaultProjectIds: readonly string[];
   requireIntegration: boolean;
 }> {
   const usage = "Task create usage: yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--require-integration].";
@@ -707,6 +843,9 @@ function parseTaskCreation(
     if (bases.has(project.id)) throw usageError(`Project base may only be specified once: ${reference}.`);
     bases.set(project.id, baseRef);
   }
+  const defaultProjectIds = projects
+    .filter((project) => !bases.has(project.id))
+    .map(({ id }) => id);
   return {
     title: parsed.positionals[0],
     projectBindings: projects.map((project) => ({
@@ -714,6 +853,7 @@ function parseTaskCreation(
       directory: project.name,
       baseRef: bases.get(project.id) ?? project.developmentBranch
     })),
+    defaultProjectIds,
     requireIntegration: parsed.options.has("--require-integration")
   };
 }
@@ -722,13 +862,19 @@ function createTaskAggregate(
   store: TaskWorkflowStore,
   title: string,
   metadata: TaskMetadata,
-  now: Date
+  now: Date,
+  defaultProjectIds: readonly string[] = []
 ): Readonly<{ task: Task; leader: Role }> {
   const task = createTask(store.nextTaskId(), title, now, metadata);
   const leader = createTaskRole(store, task, LEADER_ROLE, undefined, now);
   store.saveTask(task);
   store.saveRole(task.id, leader);
-  recordTaskEvent(store, task.id, "task.created", { status: task.status }, now);
+  recordTaskEvent(store, task.id, "task.created", {
+    status: task.status,
+    ...(defaultProjectIds.length === 0
+      ? {}
+      : { defaultProjectIds: defaultProjectIds.join(",") })
+  }, now);
   enqueueWork(store, taskMailbox(task.id), "task-created", now, [taskRef(task.id)]);
   return { task, leader };
 }
@@ -854,20 +1000,13 @@ function completeTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
-  const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
-  exactPositionals(parsed.positionals, 1, usage);
-  const summary = readCommandText(
-    parsed.options.get("--summary"),
-    parsed.options.get("--summary-file"),
-    "--summary",
-    usage
-  );
+  const request = parseTaskCompletionRequest(args, options.completionSummary);
+  const summary = request.summary;
   const now = clock(options);
   const result = store.transaction((tx) => {
-    const task = requireTask(tx, parsed.positionals[0]);
-    const actor = taskActor(options, task.id);
-    if (task.status === "completed") {
+    const preflight = preflightTaskCompletion(request.taskId, tx, options);
+    const { task, actor } = preflight;
+    if (preflight.completed) {
       return {
         task,
         changed: false,
@@ -875,48 +1014,7 @@ function completeTaskCommand(
         finalReview: undefined
       } as const;
     }
-    if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
-    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    // Resolve and authenticate the durable Task-local gate before terminalizing
-    // a Leader Run or performing any other Task/WorkItem write below.
-    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
-    assertNoOpenInputRequests(tx, task.id, "completing the Task");
-    const incompleteWork = tx.listWorkItems(task.id).find((item) => (
-      item.status !== "completed"
-      && item.status !== "retired"
-    ));
-    if (incompleteWork !== undefined) {
-      throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
-    }
-    if (task.requireIntegration) {
-      if (tx.listWorkItems(task.id).length === 0) {
-        throw usageError(`Task ${task.id} requires at least one WorkItem before completion.`);
-      }
-      if (tx.listChangeSets(task.id).length === 0) {
-        throw usageError(`Task ${task.id} requires at least one ChangeSet before completion.`);
-      }
-      if (!tx.listIntegrationAttempts(task.id).some(({ status }) => status === "committed")) {
-        throw usageError(`Task ${task.id} requires a committed Integration Attempt before completion.`);
-      }
-    }
-    const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
-      integration.status === "running"
-      || integration.status === "blocked"
-      || integration.status === "validating"
-    ));
-    if (unresolvedIntegration !== undefined) {
-      throw usageError(
-        `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
-      );
-    }
-    const isolatedWorkspace = tx.listManagedWorkspaces(task.id)
-      .find(({ owner }) => owner.type === "work-item");
-    if (isolatedWorkspace?.owner.type === "work-item") {
-      throw usageError(
-        `Task ${task.id} has an isolated WorkItem workspace: `
-        + `${isolatedWorkspace.owner.workItemId}. Capture, integrate or abandon it, then clean it up.`
-      );
-    }
+    const taskFinalContract = preflight.taskFinalReviewContract;
 
     const roles = tx.listRoles(task.id);
     const activeRuns = roles

@@ -3627,7 +3627,7 @@ test("Project Task create returns the current Task, Leader, and workspace state"
     [
       join(process.cwd(), "dist", "cli.js"),
       "--json",
-      "task", "create", "Current response", "--project", "Yui"
+      "task", "create", "Current response", "--project", "Yui", "--base", "HEAD"
     ],
     {
       encoding: "utf8",
