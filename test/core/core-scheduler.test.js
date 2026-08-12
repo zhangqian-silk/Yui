@@ -107,6 +107,7 @@ test("an open InputRequest retains pending wakeups until it is resolved", async 
 
 test("a project Task retains wakeup until its worktree cwd is ready", async () => {
   const store = fakeStore();
+  store.getTaskWorkspace = () => null;
   store.tasks[0] = {
     ...store.tasks[0],
     projectBindings: [{
@@ -122,6 +123,23 @@ test("a project Task retains wakeup until its worktree cwd is ready", async () =
   assert.equal(result[0].reason, "workspace-not-ready");
   assert.equal(store.pending.has("task-1"), true);
   assert.deepEqual(delivery.calls, []);
+});
+
+test("a Gitless Leader wake uses the durable empty Task workspace", async () => {
+  const store = fakeStore({
+    taskWorkspace: {
+      schemaVersion: 2,
+      owner: { type: "task", taskId: "task-1" },
+      root: "/repo",
+      entries: [],
+      createdAt: NOW.toISOString(),
+      updatedAt: NOW.toISOString()
+    }
+  });
+  const delivery = fakeDelivery();
+  const result = await processLeaderWakeups(store, delivery, NOW);
+  assert.deepEqual(result, [{ taskId: "task-1", runId: "agent-run-1", status: "dispatched" }]);
+  assert.equal(delivery.calls[0].input.managedWorkspace?.root, "/repo");
 });
 
 test("an idle Leader starts a real wakeup run, waits for readiness, sends once, then clears wake", async () => {
@@ -820,9 +838,23 @@ function fakeStore(options = {}) {
     id: "task-1",
     title: "Test task",
     status: "active",
-    projectBindings: []
+    projectBindings: [],
+    cwd: options.taskWorkspace?.root ?? "/repo"
   };
-  const roles = [role("leader")];
+  const taskWorkspace = options.taskWorkspace ?? {
+    schemaVersion: 2,
+    owner: { type: "task", taskId: "task-1" },
+    root: "/repo",
+    entries: [],
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  };
+  const roles = [
+    {
+      ...role("leader"),
+      managedWorkspace: taskWorkspace
+    }
+  ];
   const pending = new Map([["task-1", mergePendingWakeup("task-1", "role-result", NOW, null)]]);
   const sessions = new Map();
   if (options.session !== undefined) sessions.set(key("task-1", "leader"), options.session);
@@ -841,6 +873,7 @@ function fakeStore(options = {}) {
     getPresentationContext: () => ({ timeZone: "Asia/Shanghai" }),
     listTasks: () => store.tasks,
     getTask: (taskId) => store.tasks.find((candidate) => candidate.id === taskId) ?? null,
+    getTaskWorkspace: () => taskWorkspace,
     listRoles: (taskId) => store.roles.filter((candidate) => candidate.taskId === taskId),
     getRole: (taskId, roleName) => store.roles.find(
       (candidate) => candidate.taskId === taskId && candidate.name === roleName

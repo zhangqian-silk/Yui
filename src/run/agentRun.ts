@@ -13,7 +13,7 @@ export type AgentRunStatus = "active" | "yielded" | "failed";
 export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
-  schemaVersion: 5;
+  schemaVersion: 6;
   id: string;
   taskId: string;
   roleName: string;
@@ -22,6 +22,9 @@ export type AgentRun = {
   purpose: AgentRunPurpose;
   workItemId?: string;
   reviewRoundId?: string;
+  /** Frozen lineage inside the unified execution Group. */
+  executionGroupId?: string;
+  executionLaneId?: string;
   workspace?: ManagedWorkspace;
   /** Immutable actual launch configuration and provenance. */
   effective: EffectiveLaunchSnapshot;
@@ -56,6 +59,8 @@ export function createAgentRun(
     workItemId?: string;
     purpose?: AgentRunPurpose;
     reviewRoundId?: string;
+    executionGroupId?: string;
+    executionLaneId?: string;
     workspace?: ManagedWorkspace;
     effective: EffectiveLaunchSnapshot;
   }
@@ -65,7 +70,7 @@ export function createAgentRun(
   }
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: requireSafeIdentity(id, "Agent run id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -78,6 +83,12 @@ export function createAgentRun(
     ...(context.reviewRoundId === undefined
       ? {}
       : { reviewRoundId: requireSafeIdentity(context.reviewRoundId, "ReviewRound id") }),
+    ...(context.executionGroupId === undefined
+      ? {}
+      : { executionGroupId: requireSafeIdentity(context.executionGroupId, "ExecutionGroup id") }),
+    ...(context.executionLaneId === undefined
+      ? {}
+      : { executionLaneId: requireSafeIdentity(context.executionLaneId, "ExecutionLane id") }),
     ...(context.workspace === undefined
       ? {}
       : { workspace: validateManagedWorkspace(context.workspace) }),
@@ -118,7 +129,7 @@ export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
-  if (run.schemaVersion !== 5) throw new Error("Agent run must use schemaVersion 5.");
+  if (run.schemaVersion !== 6) throw new Error("Agent run must use schemaVersion 6.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "agentRun");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {
@@ -133,6 +144,13 @@ export function validateAgentRun(run: AgentRun): AgentRun {
   }
   if (run.reviewRoundId !== undefined) {
     validateTaskRecordReference({ taskId: run.taskId, localId: run.reviewRoundId }, "reviewRound");
+  }
+  if ((run.executionGroupId === undefined) !== (run.executionLaneId === undefined)) {
+    throw new Error("Agent run execution lineage is incomplete.");
+  }
+  if (run.executionGroupId !== undefined) {
+    requireSafeIdentity(run.executionGroupId, "ExecutionGroup id");
+    requireSafeIdentity(run.executionLaneId!, "ExecutionLane id");
   }
   if (run.workspace !== undefined) {
     validateManagedWorkspace(run.workspace);
@@ -152,6 +170,20 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     if (run.workspace.owner.type === "integration-attempt") {
       throw new Error("An IntegrationAttempt workspace cannot be used by an Agent run.");
     }
+    if (run.workspace.owner.type === "execution-lane") {
+      if (run.workspace.owner.executionGroupId !== run.executionGroupId
+        || run.workspace.owner.executionLaneId !== run.executionLaneId) {
+        throw new Error("Agent run Execution Lane workspace lineage does not match the Run.");
+      }
+      if (run.workspace.owner.purpose === "execution"
+        && run.workspace.owner.workItemId !== run.workItemId) {
+        throw new Error("Agent run Execution Lane workspace WorkItem does not match the Run.");
+      }
+      if (run.workspace.owner.purpose === "review"
+        && run.workspace.owner.reviewRoundId !== run.reviewRoundId) {
+        throw new Error("Agent run review Lane workspace ReviewRound does not match the Run.");
+      }
+    }
     if (run.workspace.owner.type === "review-round"
       && run.workspace.owner.reviewRoundId !== run.reviewRoundId) {
       throw new Error(
@@ -164,8 +196,11 @@ export function validateAgentRun(run: AgentRun): AgentRun {
       throw new Error("A review Agent run requires WorkItem and ReviewRound references.");
     }
     if (run.workspace === undefined
-      || run.workspace.owner.type !== "review-round"
-      || run.workspace.owner.reviewRoundId !== run.reviewRoundId) {
+      || !((run.workspace.owner.type === "review-round"
+        && run.workspace.owner.reviewRoundId === run.reviewRoundId)
+        || (run.workspace.owner.type === "execution-lane"
+          && run.workspace.owner.purpose === "review"
+          && run.workspace.owner.reviewRoundId === run.reviewRoundId))) {
       throw new Error(
         `A review Agent run requires its exact ReviewRound workspace owner: ${run.reviewRoundId}.`
       );
@@ -180,6 +215,9 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     }
     if (run.workspace?.owner.type === "review-round") {
       throw new Error("An execution Agent run cannot use a ReviewRound-owned workspace.");
+    }
+    if (run.workspace?.owner.type === "execution-lane" && run.workspace.owner.purpose !== "execution") {
+      throw new Error("An execution Agent run cannot use a review Lane workspace.");
     }
   }
   validateEffectiveLaunchSnapshot(run.effective);

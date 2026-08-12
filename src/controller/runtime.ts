@@ -31,6 +31,7 @@ import {
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
+import { isTaskOwnedWorkspace } from "../worktree/managedWorkspace.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
@@ -419,6 +420,17 @@ export function createRuntimeLifecycleDispatcher(
           ? `Task not found: ${request.taskId}.`
           : `Task is not active: ${request.taskId}.`
       );
+    }
+    if (request.scope === "task" && task !== null) {
+      const taskWorkspace = store.getTaskWorkspace(task.id);
+      if (!isTaskOwnedWorkspace(
+        taskWorkspace,
+        task.id,
+        task.cwd,
+        task.projectBindings.map(({ projectId, directory }) => ({ projectId, directory }))
+      )) {
+        throw new Error(`Task workspace is not ready: ${task.id}.`);
+      }
     }
     if (
       request.scope === "task"

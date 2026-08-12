@@ -62,6 +62,15 @@ export interface GitWorkspacePort {
   ): Promise<boolean>;
   headRef(repositoryPath: string): Promise<string>;
   isClean(repositoryPath: string): Promise<boolean>;
+  mergeWorktree(input: Readonly<{
+    targetPath: string;
+    sourceRefs: readonly string[];
+  }>): Promise<void>;
+  resetWorktree(input: Readonly<{
+    targetPath: string;
+    expectedHead: string;
+    restoreHead: string;
+  }>): Promise<void>;
   refresh(input: Readonly<{
     repositoryPath: string;
     remoteUrl: string;
@@ -461,6 +470,70 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       "-C", root, "status", "--porcelain=v1", "--untracked-files=all"
     ]);
     return status.length === 0;
+  }
+
+  async mergeWorktree(input: Readonly<{
+    targetPath: string;
+    sourceRefs: readonly string[];
+  }>): Promise<void> {
+    const target = await canonicalDirectory(input.targetPath, "Merge target");
+    const sources = input.sourceRefs.map((source) => safeRef(source));
+    if (sources.length === 0) {
+      throw new Error(`Git merge requires at least one source ref: ${target}.`);
+    }
+    if (!await this.isClean(target)) {
+      throw new Error(`Git merge target must be clean: ${target}.`);
+    }
+    try {
+      // Merge all selected Lane heads in one Git transaction.  A conflict in
+      // any Lane therefore aborts the complete Candidate materialization
+      // instead of leaving an earlier Lane merged into the WorkItem target.
+      await git(["-C", target, "merge", "--no-edit", "--no-ff", ...sources]);
+    } catch (error) {
+      try {
+        await git(["-C", target, "merge", "--abort"]);
+      } catch (abortError) {
+        throw new Error(
+          `Git merge failed and conflict cleanup could not be completed for ${target}.`,
+          { cause: abortError }
+        );
+      }
+      throw new Error(
+        `Git merge failed for ${target} from ${sources.join(", ")}; Candidate materialization was not completed.`,
+        { cause: error }
+      );
+    }
+  }
+
+  async resetWorktree(input: Readonly<{
+    targetPath: string;
+    expectedHead: string;
+    restoreHead: string;
+  }>): Promise<void> {
+    const target = await canonicalDirectory(input.targetPath, "Reset target");
+    const expectedHead = safeRef(input.expectedHead);
+    const restoreHead = safeRef(input.restoreHead);
+    if (!await this.isClean(target)) {
+      throw new Error(`Git reset target must be clean: ${target}.`);
+    }
+    const currentHead = (await this.inspect(target, "HEAD")).baseCommit;
+    if (currentHead !== expectedHead) {
+      throw new Error(
+        `Git reset target changed before compensation: ${target} (${currentHead}).`
+      );
+    }
+    try {
+      await git(["-C", target, "reset", "--hard", restoreHead]);
+      const restoredHead = (await this.inspect(target, "HEAD")).baseCommit;
+      if (restoredHead !== restoreHead || !await this.isClean(target)) {
+        throw new Error(`Git reset target did not restore its exact head: ${target}.`);
+      }
+    } catch (error) {
+      throw new Error(
+        `Git reset compensation failed for ${target}; Candidate materialization remains retained for diagnosis.`,
+        { cause: error }
+      );
+    }
   }
 
   async #assertRefreshCheckout(

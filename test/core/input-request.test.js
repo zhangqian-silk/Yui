@@ -41,6 +41,7 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { createInputRequestOperatorPresentation } from "../../dist/interaction/operatorPresentation.js";
 import { createWorkItem } from "../../dist/workItem/workItem.js";
+import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 const FIRST = new Date("2026-07-21T01:00:00.000Z");
 const SECOND = new Date("2026-07-21T01:01:00.000Z");
@@ -253,8 +254,11 @@ function fixture(t) {
   };
   const options = { runtime, now: () => new Date(FIRST) };
   runTaskCommand(["create", "Need user input"], store, options);
-  const task = store.listTasks()[0];
+  const createdTask = store.listTasks()[0];
+  store.saveTask({ ...createdTask, cwd: root });
+  const task = store.getTask(createdTask.id);
   runTaskCommand(["activate", task.id], store, options);
+  store.saveManagedWorkspace(taskOwnedWorkspace(task, FIRST));
   store.clearPendingWakeup(task.id);
   const role = store.getRole(task.id, "leader");
   const effective = resolveEffectiveLaunch({ role, purpose: "execution" });

@@ -14,6 +14,7 @@ import {
   selectedSchedulerTasks,
   type SchedulerReconcileSelection
 } from "./ports.js";
+import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
@@ -56,7 +57,8 @@ export async function processActiveRoleRunDeliveries(
       // acceptance): a pushed-but-unaccepted Run must never be pushed twice —
       // no duplicate Enter while acceptance is still pending.
       if (run === null || run.pushedAt !== undefined) continue;
-      if (task.projectBindings.length > 0 && task.cwd === undefined) {
+      const taskWorkspace = store.getTaskWorkspace(task.id);
+      if (!isSchedulerTaskWorkspaceReady(task, taskWorkspace)) {
         results.push({
           taskId: task.id,
           roleName: role.name,

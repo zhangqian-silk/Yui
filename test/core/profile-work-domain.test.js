@@ -86,6 +86,7 @@ test("WorkItem contains intent without provider-specific execution fields", () =
     "candidates",
     "createdAt",
     "dependsOn",
+    "executionGroups",
     "id",
     "objective",
     "revision",

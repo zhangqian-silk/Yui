@@ -11,10 +11,15 @@ import { updateRoleStatus } from "../role/role.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import {
   finishReviewRound,
+  updateReviewExecutionGroup,
   type ReviewCheck,
   type ReviewRound
 } from "../review/reviewRound.js";
 import { failAgentRun, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
+import {
+  recordExecutionLaneResult,
+  type ExecutionLaneGitSnapshot
+} from "../execution/executionGroup.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   isRuntimeLaunchReservation,
@@ -27,7 +32,11 @@ import {
   RUN_RECOVERY_REQUESTED_EVENT
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { updateWorkItemStatus } from "../workItem/workItem.js";
+import {
+  workItemExecutionGroupById,
+  updateWorkItemExecutionGroup,
+  updateWorkItemStatus
+} from "../workItem/workItem.js";
 export type ExactReviewRoundTerminalizationResult = Readonly<{
   disposition: "applied" | "obsolete";
   round: ReviewRound | null;
@@ -57,26 +66,56 @@ export function validateExactRunReviewRound(
     && round.status !== "pending" && round.status !== "running") {
     return { disposition: "obsolete", round, reason: "review-round-terminal" };
   }
-  if (
-    round.reviewerRunId !== run.id
-    || round.reviewerRoleName !== run.roleName
+  const lane = round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
+  const exactReviewerRun = round.reviewerRunId === run.id || lane?.runId === run.id;
+  const exactReviewerRole = round.reviewerRoleName === run.roleName || lane?.roleName === run.roleName;
+  if (!exactReviewerRun
+    || !exactReviewerRole
     || round.workItemId !== run.workItemId
-    || round.reviewBaseCommit !== run.effective.reviewBaseCommit
-  ) {
+    || round.reviewBaseCommit !== run.effective.reviewBaseCommit) {
     return { disposition: "obsolete", round, reason: "review-round-mismatch" };
   }
+  const laneWorkspaceRoot = lane?.workspace?.root;
   if (run.workspace === undefined || round.workspace === undefined
-    || !isDeepStrictEqual(run.workspace, round.workspace)) {
+    || (laneWorkspaceRoot === undefined && !isDeepStrictEqual(run.workspace, round.workspace))
+    || (laneWorkspaceRoot !== undefined && run.workspace.root !== laneWorkspaceRoot)) {
     return { disposition: "obsolete", round, reason: "review-workspace-mismatch" };
   }
-  const storedWorkspace = store.getReviewRoundWorkspace(run.taskId, round.id);
-  if (storedWorkspace === null || !isDeepStrictEqual(storedWorkspace, round.workspace)) {
+  const storedWorkspace = run.workspace.owner.type === "execution-lane"
+    ? store.getManagedWorkspace(run.workspace.owner)
+    : store.getReviewRoundWorkspace(run.taskId, round.id);
+  if (storedWorkspace === null
+    || (run.workspace.owner.type !== "execution-lane"
+      && !isDeepStrictEqual(storedWorkspace, round.workspace))
+    || !isDeepStrictEqual(storedWorkspace, run.workspace)) {
     return { disposition: "obsolete", round, reason: "review-workspace-drift" };
   }
-  if (storedWorkspace.owner.type !== "review-round"
-    || storedWorkspace.owner.taskId !== run.taskId
-    || storedWorkspace.owner.reviewRoundId !== round.id) {
-    return { disposition: "obsolete", round, reason: "review-workspace-owner-mismatch" };
+  if (run.workspace.owner.type !== "execution-lane") {
+    if (storedWorkspace.owner.type !== "review-round"
+      || storedWorkspace.owner.taskId !== run.taskId
+      || storedWorkspace.owner.reviewRoundId !== round.id) {
+      return { disposition: "obsolete", round, reason: "review-workspace-owner-mismatch" };
+    }
+  }
+  if (run.workspace.owner.type === "execution-lane"
+    && (run.workspace.owner.purpose !== "review"
+      || run.workspace.owner.executionGroupId !== run.executionGroupId
+      || run.workspace.owner.executionLaneId !== run.executionLaneId
+      || run.workspace.owner.reviewRoundId !== round.id)) {
+    return { disposition: "obsolete", round, reason: "review-lane-workspace-owner-mismatch" };
+  }
+  if (run.workspace.owner.type === "execution-lane") {
+    if (lane === undefined
+      || lane.runId !== run.id
+      || lane.roleName !== run.roleName
+      || lane.workspace?.root !== run.workspace.root
+      || lane.workspace.writableProjectIds.length !== run.workspace.entries.length
+      || run.workspace.entries.some((entry) => (
+        entry.access !== "write"
+        || !lane.workspace!.writableProjectIds.includes(entry.projectId)
+      ))) {
+      return { disposition: "obsolete", round, reason: "review-lane-workspace-lineage-mismatch" };
+    }
   }
   const item = store.getWorkItem(run.taskId, round.workItemId);
   if (item === null) {
@@ -144,7 +183,10 @@ export function terminalizeExactRunReviewRound(
     reviewResult?: Readonly<{
       report?: string;
       checks?: readonly ReviewCheck[];
+      findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
+      evidence?: readonly string[];
       evidenceCommit?: string;
+      gitSnapshot?: ExecutionLaneGitSnapshot;
     }>;
   }>,
   now: Date
@@ -154,8 +196,56 @@ export function terminalizeExactRunReviewRound(
     return validation;
   }
   const reviewRound = validation.round;
+  const groupedRound = input.run.executionGroupId !== undefined
+    && input.run.executionLaneId !== undefined
+    && reviewRound.executionGroup !== undefined
+    ? updateReviewExecutionGroup(
+        reviewRound,
+        recordExecutionLaneResult(
+          reviewRound.executionGroup,
+          input.run.executionLaneId,
+          {
+            summary: input.outcome.summary,
+            ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
+            ...(input.reviewResult?.checks === undefined
+              ? {}
+              : {
+                  checks: input.reviewResult.checks.map(({ name, outcome, details }) => ({
+                    name,
+                    outcome,
+                    ...(details === undefined ? {} : { details })
+                  }))
+                }),
+            ...(input.reviewResult?.findings === undefined
+              ? {}
+              : { findings: input.reviewResult.findings }),
+            ...(input.reviewResult?.evidence === undefined
+              ? {}
+              : { evidence: input.reviewResult.evidence }),
+            ...(input.reviewResult?.evidenceCommit === undefined
+              ? {}
+              : { evidenceCommit: input.reviewResult.evidenceCommit }),
+            ...(input.reviewResult?.gitSnapshot === undefined
+              ? {}
+              : { gitSnapshot: input.reviewResult.gitSnapshot })
+          },
+          input.outcome.status === "yielded" ? "completed" : "failed",
+          now
+        )
+      )
+    : reviewRound;
+  const groupedMultiLane = groupedRound.executionGroup !== undefined
+    && (groupedRound.executionGroup.lanes.length > 1
+      || groupedRound.executionGroup.strategy.mode === "adaptive");
+  if (groupedMultiLane && groupedRound.executionGroup !== undefined) {
+    // A panel Lane only contributes evidence.  The Leader must see every
+    // terminal Lane and explicitly resolve the Group before this ReviewRound
+    // can become terminal.
+    store.saveReviewRound(input.taskId, groupedRound);
+    return { disposition: "applied", round: groupedRound };
+  }
   const terminal = finishReviewRound(
-    reviewRound,
+    groupedRound,
     input.outcome.status === "yielded" ? "completed" : "failed",
     input.outcome.summary,
     now,
@@ -182,7 +272,10 @@ export type ExactRunTerminalizationInput = Readonly<{
   reviewResult?: Readonly<{
     report?: string;
     checks?: readonly ReviewCheck[];
+    findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
+    evidence?: readonly string[];
     evidenceCommit?: string;
+    gitSnapshot?: ExecutionLaneGitSnapshot;
   }>;
 }>;
 
@@ -245,7 +338,13 @@ export function terminalizeExactTaskRun(
   }
   const role = store.getRole(input.taskId, input.roleName);
   if (role === null) return obsolete(run, "role-missing");
-  const active = store.getActiveAgentRun(input.taskId, input.roleName);
+  const active = run.executionGroupId !== undefined && run.executionLaneId !== undefined
+    ? store.getActiveExecutionLaneRun(
+      input.taskId,
+      run.executionGroupId,
+      run.executionLaneId
+    )
+    : store.getActiveAgentRun(input.taskId, input.roleName);
   if (active?.id !== run.id) return obsolete(run, "active-run-mismatch");
 
   const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
@@ -317,8 +416,43 @@ export function terminalizeExactTaskRun(
   const terminal = input.outcome.status === "yielded"
     ? yieldAgentRun(run, input.outcome.summary, now)
     : failAgentRun(run, input.outcome.summary, now);
+  if (run.executionGroupId !== undefined
+    && run.executionLaneId !== undefined
+    && run.purpose === "execution"
+    && run.workItemId !== undefined) {
+    const item = store.getWorkItem(input.taskId, run.workItemId);
+    const group = item === null
+      ? undefined
+      : workItemExecutionGroupById(item, run.executionGroupId);
+    if (item !== null && group !== undefined) {
+      const grouped = recordExecutionLaneResult(
+        group,
+        run.executionLaneId,
+      {
+        summary: input.outcome.summary,
+        ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
+        ...(input.reviewResult?.checks === undefined ? {} : { checks: input.reviewResult.checks }),
+        ...(input.reviewResult?.findings === undefined ? {} : { findings: input.reviewResult.findings }),
+        ...(input.reviewResult?.evidence === undefined ? {} : { evidence: input.reviewResult.evidence }),
+        ...(input.reviewResult?.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit }),
+        ...(input.reviewResult?.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot })
+      },
+        input.outcome.status === "yielded" ? "completed" : "failed",
+        now
+      );
+      store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
+    }
+  }
   store.saveAgentRun(terminal);
-  store.clearActiveAgentRun(input.taskId, input.roleName);
+  if (terminal.executionGroupId !== undefined && terminal.executionLaneId !== undefined) {
+    store.clearActiveExecutionLaneRun(
+      input.taskId,
+      terminal.executionGroupId,
+      terminal.executionLaneId
+    );
+  } else {
+    store.clearActiveAgentRun(input.taskId, input.roleName);
+  }
   store.saveRole(input.taskId, updateRoleStatus(role, "idle", now));
   if (sessions !== null) {
     store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
@@ -381,7 +515,14 @@ function recoverExactAgentRunInTransaction(
   }
   const role = store.getRole(input.taskId, input.roleName);
   if (role === null) return stateChanged("role-missing");
-  if (store.getActiveAgentRun(input.taskId, input.roleName)?.id !== current.id) {
+  const active = current.executionGroupId !== undefined && current.executionLaneId !== undefined
+    ? store.getActiveExecutionLaneRun(
+      input.taskId,
+      current.executionGroupId,
+      current.executionLaneId
+    )
+    : store.getActiveAgentRun(input.taskId, input.roleName);
+  if (active?.id !== current.id) {
     return stateChanged("active-run-mismatch");
   }
   const progress = latestRunDurableProgressAt(

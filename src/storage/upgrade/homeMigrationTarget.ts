@@ -24,8 +24,8 @@
  *    durable temp+rename+fsync discipline.
  *
  * The production registry authorizes only explicit adjacent steps. Aggregate
- * 16→17 exercises this target against a real historical Home; all other missing
- * paths remain fail-closed.
+ * 16→17 and the execution record-family upgrades exercise this target against
+ * historical Homes; all other missing paths remain fail-closed.
  */
 
 import {

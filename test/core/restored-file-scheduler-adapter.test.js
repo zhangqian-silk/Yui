@@ -54,10 +54,16 @@ import { activateTask, archiveTask, completeTask, createTask } from "../../dist/
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import { createProject } from "../../dist/repository/project.js";
 import {
+  attachWorkItemExecutionGroup,
   createWorkItem,
+  currentWorkItemExecutionGroup,
   submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
+import {
+  createExecutionGroup,
+  updateExecutionLane
+} from "../../dist/execution/executionGroup.js";
 
 function fixture(t) {
   const home = mkdtempSync(join(tmpdir(), "yui-scheduler-store-"));
@@ -89,6 +95,19 @@ function fixture(t) {
       now
     ));
     tx.saveTask(task);
+    tx.saveManagedWorkspace(createManagedWorkspace({
+      owner: { type: "task", taskId: task.id },
+      root: home,
+      entries: [{
+        projectId: "project-1",
+        directory: "Yui",
+        access: "write",
+        path: home,
+        branch: "main",
+        baseRef: "main",
+        baseCommit: "0".repeat(40)
+      }]
+    }, now));
     tx.saveRole(task.id, role);
     queueLeaderWakeup(tx, task.id, "task-created", now);
   });
@@ -2196,6 +2215,52 @@ test("Worker delivery exhaustion atomically fails the exact Run and queues clean
   assert.deepEqual(fx.store.listMessages(fx.task.id), messagesBeforeFailure);
 });
 
+test("adaptive singleton delivery failure leaves the WorkItem open for Leader expansion or resolution", (t) => {
+  const fx = preparedDeliveryFailureFixture(t);
+  const group = updateExecutionLane(
+    createExecutionGroup("execution-group-1", fx.task.id, {
+      purpose: "execution",
+      target: {
+        schemaVersion: 1,
+        kind: "work-item",
+        taskId: fx.task.id,
+        workItemId: fx.item.id,
+        revision: fx.item.revision,
+        projects: [],
+        fingerprint: "adaptive-delivery-failure"
+      },
+      strategy: { mode: "adaptive", max: 2 },
+      lanes: [{ roleName: fx.role.name }]
+    }, fx.now),
+    "execution-group-1-lane-1",
+    { status: "running", runId: fx.run.id },
+    fx.now
+  );
+  fx.store.transaction((tx) => {
+    const item = tx.getWorkItem(fx.task.id, fx.item.id);
+    tx.saveWorkItem(fx.task.id, attachWorkItemExecutionGroup(item, group, fx.now));
+    tx.saveAgentRun({
+      ...fx.run,
+      executionGroupId: group.id,
+      executionLaneId: group.lanes[0].id
+    });
+    tx.saveActiveExecutionLaneRun({
+      ...fx.run,
+      executionGroupId: group.id,
+      executionLaneId: group.lanes[0].id
+    });
+  });
+
+  assert.equal(fx.adapter.saveRoleRunDeliveryFailure(fx.failure), "failed");
+
+  const item = fx.store.getWorkItem(fx.task.id, fx.item.id);
+  assert.equal(item.status, "running");
+  const failedLane = currentWorkItemExecutionGroup(item).lanes[0];
+  assert.equal(failedLane.status, "failed");
+  assert.equal(failedLane.result.summary.includes("retry limit exhausted"), true);
+  assert.ok(fx.store.getPendingWakeup(fx.task.id).reasons.includes("role-run-failed"));
+});
+
 test("Reviewer delivery exhaustion fails only its ReviewRound and queues the Leader", (t) => {
   const fx = preparedDeliveryFailureFixture(t, {
     roleName: "reviewer",
@@ -2449,6 +2514,164 @@ test("runtime native session registration is structured and exited work fails at
   }), "state-changed");
   assert.equal(store.getActiveAgentRun(task.id, role.name).id, replacement.id);
   assert.equal(store.getOperatorNotification(task.id).runId, replacement.id);
+});
+
+test("exited execution work terminalizes its bound lane so a retry is accepted", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const executionGroup = updateExecutionLane(
+    createExecutionGroup("execution-group-1", task.id, {
+      purpose: "execution",
+      target: {
+        schemaVersion: 1,
+        kind: "work-item",
+        taskId: task.id,
+        workItemId: "work-item-1",
+        revision: 1,
+        projects: [],
+        fingerprint: "lane-retry-fixture"
+      },
+      strategy: { mode: "fixed", count: 1 },
+      lanes: [{ roleName: role.name }]
+    }, now),
+    "execution-group-1-lane-1",
+    { status: "running", runId: "agent-run-1" },
+    now
+  );
+  const laneId = executionGroup.lanes[0].id;
+  const item = updateWorkItemStatus(createWorkItem(
+    "work-item-1",
+    task.id,
+    {
+      title: "Implement",
+      executionGroups: [executionGroup],
+      currentExecutionGroupId: executionGroup.id
+    },
+    now
+  ), "running", now);
+  const run = createAgentRun(adapter,
+    "agent-run-1",
+    task.id,
+    role.name,
+    "resume",
+    "work",
+    now,
+    {
+      workItemId: item.id,
+      executionGroupId: executionGroup.id,
+      executionLaneId: laneId
+    }
+  );
+  store.transaction((tx) => {
+    tx.saveWorkItem(task.id, item);
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, { kind: "role", taskId: task.id, roleName: role.name }, "run-dispatched", now, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
+  });
+  adapter.claimWorkMailbox({
+    target: { kind: "role", taskId: task.id, roleName: role.name },
+    batchId: `agent-run:${task.id}/${run.id}`,
+    owner: "controller",
+    now,
+    executionRef: { type: "run", taskId: task.id, id: run.id }
+  });
+  const deliveredAt = new Date(now.getTime() + 1_000).toISOString();
+  store.saveActiveAgentRun({ ...run, pushedAt: deliveredAt, deliveredAt });
+
+  assert.equal(adapter.saveExitedRoleRun({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: adapter.getRoleSession(task.id, role.name),
+    summary: "tmux exited",
+    now
+  }), "failed");
+
+  const failedItem = store.getWorkItem(task.id, item.id);
+  assert.equal(failedItem.status, "failed");
+  const failedLane = currentWorkItemExecutionGroup(failedItem).lanes.find(({ id }) => id === laneId);
+  // The lane must reach a terminal result in the same failure, otherwise a
+  // later `yui task run retry` cannot restart it.
+  assert.equal(failedLane.status, "failed");
+  assert.equal(failedLane.result.summary, "tmux exited");
+  assert.equal(store.getActiveAgentRun(task.id, role.name), null);
+});
+
+test("adaptive singleton executor exit leaves the WorkItem open for Leader expansion or resolution", (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  const executionGroup = updateExecutionLane(
+    createExecutionGroup("execution-group-1", task.id, {
+      purpose: "execution",
+      target: {
+        schemaVersion: 1,
+        kind: "work-item",
+        taskId: task.id,
+        workItemId: "work-item-1",
+        revision: 1,
+        projects: [],
+        fingerprint: "adaptive-exit-fixture"
+      },
+      strategy: { mode: "adaptive", max: 2 },
+      lanes: [{ roleName: role.name }]
+    }, now),
+    "execution-group-1-lane-1",
+    { status: "running", runId: "agent-run-1" },
+    now
+  );
+  const laneId = executionGroup.lanes[0].id;
+  const item = updateWorkItemStatus(createWorkItem(
+    "work-item-1",
+    task.id,
+    {
+      title: "Implement adaptively",
+      executionGroups: [executionGroup],
+      currentExecutionGroupId: executionGroup.id
+    },
+    now
+  ), "running", now);
+  const run = createAgentRun(adapter,
+    "agent-run-1",
+    task.id,
+    role.name,
+    "resume",
+    "work",
+    now,
+    {
+      workItemId: item.id,
+      executionGroupId: executionGroup.id,
+      executionLaneId: laneId
+    }
+  );
+  store.transaction((tx) => {
+    tx.saveWorkItem(task.id, item);
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, { kind: "role", taskId: task.id, roleName: role.name }, "run-dispatched", now, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
+  });
+  adapter.claimWorkMailbox({
+    target: { kind: "role", taskId: task.id, roleName: role.name },
+    batchId: `agent-run:${task.id}/${run.id}`,
+    owner: "controller",
+    now,
+    executionRef: { type: "run", taskId: task.id, id: run.id }
+  });
+  const deliveredAt = new Date(now.getTime() + 1_000).toISOString();
+  store.saveActiveExecutionLaneRun({ ...run, pushedAt: deliveredAt, deliveredAt });
+
+  assert.equal(adapter.saveExitedRoleRun({
+    task,
+    role: adapter.getRole(task.id, role.name),
+    run,
+    session: adapter.getRoleSession(task.id, role.name),
+    summary: "tmux exited",
+    now
+  }), "failed");
+
+  const failedItem = store.getWorkItem(task.id, item.id);
+  assert.equal(failedItem.status, "running");
+  assert.equal(currentWorkItemExecutionGroup(failedItem).lanes[0].status, "failed");
+  assert.ok(store.getPendingWakeup(task.id).reasons.includes("leader-run-failed"));
 });
 
 test("reconfirming an already delivered active run does not rewrite authoritative state", (t) => {
@@ -3029,7 +3252,11 @@ test("an exact fresh-launch reservation replaces and archives a stopped incompat
     }
   }, new Date(now.getTime() + 2));
   store.saveRole(task.id, desired);
-  const effective = resolveEffectiveLaunch({ role: desired, purpose: "execution" });
+  const effective = resolveEffectiveLaunch({
+    role: desired,
+    purpose: "execution",
+    workspace: store.getTaskWorkspace(task.id)
+  });
   adapter.reserveRuntimeLaunch(
     { owner, launchId: "launch-fresh-effective" },
     () => {},

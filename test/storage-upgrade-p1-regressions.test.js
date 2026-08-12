@@ -315,7 +315,7 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
     ].sort()
   );
   assert.deepEqual(versions.managedWorkspace, {
-    version: 1,
+    version: 2,
     path: "state.json#/tasks/*/managedWorkspaces"
   });
   assert.equal("roleWorkspace" in versions, false);
@@ -1002,6 +1002,10 @@ test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-s
       }
     };
   });
+  const schemaPath = join(home, "schema.json");
+  const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+  schema.recordVersions.managedWorkspace = 1;
+  writeFileSync(schemaPath, JSON.stringify(schema));
   const latest = LATEST();
   latest.record = {
     ...latest.record,

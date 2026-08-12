@@ -91,7 +91,12 @@ import {
   RUN_STALLED_EVENT
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { updateWorkItemStatus } from "../workItem/workItem.js";
+import {
+  currentWorkItemExecutionGroup,
+  updateWorkItemExecutionGroup,
+  updateWorkItemStatus
+} from "../workItem/workItem.js";
+import { recordExecutionLaneResult } from "../execution/executionGroup.js";
 import {
   formatAgentRunReceiptId,
   formatTaskRecordReference
@@ -128,6 +133,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
   listTasks() { return this.store.listTasks(); }
   getTask(taskId: string) { return this.store.getTask(taskId); }
+  getTaskWorkspace(taskId: string) { return this.store.getTaskWorkspace(taskId); }
   getTaskBrief(taskId: string) { return this.store.getTaskBrief(taskId); }
   listDecisions(taskId: string) { return this.store.listDecisions(taskId); }
   listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
@@ -930,10 +936,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (item !== null && ![
           "completed", "failed", "retired"
         ].includes(item.status)) {
-          store.saveWorkItem(
-            input.taskId,
-            updateWorkItemStatus(item, "failed", input.now, summary)
-          );
+          const group = currentWorkItemExecutionGroup(item);
+          const groupedPanel = group !== undefined
+            && (group.lanes.length > 1 || group.strategy.mode === "adaptive")
+            && group.resolution === undefined;
+          if (!groupedPanel) {
+            store.saveWorkItem(
+              input.taskId,
+              updateWorkItemStatus(item, "failed", input.now, summary)
+            );
+          }
         }
       }
 
@@ -1139,10 +1151,39 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (currentRun.purpose === "execution" && currentRun.workItemId !== undefined) {
         const workItem = store.getWorkItem(task.id, currentRun.workItemId);
         if (workItem !== null && !["completed", "failed", "retired"].includes(workItem.status)) {
-          store.saveWorkItem(
-            task.id,
-            updateWorkItemStatus(workItem, "failed", input.now, input.summary)
-          );
+          // Terminalize the bound execution lane in the same transaction that
+          // fails the Run. Without this, a scheduler-driven Worker failure
+          // leaves the lane "running" behind a "failed" WorkItem, and a later
+          // `yui task run retry` is rejected because the lane is not terminal.
+          // The lane result and the WorkItem status are two ordered single-step
+          // record revisions, matching the aggregate terminalization path.
+          if (currentRun.executionGroupId !== undefined
+            && currentRun.executionLaneId !== undefined
+            && currentWorkItemExecutionGroup(workItem) !== undefined) {
+            const group = currentWorkItemExecutionGroup(workItem)!;
+            store.saveWorkItem(task.id, updateWorkItemExecutionGroup(
+              workItem,
+              recordExecutionLaneResult(
+                group,
+                currentRun.executionLaneId,
+                { summary: input.summary },
+                "failed",
+                input.now
+              ),
+              input.now
+            ));
+          }
+          const laneUpdated = store.getWorkItem(task.id, currentRun.workItemId)!;
+          const laneGroup = currentWorkItemExecutionGroup(laneUpdated);
+          const groupedPanel = laneGroup !== undefined
+            && (laneGroup.lanes.length > 1 || laneGroup.strategy.mode === "adaptive")
+            && laneGroup.resolution === undefined;
+          if (!groupedPanel) {
+            store.saveWorkItem(
+              task.id,
+              updateWorkItemStatus(laneUpdated, "failed", input.now, input.summary)
+            );
+          }
         }
       }
       store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));

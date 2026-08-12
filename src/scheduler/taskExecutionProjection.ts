@@ -7,11 +7,16 @@ import type { TaskBrief } from "../brief/taskBrief.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { LeaderFailure } from "./leaderFailure.js";
 import type { OperatorNotification } from "./operatorNotification.js";
-import type { WorkItem } from "../workItem/workItem.js";
+import { currentWorkItemExecutionGroup, type WorkItem } from "../workItem/workItem.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { WorkMailbox } from "../coordination/workMailbox.js";
+import {
+  summarizeExecutionGroup,
+  type ExecutionGroup,
+  type ExecutionGroupSummary
+} from "../execution/executionGroup.js";
 import { isRoleRunStalled, latestStallProgressAt } from "./roleRunStall.js";
 
 /**
@@ -81,6 +86,8 @@ export type TaskExecutionRun = Readonly<{
   purpose: AgentRun["purpose"];
   delivered: boolean;
   status: AgentRun["status"];
+  executionGroupId?: string;
+  executionLaneId?: string;
 }>;
 
 export type TaskExecutionProjection = Readonly<{
@@ -96,6 +103,8 @@ export type TaskExecutionProjection = Readonly<{
   failClosed: boolean;
   activeExecutorCount: number;
   activeRuns: readonly TaskExecutionRun[];
+  /** Read-only Leader aggregation for every unified execution Group. */
+  executionGroups: readonly ExecutionGroupSummary[];
   attention: readonly TaskExecutionAttention[];
   blockers: readonly TaskExecutionBlocker[];
   /** Existing durable wake facts, included for idempotent reconciliation. */
@@ -157,6 +166,7 @@ export type TaskExecutionFacts = Readonly<{
   leaderMailbox?: WorkMailbox | null;
   leaderFailure?: LeaderFailure | null;
   operatorNotification?: OperatorNotification | null;
+  executionGroups?: readonly ExecutionGroup[];
   roleSessions?: readonly Readonly<{
     roleName: string;
     agentId: string;
@@ -196,6 +206,12 @@ export function buildTaskExecutionProjection(
     task,
     roles,
     runs,
+    executionGroups: store.listWorkItems === undefined && store.listReviewRounds === undefined
+      ? []
+      : collectExecutionGroups(
+          store.listWorkItems?.(taskId) ?? [],
+          store.listReviewRounds?.(taskId) ?? []
+        ),
     workItems: store.listWorkItems?.(taskId) ?? [],
     inputRequests: store.listInputRequests?.(taskId) ?? [],
     ...(store.listReviewRounds === undefined
@@ -236,15 +252,23 @@ export function projectTaskExecution(
     leaderMailbox = null,
     leaderFailure = null,
     operatorNotification = null,
-    roleSessions = []
+    roleSessions = [],
+    executionGroups = []
   } = facts;
+  const groupSummaries = executionGroups.map((group) => summarizeExecutionGroup(group));
+  const render = (input: ProjectionInput): TaskExecutionProjection => projection({
+    ...input,
+    executionGroups: groupSummaries
+  });
   const activeRuns = runs.filter((run) => run.status === "active");
   const activeRunViews = activeRuns.map((run) => ({
     id: run.id,
     roleName: run.roleName,
     purpose: run.purpose,
     delivered: run.deliveredAt !== undefined,
-    status: run.status
+    status: run.status,
+    ...(run.executionGroupId === undefined ? {} : { executionGroupId: run.executionGroupId }),
+    ...(run.executionLaneId === undefined ? {} : { executionLaneId: run.executionLaneId })
   }));
   const monitoring = task.status === "completed"
     || task.status === "retired"
@@ -253,7 +277,7 @@ export function projectTaskExecution(
     : "active";
   if (monitoring === "stopped") {
     const stoppedStatus = task.status as Extract<TaskStatus, "completed" | "retired" | "archived">;
-    return projection({
+    return render({
       task,
       status: stoppedStatus,
       owner: "none",
@@ -312,7 +336,7 @@ export function projectTaskExecution(
     const first = attention[0];
     const progressingWithAttention = first.kind === "checkpoint-overdue"
       && healthyExecutionCarriers.length > 0;
-    return projection({
+    return render({
       task,
       status: progressingWithAttention ? "progressing-with-attention" : "attention",
       owner: first.owner,
@@ -331,7 +355,7 @@ export function projectTaskExecution(
     });
   }
   if (openInputs.length > 0) {
-    return projection({
+    return render({
       task,
       status: "waiting-user",
       owner: "user",
@@ -348,7 +372,7 @@ export function projectTaskExecution(
     });
   }
   if (blockedIntegration || failedWork || hasLeaderMismatch) {
-    return projection({
+    return render({
       task,
       status: "blocked",
       owner: "leader",
@@ -365,7 +389,7 @@ export function projectTaskExecution(
     });
   }
   if (recoveryPending) {
-    return projection({
+    return render({
       task,
       status: "recovering",
       owner: leaderFailure !== null ? "operator" : "leader",
@@ -383,7 +407,7 @@ export function projectTaskExecution(
     });
   }
   if (pendingDelivery) {
-    return projection({
+    return render({
       task,
       status: "recovering",
       owner: "leader",
@@ -400,7 +424,7 @@ export function projectTaskExecution(
     });
   }
   if (activeWorkers.length > 0 && activeLeader === undefined) {
-    return projection({
+    return render({
       task,
       status: "waiting-on-agents",
       owner: roleOwner(activeWorkers[0].roleName),
@@ -417,7 +441,7 @@ export function projectTaskExecution(
     });
   }
   if (activeLeader !== undefined) {
-    return projection({
+    return render({
       task,
       status: activeWorkers.length > 0 ? "waiting-on-agents" : "working",
       owner: "leader",
@@ -436,7 +460,7 @@ export function projectTaskExecution(
     });
   }
   if (activeExecutors.length > 0) {
-    return projection({
+    return render({
       task,
       status: "waiting-on-agents",
       owner: roleOwner(activeExecutors[0].roleName),
@@ -453,7 +477,7 @@ export function projectTaskExecution(
     });
   }
   if (candidateReady || unresolvedIntegration || hasPendingLeaderWork) {
-    return projection({
+    return render({
       task,
       status: "needs-leader-action",
       owner: "leader",
@@ -475,7 +499,7 @@ export function projectTaskExecution(
       pendingWakeup
     });
   }
-  return projection({
+    return render({
     task,
     status: "needs-leader-action",
     owner: "leader",
@@ -494,9 +518,10 @@ export function projectTaskExecution(
 
 type ProjectionInput = Omit<
   TaskExecutionProjection,
-  "next" | "taskId" | "taskStatus"
+  "next" | "taskId" | "taskStatus" | "executionGroups"
 > & Readonly<{
   task: Readonly<Pick<Task, "id" | "status">>;
+  executionGroups?: readonly ExecutionGroupSummary[];
 }>;
 
 function projection(input: ProjectionInput): TaskExecutionProjection {
@@ -512,11 +537,31 @@ function projection(input: ProjectionInput): TaskExecutionProjection {
     failClosed: input.failClosed,
     activeExecutorCount: input.activeExecutorCount,
     activeRuns: input.activeRuns,
+    executionGroups: input.executionGroups ?? [],
     attention: input.attention,
     blockers: input.blockers,
     pendingWakeup: input.pendingWakeup,
     next: { owner: input.owner, action: input.action }
   };
+}
+
+function collectExecutionGroups(
+  workItems: readonly WorkItem[],
+  reviewRounds: readonly ReviewRound[]
+): ExecutionGroup[] {
+  const groups = [
+    ...workItems.flatMap((item) => {
+      const group = currentWorkItemExecutionGroup(item);
+      return group === undefined ? [] : [group];
+    }),
+    ...reviewRounds.flatMap((round) => round.executionGroup === undefined ? [] : [round.executionGroup])
+  ];
+  const seen = new Set<string>();
+  return groups.filter((group) => {
+    if (seen.has(group.id)) return false;
+    seen.add(group.id);
+    return true;
+  });
 }
 
 function collectAttention(input: Readonly<{
@@ -698,7 +743,7 @@ function collectBlockers(
       summary: request.question
     });
   }
-  if (task.status === "active" && (task.projectBindings ?? []).length > 0 && task.cwd === undefined) {
+  if (task.status === "active" && task.cwd === undefined) {
     blockers.push({
       kind: "identity",
       id: `workspace:${task.id}`,

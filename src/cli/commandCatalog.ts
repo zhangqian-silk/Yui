@@ -401,7 +401,7 @@ const taskChildren: readonly NodeInput[] = [
       title: "Commands",
       entries: [
         "create", "list", "show", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
-        "review", "accept", "reject", "retire"
+        "review", "group", "accept", "reject", "retire"
       ]
     }],
     children: [
@@ -431,8 +431,21 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "dispatch",
         summary: "Dispatch a work item to its Role.",
-        usage: "yui task work dispatch <task>/<work> [--input <text>]",
-        options: ["--input"]
+        usage: "yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...]",
+        options: ["--input", "--strategy", "--lane-role"]
+      },
+      {
+        name: "group",
+        summary: "Resolve a Worker ExecutionGroup after its Lanes finish.",
+        executable: true,
+        sections: [{ id: "manage", title: "Commands", entries: ["resolve"] }],
+        children: [{
+          name: "resolve",
+          summary: "Select Lane outputs and resolve the Worker group.",
+          usage: "yui task work group resolve <task>/<work> --decision <accept|reject|blocked> --summary <text> [--lane <lane-id> ...]",
+          options: ["--decision", "--summary", "--lane"],
+          optionValues: { "--decision": ["accept", "reject", "blocked"] }
+        }]
       },
       {
         name: "isolate",
@@ -539,13 +552,26 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "review",
     summary: "Control Task-final ReviewRounds.",
-    sections: [{ id: "manage", title: "Commands", entries: ["request", "retry"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "group", "retry"] }],
     children: [
       {
         name: "request",
         summary: "Request one Task-local final ReviewRound from a Global Role.",
-        usage: "yui task review request <task> --role <global-role>",
-        options: ["--role"]
+        usage: "yui task review request <task> --role <global-role> [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...]",
+        options: ["--role", "--strategy", "--lane-role"]
+      },
+      {
+        name: "group",
+        summary: "Resolve a Reviewer ExecutionGroup after its Lanes finish.",
+        executable: true,
+        sections: [{ id: "manage", title: "Commands", entries: ["resolve"] }],
+        children: [{
+          name: "resolve",
+          summary: "Select Reviewer Lane evidence and resolve the group.",
+          usage: "yui task review group resolve <task>/<review-round> --decision <accept|reject|blocked> --summary <text> [--lane <lane-id> ...]",
+          options: ["--decision", "--summary", "--lane"],
+          optionValues: { "--decision": ["accept", "reject", "blocked"] }
+        }]
       },
       {
         name: "retry",

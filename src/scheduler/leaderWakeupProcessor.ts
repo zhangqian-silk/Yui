@@ -18,6 +18,7 @@ import type {
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "./ports.js";
+import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
@@ -48,7 +49,8 @@ export async function processLeaderWakeups(
       results.push({ taskId: wakeup.taskId, status: "skipped", reason: "unavailable" });
       continue;
     }
-    if (task.projectBindings.length > 0 && task.cwd === undefined) {
+    const taskWorkspace = store.getTaskWorkspace(task.id);
+    if (!isSchedulerTaskWorkspaceReady(task, taskWorkspace)) {
       results.push({ taskId: task.id, status: "skipped", reason: "workspace-not-ready" });
       continue;
     }

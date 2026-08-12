@@ -41,7 +41,7 @@ test("managed workspace records a root with per-Project read and write entries",
     ]
   }, NOW);
 
-  assert.equal(workspace.schemaVersion, 1);
+  assert.equal(workspace.schemaVersion, 2);
   assert.deepEqual(workspace.owner, {
     type: "work-item",
     taskId: "task-1",
@@ -70,4 +70,48 @@ test("owner identities remain usable when Git cannot use them as ref segments", 
   assert.match(first.branch, /^yui\/task-1\/encoded-[a-f0-9]{24}$/);
   assert.deepEqual(second, first);
   assert.doesNotThrow(() => execFileSync("git", ["check-ref-format", "--branch", first.branch]));
+});
+
+test("execution Lane workspace ownership has one unambiguous lifecycle lineage", () => {
+  const root = join(process.cwd(), "tasks", "task-1", "execution-lanes", "group-1", "lane-1");
+  const base = {
+    root,
+    entries: []
+  };
+
+  assert.doesNotThrow(() => createManagedWorkspace({
+    ...base,
+    owner: {
+      type: "execution-lane",
+      taskId: "task-1",
+      executionGroupId: "group-1",
+      executionLaneId: "lane-1",
+      purpose: "execution",
+      workItemId: "work-item-1"
+    }
+  }, NOW));
+  assert.throws(() => createManagedWorkspace({
+    ...base,
+    owner: {
+      type: "execution-lane",
+      taskId: "task-1",
+      executionGroupId: "group-1",
+      executionLaneId: "lane-1",
+      purpose: "execution",
+      workItemId: "work-item-1",
+      reviewRoundId: "review-round-1"
+    }
+  }, NOW), /cannot also own a ReviewRound/);
+  assert.throws(() => createManagedWorkspace({
+    ...base,
+    owner: {
+      type: "execution-lane",
+      taskId: "task-1",
+      executionGroupId: "group-1",
+      executionLaneId: "lane-1",
+      purpose: "review",
+      workItemId: "work-item-1",
+      reviewRoundId: "review-round-1"
+    }
+  }, NOW), /cannot also own a Work Item/);
 });

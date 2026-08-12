@@ -7,6 +7,11 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
+import {
+  summarizeExecutionGroup,
+  type ExecutionGroup
+} from "../execution/executionGroup.js";
+import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -226,6 +231,9 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
                 ? "none"
                 : item.writeProjectIds.join(", ")
             }`,
+            ...(currentWorkItemExecutionGroup(item) === undefined
+              ? []
+              : renderExecutionGroup(currentWorkItemExecutionGroup(item)!)),
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
@@ -374,7 +382,10 @@ function renderWorkItemReviews(
       : latest.checks.map(({ name, outcome }) => `${name}=${outcome}`).join(", ")}`,
     ...(latest.summary === undefined
       ? []
-      : [`      Review summary: ${compactText(latest.summary)}`])
+      : [`      Review summary: ${compactText(latest.summary)}`]),
+    ...(latest.executionGroup === undefined
+      ? []
+      : renderExecutionGroup(latest.executionGroup).map((line) => `    ${line.trimStart()}`))
   ];
 }
 
@@ -478,5 +489,37 @@ function managedWorkspaceLabel(
       return `review-round ${workspace.owner.reviewRoundId}`;
     case "integration-attempt":
       return `integration-attempt ${workspace.owner.integrationAttemptId}`;
+    case "execution-lane":
+      return `execution-lane ${workspace.owner.executionGroupId}/${workspace.owner.executionLaneId}`;
   }
+}
+
+function renderExecutionGroup(group: ExecutionGroup): string[] {
+  const summary = summarizeExecutionGroup(group);
+  return [
+    `    Execution Group ${summary.groupId} [${summary.purpose}/${summary.strategy.mode}]: ${summary.activeLaneCount} active / ${summary.terminalLaneCount} terminal; ${summary.failedLaneCount} failed`,
+    ...summary.laneSummaries.flatMap((lane) => [
+      `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}) [${lane.status}]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,
+      ...(lane.report === undefined ? [] : [`        Report: ${compactText(lane.report)}`]),
+      ...(lane.checks === undefined || lane.checks.length === 0
+        ? []
+        : [`        Checks: ${lane.checks.map(({ name, outcome }) => `${name}:${outcome}`).join(", ")}`]),
+      ...(lane.findings === undefined || lane.findings.length === 0
+        ? []
+        : [`        Findings: ${lane.findings.map(({ id, severity, status }) => `${id}:${severity}/${status}`).join(", ")}`]),
+      ...(lane.evidence === undefined || lane.evidence.length === 0
+        ? []
+        : [`        Evidence: ${lane.evidence.length} item(s)`]),
+      ...(lane.evidenceCommit === undefined
+        ? []
+        : [`        Evidence commit: ${lane.evidenceCommit}`]),
+      ...(lane.decision === undefined ? [] : [`        Decision: ${lane.decision}`])
+    ]),
+    ...(summary.openHighPriorityFindingIds.length === 0
+      ? []
+      : [`      Open high findings: ${summary.openHighPriorityFindingIds.join(", ")}`]),
+    ...(summary.resolution === undefined
+      ? []
+      : [`      Resolution: ${summary.resolution.decision} — ${compactText(summary.resolution.summary)}`])
+  ];
 }

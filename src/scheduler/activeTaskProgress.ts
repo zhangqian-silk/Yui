@@ -1,5 +1,6 @@
 import {
   selectedSchedulerTasks,
+  isSchedulerTaskWorkspaceReady,
   type SchedulerReconcileSelection,
   type SchedulerStorePort
 } from "./ports.js";
@@ -47,11 +48,8 @@ export function repairOrphanedActiveTasks(
       continue;
     }
 
-    if (
-      task.projectBindings.length > 0
-      && task.cwd === undefined
-      && typeof store.queueTaskProgress === "function"
-    ) {
+    const taskWorkspace = store.getTaskWorkspace(task.id);
+    if (!isSchedulerTaskWorkspaceReady(task, taskWorkspace)) {
       store.queueTaskProgress(task.id, "task-orphaned", now);
     }
     if (leaderMailbox?.processing !== null && leaderMailbox?.processing !== undefined) {

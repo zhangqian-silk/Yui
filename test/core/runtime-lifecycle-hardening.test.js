@@ -41,6 +41,7 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 const FIRST = new Date("2026-07-24T00:00:00.000Z");
 const SECOND = new Date("2026-07-24T00:00:01.000Z");
@@ -134,18 +135,21 @@ function fixture(t, adapterId = "codex") {
     [],
     FIRST
   );
-  const task = activateTask(createTask("task-1", "Runtime hardening", FIRST), FIRST);
+  const task = activateTask(createTask("task-1", "Runtime hardening", FIRST, {
+    cwd: home
+  }), FIRST);
   const role = createRole(
     task.id,
     "leader",
     [createRoleAgentBinding(agent)],
     agent.id,
-    home,
+    join(home, "role-workspace-hint"),
     FIRST
   );
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, FIRST));
     tx.saveRole(task.id, role);
   });
   return { home, store, agent, task, role };
@@ -162,11 +166,8 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
     home,
     FIRST
   );
-  const workspace = createManagedWorkspace({
-    owner: { type: "task", taskId: task.id },
-    root: join(home, "candidate"),
-    entries: []
-  }, FIRST);
+  const workspace = store.getTaskWorkspace(task.id);
+  assert.notEqual(workspace, null);
   const run = createAgentRun(
     "agent-run-101",
     task.id,
@@ -946,7 +947,9 @@ test("launch environment keeps native context and excludes other Agents' credent
     }],
     FIRST
   );
-  const task = activateTask(createTask("task-1", "Environment isolation", FIRST), FIRST);
+  const task = activateTask(createTask("task-1", "Environment isolation", FIRST, {
+    cwd: home
+  }), FIRST);
   const role = createRole(
     task.id,
     "leader",
@@ -959,6 +962,7 @@ test("launch environment keeps native context and excludes other Agents' credent
     tx.saveConfiguredAgent(current);
     tx.saveConfiguredAgent(other);
     tx.saveTask(task);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, FIRST));
     tx.saveRole(task.id, role);
   });
   const codexHome = join(home, "native-codex-home");
@@ -1141,10 +1145,22 @@ test("Controller restart default shutdown budget exceeds lifecycle request timeo
 
 test("orphan recovery uses the store's atomic Leader enqueue operation", () => {
   const queued = [];
-  const task = { id: "task-1", status: "active", projectBindings: [] };
+  const task = {
+    id: "task-1",
+    title: "Atomic orphan recovery",
+    status: "active",
+    projectBindings: [],
+    cwd: "/tmp/yui-orphan-task-1"
+  };
+  const workspace = createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
+    root: task.cwd,
+    entries: []
+  }, FIRST);
   const store = {
     listTasks: () => [task],
     getTask: () => task,
+    getTaskWorkspace: () => workspace,
     listRoles: () => [],
     getActiveAgentRun: () => null,
     hasInFlightTurn: () => false,

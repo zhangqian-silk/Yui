@@ -52,10 +52,13 @@ import { completeTask } from "../../dist/task/task.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import {
   createCandidateGitSnapshot,
+  currentWorkItemExecutionGroup,
   recordWorkItemWorkspaceDisposition,
   submitWorkItemCandidate,
+  updateWorkItemExecutionGroup,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
+import { recordExecutionLaneResult } from "../../dist/execution/executionGroup.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 const REVIEW_PROJECT_ID = "review-project";
@@ -1038,6 +1041,144 @@ test("assigned Work dispatch honors dependencies and Worker yield awaits Leader 
   assert.equal(store.getWorkItem(second.taskId, second.id)?.status, "running");
 });
 
+test("fixed multi-Lane Worker execution waits for explicit Leader group resolution", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Worker panel");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["role", "add", task.id, "worker-2"], store, options);
+  run(["work", "create", task.id, "parallel work", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run([
+    "work", "dispatch", item.id,
+    "--strategy", "fixed:2",
+    "--lane-role", "worker",
+    "--lane-role", "worker-2"
+  ], store, options);
+  const activeRuns = store.listAgentRuns(task.id).filter(({ purpose, status }) => (
+    purpose === "execution" && status === "active"
+  ));
+  assert.equal(activeRuns.length, 2);
+  const running = store.getWorkItem(task.id, item.id);
+  assert.equal(running.status, "running");
+  assert.equal(currentWorkItemExecutionGroup(running).lanes.length, 2);
+  assert.notEqual(currentWorkItemExecutionGroup(running).lanes[0].roleName, currentWorkItemExecutionGroup(running).lanes[1].roleName);
+
+  for (const active of activeRuns) {
+    markDelivered(store, active);
+    run(["run", "yield", active.id, "--summary", `${active.roleName} result`], store, options);
+    const after = store.getWorkItem(task.id, item.id);
+    assert.equal(after.status, "running");
+    assert.equal(after.candidates.length, 0);
+  }
+  const completeGroup = currentWorkItemExecutionGroup(store.getWorkItem(task.id, item.id));
+  assert.ok(completeGroup.lanes.every(({ status }) => status === "completed"));
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  run([
+    "work", "group", "resolve", item.id,
+    "--decision", "accept",
+    "--summary", "Leader accepted the combined evidence"
+  ], store, leaderOptions);
+  const accepted = store.getWorkItem(task.id, item.id);
+  assert.equal(accepted.status, "awaiting_acceptance");
+  assert.equal(currentWorkItemExecutionGroup(accepted).resolution.decision, "accept");
+  assert.equal(accepted.candidates.length, 1);
+  assert.match(accepted.candidates[0].summary, /Leader accepted the combined evidence/);
+  assert.match(accepted.candidates[0].summary, /worker result/);
+  assert.match(accepted.candidates[0].summary, /worker-2 result/);
+});
+
+test("adaptive Worker execution can append a bounded Lane before resolution", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Adaptive panel");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["role", "add", task.id, "worker-2"], store, options);
+  run(["work", "create", task.id, "adaptive work", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id, "--strategy", "adaptive:3"], store, options);
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  run([
+    "work", "dispatch", item.id,
+    "--lane-role", "worker-2"
+  ], store, leaderOptions);
+  const running = store.getWorkItem(task.id, item.id);
+  assert.equal(currentWorkItemExecutionGroup(running).strategy.mode, "adaptive");
+  assert.equal(currentWorkItemExecutionGroup(running).strategy.max, 3);
+  assert.equal(currentWorkItemExecutionGroup(running).lanes.length, 2);
+  assert.equal(store.listAgentRuns(task.id).filter(({ status }) => status === "active").length, 2);
+});
+
+test("accept defaults to usable terminal Lanes when one panel Lane failed", (t) => {
+  const { store, options } = fixture(t);
+  const task = createTask(store, options, "Partial panel resolution");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["role", "add", task.id, "worker-2"], store, options);
+  run(["work", "create", task.id, "partial panel", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run([
+    "work", "dispatch", item.id,
+    "--strategy", "fixed:2",
+    "--lane-role", "worker",
+    "--lane-role", "worker-2"
+  ], store, options);
+  const activeRuns = store.listAgentRuns(task.id).filter(({ purpose, status }) => (
+    purpose === "execution" && status === "active"
+  ));
+  const failed = activeRuns.find(({ roleName }) => roleName === "worker-2");
+  const yielded = activeRuns.find(({ roleName }) => roleName === "worker");
+  markDelivered(store, failed);
+  markDelivered(store, yielded);
+  run(["run", "yield", yielded.id, "--summary", "lane yielded"], store, options);
+  store.transaction((tx) => {
+    const failedRun = tx.getAgentRun(task.id, failed.id);
+    tx.saveAgentRun(failAgentRun(failedRun, "lane failed", NOW));
+    tx.clearActiveAgentRun(task.id, failed.roleName);
+    tx.saveRole(task.id, updateRoleStatus(tx.getRole(task.id, failed.roleName), "idle", NOW));
+    tx.saveWorkItem(task.id, updateWorkItemExecutionGroup(
+      tx.getWorkItem(task.id, item.id),
+      recordExecutionLaneResult(
+        currentWorkItemExecutionGroup(tx.getWorkItem(task.id, item.id)),
+        failed.executionLaneId,
+        { summary: "lane failed" },
+        "failed",
+        NOW
+      ),
+      NOW
+    ));
+  });
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  run(["work", "group", "resolve", item.id, "--decision", "accept", "--summary", "accept usable lane"], store, leaderOptions);
+  const resolved = currentWorkItemExecutionGroup(store.getWorkItem(task.id, item.id));
+  assert.deepEqual(
+    resolved.resolution.selectedLaneIds,
+    [resolved.lanes.find(({ roleName }) => roleName === "worker").id]
+  );
+  assert.match(store.getWorkItem(task.id, item.id).candidates[0].summary, /worker result|lane yielded/);
+});
+
 test("desired Agent drift preserves the in-flight Run's exact yield authority", (t) => {
   const { store, options } = fixture(t);
   const task = createTask(store, options, "Immutable yield identity");
@@ -1626,18 +1767,18 @@ test("Leader rejection preserves a Worker WorkItem for another dispatch round", 
     }
   };
   run(["work", "reject", item.id, "--summary", "Fix the review findings."], store, leaderOptions);
-  assert.throws(
-    () => run(["work", "dispatch", item.id, "--input", "Apply the review findings."], store, options),
-    /repair requires the original Worker native Session/i
-  );
-  recordReadyNativeSession(store, task.id, "worker", "native-worker-history");
   run(["work", "dispatch", item.id, "--input", "Apply the review findings."], store, options);
 
   const second = store.getActiveAgentRun(task.id, "worker");
   assert.notEqual(second.id, first.id);
-  assert.equal(second.mode, "resume");
+  assert.equal(second.mode, "new");
   assert.equal(second.workItemId, item.id);
-  assert.equal(store.getWorkItem(item.taskId, item.id)?.status, "running");
+  const iterated = store.getWorkItem(item.taskId, item.id);
+  assert.equal(iterated.status, "running");
+  assert.equal(iterated.executionGroups.length, 2);
+  assert.notEqual(iterated.executionGroups[0].id, iterated.executionGroups[1].id);
+  assert.equal(iterated.currentExecutionGroupId, iterated.executionGroups[1].id);
+  assert.equal(iterated.candidates[0].executionGroupId, iterated.executionGroups[0].id);
 });
 
 test("retry replaces the old causal Run marker instead of reusing it", (t) => {
@@ -1689,6 +1830,22 @@ test("a failed Worker Run can retry its failed WorkItem", (t) => {
     tx.saveRole(task.id, updateRoleStatus(
       tx.getRole(task.id, "worker"),
       "idle",
+      NOW
+    ));
+    // Mirror the runtime failure path: a failed execution Run terminalizes its
+    // bound lane before the WorkItem is failed, so the lane reaches a retryable
+    // terminal state instead of being stranded in "running". Each record moves
+    // by exactly one revision, matching the runtime terminalization ordering.
+    const failedItem = tx.getWorkItem(task.id, item.id);
+    tx.saveWorkItem(task.id, updateWorkItemExecutionGroup(
+      failedItem,
+      recordExecutionLaneResult(
+        currentWorkItemExecutionGroup(failedItem),
+        active.executionLaneId,
+        { summary: "transient failure" },
+        "failed",
+        NOW
+      ),
       NOW
     ));
     tx.saveWorkItem(task.id, updateWorkItemStatus(
@@ -2263,6 +2420,16 @@ test("Leader creates a profiled Worker instance, binds Claude config, then launc
   const item = store.listWorkItems(task.id).at(-1);
   run(["work", "dispatch", item.id], store, options);
   assert.equal(store.getRole(task.id, "worker")?.activeAgentId, "claude");
+  store.saveTask({
+    ...store.getTask(task.id),
+    cwd: root
+  });
+  const taskWorkspace = createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
+    root,
+    entries: []
+  }, NOW);
+  store.saveManagedWorkspace(taskWorkspace);
 
   const plan = new FileRoleLaunchPlanner(root, store, {
     createNativeSessionId: () => "claude-worker-session"

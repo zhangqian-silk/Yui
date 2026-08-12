@@ -56,6 +56,7 @@ import {
   createWorkItem,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
+import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 function fixture(t, adapterId = "codex") {
   const home = mkdtempSync(join(tmpdir(), "yui-managed-launch-"));
@@ -67,12 +68,15 @@ function fixture(t, adapterId = "codex") {
     `${adapterId}-personal`, adapterId, `${adapterId}-test`, [], [], now
   );
   const binding = createRoleAgentBinding(agent);
-  const task = activateTask(createTask("task-1", "Managed launch", now), now);
+  const task = activateTask(createTask("task-1", "Managed launch", now, {
+    cwd: home
+  }), now);
   const role = createRole(task.id, "leader", [binding], agent.id, home, now);
   const globalRole = createGlobalRole("operator", [binding], agent.id, home, now);
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, now));
     tx.saveRole(task.id, role);
     tx.saveGlobalRole(globalRole);
   });
