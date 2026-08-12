@@ -1,3 +1,8 @@
+import {
+  validateTaskWorkspaceIdentity,
+  type TaskWorkspaceIdentity
+} from "../repository/taskWorkspaceIdentity.js";
+
 export type TaskPriority = "low" | "medium" | "high" | "urgent";
 export type TaskStatus =
   | "draft"
@@ -35,7 +40,7 @@ export type TaskMetadataUpdate = Partial<{
 }>;
 
 export type Task = {
-  schemaVersion: 3;
+  schemaVersion: 4;
   id: string;
   title: string;
   description?: string;
@@ -45,6 +50,12 @@ export type Task = {
   projectBindings: readonly TaskProjectBinding[];
   cwd?: string;
   requireIntegration?: true;
+  /**
+   * Durable cross-Home-unique workspace identity, minted once on first workspace
+   * preparation and reused forever. Absent only for Tasks that never had a
+   * managed Git workspace (or pre-v4 Tasks awaiting the controlled rebuild).
+   */
+  workspaceIdentity?: TaskWorkspaceIdentity;
   status: TaskStatus;
   completedAt?: string;
   completedBy?: TaskCompletedBy;
@@ -64,7 +75,7 @@ export type Task = {
 export function createTask(id: string, title: string, now: Date, metadata: TaskMetadata = {}): Task {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: requireSafeIdentity(id, "Task id"),
     title: requireText(title, "Task title"),
     ...cloneMetadata(metadata),
@@ -72,6 +83,37 @@ export function createTask(id: string, title: string, now: Date, metadata: TaskM
     createdAt: timestamp,
     updatedAt: timestamp
   };
+}
+
+/**
+ * Persist the Task's durable workspace identity. The identity is immutable on
+ * the Task: a second binding is rejected so restart/reconcile/attach can never
+ * silently adopt a different (foreign or legacy) ref namespace.
+ */
+export function bindTaskWorkspaceIdentity(
+  task: Task,
+  identity: TaskWorkspaceIdentity,
+  now: Date
+): Task {
+  validateTask(task);
+  const valid = validateTaskWorkspaceIdentity(identity);
+  if (valid.taskId !== task.id) {
+    throw new Error(`Task workspace identity belongs to another Task: ${valid.taskId}.`);
+  }
+  if (task.workspaceIdentity !== undefined) {
+    const existing = validateTaskWorkspaceIdentity(task.workspaceIdentity);
+    if (existing.token !== valid.token
+      || existing.generatedAt !== valid.generatedAt
+      || existing.homeId !== valid.homeId) {
+      throw new Error(`Task workspace identity is already bound and immutable: ${task.id}.`);
+    }
+    return task;
+  }
+  return validateTask({
+    ...task,
+    workspaceIdentity: valid,
+    updatedAt: now.toISOString()
+  });
 }
 
 export function activateTask(task: Task, now: Date): Task {
@@ -245,7 +287,7 @@ export function isTaskArchived(task: Task): boolean {
 }
 
 export function validateTask(task: Task): Task {
-  if (task.schemaVersion !== 3) throw new Error("Task must use schemaVersion 3.");
+  if (task.schemaVersion !== 4) throw new Error("Task must use schemaVersion 4.");
   requireSafeIdentity(task.id, "Task id");
   requireText(task.title, "Task title");
   if (!(["draft", "active", "completed", "retired", "archived"] as const).includes(task.status)) {
@@ -255,6 +297,12 @@ export function validateTask(task: Task): Task {
   requireTimestamp(task.updatedAt, "Task updatedAt");
   if (Date.parse(task.updatedAt) < Date.parse(task.createdAt)) {
     throw new Error("Task updatedAt cannot precede createdAt.");
+  }
+  if (task.workspaceIdentity !== undefined) {
+    const identity = validateTaskWorkspaceIdentity(task.workspaceIdentity);
+    if (identity.taskId !== task.id) {
+      throw new Error(`Task workspace identity belongs to another Task: ${identity.taskId}.`);
+    }
   }
   if (task.priority !== undefined
     && !(["low", "medium", "high", "urgent"] as const).includes(task.priority)) {

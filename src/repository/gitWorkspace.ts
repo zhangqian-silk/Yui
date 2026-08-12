@@ -55,6 +55,19 @@ export class RemoteBaselineConflictError extends Error {
 }
 export interface GitWorkspacePort {
   inspect(repositoryPath: string, baseRef?: string): Promise<GitRepositoryInspection>;
+  /** Whether a ref (branch, tag, or other refname) resolves to a commit. */
+  refExists(repositoryPath: string, ref: string): Promise<boolean>;
+  /** Every ref name matching a `git for-each-ref` pattern. */
+  listRefs(repositoryPath: string, pattern: string): Promise<string[]>;
+  /**
+   * Preserve a ref under the Home-scoped archive namespace (create-not-exists)
+   * and delete the original only if it still points at the archived commit.
+   */
+  archiveRef(input: Readonly<{
+    repositoryPath: string;
+    sourceRef: string;
+    archiveRef: string;
+  }>): Promise<void>;
   isAncestor(
     repositoryPath: string,
     ancestor: string,
@@ -105,34 +118,35 @@ export interface GitWorkspacePort {
   ensureWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    /** The Task workspace ref segment (`task-N` or `task-N-<8hex>`). */
+    taskSegment: string;
     roleName: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree>;
   inspectWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     roleName: string;
   }>): Promise<GitWorkspaceState>;
   removeWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     roleName: string;
     deleteBranch?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
   ensureIntegrationWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     integrationId: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree>;
   removeIntegrationWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     integrationId: string;
     discardChanges?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
@@ -326,6 +340,16 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       "rev-parse", "--verify", "--end-of-options", "FETCH_HEAD^{commit}"
     ])).toLowerCase();
 
+    // The advertised SHA must match what was fetched. A network race, a ref
+    // that moved mid-fetch, or any inconsistency fails closed: the stable
+    // checkout is never advanced to an unverified commit.
+    const advertisedCommit = await resolveRemoteBranchCommit(remote, stableBranch);
+    if (fetchedCommit !== advertisedCommit) {
+      throw new Error(
+        `Project remote stable branch changed while it was fetched: ${stableBranch}.`
+      );
+    }
+
     await this.#assertRefreshCheckout(initial.root, stableBranch, initial.baseCommit);
     if (fetchedCommit === initial.baseCommit) {
       return {
@@ -477,6 +501,60 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     };
   }
 
+  async refExists(repositoryPath: string, ref: string): Promise<boolean> {
+    const root = (await this.inspect(repositoryPath)).root;
+    return gitSucceeds([
+      "-C", root, "rev-parse", "--verify", "--quiet", "--end-of-options",
+      `${safeRef(ref)}^{commit}`
+    ]);
+  }
+
+  async listRefs(repositoryPath: string, pattern: string): Promise<string[]> {
+    const root = (await this.inspect(repositoryPath)).root;
+    const output = await git([
+      "-C", root, "for-each-ref", "--format=%(refname)", "--", safeRef(pattern)
+    ]);
+    return output.length === 0 ? [] : output.split("\n").map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  }
+
+  async archiveRef(input: Readonly<{
+    repositoryPath: string;
+    sourceRef: string;
+    archiveRef: string;
+  }>): Promise<void> {
+    const root = (await this.inspect(input.repositoryPath)).root;
+    const source = safeRef(input.sourceRef);
+    const target = safeRef(input.archiveRef);
+    const commit = (await gitLine([
+      "-C", root, "rev-parse", "--verify", "--end-of-options", `${source}^{commit}`
+    ])).toLowerCase();
+    if (await this.refExists(root, target)) {
+      // Resumable: a previous attempt already created the archive ref. Only
+      // the same commit may be resumed; a different archive fails closed.
+      const archived = (await gitLine([
+        "-C", root, "rev-parse", "--verify", "--end-of-options", `${target}^{commit}`
+      ])).toLowerCase();
+      if (archived !== commit) {
+        throw new Error(
+          `Archive ref already exists at a different commit: ${target}.`
+        );
+      }
+    } else {
+      // Create the archive ref only if it does not exist yet (old value zero).
+      await git([
+        "-C", root, "update-ref", "--no-deref", target, commit, "0".repeat(40)
+      ]);
+    }
+    // Delete the source only if it still exists and still points at the
+    // archived commit; an already-deleted source makes the archive a no-op.
+    if (await this.refExists(root, source)) {
+      await git([
+        "-C", root, "update-ref", "-d", "--no-deref", source, commit
+      ]);
+    }
+  }
+
   async isAncestor(
     repositoryPath: string,
     ancestor: string,
@@ -594,14 +672,14 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   async ensureWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     roleName: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree> {
     return this.#ensureManagedWorktree({
       repositoryPath: input.repositoryPath,
       container: input.container,
-      identity: worktreeIdentity(input.taskId, input.roleName),
+      identity: worktreeIdentity(input.taskSegment, input.roleName),
       baseRef: input.baseRef
     });
   }
@@ -609,14 +687,14 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   async ensureIntegrationWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     integrationId: string;
     baseRef: string;
   }>): Promise<PreparedGitWorktree> {
     return this.#ensureManagedWorktree({
       repositoryPath: input.repositoryPath,
       container: input.container,
-      identity: integrationWorktreeIdentity(input.taskId, input.integrationId),
+      identity: integrationWorktreeIdentity(input.taskSegment, input.integrationId),
       baseRef: input.baseRef
     });
   }
@@ -670,14 +748,14 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   async removeWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     roleName: string;
     deleteBranch?: boolean;
   }>): Promise<GitWorkspaceRemoval> {
     const state = await this.inspectWorktree(input);
     if (state === "dirty") return state;
     const container = resolve(input.container);
-    const identity = worktreeIdentity(input.taskId, input.roleName);
+    const identity = worktreeIdentity(input.taskSegment, input.roleName);
     const path = managedPath(container, identity.directory);
     const project = await this.inspect(input.repositoryPath);
     if (state === "missing") {
@@ -697,13 +775,13 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   async inspectWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     roleName: string;
   }>): Promise<GitWorkspaceState> {
     const container = resolve(input.container);
     const path = managedPath(
       container,
-      worktreeIdentity(input.taskId, input.roleName).directory
+      worktreeIdentity(input.taskSegment, input.roleName).directory
     );
     const kind = await pathKind(path);
     if (kind === undefined) return "missing";
@@ -719,14 +797,14 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   async removeIntegrationWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
-    taskId: string;
+    taskSegment: string;
     integrationId: string;
     discardChanges?: boolean;
   }>): Promise<GitWorkspaceRemoval> {
     return this.#removeManagedWorktree({
       repositoryPath: input.repositoryPath,
       container: input.container,
-      identity: integrationWorktreeIdentity(input.taskId, input.integrationId),
+      identity: integrationWorktreeIdentity(input.taskSegment, input.integrationId),
       discardChanges: input.discardChanges
     });
   }

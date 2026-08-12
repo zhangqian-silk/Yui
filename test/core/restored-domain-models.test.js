@@ -300,7 +300,7 @@ test("restored persistent domain records are plain JSON with explicit schema ver
   const yielded = yieldAgentRun(run, "Implemented", later);
   const snapshot = JSON.parse(JSON.stringify({ task, workItem, yielded }));
 
-  assert.equal(snapshot.task.schemaVersion, 3);
+  assert.equal(snapshot.task.schemaVersion, 4);
   assert.equal(snapshot.task.status, "draft");
   assert.equal(snapshot.workItem.schemaVersion, 9);
   assert.equal(snapshot.yielded.schemaVersion, 6);

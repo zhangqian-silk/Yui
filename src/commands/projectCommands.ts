@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -7,12 +8,15 @@ import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorksp
 import {
   addProjectKnowledge,
   createProject,
+  managedProjectPath,
   retireProjectKnowledge,
   resolveProject,
   updateProjectKnowledge,
   updateProjectMetadata,
+  validateProject,
   validateProjectName,
-  type Project
+  type Project,
+  type ProjectOwnership
 } from "../repository/project.js";
 
 export type ProjectCommandStore = Readonly<{
@@ -22,12 +26,15 @@ export type ProjectCommandStore = Readonly<{
   saveProject(project: Project): void;
   listProjects(): Project[];
   getConfig(): Readonly<{ defaultWorkspace?: string }>;
+  /** The persistent Home root; managed Project repositories live below it. */
+  rootDirectory(): string;
 }>;
 
 export type ProjectCommandOptions = Readonly<{
   git?: Pick<
     GitWorkspacePort,
     "inspect" | "headRef" | "isClean" | "refresh" | "clone" | "ensureLocalBranch"
+      | "resolveRemoteBaseline"
   >;
   now?: () => Date;
 }>;
@@ -56,6 +63,15 @@ export async function runProjectCommand(
         ? `Refreshed project ${refreshed.project.id}: ${refreshed.fromCommit} -> ${refreshed.toCommit}\n`
         : `Project ${refreshed.project.id} is already current at ${refreshed.toCommit}\n`,
       data: refreshed
+    };
+  }
+  if (command === "migrate") {
+    const migrated = await migrateProject(rest, store, options);
+    return {
+      output: migrated.preflight
+        ? `Project ${migrated.project.id} can be migrated to a Home-managed repository at ${migrated.path}\n`
+        : `Migrated project ${migrated.project.id} to a Home-managed repository at ${migrated.path}\n`,
+      data: migrated
     };
   }
   if (command === "update") {
@@ -186,29 +202,42 @@ async function cloneProject(
   store: ProjectCommandStore,
   options: ProjectCommandOptions
 ): Promise<Project> {
-  const usage = "Project clone usage: yui project clone <name> <remote> [--alias <name> ...] [--stable <ref>] [--development <ref>].";
+  const usage = "Project clone usage: yui project clone <name> <remote> [--alias <name> ...] [--stable <ref>] [--development <ref>] [--external].";
   const parsed = parseCloneArguments(args, usage);
-  const workspace = store.getConfig().defaultWorkspace;
-  if (workspace === undefined) throw usageError("No default workspace is configured; run yui setup.");
   const git = options.git ?? new NodeGitWorkspace();
   const name = validateProjectName(parsed.name);
-  const workspaceRoot = resolve(workspace);
-  const destination = resolve(workspaceRoot, name);
-  if (dirname(destination) !== workspaceRoot) {
-    throw usageError("Project clone destination must be directly inside the configured workspace.");
-  }
-  assertOutsideManagedWorktrees(destination, workspace);
   const stableRef = parsed.stable ?? "HEAD";
   const developmentRef = parsed.development ?? stableRef;
   const projectId = store.nextProjectId();
   const now = (options.now ?? (() => new Date()))();
+
+  // A remote-URL binding is Home-managed by default: its canonical repository
+  // lives below the persistent Home, so the runtime never depends on a
+  // user-controlled checkout path. --external is an explicit opt-in to the
+  // legacy clone-inside-the-workspace mode.
+  let destination: string;
+  let ownership: ProjectOwnership;
+  if (parsed.external) {
+    const workspace = store.getConfig().defaultWorkspace;
+    if (workspace === undefined) throw usageError("No default workspace is configured; run yui setup.");
+    const workspaceRoot = resolve(workspace);
+    destination = resolve(workspaceRoot, name);
+    if (dirname(destination) !== workspaceRoot) {
+      throw usageError("Project clone destination must be directly inside the configured workspace.");
+    }
+    assertOutsideManagedWorktrees(destination, workspace);
+    ownership = "external";
+  } else {
+    destination = managedProjectPath(store.rootDirectory(), projectId);
+    ownership = "managed";
+  }
   const candidate = createProject(
     projectId,
     name,
     destination,
     { stable: stableRef, development: developmentRef },
     now,
-    { aliases: parsed.aliases, remoteUrl: parsed.remote }
+    { aliases: parsed.aliases, remoteUrl: parsed.remote, ownership }
   );
   assertProjectAvailable(store, candidate);
 
@@ -227,13 +256,27 @@ async function cloneProject(
     if (developmentRef !== stableRef) {
       await git.ensureLocalBranch(destination, developmentRef);
     }
+    // Verify both configured branches against the SHAs the remote advertises
+    // now. A network race or a ref that moved during the clone fails closed
+    // before any binding is persisted.
+    await assertRemoteBranchesVerified(
+      git,
+      destination,
+      parsed.remote,
+      [
+        { ref: stableRef, localCommit: head.baseCommit },
+        ...(developmentRef === stableRef
+          ? []
+          : [{ ref: developmentRef, localCommit: (await git.inspect(destination, developmentRef)).baseCommit }])
+      ]
+    );
     const project = createProject(
       projectId,
       name,
       head.root,
       { stable: stableRef, development: developmentRef },
       now,
-      { aliases: parsed.aliases, remoteUrl: parsed.remote }
+      { aliases: parsed.aliases, remoteUrl: parsed.remote, ownership }
     );
     assertProjectAvailable(store, project);
     const created = store.createProjectIfAbsent(project);
@@ -244,6 +287,159 @@ async function cloneProject(
       await rm(destination, { recursive: true, force: true });
     }
     throw error;
+  }
+}
+
+/**
+ * Migrate an external Project binding to a Home-managed repository. The
+ * remote is cloned and both configured branches are verified against the
+ * advertised remote SHAs before the catalog record switches; the old
+ * checkout is never touched and stays usable until the switch commits. A
+ * failed migration leaves no partial state: the unfinished managed clone is
+ * removed so the command can be retried cleanly.
+ */
+async function migrateProject(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): Promise<Readonly<{
+  project: Project;
+  path: string;
+  preflight: boolean;
+}>> {
+  const usage = "Project migrate usage: yui project migrate <project> [--preflight].";
+  const parsed = parseMigrateArguments(args, usage);
+  const project = requireProject(store, parsed.project);
+  if (project.ownership === "managed") {
+    throw usageError(`Project is already Home-managed: ${project.id}.`);
+  }
+  if (project.remoteUrl === undefined) {
+    throw usageError(`Project migrate requires a remote URL: ${project.id}.`);
+  }
+  const git = options.git ?? new NodeGitWorkspace();
+  const destination = managedProjectPath(store.rootDirectory(), project.id);
+
+  // Preflight verifies the remote into a throwaway clone: it changes neither
+  // the catalog nor the persistent projects directory.
+  const verifyRoot = parsed.preflight
+    ? join(store.rootDirectory(), "projects", `.preflight-${project.id}`)
+    : destination;
+  if (!parsed.preflight) {
+    // A crashed earlier attempt can leave an unreferenced managed clone
+    // behind. It is safe to remove only because no catalog record points at
+    // it; a registered path fails closed instead.
+    await removeUnreferencedClone(store, destination, project.id);
+  } else if (existsSync(verifyRoot)) {
+    // A crashed preflight can only leave its own throwaway clone behind.
+    await rm(verifyRoot, { recursive: true, force: true });
+  }
+  let prepared = false;
+  try {
+    const head = await git.clone({
+      remoteUrl: project.remoteUrl,
+      destination: verifyRoot,
+      ...(project.stableBranch === "HEAD" ? {} : { branch: project.stableBranch })
+    });
+    prepared = true;
+    const stable = project.stableBranch === "HEAD"
+      ? head
+      : await git.inspect(verifyRoot, project.stableBranch);
+    if (head.baseCommit !== stable.baseCommit) {
+      throw new Error(`Project checkout is not on its stable ref: ${project.stableBranch}.`);
+    }
+    if (project.developmentBranch !== project.stableBranch) {
+      await git.ensureLocalBranch(verifyRoot, project.developmentBranch);
+    }
+    await assertRemoteBranchesVerified(
+      git,
+      verifyRoot,
+      project.remoteUrl,
+      [
+        { ref: project.stableBranch, localCommit: head.baseCommit },
+        ...(project.developmentBranch === project.stableBranch
+          ? []
+          : [{
+              ref: project.developmentBranch,
+              localCommit: (await git.inspect(verifyRoot, project.developmentBranch)).baseCommit
+            }])
+      ]
+    );
+    if (parsed.preflight) {
+      return { project, path: destination, preflight: true };
+    }
+    const switched = store.transaction((tx) => {
+      const latest = requireProject(tx, project.id);
+      if (latest.ownership !== "external"
+        || latest.path !== project.path
+        || latest.remoteUrl !== project.remoteUrl) {
+        throw new Error(`Project changed while migrating: ${project.id}.`);
+      }
+      // The switch only changes ownership and path; every other field is
+      // frozen, and the catalog validator re-checks the whole record.
+      const next = validateProject({
+        ...latest,
+        path: destination,
+        ownership: "managed" as const,
+        updatedAt: (options.now ?? (() => new Date()))().toISOString()
+      });
+      assertProjectAvailable(tx, next, latest.id);
+      tx.saveProject(next);
+      return next;
+    });
+    return { project: switched, path: switched.path, preflight: false };
+  } catch (error) {
+    if (prepared && !parsed.preflight
+      && !store.listProjects().some(({ path }) => path === destination)) {
+      await rm(destination, { recursive: true, force: true });
+    }
+    throw error;
+  } finally {
+    if (parsed.preflight) {
+      await rm(verifyRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+/**
+ * Remove a managed clone left behind by a crashed migration attempt. Such a
+ * directory is unreferenced garbage; a path any catalog record points at is
+ * never deleted.
+ */
+async function removeUnreferencedClone(
+  store: ProjectCommandStore,
+  destination: string,
+  migratingProjectId: string
+): Promise<void> {
+  if (!existsSync(destination)) return;
+  const registered = store.listProjects().find(({ path }) => path === destination);
+  if (registered !== undefined && registered.id !== migratingProjectId) {
+    throw new Error(`Managed Project path is already registered: ${destination}.`);
+  }
+  await rm(destination, { recursive: true, force: true });
+}
+
+/**
+ * Verify that the local SHAs of the configured branches exactly match the
+ * commits the remote advertises right now. Any mismatch fails closed.
+ */
+async function assertRemoteBranchesVerified(
+  git: NonNullable<ProjectCommandOptions["git"]>,
+  repositoryPath: string,
+  remoteUrl: string,
+  branches: readonly Readonly<{ ref: string; localCommit: string }>[]
+): Promise<void> {
+  for (const branch of branches) {
+    const resolved = await git.resolveRemoteBaseline({
+      repositoryPath,
+      remoteUrl,
+      developmentRef: branch.ref
+    });
+    if (resolved.commit.toLowerCase() !== branch.localCommit.toLowerCase()) {
+      throw new Error(
+        `Project remote branch ${resolved.branch} moved while it was fetched: `
+        + `advertised ${resolved.commit}, local ${branch.localCommit}.`
+      );
+    }
   }
 }
 
@@ -341,6 +537,7 @@ function renderAddedProject(created: Project): string {
   return [
     `Added project ${created.id}`,
     `Name: ${created.name}`,
+    `Ownership: ${created.ownership}`,
     `Path: ${created.path}`,
     `Stable: ${created.stableBranch}`,
     `Development: ${created.developmentBranch}`
@@ -391,12 +588,18 @@ function listProjects(args: readonly string[], store: ProjectCommandStore): stri
     [
       { header: "Project", minWidth: 8, maxWidth: 24 },
       { header: "Name", minWidth: 4, maxWidth: 28 },
+      { header: "Ownership", minWidth: 9, maxWidth: 10 },
       { header: "Path", minWidth: 8, maxWidth: 64 },
       { header: "Stable", minWidth: 6, maxWidth: 24 },
       { header: "Development", minWidth: 11, maxWidth: 24 }
     ],
     projects.map((project) => [
-      project.id, project.name, project.path, project.stableBranch, project.developmentBranch
+      project.id,
+      project.name,
+      project.ownership,
+      project.path,
+      project.stableBranch,
+      project.developmentBranch
     ]),
     defaultTableWidth()
   )}\n`;
@@ -408,6 +611,7 @@ function showProject(args: readonly string[], store: ProjectCommandStore): strin
   return [
     `Project: ${project.id}`,
     `Name: ${project.name}`,
+    `Ownership: ${project.ownership}`,
     `Aliases: ${project.aliases.length === 0 ? "-" : project.aliases.join(", ")}`,
     `Path: ${project.path}`,
     ...(project.remoteUrl === undefined ? [] : [`Remote: ${project.remoteUrl}`]),
@@ -715,13 +919,19 @@ function parseCloneArguments(
   aliases: readonly string[];
   stable?: string;
   development?: string;
+  external: boolean;
 }> {
   const positionals: string[] = [];
   const aliases: string[] = [];
   let stable: string | undefined;
   let development: string | undefined;
+  let external = false;
   for (let index = 0; index < args.length; index += 1) {
     const value = args[index]!;
+    if (value === "--external") {
+      external = true;
+      continue;
+    }
     if (["--alias", "--stable", "--development"].includes(value)) {
       const next = args[index + 1];
       if (next === undefined || next.startsWith("--")) {
@@ -749,8 +959,27 @@ function parseCloneArguments(
     remote: requireText(positionals[1]!, "Project remote"),
     aliases,
     ...(stable === undefined ? {} : { stable }),
-    ...(development === undefined ? {} : { development })
+    ...(development === undefined ? {} : { development }),
+    external
   };
+}
+
+function parseMigrateArguments(
+  args: readonly string[],
+  usage: string
+): Readonly<{ project: string; preflight: boolean }> {
+  const positionals: string[] = [];
+  let preflight = false;
+  for (const value of args) {
+    if (value === "--preflight") {
+      preflight = true;
+      continue;
+    }
+    if (value.startsWith("--")) throw usageError(`Unknown option: ${value}. ${usage}`);
+    positionals.push(value);
+  }
+  if (positionals.length !== 1) throw usageError(usage);
+  return { project: requireText(positionals[0]!, "Project reference"), preflight };
 }
 
 function parseSingleOption(

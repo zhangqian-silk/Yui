@@ -68,6 +68,7 @@ import {
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
+import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
 import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
@@ -604,6 +605,17 @@ export async function main(): Promise<void> {
         store,
         home,
         { environment: process.env }
+      );
+      emit(result.output, false, result.data);
+      return;
+    }
+    if (resolved[1] === "rebuild"
+      || resolved[1] === "history"
+      || resolved[1] === "replace") {
+      const result = await runTaskWorkspaceCommand(
+        resolved.slice(1),
+        store,
+        workspacePreparer
       );
       emit(result.output, false, result.data);
       return;

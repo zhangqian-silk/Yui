@@ -50,10 +50,10 @@ function readEffective(agentId, adapterId, workspace) {
     context: {}
   };
 }
-test("storage schema initializes layout v6 with aggregate v17 and rejects non-current versions", () => {
+test("storage schema initializes layout v6 with aggregate v18 and rejects non-current versions", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 17);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
@@ -100,7 +100,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const task = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "task-1",
     title: "Restore storage",
     projectBindings: [],
@@ -231,7 +231,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 17);
+  assert.equal(onDisk.schemaVersion, 18);
   assert.equal(onDisk.tasks[task.id].schemaVersion, 14);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
@@ -283,7 +283,7 @@ test("FileTaskStore persists strict task, role, and operator WorkMailboxes", () 
   const store = new FileTaskStore(home);
   const timestamp = "2026-07-22T00:00:00.000Z";
   const task = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "task-1",
     title: "Mailbox storage",
     projectBindings: [],
@@ -408,7 +408,7 @@ test("FileTaskStore rejects mailbox identity and dangling cross-references", () 
   const store = new FileTaskStore(home);
   const timestamp = "2026-07-22T00:00:00.000Z";
   store.saveTask({
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "task-1",
     title: "Mailbox validation",
     projectBindings: [],
@@ -473,11 +473,11 @@ test("record versions and aggregate shape are validated without silently repairi
   const store = new FileTaskStore(home);
   assert.throws(
     () => store.saveTask({ schemaVersion: 1, id: "task-1" }),
-    /Task.*schemaVersion 3/
+    /Task.*schemaVersion 4/
   );
   assert.throws(
     () => store.saveTask({
-      schemaVersion: 3,
+      schemaVersion: 4,
       id: "task-invalid",
       title: "Invalid completion",
       projectBindings: [],
@@ -490,7 +490,7 @@ test("record versions and aggregate shape are validated without silently repairi
 
   const timestamp = "2026-07-19T00:00:00.000Z";
   const task = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "task-1",
     title: "Validate WorkItem cleanup",
     projectBindings: [],

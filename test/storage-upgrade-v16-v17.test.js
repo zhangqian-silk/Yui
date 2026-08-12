@@ -67,6 +67,9 @@ function aggregateV16Home(t, { durableGraph = false } = {}) {
   const statePath = join(home, "state.json");
   const state = JSON.parse(readFileSync(statePath, "utf8"));
   state.schemaVersion = 16;
+  // A real v16 Home predates the persistent Home identity; the current
+  // ensureStorageSchema above minted one, so drop it for the downgrade.
+  delete state.homeIdentity;
   if (durableGraph) downgradeManagedWorkspaceFamily(state);
   writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
   return { base, home, durable };
@@ -309,20 +312,29 @@ test("production doctor and dry-run recognize an aggregate-v16 final policy Home
   const compatibility = doctor.json.data.checks.find(
     ({ name }) => name === "storage compatibility"
   );
-  assert.match(compatibility.detail, /MIGRATABLE.*aggregate=16\/17/);
+  assert.match(compatibility.detail, /MIGRATABLE.*aggregate=16\/18/);
   assert.doesNotMatch(compatibility.detail, /missing-step/);
   assert.deepEqual(sourceSnapshot(base, home), before, "doctor must be read-only");
 
   const dryRun = runCli(home, ["--json", "upgrade", "--dry-run"]);
   assert.equal(dryRun.status, 0, dryRun.stderr);
   assert.equal(dryRun.json.data.outcome, "dry-run");
-  assert.deepEqual(dryRun.json.data.report.steps, [{
-    axis: "aggregate",
-    fromVersion: 16,
-    toVersion: 17,
-    transition: "offline-migration",
-    declaredEffects: []
-  }]);
+  assert.deepEqual(dryRun.json.data.report.steps, [
+    {
+      axis: "aggregate",
+      fromVersion: 16,
+      toVersion: 17,
+      transition: "offline-migration",
+      declaredEffects: []
+    },
+    {
+      axis: "aggregate",
+      fromVersion: 17,
+      toVersion: 18,
+      transition: "offline-migration",
+      declaredEffects: []
+    }
+  ]);
   assert.equal(existsSync(`${home}.upgrade-staging`), false);
   assert.deepEqual(sourceSnapshot(base, home), before, "dry-run must not mutate the source Home");
 });
@@ -346,13 +358,16 @@ test("normal commands refuse raw v16 while execute preserves the durable graph",
   assert.ok(upgraded.json.data.backupPath);
   const afterManifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
   const afterState = JSON.parse(readFileSync(join(home, "state.json"), "utf8"));
-  assert.equal(afterManifest.aggregateSchemaVersion, 17);
+  assert.equal(afterManifest.aggregateSchemaVersion, 18);
   assert.equal(afterManifest.recordVersions.managedWorkspace, 2);
-  assert.equal(afterState.schemaVersion, 17);
+  assert.equal(afterState.schemaVersion, 18);
   const beforeWithoutWorkspaceVersions = structuredClone(beforeState);
   const afterWithoutWorkspaceVersions = structuredClone(afterState);
   downgradeManagedWorkspaceFamily(afterWithoutWorkspaceVersions);
   afterWithoutWorkspaceVersions.schemaVersion = 16;
+  // The 17->18 aggregate step mints the persistent Home identity; a real v16
+  // Home has none, so drop the minted value before comparing the graph.
+  delete afterWithoutWorkspaceVersions.homeIdentity;
   assert.deepEqual(afterWithoutWorkspaceVersions, beforeWithoutWorkspaceVersions);
 
   assert.ok(afterState.tasks[durable.taskId]);
@@ -412,7 +427,7 @@ test("record-only managedWorkspace upgrade preserves embedded lifecycle snapshot
   assert.doesNotThrow(() => new FileTaskStore(home).listTasks());
 });
 
-test("an aggregate-v16 consumer sees migrated v17 as a future Home", (t) => {
+test("an aggregate-v16 consumer sees migrated v18 as a future Home", (t) => {
   const { home } = aggregateV16Home(t);
   const upgraded = runCli(home, ["--json", "upgrade"]);
   assert.equal(upgraded.status, 0, upgraded.stderr);
@@ -426,7 +441,7 @@ test("an aggregate-v16 consumer sees migrated v17 as a future Home", (t) => {
   assert.equal(oldConsumer.classification.verdict, "NEEDS_NEW_VERSION");
   assert.equal(oldConsumer.classification.blocker.reason, "future-version");
   assert.equal(oldConsumer.classification.blocker.axis, "aggregate");
-  assert.equal(oldConsumer.classification.blocker.found, 17);
+  assert.equal(oldConsumer.classification.blocker.found, 18);
   assert.equal(oldConsumer.classification.blocker.supported, 16);
 });
 

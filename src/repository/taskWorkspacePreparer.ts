@@ -17,7 +17,10 @@ import {
   recordReviewWorkspaceDisposition
 } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import type { Task } from "../task/task.js";
+import {
+  bindTaskWorkspaceIdentity,
+  type Task
+} from "../task/task.js";
 import {
   createCandidateGitSnapshot,
   createDirectTaskMainSnapshot,
@@ -46,6 +49,15 @@ import {
   type GitWorkspaceState
 } from "./gitWorkspace.js";
 import type { Project } from "./project.js";
+import {
+  generateTaskWorkspaceIdentity,
+  isLegacyTaskRef,
+  taskArchiveRef,
+  taskMainBranch,
+  taskWorkspaceRefSegment,
+  taskWorkspaceRefSegmentFromIdentity,
+  type TaskWorkspaceIdentity
+} from "./taskWorkspaceIdentity.js";
 
 const MAIN_WORKTREE = "main";
 const LEADER_ROLE = "leader";
@@ -72,6 +84,25 @@ export type TaskWorkspaceCleanup = Readonly<{
   reason?: string;
   resource?: string;
   retryable?: boolean;
+}>;
+
+export type TaskWorkspaceRebuildResult = Readonly<{
+  task: Task;
+  /** `<projectId>:<sourceRef>` pairs archived during this invocation. */
+  archived: readonly string[];
+  /** True when the Task already owned an identity and only cleanup resumed. */
+  resumed: boolean;
+}>;
+
+export type LegacyTaskRef = Readonly<{
+  projectId: string;
+  taskId: string;
+  ref: string;
+}>;
+
+export type LegacyTaskRefArchiveResult = Readonly<{
+  archived: readonly string[];
+  refused: readonly string[];
 }>;
 
 export type PreparedExecutionLane = Readonly<{
@@ -183,6 +214,18 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
 
+    // The durable workspace identity is minted once, only for a Task that has
+    // never owned a managed Git workspace. A Task with an existing workspace
+    // record predates the identity (legacy) and keeps its refs until the
+    // controlled rebuild; a second prepare reuses the persisted identity.
+    const workspaceIdentity = task.workspaceIdentity === undefined
+      && (existing === null || existing.entries.length === 0)
+      ? await this.#mintTaskWorkspaceIdentity(task)
+      : undefined;
+    const taskSegment = taskWorkspaceRefSegment(
+      workspaceIdentity === undefined ? task : { ...task, workspaceIdentity }
+    );
+
     const root = this.#taskWorkspaceRoot(task.id);
     const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
     const defaultProjects = remoteDefaultProjects(this.store, task.id);
@@ -246,7 +289,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
-          taskId: task.id,
+          taskSegment,
           roleName: MAIN_WORKTREE,
           baseRef: previous?.baseCommit ?? baseline.baseRef
         });
@@ -297,6 +340,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         let persistedTask = isDeepStrictEqual(pinnedBindings, latest.projectBindings)
           ? latest
           : { ...latest, projectBindings: pinnedBindings, updatedAt: timestamp.toISOString() };
+        if (workspaceIdentity !== undefined) {
+          // The identity is persisted only now that every managed ref was
+          // created successfully. A concurrent prepare that bound the same
+          // identity is a no-op; a different one fails closed.
+          persistedTask = bindTaskWorkspaceIdentity(persistedTask, workspaceIdentity, timestamp);
+        }
         if (persistedTask.cwd !== root) {
           persistedTask = { ...persistedTask, cwd: root, updatedAt: timestamp.toISOString() };
         }
@@ -325,9 +374,38 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       });
       return { taskId, status: "ready", path: root };
     } catch (error) {
-      await this.#discardUnadoptedEntries(task, prepared, MAIN_WORKTREE);
+      await this.#discardUnadoptedEntries(task, taskSegment, prepared, MAIN_WORKTREE);
       throw error;
     }
+  }
+
+  /**
+   * Mint the Task's durable workspace identity with create-not-exists
+   * semantics: the candidate main branch must not already exist in any bound
+   * Project repository. On conflict (a stale ref from a crashed attempt, or
+   * another Home's work) a fresh identity is generated; only an identity whose
+   * refs were actually created is ever persisted.
+   */
+  async #mintTaskWorkspaceIdentity(task: Task): Promise<TaskWorkspaceIdentity> {
+    const home = this.store.getHomeIdentity();
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      const identity = generateTaskWorkspaceIdentity({
+        home,
+        taskId: task.id,
+        now: this.now()
+      });
+      const mainBranch = taskMainBranch(taskWorkspaceRefSegmentFromIdentity(identity));
+      let conflict = false;
+      for (const binding of task.projectBindings) {
+        const project = requireProject(this.store, binding.projectId);
+        if (await this.git.refExists(project.path, mainBranch)) {
+          conflict = true;
+          break;
+        }
+      }
+      if (!conflict) return identity;
+    }
+    throw new Error(`Could not mint a unique Task workspace identity for ${task.id}.`);
   }
 
   async snapshotCandidateWorkspace(workspace: ManagedWorkspace): Promise<CandidateGitSnapshot> {
@@ -443,6 +521,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const task = requireTask(this.store, item.taskId);
     assertWorkItemWorkspaceEligible(this.store, task, item);
     await this.prepareTaskWorkspace(task.id);
+    // prepareTaskWorkspace may have just minted and persisted the workspace
+    // identity; derive the segment from the persisted Task.
+    const taskSegment = this.#taskSegment(requireTask(this.store, task.id));
     const main = this.store.getTaskWorkspace(task.id);
     if (main === null || main.owner.type !== "task") {
       throw new Error(`Task main workspace is not ready: ${task.id}.`);
@@ -499,7 +580,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
-          taskId: task.id,
+          taskSegment,
           roleName: item.id,
           baseRef
         });
@@ -600,7 +681,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         return stored;
       });
     } catch (error) {
-      await this.#discardUnadoptedEntries(task, prepared, item.id);
+      await this.#discardUnadoptedEntries(task, taskSegment, prepared, item.id);
       throw error;
     }
   }
@@ -628,6 +709,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (source === null) {
       throw new Error(`Execution Lane source workspace is not ready: ${executionLaneId}.`);
     }
+    const taskSegment = this.#taskSegment(task);
     const owner = lineage.purpose === "execution"
       ? {
           type: "execution-lane" as const,
@@ -656,7 +738,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
-          taskId,
+          taskSegment,
           roleName: managedWorktreeName(owner),
           baseRef: entry.baseCommit
         });
@@ -684,7 +766,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
-          taskId,
+          taskSegment,
           roleName: managedWorktreeName(owner),
           baseRef: sourceEntry.baseCommit
         });
@@ -725,7 +807,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       }
       return workspace;
     } catch (error) {
-      await this.#discardUnadoptedEntries(task, prepared, managedWorktreeName(owner), true);
+      await this.#discardUnadoptedEntries(task, taskSegment, prepared, managedWorktreeName(owner), true);
       throw error;
     }
   }
@@ -943,7 +1025,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       && owner.executionLaneId === executionLaneId
     ));
     if (workspace === undefined) return "missing";
-    const state = await this.#inspectEntries(taskId, managedWorktreeName(workspace.owner), workspace.entries.filter(({ access }) => access === "write"));
+    const state = await this.#inspectEntries(this.#taskSegment(task), managedWorktreeName(workspace.owner), workspace.entries.filter(({ access }) => access === "write"));
     if (state === "dirty") return "dirty";
     let removed = false;
     for (const entry of workspace.entries.filter(({ access }) => access === "write")) {
@@ -951,7 +1033,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const result = await this.git.removeWorktree({
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
-        taskId,
+        taskSegment: this.#taskSegment(task),
         roleName: managedWorktreeName(workspace.owner),
         deleteBranch: true
       });
@@ -969,8 +1051,10 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       throw new Error("Only an execution-lane workspace can be discarded here.");
     }
     if (this.store.getManagedWorkspace(workspace.owner) !== null) return "missing";
+    const task = requireTask(this.store, workspace.owner.taskId);
+    const taskSegment = this.#taskSegment(task);
     const state = await this.#inspectEntries(
-      workspace.owner.taskId,
+      taskSegment,
       managedWorktreeName(workspace.owner),
       workspace.entries.filter(({ access }) => access === "write")
     );
@@ -981,7 +1065,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const result = await this.git.removeWorktree({
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
-        taskId: workspace.owner.taskId,
+        taskSegment,
         roleName: managedWorktreeName(workspace.owner),
         deleteBranch: true
       });
@@ -1051,6 +1135,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     reviewRoundId: string
   ): Promise<ManagedWorkspace> {
     const task = requireTask(this.store, taskId);
+    const taskSegment = this.#taskSegment(task);
     const round = this.store.getReviewRound(task.id, reviewRoundId);
     if (round === null) throw new Error(`ReviewRound not found: ${task.id}/${reviewRoundId}.`);
     if (round.status !== "pending") {
@@ -1090,7 +1175,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             throw new Error(`Task Review candidate Project is missing: ${binding.projectId}.`);
           }
           const project = requireProject(this.store, binding.projectId);
-          const identity = worktreeIdentity(task.id, round.id);
+          const identity = worktreeIdentity(taskSegment, round.id);
           return {
             projectId: binding.projectId,
             directory: binding.directory,
@@ -1156,7 +1241,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           );
         }
         const project = requireProject(this.store, entry.projectId);
-        const identity = worktreeIdentity(task.id, round.id);
+        const identity = worktreeIdentity(taskSegment, round.id);
         const expectedPath = join(
           this.#projectContainer(project.name),
           identity.directory
@@ -1262,7 +1347,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const physical = await this.git.ensureWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
-          taskId: task.id,
+          taskSegment,
           roleName: round.id,
           baseRef: source.baseCommit
         });
@@ -1394,6 +1479,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     } catch (error) {
       await this.#discardUnadoptedEntries(
         task,
+        taskSegment,
         prepared,
         round.id,
         existing === null,
@@ -1407,6 +1493,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     taskId: string,
     reviewRoundId: string
   ): Promise<GitWorkspaceState> {
+    const task = requireTask(this.store, taskId);
     const round = this.store.getReviewRound(taskId, reviewRoundId);
     if (round === null) throw new Error(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
     const workspace = this.store.getReviewRoundWorkspace(taskId, reviewRoundId);
@@ -1415,7 +1502,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (round.workspace !== undefined && !isDeepStrictEqual(round.workspace, workspace)) {
       throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
     }
-    return this.#inspectEntries(taskId, round.id, workspace.entries);
+    return this.#inspectEntries(this.#taskSegment(task), round.id, workspace.entries);
   }
 
   async snapshotReviewRoundResult(
@@ -1501,7 +1588,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     executionGroupId: string,
     executionLaneId: string
   ): Promise<GitWorkspaceState> {
-    requireTask(this.store, taskId);
+    const task = requireTask(this.store, taskId);
     const workspace = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
       owner.type === "execution-lane"
         && owner.executionGroupId === executionGroupId
@@ -1509,7 +1596,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     ));
     if (workspace === undefined) return "missing";
     return this.#inspectEntries(
-      taskId,
+      this.#taskSegment(task),
       managedWorktreeName(workspace.owner),
       workspace.entries.filter(({ access }) => access === "write")
     );
@@ -1544,7 +1631,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       assertWorkspaceSessionsRetirable(this.store, task.id, lane.roleName, this.now());
     }
     if (await this.#inspectEntries(
-      task.id,
+      this.#taskSegment(task),
       managedWorktreeName(workspace.owner),
       workspace.entries
     ) === "dirty") return "dirty";
@@ -1554,7 +1641,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const result = await this.git.removeWorktree({
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
-        taskId: task.id,
+        taskSegment: this.#taskSegment(task),
         roleName: managedWorktreeName(workspace.owner),
         deleteBranch: true
       });
@@ -1619,7 +1706,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
     const writable = workspace.entries.filter(({ access }) => access === "write");
     if (await this.#inspectEntries(
-      task.id,
+      this.#taskSegment(task),
       managedWorktreeName(workspace.owner),
       writable
     ) === "dirty") return "dirty";
@@ -1629,7 +1716,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const result = await this.git.removeWorktree({
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
-        taskId: task.id,
+        taskSegment: this.#taskSegment(task),
         roleName: managedWorktreeName(workspace.owner),
         deleteBranch: true
       });
@@ -1662,7 +1749,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (main.owner.type !== "task") {
       throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
-    return this.#inspectEntries(task.id, MAIN_WORKTREE, main.entries);
+    return this.#inspectEntries(this.#taskSegment(task), MAIN_WORKTREE, main.entries);
   }
 
   async cleanupTaskForArchive(taskId: string): Promise<TaskWorkspaceCleanup> {
@@ -1683,7 +1770,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const main = this.store.getTaskWorkspace(task.id);
     if (main !== null) {
       assertTaskArchiveState(requireTask(this.store, task.id), task);
-      if (await this.#inspectEntries(task.id, MAIN_WORKTREE, main.entries) === "dirty") {
+      if (await this.#inspectEntries(this.#taskSegment(task), MAIN_WORKTREE, main.entries) === "dirty") {
         return {
           taskId,
           status: "retained-dirty",
@@ -1696,7 +1783,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const result = await this.git.removeWorktree({
           repositoryPath: project.path,
           container: this.#projectContainer(project.name),
-          taskId: task.id,
+          taskSegment: this.#taskSegment(task),
           roleName: MAIN_WORKTREE
         });
         if (result === "dirty") {
@@ -1712,8 +1799,217 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     return { taskId, status: "removed" };
   }
 
+  /**
+   * Rebuild an eligible legacy Task's managed Git workspace under a fresh
+   * workspace identity. Legacy refs are archived (never deleted outright),
+   * the new main worktrees start from verified remote SHAs, and the Task
+   * record switches only after every Git side effect succeeded, so a crash
+   * at any point leaves the old layout usable and the command resumable.
+   *
+   * A Task that already carries an identity takes the resume path: only the
+   * pending legacy archive and old-worktree removal run.
+   */
+  async rebuildTaskWorkspace(taskId: string): Promise<TaskWorkspaceRebuildResult> {
+    const task = requireTask(this.store, taskId);
+    if (!["draft", "active"].includes(task.status)) {
+      throw new Error(`Only a draft or active Task can be rebuilt in place: ${task.id}/${task.status}.`);
+    }
+    if (task.workspaceIdentity !== undefined) {
+      const current = this.store.getTaskWorkspace(task.id);
+      if (current !== null && current.owner.type === "task") {
+        await ensureWorkspaceView(current.root, current.entries);
+      }
+      // Remove the legacy worktrees before archiving their refs: a worktree
+      // whose checked-out branch was just deleted reports an unborn-branch
+      // ("dirty") status and can no longer be removed cleanly.
+      await this.#removeLegacyWorktrees(
+        task,
+        this.store.listProjects().map((project) => project.id)
+      );
+      const archived = await this.#archiveLegacyRefs(task);
+      return { task: requireTask(this.store, task.id), archived, resumed: true };
+    }
+    assertTaskHasNoEvidence(this.store, task.id);
+    const existing = this.store.getTaskWorkspace(task.id);
+    if (existing !== null && existing.owner.type !== "task") {
+      throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
+    }
+    if (existing !== null
+      && await this.#inspectEntries(task.id, MAIN_WORKTREE, existing.entries) === "dirty") {
+      throw new Error(`Task workspace is dirty and blocks the rebuild: ${task.id}.`);
+    }
+
+    // Resolve verified remote SHAs before any Git side effect, mirroring the
+    // first-prepare pinning: a remote default Project is fetched and its
+    // exact advertised SHA is pinned; a local or explicit ref is validated.
+    const defaultProjects = remoteDefaultProjects(this.store, task.id);
+    const pins = new Map<string, string>();
+    for (const binding of task.projectBindings) {
+      const project = requireProject(this.store, binding.projectId);
+      const useRemoteDefault = defaultProjects.has(project.id)
+        && project.remoteUrl !== undefined
+        && !looksLikeCommit(binding.baseRef);
+      if (useRemoteDefault) {
+        const resolver = this.git.resolveRemoteBaseline;
+        if (typeof resolver !== "function") {
+          throw new Error(
+            `Git workspace cannot resolve the remote baseline for Project: ${project.id}.`
+          );
+        }
+        const remote = await resolver.call(this.git, {
+          repositoryPath: project.path,
+          remoteUrl: project.remoteUrl,
+          // The binding captured the configured development ref at Task
+          // creation; use that snapshot even if the Project catalog changed.
+          developmentRef: binding.baseRef
+        });
+        pins.set(project.id, remote.commit);
+      } else {
+        await this.git.inspect(project.path, binding.baseRef);
+      }
+    }
+
+    const identity = await this.#mintTaskWorkspaceIdentity(task);
+    const taskSegment = taskWorkspaceRefSegmentFromIdentity(identity);
+    const root = this.#taskWorkspaceRoot(task.id);
+    const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
+    try {
+      for (const binding of task.projectBindings) {
+        const project = requireProject(this.store, binding.projectId);
+        const baseRef = pins.get(project.id) ?? binding.baseRef;
+        const physical = await this.git.ensureWorktree({
+          repositoryPath: project.path,
+          container: this.#projectContainer(project.name),
+          taskSegment,
+          roleName: MAIN_WORKTREE,
+          baseRef
+        });
+        if (pins.has(project.id) && physical.baseCommit !== pins.get(project.id)) {
+          throw new Error(
+            `Task Project workspace did not start at the fetched remote baseline: ${project.id}.`
+          );
+        }
+        prepared.push({
+          project,
+          entry: {
+            projectId: project.id,
+            directory: binding.directory,
+            access: "write",
+            path: physical.path,
+            branch: physical.branch,
+            baseRef,
+            baseCommit: physical.baseCommit
+          }
+        });
+      }
+      await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
+      const workspace = createManagedWorkspace({
+        owner: { type: "task", taskId: task.id },
+        root,
+        entries: prepared.map(({ entry }) => entry)
+      }, this.now());
+      // Switch the durable record only now that every new ref/worktree exists.
+      this.store.transaction((tx) => {
+        const latest = requireTask(tx, task.id);
+        if (!["draft", "active"].includes(latest.status)
+          || latest.workspaceIdentity !== undefined
+          || !isDeepStrictEqual(latest.projectBindings, task.projectBindings)) {
+          throw new Error(`Task changed while rebuilding its workspace: ${task.id}.`);
+        }
+        assertTaskHasNoEvidence(tx, task.id);
+        const current = tx.getTaskWorkspace(task.id);
+        if (current === null
+          ? existing !== null
+          : existing === null || !sameManagedWorkspace(current, existing)) {
+          throw new Error(`Task workspace changed while rebuilding: ${task.id}.`);
+        }
+        const pinnedBindings = latest.projectBindings.map((binding) => {
+          const pinned = pins.get(binding.projectId);
+          return pinned !== undefined ? { ...binding, baseRef: pinned } : binding;
+        });
+        const timestamp = this.now();
+        let persistedTask = isDeepStrictEqual(pinnedBindings, latest.projectBindings)
+          ? latest
+          : { ...latest, projectBindings: pinnedBindings, updatedAt: timestamp.toISOString() };
+        persistedTask = bindTaskWorkspaceIdentity(persistedTask, identity, timestamp);
+        if (persistedTask.cwd !== root) {
+          persistedTask = { ...persistedTask, cwd: root, updatedAt: timestamp.toISOString() };
+        }
+        if (!isDeepStrictEqual(persistedTask, latest)) {
+          tx.saveTask(persistedTask);
+        }
+        if (existing !== null) tx.removeManagedWorkspace(existing.owner);
+        tx.saveManagedWorkspace(workspace);
+      });
+      // Record switched: retire the legacy layout. The worktrees leave first
+      // (their branches are retained), then the refs are archived and
+      // deleted; each step is resumable.
+      await this.#removeLegacyWorktrees(
+        task,
+        existing === null
+          ? this.store.listProjects().map((project) => project.id)
+          : existing.entries.map(({ projectId }) => projectId)
+      );
+      const archived = await this.#archiveLegacyRefs(
+        task,
+        existing === null ? undefined : [...new Set(existing.entries.map(({ projectId }) => projectId))]
+      );
+      return { task: requireTask(this.store, task.id), archived, resumed: false };
+    } catch (error) {
+      await this.#discardUnadoptedEntries(task, taskSegment, prepared, MAIN_WORKTREE, true);
+      throw error;
+    }
+  }
+
+  /**
+   * List legacy (pre-identity) Task refs across the Home's Project
+   * repositories, optionally restricted to one Task. Identity-bearing
+   * branches (`yui/task-N-<8hex>/...`) are never legacy.
+   */
+  async listLegacyTaskRefs(taskId?: string): Promise<LegacyTaskRef[]> {
+    const found: LegacyTaskRef[] = [];
+    for (const project of this.store.listProjects()) {
+      const refs = await this.git.listRefs(project.path, "refs/heads/yui/");
+      for (const ref of refs) {
+        if (!isLegacyTaskRef(ref)) continue;
+        const ownerTaskId = ref.slice("refs/heads/yui/".length).split("/")[0]!;
+        if (taskId !== undefined && ownerTaskId !== taskId) continue;
+        found.push({ projectId: project.id, taskId: ownerTaskId, ref });
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Archive legacy Task refs into the Home-scoped archive namespace
+   * (`refs/yui/archive/<homeId>/heads/...`). Refs owned by a draft/active
+   * Task are refused: their worktrees may still be live. Terminal and
+   * unknown-owner refs are archived; an already-archived or missing ref is
+   * simply absent on retry.
+   */
+  async archiveLegacyTaskRefs(taskId?: string): Promise<LegacyTaskRefArchiveResult> {
+    const home = this.store.getHomeIdentity();
+    const refused: string[] = [];
+    const archived: string[] = [];
+    for (const entry of await this.listLegacyTaskRefs(taskId)) {
+      const owner = this.store.getTask(entry.taskId);
+      if (owner !== null && ["draft", "active"].includes(owner.status)) {
+        refused.push(`${entry.projectId}:${entry.ref}`);
+        continue;
+      }
+      const project = requireProject(this.store, entry.projectId);
+      await this.git.archiveRef({
+        repositoryPath: project.path,
+        sourceRef: entry.ref,
+        archiveRef: taskArchiveRef(home.homeId, entry.ref)
+      });
+      archived.push(`${entry.projectId}:${entry.ref}`);
+    }
+    return { archived, refused };
+  }
+
   async #inspectEntries(
-    taskId: string,
+    taskSegment: string,
     roleName: string,
     entries: readonly WorkspaceProjectEntry[]
   ): Promise<GitWorkspaceState> {
@@ -1724,7 +2020,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const state = await this.git.inspectWorktree({
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
-        taskId,
+        taskSegment,
         roleName
       });
       if (state === "dirty") return "dirty";
@@ -1768,6 +2064,16 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       safePathSegment(projectName));
   }
 
+  /**
+   * The Task workspace ref segment for Git worktree derivation: the
+   * token-bearing segment for a Task with a persisted identity, its bare id
+   * for a pre-identity record. Every managed ref/path for one Task resolves
+   * through this single helper.
+   */
+  #taskSegment(task: Task): string {
+    return taskWorkspaceRefSegment(task);
+  }
+
   #taskWorkspaceRoot(taskId: string): string {
     return join(resolveTaskRoot(this.home, this.store.getConfig().defaultWorkspace),
       safePathSegment(taskId), "main");
@@ -1799,6 +2105,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
 
   async #discardUnadoptedEntries(
     task: Task,
+    taskSegment: string,
     prepared: readonly Readonly<{ project: Project; entry: WorkspaceProjectEntry }>[],
     roleName: string,
     deleteBranch = false,
@@ -1811,7 +2118,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       const removal = await this.git.removeWorktree({
         repositoryPath: project.path,
         container: this.#projectContainer(project.name),
-        taskId: task.id,
+        taskSegment,
         roleName,
         ...(deleteBranch ? { deleteBranch: true } : {})
       });
@@ -1819,6 +2126,57 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         throw new Error(
           `Unadopted managed worktree is dirty and was retained at ${entry.path}; inspect it and retry.`
         );
+      }
+    }
+  }
+
+  /**
+   * Archive one Task's legacy refs (`refs/heads/yui/<taskId>/...`) into the
+   * Home-scoped archive namespace across the given Project repositories. When
+   * no Project list is given, every Project in the Home is scanned, so the
+   * resume path also finds refs in Projects that left the Task binding.
+   */
+  async #archiveLegacyRefs(task: Task, projectIds?: readonly string[]): Promise<string[]> {
+    const home = this.store.getHomeIdentity();
+    const projects = projectIds === undefined
+      ? this.store.listProjects()
+      : projectIds.map((id) => requireProject(this.store, id));
+    const seen = new Set<string>();
+    const archived: string[] = [];
+    for (const project of projects) {
+      const refs = await this.git.listRefs(project.path, `refs/heads/yui/${task.id}/`);
+      for (const ref of refs) {
+        const ownerTaskId = ref.slice("refs/heads/yui/".length).split("/")[0];
+        if (ownerTaskId !== task.id || !isLegacyTaskRef(ref)) continue;
+        const key = `${project.id}:${ref}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        await this.git.archiveRef({
+          repositoryPath: project.path,
+          sourceRef: ref,
+          archiveRef: taskArchiveRef(home.homeId, ref)
+        });
+        archived.push(key);
+      }
+    }
+    return archived;
+  }
+
+  /**
+   * Remove the legacy worktrees of a Task (the bare `<taskId>/main` layout).
+   * A missing worktree is expected on retry and ignored; a dirty one blocks.
+   */
+  async #removeLegacyWorktrees(task: Task, projectIds: readonly string[]): Promise<void> {
+    for (const projectId of projectIds) {
+      const project = requireProject(this.store, projectId);
+      const removal = await this.git.removeWorktree({
+        repositoryPath: project.path,
+        container: this.#projectContainer(project.name),
+        taskSegment: task.id,
+        roleName: MAIN_WORKTREE
+      });
+      if (removal === "dirty") {
+        throw new Error(`Legacy Task worktree is dirty and blocks the rebuild: ${task.id}/${project.id}.`);
       }
     }
   }
@@ -1899,6 +2257,22 @@ function assertTaskArchiveState(current: Task, expected: Task): void {
       `task:${expected.id}`,
       true,
       `Task changed during archive cleanup: ${expected.id}.`
+    );
+  }
+}
+
+/**
+ * A controlled rebuild is only safe for a Task that owns no delivery
+ * evidence: a Run, WorkItem, ChangeSet, or Integration would pin the old
+ * refs and worktrees as historical proof.
+ */
+function assertTaskHasNoEvidence(store: TaskStore, taskId: string): void {
+  if (store.listAgentRuns(taskId).length > 0
+    || store.listWorkItems(taskId).length > 0
+    || store.listChangeSets(taskId).length > 0
+    || store.listIntegrationAttempts(taskId).length > 0) {
+    throw new Error(
+      `Task has Run, Work item, Change set, or Integration evidence and cannot be rebuilt in place: ${taskId}.`
     );
   }
 }
