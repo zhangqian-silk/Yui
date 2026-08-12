@@ -129,11 +129,48 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       throw new Error(`Task is not open for workspace preparation: ${task.id}.`);
     }
     if (task.projectBindings.length === 0) {
-      return {
-        taskId,
-        status: "ready",
-        ...(task.cwd === undefined ? {} : { path: task.cwd })
-      };
+      const existing = this.store.getTaskWorkspace(task.id);
+      const root = this.#taskWorkspaceRoot(task.id);
+      if (existing !== null && (
+        existing.owner.type !== "task"
+        || existing.owner.taskId !== task.id
+        || existing.root !== root
+        || existing.entries.length !== 0
+      )) {
+        throw new Error(`Gitless Task workspace ownership is invalid: ${task.id}.`);
+      }
+      // Gitless Tasks still need a durable runtime owner. The empty view is
+      // Task-specific, so launches cannot fall back to a global workspace or
+      // repository root while no Project is bound.
+      await ensureWorkspaceView(root, []);
+      const workspace = createManagedWorkspace({
+        owner: { type: "task", taskId: task.id },
+        root,
+        entries: []
+      }, this.now());
+      this.store.transaction((tx) => {
+        const latest = requireTask(tx, task.id);
+        if (!['draft', 'active'].includes(latest.status)
+          || latest.projectBindings.length !== 0) {
+          throw new Error(`Task changed while preparing its Gitless workspace: ${task.id}.`);
+        }
+        const current = tx.getTaskWorkspace(task.id);
+        if (current !== null && !isDeepStrictEqual(current, preserveWorkspaceCreatedAt(workspace, current))) {
+          throw new Error(`Gitless Task workspace changed during preparation: ${task.id}.`);
+        }
+        const timestamp = this.now();
+        if (latest.cwd !== root) {
+          tx.saveTask({ ...latest, cwd: root, updatedAt: timestamp.toISOString() });
+        }
+        if (current === null) tx.saveManagedWorkspace(workspace);
+        for (const role of tx.listRoles(task.id)) {
+          if (role.workspace !== root) {
+            retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
+            tx.saveRole(task.id, updateRole(role, { workspace: root }, timestamp));
+          }
+        }
+      });
+      return { taskId, status: "ready", path: root };
     }
     const existing = this.store.getTaskWorkspace(task.id);
     if (existing !== null && existing.owner.type !== "task") {

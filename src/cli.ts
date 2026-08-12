@@ -877,8 +877,15 @@ export async function main(): Promise<void> {
         ? null
         : store.getWorkItem(reference.taskId, reference.localId);
       const task = item === null ? null : store.getTask(item.taskId);
+      // Every Task needs an authoritative runtime owner before dispatch. A
+      // Gitless Task uses an empty Task-owned view; Project-backed WorkItems
+      // additionally receive their isolated Develop owner below.
+      if (item !== null && task !== null
+        && store.getTaskWorkspace(task.id) === null) {
+        await workspacePreparer.prepareTaskWorkspace(task.id);
+      }
       // Every Project-backed WorkItem needs its own Develop owner before a
-      // Lane can be prepared.  The physical preparer creates the symlink view
+      // Lane can be prepared. The physical preparer creates the symlink view
       // and stores the exact WorkItem owner before dispatch creates the Run.
       if (item !== null
         && task !== null
@@ -1705,6 +1712,12 @@ async function executionLaneGitSnapshotForTaskCommand(
   const stored = store.getManagedWorkspace(run.workspace.owner);
   if (stored === null || !isDeepStrictEqual(stored, run.workspace)) {
     throw usageError(`Execution Lane managed workspace changed before yield: ${run.id}.`);
+  }
+  // A Gitless fixed(1) Lane runs from the durable Task-owned empty view. It
+  // has no writable Project boundary, so there is no Lane Git snapshot to
+  // freeze; keep the normal Candidate path metadata-only.
+  if (run.workspace.owner.type === "task" && run.workspace.entries.length === 0) {
+    return null;
   }
   try {
     return (await preparer.snapshotExecutionLaneWorkspace(run.workspace)) ?? null;

@@ -5199,7 +5199,11 @@ function yieldRun(
                   executionGroupId: active.executionGroupId,
                   executionLaneId: active.executionLaneId
                 }),
-            ...(active.workspace === undefined ? {} : { workspace: active.workspace }),
+            ...(active.workspace === undefined
+              || (active.workspace.owner.type === "task"
+                && active.workspace.entries.length === 0)
+              ? {}
+              : { workspace: active.workspace }),
             ...(options.candidateGitSnapshot === undefined
               ? {}
               : { gitSnapshot: options.candidateGitSnapshot })

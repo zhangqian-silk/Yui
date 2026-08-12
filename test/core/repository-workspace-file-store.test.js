@@ -5070,6 +5070,49 @@ test("public fixed(1) Worker yield freezes a Candidate Git snapshot", async (t) 
   assert.equal(candidate.workspace.root, join(workspace, "tasks", task.id, "work-items", item.id));
 });
 
+test("public Gitless Worker yield completes without inventing Git output", async (t) => {
+  const { home, workspace, store, repositoryPath } = fixture(t);
+  const task = activateTask(createTask("task-1", "Gitless execution", NOW), NOW);
+  addTaskRoles(
+    store,
+    task,
+    repositoryPath,
+    ["leader", "worker"],
+    createStartupReadyClaudeAgent(home, NOW, "claude-mock")
+  );
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Report-only output",
+    assignee: "worker",
+    writeProjectIds: []
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const dispatched = spawnExactTaskCli(home, store, task.id, "leader", [
+    "task", "work", "dispatch", item.id
+  ]);
+  assert.equal(dispatched.status, 0, dispatched.stderr || dispatched.stdout);
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  assert.notEqual(taskWorkspace, null);
+  assert.deepEqual(taskWorkspace.owner, { type: "task", taskId: task.id });
+  assert.equal(taskWorkspace.root, join(workspace, "tasks", task.id, "main"));
+  assert.deepEqual(taskWorkspace.entries, []);
+  assert.equal(store.getTask(task.id).cwd, taskWorkspace.root);
+  assert.equal(store.getRole(task.id, "worker").workspace, taskWorkspace.root);
+  const active = store.getActiveAgentRun(task.id, "worker");
+  assert.notEqual(active, null);
+  // Establish the Mock Session delivery fence before stopping the isolated
+  // Controller; this keeps the test independent of stop-vs-launch timing.
+  markDelivered(store, active);
+  await stopFileTaskController(home);
+  const yielded = spawnExactTaskCli(home, store, task.id, "worker", [
+    "task", "run", "yield", active.id, "--summary", "report-only result"
+  ]);
+  assert.equal(yielded.status, 0, yielded.stderr || yielded.stdout);
+  const candidate = store.getWorkItem(task.id, item.id).candidates.at(-1);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "awaiting_acceptance");
+  assert.equal(candidate.workspace, undefined);
+  assert.equal(candidate.gitSnapshot, undefined);
+});
+
 test("public multi-Lane retry reuses the failed Lane workspace", async (t) => {
   const { home, workspace, repositoryPath, store } = fixture(t);
   const project = await addProject(store, repositoryPath);
@@ -5124,7 +5167,7 @@ test("public multi-Lane retry reuses the failed Lane workspace", async (t) => {
     }, failedAt);
     assert.equal(result.disposition, "applied");
   });
-  const retried = spawnExactTaskCli(home, store, task.id, failed.roleName, [
+  const retried = spawnExactTaskCli(home, store, task.id, "leader", [
     "task", "run", "retry", failed.id
   ]);
   assert.equal(retried.status, 0, retried.stderr || retried.stdout);

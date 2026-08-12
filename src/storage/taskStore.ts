@@ -3041,10 +3041,17 @@ function assertWorkItemCandidateReferences(
     || candidate.executionLaneId !== run.executionLaneId) {
     throw new StorageRecordError(`${label} execution lineage does not match its source Run.`);
   }
-  if ((candidate.workspace === undefined) !== (run.workspace === undefined)) {
+  // A Gitless execution Run still carries its durable Task-owned empty view
+  // for runtime fencing, while its Candidate intentionally has no Develop
+  // workspace or Git snapshot. This is the only source/run workspace
+  // mismatch permitted at the storage boundary.
+  const gitlessRunWorkspace = run.workspace?.owner.type === "task"
+    && run.workspace.entries.length === 0;
+  if (!gitlessRunWorkspace
+    && (candidate.workspace === undefined) !== (run.workspace === undefined)) {
     throw new StorageRecordError(`${label} workspace does not match its source Run.`);
   }
-  if (candidate.workspace !== undefined && run.workspace !== undefined) {
+  if (!gitlessRunWorkspace && candidate.workspace !== undefined && run.workspace !== undefined) {
     assertCandidateWorkspaceMatchesRun(candidate.workspace, run.workspace, label);
   }
   if (candidate.workspace !== undefined && (
