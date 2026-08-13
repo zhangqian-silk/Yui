@@ -1178,6 +1178,94 @@ test("an advanced Task main workspace resumes the fixed Leader Session with fres
   );
 });
 
+for (const [name, change] of [
+  ["path", ({ home, workspace }) => ({
+    workspace: {
+      ...workspace,
+      entries: workspace.entries.map((entry) => ({ ...entry, path: join(home, "other") }))
+    }
+  })],
+  ["branch", ({ workspace }) => ({
+    workspace: {
+      ...workspace,
+      entries: workspace.entries.map((entry) => ({ ...entry, branch: "other-main" }))
+    }
+  })],
+  ["access policy", ({ workspace, role }) => ({
+    workspace,
+    role: updateRole(role, { defaultAccess: "read" }, new Date(role.updatedAt))
+  })],
+  ["Agent config", ({ workspace, role }) => ({
+    workspace,
+    role: updateRole(role, {
+      agentBindings: {
+        codex: createRoleAgentBinding(
+          { id: "codex", adapterId: "codex" },
+          { adapterId: "codex", model: "gpt-next", effort: "high" }
+        )
+      }
+    }, new Date(role.updatedAt))
+  })]
+]) {
+  test(`native Session registration fails closed when Task main ${name} changes`, (t) => {
+    const { home, store, task, role, now, adapter } = fixture(t);
+    adapter.recordRuntimeNativeSession({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: "thread-before-invalid-drift"
+    }, now);
+    adapter.observeRuntimeTurnCompleted({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: "thread-before-invalid-drift",
+      turnId: "turn-before-invalid-drift"
+    }, now);
+    const immutable = structuredClone(adapter.getRoleSession(task.id, role.name).effective);
+    const { workspace, role: changedRole = role } = change({
+      home,
+      workspace: {
+        ...store.getTaskWorkspace(task.id),
+        entries: store.getTaskWorkspace(task.id).entries.map((entry) => ({
+          ...entry,
+          baseCommit: "2".repeat(40)
+        })),
+        updatedAt: new Date(now.getTime() + 1).toISOString()
+      },
+      role
+    });
+    if (changedRole !== role) store.saveRole(task.id, changedRole);
+    store.saveManagedWorkspace(workspace);
+    const runEffective = resolveEffectiveLaunch({
+      role: changedRole,
+      purpose: "execution",
+      workspace
+    });
+    const run = createTestAgentRun(
+      "agent-run-102",
+      task.id,
+      role.name,
+      "resume",
+      "Continue after invalid Task main drift.",
+      new Date(now.getTime() + 1),
+      { workspace, effective: runEffective }
+    );
+    store.saveActiveAgentRun(run);
+
+    assert.throws(() => adapter.recordRuntimeNativeSession({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: "thread-before-invalid-drift"
+    }, new Date(now.getTime() + 2)), /does not match the active Run/i);
+    assert.deepEqual(adapter.getRoleSession(task.id, role.name).effective, immutable);
+  });
+}
+
 test("Leader preparation owns its durable Run before awaiting tmux", async (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   let announcePreparation;

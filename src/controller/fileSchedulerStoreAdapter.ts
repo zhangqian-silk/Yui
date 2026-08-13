@@ -2227,7 +2227,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               launchId: input.launchId,
               policy: "fixed",
               status: "running",
-              effective: sessions.sessions[input.agentId]?.effective ?? run.effective
+              effective: run.effective
             }, now);
             store.saveTaskRoleSessionSet(bound);
             // Codex 0.145 emits SessionStart from inside run_turn(input), so a

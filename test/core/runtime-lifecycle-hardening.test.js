@@ -252,8 +252,8 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
   assert.notEqual(store.getActiveAgentRun(task.id, reviewer.name).pushedAt, undefined);
 });
 
-test("a fixed Leader Session resumes through the real planner after Task main advances", async (t) => {
-  const { home, store, agent, role } = fixture(t, "claude");
+async function lifecycleDispatchAfterTaskMainChange(t, change) {
+  const { home, store, agent, role: initialRole } = fixture(t, "claude");
   const task = activateTask(createTask("task-1", "Runtime hardening", FIRST, {
     projectBindings: [{ projectId: "project-1", directory: "Yui", baseRef: "main" }],
     cwd: home
@@ -287,14 +287,14 @@ test("a fixed Leader Session resumes through the real planner after Task main ad
   const oldWorkspace = withCommit(beforeWorkspace, oldCommit, FIRST);
   store.saveManagedWorkspace(oldWorkspace);
   const immutable = resolveEffectiveLaunch({
-    role,
+    role: initialRole,
     purpose: "execution",
     workspace: oldWorkspace
   });
   let sessions = createRoleSessionSet({
     scope: "task",
     taskId: task.id,
-    roleName: role.name
+    roleName: initialRole.name
   }, agent.id, FIRST);
   sessions = recordRoleAgentSession(sessions, {
     agentId: agent.id,
@@ -305,17 +305,27 @@ test("a fixed Leader Session resumes through the real planner after Task main ad
     effective: immutable
   }, FIRST);
   store.saveTaskRoleSessionSet(sessions);
-  const advancedWorkspace = withCommit(oldWorkspace, newCommit, SECOND);
+  const { workspace: changedWorkspace, role: changedRole = initialRole } = change({
+    home,
+    workspace: withCommit(oldWorkspace, newCommit, SECOND),
+    role: initialRole,
+    agent
+  });
+  if (changedRole !== initialRole) store.saveRole(task.id, changedRole);
+  const advancedWorkspace = {
+    ...changedWorkspace,
+    updatedAt: SECOND.toISOString()
+  };
   store.saveManagedWorkspace(advancedWorkspace);
   const runEffective = resolveEffectiveLaunch({
-    role,
+    role: changedRole,
     purpose: "execution",
     workspace: advancedWorkspace
   });
   const run = createAgentRun(
     "agent-run-102",
     task.id,
-    role.name,
+    changedRole.name,
     "resume",
     "Continue after Task main advanced.",
     SECOND,
@@ -335,23 +345,79 @@ test("a fixed Leader Session resumes through the real planner after Task main ad
   }, { createBindingId: () => "binding-after-main-advance" });
   const dispatch = createRuntimeLifecycleDispatcher(store, new FileSchedulerStoreAdapter(store), host);
 
-  await dispatch("runtime.ensure-role-session", {
-    scope: "task",
-    taskId: task.id,
-    roleName: role.name
-  });
+  return {
+    dispatch: () => dispatch("runtime.ensure-role-session", {
+      scope: "task",
+      taskId: task.id,
+      roleName: changedRole.name
+    }),
+    home,
+    store,
+    role: changedRole,
+    run,
+    runEffective,
+    immutable,
+    planned
+  };
+}
 
-  assert.equal(planned.length, 1);
-  const resumeIndex = planned[0].args.indexOf("--resume");
+test("a fixed Leader Session resumes through the real planner after Task main advances", async (t) => {
+  const fx = await lifecycleDispatchAfterTaskMainChange(t, ({ workspace }) => ({ workspace }));
+
+  await fx.dispatch();
+
+  assert.equal(fx.planned.length, 1);
+  const resumeIndex = fx.planned[0].args.indexOf("--resume");
   assert.notEqual(resumeIndex, -1);
-  assert.equal(planned[0].args[resumeIndex + 1], "claude-fixed-before-main-advance");
-  assert.equal(planned[0].env.YUI_RUN_ID, run.id);
-  assert.equal(runEffective.workspace.entries[0].baseCommit, newCommit);
+  assert.equal(fx.planned[0].args[resumeIndex + 1], "claude-fixed-before-main-advance");
+  assert.equal(fx.planned[0].env.YUI_RUN_ID, fx.run.id);
+  assert.equal(fx.runEffective.workspace.entries[0].baseCommit, "b".repeat(40));
   assert.deepEqual(
-    store.getRoleSession(task.id, role.name).effective,
-    immutable
+    fx.store.getRoleSession(fx.run.taskId, fx.role.name).effective,
+    fx.immutable
   );
 });
+
+for (const [name, change] of [
+  ["path", ({ home, workspace }) => ({
+    workspace: {
+      ...workspace,
+      entries: workspace.entries.map((entry) => ({ ...entry, path: join(home, "other") }))
+    }
+  })],
+  ["branch", ({ workspace }) => ({
+    workspace: {
+      ...workspace,
+      entries: workspace.entries.map((entry) => ({ ...entry, branch: "other-main" }))
+    }
+  })],
+  ["access policy", ({ workspace, role }) => ({
+    workspace,
+    role: updateRole(role, { defaultAccess: "read" }, SECOND)
+  })],
+  ["Agent config", ({ workspace, role, agent }) => ({
+    workspace,
+    role: updateRole(role, {
+      agentBindings: {
+        [agent.id]: createRoleAgentBinding(agent, {
+          adapterId: "claude",
+          model: "claude-next"
+        })
+      }
+    }, SECOND)
+  })]
+]) {
+  test(`lifecycle dispatch fails closed when Task main ${name} changes`, async (t) => {
+    const fx = await lifecycleDispatchAfterTaskMainChange(t, change);
+
+    await assert.rejects(fx.dispatch(), /incompatible with the next effective launch/i);
+    assert.equal(fx.planned.length, 0);
+    assert.deepEqual(
+      fx.store.getRoleSession(fx.run.taskId, fx.role.name).effective,
+      fx.immutable
+    );
+  });
+}
 
 test("a Role host created after Task archival is stopped without a false cleanup signal", async (t) => {
   const { store, task, role } = fixture(t);
