@@ -28,6 +28,7 @@ import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import {
   effectiveLaunchWithTaskMainWorkspace,
   effectiveLaunchSnapshotsCompatible,
+  effectiveLaunchSnapshotsCompatibleForTaskMain,
   resolveEffectiveLaunch,
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
@@ -2226,7 +2227,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               launchId: input.launchId,
               policy: "fixed",
               status: "running",
-              effective: run.effective
+              effective: sessions.sessions[input.agentId]?.effective ?? run.effective
             }, now);
             store.saveTaskRoleSessionSet(bound);
             // Codex 0.145 emits SessionStart from inside run_turn(input), so a
@@ -3172,7 +3173,11 @@ function recordTaskRuntimeNativeSession(
   const effective = input.effective === undefined
     ? resolvedEffective
     : validateEffectiveLaunchSnapshot(input.effective);
-  if (!effectiveLaunchSnapshotsCompatible(resolvedEffective, effective)) {
+  if (!effectiveLaunchSnapshotsCompatibleForTaskMain(
+    resolvedEffective,
+    effective,
+    store.getTaskWorkspace(input.taskId)
+  )) {
     throw new Error("Reserved native Session effective launch changed before persistence.");
   }
   if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
@@ -3185,7 +3190,7 @@ function recordTaskRuntimeNativeSession(
     ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
     policy: "fixed",
     status: "running",
-    effective
+    effective: effectiveExisting?.effective ?? effective
   }, now);
   store.saveRoleSessionSet(updated);
   return updated.sessions[input.agentId]!;
@@ -3324,6 +3329,19 @@ function taskSessionEffective(
       throw new Error(
         `Native Session registration does not match the effective Run Agent: ${taskId}/${roleName}.`
       );
+    }
+    if (existing !== undefined) {
+      const workspace = active.workspace ?? store.getTaskWorkspace(taskId);
+      if (!effectiveLaunchSnapshotsCompatibleForTaskMain(
+        existing.effective,
+        active.effective,
+        workspace
+      )) {
+        throw new Error(
+          `Native Session effective launch does not match the active Run: ${taskId}/${roleName}.`
+        );
+      }
+      return existing.effective;
     }
     return active.effective;
   }

@@ -488,7 +488,12 @@ export function createRuntimeLifecycleDispatcher(
       );
     }
     validateLifecycleEnvironment(request.environment, agent);
-    const mode = roleAgentSessionResumeMode(sessions, effective.agentId, effective);
+    const mode = roleAgentSessionResumeMode(
+      sessions,
+      effective.agentId,
+      effective,
+      managedWorkspace
+    );
     const session = sessions?.sessions[effective.agentId];
     const owner = request.scope === "task"
       ? { scope: "task" as const, taskId: request.taskId, roleName: request.roleName }

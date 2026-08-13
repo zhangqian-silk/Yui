@@ -1161,6 +1161,21 @@ test("an advanced Task main workspace resumes the fixed Leader Session with fres
     adapter.getRoleSession(task.id, role.name).effective,
     immutableSessionEffective
   );
+
+  adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-before-main-advance",
+    turnId: "turn-after-main-advance",
+    runId: active.id,
+    summary: "yield after Task main advanced"
+  }, new Date(advancedAt.getTime() + 1));
+  assert.deepEqual(
+    adapter.getRoleSession(task.id, role.name).effective,
+    immutableSessionEffective
+  );
 });
 
 test("Leader preparation owns its durable Run before awaiting tmux", async (t) => {

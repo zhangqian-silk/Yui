@@ -28,6 +28,10 @@ import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../../dist/core/protocol.
 import { YUI_VERSION, yuiVersionIdentity } from "../../dist/version.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import {
+  createRoleSessionSet,
+  recordRoleAgentSession
+} from "../../dist/executor/agentExecutor.js";
+import {
   createGlobalRole,
   createRole,
   createRoleAgentBinding,
@@ -38,9 +42,11 @@ import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { repairOrphanedActiveTasks } from "../../dist/scheduler/activeTaskProgress.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { createProject } from "../../dist/repository/project.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { TmuxSessionHost } from "../../dist/runtime/index.js";
 import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 const FIRST = new Date("2026-07-24T00:00:00.000Z");
@@ -244,6 +250,107 @@ test("an active Role Run may launch from its snapshotted workspace", async (t) =
   assert.equal(reviewerStart.workspace, workspace.root);
   assert.notEqual(reviewerStart.workspace, role.workspace);
   assert.notEqual(store.getActiveAgentRun(task.id, reviewer.name).pushedAt, undefined);
+});
+
+test("a fixed Leader Session resumes through the real planner after Task main advances", async (t) => {
+  const { home, store, agent, role } = fixture(t, "claude");
+  const task = activateTask(createTask("task-1", "Runtime hardening", FIRST, {
+    projectBindings: [{ projectId: "project-1", directory: "Yui", baseRef: "main" }],
+    cwd: home
+  }), FIRST);
+  store.transaction((tx) => {
+    tx.saveProject(createProject(
+      "project-1",
+      "Yui",
+      home,
+      { stable: "main", development: "main" },
+      FIRST
+    ));
+    tx.saveTask(task);
+  });
+  const beforeWorkspace = store.getTaskWorkspace(task.id);
+  const oldCommit = "a".repeat(40);
+  const newCommit = "b".repeat(40);
+  const withCommit = (workspace, baseCommit, updatedAt) => ({
+    ...workspace,
+    entries: [{
+      projectId: "project-1",
+      directory: "Yui",
+      access: "write",
+      path: home,
+      branch: "main",
+      baseRef: "main",
+      baseCommit
+    }],
+    updatedAt: updatedAt.toISOString()
+  });
+  const oldWorkspace = withCommit(beforeWorkspace, oldCommit, FIRST);
+  store.saveManagedWorkspace(oldWorkspace);
+  const immutable = resolveEffectiveLaunch({
+    role,
+    purpose: "execution",
+    workspace: oldWorkspace
+  });
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, agent.id, FIRST);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: "claude-fixed-before-main-advance",
+    policy: "fixed",
+    status: "ready",
+    effective: immutable
+  }, FIRST);
+  store.saveTaskRoleSessionSet(sessions);
+  const advancedWorkspace = withCommit(oldWorkspace, newCommit, SECOND);
+  store.saveManagedWorkspace(advancedWorkspace);
+  const runEffective = resolveEffectiveLaunch({
+    role,
+    purpose: "execution",
+    workspace: advancedWorkspace
+  });
+  const run = createAgentRun(
+    "agent-run-102",
+    task.id,
+    role.name,
+    "resume",
+    "Continue after Task main advanced.",
+    SECOND,
+    { workspace: advancedWorkspace, effective: runEffective }
+  );
+  store.saveActiveAgentRun(run);
+
+  const planner = new FileRoleLaunchPlanner(home, store, { cliPath: "/dist/cli.js" });
+  const planned = [];
+  const host = new TmuxSessionHost(planner, {
+    async ensureRoleWindowAsync(_taskId, _plannedRole, launch) {
+      planned.push(launch);
+      return false;
+    },
+    async probeRoleStatusAsync() { return "running"; },
+    killRole() {}
+  }, { createBindingId: () => "binding-after-main-advance" });
+  const dispatch = createRuntimeLifecycleDispatcher(store, new FileSchedulerStoreAdapter(store), host);
+
+  await dispatch("runtime.ensure-role-session", {
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  });
+
+  assert.equal(planned.length, 1);
+  const resumeIndex = planned[0].args.indexOf("--resume");
+  assert.notEqual(resumeIndex, -1);
+  assert.equal(planned[0].args[resumeIndex + 1], "claude-fixed-before-main-advance");
+  assert.equal(planned[0].env.YUI_RUN_ID, run.id);
+  assert.equal(runEffective.workspace.entries[0].baseCommit, newCommit);
+  assert.deepEqual(
+    store.getRoleSession(task.id, role.name).effective,
+    immutable
+  );
 });
 
 test("a Role host created after Task archival is stopped without a false cleanup signal", async (t) => {
