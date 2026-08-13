@@ -27,6 +27,11 @@ function subject(overrides) {
   };
 }
 
+/** Qualified `taskId/changeSetId` reference matching the `subject` helper. */
+function q(changeSetId) {
+  return `task-${changeSetId}/${changeSetId}`;
+}
+
 test("subjects of different Projects never overlap", () => {
   const report = diagnoseOverlap([
     subject({ changeSetId: "change-set-1", projectId: "project-1", changedPaths: ["src/index.ts"] }),
@@ -71,7 +76,7 @@ test("same public contract yields a high contract finding", () => {
   const contract = report.findings.find((finding) => finding.kind === "contract");
   assert.ok(contract);
   assert.equal(contract.risk, "high");
-  assert.deepEqual(contract.changeSetIds, ["change-set-1", "change-set-2"]);
+  assert.deepEqual(contract.changeSetIds, [q("change-set-1"), q("change-set-2")]);
 });
 
 test("same migration files yield a high schema-migration finding", () => {
@@ -261,11 +266,11 @@ test("suggested order puts schema/migration-bearing ChangeSets first", () => {
     }),
     subject({ changeSetId: "change-set-3", changedPaths: ["src/runtime/b.ts"] })
   ]);
-  assert.equal(report.suggestedOrder[0], "change-set-2");
+  assert.equal(report.suggestedOrder[0], q("change-set-2"));
   assert.deepEqual([...report.suggestedOrder].sort(), [
-    "change-set-1",
-    "change-set-2",
-    "change-set-3"
+    q("change-set-1"),
+    q("change-set-2"),
+    q("change-set-3")
   ]);
 });
 
@@ -279,7 +284,7 @@ test("suggested order is deterministic and breaks ties by id", () => {
     subject({ changeSetId: "change-set-2", changedPaths: ["src/a.ts"] })
   ]);
   assert.deepEqual(first.suggestedOrder, second.suggestedOrder);
-  assert.deepEqual(first.suggestedOrder, ["change-set-1", "change-set-2"]);
+  assert.deepEqual(first.suggestedOrder, [q("change-set-1"), q("change-set-2")]);
 });
 
 test("review areas list high and medium finding categories only", () => {
@@ -339,6 +344,33 @@ test("task overlap reports contract overlap across Tasks", async () => {
   assert.match(result.output, /\[high\] contract/);
   assert.match(result.output, /Suggested integration order/);
   assert.match(result.output, /public contract/);
+});
+
+test("task overlap qualifies same-local-id ChangeSets from different Tasks", async () => {
+  // Two Tasks both minted change-set-1: bare ids would collide and the CLI
+  // would resolve the first subject for both.  Qualified refs keep them
+  // distinct through findings, ordering, and rendering.
+  const manifest = createChangeSetManifest({ tags: ["contract"], deletedPaths: [] });
+  const store = overlapStore({
+    "task-1": [changeSetRecord({
+      id: "change-set-1", taskId: "task-1", changedPaths: ["src/index.ts"], manifest
+    })],
+    "task-2": [changeSetRecord({
+      id: "change-set-1", taskId: "task-2", changedPaths: ["src/index.ts"], manifest
+    })]
+  });
+  const result = await runTaskOverlapCommand([], store);
+  const contract = result.data.report.findings.find((item) => item.kind === "contract");
+  assert.ok(contract, "the same-local-id pair must surface a contract finding");
+  assert.deepEqual(contract.changeSetIds, ["task-1/change-set-1", "task-2/change-set-1"]);
+  assert.deepEqual(result.data.report.suggestedOrder, [
+    "task-1/change-set-1",
+    "task-2/change-set-1"
+  ]);
+  // The CLI renders both qualified refs and resolves each to its own Task.
+  assert.match(result.output, /task-1\/change-set-1/);
+  assert.match(result.output, /task-2\/change-set-1/);
+  assert.doesNotMatch(result.output, /change-set-1 vs change-set-1/);
 });
 
 test("task overlap filters by project, base, and task", async () => {

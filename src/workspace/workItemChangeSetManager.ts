@@ -340,7 +340,11 @@ export class WorkItemChangeSetManager {
       }),
       deletedPaths: result.deletedPaths,
       ...(targetRef === undefined ? {} : { targetRef }),
-      evidenceRefs: this.#captureEvidenceRefs(context.taskId, result.headCommit)
+      evidenceRefs: this.#captureEvidenceRefs(
+        context.taskId,
+        context.workItemId,
+        result.headCommit
+      )
     });
     return this.store.transaction((tx) => {
       assertCaptureStillCurrent(tx, context);
@@ -387,9 +391,23 @@ export class WorkItemChangeSetManager {
     });
   }
 
-  #captureEvidenceRefs(taskId: string, headCommit: string): readonly string[] {
+  /**
+   * Verified evidence for the exact reviewed candidate.  A completed
+   * ReviewRound freezes the candidate it reviewed at `reviewBaseCommit`; when
+   * the captured ChangeSet head is that commit, the round's checks are
+   * durable evidence for it.  The reviewer's diagnostic `evidenceCommit`
+   * intentionally differs from the reviewed base and never becomes a
+   * ChangeSet head, so it cannot serve as this link.
+   */
+  #captureEvidenceRefs(
+    taskId: string,
+    workItemId: string,
+    headCommit: string
+  ): readonly string[] {
     return this.store.listReviewRounds(taskId)
-      .filter(({ evidenceCommit }) => evidenceCommit === headCommit)
+      .filter((round) => round.status === "completed"
+        && round.workItemId === workItemId
+        && round.reviewBaseCommit === headCommit)
       .map(({ id }) => `review-round:${id}`);
   }
 }

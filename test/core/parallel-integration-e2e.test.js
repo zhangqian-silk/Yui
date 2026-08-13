@@ -22,8 +22,11 @@ import { createProductionStorageRegistry } from "../../dist/storage/migration/pr
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { createProject } from "../../dist/repository/project.js";
+import { createReviewRound, finishReviewRound } from "../../dist/review/reviewRound.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
-import { createWorkItem } from "../../dist/workItem/workItem.js";
+import { createWorkItem, submitWorkItemCandidate, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
+import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
+import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 
 /**
  * Cross-Task parallel integration E2E.
@@ -140,8 +143,7 @@ function addParallelChange(fixture, task, options) {
   const tags = options.tags ?? deriveManifestTags({ changedPaths });
   const manifest = createChangeSetManifest({
     tags,
-    deletedPaths: [],
-    ...(options.evidenceRefs === undefined ? {} : { evidenceRefs: options.evidenceRefs })
+    deletedPaths: []
   });
   const changeSet = createWorkItemChangeSet({
     id: options.id,
@@ -191,6 +193,115 @@ function masterCommitCount(fixture) {
   return Number(git(["-C", fixture.repositoryPath, "rev-list", "--count", "master"]).trim());
 }
 
+// --- Capturable WorkItem fixtures (production capture path) -----------------
+
+/**
+ * A WorkItem in a capturable state with a persistent develop worktree on a
+ * managed branch, registered as its managed workspace.  The production
+ * capture manager reads the ChangeSet straight from this workspace, so the
+ * test exercises the real capture path instead of hand-writing a record.
+ */
+function createCapturableWorkItem(fixture, task, options) {
+  // Production lifecycle: pending -> running -> submit candidate -> awaiting
+  // acceptance, which is the state capture expects.
+  const running = updateWorkItemStatus(
+    createWorkItem(
+      fixture.store.nextWorkItemId(task.id),
+      task.id,
+      {
+        title: `Capturable change ${options.label}`,
+        acceptance: [],
+        dependsOn: [],
+        writeProjectIds: [fixture.project.id]
+      },
+      now
+    ),
+    "running",
+    now
+  );
+  const workItem = submitWorkItemCandidate(
+    running,
+    { summary: `Change ${options.label}`, source: { type: "direct" } },
+    now
+  );
+  fixture.store.saveWorkItem(task.id, workItem);
+
+  const branch = `develop/${task.id}/${workItem.id}`;
+  const worktree = join(fixture.root, `dw-${workItem.id}`);
+  git(["-C", fixture.repositoryPath, "worktree", "add", "-b", branch, worktree, fixture.baseCommit]);
+  for (const [path, content] of Object.entries(options.paths)) {
+    const fullPath = join(worktree, path);
+    mkdirSync(dirname(fullPath), { recursive: true });
+    writeFileSync(fullPath, content);
+  }
+  git(["-C", worktree, "add", "-A"]);
+  git([
+    "-C", worktree,
+    "-c", "user.name=Test",
+    "-c", "user.email=test@example.com",
+    "commit", "-m", `change ${options.label}`
+  ]);
+  const headCommit = git(["-C", worktree, "rev-parse", "HEAD"]).trim();
+
+  const workspace = createManagedWorkspace({
+    owner: { type: "work-item", taskId: task.id, workItemId: workItem.id },
+    root: worktree,
+    entries: [{
+      projectId: fixture.project.id,
+      directory: fixture.project.name,
+      access: "write",
+      path: worktree,
+      branch,
+      baseRef: "master",
+      baseCommit: fixture.baseCommit
+    }]
+  }, now);
+  fixture.store.saveManagedWorkspace(workspace);
+  return { workItem, workspace, headCommit, worktree, branch };
+}
+
+/**
+ * A completed ReviewRound for a WorkItem's exact candidate.  The reviewer's
+ * diagnostic `evidenceCommit` is a real commit that intentionally differs
+ * from `reviewBaseCommit`, so a test can prove the capture links evidence to
+ * the reviewed base rather than the diagnostic commit.
+ */
+function createCompletedReviewRound(fixture, task, workItem, reviewBaseCommit) {
+  const reviewBranch = `review/${task.id}/${workItem.id}`;
+  const reviewWorktree = join(fixture.root, `rw-${workItem.id}`);
+  git(["-C", fixture.repositoryPath, "worktree", "add", "-b", reviewBranch, reviewWorktree, reviewBaseCommit]);
+  let evidenceCommit;
+  try {
+    writeFileSync(join(reviewWorktree, "review-diagnostic.txt"), "diagnostic\n");
+    git(["-C", reviewWorktree, "add", "-A"]);
+    git([
+      "-C", reviewWorktree,
+      "-c", "user.name=Test",
+      "-c", "user.email=test@example.com",
+      "commit", "-m", "review diagnostic"
+    ]);
+    evidenceCommit = git(["-C", reviewWorktree, "rev-parse", "HEAD"]).trim();
+  } finally {
+    git(["-C", fixture.repositoryPath, "worktree", "remove", reviewWorktree]);
+  }
+  const pending = createReviewRound(
+    fixture.store.nextReviewRoundId(task.id),
+    task.id,
+    workItem.id,
+    "candidate-1",
+    "reviewer",
+    "leader",
+    reviewBaseCommit,
+    now
+  );
+  const completed = finishReviewRound(pending, "completed", "Candidate reviewed.", now, {
+    checks: [{ name: "review", outcome: "passed", details: "candidate verified" }],
+    evidenceCommit
+  });
+  fixture.store.saveReviewRound(task.id, completed);
+  return completed;
+}
+
 // --- The eight-Task matrix --------------------------------------------------
 
 test("eight same-base Tasks: diagnostics, exact-target queue, localized conflict, independence", async () => {
@@ -209,29 +320,32 @@ test("eight same-base Tasks: diagnostics, exact-target queue, localized conflict
   // Overlap diagnostics run BEFORE any integration.
   const overlap = await runTaskOverlapCommand([], fixture.store);
   const findings = overlap.data.report.findings;
+  // Findings and order key ChangeSets by qualified taskId/changeSetId so
+  // same-local-id ChangeSets from different Tasks stay distinct.
+  const ref = (grown) => `${grown.task.id}/${grown.changeSet.id}`;
   const contract = findings.find((item) => item.kind === "contract");
   assert.ok(contract, "the runtime-module pair must surface a contract finding");
   assert.equal(contract.risk, "high");
-  assert.deepEqual(contract.changeSetIds, [t1.changeSet.id, t2.changeSet.id]);
+  assert.deepEqual(contract.changeSetIds, [ref(t1), ref(t2)]);
   const schema = findings.find((item) => item.kind === "schema-migration");
   assert.ok(schema, "the schema pair must surface a schema-migration finding");
   assert.equal(schema.risk, "medium");
-  assert.deepEqual(schema.changeSetIds, [t5.changeSet.id, t6.changeSet.id]);
+  assert.deepEqual(schema.changeSetIds, [ref(t5), ref(t6)]);
   const cliSurface = findings.find((item) => item.kind === "cli-surface");
   assert.ok(cliSurface, "the snapshot pair must surface a cli-surface finding");
   assert.equal(cliSurface.risk, "medium");
-  assert.deepEqual(cliSurface.changeSetIds, [t7.changeSet.id, t8.changeSet.id]);
+  assert.deepEqual(cliSurface.changeSetIds, [ref(t7), ref(t8)]);
   // The unrelated-files pair produces no findings.
   assert.ok(!findings.some((item) =>
-    item.changeSetIds.includes(t3.changeSet.id) || item.changeSetIds.includes(t4.changeSet.id)));
+    item.changeSetIds.includes(ref(t3)) || item.changeSetIds.includes(ref(t4))));
   // Suggested order: schema-bearing ChangeSets first, then ascending
   // high-risk finding count (the contract pair carries the only high-risk
-  // finding and lands last), then ChangeSet id.
+  // finding and lands last), then qualified ChangeSet reference.
   assert.deepEqual(overlap.data.report.suggestedOrder, [
-    t5.changeSet.id, t6.changeSet.id,
-    t3.changeSet.id, t4.changeSet.id,
-    t7.changeSet.id, t8.changeSet.id,
-    t1.changeSet.id, t2.changeSet.id
+    ref(t5), ref(t6),
+    ref(t3), ref(t4),
+    ref(t7), ref(t8),
+    ref(t1), ref(t2)
   ]);
   assert.ok(overlap.data.report.reviewAreas.some((area) => area.startsWith("public contract")));
   assert.ok(overlap.data.report.reviewAreas.some((area) => area.startsWith("schema/migration")));
@@ -413,9 +527,10 @@ test("enqueue converges when the ChangeSet head is already a target ancestor", a
 
 test("reusable evidence validates a waiting WorkItem without re-running its gate", async () => {
   const fixture = await createFixture();
-  // One Task, two WorkItems with disjoint paths: the second carries
-  // evidence and a failing gate.  It must be validated by the first
-  // landing and commit without its checks running.
+  // One Task, two WorkItems with disjoint paths, captured through the
+  // production capture manager.  The second carries a completed ReviewRound
+  // whose reviewBaseCommit is the exact captured candidate, so its evidence
+  // is reusable; its gate is a failing command that must never run.
   const task = activateTask(createTask(
     fixture.store.nextTaskId(),
     "Evidence task",
@@ -429,23 +544,40 @@ test("reusable evidence validates a waiting WorkItem without re-running its gate
     }
   ), now);
   fixture.store.saveTask(task);
-  const first = addParallelChange(fixture, task, {
-    id: "change-set-301",
+  const first = createCapturableWorkItem(fixture, task, {
+    label: "first",
     paths: { "src/feature-a.ts": "a\n" }
   });
-  const second = addParallelChange(fixture, task, {
-    id: "change-set-302",
-    paths: { "src/feature-b.ts": "b\n" },
-    evidenceRefs: ["review-round:review-round-302"]
+  const second = createCapturableWorkItem(fixture, task, {
+    label: "second",
+    paths: { "src/feature-b.ts": "b\n" }
   });
-  await enqueueChange(fixture, task, first.changeSet, { checkCommands: ["true"] });
-  await enqueueChange(fixture, task, second.changeSet, { checkCommands: ["false"] });
+  // A completed review of the second WorkItem's exact candidate.  The
+  // diagnostic evidence commit differs from the reviewed base on purpose.
+  const round = createCompletedReviewRound(fixture, task, second.workItem, second.headCommit);
+
+  const manager = new WorkItemChangeSetManager(fixture.store, () => now);
+  const firstSets = await manager.capture(task.id, first.workItem.id);
+  const secondSets = await manager.capture(task.id, second.workItem.id);
+  assert.equal(firstSets.length, 1);
+  assert.equal(secondSets.length, 1);
+  const firstChangeSet = firstSets[0];
+  const secondChangeSet = secondSets[0];
+  // Production capture persisted the evidence link from the real ReviewRound
+  // (keyed on reviewBaseCommit, not the differing diagnostic evidenceCommit).
+  assert.deepEqual(secondChangeSet.manifest.evidenceRefs, [`review-round:${round.id}`]);
+  assert.deepEqual(firstChangeSet.manifest.evidenceRefs, []);
+
+  await enqueueChange(fixture, task, firstChangeSet, { checkCommands: ["true"] });
+  await enqueueChange(fixture, task, secondChangeSet, { checkCommands: ["false"] });
   const processed = await processTask(fixture, task);
   assert.equal(processed.length, 2);
-  assert.equal(processed[0].entry.changeSetId, "change-set-301");
+  assert.equal(processed[0].entry.changeSetId, firstChangeSet.id);
   assert.equal(processed[0].entry.status, "committed");
-  assert.equal(processed[1].entry.changeSetId, "change-set-302");
+  assert.equal(processed[1].entry.changeSetId, secondChangeSet.id);
   assert.equal(processed[1].entry.status, "committed");
+  // The second WorkItem was validated by the first landing: its failing gate
+  // never ran because the reusable evidence covered the exact candidate.
   assert.deepEqual(processed[1].attempt.checkCommands, []);
   assert.deepEqual(processed[1].attempt.checks, []);
   assert.equal(masterFile(fixture, "src/feature-a.ts"), "a\n");
@@ -559,7 +691,8 @@ test("a migrated v2 ChangeSet degrades to path-only diagnostics and still integr
   });
   const overlap = await runTaskOverlapCommand([], fixture.store);
   const pair = overlap.data.report.findings.find((item) =>
-    item.changeSetIds.includes("change-set-401") && item.changeSetIds.includes("change-set-402"));
+    item.changeSetIds.includes(`${task.id}/change-set-401`)
+    && item.changeSetIds.includes(`${modern.task.id}/change-set-402`));
   assert.ok(pair, "the legacy/modern pair must share the path");
   assert.equal(pair.kind, "path-only");
   assert.equal(pair.risk, "low");

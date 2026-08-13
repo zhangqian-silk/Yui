@@ -3,6 +3,7 @@ import type { ChangeSet } from "../integration/changeSet.js";
 import {
   diagnoseOverlap,
   overlapSubjectFromChangeSet,
+  overlapSubjectKey,
   type OverlapFinding
 } from "../integration/overlapDiagnostics.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -114,9 +115,9 @@ function renderOverlapReport(
     }
   }
   lines.push("Suggested integration order:");
-  suggestedOrder.forEach((id, index) => {
-    const subject = subjects.find((candidate) => candidate.changeSetId === id);
-    lines.push(`  ${index + 1}. ${id}${subject === undefined ? "" : ` (${subject.taskId}/${subject.workItemId})`}`);
+  suggestedOrder.forEach((ref, index) => {
+    const subject = subjects.find((candidate) => overlapSubjectKey(candidate) === ref);
+    lines.push(`  ${index + 1}. ${ref}${subject === undefined ? "" : ` (${subject.workItemId})`}`);
   });
   if (reviewAreas.length === 0) {
     lines.push("Review areas: none (no high/medium findings)");

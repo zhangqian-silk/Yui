@@ -1,6 +1,7 @@
 import type { ChangeSetManifestTag } from "./changeSetManifest.js";
 import { manifestTagsForPath } from "./manifestTags.js";
 import type { ChangeSet } from "./changeSet.js";
+import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 
 /**
  * Read-only cross-Task overlap diagnostics.
@@ -37,7 +38,11 @@ export type OverlapSubject = Readonly<{
 export type OverlapFinding = Readonly<{
   kind: OverlapFindingKind;
   risk: OverlapRisk;
-  /** The two ChangeSets whose overlap produced this finding, sorted by id. */
+  /**
+   * The two ChangeSets whose overlap produced this finding, sorted.  Each
+   * entry is a qualified Task record reference (`taskId/changeSetId`) so that
+   * same-local-id ChangeSets from different Tasks stay distinct.
+   */
   changeSetIds: readonly string[];
   /** The shared paths that drive this finding, sorted. */
   paths: readonly string[];
@@ -47,11 +52,23 @@ export type OverlapFinding = Readonly<{
 export type OverlapReport = Readonly<{
   subjects: readonly OverlapSubject[];
   findings: readonly OverlapFinding[];
-  /** ChangeSet ids in the suggested integration order. */
+  /**
+   * Qualified ChangeSet references (`taskId/changeSetId`) in the suggested
+   * integration order.
+   */
   suggestedOrder: readonly string[];
   /** Human-readable semantic review areas for high/medium findings. */
   reviewAreas: readonly string[];
 }>;
+
+/**
+ * Qualified Task record reference for a subject's ChangeSet.  A bare
+ * `changeSetId` is only unique within its Task, so cross-Task findings and
+ * ordering key subjects by `taskId/changeSetId`.
+ */
+export function overlapSubjectKey(subject: OverlapSubject): string {
+  return formatTaskRecordReference(subject.taskId, subject.changeSetId, "changeSet");
+}
 
 export const OVERLAP_FINDING_KINDS: readonly OverlapFindingKind[] = [
   "path-only",
@@ -105,7 +122,7 @@ export function diagnoseOverlap(subjects: readonly OverlapSubject[]): OverlapRep
 function pairFindings(left: OverlapSubject, right: OverlapSubject): OverlapFinding[] {
   const shared = sortedIntersection(left.changedPaths, right.changedPaths);
   if (shared.length === 0) return [];
-  const pair = [left.changeSetId, right.changeSetId].sort();
+  const pair = [overlapSubjectKey(left), overlapSubjectKey(right)].sort();
   const findings: OverlapFinding[] = [];
 
   // Deletions that touch paths the other side still changes are the highest
@@ -202,7 +219,7 @@ function pairFindings(left: OverlapSubject, right: OverlapSubject): OverlapFindi
  *  1. schema/migration-bearing ChangeSets first (they define the sequence
  *     everything else builds on),
  *  2. then subjects by ascending high-risk finding count,
- *  3. then by ChangeSet id for a deterministic order.
+ *  3. then by qualified ChangeSet reference for a deterministic order.
  */
 function suggestedOrder(
   subjects: readonly OverlapSubject[],
@@ -211,8 +228,8 @@ function suggestedOrder(
   const highRiskCount = new Map<string, number>();
   for (const finding of findings) {
     if (finding.risk !== "high") continue;
-    for (const id of finding.changeSetIds) {
-      highRiskCount.set(id, (highRiskCount.get(id) ?? 0) + 1);
+    for (const ref of finding.changeSetIds) {
+      highRiskCount.set(ref, (highRiskCount.get(ref) ?? 0) + 1);
     }
   }
   return [...subjects]
@@ -220,12 +237,12 @@ function suggestedOrder(
       const leftSchema = carriesSchemaOrMigration(left) ? 0 : 1;
       const rightSchema = carriesSchemaOrMigration(right) ? 0 : 1;
       if (leftSchema !== rightSchema) return leftSchema - rightSchema;
-      const leftRisk = highRiskCount.get(left.changeSetId) ?? 0;
-      const rightRisk = highRiskCount.get(right.changeSetId) ?? 0;
+      const leftRisk = highRiskCount.get(overlapSubjectKey(left)) ?? 0;
+      const rightRisk = highRiskCount.get(overlapSubjectKey(right)) ?? 0;
       if (leftRisk !== rightRisk) return leftRisk - rightRisk;
       return compareSubjects(left, right);
     })
-    .map((subject) => subject.changeSetId);
+    .map((subject) => overlapSubjectKey(subject));
 }
 
 const REVIEW_AREA_LABELS: Readonly<Record<OverlapFindingKind, string>> = {
@@ -268,7 +285,7 @@ function sortedIntersection(left: readonly string[], right: readonly string[]): 
 }
 
 function compareSubjects(left: OverlapSubject, right: OverlapSubject): number {
-  return left.changeSetId.localeCompare(right.changeSetId);
+  return overlapSubjectKey(left).localeCompare(overlapSubjectKey(right));
 }
 
 function compareFindings(left: OverlapFinding, right: OverlapFinding): number {
