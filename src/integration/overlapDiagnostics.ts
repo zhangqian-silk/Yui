@@ -109,17 +109,20 @@ function pairFindings(left: OverlapSubject, right: OverlapSubject): OverlapFindi
   const findings: OverlapFinding[] = [];
 
   // Deletions that touch paths the other side still changes are the highest
-  // risk: one side removes what the other side builds on.
+  // risk: one side removes what the other side builds on.  The trigger is the
+  // real deleted-path overlap itself; requiring both sides to carry the
+  // deletion tag would miss the ordinary delete-vs-modify case, where only
+  // the deleting side can record the deletion.
   const deletedVsOther = sortedIntersection(left.deletedPaths, right.changedPaths)
     .concat(sortedIntersection(right.deletedPaths, left.changedPaths));
   const deletedOverlap = [...new Set(deletedVsOther)].sort();
-  if (hasTag(left, "deletion") && hasTag(right, "deletion") && deletedOverlap.length > 0) {
+  if (deletedOverlap.length > 0) {
     findings.push({
       kind: "high-risk-deletion",
       risk: "high",
       changeSetIds: pair,
       paths: deletedOverlap,
-      detail: "Both ChangeSets delete paths the other still changes; reconcile deletion intent before integration."
+      detail: "One ChangeSet deletes paths the other still changes; reconcile deletion intent before integration."
     });
   }
 

@@ -159,7 +159,9 @@ test("same package metadata yields a medium package-version finding", () => {
   assert.equal(finding.risk, "medium");
 });
 
-test("deletions against paths the other side changes are high-risk", () => {
+test("a deletion against a path the other side modifies is high-risk", () => {
+  // The ordinary delete-vs-modify case: only the deleting side can record
+  // the deletion, so the finding must not require both sides to be tagged.
   const report = diagnoseOverlap([
     subject({
       changeSetId: "change-set-1",
@@ -170,7 +172,32 @@ test("deletions against paths the other side changes are high-risk", () => {
     subject({
       changeSetId: "change-set-2",
       changedPaths: ["src/old.ts", "src/new.ts"],
-      manifestTags: ["deletion"],
+      manifestTags: [],
+      deletedPaths: []
+    })
+  ]);
+  const finding = report.findings.find((item) => item.kind === "high-risk-deletion");
+  assert.ok(finding);
+  assert.equal(finding.risk, "high");
+  assert.deepEqual(finding.paths, ["src/old.ts"]);
+  assert.match(finding.detail, /One ChangeSet deletes/);
+  assert.ok(report.reviewAreas.some((area) => area.startsWith("high-risk deletion")));
+});
+
+test("the deletion finding triggers on recorded deleted paths, not on tags", () => {
+  // A manifest records real deletedPaths even when its tag list omits the
+  // derived deletion tag; the recorded data is the trigger.
+  const report = diagnoseOverlap([
+    subject({
+      changeSetId: "change-set-1",
+      changedPaths: ["src/old.ts"],
+      manifestTags: [],
+      deletedPaths: ["src/old.ts"]
+    }),
+    subject({
+      changeSetId: "change-set-2",
+      changedPaths: ["src/old.ts"],
+      manifestTags: [],
       deletedPaths: []
     })
   ]);
