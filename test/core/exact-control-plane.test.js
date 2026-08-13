@@ -452,7 +452,7 @@ test("managed Task invocation rejects bare, candidate, and mismatched runtime co
     "version"
   ], { encoding: "utf8", env: environment });
   assert.equal(exact.status, 0, exact.stderr);
-  assert.match(exact.stdout, /0\.5\.1/u);
+  assert.match(exact.stdout, /0\.5\.2/u);
   assert.equal(readFileSync(schemaPath, "utf8"), before);
   assert.equal(readFileSync(statePath, "utf8"), stateBefore);
 });
