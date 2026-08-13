@@ -33,6 +33,8 @@ const ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION = 2;
 const ACTIVE_RUN_POINTER_NAMESPACE_TO_VERSION = 3;
 const MANAGED_WORKSPACE_FROM_VERSION = 1;
 const MANAGED_WORKSPACE_TO_VERSION = 2;
+const CHANGE_SET_MANIFEST_FROM_VERSION = 2;
+const CHANGE_SET_MANIFEST_TO_VERSION = 3;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -97,7 +99,8 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       "activeRuns"
     ))
     .registerOfflineMigration(managedWorkspaceFamilyStep())
-    .registerOfflineMigration(activeRunPointerNamespaceStep());
+    .registerOfflineMigration(activeRunPointerNamespaceStep())
+    .registerOfflineMigration(changeSetManifestStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
@@ -458,6 +461,90 @@ function migrateActiveRunPointerNamespace(snapshot: HomeSnapshot): HomeSnapshot 
       }
     }
     nextTasks[taskId] = { ...task, activeRuns: nextActiveRuns };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * ChangeSet v3 adds the optional integration manifest (tags, deleted paths,
+ * target ref, evidence references).  The manifest is optional, so the
+ * transition only rewrites the record version; legacy records without a
+ * manifest remain valid and keep integrating.
+ */
+function changeSetManifestStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "changeSet",
+    fromVersion: CHANGE_SET_MANIFEST_FROM_VERSION,
+    toVersion: CHANGE_SET_MANIFEST_TO_VERSION,
+    preconditions: requireChangeSetManifestVersion,
+    transform: migrateChangeSetManifest,
+    declaredEffects: []
+  };
+}
+
+function requireChangeSetManifestVersion(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.changeSet !== CHANGE_SET_MANIFEST_FROM_VERSION) {
+    throw new Error(
+      `Record changeSet migration requires manifest version ${CHANGE_SET_MANIFEST_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.changeSets === undefined) continue;
+    const changeSets = asObject(task.changeSets, `changeSet map ${taskId}`);
+    for (const [changeSetId, rawRecord] of Object.entries(changeSets)) {
+      const record = asObject(rawRecord, `changeSet ${taskId}/${changeSetId}`);
+      if (record.schemaVersion !== CHANGE_SET_MANIFEST_FROM_VERSION) {
+        throw new Error(
+          `changeSet ${taskId}/${changeSetId} must use schemaVersion ${CHANGE_SET_MANIFEST_FROM_VERSION}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateChangeSetManifest(snapshot: HomeSnapshot): HomeSnapshot {
+  requireChangeSetManifestVersion(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      changeSet: CHANGE_SET_MANIFEST_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.changeSets === undefined) {
+      nextTasks[taskId] = { ...task };
+      continue;
+    }
+    const changeSets = asObject(task.changeSets, `changeSet map ${taskId}`);
+    const nextChangeSets: Record<string, unknown> = {};
+    for (const [changeSetId, rawRecord] of Object.entries(changeSets)) {
+      const record = asObject(rawRecord, `changeSet ${taskId}/${changeSetId}`);
+      nextChangeSets[changeSetId] = {
+        ...record,
+        schemaVersion: CHANGE_SET_MANIFEST_TO_VERSION
+      };
+    }
+    nextTasks[taskId] = { ...task, changeSets: nextChangeSets };
   }
   return {
     schemaManifest,

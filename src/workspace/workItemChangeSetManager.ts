@@ -4,6 +4,8 @@ import {
   createWorkItemChangeSet,
   type WorkItemChangeSet
 } from "../integration/changeSet.js";
+import { createChangeSetManifest } from "../integration/changeSetManifest.js";
+import { deriveManifestTags } from "../integration/manifestTags.js";
 import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
 import {
   sameTaskFinalReviewContract,
@@ -330,6 +332,16 @@ export class WorkItemChangeSetManager {
       result.headCommit
     );
     if (existing !== undefined) return existing;
+    const targetRef = captureTargetRef(this.store, context.taskId, entry.projectId);
+    const manifest = createChangeSetManifest({
+      tags: deriveManifestTags({
+        changedPaths: result.changedPaths,
+        deletedPaths: result.deletedPaths
+      }),
+      deletedPaths: result.deletedPaths,
+      ...(targetRef === undefined ? {} : { targetRef }),
+      evidenceRefs: this.#captureEvidenceRefs(context.taskId, result.headCommit)
+    });
     return this.store.transaction((tx) => {
       assertCaptureStillCurrent(tx, context);
       const concurrent = findWorkItemChangeSet(
@@ -361,7 +373,8 @@ export class WorkItemChangeSetManager {
         baseCommit: entry.baseCommit,
         headCommit: result.headCommit,
         branch: entry.branch,
-        changedPaths: result.changedPaths
+        changedPaths: result.changedPaths,
+        manifest
       }, nextCaptureTime(
         tx,
         context.taskId,
@@ -372,6 +385,12 @@ export class WorkItemChangeSetManager {
       tx.saveChangeSet(context.taskId, changeSet);
       return changeSet;
     });
+  }
+
+  #captureEvidenceRefs(taskId: string, headCommit: string): readonly string[] {
+    return this.store.listReviewRounds(taskId)
+      .filter(({ evidenceCommit }) => evidenceCommit === headCommit)
+      .map(({ id }) => `review-round:${id}`);
   }
 }
 
@@ -625,9 +644,8 @@ function latestWorkItemChangeSet(
   commits?: Readonly<{ baseCommit: string; headCommit: string }>
 ): WorkItemChangeSet | undefined {
   return store.listChangeSets(taskId).filter(
-    (changeSet): changeSet is WorkItemChangeSet => (
-      changeSet.schemaVersion === 2
-      && changeSet.workItemId === workItemId
+    (changeSet) => (
+      changeSet.workItemId === workItemId
       && changeSet.projectId === projectId
       && (commits === undefined
         || (changeSet.baseCommit === commits.baseCommit
@@ -648,6 +666,24 @@ function findWorkItemChangeSet(
     baseCommit,
     headCommit
   });
+}
+
+/**
+ * The intended integration target for a captured Project change: the Task
+ * main worktree branch for that Project, matching the Integration default.
+ * Returns undefined when the Task main worktree is not ready yet.
+ */
+function captureTargetRef(
+  store: TaskStore,
+  taskId: string,
+  projectId: string
+): string | undefined {
+  const mainWorkspace = store.getTaskWorkspace(taskId);
+  if (mainWorkspace === null) return undefined;
+  const entry = mainWorkspace.entries.find(
+    (candidate) => candidate.projectId === projectId
+  );
+  return entry?.branch;
 }
 
 function compareNewestFirst(left: WorkItemChangeSet, right: WorkItemChangeSet): number {

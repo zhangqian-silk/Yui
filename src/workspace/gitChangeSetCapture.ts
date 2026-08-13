@@ -6,6 +6,7 @@ const executeFile = promisify(execFile);
 export type ManagedGitChange = Readonly<{
   headCommit: string;
   changedPaths: readonly string[];
+  deletedPaths: readonly string[];
 }>;
 
 export async function captureManagedGitChanges(input: Readonly<{
@@ -41,7 +42,13 @@ export async function captureManagedGitChanges(input: Readonly<{
     input.baseCommit,
     headCommit
   ])).split("\0").filter(Boolean);
-  return { headCommit, changedPaths };
+  const deletedPaths = (await git([
+    "-C", input.path,
+    "diff", "--name-only", "-z", "--diff-filter=D",
+    input.baseCommit,
+    headCommit
+  ])).split("\0").filter(Boolean);
+  return { headCommit, changedPaths, deletedPaths };
 }
 
 async function assertManagedHead(input: Readonly<{
