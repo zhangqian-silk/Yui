@@ -206,8 +206,15 @@ test("setup configures selected Agents plus Operator, Leader, and Worker setting
   assert.match(rendered, /Operator Agent configuration: codex/);
   assert.match(rendered, /Worker is the default Agent configuration copied into Task Roles/i);
   assert.match(rendered, /Choose Worker configuration/i);
+  assert.match(rendered, /1\s+Reuse Leader \(default\)\s+Copy the complete Leader Agent launch configuration/);
+  assert.match(rendered, /2\s+Configure separately\s+Choose the Worker Agent, model, effort, and permission\s+independently/);
   assert.match(rendered, /Select model/);
   assert.match(rendered, /Select reasoning effort/);
+  assert.match(rendered, /Choose model \[[^\n]+\]: \n\nSelect reasoning effort/);
+  assert.match(rendered, /Choose effort \[[^\n]+\]: \n\nSelect permission strategy/);
+  assert.doesNotMatch(rendered, /Configure Worker separately:/);
+  assert.doesNotMatch(rendered, /Choose Worker Agent/);
+  assert.match(rendered, /Choose Worker configuration \[1-2; default 1\]: \n\nProject workspace/);
   assert.match(result, /Leader model: gpt-5\.6-sol/);
   assert.match(result, /Leader reasoning effort: xhigh/);
   assert.match(result, /Leader permission: bypass/);
@@ -404,6 +411,9 @@ test("setup can configure Worker separately from Leader", async (t) => {
     chmodSync(join(bin, command), 0o755);
   }
   const input = new PassThrough();
+  const output = new PassThrough();
+  let rendered = "";
+  output.on("data", (chunk) => { rendered += chunk.toString(); });
   input.end([
     "all",
     "codex",
@@ -420,6 +430,7 @@ test("setup can configure Worker separately from Leader", async (t) => {
     "claude",
     "sonnet",
     "max",
+    "",
     workspace,
     "skip"
   ].join("\n") + "\n");
@@ -433,7 +444,7 @@ test("setup can configure Worker separately from Leader", async (t) => {
     run: () => "tmux 3.4"
   }, {
     input,
-    output: new PassThrough(),
+    output,
     forceInteractive: true
   });
 
@@ -447,6 +458,11 @@ test("setup can configure Worker separately from Leader", async (t) => {
   });
   assert.match(result, /Worker configuration: Configured separately/);
   assert.match(result, /Worker Agent: claude/);
+  assert.match(rendered, /Choose Worker configuration \[1-2; default 1\]: \n\nConfigure Worker separately:/);
+  assert.match(rendered, /Configure Worker separately:\nChoose Worker Agent \[codex\]: /);
+  assert.match(rendered, /Worker Agent configuration: claude/);
+  assert.match(rendered, /Worker Agent configuration: claude[\s\S]*Choose effort \[[^\n]+\]: \n\nSelect permission strategy/);
+  assert.match(rendered, /Choose permission strategy \[[^\n]+\]: \n\nProject workspace/);
 });
 
 test("setup independently persists configured Reviewer permission", async (t) => {
