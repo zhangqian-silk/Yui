@@ -7,7 +7,7 @@ different level is not higher confidence, it is duplication.
 | Level | Where | What it proves | Runs |
 | --- | --- | --- | --- |
 | **L1 — change-related targeted evidence** | local development | the changed behavior, under the smallest relevant check | on every change, sized to its risk |
-| **L2 — PR global gate** | `ci.yml` on the PR / master exact commit | the whole tree builds, lints, passes the full deterministic suite, and packages | once per exact commit, owned by CI |
+| **L2 — PR global gate** | `ci.yml` on the PR / master exact commit | the whole tree builds, lints, passes the full deterministic suite, and packages, in a hermetic environment | once per exact commit, owned by CI |
 | **L3 — release package smoke** | `publish.yml` on the tag | the exact published artifact is installable and runnable across supported Node versions | once per release, on the L2-passing commit |
 
 ## L1: risk-based local verification
@@ -32,12 +32,37 @@ Release E2E) stay opt-in and are never routine local verification.
 
 ## L2: the PR gate owns the full suite
 
-`ci.yml` runs exactly once on the exact PR commit: build, lint, the full
+`ci.yml` runs exactly once on the exact PR commit through the hermetic gate
+runner (`scripts/gate-hermetic.mjs`): install, build, lint, the full
 deterministic suite (Unit + Isolated Integration + Mock Agent Session, no real
 model), and package structure smoke including the `dist/cli.js` `0755`
-assertion. Agents and humans do not re-run that suite to "approve" a change —
-the gate is the completion evidence. A flaky failure is fixed at its source;
-CI must not depend on a human reading logs and clicking re-run.
+assertion. The runner is the L2 executable form — the same command gates a
+local checkout, a CI checkout, and any exact SHA:
+
+- **Hermetic environment.** Every run isolates `HOME`, the XDG config/cache/
+  data tree, the global git identity (`GIT_CONFIG_GLOBAL`), `TMPDIR`, and the
+  npm cache under a fresh root, and replaces `PATH` with the resolved
+  node/npm/git/tmux directories followed by the standard system directories.
+  The gate cannot silently depend on a developer's `~/.gitconfig`, a global
+  npm cache, or a machine-specific `PATH` (a missing `tsc` or a fixture
+  reading host config fails the gate instead of corrupting it).
+- **Per-SHA gate record.** Each run writes `gate-record.json`: the exact
+  commit SHA, the per-step pass/fail results with durations, and the
+  environment the steps ran in. CI uploads it as the `gate-record` artifact —
+  the durable, per-commit pass/fail evidence. A later PR or release consumes
+  the record for that exact SHA instead of re-running the gate; repeating the
+  same suite on the same SHA is not higher confidence.
+- **Failure baseline.** When the gate fails, re-run with `--base <sha>` (the
+  merge base). The runner gates the base in the same hermetic environment and
+  classifies every failing step as **introduced** (fails on the candidate,
+  passes on the base), **pre-existing** (fails on both), or **fixed** (passes
+  on the candidate, fails on the base). It exits non-zero only for introduced
+  failures, so a red base never blocks a change that did not cause the
+  failure, and a new failure is never blamed on history.
+
+Agents and humans do not re-run the suite to "approve" a change — the gate
+record is the completion evidence. A flaky failure is fixed at its source; CI
+must not depend on a human reading logs and clicking re-run.
 
 ## L3: release reuses the gated exact commit
 

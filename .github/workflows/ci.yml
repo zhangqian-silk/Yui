@@ -1,10 +1,14 @@
 name: Deterministic CI
 
 # The single PR/master deterministic gate (see docs/testing/verification-levels.md).
-# It runs once on the exact commit: build, lint, the full deterministic suite,
-# and package structure smoke. Local development uses risk-targeted checks
-# instead of repeating this suite; the release workflow reuses its result on
-# the exact tagged commit instead of running it again.
+# It runs once on the exact commit through the hermetic gate runner
+# (scripts/gate-hermetic.mjs): install, build, lint, the full deterministic
+# suite, and package structure smoke, inside an isolated HOME, XDG tree, git
+# identity, temp dir, and npm cache with a sanitized PATH. The runner persists
+# a per-SHA gate record (gate-record.json) uploaded as the `gate-record`
+# artifact: the per-commit pass/fail evidence. Local development uses
+# risk-targeted checks instead of repeating this suite; the release workflow
+# reuses its result on the exact tagged commit.
 
 on:
   pull_request:
@@ -28,24 +32,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
-          cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Hermetic deterministic gate
+        run: node scripts/gate-hermetic.mjs --record gate-record.json
 
-      - name: Build
-        run: npm run build
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Safe deterministic tests
-        run: npm test
-
-      - name: Package structure smoke
-        shell: bash
-        run: |
-          rm -rf .release-stage package-smoke.json
-          node scripts/assemble-runtime-package.mjs --output .release-stage
-          npm pack ./.release-stage --dry-run --ignore-scripts --json > package-smoke.json
-          node scripts/check-runtime-package-structure.mjs package-smoke.json
+      - name: Upload gate record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-record
+          path: gate-record.json
+          if-no-files-found: error
+          retention-days: 90

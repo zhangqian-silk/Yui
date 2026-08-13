@@ -17,6 +17,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdtempSync,
   readdirSync,
@@ -204,6 +205,64 @@ test("a local-ref import failure leaves the Project external and removes the clo
   assert.deepEqual(fixture.store.getProject("project-1"), external);
   assert.equal(existsSync(managedPath), false);
   assert.equal(git(fixture.checkout, ["rev-parse", "refs/heads/yui/task-2/main"]), fixture.commitA);
+});
+
+test("an external checkout disappearing during migration fails closed and stays retryable", async (t) => {
+  const fixture = migrateFixture(t);
+  const external = await registerExternalProject(fixture);
+  const before = structuredClone(external);
+  const managedPath = managedProjectPath(fixture.home, "project-1");
+
+  // Snapshot the external checkout so the retry can restore it exactly.
+  const snapshot = join(fixture.root, "checkout-snapshot");
+  cpSync(fixture.checkout, snapshot, { recursive: true, preserveTimestamps: true });
+
+  // The migrate command reads the external checkout only when it preserves the
+  // local Yui refs (copyRefs). Remove the checkout at exactly that seam: the
+  // command must fail closed with a bounded diagnosis and drop the
+  // half-prepared managed clone.
+  const real = new NodeGitWorkspace();
+  const disappearing = new Proxy(real, {
+    get(target, property) {
+      if (property === "copyRefs") {
+        return async (input) => {
+          rmSync(input.sourceRepositoryPath, { recursive: true, force: true });
+          return target.copyRefs(input);
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  await assert.rejects(
+    runProjectCommand(["migrate", "project-1"], fixture.store, {
+      now: () => new Date(NOW),
+      git: disappearing
+    }),
+    (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.ok(message.length > 0, "a disappearing checkout must surface a bounded diagnosis");
+      assert.match(message, /no such file|does not exist|ENOENT|not a git repository/i);
+      return true;
+    }
+  );
+
+  // No half-migrated state: the catalog still points at the external checkout
+  // and the half-prepared managed clone was removed.
+  assert.deepEqual(fixture.store.getProject("project-1"), before);
+  assert.equal(existsSync(managedPath), false, "the half-prepared managed clone was removed");
+
+  // Retryable: restore the external checkout exactly and migrate again.
+  cpSync(snapshot, fixture.checkout, { recursive: true, preserveTimestamps: true });
+  const result = await runProjectCommand(
+    ["migrate", "project-1"],
+    fixture.store,
+    { now: () => new Date(NOW) }
+  );
+  assert.equal(result.data.preflight, false);
+  assert.equal(fixture.store.getProject("project-1").ownership, "managed");
+  assert.equal(git(result.data.path, ["rev-parse", "HEAD"]), fixture.commitA);
 });
 
 test("project migrate --preflight is read-only", async (t) => {
