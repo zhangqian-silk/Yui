@@ -42,6 +42,13 @@ export type IntegrationQueueEntry = Readonly<{
    * set plus reusable evidence lets the entry skip re-verification.
    */
   affectedPaths?: readonly string[];
+  /**
+   * The exact target head the entry's reusable evidence was validated against.
+   * A `validated` entry only skips its checks while the target still equals
+   * this boundary; an out-of-band advance invalidates the evidence and the
+   * entry runs its checks again.
+   */
+  evidenceTargetHead?: string;
   /** Durable verification evidence for the entry's exact head commit. */
   evidenceRefs: readonly string[];
   supersedeReason?: string;
@@ -181,11 +188,14 @@ export function markIntegrationQueueCommitted(
 
 /**
  * A target advance proved this entry's ChangeSet unaffected, and it carries
- * reusable exact-SHA evidence: its checks need not be re-executed.
+ * reusable exact-SHA evidence: its checks need not be re-executed.  The
+ * `evidenceTargetHead` records the exact target head the evidence was
+ * validated against, so a later out-of-band advance can be fenced.
  */
 export function markIntegrationQueueValidated(
   entry: IntegrationQueueEntry,
-  now: Date
+  now: Date,
+  evidenceTargetHead?: string
 ): IntegrationQueueEntry {
   validateIntegrationQueueEntry(entry);
   if (entry.status !== "queued") {
@@ -197,6 +207,7 @@ export function markIntegrationQueueValidated(
   return validateIntegrationQueueEntry({
     ...entry,
     status: "validated",
+    ...(evidenceTargetHead === undefined ? {} : { evidenceTargetHead }),
     updatedAt: now.toISOString()
   });
 }
@@ -291,6 +302,9 @@ export function validateIntegrationQueueEntry(
   }
   if (entry.targetBefore !== undefined) requireCommit(entry.targetBefore, "Integration queue targetBefore");
   if (entry.targetAfter !== undefined) requireCommit(entry.targetAfter, "Integration queue targetAfter");
+  if (entry.evidenceTargetHead !== undefined) {
+    requireCommit(entry.evidenceTargetHead, "Integration queue evidenceTargetHead");
+  }
   if (entry.integrationAttemptId !== undefined) {
     normalizedUniqueIdentities([entry.integrationAttemptId], "Integration attempt id");
   }

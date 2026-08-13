@@ -611,6 +611,142 @@ test("queue entries round-trip through the store and reject an updatedAt move ba
   );
 });
 
+// --- task-16 review regressions --------------------------------------------
+
+test("an out-of-band target advance invalidates reusable evidence and re-runs the gate", async () => {
+  const fixture = await createFixture();
+  // The trigger lands first so the target item is validated by evidence.
+  const trigger = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "other.txt": "other\n" }
+  });
+  // The target item carries evidence and a gate that reads a file it does not
+  // touch: the gate fails once config.txt says THREE.
+  const target = await branchChangeSet(fixture, {
+    id: "change-set-2",
+    paths: { "app.js": "app\n" },
+    manifest: EVIDENCE
+  });
+  await enqueue(fixture, trigger, { checkCommands: ["true"] });
+  await enqueue(fixture, target, { checkCommands: ["! grep -q THREE config.txt"] });
+  // First run: the trigger commits and the target is validated against the
+  // exact target head the trigger produced, without running its gate.
+  const first = await processQueue(fixture, { limit: 1 });
+  assert.equal(first.length, 1);
+  assert.equal(first[0].entry.status, "committed");
+  const validated = fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-2");
+  assert.equal(validated.status, "validated");
+  assert.equal(validated.evidenceTargetHead, first[0].entry.targetAfter);
+  // Another Task advances the shared target out of band, writing THREE to the
+  // file the target item's gate reads.
+  writeFileSync(join(fixture.repositoryPath, "config.txt"), "THREE\n");
+  git(["-C", fixture.repositoryPath, "add", "config.txt"]);
+  git(["-C", fixture.repositoryPath, "commit", "-m", "out-of-band config change"]);
+  // Second run: the evidence no longer covers the target, so the item is
+  // requeued and its gate runs (and fails) instead of committing unchecked.
+  const second = await processQueue(fixture);
+  assert.equal(second.length, 1);
+  assert.equal(second[0].entry.status, "conflicted");
+  assert.match(second[0].entry.conflictSummary, /gate failed/);
+  assert.equal(second[0].attempt.checks.length, 1);
+  assert.equal(second[0].attempt.checks[0].outcome, "failed");
+  // The failed change never reached the target.
+  assert.equal(existsSync(join(fixture.repositoryPath, "app.js")), false);
+});
+
+test("concurrent enqueues of the same ChangeSet create a single entry across store instances", async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  const otherStore = new FileTaskStore(fixture.home);
+  const shared = {
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    changeSetId: changeSet.id,
+    targetRef: "master",
+    now: () => now
+  };
+  const [first, second] = await Promise.all([
+    enqueueIntegrationQueueEntry({ store: fixture.store, ...shared }),
+    enqueueIntegrationQueueEntry({ store: otherStore, ...shared })
+  ]);
+  const outcomes = [first.outcome, second.outcome].sort();
+  assert.deepEqual(outcomes, ["already-queued", "queued"]);
+  assert.equal(first.entry.id, second.entry.id);
+  assert.equal(fixture.store.listIntegrationQueueEntries(fixture.task.id).length, 1);
+});
+
+test("concurrent process calls claim a waiting entry exactly once across store instances", async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  await enqueue(fixture, changeSet, { checkCommands: ["true"] });
+  const otherStore = new FileTaskStore(fixture.home);
+  const [first, second] = await Promise.all([
+    processQueue(fixture),
+    processIntegrationQueue(otherStore, fixture.home, fixture.task.id, { now: () => now })
+  ]);
+  const processed = [...first, ...second];
+  assert.equal(processed.length, 1);
+  assert.equal(processed[0].entry.status, "committed");
+  const attempts = fixture.store.listIntegrationAttempts(fixture.task.id);
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0].status, "committed");
+  const entry = fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-1");
+  assert.equal(entry.status, "committed");
+});
+
+test("process and list honor numeric id order past ten entries", async () => {
+  const fixture = await createFixture();
+  for (let index = 1; index <= 11; index += 1) {
+    const changeSet = await branchChangeSet(fixture, {
+      id: `change-set-${index}`,
+      paths: { [`file-${index}.txt`]: `${index}\n` }
+    });
+    await enqueue(fixture, changeSet, { checkCommands: ["true"] });
+  }
+  const listed = await runTaskIntegrationQueueCommand(
+    ["list", fixture.task.id],
+    fixture.store,
+    fixture.home,
+    {}
+  );
+  assert.deepEqual(
+    listed.data.entries.map(({ id }) => id),
+    Array.from({ length: 11 }, (_, index) => `integration-queue-${index + 1}`)
+  );
+  const processed = await processQueue(fixture);
+  assert.equal(processed.length, 11);
+  assert.deepEqual(
+    processed.map(({ entry }) => entry.id),
+    Array.from({ length: 11 }, (_, index) => `integration-queue-${index + 1}`)
+  );
+});
+
+test("a dirty checked-out target fails before the check commands run", async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  const marker = join(fixture.root, "check-ran-marker");
+  await enqueue(fixture, changeSet, { checkCommands: [`printf ran > ${marker}`] });
+  // Another Task leaves the checked-out target worktree dirty.
+  writeFileSync(join(fixture.repositoryPath, "dirty.txt"), "dirty\n");
+  const processed = await processQueue(fixture);
+  assert.equal(processed.length, 1);
+  assert.equal(processed[0].entry.status, "conflicted");
+  assert.match(processed[0].entry.conflictSummary, /not clean/);
+  // The check command never ran: no marker file, and the only recorded check
+  // is the static preflight failure rather than the command itself.
+  assert.equal(existsSync(marker), false);
+  assert.deepEqual(processed[0].attempt.checks.map(({ name }) => name), ["integration"]);
+});
+
 // --- CLI --------------------------------------------------------------------
 
 test("the queue CLI enqueues, lists, shows and processes as the Task Leader", async () => {

@@ -47,6 +47,11 @@ export type IntegrationQueueGitPort = GitWorkspacePort & {
     rightCommit: string;
     paths: readonly string[];
   }>) => Promise<boolean>;
+  changedFilesBetween?: (input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>) => Promise<readonly string[]>;
 };
 
 export type EnqueueIntegrationQueueOutcome =
@@ -95,10 +100,13 @@ export async function enqueueIntegrationQueueEntry(
   if (!task.projectBindings.some(({ projectId }) => projectId === input.projectId)) {
     throw new Error(`Project does not belong to Task: ${input.projectId}.`);
   }
-  const existing = input.store.listIntegrationQueueEntries(task.id)
-    .find((entry) => entry.projectId === input.projectId
-      && entry.changeSetId === input.changeSetId);
-  if (existing !== undefined && existing.status !== "superseded") {
+  // Fast path: a duplicate already visible returns without any git inspection.
+  // The authoritative re-check happens inside the write transaction so two
+  // concurrent enqueues cannot both create entries for the same ChangeSet.
+  const existing = findActiveQueueDuplicate(
+    input.store, task.id, input.projectId, input.changeSetId
+  );
+  if (existing !== undefined) {
     return {
       entry: existing,
       outcome: existing.status === "committed" ? "already-committed" : "already-queued"
@@ -126,6 +134,15 @@ export async function enqueueIntegrationQueueEntry(
     equivalent = await findContainedChangeSet(git, project.path, changeSet, targetHead);
   }
   return input.store.transaction((tx) => {
+    const duplicate = findActiveQueueDuplicate(
+      tx, task.id, input.projectId, input.changeSetId
+    );
+    if (duplicate !== undefined) {
+      return {
+        entry: duplicate,
+        outcome: duplicate.status === "committed" ? "already-committed" : "already-queued"
+      };
+    }
     const id = tx.nextIntegrationQueueEntryId(task.id);
     const entry = equivalent === null
       ? createIntegrationQueueEntry({
@@ -151,6 +168,18 @@ export async function enqueueIntegrationQueueEntry(
     tx.saveIntegrationQueueEntry(task.id, entry);
     return { entry, outcome: equivalent === null ? "queued" : "converged" as const };
   });
+}
+
+function findActiveQueueDuplicate(
+  store: TaskStore,
+  taskId: string,
+  projectId: string,
+  changeSetId: string
+): IntegrationQueueEntry | undefined {
+  return store.listIntegrationQueueEntries(taskId)
+    .find((entry) => entry.projectId === projectId
+      && entry.changeSetId === changeSetId
+      && entry.status !== "superseded");
 }
 
 export type ProcessIntegrationQueueOptions = Readonly<{
@@ -190,39 +219,64 @@ export async function processIntegrationQueue(
   for (;;) {
     if (options.limit !== undefined && processed.length >= options.limit) break;
     reconcileCommittedEntries(store, task.id, now);
-    const next = store.listIntegrationQueueEntries(task.id)
+    // The store already returns entries in numeric id order; trust it instead
+    // of re-sorting with a lexicographic compare (which yields 1, 10, 2, ...).
+    const candidate = store.listIntegrationQueueEntries(task.id)
       .filter((entry) =>
         (options.projectId === undefined || entry.projectId === options.projectId)
-        && (entry.status === "queued" || entry.status === "validated"))
-      .sort((left, right) => left.id.localeCompare(right.id))[0];
-    if (next === undefined) break;
-    const project = store.getProject(next.projectId);
-    if (project === null) throw new Error(`Project not found: ${next.projectId}.`);
-    const skipChecks = next.status === "validated";
-    const targetBefore = (await git.inspect(project.path, next.targetRef)).baseCommit;
-    const prepared = store.transaction((tx) => {
+        && (entry.status === "queued" || entry.status === "validated"))[0];
+    if (candidate === undefined) break;
+    const project = store.getProject(candidate.projectId);
+    if (project === null) throw new Error(`Project not found: ${candidate.projectId}.`);
+    const targetBefore = (await git.inspect(project.path, candidate.targetRef)).baseCommit;
+    // Evidence fence: a validated entry's reusable evidence only covers the
+    // exact target head it was validated against.  An out-of-band target
+    // advance (another Task) that touches the entry's paths, or whose impact
+    // cannot be proven, invalidates the evidence: requeue and run its checks.
+    if (candidate.status === "validated"
+      && await evidenceTargetAdvanced(
+        git, project.path, candidate, targetBefore, store, task.id
+      )) {
+      store.transaction((tx) => {
+        const current = tx.getIntegrationQueueEntry(task.id, candidate.id);
+        if (current !== null && current.status === "validated") {
+          tx.saveIntegrationQueueEntry(task.id, markIntegrationQueueRequeued(current, now()));
+        }
+      });
+      continue;
+    }
+    // CAS claim: re-read the entry inside the write transaction.  Another
+    // store instance may have taken it since selection; if the status changed,
+    // do not create an Attempt and re-select instead.
+    const claimed = store.transaction((tx) => {
+      const current = tx.getIntegrationQueueEntry(task.id, candidate.id);
+      if (current === null
+        || (current.status !== "queued" && current.status !== "validated")) {
+        return { skipped: true as const };
+      }
       const attempt = createIntegrationAttempt({
         id: tx.nextIntegrationAttemptId(task.id),
         taskId: task.id,
-        projectId: next.projectId,
-        targetRef: next.targetRef,
+        projectId: current.projectId,
+        targetRef: current.targetRef,
         expectedHead: targetBefore,
-        changeSetIds: [next.changeSetId],
-        checkCommands: skipChecks ? [] : next.checkCommands
+        changeSetIds: [current.changeSetId],
+        checkCommands: current.status === "validated" ? [] : current.checkCommands
       }, now());
       tx.saveIntegrationAttempt(task.id, attempt);
       const entry = recordIntegrationQueueAttempt(
-        markIntegrationQueueRunning(next, targetBefore, now()),
+        markIntegrationQueueRunning(current, targetBefore, now()),
         attempt.id,
         now()
       );
       tx.saveIntegrationQueueEntry(task.id, entry);
-      return { entry, attempt };
+      return { skipped: false as const, entry, attempt };
     });
+    if (claimed.skipped) continue;
     const result = await new GitIntegrationService(home, store, git, now, options.environment)
-      .integrate(task.id, prepared.attempt.id);
+      .integrate(task.id, claimed.attempt.id);
     const settled = store.transaction((tx) => {
-      let entry = prepared.entry;
+      let entry = claimed.entry;
       if (result.status === "committed") {
         entry = markIntegrationQueueCommitted(entry, committedTargetAfter(result.attempt), now());
       } else if (result.status === "blocked") {
@@ -244,6 +298,51 @@ export async function processIntegrationQueue(
     processed.push({ entry: settled, attempt: result.attempt, result });
   }
   return processed;
+}
+
+/**
+ * Whether a validated entry's reusable evidence no longer covers the current
+ * target.  The evidence only proves the gate as of `entry.evidenceTargetHead`;
+ * an out-of-band target advance (another Task) on the entry's own paths, or any
+ * advance whose impact on the entry's gate cannot be proven, invalidates it.
+ * Returns false (evidence still covers the target) only when proven unaffected.
+ */
+async function evidenceTargetAdvanced(
+  git: IntegrationQueueGitPort,
+  repositoryPath: string,
+  entry: IntegrationQueueEntry,
+  currentTargetHead: string,
+  store: TaskStore,
+  taskId: string
+): Promise<boolean> {
+  const boundary = entry.evidenceTargetHead;
+  if (boundary === undefined) return true;
+  if (boundary === currentTargetHead) return false;
+  // The target advanced out of band since the evidence boundary.  Compute the
+  // real path delta and re-run the gate unless the entry is provably unaffected.
+  if (git.changedFilesBetween === undefined) return true;
+  let delta: readonly string[];
+  try {
+    delta = await git.changedFilesBetween({
+      repositoryPath,
+      fromCommit: boundary,
+      toCommit: currentTargetHead
+    });
+  } catch {
+    return true;
+  }
+  const changeSet = store.getChangeSet(taskId, entry.changeSetId);
+  if (changeSet === null) return true;
+  const ownPaths = new Set([
+    ...changeSet.changedPaths,
+    ...(changeSet.manifest?.deletedPaths ?? [])
+  ]);
+  if (delta.some((path) => ownPaths.has(path))) return true;
+  // The delta does not touch the entry's own paths, but the entry's gate may
+  // read any file: a non-empty delta means non-impact cannot be proven, so the
+  // checks must run again.  An empty delta (identical trees) cannot affect a
+  // gate, and an entry without checks has nothing to re-run.
+  return delta.length > 0 && entry.checkCommands.length > 0;
 }
 
 /** A conflicted entry whose manual-resolution Attempt committed converges. */
@@ -345,7 +444,9 @@ function recomputeAffectedPaths(
       && (updated.affectedPaths?.length ?? 0) === 0
       && updated.evidenceRefs.length > 0
     ) {
-      updated = markIntegrationQueueValidated(updated, now());
+      // The evidence is validated against the exact target head this commit
+      // just produced; a later out-of-band advance is fenced at process time.
+      updated = markIntegrationQueueValidated(updated, now(), committed.targetAfter);
     }
     if (updated.status !== entry.status
       || (updated.affectedPaths?.length ?? 0) !== beforeAffected) {

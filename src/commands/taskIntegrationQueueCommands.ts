@@ -87,9 +87,10 @@ function list(
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const task = requireActiveTask(store, parsed.positionals[0]);
   const projectId = parsed.one.get("--project");
+  // The store already returns entries in numeric id order; trust it instead of
+  // re-sorting with a lexicographic compare (which yields 1, 10, 2, ...).
   const entries = store.listIntegrationQueueEntries(task.id)
-    .filter((entry) => projectId === undefined || entry.projectId === projectId)
-    .sort((left, right) => left.id.localeCompare(right.id));
+    .filter((entry) => projectId === undefined || entry.projectId === projectId);
   const output = entries.length === 0
     ? "Integration queue is empty.\n"
     : `${renderTable(

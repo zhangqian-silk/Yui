@@ -237,6 +237,25 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   }
 
   /**
+   * Every path changed between two commits.  The integration queue uses this
+   * to fence a validated entry: a target advance whose real path delta
+   * overlaps the entry's own paths (or whose impact cannot be proven)
+   * invalidates the entry's reusable evidence.
+   */
+  async changedFilesBetween(input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>): Promise<string[]> {
+    const output = await git([
+      "-C", input.repositoryPath,
+      "diff", "--name-only",
+      input.fromCommit, input.toCommit
+    ]);
+    return output.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  }
+
+  /**
    * Resolve the configured Project branch directly from its remote.  This is
    * deliberately read-only: unlike `refresh`, it never advances the stable
    * Project checkout or changes its refs.

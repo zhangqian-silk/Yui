@@ -69,7 +69,8 @@ import {
 } from "../integration/integrationAttempt.js";
 import {
   validateIntegrationQueueEntry,
-  type IntegrationQueueEntry
+  type IntegrationQueueEntry,
+  type IntegrationQueueStatus
 } from "../integration/integrationQueueEntry.js";
 import {
   validateGlobalRole,
@@ -836,11 +837,15 @@ export class FileTaskStore implements TaskStore {
       );
     }
     const existing = aggregate.integrationQueue[stored.id];
-    if (existing !== undefined
-      && Date.parse(stored.updatedAt) < Date.parse(existing.updatedAt)) {
-      throw new StorageRecordError(
-        `Integration queue entry updatedAt cannot move backwards: ${stored.id}.`
-      );
+    if (existing !== undefined) {
+      if (Date.parse(stored.updatedAt) < Date.parse(existing.updatedAt)) {
+        throw new StorageRecordError(
+          `Integration queue entry updatedAt cannot move backwards: ${stored.id}.`
+        );
+      }
+      if (!validIntegrationQueueTransition(existing, stored)) {
+        throw new StorageRecordError(`Integration queue entry transition is invalid: ${stored.id}.`);
+      }
     }
     this.#mutate((state) => {
       const task = state.tasks[taskId];
@@ -2982,6 +2987,37 @@ function validIntegrationTransition(
     validating: ["validating", "committed", "failed"],
     committed: ["committed"],
     failed: ["failed"]
+  };
+  return allowed[before.status].includes(after.status);
+}
+
+/**
+ * Storage-level defence in depth for the integration queue state machine: the
+ * identity fields and the check/evidence lists are immutable once written, and
+ * a status may only move along the queue's legal transitions.  The service
+ * owns the CAS claim; this rejects a stale or forged write that slipped past it.
+ */
+function validIntegrationQueueTransition(
+  before: IntegrationQueueEntry,
+  after: IntegrationQueueEntry
+): boolean {
+  if (
+    before.id !== after.id
+    || before.taskId !== after.taskId
+    || before.projectId !== after.projectId
+    || before.changeSetId !== after.changeSetId
+    || before.targetRef !== after.targetRef
+    || !isDeepStrictEqual(before.checkCommands, after.checkCommands)
+    || !isDeepStrictEqual(before.evidenceRefs, after.evidenceRefs)
+    || before.createdAt !== after.createdAt
+  ) return false;
+  const allowed: Readonly<Record<IntegrationQueueStatus, readonly IntegrationQueueStatus[]>> = {
+    queued: ["queued", "running", "validated", "superseded"],
+    running: ["running", "conflicted", "committed"],
+    conflicted: ["conflicted", "running", "committed", "queued", "superseded"],
+    validated: ["validated", "running", "queued", "superseded"],
+    committed: ["committed"],
+    superseded: ["superseded"]
   };
   return allowed[before.status].includes(after.status);
 }

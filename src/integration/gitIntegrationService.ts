@@ -214,6 +214,11 @@ export class GitIntegrationService {
         return conflict;
       }
 
+      // Static preflight: fail before any expensive check when the target
+      // moved or its worktree is dirty, so the check commands never run on a
+      // target that cannot be advanced.  advanceTargetRef re-verifies both
+      // after the checks, so a move during the gate is still fenced at CAS.
+      await assertTargetReadyForChecks(project.path, current.targetRef, current.expectedHead);
       const checkResults = await this.#runChecks(current, managedWorkspace, prepared.path);
       if (checkResults.some((check) => check.outcome === "failed")) {
         current = updateIntegrationAttempt(current, {
@@ -810,6 +815,36 @@ async function resolveRef(repositoryPath: string, ref: string): Promise<string> 
     "-C", repositoryPath, "rev-parse", "--verify", "--end-of-options",
     `${fullTargetRef(ref)}^{commit}`
   ]);
+}
+
+/**
+ * Static preflight before the (potentially expensive) checks: the target ref
+ * must still equal the expected head and a checked-out target worktree must be
+ * clean.  A failure here means the check commands must not run.  The post-check
+ * {@link advanceTargetRef} re-verifies both before the CAS, so a target that
+ * moves during the gate is still fenced.
+ */
+async function assertTargetReadyForChecks(
+  repositoryPath: string,
+  targetRef: string,
+  expectedHead: string
+): Promise<void> {
+  const current = await resolveRef(repositoryPath, targetRef);
+  if (current !== expectedHead) {
+    throw new Error(`Target moved to ${current}; expected ${expectedHead}.`);
+  }
+  const checkedOutPaths = await checkedOutWorktreePaths(repositoryPath, fullTargetRef(targetRef));
+  if (checkedOutPaths.length > 1) {
+    throw new Error(`Integration target is checked out in multiple worktrees: ${targetRef}.`);
+  }
+  if (checkedOutPaths.length === 1) {
+    const status = await git([
+      "-C", checkedOutPaths[0], "status", "--porcelain=v1", "--untracked-files=all"
+    ]);
+    if (status.trim().length > 0) {
+      throw new Error(`Integration target worktree is not clean: ${checkedOutPaths[0]}.`);
+    }
+  }
 }
 
 async function advanceTargetRef(
