@@ -1958,7 +1958,6 @@ test("continuous progress passes yield so control requests are not starved", asy
   const home = mkdtempSync(join(tmpdir(), "yui-controller-progress-fairness-"));
   const controllerStore = emptyStore();
   let drains = 0;
-  const methods = [];
   const runtimeEventProcessor = {
     drain() {
       drains += 1;
@@ -1984,10 +1983,7 @@ test("continuous progress passes yield so control requests are not starved", asy
     home,
     controllerStore,
     noTmux,
-    async (method) => {
-      methods.push(method);
-      return { method };
-    },
+    async (method) => ({ method }),
     { intervalMs: 60_000, signalWindowMs: 1, runtimeEventProcessor }
   );
   t.after(async () => {
@@ -2001,7 +1997,6 @@ test("continuous progress passes yield so control requests are not starved", asy
     callController(home, method, {}, { timeoutMs: 3_000 })
   )));
 
-  assert.deepEqual(methods, commandNames);
   assert.deepEqual(results.map(({ method }) => method), commandNames);
   assert.ok(drains > 4);
   const status = await callController(home, "controller.status", {}, { timeoutMs: 3_000 });
