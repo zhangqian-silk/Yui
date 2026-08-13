@@ -38,6 +38,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
+  effectiveLaunchSnapshotsCompatibleForTaskMain,
   effectiveLaunchSnapshotsCompatible,
   effectiveRoleForLaunch,
   resolveEffectiveLaunch,
@@ -271,7 +272,13 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const effective = input.effective ?? resolvedEffective;
     const existing = sessionSet?.sessions[effective.agentId];
     const compatibleExisting = existing !== undefined
-      && effectiveLaunchSnapshotsCompatible(existing.effective, effective);
+      && (input.mode === "resume"
+        ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+            existing.effective,
+            effective,
+            runWorkspace ?? workspace
+          )
+        : effectiveLaunchSnapshotsCompatible(existing.effective, effective));
     if (input.mode === "resume" && !compatibleExisting) {
       throw new Error(
         `Task Role resume effective snapshot drifted: ${task.id}/${role.name}.`

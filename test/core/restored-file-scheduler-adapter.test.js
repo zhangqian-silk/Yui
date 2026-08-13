@@ -1098,6 +1098,71 @@ test("desired drift does not block a wake delivered to the still-live Leader Ses
   assert.ok(store.getRole(task.id, role.name).launchRevision > immutable.sourceDesiredRevision);
 });
 
+test("an advanced Task main workspace resumes the fixed Leader Session with fresh Run evidence", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-before-main-advance"
+  }, now);
+  adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-before-main-advance",
+    turnId: "turn-before-main-advance",
+    summary: "idle before Task main advanced"
+  }, now);
+  const immutableSessionEffective = structuredClone(
+    adapter.getRoleSession(task.id, role.name).effective
+  );
+  const advancedAt = new Date(now.getTime() + 1);
+  const previousWorkspace = store.getTaskWorkspace(task.id);
+  const advancedCommit = "1".repeat(40);
+  store.saveManagedWorkspace({
+    ...previousWorkspace,
+    entries: previousWorkspace.entries.map((entry) => ({
+      ...entry,
+      baseCommit: advancedCommit
+    })),
+    updatedAt: advancedAt.toISOString()
+  });
+
+  let preparedInput;
+  const [result] = await processLeaderWakeups(adapter, {
+    async prepareRoleSession(input) {
+      preparedInput = input;
+      return { ...input, deliveryId: "wake-after-main-advance", sessionStarted: false };
+    },
+    async waitUntilReady(prepared) {
+      return {
+        prepared,
+        session: {
+          ...adapter.getRoleSession(task.id, role.name),
+          status: "running",
+          effective: prepared.effective
+        }
+      };
+    },
+    async sendOnce() { return "sent"; }
+  }, advancedAt);
+
+  assert.equal(result.status, "dispatched");
+  assert.equal(preparedInput.mode, "resume");
+  assert.equal(preparedInput.nativeSessionId, "thread-before-main-advance");
+  assert.equal(preparedInput.effective.workspace.entries[0].baseCommit, advancedCommit);
+  const active = store.getActiveAgentRun(task.id, role.name);
+  assert.equal(active.workspace.entries[0].baseCommit, advancedCommit);
+  assert.equal(active.effective.workspace.entries[0].baseCommit, advancedCommit);
+  assert.deepEqual(
+    adapter.getRoleSession(task.id, role.name).effective,
+    immutableSessionEffective
+  );
+});
+
 test("Leader preparation owns its durable Run before awaiting tmux", async (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   let announcePreparation;

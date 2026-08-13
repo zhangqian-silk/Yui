@@ -11,6 +11,7 @@ import type {
   ManagedWorkspace,
   WorkspaceProjectEntry
 } from "../worktree/managedWorkspace.js";
+import { validateManagedWorkspace } from "../worktree/managedWorkspace.js";
 import {
   resolveAgentAdapter,
   type AdvancedAgentConfig,
@@ -168,6 +169,70 @@ export function effectiveLaunchSnapshotsCompatible(
     withoutDesiredRevision(existing),
     withoutDesiredRevision(desired)
   );
+}
+
+/**
+ * A Task-owned main workspace is a mutable checkout: Integration advances its
+ * durable Git heads while an idle native Session keeps the immutable launch
+ * configuration with which it started. A later Run may resume that exact
+ * Session only when the current durable Task workspace proves that every
+ * non-commit workspace identity and every other launch field is unchanged.
+ * WorkItem, ReviewRound and ExecutionLane workspaces remain strict.
+ */
+export function effectiveLaunchSnapshotsCompatibleForTaskMain(
+  existing: EffectiveLaunchSnapshot,
+  desired: EffectiveLaunchSnapshot,
+  workspace: ManagedWorkspace | null | undefined
+): boolean {
+  if (effectiveLaunchSnapshotsCompatible(existing, desired)) return true;
+  validateEffectiveLaunchSnapshot(existing);
+  validateEffectiveLaunchSnapshot(desired);
+  if (workspace === null || workspace === undefined) return false;
+  validateManagedWorkspace(workspace);
+  if (workspace.owner.type !== "task") return false;
+  const durableWorkspace: EffectiveLaunchWorkspace = {
+    root: workspace.root,
+    entries: workspace.entries.map((entry) => ({ ...entry }))
+  };
+  if (!isDeepStrictEqual(desired.workspace, durableWorkspace)) return false;
+  return isDeepStrictEqual(
+    taskMainCompatibleSnapshot(existing),
+    taskMainCompatibleSnapshot(desired)
+  );
+}
+
+/** Preserves a fixed Session's launch configuration while freezing fresh Task-main Git facts. */
+export function effectiveLaunchWithTaskMainWorkspace(
+  existing: EffectiveLaunchSnapshot,
+  workspace: ManagedWorkspace
+): EffectiveLaunchSnapshot {
+  validateEffectiveLaunchSnapshot(existing);
+  validateManagedWorkspace(workspace);
+  if (workspace.owner.type !== "task") {
+    throw new Error("Only a Task-owned main workspace may refresh fixed Session Run evidence.");
+  }
+  return validateEffectiveLaunchSnapshot({
+    ...existing,
+    workspace: {
+      root: workspace.root,
+      entries: workspace.entries.map((entry) => ({ ...entry }))
+    }
+  });
+}
+
+function taskMainCompatibleSnapshot(snapshot: EffectiveLaunchSnapshot): unknown {
+  const {
+    sourceDesiredRevision: _sourceDesiredRevision,
+    workspace,
+    ...launch
+  } = snapshot;
+  return {
+    ...launch,
+    workspace: {
+      root: workspace.root,
+      entries: workspace.entries.map(({ baseCommit: _baseCommit, ...entry }) => entry)
+    }
+  };
 }
 
 export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapshot>(

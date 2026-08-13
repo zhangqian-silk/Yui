@@ -26,6 +26,7 @@ import { createTaskEvent } from "../event/taskEvent.js";
 import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import {
+  effectiveLaunchWithTaskMainWorkspace,
   effectiveLaunchSnapshotsCompatible,
   resolveEffectiveLaunch,
   validateEffectiveLaunchSnapshot,
@@ -3280,15 +3281,18 @@ function mapRole(
     ?? undefined;
   const reopened = role.name === "leader"
     && store.getPendingWakeup(role.taskId)?.reasons.includes("task-reopened") === true;
+  const liveSession = activeLiveRoleAgentSession(
+    store.getTaskRoleSessionSet(role.taskId, role.name)
+  );
   const effective = reopened
     ? resolveEffectiveLaunch({
         role,
         purpose: "execution",
         ...(workspace === undefined ? {} : { workspace })
       })
-    : activeLiveRoleAgentSession(
-        store.getTaskRoleSessionSet(role.taskId, role.name)
-      )?.effective ?? resolveEffectiveLaunch({
+    : liveSession !== null && workspace?.owner.type === "task"
+      ? effectiveLaunchWithTaskMainWorkspace(liveSession.effective, workspace)
+      : liveSession?.effective ?? resolveEffectiveLaunch({
           role,
           purpose: "execution",
           ...(workspace === undefined ? {} : { workspace })

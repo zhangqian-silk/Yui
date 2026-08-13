@@ -28,6 +28,7 @@ import {
 } from "../executor/agentExecutor.js";
 import {
   effectiveLaunchSnapshotsCompatible,
+  effectiveLaunchSnapshotsCompatibleForTaskMain,
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
@@ -636,7 +637,14 @@ function assertRuntimeLaunchRequestCurrent(
       || session.nativeSessionId !== request.nativeSessionId) {
       throw new Error(`Native session changed: ${request.owner.roleName}.`);
     }
-    if (!effectiveLaunchSnapshotsCompatible(session.effective, request.effective)) {
+    const sessionEffectiveCompatible = request.owner.scope === "task"
+      ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+          session.effective,
+          request.effective,
+          request.managedWorkspace
+        )
+      : effectiveLaunchSnapshotsCompatible(session.effective, request.effective);
+    if (!sessionEffectiveCompatible) {
       throw new Error(`Native session effective launch changed: ${request.owner.roleName}.`);
     }
   }
