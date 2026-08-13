@@ -523,7 +523,7 @@ test("same-millisecond progress retains the greatest sequence at admission and r
   assert.deepEqual(calls, [2, "accepted", 2]);
 });
 
-test("same-millisecond mixed sequence progress remains incomparable at admission", (t) => {
+test("same-millisecond mixed sequence progress remains incomparable at admission and restart", (t) => {
   const { home } = fixture(t);
   const receivedAt = new Date("2026-08-13T00:00:00.000Z");
   const common = {
@@ -551,14 +551,41 @@ test("same-millisecond mixed sequence progress remains incomparable at admission
     "fixture ids deliberately reverse the durable input order"
   );
 
+  const durableOrder = inbox.list().map(({ progressId }) => progressId);
   assert.deepEqual(
-    inbox.list().map(({ progressId }) => progressId),
+    durableOrder,
     ["sequenced-second-1", "missing-first-1"],
     "incomparable facts must both remain durable; hash order is listing only"
   );
+
+  // Equal timestamps do not encode publication order. A recreated inbox
+  // provides its deterministic durable order; the content hash is not recency.
+  const restartInbox = new FileRuntimeEventInbox(home);
+  assert.deepEqual(
+    restartInbox.list().map(({ progressId }) => progressId),
+    durableOrder
+  );
+  const calls = [];
+  const processor = new FileRuntimeEventProcessor(restartInbox, {
+    withRuntimeEventTransaction: (execute) => execute(),
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress(input) {
+      calls.push(input.progressId);
+      return "applied";
+    },
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.deepEqual(calls, durableOrder);
+  assert.equal(result.metrics.progressEventsCoalesced, 0);
+  assert.equal(result.acknowledgedEventIds.length, 2);
+  assert.deepEqual(restartInbox.list(), []);
 });
 
-test("same-millisecond missing-sequence progress remains incomparable at admission", (t) => {
+test("same-millisecond missing-sequence progress remains incomparable at admission and restart", (t) => {
   const { home } = fixture(t);
   const receivedAt = new Date("2026-08-13T00:00:00.000Z");
   const common = {
@@ -582,30 +609,20 @@ test("same-millisecond missing-sequence progress remains incomparable at admissi
   }).event;
   assert.ok(first.id > second.id, "fixture ids reverse durable input order");
 
+  const durableOrder = inbox.list().map(({ progressId }) => progressId);
   assert.deepEqual(
-    inbox.list().map(({ progressId }) => progressId),
+    durableOrder,
     ["missing-second-0", "missing-first-0"],
     "two missing sequences cannot supersede one another by hash"
   );
-});
 
-test("restart drain preserves same-millisecond mixed sequence facts instead of choosing by hash", () => {
-  const receivedAt = "2026-08-13T00:00:00.000Z";
-  const missing = progressEvent(0, 1, {
-    id: testEventId(9),
-    receivedAt,
-    progressId: "missing-first",
-    sequence: undefined
-  });
-  const sequenced = progressEvent(0, 2, {
-    id: testEventId(1),
-    receivedAt,
-    progressId: "sequenced-second",
-    sequence: 2
-  });
-  assert.ok(missing.id > sequenced.id, "fixture ids reverse durable input order");
+  const restartInbox = new FileRuntimeEventInbox(home);
+  assert.deepEqual(
+    restartInbox.list().map(({ progressId }) => progressId),
+    durableOrder
+  );
   const calls = [];
-  const processor = new FileRuntimeEventProcessor(memoryInbox([missing, sequenced]), {
+  const processor = new FileRuntimeEventProcessor(restartInbox, {
     withRuntimeEventTransaction: (execute) => execute(),
     getTask: () => ({ id: "task-1", status: "active" }),
     observeProviderTurnProgress(input) {
@@ -618,41 +635,10 @@ test("restart drain preserves same-millisecond mixed sequence facts instead of c
 
   const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
 
-  assert.deepEqual(calls, ["missing-first", "sequenced-second"]);
+  assert.deepEqual(calls, durableOrder);
   assert.equal(result.metrics.progressEventsCoalesced, 0);
   assert.equal(result.acknowledgedEventIds.length, 2);
-});
-
-test("restart drain preserves same-millisecond missing-sequence durable order", () => {
-  const receivedAt = "2026-08-13T00:00:00.000Z";
-  const first = progressEvent(0, 1, {
-    id: testEventId(9),
-    receivedAt,
-    progressId: "missing-first",
-    sequence: undefined
-  });
-  const second = progressEvent(0, 2, {
-    id: testEventId(1),
-    receivedAt,
-    progressId: "missing-second",
-    sequence: undefined
-  });
-  const calls = [];
-  const processor = new FileRuntimeEventProcessor(memoryInbox([first, second]), {
-    withRuntimeEventTransaction: (execute) => execute(),
-    getTask: () => ({ id: "task-1", status: "active" }),
-    observeProviderTurnProgress(input) {
-      calls.push(input.progressId);
-      return "applied";
-    },
-    observeRuntimeTurnCompleted() {},
-    observeGlobalRuntimeTurnCompleted() {}
-  });
-
-  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
-
-  assert.deepEqual(calls, ["missing-first", "missing-second"]);
-  assert.equal(result.metrics.progressEventsCoalesced, 0);
+  assert.deepEqual(restartInbox.list(), []);
 });
 
 test("restart drain preserves global order across interleaved incomparable streams", () => {
