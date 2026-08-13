@@ -19,6 +19,7 @@ import {
 import {
   classifyRuntimeProcess,
   forEachInEventLoopBatches,
+  INVENTORY_EVENT_LOOP_TURN_BUDGET_MS,
   linuxProcessEntryPid,
   parseLinuxProcessStat,
   scanControllerResourceInventory
@@ -59,17 +60,54 @@ test("Linux process inventory accepts only numeric /proc entry names", () => {
 test("Linux process inventory yields between bounded entry batches", async () => {
   let socketCallbackRan = false;
   let callbackObservedBySecondBatch = false;
+  const visited = [];
   setImmediate(() => { socketCallbackRan = true; });
 
   await forEachInEventLoopBatches(
     Array.from({ length: 65 }, (_, index) => index),
     64,
     (_entry, index) => {
+      visited.push(index);
       if (index === 64) callbackObservedBySecondBatch = socketCallbackRan;
     }
   );
 
   assert.equal(callbackObservedBySecondBatch, true);
+  assert.deepEqual(visited, Array.from({ length: 65 }, (_, index) => index));
+});
+
+test("Linux process inventory also yields at its wall-clock turn budget", async () => {
+  let now = 0;
+  let socketCallbackRan = false;
+  let callbackObservedAfterBudget = false;
+  const visited = [];
+  setImmediate(() => { socketCallbackRan = true; });
+
+  await forEachInEventLoopBatches(
+    [0, 1, 2],
+    64,
+    (entry) => {
+      visited.push(entry);
+      if (entry === 2) callbackObservedAfterBudget = socketCallbackRan;
+      now += INVENTORY_EVENT_LOOP_TURN_BUDGET_MS;
+    },
+    { now: () => now }
+  );
+
+  assert.equal(callbackObservedAfterBudget, true);
+  assert.deepEqual(visited, [0, 1, 2]);
+});
+
+test("Linux process inventory propagates visitor failures without revisiting entries", async () => {
+  const visited = [];
+  await assert.rejects(
+    forEachInEventLoopBatches([0, 1, 2], 64, (entry) => {
+      visited.push(entry);
+      if (entry === 1) throw new Error("inventory visit failed");
+    }),
+    /inventory visit failed/
+  );
+  assert.deepEqual(visited, [0, 1]);
 });
 
 test("Linux inventory finds the default tmux root under a deep TMPDIR", async (t) => {

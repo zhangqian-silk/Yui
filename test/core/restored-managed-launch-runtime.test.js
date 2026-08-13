@@ -14,7 +14,10 @@ import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
-import { createRuntimeLifecycleDispatcher } from "../../dist/controller/runtime.js";
+import {
+  createRuntimeLifecycleDispatcher,
+  refreshAppliedTaskRuntimeDescriptor
+} from "../../dist/controller/runtime.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import {
   parseCodexSessionNotification,
@@ -23,6 +26,8 @@ import {
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
+  bindTaskRoleRun,
+  clearTaskRoleRun,
   createRoleSessionSet,
   recordRoleAgentSession
 } from "../../dist/executor/agentExecutor.js";
@@ -39,7 +44,8 @@ import {
   updateRoleStatus
 } from "../../dist/role/role.js";
 import {
-  markAgentRunDelivered
+  markAgentRunDelivered,
+  yieldAgentRun
 } from "../../dist/run/agentRun.js";
 import { createAgentRun } from "../helpers/effectiveLaunch.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -48,9 +54,12 @@ import { activateTask, createTask } from "../../dist/task/task.js";
 import {
   YUI_CONTROL_PLANE_DESCRIPTOR,
   YUI_TASK_RUNTIME_DESCRIPTOR,
+  assertExactTaskRuntimeState,
+  createExactTaskRuntimeDescriptor,
   exactControlPlaneCommandPrefix,
   parseExactControlPlaneDescriptor,
-  readExactTaskRuntimeDescriptorSource
+  readExactTaskRuntimeDescriptorSource,
+  serializeExactDescriptor
 } from "../../dist/runtime/exactControlPlane.js";
 import {
   createWorkItem,
@@ -370,6 +379,282 @@ test("a replacement Controller cannot retarget an existing Task's exact control 
     oldCli
   );
   assert.equal(existsSync(join(home, "runtime", "bin", "yui")), false);
+});
+
+test("a replacement Controller refreshes only stable descriptors for the reused Session generation", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t, "claude");
+  const oldCli = join(home, "old-cli.js");
+  const newCli = join(home, "new-cli.js");
+  const historicalCli = join(home, "historical-cli.js");
+  writeFileSync(oldCli, "process.stdout.write('old');\n", { mode: 0o600 });
+  writeFileSync(newCli, "process.stdout.write('new');\n", { mode: 0o600 });
+  writeFileSync(historicalCli, "process.stdout.write('historical');\n", { mode: 0o600 });
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  const oldPlanner = new FileRoleLaunchPlanner(home, store, { cliPath: oldCli });
+  const oldPlan = oldPlanner.plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    effective,
+    mode: "new",
+    launchId: "launch-1"
+  });
+  const oldSource = oldPlan.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
+  const oldDescriptor = readExactTaskRuntimeDescriptorSource(oldSource, home);
+  const currentNativeSessionId = oldPlan.session.nativeSessionId;
+  writeFileSync(oldSource, `${serializeExactDescriptor(createExactTaskRuntimeDescriptor({
+    ...oldDescriptor,
+    runId: "agent-run-1",
+    launchId: "launch-old",
+    nativeSessionId: currentNativeSessionId
+  }))}\n`);
+  const historicalPlan = new FileRoleLaunchPlanner(home, store, {
+    cliPath: historicalCli
+  }).plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    effective,
+    mode: "new",
+    launchId: "historical-launch"
+  });
+  const historicalSource = historicalPlan.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
+  const historicalDescriptor = createExactTaskRuntimeDescriptor({
+    ...readExactTaskRuntimeDescriptorSource(historicalSource, home),
+    runId: "agent-run-1",
+    launchId: "historical-launch",
+    nativeSessionId: "historical-native"
+  });
+  writeFileSync(historicalSource, `${serializeExactDescriptor(historicalDescriptor)}\n`);
+  const historicalBytes = readFileSync(historicalSource);
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, agent.id, now);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId: currentNativeSessionId,
+    launchId: "launch-current",
+    policy: "fixed",
+    status: "running",
+    effective
+  }, now);
+  sessions = bindTaskRoleRun(sessions, {
+    agentId: agent.id,
+    runId: "agent-run-2",
+    receiptId: `agent-run:${task.id}/agent-run-2`
+  }, new Date(now.getTime() + 1));
+  const resumedRun = createAgentRun(
+    "agent-run-2",
+    task.id,
+    role.name,
+    "resume",
+    "continue the fixed Session",
+    new Date(now.getTime() + 1),
+    { effective }
+  );
+  store.transaction((tx) => {
+    tx.saveActiveAgentRun(resumedRun);
+    tx.saveTaskRoleSessionSet(sessions);
+  });
+
+  new FileRoleLaunchPlanner(home, store, { cliPath: newCli })
+    .refreshTaskRuntimeDescriptor({
+      taskId: task.id,
+      roleName: role.name,
+      runId: resumedRun.id,
+      launchId: "launch-current",
+      nativeSessionId: currentNativeSessionId,
+      agentId: agent.id,
+      adapterId: agent.adapterId,
+      workspace: effective.workspace.root
+    });
+
+  const refreshedOld = readExactTaskRuntimeDescriptorSource(oldSource, home);
+  assert.equal(refreshedOld.runId, "agent-run-2");
+  assert.equal(refreshedOld.launchId, "launch-current");
+  assert.equal(refreshedOld.nativeSessionId, currentNativeSessionId);
+  assert.equal(
+    refreshedOld.controlPlaneDigest,
+    oldDescriptor.controlPlaneDigest
+  );
+  assert.deepEqual(readFileSync(historicalSource), historicalBytes);
+  assert.throws(
+    () => assertExactTaskRuntimeState(
+      readExactTaskRuntimeDescriptorSource(historicalSource, home),
+      store
+    ),
+    /not current/i
+  );
+});
+
+test("applied runtime refresh uses the exact active generation, rejects drift, and skips terminal Runs", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t, "claude");
+  const cli = join(home, "generation-fence-cli.js");
+  writeFileSync(cli, "process.stdout.write('fenced');\n", { mode: 0o600 });
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  const planner = new FileRoleLaunchPlanner(home, store, { cliPath: cli });
+  const planA = planner.plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    effective,
+    mode: "new",
+    launchId: "launch-a"
+  });
+  const source = planA.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
+  const nativeSessionId = planA.session.nativeSessionId;
+  writeFileSync(source, `${serializeExactDescriptor(createExactTaskRuntimeDescriptor({
+    ...readExactTaskRuntimeDescriptorSource(source, home),
+    runId: "agent-run-1",
+    launchId: "launch-a",
+    nativeSessionId
+  }))}\n`);
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, agent.id, now);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId,
+    launchId: "launch-a",
+    policy: "fixed",
+    status: "running",
+    effective
+  }, now);
+  sessions = bindTaskRoleRun(sessions, {
+    agentId: agent.id,
+    runId: "agent-run-1",
+    receiptId: `agent-run:${task.id}/agent-run-1`
+  }, now);
+  const runA = createAgentRun(
+    "agent-run-1",
+    task.id,
+    role.name,
+    "resume",
+    "applied generation",
+    now,
+    { effective }
+  );
+  store.transaction((tx) => {
+    tx.saveTaskRoleSessionSet(sessions);
+    tx.saveActiveAgentRun(runA);
+  });
+
+  const applied = {
+    taskId: task.id,
+    roleName: role.name,
+    runId: "agent-run-1",
+    launchId: "launch-a",
+    nativeSessionId,
+    agentId: agent.id,
+    adapterId: agent.adapterId
+  };
+  const refreshes = [];
+  refreshAppliedTaskRuntimeDescriptor(store, {
+    refreshTaskRuntimeDescriptor(input) {
+      refreshes.push(input);
+      planner.refreshTaskRuntimeDescriptor(input);
+    }
+  }, applied);
+  assert.deepEqual(refreshes, [{
+    ...applied,
+    workspace: effective.workspace.root
+  }]);
+  const bytesA = readFileSync(source);
+
+  const runB = createAgentRun(
+    "agent-run-2",
+    task.id,
+    role.name,
+    "resume",
+    "current generation",
+    new Date(now.getTime() + 1),
+    { effective }
+  );
+  sessions = clearTaskRoleRun(sessions, {
+    agentId: agent.id,
+    runId: runA.id,
+    receiptId: `agent-run:${task.id}/${runA.id}`
+  }, new Date(now.getTime() + 1));
+  sessions = bindTaskRoleRun(sessions, {
+    agentId: agent.id,
+    runId: runB.id,
+    receiptId: `agent-run:${task.id}/${runB.id}`
+  }, new Date(now.getTime() + 1));
+  store.transaction((tx) => {
+    tx.clearActiveAgentRun(task.id, role.name);
+    tx.saveTaskRoleSessionSet(sessions);
+    tx.saveActiveAgentRun(runB);
+  });
+
+  assert.throws(
+    () => refreshAppliedTaskRuntimeDescriptor(store, planner, applied),
+    /Prepared Task runtime generation is not current/i
+  );
+  assert.deepEqual(readFileSync(source), bytesA);
+
+  store.saveAgentRun(yieldAgentRun(runA, "terminal completion applied", new Date(now.getTime() + 2)));
+  let terminalRefreshes = 0;
+  assert.doesNotThrow(() => refreshAppliedTaskRuntimeDescriptor(store, {
+    refreshTaskRuntimeDescriptor() { terminalRefreshes += 1; }
+  }, applied));
+  assert.equal(terminalRefreshes, 0);
+  assert.deepEqual(readFileSync(source), bytesA);
+});
+
+test("a Task Session without an active Run refreshes its exact native generation", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t, "claude");
+  const cli = join(home, "no-run-cli.js");
+  writeFileSync(cli, "process.stdout.write('no-run');\n", { mode: 0o600 });
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  const planner = new FileRoleLaunchPlanner(home, store, { cliPath: cli });
+  const plan = planner.plan({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    effective,
+    mode: "new",
+    launchId: "launch-no-run"
+  });
+  const source = plan.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
+  const nativeSessionId = plan.session.nativeSessionId;
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  }, agent.id, now);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    nativeSessionId,
+    launchId: "launch-no-run",
+    policy: "fixed",
+    status: "running",
+    effective
+  }, now);
+  store.saveTaskRoleSessionSet(sessions);
+
+  assert.doesNotThrow(() => refreshAppliedTaskRuntimeDescriptor(store, planner, {
+    taskId: task.id,
+    roleName: role.name,
+    launchId: "launch-no-run",
+    nativeSessionId,
+    agentId: agent.id,
+    adapterId: agent.adapterId
+  }));
+  const refreshed = readExactTaskRuntimeDescriptorSource(source, home);
+  assert.equal(refreshed.runId, undefined);
+  assert.equal(refreshed.launchId, "launch-no-run");
+  assert.equal(refreshed.nativeSessionId, nativeSessionId);
 });
 
 test("managed Codex Task Run installs lifecycle hooks while native identity remains provider-discovered", (t) => {

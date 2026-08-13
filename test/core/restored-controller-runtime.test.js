@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +12,9 @@ import {
   startFileTaskController
 } from "../../dist/controller/controller.js";
 import {
+  forEachInEventLoopBatches
+} from "../../dist/controller/resourceInventoryLinux.js";
+import {
   DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
   MAX_RECONCILIATION_INTERVAL_SECONDS,
   MIN_RECONCILIATION_INTERVAL_SECONDS,
@@ -21,7 +25,11 @@ import {
   ControllerClientError,
   readControllerDiscovery
 } from "../../dist/core/controllerClient.js";
-import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../../dist/core/protocol.js";
+import {
+  encodeControllerRequest,
+  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+  parseControllerResponse
+} from "../../dist/core/protocol.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../../dist/version.js";
 import {
   FileTaskWorkflowRuntime,
@@ -2730,6 +2738,259 @@ test("continuous progress passes yield so control requests are not starved", asy
     assert.ok(progressDepth > 0);
     assert.equal(inventoryReleased, false);
     assert.equal(leaderDispatched, true, "Leader wakeup must dispatch before inventory completes");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("periodic full inventory yields to an already-written status request", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-controller-periodic-fairness-"));
+  const store = emptyStore();
+  const task = gitlessTask("task-inventory");
+  const worker = role(task.id, "worker");
+  const run = deliveredRun(task.id, worker.name);
+  store.listTasks = () => [task];
+  store.getTask = (taskId) => taskId === task.id ? task : null;
+  store.getTaskWorkspace = (taskId) => taskId === task.id
+    ? taskOwnedWorkspace(task)
+    : null;
+  store.listRoles = (taskId) => taskId === task.id ? [worker] : [];
+  store.getRole = (taskId, roleName) => (
+    taskId === task.id && roleName === worker.name ? worker : null
+  );
+  store.getActiveAgentRun = (taskId, roleName) => (
+    taskId === task.id && roleName === worker.name ? run : null
+  );
+  store.getRoleSession = () => null;
+
+  let inventoryCalls = 0;
+  let markStartupInventory;
+  const startupInventory = new Promise((resolve) => { markStartupInventory = resolve; });
+  const delivery = {
+    ...noTmux,
+    async inspectRoles(inputs) {
+      inventoryCalls += 1;
+      if (inventoryCalls === 1) markStartupInventory();
+      if (inventoryCalls === 2) {
+        await forEachInEventLoopBatches(
+          Array.from({ length: 129 }),
+          128,
+          () => {
+            const blockedUntil = performance.now() + 25;
+            while (performance.now() < blockedUntil) {
+              // Model one short synchronous /proc entry inspection.
+            }
+          }
+        );
+      }
+      return inputs.map(({ taskId, roleName }) => ({
+        taskId,
+        roleName,
+        status: "present"
+      }));
+    }
+  };
+
+  let controller;
+  let socket;
+  let periodicPass;
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    socket?.destroy();
+    if (periodicPass !== undefined) await Promise.allSettled([periodicPass]);
+    await controller?.close();
+    rmSync(home, { recursive: true, force: true });
+  };
+  t.after(cleanup);
+  try {
+    controller = await startFileTaskController(
+      home,
+      store,
+      delivery,
+      undefined,
+      { intervalMs: 60_000 }
+    );
+    await startupInventory;
+    await new Promise((resolve) => setImmediate(resolve));
+    const discovery = await readControllerDiscovery(home);
+    socket = createConnection(discovery.socketPath);
+    await new Promise((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+
+    const requestId = "periodic-status-request";
+    const response = new Promise((resolve, reject) => {
+      let buffer = Buffer.alloc(0);
+      socket.on("data", (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        const newline = buffer.indexOf(0x0a);
+        if (newline >= 0) resolve(buffer.subarray(0, newline).toString("utf8"));
+      });
+      socket.once("error", reject);
+    });
+    await new Promise((resolve, reject) => {
+      socket.write(encodeControllerRequest({
+        id: requestId,
+        token: discovery.token,
+        method: "controller.status",
+        params: {}
+      }), (error) => error == null ? resolve() : reject(error));
+    });
+    const startedAt = performance.now();
+    periodicPass = controller.runtime.pump();
+    let responseTimer;
+    let line;
+    try {
+      line = await Promise.race([
+        response,
+        new Promise((_, reject) => {
+          responseTimer = setTimeout(
+            () => reject(new Error("controller.status response did not arrive")),
+            10_000
+          );
+          responseTimer.unref();
+        })
+      ]);
+    } finally {
+      clearTimeout(responseTimer);
+    }
+    const elapsedMs = performance.now() - startedAt;
+
+    const parsed = parseControllerResponse(line, requestId);
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) assert.equal(parsed.result.running, true);
+    assert.ok(
+      elapsedMs < 3_000,
+      `controller.status socket callback took ${Math.round(elapsedMs)}ms during periodic inventory`
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("periodic reconciliation yields between whole-state projections", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-controller-projection-fairness-"));
+  const store = emptyStore();
+  const baseListTasks = store.listTasks.bind(store);
+  let controller;
+  let socket;
+  let periodicPass;
+  let slowProjections = false;
+  let projectionCalls = 0;
+  let requestStartedAt;
+  let request;
+  let writeError;
+
+  // A current 18 MiB Home spends roughly 0.7-0.8s cloning one whole-Task
+  // projection. Model that measured lower bound without embedding a giant
+  // aggregate fixture: a full pass currently repeats the projection across
+  // cleanup, repair, workspace, delivery, and Turn-completion phases.
+  store.enqueueRuntimeCleanup = () => {};
+  store.listTasks = () => {
+    if (slowProjections) {
+      projectionCalls += 1;
+      if (requestStartedAt === undefined) {
+        requestStartedAt = performance.now();
+        socket.write(request, (error) => {
+          if (error !== null && error !== undefined) writeError = error;
+        });
+      }
+      const blockedUntil = performance.now() + 650;
+      while (performance.now() < blockedUntil) {
+        // Model one synchronous whole-state projection.
+      }
+    }
+    return baseListTasks();
+  };
+  store.listPendingRuntimeTurnCompletions = () => {
+    store.listTasks();
+    return [];
+  };
+
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    slowProjections = false;
+    socket?.destroy();
+    if (periodicPass !== undefined) await Promise.allSettled([periodicPass]);
+    await controller?.close();
+    rmSync(home, { recursive: true, force: true });
+  };
+  t.after(cleanup);
+  try {
+    controller = await startFileTaskController(
+      home,
+      store,
+      noTmux,
+      undefined,
+      {
+        intervalMs: 60_000,
+        workspacePreparer: {
+          async prepareTaskWorkspace() { throw new Error("unused"); }
+        }
+      }
+    );
+    await controller.runtime.pump();
+
+    const discovery = await readControllerDiscovery(home);
+    socket = createConnection(discovery.socketPath);
+    await new Promise((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    const requestId = "periodic-projection-status-request";
+    request = encodeControllerRequest({
+      id: requestId,
+      token: discovery.token,
+      method: "controller.status",
+      params: {}
+    });
+    const response = new Promise((resolve, reject) => {
+      let buffer = Buffer.alloc(0);
+      socket.on("data", (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        const newline = buffer.indexOf(0x0a);
+        if (newline >= 0) {
+          slowProjections = false;
+          resolve(buffer.subarray(0, newline).toString("utf8"));
+        }
+      });
+      socket.once("error", reject);
+    });
+
+    slowProjections = true;
+    periodicPass = controller.runtime.pump();
+    let responseTimer;
+    let line;
+    try {
+      line = await Promise.race([
+        response,
+        new Promise((_, reject) => {
+          responseTimer = setTimeout(
+            () => reject(new Error("controller.status response did not arrive")),
+            10_000
+          );
+          responseTimer.unref();
+        })
+      ]);
+    } finally {
+      clearTimeout(responseTimer);
+    }
+    const elapsedMs = performance.now() - requestStartedAt;
+
+    const parsed = parseControllerResponse(line, requestId);
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) assert.equal(parsed.result.running, true);
+    assert.equal(writeError, undefined);
+    assert.ok(projectionCalls > 1);
+    assert.ok(
+      elapsedMs < 3_000,
+      `controller.status socket callback took ${Math.round(elapsedMs)}ms during periodic state projections`
+    );
   } finally {
     await cleanup();
   }

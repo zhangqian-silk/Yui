@@ -860,6 +860,43 @@ test("a failed batch transaction acknowledges nothing before isolated retries co
   assert.deepEqual(result.failed, []);
 });
 
+test("runtime apply callbacks retain the folded candidate generation after commit", () => {
+  const event = semanticEvent("native-prompt-accepted", 7, "agent-run-1");
+  let durableRunId = event.runId;
+  let applied;
+  const processor = new FileRuntimeEventProcessor(memoryInbox([event]), {
+    withRuntimeEventTransaction(execute) {
+      const result = execute();
+      durableRunId = "agent-run-2";
+      return result;
+    },
+    getTask: () => ({ id: event.taskId, status: "active" }),
+    observeProviderPromptAccepted(input) {
+      assert.equal(durableRunId, event.runId);
+      assert.equal(input.runId, event.runId);
+      return "applied";
+    },
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  }, {
+    onTaskRuntimeApplied(input) { applied = input; }
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.equal(durableRunId, "agent-run-2");
+  assert.deepEqual(applied, {
+    taskId: event.taskId,
+    roleName: event.roleName,
+    agentId: event.agentId,
+    adapterId: event.adapterId,
+    launchId: event.launchId,
+    nativeSessionId: event.nativeSessionId,
+    runId: event.runId
+  });
+  assert.deepEqual(result.failed, []);
+});
+
 test("bounded drains preserve arrival order before reaching a semantic event", () => {
   const events = Array.from({ length: 25 }, (_, stream) => (
     progressEvent(stream, 0)

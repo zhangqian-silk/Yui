@@ -74,6 +74,7 @@ type LinuxProcessIo = Readonly<{
 }>;
 
 const LINUX_PROCESS_SCAN_BATCH_SIZE = 64;
+export const INVENTORY_EVENT_LOOP_TURN_BUDGET_MS = 25;
 
 export async function scanControllerResourceInventory(
   options: ControllerInventoryScanOptions
@@ -339,15 +340,28 @@ async function listLinuxProcesses(warnings: string[]): Promise<RuntimeProcessFac
 export async function forEachInEventLoopBatches<T>(
   entries: readonly T[],
   batchSize: number,
-  visit: (entry: T, index: number) => void
+  visit: (entry: T, index: number) => void,
+  timing: Readonly<{ now?: () => number }> = {}
 ): Promise<void> {
   if (!Number.isSafeInteger(batchSize) || batchSize < 1) {
     throw new Error("Event-loop batch size must be a positive integer.");
   }
+  const now = timing.now ?? (() => performance.now());
+  let turnStartedAt = now();
+  let entriesInTurn = 0;
   for (let index = 0; index < entries.length; index += 1) {
     visit(entries[index]!, index);
-    if ((index + 1) % batchSize === 0 && index + 1 < entries.length) {
+    entriesInTurn += 1;
+    if (
+      index + 1 < entries.length
+      && (
+        entriesInTurn >= batchSize
+        || now() - turnStartedAt >= INVENTORY_EVENT_LOOP_TURN_BUDGET_MS
+      )
+    ) {
       await new Promise<void>((resolve) => setImmediate(resolve));
+      turnStartedAt = now();
+      entriesInTurn = 0;
     }
   }
 }

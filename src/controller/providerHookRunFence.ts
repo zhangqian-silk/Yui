@@ -6,6 +6,13 @@ import {
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
+import {
+  YUI_CONTROL_PLANE_DESCRIPTOR,
+  YUI_TASK_RUNTIME_DESCRIPTOR,
+  assertExactTaskRuntimeEnvironment,
+  exactControlPlaneDigest,
+  parseExactControlPlaneDescriptor
+} from "../runtime/exactControlPlane.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
 export type ProviderHookRunFence = Readonly<{
@@ -47,9 +54,24 @@ export function resolveProviderHookRunFence(
   const roleName = requireIdentity(environment.YUI_ROLE, "Role name");
   const agentId = requireIdentity(environment.YUI_AGENT_ID, "Agent id");
   const workspace = requireIdentity(environment.YUI_WORKSPACE, "YUI workspace");
-  const launchId = requireIdentity(environment.YUI_LAUNCH_ID, "Launch id");
+  const runtimeSource = environment[YUI_TASK_RUNTIME_DESCRIPTOR];
+  const runtime = runtimeSource === undefined
+    ? undefined
+    : assertExactTaskRuntimeEnvironment(
+        runtimeSource,
+        environment,
+        exactControlPlaneDigest(parseExactControlPlaneDescriptor(requireIdentity(
+          environment[YUI_CONTROL_PLANE_DESCRIPTOR],
+          "Exact control-plane descriptor"
+        ))),
+        home
+      );
+  const launchId = requireIdentity(
+    runtime?.launchId ?? environment.YUI_LAUNCH_ID,
+    "Launch id"
+  );
   const nativeSessionId = requireIdentity(payloadNativeSessionId, "Provider session id");
-  const expectedNativeSessionId = environment.YUI_NATIVE_SESSION_ID;
+  const expectedNativeSessionId = runtime?.nativeSessionId ?? environment.YUI_NATIVE_SESSION_ID;
   if (expectedNativeSessionId !== undefined
     && nativeSessionId !== requireIdentity(expectedNativeSessionId, "YUI native session id")) {
     throw new Error("Provider lifecycle hook native session does not match its launch envelope.");
@@ -79,7 +101,7 @@ export function resolveProviderHookRunFence(
     && !hasRuntimeCleanupObligation(mailbox);
   const executionRef = mailbox?.processing?.executionRef;
   const startupRunId = options.allowPreallocatedClaudeStartup === true
-    ? requireIdentity(environment.YUI_RUN_ID, "Run id")
+    ? requireIdentity(runtime?.runId ?? environment.YUI_RUN_ID, "Run id")
     : undefined;
   const deterministicClaudeStartup = adapterId === "claude"
     && options.allowPreallocatedClaudeStartup === true
@@ -113,6 +135,9 @@ export function resolveProviderHookRunFence(
     throw new Error("Provider lifecycle hook has no matching durable in-flight Run.");
   }
   const runId = inFlight?.runId ?? startupRunId!;
+  if (runtime?.runId !== undefined && runtime.runId !== runId) {
+    throw new Error("Provider lifecycle hook Run does not match its current descriptor.");
+  }
   const run = store.getActiveAgentRun(taskId, roleName);
   if (run === null
     || run.id !== runId

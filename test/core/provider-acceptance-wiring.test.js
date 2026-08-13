@@ -385,6 +385,67 @@ test("hook resolves the current in-flight Run instead of a stale process YUI_RUN
   assert.notEqual(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
 });
 
+test("hook resolves a resumed Session generation from its stable runtime descriptor", async (t) => {
+  const fx = fixture(t, "claude");
+  const sessions = fx.store.getTaskRoleSessionSet(fx.task.id, fx.worker.name);
+  const currentSession = sessions.sessions[fx.agent.id];
+  fx.store.saveTaskRoleSessionSet(recordRoleAgentSession(sessions, {
+    agentId: fx.agent.id,
+    adapterId: "claude",
+    nativeSessionId: fx.nativeSessionId,
+    launchId: "launch-2",
+    policy: "fixed",
+    status: "running",
+    effective: currentSession.effective
+  }, new Date("2026-08-06T02:00:02.000Z")));
+
+  const cliEntry = join(process.cwd(), "dist", "cli.js");
+  const control = createExactControlPlaneDescriptor({
+    executable: process.execPath,
+    cliEntry,
+    yuiHome: fx.home
+  });
+  const runtime = createExactTaskRuntimeDescriptor({
+    controlPlaneDigest: exactControlPlaneDigest(control),
+    taskId: fx.task.id,
+    roleName: fx.worker.name,
+    agentId: fx.agent.id,
+    adapterId: "claude",
+    workspace: fx.run.effective.workspace.root,
+    runId: fx.run.id,
+    launchId: "launch-2",
+    nativeSessionId: fx.nativeSessionId
+  });
+  const runtimeSource = exactTaskRuntimeDescriptorPath(fx.home, runtime);
+  writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(runtime)}\n`);
+
+  await runClaudeLifecycleHookCommand(
+    JSON.stringify({
+      hook_event_name: "PostToolUse",
+      session_id: fx.nativeSessionId,
+      tool_use_id: "toolu_resumed_generation",
+      tool_name: "Read",
+      tool_input: { file_path: "/managed/workspace/input.txt" }
+    }),
+    {
+      ...fx.environment,
+      // A reused native process cannot receive a new environment. The file
+      // source is the current durable generation; these ambient fields are
+      // intentionally the prior generation.
+      YUI_LAUNCH_ID: "launch-1",
+      [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(control),
+      [YUI_TASK_RUNTIME_DESCRIPTOR]: runtimeSource
+    },
+    async () => ({})
+  );
+
+  const [event] = new FileRuntimeEventInbox(fx.home).list();
+  assert.equal(event.type, "native-turn-progress");
+  assert.equal(event.runId, fx.run.id);
+  assert.equal(event.launchId, "launch-2");
+  assert.equal(event.nativeSessionId, fx.nativeSessionId);
+});
+
 test("Claude SessionStart hook folds to a session-lifecycle event, never delivered", async (t) => {
   const fx = fixture(t, "claude", "reserved");
   await runClaudeLifecycleHookCommand(

@@ -174,11 +174,18 @@ export interface RuntimeEventProcessorPort {
   drain(now: Date): RuntimeEventDrainResult;
 }
 
+export type TaskRuntimeAppliedInput = Readonly<{
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "codex" | "claude";
+  launchId?: string;
+  nativeSessionId: string;
+  runId?: string;
+}>;
+
 export type FileRuntimeEventProcessorOptions = Readonly<{
-  onTaskRuntimeApplied?: (input: Readonly<{
-    taskId: string;
-    roleName: string;
-  }>) => void;
+  onTaskRuntimeApplied?: (input: TaskRuntimeAppliedInput) => void;
   /** Maximum folded representatives in one state transaction. */
   maxEventsPerDrain?: number;
 }>;
@@ -341,7 +348,12 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         if (event.scope === "task" && event.taskId !== undefined) {
           this.options.onTaskRuntimeApplied?.({
             taskId: event.taskId,
-            roleName: event.roleName
+            roleName: event.roleName,
+            agentId: event.agentId,
+            adapterId: event.adapterId,
+            ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
+            nativeSessionId: event.nativeSessionId,
+            ...(event.runId === undefined ? {} : { runId: event.runId })
           });
         }
       }

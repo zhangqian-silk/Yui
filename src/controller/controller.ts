@@ -192,6 +192,11 @@ export async function runControllerSchedulerPass(
     ? compiledSelection
     : { ...compiledSelection, operator: false };
   queueSelectedCompletedTaskRuntimeCleanups(store, selection, now);
+  // A full-state Task projection can be individually bounded yet still starve
+  // control sockets when several scheduler phases repeat it in one native
+  // event-loop turn. Give already-written requests a poll boundary before the
+  // next durable phase; later phases retain their existing CAS fences.
+  await controlEventLoopTurn();
   const failedCleanupRoles = await processSelectedRoleRuntimeCleanups(
     store,
     delivery,
@@ -223,12 +228,17 @@ export async function runControllerSchedulerPass(
       now,
       exactTaskSelection(new Set(initialWakeups.keys()))
     );
+    // Preserve ready-Leader-first ordering, then bound the repeated state
+    // projections that follow it in this pass.
+    await controlEventLoopTurn();
     const workspacePreparation = await prepareActiveWorkspaces(
       store, workspacePreparer, selection
     );
+    await controlEventLoopTurn();
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection
     );
+    await controlEventLoopTurn();
     const unsettledRunRefs = new Set(activeRunDeliveries.flatMap((result) => (
       result.reason === "delivery-uncertain" || result.terminalFailure !== undefined
         ? [formatTaskRecordReference(result.taskId, result.runId, "agentRun")]
@@ -260,7 +270,7 @@ export async function runControllerSchedulerPass(
     }
     // Let socket callbacks queued during the bounded scheduler phases run
     // before starting a potentially large liveness inventory.
-    await eventLoopTurn();
+    await controlEventLoopTurn();
     const liveStatuses = new Map<string, "present" | "absent">();
     const resourceEvidence = new Map<string, RoleRunResourceEvidence>();
     const failedRunRefs = await reconcileExitedRoleRuns(
@@ -272,6 +282,7 @@ export async function runControllerSchedulerPass(
       liveStatuses,
       resourceEvidence
     );
+    await controlEventLoopTurn();
     await reconcileStalledRoleRuns(
       store,
       delivery,
@@ -282,6 +293,7 @@ export async function runControllerSchedulerPass(
       resourceEvidence,
       resourceSuppressionKeys
     );
+    await controlEventLoopTurn();
     await reconcileDormantRuntimeOwners(
       store,
       delivery,
@@ -1809,6 +1821,14 @@ function monotonicMilliseconds(): number {
 
 function eventLoopTurn(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function controlEventLoopTurn(): Promise<void> {
+  // A setImmediate scheduled from the check phase may resume before the next
+  // poll phase. Two turns guarantee already-written socket data gets one poll
+  // opportunity before another synchronous scheduler projection starts.
+  await eventLoopTurn();
+  await eventLoopTurn();
 }
 
 function signalMailboxKey(value: JsonValue): MailboxKey {
