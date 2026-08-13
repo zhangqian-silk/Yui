@@ -2175,6 +2175,76 @@ test("a failed Task workspace retries retained processing before newer pending w
   assert.equal(mailbox.processing, null);
 });
 
+test("Task workspace fast retries stop before the general delivery retry budget", async () => {
+  const target = { kind: "task", taskId: "task-1" };
+  const batch = {
+    fromSequence: 1, toSequence: 1, reasons: ["task-updated"], refs: [],
+    requestCount: 1, firstQueuedAt: new Date(0).toISOString(),
+    lastQueuedAt: new Date(0).toISOString()
+  };
+  let mailbox = {
+    schemaVersion: 1, target, nextSequence: 2, processing: null, pending: batch
+  };
+  let attempts = 0;
+  let announceThirdAttempt;
+  const thirdAttempt = new Promise((resolve) => { announceThirdAttempt = resolve; });
+  const store = emptyStore();
+  store.getTask = () => ({ id: "task-1", status: "active", projectBindings: [] });
+  store.getWorkMailbox = (mailboxTarget) => (
+    mailboxTarget.kind === "task" ? mailbox : null
+  );
+  store.claimWorkMailbox = ({ batchId, owner, now }) => {
+    if (mailbox.processing !== null) {
+      return { status: "processing", processing: mailbox.processing };
+    }
+    mailbox = {
+      ...mailbox,
+      pending: null,
+      processing: { batchId, batch: mailbox.pending, owner, startedAt: now.toISOString() }
+    };
+    return { status: "claimed", processing: mailbox.processing };
+  };
+  store.completeWorkMailbox = () => {
+    throw new Error("failed work must not complete");
+  };
+  const controller = new FileTaskController(store, noTmux, {
+    signalWindowMs: 1,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 60,
+    workspacePreparer: {
+      async prepareTaskWorkspace() {
+        attempts += 1;
+        if (attempts === 3) announceThirdAttempt();
+        return { taskId: "task-1", status: "failed", error: "still unavailable" };
+      }
+    },
+    onError() {}
+  });
+
+  controller.signal("task:task-1");
+  let attemptTimeout;
+  try {
+    await Promise.race([
+      thirdAttempt,
+      new Promise((_, reject) => {
+        attemptTimeout = setTimeout(
+          () => reject(new Error("Task workspace fast retries did not run")),
+          3_000
+        );
+      })
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  } finally {
+    clearTimeout(attemptTimeout);
+    controller.stop();
+    await controller.shutdownAndDrain();
+  }
+
+  assert.equal(attempts, 3, "expensive orchestration must defer to periodic recovery");
+  assert.equal(mailbox.pending, null);
+  assert.equal(mailbox.processing?.batchId, "task:task-1:1-1");
+});
+
 test("stopping before a Task workspace retry retains truthful processing ownership", async () => {
   const target = { kind: "task", taskId: "task-1" };
   const batch = {

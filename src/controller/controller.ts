@@ -68,6 +68,7 @@ const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 const DEFAULT_SIGNAL_WINDOW_MS = 100;
 const DEFAULT_DELIVERY_RETRY_MS = 250;
 const DEFAULT_DELIVERY_RETRY_LIMIT = 60;
+const DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT = 2;
 const RUNTIME_RESERVATION_RECOVERY_AGE_MS = 120_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const CONTROLLER_LATENCY_BUCKETS_MS = [10, 50, 100, 250, 500, 1_000, 3_000] as const;
@@ -97,6 +98,7 @@ export type ControllerRuntimeOptions = Readonly<{
   signalWindowMs?: number;
   deliveryRetryMs?: number;
   deliveryRetryLimit?: number;
+  taskOrchestrationRetryLimit?: number;
   stallWindowMs?: number;
   now?: () => Date;
   onError?: (error: unknown) => void;
@@ -969,6 +971,7 @@ export class FileTaskController {
     | undefined;
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
+  readonly #taskOrchestrationRetryLimit: number;
   readonly #stallWindowMs: number;
   /** Narrow-port fallback; FileSchedulerStoreAdapter durably records these keys. */
   readonly #resourceSuppressionKeys = new Set<string>();
@@ -1031,6 +1034,11 @@ export class FileTaskController {
       options.deliveryRetryLimit,
       DEFAULT_DELIVERY_RETRY_LIMIT,
       "Controller delivery retry limit"
+    );
+    this.#taskOrchestrationRetryLimit = positiveInteger(
+      options.taskOrchestrationRetryLimit,
+      DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT,
+      "Controller Task orchestration retry limit"
     );
     this.#stallWindowMs = positiveInteger(
       options.stallWindowMs,
@@ -1573,7 +1581,10 @@ export class FileTaskController {
       return;
     }
     const attempts = previous?.attempts ?? 0;
-    if (attempts >= this.#deliveryRetryLimit) {
+    const retryLimit = key.startsWith("task:")
+      ? this.#taskOrchestrationRetryLimit
+      : this.#deliveryRetryLimit;
+    if (attempts >= retryLimit) {
       if (key === "operator") this.#operatorStartupRetryArmed = false;
       this.#terminalizePreparedAfterRetryExhaustion(
         key,
