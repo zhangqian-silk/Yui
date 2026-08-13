@@ -1,5 +1,13 @@
 name: Publish npm package
 
+# Release evidence contract (see docs/testing/verification-levels.md):
+# release never re-runs the deterministic suite. The exact tagged commit already
+# passed the PR/master gate in ci.yml; this workflow only adds evidence the gate
+# cannot substitute: tag/version identity, the packaged artifact's structure and
+# executable bit, a fresh install across the supported Node matrix, and npm
+# provenance. The build job assembles one tarball from the exact tagged commit;
+# smoke and publish consume that same artifact, verified by SHA-256.
+
 on:
   push:
     tags:
@@ -16,6 +24,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reuse the PR/master-gated exact commit
+        shell: bash
+        run: |
+          # A release tag must point at a master commit. Branch protection on
+          # master requires the ci.yml deterministic gate, so this asserts the
+          # exact commit being released already passed that gate, without any
+          # release state machine.
+          git fetch origin master
+          if ! git merge-base --is-ancestor HEAD origin/master; then
+            echo "Tag ${GITHUB_REF_NAME} points at $(git rev-parse HEAD), which is not on master." >&2
+            echo "Releases reuse the exact commit that passed the PR/master gate." >&2
+            exit 1
+          fi
+          echo "Releasing master-gated commit $(git rev-parse HEAD)"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -26,22 +51,11 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Install runtime dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes tmux
-
       - name: Verify release tag
         run: npm run verify:release-tag
 
       - name: Build
         run: npm run build
-
-      - name: Test
-        run: npm test
-
-      - name: Lint
-        run: npm run lint
 
       - name: Assemble and pack
         run: |
@@ -66,12 +80,26 @@ jobs:
           grep -qx 'package/skills/yui-reviewer/SKILL.md' package-files.txt
           if [ "$(grep -Ec '^package/skills/' package-files.txt)" -ne 4 ]; then exit 1; fi
           if grep -Eq '^package/(binding\.gyp|native/|build/|scripts/|test/)' package-files.txt; then exit 1; fi
+          # The executable bit must survive into the actual tarball, not only
+          # the npm pack manifest (PR #110 regression contract).
+          test "$(tar -tvf yui-runtime.tgz | awk '$NF=="package/dist/cli.js"{print $1}')" = "-rwxr-xr-x"
+
+      - name: Record artifact provenance
+        run: |
+          sha256sum yui-runtime.tgz | tee yui-runtime.sha256
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "tag=${GITHUB_REF_NAME}"
+            cat yui-runtime.sha256
+          } | tee release-provenance.txt
 
       - name: Upload tested package
         uses: actions/upload-artifact@v4
         with:
           name: yui-runtime-tarball
-          path: yui-runtime.tgz
+          path: |
+            yui-runtime.tgz
+            release-provenance.txt
           if-no-files-found: error
           retention-days: 1
 
@@ -92,11 +120,21 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+
       - name: Download tested package
         uses: actions/download-artifact@v4
         with:
           name: yui-runtime-tarball
           path: release-artifact
+
+      - name: Verify artifact provenance
+        run: |
+          cd release-artifact
+          sha256sum -c yui-runtime.sha256
 
       - name: Install and exercise the package
         run: |
@@ -122,6 +160,11 @@ jobs:
         with:
           name: yui-runtime-tarball
           path: release-artifact
+
+      - name: Verify artifact provenance
+        run: |
+          cd release-artifact
+          sha256sum -c yui-runtime.sha256
 
       - name: Publish tested package
         run: npm publish ./release-artifact/yui-runtime.tgz --access public --provenance

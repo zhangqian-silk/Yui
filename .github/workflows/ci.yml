@@ -1,5 +1,11 @@
 name: Deterministic CI
 
+# The single PR/master deterministic gate (see docs/testing/verification-levels.md).
+# It runs once on the exact commit: build, lint, the full deterministic suite,
+# and package structure smoke. Local development uses risk-targeted checks
+# instead of repeating this suite; the release workflow reuses its result on
+# the exact tagged commit instead of running it again.
+
 on:
   pull_request:
     branches:

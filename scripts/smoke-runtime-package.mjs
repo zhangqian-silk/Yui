@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync
 } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
@@ -45,6 +46,18 @@ try {
   }
   if (packageJson.bin?.yui !== "./dist/cli.js") {
     throw new Error("Installed runtime package does not expose the expected yui bin.");
+  }
+  // PR #110 regression: the installed CLI must stay executable. npm applies
+  // the process umask on extraction, so the exact tarball mode (asserted as
+  // 0755 in the package structure check) may land as 0700 locally; the
+  // regression contract is a surviving execute bit, and the .bin/yui
+  // invocations below prove it is runnable.
+  const installedCli = join(root, "dist", "cli.js");
+  const installedMode = statSync(installedCli).mode & 0o777;
+  if ((installedMode & 0o111) === 0) {
+    throw new Error(
+      `Installed dist/cli.js must be executable, received ${installedMode.toString(8).padStart(4, "0")}.`
+    );
   }
 
   cli = resolve(root, "..", "..", ".bin", "yui");
