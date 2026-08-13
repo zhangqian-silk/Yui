@@ -394,7 +394,7 @@ async function choose(
   defaultValue: string,
   label: string
 ): Promise<string | undefined> {
-  io.write(`${renderTable(
+  io.write(`\n\n${renderTable(
     title,
     [{ header: "#", minWidth: 1, maxWidth: 4 }, ...COLUMNS],
     choices.map((choice, index) => [
