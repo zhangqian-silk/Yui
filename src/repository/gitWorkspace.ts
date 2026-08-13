@@ -75,6 +75,20 @@ export interface GitWorkspacePort {
     sourceRef: string;
     archiveRef: string;
   }>): Promise<void>;
+  /**
+   * Fail closed when a live worktree of the repository still has `ref`
+   * checked out. `archiveRef` deletes the ref with `update-ref -d`, which
+   * bypasses git's worktree-occupancy check, so every same-repo worktree on
+   * the exact ref must be gone before the ref may be deleted.
+   * `excludeWorktreePath` names the recorded worktree the caller removes as
+   * part of the same archive flow; prunable (dead) worktree registrations
+   * are ignored.
+   */
+  assertNoForeignWorktreeOnRef(input: Readonly<{
+    repositoryPath: string;
+    ref: string;
+    excludeWorktreePath?: string;
+  }>): Promise<void>;
   isAncestor(
     repositoryPath: string,
     ancestor: string,
@@ -659,6 +673,59 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       await git([
         "-C", root, "update-ref", "-d", "--no-deref", source, commit
       ]);
+    }
+  }
+
+  async assertNoForeignWorktreeOnRef(input: Readonly<{
+    repositoryPath: string;
+    ref: string;
+    excludeWorktreePath?: string;
+  }>): Promise<void> {
+    const root = (await this.inspect(input.repositoryPath)).root;
+    const wanted = safeRef(input.ref);
+    // The recorded worktree is removed in the same archive flow; it is the
+    // only same-repo worktree on the ref that may stay for now. A path that
+    // no longer exists cannot match a live worktree.
+    const excluded = input.excludeWorktreePath === undefined
+      ? undefined
+      : await realpath(resolve(input.excludeWorktreePath)).catch(() => undefined);
+    const porcelain = await git(["-C", root, "worktree", "list", "--porcelain"]);
+    const records: Array<{ path: string; branch?: string; prunable: boolean }> = [];
+    let current: { path?: string; branch?: string; prunable: boolean } = { prunable: false };
+    for (const line of porcelain.split("\n")) {
+      if (line.length === 0) {
+        const path = current.path;
+        if (path !== undefined) {
+          records.push({ path, branch: current.branch, prunable: current.prunable });
+        }
+        current = { prunable: false };
+        continue;
+      }
+      if (line.startsWith("worktree ")) {
+        current.path = line.slice("worktree ".length);
+      } else if (line.startsWith("branch ")) {
+        current.branch = line.slice("branch ".length);
+      } else if (line.startsWith("prunable")) {
+        current.prunable = true;
+      }
+    }
+    const lastPath = current.path;
+    if (lastPath !== undefined) {
+      records.push({ path: lastPath, branch: current.branch, prunable: current.prunable });
+    }
+    for (const record of records) {
+      // A dead registration (its directory is gone) occupies nothing; a
+      // worktree on another ref or a detached HEAD does not occupy this one.
+      if (record.prunable || record.branch !== wanted) continue;
+      // git reports canonical absolute paths; compare canonicals so a
+      // symlinked workspace root cannot make the recorded worktree look
+      // foreign.
+      const canonical = await realpath(record.path).catch(() => record.path);
+      if (canonical === excluded) continue;
+      throw new Error(
+        `Ref ${wanted} is checked out by a worktree outside this Home's management ` +
+        `(${record.path}); the archive refuses to delete the ref and strand that worktree.`
+      );
     }
   }
 

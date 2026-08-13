@@ -9,7 +9,7 @@
  *   --------------------------------------------------  ----------------------------
  *   active checked-out ref, recorded worktree           task-archive-ordering.test.js
  *   active checked-out ref, cross-repo recorded wt      this file (A4) + rebuild tests
- *   active checked-out ref, same-repo foreign wt        this file (A5, skipped: confirmed gap)
+ *   active checked-out ref, same-repo foreign wt        this file (A5)
  *   dirty worktree                                      task-archive-ordering / rebuild
  *   missing recorded worktree (path gone, ref kept)     this file (A1)
  *   Controller concurrent prepare during a rebuild      this file (A3)
@@ -400,16 +400,13 @@ test("A4 archive fails closed on a cross-repo worktree at the recorded path", as
   );
 });
 
-// CONFIRMED GAP (not yet fail-closed): a same-repo foreign worktree on the
-// legacy ref is invisible to the Home's recorded-worktree preflight, which
-// only inspects the recorded path. With the recorded worktree gone, the
-// archive proceeds: `archiveRef` creates the archive ref and then deletes the
-// source ref via `update-ref -d`, which bypasses git's worktree-occupancy
-// check. The foreign worktree is left with an unborn HEAD and the active ref
-// is gone. Verified on the integrated main (slices 1-4): the archive returns
-// `{ archived: [...] }` without throwing. Enable once the archive preflight
-// enumerates same-repo foreign worktrees on the target ref and fails closed.
-test.skip("A5 archive fails closed when a same-repo foreign worktree occupies the ref", async (t) => {
+// A same-repo foreign worktree on the legacy ref (one this Home does not
+// manage) must fail the archive closed: the pre-archive enumeration lists
+// every worktree on the exact ref, excludes the recorded worktree this Home
+// removes in the same flow, and refuses to touch the ref while a foreign
+// worktree still has it checked out. The ref stays, the foreign worktree
+// keeps a valid HEAD, and no archive ref is created.
+test("A5 archive fails closed when a same-repo foreign worktree occupies the ref", async (t) => {
   const fixture = await matrixFixture(t);
   const { task, legacyRef } = await legacyTask(fixture);
   const legacyCommit = git(fixture.project.path, ["rev-parse", legacyRef]);

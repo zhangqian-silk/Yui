@@ -2091,7 +2091,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
    *
    * Every registered worktree on a to-be-archived ref is preflighted before
    * the first side effect: a dirty or unidentifiable one fails the whole
-   * archive with nothing created, deleted, or removed.
+   * archive with nothing created, deleted, or removed. A same-repo worktree
+   * this Home does not manage that still has the ref checked out fails the
+   * archive closed as well, so deleting the ref cannot strand it.
    */
   async archiveLegacyTaskRefs(taskId?: string): Promise<LegacyTaskRefArchiveResult> {
     const home = this.store.getHomeIdentity();
@@ -2337,9 +2339,20 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
    * active ref is deleted; a dirty worktree fails the ref closed. Each step
    * is resumable: a same-commit archive ref resumes, a missing worktree and
    * an already-deleted source are no-ops.
+   *
+   * Before any mutation, a same-repo worktree this Home does not manage that
+   * still has the ref checked out fails the archive closed: `archiveRef`
+   * deletes the ref with `update-ref -d`, which bypasses git's
+   * worktree-occupancy check and would strand that worktree with an unborn
+   * HEAD. The recorded worktree removed below is excluded from the check.
    */
   async #archiveLegacyRef(target: LegacyRefArchiveTarget): Promise<void> {
     const worktree = this.#legacyRefWorktree(target);
+    await this.git.assertNoForeignWorktreeOnRef({
+      repositoryPath: target.project.path,
+      ref: target.ref,
+      excludeWorktreePath: worktree?.path
+    });
     if (worktree !== undefined) {
       const removal = await this.git.removeRecordedWorktree({
         ...worktree,
