@@ -69,6 +69,7 @@ import {
 import { taskActor } from "./commands/taskActor.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { runTaskChangeSetCommand } from "./commands/taskChangeSetCommands.js";
+import { runTaskOverlapCommand } from "./commands/taskOverlapCommands.js";
 import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
 import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
@@ -612,6 +613,11 @@ export async function main(): Promise<void> {
     }
     if (resolved[1] === "change-set") {
       const result = await runTaskChangeSetCommand(resolved.slice(2), store);
+      emit(result.output, false, result.data);
+      return;
+    }
+    if (resolved[1] === "overlap") {
+      const result = await runTaskOverlapCommand(resolved.slice(2), store);
       emit(result.output, false, result.data);
       return;
     }

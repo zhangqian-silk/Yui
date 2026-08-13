@@ -13,7 +13,7 @@ export function deriveManifestTags(input: Readonly<{
 }>): readonly ChangeSetManifestTag[] {
   const tags = new Set<ChangeSetManifestTag>();
   for (const path of input.changedPaths) {
-    for (const tag of tagsForPath(path)) tags.add(tag);
+    for (const tag of manifestTagsForPath(path)) tags.add(tag);
   }
   if (input.deletedPaths !== undefined && input.deletedPaths.length > 0) {
     tags.add("deletion");
@@ -32,7 +32,11 @@ const CHANGE_SET_TAG_ORDER: readonly ChangeSetManifestTag[] = [
   "deletion"
 ];
 
-function tagsForPath(path: string): readonly ChangeSetManifestTag[] {
+/**
+ * Classify a single changed path by every semantic tag it matches.  Overlap
+ * diagnostics use this to attribute shared paths to a finding category.
+ */
+export function manifestTagsForPath(path: string): readonly ChangeSetManifestTag[] {
   const normalized = path.split("\\").join("/");
   const segments = normalized.split("/");
   const file = segments.at(-1) ?? normalized;
