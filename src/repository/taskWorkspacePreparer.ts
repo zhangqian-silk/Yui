@@ -16,7 +16,7 @@ import {
   attachReviewRoundWorkspace,
   recordReviewWorkspaceDisposition
 } from "../review/reviewRound.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import { StorageConflictError, type TaskStore } from "../storage/taskStore.js";
 import {
   bindTaskWorkspaceIdentity,
   type Task
@@ -57,11 +57,19 @@ import {
   taskMainBranch,
   taskWorkspaceRefSegment,
   taskWorkspaceRefSegmentFromIdentity,
+  validateTaskWorkspaceIdentity,
   type TaskWorkspaceIdentity
 } from "./taskWorkspaceIdentity.js";
 
 const MAIN_WORKTREE = "main";
 const LEADER_ROLE = "leader";
+/**
+ * Bound for prepare attempts after a lost identity race or a storage
+ * revision conflict. Each conflict already discarded the attempt's refs, so
+ * retrying converges with the committed state; the bound stops a persistent
+ * competitor from pinning this caller forever.
+ */
+const TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES = 3;
 
 type TaskWorkspaceBaseline = Readonly<{
   baseRef: string;
@@ -166,6 +174,25 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   ) {}
 
   async prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation> {
+    // A lost prepare/rebuild identity race (or a storage revision conflict)
+    // surfaces as StorageConflictError: the attempt's refs were already
+    // discarded, so re-prepare against the committed state. The bound keeps
+    // a crash-looping competitor from pinning this caller; the last conflict
+    // surfaces once it is exhausted.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.#prepareTaskWorkspaceOnce(taskId);
+      } catch (error) {
+        if (error instanceof StorageConflictError
+          && attempt < TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  async #prepareTaskWorkspaceOnce(taskId: string): Promise<TaskWorkspacePreparation> {
     const task = requireTask(this.store, taskId);
     if (!["draft", "active"].includes(task.status)) {
       throw new Error(`Task is not open for workspace preparation: ${task.id}.`);
@@ -338,6 +365,28 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         if (current !== null && current.owner.type !== "task") {
           throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
         }
+        // Single-writer CAS, mirroring the rebuild guard: this attempt only
+        // commits while the Task is still unbound (or carries the identity it
+        // started with). A concurrent prepare or rebuild that bound a
+        // different identity wins; this attempt discards its refs and retries
+        // through the StorageConflictError channel.
+        if (workspaceIdentity !== undefined
+          && latest.workspaceIdentity !== undefined
+          && !isDeepStrictEqual(
+            validateTaskWorkspaceIdentity(latest.workspaceIdentity),
+            workspaceIdentity
+          )) {
+          throw new StorageConflictError(
+            `Task workspace identity changed while preparing its workspace: ${task.id}.`
+          );
+        }
+        if (current === null
+          ? existing !== null
+          : existing === null || !sameManagedWorkspace(current, existing)) {
+          throw new StorageConflictError(
+            `Task workspace changed while preparing its workspace: ${task.id}.`
+          );
+        }
         const pinnedBindings = latest.projectBindings.map((binding) => {
           const baseline = baselines.get(binding.projectId);
           return baseline?.pinTask === true
@@ -382,7 +431,10 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       });
       return { taskId, status: "ready", path: root };
     } catch (error) {
-      await this.#discardUnadoptedEntries(task, taskSegment, prepared, MAIN_WORKTREE);
+      // A failed or conflicted preparation owns no durable record: drop the
+      // branches too, so a retry mints a clean identity without half-created
+      // refs behind. Adopted (already catalogued) worktrees are never touched.
+      await this.#discardUnadoptedEntries(task, taskSegment, prepared, MAIN_WORKTREE, true);
       throw error;
     }
   }
