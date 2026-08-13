@@ -422,6 +422,104 @@ test("progress admission keeps only the latest exact-Run fact within each semant
   );
 });
 
+test("same-millisecond progress retains the greatest sequence at admission and restart", (t) => {
+  const { home } = fixture(t);
+  const receivedAt = new Date("2026-08-13T00:00:00.000Z");
+  const progressInput = (progressId, sequence) => ({
+    scope: "task",
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex-personal",
+    adapterId: "codex",
+    launchId: "launch-current",
+    nativeSessionId: "thread-native-1",
+    runId: "agent-run-1",
+    progressId,
+    sequence
+  });
+
+  const admission = new FileRuntimeEventInbox(home, () => receivedAt);
+  // These fixed identities deliberately sort opposite to sequence: id(1) > id(2).
+  const first = admission.enqueueProviderProgress(
+    progressInput("before-sequence-1-0", 1)
+  ).event;
+  const second = admission.enqueueProviderProgress(
+    progressInput("before-sequence-2-1", 2)
+  ).event;
+  assert.ok(first.id > second.id);
+  assert.deepEqual(
+    admission.list().filter(({ type }) => type === "native-turn-progress")
+      .map(({ sequence }) => sequence),
+    [2]
+  );
+
+  const restartHome = mkdtempSync(join(tmpdir(), "yui-runtime-inbox-restart-"));
+  t.after(() => rmSync(restartHome, { recursive: true, force: true }));
+  const restartTimes = [
+    new Date("2026-08-13T00:01:00.000Z"),
+    new Date("2026-08-13T00:02:00.000Z"),
+    new Date("2026-08-13T00:03:00.000Z"),
+    new Date("2026-08-13T00:03:00.000Z")
+  ];
+  const restartWriter = new FileRuntimeEventInbox(
+    restartHome,
+    () => restartTimes.shift()
+  );
+  const beforeBarrier = restartWriter.enqueueProviderProgress(
+    progressInput("before-sequence-2-1", 2)
+  ).event;
+  const barrier = restartWriter.enqueuePromptAccepted({
+    scope: "task",
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex-personal",
+    adapterId: "codex",
+    launchId: "launch-current",
+    nativeSessionId: "thread-native-1",
+    runId: "agent-run-1",
+    receiptId: "receipt-barrier"
+  }).event;
+  const afterFirst = restartWriter.enqueueProviderProgress(
+    progressInput("after-sequence-1-0", 1)
+  ).event;
+  const afterSecond = restartWriter.enqueueProviderProgress(
+    progressInput("after-sequence-2-0", 2)
+  ).event;
+  assert.ok(afterFirst.id > afterSecond.id);
+  // Restore the superseded sequence-1 file to model a crash/restart backlog.
+  const restored = { ...afterFirst, receivedAt: afterSecond.receivedAt };
+  writeFileSync(
+    join(restartHome, "runtime", "inbox", `${restored.id}.json`),
+    `${JSON.stringify(restored)}\n`,
+    { mode: 0o600 }
+  );
+
+  const calls = [];
+  const restartInbox = new FileRuntimeEventInbox(restartHome);
+  assert.deepEqual(
+    restartInbox.list().map(({ id }) => id),
+    [beforeBarrier.id, barrier.id, afterSecond.id, restored.id]
+  );
+  const processor = new FileRuntimeEventProcessor(restartInbox, {
+    withRuntimeEventTransaction: (execute) => execute(),
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress(input) {
+      calls.push(input.sequence);
+      return "applied";
+    },
+    observeProviderPromptAccepted() {
+      calls.push("accepted");
+      return "applied";
+    },
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  });
+
+  processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.deepEqual(calls, [2, "accepted", 2]);
+});
+
 test("restart drain coalesces 25 progress streams into one state transaction", () => {
   const events = [];
   for (let stream = 0; stream < 25; stream += 1) {

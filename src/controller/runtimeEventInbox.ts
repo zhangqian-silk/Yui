@@ -422,7 +422,13 @@ export class FileRuntimeEventInbox {
       && compareRuntimeEvents(candidate, segment.before) > 0
       && (segment.after === undefined || compareRuntimeEvents(candidate, segment.after) < 0)
     ));
-    const retained = candidates.at(-1);
+    const retained = candidates.reduce<RuntimeProviderProgressEvent | undefined>(
+      (latest, candidate) => latest === undefined
+        || compareRuntimeProgressRecency(candidate, latest) > 0
+        ? candidate
+        : latest,
+      undefined
+    );
     return candidates.flatMap(({ id }) => id === retained?.id ? [] : [id]);
   }
 
@@ -823,6 +829,23 @@ function compareRuntimeEvents(
 ): number {
   return left.receivedAt.localeCompare(right.receivedAt)
     || left.id.localeCompare(right.id);
+}
+
+/** Chooses one latest fact inside an already-isolated exact progress stream. */
+export function compareRuntimeProgressRecency(
+  left: Pick<RuntimeProviderProgressEvent, "receivedAt" | "id" | "sequence">,
+  right: Pick<RuntimeProviderProgressEvent, "receivedAt" | "id" | "sequence">
+): number {
+  const receivedAt = left.receivedAt.localeCompare(right.receivedAt);
+  if (receivedAt !== 0) return receivedAt;
+  if (
+    left.sequence !== undefined
+    && right.sequence !== undefined
+    && left.sequence !== right.sequence
+  ) {
+    return left.sequence - right.sequence;
+  }
+  return left.id.localeCompare(right.id);
 }
 
 function semanticSegment(

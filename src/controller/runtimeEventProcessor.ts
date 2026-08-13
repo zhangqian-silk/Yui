@@ -8,6 +8,7 @@ import type {
   RuntimeSessionLifecycleEvent,
   RuntimeTurnCompletedEvent
 } from "./runtimeEventInbox.js";
+import { compareRuntimeProgressRecency } from "./runtimeEventInbox.js";
 
 export type TaskProviderSessionLifecycle = Readonly<{
   eventId: string;
@@ -540,7 +541,9 @@ function coalesceRuntimeProgress(
   events: readonly RuntimeLifecycleEvent[]
 ): CoalescedRuntimeEvent[] {
   const result: CoalescedRuntimeEvent[] = [];
-  let segment = new Map<string, CoalescedRuntimeEvent>();
+  let segment = new Map<string, CoalescedRuntimeEvent & Readonly<{
+    event: RuntimeProviderProgressEvent;
+  }>>();
   const flush = (): void => {
     result.push(...segment.values());
     segment = new Map();
@@ -553,8 +556,12 @@ function coalesceRuntimeProgress(
     }
     const key = progressStreamKey(event);
     const existing = segment.get(key);
+    const retained = existing === undefined
+      || compareRuntimeProgressRecency(event, existing.event) > 0
+      ? event
+      : existing.event;
     segment.set(key, {
-      event,
+      event: retained,
       representedEventIds: [
         ...(existing?.representedEventIds ?? []),
         event.id
