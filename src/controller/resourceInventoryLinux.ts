@@ -70,6 +70,8 @@ type LinuxProcessIo = Readonly<{
   ioWriteBytes: number;
 }>;
 
+const LINUX_PROCESS_SCAN_BATCH_SIZE = 64;
+
 export async function scanControllerResourceInventory(
   options: ControllerInventoryScanOptions
 ): Promise<ControllerResourceInventory> {
@@ -78,7 +80,7 @@ export async function scanControllerResourceInventory(
   const observedAt = (options.now ?? (() => new Date()))();
   const warnings: string[] = [];
   const activeSockets = readActiveUnixSocketPaths(warnings);
-  const processes = listLinuxProcesses(warnings)
+  const processes = (await listLinuxProcesses(warnings))
     .filter(({ pid }) => pid !== process.pid);
   const homes = new Set<string>([currentHome]);
   if (options.scope === "all") {
@@ -272,7 +274,7 @@ export function classifyRuntimeProcess(
   return "other";
 }
 
-function listLinuxProcesses(warnings: string[]): RuntimeProcessFact[] {
+async function listLinuxProcesses(warnings: string[]): Promise<RuntimeProcessFact[]> {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
   const clockTicks = readClockTicks();
   const uptimeMs = readSystemUptimeMs();
@@ -286,42 +288,65 @@ function listLinuxProcesses(warnings: string[]): RuntimeProcessFact[] {
     warnings.push(`Cannot enumerate Linux processes: ${message(error)}`);
     return [];
   }
-  return entries.flatMap((entryName): RuntimeProcessFact[] => {
-    try {
+  const result: RuntimeProcessFact[] = [];
+  await forEachInEventLoopBatches(
+    entries,
+    LINUX_PROCESS_SCAN_BATCH_SIZE,
+    (entryName) => {
       const pid = linuxProcessEntryPid(entryName);
-      if (pid === undefined) return [];
-      const status = readFileSync(`/proc/${pid}/status`, "utf8");
-      const processUid = parseStatusNumber(status, "Uid");
-      if (processUid !== uid) return [];
-      const parsed = parseLinuxProcessStat(
-        readFileSync(`/proc/${pid}/stat`, "utf8"),
-        clockTicks,
-        uptimeMs
-      );
-      const args = splitNullDelimited(readFileSync(`/proc/${pid}/cmdline`));
-      const command = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
-      const yuiHome = readYuiHome(pid);
-      const io = readProcessIo(pid);
-      return [{
-        pid,
-        ppid: parsed.ppid,
-        uid: processUid,
-        startIdentity: parsed.startIdentity,
-        ...(yuiHome === undefined ? {} : { yuiHome }),
-        kind: classifyRuntimeProcess(args, command),
-        command,
-        args,
-        rssBytes: parseStatusNumber(status, "VmRSS", 0) * 1024,
-        cpuTimeMs: parsed.cpuTimeMs,
-        ...(io === undefined ? {} : io),
-        ageMs: parsed.ageMs
-      }];
-    } catch {
-      // Processes commonly exit during a /proc scan. A point-in-time inventory
-      // omits those races instead of turning them into persistent warnings.
-      return [];
+      if (pid === undefined) return;
+      try {
+        const status = readFileSync(`/proc/${pid}/status`, "utf8");
+        const processUid = parseStatusNumber(status, "Uid");
+        if (processUid === uid) {
+          const parsed = parseLinuxProcessStat(
+            readFileSync(`/proc/${pid}/stat`, "utf8"),
+            clockTicks,
+            uptimeMs
+          );
+          const args = splitNullDelimited(readFileSync(`/proc/${pid}/cmdline`));
+          const command = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+          const yuiHome = readYuiHome(pid);
+          const io = readProcessIo(pid);
+          result.push({
+            pid,
+            ppid: parsed.ppid,
+            uid: processUid,
+            startIdentity: parsed.startIdentity,
+            ...(yuiHome === undefined ? {} : { yuiHome }),
+            kind: classifyRuntimeProcess(args, command),
+            command,
+            args,
+            rssBytes: parseStatusNumber(status, "VmRSS", 0) * 1024,
+            cpuTimeMs: parsed.cpuTimeMs,
+            ...(io === undefined ? {} : io),
+            ageMs: parsed.ageMs
+          });
+        }
+      } catch {
+        // Processes commonly exit during a /proc scan. A point-in-time inventory
+        // omits those races instead of turning them into persistent warnings.
+      }
     }
-  });
+  );
+  return result;
+}
+
+/** Cooperatively visits synchronous inventory entries in bounded turns. */
+export async function forEachInEventLoopBatches<T>(
+  entries: readonly T[],
+  batchSize: number,
+  visit: (entry: T, index: number) => void
+): Promise<void> {
+  if (!Number.isSafeInteger(batchSize) || batchSize < 1) {
+    throw new Error("Event-loop batch size must be a positive integer.");
+  }
+  for (let index = 0; index < entries.length; index += 1) {
+    visit(entries[index]!, index);
+    if ((index + 1) % batchSize === 0 && index + 1 < entries.length) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
 }
 
 /**

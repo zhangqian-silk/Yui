@@ -4,6 +4,10 @@ import {
   type LeaderWakeupProcessingResult
 } from "../scheduler/leaderWakeupProcessor.js";
 import {
+  pendingWakeupsMatch,
+  type PendingWakeup
+} from "../scheduler/pendingWakeup.js";
+import {
   processActiveRoleRunDeliveries,
   type ActiveRoleRunDeliveryResult
 } from "../scheduler/activeRoleRunDelivery.js";
@@ -219,6 +223,32 @@ export async function runControllerSchedulerPass(
         : []
     )));
     resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
+    // Durable Leader work is on the control path. Claim and dispatch the
+    // exact wakeups that existed at this boundary before entering provider
+    // and resource inventories, which are recovery/advisory work.
+    const initialWakeups = selectedPendingWakeups(store, wakeupSelection);
+    const initialWakeupResults = await processLeaderWakeups(
+      store,
+      delivery,
+      now,
+      exactTaskSelection(new Set(initialWakeups.keys()))
+    );
+    // Phase-one Leader Runs did not exist at the pass's liveness boundary.
+    // Keep every newly claimed Run outside destructive absence decisions until
+    // a later pass can observe its stable provider/session generation.
+    for (const result of initialWakeupResults) {
+      if (
+        result.runId !== undefined
+        && store.getActiveAgentRun(result.taskId, "leader")?.id === result.runId
+      ) {
+        unsettledRunRefs.add(
+          formatTaskRecordReference(result.taskId, result.runId, "agentRun")
+        );
+      }
+    }
+    // Let socket callbacks queued during the bounded scheduler phases run
+    // before starting a potentially large liveness inventory.
+    await eventLoopTurn();
     const liveStatuses = new Map<string, "present" | "absent">();
     const resourceEvidence = new Map<string, RoleRunResourceEvidence>();
     const failedRunRefs = await reconcileExitedRoleRuns(
@@ -252,7 +282,31 @@ export async function runControllerSchedulerPass(
       : selection.taskIds.size === 0
         ? []
         : store.resolveExpiredInputRecommendations(now, selection.taskIds);
-    const wakeups = await processLeaderWakeups(store, delivery, now, wakeupSelection);
+    // Liveness and auto-resolution can durably queue new Leader work. Process
+    // only Tasks that were not part of phase one, so a retained/busy wakeup is
+    // never re-run in the same pass and result order stays deterministic.
+    const autoResolvedTaskIds = new Set(autoResolvedInputs.map(({ taskId }) => taskId));
+    const waitingInputTaskIds = new Set(initialWakeupResults.flatMap((result) => (
+      result.reason === "waiting-input" && autoResolvedTaskIds.has(result.taskId)
+        ? [result.taskId]
+        : []
+    )));
+    const laterWakeupTaskIds = new Set(
+      [...selectedPendingWakeups(store, wakeupSelection)].flatMap(([taskId, wakeup]) => {
+        const initial = initialWakeups.get(taskId);
+        return initial === undefined
+          || !pendingWakeupsMatch(initial, wakeup)
+          || waitingInputTaskIds.has(taskId)
+          ? [taskId]
+          : [];
+      })
+    );
+    const laterWakeups = await processLeaderWakeups(
+      store,
+      delivery,
+      now,
+      exactTaskSelection(laterWakeupTaskIds)
+    );
     const inputNotifications = includeOperator
       ? await processOperatorInputNotifications(store, delivery, selection, now)
       : [];
@@ -266,7 +320,7 @@ export async function runControllerSchedulerPass(
     return {
       activeRunDeliveries,
       failedRunRefs,
-      wakeups,
+      wakeups: mergeWakeupPhaseResults(initialWakeupResults, laterWakeups),
       inputNotifications,
       autoResolvedInputs
     };
@@ -276,6 +330,50 @@ export async function runControllerSchedulerPass(
     }
     throw error;
   }
+}
+
+function selectedPendingWakeups(
+  store: Pick<SchedulerStorePort, "getPendingWakeup" | "listPendingWakeups">,
+  selection: SchedulerReconcileSelection
+): Map<string, PendingWakeup> {
+  const wakeups = selection.full
+    ? store.listPendingWakeups()
+    : [...selection.taskIds].flatMap((taskId) => {
+        const wakeup = store.getPendingWakeup(taskId);
+        return wakeup === null ? [] : [wakeup];
+      });
+  return new Map(wakeups.map((wakeup) => [
+    wakeup.taskId,
+    { ...wakeup, reasons: [...wakeup.reasons] }
+  ]));
+}
+
+function exactTaskSelection(taskIds: ReadonlySet<string>): SchedulerReconcileSelection {
+  return {
+    full: false,
+    taskIds,
+    allRoleTaskIds: new Set(),
+    rolesByTask: new Map(),
+    operator: false
+  };
+}
+
+function mergeWakeupPhaseResults(
+  initial: readonly LeaderWakeupProcessingResult[],
+  later: readonly LeaderWakeupProcessingResult[]
+): LeaderWakeupProcessingResult[] {
+  const merged = [...initial];
+  const positions = new Map(initial.map(({ taskId }, index) => [taskId, index]));
+  for (const result of later) {
+    const position = positions.get(result.taskId);
+    if (position === undefined) {
+      positions.set(result.taskId, merged.length);
+      merged.push(result);
+    } else {
+      merged[position] = result;
+    }
+  }
+  return merged;
 }
 
 type ClaimedTaskMailbox = Readonly<{

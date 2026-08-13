@@ -15,6 +15,7 @@ import {
 } from "../../dist/controller/resourceInventory.js";
 import {
   classifyRuntimeProcess,
+  forEachInEventLoopBatches,
   linuxProcessEntryPid,
   parseLinuxProcessStat,
   scanControllerResourceInventory
@@ -45,6 +46,22 @@ test("Linux process inventory accepts only numeric /proc entry names", () => {
   assert.equal(linuxProcessEntryPid("4916 (deleted)"), undefined);
   assert.equal(linuxProcessEntryPid("0"), undefined);
   assert.equal(linuxProcessEntryPid("42"), 42);
+});
+
+test("Linux process inventory yields between bounded entry batches", async () => {
+  let socketCallbackRan = false;
+  let callbackObservedBySecondBatch = false;
+  setImmediate(() => { socketCallbackRan = true; });
+
+  await forEachInEventLoopBatches(
+    Array.from({ length: 65 }, (_, index) => index),
+    64,
+    (_entry, index) => {
+      if (index === 64) callbackObservedBySecondBatch = socketCallbackRan;
+    }
+  );
+
+  assert.equal(callbackObservedBySecondBatch, true);
 });
 
 function roleResource(overrides = {}) {

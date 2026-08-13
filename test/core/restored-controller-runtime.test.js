@@ -93,7 +93,7 @@ const noTmux = {
   async stopTask() { return false; }
 };
 
-test("controller scheduler folds completion and liveness phases before wakeups", async () => {
+test("controller scheduler scans durable wakeups before and after liveness", async () => {
   const events = [];
   const result = await runControllerSchedulerPass(emptyStore(events), noTmux, new Date(0));
   assert.deepEqual(result, {
@@ -103,7 +103,107 @@ test("controller scheduler folds completion and liveness phases before wakeups",
     inputNotifications: [],
     autoResolvedInputs: []
   });
-  assert.deepEqual(events, ["list-tasks", "list-tasks", "list-tasks", "list-wakeups"]);
+  assert.deepEqual(events, [
+    "list-tasks", "list-tasks", "list-wakeups", "list-tasks", "list-wakeups"
+  ]);
+});
+
+test("liveness may replace a phase-one busy wake without duplicate results", async () => {
+  const now = new Date(1);
+  const task = gitlessTask("task-1");
+  const leader = role(task.id, "leader");
+  let activeRun = deliveredRun(task.id, leader.name);
+  let session = null;
+  let wakeup = {
+    schemaVersion: 1,
+    taskId: task.id,
+    reasons: ["worker-result"],
+    requestCount: 1,
+    firstRequestedAt: new Date(0).toISOString(),
+    lastRequestedAt: new Date(0).toISOString()
+  };
+  let mailbox = {
+    schemaVersion: 1,
+    target: { kind: "role", taskId: task.id, roleName: leader.name },
+    nextSequence: 2,
+    processing: null,
+    pending: {
+      fromSequence: 1,
+      toSequence: 1,
+      reasons: ["worker-result"],
+      refs: [{ type: "task", id: task.id }],
+      requestCount: 1,
+      firstQueuedAt: new Date(0).toISOString(),
+      lastQueuedAt: new Date(0).toISOString()
+    }
+  };
+  let dispatchClaims = 0;
+  let deliveries = 0;
+  const store = emptyStore();
+  store.listTasks = () => [task];
+  store.getTask = (taskId) => taskId === task.id ? task : null;
+  store.listRoles = () => [leader];
+  store.getRole = (_taskId, roleName) => roleName === leader.name ? leader : null;
+  store.getTaskWorkspace = () => taskOwnedWorkspace(task);
+  store.getActiveAgentRun = () => activeRun;
+  store.getRoleSession = () => session;
+  store.peekNextAgentRunId = () => "agent-run-2";
+  store.getPendingWakeup = () => wakeup;
+  store.listPendingWakeups = () => wakeup === null ? [] : [wakeup];
+  store.getWorkMailbox = (target) => target.kind === "role" ? mailbox : null;
+  store.listWorkMailboxes = () => [mailbox];
+  store.saveExitedRoleRun = () => {
+    activeRun = null;
+    wakeup = {
+      ...wakeup,
+      reasons: [...wakeup.reasons, "leader-run-failed"],
+      requestCount: 2,
+      lastRequestedAt: now.toISOString()
+    };
+    mailbox = {
+      ...mailbox,
+      pending: {
+        ...mailbox.pending,
+        reasons: [...mailbox.pending.reasons, "leader-run-failed"],
+        requestCount: 2,
+        lastQueuedAt: now.toISOString()
+      }
+    };
+    return "failed";
+  };
+  store.saveLeaderDispatch = ({ run }) => {
+    dispatchClaims += 1;
+    activeRun = run;
+    wakeup = null;
+    mailbox = { ...mailbox, pending: null };
+    return "claimed";
+  };
+  store.saveRoleRunDelivery = ({ run }) => {
+    deliveries += 1;
+    activeRun = { ...run, pushedAt: now.toISOString() };
+  };
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return {
+        ...input,
+        deliveryId: "delivery-1",
+        inputSubmittedAtLaunch: true
+      };
+    },
+    async waitUntilReady(prepared) { return { prepared, session: null }; },
+    async inspectRole() { return "absent"; }
+  };
+
+  const result = await runControllerSchedulerPass(store, delivery, now);
+
+  assert.deepEqual(result.wakeups, [{
+    taskId: task.id,
+    runId: "agent-run-2",
+    status: "dispatched"
+  }]);
+  assert.equal(dispatchClaims, 1);
+  assert.equal(deliveries, 1);
 });
 
 test("full controller liveness and stall phases reuse one Role inventory", async () => {
@@ -300,7 +400,7 @@ test("periodic recovery skips active workspace scans without durable Task work",
     workspacePreparer
   );
   assert.deepEqual(events, [
-    "list-tasks", "list-tasks", "list-tasks", "list-tasks", "list-wakeups"
+    "list-tasks", "list-tasks", "list-tasks", "list-wakeups", "list-tasks", "list-wakeups"
   ]);
 });
 
@@ -1410,7 +1510,20 @@ test("Operator attention is not blocked by a slow Task reconciliation", async ()
   });
 
   controller.signal("task:task-1");
-  await started;
+  let workspaceStartTimeout;
+  try {
+    await Promise.race([
+      started,
+      new Promise((_, reject) => {
+        workspaceStartTimeout = setTimeout(
+          () => reject(new Error("workspace reconciliation did not start")),
+          3_000
+        );
+      })
+    ]);
+  } finally {
+    clearTimeout(workspaceStartTimeout);
+  }
   controller.signal("operator");
   await new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -1957,52 +2070,215 @@ test("a dirty Hook fold signals Operator work created after scheduler phases", a
 test("continuous progress passes yield so control requests are not starved", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-controller-progress-fairness-"));
   const controllerStore = emptyStore();
+  const now = new Date();
+  const leaderTask = gitlessTask("task-leader");
+  const leaderRole = role(leaderTask.id, "leader");
+  const inventoryTasks = Array.from({ length: 256 }, (_, index) => (
+    gitlessTask(`task-inventory-${index}`)
+  ));
+  const inventoryRoles = new Map(inventoryTasks.map((task) => (
+    [task.id, role(task.id, "worker")]
+  )));
+  const activeRuns = new Map(inventoryTasks.map((task) => {
+    const run = deliveredRun(task.id, "worker");
+    const timestamp = now.toISOString();
+    return [task.id, { ...run, createdAt: timestamp, updatedAt: timestamp, deliveredAt: timestamp }];
+  }));
+  const pendingBatch = {
+    fromSequence: 1,
+    toSequence: 1,
+    reasons: ["task-created"],
+    refs: [{ type: "task", id: leaderTask.id }],
+    requestCount: 1,
+    firstQueuedAt: now.toISOString(),
+    lastQueuedAt: now.toISOString()
+  };
+  let leaderMailbox = {
+    schemaVersion: 1,
+    target: { kind: "role", taskId: leaderTask.id, roleName: "leader" },
+    nextSequence: 2,
+    processing: null,
+    pending: pendingBatch
+  };
+  let pendingWakeup = {
+    schemaVersion: 1,
+    taskId: leaderTask.id,
+    reasons: ["task-created"],
+    requestCount: 1,
+    firstRequestedAt: now.toISOString(),
+    lastRequestedAt: now.toISOString()
+  };
+  let leaderDispatched = false;
+  controllerStore.listTasks = () => [...inventoryTasks, leaderTask];
+  controllerStore.getTask = (taskId) => (
+    taskId === leaderTask.id
+      ? leaderTask
+      : inventoryTasks.find(({ id }) => id === taskId) ?? null
+  );
+  controllerStore.listRoles = (taskId) => (
+    taskId === leaderTask.id ? [leaderRole] : [inventoryRoles.get(taskId)].filter(Boolean)
+  );
+  controllerStore.getRole = (taskId, roleName) => (
+    taskId === leaderTask.id && roleName === "leader"
+      ? leaderRole
+      : roleName === "worker" ? inventoryRoles.get(taskId) ?? null : null
+  );
+  controllerStore.getTaskWorkspace = (taskId) => taskOwnedWorkspace(
+    controllerStore.getTask(taskId)
+  );
+  controllerStore.getActiveAgentRun = (taskId) => activeRuns.get(taskId) ?? null;
+  controllerStore.getRoleSession = (taskId) => taskId !== leaderTask.id && activeRuns.has(taskId)
+    ? {
+        agentId: inventoryRoles.get(taskId).effective.agentId,
+        adapterId: "codex",
+        nativeSessionId: `native-${taskId}`,
+        status: "running",
+        effective: inventoryRoles.get(taskId).effective
+      }
+    : null;
+  controllerStore.getPendingWakeup = (taskId) => (
+    taskId === leaderTask.id ? pendingWakeup : null
+  );
+  controllerStore.listPendingWakeups = () => pendingWakeup === null ? [] : [pendingWakeup];
+  controllerStore.getWorkMailbox = (target) => (
+    target.kind === "role" && target.taskId === leaderTask.id && target.roleName === "leader"
+      ? leaderMailbox
+      : null
+  );
+  controllerStore.listWorkMailboxes = () => [leaderMailbox];
+  controllerStore.saveLeaderDispatch = ({ run }) => {
+    activeRuns.set(leaderTask.id, run);
+    pendingWakeup = null;
+    leaderMailbox = { ...leaderMailbox, pending: null };
+    return "claimed";
+  };
+  controllerStore.saveRoleRunDelivery = ({ run }) => {
+    activeRuns.set(leaderTask.id, { ...run, pushedAt: now.toISOString() });
+    leaderDispatched = true;
+  };
+  controllerStore.saveExitedRoleRun = ({ task }) => {
+    assert.notEqual(
+      task.id,
+      leaderTask.id,
+      "a phase-one Leader Run must be fenced from same-pass destructive liveness"
+    );
+    return "state-changed";
+  };
+
+  let releaseInventory;
+  let inventoryReleased = false;
+  const inventoryGate = new Promise((resolve) => { releaseInventory = resolve; });
+  let markInventoryStarted;
+  const inventoryStarted = new Promise((resolve) => { markInventoryStarted = resolve; });
+  const releaseHeldInventory = () => {
+    if (inventoryReleased) return;
+    inventoryReleased = true;
+    releaseInventory();
+  };
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return {
+        deliveryId: `delivery-${input.taskId}`,
+        taskId: input.taskId,
+        roleName: input.roleName,
+        agentId: input.agentId,
+        adapterId: input.adapterId,
+        mode: input.mode,
+        inputSubmittedAtLaunch: true
+      };
+    },
+    async waitUntilReady(prepared) { return { prepared, session: null }; },
+    async inspectRoles(inputs) {
+      markInventoryStarted();
+      await inventoryGate;
+      return inputs.map(({ taskId, roleName }) => ({
+        taskId,
+        roleName,
+        status: taskId === leaderTask.id ? "absent" : "present"
+      }));
+    }
+  };
   let drains = 0;
+  let progressDepth = 4_096;
   const runtimeEventProcessor = {
     drain() {
       drains += 1;
+      const listed = progressDepth;
+      const selected = Math.min(progressDepth, 64);
+      progressDepth -= selected;
       return {
-        acknowledgedEventIds: [`progress-${drains}`],
+        acknowledgedEventIds: Array.from(
+          { length: selected },
+          (_, index) => `progress-${drains}-${index}`
+        ),
         deferred: [],
         failed: [],
-        remainingEventCount: 1,
+        remainingEventCount: progressDepth,
         metrics: {
-          listedEventCount: 1,
-          selectedEventCount: 1,
+          listedEventCount: listed,
+          selectedEventCount: selected,
           semanticEventsSelected: 0,
-          progressEventsSelected: 1,
+          progressEventsSelected: selected,
           progressEventsCoalesced: 0,
-          stateTransactions: 1,
+          stateTransactions: selected === 0 ? 0 : 1,
           remainingSemanticEventCount: 0,
-          remainingProgressEventCount: 1
+          remainingProgressEventCount: progressDepth
         }
       };
     }
   };
-  const controller = await startFileTaskController(
-    home,
-    controllerStore,
-    noTmux,
-    async (method) => ({ method }),
-    { intervalMs: 60_000, signalWindowMs: 1, runtimeEventProcessor }
-  );
-  t.after(async () => {
-    await controller.close();
+  const methods = [];
+  let controller;
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    releaseHeldInventory();
+    await controller?.close();
     rmSync(home, { recursive: true, force: true });
-  });
+  };
+  t.after(cleanup);
+  try {
+    controller = await startFileTaskController(
+      home,
+      controllerStore,
+      delivery,
+      async (method) => { methods.push(method); return { method }; },
+      { intervalMs: 60_000, signalWindowMs: 1, runtimeEventProcessor }
+    );
+    let inventoryStartTimeout;
+    try {
+      await Promise.race([
+        inventoryStarted,
+        new Promise((_, reject) => {
+          inventoryStartTimeout = setTimeout(
+            () => reject(new Error("inventory did not start")),
+            3_000
+          );
+        })
+      ]);
+    } finally {
+      clearTimeout(inventoryStartTimeout);
+    }
+    const commandNames = ["task.query", "task.write", "task.run.yield"];
+    const results = await Promise.all(commandNames.map((method) => (
+      callController(home, method, {}, { timeoutMs: 3_000 })
+    )));
+    const status = await callController(home, "controller.status", {}, { timeoutMs: 3_000 });
 
-  while (drains < 4) await new Promise((resolve) => setImmediate(resolve));
-  const commandNames = ["task.query", "task.write", "task.run.yield"];
-  const results = await Promise.all(commandNames.map((method) => (
-    callController(home, method, {}, { timeoutMs: 3_000 })
-  )));
-
-  assert.deepEqual(results.map(({ method }) => method), commandNames);
-  assert.ok(drains > 4);
-  const status = await callController(home, "controller.status", {}, { timeoutMs: 3_000 });
-  assert.ok(status.runtime.commands.completed >= 3);
-  assert.equal(status.runtime.commands.inFlight, 0);
-  assert.ok(status.runtime.commands.latencyBuckets.le3000ms >= 3);
+    assert.deepEqual(results.map(({ method }) => method), commandNames);
+    assert.deepEqual([...methods].sort(), [...commandNames].sort());
+    assert.equal(new Set(methods).size, methods.length);
+    assert.ok(status.runtime.commands.completed >= 3);
+    assert.equal(status.runtime.commands.inFlight, 0);
+    assert.ok(status.runtime.commands.latencyBuckets.le3000ms >= 3);
+    assert.ok(progressDepth > 0);
+    assert.equal(inventoryReleased, false);
+    assert.equal(leaderDispatched, true, "Leader wakeup must dispatch before inventory completes");
+  } finally {
+    await cleanup();
+  }
 });
 
 test("restart progress backlog continues bounded drains until it is empty", async () => {
