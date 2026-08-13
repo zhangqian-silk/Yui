@@ -896,7 +896,7 @@ async function prepareActiveWorkspaces(
     ? new Set(store.listTasks()
       .filter((task) => task.status === "active")
       .map((task) => task.id))
-    : new Set([...selection.taskIds, ...selection.allRoleTaskIds]);
+    : new Set(selection.allRoleTaskIds);
   const failed = new Set<string>();
   const ready = new Set<string>();
   for (const taskId of taskIds) {

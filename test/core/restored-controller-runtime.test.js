@@ -1560,6 +1560,7 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     taskId: task.id, name, activeAgentId: `codex-${name}`, adapterId: "codex", status: "running"
   }));
   const inspected = [];
+  let workspacePreparations = 0;
   const store = emptyStore();
   store.getTask = (taskId) => taskId === task.id ? task : null;
   store.getRole = (taskId, roleName) => roles.find(
@@ -1586,7 +1587,8 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
   };
   const workspace = {
     async prepareTaskWorkspace() {
-      throw new Error("Role-only pass must not prepare the Task workspace");
+      workspacePreparations += 1;
+      return { taskId: task.id, status: "ready" };
     },
   };
 
@@ -1595,6 +1597,7 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
   });
 
   assert.deepEqual(inspected, ["worker"]);
+  assert.equal(workspacePreparations, 0);
 });
 
 test("an Operator-only dirty pass does not scan Task phases", async () => {
