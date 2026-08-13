@@ -11,6 +11,7 @@ import {
   type IntegrationAttempt
 } from "../integration/integrationAttempt.js";
 import { GitIntegrationService } from "../integration/gitIntegrationService.js";
+import { runTaskIntegrationQueueCommand } from "./taskIntegrationQueueCommands.js";
 import { taskActor } from "./taskActor.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 
@@ -40,6 +41,9 @@ export async function runTaskIntegrationCommand(
   }
   if (command === "list") return list(rest, store);
   if (command === "show") return show(rest, store, options.environment);
+  if (command === "queue") {
+    return runTaskIntegrationQueueCommand(rest, store, home, options);
+  }
   throw usageError(command === undefined
     ? "Task Integration command is required."
     : `Unknown command: task integration ${command}`);
@@ -357,7 +361,7 @@ function requireIntegration(
   return attempt;
 }
 
-function parseRepeatable(
+export function parseRepeatable(
   args: readonly string[],
   repeatable: ReadonlySet<string>,
   singular: ReadonlySet<string>,

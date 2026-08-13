@@ -35,6 +35,8 @@ const MANAGED_WORKSPACE_FROM_VERSION = 1;
 const MANAGED_WORKSPACE_TO_VERSION = 2;
 const CHANGE_SET_MANIFEST_FROM_VERSION = 2;
 const CHANGE_SET_MANIFEST_TO_VERSION = 3;
+const INTEGRATION_QUEUE_FROM_VERSION = 0;
+const INTEGRATION_QUEUE_TO_VERSION = 1;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -100,7 +102,8 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     ))
     .registerOfflineMigration(managedWorkspaceFamilyStep())
     .registerOfflineMigration(activeRunPointerNamespaceStep())
-    .registerOfflineMigration(changeSetManifestStep());
+    .registerOfflineMigration(changeSetManifestStep())
+    .registerOfflineMigration(integrationQueueIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
@@ -545,6 +548,69 @@ function migrateChangeSetManifest(snapshot: HomeSnapshot): HomeSnapshot {
       };
     }
     nextTasks[taskId] = { ...task, changeSets: nextChangeSets };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * The integration queue is a post-baseline per-Task record family.  Its
+ * explicit 0->1 introduction adds the empty map to every Task aggregate and
+ * the family to the record manifest; old Homes keep integrating without it
+ * until the queue is first used.
+ */
+function integrationQueueIntroductionStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "integrationQueue",
+    fromVersion: INTEGRATION_QUEUE_FROM_VERSION,
+    toVersion: INTEGRATION_QUEUE_TO_VERSION,
+    introduction: true,
+    preconditions: requireIntegrationQueueIntroduction,
+    transform: introduceIntegrationQueue,
+    declaredEffects: []
+  };
+}
+
+function requireIntegrationQueueIntroduction(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.integrationQueue !== undefined) {
+    throw new Error("integrationQueue is already introduced in the record manifest.");
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.integrationQueue !== undefined) {
+      throw new Error(`Task aggregate already carries an integrationQueue map: ${taskId}.`);
+    }
+  }
+}
+
+function introduceIntegrationQueue(snapshot: HomeSnapshot): HomeSnapshot {
+  requireIntegrationQueueIntroduction(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      integrationQueue: INTEGRATION_QUEUE_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    nextTasks[taskId] = { ...task, integrationQueue: {} };
   }
   return {
     schemaManifest,

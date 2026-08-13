@@ -68,6 +68,10 @@ import {
   type IntegrationAttempt
 } from "../integration/integrationAttempt.js";
 import {
+  validateIntegrationQueueEntry,
+  type IntegrationQueueEntry
+} from "../integration/integrationQueueEntry.js";
+import {
   validateGlobalRole,
   validateTaskRole,
   type GlobalRole,
@@ -231,6 +235,7 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 14 as const;
  */
 export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
 export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 6 as const;
+export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 
 type StoredTask = {
   schemaVersion: typeof CURRENT_STORED_TASK_SCHEMA_VERSION;
@@ -239,6 +244,7 @@ type StoredTask = {
   brief: TaskBrief | null;
   changeSets: Record<string, ChangeSet>;
   integrationAttempts: Record<string, IntegrationAttempt>;
+  integrationQueue: Record<string, IntegrationQueueEntry>;
   roles: Record<string, TaskRole>;
   managedWorkspaces: Record<string, ManagedWorkspace>;
   roleSessionSets: Record<string, TaskRoleSessionSet>;
@@ -319,6 +325,10 @@ export type TaskStore = {
   saveIntegrationAttempt(taskId: string, attempt: IntegrationAttempt): void;
   listIntegrationAttempts(taskId: string): IntegrationAttempt[];
   getIntegrationAttempt(taskId: string, integrationId: string): IntegrationAttempt | null;
+  nextIntegrationQueueEntryId(taskId: string): string;
+  saveIntegrationQueueEntry(taskId: string, entry: IntegrationQueueEntry): void;
+  listIntegrationQueueEntries(taskId: string): IntegrationQueueEntry[];
+  getIntegrationQueueEntry(taskId: string, entryId: string): IntegrationQueueEntry | null;
   saveRole(taskId: string, role: TaskRole): void;
   listRoles(taskId: string): TaskRole[];
   getRole(taskId: string, name: string): TaskRole | null;
@@ -793,6 +803,56 @@ export class FileTaskStore implements TaskStore {
   }
   getIntegrationAttempt(taskId: string, integrationId: string): IntegrationAttempt | null {
     return optional(this.#state().tasks[taskId]?.integrationAttempts[integrationId]);
+  }
+
+  nextIntegrationQueueEntryId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "integrationQueue");
+  }
+  saveIntegrationQueueEntry(taskId: string, entry: IntegrationQueueEntry): void {
+    const stored = identified<IntegrationQueueEntry>(
+      entry,
+      CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION,
+      "id",
+      entry.id,
+      "Integration queue entry"
+    );
+    validateIntegrationQueueEntry(stored);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Integration queue entry belongs to another Task: ${stored.taskId}.`);
+    }
+    const aggregate = this.#requireTaskForWrite(taskId);
+    if (!aggregate.task.projectBindings.some(
+      ({ projectId }) => projectId === stored.projectId
+    )) {
+      throw new StorageRecordError(`Integration queue Project does not match Task: ${stored.id}.`);
+    }
+    const changeSet = aggregate.changeSets[stored.changeSetId];
+    if (changeSet === undefined) {
+      throw new StorageRecordError(`Integration queue ChangeSet not found: ${stored.changeSetId}.`);
+    }
+    if (changeSet.projectId !== stored.projectId) {
+      throw new StorageRecordError(
+        `Integration queue ChangeSet belongs to another Project: ${stored.changeSetId}.`
+      );
+    }
+    const existing = aggregate.integrationQueue[stored.id];
+    if (existing !== undefined
+      && Date.parse(stored.updatedAt) < Date.parse(existing.updatedAt)) {
+      throw new StorageRecordError(
+        `Integration queue entry updatedAt cannot move backwards: ${stored.id}.`
+      );
+    }
+    this.#mutate((state) => {
+      const task = state.tasks[taskId];
+      observeTaskRecordId(task, "integrationQueue", stored.id);
+      task.integrationQueue[stored.id] = stored;
+    });
+  }
+  listIntegrationQueueEntries(taskId: string): IntegrationQueueEntry[] {
+    return values(this.#requireTask(taskId).integrationQueue, "id");
+  }
+  getIntegrationQueueEntry(taskId: string, entryId: string): IntegrationQueueEntry | null {
+    return optional(this.#state().tasks[taskId]?.integrationQueue[entryId]);
   }
 
   saveRole(taskId: string, role: TaskRole): void {
@@ -1658,6 +1718,7 @@ function emptyStoredTask(task: Task): StoredTask {
     brief: null,
     changeSets: {},
     integrationAttempts: {},
+    integrationQueue: {},
     roles: {},
     managedWorkspaces: {},
     roleSessionSets: {},
@@ -1682,6 +1743,7 @@ function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
     reviewRound: 0,
     changeSet: 0,
     integrationAttempt: 0,
+    integrationQueue: 0,
     message: 0,
     inputRequest: 0,
     decision: 0,
@@ -1896,6 +1958,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "brief",
     "changeSets",
     "integrationAttempts",
+    "integrationQueue",
     "roles",
     "managedWorkspaces",
     "roleSessionSets",
@@ -1935,6 +1998,27 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationAttempt(attempt);
     return attempt;
   }, "integrationAttempts");
+  parseMap(aggregate.integrationQueue, (record, key) => {
+    const entry = identified<IntegrationQueueEntry>(
+      record,
+      CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION,
+      "id",
+      key,
+      "Integration queue entry"
+    );
+    if (entry.taskId !== taskId) {
+      throw new StorageRecordError(
+        `Integration queue entry belongs to another Task: ${entry.taskId}.`
+      );
+    }
+    if (aggregate.changeSets[entry.changeSetId] === undefined) {
+      throw new StorageRecordError(
+        `Integration queue entry ChangeSet not found: ${entry.changeSetId}.`
+      );
+    }
+    validateIntegrationQueueEntry(entry);
+    return entry;
+  }, "integrationQueue");
   versioned(
     aggregate,
     CURRENT_STORED_TASK_SCHEMA_VERSION,
@@ -2117,6 +2201,7 @@ function validateTaskIdHighWaterCoverage(
     reviewRound: aggregate.reviewRounds,
     changeSet: aggregate.changeSets,
     integrationAttempt: aggregate.integrationAttempts,
+    integrationQueue: aggregate.integrationQueue,
     message: aggregate.messages,
     inputRequest: aggregate.inputRequests,
     decision: aggregate.decisions,
