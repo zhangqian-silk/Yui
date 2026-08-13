@@ -403,6 +403,15 @@ test("release reuses the gated exact commit and smokes the same package on Node 
   assert.match(workflow, /gh run download/u);
   assert.match(workflow, /verify-gate-record\.mjs[^\n]*--expected-sha/u);
 
+  // gh is not auto-authenticated by github.token in Actions: the step that
+  // queries and downloads the gate record must export GH_TOKEN explicitly or
+  // every tag release stops before the build (review-round-2 P1 contract).
+  const gateRecordStep = workflow.match(
+    /- name: Verify the exact commit's Deterministic CI gate record[\s\S]*?(?=\n      - name:|\n  \S|\s*$)/u
+  )?.[0];
+  assert.ok(gateRecordStep, "publish.yml must keep the exact-commit gate-record verification step");
+  assert.match(gateRecordStep, /GH_TOKEN: \$\{\{ github\.token \}\}/u);
+
   // One tarball, provenance-pinned: its SHA-256 is recorded with the exact
   // commit and re-verified by every consumer (smoke matrix and publish).
   assert.match(workflow, /sha256sum yui-runtime\.tgz/u);

@@ -44,6 +44,10 @@ jobs:
 
       - name: Verify the exact commit's Deterministic CI gate record
         shell: bash
+        env:
+          # gh is not auto-authenticated by github.token in Actions; without
+          # this export every tag release stops at `gh run list` below.
+          GH_TOKEN: ${{ github.token }}
         run: |
           # ci.yml persists a per-SHA gate-record artifact for every gate run.
           # Download the successful master run for this exact commit and verify
