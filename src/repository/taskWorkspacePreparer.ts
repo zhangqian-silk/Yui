@@ -105,6 +105,13 @@ export type LegacyTaskRefArchiveResult = Readonly<{
   refused: readonly string[];
 }>;
 
+type LegacyRefArchiveTarget = Readonly<{
+  project: Project;
+  taskId: string;
+  ref: string;
+  archiveRef: string;
+}>;
+
 export type PreparedExecutionLane = Readonly<{
   workspace: ManagedWorkspace;
   persisted: boolean;
@@ -1992,24 +1999,35 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
    * Task are refused: their worktrees may still be live. Terminal and
    * unknown-owner refs are archived; an already-archived or missing ref is
    * simply absent on retry.
+   *
+   * Every registered worktree on a to-be-archived ref is preflighted before
+   * the first side effect: a dirty or unidentifiable one fails the whole
+   * archive with nothing created, deleted, or removed.
    */
   async archiveLegacyTaskRefs(taskId?: string): Promise<LegacyTaskRefArchiveResult> {
     const home = this.store.getHomeIdentity();
     const refused: string[] = [];
     const archived: string[] = [];
+    const pending: LegacyRefArchiveTarget[] = [];
     for (const entry of await this.listLegacyTaskRefs(taskId)) {
       const owner = this.store.getTask(entry.taskId);
       if (owner !== null && ["draft", "active"].includes(owner.status)) {
         refused.push(`${entry.projectId}:${entry.ref}`);
         continue;
       }
-      const project = requireProject(this.store, entry.projectId);
-      await this.git.archiveRef({
-        repositoryPath: project.path,
-        sourceRef: entry.ref,
+      pending.push({
+        project: requireProject(this.store, entry.projectId),
+        taskId: entry.taskId,
+        ref: entry.ref,
         archiveRef: taskArchiveRef(home.homeId, entry.ref)
       });
-      archived.push(`${entry.projectId}:${entry.ref}`);
+    }
+    for (const target of pending) {
+      await this.#assertLegacyRefWorktreeArchivable(target);
+    }
+    for (const target of pending) {
+      await this.#archiveLegacyRef(target);
+      archived.push(`${target.project.id}:${target.ref}`);
     }
     return { archived, refused };
   }
@@ -2157,15 +2175,80 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const key = `${project.id}:${ref}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        await this.git.archiveRef({
-          repositoryPath: project.path,
-          sourceRef: ref,
+        await this.#archiveLegacyRef({
+          project,
+          taskId: task.id,
+          ref,
           archiveRef: taskArchiveRef(home.homeId, ref)
         });
         archived.push(key);
       }
     }
     return archived;
+  }
+
+  /**
+   * The recorded worktree of a legacy Task ref, when the ref is the Task's
+   * main branch. The legacy layout registers exactly one worktree per Task
+   * and Project (`<taskId>/main` on `yui/<taskId>/main`); every other legacy
+   * ref has no registered worktree and is archived directly.
+   */
+  #legacyRefWorktree(target: LegacyRefArchiveTarget) {
+    const identity = worktreeIdentity(target.taskId, MAIN_WORKTREE);
+    if (target.ref !== `refs/heads/${identity.branch}`) return undefined;
+    const container = this.#projectContainer(target.project.name);
+    return {
+      repositoryPath: target.project.path,
+      container,
+      path: join(container, target.taskId, MAIN_WORKTREE),
+      branch: identity.branch,
+      taskSegment: target.taskId,
+      roleName: MAIN_WORKTREE
+    };
+  }
+
+  /**
+   * Preflight the worktree of a to-be-archived ref: a registered worktree
+   * must be clean (or absent) before the archive may touch any ref. An
+   * unidentifiable worktree makes `inspectRecordedWorktree` throw, which
+   * likewise fails the archive closed.
+   */
+  async #assertLegacyRefWorktreeArchivable(target: LegacyRefArchiveTarget): Promise<void> {
+    const worktree = this.#legacyRefWorktree(target);
+    if (worktree === undefined) return;
+    const state = await this.git.inspectRecordedWorktree(worktree);
+    if (state === "dirty") {
+      throw new Error(
+        `Legacy Task worktree is dirty and blocks the archive: ${target.taskId}/${target.project.id}.`
+      );
+    }
+  }
+
+  /**
+   * Archive one legacy ref after removing its registered worktree. The
+   * worktree leaves first (its commit retained in the archive ref), then the
+   * active ref is deleted; a dirty worktree fails the ref closed. Each step
+   * is resumable: a same-commit archive ref resumes, a missing worktree and
+   * an already-deleted source are no-ops.
+   */
+  async #archiveLegacyRef(target: LegacyRefArchiveTarget): Promise<void> {
+    const worktree = this.#legacyRefWorktree(target);
+    if (worktree !== undefined) {
+      const removal = await this.git.removeRecordedWorktree({
+        ...worktree,
+        retainedRef: target.archiveRef
+      });
+      if (removal === "dirty") {
+        throw new Error(
+          `Legacy Task worktree is dirty and blocks the archive: ${target.taskId}/${target.project.id}.`
+        );
+      }
+    }
+    await this.git.archiveRef({
+      repositoryPath: target.project.path,
+      sourceRef: target.ref,
+      archiveRef: target.archiveRef
+    });
   }
 
   /**
