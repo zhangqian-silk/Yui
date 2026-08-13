@@ -394,6 +394,15 @@ test("release reuses the gated exact commit and smokes the same package on Node 
   assert.doesNotMatch(workflow, /npm run lint/u);
   assert.match(workflow, /merge-base --is-ancestor/u);
 
+  // Ancestry only proves branch membership. The release also downloads the
+  // per-SHA gate-record artifact persisted by ci.yml for this exact commit and
+  // verifies sha + result, so a skipped, cancelled, or bypassed gate blocks the
+  // release (P2-2 regression contract).
+  assert.match(workflow, /actions: read/u);
+  assert.match(workflow, /gh run list[^\n]*--commit/u);
+  assert.match(workflow, /gh run download/u);
+  assert.match(workflow, /verify-gate-record\.mjs[^\n]*--expected-sha/u);
+
   // One tarball, provenance-pinned: its SHA-256 is recorded with the exact
   // commit and re-verified by every consumer (smoke matrix and publish).
   assert.match(workflow, /sha256sum yui-runtime\.tgz/u);

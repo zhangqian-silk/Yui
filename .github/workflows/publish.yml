@@ -14,6 +14,7 @@ on:
       - "v*"
 
 permissions:
+  actions: read
   contents: read
   id-token: write
 
@@ -30,10 +31,9 @@ jobs:
       - name: Reuse the PR/master-gated exact commit
         shell: bash
         run: |
-          # A release tag must point at a master commit. Branch protection on
-          # master requires the ci.yml deterministic gate, so this asserts the
-          # exact commit being released already passed that gate, without any
-          # release state machine.
+          # A release tag must point at a master commit. Ancestry alone does
+          # not prove the Deterministic CI gate passed for this exact SHA;
+          # the next step verifies the persisted per-SHA gate record.
           git fetch origin master
           if ! git merge-base --is-ancestor HEAD origin/master; then
             echo "Tag ${GITHUB_REF_NAME} points at $(git rev-parse HEAD), which is not on master." >&2
@@ -41,6 +41,24 @@ jobs:
             exit 1
           fi
           echo "Releasing master-gated commit $(git rev-parse HEAD)"
+
+      - name: Verify the exact commit's Deterministic CI gate record
+        shell: bash
+        run: |
+          # ci.yml persists a per-SHA gate-record artifact for every gate run.
+          # Download the successful master run for this exact commit and verify
+          # the record binds this SHA to a pass result, before building anything.
+          # A skipped, cancelled, or bypassed gate leaves no successful run and
+          # fails the release here.
+          head_sha="$(git rev-parse HEAD)"
+          run_id="$(gh run list --workflow=ci.yml --commit "$head_sha" --branch master --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          if [ -z "$run_id" ]; then
+            echo "No successful Deterministic CI run found for $head_sha on master." >&2
+            echo "Releases reuse the exact commit that passed the PR/master gate." >&2
+            exit 1
+          fi
+          gh run download "$run_id" --name gate-record --dir gate-evidence
+          node scripts/verify-gate-record.mjs gate-evidence/gate-record.json --expected-sha "$head_sha"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
