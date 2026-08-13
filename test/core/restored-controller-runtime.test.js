@@ -1957,11 +1957,13 @@ test("a dirty Hook fold signals Operator work created after scheduler phases", a
 test("continuous progress passes yield so control requests are not starved", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-controller-progress-fairness-"));
   const controllerStore = emptyStore();
-  let scans = 0;
+  let drains = 0;
+  const methods = [];
   const runtimeEventProcessor = {
     drain() {
+      drains += 1;
       return {
-        acknowledgedEventIds: [],
+        acknowledgedEventIds: [`progress-${drains}`],
         deferred: [],
         failed: [],
         remainingEventCount: 1,
@@ -1983,9 +1985,8 @@ test("continuous progress passes yield so control requests are not starved", asy
     controllerStore,
     noTmux,
     async (method) => {
-      assert.equal(method, "test.query");
-      scans += 1;
-      return { scans };
+      methods.push(method);
+      return { method };
     },
     { intervalMs: 60_000, signalWindowMs: 1, runtimeEventProcessor }
   );
@@ -1994,16 +1995,19 @@ test("continuous progress passes yield so control requests are not starved", asy
     rmSync(home, { recursive: true, force: true });
   });
 
-  for (let index = 0; index < 100; index += 1) {
-    controller.runtime.signal(`role:task-${index}/worker`);
-  }
-  const query = await callController(home, "test.query", {}, { timeoutMs: 3_000 });
+  while (drains < 4) await new Promise((resolve) => setImmediate(resolve));
+  const commandNames = ["task.query", "task.write", "task.run.yield"];
+  const results = await Promise.all(commandNames.map((method) => (
+    callController(home, method, {}, { timeoutMs: 3_000 })
+  )));
 
-  assert.equal(query.scans, 1);
+  assert.deepEqual(methods, commandNames);
+  assert.deepEqual(results.map(({ method }) => method), commandNames);
+  assert.ok(drains > 4);
   const status = await callController(home, "controller.status", {}, { timeoutMs: 3_000 });
-  assert.ok(status.runtime.commands.completed >= 1);
+  assert.ok(status.runtime.commands.completed >= 3);
   assert.equal(status.runtime.commands.inFlight, 0);
-  assert.ok(status.runtime.commands.latencyBuckets.le3000ms >= 1);
+  assert.ok(status.runtime.commands.latencyBuckets.le3000ms >= 3);
 });
 
 test("restart progress backlog continues bounded drains until it is empty", async () => {

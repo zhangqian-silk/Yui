@@ -586,14 +586,15 @@ test("a failed batch transaction acknowledges nothing before isolated retries co
   assert.deepEqual(result.failed, []);
 });
 
-test("a bounded drain reserves capacity for the oldest semantic event", () => {
+test("bounded drains preserve arrival order before reaching a semantic event", () => {
   const events = Array.from({ length: 25 }, (_, stream) => (
     progressEvent(stream, 0)
   ));
   const semantic = semanticEvent("native-prompt-accepted", 30, "agent-run-semantic");
   events.push(semantic);
   const calls = [];
-  const processor = new FileRuntimeEventProcessor(memoryInbox(events), {
+  const inbox = memoryInbox(events);
+  const processor = new FileRuntimeEventProcessor(inbox, {
     withRuntimeEventTransaction: (execute) => execute(),
     getTask: () => ({ id: "task-1", status: "active" }),
     observeProviderTurnProgress(input) {
@@ -608,12 +609,21 @@ test("a bounded drain reserves capacity for the oldest semantic event", () => {
     observeGlobalRuntimeTurnCompleted() {}
   }, { maxEventsPerDrain: 8 });
 
-  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+  const first = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
 
-  assert.equal(result.metrics.selectedEventCount, 8);
-  assert.equal(result.metrics.semanticEventsSelected, 1);
+  assert.equal(first.metrics.selectedEventCount, 8);
+  assert.equal(first.metrics.semanticEventsSelected, 0);
+  assert.deepEqual(calls, Array.from(
+    { length: 8 },
+    (_, stream) => `progress-${stream}-0`
+  ));
+  assert.ok(first.remainingEventCount > 0);
+
+  while (inbox.depth() > 0) {
+    processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+  }
+  assert.equal(calls.length, 26);
   assert.equal(calls.at(-1), "semantic");
-  assert.ok(result.remainingEventCount > 0);
 });
 
 function progressEvent(stream, sequence, overrides = {}) {

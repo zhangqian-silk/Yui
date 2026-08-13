@@ -569,19 +569,10 @@ function selectDrainBatch(
   events: readonly CoalescedRuntimeEvent[],
   maximum: number
 ): CoalescedRuntimeEvent[] {
-  const selected = events.slice(0, maximum);
-  if (selected.some(({ event }) => event.type !== "native-turn-progress")) {
-    return selected;
-  }
-  const nextSemanticIndex = events.findIndex(({ event }) => (
-    event.type !== "native-turn-progress"
-  ));
-  if (nextSemanticIndex < 0) return selected;
-  const semantic = events[nextSemanticIndex];
-  if (selected.length < maximum) return [...selected, semantic];
-  // Reserve one slot for the oldest semantic event. Progress representatives
-  // remain coalescible and can wait one bounded drain; semantic facts cannot.
-  return [...selected.slice(0, maximum - 1), semantic];
+  // A batch is always an arrival-order prefix. Admission and drain coalescing
+  // keep a progress flood bounded without allowing a later semantic fact to
+  // overtake an earlier progress fence from another Run.
+  return events.slice(0, maximum);
 }
 
 function progressStreamKey(event: RuntimeProviderProgressEvent): string {
