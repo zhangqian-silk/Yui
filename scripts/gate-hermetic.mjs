@@ -9,24 +9,34 @@
 //   node scripts/gate-hermetic.mjs [--ref <sha>] [--base <sha>]
 //                                  [--record <path|->] [--npm-cache <path>]
 //
-// Without --ref, gates the current checkout in place. With --ref, gates a
-// temporary git worktree at that SHA (the record still lands in the invoker's
-// cwd). With --base, on a candidate failure the base SHA is gated in a second
-// worktree and the two records are classified into introduced, pre-existing,
-// and fixed checks: the run exits non-zero only for introduced failures.
+// The candidate is always gated in a fresh detached worktree at the resolved
+// HEAD (or --ref): the source checkout is only used for git operations, so
+// uncommitted or untracked content can never enter the gated tree and a dirty
+// checkout cannot produce pass evidence labeled with a clean SHA.
+//
+// With --base, on a candidate failure the base SHA is gated in a second
+// worktree and the two records are classified at failure level (the test
+// step carries stable failing-test fingerprints parsed from its TAP stream):
+// the run exits non-zero only for introduced failures, and the --record file
+// ends up as the self-contained combined record (candidate record, base SHA
+// and record, classification, disposition) rather than the candidate-only
+// record.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   GATE_STEPS,
+  buildCombinedGateRecord,
   buildGateRecord,
   buildHermeticEnvironment,
   classifyGateResults,
   gateExitCode,
+  parseTapFailureFingerprints,
+  planCandidateCheckout,
   shortTmpBase,
   writeHermeticGitConfig
 } from "../test/helpers/gateHermetic.js";
@@ -78,16 +88,32 @@ function git(cwd, args, env) {
   return result.stdout.trim();
 }
 
+function readTapFailures(basename, hermetic, checkout) {
+  try {
+    const tap = readFileSync(join(hermetic.TMPDIR, basename), "utf8");
+    return parseTapFailureFingerprints(tap, { checkout });
+  } catch {
+    // No TAP evidence (the runner crashed before writing it): the check
+    // keeps an empty failure list, which classifies as unprovable identity
+    // (fail-closed).
+    return [];
+  }
+}
+
 function runSteps(checkout, hermetic, recordToStdout) {
   const checks = [];
   for (const step of GATE_STEPS) {
     const started = Date.now();
     const result = run(checkout, step.command, hermetic, { capture: recordToStdout });
-    checks.push({
+    const check = {
       name: step.name,
       status: result.status === 0 ? "pass" : "fail",
       durationMs: Date.now() - started
-    });
+    };
+    if (check.status === "fail" && step.tapDestination !== undefined) {
+      check.failures = readTapFailures(step.tapDestination, hermetic, checkout);
+    }
+    checks.push(check);
   }
   return checks;
 }
@@ -148,26 +174,34 @@ async function main() {
       ? npmVersionResult.stdout.trim()
       : "unknown";
 
-    let candidateCheckout = sourceCheckout;
     let candidateSha;
     if (options.ref !== undefined) {
       candidateSha = git(sourceCheckout, ["rev-parse", options.ref], hermetic);
-      candidateCheckout = join(root, "worktree-candidate");
-      git(sourceCheckout, ["worktree", "add", "--detach", candidateCheckout, candidateSha], hermetic);
-      worktrees.push(candidateCheckout);
     } else {
       candidateSha = git(sourceCheckout, ["rev-parse", "HEAD"], hermetic);
     }
+    // Always gate a fresh detached worktree at the resolved SHA: the source
+    // checkout only answers git questions, so dirty or untracked content can
+    // never be part of the gated tree.
+    const candidatePlan = planCandidateCheckout({ root, sha: candidateSha });
+    git(sourceCheckout, candidatePlan.addArgs, hermetic);
+    worktrees.push(candidatePlan.checkout);
 
     const candidate = gateCheckout({
-      checkout: candidateCheckout,
+      checkout: candidatePlan.checkout,
       sha: candidateSha,
       ref: options.ref ?? candidateSha,
       hermetic,
       recordToStdout,
       npmVersion
     });
-    writeRecord(candidate, options.record);
+
+    // With --base, the candidate-only record is superseded by the combined
+    // record once the base is gated; without --base (or on a green candidate)
+    // the candidate record is the final record.
+    if (candidate.result === "pass" || options.base === undefined) {
+      writeRecord(candidate, options.record);
+    }
 
     if (candidate.result === "pass") {
       summary(
@@ -200,13 +234,16 @@ async function main() {
       recordToStdout,
       npmVersion
     });
-    writeRecord(base, join(root, "base-record.json"));
 
     const classification = classifyGateResults(candidate, base);
+    const combined = buildCombinedGateRecord({ candidate, base, baseSha, classification });
+    writeRecord(combined, options.record);
+
     summary(`GATE FAIL sha=${candidateSha} base=${baseSha} failing: ${failing.join(", ")}`);
     summary(`  introduced:   ${classification.introduced.join(", ") || "(none)"}`);
     summary(`  pre-existing: ${classification.preExisting.join(", ") || "(none)"}`);
     summary(`  fixed:        ${classification.fixed.join(", ") || "(none)"}`);
+    summary(`  disposition:  ${combined.disposition}`);
     if (classification.introduced.length === 0) {
       summary("No introduced failures: the candidate failures are pre-existing on the base.");
     }
