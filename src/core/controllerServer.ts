@@ -38,6 +38,7 @@ export type RunningControllerServer = Readonly<{
 
 export type ControllerServerOptions = Readonly<{
   domainIdentity?: EphemeralDomainIdentity;
+  status?: () => JsonValue;
 }>;
 
 export async function startControllerServer(
@@ -77,7 +78,13 @@ async function startControllerServerLocked(
   const token = randomBytes(32).toString("hex");
   let closeRunning: () => Promise<void> = async () => undefined;
   const netServer = createServer((socket) => {
-    receiveRequest(socket, token, dispatcher, () => closeRunning());
+    receiveRequest(
+      socket,
+      token,
+      dispatcher,
+      () => closeRunning(),
+      options.status
+    );
   });
 
   try {
@@ -167,7 +174,8 @@ function receiveRequest(
   socket: Socket,
   token: string,
   dispatcher: ControllerDispatcher | undefined,
-  stop: () => Promise<void>
+  stop: () => Promise<void>,
+  status: (() => JsonValue) | undefined
 ): void {
   let buffer = Buffer.alloc(0);
   let complete = false;
@@ -197,7 +205,14 @@ function receiveRequest(
       return;
     }
     complete = true;
-    void routeRequest(socket, buffer.subarray(0, newline).toString("utf8"), token, dispatcher, stop);
+    void routeRequest(
+      socket,
+      buffer.subarray(0, newline).toString("utf8"),
+      token,
+      dispatcher,
+      stop,
+      status
+    );
   });
   socket.on("end", () => {
     if (!complete) fail("INVALID_REQUEST", "Invalid controller request.");
@@ -210,7 +225,8 @@ async function routeRequest(
   line: string,
   token: string,
   dispatcher: ControllerDispatcher | undefined,
-  stop: () => Promise<void>
+  stop: () => Promise<void>,
+  status: (() => JsonValue) | undefined
 ): Promise<void> {
   let request;
   try {
@@ -278,7 +294,8 @@ async function routeRequest(
         protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
         version: YUI_VERSION,
         storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,
-        aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion
+        aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion,
+        ...(status === undefined ? {} : { runtime: status() })
       }
     });
     return;

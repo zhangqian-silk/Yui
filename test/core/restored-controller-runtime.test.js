@@ -1954,6 +1954,109 @@ test("a dirty Hook fold signals Operator work created after scheduler phases", a
   controller.stop();
 });
 
+test("continuous progress passes yield so control requests are not starved", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-controller-progress-fairness-"));
+  const controllerStore = emptyStore();
+  let scans = 0;
+  const runtimeEventProcessor = {
+    drain() {
+      return {
+        acknowledgedEventIds: [],
+        deferred: [],
+        failed: [],
+        remainingEventCount: 1,
+        metrics: {
+          listedEventCount: 1,
+          selectedEventCount: 1,
+          semanticEventsSelected: 0,
+          progressEventsSelected: 1,
+          progressEventsCoalesced: 0,
+          stateTransactions: 1,
+          remainingSemanticEventCount: 0,
+          remainingProgressEventCount: 1
+        }
+      };
+    }
+  };
+  const controller = await startFileTaskController(
+    home,
+    controllerStore,
+    noTmux,
+    async (method) => {
+      assert.equal(method, "test.query");
+      scans += 1;
+      return { scans };
+    },
+    { intervalMs: 60_000, signalWindowMs: 1, runtimeEventProcessor }
+  );
+  t.after(async () => {
+    await controller.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  for (let index = 0; index < 100; index += 1) {
+    controller.runtime.signal(`role:task-${index}/worker`);
+  }
+  const query = await callController(home, "test.query", {}, { timeoutMs: 3_000 });
+
+  assert.equal(query.scans, 1);
+  const status = await callController(home, "controller.status", {}, { timeoutMs: 3_000 });
+  assert.ok(status.runtime.commands.completed >= 1);
+  assert.equal(status.runtime.commands.inFlight, 0);
+  assert.ok(status.runtime.commands.latencyBuckets.le3000ms >= 1);
+});
+
+test("restart progress backlog continues bounded drains until it is empty", async () => {
+  let depth = 150;
+  let drains = 0;
+  const runtimeEventProcessor = {
+    drain() {
+      drains += 1;
+      const listed = depth;
+      const selected = Math.min(depth, 64);
+      depth -= selected;
+      return {
+        acknowledgedEventIds: Array.from(
+          { length: selected },
+          (_, index) => `event-${drains}-${index}`
+        ),
+        deferred: [],
+        failed: [],
+        remainingEventCount: depth,
+        metrics: {
+          listedEventCount: listed,
+          selectedEventCount: selected,
+          semanticEventsSelected: 0,
+          progressEventsSelected: selected,
+          progressEventsCoalesced: 0,
+          stateTransactions: selected === 0 ? 0 : 1,
+          remainingSemanticEventCount: 0,
+          remainingProgressEventCount: depth
+        }
+      };
+    }
+  };
+  const controller = new FileTaskController(emptyStore(), noTmux, {
+    runtimeEventProcessor
+  });
+
+  await controller.pump();
+
+  assert.equal(depth, 0);
+  assert.equal(drains, 4);
+  assert.deepEqual(controller.runtimeMetrics(), {
+    inbox: { depth: 0, semanticDepth: 0, progressDepth: 0 },
+    drain: {
+      passes: 4,
+      listedEvents: 258,
+      selectedEvents: 150,
+      progressEventsCoalesced: 0,
+      stateTransactions: 3
+    }
+  });
+  controller.stop();
+});
+
 test("a non-ready Role delivery uses bounded queued retries instead of blocking readiness polling", async () => {
   const task = gitlessTask("task-1");
   const roleValue = role(task.id, "worker");
@@ -2535,6 +2638,22 @@ test("background FileTask controller exposes status, scan and stop on one privat
   assert.equal(status.version, YUI_VERSION);
   assert.equal(status.storageLayoutVersion, yuiVersionIdentity().storageLayoutVersion);
   assert.equal(status.aggregateSchemaVersion, yuiVersionIdentity().aggregateSchemaVersion);
+  assert.deepEqual(status.runtime.inbox, {
+    depth: 0,
+    semanticDepth: 0,
+    progressDepth: 0
+  });
+  assert.ok(status.runtime.drain.passes >= 0);
+  assert.equal(status.runtime.drain.listedEvents, 0);
+  assert.equal(status.runtime.drain.selectedEvents, 0);
+  assert.equal(status.runtime.drain.progressEventsCoalesced, 0);
+  assert.equal(status.runtime.drain.stateTransactions, 0);
+  assert.equal(status.runtime.commands.inFlight, 0);
+  assert.equal(status.runtime.commands.completed, 0);
+  assert.equal(status.runtime.commands.maximumLatencyMs, 0);
+  assert.deepEqual(Object.keys(status.runtime.commands.latencyBuckets), [
+    "le10ms", "le50ms", "le100ms", "le250ms", "le500ms", "le1000ms", "le3000ms"
+  ]);
   assert.deepEqual(await callController(home, "controller.identity", {}), {
     executablePath: process.execPath,
     args: process.argv.slice(1),

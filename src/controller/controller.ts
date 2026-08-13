@@ -54,6 +54,10 @@ import type {
 } from "../runtime/taskRuntimeIsolation.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import type { RuntimeEventProcessorPort } from "./runtimeEventProcessor.js";
+import type {
+  RuntimeEventDrainMetrics,
+  RuntimeEventDrainResult
+} from "./runtimeEventProcessor.js";
 import type { EphemeralDomainIdentity } from "./domainIdentity.js";
 
 const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
@@ -62,6 +66,7 @@ const DEFAULT_DELIVERY_RETRY_MS = 250;
 const DEFAULT_DELIVERY_RETRY_LIMIT = 60;
 const RUNTIME_RESERVATION_RECOVERY_AGE_MS = 120_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const CONTROLLER_LATENCY_BUCKETS_MS = [10, 50, 100, 250, 500, 1_000, 3_000] as const;
 
 class RuntimeEventApplyError extends AggregateError {}
 
@@ -127,6 +132,38 @@ export type RunningFileTaskController = Readonly<{
   closed: Promise<void>;
   close(): Promise<void>;
 }>;
+
+export type ControllerRuntimeMetrics = Readonly<{
+  inbox: Readonly<{
+    depth: number;
+    semanticDepth: number;
+    progressDepth: number;
+  }>;
+  drain: Readonly<{
+    passes: number;
+    listedEvents: number;
+    selectedEvents: number;
+    progressEventsCoalesced: number;
+    stateTransactions: number;
+  }>;
+  commands: Readonly<{
+    completed: number;
+    inFlight: number;
+    maximumLatencyMs: number;
+    latencyBuckets: Readonly<Record<string, number>>;
+  }>;
+}>;
+
+const ZERO_DRAIN_METRICS: RuntimeEventDrainMetrics = Object.freeze({
+  listedEventCount: 0,
+  selectedEventCount: 0,
+  semanticEventsSelected: 0,
+  progressEventsSelected: 0,
+  progressEventsCoalesced: 0,
+  stateTransactions: 0,
+  remainingSemanticEventCount: 0,
+  remainingProgressEventCount: 0
+});
 
 /**
  * Runs one lean scheduler pass. Due native Turn completions are folded before
@@ -848,6 +885,12 @@ export class FileTaskController {
   #operatorStartupRetryArmed = false;
   #lastOperatorSignalIdentity: string | undefined;
   #stopped = false;
+  #lastRuntimeDrain: RuntimeEventDrainResult | undefined;
+  #runtimeDrainPasses = 0;
+  #runtimeListedEvents = 0;
+  #runtimeSelectedEvents = 0;
+  #runtimeProgressEventsCoalesced = 0;
+  #runtimeStateTransactions = 0;
 
   constructor(
     readonly store: SchedulerStorePort,
@@ -918,6 +961,26 @@ export class FileTaskController {
 
   get reconciliationIntervalMs(): number {
     return this.#intervalMs;
+  }
+
+  runtimeMetrics(): Pick<ControllerRuntimeMetrics, "inbox" | "drain"> {
+    const metrics = this.#lastRuntimeDrain?.metrics ?? ZERO_DRAIN_METRICS;
+    return {
+      // Status is intentionally O(1): scanning the inbox while serving the
+      // control socket would recreate the starvation this metric diagnoses.
+      inbox: {
+        depth: this.#lastRuntimeDrain?.remainingEventCount ?? 0,
+        semanticDepth: metrics.remainingSemanticEventCount,
+        progressDepth: metrics.remainingProgressEventCount
+      },
+      drain: {
+        passes: this.#runtimeDrainPasses,
+        listedEvents: this.#runtimeListedEvents,
+        selectedEvents: this.#runtimeSelectedEvents,
+        progressEventsCoalesced: this.#runtimeProgressEventsCoalesced,
+        stateTransactions: this.#runtimeStateTransactions
+      }
+    };
   }
 
   updateReconciliationInterval(intervalMs: number): void {
@@ -1051,12 +1114,14 @@ export class FileTaskController {
       inputNotifications: [],
       autoResolvedInputs: []
     };
+    let pendingRuntimeDrain = false;
     try {
-      while (this.#pendingFull || this.#pendingKeys.size > 0) {
+      while (this.#pendingFull || this.#pendingKeys.size > 0 || pendingRuntimeDrain) {
         const scope: ReconcileScope = this.#pendingFull
           ? { kind: "full" }
           : { kind: "dirty", keys: [...this.#pendingKeys] };
         const runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [];
+        pendingRuntimeDrain = false;
         this.#pendingFull = false;
         this.#pendingKeys.clear();
         try {
@@ -1094,6 +1159,13 @@ export class FileTaskController {
             this.#resourceSuppressionKeys
           );
           const secondRuntimeDrain = this.#drainRuntimeEvents();
+          pendingRuntimeDrain = (
+            (secondRuntimeDrain?.remainingEventCount ?? 0) > 0
+            && (
+              (firstRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
+              || (secondRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
+            )
+          );
           this.#clearPassRetry();
           this.#scheduleRuntimeCleanupRetries(runtimeCleanupOutcomes);
           this.#scheduleDeliveryRetries(result);
@@ -1117,6 +1189,11 @@ export class FileTaskController {
           throw error;
         }
         if (this.#stopped) break;
+        if (this.#pendingFull || this.#pendingKeys.size > 0 || pendingRuntimeDrain) {
+          // A continuous Hook signal stream must yield to socket callbacks
+          // between bounded scheduler passes.
+          await eventLoopTurn();
+        }
       }
       return result;
     } finally {
@@ -1162,6 +1239,15 @@ export class FileTaskController {
 
   #drainRuntimeEvents(): ReturnType<RuntimeEventProcessorPort["drain"]> | undefined {
     const result = this.#runtimeEventProcessor?.drain(this.#now());
+    if (result !== undefined) {
+      this.#lastRuntimeDrain = result;
+      this.#runtimeDrainPasses += 1;
+      const metrics = result.metrics ?? ZERO_DRAIN_METRICS;
+      this.#runtimeListedEvents += metrics.listedEventCount;
+      this.#runtimeSelectedEvents += metrics.selectedEventCount;
+      this.#runtimeProgressEventsCoalesced += metrics.progressEventsCoalesced;
+      this.#runtimeStateTransactions += metrics.stateTransactions;
+    }
     if (result !== undefined && result.failed.length > 0) {
       throw new RuntimeEventApplyError(
         result.failed.map((failure) => failure.error),
@@ -1472,42 +1558,55 @@ export async function startFileTaskController(
   const runtime = new FileTaskController(store, delivery, options);
   let stopping = false;
   const lifecycleRequests = new Set<Promise<unknown>>();
+  const commandLatency = new ControllerCommandLatencyMetrics();
   const server = await startControllerServer(home, async (method, params) => {
-    if (stopping) {
-      throw controllerApplicationError("METHOD_NOT_FOUND", "Controller is stopping.");
-    }
-    if (method === "scheduler.signal") {
-      runtime.signal(signalMailboxKey(params));
-      return { accepted: true };
-    }
-    if (method === "scheduler.scan") {
-      if (!isEmptyJsonObject(params)) {
-        throw controllerApplicationError("INVALID_PARAMS", "scheduler.scan params are invalid.");
-      }
-      return schedulerResultJson(await runtime.pump());
-    }
-    if (method === "scheduler.configure") {
-      requireEmptySchedulerConfigureParams(params);
-      const intervalMs = runtime.reloadReconciliationInterval();
-      return { configured: true, reconciliationIntervalMs: intervalMs };
-    }
-    if (dispatcher === undefined) {
-      throw controllerApplicationError("METHOD_NOT_FOUND", "Controller method was not found.");
-    }
-    const request = Promise.resolve(dispatcher(method, params));
-    lifecycleRequests.add(request);
+    const startedAt = monotonicMilliseconds();
+    commandLatency.started();
     try {
-      const result = await request;
-      if (
-        method === "runtime.ensure-role-session"
-        && isGlobalOperatorSessionRequest(params)
-        && isStartedRuntimeSessionResult(result)
-      ) {
-        runtime.armOperatorStartupRetry();
+      if (stopping) {
+        throw controllerApplicationError("METHOD_NOT_FOUND", "Controller is stopping.");
       }
-      return result;
+      if (method === "scheduler.signal") {
+        runtime.signal(signalMailboxKey(params));
+        return { accepted: true };
+      }
+      if (method === "scheduler.scan") {
+        if (!isEmptyJsonObject(params)) {
+          throw controllerApplicationError(
+            "INVALID_PARAMS",
+            "scheduler.scan params are invalid."
+          );
+        }
+        return schedulerResultJson(await runtime.pump());
+      }
+      if (method === "scheduler.configure") {
+        requireEmptySchedulerConfigureParams(params);
+        const intervalMs = runtime.reloadReconciliationInterval();
+        return { configured: true, reconciliationIntervalMs: intervalMs };
+      }
+      if (dispatcher === undefined) {
+        throw controllerApplicationError(
+          "METHOD_NOT_FOUND",
+          "Controller method was not found."
+        );
+      }
+      const request = Promise.resolve(dispatcher(method, params));
+      lifecycleRequests.add(request);
+      try {
+        const result = await request;
+        if (
+          method === "runtime.ensure-role-session"
+          && isGlobalOperatorSessionRequest(params)
+          && isStartedRuntimeSessionResult(result)
+        ) {
+          runtime.armOperatorStartupRetry();
+        }
+        return result;
+      } finally {
+        lifecycleRequests.delete(request);
+      }
     } finally {
-      lifecycleRequests.delete(request);
+      commandLatency.completed(monotonicMilliseconds() - startedAt);
     }
   }, async () => {
     stopping = true;
@@ -1515,7 +1614,11 @@ export async function startFileTaskController(
     await Promise.allSettled([...lifecycleRequests]);
     await runtime.shutdownAndDrain();
   }, {
-    domainIdentity: options.domainIdentity
+    domainIdentity: options.domainIdentity,
+    status: () => ({
+      ...runtime.runtimeMetrics(),
+      commands: commandLatency.snapshot()
+    })
   });
   runtime.start();
   const closed = server.closed;
@@ -1529,6 +1632,53 @@ export async function startFileTaskController(
       await runtime.shutdownAndDrain();
     }
   };
+}
+
+class ControllerCommandLatencyMetrics {
+  #completed = 0;
+  #inFlight = 0;
+  #maximumLatencyMs = 0;
+  readonly #buckets = new Map<number, number>(
+    CONTROLLER_LATENCY_BUCKETS_MS.map((threshold) => [threshold, 0])
+  );
+
+  started(): void {
+    this.#inFlight += 1;
+  }
+
+  completed(latencyMs: number): void {
+    this.#inFlight = Math.max(0, this.#inFlight - 1);
+    this.#completed += 1;
+    const bounded = Math.max(0, Math.ceil(latencyMs));
+    this.#maximumLatencyMs = Math.max(this.#maximumLatencyMs, bounded);
+    for (const threshold of CONTROLLER_LATENCY_BUCKETS_MS) {
+      if (bounded <= threshold) {
+        this.#buckets.set(threshold, (this.#buckets.get(threshold) ?? 0) + 1);
+      }
+    }
+  }
+
+  snapshot(): ControllerRuntimeMetrics["commands"] {
+    return {
+      completed: this.#completed,
+      inFlight: this.#inFlight,
+      maximumLatencyMs: this.#maximumLatencyMs,
+      latencyBuckets: Object.fromEntries(
+        CONTROLLER_LATENCY_BUCKETS_MS.map((threshold) => [
+          `le${threshold}ms`,
+          this.#buckets.get(threshold) ?? 0
+        ])
+      )
+    };
+  }
+}
+
+function monotonicMilliseconds(): number {
+  return Number(process.hrtime.bigint()) / 1_000_000;
+}
+
+function eventLoopTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function signalMailboxKey(value: JsonValue): MailboxKey {

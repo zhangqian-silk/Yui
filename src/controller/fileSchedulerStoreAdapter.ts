@@ -128,6 +128,10 @@ import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.j
 export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   constructor(readonly store: TaskStore) {}
 
+  withRuntimeEventTransaction<T>(execute: () => T): T {
+    return this.store.withRuntimeEventTransaction(execute);
+  }
+
   getPresentationContext() {
     return { timeZone: this.store.getConfig().timeZone };
   }

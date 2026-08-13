@@ -273,6 +273,12 @@ type StorageState = {
 export type TaskStore = {
   rootDirectory(): string;
   transaction<T>(execute: (store: TaskStore) => T): T;
+  /**
+   * Runs a Controller runtime-inbox fold as one aggregate transaction.  The
+   * named seam lets the processor batch independent durable facts without
+   * depending on a concrete FileTaskStore.
+   */
+  withRuntimeEventTransaction<T>(execute: () => T): T;
   getConfig(): YuiConfig;
   /** The durable Home identity minted once for this store. */
   getHomeIdentity(): HomeIdentity;
@@ -431,6 +437,10 @@ export class FileTaskStore implements TaskStore {
         this.#transaction = null;
       }
     });
+  }
+
+  withRuntimeEventTransaction<T>(execute: () => T): T {
+    return this.transaction(() => execute());
   }
 
   getConfig(): YuiConfig { return clone(this.#state().config); }

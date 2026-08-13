@@ -256,6 +256,26 @@ test("Controller reports a top-level inbox read failure for fast retry", () => {
   assert.equal(result.failed[0].error, failure);
 });
 
+test("Controller reports only inbox ids actually removed by acknowledgement", () => {
+  const event = progressEvent(0, 0);
+  const processor = new FileRuntimeEventProcessor({
+    list: () => [event],
+    acknowledge: () => false,
+    acknowledgeMany: () => []
+  }, {
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress: () => "applied",
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.deepEqual(result.acknowledgedEventIds, []);
+  assert.equal(result.remainingEventCount, 1);
+  assert.equal(result.metrics.remainingProgressEventCount, 1);
+});
+
 test("invalid inbox files are quarantined without blocking valid Hook events", (t) => {
   const { home } = fixture(t);
   const inbox = new FileRuntimeEventInbox(home);
@@ -345,3 +365,320 @@ test("Codex notify rejects payloads above its input limit before writing", async
 
   assert.deepEqual(new FileRuntimeEventInbox(home).list(), []);
 });
+
+test("progress admission keeps only the latest exact-Run fact within each semantic segment", (t) => {
+  const { home } = fixture(t);
+  const receivedAt = [
+    ...Array.from({ length: 10 }, (_, index) => (
+      new Date(Date.UTC(2026, 7, 13, 0, 0, index))
+    )),
+    new Date(Date.UTC(2026, 7, 13, 0, 0, 10)),
+    ...Array.from({ length: 10 }, (_, index) => (
+      new Date(Date.UTC(2026, 7, 13, 0, 0, 11 + index))
+    )),
+    // A delayed retry from before the terminal boundary must not replace the
+    // latest progress in the segment after that boundary.
+    new Date(Date.UTC(2026, 7, 13, 0, 0, 9, 500))
+  ];
+  const inbox = new FileRuntimeEventInbox(home, () => receivedAt.shift());
+  const progress = (progressId) => inbox.enqueueProviderProgress({
+    scope: "task",
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex-personal",
+    adapterId: "codex",
+    launchId: "launch-current",
+    nativeSessionId: "thread-native-1",
+    runId: "agent-run-1",
+    progressId
+  });
+
+  for (let index = 0; index < 10; index += 1) progress(`before-${index}`);
+  inbox.enqueueTurnCompleted({
+    scope: "task",
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex-personal",
+    adapterId: "codex",
+    launchId: "launch-current",
+    nativeSessionId: "thread-native-1",
+    turnId: "turn-terminal",
+    runId: "agent-run-1",
+    summary: "terminal boundary"
+  });
+  for (let index = 0; index < 10; index += 1) progress(`after-${index}`);
+  progress("before-retry");
+
+  const events = inbox.list();
+  assert.deepEqual(events.map(({ type }) => type), [
+    "native-turn-progress",
+    "native-turn-completed",
+    "native-turn-progress"
+  ]);
+  assert.deepEqual(
+    events.filter(({ type }) => type === "native-turn-progress")
+      .map(({ progressId }) => progressId),
+    ["before-retry", "after-9"]
+  );
+});
+
+test("restart drain coalesces 25 progress streams into one state transaction", () => {
+  const events = [];
+  for (let stream = 0; stream < 25; stream += 1) {
+    for (let sequence = 0; sequence < 20; sequence += 1) {
+      events.push(progressEvent(stream, sequence));
+    }
+  }
+  const inbox = memoryInbox(events);
+  const observed = [];
+  let transactions = 0;
+  const processor = new FileRuntimeEventProcessor(inbox, {
+    withRuntimeEventTransaction(execute) {
+      transactions += 1;
+      return execute();
+    },
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress(input) {
+      observed.push(input);
+      return "applied";
+    },
+    observeRuntimeTurnCompleted() {
+      throw new Error("unexpected terminal event");
+    },
+    observeGlobalRuntimeTurnCompleted() {
+      throw new Error("unexpected global event");
+    }
+  }, { maxEventsPerDrain: 64 });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.equal(transactions, 1);
+  assert.equal(observed.length, 25);
+  assert.deepEqual(observed.map(({ progressId }) => progressId),
+    Array.from({ length: 25 }, (_, index) => `progress-${index}-19`));
+  assert.equal(result.acknowledgedEventIds.length, 500);
+  assert.equal(result.failed.length, 0);
+  assert.equal(result.remainingEventCount, 0);
+  assert.equal(result.metrics.progressEventsCoalesced, 475);
+  assert.equal(result.metrics.stateTransactions, 1);
+  assert.equal(inbox.depth(), 0);
+});
+
+test("progress coalescing never crosses ordered semantic events", () => {
+  const runId = "agent-run-1";
+  const events = [
+    progressEvent(0, 0, { runId }),
+    progressEvent(0, 1, { runId }),
+    semanticEvent("native-prompt-accepted", 2, runId),
+    progressEvent(0, 3, { runId }),
+    progressEvent(0, 4, { runId }),
+    semanticEvent("native-turn-completed", 5, runId),
+    progressEvent(0, 6, { runId }),
+    progressEvent(0, 7, { runId })
+  ];
+  const calls = [];
+  const processor = new FileRuntimeEventProcessor(memoryInbox(events), {
+    withRuntimeEventTransaction: (execute) => execute(),
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress(input) {
+      calls.push(input.progressId);
+      return "applied";
+    },
+    observeProviderPromptAccepted() {
+      calls.push("accepted");
+      return "applied";
+    },
+    classifyRuntimeTurnCompleted: () => "apply",
+    observeRuntimeTurnCompleted() {
+      calls.push("terminal");
+    },
+    observeGlobalRuntimeTurnCompleted() {
+      throw new Error("unexpected global event");
+    }
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.deepEqual(calls, [
+    "progress-0-1",
+    "accepted",
+    "progress-0-4",
+    "terminal",
+    "progress-0-7"
+  ]);
+  assert.equal(result.acknowledgedEventIds.length, events.length);
+  assert.equal(result.metrics.progressEventsCoalesced, 3);
+});
+
+test("a failed batched fold is isolated without acknowledging the bad semantic event", () => {
+  const bad = semanticEvent("native-prompt-accepted", 2, "agent-run-bad");
+  const good = semanticEvent("native-turn-completed", 3, "agent-run-good");
+  const inbox = memoryInbox([
+    progressEvent(0, 0),
+    progressEvent(0, 1),
+    bad,
+    good
+  ]);
+  let transactionCalls = 0;
+  const processor = new FileRuntimeEventProcessor(inbox, {
+    withRuntimeEventTransaction(execute) {
+      transactionCalls += 1;
+      return execute();
+    },
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress: () => "applied",
+    observeProviderPromptAccepted() {
+      throw new Error("bad semantic event");
+    },
+    classifyRuntimeTurnCompleted: () => "apply",
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {
+      throw new Error("unexpected global event");
+    }
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.equal(transactionCalls, 4);
+  assert.equal(result.failed.length, 1);
+  assert.equal(result.failed[0].eventId, bad.id);
+  assert.deepEqual(inbox.list().map(({ id }) => id), [bad.id]);
+  assert.equal(result.acknowledgedEventIds.length, 3);
+});
+
+test("a failed batch transaction acknowledges nothing before isolated retries commit", () => {
+  const first = progressEvent(0, 0);
+  const second = semanticEvent("native-prompt-accepted", 2, "agent-run-bad");
+  const acknowledged = [];
+  let transactionCalls = 0;
+  const processor = new FileRuntimeEventProcessor({
+    list: () => [first, second],
+    acknowledge(id) {
+      acknowledged.push(id);
+      return true;
+    },
+    acknowledgeMany(ids) {
+      acknowledged.push(...ids);
+      return [...ids];
+    }
+  }, {
+    withRuntimeEventTransaction(execute) {
+      transactionCalls += 1;
+      const result = execute();
+      if (transactionCalls === 1) {
+        assert.deepEqual(acknowledged, []);
+        throw new Error("aggregate commit failed");
+      }
+      return result;
+    },
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress: () => "applied",
+    observeProviderPromptAccepted: () => "applied",
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.equal(transactionCalls, 3);
+  assert.deepEqual(acknowledged, [first.id, second.id]);
+  assert.deepEqual(result.acknowledgedEventIds, acknowledged);
+  assert.deepEqual(result.failed, []);
+});
+
+test("a bounded drain reserves capacity for the oldest semantic event", () => {
+  const events = Array.from({ length: 25 }, (_, stream) => (
+    progressEvent(stream, 0)
+  ));
+  const semantic = semanticEvent("native-prompt-accepted", 30, "agent-run-semantic");
+  events.push(semantic);
+  const calls = [];
+  const processor = new FileRuntimeEventProcessor(memoryInbox(events), {
+    withRuntimeEventTransaction: (execute) => execute(),
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress(input) {
+      calls.push(input.progressId);
+      return "applied";
+    },
+    observeProviderPromptAccepted() {
+      calls.push("semantic");
+      return "applied";
+    },
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  }, { maxEventsPerDrain: 8 });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.equal(result.metrics.selectedEventCount, 8);
+  assert.equal(result.metrics.semanticEventsSelected, 1);
+  assert.equal(calls.at(-1), "semantic");
+  assert.ok(result.remainingEventCount > 0);
+});
+
+function progressEvent(stream, sequence, overrides = {}) {
+  return Object.freeze({
+    schemaVersion: 1,
+    id: testEventId(stream * 1_000 + sequence),
+    type: "native-turn-progress",
+    receivedAt: new Date(Date.UTC(2026, 7, 13, 0, 0, stream * 20 + sequence))
+      .toISOString(),
+    scope: "task",
+    taskId: "task-1",
+    roleName: `worker-${stream}`,
+    agentId: `agent-${stream}`,
+    adapterId: "codex",
+    launchId: `launch-${stream}`,
+    nativeSessionId: `session-${stream}`,
+    runId: `agent-run-${stream + 1}`,
+    progressId: `progress-${stream}-${sequence}`,
+    sequence,
+    ...overrides
+  });
+}
+
+function semanticEvent(type, sequence, runId) {
+  const common = {
+    schemaVersion: 1,
+    id: testEventId(50_000 + sequence),
+    type,
+    receivedAt: new Date(Date.UTC(2026, 7, 13, 0, 10, sequence)).toISOString(),
+    scope: "task",
+    taskId: "task-1",
+    roleName: "worker-0",
+    agentId: "agent-0",
+    adapterId: "codex",
+    launchId: "launch-0",
+    nativeSessionId: "session-0",
+    runId
+  };
+  return type === "native-prompt-accepted"
+    ? Object.freeze({ ...common, receiptId: "receipt-1" })
+    : Object.freeze({
+        ...common,
+        turnId: "turn-1",
+        summary: "done"
+      });
+}
+
+function testEventId(value) {
+  return `turn-${value.toString(16).padStart(64, "0")}`;
+}
+
+function memoryInbox(seed) {
+  const remaining = new Map(seed.map((event) => [event.id, event]));
+  return {
+    list: () => [...remaining.values()],
+    acknowledge(id) {
+      return remaining.delete(id);
+    },
+    acknowledgeMany(ids) {
+      const acknowledged = [];
+      for (const id of ids) {
+        if (remaining.delete(id)) acknowledged.push(id);
+      }
+      return acknowledged;
+    },
+    depth: () => remaining.size
+  };
+}
