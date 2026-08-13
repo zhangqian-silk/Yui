@@ -211,7 +211,17 @@ export async function runControllerSchedulerPass(
   if (selection.full) repairOrphanedActiveTasks(store, now, selection);
   const claimedTaskMailboxes = claimSelectedTaskMailboxes(store, selection, now);
   try {
-    const failedTaskMailboxes = await prepareActiveWorkspaces(
+    // Durable Leader work that already has a ready Task workspace belongs to
+    // the control path. Dispatch it before any unrelated Task workspace I/O;
+    // the processor itself retains the fail-closed workspace-ready guard.
+    const initialWakeups = selectedPendingWakeups(store, wakeupSelection);
+    const initialWakeupResults = await processLeaderWakeups(
+      store,
+      delivery,
+      now,
+      exactTaskSelection(new Set(initialWakeups.keys()))
+    );
+    const workspacePreparation = await prepareActiveWorkspaces(
       store, workspacePreparer, selection
     );
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
@@ -223,16 +233,16 @@ export async function runControllerSchedulerPass(
         : []
     )));
     resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
-    // Durable Leader work is on the control path. Claim and dispatch the
-    // exact wakeups that existed at this boundary before entering provider
-    // and resource inventories, which are recovery/advisory work.
-    const initialWakeups = selectedPendingWakeups(store, wakeupSelection);
-    const initialWakeupResults = await processLeaderWakeups(
-      store,
-      delivery,
-      now,
-      exactTaskSelection(new Set(initialWakeups.keys()))
-    );
+    const newlyIdleBusyTaskIds = new Set(initialWakeupResults.flatMap((result) => (
+      result.reason === "busy"
+        && store.getActiveAgentRun(result.taskId, "leader") === null
+        && (
+          typeof store.hasInFlightTurn !== "function"
+          || !store.hasInFlightTurn(result.taskId, "leader")
+        )
+        ? [result.taskId]
+        : []
+    )));
     // Phase-one Leader Runs did not exist at the pass's liveness boundary.
     // Keep every newly claimed Run outside destructive absence decisions until
     // a later pass can observe its stable provider/session generation.
@@ -283,11 +293,18 @@ export async function runControllerSchedulerPass(
         ? []
         : store.resolveExpiredInputRecommendations(now, selection.taskIds);
     // Liveness and auto-resolution can durably queue new Leader work. Process
-    // only Tasks that were not part of phase one, so a retained/busy wakeup is
-    // never re-run in the same pass and result order stays deterministic.
+    // only Tasks that were not part of phase one, except when a same-pass due
+    // completion made an initially busy Leader idle. Result order remains
+    // deterministic and every other retained/busy wake stays single-shot.
     const autoResolvedTaskIds = new Set(autoResolvedInputs.map(({ taskId }) => taskId));
     const waitingInputTaskIds = new Set(initialWakeupResults.flatMap((result) => (
       result.reason === "waiting-input" && autoResolvedTaskIds.has(result.taskId)
+        ? [result.taskId]
+        : []
+    )));
+    const workspaceReadyTaskIds = new Set(initialWakeupResults.flatMap((result) => (
+      result.reason === "workspace-not-ready"
+        && workspacePreparation.ready.has(result.taskId)
         ? [result.taskId]
         : []
     )));
@@ -297,6 +314,8 @@ export async function runControllerSchedulerPass(
         return initial === undefined
           || !pendingWakeupsMatch(initial, wakeup)
           || waitingInputTaskIds.has(taskId)
+          || workspaceReadyTaskIds.has(taskId)
+          || newlyIdleBusyTaskIds.has(taskId)
           ? [taskId]
           : [];
       })
@@ -311,9 +330,7 @@ export async function runControllerSchedulerPass(
       ? await processOperatorInputNotifications(store, delivery, selection, now)
       : [];
     for (const claim of claimedTaskMailboxes) {
-      if (failedTaskMailboxes.has(claim.target.taskId)) {
-        store.releaseWorkMailbox(claim.target, claim.processing.batchId);
-      } else {
+      if (!workspacePreparation.failed.has(claim.target.taskId)) {
         store.completeWorkMailbox(claim.target, claim.processing.batchId);
       }
     }
@@ -325,9 +342,9 @@ export async function runControllerSchedulerPass(
       autoResolvedInputs
     };
   } catch (error) {
-    for (const claim of claimedTaskMailboxes) {
-      store.releaseWorkMailbox(claim.target, claim.processing.batchId);
-    }
+    // Task orchestration retries are owned by this Controller generation.
+    // Preserve each exact processing claim in place; releasing here would
+    // rewrite the full aggregate and then immediately claim the same batch.
     throw error;
   }
 }
@@ -871,25 +888,27 @@ async function prepareActiveWorkspaces(
   store: SchedulerStorePort,
   workspace: ControllerRuntimeOptions["workspacePreparer"],
   selection: ReconcileSelection
-): Promise<Set<string>> {
-  if (workspace === undefined) return new Set();
+): Promise<Readonly<{ failed: Set<string>; ready: Set<string> }>> {
+  if (workspace === undefined) return { failed: new Set(), ready: new Set() };
   const taskIds = selection.full
     ? new Set(store.listTasks()
       .filter((task) => task.status === "active")
       .map((task) => task.id))
     : new Set([...selection.taskIds, ...selection.allRoleTaskIds]);
   const failed = new Set<string>();
+  const ready = new Set<string>();
   for (const taskId of taskIds) {
     if (store.getTask(taskId)?.status === "active") {
       try {
         const result = await workspace.prepareTaskWorkspace(taskId);
         if (result.status === "failed") failed.add(taskId);
+        else ready.add(taskId);
       } catch {
         failed.add(taskId);
       }
     }
   }
-  return failed;
+  return { failed, ready };
 }
 
 function parseMailboxKey(key: string):
@@ -1519,7 +1538,9 @@ export class FileTaskController {
     for (const target of targets) {
       const key = `task:${encodeURIComponent(target.taskId)}` as const;
       const mailbox = this.store.getWorkMailbox(target);
-      const batch = mailbox?.pending ?? mailbox?.processing?.batch;
+      // A newly queued pending batch must not reset the retry identity/bound
+      // while this Controller still owns an older processing batch.
+      const batch = mailbox?.processing?.batch ?? mailbox?.pending;
       if (batch === undefined || batch === null) {
         this.#clearDeliveryRetry(key);
         continue;

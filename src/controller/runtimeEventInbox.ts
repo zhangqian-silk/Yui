@@ -422,14 +422,32 @@ export class FileRuntimeEventInbox {
       && compareRuntimeEvents(candidate, segment.before) > 0
       && (segment.after === undefined || compareRuntimeEvents(candidate, segment.after) < 0)
     ));
-    const retained = candidates.reduce<RuntimeProviderProgressEvent | undefined>(
-      (latest, candidate) => latest === undefined
-        || compareRuntimeProgressRecency(candidate, latest) > 0
-        ? candidate
-        : latest,
-      undefined
-    );
-    return candidates.flatMap(({ id }) => id === retained?.id ? [] : [id]);
+    let latestReceivedAt = "";
+    let greatestSequence: number | undefined;
+    for (const candidate of candidates) {
+      const receivedAtOrder = candidate.receivedAt.localeCompare(latestReceivedAt);
+      if (receivedAtOrder > 0) {
+        latestReceivedAt = candidate.receivedAt;
+        greatestSequence = candidate.sequence;
+      } else if (
+        receivedAtOrder === 0
+        && candidate.sequence !== undefined
+        && (greatestSequence === undefined || candidate.sequence > greatestSequence)
+      ) {
+        greatestSequence = candidate.sequence;
+      }
+    }
+    return candidates.flatMap((candidate) => (
+      candidate.receivedAt.localeCompare(latestReceivedAt) < 0
+      || (
+        candidate.receivedAt === latestReceivedAt
+        && candidate.sequence !== undefined
+        && greatestSequence !== undefined
+        && candidate.sequence < greatestSequence
+      )
+        ? [candidate.id]
+        : []
+    ));
   }
 
   private eventPath(id: string): string {
@@ -845,7 +863,9 @@ export function compareRuntimeProgressRecency(
   ) {
     return left.sequence - right.sequence;
   }
-  return left.id.localeCompare(right.id);
+  // A content-derived event id is identity, not arrival evidence. Without two
+  // comparable provider sequences, same-timestamp facts remain incomparable.
+  return 0;
 }
 
 function semanticSegment(

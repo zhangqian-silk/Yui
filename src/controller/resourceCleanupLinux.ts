@@ -1,9 +1,12 @@
 import { lstatSync, readFileSync, unlinkSync, type Stats } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager } from "../tmux/tmuxManager.js";
+import {
+  tmuxSocketDirectory,
+  tmuxSocketEnvironment
+} from "../tmux/tmuxSocketEndpoint.js";
 import type { RuntimeResource } from "./resourceInventory.js";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import {
@@ -51,7 +54,7 @@ export async function cleanControllerResource(
   const ports = options.ports ?? linuxCleanupPorts(environment);
   const cleanup = async (): Promise<void> => {
     if (resource.artifact !== undefined) {
-      cleanArtifact(resource, ports);
+      cleanArtifact(resource, ports, environment);
       return;
     }
     if (resource.kind === "agent-session") {
@@ -146,10 +149,14 @@ function assertEphemeralDomainFence(resource: RuntimeResource): void {
   }
 }
 
-function cleanArtifact(resource: RuntimeResource, ports: ControllerCleanupPorts): void {
+function cleanArtifact(
+  resource: RuntimeResource,
+  ports: ControllerCleanupPorts,
+  environment: NodeJS.ProcessEnv
+): void {
   const artifact = resource.artifact;
   if (artifact === undefined) throw new Error(`Artifact is unavailable: ${resource.id}.`);
-  assertOwnedArtifactPath(resource);
+  assertOwnedArtifactPath(resource, environment);
   const currentFingerprint = ports.artifactFingerprint(artifact.path);
   // A concurrent exact cleanup may have already removed this artifact. The
   // desired state is still satisfied; only a changed live inode is ambiguous.
@@ -294,9 +301,20 @@ function tmuxManagerForResource(
   if (home === undefined) {
     throw new Error(`Tmux resource home is unavailable: ${resource.id}.`);
   }
+  const executor = new NodeCommandExecutor();
+  const commandEnvironment = tmuxSocketEnvironment(environment);
   return new TmuxManager(
     environment.YUI_TMUX_BIN ?? "tmux",
-    new NodeCommandExecutor(),
+    {
+      run: (command, args, options) => executor.run(command, args, {
+        ...options,
+        environment: {
+          ...commandEnvironment,
+          ...options?.environment,
+          TMUX_TMPDIR: commandEnvironment.TMUX_TMPDIR
+        }
+      })
+    },
     { yuiHome: home }
   );
 }
@@ -325,15 +343,16 @@ function unixSocketIsActive(expectedPath: string): boolean {
   }
 }
 
-function assertOwnedArtifactPath(resource: RuntimeResource): void {
+function assertOwnedArtifactPath(
+  resource: RuntimeResource,
+  environment: NodeJS.ProcessEnv
+): void {
   const artifact = resource.artifact;
   if (artifact === undefined) throw new Error(`Artifact is unavailable: ${resource.id}.`);
-  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
   const path = resolve(artifact.path);
   if (artifact.artifactKind === "tmux-socket") {
-    const directory = join(tmpdir(), `tmux-${uid}`);
     if (
-      dirname(path) !== directory
+      dirname(path) !== tmuxSocketDirectory(environment)
       || !/^yui-[a-f0-9]{24}$/u.test(basename(path))
     ) {
       throw new Error(`Artifact path is outside the Yui tmux namespace: ${path}.`);

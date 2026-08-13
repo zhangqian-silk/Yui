@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -32,6 +35,11 @@ import { MigrationRegistry } from "../../dist/storage/migration/index.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
+import { NodeCommandExecutor } from "../../dist/tmux/commandExecutor.js";
+import {
+  TmuxManager,
+  yuiTmuxServerName
+} from "../../dist/tmux/tmuxManager.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import {
   createAgentRun,
@@ -62,6 +70,76 @@ test("Linux process inventory yields between bounded entry batches", async () =>
   );
 
   assert.equal(callbackObservedBySecondBatch, true);
+});
+
+test("Linux inventory finds the default tmux root under a deep TMPDIR", async (t) => {
+  const fixtureRoot = mkdtempSync(join("/tmp", "yui-inventory-deep-tmp-"));
+  const deepTmp = join(
+    fixtureRoot,
+    "explicitly-long-temporary-root",
+    "nested-runtime-boundary",
+    "nested-runtime-boundary",
+    "nested-runtime-boundary"
+  );
+  mkdirSync(deepTmp, { recursive: true });
+  const home = join(deepTmp, "yui-home");
+  const tmuxServer = yuiTmuxServerName(home);
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const defaultTmuxSocket = join("/tmp", `tmux-${uid}`, tmuxServer);
+  const previousTmpdir = process.env.TMPDIR;
+  const previousTmuxTmpdir = process.env.TMUX_TMPDIR;
+  process.env.TMPDIR = deepTmp;
+  delete process.env.TMUX_TMPDIR;
+  t.after(() => {
+    spawnSync(
+      process.env.YUI_TMUX_BIN ?? "tmux",
+      ["-L", tmuxServer, "kill-server"],
+      { env: { ...process.env, TMPDIR: deepTmp } }
+    );
+    rmSync(defaultTmuxSocket, { force: true });
+    if (previousTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpdir;
+    if (previousTmuxTmpdir === undefined) delete process.env.TMUX_TMPDIR;
+    else process.env.TMUX_TMPDIR = previousTmuxTmpdir;
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+
+  ensureStorageSchema(home, new Date("2026-08-14T00:00:00.000Z"));
+  const tmux = new TmuxManager(
+    process.env.YUI_TMUX_BIN ?? "tmux",
+    new NodeCommandExecutor(),
+    { yuiHome: home }
+  );
+  tmux.ensureRoleWindow(
+    "task-deep-tmp",
+    { name: "worker", workspace: home },
+    {
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 60000)"],
+      env: { YUI_HOME: home }
+    }
+  );
+  const [expectedPane] = tmux.inspectRolePaneInventory();
+  assert.notEqual(expectedPane, undefined);
+  assert.equal(existsSync(defaultTmuxSocket), true);
+  assert.equal(existsSync(join(deepTmp, `tmux-${uid}`, tmuxServer)), false);
+
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "current",
+    environment: { ...process.env, TMPDIR: deepTmp }
+  });
+  const pane = snapshot.resources.find((resource) => (
+    resource.kind === "agent-session"
+    && resource.target === expectedPane.target
+  ));
+
+  assert.notEqual(pane, undefined, JSON.stringify(snapshot.resources, null, 2));
+  assert.equal(pane.processes.some(({ pid }) => pid === expectedPane.pid), true);
+  assert.equal(snapshot.resources.some((resource) => (
+    resource.reasonCode === "unattributed-other"
+    && resource.processes.some(({ pid }) => pid === expectedPane.pid)
+  )), false);
 });
 
 function roleResource(overrides = {}) {

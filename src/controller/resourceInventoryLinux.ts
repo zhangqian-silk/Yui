@@ -6,7 +6,6 @@ import {
   readdirSync,
   type Stats
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
@@ -20,6 +19,10 @@ import {
   TmuxManager,
   yuiTmuxServerName
 } from "../tmux/tmuxManager.js";
+import {
+  tmuxSocketDirectory,
+  tmuxSocketEnvironment
+} from "../tmux/tmuxSocketEndpoint.js";
 import { readControllerDiscovery } from "../core/controllerClient.js";
 import {
   CONTROLLER_DISCOVERY_PATH
@@ -89,9 +92,9 @@ export async function scanControllerResourceInventory(
     }
   }
 
-  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const tmuxDirectory = tmuxSocketDirectory(environment);
   const rawTmuxArtifacts = listSocketArtifacts(
-    join(tmpdir(), `tmux-${uid}`),
+    tmuxDirectory,
     /^yui-[a-f0-9]{24}$/u,
     "tmux-socket",
     activeSockets
@@ -108,13 +111,13 @@ export async function scanControllerResourceInventory(
       state.storageStatus,
       observedAt
     );
-    const tmuxSocketPath = join(tmpdir(), `tmux-${uid}`, yuiTmuxServerName(home));
+    const tmuxSocketPath = join(tmuxDirectory, yuiTmuxServerName(home));
     const tmuxArtifact = rawTmuxArtifacts.find(({ path }) => path === tmuxSocketPath);
     if (tmuxArtifact !== undefined) associatedArtifacts.add(tmuxArtifact.path);
     const panes = options.panes !== undefined
       ? options.panes
       : tmuxArtifact?.active === true
-        ? inspectHomePanes(home, environment.YUI_TMUX_BIN ?? "tmux", warnings)
+        ? inspectHomePanes(home, environment, warnings)
         : [];
     const discovery = await inspectDiscovery(home, matchingProcesses, activeSockets);
     if (
@@ -742,11 +745,22 @@ function loadHomeState(
 
 function inspectHomePanes(
   home: string,
-  tmuxBin: string,
+  environment: NodeJS.ProcessEnv,
   warnings: string[]
 ) {
   try {
-    return new TmuxManager(tmuxBin, new NodeCommandExecutor(), {
+    const executor = new NodeCommandExecutor();
+    const commandEnvironment = tmuxSocketEnvironment(environment);
+    return new TmuxManager(environment.YUI_TMUX_BIN ?? "tmux", {
+      run: (command, args, options) => executor.run(command, args, {
+        ...options,
+        environment: {
+          ...commandEnvironment,
+          ...options?.environment,
+          TMUX_TMPDIR: commandEnvironment.TMUX_TMPDIR
+        }
+      })
+    }, {
       yuiHome: home
     }).inspectRolePaneInventory();
   } catch (error) {

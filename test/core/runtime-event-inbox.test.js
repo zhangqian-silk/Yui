@@ -16,7 +16,10 @@ import {
   FileRuntimeEventInbox,
   MAX_RUNTIME_TURN_SUMMARY_BYTES
 } from "../../dist/controller/runtimeEventInbox.js";
-import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
+import {
+  coalesceRuntimeProgress,
+  FileRuntimeEventProcessor
+} from "../../dist/controller/runtimeEventProcessor.js";
 import { runSessionNotifyCommand } from "../../dist/controller/sessionNotify.js";
 
 function fixture(t) {
@@ -518,6 +521,193 @@ test("same-millisecond progress retains the greatest sequence at admission and r
   processor.drain(new Date("2026-08-13T01:00:00.000Z"));
 
   assert.deepEqual(calls, [2, "accepted", 2]);
+});
+
+test("same-millisecond mixed sequence progress remains incomparable at admission", (t) => {
+  const { home } = fixture(t);
+  const receivedAt = new Date("2026-08-13T00:00:00.000Z");
+  const common = {
+    scope: "task",
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex-personal",
+    adapterId: "codex",
+    launchId: "launch-current",
+    nativeSessionId: "thread-native-1",
+    runId: "agent-run-1"
+  };
+  const inbox = new FileRuntimeEventInbox(home, () => receivedAt);
+  const missing = inbox.enqueueProviderProgress({
+    ...common,
+    progressId: "missing-first-1"
+  }).event;
+  const sequenced = inbox.enqueueProviderProgress({
+    ...common,
+    progressId: "sequenced-second-1",
+    sequence: 2
+  }).event;
+  assert.ok(
+    missing.id > sequenced.id,
+    "fixture ids deliberately reverse the durable input order"
+  );
+
+  assert.deepEqual(
+    inbox.list().map(({ progressId }) => progressId),
+    ["sequenced-second-1", "missing-first-1"],
+    "incomparable facts must both remain durable; hash order is listing only"
+  );
+});
+
+test("same-millisecond missing-sequence progress remains incomparable at admission", (t) => {
+  const { home } = fixture(t);
+  const receivedAt = new Date("2026-08-13T00:00:00.000Z");
+  const common = {
+    scope: "task",
+    taskId: "task-1",
+    roleName: "leader",
+    agentId: "codex-personal",
+    adapterId: "codex",
+    launchId: "launch-current",
+    nativeSessionId: "thread-native-1",
+    runId: "agent-run-1"
+  };
+  const inbox = new FileRuntimeEventInbox(home, () => receivedAt);
+  const first = inbox.enqueueProviderProgress({
+    ...common,
+    progressId: "missing-first-0"
+  }).event;
+  const second = inbox.enqueueProviderProgress({
+    ...common,
+    progressId: "missing-second-0"
+  }).event;
+  assert.ok(first.id > second.id, "fixture ids reverse durable input order");
+
+  assert.deepEqual(
+    inbox.list().map(({ progressId }) => progressId),
+    ["missing-second-0", "missing-first-0"],
+    "two missing sequences cannot supersede one another by hash"
+  );
+});
+
+test("restart drain preserves same-millisecond mixed sequence facts instead of choosing by hash", () => {
+  const receivedAt = "2026-08-13T00:00:00.000Z";
+  const missing = progressEvent(0, 1, {
+    id: testEventId(9),
+    receivedAt,
+    progressId: "missing-first",
+    sequence: undefined
+  });
+  const sequenced = progressEvent(0, 2, {
+    id: testEventId(1),
+    receivedAt,
+    progressId: "sequenced-second",
+    sequence: 2
+  });
+  assert.ok(missing.id > sequenced.id, "fixture ids reverse durable input order");
+  const calls = [];
+  const processor = new FileRuntimeEventProcessor(memoryInbox([missing, sequenced]), {
+    withRuntimeEventTransaction: (execute) => execute(),
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress(input) {
+      calls.push(input.progressId);
+      return "applied";
+    },
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.deepEqual(calls, ["missing-first", "sequenced-second"]);
+  assert.equal(result.metrics.progressEventsCoalesced, 0);
+  assert.equal(result.acknowledgedEventIds.length, 2);
+});
+
+test("restart drain preserves same-millisecond missing-sequence durable order", () => {
+  const receivedAt = "2026-08-13T00:00:00.000Z";
+  const first = progressEvent(0, 1, {
+    id: testEventId(9),
+    receivedAt,
+    progressId: "missing-first",
+    sequence: undefined
+  });
+  const second = progressEvent(0, 2, {
+    id: testEventId(1),
+    receivedAt,
+    progressId: "missing-second",
+    sequence: undefined
+  });
+  const calls = [];
+  const processor = new FileRuntimeEventProcessor(memoryInbox([first, second]), {
+    withRuntimeEventTransaction: (execute) => execute(),
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress(input) {
+      calls.push(input.progressId);
+      return "applied";
+    },
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.deepEqual(calls, ["missing-first", "missing-second"]);
+  assert.equal(result.metrics.progressEventsCoalesced, 0);
+});
+
+test("restart drain preserves global order across interleaved incomparable streams", () => {
+  const receivedAt = "2026-08-13T00:00:00.000Z";
+  const events = [
+    progressEvent(0, 1, { receivedAt, progressId: "stream-a-first", sequence: undefined }),
+    progressEvent(1, 1, { receivedAt, progressId: "stream-b" }),
+    progressEvent(0, 2, { receivedAt, progressId: "stream-a-second", sequence: 2 })
+  ];
+  const calls = [];
+  const processor = new FileRuntimeEventProcessor(memoryInbox(events), {
+    withRuntimeEventTransaction: (execute) => execute(),
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeProviderTurnProgress(input) {
+      calls.push(input.progressId);
+      return "applied";
+    },
+    observeRuntimeTurnCompleted() {},
+    observeGlobalRuntimeTurnCompleted() {}
+  });
+
+  const result = processor.drain(new Date("2026-08-13T01:00:00.000Z"));
+
+  assert.deepEqual(calls, ["stream-a-first", "stream-b", "stream-a-second"]);
+  assert.equal(result.metrics.progressEventsCoalesced, 0);
+});
+
+test("large mixed-sequence restart frontiers stay ordered with linear visits", () => {
+  const receivedAt = "2026-08-13T00:00:00.000Z";
+  const events = Array.from({ length: 2_048 }, (_, stream) => [
+    progressEvent(stream, 0, {
+      receivedAt,
+      progressId: `missing-${stream}`,
+      sequence: undefined
+    }),
+    progressEvent(stream, 1, {
+      receivedAt,
+      progressId: `sequenced-${stream}`,
+      sequence: 1
+    })
+  ]).flat();
+  let visits = 0;
+
+  const coalesced = coalesceRuntimeProgress(events, {
+    onProgressVisit() { visits += 1; }
+  });
+
+  assert.equal(coalesced.length, 4_096);
+  assert.deepEqual(coalesced.map(({ event }) => event.id), events.map(({ id }) => id));
+  assert.equal(
+    coalesced.reduce((count, candidate) => count + candidate.representedEventIds.length, 0)
+      - coalesced.length,
+    0
+  );
+  assert.equal(visits, events.length * 2, "each fact receives two bounded frontier visits");
 });
 
 test("restart drain coalesces 25 progress streams into one state transaction", () => {

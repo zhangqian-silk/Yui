@@ -8,7 +8,6 @@ import type {
   RuntimeSessionLifecycleEvent,
   RuntimeTurnCompletedEvent
 } from "./runtimeEventInbox.js";
-import { compareRuntimeProgressRecency } from "./runtimeEventInbox.js";
 
 export type TaskProviderSessionLifecycle = Readonly<{
   eventId: string;
@@ -187,9 +186,14 @@ export type FileRuntimeEventProcessorOptions = Readonly<{
 type RuntimeEventInboxPort = Pick<FileRuntimeEventInbox, "list" | "acknowledge">
   & Partial<Pick<FileRuntimeEventInbox, "acknowledgeMany">>;
 
-type CoalescedRuntimeEvent = Readonly<{
+export type CoalescedRuntimeEvent = Readonly<{
   event: RuntimeLifecycleEvent;
   representedEventIds: readonly string[];
+}>;
+
+export type RuntimeProgressCoalescingInstrumentation = Readonly<{
+  /** Test/diagnostic seam proving each progress fact receives bounded visits. */
+  onProgressVisit?(): void;
 }>;
 
 type FoldedRuntimeEvent = Readonly<{
@@ -537,16 +541,76 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
   }
 }
 
-function coalesceRuntimeProgress(
-  events: readonly RuntimeLifecycleEvent[]
+export function coalesceRuntimeProgress(
+  events: readonly RuntimeLifecycleEvent[],
+  instrumentation: RuntimeProgressCoalescingInstrumentation = {}
 ): CoalescedRuntimeEvent[] {
   const result: CoalescedRuntimeEvent[] = [];
-  let segment = new Map<string, CoalescedRuntimeEvent & Readonly<{
-    event: RuntimeProviderProgressEvent;
-  }>>();
+  let segment: RuntimeProviderProgressEvent[] = [];
   const flush = (): void => {
-    result.push(...segment.values());
-    segment = new Map();
+    if (segment.length === 0) return;
+    const frontiers = new Map<string, Readonly<{
+      latestReceivedAt: string;
+      greatestSequence?: number;
+      firstLatestIndex: number;
+      firstGreatestSequenceIndex?: number;
+    }>>();
+    for (let index = 0; index < segment.length; index += 1) {
+      instrumentation.onProgressVisit?.();
+      const event = segment[index]!;
+      const key = progressStreamKey(event);
+      const frontier = frontiers.get(key);
+      if (frontier === undefined || event.receivedAt > frontier.latestReceivedAt) {
+        frontiers.set(key, {
+          latestReceivedAt: event.receivedAt,
+          ...(event.sequence === undefined
+            ? {}
+            : {
+                greatestSequence: event.sequence,
+                firstGreatestSequenceIndex: index
+              }),
+          firstLatestIndex: index
+        });
+      } else if (
+        event.receivedAt === frontier.latestReceivedAt
+        && event.sequence !== undefined
+        && (
+          frontier.greatestSequence === undefined
+          || event.sequence > frontier.greatestSequence
+        )
+      ) {
+        frontiers.set(key, {
+          ...frontier,
+          greatestSequence: event.sequence,
+          firstGreatestSequenceIndex: index
+        });
+      }
+    }
+    const representedByIndex = new Map<number, string[]>();
+    for (let index = 0; index < segment.length; index += 1) {
+      instrumentation.onProgressVisit?.();
+      const event = segment[index]!;
+      const frontier = frontiers.get(progressStreamKey(event))!;
+      const strictlyDominated = event.receivedAt < frontier.latestReceivedAt
+        || (
+          event.receivedAt === frontier.latestReceivedAt
+          && event.sequence !== undefined
+          && frontier.greatestSequence !== undefined
+          && event.sequence < frontier.greatestSequence
+        );
+      const representativeIndex = strictlyDominated
+        ? frontier.firstGreatestSequenceIndex ?? frontier.firstLatestIndex
+        : index;
+      const represented = representedByIndex.get(representativeIndex) ?? [];
+      represented.push(event.id);
+      representedByIndex.set(representativeIndex, represented);
+    }
+    for (let index = 0; index < segment.length; index += 1) {
+      const representedEventIds = representedByIndex.get(index);
+      if (representedEventIds === undefined) continue;
+      result.push({ event: segment[index]!, representedEventIds });
+    }
+    segment = [];
   };
   for (const event of events) {
     if (event.type !== "native-turn-progress") {
@@ -554,19 +618,7 @@ function coalesceRuntimeProgress(
       result.push({ event, representedEventIds: [event.id] });
       continue;
     }
-    const key = progressStreamKey(event);
-    const existing = segment.get(key);
-    const retained = existing === undefined
-      || compareRuntimeProgressRecency(event, existing.event) > 0
-      ? event
-      : existing.event;
-    segment.set(key, {
-      event: retained,
-      representedEventIds: [
-        ...(existing?.representedEventIds ?? []),
-        event.id
-      ]
-    });
+    segment.push(event);
   }
   flush();
   return result;
