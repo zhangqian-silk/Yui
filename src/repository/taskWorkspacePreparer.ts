@@ -1809,7 +1809,10 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
    * A Task that already carries an identity takes the resume path: only the
    * pending legacy archive and old-worktree removal run.
    */
-  async rebuildTaskWorkspace(taskId: string): Promise<TaskWorkspaceRebuildResult> {
+  async rebuildTaskWorkspace(
+    taskId: string,
+    options: Readonly<{ latestRemote?: boolean }> = {}
+  ): Promise<TaskWorkspaceRebuildResult> {
     const task = requireTask(this.store, taskId);
     if (!["draft", "active"].includes(task.status)) {
       throw new Error(`Only a draft or active Task can be rebuilt in place: ${task.id}/${task.status}.`);
@@ -1846,9 +1849,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const pins = new Map<string, string>();
     for (const binding of task.projectBindings) {
       const project = requireProject(this.store, binding.projectId);
-      const useRemoteDefault = defaultProjects.has(project.id)
-        && project.remoteUrl !== undefined
-        && !looksLikeCommit(binding.baseRef);
+      // `--latest` explicitly re-resolves every remote-backed Project. Without
+      // it, only a still-symbolic creation default is refreshed; an explicit
+      // or previously pinned commit retains the established rebuild behavior.
+      const useRemoteDefault = (options.latestRemote === true
+          || (defaultProjects.has(project.id) && !looksLikeCommit(binding.baseRef)))
+        && project.remoteUrl !== undefined;
       if (useRemoteDefault) {
         const resolver = this.git.resolveRemoteBaseline;
         if (typeof resolver !== "function") {
@@ -1859,9 +1865,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const remote = await resolver.call(this.git, {
           repositoryPath: project.path,
           remoteUrl: project.remoteUrl,
-          // The binding captured the configured development ref at Task
-          // creation; use that snapshot even if the Project catalog changed.
-          developmentRef: binding.baseRef
+          developmentRef: options.latestRemote === true
+            ? project.developmentBranch
+            : binding.baseRef
         });
         pins.set(project.id, remote.commit);
       } else {
