@@ -118,6 +118,28 @@ test("Role status treats a tmux server exiting during inspection as stopped", as
   assert.equal(await asyncManager.probeRoleStatusAsync("task-1", "worker"), "exited");
 });
 
+test("Role status treats a tmux server with no current target as stopped", async () => {
+  const syncManager = new TmuxManager("tmux-test", {
+    run(_command, args) {
+      assert.equal(tmuxCommand(args), "has-session");
+      throw new CommandExecutionError("COMMAND_FAILED", 1, "no current target\n");
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+  assert.equal(syncManager.probeRoleStatus("task-1", "worker"), "exited");
+
+  const asyncManager = new TmuxManager("tmux-test", {
+    run() {
+      throw new Error("sync executor path must not be used");
+    },
+    async runAsync(_command, args) {
+      assert.equal(tmuxCommand(args), "list-windows");
+      throw new CommandExecutionError("COMMAND_FAILED", 1, "no current target\n");
+    }
+  }, { yuiHome: "/tmp/yui-home" });
+
+  assert.equal(await asyncManager.probeRoleStatusAsync("task-1", "worker"), "exited");
+});
+
 test("target recorder failure blocks sync and async pane mutation", async () => {
   const syncCalls = [];
   const syncManager = new TmuxManager("tmux-test", {

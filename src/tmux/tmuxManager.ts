@@ -1277,7 +1277,7 @@ function launchCommand(launch: TmuxLaunchPlan): string[] {
 
 function isExplicitlyAbsentTmuxSession(error: unknown): boolean {
   if (!(error instanceof CommandExecutionError)) return false;
-  return /can't find (?:session|window|pane)|no server running|error connecting to .+ \(No such file or directory\)/i
+  return /can't find (?:session|window|pane)|no server running|no current target|session not found|error connecting to .+ \(No such file or directory\)/i
     .test(error.stderr);
 }
 

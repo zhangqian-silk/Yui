@@ -23,6 +23,12 @@ test("Mock Session cleanup classifies only explicit tmux absence", () => {
     )
   ), true);
   assert.equal(isExplicitTmuxResourceAbsenceError(
+    new CommandExecutionError("COMMAND_FAILED", 1, "no current target")
+  ), true);
+  assert.equal(isExplicitTmuxResourceAbsenceError(
+    new CommandExecutionError("COMMAND_FAILED", 1, "session not found: worker")
+  ), true);
+  assert.equal(isExplicitTmuxResourceAbsenceError(
     new CommandExecutionError("COMMAND_FAILED", 1, "")
   ), false);
   assert.equal(isExplicitTmuxResourceAbsenceError(
