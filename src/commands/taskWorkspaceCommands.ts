@@ -40,10 +40,17 @@ async function rebuildTaskCommand(
   args: readonly string[],
   preparer: FileTaskWorkspacePreparer
 ): Promise<TaskWorkspaceCommandResult> {
-  const usage = "Task rebuild usage: yui task rebuild <task>.";
+  const usage = "Task rebuild usage: yui task rebuild <task> [--latest].";
   const taskId = args[0];
-  if (taskId === undefined || args.length !== 1) throw usageError(usage);
-  const result = await preparer.rebuildTaskWorkspace(taskId);
+  const options = new Set(args.slice(1));
+  if (taskId === undefined
+    || options.size !== args.length - 1
+    || [...options].some((option) => option !== "--latest")) {
+    throw usageError(usage);
+  }
+  const result = await preparer.rebuildTaskWorkspace(taskId, {
+    latestRemote: options.has("--latest")
+  });
   const archived = result.archived.length === 0
     ? "no legacy refs"
     : `${result.archived.length} legacy ref(s) archived`;
@@ -54,7 +61,8 @@ async function rebuildTaskCommand(
     data: {
       taskId: result.task.id,
       archived: result.archived,
-      resumed: result.resumed
+      resumed: result.resumed,
+      latestRemote: options.has("--latest")
     }
   };
 }

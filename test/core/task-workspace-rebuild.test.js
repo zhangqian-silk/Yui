@@ -226,6 +226,36 @@ test("rebuild pins remote-default Projects to the advertised remote SHA", async 
   assert.equal(git(managed.entries[0].path, ["rev-parse", "HEAD"]), advertised);
 });
 
+test("rebuild --latest refreshes a previously pinned Project to the latest remote SHA", async (t) => {
+  const fixture = await rebuildFixture(t, { remote: true });
+  const { task } = await legacyTask(fixture);
+  const original = fixture.store.getTask(task.id);
+  const initialCommit = git(fixture.repositoryPath, ["rev-parse", "main"]);
+  fixture.store.saveTask({
+    ...original,
+    projectBindings: original.projectBindings.map((binding) => ({
+      ...binding,
+      baseRef: initialCommit
+    }))
+  });
+
+  const seed = join(fixture.root, "seed");
+  writeFileSync(join(seed, "tracked.txt"), "remote latest after first pin\n");
+  git(seed, ["commit", "-qam", "remote latest after first pin"]);
+  git(seed, ["push", "-q", "fixture", "main"]);
+  const advertised = git(seed, ["rev-parse", "HEAD"]);
+
+  await runTaskWorkspaceCommand(["rebuild", task.id, "--latest"], fixture.store, fixture.preparer, {
+    now: () => new Date(NOW)
+  });
+
+  const rebuilt = fixture.store.getTask(task.id);
+  assert.equal(rebuilt.projectBindings[0].baseRef, advertised);
+  const managed = fixture.store.getTaskWorkspace(task.id);
+  assert.equal(managed.entries[0].baseCommit, advertised);
+  assert.equal(git(managed.entries[0].path, ["rev-parse", "HEAD"]), advertised);
+});
+
 test("rebuild moves a legacy Task from a migrated external Project into the Home repository", async (t) => {
   const fixture = await rebuildFixture(t, { remote: true });
   const { task, legacyRef, entry } = await legacyTask(fixture);

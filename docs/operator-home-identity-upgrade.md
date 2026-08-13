@@ -90,6 +90,7 @@ managed worktrees under the identity-derived branch
 
 ```sh
 yui task rebuild <task>
+yui task rebuild <task> --latest   # explicitly re-pin every remote Project
 ```
 
 The rebuild is resumable: a crash or failure leaves the old layout usable, and
@@ -97,6 +98,9 @@ re-running the command completes the remaining work. After a Project migration,
 the exact clean legacy worktree is also retired from its former repository only
 after its branch commit has been retained in the Home repository. A dirty or
 mismatched legacy worktree, or any evidence record, blocks the rebuild.
+`--latest` resolves each remote-backed Project's configured development branch
+again and persists its advertised SHA; omit it to retain an explicit or
+previously pinned Task base.
 
 ### Terminal Tasks (completed, retired, or archived)
 

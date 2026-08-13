@@ -303,8 +303,8 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "rebuild",
     summary: "Rebuild a legacy Task workspace under its canonical identity.",
-    usage: "yui task rebuild <task>",
-    options: []
+    usage: "yui task rebuild <task> [--latest]",
+    options: ["--latest"]
   },
   {
     name: "history",
