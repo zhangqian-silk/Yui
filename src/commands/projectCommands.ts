@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
+import { acquireProjectMaintenanceLock } from "../repository/projectMaintenanceLock.js";
 import {
   addProjectKnowledge,
   createProject,
@@ -318,94 +319,101 @@ async function migrateProject(
   }
   const git = options.git ?? new NodeGitWorkspace();
   const destination = managedProjectPath(store.rootDirectory(), project.id);
-
-  // Preflight verifies the remote into a throwaway clone: it changes neither
-  // the catalog nor the persistent projects directory.
-  const verifyRoot = parsed.preflight
-    ? join(store.rootDirectory(), "projects", `.preflight-${project.id}`)
-    : destination;
-  if (!parsed.preflight) {
-    // A crashed earlier attempt can leave an unreferenced managed clone
-    // behind. It is safe to remove only because no catalog record points at
-    // it; a registered path fails closed instead.
-    await removeUnreferencedClone(store, destination, project.id);
-  } else if (existsSync(verifyRoot)) {
-    // A crashed preflight can only leave its own throwaway clone behind.
-    await rm(verifyRoot, { recursive: true, force: true });
-  }
-  let prepared = false;
+  // Migration rewrites the Project's Git repository: hold the per-Project
+  // maintenance fence so no rebuild/archive/cleanup (or a second migrate)
+  // interleaves, and the Controller defers worktree preparation meanwhile.
+  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
   try {
-    const head = await git.clone({
-      remoteUrl: project.remoteUrl,
-      destination: verifyRoot,
-      ...(project.stableBranch === "HEAD" ? {} : { branch: project.stableBranch })
-    });
-    prepared = true;
-    const stable = project.stableBranch === "HEAD"
-      ? head
-      : await git.inspect(verifyRoot, project.stableBranch);
-    if (head.baseCommit !== stable.baseCommit) {
-      throw new Error(`Project checkout is not on its stable ref: ${project.stableBranch}.`);
-    }
-    if (project.developmentBranch !== project.stableBranch) {
-      await git.ensureLocalBranch(verifyRoot, project.developmentBranch);
-    }
-    await assertRemoteBranchesVerified(
-      git,
-      verifyRoot,
-      project.remoteUrl,
-      [
-        { ref: project.stableBranch, localCommit: head.baseCommit },
-        ...(project.developmentBranch === project.stableBranch
-          ? []
-          : [{
-              ref: project.developmentBranch,
-              localCommit: (await git.inspect(verifyRoot, project.developmentBranch)).baseCommit
-            }])
-      ]
-    );
-    const copyRefs = git.copyRefs;
-    if (typeof copyRefs !== "function") {
-      throw new Error(`Git workspace cannot preserve local Yui refs for Project: ${project.id}.`);
-    }
-    await copyRefs.call(git, {
-      sourceRepositoryPath: project.path,
-      destinationRepositoryPath: verifyRoot,
-      patterns: ["refs/heads/yui/", "refs/yui/archive/"]
-    });
-    if (parsed.preflight) {
-      return { project, path: destination, preflight: true };
-    }
-    const switched = store.transaction((tx) => {
-      const latest = requireProject(tx, project.id);
-      if (latest.ownership !== "external"
-        || latest.path !== project.path
-        || latest.remoteUrl !== project.remoteUrl) {
-        throw new Error(`Project changed while migrating: ${project.id}.`);
-      }
-      // The switch only changes ownership and path; every other field is
-      // frozen, and the catalog validator re-checks the whole record.
-      const next = validateProject({
-        ...latest,
-        path: destination,
-        ownership: "managed" as const,
-        updatedAt: (options.now ?? (() => new Date()))().toISOString()
-      });
-      assertProjectAvailable(tx, next, latest.id);
-      tx.saveProject(next);
-      return next;
-    });
-    return { project: switched, path: switched.path, preflight: false };
-  } catch (error) {
-    if (prepared && !parsed.preflight
-      && !store.listProjects().some(({ path }) => path === destination)) {
-      await rm(destination, { recursive: true, force: true });
-    }
-    throw error;
-  } finally {
-    if (parsed.preflight) {
+    // Preflight verifies the remote into a throwaway clone: it changes neither
+    // the catalog nor the persistent projects directory.
+    const verifyRoot = parsed.preflight
+      ? join(store.rootDirectory(), "projects", `.preflight-${project.id}`)
+      : destination;
+    if (!parsed.preflight) {
+      // A crashed earlier attempt can leave an unreferenced managed clone
+      // behind. It is safe to remove only because no catalog record points at
+      // it; a registered path fails closed instead.
+      await removeUnreferencedClone(store, destination, project.id);
+    } else if (existsSync(verifyRoot)) {
+      // A crashed preflight can only leave its own throwaway clone behind.
       await rm(verifyRoot, { recursive: true, force: true });
     }
+    let prepared = false;
+    try {
+      const head = await git.clone({
+        remoteUrl: project.remoteUrl,
+        destination: verifyRoot,
+        ...(project.stableBranch === "HEAD" ? {} : { branch: project.stableBranch })
+      });
+      prepared = true;
+      const stable = project.stableBranch === "HEAD"
+        ? head
+        : await git.inspect(verifyRoot, project.stableBranch);
+      if (head.baseCommit !== stable.baseCommit) {
+        throw new Error(`Project checkout is not on its stable ref: ${project.stableBranch}.`);
+      }
+      if (project.developmentBranch !== project.stableBranch) {
+        await git.ensureLocalBranch(verifyRoot, project.developmentBranch);
+      }
+      await assertRemoteBranchesVerified(
+        git,
+        verifyRoot,
+        project.remoteUrl,
+        [
+          { ref: project.stableBranch, localCommit: head.baseCommit },
+          ...(project.developmentBranch === project.stableBranch
+            ? []
+            : [{
+                ref: project.developmentBranch,
+                localCommit: (await git.inspect(verifyRoot, project.developmentBranch)).baseCommit
+              }])
+        ]
+      );
+      const copyRefs = git.copyRefs;
+      if (typeof copyRefs !== "function") {
+        throw new Error(`Git workspace cannot preserve local Yui refs for Project: ${project.id}.`);
+      }
+      await copyRefs.call(git, {
+        sourceRepositoryPath: project.path,
+        destinationRepositoryPath: verifyRoot,
+        patterns: ["refs/heads/yui/", "refs/yui/archive/"]
+      });
+      if (parsed.preflight) {
+        return { project, path: destination, preflight: true };
+      }
+      const switched = store.transaction((tx) => {
+        const latest = requireProject(tx, project.id);
+        if (latest.ownership !== "external"
+          || latest.path !== project.path
+          || latest.remoteUrl !== project.remoteUrl) {
+          throw new Error(`Project changed while migrating: ${project.id}.`);
+        }
+        // The switch only changes ownership and path; every other field is
+        // frozen, and the catalog validator re-checks the whole record.
+        const next = validateProject({
+          ...latest,
+          path: destination,
+          ownership: "managed" as const,
+          updatedAt: (options.now ?? (() => new Date()))().toISOString()
+        });
+        assertProjectAvailable(tx, next, latest.id);
+        tx.saveProject(next);
+        return next;
+      });
+      return { project: switched, path: switched.path, preflight: false };
+    } catch (error) {
+      if (prepared && !parsed.preflight
+        && !store.listProjects().some(({ path }) => path === destination)) {
+        await rm(destination, { recursive: true, force: true });
+      }
+      throw error;
+    } finally {
+      if (parsed.preflight) {
+        await rm(verifyRoot, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    releaseMaintenance();
   }
 }
 

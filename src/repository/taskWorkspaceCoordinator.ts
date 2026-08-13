@@ -17,6 +17,7 @@ import {
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
 import type { GitWorkspaceRemoval } from "./gitWorkspace.js";
+import { acquireProjectMaintenanceLocks } from "./projectMaintenanceLock.js";
 import {
   FileTaskWorkspacePreparer,
   WorkspaceCleanupBlockedError,
@@ -153,6 +154,7 @@ export class TaskWorkspaceCoordinator {
     taskId: string,
     disposition: WorkItemWorkspaceDisposition
   ): Promise<TaskWorkspaceCleanup> {
+    let releaseMaintenance: (() => void) | undefined;
     try {
       const task = this.store.getTask(taskId);
       if (task === null) throw new Error(`Task not found: ${taskId}.`);
@@ -162,6 +164,14 @@ export class TaskWorkspaceCoordinator {
       const managedWorkspaces = [...this.store.listManagedWorkspaces(task.id)]
         .sort((left, right) => managedWorkspaceKey(left.owner)
           .localeCompare(managedWorkspaceKey(right.owner)));
+      // Archive cleanup removes worktrees from every Project the Task uses:
+      // hold each Project's maintenance fence so the Controller defers
+      // preparation and no migrate/rebuild/archive interleaves.
+      const projectIds = new Set(task.projectBindings.map(({ projectId }) => projectId));
+      for (const workspace of managedWorkspaces) {
+        for (const entry of workspace.entries) projectIds.add(entry.projectId);
+      }
+      releaseMaintenance = acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
       const laneWorkspaces = managedWorkspaces.filter(({ owner }) => owner.type === "execution-lane");
       const workspaces = managedWorkspaces
         .filter(({ owner }) => owner.type === "work-item");
@@ -306,6 +316,8 @@ export class TaskWorkspaceCoordinator {
               retryable: true
             })
       };
+    } finally {
+      releaseMaintenance?.();
     }
   }
 

@@ -49,6 +49,7 @@ import {
   type GitWorkspaceState
 } from "./gitWorkspace.js";
 import type { Project } from "./project.js";
+import { acquireProjectMaintenanceLocks } from "./projectMaintenanceLock.js";
 import {
   generateTaskWorkspaceIdentity,
   isLegacyTaskRef,
@@ -1824,6 +1825,31 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (!["draft", "active"].includes(task.status)) {
       throw new Error(`Only a draft or active Task can be rebuilt in place: ${task.id}/${task.status}.`);
     }
+    // The rebuild holds every touched Project's maintenance fence for its
+    // whole duration, so the Controller defers preparation and no other
+    // maintenance interleaves. The resume path may clean up legacy
+    // worktrees/refs in any Project; the fresh path touches its bound
+    // Projects plus any still holding the Task's legacy refs.
+    const projectIds = task.workspaceIdentity !== undefined
+      ? this.store.listProjects().map(({ id }) => id)
+      : [
+          ...new Set([
+            ...task.projectBindings.map(({ projectId }) => projectId),
+            ...(await this.listLegacyTaskRefs(task.id)).map(({ projectId }) => projectId)
+          ])
+        ];
+    const releaseMaintenance = acquireProjectMaintenanceLocks(this.home, projectIds);
+    try {
+      return await this.#rebuildTaskWorkspaceLocked(task, options);
+    } finally {
+      releaseMaintenance();
+    }
+  }
+
+  async #rebuildTaskWorkspaceLocked(
+    task: Task,
+    options: Readonly<{ latestRemote?: boolean }>
+  ): Promise<TaskWorkspaceRebuildResult> {
     if (task.workspaceIdentity !== undefined) {
       const current = this.store.getTaskWorkspace(task.id);
       if (current !== null && current.owner.type === "task") {
@@ -2022,14 +2048,25 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         archiveRef: taskArchiveRef(home.homeId, entry.ref)
       });
     }
-    for (const target of pending) {
-      await this.#assertLegacyRefWorktreeArchivable(target);
+    // The fence covers preflight and archive alike: a concurrent rebuild
+    // must not remove a worktree between its inspection and its ref's
+    // archival.
+    const releaseMaintenance = acquireProjectMaintenanceLocks(
+      this.home,
+      pending.map(({ project }) => project.id)
+    );
+    try {
+      for (const target of pending) {
+        await this.#assertLegacyRefWorktreeArchivable(target);
+      }
+      for (const target of pending) {
+        await this.#archiveLegacyRef(target);
+        archived.push(`${target.project.id}:${target.ref}`);
+      }
+      return { archived, refused };
+    } finally {
+      releaseMaintenance();
     }
-    for (const target of pending) {
-      await this.#archiveLegacyRef(target);
-      archived.push(`${target.project.id}:${target.ref}`);
-    }
-    return { archived, refused };
   }
 
   async #inspectEntries(
