@@ -34,7 +34,7 @@ export type ProjectCommandOptions = Readonly<{
   git?: Pick<
     GitWorkspacePort,
     "inspect" | "headRef" | "isClean" | "refresh" | "clone" | "ensureLocalBranch"
-      | "resolveRemoteBaseline"
+      | "resolveRemoteBaseline" | "copyRefs"
   >;
   now?: () => Date;
 }>;
@@ -292,11 +292,11 @@ async function cloneProject(
 
 /**
  * Migrate an external Project binding to a Home-managed repository. The
- * remote is cloned and both configured branches are verified against the
- * advertised remote SHAs before the catalog record switches; the old
- * checkout is never touched and stays usable until the switch commits. A
- * failed migration leaves no partial state: the unfinished managed clone is
- * removed so the command can be retried cleanly.
+ * remote is cloned, both configured branches are verified against the
+ * advertised remote SHAs, and local Yui refs are imported before the catalog
+ * record switches. The old checkout is never touched. A failed migration
+ * leaves no partial state: the unfinished managed clone is removed so the
+ * command can be retried cleanly.
  */
 async function migrateProject(
   args: readonly string[],
@@ -364,6 +364,15 @@ async function migrateProject(
             }])
       ]
     );
+    const copyRefs = git.copyRefs;
+    if (typeof copyRefs !== "function") {
+      throw new Error(`Git workspace cannot preserve local Yui refs for Project: ${project.id}.`);
+    }
+    await copyRefs.call(git, {
+      sourceRepositoryPath: project.path,
+      destinationRepositoryPath: verifyRoot,
+      patterns: ["refs/heads/yui/", "refs/yui/archive/"]
+    });
     if (parsed.preflight) {
       return { project, path: destination, preflight: true };
     }

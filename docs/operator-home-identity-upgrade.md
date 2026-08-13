@@ -50,10 +50,11 @@ yui project migrate <project>               # clone + verify + atomic switch
 ```
 
 The migration clones the remote into `$YUI_HOME/projects/<projectId>`, verifies
-both configured branches against the advertised remote SHAs, and switches the
-catalog record only after verification succeeds. The old external checkout is
-never touched and stays usable until the switch commits. A failed migration
-removes the unfinished clone and can be retried.
+both configured branches against the advertised remote SHAs, and copies local
+Yui Task/archive refs (including their objects) before switching the catalog
+record. The old external checkout is never touched during migration and stays
+usable after the switch. A failed verification or ref import removes the
+unfinished clone, leaves the catalog external, and can be retried.
 
 Projects already Home-managed (a remote URL-only `project clone`) need no
 action. Projects without a remote URL cannot be migrated; keep them as external
@@ -92,8 +93,10 @@ yui task rebuild <task>
 ```
 
 The rebuild is resumable: a crash or failure leaves the old layout usable, and
-re-running the command completes the remaining work. A dirty legacy worktree or
-any evidence record blocks the rebuild.
+re-running the command completes the remaining work. After a Project migration,
+the exact clean legacy worktree is also retired from its former repository only
+after its branch commit has been retained in the Home repository. A dirty or
+mismatched legacy worktree, or any evidence record, blocks the rebuild.
 
 ### Terminal Tasks (completed, retired, or archived)
 

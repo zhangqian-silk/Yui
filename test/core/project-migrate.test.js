@@ -5,7 +5,8 @@
  *  - a remote URL-only `project clone` defaults to Home-managed ownership and
  *    lives under the persistent Project-identity path;
  *  - `project migrate` clones and verifies the remote before switching the
- *    catalog record atomically; the old external checkout is never touched;
+ *    catalog record atomically, preserving local Yui refs and their objects;
+ *    the old external checkout is never touched;
  *  - `project migrate --preflight` is read-only;
  *  - a failed migration leaves no half-migrated state and is retryable;
  *  - already-managed and remote-less Projects are rejected;
@@ -131,6 +132,78 @@ test("project migrate switches an external Project to a Home-managed repository"
   // The old external checkout is untouched and still usable.
   assert.equal(git(fixture.checkout, ["rev-parse", "HEAD"]), fixture.commitA);
   assert.ok(existsSync(join(fixture.checkout, "tracked.txt")));
+});
+
+test("project migrate preserves local Yui heads and archives with their exact commits", async (t) => {
+  const fixture = migrateFixture(t);
+  await registerExternalProject(fixture);
+  writeFileSync(join(fixture.checkout, "local-task.txt"), "local task commit\n");
+  git(fixture.checkout, ["add", "local-task.txt"]);
+  git(fixture.checkout, ["commit", "-qm", "local task commit"]);
+  const taskCommit = git(fixture.checkout, ["rev-parse", "HEAD"]);
+  git(fixture.checkout, ["branch", "yui/task-2/main", taskCommit]);
+  git(fixture.checkout, [
+    "update-ref", "refs/yui/archive/home-test/heads/yui/task-1/main", fixture.commitA
+  ]);
+  git(fixture.checkout, ["reset", "--hard", fixture.commitA]);
+
+  await runProjectCommand(
+    ["migrate", "project-1"],
+    fixture.store,
+    { now: () => new Date(NOW) }
+  );
+
+  const managed = fixture.store.getProject("project-1");
+  assert.equal(git(managed.path, ["rev-parse", "refs/heads/yui/task-2/main"]), taskCommit);
+  assert.equal(
+    git(managed.path, ["rev-parse", "refs/yui/archive/home-test/heads/yui/task-1/main"]),
+    fixture.commitA
+  );
+  assert.equal(
+    git(managed.path, ["show", "refs/heads/yui/task-2/main:local-task.txt"]),
+    "local task commit"
+  );
+  assert.equal(
+    git(managed.path, ["for-each-ref", "--format=%(refname)", "refs/yui/migration-import/"]),
+    "",
+    "temporary import refs are always removed"
+  );
+  assert.equal(
+    git(fixture.checkout, ["rev-parse", "refs/heads/yui/task-2/main"]),
+    taskCommit,
+    "migration does not mutate the source refs"
+  );
+});
+
+test("a local-ref import failure leaves the Project external and removes the clone", async (t) => {
+  const fixture = migrateFixture(t);
+  const external = await registerExternalProject(fixture);
+  git(fixture.checkout, ["branch", "yui/task-2/main", fixture.commitA]);
+  const managedPath = managedProjectPath(fixture.home, "project-1");
+  const real = new NodeGitWorkspace();
+  const failing = new Proxy(real, {
+    get(target, property) {
+      if (property === "copyRefs") {
+        return async () => {
+          throw new Error("simulated local ref import failure");
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  await assert.rejects(
+    runProjectCommand(["migrate", "project-1"], fixture.store, {
+      now: () => new Date(NOW),
+      git: failing
+    }),
+    /simulated local ref import failure/
+  );
+
+  assert.deepEqual(fixture.store.getProject("project-1"), external);
+  assert.equal(existsSync(managedPath), false);
+  assert.equal(git(fixture.checkout, ["rev-parse", "refs/heads/yui/task-2/main"]), fixture.commitA);
 });
 
 test("project migrate --preflight is read-only", async (t) => {

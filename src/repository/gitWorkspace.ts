@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -59,6 +59,13 @@ export interface GitWorkspacePort {
   refExists(repositoryPath: string, ref: string): Promise<boolean>;
   /** Every ref name matching a `git for-each-ref` pattern. */
   listRefs(repositoryPath: string, pattern: string): Promise<string[]>;
+  /** Copy selected local refs and their objects into another repository while
+   * preserving any existing equal target and rejecting every collision. */
+  copyRefs(input: Readonly<{
+    sourceRepositoryPath: string;
+    destinationRepositoryPath: string;
+    patterns: readonly string[];
+  }>): Promise<string[]>;
   /**
    * Preserve a ref under the Home-scoped archive namespace (create-not-exists)
    * and delete the original only if it still points at the archived commit.
@@ -129,12 +136,35 @@ export interface GitWorkspacePort {
     taskSegment: string;
     roleName: string;
   }>): Promise<GitWorkspaceState>;
+  /** Inspect a durable workspace entry after its Project catalog path changed.
+   * The worktree is trusted only when its exact branch/head is retained in the
+   * current Project repository. */
+  inspectRecordedWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    path: string;
+    branch: string;
+    taskSegment: string;
+    roleName: string;
+  }>): Promise<GitWorkspaceState>;
   removeWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
     taskSegment: string;
     roleName: string;
     deleteBranch?: boolean;
+  }>): Promise<GitWorkspaceRemoval>;
+  /** Remove the exact clean worktree proven by inspectRecordedWorktree. If
+   * the Project moved repositories, delete the obsolete source branch only
+   * after the same commit is proven retained in the current repository. */
+  removeRecordedWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    path: string;
+    branch: string;
+    retainedRef: string;
+    taskSegment: string;
+    roleName: string;
   }>): Promise<GitWorkspaceRemoval>;
   ensureIntegrationWorktree(input: Readonly<{
     repositoryPath: string;
@@ -518,6 +548,83 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       .filter((line) => line.length > 0);
   }
 
+  async copyRefs(input: Readonly<{
+    sourceRepositoryPath: string;
+    destinationRepositoryPath: string;
+    patterns: readonly string[];
+  }>): Promise<string[]> {
+    const source = await this.inspect(input.sourceRepositoryPath);
+    const destination = await this.inspect(input.destinationRepositoryPath);
+    if (source.gitDirectory === destination.gitDirectory) return [];
+
+    const refs = [...new Set((await Promise.all(
+      input.patterns.map((pattern) => this.listRefs(source.root, pattern))
+    )).flat())].sort();
+    const snapshots = [];
+    for (const ref of refs) {
+      const name = safeRef(ref);
+      const commit = await resolveRefCommit(source.root, name);
+      if (await this.refExists(destination.root, name)) {
+        const existing = await resolveRefCommit(destination.root, name);
+        if (existing !== commit) {
+          throw new Error(`Destination ref already exists at a different commit: ${name}.`);
+        }
+      }
+      snapshots.push({ ref: name, commit });
+    }
+
+    const importRoot = `refs/yui/migration-import/${randomBytes(16).toString("hex")}`;
+    const temporary: Array<Readonly<{ ref: string; commit: string }>> = [];
+    try {
+      for (const [index, snapshot] of snapshots.entries()) {
+        const importedRef = `${importRoot}/${index}`;
+        await git([
+          "-C", destination.root,
+          "fetch", "--no-tags", "--no-write-fetch-head", "--",
+          source.root, `${snapshot.ref}:${importedRef}`
+        ]);
+        const imported = await resolveRefCommit(destination.root, importedRef);
+        if (imported !== snapshot.commit) {
+          throw new Error(`Imported ref did not preserve its exact commit: ${snapshot.ref}.`);
+        }
+        temporary.push({ ref: importedRef, commit: imported });
+      }
+
+      // Freeze the source snapshots through publication. A moving local ref is
+      // never silently copied under an earlier/later identity.
+      for (const snapshot of snapshots) {
+        if (await resolveRefCommit(source.root, snapshot.ref) !== snapshot.commit) {
+          throw new Error(`Source ref changed while it was being copied: ${snapshot.ref}.`);
+        }
+      }
+      for (const snapshot of snapshots) {
+        if (await this.refExists(destination.root, snapshot.ref)) {
+          if (await resolveRefCommit(destination.root, snapshot.ref) !== snapshot.commit) {
+            throw new Error(
+              `Destination ref changed while it was being copied: ${snapshot.ref}.`
+            );
+          }
+          continue;
+        }
+        await git([
+          "-C", destination.root,
+          "update-ref", "--no-deref", snapshot.ref, snapshot.commit,
+          "0".repeat(snapshot.commit.length)
+        ]);
+      }
+      return snapshots.map(({ ref }) => ref);
+    } finally {
+      for (const entry of temporary) {
+        if (await this.refExists(destination.root, entry.ref)) {
+          await git([
+            "-C", destination.root,
+            "update-ref", "-d", "--no-deref", entry.ref, entry.commit
+          ]);
+        }
+      }
+    }
+  }
+
   async archiveRef(input: Readonly<{
     repositoryPath: string;
     sourceRef: string;
@@ -543,7 +650,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     } else {
       // Create the archive ref only if it does not exist yet (old value zero).
       await git([
-        "-C", root, "update-ref", "--no-deref", target, commit, "0".repeat(40)
+        "-C", root, "update-ref", "--no-deref", target, commit, "0".repeat(commit.length)
       ]);
     }
     // Delete the source only if it still exists and still points at the
@@ -772,6 +879,50 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     return "removed";
   }
 
+  async inspectRecordedWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    path: string;
+    branch: string;
+    taskSegment: string;
+    roleName: string;
+  }>): Promise<GitWorkspaceState> {
+    const inspected = await inspectExactRecordedWorktree(input);
+    return inspected?.state ?? "missing";
+  }
+
+  async removeRecordedWorktree(input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    path: string;
+    branch: string;
+    retainedRef: string;
+    taskSegment: string;
+    roleName: string;
+  }>): Promise<GitWorkspaceRemoval> {
+    const inspected = await inspectExactRecordedWorktree(input);
+    if (inspected === undefined) return "missing";
+    if (inspected.state === "dirty") return "dirty";
+    // Revalidate immediately before asking the worktree's own Git common-dir
+    // to remove it. This never relies on the Project catalog's former path.
+    const current = await inspectExactRecordedWorktree(input);
+    if (current === undefined) return "missing";
+    if (current.state === "dirty") return "dirty";
+    await retainCommitRef(current.destinationRoot, input.retainedRef, current.head);
+    await git(["-C", current.path, "worktree", "remove", "--", current.path]);
+    if (await pathKind(current.path) !== undefined) {
+      throw new Error(`Recorded managed worktree remained after removal: ${current.path}.`);
+    }
+    if (current.gitDirectory !== current.destinationGitDirectory) {
+      await git([
+        `--git-dir=${current.gitDirectory}`,
+        "update-ref", "-d", "--no-deref", `refs/heads/${safeRef(input.branch)}`,
+        current.head
+      ]);
+    }
+    return "removed";
+  }
+
   async inspectWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
@@ -925,6 +1076,105 @@ async function assertOwnedWorktree(
   if (common !== project.gitDirectory) {
     throw new Error("Managed worktree belongs to another project.");
   }
+}
+
+type ExactRecordedWorktree = Readonly<{
+  path: string;
+  gitDirectory: string;
+  destinationGitDirectory: string;
+  destinationRoot: string;
+  head: string;
+  state: "clean" | "dirty";
+}>;
+
+async function inspectExactRecordedWorktree(input: Readonly<{
+  repositoryPath: string;
+  container: string;
+  path: string;
+  branch: string;
+  taskSegment: string;
+  roleName: string;
+}>): Promise<ExactRecordedWorktree | undefined> {
+  const container = resolve(input.container);
+  const identity = worktreeIdentity(input.taskSegment, input.roleName);
+  const expectedPath = managedPath(container, identity.directory);
+  if (resolve(input.path) !== expectedPath || input.branch !== identity.branch) {
+    throw new Error("Recorded managed worktree identity is invalid.");
+  }
+  const kind = await pathKind(expectedPath);
+  if (kind === undefined) return undefined;
+  if (kind === "symlink") {
+    throw new Error("Recorded managed worktree path must not be a symbolic link.");
+  }
+
+  const canonicalContainerPath = await canonicalContainer(container, false);
+  const path = await canonicalDirectory(expectedPath, "Recorded managed worktree");
+  assertContained(canonicalContainerPath, path);
+  if (path !== expectedPath) {
+    throw new Error("Recorded managed worktree resolves through a symbolic link.");
+  }
+  const root = await canonicalDirectory(
+    await gitLine(["-C", path, "rev-parse", "--show-toplevel"]),
+    "Recorded managed worktree root"
+  );
+  if (root !== path) {
+    throw new Error("Recorded managed worktree root does not match its deterministic path.");
+  }
+  const branch = await gitLine(["-C", path, "symbolic-ref", "--short", "HEAD"]);
+  if (branch !== input.branch) {
+    throw new Error(`Recorded managed worktree is on an unexpected branch: ${branch}.`);
+  }
+  const gitDirectory = await canonicalDirectory(
+    await gitLine(["-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    "Recorded managed Git common directory"
+  );
+  const destination = await new NodeGitWorkspace().inspect(input.repositoryPath);
+  const head = await resolveRefCommit(path, "HEAD");
+  const retained = await resolveRefCommit(destination.root, `refs/heads/${input.branch}`);
+  if (retained !== head) {
+    throw new Error(
+      `Recorded managed worktree is not retained by the current Project: ${input.branch}.`
+    );
+  }
+  const status = await git(["-C", path, "status", "--porcelain=v1", "--untracked-files=all"]);
+  return {
+    path,
+    gitDirectory,
+    destinationGitDirectory: destination.gitDirectory,
+    destinationRoot: destination.root,
+    head,
+    state: status.length === 0 ? "clean" : "dirty"
+  };
+}
+
+async function resolveRefCommit(repositoryPath: string, ref: string): Promise<string> {
+  const commit = (await gitLine([
+    "-C", repositoryPath,
+    "rev-parse", "--verify", "--end-of-options", `${safeRef(ref)}^{commit}`
+  ])).toLowerCase();
+  if (!isCommit(commit)) throw new Error("Git returned an invalid ref commit.");
+  return commit;
+}
+
+async function retainCommitRef(
+  repositoryPath: string,
+  ref: string,
+  commit: string
+): Promise<void> {
+  const target = safeRef(ref);
+  if (await gitSucceeds([
+    "-C", repositoryPath,
+    "rev-parse", "--verify", "--quiet", "--end-of-options", `${target}^{commit}`
+  ])) {
+    if (await resolveRefCommit(repositoryPath, target) !== commit) {
+      throw new Error(`Retained ref already exists at a different commit: ${target}.`);
+    }
+    return;
+  }
+  await git([
+    "-C", repositoryPath,
+    "update-ref", "--no-deref", target, commit, "0".repeat(commit.length)
+  ]);
 }
 
 async function canonicalContainer(path: string, create: boolean): Promise<string> {

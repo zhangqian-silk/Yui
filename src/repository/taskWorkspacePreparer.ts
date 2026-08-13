@@ -1835,7 +1835,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
     if (existing !== null
-      && await this.#inspectEntries(task.id, MAIN_WORKTREE, existing.entries) === "dirty") {
+      && await this.#inspectLegacyTaskEntries(task, existing.entries) === "dirty") {
       throw new Error(`Task workspace is dirty and blocks the rebuild: ${task.id}.`);
     }
 
@@ -2169,9 +2169,17 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async #removeLegacyWorktrees(task: Task, projectIds: readonly string[]): Promise<void> {
     for (const projectId of projectIds) {
       const project = requireProject(this.store, projectId);
-      const removal = await this.git.removeWorktree({
+      const container = this.#projectContainer(project.name);
+      const branch = worktreeIdentity(task.id, MAIN_WORKTREE).branch;
+      const removal = await this.git.removeRecordedWorktree({
         repositoryPath: project.path,
-        container: this.#projectContainer(project.name),
+        container,
+        path: join(container, task.id, MAIN_WORKTREE),
+        branch,
+        retainedRef: taskArchiveRef(
+          this.store.getHomeIdentity().homeId,
+          `refs/heads/${branch}`
+        ),
         taskSegment: task.id,
         roleName: MAIN_WORKTREE
       });
@@ -2179,6 +2187,27 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         throw new Error(`Legacy Task worktree is dirty and blocks the rebuild: ${task.id}/${project.id}.`);
       }
     }
+  }
+
+  async #inspectLegacyTaskEntries(
+    task: Task,
+    entries: readonly WorkspaceProjectEntry[]
+  ): Promise<GitWorkspaceState> {
+    let found = false;
+    for (const entry of entries) {
+      const project = requireProject(this.store, entry.projectId);
+      const state = await this.git.inspectRecordedWorktree({
+        repositoryPath: project.path,
+        container: this.#projectContainer(project.name),
+        path: entry.path,
+        branch: entry.branch,
+        taskSegment: task.id,
+        roleName: MAIN_WORKTREE
+      });
+      if (state === "dirty") return state;
+      found ||= state === "clean";
+    }
+    return found ? "clean" : "missing";
   }
 
   #recordWorkspaceRemoval(

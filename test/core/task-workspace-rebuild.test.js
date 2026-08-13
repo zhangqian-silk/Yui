@@ -226,6 +226,56 @@ test("rebuild pins remote-default Projects to the advertised remote SHA", async 
   assert.equal(git(managed.entries[0].path, ["rev-parse", "HEAD"]), advertised);
 });
 
+test("rebuild moves a legacy Task from a migrated external Project into the Home repository", async (t) => {
+  const fixture = await rebuildFixture(t, { remote: true });
+  const { task, legacyRef, entry } = await legacyTask(fixture);
+  const legacyCommit = git(fixture.repositoryPath, ["rev-parse", legacyRef]);
+  assert.equal(existsSync(entry.path), true);
+
+  await runProjectCommand(
+    ["migrate", "project-1"],
+    fixture.store,
+    { now: () => new Date(NOW) }
+  );
+  const managedProject = fixture.store.getProject("project-1");
+  assert.equal(managedProject.ownership, "managed");
+  assert.equal(
+    git(managedProject.path, ["rev-parse", legacyRef]),
+    legacyCommit,
+    "migration preserves the legacy Task ref and its objects in the Home repository"
+  );
+
+  await runTaskWorkspaceCommand(
+    ["rebuild", task.id],
+    fixture.store,
+    fixture.preparer,
+    { now: () => new Date(NOW) }
+  );
+
+  const rebuilt = fixture.store.getTask(task.id);
+  const segment = `${task.id}-${rebuilt.workspaceIdentity.token}`;
+  const workspace = fixture.store.getTaskWorkspace(task.id);
+  assert.equal(workspace.entries[0].branch, `yui/${segment}/main`);
+  assert.equal(existsSync(workspace.entries[0].path), true);
+  assert.equal(
+    git(workspace.entries[0].path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    join(managedProject.path, ".git"),
+    "the rebuilt checkout is owned by the Project repository in YUI_HOME"
+  );
+  assert.equal(existsSync(entry.path), false, "the exact legacy worktree is removed from its old owner");
+
+  const homeId = fixture.store.getHomeIdentity().homeId;
+  const archiveRef = `refs/yui/archive/${homeId}/heads/${legacyRef}`;
+  assert.equal(git(managedProject.path, ["rev-parse", archiveRef]), legacyCommit);
+  assert.throws(() => git(managedProject.path, ["rev-parse", legacyRef]));
+  assert.throws(
+    () => git(fixture.repositoryPath, ["rev-parse", legacyRef]),
+    undefined,
+    "the obsolete branch is removed from its former repository after its exact commit is archived"
+  );
+  assert.equal(existsSync(fixture.repositoryPath), true, "the user's external checkout remains intact");
+});
+
 test("rebuild blocks on evidence, a dirty worktree, and a terminal Task", async (t) => {
   const evidenceKinds = [
     ["work item", async (fx, task) => {
@@ -305,6 +355,64 @@ test("rebuild blocks on evidence, a dirty worktree, and a terminal Task", async 
       /dirty and blocks the rebuild/i
     );
     assert.equal(fixture.store.getTask(task.id).workspaceIdentity, undefined);
+  });
+
+  await t.test("dirty legacy worktree after Project migration", async (t) => {
+    const fixture = await rebuildFixture(t, { remote: true });
+    const { task, entry, legacyRef } = await legacyTask(fixture);
+    await runProjectCommand(
+      ["migrate", "project-1"],
+      fixture.store,
+      { now: () => new Date(NOW) }
+    );
+    writeFileSync(join(entry.path, "uncommitted.txt"), "dirty after migration\n");
+
+    await assert.rejects(
+      runTaskWorkspaceCommand(["rebuild", task.id], fixture.store, fixture.preparer, {
+        now: () => new Date(NOW)
+      }),
+      /dirty and blocks the rebuild/i
+    );
+
+    assert.equal(fixture.store.getTask(task.id).workspaceIdentity, undefined);
+    assert.equal(existsSync(entry.path), true);
+    assert.equal(
+      git(fixture.store.getProject("project-1").path, ["rev-parse", legacyRef]).length,
+      40
+    );
+  });
+
+  await t.test("mismatched retained ref after Project migration", async (t) => {
+    const fixture = await rebuildFixture(t, { remote: true });
+    const { task, entry, legacyRef } = await legacyTask(fixture);
+    const legacyCommit = git(fixture.repositoryPath, ["rev-parse", legacyRef]);
+    await runProjectCommand(
+      ["migrate", "project-1"],
+      fixture.store,
+      { now: () => new Date(NOW) }
+    );
+    const managed = fixture.store.getProject("project-1");
+    // The legacy branch initially equals main in this fixture. Create a
+    // distinct commit only in the Home repository, then move the retained ref
+    // to prove cleanup cannot mistake branch name equality for commit proof.
+    git(managed.path, ["config", "user.name", "Yui Test"]);
+    git(managed.path, ["config", "user.email", "yui@example.invalid"]);
+    writeFileSync(join(managed.path, "retained-mismatch.txt"), "mismatch\n");
+    git(managed.path, ["add", "retained-mismatch.txt"]);
+    git(managed.path, ["commit", "-qm", "retained mismatch"]);
+    const mismatchedCommit = git(managed.path, ["rev-parse", "HEAD"]);
+    git(managed.path, ["update-ref", `refs/heads/${legacyRef}`, mismatchedCommit]);
+
+    await assert.rejects(
+      runTaskWorkspaceCommand(["rebuild", task.id], fixture.store, fixture.preparer, {
+        now: () => new Date(NOW)
+      }),
+      /not retained by the current Project/i
+    );
+
+    assert.equal(fixture.store.getTask(task.id).workspaceIdentity, undefined);
+    assert.equal(existsSync(entry.path), true);
+    assert.equal(git(fixture.repositoryPath, ["rev-parse", legacyRef]), legacyCommit);
   });
 
   await t.test("terminal Task", async (t) => {
