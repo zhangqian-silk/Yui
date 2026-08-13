@@ -12,6 +12,8 @@ import {
 import { join, resolve } from "node:path";
 import test from "node:test";
 
+import { GATE_STEPS } from "../helpers/gateHermetic.js";
+
 const root = resolve(import.meta.dirname, "../..");
 
 function readJson(path) {
@@ -182,9 +184,13 @@ test("CI package smoke consumes npm JSON paths relative to the package root", (t
     /runtime package is missing dist\/cli\.js/u
   );
 
+  // The package smoke moved from inline ci.yml steps into the hermetic gate
+  // runner (scripts/gate-hermetic.mjs); pin the command where it now lives.
   const workflow = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
-  assert.match(workflow, /check-runtime-package-structure\.mjs package-smoke\.json/u);
-  assert.doesNotMatch(workflow, /package\/dist\/cli\.js/u);
+  assert.match(workflow, /node scripts\/gate-hermetic\.mjs/u);
+  const smoke = GATE_STEPS.find((step) => step.name === "package-smoke").command;
+  assert.match(smoke, /check-runtime-package-structure\.mjs package-smoke\.json/u);
+  assert.doesNotMatch(smoke, /package\/dist\/cli\.js/u);
 });
 
 test("Leader and Operator keep native subagent creation inside the Leader conversation", () => {

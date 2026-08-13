@@ -26,6 +26,8 @@ import {
   buildGateRecord,
   buildHermeticEnvironment,
   classifyGateResults,
+  gateExitCode,
+  shortTmpBase,
   writeHermeticGitConfig
 } from "../test/helpers/gateHermetic.js";
 
@@ -95,8 +97,11 @@ function gateCheckout({ checkout, sha, ref, hermetic, recordToStdout, npmVersion
   return buildGateRecord({ sha, ref, checks, hermetic, npmVersion });
 }
 
-function prepareHermetic(root, options) {
-  const hermetic = buildHermeticEnvironment(root, { npmCache: options.npmCache });
+function prepareHermetic(root, tmpHome, options) {
+  const hermetic = buildHermeticEnvironment(root, {
+    npmCache: options.npmCache,
+    tmpdir: tmpHome
+  });
   for (const dir of [
     hermetic.HOME,
     hermetic.XDG_CONFIG_HOME,
@@ -127,11 +132,14 @@ async function main() {
   };
   const sourceCheckout = process.cwd();
   const root = mkdtempSync(join(tmpdir(), "yui-gate-"));
+  // TMPDIR lives outside the (possibly deep) gate root: Unix domain sockets
+  // are capped at 108 chars on Linux, and the suite's Controller/tmux sockets
+  // are addressed under TMPDIR.
+  const tmpHome = mkdtempSync(join(shortTmpBase(), "yui-gate-tmp-"));
   const worktrees = [];
-  let exitCode = 0;
 
   try {
-    const hermetic = prepareHermetic(root, options);
+    const hermetic = prepareHermetic(root, tmpHome, options);
     const npmVersionResult = spawnSync("npm", ["--version"], {
       env: hermetic,
       encoding: "utf8"
@@ -165,7 +173,7 @@ async function main() {
       summary(
         `GATE PASS sha=${candidateSha} record=${options.record === "-" ? "stdout" : options.record}`
       );
-      return;
+      return 0;
     }
 
     const failing = candidate.checks
@@ -177,8 +185,7 @@ async function main() {
       summary(
         "Re-run with --base <merge-base-sha> to classify introduced vs pre-existing failures."
       );
-      exitCode = 1;
-      return;
+      return 1;
     }
 
     const baseSha = git(sourceCheckout, ["rev-parse", options.base], hermetic);
@@ -200,11 +207,10 @@ async function main() {
     summary(`  introduced:   ${classification.introduced.join(", ") || "(none)"}`);
     summary(`  pre-existing: ${classification.preExisting.join(", ") || "(none)"}`);
     summary(`  fixed:        ${classification.fixed.join(", ") || "(none)"}`);
-    if (classification.introduced.length > 0) {
-      exitCode = 1;
-    } else {
+    if (classification.introduced.length === 0) {
       summary("No introduced failures: the candidate failures are pre-existing on the base.");
     }
+    return gateExitCode(candidate, classification);
   } finally {
     for (const worktree of worktrees) {
       spawnSync("git", ["worktree", "remove", "--force", worktree], {
@@ -213,15 +219,20 @@ async function main() {
       });
     }
     rmSync(root, { recursive: true, force: true });
+    rmSync(tmpHome, { recursive: true, force: true });
   }
-  process.exitCode = exitCode;
 }
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((error) => {
-    process.stderr.write(
-      `GATE ERROR: ${error instanceof Error ? error.message : String(error)}\n`
-    );
-    process.exitCode = 1;
-  });
+  main().then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (error) => {
+      process.stderr.write(
+        `GATE ERROR: ${error instanceof Error ? error.message : String(error)}\n`
+      );
+      process.exitCode = 1;
+    }
+  );
 }

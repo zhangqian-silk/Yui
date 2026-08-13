@@ -10,7 +10,8 @@
 // classifies introduced vs pre-existing failures against a base commit.
 
 import { execFileSync } from "node:child_process";
-import { accessSync, mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 
 /** Standard system PATH entries, in order, after the resolved tool dirs. */
@@ -25,6 +26,27 @@ export const STANDARD_SYSTEM_PATH = Object.freeze([
 
 /** Tools whose directories must lead the sanitized PATH, in order. */
 const PATH_TOOLS = Object.freeze(["node", "npm", "git", "tmux"]);
+
+/**
+ * Pick a short base directory for the gate's TMPDIR. Unix domain sockets live
+ * under TMPDIR and are capped at 108 chars on Linux; a deep host tmpdir (some
+ * CI runners, sandboxed homes) would push the Controller and tmux socket
+ * paths past that limit and break the suite mid-gate. `/tmp` is used when it
+ * is a writable directory on Linux/macOS; every other platform falls back to
+ * the host tmpdir. The gate still creates a unique subdirectory per run, so
+ * isolation is preserved.
+ */
+export function shortTmpBase(platform = process.platform) {
+  if (platform === "linux" || platform === "darwin") {
+    try {
+      accessSync("/tmp", constants.R_OK | constants.W_OK | constants.X_OK);
+      return "/tmp";
+    } catch {
+      // Not usable here; fall through to the host tmpdir.
+    }
+  }
+  return tmpdir();
+}
 
 function deepFreeze(value) {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
@@ -198,6 +220,23 @@ export function classifyGateResults(candidateRecord, baseRecord) {
     }
   }
   return deepFreeze({ introduced, preExisting, fixed });
+}
+
+/**
+ * The gate process exit code for a run. A passing candidate exits 0. A failing
+ * candidate without a base exits 1 (the failure is unclassified and blocks).
+ * With a base classification, only introduced failures exit 1; pre-existing
+ * failures exit 0 so a red base never blocks a change that did not cause the
+ * failure. `classification` is null when no --base run happened.
+ */
+export function gateExitCode(candidateRecord, classification = null) {
+  if (candidateRecord.result === "pass") {
+    return 0;
+  }
+  if (classification === null) {
+    return 1;
+  }
+  return classification.introduced.length > 0 ? 1 : 0;
 }
 
 /**

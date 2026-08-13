@@ -10,7 +10,9 @@ import {
   buildGateRecord,
   buildHermeticEnvironment,
   classifyGateResults,
+  gateExitCode,
   resolveToolDirectory,
+  shortTmpBase,
   writeHermeticGitConfig
 } from "../helpers/gateHermetic.js";
 
@@ -102,6 +104,11 @@ test("GATE_STEPS is the ordered install/build/lint/test/package-smoke gate", () 
   assert.match(smoke.command, /assemble-runtime-package\.mjs/);
   assert.match(smoke.command, /npm pack/);
   assert.match(smoke.command, /check-runtime-package-structure\.mjs/);
+  // The pack manifest goes through a file: readFileSync on a pipe is racy
+  // with npm as the producer (EAGAIN), so the gate never pipes npm pack into
+  // the checker.
+  assert.match(smoke.command, /check-runtime-package-structure\.mjs package-smoke\.json/);
+  assert.doesNotMatch(smoke.command, /\|\s*node scripts\/check-runtime-package-structure/u);
 });
 
 function fakeHermetic(root) {
@@ -221,4 +228,34 @@ test("writeHermeticGitConfig writes the gate identity", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("shortTmpBase keeps socket paths short on Linux and macOS", () => {
+  // Unix domain sockets are capped at 108 chars on Linux; the base must be
+  // short enough that a Controller socket under it stays under the limit.
+  for (const platform of ["linux", "darwin"]) {
+    const base = shortTmpBase(platform);
+    assert.ok(base.length <= 16, `${platform} tmp base ${base} is too deep`);
+    assert.ok(!base.endsWith("/"), `${platform} tmp base has no trailing slash`);
+  }
+  // Other platforms fall back to the host tmpdir.
+  assert.equal(shortTmpBase("win32"), tmpdir());
+});
+
+test("gateExitCode blocks on any unclassified failure and only introduced failures with a base", () => {
+  const pass = recordFor("pass", [["install", "pass"]]);
+  const fail = recordFor("fail", [["install", "fail"]]);
+  assert.equal(gateExitCode(pass), 0);
+  assert.equal(gateExitCode(pass, { introduced: [], preExisting: [], fixed: [] }), 0);
+  assert.equal(gateExitCode(fail), 1, "an unclassified failure blocks");
+  assert.equal(
+    gateExitCode(fail, { introduced: ["install"], preExisting: [], fixed: [] }),
+    1,
+    "an introduced failure blocks"
+  );
+  assert.equal(
+    gateExitCode(fail, { introduced: [], preExisting: ["install"], fixed: [] }),
+    0,
+    "a pre-existing failure does not block"
+  );
 });
