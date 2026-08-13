@@ -399,6 +399,14 @@ test("release reuses the gated exact commit and smokes the same package on Node 
   assert.match(workflow, /sha256sum yui-runtime\.tgz/u);
   assert.match(workflow, /sha256sum -c yui-runtime\.sha256/u);
   assert.match(workflow, /commit=\$\(git rev-parse HEAD\)/u);
+  // The checksum file must be uploaded together with the tarball: every
+  // consumer runs `sha256sum -c` on the downloaded artifact, so a missing
+  // checksum fails the release before smoke (P1-1 regression contract).
+  const uploadStep = workflow.match(
+    /- name: Upload tested package[\s\S]*?(?=\n  \S|\s*$)/u
+  )?.[0];
+  assert.ok(uploadStep, "publish.yml must keep the Upload tested package step");
+  assert.match(uploadStep, /\n\s+yui-runtime\.sha256\s*\n/u);
 
   // The executable bit is asserted on the actual tarball, the installed file,
   // and the executed .bin/yui (PR #110 regression contract).

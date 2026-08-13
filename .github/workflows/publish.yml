@@ -99,6 +99,7 @@ jobs:
           name: yui-runtime-tarball
           path: |
             yui-runtime.tgz
+            yui-runtime.sha256
             release-provenance.txt
           if-no-files-found: error
           retention-days: 1
