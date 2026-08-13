@@ -841,6 +841,125 @@ test("archiving a Task removes its worktrees but keeps the Project repository", 
   assert.equal(git(fixture.project.path, ["rev-parse", "HEAD"]).length, 40);
 });
 
+test("rebuild resume completes after the external checkout is deleted", async (t) => {
+  const fixture = await rebuildFixture(t);
+  // Prepare the Task so it owns an identity and a token worktree.
+  const created = runTaskCommand(
+    ["create", "External Task", "--project", "project-1"],
+    fixture.store,
+    { now: () => new Date(NOW) }
+  );
+  const task = created.data.task;
+  await fixture.preparer.prepareTaskWorkspace(task.id);
+  const prepared = fixture.store.getTask(task.id);
+  const currentSegment = `${task.id}-${prepared.workspaceIdentity.token}`;
+  const currentWorktree = join(fixture.workspace, "worktree", "Yui", currentSegment, "main");
+  assert.equal(existsSync(currentWorktree), true);
+
+  // A leftover legacy worktree from a partial rebuild (identity bound, legacy
+  // cleanup not yet run).
+  const legacyWorktree = join(fixture.workspace, "worktree", "Yui", task.id, "main");
+  const gitWorkspace = new NodeGitWorkspace();
+  await gitWorkspace.ensureWorktree({
+    repositoryPath: fixture.project.path,
+    container: join(fixture.workspace, "worktree", "Yui"),
+    taskSegment: task.id,
+    roleName: "main",
+    baseRef: task.projectBindings[0].baseRef
+  });
+  assert.equal(existsSync(legacyWorktree), true);
+
+  // The user deletes their external checkout; every worktree loses its common dir.
+  rmSync(fixture.project.path, { recursive: true, force: true });
+
+  // The rebuild resume must complete, not hard-fail on the missing common dir.
+  const result = await runTaskWorkspaceCommand(
+    ["rebuild", task.id],
+    fixture.store,
+    fixture.preparer,
+    { now: () => new Date(NOW) }
+  );
+  assert.equal(result.data.resumed, true);
+  // The broken legacy worktree directory is removed; the cataloged token
+  // worktree is left for the Leader to reconcile, not reclaimed.
+  assert.equal(existsSync(legacyWorktree), false, "the broken legacy worktree is removed");
+  assert.equal(existsSync(currentWorktree), true, "the cataloged token worktree is not reclaimed");
+});
+
+test("rebuild resume reclaims a token worktree and branch without a catalog record", async (t) => {
+  const fixture = await rebuildFixture(t);
+  const created = runTaskCommand(
+    ["create", "Orphan Task", "--project", "project-1"],
+    fixture.store,
+    { now: () => new Date(NOW) }
+  );
+  const task = created.data.task;
+  await fixture.preparer.prepareTaskWorkspace(task.id);
+  const prepared = fixture.store.getTask(task.id);
+  const currentSegment = `${task.id}-${prepared.workspaceIdentity.token}`;
+  const currentWorktree = join(fixture.workspace, "worktree", "Yui", currentSegment, "main");
+
+  // A crashed prepare/rebuild left a token worktree+branch without a catalog
+  // record. Simulate it with a distinct token.
+  const orphanToken = "aabbccdd";
+  const orphanSegment = `${task.id}-${orphanToken}`;
+  assert.notEqual(orphanSegment, currentSegment, "the orphan token differs from the current one");
+  const orphanWorktree = join(fixture.workspace, "worktree", "Yui", orphanSegment, "main");
+  const orphanBranch = `yui/${orphanSegment}/main`;
+  const gitWorkspace = new NodeGitWorkspace();
+  await gitWorkspace.ensureWorktree({
+    repositoryPath: fixture.project.path,
+    container: join(fixture.workspace, "worktree", "Yui"),
+    taskSegment: orphanSegment,
+    roleName: "main",
+    baseRef: task.projectBindings[0].baseRef
+  });
+  assert.equal(existsSync(orphanWorktree), true);
+  assert.equal(git(fixture.project.path, ["rev-parse", orphanBranch]).length, 40);
+
+  const result = await runTaskWorkspaceCommand(
+    ["rebuild", task.id],
+    fixture.store,
+    fixture.preparer,
+    { now: () => new Date(NOW) }
+  );
+  assert.equal(result.data.resumed, true);
+
+  // The orphaned worktree and branch are reclaimed...
+  assert.equal(existsSync(orphanWorktree), false, "the orphaned token worktree is removed");
+  assert.throws(
+    () => git(fixture.project.path, ["rev-parse", orphanBranch]),
+    undefined,
+    "the orphaned token branch is deleted"
+  );
+  // ...and the current (cataloged) workspace is untouched.
+  assert.equal(existsSync(currentWorktree), true, "the cataloged worktree is not reclaimed");
+  assert.equal(
+    git(fixture.project.path, ["rev-parse", `yui/${currentSegment}/main`]).length,
+    40,
+    "the cataloged branch is retained"
+  );
+});
+
+test("task history archive completes after the external checkout is deleted", async (t) => {
+  const fixture = await rebuildFixture(t);
+  const { task } = await legacyTask(fixture);
+  const completed = completeTask(activateTask(task, NOW), NOW, { by: "leader", summary: "done" });
+  fixture.store.saveTask(archiveTask(completed, NOW));
+
+  // The user deletes their external checkout; the legacy worktree is broken.
+  rmSync(fixture.project.path, { recursive: true, force: true });
+
+  // The archive scan must not hard-fail on the missing repository.
+  const result = await runTaskWorkspaceCommand(
+    ["history", "archive", task.id],
+    fixture.store,
+    fixture.preparer,
+    { now: () => new Date(NOW) }
+  );
+  assert.deepEqual(result.data.archived, []);
+});
+
 test("the task workspace commands are wired through the CLI", async (t) => {
   const fixture = await rebuildFixture(t);
   const { legacyRef } = await legacyTask(fixture);

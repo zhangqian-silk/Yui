@@ -57,6 +57,7 @@ import {
   taskMainBranch,
   taskWorkspaceRefSegment,
   taskWorkspaceRefSegmentFromIdentity,
+  TASK_WORKSPACE_TOKEN_PATTERN,
   validateTaskWorkspaceIdentity,
   type TaskWorkspaceIdentity
 } from "./taskWorkspaceIdentity.js";
@@ -1915,6 +1916,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         this.store.listProjects().map((project) => project.id)
       );
       const archived = await this.#archiveLegacyRefs(task);
+      // Reclaim token worktrees/branches a crashed prepare or rebuild left
+      // behind without a catalog record, so they do not accumulate.
+      await this.#reclaimOrphanedTaskWorktrees(task);
       return { task: requireTask(this.store, task.id), archived, resumed: true };
     }
     assertTaskHasNoEvidence(this.store, task.id);
@@ -2060,7 +2064,14 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async listLegacyTaskRefs(taskId?: string): Promise<LegacyTaskRef[]> {
     const found: LegacyTaskRef[] = [];
     for (const project of this.store.listProjects()) {
-      const refs = await this.git.listRefs(project.path, "refs/heads/yui/");
+      let refs: string[];
+      try {
+        refs = await this.git.listRefs(project.path, "refs/heads/yui/");
+      } catch (error) {
+        // A deleted external checkout has no refs to scan; skip it.
+        if (isMissingPath(error)) continue;
+        throw error;
+      }
       for (const ref of refs) {
         if (!isLegacyTaskRef(ref)) continue;
         const ownerTaskId = ref.slice("refs/heads/yui/".length).split("/")[0]!;
@@ -2257,7 +2268,14 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const seen = new Set<string>();
     const archived: string[] = [];
     for (const project of projects) {
-      const refs = await this.git.listRefs(project.path, `refs/heads/yui/${task.id}/`);
+      let refs: string[];
+      try {
+        refs = await this.git.listRefs(project.path, `refs/heads/yui/${task.id}/`);
+      } catch (error) {
+        // A deleted external checkout has no refs to archive; skip it.
+        if (isMissingPath(error)) continue;
+        throw error;
+      }
       for (const ref of refs) {
         const ownerTaskId = ref.slice("refs/heads/yui/".length).split("/")[0];
         if (ownerTaskId !== task.id || !isLegacyTaskRef(ref)) continue;
@@ -2363,6 +2381,70 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       });
       if (removal === "dirty") {
         throw new Error(`Legacy Task worktree is dirty and blocks the rebuild: ${task.id}/${project.id}.`);
+      }
+    }
+  }
+
+  /**
+   * Reclaim token worktrees of this Task that no catalog record owns. A
+   * crashed prepare or rebuild (SIGKILL before the catalog transaction) leaves
+   * a token-bearing worktree and branch behind; a retry mints a fresh token,
+   * so the old one is orphaned. The resume path scans this Home's project
+   * containers for `task-N-<token>` directories and removes any the catalog
+   * no longer owns, reusing the recorded-worktree mechanism: prove the exact
+   * identity, retain the commit in the Home archive, remove the worktree, then
+   * archive and delete its now-unchecked-out branch.
+   *
+   * Only this Home's project containers are scanned, and every candidate must
+   * pass the exact recorded-worktree proof (its branch retained in this
+   * Home's Project repository) before it is removed. A deleted external
+   * checkout orphans the worktree directory, which `removeRecordedWorktree`
+   * removes outright; its branch is gone with the repository and needs no
+   * further action.
+   */
+  async #reclaimOrphanedTaskWorktrees(task: Task): Promise<void> {
+    const cataloged = new Set(
+      this.store.listManagedWorkspaces(task.id)
+        .flatMap((workspace) => workspace.entries.map(({ path }) => path))
+    );
+    const homeId = this.store.getHomeIdentity().homeId;
+    for (const project of this.store.listProjects()) {
+      const container = this.#projectContainer(project.name);
+      for (const segment of await listTaskTokenSegments(container, task.id)) {
+        const worktreePath = join(container, segment, MAIN_WORKTREE);
+        if (cataloged.has(worktreePath)) continue;
+        const branch = worktreeIdentity(segment, MAIN_WORKTREE).branch;
+        const archiveRef = taskArchiveRef(homeId, `refs/heads/${branch}`);
+        const removal = await this.git.removeRecordedWorktree({
+          repositoryPath: project.path,
+          container,
+          path: worktreePath,
+          branch,
+          retainedRef: archiveRef,
+          taskSegment: segment,
+          roleName: MAIN_WORKTREE
+        });
+        if (removal === "dirty") {
+          throw new Error(
+            `Orphaned Task worktree is dirty and blocks the rebuild: ${task.id}/${project.id}.`
+          );
+        }
+        // The worktree is gone; archive+delete its now-unchecked-out branch.
+        // A deleted external checkout takes the branch with it, so a missing
+        // repository or an already-absent branch is a no-op.
+        let branchExists = false;
+        try {
+          branchExists = await this.git.refExists(project.path, `refs/heads/${branch}`);
+        } catch (error) {
+          if (!isMissingPath(error)) throw error;
+        }
+        if (branchExists) {
+          await this.git.archiveRef({
+            repositoryPath: project.path,
+            sourceRef: `refs/heads/${branch}`,
+            archiveRef
+          });
+        }
       }
     }
   }
@@ -2630,6 +2712,30 @@ function sameManagedWorkspaceIdentity(left: ManagedWorkspace, right: ManagedWork
 function isMissingPath(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error
     && (error as { code?: unknown }).code === "ENOENT";
+}
+
+/**
+ * The token-bearing ref segments (`task-N-<8hex>`) under a Project's worktree
+ * container for one Task. A missing container yields no segments; legacy
+ * (`task-N`) and foreign-Task directories are ignored.
+ */
+async function listTaskTokenSegments(container: string, taskId: string): Promise<string[]> {
+  let entries;
+  try {
+    entries = await readdir(container, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingPath(error)) return [];
+    throw error;
+  }
+  const prefix = `${taskId}-`;
+  const segments: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (!entry.name.startsWith(prefix)) continue;
+    if (!TASK_WORKSPACE_TOKEN_PATTERN.test(entry.name.slice(prefix.length))) continue;
+    segments.push(entry.name);
+  }
+  return segments.sort();
 }
 
 function recordWorkspaceDisposition(

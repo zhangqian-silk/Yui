@@ -900,7 +900,17 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     taskSegment: string;
     roleName: string;
   }>): Promise<GitWorkspaceRemoval> {
-    const inspected = await inspectExactRecordedWorktree(input);
+    let inspected: ExactRecordedWorktree | undefined;
+    try {
+      inspected = await inspectExactRecordedWorktree(input);
+    } catch (error) {
+      // A deleted external checkout takes the worktree's common dir with it,
+      // so every git op against the worktree fails. When the Project
+      // repository itself is gone, the recorded worktree is an orphaned
+      // directory: remove it outright so the cleanup can complete.
+      if (await removeOrphanedWorktreeDirectory(input)) return "removed";
+      throw error;
+    }
     if (inspected === undefined) return "missing";
     if (inspected.state === "dirty") return "dirty";
     // Revalidate immediately before asking the worktree's own Git common-dir
@@ -1154,6 +1164,32 @@ async function resolveRefCommit(repositoryPath: string, ref: string): Promise<st
   ])).toLowerCase();
   if (!isCommit(commit)) throw new Error("Git returned an invalid ref commit.");
   return commit;
+}
+
+/**
+ * Remove a recorded worktree whose Project repository is gone. A deleted
+ * external checkout takes the worktree's common dir with it, so every git op
+ * against the worktree fails; the worktree directory itself is orphaned. When
+ * the repository path no longer exists, remove that directory outright so the
+ * cleanup can complete. Returns false when the repository is still present,
+ * leaving the original error for the caller. The exact recorded identity is
+ * re-validated so a mismatched path/branch is never removed.
+ */
+async function removeOrphanedWorktreeDirectory(input: Readonly<{
+  repositoryPath: string;
+  container: string;
+  path: string;
+  branch: string;
+  taskSegment: string;
+  roleName: string;
+}>): Promise<boolean> {
+  if (await pathKind(input.repositoryPath) !== undefined) return false;
+  const identity = worktreeIdentity(input.taskSegment, input.roleName);
+  const expectedPath = managedPath(resolve(input.container), identity.directory);
+  if (resolve(input.path) !== expectedPath || input.branch !== identity.branch) return false;
+  if (await pathKind(expectedPath) !== "directory") return false;
+  await rm(expectedPath, { recursive: true, force: true });
+  return true;
 }
 
 async function retainCommitRef(
