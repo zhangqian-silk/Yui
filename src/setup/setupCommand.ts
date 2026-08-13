@@ -341,20 +341,18 @@ async function configureYui(
     leaderConfig
   );
   io.output?.write(
-    "\nWorker is the default Agent configuration copied into Task Roles such as "
+    "\n\nWorker is the default Agent configuration copied into Task Roles such as "
     + "investigator and implementer. Each Task Role gets its own Session.\n"
   );
-  const workerReusesLeader = parseWorkerConfigurationMode(
-    await question(
-      `Choose Worker configuration (reuse Leader/configure separately) [${
-        workerModeFallback === "reuse-leader" ? "reuse Leader" : "configure separately"
-      }]: `
-    ),
+  const workerReusesLeader = await selectWorkerConfigurationMode(
+    question,
+    io,
     workerModeFallback
   ) === "reuse-leader";
   let workerAgentId = defaultAgentId;
   let workerConfig = structuredClone(leaderConfig);
   if (!workerReusesLeader) {
+    io.output?.write("\n\nConfigure Worker separately:\n");
     const existingWorkerAgent = existingWorker?.activeAgentId;
     const workerFallback = configuredIds.has(existingWorkerAgent ?? "")
       ? existingWorkerAgent as string
@@ -374,11 +372,13 @@ async function configureYui(
       existingWorker,
       home,
       selectionIo,
-      catalogs
+      catalogs,
+      true
     );
   }
   const suggestedWorkspace = config.defaultWorkspace?.trim()
     || join(dirname(resolve(home)), "workspace");
+  io.output?.write("\n\n");
   const workspaceAnswer = (await question(
     `Project workspace for stable checkouts and managed worktrees [${suggestedWorkspace}]: `
   )).trim();
@@ -479,6 +479,40 @@ function reviewerRoleProfile(): RoleProfile {
 
 type WorkerConfigurationMode = "reuse-leader" | "configure-separately";
 
+async function selectWorkerConfigurationMode(
+  question: SetupQuestion,
+  io: SetupIo,
+  fallback: WorkerConfigurationMode
+): Promise<WorkerConfigurationMode> {
+  const choices: readonly (readonly [string, string, string])[] = [
+    [
+      "1",
+      `Reuse Leader${fallback === "reuse-leader" ? " (default)" : ""}`,
+      "Copy the complete Leader Agent launch configuration; skip Worker-specific prompts"
+    ],
+    [
+      "2",
+      `Configure separately${fallback === "configure-separately" ? " (default)" : ""}`,
+      "Choose the Worker Agent, model, effort, and permission independently"
+    ]
+  ];
+  const fallbackNumber = fallback === "reuse-leader" ? "1" : "2";
+  io.output?.write(`\n${renderTable(
+    "Choose Worker configuration",
+    [
+      { header: "#", minWidth: 1, maxWidth: 4 },
+      { header: "Choice", minWidth: 16, maxWidth: 28 },
+      { header: "Consequence", minWidth: 24, maxWidth: 64 }
+    ],
+    choices,
+    tableWidth(io)
+  )}\n\n`);
+  return parseWorkerConfigurationMode(
+    await question(`Choose Worker configuration [1-2; default ${fallbackNumber}]: `),
+    fallback
+  );
+}
+
 function workerConfigurationModeFallback(
   existing: GlobalRole | null,
   leaderAgentId: string,
@@ -548,7 +582,7 @@ async function promptRoleAgentConfig(
   const existing = existingRole?.activeAgentId === agent.id
     ? existingRole.agentBindings[agent.id]?.config
     : undefined;
-  io.write(`\n${label} Agent configuration: ${agent.id}\n`);
+  io.write(`\n\n${label} Agent configuration: ${agent.id}\n`);
   const resolved = await catalogs.resolve({
       agent,
       cwd,
