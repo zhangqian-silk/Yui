@@ -25,6 +25,7 @@ import {
   GitIntegrationService,
   type IntegrationResult
 } from "./gitIntegrationService.js";
+import type { ChangeSet } from "./changeSet.js";
 
 /**
  * The serialized integration queue.  Every item gets a fresh apply on the
@@ -40,6 +41,12 @@ export type IntegrationQueueGitPort = GitWorkspacePort & {
     sourceCommit: string;
     historyHead: string;
   }>) => Promise<string | null>;
+  treesAgreeOnPaths?: (input: Readonly<{
+    repositoryPath: string;
+    leftCommit: string;
+    rightCommit: string;
+    paths: readonly string[];
+  }>) => Promise<boolean>;
 };
 
 export type EnqueueIntegrationQueueOutcome =
@@ -106,12 +113,18 @@ export async function enqueueIntegrationQueueEntry(
     throw new Error(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
   const targetHead = (await git.inspect(project.path, targetRef)).baseCommit;
-  const equivalent = await findEquivalentCommit(
+  let equivalent = await findEquivalentCommit(
     git,
     project.path,
     changeSet.headCommit,
     targetHead
   );
+  if (equivalent === null) {
+    // The identical change may already have landed through another commit
+    // while the target also moved on with unrelated work: the whole-tree
+    // check misses it, but the touched paths already agree.
+    equivalent = await findContainedChangeSet(git, project.path, changeSet, targetHead);
+  }
   return input.store.transaction((tx) => {
     const id = tx.nextIntegrationQueueEntryId(task.id);
     const entry = equivalent === null
@@ -367,6 +380,34 @@ async function findEquivalentCommit(
       : null;
   }
   return git.findCommitWithSameTreeInHistory({ repositoryPath, sourceCommit, historyHead });
+}
+
+/**
+ * A ChangeSet whose head already agrees with the target on every path it
+ * touched (deletions included) is fully represented there: an identical
+ * parallel change landed through another commit.  Converge it directly,
+ * since applying it would be a no-op and a second commit would only
+ * duplicate the same work.
+ */
+async function findContainedChangeSet(
+  git: IntegrationQueueGitPort,
+  repositoryPath: string,
+  changeSet: ChangeSet,
+  targetHead: string
+): Promise<string | null> {
+  if (git.treesAgreeOnPaths === undefined) return null;
+  const paths = [...new Set([
+    ...changeSet.changedPaths,
+    ...(changeSet.manifest?.deletedPaths ?? [])
+  ])];
+  if (paths.length === 0) return null;
+  const agrees = await git.treesAgreeOnPaths({
+    repositoryPath,
+    leftCommit: changeSet.headCommit,
+    rightCommit: targetHead,
+    paths
+  });
+  return agrees ? targetHead : null;
 }
 
 function taskMainBranch(

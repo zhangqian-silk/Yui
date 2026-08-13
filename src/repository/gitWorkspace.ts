@@ -216,6 +216,27 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   }
 
   /**
+   * Whether two commits hold the same tree content on the given paths.
+   * An enqueued ChangeSet whose head agrees with the target on every path
+   * it touched is already represented there and converges without a new
+   * commit, even when other unrelated changes landed in between.
+   */
+  async treesAgreeOnPaths(input: Readonly<{
+    repositoryPath: string;
+    leftCommit: string;
+    rightCommit: string;
+    paths: readonly string[];
+  }>): Promise<boolean> {
+    if (input.paths.length === 0) return false;
+    return gitSucceeds([
+      "-C", input.repositoryPath,
+      "diff", "--quiet",
+      input.leftCommit, input.rightCommit,
+      "--", ...input.paths
+    ]);
+  }
+
+  /**
    * Resolve the configured Project branch directly from its remote.  This is
    * deliberately read-only: unlike `refresh`, it never advances the stable
    * Project checkout or changes its refs.

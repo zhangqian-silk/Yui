@@ -394,6 +394,27 @@ test("enqueue converges on a tree-equivalent target commit", async () => {
   assert.deepEqual(result.entry.evidenceRefs, [`tree-convergence:${equivalent}`]);
 });
 
+test("enqueue converges when the identical change already landed with other work", async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  // A parallel Task lands the same change together with unrelated work, so
+  // no master commit shares the ChangeSet's whole tree.
+  writeFileSync(join(fixture.repositoryPath, "a.txt"), "a\n");
+  writeFileSync(join(fixture.repositoryPath, "other.txt"), "other\n");
+  git(["-C", fixture.repositoryPath, "add", "a.txt", "other.txt"]);
+  git(["-C", fixture.repositoryPath, "commit", "-m", "parallel landing"]);
+  const landed = masterHead(fixture);
+  const result = await enqueue(fixture, changeSet);
+  assert.equal(result.outcome, "converged");
+  assert.equal(result.entry.status, "committed");
+  assert.deepEqual(result.entry.evidenceRefs, [`tree-convergence:${landed}`]);
+  assert.equal(result.entry.targetBefore, result.entry.targetAfter);
+  assert.equal(masterHead(fixture), landed);
+});
+
 // --- Process semantics ------------------------------------------------------
 
 test("process commits the exact head and records the target before and after", async () => {
