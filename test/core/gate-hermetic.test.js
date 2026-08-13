@@ -1,22 +1,27 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
   GATE_STEPS,
   STANDARD_SYSTEM_PATH,
   TEST_STEP_TAP_BASENAME,
+  assertCleanSourceCheckout,
   buildCombinedGateRecord,
   buildGateRecord,
   buildHermeticEnvironment,
   classifyGateResults,
   gateDisposition,
   gateExitCode,
+  isFullSha,
   parseTapFailureFingerprints,
   planCandidateCheckout,
+  recordPathPrefixes,
+  resolveMergeBase,
   resolveToolDirectory,
   shortTmpBase,
   writeHermeticGitConfig
@@ -205,6 +210,8 @@ function recordFor(sha, statuses) {
 }
 
 test("classifyGateResults separates introduced, pre-existing, and fixed checks", () => {
+  // A non-test step failing on both sides has no comparable identity, so it
+  // is introduced (fail-closed), never silently pre-existing.
   const candidate = recordFor("candidate", [
     ["install", "pass"],
     ["build", "fail"],
@@ -218,8 +225,8 @@ test("classifyGateResults separates introduced, pre-existing, and fixed checks",
     ["test", "fail"]
   ]);
   const classification = classifyGateResults(candidate, base);
-  assert.deepEqual(classification.introduced, ["build"]);
-  assert.deepEqual(classification.preExisting, ["lint"]);
+  assert.deepEqual(classification.introduced, ["build", "lint"]);
+  assert.deepEqual(classification.preExisting, []);
   assert.deepEqual(classification.fixed, ["test"]);
   assert.ok(Object.isFrozen(classification));
 });
@@ -370,6 +377,8 @@ test("parseTapFailureFingerprints handles results without YAML or location", () 
 
 test("parseTapFailureFingerprints normalizes file-wrapper subtests (file-wrapped TAP layout)", () => {
   // Node 22+ wraps each file's tests under a subtest named with the file path.
+  // The wrapper's own `not ok` carries only the file as identity; without a
+  // crash diagnostic it contributes no fingerprint (the inner failure does).
   const tap = [
     "TAP version 13",
     "# Subtest: /gate/w/test/core/sample.test.js",
@@ -384,10 +393,88 @@ test("parseTapFailureFingerprints normalizes file-wrapper subtests (file-wrapped
     "  ..."
   ].join("\n");
   const fingerprints = parseTapFailureFingerprints(tap, { checkout: "/gate/w" });
-  assert.deepEqual(fingerprints, [
-    "test/core/sample.test.js",
-    "test/core/sample.test.js > failing test B"
+  assert.deepEqual(fingerprints, ["test/core/sample.test.js > failing test B"]);
+});
+
+test("parseTapFailureFingerprints gives a file-wrapper crash a diagnostic fingerprint", () => {
+  // A test file that crashes before registering tests only produces the
+  // file-wrapper `not ok`. The crash error (printed as a TAP comment) is the
+  // positive identity: base error A and candidate error B in the same file
+  // must produce different fingerprints.
+  const crashTap = (checkout, message) =>
+    [
+      "TAP version 13",
+      `# ${checkout}/test/core/crash.test.js:2`,
+      `# throw new Error("${message}");`,
+      "# ^",
+      `# Error: ${message}`,
+      `#     at Object.<anonymous> (${checkout}/test/core/crash.test.js:2:7)`,
+      "# Node.js v24.19.0",
+      `# Subtest: ${checkout}/test/core/crash.test.js`,
+      `not ok 1 - ${checkout}/test/core/crash.test.js`,
+      "  ---",
+      "  duration_ms: 29.5",
+      `  location: '${checkout}/test/core/crash.test.js:1:1'`,
+      "  failureType: 'testCodeFailure'",
+      "  exitCode: 1",
+      "  error: 'test failed'",
+      "  code: 'ERR_TEST_FAILURE'",
+      "  ...",
+      "1..1",
+      "# fail 1"
+    ].join("\n");
+  const candidate = parseTapFailureFingerprints(crashTap("/gate/worktree-candidate", "boom-error-A"), {
+    checkout: "/gate/worktree-candidate"
+  });
+  const base = parseTapFailureFingerprints(crashTap("/gate/worktree-base", "boom-error-B"), {
+    checkout: "/gate/worktree-base"
+  });
+  assert.deepEqual(candidate, ["test/core/crash.test.js :: Error: boom-error-A"]);
+  assert.deepEqual(base, ["test/core/crash.test.js :: Error: boom-error-B"]);
+  assert.notDeepEqual(candidate, base, "A and B in the same file must differ");
+});
+
+test("parseTapFailureFingerprints keeps a file-wrapper crash stable across worktrees", () => {
+  // The same crash on the base and the candidate must produce the same
+  // fingerprint despite the different worktree paths (in the error message).
+  const crashTap = (checkout) =>
+    [
+      "TAP version 13",
+      `# Error: Cannot find module '${checkout}/lib/missing.js'`,
+      `# Subtest: ${checkout}/test/core/crash.test.js`,
+      `not ok 1 - ${checkout}/test/core/crash.test.js`,
+      "  ---",
+      `  location: '${checkout}/test/core/crash.test.js:1:1'`,
+      "  error: 'test failed'",
+      "  ..."
+    ].join("\n");
+  const candidate = parseTapFailureFingerprints(crashTap("/gate/worktree-candidate"), {
+    checkout: "/gate/worktree-candidate"
+  });
+  const base = parseTapFailureFingerprints(crashTap("/gate/worktree-base"), {
+    checkout: "/gate/worktree-base"
+  });
+  assert.deepEqual(candidate, base);
+  assert.deepEqual(candidate, [
+    "test/core/crash.test.js :: Error: Cannot find module '<checkout>/lib/missing.js'"
   ]);
+});
+
+test("parseTapFailureFingerprints fails closed for a file wrapper without a diagnostic", () => {
+  // A wrapper `not ok` with no crash comment has no provable identity: it
+  // contributes no fingerprint, so the classifier treats the failure as
+  // unprovable (introduced).
+  const tap = [
+    "TAP version 13",
+    "# Subtest: /gate/w/test/core/crash.test.js",
+    "not ok 1 - /gate/w/test/core/crash.test.js",
+    "  ---",
+    "  duration_ms: 1.0",
+    "  location: '/gate/w/test/core/crash.test.js:1:1'",
+    "  error: 'test failed'",
+    "  ..."
+  ].join("\n");
+  assert.deepEqual(parseTapFailureFingerprints(tap, { checkout: "/gate/w" }), []);
 });
 
 function recordWithFailures(sha, entries) {
@@ -486,7 +573,11 @@ test("classifyGateResults fails closed when a failed test step has no fingerprin
   assert.equal(gateExitCode(bareCandidate, bareClassification), 1);
 });
 
-test("classifyGateResults keeps whole-step identity for the non-test steps", () => {
+test("classifyGateResults fails closed for a non-test step failing on both sides", () => {
+  // install/build/lint/package-smoke carry no stable failure identity: a lint
+  // error on the base and a different lint error on the candidate cannot be
+  // proven the same, so both-sides failures are introduced (fail-closed),
+  // never swallowed as pre-existing.
   const candidate = recordWithFailures("candidate", [
     ["install", "pass"],
     ["lint", "fail"]
@@ -496,8 +587,45 @@ test("classifyGateResults keeps whole-step identity for the non-test steps", () 
     ["lint", "fail"]
   ]);
   const classification = classifyGateResults(candidate, base);
-  assert.deepEqual(classification.preExisting, ["lint"]);
-  assert.equal(gateExitCode(candidate, classification), 0);
+  assert.deepEqual(classification.introduced, ["lint"]);
+  assert.deepEqual(classification.preExisting, []);
+  assert.equal(gateExitCode(candidate, classification), 1, "an unprovable both-sides failure exits red");
+});
+
+test("classifyGateResults at failure level: a file-wrapper crash A on the candidate vs B on the base is introduced", () => {
+  // The P1 regression: a file that crashes before registering tests only
+  // produces the file-wrapper identity. With the crash diagnostic as the
+  // fingerprint, base error B and candidate error A in the same file no
+  // longer collide, so the new failure is introduced and exits red.
+  const candidate = recordWithFailures("candidate", [
+    ["install", "pass"],
+    ["test", "fail", ["test/core/crash.test.js :: Error: boom-error-A"]]
+  ]);
+  const base = recordWithFailures("base", [
+    ["install", "pass"],
+    ["test", "fail", ["test/core/crash.test.js :: Error: boom-error-B"]]
+  ]);
+  const classification = classifyGateResults(candidate, base);
+  assert.deepEqual(classification.introduced, ["test: test/core/crash.test.js :: Error: boom-error-A"]);
+  assert.deepEqual(classification.preExisting, []);
+  assert.deepEqual(classification.fixed, ["test: test/core/crash.test.js :: Error: boom-error-B"]);
+  assert.equal(gateExitCode(candidate, classification), 1, "the new crash must exit red");
+});
+
+test("classifyGateResults at failure level: the same file-wrapper crash on both sides is pre-existing", () => {
+  const failures = ["test/core/crash.test.js :: Error: boom-error-A"];
+  const candidate = recordWithFailures("candidate", [
+    ["install", "pass"],
+    ["test", "fail", failures]
+  ]);
+  const base = recordWithFailures("base", [
+    ["install", "pass"],
+    ["test", "fail", failures]
+  ]);
+  const classification = classifyGateResults(candidate, base);
+  assert.deepEqual(classification.introduced, []);
+  assert.deepEqual(classification.preExisting, ["test: test/core/crash.test.js :: Error: boom-error-A"]);
+  assert.equal(gateExitCode(candidate, classification), 0, "a proven red base stays green");
 });
 
 test("gateDisposition aligns with the exit code in every case", () => {
@@ -603,6 +731,198 @@ test("a dirty checkout cannot gate as HEAD: the candidate worktree excludes unco
     } finally {
       execFileSync("git", ["worktree", "remove", "--force", plan.checkout], { cwd: source });
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function setupRunnerRepo(root) {
+  // Commit the real runner and helper into a fresh repo so a spawned gate
+  // process loads the actual code under test.
+  const source = join(root, "source");
+  mkdirSync(join(source, "scripts"), { recursive: true });
+  mkdirSync(join(source, "test", "helpers"), { recursive: true });
+  git(["init", "-b", "master"], source);
+  git(["config", "user.name", "Yui Gate"], source);
+  git(["config", "user.email", "yui-gate@example.invalid"], source);
+  copyFileSync(
+    fileURLToPath(new URL("../../scripts/gate-hermetic.mjs", import.meta.url)),
+    join(source, "scripts", "gate-hermetic.mjs")
+  );
+  copyFileSync(
+    fileURLToPath(new URL("../helpers/gateHermetic.js", import.meta.url)),
+    join(source, "test", "helpers", "gateHermetic.js")
+  );
+  git(["add", "scripts/gate-hermetic.mjs", "test/helpers/gateHermetic.js"], source);
+  git(["commit", "-m", "gate runner"], source);
+  return source;
+}
+
+test("a dirty source checkout cannot produce gate evidence (e2e dirty-runner)", () => {
+  // P2-2: the runner and helper are loaded from the caller's checkout, so a
+  // dirty checkout could run modified code and label its result with the HEAD
+  // SHA. The gate must fail-closed before gating and write no pass record.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-dirty-runner-"));
+  try {
+    const source = setupRunnerRepo(root);
+    const headSha = git(["rev-parse", "HEAD"], source);
+
+    // Dirty a tracked file (the helper, like the reviewer's GATE_STEPS edit):
+    // a behavior-changing uncommitted edit that would alter the gate if it ran.
+    const helperPath = join(source, "test", "helpers", "gateHermetic.js");
+    const original = readFileSync(helperPath, "utf8");
+    writeFileSync(
+      helperPath,
+      original.replace("yui-gate@example.invalid", "attacker@example.invalid")
+    );
+
+    const recordPath = join(root, "record.json");
+    const result = spawnSync(
+      process.execPath,
+      [join(source, "scripts", "gate-hermetic.mjs"), "--record", recordPath],
+      { cwd: source, encoding: "utf8" }
+    );
+    assert.notEqual(result.status, 0, "a dirty source checkout must fail-closed");
+    assert.match(result.stderr, /dirty/u, "the failure must name the dirty checkout");
+    // No pass record labeled with the HEAD SHA.
+    if (existsSync(recordPath)) {
+      const record = JSON.parse(readFileSync(recordPath, "utf8"));
+      assert.notEqual(record.result, "pass", "a dirty checkout must not produce pass evidence");
+      assert.notEqual(record.sha, headSha, "a dirty checkout must not label evidence with HEAD");
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the runner rejects an unresolvable --base-ref before gating (e2e)", () => {
+  // P2-1: an empty merge base (shallow checkout, missing ref) must exit before
+  // the candidate is gated, so an empty SHA can never reach a record.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-baseref-"));
+  try {
+    const source = setupRunnerRepo(root);
+    const recordPath = join(root, "record.json");
+    const result = spawnSync(
+      process.execPath,
+      [
+        join(source, "scripts", "gate-hermetic.mjs"),
+        "--base-ref",
+        "refs/does-not-exist",
+        "--record",
+        recordPath
+      ],
+      { cwd: source, encoding: "utf8" }
+    );
+    assert.notEqual(result.status, 0, "an unresolvable base ref must fail-closed");
+    assert.match(result.stderr, /merge base/u, "the failure must name the merge-base resolution");
+    assert.ok(!existsSync(recordPath), "no record may be written when the base cannot be resolved");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveMergeBase fails closed on a shallow graph and resolves on a full graph", () => {
+  // P2-1: actions/checkout defaults to fetch-depth=1, so a PR's synthetic
+  // merge commit has no common ancestor with the base branch: `git merge-base`
+  // exits non-zero with empty output. The gate must treat that as "no provable
+  // base" (null), never as an empty SHA.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-shallow-"));
+  try {
+    const origin = join(root, "origin");
+    mkdirSync(origin);
+    git(["init", "-b", "master"], origin);
+    git(["config", "user.name", "Yui Gate"], origin);
+    git(["config", "user.email", "yui-gate@example.invalid"], origin);
+    writeFileSync(join(origin, "f.txt"), "a\n");
+    git(["add", "f.txt"], origin);
+    git(["commit", "-m", "A"], origin);
+    const aSha = git(["rev-parse", "HEAD"], origin);
+    writeFileSync(join(origin, "f.txt"), "ab\n");
+    git(["add", "f.txt"], origin);
+    git(["commit", "-m", "B"], origin);
+    writeFileSync(join(origin, "f.txt"), "abc\n");
+    git(["add", "f.txt"], origin);
+    git(["commit", "-m", "C"], origin);
+    git(["branch", "feat", aSha], origin);
+    git(["checkout", "feat"], origin);
+    writeFileSync(join(origin, "f.txt"), "ad\n");
+    git(["add", "f.txt"], origin);
+    git(["commit", "-m", "D"], origin);
+    git(["checkout", "master"], origin);
+
+    // Full graph: the merge base of master and feat is A.
+    assert.equal(resolveMergeBase(origin, "feat"), aSha);
+
+    // Shallow clone: depth 1 fetches only C (master) and only D (feat); their
+    // common ancestor A is absent, so merge-base cannot resolve.
+    const shallow = join(root, "shallow");
+    execFileSync(
+      "git",
+      ["clone", "--depth=1", "--branch", "master", origin, shallow],
+      { stdio: "ignore" }
+    );
+    execFileSync("git", ["fetch", "--depth=1", "origin", "feat"], {
+      cwd: shallow,
+      stdio: "ignore"
+    });
+    assert.equal(resolveMergeBase(shallow, "FETCH_HEAD"), null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("isFullSha accepts only full 40-hex commit SHAs", () => {
+  assert.equal(isFullSha("0123456789abcdef0123456789abcdef01234567"), true);
+  assert.equal(isFullSha("0123456789abcdef0123456789abcdef0123456"), false, "too short");
+  assert.equal(isFullSha("0123456789abcdef0123456789abcdef012345678"), false, "too long");
+  assert.equal(isFullSha("0123456789abcdef0123456789abcdef0123456g"), false, "non-hex");
+  assert.equal(isFullSha(""), false, "empty");
+  assert.equal(isFullSha(undefined), false);
+});
+
+test("recordPathPrefixes lists the record and its ancestor directories", () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-recprefix-"));
+  try {
+    assert.deepEqual(recordPathPrefixes(root, join(root, "out", "record.json")), [
+      "out",
+      "out/record.json"
+    ]);
+    assert.deepEqual(recordPathPrefixes(root, join(root, "gate-record.json")), ["gate-record.json"]);
+    assert.deepEqual(recordPathPrefixes(root, "-"), []);
+    // A record outside the checkout is not exempted (it never shows in status).
+    assert.deepEqual(recordPathPrefixes(root, join(tmpdir(), "elsewhere.json")), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("assertCleanSourceCheckout passes clean and refuses dirty, exempting the gate record", () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-clean-"));
+  try {
+    const repo = join(root, "repo");
+    mkdirSync(repo);
+    git(["init", "-b", "master"], repo);
+    git(["config", "user.name", "Yui Gate"], repo);
+    git(["config", "user.email", "yui-gate@example.invalid"], repo);
+    writeFileSync(join(repo, "tracked.txt"), "committed\n");
+    git(["add", "tracked.txt"], repo);
+    git(["commit", "-m", "base"], repo);
+
+    // A clean checkout passes.
+    assertCleanSourceCheckout(repo);
+
+    // The gate's own record output is exempted.
+    writeFileSync(join(repo, "gate-record.json"), "{}\n");
+    assertCleanSourceCheckout(repo, { except: ["gate-record.json"] });
+
+    // A tracked edit is refused.
+    writeFileSync(join(repo, "tracked.txt"), "uncommitted\n");
+    assert.throws(() => assertCleanSourceCheckout(repo), /dirty/u);
+
+    // An untracked file that is not exempted is refused.
+    writeFileSync(join(repo, "tracked.txt"), "committed\n");
+    writeFileSync(join(repo, "scratch.txt"), "untracked\n");
+    assert.throws(() => assertCleanSourceCheckout(repo), /dirty/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

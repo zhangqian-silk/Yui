@@ -7,20 +7,24 @@
 //
 // Usage:
 //   node scripts/gate-hermetic.mjs [--ref <sha>] [--base <sha>]
-//                                  [--record <path|->] [--npm-cache <path>]
+//                                  [--base-ref <ref>] [--record <path|->]
+//                                  [--npm-cache <path>]
 //
 // The candidate is always gated in a fresh detached worktree at the resolved
 // HEAD (or --ref): the source checkout is only used for git operations, so
-// uncommitted or untracked content can never enter the gated tree and a dirty
-// checkout cannot produce pass evidence labeled with a clean SHA.
+// uncommitted or untracked content can never enter the gated tree. The
+// runner and helper are still loaded from the caller's checkout, though, so
+// the gate first refuses to run on a dirty source checkout: modified code
+// must never produce evidence labeled with a clean HEAD SHA.
 //
-// With --base, on a candidate failure the base SHA is gated in a second
-// worktree and the two records are classified at failure level (the test
-// step carries stable failing-test fingerprints parsed from its TAP stream):
-// the run exits non-zero only for introduced failures, and the --record file
-// ends up as the self-contained combined record (candidate record, base SHA
-// and record, classification, disposition) rather than the candidate-only
-// record.
+// With --base (an exact SHA) or --base-ref (a ref whose merge base with HEAD
+// is resolved, fail-closed, before any gating), on a candidate failure the
+// base is gated in a second worktree and the two records are classified at
+// failure level (the test step carries stable failing-test fingerprints
+// parsed from its TAP stream): the run exits non-zero only for introduced
+// failures, and the --record file ends up as the self-contained combined
+// record (candidate record, base SHA and record, classification,
+// disposition) rather than the candidate-only record.
 
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -30,13 +34,17 @@ import { fileURLToPath } from "node:url";
 
 import {
   GATE_STEPS,
+  assertCleanSourceCheckout,
   buildCombinedGateRecord,
   buildGateRecord,
   buildHermeticEnvironment,
   classifyGateResults,
   gateExitCode,
+  isFullSha,
   parseTapFailureFingerprints,
   planCandidateCheckout,
+  recordPathPrefixes,
+  resolveMergeBase,
   shortTmpBase,
   writeHermeticGitConfig
 } from "../test/helpers/gateHermetic.js";
@@ -47,19 +55,29 @@ function parseArgs(argv) {
   const options = { record: "gate-record.json" };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === "--ref" || arg === "--base" || arg === "--record" || arg === "--npm-cache") {
+    if (
+      arg === "--ref"
+      || arg === "--base"
+      || arg === "--base-ref"
+      || arg === "--record"
+      || arg === "--npm-cache"
+    ) {
       const value = argv[index + 1];
       if (value === undefined || value.startsWith("--")) {
         throw new Error(`${arg} requires a value`);
       }
       if (arg === "--ref") options.ref = value;
       else if (arg === "--base") options.base = value;
+      else if (arg === "--base-ref") options.baseRef = value;
       else if (arg === "--record") options.record = value;
       else options.npmCache = value;
       index += 1;
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }
+  }
+  if (options.base !== undefined && options.baseRef !== undefined) {
+    throw new Error("--base and --base-ref are mutually exclusive");
   }
   return options;
 }
@@ -174,12 +192,43 @@ async function main() {
       ? npmVersionResult.stdout.trim()
       : "unknown";
 
+    // The runner and helper are loaded from this checkout, so modified code
+    // here could produce pass evidence labeled with the HEAD SHA. Refuse to
+    // gate on a dirty checkout (the gate's own record output is exempt).
+    assertCleanSourceCheckout(sourceCheckout, {
+      env: hermetic,
+      except: recordPathPrefixes(sourceCheckout, options.record)
+    });
+
     let candidateSha;
     if (options.ref !== undefined) {
       candidateSha = git(sourceCheckout, ["rev-parse", options.ref], hermetic);
     } else {
       candidateSha = git(sourceCheckout, ["rev-parse", "HEAD"], hermetic);
     }
+    if (!isFullSha(candidateSha)) {
+      throw new Error(`candidate did not resolve to a full SHA: ${JSON.stringify(candidateSha)}`);
+    }
+
+    // Resolve the base before gating anything: an unresolvable merge base
+    // (a shallow checkout, a missing ref) exits before the candidate is
+    // gated, so an empty or partial base SHA can never reach a record.
+    let baseSha;
+    if (options.baseRef !== undefined) {
+      baseSha = resolveMergeBase(sourceCheckout, options.baseRef, { env: hermetic });
+      if (baseSha === null) {
+        throw new Error(
+          `cannot resolve merge base with ${options.baseRef}`
+          + " (shallow checkout or missing ref; fetch full history first)"
+        );
+      }
+    } else if (options.base !== undefined) {
+      baseSha = git(sourceCheckout, ["rev-parse", options.base], hermetic);
+      if (!isFullSha(baseSha)) {
+        throw new Error(`base did not resolve to a full SHA: ${JSON.stringify(baseSha)}`);
+      }
+    }
+
     // Always gate a fresh detached worktree at the resolved SHA: the source
     // checkout only answers git questions, so dirty or untracked content can
     // never be part of the gated tree.
@@ -196,10 +245,10 @@ async function main() {
       npmVersion
     });
 
-    // With --base, the candidate-only record is superseded by the combined
-    // record once the base is gated; without --base (or on a green candidate)
+    // With a base, the candidate-only record is superseded by the combined
+    // record once the base is gated; without a base (or on a green candidate)
     // the candidate record is the final record.
-    if (candidate.result === "pass" || options.base === undefined) {
+    if (candidate.result === "pass" || baseSha === undefined) {
       writeRecord(candidate, options.record);
     }
 
@@ -214,7 +263,7 @@ async function main() {
       .filter((check) => check.status !== "pass")
       .map((check) => check.name);
 
-    if (options.base === undefined) {
+    if (baseSha === undefined) {
       summary(`GATE FAIL sha=${candidateSha} failing: ${failing.join(", ")}`);
       summary(
         "Re-run with --base <merge-base-sha> to classify introduced vs pre-existing failures."
@@ -222,7 +271,6 @@ async function main() {
       return 1;
     }
 
-    const baseSha = git(sourceCheckout, ["rev-parse", options.base], hermetic);
     const baseCheckout = join(root, "worktree-base");
     git(sourceCheckout, ["worktree", "add", "--detach", baseCheckout, baseSha], hermetic);
     worktrees.push(baseCheckout);

@@ -14,15 +14,21 @@
 // from it. Classification is failure-level: a candidate failure is
 // pre-existing only when its fingerprint is proven present on the base. A
 // failed test step without fingerprint data cannot prove identity and is
-// classified introduced (fail-closed). The other steps keep whole-step
-// identity (the step name). A --base run persists a combined record
-// (candidate record, base evidence, classification, disposition) so the
-// saved evidence is consumable without re-running anything.
+// classified introduced (fail-closed). A file-wrapper failure (a test file
+// that crashed before registering tests) carries only the file path as
+// identity, which cannot distinguish two different failures in the same
+// file, so it additionally requires the crash error parsed from the TAP
+// comments; without that positive diagnostic it contributes no fingerprint
+// (fail-closed). The non-test steps carry no stable failure identity at all,
+// so a failure on both sides is introduced (fail-closed): a red base must
+// never swallow a failure the gate cannot prove is the same. A --base run
+// persists a combined record (candidate record, base evidence, classification,
+// disposition) so the saved evidence is consumable without re-running anything.
 
 import { execFileSync } from "node:child_process";
 import { accessSync, constants, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Standard system PATH entries, in order, after the resolved tool dirs. */
@@ -228,6 +234,42 @@ function normalizeTapPath(value, checkout) {
 }
 
 /**
+ * A test-file path in a `not ok` name. Node wraps a test file that crashed
+ * before registering tests in a top-level `not ok` named after the file
+ * (the basename on Node 22+, the full path on Node 20). Such a wrapper
+ * carries only the file as identity and needs the crash diagnostic to
+ * distinguish different failures in the same file.
+ */
+const TEST_FILE_PATH = /\.(?:test|spec)\.(?:js|mjs|cjs)$/u;
+
+/**
+ * A crash diagnostic printed as a TAP comment: `# <Type>Error: <message>`.
+ * Node prints the uncaught error this way before the file-wrapper subtest,
+ * while the wrapper's own YAML `error:` stays the generic `'test failed'`.
+ * The captured `<Type>: <message>` first line is the stable diagnostic. The
+ * type is captured as a word and then checked for an Error/Exception suffix
+ * (a single greedy regex cannot match a word that ends in its own suffix).
+ */
+const ERROR_COMMENT = /^#\s*([A-Za-z_$][\w$]*)\s*:\s*(.*\S)\s*$/u;
+const ERROR_TYPE_SUFFIX = /(?:Error|Exception)$/u;
+
+/** The longest diagnostic signature kept, so a pathological error line cannot bloat a record. */
+const MAX_DIAGNOSTIC_LENGTH = 200;
+
+function normalizeErrorSignature(signature, checkout) {
+  let normalized = signature.trim();
+  if (checkout !== "") {
+    // The base and candidate gate in different worktrees; normalize the
+    // worktree path out of a diagnostic (e.g. a module-not-found error) so
+    // the same failure produces the same signature on both sides.
+    normalized = normalized.split(checkout).join("<checkout>");
+  }
+  return normalized.length > MAX_DIAGNOSTIC_LENGTH
+    ? normalized.slice(0, MAX_DIAGNOSTIC_LENGTH)
+    : normalized;
+}
+
+/**
  * Parse the stable failing-test fingerprints from a TAP stream.
  *
  * A fingerprint is the repo-relative test file (from the YAML `location` of
@@ -239,6 +281,16 @@ function normalizeTapPath(value, checkout) {
  * layouts are handled: a file-wrapper subtest name is normalized to the
  * same repo-relative path and de-duplicated against the `location` file.
  *
+ * A file-wrapper `not ok` (a file that crashed before registering tests)
+ * carries only the file path as identity, which cannot distinguish two
+ * different failures in the same file. Such a result additionally requires
+ * the crash diagnostic (the `# <Type>Error: <message>` comment Node prints
+ * for the uncaught error): the fingerprint becomes `<file> :: <Type>:
+ * <message>`, so a base error A and a candidate error B in the same file
+ * produce different fingerprints. A wrapper without a diagnostic
+ * contributes no fingerprint: its identity is unprovable, and the
+ * classifier treats the empty failure list as introduced (fail-closed).
+ *
  * Returns a sorted, de-duplicated list. An empty list means the stream
  * carried no failing-test identity (for example a runner crash), which the
  * classifier treats as unprovable identity (fail-closed).
@@ -247,10 +299,23 @@ export function parseTapFailureFingerprints(tapText, { checkout = "" } = {}) {
   const fingerprints = new Set();
   const stack = [];
   let pending = null;
+  let pendingErrorComment = null;
 
   const flush = () => {
     if (pending !== null) {
-      fingerprints.add(pending.path.join(" > "));
+      if (pending.isFileWrapper) {
+        // The file path alone cannot prove which failure this is; require the
+        // crash diagnostic. Without it the failure has no fingerprint and is
+        // classified introduced (fail-closed).
+        if (pending.diagnostic !== null) {
+          const file = pending.path[0];
+          if (file !== undefined && file !== "") {
+            fingerprints.add(`${file} :: ${pending.diagnostic}`);
+          }
+        }
+      } else {
+        fingerprints.add(pending.path.join(" > "));
+      }
       pending = null;
     }
   };
@@ -269,9 +334,25 @@ export function parseTapFailureFingerprints(tapText, { checkout = "" } = {}) {
           .replace(/:\d+:\d+$/u, "");
         const file = normalizeTapPath(raw, checkout);
         if (file !== "") {
-          pending.path = [file, ...pending.path.filter((entry) => entry !== file)];
+          if (pending.isFileWrapper) {
+            // The location is the authoritative repo-relative file for a
+            // wrapper (the `not ok` name may be just a basename).
+            pending.path = [file];
+          } else {
+            pending.path = [file, ...pending.path.filter((entry) => entry !== file)];
+          }
         }
       }
+      continue;
+    }
+
+    const errorCommentMatch = ERROR_COMMENT.exec(line);
+    if (errorCommentMatch !== null && ERROR_TYPE_SUFFIX.test(errorCommentMatch[1])) {
+      // The most recent crash diagnostic before a `not ok` belongs to it.
+      pendingErrorComment = normalizeErrorSignature(
+        `${errorCommentMatch[1]}: ${errorCommentMatch[2]}`,
+        checkout
+      );
       continue;
     }
 
@@ -290,16 +371,31 @@ export function parseTapFailureFingerprints(tapText, { checkout = "" } = {}) {
     if (notOkMatch !== null) {
       flush();
       const indent = notOkMatch[1].length;
+      const rawName = notOkMatch[2];
+      const isFileWrapper = TEST_FILE_PATH.test(rawName);
       const parents = stack
         .filter((entry) => entry.indent < indent)
         .map((entry) => entry.name);
-      // In the file-wrapped TAP layout the file wrapper's own `not ok` uses
-      // the absolute file path as its name; normalize it like a subtest name.
+      // A file wrapper is the file itself, not a child of the file subtest:
+      // its identity is the file (plus the crash diagnostic), not the file
+      // subtest's name repeated.
       pending = {
-        path: [...parents, normalizeTapPath(notOkMatch[2], checkout)],
-        yamlIndent: -1
+        path: isFileWrapper
+          ? [normalizeTapPath(rawName, checkout)]
+          : [...parents, normalizeTapPath(rawName, checkout)],
+        yamlIndent: -1,
+        isFileWrapper,
+        diagnostic: pendingErrorComment
       };
+      pendingErrorComment = null;
       continue;
+    }
+
+    // A passing result ends any pending diagnostic window: a crash diagnostic
+    // is always consumed by the next `not ok`, so a stale one must not leak
+    // into a later failure.
+    if (/^(\s*)ok \d+ -/u.test(line)) {
+      pendingErrorComment = null;
     }
 
     const yamlStart = /^(\s*)---\s*$/.exec(line);
@@ -376,11 +472,13 @@ function qualifyFailure(stepName, failure) {
  * cannot be proven and the failure is `introduced` (fail-closed): a red base
  * must never swallow an unidentifiable new failure.
  *
- * The other steps keep whole-step identity (the step name): failing on both
- * is `preExisting`, failing only on the candidate is `introduced`, passing
- * on the candidate while the base failed is `fixed`. A check absent on one
- * side counts as failing on that side, so a missing check is never silently
- * treated as a pass.
+ * The other steps carry no stable failure identity (a lint error and a build
+ * error have no comparable fingerprint), so a failure on both sides is
+ * `introduced` (fail-closed): a red base must never swallow a failure the
+ * gate cannot prove is the same. Failing only on the candidate is
+ * `introduced`; passing on the candidate while the base failed is `fixed`. A
+ * check absent on one side counts as failing on that side, so a missing
+ * check is never silently treated as a pass.
  *
  * Fingerprint-level entries are qualified as `<step>: <fingerprint>` so the
  * classification stays human-readable.
@@ -446,7 +544,9 @@ export function classifyGateResults(candidateRecord, baseRecord) {
         }
       }
     } else if (candidateFailed && baseFailed) {
-      preExisting.push(name);
+      // No fingerprint identity on either side: the gate cannot prove the
+      // two failures are the same, so a red base must not swallow this.
+      introduced.push(name);
     } else if (candidateFailed) {
       introduced.push(name);
     } else {
@@ -530,4 +630,102 @@ export function writeHermeticGitConfig(path) {
     "[user]\n\tname = Yui Gate\n\temail = yui-gate@example.invalid\n",
     { encoding: "utf8", mode: 0o600 }
   );
+}
+
+/** A full 40-hex commit SHA. The gate never accepts a partial or empty SHA. */
+const FULL_SHA = /^[0-9a-f]{40}$/u;
+
+export function isFullSha(value) {
+  return typeof value === "string" && FULL_SHA.test(value);
+}
+
+/**
+ * Resolve the merge base of HEAD and `ref` in the checkout at `cwd`, or
+ * `null` when it cannot be computed. A shallow checkout (the actions/checkout
+ * default of fetch-depth=1) has no common ancestor between the PR merge
+ * commit and the base branch, so `git merge-base` exits non-zero with empty
+ * output; the caller must treat `null` as "no provable base" and fail
+ * closed, never as an empty SHA.
+ */
+export function resolveMergeBase(cwd, ref, { env = process.env } = {}) {
+  let output;
+  try {
+    output = execFileSync("git", ["merge-base", "HEAD", ref], {
+      cwd,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+  } catch {
+    return null;
+  }
+  return isFullSha(output) ? output : null;
+}
+
+/**
+ * The record paths (relative to `cwd`) that the gate is about to write, so
+ * the source-checkout cleanliness check does not mistake the gate's own
+ * record output for dirtiness. Only paths under `cwd` are returned; a
+ * record written elsewhere never shows up in `git status`.
+ */
+export function recordPathPrefixes(cwd, recordPath) {
+  if (recordPath === undefined || recordPath === "-") {
+    return [];
+  }
+  const relativePath = relative(cwd, resolve(cwd, recordPath));
+  if (relativePath === "" || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    return [];
+  }
+  const parts = relativePath.split(sep).filter((entry) => entry !== "");
+  const prefixes = [];
+  for (let index = 1; index <= parts.length; index += 1) {
+    prefixes.push(parts.slice(0, index).join(sep));
+  }
+  return prefixes;
+}
+
+/**
+ * Fail-closed source-checkout cleanliness check. The runner and helper are
+ * loaded from the caller's checkout, so a dirty checkout (a tracked edit, a
+ * staged change, or an untracked file) could run modified code and label its
+ * result with the HEAD SHA. The gate refuses to produce evidence until the
+ * checkout is clean. `except` lists untracked paths (relative to `cwd`) that
+ * are the gate's own imminent output and must not count as dirtiness.
+ * Throws when the checkout is dirty or its status cannot be read.
+ */
+export function assertCleanSourceCheckout(cwd, { env = process.env, except = [] } = {}) {
+  let porcelain;
+  try {
+    porcelain = execFileSync("git", ["status", "--porcelain"], {
+      cwd,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+  } catch (error) {
+    throw new Error(
+      `cannot verify source checkout cleanliness: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  const exceptSet = new Set(except);
+  const dirty = [];
+  for (const line of porcelain.split(/\r?\n/u)) {
+    if (line.trim() === "") {
+      continue;
+    }
+    // Porcelain format is `XY <path>`; untracked entries are `??`.
+    const status = line.slice(0, 2);
+    const path = line.slice(3).replace(/\/$/u, "");
+    if (status === "??" && exceptSet.has(path)) {
+      continue;
+    }
+    dirty.push(line);
+  }
+  if (dirty.length > 0) {
+    throw new Error(
+      `source checkout is dirty; refusing to gate (commit or stash first): ${dirty
+        .slice(0, 5)
+        .join(" | ")}`
+    );
+  }
 }
