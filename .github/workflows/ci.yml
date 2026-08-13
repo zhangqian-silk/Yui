@@ -9,6 +9,12 @@ name: Deterministic CI
 # artifact: the per-commit pass/fail evidence. Local development uses
 # risk-targeted checks instead of repeating this suite; the release workflow
 # reuses its result on the exact tagged commit.
+#
+# On a pull request the job passes the exact merge base (the base branch tip
+# the PR merge commit was built against) as --base, so a red baseline is
+# classified automatically: the job stays green for pre-existing failures and
+# goes red only for failures the change introduced. A push to master has no
+# comparable base, so it runs without --base and stays fail-closed.
 
 on:
   pull_request:
@@ -33,8 +39,22 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Resolve pull request merge base
+        if: github.event_name == 'pull_request'
+        id: merge-base
+        run: |
+          # actions/checkout checks out the PR merge commit; its second parent
+          # is the base branch tip, so the merge base is the exact baseline.
+          git fetch origin master --depth=1
+          echo "sha=$(git merge-base HEAD origin/master)" >> "$GITHUB_OUTPUT"
+
       - name: Hermetic deterministic gate
-        run: node scripts/gate-hermetic.mjs --record gate-record.json
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            node scripts/gate-hermetic.mjs --base "${{ steps.merge-base.outputs.sha }}" --record gate-record.json
+          else
+            node scripts/gate-hermetic.mjs --record gate-record.json
+          fi
 
       - name: Upload gate record
         if: always()
