@@ -14,6 +14,7 @@ import {
 } from "../repository/gitWorkspace.js";
 import type { GitWorkspaceRemoval } from "../repository/gitWorkspace.js";
 import { resolveWorktreeRoot } from "../repository/taskWorkspacePreparer.js";
+import { acquireProjectMaintenanceLocks } from "../repository/projectMaintenanceLock.js";
 import { taskWorkspaceRefSegment } from "../repository/taskWorkspaceIdentity.js";
 import {
   FileTaskRuntimeIsolation,
@@ -109,6 +110,13 @@ export class GitIntegrationService {
     options: Readonly<{ remoteBaseline?: RemoteBaseline }> = {}
   ): Promise<IntegrationResult> {
     const initial = requireIntegration(this.store, taskId, integrationId);
+    // The whole Integration is one Git transaction against the Project's
+    // repository: worktree creation, cherry-picks, checks, and the target ref
+    // CAS. A concurrent `project migrate` must not switch the catalog path or
+    // remove the old checkout mid-Integration, so the per-Project maintenance
+    // fence is held across every Git effect and released only on exit.
+    const release = acquireProjectMaintenanceLocks(this.home, [initial.projectId]);
+    try {
     const task = this.store.getTask(initial.taskId);
     if (task === null || !task.projectBindings.some(
       ({ projectId }) => projectId === initial.projectId
@@ -261,6 +269,9 @@ export class GitIntegrationService {
         }
       }
       return this.#fail(current, error, "integration", workspace);
+    }
+    } finally {
+      release();
     }
   }
 

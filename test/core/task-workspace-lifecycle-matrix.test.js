@@ -32,7 +32,8 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -101,6 +102,20 @@ async function matrixFixture(t) {
   const project = store.getProject("project-1");
   const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
   return { root, home, workspace, repositoryPath, store, project, preparer };
+}
+
+/**
+ * A separate Home for a CAS competitor. The per-Project maintenance fence
+ * lives under the Home's `locks/` area, so a competitor with its own Home
+ * does not contend with the racing preparer's fence. This simulates a
+ * cross-process fence failure and exercises the single-writer CAS as
+ * defense-in-depth: the CAS must still catch a competitor the fence would
+ * normally exclude.
+ */
+function competitorHome(t) {
+  const home = mkdtempSync(join(tmpdir(), "yui-competitor-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  return home;
 }
 
 /**
@@ -454,6 +469,11 @@ test("B1 a concurrent prepare loses the workspaceIdentity CAS and discards its r
   const task = created.data.task;
   fixture.store.saveTask(activateTask(task, NOW));
 
+  // The competitor prepare uses a separate Home (and thus a separate
+  // maintenance fence) to simulate a cross-process fence failure for the CAS.
+  const competitor = new FileTaskWorkspacePreparer(
+    competitorHome(t), fixture.store, undefined, () => new Date(NOW)
+  );
   const real = new NodeGitWorkspace();
   let nested = false;
   const racing = new Proxy(real, {
@@ -464,7 +484,7 @@ test("B1 a concurrent prepare loses the workspaceIdentity CAS and discards its r
           if (!nested && /^task-\d+-[a-f0-9]{8}$/.test(input.taskSegment)) {
             nested = true;
             // A concurrent prepare completes first and binds its own identity.
-            await fixture.preparer.prepareTaskWorkspace(task.id);
+            await competitor.prepareTaskWorkspace(task.id);
           }
           return physical;
         };
@@ -515,6 +535,11 @@ test("B2 a prepare racing a rebuild loses the workspaceIdentity CAS", async (t) 
   );
   const task = created.data.task;
 
+  // The competitor rebuild uses a separate Home (and thus a separate
+  // maintenance fence) to simulate a cross-process fence failure for the CAS.
+  const competitor = new FileTaskWorkspacePreparer(
+    competitorHome(t), fixture.store, undefined, () => new Date(NOW)
+  );
   const real = new NodeGitWorkspace();
   let nested = false;
   const racing = new Proxy(real, {
@@ -525,7 +550,7 @@ test("B2 a prepare racing a rebuild loses the workspaceIdentity CAS", async (t) 
           if (!nested && /^task-\d+-[a-f0-9]{8}$/.test(input.taskSegment)) {
             nested = true;
             // A concurrent rebuild binds its own identity first.
-            await fixture.preparer.rebuildTaskWorkspace(task.id);
+            await competitor.rebuildTaskWorkspace(task.id);
           }
           return physical;
         };

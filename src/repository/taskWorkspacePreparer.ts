@@ -178,34 +178,63 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     // The per-Project maintenance fence makes prepare mutually exclusive with
     // migrate/rebuild/archive: a concurrent migration must not switch the
     // Project catalog to the Home-managed repo while prepare is creating
-    // worktrees from the old external checkout. The fence is held for the
-    // whole prepare (including its conflict retries). Gitless Tasks hold no
-    // fence. The Controller's check-then-call probe is kept for scheduling
-    // deferral; the fence here makes the prepare itself safe regardless.
-    const task = requireTask(this.store, taskId);
+    // worktrees from the old external checkout. The fence is acquired on
+    // every conflict retry so the locked set always covers the Task's
+    // current bindings. Gitless Tasks hold no fence. The Controller's
+    // check-then-call probe is kept for scheduling deferral; the fence here
+    // makes the prepare itself safe regardless.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const task = requireTask(this.store, taskId);
+        const { release, current } = this.#acquireTaskProjectMaintenanceLocks(task);
+        try {
+          return await this.#prepareTaskWorkspaceLocked(current.id);
+        } finally {
+          release();
+        }
+      } catch (error) {
+        if (error instanceof StorageConflictError
+          && attempt < TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Acquire the per-Project maintenance fences for every Project bound to a
+   * Task, then re-read the Task under those fences and prove its binding set
+   * is still the one the fences cover. Gitless Tasks hold no fence.
+   *
+   * The returned Task is the fresh under-lock snapshot; callers MUST use it
+   * (not the pre-lock snapshot) for every Project read and Git effect. A
+   * binding-set change rides the StorageConflictError retry channel so the
+   * caller re-reads the Task and re-acquires the correct fence set. The
+   * caller owns `release` and MUST call it on every exit path.
+   */
+  #acquireTaskProjectMaintenanceLocks(task: Task): Readonly<{
+    release: () => void;
+    current: Task;
+  }> {
     const projectIds = task.projectBindings.map(({ projectId }) => projectId);
     const release = projectIds.length === 0
       ? () => {}
       : acquireProjectMaintenanceLocks(this.home, projectIds);
     try {
-      // A lost prepare/rebuild identity race (or a storage revision conflict)
-      // surfaces as StorageConflictError: the attempt's refs were already
-      // discarded, so re-prepare against the committed state. The bound keeps
-      // a crash-looping competitor from pinning this caller; the last conflict
-      // surfaces once it is exhausted.
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          return await this.#prepareTaskWorkspaceLocked(taskId);
-        } catch (error) {
-          if (error instanceof StorageConflictError
-            && attempt < TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
-            continue;
-          }
-          throw error;
-        }
+      const current = requireTask(this.store, task.id);
+      const currentIds = current.projectBindings.map(({ projectId }) => projectId).sort();
+      const lockedIds = [...projectIds].sort();
+      if (currentIds.length !== lockedIds.length
+        || currentIds.some((id, index) => id !== lockedIds[index])) {
+        throw new StorageConflictError(
+          `Task Project bindings changed while its workspace fence was acquired: ${task.id}.`
+        );
       }
-    } finally {
+      return { release, current };
+    } catch (error) {
       release();
+      throw error;
     }
   }
 
@@ -470,6 +499,36 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   }
 
   /**
+   * The conflict-retry loop for a Task-main prepare, run with the caller's
+   * fences already held. A lost identity/workspace CAS retries safely under
+   * the same fence set; a binding-set change makes that fence set stale, so
+   * the conflict is rethrown and only the caller (which can re-acquire) may
+   * retry it.
+   */
+  async #prepareTaskWorkspaceWithRetries(
+    taskId: string,
+    lockedProjectIds: readonly string[]
+  ): Promise<TaskWorkspacePreparation> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.#prepareTaskWorkspaceLocked(taskId);
+      } catch (error) {
+        if (!(error instanceof StorageConflictError)
+          || attempt >= TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
+          throw error;
+        }
+        const current = requireTask(this.store, taskId);
+        const currentIds = current.projectBindings.map(({ projectId }) => projectId).sort();
+        const locked = [...lockedProjectIds].sort();
+        if (currentIds.length !== locked.length
+          || currentIds.some((id, index) => id !== locked[index])) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  /**
    * Mint the Task's durable workspace identity with create-not-exists
    * semantics: the candidate main branch must not already exist in any bound
    * Project repository. On conflict (a stale ref from a crashed attempt, or
@@ -610,169 +669,179 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const item = requireWorkItem(this.store, taskId, workItemId);
     const task = requireTask(this.store, item.taskId);
     assertWorkItemWorkspaceEligible(this.store, task, item);
-    await this.prepareTaskWorkspace(task.id);
-    // prepareTaskWorkspace may have just minted and persisted the workspace
-    // identity; derive the segment from the persisted Task.
-    const taskSegment = this.#taskSegment(requireTask(this.store, task.id));
-    const main = this.store.getTaskWorkspace(task.id);
-    if (main === null || main.owner.type !== "task") {
-      throw new Error(`Task main workspace is not ready: ${task.id}.`);
-    }
-    const existing = this.store.getWorkItemWorkspace(task.id, item.id);
-    if (existing !== null && (
-      existing.owner.type !== "work-item"
-      || existing.owner.workItemId !== item.id
-    )) {
-      throw new Error(`WorkItem workspace owner is invalid: ${task.id}/${item.id}.`);
-    }
-    if (item.assignee !== undefined) {
-      assertWorkspaceSessionsRetirable(this.store, task.id, item.assignee, this.now());
-    }
-
-    const writeProjects = new Set(item.writeProjectIds);
-    const boundProjects = new Set(task.projectBindings.map(({ projectId }) => projectId));
-    for (const baseRef of item.baseRefs ?? []) {
-      if (!boundProjects.has(baseRef.projectId)) {
-        throw new Error(
-          `WorkItem base-ref Project is not bound to its Task: ${item.id}/${baseRef.projectId}.`
-        );
-      }
-      if (!writeProjects.has(baseRef.projectId)) {
-        throw new Error(
-          `WorkItem base-ref Project is not writable: ${item.id}/${baseRef.projectId}.`
-        );
-      }
-    }
-    const root = this.#workItemWorkspaceRoot(task.id, item.id);
-    const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
+    // Hold the per-Project maintenance fence across the ensure-main-prepared
+    // and the WorkItem worktree creation, so a concurrent migrate/rebuild
+    // cannot switch the Project catalog between the two. The under-lock Task
+    // snapshot drives every Project read and Git effect below.
+    const { release, current: lockedTask } = this.#acquireTaskProjectMaintenanceLocks(task);
     try {
-      for (const binding of task.projectBindings) {
-        const project = requireProject(this.store, binding.projectId);
-        const mainEntry = requireWorkspaceEntry(main, project.id);
-        if (!writeProjects.has(project.id)) {
-          prepared.push({
-            project,
-            entry: { ...mainEntry, access: "read" }
-          });
-          continue;
-        }
-        const previous = existing?.entries.find(({ projectId }) => projectId === project.id);
-        const head = await this.git.inspect(mainEntry.path, "HEAD");
-        const requestedBaseRef = item.baseRefs?.find(({ projectId }) => (
-          projectId === project.id
-        ))?.baseRef;
-        const baseRef = previous?.access === "write"
-          ? previous.baseCommit
-          : requestedBaseRef ?? head.baseCommit;
-        const requestedBase = previous?.access === "write" || requestedBaseRef === undefined
-          ? null
-          : await this.git.inspect(project.path, requestedBaseRef);
-        const physical = await this.git.ensureWorktree({
-          repositoryPath: project.path,
-          container: this.#projectContainer(project.name),
-          taskSegment,
-          roleName: item.id,
-          baseRef
-        });
-        const entry: WorkspaceProjectEntry = {
-          projectId: project.id,
-          directory: binding.directory,
-          access: "write",
-          path: physical.path,
-          branch: physical.branch,
-          baseRef: previous?.access === "write" ? previous.baseRef : baseRef,
-          // The recorded base is the immutable capture boundary. An existing
-          // worktree reports its current HEAD from ensureWorktree(), which
-          // may already contain committed Worker changes and must never
-          // replace that boundary during scope expansion or reconciliation.
-          baseCommit: previous?.access === "write"
-            ? previous.baseCommit
-            : physical.baseCommit
-        };
-        // Track the physical entry before any postcondition check. If a
-        // freshly attached deterministic branch is rejected below, the
-        // catch-path must remove its unadopted worktree even though no
-        // durable ManagedWorkspace has been written yet.
-        prepared.push({ project, entry });
-        if (previous?.access === "write" && (
-          physical.path !== previous.path
-          || physical.branch !== previous.branch
-        )) {
+      const lockedProjectIds = lockedTask.projectBindings.map(({ projectId }) => projectId);
+      await this.#prepareTaskWorkspaceWithRetries(lockedTask.id, lockedProjectIds);
+      // prepareTaskWorkspace may have just minted and persisted the workspace
+      // identity; derive the segment from the persisted Task.
+      const taskSegment = this.#taskSegment(requireTask(this.store, lockedTask.id));
+      const main = this.store.getTaskWorkspace(lockedTask.id);
+      if (main === null || main.owner.type !== "task") {
+        throw new Error(`Task main workspace is not ready: ${lockedTask.id}.`);
+      }
+      const existing = this.store.getWorkItemWorkspace(lockedTask.id, item.id);
+      if (existing !== null && (
+        existing.owner.type !== "work-item"
+        || existing.owner.workItemId !== item.id
+      )) {
+        throw new Error(`WorkItem workspace owner is invalid: ${lockedTask.id}/${item.id}.`);
+      }
+      if (item.assignee !== undefined) {
+        assertWorkspaceSessionsRetirable(this.store, lockedTask.id, item.assignee, this.now());
+      }
+
+      const writeProjects = new Set(item.writeProjectIds);
+      const boundProjects = new Set(lockedTask.projectBindings.map(({ projectId }) => projectId));
+      for (const baseRef of item.baseRefs ?? []) {
+        if (!boundProjects.has(baseRef.projectId)) {
           throw new Error(
-            `Existing WorkItem Project workspace identity changed: ${item.id}/${project.id}.`
+            `WorkItem base-ref Project is not bound to its Task: ${item.id}/${baseRef.projectId}.`
           );
         }
-        if (previous?.access === "write") {
-          if (requestedBaseRef === undefined && previous.baseRef !== previous.baseCommit) {
+        if (!writeProjects.has(baseRef.projectId)) {
+          throw new Error(
+            `WorkItem base-ref Project is not writable: ${item.id}/${baseRef.projectId}.`
+          );
+        }
+      }
+      const root = this.#workItemWorkspaceRoot(lockedTask.id, item.id);
+      const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
+      try {
+        for (const binding of lockedTask.projectBindings) {
+          const project = requireProject(this.store, binding.projectId);
+          const mainEntry = requireWorkspaceEntry(main, project.id);
+          if (!writeProjects.has(project.id)) {
+            prepared.push({
+              project,
+              entry: { ...mainEntry, access: "read" }
+            });
+            continue;
+          }
+          const previous = existing?.entries.find(({ projectId }) => projectId === project.id);
+          const head = await this.git.inspect(mainEntry.path, "HEAD");
+          const requestedBaseRef = item.baseRefs?.find(({ projectId }) => (
+            projectId === project.id
+          ))?.baseRef;
+          const baseRef = previous?.access === "write"
+            ? previous.baseCommit
+            : requestedBaseRef ?? head.baseCommit;
+          const requestedBase = previous?.access === "write" || requestedBaseRef === undefined
+            ? null
+            : await this.git.inspect(project.path, requestedBaseRef);
+          const physical = await this.git.ensureWorktree({
+            repositoryPath: project.path,
+            container: this.#projectContainer(project.name),
+            taskSegment,
+            roleName: item.id,
+            baseRef
+          });
+          const entry: WorkspaceProjectEntry = {
+            projectId: project.id,
+            directory: binding.directory,
+            access: "write",
+            path: physical.path,
+            branch: physical.branch,
+            baseRef: previous?.access === "write" ? previous.baseRef : baseRef,
+            // The recorded base is the immutable capture boundary. An existing
+            // worktree reports its current HEAD from ensureWorktree(), which
+            // may already contain committed Worker changes and must never
+            // replace that boundary during scope expansion or reconciliation.
+            baseCommit: previous?.access === "write"
+              ? previous.baseCommit
+              : physical.baseCommit
+          };
+          // Track the physical entry before any postcondition check. If a
+          // freshly attached deterministic branch is rejected below, the
+          // catch-path must remove its unadopted worktree even though no
+          // durable ManagedWorkspace has been written yet.
+          prepared.push({ project, entry });
+          if (previous?.access === "write" && (
+            physical.path !== previous.path
+            || physical.branch !== previous.branch
+          )) {
             throw new Error(
-              `Existing WorkItem Project base ref record changed: ${item.id}/${project.id}.`
+              `Existing WorkItem Project workspace identity changed: ${item.id}/${project.id}.`
             );
           }
-          if (requestedBaseRef !== undefined && requestedBaseRef !== previous.baseRef) {
+          if (previous?.access === "write") {
+            if (requestedBaseRef === undefined && previous.baseRef !== previous.baseCommit) {
+              throw new Error(
+                `Existing WorkItem Project base ref record changed: ${item.id}/${project.id}.`
+              );
+            }
+            if (requestedBaseRef !== undefined && requestedBaseRef !== previous.baseRef) {
+              throw new Error(
+                `Existing WorkItem Project base ref changed: ${item.id}/${project.id}.`
+              );
+            }
+            if (!await this.git.isAncestor(project.path, previous.baseCommit, physical.baseCommit)) {
+              throw new Error(
+                `Existing WorkItem Project HEAD does not descend from its frozen base: `
+                + `${item.id}/${project.id}.`
+              );
+            }
+          } else if (requestedBase !== null && physical.baseCommit !== requestedBase.baseCommit) {
             throw new Error(
-              `Existing WorkItem Project base ref changed: ${item.id}/${project.id}.`
-            );
-          }
-          if (!await this.git.isAncestor(project.path, previous.baseCommit, physical.baseCommit)) {
-            throw new Error(
-              `Existing WorkItem Project HEAD does not descend from its frozen base: `
+              `WorkItem Project workspace did not start at its requested base ref: `
               + `${item.id}/${project.id}.`
             );
           }
-        } else if (requestedBase !== null && physical.baseCommit !== requestedBase.baseCommit) {
-          throw new Error(
-            `WorkItem Project workspace did not start at its requested base ref: `
-            + `${item.id}/${project.id}.`
-          );
         }
-      }
-      await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
-      const workspace = createManagedWorkspace({
-        owner: { type: "work-item", taskId: task.id, workItemId: item.id },
-        root,
-        entries: prepared.map(({ entry }) => entry)
-      }, this.now());
-      return this.store.transaction((tx) => {
-        const latestTask = requireTask(tx, task.id);
-        const latestItem = tx.getWorkItem(task.id, item.id);
-        if (latestTask.status !== "active" || latestItem === null) {
-          throw new Error(`Work item changed while preparing its workspace: ${item.id}.`);
-        }
-        if (latestItem.revision !== item.revision
-          || !isDeepStrictEqual(latestItem.writeProjectIds, item.writeProjectIds)) {
-          throw new Error(`Work item changed while preparing its workspace: ${item.id}.`);
-        }
-        const activeDevelopRun = tx.listAgentRuns(task.id)
-          .find((run) => run.status === "active" && run.workItemId === item.id);
-        if (activeDevelopRun !== undefined) {
-          throw new Error(`Work Item already has an active Develop Run: ${activeDevelopRun.id}.`);
-        }
-        if (latestItem.assignee !== undefined
-          && tx.getActiveAgentRun(task.id, latestItem.assignee) !== null) {
-          throw new Error(`Role has an active Run: ${task.id}/${latestItem.assignee}.`);
-        }
-        const current = tx.getWorkItemWorkspace(task.id, item.id);
-        if (current !== null && (
-          current.owner.type !== "work-item"
-          || current.owner.workItemId !== item.id
-        )) {
-          throw new Error(`WorkItem workspace changed: ${task.id}/${item.id}.`);
-        }
-        const timestamp = this.now();
-        const stored = preserveWorkspaceCreatedAt(workspace, current);
-        tx.saveManagedWorkspace(stored);
-        if (latestItem.assignee !== undefined) {
-          const latestRole = tx.getRole(task.id, latestItem.assignee);
-          if (latestRole !== null && latestRole.workspace !== root) {
-            retireWorkspaceBoundSession(tx, task.id, latestItem.assignee, timestamp);
-            tx.saveRole(task.id, updateRole(latestRole, { workspace: root }, timestamp));
+        await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
+        const workspace = createManagedWorkspace({
+          owner: { type: "work-item", taskId: lockedTask.id, workItemId: item.id },
+          root,
+          entries: prepared.map(({ entry }) => entry)
+        }, this.now());
+        return this.store.transaction((tx) => {
+          const latestTask = requireTask(tx, lockedTask.id);
+          const latestItem = tx.getWorkItem(lockedTask.id, item.id);
+          if (latestTask.status !== "active" || latestItem === null) {
+            throw new Error(`Work item changed while preparing its workspace: ${item.id}.`);
           }
-        }
-        return stored;
-      });
-    } catch (error) {
-      await this.#discardUnadoptedEntries(task, taskSegment, prepared, item.id);
-      throw error;
+          if (latestItem.revision !== item.revision
+            || !isDeepStrictEqual(latestItem.writeProjectIds, item.writeProjectIds)) {
+            throw new Error(`Work item changed while preparing its workspace: ${item.id}.`);
+          }
+          const activeDevelopRun = tx.listAgentRuns(lockedTask.id)
+            .find((run) => run.status === "active" && run.workItemId === item.id);
+          if (activeDevelopRun !== undefined) {
+            throw new Error(`Work Item already has an active Develop Run: ${activeDevelopRun.id}.`);
+          }
+          if (latestItem.assignee !== undefined
+            && tx.getActiveAgentRun(lockedTask.id, latestItem.assignee) !== null) {
+            throw new Error(`Role has an active Run: ${lockedTask.id}/${latestItem.assignee}.`);
+          }
+          const existingWorkspace = tx.getWorkItemWorkspace(lockedTask.id, item.id);
+          if (existingWorkspace !== null && (
+            existingWorkspace.owner.type !== "work-item"
+            || existingWorkspace.owner.workItemId !== item.id
+          )) {
+            throw new Error(`WorkItem workspace changed: ${lockedTask.id}/${item.id}.`);
+          }
+          const timestamp = this.now();
+          const stored = preserveWorkspaceCreatedAt(workspace, existingWorkspace);
+          tx.saveManagedWorkspace(stored);
+          if (latestItem.assignee !== undefined) {
+            const latestRole = tx.getRole(lockedTask.id, latestItem.assignee);
+            if (latestRole !== null && latestRole.workspace !== root) {
+              retireWorkspaceBoundSession(tx, lockedTask.id, latestItem.assignee, timestamp);
+              tx.saveRole(lockedTask.id, updateRole(latestRole, { workspace: root }, timestamp));
+            }
+          }
+          return stored;
+        });
+      } catch (error) {
+        await this.#discardUnadoptedEntries(lockedTask, taskSegment, prepared, item.id);
+        throw error;
+      }
+    } finally {
+      release();
     }
   }
 
@@ -792,14 +861,19 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }>
   ): Promise<ManagedWorkspace> {
     const task = requireTask(this.store, taskId);
-    const lineage = executionLaneLineage(this.store, task, executionGroupId, executionLaneId, hint);
-    const source = lineage.purpose === "execution"
-      ? this.store.getWorkItemWorkspace(taskId, lineage.workItemId)
-      : this.store.getReviewRoundWorkspace(taskId, lineage.reviewRoundId);
-    if (source === null) {
-      throw new Error(`Execution Lane source workspace is not ready: ${executionLaneId}.`);
-    }
-    const taskSegment = this.#taskSegment(task);
+    // Hold the per-Project maintenance fence across Lane worktree creation
+    // (both the reuse and the fresh-mint paths), so a concurrent
+    // migrate/rebuild cannot switch the Project catalog mid-prepare.
+    const { release, current: lockedTask } = this.#acquireTaskProjectMaintenanceLocks(task);
+    try {
+      const lineage = executionLaneLineage(this.store, lockedTask, executionGroupId, executionLaneId, hint);
+      const source = lineage.purpose === "execution"
+        ? this.store.getWorkItemWorkspace(taskId, lineage.workItemId)
+        : this.store.getReviewRoundWorkspace(taskId, lineage.reviewRoundId);
+      if (source === null) {
+        throw new Error(`Execution Lane source workspace is not ready: ${executionLaneId}.`);
+      }
+      const taskSegment = this.#taskSegment(lockedTask);
     const owner = lineage.purpose === "execution"
       ? {
           type: "execution-lane" as const,
@@ -843,10 +917,10 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       : null;
     const writable = new Set(lineage.purpose === "execution"
       ? item?.writeProjectIds ?? []
-      : task.projectBindings.map(({ projectId }) => projectId));
+      : lockedTask.projectBindings.map(({ projectId }) => projectId));
     const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
     try {
-      for (const binding of task.projectBindings) {
+      for (const binding of lockedTask.projectBindings) {
         const project = requireProject(this.store, binding.projectId);
         const sourceEntry = requireWorkspaceEntry(source, project.id);
         if (!writable.has(project.id)) {
@@ -897,8 +971,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       }
       return workspace;
     } catch (error) {
-      await this.#discardUnadoptedEntries(task, taskSegment, prepared, managedWorktreeName(owner), true);
+      await this.#discardUnadoptedEntries(lockedTask, taskSegment, prepared, managedWorktreeName(owner), true);
       throw error;
+    }
+    } finally {
+      release();
     }
   }
 
@@ -1224,7 +1301,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     taskId: string,
     reviewRoundId: string
   ): Promise<ManagedWorkspace> {
-    const task = requireTask(this.store, taskId);
+    const taskSnapshot = requireTask(this.store, taskId);
+    const { release, current: task } = this.#acquireTaskProjectMaintenanceLocks(taskSnapshot);
+    try {
     const taskSegment = this.#taskSegment(task);
     const round = this.store.getReviewRound(task.id, reviewRoundId);
     if (round === null) throw new Error(`ReviewRound not found: ${task.id}/${reviewRoundId}.`);
@@ -1576,6 +1655,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         new Set([...retained.values()].map(({ entry }) => entry.path))
       );
       throw error;
+    }
+    } finally {
+      release();
     }
   }
 
@@ -2135,28 +2217,32 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const home = this.store.getHomeIdentity();
     const refused: string[] = [];
     const archived: string[] = [];
-    const pending: LegacyRefArchiveTarget[] = [];
+    // Scan read-only first to discover the Project set. The Project records
+    // (including their catalog path) are re-read under the fence, so a
+    // concurrent migrate cannot leave archive acting on a stale path.
+    const scanned: Array<{ projectId: string; taskId: string; ref: string }> = [];
     for (const entry of await this.listLegacyTaskRefs(taskId)) {
       const owner = this.store.getTask(entry.taskId);
       if (owner !== null && ["draft", "active"].includes(owner.status)) {
         refused.push(`${entry.projectId}:${entry.ref}`);
         continue;
       }
-      pending.push({
-        project: requireProject(this.store, entry.projectId),
-        taskId: entry.taskId,
-        ref: entry.ref,
-        archiveRef: taskArchiveRef(home.homeId, entry.ref)
-      });
+      scanned.push({ projectId: entry.projectId, taskId: entry.taskId, ref: entry.ref });
     }
+    const projectIds = [...new Set(scanned.map(({ projectId }) => projectId))].sort();
     // The fence covers preflight and archive alike: a concurrent rebuild
     // must not remove a worktree between its inspection and its ref's
     // archival.
-    const releaseMaintenance = acquireProjectMaintenanceLocks(
-      this.home,
-      pending.map(({ project }) => project.id)
-    );
+    const releaseMaintenance = projectIds.length === 0
+      ? () => {}
+      : acquireProjectMaintenanceLocks(this.home, projectIds);
     try {
+      const pending: LegacyRefArchiveTarget[] = scanned.map(({ projectId, taskId, ref }) => ({
+        project: requireProject(this.store, projectId),
+        taskId,
+        ref,
+        archiveRef: taskArchiveRef(home.homeId, ref)
+      }));
       for (const target of pending) {
         await this.#assertLegacyRefWorktreeArchivable(target);
       }

@@ -91,6 +91,20 @@ function expectedWorktreePath(fixture, taskId, identity) {
 }
 
 /**
+ * A separate Home for the competitor preparer. The per-Project maintenance
+ * fence lives under the Home's `locks/` area, so a competitor with its own
+ * Home does not contend with the racing preparer's fence. This simulates a
+ * cross-process fence failure and exercises the single-writer CAS as
+ * defense-in-depth: the CAS must still catch a competitor that the fence
+ * would normally exclude.
+ */
+function competitorHome(t) {
+  const home = mkdtempSync(join(tmpdir(), "yui-competitor-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  return home;
+}
+
+/**
  * A git port that lets a competitor win the identity race after this
  * prepare minted its own identity but before it commits: the competitor
  * runs to completion inside the first `ensureWorktree` call, then the
@@ -123,9 +137,11 @@ test("a prepare that loses the identity race to a rebuild discards its refs and 
   );
   const task = created.data.task;
 
-  // The competitor rebuild runs with the real git port and the same store.
+  // The competitor rebuild runs with the real git port and the same store,
+  // but a separate Home (and thus a separate maintenance fence) to simulate
+  // a cross-process fence failure for the CAS.
   const rebuildPreparer = new FileTaskWorkspacePreparer(
-    fixture.home,
+    competitorHome(t),
     fixture.store,
     undefined,
     () => new Date(NOW)
@@ -163,9 +179,11 @@ test("a prepare that loses the identity race to a concurrent prepare converges t
   );
   const task = created.data.task;
 
-  // The competitor is a second prepare over the same store and repository.
+  // The competitor is a second prepare over the same store and repository,
+  // with a separate Home (and thus a separate maintenance fence) to simulate
+  // a cross-process fence failure for the CAS.
   const competing = new FileTaskWorkspacePreparer(
-    fixture.home,
+    competitorHome(t),
     fixture.store,
     undefined,
     () => new Date(NOW)
@@ -197,9 +215,11 @@ test("a rebuild that loses the identity race to a prepare fails without half-cre
   );
   const task = created.data.task;
 
-  // A prepare wins the identity race while the rebuild is creating its worktrees.
+  // A prepare wins the identity race while the rebuild is creating its
+  // worktrees. The competitor uses a separate Home (and thus a separate
+  // maintenance fence) to simulate a cross-process fence failure.
   const competing = new FileTaskWorkspacePreparer(
-    fixture.home,
+    competitorHome(t),
     fixture.store,
     undefined,
     () => new Date(NOW)

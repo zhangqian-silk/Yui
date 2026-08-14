@@ -324,6 +324,20 @@ async function migrateProject(
   // interleaves, and the Controller defers worktree preparation meanwhile.
   const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
   try {
+    // Re-read the Project under the fence. A concurrent migration may have
+    // completed and switched the catalog to the Home-managed repo since the
+    // record was resolved above; the stale snapshot must not drive any Git
+    // effect (in particular it must not delete the now-canonical repo).
+    const current = requireProject(store, project.id);
+    if (current.ownership === "managed") {
+      throw usageError(`Project is already Home-managed: ${project.id}.`);
+    }
+    if (current.remoteUrl === undefined) {
+      throw usageError(`Project migrate requires a remote URL: ${project.id}.`);
+    }
+    if (current.path !== project.path || current.remoteUrl !== project.remoteUrl) {
+      throw new Error(`Project changed while migrating: ${project.id}.`);
+    }
     // Preflight verifies the remote into a throwaway clone: it changes neither
     // the catalog nor the persistent projects directory.
     const verifyRoot = parsed.preflight
@@ -374,18 +388,18 @@ async function migrateProject(
         throw new Error(`Git workspace cannot preserve local Yui refs for Project: ${project.id}.`);
       }
       await copyRefs.call(git, {
-        sourceRepositoryPath: project.path,
+        sourceRepositoryPath: current.path,
         destinationRepositoryPath: verifyRoot,
         patterns: ["refs/heads/yui/", "refs/yui/archive/"]
       });
       if (parsed.preflight) {
-        return { project, path: destination, preflight: true };
+        return { project: current, path: destination, preflight: true };
       }
       const switched = store.transaction((tx) => {
         const latest = requireProject(tx, project.id);
         if (latest.ownership !== "external"
-          || latest.path !== project.path
-          || latest.remoteUrl !== project.remoteUrl) {
+          || latest.path !== current.path
+          || latest.remoteUrl !== current.remoteUrl) {
           throw new Error(`Project changed while migrating: ${project.id}.`);
         }
         // The switch only changes ownership and path; every other field is
@@ -420,7 +434,10 @@ async function migrateProject(
 /**
  * Remove a managed clone left behind by a crashed migration attempt. Such a
  * directory is unreferenced garbage; a path any catalog record points at is
- * never deleted.
+ * never deleted. The check fails closed even when the destination is
+ * registered to the migrating Project itself: a concurrent migration may
+ * already have completed and switched the catalog to this path, making it
+ * the canonical repository that must not be removed.
  */
 async function removeUnreferencedClone(
   store: ProjectCommandStore,
@@ -429,8 +446,12 @@ async function removeUnreferencedClone(
 ): Promise<void> {
   if (!existsSync(destination)) return;
   const registered = store.listProjects().find(({ path }) => path === destination);
-  if (registered !== undefined && registered.id !== migratingProjectId) {
-    throw new Error(`Managed Project path is already registered: ${destination}.`);
+  if (registered !== undefined) {
+    throw new Error(
+      registered.id === migratingProjectId
+        ? `Project already migrated to the managed path: ${destination}.`
+        : `Managed Project path is already registered: ${destination}.`
+    );
   }
   await rm(destination, { recursive: true, force: true });
 }
