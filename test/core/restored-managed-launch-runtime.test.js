@@ -59,6 +59,7 @@ import {
   exactControlPlaneCommandPrefix,
   parseExactControlPlaneDescriptor,
   readExactTaskRuntimeDescriptorSource,
+  refreshReusedTaskRuntimeDescriptorSource,
   serializeExactDescriptor
 } from "../../dist/runtime/exactControlPlane.js";
 import {
@@ -381,7 +382,7 @@ test("a replacement Controller cannot retarget an existing Task's exact control 
   assert.equal(existsSync(join(home, "runtime", "bin", "yui")), false);
 });
 
-test("a replacement Controller refreshes only stable descriptors for the reused Session generation", (t) => {
+test("a replacement Controller writes only its current source while the reused Hook self-refreshes its own", (t) => {
   const { home, store, task, role, agent, now } = fixture(t, "claude");
   const oldCli = join(home, "old-cli.js");
   const newCli = join(home, "new-cli.js");
@@ -409,6 +410,7 @@ test("a replacement Controller refreshes only stable descriptors for the reused 
     launchId: "launch-old",
     nativeSessionId: currentNativeSessionId
   }))}\n`);
+  const oldBytes = readFileSync(oldSource);
   const historicalPlan = new FileRoleLaunchPlanner(home, store, {
     cliPath: historicalCli
   }).plan({
@@ -474,15 +476,24 @@ test("a replacement Controller refreshes only stable descriptors for the reused 
       workspace: effective.workspace.root
     });
 
-  const refreshedOld = readExactTaskRuntimeDescriptorSource(oldSource, home);
-  assert.equal(refreshedOld.runId, "agent-run-2");
-  assert.equal(refreshedOld.launchId, "launch-current");
-  assert.equal(refreshedOld.nativeSessionId, currentNativeSessionId);
+  // The Controller writes only its current-control source; the reused pane's
+  // original source is untouched until its own Hook self-refreshes.
+  assert.deepEqual(readFileSync(oldSource), oldBytes);
+  assert.deepEqual(readFileSync(historicalSource), historicalBytes);
+
+  const reused = refreshReusedTaskRuntimeDescriptorSource(oldSource, home, store, {
+    runId: resumedRun.id,
+    launchId: "launch-current",
+    nativeSessionId: currentNativeSessionId
+  });
+  assert.equal(reused.runId, "agent-run-2");
+  assert.equal(reused.launchId, "launch-current");
+  assert.equal(reused.nativeSessionId, currentNativeSessionId);
   assert.equal(
-    refreshedOld.controlPlaneDigest,
+    reused.controlPlaneDigest,
     oldDescriptor.controlPlaneDigest
   );
-  assert.deepEqual(readFileSync(historicalSource), historicalBytes);
+  assert.deepEqual(readExactTaskRuntimeDescriptorSource(oldSource, home), reused);
   assert.throws(
     () => assertExactTaskRuntimeState(
       readExactTaskRuntimeDescriptorSource(historicalSource, home),

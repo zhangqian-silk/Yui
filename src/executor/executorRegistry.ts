@@ -292,9 +292,10 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         throw new Error("Runtime prompt delivery requires a Task-local Run id.");
       }
       // A reused native process retains the stable descriptor path from its
-      // original control plane. Advance every matching source only after the
-      // current Run/Session fence is durable and immediately before provider
-      // input, so its synchronous Hook observes this exact generation.
+      // original control plane. Publish only the current-control source after
+      // the Run/Session fence is durable and immediately before provider input;
+      // the reused Hook self-refreshes its own source before the volatile
+      // fence instead of the Controller scanning history to keep it fresh.
       if (
         prepared.binding.hostCreated === false
         && this.planner.refreshTaskRuntimeDescriptor !== undefined

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, readdirSync, realpathSync } from "node:fs";
+import { chmodSync, realpathSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -53,7 +53,6 @@ import {
   exactControlPlaneCommandPrefix,
   exactControlPlaneDigest,
   exactTaskRuntimeDescriptorPath,
-  readExactTaskRuntimeDescriptorSource,
   serializeExactDescriptor,
   type ExactControlPlaneDescriptor
 } from "../runtime/exactControlPlane.js";
@@ -186,45 +185,11 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       throw new Error("Prepared Task runtime generation is not current.");
     }
     assertExactTaskRuntimeState(descriptor, this.store);
-    const directory = join(resolve(this.home), "runtime", "exact-task-runtime");
+    // Publish only the current-control source. A reused native pane keeps its
+    // own stable source path; its Hook self-refreshes that source before the
+    // volatile fence instead of the Controller scanning history to find it.
     const currentSource = exactTaskRuntimeDescriptorPath(this.home, descriptor);
-    const sources = new Set([currentSource]);
-    try {
-      for (const name of readdirSync(directory)) {
-        if (!/^[a-f0-9]{64}\.json$/u.test(name)) continue;
-        const source = join(directory, name);
-        const existing = readExactTaskRuntimeDescriptorSource(source, this.home);
-        if (
-          existing.taskId === descriptor.taskId
-          && existing.roleName === descriptor.roleName
-          && existing.agentId === descriptor.agentId
-          && existing.adapterId === descriptor.adapterId
-          && existing.workspace === descriptor.workspace
-          && existing.nativeSessionId === input.nativeSessionId
-        ) {
-          sources.add(source);
-        }
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    const updates = [...sources].sort().map((source) => {
-      const existing = source === currentSource
-        ? descriptor
-        : readExactTaskRuntimeDescriptorSource(source, this.home);
-      const refreshed = createExactTaskRuntimeDescriptor({
-        ...descriptor,
-        controlPlaneDigest: existing.controlPlaneDigest
-      });
-      if (exactTaskRuntimeDescriptorPath(this.home, refreshed) !== source) {
-        throw new Error("Task runtime descriptor source changed its stable identity.");
-      }
-      assertExactTaskRuntimeState(refreshed, this.store);
-      return { source, refreshed };
-    });
-    for (const { source, refreshed } of updates) {
-      writeTextFileAtomically(source, `${serializeExactDescriptor(refreshed)}\n`);
-    }
+    writeTextFileAtomically(currentSource, `${serializeExactDescriptor(descriptor)}\n`);
   }
 
   plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
