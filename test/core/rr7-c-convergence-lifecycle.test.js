@@ -27,6 +27,7 @@ import {
   supersedeIntegrationQueueEntry
 } from "../../dist/integration/integrationQueueService.js";
 import { createProject } from "../../dist/repository/project.js";
+import { NodeGitWorkspace } from "../../dist/repository/gitWorkspace.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
@@ -507,10 +508,11 @@ test("manual reconciliation replays affected-path updates for waiting entries", 
     updateIntegrationAttempt(validating, { status: "committed" }, now)
   );
 
-  reconcileIntegrationQueueEntry(
+  await reconcileIntegrationQueueEntry(
     fixture.store,
     fixture.task.id,
     firstQueued.entry.id,
+    new NodeGitWorkspace(),
     () => now
   );
   const waiting = fixture.store.getIntegrationQueueEntry(

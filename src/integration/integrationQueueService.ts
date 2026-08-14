@@ -120,6 +120,44 @@ function assertEnqueueableProducer(
 }
 
 /**
+ * A ChangeSet captured from a since-superseded Candidate must not enter the
+ * queue.  When the producer WorkItem still owns a managed workspace, its
+ * checked-out HEAD is the current Candidate's commit; a ChangeSet whose
+ * headCommit no longer matches was captured from an earlier Candidate.
+ * A missing workspace (cleaned up after acceptance) cannot be verified and
+ * does not block enqueue.
+ */
+async function assertCurrentCandidateHead(
+  store: TaskStore,
+  taskId: string,
+  changeSet: ChangeSet,
+  git: IntegrationQueueGitPort
+): Promise<void> {
+  const workspace = store.getManagedWorkspace({
+    type: "work-item",
+    taskId,
+    workItemId: changeSet.workItemId
+  });
+  if (workspace === null) return;
+  const entry = workspace.entries.find((e) => e.projectId === changeSet.projectId);
+  if (entry === undefined) return;
+  let currentHead: string;
+  try {
+    currentHead = (await git.inspect(entry.path)).baseCommit;
+  } catch {
+    // The worktree is gone (cleaned up or removed); the fence cannot be
+    // evaluated and must not block a legitimate ChangeSet.
+    return;
+  }
+  if (currentHead !== changeSet.headCommit) {
+    throw new Error(
+      `ChangeSet ${changeSet.id} was captured from a superseded Candidate: `
+      + `workspace HEAD is ${currentHead}, ChangeSet head is ${changeSet.headCommit}.`
+    );
+  }
+}
+
+/**
  * Enqueue one ChangeSet.  Enqueue is idempotent per (Project, ChangeSet): an
  * existing non-superseded entry is returned instead of duplicated.  When the
  * ChangeSet is already represented on the target (an ancestor or a same-tree
@@ -158,6 +196,12 @@ export async function enqueueIntegrationQueueEntry(
   // Producer fence: only a ChangeSet whose WorkItem reached a deliverable may
   // enter the queue.  Re-checked inside the write transaction.
   assertEnqueueableProducer(input.store, task.id, changeSet);
+  // Current-Candidate fence: a ChangeSet captured from a since-superseded
+  // Candidate must not enter the queue.  When the producer WorkItem still
+  // owns a managed workspace, its checked-out HEAD is the current Candidate's
+  // commit; a ChangeSet whose headCommit no longer matches was captured from
+  // an earlier Candidate and is stale.
+  await assertCurrentCandidateHead(input.store, task.id, changeSet, git);
   const project = input.store.getProject(input.projectId);
   if (project === null) throw new Error(`Project not found: ${input.projectId}.`);
   const targetRef = input.targetRef
@@ -166,6 +210,7 @@ export async function enqueueIntegrationQueueEntry(
   if (targetRef === undefined) {
     throw new Error(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
+  const canonicalTargetRef = canonicalizeTargetRef(targetRef);
   const targetHead = (await git.inspect(project.path, targetRef)).baseCommit;
   let equivalent = await findEquivalentCommit(
     git,
@@ -200,7 +245,7 @@ export async function enqueueIntegrationQueueEntry(
         taskId: task.id,
         projectId: input.projectId,
         changeSetId: input.changeSetId,
-        targetRef,
+        targetRef: canonicalTargetRef,
         checkCommands: requestedChecks,
         evidenceRefs: changeSet.manifest?.evidenceRefs ?? []
       }, now());
@@ -229,7 +274,7 @@ export async function enqueueIntegrationQueueEntry(
         id: tx.nextIntegrationAttemptId(task.id),
         taskId: task.id,
         projectId: input.projectId,
-        targetRef,
+        targetRef: canonicalTargetRef,
         expectedHead: targetHead,
         changeSetIds: [input.changeSetId],
         checkCommands: []
@@ -243,7 +288,7 @@ export async function enqueueIntegrationQueueEntry(
       taskId: task.id,
       projectId: input.projectId,
       changeSetId: input.changeSetId,
-      targetRef,
+      targetRef: canonicalTargetRef,
       targetHead,
       proof: equivalent === changeSet.headCommit
         ? `ancestor-convergence:${equivalent}`
@@ -369,7 +414,7 @@ export async function processIntegrationQueue(
   const processed: ProcessIntegrationQueueItem[] = [];
   for (;;) {
     if (options.limit !== undefined && processed.length >= options.limit) break;
-    reconcileTerminalAttempts(store, task.id, now);
+    await reconcileTerminalAttempts(store, task.id, git, now);
     // The store already returns entries in numeric id order; trust it instead
     // of re-sorting with a lexicographic compare (which yields 1, 10, 2, ...).
     // A running entry is the persistent head of its lane: its successors are
@@ -449,11 +494,14 @@ export async function processIntegrationQueue(
         entry = markIntegrationQueueBlocked(entry, gateFailureSummary(result.attempt), now());
       }
       tx.saveIntegrationQueueEntry(task.id, entry);
-      if (result.status === "committed") {
-        recomputeAffectedPaths(tx, task.id, entry, now);
-      }
       return entry;
     });
+    if (result.status === "committed") {
+      const project = store.getProject(settled.projectId);
+      if (project !== null) {
+        await recomputeAffectedPaths(store, task.id, settled, project.path, git, now);
+      }
+    }
     processed.push({ entry: settled, attempt: result.attempt, result });
   }
   return processed;
@@ -464,8 +512,17 @@ export async function processIntegrationQueue(
  * targetRef integrate one at a time in id order.  Entries of different lanes
  * (another Project or ref) do not share a target and may integrate alongside.
  */
+/**
+ * Canonicalise a Git ref so that "master" and "refs/heads/master" share one
+ * lane.  Only the `refs/heads/` prefix is stripped; other ref namespaces
+ * (tags, remotes) are kept distinct.
+ */
+function canonicalizeTargetRef(ref: string): string {
+  return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+}
+
 function queueLaneKey(entry: IntegrationQueueEntry): string {
-  return `${entry.projectId} ${entry.targetRef}`;
+  return `${entry.projectId} ${canonicalizeTargetRef(entry.targetRef)}`;
 }
 
 /**
@@ -558,16 +615,17 @@ async function evidenceTargetAdvanced(
 
 /**
  * A conflicted entry whose manual-resolution Attempt committed converges.  The
- * settle and the downstream affected-path recompute a normal commit performs
- * happen in one transaction, so waiting successors never observe a committed
- * entry with stale overlap evidence.
+ * settle happens in one transaction; the downstream affected-path recompute
+ * follows with the same committed evidence, so waiting successors never keep
+ * stale overlap evidence.
  */
-export function reconcileIntegrationQueueEntry(
+export async function reconcileIntegrationQueueEntry(
   store: TaskStore,
   taskId: string,
   entryId: string,
+  git: IntegrationQueueGitPort,
   now: () => Date = () => new Date()
-): IntegrationQueueEntry {
+): Promise<IntegrationQueueEntry> {
   const entry = store.getIntegrationQueueEntry(taskId, entryId);
   if (entry === null) {
     throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
@@ -583,12 +641,16 @@ export function reconcileIntegrationQueueEntry(
       `Integration Attempt has not committed: ${entry.integrationAttemptId ?? "-"}/${attempt?.status ?? "missing"}.`
     );
   }
-  return store.transaction((tx) => {
-    const committed = markIntegrationQueueCommitted(entry, committedTargetAfter(attempt), now());
-    tx.saveIntegrationQueueEntry(taskId, committed);
-    recomputeAffectedPaths(tx, taskId, committed, now);
-    return committed;
+  const committed = store.transaction((tx) => {
+    const settled = markIntegrationQueueCommitted(entry, committedTargetAfter(attempt), now());
+    tx.saveIntegrationQueueEntry(taskId, settled);
+    return settled;
   });
+  const project = store.getProject(committed.projectId);
+  if (project !== null) {
+    await recomputeAffectedPaths(store, taskId, committed, project.path, git, now);
+  }
+  return committed;
 }
 
 /**
@@ -658,18 +720,22 @@ export function supersedeIntegrationQueueEntry(
  * or blocked Attempt to `conflicted` carrying the Attempt's own diagnosis —
  * so the next process pass sees a consistent queue and a wedged lane frees.
  */
-function reconcileTerminalAttempts(
+async function reconcileTerminalAttempts(
   store: TaskStore,
   taskId: string,
+  git: IntegrationQueueGitPort,
   now: () => Date
-): void {
+): Promise<void> {
   for (const entry of store.listIntegrationQueueEntries(taskId)) {
     if (entry.integrationAttemptId === undefined) continue;
     if (entry.status === "committed") {
       // Crash window: the settle marked this entry committed but died before
       // recomputing downstream affectedPaths.  Replay that update idempotently
       // so waiting entries regain their overlap evidence.
-      recomputeAffectedPaths(store, taskId, entry, now);
+      const project = store.getProject(entry.projectId);
+      if (project !== null) {
+        await recomputeAffectedPaths(store, taskId, entry, project.path, git, now);
+      }
       continue;
     }
     if (entry.status !== "conflicted" && entry.status !== "running") continue;
@@ -682,7 +748,10 @@ function reconcileTerminalAttempts(
         now()
       );
       store.saveIntegrationQueueEntry(taskId, committed);
-      recomputeAffectedPaths(store, taskId, committed, now);
+      const project = store.getProject(committed.projectId);
+      if (project !== null) {
+        await recomputeAffectedPaths(store, taskId, committed, project.path, git, now);
+      }
       continue;
     }
     // Crash window: the Attempt persisted a terminal failed/blocked outcome
@@ -703,27 +772,30 @@ function reconcileTerminalAttempts(
   }
 }
 
-function recomputeAffectedPaths(
+async function recomputeAffectedPaths(
   store: TaskStore,
   taskId: string,
   committed: IntegrationQueueEntry,
+  projectPath: string,
+  git: IntegrationQueueGitPort,
   now: () => Date
-): void {
+): Promise<void> {
   const committedChangeSet = store.getChangeSet(taskId, committed.changeSetId);
   if (committedChangeSet === null) return;
   const landed = new Set(committedChangeSet.changedPaths);
   for (const entry of store.listIntegrationQueueEntries(taskId)) {
     if (entry.projectId !== committed.projectId) continue;
-    if (entry.targetRef !== committed.targetRef) continue;
+    if (canonicalizeTargetRef(entry.targetRef) !== canonicalizeTargetRef(committed.targetRef)) continue;
     if (entry.status !== "queued" && entry.status !== "validated") continue;
     const changeSet = store.getChangeSet(taskId, entry.changeSetId);
     if (changeSet === null) continue;
-    // A committed entry whose targetAfter is already the waiting entry's
-    // baseCommit is part of that entry's base, not a post-enqueue target
-    // advance.  This prevents recovery replay from reviving evidence that
-    // was valid at enqueue time.
+    // A committed entry whose targetAfter is already an ancestor of the
+    // waiting entry's baseCommit is part of that entry's base, not a
+    // post-enqueue target advance.  This prevents recovery replay from
+    // reviving evidence that was valid at enqueue time, and covers both
+    // the direct predecessor and transitive history cases.
     if (committed.targetAfter !== undefined
-      && changeSet.baseCommit === committed.targetAfter) continue;
+      && await git.isAncestor(projectPath, committed.targetAfter, changeSet.baseCommit)) continue;
     const affected = changeSet.changedPaths.filter((path) => landed.has(path));
     const beforeAffected = (entry.affectedPaths ?? []).length;
     let updated = recordIntegrationQueueAffectedPaths(entry, affected, now());

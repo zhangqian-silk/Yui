@@ -33,6 +33,7 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
+  retryFailedWorkItem,
   retireWorkItem,
   submitWorkItemCandidate,
   updateWorkItemStatus
@@ -307,6 +308,38 @@ test("a running lane blocks a requeued predecessor as well as its successors", a
   );
 });
 
+test("a running lane blocks an equivalent full-ref target spelling", async () => {
+  const fixture = createFixture("running-ref-alias");
+  const first = createStoredChangeSet(fixture, "change-set-1", {
+    "first.txt": "first\n"
+  });
+  const second = createStoredChangeSet(fixture, "change-set-2", {
+    "second.txt": "second\n"
+  });
+  const firstQueued = await enqueue(fixture, first, ["true"]);
+  await enqueueIntegrationQueueEntry({
+    store: fixture.store,
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    changeSetId: second.id,
+    targetRef: "refs/heads/master",
+    checkCommands: ["true"],
+    now: () => now
+  });
+  fixture.store.saveIntegrationQueueEntry(
+    fixture.task.id,
+    markIntegrationQueueRunning(firstQueued.entry, fixture.baseCommit, now)
+  );
+
+  const processed = await processQueue(fixture, { limit: 1 });
+
+  assert.equal(
+    processed.length,
+    0,
+    "short and full ref spellings of the same branch must share one running barrier"
+  );
+});
+
 // --- Finding 7: exact-SHA evidence -> validated -> skip checks --------------
 
 test("durable exact-SHA evidence validates an unchanged-target entry and a target advance re-runs its checks", async () => {
@@ -438,6 +471,40 @@ async function captureCandidate(fixture, candidate) {
   return changeSet;
 }
 
+test("enqueue refuses a ChangeSet captured from a superseded Candidate", async () => {
+  const fixture = createFixture("candidate-current-fence");
+  const firstCandidate = createCandidateWorkspace(fixture, "candidate-1", {
+    "candidate.txt": "rejected\n"
+  });
+  const rejectedChangeSet = await captureCandidate(fixture, firstCandidate);
+
+  const failed = updateWorkItemStatus(
+    firstCandidate.workItem,
+    "failed",
+    now,
+    "candidate rejected"
+  );
+  fixture.store.saveWorkItem(fixture.task.id, failed);
+  const retried = retryFailedWorkItem(failed, now);
+  fixture.store.saveWorkItem(fixture.task.id, retried);
+
+  writeFileSync(join(firstCandidate.worktree, "candidate.txt"), "accepted\n");
+  git(["-C", firstCandidate.worktree, "add", "candidate.txt"]);
+  git(["-C", firstCandidate.worktree, "commit", "-m", "candidate-2"]);
+  const current = submitWorkItemCandidate(
+    retried,
+    { summary: "candidate-2", source: { type: "direct" } },
+    now
+  );
+  fixture.store.saveWorkItem(fixture.task.id, current);
+  await captureCandidate(fixture, { workItem: current });
+
+  await assert.rejects(
+    enqueue(fixture, rejectedChangeSet, ["true"]),
+    /current Candidate|superseded Candidate/
+  );
+});
+
 test("review evidence cannot waive a different queue gate", async () => {
   const fixture = createFixture("evidence-command-scope");
   const candidate = createCandidateWorkspace(fixture, "reviewed-command", {
@@ -532,6 +599,38 @@ test("recovery replay does not invalidate evidence with commits older than the e
     processed.attempt.checkCommands,
     [],
     "an older committed entry must not revoke exact-head evidence for a later enqueue"
+  );
+});
+
+test("recovery replay ignores every historical ancestor of a later entry base", async () => {
+  const fixture = createFixture("recovery-transitive-history-boundary");
+  const firstHistorical = createStoredChangeSet(fixture, "change-set-1", {
+    "shared.txt": "historical-1\n"
+  });
+  await enqueue(fixture, firstHistorical, ["true"]);
+  const [firstLanded] = await processQueue(fixture);
+  assert.equal(firstLanded.entry.status, "committed");
+
+  const secondHistorical = createStoredChangeSet(fixture, "change-set-2", {
+    "shared.txt": "historical-2\n"
+  }, { base: firstLanded.entry.targetAfter });
+  await enqueue(fixture, secondHistorical, ["true"]);
+  const [secondLanded] = await processQueue(fixture);
+  assert.equal(secondLanded.entry.status, "committed");
+
+  const currentHead = secondLanded.entry.targetAfter;
+  const reviewed = createEvidencedChangeSet(fixture, "change-set-3", {
+    "shared.txt": "reviewed\n"
+  }, { base: currentHead, checkName: "false" });
+  const enqueued = await enqueue(fixture, reviewed, ["false"]);
+  assert.equal(enqueued.entry.status, "validated");
+
+  const [processed] = await processQueue(fixture);
+  assert.equal(processed.entry.status, "committed");
+  assert.deepEqual(
+    processed.attempt.checkCommands,
+    [],
+    "every commit already contained in the entry base must stay outside the replay window"
   );
 });
 

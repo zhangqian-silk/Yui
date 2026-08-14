@@ -1,5 +1,6 @@
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   enqueueIntegrationQueueEntry,
@@ -223,19 +224,20 @@ function requeue(
   };
 }
 
-function reconcile(
+async function reconcile(
   args: readonly string[],
   store: TaskStore,
   options: TaskIntegrationCommandOptions
-): Readonly<{ output: string; data: unknown }> {
+): Promise<Readonly<{ output: string; data: unknown }>> {
   const usage = "Task Integration queue reconcile usage: yui task integration queue reconcile <task>/<entry>.";
   if (args.length !== 1) throw usageError(usage);
   const entry = requireQueueEntry(store, args[0], options.environment);
   requireLeader(options.environment, entry.taskId);
-  const committed = reconcileIntegrationQueueEntry(
+  const committed = await reconcileIntegrationQueueEntry(
     store,
     entry.taskId,
     entry.id,
+    new NodeGitWorkspace(),
     options.now ?? (() => new Date())
   );
   return {

@@ -587,10 +587,11 @@ test("reconcile closes a conflicted item whose attempt later committed", async (
       now
     )
   );
-  const reconciled = reconcileIntegrationQueueEntry(
+  const reconciled = await reconcileIntegrationQueueEntry(
     fixture.store,
     fixture.task.id,
     conflicted.id,
+    new NodeGitWorkspace(),
     () => now
   );
   assert.equal(reconciled.status, "committed");
