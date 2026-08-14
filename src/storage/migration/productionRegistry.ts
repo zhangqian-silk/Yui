@@ -611,7 +611,7 @@ function introduceIntegrationQueue(snapshot: HomeSnapshot): HomeSnapshot {
   for (const [taskId, rawTask] of Object.entries(tasks)) {
     const task = asObject(rawTask, `Task aggregate ${taskId}`);
     const highWaterMarks = asObject(
-      task.idHighWaterMarks,
+      task.idHighWaterMarks ?? {},
       `Task id high-water marks ${taskId}`
     );
     nextTasks[taskId] = {
