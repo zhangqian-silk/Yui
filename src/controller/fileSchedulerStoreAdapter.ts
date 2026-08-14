@@ -309,7 +309,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       listIntegrationAttempts: () => projected.integrationAttempts,
       listInputRequests: () => projected.inputRequests
     };
-    return latestRunDurableProgressAt(view, taskId, roleName, runId, projected.runFacts.get(runId));
+    // A missing fold entry is an authoritative empty fold, not a signal to
+    // re-scan the whole history. Pass {} so latestRunDurableProgressAt treats
+    // the fold as present and skips the per-candidate fallback scans.
+    return latestRunDurableProgressAt(view, taskId, roleName, runId, projected.runFacts.get(runId) ?? {});
   }
 
   recordRoleRunStall(

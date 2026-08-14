@@ -400,10 +400,18 @@ export function latestRunDurableProgressAt(
   const run = store.getAgentRun(taskId, runId);
   if (run === null || run.taskId !== taskId || run.roleName !== roleName) return null;
   const events = store.listEvents(taskId);
-  // The adapter folds checkpoint/activity once per revision; reuse it instead
-  // of re-scanning the whole history per candidate.
-  const latestCheckpointAt = precomputed?.latestCheckpointAt ?? latestRunProgressAt(events, run.id);
-  const latestActivityAt = precomputed?.latestActivityAt ?? latestRunActivityAt(events, run.id);
+  // The adapter folds checkpoint/activity once per revision. When the fold
+  // port exists, a missing per-Run entry is an authoritative empty fold: use
+  // its (possibly undefined) values directly and never re-scan the whole
+  // history per candidate. Legacy callers without the port omit precomputed
+  // and keep the per-candidate full-history scans.
+  const folded = precomputed !== undefined;
+  const latestCheckpointAt = folded
+    ? precomputed!.latestCheckpointAt
+    : latestRunProgressAt(events, run.id);
+  const latestActivityAt = folded
+    ? precomputed!.latestActivityAt
+    : latestRunActivityAt(events, run.id);
   const baseline = run.deliveredAt === undefined
     ? run.createdAt
     : latestDurableProgressAt({
@@ -681,6 +689,11 @@ export async function reconcileStalledRoleRuns(
   // existing mailbox work without manufacturing another episode.
   if (selection !== undefined && !selection.full) return [];
   if (store.listEvents === undefined || store.recordRoleRunStall === undefined) return [];
+  // When the fold port exists, a missing per-Run entry is an authoritative
+  // empty fold: the stall reconciliation must not re-scan the whole history
+  // per candidate. Legacy stores without the port keep the per-candidate
+  // scans.
+  const foldPortPresent = store.getRunProgressFacts !== undefined;
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
     task.status !== "active"
       ? []
@@ -839,8 +852,9 @@ export async function reconcileStalledRoleRuns(
       progressAt,
       now,
       windowMs,
-      lastAttentionProgressAt: progressFacts?.latestStall?.progressAt
-        ?? latestStallProgressAt(events, candidate.run.id)
+      lastAttentionProgressAt: foldPortPresent
+        ? progressFacts?.latestStall?.progressAt
+        : latestStallProgressAt(events, candidate.run.id)
     });
     const runAgentId = candidate.run.effective.agentId;
     const runAdapterId = candidate.run.effective.adapterId;
@@ -940,8 +954,9 @@ export async function reconcileStalledRoleRuns(
   for (const current of observed.values()) {
     if (current.live !== "present" || !current.stalled || !current.stallCandidate) continue;
     const { candidate, progressAt } = current;
-    const previous = store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
-      ?? latestStallEvidenceKey(store.listEvents(candidate.task.id), candidate.run.id);
+    const previous = foldPortPresent
+      ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
+      : latestStallEvidenceKey(store.listEvents(candidate.task.id), candidate.run.id);
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)
@@ -1013,8 +1028,9 @@ export async function reconcileStalledRoleRuns(
   for (const current of observed.values()) {
     if (current.live !== "present" || current.stalled || !current.stallCandidate) continue;
     const { candidate, progressAt } = current;
-    const previous = store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
-      ?? latestStallEvidenceKey(store.listEvents(candidate.task.id), candidate.run.id);
+    const previous = foldPortPresent
+      ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
+      : latestStallEvidenceKey(store.listEvents(candidate.task.id), candidate.run.id);
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)
