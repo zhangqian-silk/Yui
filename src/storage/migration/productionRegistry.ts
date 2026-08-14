@@ -557,9 +557,9 @@ function migrateChangeSetManifest(snapshot: HomeSnapshot): HomeSnapshot {
 
 /**
  * The integration queue is a post-baseline per-Task record family.  Its
- * explicit 0->1 introduction adds the empty map to every Task aggregate and
- * the family to the record manifest; old Homes keep integrating without it
- * until the queue is first used.
+ * explicit 0->1 introduction adds the empty map and its id high-water mark to
+ * every Task aggregate and the family to the record manifest; old Homes keep
+ * integrating without it until the queue is first used.
  */
 function integrationQueueIntroductionStep(): MigrationStep<HomeSnapshot> {
   return {
@@ -610,7 +610,15 @@ function introduceIntegrationQueue(snapshot: HomeSnapshot): HomeSnapshot {
   const nextTasks: Record<string, unknown> = {};
   for (const [taskId, rawTask] of Object.entries(tasks)) {
     const task = asObject(rawTask, `Task aggregate ${taskId}`);
-    nextTasks[taskId] = { ...task, integrationQueue: {} };
+    const highWaterMarks = asObject(
+      task.idHighWaterMarks,
+      `Task id high-water marks ${taskId}`
+    );
+    nextTasks[taskId] = {
+      ...task,
+      idHighWaterMarks: { ...highWaterMarks, integrationQueue: 0 },
+      integrationQueue: {}
+    };
   }
   return {
     schemaManifest,
