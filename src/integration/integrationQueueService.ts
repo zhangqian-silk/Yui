@@ -17,6 +17,7 @@ import {
   markIntegrationQueueRequeued,
   markIntegrationQueueRunning,
   markIntegrationQueueSuperseded,
+  markIntegrationQueueValidated,
   recordIntegrationQueueAffectedPaths,
   recordIntegrationQueueAttempt,
   type IntegrationQueueEntry
@@ -78,6 +79,46 @@ export type EnqueueIntegrationQueueInput = Readonly<{
 }>;
 
 /**
+ * Producer WorkItem statuses that close the WorkItem lifecycle.  A ChangeSet
+ * captured from a WorkItem that reached one of these without ever producing a
+ * Candidate has no deliverable to integrate: landing it would break Task-final
+ * provenance, which traces every queued ChangeSet back to its WorkItem's
+ * Candidate.
+ */
+const TERMINAL_PRODUCER_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "retired"
+]);
+
+/**
+ * Only a ChangeSet whose producer WorkItem reached a deliverable may enter the
+ * queue.  In-progress WorkItems are left to the capture path, which only runs
+ * once a Candidate exists; the re-check inside the write transaction closes
+ * the TOCTOU window between this read and the entry creation.
+ */
+function assertEnqueueableProducer(
+  store: TaskStore,
+  taskId: string,
+  changeSet: ChangeSet
+): void {
+  const workItem = store.getWorkItem(taskId, changeSet.workItemId);
+  if (workItem === null) {
+    throw new Error(
+      `ChangeSet producer WorkItem not found: ${changeSet.workItemId}.`
+    );
+  }
+  if (
+    workItem.candidates.length === 0
+    && TERMINAL_PRODUCER_STATUSES.has(workItem.status)
+  ) {
+    throw new Error(
+      `ChangeSet producer WorkItem has no terminal Candidate: ${workItem.id}/${workItem.status}.`
+    );
+  }
+}
+
+/**
  * Enqueue one ChangeSet.  Enqueue is idempotent per (Project, ChangeSet): an
  * existing non-superseded entry is returned instead of duplicated.  When the
  * ChangeSet is already represented on the target (an ancestor or a same-tree
@@ -113,6 +154,9 @@ export async function enqueueIntegrationQueueEntry(
       outcome: existing.status === "committed" ? "already-committed" : "already-queued"
     };
   }
+  // Producer fence: only a ChangeSet whose WorkItem reached a deliverable may
+  // enter the queue.  Re-checked inside the write transaction.
+  assertEnqueueableProducer(input.store, task.id, changeSet);
   const project = input.store.getProject(input.projectId);
   if (project === null) throw new Error(`Project not found: ${input.projectId}.`);
   const targetRef = input.targetRef
@@ -144,9 +188,12 @@ export async function enqueueIntegrationQueueEntry(
         outcome: duplicate.status === "committed" ? "already-committed" : "already-queued"
       };
     }
+    // Re-verify the producer inside the write transaction: the WorkItem may
+    // have retired (or been deleted) between the read above and this commit.
+    assertEnqueueableProducer(tx, task.id, changeSet);
     const id = tx.nextIntegrationQueueEntryId(task.id);
     if (equivalent === null) {
-      const entry = createIntegrationQueueEntry({
+      let entry = createIntegrationQueueEntry({
         id,
         taskId: task.id,
         projectId: input.projectId,
@@ -155,6 +202,14 @@ export async function enqueueIntegrationQueueEntry(
         checkCommands: input.checkCommands ?? [],
         evidenceRefs: changeSet.manifest?.evidenceRefs ?? []
       }, now());
+      // Durable positive exact-SHA evidence on an unchanged target, at the lane
+      // head, validates the entry so processing skips its checks.  The process-
+      // path evidence fence still invalidates the binding if the target moves
+      // before this entry runs, so a non-empty advance never rebinds old
+      // evidence.
+      if (canReuseEvidenceAtHead(tx.listIntegrationQueueEntries(task.id), entry, changeSet, targetHead)) {
+        entry = markIntegrationQueueValidated(entry, now(), targetHead);
+      }
       tx.saveIntegrationQueueEntry(task.id, entry);
       return { entry, outcome: "queued" as const };
     }
@@ -207,6 +262,28 @@ function findActiveQueueDuplicate(
       && entry.status !== "superseded");
 }
 
+/**
+ * Whether a freshly queued entry may start `validated` (skipping its checks):
+ * its ChangeSet carries durable positive exact-SHA evidence, the target is
+ * unchanged since the ChangeSet was based (so integrating fast-forwards to
+ * the reviewed head), and no earlier lane entry will advance the target
+ * first.  Entries behind a lane mate stay `queued`: the mate's commit moves
+ * the target, so the evidence would not cover their integration anyway.
+ */
+function canReuseEvidenceAtHead(
+  entries: readonly IntegrationQueueEntry[],
+  entry: IntegrationQueueEntry,
+  changeSet: ChangeSet,
+  targetHead: string
+): boolean {
+  if (entry.evidenceRefs.length === 0) return false;
+  if (targetHead !== changeSet.baseCommit) return false;
+  const lane = queueLaneKey(entry);
+  return !entries.some((existing) => queueLaneKey(existing) === lane
+    && existing.status !== "committed"
+    && existing.status !== "superseded");
+}
+
 export type ProcessIntegrationQueueOptions = Readonly<{
   projectId?: string;
   limit?: number;
@@ -229,10 +306,11 @@ export type ProcessIntegrationQueueItem = Readonly<{
  * its evidence coverage and runs its checks again.
  *
  * A lane (one Project/targetRef pair) integrates one item at a time: while an
- * earlier item is `running` — claimed by this or another processor — its
- * successors are not even selected, and the claim re-checks the barrier
- * inside its write transaction so two store instances cannot run adjacent
- * items of the same target concurrently.
+ * item is `running` — claimed by this or another processor — no other item of
+ * the lane is selected, and the claim re-checks the barrier inside its write
+ * transaction so two store instances cannot run items of the same target
+ * concurrently.  The barrier covers the whole lane regardless of id order, so
+ * a requeued predecessor is serialized behind a successor that started first.
  */
 export async function processIntegrationQueue(
   store: TaskStore,
@@ -351,8 +429,9 @@ function queueLaneKey(entry: IntegrationQueueEntry): string {
 
 /**
  * The first entry a processor may claim: the earliest queued/validated entry
- * whose lane has no running entry ahead of it.  Entries arrive in numeric id
- * order, so a running entry marks its lane as blocked for every successor.
+ * whose lane has no running entry anywhere in it.  A running entry serializes
+ * its whole lane — predecessors and successors alike — so a requeued
+ * predecessor cannot slip past a successor that is already running.
  */
 function firstClaimableQueueEntry(
   entries: readonly IntegrationQueueEntry[],
@@ -363,8 +442,10 @@ function firstClaimableQueueEntry(
     if (projectId !== undefined && entry.projectId !== projectId) continue;
     if (entry.status === "running") {
       blockedLanes.add(queueLaneKey(entry));
-      continue;
     }
+  }
+  for (const entry of entries) {
+    if (projectId !== undefined && entry.projectId !== projectId) continue;
     if ((entry.status === "queued" || entry.status === "validated")
       && !blockedLanes.has(queueLaneKey(entry))) {
       return entry;
@@ -375,20 +456,18 @@ function firstClaimableQueueEntry(
 
 /**
  * The claim-time re-check of the running barrier: the candidate stays
- * claimable only while no earlier entry of its lane started running since
- * selection.  Entries arrive in numeric id order, so reaching the candidate
- * without meeting a same-lane running entry proves the lane is clear.
+ * claimable only while no other entry of its lane is running.  The barrier
+ * covers the whole lane regardless of id order, so a requeued predecessor is
+ * serialized behind a successor that started running first.
  */
 function laneBlockedByRunningEntry(
   entries: readonly IntegrationQueueEntry[],
   candidate: IntegrationQueueEntry
 ): boolean {
   const lane = queueLaneKey(candidate);
-  for (const entry of entries) {
-    if (entry.id === candidate.id) return false;
-    if (entry.status === "running" && queueLaneKey(entry) === lane) return true;
-  }
-  return false;
+  return entries.some((entry) => entry.id !== candidate.id
+    && entry.status === "running"
+    && queueLaneKey(entry) === lane);
 }
 
 /**
