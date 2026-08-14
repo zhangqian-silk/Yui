@@ -857,11 +857,13 @@ function resolveBlockedAttempt(
 }
 
 /**
- * A committed Integration Attempt already landed its change on the target.
- * Requeue or supersede would discard that provenance; the caller must
- * reconcile the queue entry against the committed Attempt instead.
+ * A linked Integration Attempt that is actively processing or already
+ * committed cannot be discarded by requeue or supersede.  Only a blocked
+ * Attempt (finalized by resolveBlockedAttempt) or a failed one is safe to
+ * recover; a running, validating, or committed Attempt would leave the
+ * queue entry contradicting the Attempt/target state.
  */
-function assertNotCommittedAttempt(
+function assertRecoverableAttempt(
   store: TaskStore,
   taskId: string,
   entry: IntegrationQueueEntry,
@@ -869,10 +871,12 @@ function assertNotCommittedAttempt(
 ): void {
   if (entry.integrationAttemptId === undefined) return;
   const attempt = store.getIntegrationAttempt(taskId, entry.integrationAttemptId);
-  if (attempt !== null && attempt.status === "committed") {
+  if (attempt === null) return;
+  if (attempt.status !== "blocked" && attempt.status !== "failed") {
     throw new Error(
-      `Integration queue entry ${entry.id} is backed by committed Integration `
-      + `Attempt ${attempt.id}; reconcile the queue entry instead of ${action} it.`
+      `Integration queue entry ${entry.id} is backed by ${attempt.status} `
+      + `Integration Attempt ${attempt.id}; reconcile the queue entry instead `
+      + `of ${action} it.`
     );
   }
 }
@@ -894,7 +898,7 @@ export function requeueIntegrationQueueEntry(
     if (entry === null) {
       throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
     }
-    assertNotCommittedAttempt(tx, taskId, entry, "requeue");
+    assertRecoverableAttempt(tx, taskId, entry, "requeue");
     resolveBlockedAttempt(tx, taskId, entry, "requeue", now);
     const waiting = markIntegrationQueueRequeued(entry, now());
     tx.saveIntegrationQueueEntry(taskId, waiting);
@@ -914,7 +918,7 @@ export function supersedeIntegrationQueueEntry(
     if (entry === null) {
       throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
     }
-    assertNotCommittedAttempt(tx, taskId, entry, "supersede");
+    assertRecoverableAttempt(tx, taskId, entry, "supersede");
     resolveBlockedAttempt(tx, taskId, entry, "supersede", now);
     const superseded = markIntegrationQueueSuperseded(entry, reason, now());
     tx.saveIntegrationQueueEntry(taskId, superseded);

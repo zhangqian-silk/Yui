@@ -848,6 +848,100 @@ test("recovery commands cannot race a manual-resolution Attempt commit", {
   );
 });
 
+test("recovery commands cannot overtake a validating manual-resolution Attempt", {
+  skip: process.env.YUI_REVIEW_VALIDATING_QUEUE_RACE !== "1"
+}, async () => {
+  const invalidActions = [];
+  for (const action of ["requeue", "supersede"]) {
+    const fixture = await createFixture();
+    const changeSet = await branchChangeSet(fixture, {
+      id: "change-set-1",
+      paths: { "manual.txt": "resolved\n" }
+    });
+    const queued = await enqueue(fixture, changeSet, { checkCommands: ["true"] });
+    let attempt = createIntegrationAttempt({
+      id: fixture.store.nextIntegrationAttemptId(fixture.task.id),
+      taskId: fixture.task.id,
+      projectId: fixture.project.id,
+      targetRef: "master",
+      expectedHead: fixture.baseCommit,
+      changeSetIds: [changeSet.id],
+      checkCommands: ["true"]
+    }, now);
+    fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+    const running = recordIntegrationQueueAttempt(
+      markIntegrationQueueRunning(queued.entry, fixture.baseCommit, now),
+      attempt.id,
+      now
+    );
+    fixture.store.saveIntegrationQueueEntry(fixture.task.id, running);
+    attempt = requireLeaderDecision(attempt, {
+      affectedPaths: ["manual.txt"],
+      summary: "manual conflict resolution"
+    }, now);
+    fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+    fixture.store.saveIntegrationQueueEntry(
+      fixture.task.id,
+      markIntegrationQueueBlocked(running, "manual conflict resolution", now)
+    );
+    attempt = recordResolutionDecision(attempt, {
+      action: "manual-resolution",
+      rationale: "preserve the combined result"
+    }, now);
+    fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+
+    // GitIntegrationService persists `validating` before advancing the target.
+    // Pause that supported continuation here, let queue recovery run, then
+    // resume the exact CAS -> committed tail of the continuation.
+    const validating = updateIntegrationAttempt(attempt, {
+      status: "validating",
+      candidateCommit: changeSet.headCommit,
+      checks: [{ name: "true", outcome: "passed" }]
+    }, now);
+    fixture.store.saveIntegrationAttempt(fixture.task.id, validating);
+    try {
+      if (action === "requeue") {
+        requeueIntegrationQueueEntry(
+          fixture.store,
+          fixture.task.id,
+          queued.entry.id,
+          () => now
+        );
+      } else {
+        supersedeIntegrationQueueEntry(
+          fixture.store,
+          fixture.task.id,
+          queued.entry.id,
+          "do not discard an in-flight manual resolution",
+          () => now
+        );
+      }
+    } catch {
+      // Fail-closed is the safe recovery result while the Attempt is in flight.
+    }
+    git(["-C", fixture.repositoryPath, "merge", "--ff-only", changeSet.branch]);
+    fixture.store.saveIntegrationAttempt(
+      fixture.task.id,
+      updateIntegrationAttempt(validating, { status: "committed" }, now)
+    );
+
+    const finalAttempt = fixture.store.getIntegrationAttempt(fixture.task.id, attempt.id);
+    const finalEntry = fixture.store.getIntegrationQueueEntry(
+      fixture.task.id,
+      queued.entry.id
+    );
+    if (finalAttempt.status === "committed"
+      && (finalEntry.status === "queued" || finalEntry.status === "superseded")) {
+      invalidActions.push(action);
+    }
+  }
+  assert.deepEqual(
+    invalidActions,
+    [],
+    "recovery must reject a queue entry while its manual-resolution Attempt is validating"
+  );
+});
+
 test("queue entries round-trip through the store and reject an updatedAt move backwards", async () => {
   const fixture = await createFixture();
   const changeSet = await branchChangeSet(fixture, {
