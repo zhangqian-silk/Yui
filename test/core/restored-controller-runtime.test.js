@@ -12,7 +12,8 @@ import {
   startFileTaskController
 } from "../../dist/controller/controller.js";
 import {
-  forEachInEventLoopBatches
+  forEachInEventLoopBatches,
+  scanControllerResourceInventory
 } from "../../dist/controller/resourceInventoryLinux.js";
 import {
   DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
@@ -3109,6 +3110,187 @@ test("periodic full inventory yields to an already-written status request", asyn
     assert.ok(
       elapsedMs < 3_000,
       `controller.status socket callback took ${Math.round(elapsedMs)}ms during periodic inventory`
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("current-scope role inventory does not starve control requests under a large shared tmux directory", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-controller-current-scope-fairness-"));
+  const store = emptyStore();
+  const task = gitlessTask("task-inventory");
+  const worker = role(task.id, "worker");
+  const run = deliveredRun(task.id, worker.name);
+  store.listTasks = () => [task];
+  store.getTask = (taskId) => taskId === task.id ? task : null;
+  store.getTaskWorkspace = (taskId) => taskId === task.id
+    ? taskOwnedWorkspace(task)
+    : null;
+  store.listRoles = (taskId) => taskId === task.id ? [worker] : [];
+  store.getRole = (taskId, roleName) => (
+    taskId === task.id && roleName === worker.name ? worker : null
+  );
+  store.getActiveAgentRun = (taskId, roleName) => (
+    taskId === task.id && roleName === worker.name ? run : null
+  );
+  store.getRoleSession = () => null;
+
+  // Production strace: a shared /tmp/tmux-<uid> with 8889 yui-* entries cost
+  // 3230 synchronous statx calls in six seconds during a scope=current role
+  // inventory, starving control commands. Model that enumeration cost
+  // deterministically through the test seam. On the old path the enumerator
+  // fires inside the inventory, writes the in-flight control requests into
+  // the socket buffer, then blocks the event loop; the server can only answer
+  // after the block. scope=current must never reach the enumerator.
+  let enumerations = 0;
+  let blockEnumeration = false;
+  let inspectCalls = 0;
+  let requestToken;
+  let statusSocket;
+  let querySocket;
+  let sentAt;
+  function writeBufferedRequests() {
+    statusSocket.write(encodeControllerRequest({
+      id: "fairness-status",
+      token: requestToken,
+      method: "controller.status",
+      params: {}
+    }));
+    querySocket.write(encodeControllerRequest({
+      id: "fairness-query",
+      token: requestToken,
+      method: "task.query",
+      params: {}
+    }));
+  }
+  const delivery = {
+    ...noTmux,
+    async inspectRoles(inputs) {
+      inspectCalls += 1;
+      await scanControllerResourceInventory({
+        currentHome: home,
+        scope: "current",
+        listTmuxSocketArtifacts: () => {
+          enumerations += 1;
+          if (!blockEnumeration) return [];
+          // A client's requests are already in flight when the inventory
+          // blocks the event loop. Write them into the socket buffer
+          // synchronously, then model the readdir+lstat enumeration cost.
+          writeBufferedRequests();
+          sentAt = performance.now();
+          const blockedUntil = sentAt + 3_500;
+          while (performance.now() < blockedUntil) {
+            // Model synchronous readdir + lstat per unrelated yui-* socket.
+          }
+          return [];
+        }
+      });
+      return inputs.map(({ taskId, roleName }) => ({
+        taskId,
+        roleName,
+        status: "present"
+      }));
+    }
+  };
+
+  let controller;
+  let statusResponse;
+  let queryResponse;
+  let pumped;
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    statusSocket?.destroy();
+    querySocket?.destroy();
+    if (pumped !== undefined) await Promise.allSettled([pumped]);
+    await controller?.close();
+    rmSync(home, { recursive: true, force: true });
+  };
+  t.after(cleanup);
+  try {
+    controller = await startFileTaskController(
+      home,
+      store,
+      delivery,
+      async (method) => ({ method }),
+      { intervalMs: 60_000 }
+    );
+    // Let the startup pass finish so the next pump starts a fresh inventory
+    // instead of coalescing into the still-running startup pass.
+    await controller.runtime.pump();
+
+    const discovery = await readControllerDiscovery(home);
+    requestToken = discovery.token;
+    const connect = async (requestId, method) => {
+      const socket = createConnection(discovery.socketPath);
+      await new Promise((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+      });
+      const response = new Promise((resolve, reject) => {
+        let buffer = Buffer.alloc(0);
+        socket.on("data", (chunk) => {
+          buffer = Buffer.concat([buffer, chunk]);
+          const newline = buffer.indexOf(0x0a);
+          if (newline >= 0) resolve(buffer.subarray(0, newline).toString("utf8"));
+        });
+        socket.once("error", reject);
+      });
+      return { socket, response };
+    };
+    const status = await connect("fairness-status", "controller.status");
+    statusSocket = status.socket;
+    statusResponse = status.response;
+    const query = await connect("fairness-query", "task.query");
+    querySocket = query.socket;
+    queryResponse = query.response;
+
+    blockEnumeration = true;
+    pumped = controller.runtime.pump();
+    await pumped;
+
+    if (enumerations === 0) {
+      // scope=current never reached the enumerator: send the requests now and
+      // prove they are answered without a multi-second event-loop block.
+      writeBufferedRequests();
+      sentAt = performance.now();
+    }
+
+    let responseTimer;
+    let statusLine;
+    let queryLine;
+    try {
+      [statusLine, queryLine] = await Promise.race([
+        Promise.all([statusResponse, queryResponse]),
+        new Promise((_, reject) => {
+          responseTimer = setTimeout(
+            () => reject(new Error("control requests starved by current-scope inventory")),
+            10_000
+          );
+          responseTimer.unref();
+        })
+      ]);
+    } finally {
+      clearTimeout(responseTimer);
+    }
+    const latencyMs = performance.now() - sentAt;
+
+    const statusResult = parseControllerResponse(statusLine, "fairness-status");
+    const queryResult = parseControllerResponse(queryLine, "fairness-query");
+    assert.equal(statusResult.ok, true);
+    assert.equal(queryResult.ok, true);
+    assert.equal(queryResult.result.method, "task.query");
+    assert.ok(inspectCalls >= 2, "the pump must run a role inventory pass");
+    assert.equal(
+      enumerations,
+      0,
+      "scope=current must not enumerate the shared tmux directory"
+    );
+    assert.ok(
+      latencyMs < 3_000,
+      `control requests took ${Math.round(latencyMs)}ms during current-scope inventory`
     );
   } finally {
     await cleanup();

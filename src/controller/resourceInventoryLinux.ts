@@ -59,7 +59,19 @@ export type ControllerInventoryScanOptions = Readonly<{
   openCompatibleStore?: (
     home: string
   ) => ReturnType<typeof openCompatibleFileTaskStore>;
+  /**
+   * Test seam for the shared tmux socket directory enumeration. Production
+   * always enumerates with the real readdir+lstat path; scope=current must
+   * not reach it because only the exact current-Home socket is observable
+   * there, so a large unrelated shared directory cannot block the event loop.
+   */
+  listTmuxSocketArtifacts?: TmuxSocketArtifactLister;
 }>;
+
+export type TmuxSocketArtifactLister = (
+  directory: string,
+  activeSockets: ReadonlySet<string>
+) => RuntimeArtifactFact[];
 
 type LinuxProcessStat = Readonly<{
   ppid: number;
@@ -94,12 +106,16 @@ export async function scanControllerResourceInventory(
   }
 
   const tmuxDirectory = tmuxSocketDirectory(environment);
-  const rawTmuxArtifacts = listSocketArtifacts(
-    tmuxDirectory,
-    /^yui-[a-f0-9]{24}$/u,
-    "tmux-socket",
-    activeSockets
-  );
+  const listTmuxSocketArtifacts = options.listTmuxSocketArtifacts
+    ?? listSharedTmuxSocketArtifacts;
+  // scope=current owns exactly one YUI_HOME, so only its exact tmux server
+  // socket is observable. Enumerating the whole shared directory (readdir +
+  // lstat per entry) blocked the event loop for seconds under a large
+  // unrelated yui-* population and starved control commands. scope=all keeps
+  // the full cross-domain enumeration for global cleanup reporting.
+  const rawTmuxArtifacts = options.scope === "all"
+    ? listTmuxSocketArtifacts(tmuxDirectory, activeSockets)
+    : inspectExactTmuxSocket(currentHome, tmuxDirectory, activeSockets);
   const homeFacts: RuntimeHomeFact[] = [];
   const associatedArtifacts = new Set<string>();
   for (const home of [...homes].sort()) {
@@ -465,24 +481,59 @@ function listSocketArtifacts(
   try {
     return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
       if (!pattern.test(entry.name)) return [];
-      const path = join(directory, entry.name);
-      let metadata: Stats;
-      try {
-        metadata = lstatSync(path);
-      } catch {
-        return [];
-      }
-      if (!metadata.isSocket()) return [];
-      return [{
+      return inspectSocketArtifact(
+        join(directory, entry.name),
         artifactKind,
-        path,
-        active: activeSockets.has(path),
-        fingerprint: statFingerprint(metadata)
-      }];
+        activeSockets
+      );
     });
   } catch {
     return [];
   }
+}
+
+function listSharedTmuxSocketArtifacts(
+  directory: string,
+  activeSockets: ReadonlySet<string>
+): RuntimeArtifactFact[] {
+  return listSocketArtifacts(
+    directory,
+    /^yui-[a-f0-9]{24}$/u,
+    "tmux-socket",
+    activeSockets
+  );
+}
+
+function inspectExactTmuxSocket(
+  currentHome: string,
+  tmuxDirectory: string,
+  activeSockets: ReadonlySet<string>
+): RuntimeArtifactFact[] {
+  return inspectSocketArtifact(
+    join(tmuxDirectory, yuiTmuxServerName(currentHome)),
+    "tmux-socket",
+    activeSockets
+  );
+}
+
+function inspectSocketArtifact(
+  path: string,
+  artifactKind: RuntimeArtifactFact["artifactKind"],
+  activeSockets: ReadonlySet<string>
+): RuntimeArtifactFact[] {
+  let metadata: Stats;
+  try {
+    metadata = lstatSync(path);
+  } catch {
+    return [];
+  }
+  if (!metadata.isSocket()) return [];
+  return [{
+    artifactKind,
+    path,
+    active: activeSockets.has(path),
+    fingerprint: statFingerprint(metadata)
+  }];
 }
 
 async function inspectDiscovery(

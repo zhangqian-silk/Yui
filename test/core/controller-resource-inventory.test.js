@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -8,6 +9,7 @@ import {
   rmSync,
   writeFileSync
 } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -901,4 +903,116 @@ test("Linux process facts use start identity for cleanup fencing and classify on
     "tmux-server"
   );
   assert.equal(classifyRuntimeProcess(["node", "unrelated.js"], "node"), "other");
+});
+
+/**
+ * Builds a shared tmux directory that holds the exact current-Home server
+ * socket plus a batch of unrelated, valid yui-* server sockets. This models
+ * the production shared directory (thousands of cross-domain entries) without
+ * depending on a real tmux binary.
+ */
+async function createSharedTmuxFixture(home, unrelatedCount) {
+  // Unix socket paths are capped near 108 bytes; keep the fixture root shallow
+  // so the yui-<24hex> server names stay bindable regardless of TMPDIR.
+  const fixtureRoot = mkdtempSync(join("/tmp", "yui-shared-tmux-"));
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const tmuxDirectory = join(fixtureRoot, `tmux-${uid}`);
+  mkdirSync(tmuxDirectory, { recursive: true });
+  const servers = [];
+  const listen = (path) => new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(path, () => resolve(server));
+  });
+  const exactSocket = join(tmuxDirectory, yuiTmuxServerName(home));
+  servers.push(await listen(exactSocket));
+  const unrelatedSockets = [];
+  for (let index = 0; index < unrelatedCount; index += 1) {
+    const path = join(tmuxDirectory, `yui-${randomBytes(12).toString("hex")}`);
+    unrelatedSockets.push(path);
+    servers.push(await listen(path));
+  }
+  return {
+    fixtureRoot,
+    tmuxDirectory,
+    exactSocket,
+    unrelatedSockets,
+    async close() {
+      await Promise.all(servers.map((server) => new Promise((resolve) => {
+        server.close(() => resolve());
+      })));
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  };
+}
+
+test("current-scope inventory observes only the exact current-Home socket", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-current-scope-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home, new Date(NOW));
+  const fixture = await createSharedTmuxFixture(home, 32);
+  t.after(() => fixture.close());
+
+  let enumerations = 0;
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "current",
+    environment: { ...process.env, TMUX_TMPDIR: fixture.fixtureRoot },
+    panes: [],
+    listTmuxSocketArtifacts: () => {
+      enumerations += 1;
+      return [];
+    }
+  });
+
+  // The shared-directory enumerator must not run for scope=current; only the
+  // exact current-Home socket is observable there.
+  assert.equal(enumerations, 0);
+  // The exact current-Home socket is still observed via its exact target.
+  const exactResource = snapshot.resources.find((resource) => (
+    resource.kind === "artifact" && resource.artifact?.path === fixture.exactSocket
+  ));
+  assert.notEqual(exactResource, undefined, JSON.stringify(snapshot.resources, null, 2));
+  assert.equal(exactResource.artifact.active, true);
+  // No unrelated cross-domain socket leaks into the current-scope inventory.
+  for (const unrelated of fixture.unrelatedSockets) {
+    assert.equal(
+      snapshot.resources.some((resource) => resource.artifact?.path === unrelated),
+      false,
+      `unrelated socket ${unrelated} must not appear in scope=current`
+    );
+  }
+});
+
+test("all-scope inventory still enumerates cross-domain unassociated sockets", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-all-scope-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home, new Date(NOW));
+  const fixture = await createSharedTmuxFixture(home, 32);
+  t.after(() => fixture.close());
+
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "all",
+    environment: { ...process.env, TMUX_TMPDIR: fixture.fixtureRoot },
+    panes: []
+  });
+
+  // The exact current-Home socket stays associated with its own domain.
+  const exactResource = snapshot.resources.find((resource) => (
+    resource.artifact?.path === fixture.exactSocket
+  ));
+  assert.notEqual(exactResource, undefined);
+  assert.notEqual(exactResource.yuiHome, undefined);
+  // Every unrelated valid socket is still reported as a cross-domain global
+  // artifact so `controller cleanup --all` keeps its full cleanup authority.
+  const reportedUnrelated = fixture.unrelatedSockets.filter((path) => (
+    snapshot.resources.some((resource) => resource.artifact?.path === path)
+  ));
+  assert.equal(reportedUnrelated.length, fixture.unrelatedSockets.length);
+  const globalUnrelated = snapshot.resources.find((resource) => (
+    resource.artifact?.path === fixture.unrelatedSockets[0]
+  ));
+  assert.equal(globalUnrelated.owner.kind, "none");
+  assert.equal(globalUnrelated.yuiHome, undefined);
 });
