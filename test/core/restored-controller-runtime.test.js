@@ -2974,9 +2974,11 @@ test("continuous progress passes yield so control requests are not starved", asy
     assert.deepEqual(results.map(({ method }) => method), commandNames);
     assert.deepEqual([...methods].sort(), [...commandNames].sort());
     assert.equal(new Set(methods).size, methods.length);
-    assert.ok(status.runtime.commands.completed >= 3);
-    assert.equal(status.runtime.commands.inFlight, 0);
-    assert.ok(status.runtime.commands.latencyBuckets.le3000ms >= 3);
+    assert.ok(status.runtime.commands.dispatcher.completed >= 3);
+    assert.equal(status.runtime.commands.dispatcher.inFlight, 0);
+    assert.ok(status.runtime.commands.dispatcher.serviceTimeBuckets.le3000ms >= 3);
+    assert.ok(status.runtime.commands.routes.dispatched.completed >= 3);
+    assert.equal(status.runtime.commands.routes.dispatched.failed, 0);
     assert.ok(progressDepth > 0);
     assert.equal(inventoryReleased, false);
     assert.equal(leaderDispatched, true, "Leader wakeup must dispatch before inventory completes");
@@ -3880,10 +3882,19 @@ test("background FileTask controller exposes status, scan and stop on one privat
   assert.equal(status.runtime.drain.selectedEvents, 0);
   assert.equal(status.runtime.drain.progressEventsCoalesced, 0);
   assert.equal(status.runtime.drain.stateTransactions, 0);
-  assert.equal(status.runtime.commands.inFlight, 0);
-  assert.equal(status.runtime.commands.completed, 0);
-  assert.equal(status.runtime.commands.maximumLatencyMs, 0);
-  assert.deepEqual(Object.keys(status.runtime.commands.latencyBuckets), [
+  assert.equal(status.runtime.commands.dispatcher.inFlight, 0);
+  assert.equal(status.runtime.commands.dispatcher.completed, 0);
+  assert.equal(status.runtime.commands.dispatcher.maximumServiceTimeMs, 0);
+  assert.deepEqual(Object.keys(status.runtime.commands.dispatcher.serviceTimeBuckets), [
+    "le10ms", "le50ms", "le100ms", "le250ms", "le500ms", "le1000ms", "le3000ms"
+  ]);
+  // The snapshot is taken while this very status request is still being routed.
+  assert.equal(status.runtime.commands.routes.received, 1);
+  assert.equal(status.runtime.commands.routes.completed, 0);
+  assert.equal(status.runtime.commands.routes.inFlight, 1);
+  assert.equal(status.runtime.commands.routes.builtin.completed, 0);
+  assert.equal(status.runtime.commands.eventLoopDelay.maximumLagMs, 0);
+  assert.deepEqual(Object.keys(status.runtime.commands.eventLoopDelay.lagBuckets), [
     "le10ms", "le50ms", "le100ms", "le250ms", "le500ms", "le1000ms", "le3000ms"
   ]);
   assert.deepEqual(await callController(home, "controller.identity", {}), {

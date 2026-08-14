@@ -39,6 +39,11 @@ import {
   type ControllerDispatcher,
   type RunningControllerServer
 } from "../core/controllerServer.js";
+import {
+  monotonicMilliseconds,
+  type ControllerEventLoopDelayMetrics,
+  type ControllerRouteMetrics
+} from "../core/controllerTelemetry.js";
 import type { JsonValue } from "../core/protocol.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import { MailboxScheduler } from "../coordination/mailboxScheduler.js";
@@ -153,10 +158,21 @@ export type ControllerRuntimeMetrics = Readonly<{
     stateTransactions: number;
   }>;
   commands: Readonly<{
-    completed: number;
-    inFlight: number;
-    maximumLatencyMs: number;
-    latencyBuckets: Readonly<Record<string, number>>;
+    // Dispatcher service time only: measured inside the FileTask dispatcher
+    // from dispatch to completion. It does not include the socket/event-loop
+    // wait before routing, so it must not be read as end-to-end latency.
+    dispatcher: Readonly<{
+      completed: number;
+      inFlight: number;
+      maximumServiceTimeMs: number;
+      serviceTimeBuckets: Readonly<Record<string, number>>;
+    }>;
+    // Core routing observation: every authenticated request counted once at
+    // the routing layer, covering built-in and dispatcher routes.
+    routes: ControllerRouteMetrics;
+    // Bounded event-loop delay sampled by the core server: the pre-dispatch
+    // wait an already-written request experiences while the loop is busy.
+    eventLoopDelay: ControllerEventLoopDelayMetrics;
   }>;
 }>;
 
@@ -1704,10 +1720,10 @@ export async function startFileTaskController(
   const runtime = new FileTaskController(store, delivery, options);
   let stopping = false;
   const lifecycleRequests = new Set<Promise<unknown>>();
-  const commandLatency = new ControllerCommandLatencyMetrics();
+  const dispatcherServiceTime = new ControllerDispatcherServiceTimeMetrics();
   const server = await startControllerServer(home, async (method, params) => {
     const startedAt = monotonicMilliseconds();
-    commandLatency.started();
+    dispatcherServiceTime.started();
     try {
       if (stopping) {
         throw controllerApplicationError("METHOD_NOT_FOUND", "Controller is stopping.");
@@ -1752,7 +1768,7 @@ export async function startFileTaskController(
         lifecycleRequests.delete(request);
       }
     } finally {
-      commandLatency.completed(monotonicMilliseconds() - startedAt);
+      dispatcherServiceTime.completed(monotonicMilliseconds() - startedAt);
     }
   }, async () => {
     stopping = true;
@@ -1761,9 +1777,13 @@ export async function startFileTaskController(
     await runtime.shutdownAndDrain();
   }, {
     domainIdentity: options.domainIdentity,
-    status: () => ({
+    status: ({ commandObserver, eventLoopDelay }) => ({
       ...runtime.runtimeMetrics(),
-      commands: commandLatency.snapshot()
+      commands: {
+        dispatcher: dispatcherServiceTime.snapshot(),
+        routes: commandObserver.snapshot(),
+        eventLoopDelay: eventLoopDelay.snapshot()
+      }
     })
   });
   runtime.start();
@@ -1780,10 +1800,16 @@ export async function startFileTaskController(
   };
 }
 
-class ControllerCommandLatencyMetrics {
+/**
+ * Measures dispatcher service time only: the elapsed time inside the FileTask
+ * dispatcher from dispatch to completion. It deliberately excludes the
+ * socket/event-loop wait before routing, which the core server's event-loop
+ * delay telemetry observes separately.
+ */
+class ControllerDispatcherServiceTimeMetrics {
   #completed = 0;
   #inFlight = 0;
-  #maximumLatencyMs = 0;
+  #maximumServiceTimeMs = 0;
   readonly #buckets = new Map<number, number>(
     CONTROLLER_LATENCY_BUCKETS_MS.map((threshold) => [threshold, 0])
   );
@@ -1792,11 +1818,11 @@ class ControllerCommandLatencyMetrics {
     this.#inFlight += 1;
   }
 
-  completed(latencyMs: number): void {
+  completed(serviceTimeMs: number): void {
     this.#inFlight = Math.max(0, this.#inFlight - 1);
     this.#completed += 1;
-    const bounded = Math.max(0, Math.ceil(latencyMs));
-    this.#maximumLatencyMs = Math.max(this.#maximumLatencyMs, bounded);
+    const bounded = Math.max(0, Math.ceil(serviceTimeMs));
+    this.#maximumServiceTimeMs = Math.max(this.#maximumServiceTimeMs, bounded);
     for (const threshold of CONTROLLER_LATENCY_BUCKETS_MS) {
       if (bounded <= threshold) {
         this.#buckets.set(threshold, (this.#buckets.get(threshold) ?? 0) + 1);
@@ -1804,12 +1830,12 @@ class ControllerCommandLatencyMetrics {
     }
   }
 
-  snapshot(): ControllerRuntimeMetrics["commands"] {
+  snapshot(): ControllerRuntimeMetrics["commands"]["dispatcher"] {
     return {
       completed: this.#completed,
       inFlight: this.#inFlight,
-      maximumLatencyMs: this.#maximumLatencyMs,
-      latencyBuckets: Object.fromEntries(
+      maximumServiceTimeMs: this.#maximumServiceTimeMs,
+      serviceTimeBuckets: Object.fromEntries(
         CONTROLLER_LATENCY_BUCKETS_MS.map((threshold) => [
           `le${threshold}ms`,
           this.#buckets.get(threshold) ?? 0
@@ -1817,10 +1843,6 @@ class ControllerCommandLatencyMetrics {
       )
     };
   }
-}
-
-function monotonicMilliseconds(): number {
-  return Number(process.hrtime.bigint()) / 1_000_000;
 }
 
 function eventLoopTurn(): Promise<void> {
