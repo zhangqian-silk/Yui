@@ -35,7 +35,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -43,6 +43,7 @@ import {
   runMigration,
   type MigrationRegistry,
   type MigrationReport,
+  type MigrationTarget,
   type StorageVersionState
 } from "../migration/index.js";
 import { validateCompatibleFileTaskStore } from "../compatibleTaskStore.js";
@@ -54,6 +55,7 @@ import {
 } from "../../controller/clientRuntime.js";
 import { callController } from "../../core/controllerClient.js";
 import { FileTaskStore, STORAGE_STATE_FILE, withStorageWriteLock } from "../taskStore.js";
+import { SqliteTaskStore } from "../sqliteStore.js";
 import {
   clearUpgradeFence,
   placeUpgradeFence,
@@ -79,6 +81,7 @@ import {
   type HomeSnapshot,
   type SwitchStep
 } from "./homeMigrationTarget.js";
+import { createSqliteMigrationTarget } from "./sqliteMigrationTarget.js";
 import {
   inspectOfflineUpgradeInventory,
   type OfflineUpgradeBlocker,
@@ -376,14 +379,20 @@ export async function runStorageUpgrade(
     }
   }
 
-  const target = createHomeMigrationTarget({
-    home,
-    latest,
-    now,
-    callerPid,
-    ...(options.renameImpl === undefined ? {} : { renameImpl: options.renameImpl }),
-    ...(options.switchFaultHook === undefined ? {} : { switchFaultHook: options.switchFaultHook })
-  });
+  // Select the migration target. A layout-6 Home migrates to the SQLite
+  // control-plane layout (7) via the staged state.json→SQLite target; all
+  // other plans (record-only on layout 7) use the file-document target.
+  const usesSqliteTarget = classification.layoutVersion === 6 && latest.layout === 7;
+  const target: MigrationTarget<HomeSnapshot> = usesSqliteTarget
+    ? createSqliteMigrationTarget({ home, latest, registry, now, callerPid })
+    : createHomeMigrationTarget({
+        home,
+        latest,
+        now,
+        callerPid,
+        ...(options.renameImpl === undefined ? {} : { renameImpl: options.renameImpl }),
+        ...(options.switchFaultHook === undefined ? {} : { switchFaultHook: options.switchFaultHook })
+      });
 
   // 2) A USABLE (already-current) Home has nothing to migrate; the engine
   // confirms with a no-op and we never fence, drain, or switch.
@@ -480,7 +489,7 @@ function offlineInventoryBlocker(
 function dryRun(
   options: RunStorageUpgradeOptions<HomeSnapshot>,
   classification: HomeClassification,
-  target: ReturnType<typeof createHomeMigrationTarget>
+  target: MigrationTarget<HomeSnapshot>
 ): UpgradeResult {
   // Refuse to reuse a stale staging directory from an interrupted run.
   target.discardFreshOutput();
@@ -508,7 +517,7 @@ function dryRun(
 async function execute(
   options: RunStorageUpgradeOptions<HomeSnapshot>,
   classification: HomeClassification,
-  target: ReturnType<typeof createHomeMigrationTarget>,
+  target: MigrationTarget<HomeSnapshot>,
   callerPid: number,
   now: () => Date
 ): Promise<UpgradeResult> {
@@ -811,7 +820,7 @@ async function execute(
 function executeFenced(
   options: RunStorageUpgradeOptions<HomeSnapshot>,
   classification: HomeClassification,
-  target: ReturnType<typeof createHomeMigrationTarget>,
+  target: MigrationTarget<HomeSnapshot>,
   callerPid: number,
   now: () => Date,
   switchState: SwitchCommitState
@@ -1059,12 +1068,28 @@ function readCommittedRevision(home: string): number {
 /** Post-switch health check: a fresh loader must parse the promoted Home. */
 function postSwitchHealthCheck(home: string): UpgradeBlocker | null {
   try {
-    const store = new FileTaskStore(home);
-    store.getConfig();
-    store.listTasks();
-    store.listProjects();
-    store.listConfiguredAgents();
-    store.listWorkMailboxes();
+    // A layout-7 Home that went through the SQLite staged migration has
+    // yui.db; verify it through the SQLite store. Otherwise fall back to the
+    // file-document store (record-only migrations on an existing layout-7 Home).
+    if (existsSync(join(home, "yui.db"))) {
+      const store = new SqliteTaskStore(home);
+      try {
+        store.getConfig();
+        store.listTasks();
+        store.listProjects();
+        store.listConfiguredAgents();
+        store.listWorkMailboxes();
+      } finally {
+        store.close();
+      }
+    } else {
+      const store = new FileTaskStore(home);
+      store.getConfig();
+      store.listTasks();
+      store.listProjects();
+      store.listConfiguredAgents();
+      store.listWorkMailboxes();
+    }
     return null;
   } catch (error) {
     return {

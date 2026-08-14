@@ -50,9 +50,9 @@ function readEffective(agentId, adapterId, workspace) {
     context: {}
   };
 }
-test("storage schema initializes layout v6 with aggregate v18 and rejects non-current versions", () => {
+test("storage schema initializes layout v7 with aggregate v18 and rejects non-current versions", () => {
   const home = temporaryHome();
-  assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 6);
+  assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 7);
   assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
@@ -63,7 +63,7 @@ test("storage schema initializes layout v6 with aggregate v18 and rejects non-cu
   }
   assert.deepEqual(JSON.parse(readFileSync(join(home, "schema.json"), "utf8")), {
     schemaVersion: 1,
-    storageVersion: 6,
+    storageVersion: 7,
     aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
     recordVersions: expectedRecordVersions,
     updatedAt: "2026-07-19T00:00:00.000Z"
@@ -71,7 +71,7 @@ test("storage schema initializes layout v6 with aggregate v18 and rejects non-cu
   assert.equal(inspectStorageSchema(home).status, "current");
   assert.doesNotThrow(() => requireStorageSchema(home));
 
-  for (const storageVersion of [5, 7]) {
+  for (const storageVersion of [5, 6, 8]) {
     writeFileSync(join(home, "schema.json"), JSON.stringify({
       schemaVersion: 1,
       storageVersion,
@@ -80,7 +80,7 @@ test("storage schema initializes layout v6 with aggregate v18 and rejects non-cu
     }));
     assert.throws(
       () => requireStorageSchema(home),
-      storageVersion < 6 ? /older.*no migration/i : /newer.*Yui/i
+      storageVersion < 7 ? /older.*no migration/i : /newer.*Yui/i
     );
   }
 });

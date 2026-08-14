@@ -91,6 +91,13 @@ import {
 export type SqliteTaskStoreOptions = Readonly<{
   /** Override the database filename (defaults to "yui.db"). */
   databaseFilename?: string;
+  /**
+   * Migration bulk-load mode. The staged state.json→SQLite migration populates
+   * the sidecar database while the upgrade fence is active (the migration IS
+   * the upgrade), so the per-write fence admission check is skipped. Production
+   * stores never set this.
+   */
+  migration?: boolean;
 }>;
 
 /** Options for {@link SqliteTaskStore.transaction}. */
@@ -150,11 +157,13 @@ function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | n
 export class SqliteTaskStore implements TaskStore {
   readonly #db: Database.Database;
   readonly #rootDir: string;
+  readonly #migration: boolean;
   #inTransaction = false;
   #dirty = false;
 
   constructor(rootDir: string, _options: SqliteTaskStoreOptions = {}) {
     this.#rootDir = rootDir;
+    this.#migration = _options.migration ?? false;
     mkdirSync(rootDir, { recursive: true, mode: 0o700 });
     const filename = _options.databaseFilename ?? "yui.db";
     this.#db = new Database(join(rootDir, filename));
@@ -214,7 +223,13 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   /** The upgrade-admission fence, honored at the single write moment (§9). */
-  #prepareWrite(): void { assertHomeWritable(this.#rootDir); }
+  #prepareWrite(): void {
+    // The staged migration populates the sidecar database while the upgrade
+    // fence is active (the migration IS the upgrade), so it bypasses the
+    // per-write admission check. Production stores never set migration mode.
+    if (this.#migration) return;
+    assertHomeWritable(this.#rootDir);
+  }
 
   #bumpRevision(): void {
     this.#db.prepare("UPDATE home_meta SET revision = revision + 1, updated_at = ? WHERE id = 1").run(this.#now());
@@ -235,7 +250,9 @@ export class SqliteTaskStore implements TaskStore {
     this.#begin();
     try {
       const result = fn();
-      this.#bumpRevision();
+      if (!this.#migration) {
+        this.#bumpRevision();
+      }
       this.#commit();
       return result;
     } catch (error) {
@@ -259,7 +276,11 @@ export class SqliteTaskStore implements TaskStore {
         if (options?.requestId !== undefined) {
           this.#insertOutbox(options.requestId, options.outboxCommand ?? null);
         }
-        this.#bumpRevision();
+        // The staged migration sets the revision explicitly via
+        // migrationSetHomeMeta; the commit must not bump it.
+        if (!this.#migration) {
+          this.#bumpRevision();
+        }
       }
       this.#commit();
       return result;
@@ -290,7 +311,11 @@ export class SqliteTaskStore implements TaskStore {
         if (options?.requestId !== undefined) {
           this.#insertOutbox(options.requestId, options.outboxCommand ?? null);
         }
-        this.#bumpRevision();
+        // The staged migration sets the revision explicitly via
+        // migrationSetHomeMeta; the commit must not bump it.
+        if (!this.#migration) {
+          this.#bumpRevision();
+        }
       }
       this.#commit();
       return result;
@@ -403,6 +428,41 @@ export class SqliteTaskStore implements TaskStore {
   #requireTask(taskId: string): void {
     const row = this.#db.prepare("SELECT 1 FROM task_records WHERE task_id = ?").get(taskId);
     if (row === undefined) throw new StorageRecordError(`Task not found: ${taskId}`);
+  }
+
+  // -- migration bulk-load helpers (state.json -> SQLite, task-21 §8) ----------
+  // These are used only by the staged offline migration, which runs with the
+  // `migration` option (fence bypass). They seed infrastructure tables that the
+  // document owns (home identity/revision, global and per-task ID high-water
+  // marks) so the opened store continues from the same counters.
+
+  /** Preserve the document's Home identity and revision in `home_meta`. */
+  migrationSetHomeMeta(identity: HomeIdentity, revision: number): void {
+    this.#mutate(() => {
+      this.#db.prepare(
+        `UPDATE home_meta SET home_identity = ?, revision = ?, updated_at = ? WHERE id = 1`
+      ).run(this.#json(identity), revision, this.#now());
+    });
+  }
+
+  /** Seed a global ID high-water mark (task/project) at least `highWater`. */
+  migrationSeedGlobalSequence(name: string, highWater: number): void {
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO global_sequences (name, high_water) VALUES (?, ?)
+         ON CONFLICT(name) DO UPDATE SET high_water = MAX(high_water, ?)`
+      ).run(name, highWater, highWater);
+    });
+  }
+
+  /** Seed a per-task ID high-water mark at least `highWater`. */
+  migrationSeedIdSequence(taskId: string, kind: string, highWater: number): void {
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO id_sequences (task_id, kind, high_water) VALUES (?, ?, ?)
+         ON CONFLICT(task_id, kind) DO UPDATE SET high_water = MAX(high_water, ?)`
+      ).run(taskId, kind, highWater, highWater);
+    });
   }
 
   // -- generic payload helpers ------------------------------------------------
