@@ -238,6 +238,21 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
   }
 
+  /**
+   * Acquire the per-Project maintenance fences for a Task's bindings and
+   * return the under-lock Task snapshot plus the release handle. Used by the
+   * dispatch preflight to hold ONE fence across new-Lane preparation and the
+   * command's adoption transaction, so a migrate cannot switch the Project
+   * catalog in that gap. The caller owns `release` and must call it on every
+   * exit path.
+   */
+  acquireTaskProjectMaintenanceLocks(taskId: string): Readonly<{
+    release: () => void;
+    current: Task;
+  }> {
+    return this.#acquireTaskProjectMaintenanceLocks(requireTask(this.store, taskId));
+  }
+
   async #prepareTaskWorkspaceLocked(taskId: string): Promise<TaskWorkspacePreparation> {
     const task = requireTask(this.store, taskId);
     if (!["draft", "active"].includes(task.status)) {
@@ -858,13 +873,19 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       purpose: "execution" | "review";
       workItemId?: string;
       reviewRoundId?: string;
-    }>
+    }>,
+    heldFence?: Readonly<{ current: Task }>
   ): Promise<ManagedWorkspace> {
     const task = requireTask(this.store, taskId);
     // Hold the per-Project maintenance fence across Lane worktree creation
     // (both the reuse and the fresh-mint paths), so a concurrent
-    // migrate/rebuild cannot switch the Project catalog mid-prepare.
-    const { release, current: lockedTask } = this.#acquireTaskProjectMaintenanceLocks(task);
+    // migrate/rebuild cannot switch the Project catalog mid-prepare. A
+    // dispatch preflight that prepares a whole new Group passes the fence it
+    // already holds (one locked boundary across preparation and adoption);
+    // otherwise the fence is acquired here.
+    const { release, current: lockedTask } = heldFence === undefined
+      ? this.#acquireTaskProjectMaintenanceLocks(task)
+      : { release: () => {}, current: heldFence.current };
     try {
       const lineage = executionLaneLineage(this.store, lockedTask, executionGroupId, executionLaneId, hint);
       const source = lineage.purpose === "execution"
@@ -2217,18 +2238,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const home = this.store.getHomeIdentity();
     const refused: string[] = [];
     const archived: string[] = [];
-    // Scan read-only first to discover the Project set. The Project records
-    // (including their catalog path) are re-read under the fence, so a
-    // concurrent migrate cannot leave archive acting on a stale path.
-    const scanned: Array<{ projectId: string; taskId: string; ref: string }> = [];
-    for (const entry of await this.listLegacyTaskRefs(taskId)) {
-      const owner = this.store.getTask(entry.taskId);
-      if (owner !== null && ["draft", "active"].includes(owner.status)) {
-        refused.push(`${entry.projectId}:${entry.ref}`);
-        continue;
-      }
-      scanned.push({ projectId: entry.projectId, taskId: entry.taskId, ref: entry.ref });
-    }
+    // The pre-lock scan discovers ONLY the sorted Project lock set. The pending
+    // set is rebuilt under the fence (below) by re-listing refs and
+    // re-classifying their owners, so a Task that transitions terminal ->
+    // active between the scan and the lock is refused rather than archived.
+    const scanned = await this.listLegacyTaskRefs(taskId);
     const projectIds = [...new Set(scanned.map(({ projectId }) => projectId))].sort();
     // The fence covers preflight and archive alike: a concurrent rebuild
     // must not remove a worktree between its inspection and its ref's
@@ -2237,12 +2251,22 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       ? () => {}
       : acquireProjectMaintenanceLocks(this.home, projectIds);
     try {
-      const pending: LegacyRefArchiveTarget[] = scanned.map(({ projectId, taskId, ref }) => ({
-        project: requireProject(this.store, projectId),
-        taskId,
-        ref,
-        archiveRef: taskArchiveRef(home.homeId, ref)
-      }));
+      const locked = new Set(projectIds);
+      const pending: LegacyRefArchiveTarget[] = [];
+      for (const entry of await this.listLegacyTaskRefs(taskId)) {
+        if (!locked.has(entry.projectId)) continue; // added after the pre-lock scan; not fenced.
+        const owner = this.store.getTask(entry.taskId);
+        if (owner !== null && ["draft", "active"].includes(owner.status)) {
+          refused.push(`${entry.projectId}:${entry.ref}`);
+          continue;
+        }
+        pending.push({
+          project: requireProject(this.store, entry.projectId),
+          taskId: entry.taskId,
+          ref: entry.ref,
+          archiveRef: taskArchiveRef(home.homeId, entry.ref)
+        });
+      }
       for (const target of pending) {
         await this.#assertLegacyRefWorktreeArchivable(target);
       }

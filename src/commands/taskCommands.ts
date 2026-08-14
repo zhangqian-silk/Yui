@@ -331,6 +331,14 @@ export type TaskCommandOptions = Readonly<{
   directTaskMainSnapshot?: DirectTaskMainSnapshot;
   /** Prepared by the repository/workspace lifecycle before command mutation. */
   executionLaneWorkspaces?: ReadonlyMap<string, ManagedWorkspace>;
+  /**
+   * Under-fence Project path snapshot captured when a new Group's Lane
+   * workspaces were prepared. The dispatch aggregate CAS revalidates the Task
+   * binding set and exact Project paths against it, so a project migrate in
+   * the prepare/adopt gap fails closed instead of stranding a Lane on the
+   * external checkout. Undefined when no fence is held (existing Group).
+   */
+  laneDispatchProjectPaths?: ReadonlyMap<string, string>;
   /** Frozen managed workspace heads captured immediately before Lane yield. A
    * null value is an explicit preflight result for a Gitless/read-only Lane. */
   executionLaneGitSnapshot?: ExecutionLaneGitSnapshot | null;
@@ -2501,6 +2509,24 @@ function dispatchWork(
           || prepared.owner.executionGroupId !== runningGroup.id
           || prepared.owner.executionLaneId !== lane.id) {
           throw usageError(`Execution Lane workspace identity does not match dispatch: ${runningGroup.id}/${lane.id}.`);
+        }
+        if (options.laneDispatchProjectPaths !== undefined) {
+          // The prepared workspaces were created under a held maintenance
+          // fence that this transaction still holds. Re-prove the Task
+          // binding set and exact Project paths match the preparation
+          // snapshot: a migrate in the prepare/adopt gap fails closed here
+          // rather than stranding a Lane on the external checkout.
+          const currentIds = task.projectBindings.map(({ projectId }) => projectId).sort();
+          const proofIds = [...options.laneDispatchProjectPaths.keys()].sort();
+          if (currentIds.length !== proofIds.length
+            || currentIds.some((projectId, index) => projectId !== proofIds[index])) {
+            throw new Error(`Task Project bindings changed during Lane dispatch: ${task.id}.`);
+          }
+          for (const [projectId, preparedPath] of options.laneDispatchProjectPaths) {
+            if (requireProject(tx, projectId).path !== preparedPath) {
+              throw new Error(`Project path changed during Lane dispatch: ${projectId}.`);
+            }
+          }
         }
         if (tx.getManagedWorkspace(prepared.owner) === null) tx.saveManagedWorkspace(prepared);
       }

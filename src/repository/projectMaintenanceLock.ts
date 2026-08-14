@@ -67,16 +67,15 @@ export function acquireProjectMaintenanceLock(home: string, projectId: string): 
   while (true) {
     try {
       mkdirSync(lock, { mode: 0o700 });
-      writeFileSync(
-        join(lock, "owner"),
-        `${process.pid}:${processStartIdentity() ?? ""}\n`,
-        { mode: 0o600 }
-      );
+      const ownerIdentity = writeOwnerIdentity(lock);
       let released = false;
       return () => {
         if (released) return;
         released = true;
-        rmSync(lock, { recursive: true, force: true });
+        // Release only the exact acquired instance: a lock that was reclaimed
+        // and replaced by a successor after a crash is never deleted by a
+        // stale release handle.
+        releaseOwnedProjectMaintenanceLock(lock, ownerIdentity);
       };
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
@@ -85,6 +84,29 @@ export function acquireProjectMaintenanceLock(home: string, projectId: string): 
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, PROJECT_MAINTENANCE_LOCK_RETRY_MS);
     }
   }
+}
+
+/** Write this process's owner identity and return the exact bytes recorded. */
+function writeOwnerIdentity(lock: string): string {
+  const identity = `${process.pid}:${processStartIdentity() ?? ""}`;
+  writeFileSync(join(lock, "owner"), `${identity}\n`, { mode: 0o600 });
+  return identity;
+}
+
+/**
+ * Remove the lock directory only when its owner file still records the exact
+ * identity this handle acquired. A replaced (successor) lock is left intact.
+ */
+function releaseOwnedProjectMaintenanceLock(lock: string, ownerIdentity: string): void {
+  let owner: string;
+  try {
+    owner = readFileSync(join(lock, "owner"), "utf8").trim();
+  } catch (error) {
+    if (isEnoent(error)) return; // already gone; nothing to release.
+    throw error;
+  }
+  if (owner !== ownerIdentity) return;
+  rmSync(lock, { recursive: true, force: true });
 }
 
 /**
@@ -126,13 +148,92 @@ export function isProjectMaintenanceFenced(home: string, projectId: string): boo
   return lockOwnerIsAlive(lock);
 }
 
+/**
+ * Reclaim a stale (dead-owner) lock through a crash-safe compare-and-delete
+ * critical section. Two contenders can both observe the same dead owner;
+ * without serialization the second could rmSync the successor lock the first
+ * created after reclaiming, admitting two holders. A reclaim lock (itself
+ * reclaimable) serializes reclaimers, and under it we re-read the owner and
+ * delete only when it is still the exact stale instance observed above.
+ */
 function reclaimStaleProjectMaintenanceLock(lock: string): void {
+  let expectedOwner: string | null;
+  try {
+    expectedOwner = readFileSync(join(lock, "owner"), "utf8");
+  } catch (error) {
+    if (isEnoent(error)) return; // vanished; the caller retries the O_EXCL mkdir.
+    throw error;
+  }
   try {
     if (Date.now() - statSync(lock).mtimeMs < STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS) return;
-    if (lockOwnerIsAlive(lock)) return;
-    rmSync(lock, { recursive: true, force: true });
   } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return;
+    if (isEnoent(error)) return;
+    throw error;
+  }
+  if (expectedOwner !== null && lockOwnerIsAlive(lock)) return;
+
+  const reclaimLock = `${lock}.reclaim`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      mkdirSync(reclaimLock, { mode: 0o700 });
+    } catch (error) {
+      if (!isEexist(error)) throw error;
+      // Another reclaimer holds the critical section. Reclaim its lock only
+      // when orphaned (dead owner and old enough), then retry once; a live
+      // reclaimer will finish and the caller's next O_EXCL mkdir settles it.
+      if (reclaimOrphanedReclaimLock(reclaimLock)) continue;
+      return;
+    }
+    try {
+      writeOwnerIdentity(reclaimLock);
+      // Compare-and-delete under the lock: re-read and remove only the exact
+      // stale instance observed above. A successor that replaced the lock has
+      // different owner bytes (and a fresh mtime) and is never clobbered.
+      let stat;
+      try {
+        stat = statSync(lock);
+      } catch (error) {
+        if (isEnoent(error)) return;
+        throw error;
+      }
+      if (Date.now() - stat.mtimeMs < STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS) return;
+      let currentOwner: string | null;
+      try {
+        currentOwner = readFileSync(join(lock, "owner"), "utf8");
+      } catch (error) {
+        if (isEnoent(error)) return;
+        throw error;
+      }
+      if (currentOwner !== expectedOwner) return;
+      if (currentOwner !== null && lockOwnerIsAlive(lock)) return;
+      rmSync(lock, { recursive: true, force: true });
+    } finally {
+      rmSync(reclaimLock, { recursive: true, force: true });
+    }
+    return;
+  }
+}
+
+/**
+ * Reclaim a reclaim-lock directory only when it is provably orphaned: its
+ * owner pid is dead (or unrecorded) AND it is older than the age bound, so a
+ * lock whose owner just mkdir'ed but has not written its pid is not stolen.
+ * Returns true when it removed the lock (caller retries), false otherwise.
+ */
+function reclaimOrphanedReclaimLock(reclaimLock: string): boolean {
+  try {
+    if (Date.now() - statSync(reclaimLock).mtimeMs < STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS) return false;
+    let pid: number | null;
+    try {
+      pid = Number.parseInt(readFileSync(join(reclaimLock, "owner"), "utf8"), 10);
+    } catch {
+      pid = null; // no/unreadable owner on an old lock: treat as orphaned.
+    }
+    if (pid !== null && Number.isInteger(pid) && processIsAlive(pid)) return false;
+    rmSync(reclaimLock, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    return isEnoent(error);
   }
 }
 
@@ -177,4 +278,12 @@ function processIsAlive(pid: number): boolean {
   } catch (error) {
     return error instanceof Error && "code" in error && error.code === "EPERM";
   }
+}
+
+function isEnoent(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function isEexist(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "EEXIST";
 }

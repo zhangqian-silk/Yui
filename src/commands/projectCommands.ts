@@ -335,7 +335,10 @@ async function migrateProject(
     if (current.remoteUrl === undefined) {
       throw usageError(`Project migrate requires a remote URL: ${project.id}.`);
     }
-    if (current.path !== project.path || current.remoteUrl !== project.remoteUrl) {
+    if (current.path !== project.path
+      || current.remoteUrl !== project.remoteUrl
+      || current.stableBranch !== project.stableBranch
+      || current.developmentBranch !== project.developmentBranch) {
       throw new Error(`Project changed while migrating: ${project.id}.`);
     }
     // Preflight verifies the remote into a throwaway clone: it changes neither
@@ -354,32 +357,36 @@ async function migrateProject(
     }
     let prepared = false;
     try {
+      // Every Git effect is driven from the under-fence snapshot `current`,
+      // never the pre-lock `project`: a branch/remote change between the read
+      // and the lock fails closed above, and the publication CAS below covers
+      // a change between the lock and the switch.
       const head = await git.clone({
-        remoteUrl: project.remoteUrl,
+        remoteUrl: current.remoteUrl,
         destination: verifyRoot,
-        ...(project.stableBranch === "HEAD" ? {} : { branch: project.stableBranch })
+        ...(current.stableBranch === "HEAD" ? {} : { branch: current.stableBranch })
       });
       prepared = true;
-      const stable = project.stableBranch === "HEAD"
+      const stable = current.stableBranch === "HEAD"
         ? head
-        : await git.inspect(verifyRoot, project.stableBranch);
+        : await git.inspect(verifyRoot, current.stableBranch);
       if (head.baseCommit !== stable.baseCommit) {
-        throw new Error(`Project checkout is not on its stable ref: ${project.stableBranch}.`);
+        throw new Error(`Project checkout is not on its stable ref: ${current.stableBranch}.`);
       }
-      if (project.developmentBranch !== project.stableBranch) {
-        await git.ensureLocalBranch(verifyRoot, project.developmentBranch);
+      if (current.developmentBranch !== current.stableBranch) {
+        await git.ensureLocalBranch(verifyRoot, current.developmentBranch);
       }
       await assertRemoteBranchesVerified(
         git,
         verifyRoot,
-        project.remoteUrl,
+        current.remoteUrl,
         [
-          { ref: project.stableBranch, localCommit: head.baseCommit },
-          ...(project.developmentBranch === project.stableBranch
+          { ref: current.stableBranch, localCommit: head.baseCommit },
+          ...(current.developmentBranch === current.stableBranch
             ? []
             : [{
-                ref: project.developmentBranch,
-                localCommit: (await git.inspect(verifyRoot, project.developmentBranch)).baseCommit
+                ref: current.developmentBranch,
+                localCommit: (await git.inspect(verifyRoot, current.developmentBranch)).baseCommit
               }])
         ]
       );
@@ -399,7 +406,9 @@ async function migrateProject(
         const latest = requireProject(tx, project.id);
         if (latest.ownership !== "external"
           || latest.path !== current.path
-          || latest.remoteUrl !== current.remoteUrl) {
+          || latest.remoteUrl !== current.remoteUrl
+          || latest.stableBranch !== current.stableBranch
+          || latest.developmentBranch !== current.developmentBranch) {
           throw new Error(`Project changed while migrating: ${project.id}.`);
         }
         // The switch only changes ownership and path; every other field is
