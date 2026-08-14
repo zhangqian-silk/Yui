@@ -869,6 +869,12 @@ test("rebuild resume completes after the external checkout is deleted", async (t
   });
   assert.equal(existsSync(legacyWorktree), true);
 
+  // The legacy worktree directory is already gone (a prior cleanup pass, or a
+  // manual removal) before the user deletes their external checkout. With no
+  // extant directory to prove, the resume treats the recorded worktree as
+  // missing and completes; an extant directory would fail closed instead.
+  rmSync(legacyWorktree, { recursive: true, force: true });
+
   // The user deletes their external checkout; every worktree loses its common dir.
   rmSync(fixture.project.path, { recursive: true, force: true });
 
@@ -880,9 +886,9 @@ test("rebuild resume completes after the external checkout is deleted", async (t
     { now: () => new Date(NOW) }
   );
   assert.equal(result.data.resumed, true);
-  // The broken legacy worktree directory is removed; the cataloged token
-  // worktree is left for the Leader to reconcile, not reclaimed.
-  assert.equal(existsSync(legacyWorktree), false, "the broken legacy worktree is removed");
+  // The already-absent legacy worktree is treated as missing; the cataloged
+  // token worktree is left for the Leader to reconcile, not reclaimed.
+  assert.equal(existsSync(legacyWorktree), false, "the absent legacy worktree is treated as missing");
   assert.equal(existsSync(currentWorktree), true, "the cataloged token worktree is not reclaimed");
 });
 
@@ -958,6 +964,110 @@ test("task history archive completes after the external checkout is deleted", as
     { now: () => new Date(NOW) }
   );
   assert.deepEqual(result.data.archived, []);
+});
+
+test("rebuild fails closed without deleting an extant worktree when the external checkout is gone", async (t) => {
+  const fixture = await rebuildFixture(t);
+  // Prepare the Task so it owns an identity and a token worktree.
+  const created = runTaskCommand(
+    ["create", "Uncommitted Task", "--project", "project-1"],
+    fixture.store,
+    { now: () => new Date(NOW) }
+  );
+  const task = created.data.task;
+  await fixture.preparer.prepareTaskWorkspace(task.id);
+
+  // A pending legacy worktree with uncommitted user work.
+  const legacyWorktree = join(fixture.workspace, "worktree", "Yui", task.id, "main");
+  const gitWorkspace = new NodeGitWorkspace();
+  await gitWorkspace.ensureWorktree({
+    repositoryPath: fixture.project.path,
+    container: join(fixture.workspace, "worktree", "Yui"),
+    taskSegment: task.id,
+    roleName: "main",
+    baseRef: task.projectBindings[0].baseRef
+  });
+  assert.equal(existsSync(legacyWorktree), true);
+  writeFileSync(join(legacyWorktree, "UNCOMMITTED-USER-WORK.txt"), "user work\n");
+
+  // The user deletes their external checkout; the worktree's common dir is gone.
+  rmSync(fixture.project.path, { recursive: true, force: true });
+
+  // The rebuild resume must fail closed with a manual-cleanup diagnosis, not
+  // recursively delete the extant worktree directory.
+  await assert.rejects(
+    runTaskWorkspaceCommand(["rebuild", task.id], fixture.store, fixture.preparer, {
+      now: () => new Date(NOW)
+    }),
+    /manual cleanup/i
+  );
+
+  // The worktree directory and its uncommitted content are retained.
+  assert.equal(existsSync(legacyWorktree), true, "the extant worktree directory is retained");
+  assert.equal(
+    existsSync(join(legacyWorktree, "UNCOMMITTED-USER-WORK.txt")),
+    true,
+    "the uncommitted user work is retained"
+  );
+});
+
+test("a fresh rebuild reaps an orphan token worktree and branch before minting a new identity", async (t) => {
+  const fixture = await rebuildFixture(t);
+  const created = runTaskCommand(
+    ["create", "Pre-commit Crash Task", "--project", "project-1"],
+    fixture.store,
+    { now: () => new Date(NOW) }
+  );
+  const task = created.data.task;
+  // The Task is unbound: no workspaceIdentity, no catalog record.
+  assert.equal(task.workspaceIdentity, undefined);
+  assert.equal(fixture.store.getTaskWorkspace(task.id), null);
+
+  // A crashed prepare left a token worktree+branch without a catalog record.
+  const orphanToken = "deadbeef";
+  const orphanSegment = `${task.id}-${orphanToken}`;
+  const orphanWorktree = join(fixture.workspace, "worktree", "Yui", orphanSegment, "main");
+  const orphanBranch = `yui/${orphanSegment}/main`;
+  const gitWorkspace = new NodeGitWorkspace();
+  await gitWorkspace.ensureWorktree({
+    repositoryPath: fixture.project.path,
+    container: join(fixture.workspace, "worktree", "Yui"),
+    taskSegment: orphanSegment,
+    roleName: "main",
+    baseRef: task.projectBindings[0].baseRef
+  });
+  assert.equal(existsSync(orphanWorktree), true);
+  assert.equal(git(fixture.project.path, ["rev-parse", orphanBranch]).length, 40);
+
+  // The fresh rebuild reaps the orphan before minting a new identity.
+  const result = await runTaskWorkspaceCommand(
+    ["rebuild", task.id],
+    fixture.store,
+    fixture.preparer,
+    { now: () => new Date(NOW) }
+  );
+  assert.equal(result.data.resumed, false, "the Task was unbound, so the rebuild took the fresh path");
+
+  // The orphan token worktree and branch are reaped.
+  assert.equal(existsSync(orphanWorktree), false, "the orphan token worktree is reaped");
+  assert.throws(
+    () => git(fixture.project.path, ["rev-parse", orphanBranch]),
+    undefined,
+    "the orphan token branch is reaped"
+  );
+
+  // The Task is bound to a fresh identity whose worktree serves it.
+  const rebuilt = fixture.store.getTask(task.id);
+  assert.ok(rebuilt.workspaceIdentity, "the Task is bound to a new identity");
+  assert.notEqual(rebuilt.workspaceIdentity.token, orphanToken, "the new identity is not the orphan token");
+  const newSegment = `${task.id}-${rebuilt.workspaceIdentity.token}`;
+  const newWorktree = join(fixture.workspace, "worktree", "Yui", newSegment, "main");
+  assert.equal(existsSync(newWorktree), true, "the new worktree serves the Task");
+  assert.equal(
+    git(fixture.project.path, ["rev-parse", `yui/${newSegment}/main`]).length,
+    40,
+    "the new branch exists"
+  );
 });
 
 test("the task workspace commands are wired through the CLI", async (t) => {

@@ -973,10 +973,11 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     } catch (error) {
       // A deleted external checkout takes the worktree's common dir with it,
       // so every git op against the worktree fails. When the Project
-      // repository itself is gone, the recorded worktree is an orphaned
-      // directory: remove it outright so the cleanup can complete.
-      if (await removeOrphanedWorktreeDirectory(input)) return "removed";
-      throw error;
+      // repository itself is gone, the worktree's Git identity, HEAD, index,
+      // and dirty state can no longer be proven. An extant directory is
+      // retained and the caller fails closed with a manual-cleanup diagnosis;
+      // only a directory that is also absent is treated as missing.
+      return await recordedWorktreeWithoutRepository(input, error);
     }
     if (inspected === undefined) return "missing";
     if (inspected.state === "dirty") return "dirty";
@@ -1234,29 +1235,37 @@ async function resolveRefCommit(repositoryPath: string, ref: string): Promise<st
 }
 
 /**
- * Remove a recorded worktree whose Project repository is gone. A deleted
- * external checkout takes the worktree's common dir with it, so every git op
- * against the worktree fails; the worktree directory itself is orphaned. When
- * the repository path no longer exists, remove that directory outright so the
- * cleanup can complete. Returns false when the repository is still present,
- * leaving the original error for the caller. The exact recorded identity is
- * re-validated so a mismatched path/branch is never removed.
+ * Classify a recorded worktree whose Project repository can no longer be
+ * inspected. A deleted external checkout takes the worktree's common dir with
+ * it, so the worktree's Git identity, HEAD, index, and dirty/untracked state
+ * cannot be proven. An extant directory is retained and the caller fails
+ * closed with a bounded manual-cleanup diagnosis; only a directory that is
+ * also absent is treated as missing. The exact recorded identity is
+ * re-validated so a mismatched path/branch is never classified.
  */
-async function removeOrphanedWorktreeDirectory(input: Readonly<{
-  repositoryPath: string;
-  container: string;
-  path: string;
-  branch: string;
-  taskSegment: string;
-  roleName: string;
-}>): Promise<boolean> {
-  if (await pathKind(input.repositoryPath) !== undefined) return false;
+async function recordedWorktreeWithoutRepository(
+  input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    path: string;
+    branch: string;
+    taskSegment: string;
+    roleName: string;
+  }>,
+  cause: unknown
+): Promise<GitWorkspaceRemoval> {
+  if (await pathKind(input.repositoryPath) !== undefined) throw cause;
   const identity = worktreeIdentity(input.taskSegment, input.roleName);
   const expectedPath = managedPath(resolve(input.container), identity.directory);
-  if (resolve(input.path) !== expectedPath || input.branch !== identity.branch) return false;
-  if (await pathKind(expectedPath) !== "directory") return false;
-  await rm(expectedPath, { recursive: true, force: true });
-  return true;
+  if (resolve(input.path) !== expectedPath || input.branch !== identity.branch) {
+    throw cause;
+  }
+  if (await pathKind(expectedPath) === undefined) return "missing";
+  throw new Error(
+    `Recorded worktree survives its Project repository and needs manual cleanup: ${expectedPath}. `
+    + `The Project repository is gone, so the worktree's Git state cannot be verified; `
+    + `remove the directory manually once its contents are safe.`
+  );
 }
 
 async function retainCommitRef(

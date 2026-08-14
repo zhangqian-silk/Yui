@@ -30,6 +30,7 @@ import {
   ProjectMaintenanceLockedError,
   projectMaintenanceLockPath
 } from "../../dist/repository/projectMaintenanceLock.js";
+import { NodeGitWorkspace } from "../../dist/repository/gitWorkspace.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
@@ -198,4 +199,115 @@ test("a crashed holder is reclaimed; a live owner keeps the fence", async (t) =>
   } finally {
     liveRelease();
   }
+});
+
+test("prepareTaskWorkspace holds the per-Project maintenance fence while preparing", async (t) => {
+  const { home, projectIds, store } = await fenceFixture(t);
+  const created = runTaskCommand(
+    ["create", "Fenced Prepare Task", "--project", projectIds[0]],
+    store,
+    { now: () => new Date(NOW) }
+  );
+  const task = created.data.task;
+
+  // During ensureWorktree the prepare must hold the file-based fence: a
+  // concurrent singular acquisition (the same entry migrate and the fence
+  // probe use) fails fast with ProjectMaintenanceLockedError. The singular
+  // entry always contends, so this proves the prepare took the lock rather
+  // than relying on the Controller's check-then-call probe.
+  const real = new NodeGitWorkspace();
+  let checked = false;
+  const fencingGit = new Proxy(real, {
+    get(target, property) {
+      if (property === "ensureWorktree" && !checked) {
+        return async (input) => {
+          checked = true;
+          assert.throws(
+            () => acquireProjectMaintenanceLock(home, projectIds[0]),
+            ProjectMaintenanceLockedError
+          );
+          return target.ensureWorktree(input);
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  const fencing = new FileTaskWorkspacePreparer(
+    home,
+    store,
+    fencingGit,
+    () => new Date(NOW)
+  );
+  await fencing.prepareTaskWorkspace(task.id);
+
+  assert.ok(store.getTask(task.id).workspaceIdentity, "the Task is prepared");
+  // The fence is released once the prepare returns.
+  const release = acquireProjectMaintenanceLock(home, projectIds[0]);
+  release();
+});
+
+test("prepare revalidates the Project catalog path and retries after a concurrent migrate", async (t) => {
+  const { home, projectIds, store, workspace } = await fenceFixture(t);
+  // A second repo stands in for the Home-managed repo a migrate switches to.
+  const migratedPath = join(workspace, "Migrated");
+  initRepository(migratedPath);
+  const originalPath = store.getProject(projectIds[0]).path;
+  assert.notEqual(originalPath, migratedPath);
+
+  const created = runTaskCommand(
+    ["create", "Migrate Race Task", "--project", projectIds[0]],
+    store,
+    { now: () => new Date(NOW) }
+  );
+  const task = created.data.task;
+
+  // During the first ensureWorktree a concurrent migrate switches the Project
+  // catalog to the Home-managed repo. The revalidation inside the prepare
+  // transaction catches the changed path and rides the StorageConflictError
+  // retry channel; the retry re-reads the catalog and prepares against the
+  // migrated repo.
+  const real = new NodeGitWorkspace();
+  let migrated = false;
+  const racingGit = new Proxy(real, {
+    get(target, property) {
+      if (property === "ensureWorktree" && !migrated) {
+        return async (input) => {
+          migrated = true;
+          const project = store.getProject(projectIds[0]);
+          store.saveProject({ ...project, path: migratedPath });
+          return target.ensureWorktree(input);
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  const racing = new FileTaskWorkspacePreparer(
+    home,
+    store,
+    racingGit,
+    () => new Date(NOW)
+  );
+  await racing.prepareTaskWorkspace(task.id);
+
+  // The prepare retried against the migrated path and bound the Task.
+  const prepared = store.getTask(task.id);
+  assert.ok(prepared.workspaceIdentity, "the Task is bound after the retry");
+  const segment = `${task.id}-${prepared.workspaceIdentity.token}`;
+  const branch = `yui/${segment}/main`;
+
+  // The new worktree's branch lives in the migrated repo, not the original.
+  assert.equal(
+    git(migratedPath, ["rev-parse", branch]).length,
+    40,
+    "the branch exists in the migrated repo"
+  );
+  assert.throws(
+    () => git(originalPath, ["rev-parse", branch]),
+    undefined,
+    "the original repo has no prepare branch (the failed attempt was cleaned up)"
+  );
 });

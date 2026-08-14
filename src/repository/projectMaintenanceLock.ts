@@ -49,10 +49,39 @@ export function projectMaintenanceLockPath(home: string, projectId: string): str
 }
 
 /**
+ * In-process reentrancy depth for each lock path. The file-based fence
+ * coordinates separate processes (Controller vs CLI); within one process a
+ * nested preparation (e.g. a CAS competitor injected at a test seam, or an
+ * internal prepare-then-isolate sequence) must not deadlock against the
+ * outer holder. The depth is tracked per lock path so the file fence is only
+ * torn down once every in-process acquisition released. Reentrancy is only
+ * honoured by {@link acquireProjectMaintenanceLocks} (the batch entry used by
+ * the preparer); the singular {@link acquireProjectMaintenanceLock} always
+ * contends, so a direct second acquisition (migrate, a fence probe) still
+ * fails fast.
+ */
+const inProcessDepth = new Map<string, number>();
+
+function noteInProcessAcquisition(lock: string): void {
+  inProcessDepth.set(lock, (inProcessDepth.get(lock) ?? 0) + 1);
+}
+
+function releaseInProcess(lock: string): void {
+  const current = inProcessDepth.get(lock) ?? 1;
+  if (current <= 1) {
+    inProcessDepth.delete(lock);
+  } else {
+    inProcessDepth.set(lock, current - 1);
+  }
+}
+
+/**
  * Acquire one Project's maintenance fence. Returns the release function;
  * callers MUST release on every exit path (try/finally). A live holder
  * fails fast with {@link ProjectMaintenanceLockedError}; a stale (dead)
- * holder is reclaimed.
+ * holder is reclaimed. This singular entry always contends: it does not
+ * honour in-process reentrancy, so a direct second acquisition (migrate, a
+ * fence probe) still fails fast.
  */
 export function acquireProjectMaintenanceLock(home: string, projectId: string): () => void {
   const lock = projectMaintenanceLockPath(home, projectId);
@@ -66,10 +95,12 @@ export function acquireProjectMaintenanceLock(home: string, projectId: string): 
         `${process.pid}:${processStartIdentity() ?? ""}\n`,
         { mode: 0o600 }
       );
+      noteInProcessAcquisition(lock);
       let released = false;
       return () => {
         if (released) return;
         released = true;
+        releaseInProcess(lock);
         rmSync(lock, { recursive: true, force: true });
       };
     } catch (error) {
@@ -84,7 +115,10 @@ export function acquireProjectMaintenanceLock(home: string, projectId: string): 
 /**
  * Acquire the maintenance fence for several Projects in a stable (sorted)
  * order, so multi-Project maintenance can never deadlock against itself.
- * A failure releases every fence already taken.
+ * A failure releases every fence already taken. A lock this process already
+ * holds (a nested prepare/rebuild injected at a seam) is re-entered without
+ * contending against itself; the file fence is only torn down once the
+ * outermost acquisition releases.
  */
 export function acquireProjectMaintenanceLocks(
   home: string,
@@ -93,7 +127,14 @@ export function acquireProjectMaintenanceLocks(
   const releases: Array<() => void> = [];
   try {
     for (const projectId of [...new Set(projectIds)].sort()) {
-      releases.push(acquireProjectMaintenanceLock(home, projectId));
+      const lock = projectMaintenanceLockPath(home, projectId);
+      const depth = inProcessDepth.get(lock) ?? 0;
+      if (depth > 0) {
+        inProcessDepth.set(lock, depth + 1);
+        releases.push(() => releaseInProcess(lock));
+      } else {
+        releases.push(acquireProjectMaintenanceLock(home, projectId));
+      }
     }
   } catch (error) {
     for (const release of releases.reverse()) release();

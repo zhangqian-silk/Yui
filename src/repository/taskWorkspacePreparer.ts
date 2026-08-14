@@ -175,25 +175,41 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   ) {}
 
   async prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation> {
-    // A lost prepare/rebuild identity race (or a storage revision conflict)
-    // surfaces as StorageConflictError: the attempt's refs were already
-    // discarded, so re-prepare against the committed state. The bound keeps
-    // a crash-looping competitor from pinning this caller; the last conflict
-    // surfaces once it is exhausted.
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        return await this.#prepareTaskWorkspaceOnce(taskId);
-      } catch (error) {
-        if (error instanceof StorageConflictError
-          && attempt < TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
-          continue;
+    // The per-Project maintenance fence makes prepare mutually exclusive with
+    // migrate/rebuild/archive: a concurrent migration must not switch the
+    // Project catalog to the Home-managed repo while prepare is creating
+    // worktrees from the old external checkout. The fence is held for the
+    // whole prepare (including its conflict retries). Gitless Tasks hold no
+    // fence. The Controller's check-then-call probe is kept for scheduling
+    // deferral; the fence here makes the prepare itself safe regardless.
+    const task = requireTask(this.store, taskId);
+    const projectIds = task.projectBindings.map(({ projectId }) => projectId);
+    const release = projectIds.length === 0
+      ? () => {}
+      : acquireProjectMaintenanceLocks(this.home, projectIds);
+    try {
+      // A lost prepare/rebuild identity race (or a storage revision conflict)
+      // surfaces as StorageConflictError: the attempt's refs were already
+      // discarded, so re-prepare against the committed state. The bound keeps
+      // a crash-looping competitor from pinning this caller; the last conflict
+      // surfaces once it is exhausted.
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await this.#prepareTaskWorkspaceLocked(taskId);
+        } catch (error) {
+          if (error instanceof StorageConflictError
+            && attempt < TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
+            continue;
+          }
+          throw error;
         }
-        throw error;
       }
+    } finally {
+      release();
     }
   }
 
-  async #prepareTaskWorkspaceOnce(taskId: string): Promise<TaskWorkspacePreparation> {
+  async #prepareTaskWorkspaceLocked(taskId: string): Promise<TaskWorkspacePreparation> {
     const task = requireTask(this.store, taskId);
     if (!["draft", "active"].includes(task.status)) {
       throw new Error(`Task is not open for workspace preparation: ${task.id}.`);
@@ -361,6 +377,19 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         }
         if (!isDeepStrictEqual(latest.projectBindings, task.projectBindings)) {
           throw new Error(`Task Projects changed while preparing its workspace: ${task.id}.`);
+        }
+        // Revalidate the Project catalog path after acquiring the fence: a
+        // concurrent migration must not leave a persisted worktree whose Git
+        // common dir is the old external checkout. A changed path rides the
+        // StorageConflictError retry channel so the retry re-reads the catalog
+        // and prepares against the current (Home-managed) repository.
+        for (const { project } of prepared) {
+          const latestProject = requireProject(tx, project.id);
+          if (latestProject.path !== project.path) {
+            throw new StorageConflictError(
+              `Project path changed while preparing its workspace: ${project.id}.`
+            );
+          }
         }
         const current = tx.getTaskWorkspace(task.id);
         if (current !== null && current.owner.type !== "task") {
@@ -1930,6 +1959,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       && await this.#inspectLegacyTaskEntries(task, existing.entries) === "dirty") {
       throw new Error(`Task workspace is dirty and blocks the rebuild: ${task.id}.`);
     }
+
+    // Reclaim token worktrees/branches a crashed prepare or rebuild left
+    // behind without a catalog record, before minting a new identity. A hard
+    // crash after `ensureWorktree` but before the Task/catalog transaction
+    // leaves the Task unbound; without this reaping the fresh path would
+    // report success and leave the orphaned token worktree/branch behind.
+    await this.#reclaimOrphanedTaskWorktrees(task);
 
     // Resolve verified remote SHAs before any Git side effect, mirroring the
     // first-prepare pinning: a remote default Project is fetched and its
