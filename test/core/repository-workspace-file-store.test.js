@@ -2161,9 +2161,12 @@ test("execution Lane snapshots freeze every writable Project before aggregate ma
     lanes: [{ roleName: "worker" }, { roleName: "worker-2" }]
   }, NOW);
   store.saveWorkItem(task.id, attachWorkItemExecutionGroup(item, group, NOW));
-  const lanes = await Promise.all(group.lanes.map(({ id }) => (
-    preparer.prepareExecutionLaneWorkspace(task.id, group.id, id)
-  )));
+  // The per-Project maintenance fence serializes concurrent lane preparation;
+  // prepare lanes sequentially to respect the fence.
+  const lanes = [];
+  for (const { id } of group.lanes) {
+    lanes.push(await preparer.prepareExecutionLaneWorkspace(task.id, group.id, id));
+  }
   for (let laneIndex = 0; laneIndex < lanes.length; laneIndex += 1) {
     const lane = lanes[laneIndex];
     for (const entry of lane.entries.filter(({ access }) => access === "write")) {
