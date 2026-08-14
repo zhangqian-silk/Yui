@@ -14,7 +14,10 @@ import test from "node:test";
 import { runTaskIntegrationQueueCommand } from "../../dist/commands/taskIntegrationQueueCommands.js";
 import { createChangeSetManifest } from "../../dist/integration/changeSetManifest.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
-import { updateIntegrationAttempt } from "../../dist/integration/integrationAttempt.js";
+import {
+  createIntegrationAttempt,
+  updateIntegrationAttempt
+} from "../../dist/integration/integrationAttempt.js";
 import {
   createConvergedIntegrationQueueEntry,
   createIntegrationQueueEntry,
@@ -25,6 +28,7 @@ import {
   markIntegrationQueueSuperseded,
   markIntegrationQueueValidated,
   recordIntegrationQueueAffectedPaths,
+  recordIntegrationQueueAttempt,
   validateIntegrationQueueEntry
 } from "../../dist/integration/integrationQueueEntry.js";
 import {
@@ -652,6 +656,77 @@ test("an out-of-band target advance invalidates reusable evidence and re-runs th
   assert.equal(second[0].attempt.checks[0].outcome, "failed");
   // The failed change never reached the target.
   assert.equal(existsSync(join(fixture.repositoryPath, "app.js")), false);
+});
+
+test("a running entry whose attempt committed before the settle converges on restart", async () => {
+  const fixture = await createFixture();
+  const first = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  // A second, unaffected entry with reusable evidence: its evidence-only
+  // commit after the restart proves the reconciled commit replayed the same
+  // downstream affected/evidence updates as a normal settle.
+  const second = await branchChangeSet(fixture, {
+    id: "change-set-2",
+    paths: { "b.txt": "b\n" },
+    manifest: EVIDENCE
+  });
+  const queued = await enqueue(fixture, first, { checkCommands: ["true"] });
+  await enqueue(fixture, second, { checkCommands: ["true"] });
+
+  // Simulate the crash window: the entry is claimed and running, its attempt
+  // commits and advances the target, but the process dies before the settle
+  // transaction writes the entry back.
+  const attempt = createIntegrationAttempt({
+    id: fixture.store.nextIntegrationAttemptId(fixture.task.id),
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    targetRef: "master",
+    expectedHead: fixture.baseCommit,
+    changeSetIds: [first.id],
+    checkCommands: ["true"]
+  }, now);
+  fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+  fixture.store.saveIntegrationQueueEntry(
+    fixture.task.id,
+    recordIntegrationQueueAttempt(
+      markIntegrationQueueRunning(queued.entry, fixture.baseCommit, now),
+      attempt.id,
+      now
+    )
+  );
+  git(["-C", fixture.repositoryPath, "merge", "--ff-only", first.branch]);
+  const validating = updateIntegrationAttempt(attempt, {
+    status: "validating",
+    candidateCommit: first.headCommit,
+    checks: [{ name: "true", outcome: "passed" }]
+  }, now);
+  fixture.store.saveIntegrationAttempt(fixture.task.id, validating);
+  fixture.store.saveIntegrationAttempt(
+    fixture.task.id,
+    updateIntegrationAttempt(validating, { status: "committed" }, now)
+  );
+
+  // Restart: the next process pass must converge the stuck entry instead of
+  // leaving it running forever.
+  const processed = await processQueue(fixture);
+
+  const reconciled = fixture.store.getIntegrationQueueEntry(
+    fixture.task.id,
+    queued.entry.id
+  );
+  assert.equal(reconciled.status, "committed");
+  assert.equal(reconciled.targetAfter, first.headCommit);
+  assert.ok(reconciled.endedAt !== undefined);
+  // The reconciled commit replayed the downstream updates: the unaffected
+  // second entry was validated by evidence and committed without re-running
+  // its checks.
+  assert.equal(processed.length, 1);
+  assert.equal(processed[0].entry.id, "integration-queue-2");
+  assert.equal(processed[0].entry.status, "committed");
+  assert.deepEqual(processed[0].attempt.checkCommands, []);
+  assert.deepEqual(processed[0].attempt.checks, []);
 });
 
 test("concurrent enqueues of the same ChangeSet create a single entry across store instances", async () => {

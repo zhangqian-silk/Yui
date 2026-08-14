@@ -404,19 +404,31 @@ export function supersedeIntegrationQueueEntry(
   return superseded;
 }
 
+/**
+ * Converge entries whose linked IntegrationAttempt already committed.  A
+ * conflicted entry whose manual resolve committed, or a `running` entry
+ * whose process crashed between the commit and the queue settle, both prove
+ * their work landed through the Attempt itself; converge them idempotently
+ * and replay the downstream affected/evidence updates a normal settle would
+ * have performed, so the next process pass sees a consistent queue.
+ */
 function reconcileCommittedEntries(
   store: TaskStore,
   taskId: string,
   now: () => Date
 ): void {
   for (const entry of store.listIntegrationQueueEntries(taskId)) {
-    if (entry.status !== "conflicted" || entry.integrationAttemptId === undefined) continue;
+    if ((entry.status !== "conflicted" && entry.status !== "running")
+      || entry.integrationAttemptId === undefined) continue;
     const attempt = store.getIntegrationAttempt(taskId, entry.integrationAttemptId);
     if (attempt?.status !== "committed") continue;
-    store.saveIntegrationQueueEntry(
-      taskId,
-      markIntegrationQueueCommitted(entry, committedTargetAfter(attempt), now())
+    const committed = markIntegrationQueueCommitted(
+      entry,
+      committedTargetAfter(attempt),
+      now()
     );
+    store.saveIntegrationQueueEntry(taskId, committed);
+    recomputeAffectedPaths(store, taskId, committed, now);
   }
 }
 
