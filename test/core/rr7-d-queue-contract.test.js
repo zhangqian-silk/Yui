@@ -27,6 +27,7 @@ import {
   requeueIntegrationQueueEntry
 } from "../../dist/integration/integrationQueueService.js";
 import { createProject } from "../../dist/repository/project.js";
+import { NodeGitWorkspace } from "../../dist/repository/gitWorkspace.js";
 import { createReviewRound, finishReviewRound } from "../../dist/review/reviewRound.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
@@ -340,6 +341,31 @@ test("a running lane blocks an equivalent full-ref target spelling", async () =>
   );
 });
 
+test("a short branch target cannot converge against an ambiguous same-named tag", async () => {
+  const fixture = createFixture("target-ref-tag-ambiguity");
+  const candidate = createCandidateWorkspace(fixture, "tagged-candidate", {
+    "candidate.txt": "candidate\n"
+  });
+  const changeSet = await captureCandidate(fixture, candidate);
+  // Git permits a branch and tag to share a name. A short target names the
+  // branch throughout Integration, while generic rev-parse resolves the tag
+  // first. Pointing the tag at the ChangeSet must not create a false
+  // convergence proof for the still-unchanged branch.
+  git(["-C", fixture.repositoryPath, "tag", "master", changeSet.headCommit]);
+
+  const enqueued = await enqueue(fixture, changeSet);
+
+  assert.equal(
+    enqueued.outcome,
+    "queued",
+    "the queue must inspect refs/heads/master, not a same-named tag"
+  );
+  assert.equal(
+    git(["-C", fixture.repositoryPath, "rev-parse", "refs/heads/master"]).trim(),
+    fixture.baseCommit
+  );
+});
+
 // --- Finding 7: exact-SHA evidence -> validated -> skip checks --------------
 
 test("durable exact-SHA evidence validates an unchanged-target entry and a target advance re-runs its checks", async () => {
@@ -505,6 +531,30 @@ test("enqueue refuses a ChangeSet captured from a superseded Candidate", async (
   );
 });
 
+test("enqueue refuses a rejected ChangeSet while its WorkItem retry has no current Candidate", async () => {
+  const fixture = createFixture("candidate-retry-window");
+  const rejectedCandidate = createCandidateWorkspace(fixture, "rejected-candidate", {
+    "candidate.txt": "rejected\n"
+  });
+  const rejectedChangeSet = await captureCandidate(fixture, rejectedCandidate);
+  const failed = updateWorkItemStatus(
+    rejectedCandidate.workItem,
+    "failed",
+    now,
+    "candidate rejected"
+  );
+  fixture.store.saveWorkItem(fixture.task.id, failed);
+  const retrying = retryFailedWorkItem(failed, now);
+  fixture.store.saveWorkItem(fixture.task.id, retrying);
+  assert.equal(retrying.status, "running");
+
+  await assert.rejects(
+    enqueue(fixture, rejectedChangeSet, ["true"]),
+    /current Candidate|superseded Candidate/,
+    "a historical Candidate must not become current merely because the worktree HEAD has not moved yet"
+  );
+});
+
 test("review evidence cannot waive a different queue gate", async () => {
   const fixture = createFixture("evidence-command-scope");
   const candidate = createCandidateWorkspace(fixture, "reviewed-command", {
@@ -631,6 +681,77 @@ test("recovery replay ignores every historical ancestor of a later entry base", 
     processed.attempt.checkCommands,
     [],
     "every commit already contained in the entry base must stay outside the replay window"
+  );
+});
+
+test("ancestry recompute cannot overwrite a concurrently recorded conflict", async () => {
+  const fixture = createFixture("recompute-conflict-race");
+  const firstCandidate = createCandidateWorkspace(fixture, "race-first", {
+    "shared.txt": "first\n"
+  });
+  const secondCandidate = createCandidateWorkspace(fixture, "race-second", {
+    "shared.txt": "second\n"
+  });
+  const first = await captureCandidate(fixture, firstCandidate);
+  const second = await captureCandidate(fixture, secondCandidate);
+  await enqueue(fixture, first, ["true"]);
+  await enqueue(fixture, second, ["true"]);
+
+  let notifyPaused;
+  const paused = new Promise((resolve) => { notifyPaused = resolve; });
+  let releaseRecompute;
+  const released = new Promise((resolve) => { releaseRecompute = resolve; });
+  class PausingAncestryGit extends NodeGitWorkspace {
+    paused = false;
+
+    async isAncestor(repositoryPath, ancestor, descendant) {
+      const result = await super.isAncestor(repositoryPath, ancestor, descendant);
+      if (!this.paused) {
+        this.paused = true;
+        notifyPaused();
+        await released;
+      }
+      return result;
+    }
+  }
+
+  // Processor A commits the first entry, then pauses after reading the second
+  // as queued but before persisting its overlap recompute.
+  const firstProcessor = processQueue(fixture, {
+    git: new PausingAncestryGit(),
+    limit: 1
+  });
+  await paused;
+
+  let concurrent;
+  try {
+    // Processor B observes the committed first entry, claims the second, and
+    // records its real Git conflict while A still holds a stale queued value.
+    concurrent = await processIntegrationQueue(
+      new FileTaskStore(fixture.home),
+      fixture.home,
+      fixture.task.id,
+      { limit: 1, now: () => now }
+    );
+    assert.equal(concurrent[0].entry.status, "conflicted");
+  } finally {
+    releaseRecompute();
+  }
+  await firstProcessor;
+
+  const finalEntry = fixture.store.getIntegrationQueueEntry(
+    fixture.task.id,
+    "integration-queue-2"
+  );
+  assert.equal(
+    finalEntry.status,
+    "conflicted",
+    "a stale affected-path write must not silently requeue a conflicted entry"
+  );
+  assert.equal(finalEntry.integrationAttemptId, concurrent[0].attempt.id);
+  assert.equal(
+    fixture.store.getIntegrationAttempt(fixture.task.id, concurrent[0].attempt.id).status,
+    "blocked"
   );
 });
 

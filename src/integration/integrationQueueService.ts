@@ -28,6 +28,7 @@ import {
   type IntegrationResult
 } from "./gitIntegrationService.js";
 import type { ChangeSet } from "./changeSet.js";
+import type { WorkItemCandidate } from "../workItem/workItem.js";
 
 /**
  * The serialized integration queue.  Every item gets a fresh apply on the
@@ -121,11 +122,11 @@ function assertEnqueueableProducer(
 
 /**
  * A ChangeSet captured from a since-superseded Candidate must not enter the
- * queue.  When the producer WorkItem still owns a managed workspace, its
- * checked-out HEAD is the current Candidate's commit; a ChangeSet whose
- * headCommit no longer matches was captured from an earlier Candidate.
- * A missing workspace (cleaned up after acceptance) cannot be verified and
- * does not block enqueue.
+ * queue.  The fence binds to the latest immutable Candidate snapshot: a
+ * running WorkItem has no current Candidate, and a ChangeSet whose headCommit
+ * no longer matches the latest Candidate (or the workspace HEAD when the
+ * Candidate carries no head snapshot) was captured from an earlier Candidate.
+ * When the workspace exists but cannot be inspected, fail closed.
  */
 async function assertCurrentCandidateHead(
   store: TaskStore,
@@ -133,6 +134,34 @@ async function assertCurrentCandidateHead(
   changeSet: ChangeSet,
   git: IntegrationQueueGitPort
 ): Promise<void> {
+  const workItem = store.getWorkItem(taskId, changeSet.workItemId);
+  if (workItem === null) {
+    throw new Error(`ChangeSet producer WorkItem not found: ${changeSet.workItemId}.`);
+  }
+  // A running WorkItem has no current Candidate: a new one is expected.
+  if (workItem.status === "running") {
+    throw new Error(
+      `ChangeSet ${changeSet.id} has no current Candidate: `
+      + `WorkItem ${workItem.id} is running.`
+    );
+  }
+  const latestCandidate = workItem.candidates.at(-1);
+  if (latestCandidate !== undefined) {
+    // Prefer the immutable Candidate head-commit snapshot when available.
+    const snapshotHead = candidateHeadCommit(latestCandidate, changeSet.projectId);
+    if (snapshotHead !== undefined) {
+      if (snapshotHead !== changeSet.headCommit) {
+        throw new Error(
+          `ChangeSet ${changeSet.id} was captured from a superseded Candidate: `
+          + `current Candidate head is ${snapshotHead}, ChangeSet head is ${changeSet.headCommit}.`
+        );
+      }
+      return;
+    }
+  }
+  // Fall back to the managed workspace HEAD when the Candidate carries no
+  // head-commit snapshot.  Fail closed: a workspace that exists but cannot
+  // be inspected blocks enqueue.
   const workspace = store.getManagedWorkspace({
     type: "work-item",
     taskId,
@@ -145,9 +174,10 @@ async function assertCurrentCandidateHead(
   try {
     currentHead = (await git.inspect(entry.path)).baseCommit;
   } catch {
-    // The worktree is gone (cleaned up or removed); the fence cannot be
-    // evaluated and must not block a legitimate ChangeSet.
-    return;
+    throw new Error(
+      `ChangeSet ${changeSet.id} cannot be verified: `
+      + `workspace ${entry.path} exists but cannot be inspected.`
+    );
   }
   if (currentHead !== changeSet.headCommit) {
     throw new Error(
@@ -155,6 +185,19 @@ async function assertCurrentCandidateHead(
       + `workspace HEAD is ${currentHead}, ChangeSet head is ${changeSet.headCommit}.`
     );
   }
+}
+
+function candidateHeadCommit(
+  candidate: WorkItemCandidate,
+  projectId: string
+): string | undefined {
+  const gitSnapshotHead = candidate.gitSnapshot?.projects
+    .find((p) => p.projectId === projectId)?.commit;
+  if (gitSnapshotHead !== undefined) return gitSnapshotHead;
+  const taskMainHead = candidate.taskMainSnapshot?.projects
+    .find((p) => p.projectId === projectId)?.headCommit;
+  if (taskMainHead !== undefined) return taskMainHead;
+  return undefined;
 }
 
 /**
@@ -181,6 +224,14 @@ export async function enqueueIntegrationQueueEntry(
   if (!task.projectBindings.some(({ projectId }) => projectId === input.projectId)) {
     throw new Error(`Project does not belong to Task: ${input.projectId}.`);
   }
+  // Producer fence: only a ChangeSet whose WorkItem reached a deliverable may
+  // enter the queue.  Re-checked inside the write transaction.
+  assertEnqueueableProducer(input.store, task.id, changeSet);
+  // Current-Candidate fence: a ChangeSet captured from a since-superseded
+  // Candidate must not enter the queue.  Runs before the duplicate fast path
+  // so a retry-window WorkItem cannot resurrect a stale ChangeSet that was
+  // enqueued before its Candidate was superseded.
+  await assertCurrentCandidateHead(input.store, task.id, changeSet, git);
   // Fast path: a duplicate already visible returns without any git inspection.
   // The authoritative re-check happens inside the write transaction so two
   // concurrent enqueues cannot both create entries for the same ChangeSet.
@@ -193,15 +244,6 @@ export async function enqueueIntegrationQueueEntry(
       outcome: existing.status === "committed" ? "already-committed" : "already-queued"
     };
   }
-  // Producer fence: only a ChangeSet whose WorkItem reached a deliverable may
-  // enter the queue.  Re-checked inside the write transaction.
-  assertEnqueueableProducer(input.store, task.id, changeSet);
-  // Current-Candidate fence: a ChangeSet captured from a since-superseded
-  // Candidate must not enter the queue.  When the producer WorkItem still
-  // owns a managed workspace, its checked-out HEAD is the current Candidate's
-  // commit; a ChangeSet whose headCommit no longer matches was captured from
-  // an earlier Candidate and is stale.
-  await assertCurrentCandidateHead(input.store, task.id, changeSet, git);
   const project = input.store.getProject(input.projectId);
   if (project === null) throw new Error(`Project not found: ${input.projectId}.`);
   const targetRef = input.targetRef
@@ -211,7 +253,7 @@ export async function enqueueIntegrationQueueEntry(
     throw new Error(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
   const canonicalTargetRef = canonicalizeTargetRef(targetRef);
-  const targetHead = (await git.inspect(project.path, targetRef)).baseCommit;
+  const targetHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
   let equivalent = await findEquivalentCommit(
     git,
     project.path,
@@ -427,7 +469,7 @@ export async function processIntegrationQueue(
     if (candidate === undefined) break;
     const project = store.getProject(candidate.projectId);
     if (project === null) throw new Error(`Project not found: ${candidate.projectId}.`);
-    const targetBefore = (await git.inspect(project.path, candidate.targetRef)).baseCommit;
+    const targetBefore = (await git.inspect(project.path, exactBranchRef(candidate.targetRef))).baseCommit;
     // Evidence fence: a validated entry's reusable evidence only covers the
     // exact target head it was validated against.  An out-of-band target
     // advance (another Task) that touches the entry's paths, or whose impact
@@ -519,6 +561,16 @@ export async function processIntegrationQueue(
  */
 function canonicalizeTargetRef(ref: string): string {
   return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+}
+
+/**
+ * Resolve a canonical target ref to its exact Git ref for inspection.  A
+ * short name or `refs/heads/*` resolves to the exact branch ref, so a
+ * same-named tag cannot shadow the branch.  Other fully-qualified refs
+ * keep their exact meaning.
+ */
+function exactBranchRef(canonicalRef: string): string {
+  return canonicalRef.startsWith("refs/") ? canonicalRef : `refs/heads/${canonicalRef}`;
 }
 
 function queueLaneKey(entry: IntegrationQueueEntry): string {
@@ -797,22 +849,29 @@ async function recomputeAffectedPaths(
     if (committed.targetAfter !== undefined
       && await git.isAncestor(projectPath, committed.targetAfter, changeSet.baseCommit)) continue;
     const affected = changeSet.changedPaths.filter((path) => landed.has(path));
-    const beforeAffected = (entry.affectedPaths ?? []).length;
-    let updated = recordIntegrationQueueAffectedPaths(entry, affected, now());
-    if (updated.status === "validated" && (updated.affectedPaths?.length ?? 0) > 0) {
-      // The target advanced onto this entry's own paths: its evidence no
-      // longer covers the target, so the gate must run again.
-      updated = markIntegrationQueueRequeued(updated, now());
-    }
-    // A queued entry keeps its place and runs its checks against the exact
-    // current target at process time.  Disjoint changedPaths must never
-    // rebind its evidence to the new target head: a gate may read any file,
-    // so a non-empty target increment cannot be proven irrelevant from path
-    // metadata alone.
-    if (updated.status !== entry.status
-      || (updated.affectedPaths?.length ?? 0) !== beforeAffected) {
-      store.saveIntegrationQueueEntry(taskId, updated);
-    }
+    // Re-read inside the transaction: a concurrent processor may have claimed
+    // or conflicted this entry during the async isAncestor gap above.  Only
+    // persist the recompute when the entry is still waiting to be processed.
+    store.transaction((tx) => {
+      const current = tx.getIntegrationQueueEntry(taskId, entry.id);
+      if (current === null) return;
+      if (current.status !== "queued" && current.status !== "validated") return;
+      let updated = recordIntegrationQueueAffectedPaths(current, affected, now());
+      if (updated.status === "validated" && (updated.affectedPaths?.length ?? 0) > 0) {
+        // The target advanced onto this entry's own paths: its evidence no
+        // longer covers the target, so the gate must run again.
+        updated = markIntegrationQueueRequeued(updated, now());
+      }
+      // A queued entry keeps its place and runs its checks against the exact
+      // current target at process time.  Disjoint changedPaths must never
+      // rebind its evidence to the new target head: a gate may read any file,
+      // so a non-empty target increment cannot be proven irrelevant from path
+      // metadata alone.
+      if (updated.status !== current.status
+        || (updated.affectedPaths ?? []).join("\n") !== (current.affectedPaths ?? []).join("\n")) {
+        tx.saveIntegrationQueueEntry(taskId, updated);
+      }
+    });
   }
 }
 
