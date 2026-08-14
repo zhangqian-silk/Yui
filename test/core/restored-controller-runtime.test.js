@@ -673,6 +673,248 @@ test("a scheduler exception after Task claim retains the exact processing owner"
   assert.equal(mailbox.processing?.owner, "controller");
 });
 
+test("a failed Task reconciliation does not hold another progressed Task mailbox", async () => {
+  const now = new Date();
+  const timestamp = now.toISOString();
+  const taskA = gitlessTask("task-a");
+  const taskB = gitlessTask("task-b");
+  const workerA = role(taskA.id, "worker");
+  const leaderB = role(taskB.id, "leader");
+  const runA = {
+    ...deliveredRun(taskA.id, workerA.name),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    pushedAt: timestamp,
+    deliveredAt: timestamp
+  };
+  const batch = (taskId) => ({
+    fromSequence: 1,
+    toSequence: 1,
+    reasons: ["task-updated"],
+    refs: [{ type: "task", id: taskId }],
+    requestCount: 1,
+    firstQueuedAt: timestamp,
+    lastQueuedAt: timestamp
+  });
+  const mailboxes = new Map([taskA, taskB].map((task) => {
+    const target = { kind: "task", taskId: task.id };
+    return [task.id, {
+      schemaVersion: 1,
+      target,
+      nextSequence: 2,
+      processing: null,
+      pending: batch(task.id)
+    }];
+  }));
+  const claimAttempts = new Map([taskA.id, taskB.id].map((taskId) => [taskId, []]));
+  const claimWrites = new Map([taskA.id, taskB.id].map((taskId) => [taskId, 0]));
+  const releaseWrites = new Map([taskA.id, taskB.id].map((taskId) => [taskId, 0]));
+  const completionWrites = new Map([taskA.id, taskB.id].map((taskId) => [taskId, 0]));
+  const durableOperations = new Map([taskA.id, taskB.id].map((taskId) => [taskId, []]));
+  let pendingWakeup = {
+    schemaVersion: 1,
+    taskId: taskB.id,
+    reasons: ["task-created"],
+    requestCount: 1,
+    firstRequestedAt: timestamp,
+    lastRequestedAt: timestamp
+  };
+  const activeRuns = new Map([[`${taskA.id}/${workerA.name}`, runA]]);
+  let leaderDispatches = 0;
+  let leaderDeliveries = 0;
+  let livenessAttempts = 0;
+  const inventoryInputs = [];
+  const sentinelCause = new Error("inventory subprocess failed");
+  const sentinel = new Error("sentinel global reconciliation failure", {
+    cause: sentinelCause
+  });
+  sentinel.name = "SentinelReconciliationError";
+
+  const store = emptyStore();
+  store.listTasks = () => [taskA, taskB];
+  store.getTask = (taskId) => (
+    taskId === taskA.id ? taskA : taskId === taskB.id ? taskB : null
+  );
+  store.getTaskWorkspace = (taskId) => taskOwnedWorkspace(store.getTask(taskId));
+  store.listRoles = (taskId) => (
+    taskId === taskA.id ? [workerA] : taskId === taskB.id ? [leaderB] : []
+  );
+  store.getRole = (taskId, roleName) => store.listRoles(taskId).find(
+    (candidate) => candidate.name === roleName
+  ) ?? null;
+  store.getActiveAgentRun = (taskId, roleName) => (
+    activeRuns.get(`${taskId}/${roleName}`) ?? null
+  );
+  store.getRoleSession = () => null;
+  store.listWorkMailboxes = () => [...mailboxes.values()];
+  store.getWorkMailbox = (target) => (
+    target.kind === "task" ? mailboxes.get(target.taskId) ?? null : null
+  );
+  store.claimWorkMailbox = ({ target, batchId, owner, now: claimedAt }) => {
+    if (target.kind !== "task") return { status: "empty" };
+    const attempts = claimAttempts.get(target.taskId);
+    attempts.push(batchId);
+    let mailbox = mailboxes.get(target.taskId);
+    if (mailbox.processing !== null) {
+      return { status: "processing", processing: mailbox.processing };
+    }
+    assert.notEqual(mailbox.pending, null);
+    claimWrites.set(target.taskId, claimWrites.get(target.taskId) + 1);
+    durableOperations.get(target.taskId).push(`claim:${batchId}`);
+    mailbox = {
+      ...mailbox,
+      pending: null,
+      processing: {
+        batchId,
+        batch: mailbox.pending,
+        owner,
+        startedAt: claimedAt.toISOString()
+      }
+    };
+    mailboxes.set(target.taskId, mailbox);
+    return { status: "claimed", processing: mailbox.processing };
+  };
+  store.releaseWorkMailbox = (target, batchId) => {
+    if (target.kind !== "task") return false;
+    let mailbox = mailboxes.get(target.taskId);
+    if (mailbox.processing?.batchId !== batchId) return false;
+    releaseWrites.set(target.taskId, releaseWrites.get(target.taskId) + 1);
+    durableOperations.get(target.taskId).push(`release:${batchId}`);
+    mailbox = {
+      ...mailbox,
+      pending: mailbox.processing.batch,
+      processing: null
+    };
+    mailboxes.set(target.taskId, mailbox);
+    return true;
+  };
+  store.completeWorkMailbox = (target, batchId) => {
+    if (target.kind !== "task") return false;
+    let mailbox = mailboxes.get(target.taskId);
+    if (mailbox.processing?.batchId !== batchId) return false;
+    completionWrites.set(target.taskId, completionWrites.get(target.taskId) + 1);
+    durableOperations.get(target.taskId).push(`complete:${batchId}`);
+    mailbox = { ...mailbox, processing: null };
+    mailboxes.set(target.taskId, mailbox);
+    return true;
+  };
+  store.getPendingWakeup = (taskId) => (
+    taskId === taskB.id ? pendingWakeup : null
+  );
+  store.listPendingWakeups = () => pendingWakeup === null ? [] : [pendingWakeup];
+  store.saveLeaderDispatch = ({ task, role: roleValue, run }) => {
+    assert.equal(task.id, taskB.id);
+    assert.equal(roleValue.name, leaderB.name);
+    leaderDispatches += 1;
+    activeRuns.set(`${task.id}/${roleValue.name}`, run);
+    pendingWakeup = null;
+    return "claimed";
+  };
+  store.saveRoleRunPrepared = () => {};
+  store.saveRoleRunDelivery = ({ task, role: roleValue, run, now: deliveredAt }) => {
+    leaderDeliveries += 1;
+    activeRuns.set(`${task.id}/${roleValue.name}`, {
+      ...run,
+      pushedAt: deliveredAt.toISOString()
+    });
+  };
+
+  const delivery = {
+    ...noTmux,
+    async prepareRoleSession(input) {
+      return {
+        deliveryId: `delivery-${input.taskId}`,
+        taskId: input.taskId,
+        roleName: input.roleName,
+        agentId: input.agentId,
+        adapterId: input.adapterId,
+        mode: input.mode,
+        inputSubmittedAtLaunch: true
+      };
+    },
+    async waitUntilReady(prepared) { return { prepared, session: null }; },
+    async inspectRoles(inputs) {
+      livenessAttempts += 1;
+      inventoryInputs.push(inputs.map(({ taskId, roleName }) => `${taskId}/${roleName}`));
+      throw sentinel;
+    }
+  };
+  const observedErrors = [];
+  let announceThirdError;
+  const thirdError = new Promise((resolve) => { announceThirdError = resolve; });
+  const controller = new FileTaskController(store, delivery, {
+    intervalMs: 60_000,
+    deliveryRetryMs: 2,
+    deliveryRetryLimit: 2,
+    workspacePreparer: {
+      async prepareTaskWorkspace(taskId) {
+        return taskId === taskA.id
+          ? { taskId, status: "failed", error: "Task A workspace is unavailable" }
+          : { taskId, status: "ready" };
+      }
+    },
+    onError(error) {
+      observedErrors.push(error);
+      if (observedErrors.length === 3) announceThirdError();
+    }
+  });
+
+  controller.start();
+  let timeout;
+  try {
+    await Promise.race([
+      thirdError,
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Controller did not report the bounded whole-pass retries")),
+          3_000
+        );
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+    controller.stop();
+    await controller.shutdownAndDrain();
+  }
+
+  assert.equal(livenessAttempts, 3);
+  assert.equal(leaderDispatches, 1, "Task B Leader work must progress before Task A inventory fails");
+  assert.equal(leaderDeliveries, 1);
+  assert.equal(pendingWakeup, null);
+  assert.notEqual(activeRuns.get(`${taskB.id}/${leaderB.name}`)?.pushedAt, undefined);
+  assert.ok(inventoryInputs.every((inputs) => inputs.includes(`${taskA.id}/${workerA.name}`)));
+  assert.deepEqual(observedErrors, [sentinel, sentinel, sentinel]);
+  assert.equal(observedErrors[0].message, "sentinel global reconciliation failure");
+  assert.strictEqual(observedErrors[0].cause, sentinelCause);
+
+  const taskABatchId = `task:${taskA.id}:1-1`;
+  assert.deepEqual(claimAttempts.get(taskA.id), Array(3).fill(taskABatchId));
+  assert.deepEqual(durableOperations.get(taskA.id), [`claim:${taskABatchId}`]);
+  assert.equal(claimWrites.get(taskA.id), 1);
+  assert.equal(completionWrites.get(taskA.id), 0);
+  assert.equal(releaseWrites.get(taskA.id), 0);
+  assert.equal(mailboxes.get(taskA.id).pending, null);
+  assert.equal(mailboxes.get(taskA.id).processing?.batchId, taskABatchId);
+  assert.equal(mailboxes.get(taskA.id).processing?.owner, "controller");
+
+  const taskBBatchId = `task:${taskB.id}:1-1`;
+  assert.deepEqual(
+    durableOperations.get(taskB.id),
+    [`claim:${taskBBatchId}`, `complete:${taskBBatchId}`],
+    "Task B must complete independently before Task A's later reconciliation fails"
+  );
+  assert.deepEqual(
+    claimAttempts.get(taskB.id),
+    [taskBBatchId],
+    "Task B must leave the retry set after its independent orchestration succeeds"
+  );
+  assert.equal(claimWrites.get(taskB.id), 1);
+  assert.equal(completionWrites.get(taskB.id), 1);
+  assert.equal(releaseWrites.get(taskB.id), 0);
+  assert.equal(mailboxes.get(taskB.id).pending, null);
+  assert.equal(mailboxes.get(taskB.id).processing, null);
+});
+
 test("a main full pass never consumes the Operator mailbox", async () => {
   const store = emptyStore();
   store.getWorkMailbox = (target) => {

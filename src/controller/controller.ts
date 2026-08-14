@@ -245,6 +245,15 @@ export async function runControllerSchedulerPass(
         : []
     )));
     resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
+    // Every successful Task has completed the targeted phases owned by its
+    // mailbox at this boundary. Settle that exact claim before advisory
+    // cross-Task reconciliation so an unrelated failure cannot retain and
+    // retry already-progressed work.
+    for (const claim of claimedTaskMailboxes) {
+      if (!workspacePreparation.failed.has(claim.target.taskId)) {
+        store.completeWorkMailbox(claim.target, claim.processing.batchId);
+      }
+    }
     const newlyIdleBusyTaskIds = new Set(initialWakeupResults.flatMap((result) => (
       result.reason === "busy"
         && store.getActiveAgentRun(result.taskId, "leader") === null
@@ -343,11 +352,6 @@ export async function runControllerSchedulerPass(
     const inputNotifications = includeOperator
       ? await processOperatorInputNotifications(store, delivery, selection, now)
       : [];
-    for (const claim of claimedTaskMailboxes) {
-      if (!workspacePreparation.failed.has(claim.target.taskId)) {
-        store.completeWorkMailbox(claim.target, claim.processing.batchId);
-      }
-    }
     return {
       activeRunDeliveries,
       failedRunRefs,
