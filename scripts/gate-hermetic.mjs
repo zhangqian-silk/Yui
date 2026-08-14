@@ -22,7 +22,9 @@
 // is resolved, fail-closed, before any gating), on a candidate failure the
 // base is gated in a second clone and its own hermetic domain (separate
 // HOME, XDG tree, git config, TMPDIR, npm cache, and TAP file). Each clone
-// owns its .git directory (hooks, config, refs), so neither side can leave
+// owns its .git directory (hooks, config, refs), and the hermetic domain
+// strips host Git control env vars (GIT_CONFIG_SYSTEM, GIT_TEMPLATE_DIR,
+// ...) that could redirect config or templates, so neither side can leave
 // writable git state that changes the other's result. The two records are
 // classified at failure level (the test step carries stable
 // failing-test fingerprints parsed from its TAP stream): the run exits

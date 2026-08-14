@@ -101,6 +101,71 @@ test("buildHermeticEnvironment inherits unrelated host vars and honors overrides
   }
 });
 
+test("buildHermeticEnvironment strips host Git control vars that could poison the other side", () => {
+  // P1 (review-round-8): the per-side clone isolated .git directories, but
+  // host Git control env vars were still inherited by both sides. With
+  // GIT_CONFIG_SYSTEM pointing at a host-writable file, a candidate test can
+  // write core.hooksPath + a post-checkout hook to that file; the base
+  // checkout then reads the same system config and runs the hook, poisoning
+  // the base. The hermetic domain must strip every Git control var that can
+  // redirect config, templates, the repository/common dir, the index, or the
+  // object store, and set its own per-side values.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-gitenv-"));
+  try {
+    const hostileEnv = {
+      ...FAKE_ENV,
+      GIT_CONFIG_SYSTEM: "/host/writable/system-gitconfig",
+      GIT_CONFIG_PARAMETERS: "'core.hooksPath=/host/hooks'",
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: "core.hooksPath",
+      GIT_CONFIG_VALUE_0: "/host/hooks",
+      GIT_CONFIG_KEY_1: "core.fsmonitor",
+      GIT_CONFIG_VALUE_1: "/host/fsmonitor",
+      GIT_TEMPLATE_DIR: "/host/writable/template",
+      GIT_DIR: "/host/.git",
+      GIT_WORK_TREE: "/host/work",
+      GIT_COMMON_DIR: "/host/.git/common",
+      GIT_INDEX_FILE: "/host/.git/index",
+      GIT_OBJECT_DIRECTORY: "/host/.git/objects",
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: "/host/.git/alt-objects"
+    };
+    const env = buildHermeticEnvironment(root, { environment: hostileEnv });
+    // Every hostile Git control var is stripped from the domain (except
+    // GIT_TEMPLATE_DIR, which the domain re-sets to its own per-side dir).
+    for (const name of [
+      "GIT_CONFIG_SYSTEM",
+      "GIT_CONFIG_PARAMETERS",
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_KEY_0",
+      "GIT_CONFIG_VALUE_0",
+      "GIT_CONFIG_KEY_1",
+      "GIT_CONFIG_VALUE_1",
+      "GIT_DIR",
+      "GIT_WORK_TREE",
+      "GIT_COMMON_DIR",
+      "GIT_INDEX_FILE",
+      "GIT_OBJECT_DIRECTORY",
+      "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+    ]) {
+      assert.equal(env[name], undefined, `${name} must not enter the hermetic domain`);
+    }
+    // The host's GIT_TEMPLATE_DIR value must not survive; the domain sets its own.
+    assert.notEqual(env.GIT_TEMPLATE_DIR, "/host/writable/template");
+    // The domain sets its own per-side Git isolation.
+    assert.equal(env.GIT_CONFIG_NOSYSTEM, "1");
+    assert.equal(env.GIT_TEMPLATE_DIR, join(root, "git-template"));
+    assert.ok(
+      env.GIT_TEMPLATE_DIR.startsWith(root),
+      "GIT_TEMPLATE_DIR must be per-side under the root"
+    );
+    assert.equal(env.GIT_CONFIG_GLOBAL, join(root, "gitconfig"));
+    // Unrelated host vars are still inherited.
+    assert.equal(env.YUI_GATE_TEST_SENTINEL, "sentinel-value");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("GATE_STEPS is the ordered install/build/lint/test/package-smoke gate", () => {
   assert.deepEqual(
     GATE_STEPS.map((step) => step.name),
@@ -843,6 +908,69 @@ function setupRunnerRepo(root) {
   return source;
 }
 
+function setupSharedStateGateRepo(root) {
+  // Common setup for the shared-state e2e regressions: a repo with the real
+  // runner/helper, a minimal package so install/build/lint/package-smoke pass
+  // fast, and the base version of the shared-state test (passes when no
+  // marker). Returns { source, baseSha }; the caller writes the candidate
+  // version of test/core/shared-state.test.js, commits, and runs the gate.
+  const source = join(root, "source");
+  mkdirSync(join(source, "scripts"), { recursive: true });
+  mkdirSync(join(source, "test", "helpers"), { recursive: true });
+  mkdirSync(join(source, "test", "core"), { recursive: true });
+  git(["init", "-b", "master"], source);
+  git(["config", "user.name", "Yui Gate"], source);
+  git(["config", "user.email", "yui-gate@example.invalid"], source);
+  copyFileSync(
+    fileURLToPath(new URL("../../scripts/gate-hermetic.mjs", import.meta.url)),
+    join(source, "scripts", "gate-hermetic.mjs")
+  );
+  copyFileSync(
+    fileURLToPath(new URL("../helpers/gateHermetic.js", import.meta.url)),
+    join(source, "test", "helpers", "gateHermetic.js")
+  );
+  writeFileSync(join(source, "package.json"), JSON.stringify({
+    name: "gate-fixture",
+    version: "1.0.0",
+    private: true,
+    type: "module",
+    scripts: { build: "true", lint: "true" }
+  }, null, 2));
+  writeFileSync(join(source, "package-lock.json"), JSON.stringify({
+    name: "gate-fixture",
+    version: "1.0.0",
+    lockfileVersion: 3,
+    requires: true,
+    packages: { "": { name: "gate-fixture", version: "1.0.0" } }
+  }, null, 2));
+  writeFileSync(join(source, "test", "helpers", "scrubSessionEnv.js"), "// no-op for the fixture\n");
+  writeFileSync(
+    join(source, "scripts", "assemble-runtime-package.mjs"),
+    "import { mkdirSync, writeFileSync } from \"node:fs\";\n"
+      + "mkdirSync(\".release-stage\", { recursive: true });\n"
+      + "writeFileSync(\".release-stage/package.json\", JSON.stringify({ name: \"gate-fixture\", version: \"1.0.0\" }));\n"
+  );
+  writeFileSync(join(source, "scripts", "check-runtime-package-structure.mjs"), "process.exit(0);\n");
+  // A passing test directly in test/ so the test/*.test.js glob matches.
+  writeFileSync(
+    join(source, "test", "dummy.test.js"),
+    "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+      + "test(\"dummy passes\", () => { assert.ok(true); });\n"
+  );
+  // The base version of the shared-state test: passes when no marker.
+  writeFileSync(
+    join(source, "test", "core", "shared-state.test.js"),
+    "import { existsSync } from \"node:fs\";\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+      + "test(\"shared-state regression\", () => {\n"
+      + "  assert.ok(!existsSync(\".git-poison-marker\"), \"base checkout was poisoned by candidate git state\");\n"
+      + "});\n"
+  );
+  git(["add", "-A"], source);
+  git(["commit", "-m", "base"], source);
+  const baseSha = git(["rev-parse", "HEAD"], source);
+  return { source, baseSha };
+}
+
 test("a dirty source checkout cannot produce gate evidence (e2e dirty-runner)", () => {
   // P2-2: the runner and helper are loaded from the caller's checkout, so a
   // dirty checkout could run modified code and label its result with the HEAD
@@ -1066,62 +1194,7 @@ test("the base worktree is created with the base hermetic env, not the candidate
   // can never reach it.
   const root = mkdtempSync(join(tmpdir(), "yui-gate-base-env-"));
   try {
-    const source = join(root, "source");
-    mkdirSync(join(source, "scripts"), { recursive: true });
-    mkdirSync(join(source, "test", "helpers"), { recursive: true });
-    mkdirSync(join(source, "test", "core"), { recursive: true });
-    git(["init", "-b", "master"], source);
-    git(["config", "user.name", "Yui Gate"], source);
-    git(["config", "user.email", "yui-gate@example.invalid"], source);
-    copyFileSync(
-      fileURLToPath(new URL("../../scripts/gate-hermetic.mjs", import.meta.url)),
-      join(source, "scripts", "gate-hermetic.mjs")
-    );
-    copyFileSync(
-      fileURLToPath(new URL("../helpers/gateHermetic.js", import.meta.url)),
-      join(source, "test", "helpers", "gateHermetic.js")
-    );
-    // A minimal package so install/build/lint/package-smoke pass fast; only
-    // the shared-state regression drives the gate outcome.
-    writeFileSync(join(source, "package.json"), JSON.stringify({
-      name: "gate-fixture",
-      version: "1.0.0",
-      private: true,
-      type: "module",
-      scripts: { build: "true", lint: "true" }
-    }, null, 2));
-    writeFileSync(join(source, "package-lock.json"), JSON.stringify({
-      name: "gate-fixture",
-      version: "1.0.0",
-      lockfileVersion: 3,
-      requires: true,
-      packages: { "": { name: "gate-fixture", version: "1.0.0" } }
-    }, null, 2));
-    writeFileSync(join(source, "test", "helpers", "scrubSessionEnv.js"), "// no-op for the fixture\n");
-    writeFileSync(
-      join(source, "scripts", "assemble-runtime-package.mjs"),
-      "import { mkdirSync, writeFileSync } from \"node:fs\";\n"
-        + "mkdirSync(\".release-stage\", { recursive: true });\n"
-        + "writeFileSync(\".release-stage/package.json\", JSON.stringify({ name: \"gate-fixture\", version: \"1.0.0\" }));\n"
-    );
-    writeFileSync(join(source, "scripts", "check-runtime-package-structure.mjs"), "process.exit(0);\n");
-    // A passing test directly in test/ so the test/*.test.js glob matches.
-    writeFileSync(
-      join(source, "test", "dummy.test.js"),
-      "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
-        + "test(\"dummy passes\", () => { assert.ok(true); });\n"
-    );
-    // The base version of the shared-state test: passes when no marker.
-    writeFileSync(
-      join(source, "test", "core", "shared-state.test.js"),
-      "import { existsSync } from \"node:fs\";\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
-        + "test(\"shared-state regression\", () => {\n"
-        + "  assert.ok(!existsSync(\".git-poison-marker\"), \"base worktree was poisoned by the candidate git config\");\n"
-        + "});\n"
-    );
-    git(["add", "-A"], source);
-    git(["commit", "-m", "base"], source);
-    const baseSha = git(["rev-parse", "HEAD"], source);
+    const { source, baseSha } = setupSharedStateGateRepo(root);
 
     // The candidate version: plants a post-checkout hook in its own
     // GIT_CONFIG_GLOBAL, then fails so the runner gates the base.
@@ -1183,62 +1256,7 @@ test("the candidate cannot poison the base through the shared git common dir (e2
   // must gate in its own clone, whose .git no other side can reach.
   const root = mkdtempSync(join(tmpdir(), "yui-gate-common-dir-"));
   try {
-    const source = join(root, "source");
-    mkdirSync(join(source, "scripts"), { recursive: true });
-    mkdirSync(join(source, "test", "helpers"), { recursive: true });
-    mkdirSync(join(source, "test", "core"), { recursive: true });
-    git(["init", "-b", "master"], source);
-    git(["config", "user.name", "Yui Gate"], source);
-    git(["config", "user.email", "yui-gate@example.invalid"], source);
-    copyFileSync(
-      fileURLToPath(new URL("../../scripts/gate-hermetic.mjs", import.meta.url)),
-      join(source, "scripts", "gate-hermetic.mjs")
-    );
-    copyFileSync(
-      fileURLToPath(new URL("../helpers/gateHermetic.js", import.meta.url)),
-      join(source, "test", "helpers", "gateHermetic.js")
-    );
-    // A minimal package so install/build/lint/package-smoke pass fast; only
-    // the shared-state regression drives the gate outcome.
-    writeFileSync(join(source, "package.json"), JSON.stringify({
-      name: "gate-fixture",
-      version: "1.0.0",
-      private: true,
-      type: "module",
-      scripts: { build: "true", lint: "true" }
-    }, null, 2));
-    writeFileSync(join(source, "package-lock.json"), JSON.stringify({
-      name: "gate-fixture",
-      version: "1.0.0",
-      lockfileVersion: 3,
-      requires: true,
-      packages: { "": { name: "gate-fixture", version: "1.0.0" } }
-    }, null, 2));
-    writeFileSync(join(source, "test", "helpers", "scrubSessionEnv.js"), "// no-op for the fixture\n");
-    writeFileSync(
-      join(source, "scripts", "assemble-runtime-package.mjs"),
-      "import { mkdirSync, writeFileSync } from \"node:fs\";\n"
-        + "mkdirSync(\".release-stage\", { recursive: true });\n"
-        + "writeFileSync(\".release-stage/package.json\", JSON.stringify({ name: \"gate-fixture\", version: \"1.0.0\" }));\n"
-    );
-    writeFileSync(join(source, "scripts", "check-runtime-package-structure.mjs"), "process.exit(0);\n");
-    // A passing test directly in test/ so the test/*.test.js glob matches.
-    writeFileSync(
-      join(source, "test", "dummy.test.js"),
-      "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
-        + "test(\"dummy passes\", () => { assert.ok(true); });\n"
-    );
-    // The base version of the shared-state test: passes when no marker.
-    writeFileSync(
-      join(source, "test", "core", "shared-state.test.js"),
-      "import { existsSync } from \"node:fs\";\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
-        + "test(\"shared-state regression\", () => {\n"
-        + "  assert.ok(!existsSync(\".git-poison-marker\"), \"base checkout was poisoned by a candidate git hook\");\n"
-        + "});\n"
-    );
-    git(["add", "-A"], source);
-    git(["commit", "-m", "base"], source);
-    const baseSha = git(["rev-parse", "HEAD"], source);
+    const { source, baseSha } = setupSharedStateGateRepo(root);
 
     // The candidate version: plants a post-checkout hook in its git common
     // dir (the shared source .git under worktrees, its own clone .git under
@@ -1274,6 +1292,79 @@ test("the candidate cannot poison the base through the shared git common dir (e2
     // The candidate failure must be classified introduced (the base clone
     // cannot be poisoned through the shared common dir), so the gate exits
     // non-zero.
+    assert.notEqual(result.status, 0, "an introduced failure must exit non-zero");
+    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    assert.equal(record.disposition, "introduced-failures");
+    const fingerprint = "test: test/core/shared-state.test.js > shared-state regression";
+    assert.ok(
+      record.classification.introduced.includes(fingerprint),
+      "the candidate failure must be classified introduced"
+    );
+    assert.ok(
+      !record.classification.preExisting.includes(fingerprint),
+      "the candidate failure must not be classified pre-existing"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the candidate cannot poison the base through the host Git config system env (e2e)", () => {
+  // P1 (review-round-8): the per-side clone isolated .git directories, but
+  // host Git control env vars were still inherited by both sides. With
+  // GIT_CONFIG_SYSTEM pointing at a host-writable file, a candidate test can
+  // write core.hooksPath + a post-checkout hook to that file; the base
+  // clone's checkout then reads the same system config and runs the hook,
+  // planting a marker in the base tree. The base fails the same test, the
+  // introduced failure is misclassified pre-existing, and the gate exits 0.
+  // The hermetic domain must strip GIT_CONFIG_SYSTEM (and set
+  // GIT_CONFIG_NOSYSTEM) so the candidate cannot reach the base through it.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-syscfg-"));
+  try {
+    const { source, baseSha } = setupSharedStateGateRepo(root);
+
+    // The host points GIT_CONFIG_SYSTEM at a writable file.
+    const systemConfigPath = join(root, "host-system-gitconfig");
+    writeFileSync(systemConfigPath, "# host system gitconfig\n");
+
+    // The candidate version: writes core.hooksPath + a post-checkout hook to
+    // the host system config (discovered via GIT_CONFIG_SYSTEM), then fails
+    // so the runner gates the base.
+    writeFileSync(
+      join(source, "test", "core", "shared-state.test.js"),
+      "import { chmodSync, mkdirSync, writeFileSync } from \"node:fs\";\nimport { join } from \"node:path\";\n"
+        + "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+        + "test(\"shared-state regression\", () => {\n"
+        + "  const systemConfig = process.env.GIT_CONFIG_SYSTEM;\n"
+        + "  if (systemConfig) {\n"
+        + "    const hooksDir = join(process.env.HOME, \"poison-hooks\");\n"
+        + "    mkdirSync(hooksDir, { recursive: true });\n"
+        + "    const hook = join(hooksDir, \"post-checkout\");\n"
+        + "    writeFileSync(hook, \"#!/bin/sh\\ntouch .git-poison-marker\\n\");\n"
+        + "    chmodSync(hook, 0o755);\n"
+        + "    writeFileSync(systemConfig, \"[core]\\n\\thooksPath = \" + hooksDir + \"\\n\");\n"
+        + "  }\n"
+        + "  assert.fail(\"candidate failure to trigger base gating\");\n"
+        + "});\n"
+    );
+    git(["add", "-A"], source);
+    git(["commit", "-m", "candidate"], source);
+
+    const recordPath = join(root, "record.json");
+    // Strip NODE_TEST_CONTEXT (see above) and set the hostile GIT_CONFIG_SYSTEM
+    // that the candidate test will try to poison.
+    const gateEnv = {
+      ...process.env,
+      NODE_TEST_CONTEXT: undefined,
+      GIT_CONFIG_SYSTEM: systemConfigPath
+    };
+    const result = spawnSync(
+      process.execPath,
+      [join(source, "scripts", "gate-hermetic.mjs"), "--base", baseSha, "--record", recordPath],
+      { cwd: source, encoding: "utf8", env: gateEnv }
+    );
+    // The candidate failure must be classified introduced (the base was not
+    // poisoned through the host system config), so the gate exits non-zero.
     assert.notEqual(result.status, 0, "an introduced failure must exit non-zero");
     const record = JSON.parse(readFileSync(recordPath, "utf8"));
     assert.equal(record.disposition, "introduced-failures");

@@ -45,6 +45,39 @@ export const STANDARD_SYSTEM_PATH = Object.freeze([
 const PATH_TOOLS = Object.freeze(["node", "npm", "git", "tmux"]);
 
 /**
+ * Host Git control environment variables that can redirect config, templates,
+ * the repository/common dir, the index, or the object store. Inheriting any
+ * of these would let one side's writable state reach the other: a candidate
+ * test could point GIT_CONFIG_SYSTEM at a host-writable file, set
+ * core.hooksPath in it, and the base clone's checkout would run that hook.
+ * The hermetic domain strips every one of these (plus the indexed
+ * GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> pairs that accompany
+ * GIT_CONFIG_COUNT) and re-establishes only the per-side GIT_CONFIG_GLOBAL,
+ * GIT_CONFIG_NOSYSTEM, and GIT_TEMPLATE_DIR it needs.
+ */
+const STRIPPED_GIT_ENV_VARS = Object.freeze([
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_TEMPLATE_DIR",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+]);
+
+function isStrippedGitEnvVar(name) {
+  if (STRIPPED_GIT_ENV_VARS.includes(name)) {
+    return true;
+  }
+  // GIT_CONFIG_COUNT's indexed key/value pairs: GIT_CONFIG_KEY_0,
+  // GIT_CONFIG_VALUE_0, GIT_CONFIG_KEY_1, ...
+  return /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u.test(name);
+}
+
+/**
  * Pick a short base directory for the gate's TMPDIR. Unix domain sockets live
  * under TMPDIR and are capped at 108 chars on Linux; a deep host tmpdir (some
  * CI runners, sandboxed homes) would push the Controller and tmux socket
@@ -114,11 +147,23 @@ export function resolveToolDirectory(name, environment = process.env) {
  * with fresh locations under `root`, and replaces PATH with the directories
  * of node/npm/git/tmux (resolved from the current process env at call time)
  * followed by the standard system directories, de-duplicated in that order.
- * Every other host env var is inherited.
+ *
+ * Host Git control variables (GIT_CONFIG_SYSTEM, GIT_TEMPLATE_DIR,
+ * GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT and its indexed key/value pairs,
+ * GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE,
+ * GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES) are stripped: they
+ * can redirect config, templates, the repository/common dir, the index, or
+ * the object store, so inheriting them would let one side's writable state
+ * reach the other (a candidate test could write core.hooksPath to a
+ * host-writable GIT_CONFIG_SYSTEM file and the base checkout would run that
+ * hook). The domain re-establishes only the per-side GIT_CONFIG_GLOBAL,
+ * GIT_CONFIG_NOSYSTEM, and an empty per-side GIT_TEMPLATE_DIR. Every other
+ * host env var is inherited.
  *
  * `options` overrides any derived path (home, xdgConfigHome, xdgCacheHome,
- * xdgDataHome, gitConfigGlobal, tmpdir, npmCache) and may supply `environment`
- * as the source env instead of process.env (used by the unit tests).
+ * xdgDataHome, gitConfigGlobal, gitTemplateDir, tmpdir, npmCache) and may
+ * supply `environment` as the source env instead of process.env (used by the
+ * unit tests).
  */
 export function buildHermeticEnvironment(root, options = {}) {
   const environment = options.environment ?? process.env;
@@ -127,13 +172,25 @@ export function buildHermeticEnvironment(root, options = {}) {
     .filter((dir) => dir !== null);
   const pathEntries = [...new Set([...toolDirs, ...STANDARD_SYSTEM_PATH])];
 
+  // Strip host Git control variables that could redirect config, templates,
+  // the repository/common dir, the index, or the object store. Inheriting
+  // any of these would let one side's writable state reach the other.
+  const inherited = {};
+  for (const [name, value] of Object.entries(environment)) {
+    if (!isStrippedGitEnvVar(name)) {
+      inherited[name] = value;
+    }
+  }
+
   return {
-    ...environment,
+    ...inherited,
     HOME: options.home ?? join(root, "home"),
     XDG_CONFIG_HOME: options.xdgConfigHome ?? join(root, "xdg-config"),
     XDG_CACHE_HOME: options.xdgCacheHome ?? join(root, "xdg-cache"),
     XDG_DATA_HOME: options.xdgDataHome ?? join(root, "xdg-data"),
     GIT_CONFIG_GLOBAL: options.gitConfigGlobal ?? join(root, "gitconfig"),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TEMPLATE_DIR: options.gitTemplateDir ?? join(root, "git-template"),
     TMPDIR: options.tmpdir ?? join(root, "tmp"),
     npm_config_cache: options.npmCache ?? join(root, "npm-cache"),
     PATH: pathEntries.join(delimiter)
@@ -211,8 +268,12 @@ function resolveNpmVersion(hermetic) {
  * flips an executable config (core.hooksPath, core.fsmonitor, ...) can
  * therefore never reach the other side's checkout. `--no-checkout` keeps
  * the clone itself from checking out (and running hooks for) the source
- * HEAD, and `--no-hardlinks` gives the clone its own object store, so the
- * two sides share no writable git metadata at all.
+ * HEAD, and `--no-hardlinks` avoids hardlinking the source's object store.
+ * (A reference/shared source could still contribute alternates; objects are
+ * content-addressed and a corrupt one fails closed, so this is not a
+ * writable-state vector.) The host Git control env is stripped separately
+ * by buildHermeticEnvironment, so GIT_CONFIG_SYSTEM/GIT_TEMPLATE_DIR and
+ * the other redirectors cannot bridge the two sides either.
  *
  * `cloneArgs` run with the source checkout as cwd and the side's hermetic
  * env; `detachArgs` then run inside the clone with the same env.
@@ -450,6 +511,8 @@ export function buildGateRecord({ sha, ref, checks, hermetic, npmVersion, now })
       home: hermetic.HOME,
       xdgConfigHome: hermetic.XDG_CONFIG_HOME,
       gitConfigGlobal: hermetic.GIT_CONFIG_GLOBAL,
+      gitConfigNoSystem: hermetic.GIT_CONFIG_NOSYSTEM,
+      gitTemplateDir: hermetic.GIT_TEMPLATE_DIR,
       tmpdir: hermetic.TMPDIR,
       npmCache: hermetic.npm_config_cache,
       pathEntries: hermetic.PATH.split(delimiter)
@@ -677,6 +740,7 @@ export function createGateSideDomain(root, tmpHome, options = {}, side) {
     hermetic.XDG_CONFIG_HOME,
     hermetic.XDG_CACHE_HOME,
     hermetic.XDG_DATA_HOME,
+    hermetic.GIT_TEMPLATE_DIR,
     hermetic.TMPDIR,
     hermetic.npm_config_cache
   ]) {
