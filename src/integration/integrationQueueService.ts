@@ -6,6 +6,7 @@ import { workspaceProjectEntry } from "../worktree/managedWorkspace.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   createIntegrationAttempt,
+  recordResolutionDecision,
   updateIntegrationAttempt,
   type IntegrationAttempt
 } from "./integrationAttempt.js";
@@ -590,6 +591,29 @@ export function reconcileIntegrationQueueEntry(
   });
 }
 
+/**
+ * A conflicted entry may carry a blocked IntegrationAttempt waiting for a
+ * leader decision.  Requeue or supersede IS that decision — the blocked
+ * attempt is abandoned — so resolve it as rejected (terminal `failed`)
+ * rather than leaving it to block Task retirement.
+ */
+function resolveBlockedAttempt(
+  store: TaskStore,
+  taskId: string,
+  entry: IntegrationQueueEntry,
+  decision: "requeue" | "supersede",
+  now: () => Date
+): void {
+  if (entry.integrationAttemptId === undefined) return;
+  const attempt = store.getIntegrationAttempt(taskId, entry.integrationAttemptId);
+  if (attempt === null || attempt.status !== "blocked") return;
+  const rejected = recordResolutionDecision(attempt, {
+    action: "reject",
+    rationale: `Integration Attempt rejected by queue ${decision}.`
+  }, now());
+  store.saveIntegrationAttempt(taskId, rejected);
+}
+
 /** Retry a conflicted item (for example after a gate failure was fixed). */
 export function requeueIntegrationQueueEntry(
   store: TaskStore,
@@ -601,6 +625,7 @@ export function requeueIntegrationQueueEntry(
   if (entry === null) {
     throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
   }
+  resolveBlockedAttempt(store, taskId, entry, "requeue", now);
   const waiting = markIntegrationQueueRequeued(entry, now());
   store.saveIntegrationQueueEntry(taskId, waiting);
   return waiting;
@@ -617,6 +642,7 @@ export function supersedeIntegrationQueueEntry(
   if (entry === null) {
     throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
   }
+  resolveBlockedAttempt(store, taskId, entry, "supersede", now);
   const superseded = markIntegrationQueueSuperseded(entry, reason, now());
   store.saveIntegrationQueueEntry(taskId, superseded);
   return superseded;
@@ -639,6 +665,13 @@ function reconcileTerminalAttempts(
 ): void {
   for (const entry of store.listIntegrationQueueEntries(taskId)) {
     if (entry.integrationAttemptId === undefined) continue;
+    if (entry.status === "committed") {
+      // Crash window: the settle marked this entry committed but died before
+      // recomputing downstream affectedPaths.  Replay that update idempotently
+      // so waiting entries regain their overlap evidence.
+      recomputeAffectedPaths(store, taskId, entry, now);
+      continue;
+    }
     if (entry.status !== "conflicted" && entry.status !== "running") continue;
     const attempt = store.getIntegrationAttempt(taskId, entry.integrationAttemptId);
     if (attempt === null) continue;

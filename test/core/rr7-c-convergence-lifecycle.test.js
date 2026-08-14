@@ -22,7 +22,9 @@ import {
 import {
   enqueueIntegrationQueueEntry,
   processIntegrationQueue,
-  reconcileIntegrationQueueEntry
+  reconcileIntegrationQueueEntry,
+  requeueIntegrationQueueEntry,
+  supersedeIntegrationQueueEntry
 } from "../../dist/integration/integrationQueueService.js";
 import { createProject } from "../../dist/repository/project.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -289,6 +291,179 @@ test("restart settles a running queue entry whose linked Attempt is blocked", as
 
   assert.equal(recovered.status, "conflicted");
   assert.equal(recovered.conflictSummary, "semantic conflict needs a leader decision");
+});
+
+test("queue recovery cannot silently leave its linked blocked Attempt unresolved", async (t) => {
+  const recoveries = [
+    {
+      name: "requeue",
+      apply: (fixture, entry) => requeueIntegrationQueueEntry(
+        fixture.store,
+        fixture.task.id,
+        entry.id,
+        () => now
+      )
+    },
+    {
+      name: "supersede",
+      apply: (fixture, entry) => supersedeIntegrationQueueEntry(
+        fixture.store,
+        fixture.task.id,
+        entry.id,
+        "replaced by a corrected ChangeSet",
+        () => now
+      )
+    }
+  ];
+
+  for (const recovery of recoveries) {
+    await t.test(recovery.name, async () => {
+      const fixture = createFixture(`blocked-${recovery.name}`);
+      const changeSet = createStoredChangeSet(fixture, "change-set-1", {
+        "blocked.txt": "blocked\n"
+      });
+      const queued = await enqueue(fixture, changeSet, ["true"]);
+      const attempt = createIntegrationAttempt({
+        id: fixture.store.nextIntegrationAttemptId(fixture.task.id),
+        taskId: fixture.task.id,
+        projectId: fixture.project.id,
+        targetRef: "master",
+        expectedHead: fixture.baseCommit,
+        changeSetIds: [changeSet.id],
+        checkCommands: ["true"]
+      }, now);
+      fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+      fixture.store.saveIntegrationQueueEntry(
+        fixture.task.id,
+        recordIntegrationQueueAttempt(
+          markIntegrationQueueRunning(queued.entry, fixture.baseCommit, now),
+          attempt.id,
+          now
+        )
+      );
+      fixture.store.saveIntegrationAttempt(
+        fixture.task.id,
+        updateIntegrationAttempt(attempt, {
+          status: "blocked",
+          conflict: {
+            affectedPaths: ["blocked.txt"],
+            summary: "semantic conflict needs a leader decision"
+          }
+        }, now)
+      );
+      await processIntegrationQueue(fixture.store, fixture.home, fixture.task.id, {
+        now: () => now
+      });
+      const conflicted = fixture.store.getIntegrationQueueEntry(
+        fixture.task.id,
+        queued.entry.id
+      );
+
+      try {
+        recovery.apply(fixture, conflicted);
+      } catch (error) {
+        assert.match(String(error), /blocked|Integration Attempt/);
+        return;
+      }
+
+      await assert.doesNotReject(
+        () => new WorkItemChangeSetManager(fixture.store, () => now)
+          .assertRetirable(fixture.task.id),
+        `successful ${recovery.name} must not strand the Task behind ${attempt.id}`
+      );
+    });
+  }
+});
+
+test("committed-attempt recovery replays downstream overlap after a crash during the settle", async () => {
+  const fixture = createFixture("committed-recovery-atomicity");
+  const first = createStoredChangeSet(fixture, "change-set-1", {
+    "shared.txt": "first\n"
+  });
+  const second = createStoredChangeSet(fixture, "change-set-2", {
+    "shared.txt": "second\n"
+  });
+  const firstQueued = await enqueue(fixture, first, ["true"]);
+  const secondQueued = await enqueue(fixture, second, ["true"]);
+  const attempt = createIntegrationAttempt({
+    id: fixture.store.nextIntegrationAttemptId(fixture.task.id),
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    targetRef: "master",
+    expectedHead: fixture.baseCommit,
+    changeSetIds: [first.id],
+    checkCommands: ["true"]
+  }, now);
+  fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+  fixture.store.saveIntegrationQueueEntry(
+    fixture.task.id,
+    recordIntegrationQueueAttempt(
+      markIntegrationQueueRunning(firstQueued.entry, fixture.baseCommit, now),
+      attempt.id,
+      now
+    )
+  );
+  git(["-C", fixture.repositoryPath, "merge", "--ff-only", first.branch]);
+  const validating = updateIntegrationAttempt(attempt, {
+    status: "validating",
+    candidateCommit: first.headCommit,
+    checks: [{ name: "true", outcome: "passed" }]
+  }, now);
+  fixture.store.saveIntegrationAttempt(fixture.task.id, validating);
+  fixture.store.saveIntegrationAttempt(
+    fixture.task.id,
+    updateIntegrationAttempt(validating, { status: "committed" }, now)
+  );
+
+  let injectCrash = true;
+  const crashingStore = new Proxy(fixture.store, {
+    get(target, property) {
+      if (property === "saveIntegrationQueueEntry") {
+        return (taskId, entry) => {
+          target.saveIntegrationQueueEntry(taskId, entry);
+          if (
+            injectCrash
+            && entry.id === firstQueued.entry.id
+            && entry.status === "committed"
+          ) {
+            injectCrash = false;
+            throw new Error("simulated crash after queue settle");
+          }
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  await assert.rejects(
+    processIntegrationQueue(crashingStore, fixture.home, fixture.task.id, {
+      projectId: "project-not-in-task",
+      now: () => now
+    }),
+    /simulated crash after queue settle/
+  );
+  assert.equal(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, firstQueued.entry.id).status,
+    "committed"
+  );
+  assert.equal(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, secondQueued.entry.id).affectedPaths,
+    undefined
+  );
+
+  // A normal restart must finish the interrupted recovery.  Today the first
+  // entry is already terminal, so reconciliation skips it and the overlap is
+  // lost permanently.
+  await processIntegrationQueue(fixture.store, fixture.home, fixture.task.id, {
+    projectId: "project-not-in-task",
+    now: () => now
+  });
+  const waiting = fixture.store.getIntegrationQueueEntry(
+    fixture.task.id,
+    secondQueued.entry.id
+  );
+  assert.deepEqual(waiting.affectedPaths, ["shared.txt"]);
 });
 
 test("manual reconciliation replays affected-path updates for waiting entries", async () => {
