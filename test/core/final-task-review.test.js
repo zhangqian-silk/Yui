@@ -1244,6 +1244,55 @@ test("Reviewer panels retain each Lane until Leader resolution", (t) => {
   assert.match(completed.report, /second report/);
 });
 
+test("a clean panel Lane cannot attest checks contributed by a dirty Lane", {
+  skip: process.env.YUI_REVIEW_PANEL_DIRTY_EVIDENCE !== "1"
+}, (t) => {
+  const fx = fixture(t);
+  const { store, task, leaderOptions } = fx;
+  runTaskCommand(
+    ["role", "add", task.id, "reviewer-2", "--agent", "codex"],
+    store,
+    leaderOptions
+  );
+  runTaskCommand([
+    "review", "request", task.id,
+    "--role", "reviewer",
+    "--strategy", "fixed:2",
+    "--lane-role", "reviewer",
+    "--lane-role", "reviewer-2"
+  ], store, leaderOptions);
+  const round = store.listReviewRounds(task.id)[0];
+  const firstRun = dispatchFinalReview(fx, round);
+  const secondRun = store.listAgentRuns(task.id).find(({ id }) => id !== firstRun.id);
+  assert.ok(secondRun);
+
+  finishFinalReviewRun(fx, firstRun, "yielded", "clean perspective", {
+    report: "clean report",
+    checks: [{ name: "clean-check", outcome: "passed" }],
+    evidenceCommit: round.reviewBaseCommit
+  });
+  finishFinalReviewRun(fx, secondRun, "yielded", "dirty perspective", {
+    report: "dirty report",
+    checks: [{ name: "dirty-only-check", outcome: "passed" }]
+  });
+
+  runTaskCommand([
+    "review", "group", "resolve", round.id,
+    "--decision", "accept",
+    "--summary", "Leader accepted both perspectives"
+  ], store, leaderOptions);
+  const completed = store.getReviewRound(task.id, round.id);
+  assert.deepEqual(completed.checks.map(({ name }) => name), [
+    "clean-check",
+    "dirty-only-check"
+  ]);
+  assert.equal(
+    completed.evidenceCommit,
+    undefined,
+    "the aggregate must not bind a dirty Lane's checks to the clean Lane's base attestation"
+  );
+});
+
 test("a changed integrated head creates a fresh final ReviewRound and keeps prior evidence", (t) => {
   const { store, task, item, leaderOptions } = fixture(t);
   runTaskCommand(["complete", task.id, "--summary", "finish"], store, leaderOptions);

@@ -3193,29 +3193,34 @@ function resolveReviewExecutionGroup(
         : selectedLaneIds === undefined ? {} : { selectedLaneIds })
     }, now);
     const withGroup = updateReviewExecutionGroup(round, resolved);
-    const laneReports = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const selectedLanes = resolved.lanes
+      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false);
+    const laneReports = selectedLanes
       .map((lane) => lane.result?.report ?? lane.result?.summary ?? "")
       .filter((report) => report.length > 0);
-    const checks = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const checks = selectedLanes
       .flatMap((lane) => lane.result?.checks ?? [])
       .map(({ name, outcome, details }) => ({
         name,
         outcome,
         ...(details === undefined ? {} : { details })
       }));
-    const findings = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const findings = selectedLanes
       .flatMap((lane) => lane.result?.findings ?? []);
-    const evidence = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const evidence = selectedLanes
       .flatMap((lane) => lane.result?.evidence ?? []);
-    const evidenceCommits = [...new Set(resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const evidenceCommits = [...new Set(selectedLanes
       .map((lane) => lane.result?.evidenceCommit)
       .filter((commit): commit is string => commit !== undefined))];
-    const evidenceCommit = evidenceCommits.length === 1 ? evidenceCommits[0] : undefined;
+    // A Round attests a single tree only when EVERY selected Lane attests it.
+    // A dirty Lane (no evidenceCommit) ran checks on an uncommitted tree, so its
+    // checks cannot be covered by another Lane's base attestation.
+    const allLanesAttest = selectedLanes.every(
+      (lane) => lane.result?.evidenceCommit !== undefined
+    );
+    const evidenceCommit = allLanesAttest && evidenceCommits.length === 1
+      ? evidenceCommits[0]
+      : undefined;
     const terminal = finishReviewRound(
       withGroup,
       decision === "accept" ? "completed" : "failed",
