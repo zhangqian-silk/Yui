@@ -266,6 +266,25 @@ export async function enqueueIntegrationQueueEntry(
     input.store, task.id, input.projectId, input.changeSetId
   );
   if (existing !== undefined) {
+    // A conflicting idempotency retry must fail closed, even on the fast
+    // path: a caller that enqueues with a different explicit gate is either
+    // mistaken or trying to bypass the original gate.  Reject instead of
+    // silently discarding the requested checks.  A retry with no gate is a
+    // plain idempotent lookup and returns the existing entry.
+    const requestedChecks = input.checkCommands ?? [];
+    if (
+      requestedChecks.length > 0
+      && (
+        existing.checkCommands.length !== requestedChecks.length
+        || existing.checkCommands.some((cmd, i) => cmd !== requestedChecks[i])
+      )
+    ) {
+      throw new Error(
+        `ChangeSet ${input.changeSetId} is already queued as ${existing.id} `
+        + `with checkCommands [${existing.checkCommands.join(", ")}]; `
+        + `a conflicting retry with [${requestedChecks.join(", ")}] is not allowed.`
+      );
+    }
     return {
       entry: existing,
       outcome: existing.status === "committed" ? "already-committed" : "already-queued"
@@ -298,6 +317,25 @@ export async function enqueueIntegrationQueueEntry(
       tx, task.id, input.projectId, input.changeSetId
     );
     if (duplicate !== undefined) {
+      // A conflicting idempotency retry must fail closed: a caller that
+      // enqueues with a different explicit gate is either mistaken or trying
+      // to bypass the original gate.  Reject instead of silently discarding
+      // the requested checks.  A retry with no gate is a plain idempotent
+      // lookup and returns the existing entry.
+      const requestedChecks = input.checkCommands ?? [];
+      if (
+        requestedChecks.length > 0
+        && (
+          duplicate.checkCommands.length !== requestedChecks.length
+          || duplicate.checkCommands.some((cmd, i) => cmd !== requestedChecks[i])
+        )
+      ) {
+        throw new Error(
+          `ChangeSet ${input.changeSetId} is already queued as ${duplicate.id} `
+          + `with checkCommands [${duplicate.checkCommands.join(", ")}]; `
+          + `a conflicting retry with [${requestedChecks.join(", ")}] is not allowed.`
+        );
+      }
       return {
         entry: duplicate,
         outcome: duplicate.status === "committed" ? "already-committed" : "already-queued"
@@ -796,6 +834,7 @@ export function requeueIntegrationQueueEntry(
   entryId: string,
   now: () => Date = () => new Date()
 ): IntegrationQueueEntry {
+  assertTaskActive(store, taskId);
   const entry = store.getIntegrationQueueEntry(taskId, entryId);
   if (entry === null) {
     throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);

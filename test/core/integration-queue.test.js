@@ -365,6 +365,29 @@ test("enqueue is idempotent per Project and ChangeSet", async () => {
   assert.equal(second.entry.id, first.entry.id);
 });
 
+test("duplicate enqueue cannot silently discard a later explicit gate", async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  await enqueue(fixture, changeSet, { checkCommands: ["true"] });
+
+  let rejected = false;
+  try {
+    await enqueue(fixture, changeSet, { checkCommands: ["false"] });
+  } catch {
+    rejected = true;
+  }
+  const active = fixture.store.listIntegrationQueueEntries(fixture.task.id)
+    .filter((entry) => entry.status !== "superseded");
+
+  assert.ok(
+    rejected || (active.length === 1 && active[0].checkCommands.includes("false")),
+    "a conflicting idempotency retry must fail closed or preserve the requested gate"
+  );
+});
+
 test("enqueue converges when the ChangeSet head is already a target ancestor", async () => {
   const fixture = await createFixture();
   const changeSet = await branchChangeSet(fixture, {

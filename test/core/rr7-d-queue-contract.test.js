@@ -1022,3 +1022,41 @@ test("queue claim cannot create a running Attempt after the Task retires", async
     "the claim transaction must not create an Attempt for a terminal Task"
   );
 });
+
+test("manual requeue cannot recreate waiting work on a terminal Task", async () => {
+  const fixture = createFixture("requeue-task-lifecycle");
+  const changeSet = createEvidencedChangeSet(fixture, "change-set-1", {
+    "stale.txt": "stale\n"
+  }, { checkName: "true" });
+  const queued = await enqueue(fixture, changeSet, ["true"]);
+  const current = fixture.store.getWorkItem(fixture.task.id, changeSet.workItemId);
+  const failed = updateWorkItemStatus(current, "failed", now, "candidate rejected");
+  fixture.store.saveWorkItem(fixture.task.id, failed);
+  fixture.store.saveWorkItem(fixture.task.id, retryFailedWorkItem(failed, now));
+  await processQueue(fixture, { limit: 1 });
+  assert.equal(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, queued.entry.id).status,
+    "conflicted"
+  );
+
+  fixture.store.saveTask(retireTask(
+    fixture.store.getTask(fixture.task.id),
+    { by: "leader", summary: "retired before a stale requeue" },
+    new Date(now.getTime() + 1_000)
+  ));
+
+  assert.throws(
+    () => requeueIntegrationQueueEntry(
+      fixture.store,
+      fixture.task.id,
+      queued.entry.id,
+      () => new Date(now.getTime() + 2_000)
+    ),
+    /Task is not active/
+  );
+  assert.equal(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, queued.entry.id).status,
+    "conflicted",
+    "a terminal Task must not regain actionable queue work"
+  );
+});
