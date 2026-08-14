@@ -714,9 +714,16 @@ function recomputeAffectedPaths(
   const landed = new Set(committedChangeSet.changedPaths);
   for (const entry of store.listIntegrationQueueEntries(taskId)) {
     if (entry.projectId !== committed.projectId) continue;
+    if (entry.targetRef !== committed.targetRef) continue;
     if (entry.status !== "queued" && entry.status !== "validated") continue;
     const changeSet = store.getChangeSet(taskId, entry.changeSetId);
     if (changeSet === null) continue;
+    // A committed entry whose targetAfter is already the waiting entry's
+    // baseCommit is part of that entry's base, not a post-enqueue target
+    // advance.  This prevents recovery replay from reviving evidence that
+    // was valid at enqueue time.
+    if (committed.targetAfter !== undefined
+      && changeSet.baseCommit === committed.targetAfter) continue;
     const affected = changeSet.changedPaths.filter((path) => landed.has(path));
     const beforeAffected = (entry.affectedPaths ?? []).length;
     let updated = recordIntegrationQueueAffectedPaths(entry, affected, now());

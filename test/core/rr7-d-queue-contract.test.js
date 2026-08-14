@@ -505,3 +505,67 @@ test("tree or ancestor convergence still honors an explicitly requested gate", a
   assert.deepEqual(attempt.checkCommands, ["test ! -f broken.txt"]);
   assert.equal(finalEntry.status, "conflicted");
 });
+
+test("recovery replay does not invalidate evidence with commits older than the entry", async () => {
+  const fixture = createFixture("recovery-history-boundary");
+  const historical = createStoredChangeSet(fixture, "change-set-1", {
+    "shared.txt": "historical\n"
+  });
+  await enqueue(fixture, historical, ["true"]);
+  const [landed] = await processQueue(fixture);
+  assert.equal(landed.entry.status, "committed");
+
+  // This candidate and its evidence are based on the target *after* the first
+  // queue entry committed. Historical queue records therefore cannot describe
+  // a target advance that happened after this entry was enqueued.
+  const currentHead = landed.entry.targetAfter;
+  const reviewed = createEvidencedChangeSet(fixture, "change-set-2", {
+    "shared.txt": "reviewed\n"
+  }, { base: currentHead, checkName: "false" });
+  const enqueued = await enqueue(fixture, reviewed, ["false"]);
+  assert.equal(enqueued.entry.status, "validated");
+  assert.equal(enqueued.entry.evidenceTargetHead, currentHead);
+
+  const [processed] = await processQueue(fixture);
+  assert.equal(processed.entry.status, "committed");
+  assert.deepEqual(
+    processed.attempt.checkCommands,
+    [],
+    "an older committed entry must not revoke exact-head evidence for a later enqueue"
+  );
+});
+
+test("a target advance recomputes overlap only within its target lane", async () => {
+  const fixture = createFixture("target-lane-overlap");
+  git(["-C", fixture.repositoryPath, "branch", "release", fixture.baseCommit]);
+  const masterChange = createStoredChangeSet(fixture, "change-set-1", {
+    "shared.txt": "master\n"
+  });
+  const releaseChange = createEvidencedChangeSet(fixture, "change-set-2", {
+    "shared.txt": "release\n"
+  }, { checkName: "false" });
+
+  await enqueue(fixture, masterChange, ["true"]);
+  const releaseQueued = await enqueueIntegrationQueueEntry({
+    store: fixture.store,
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    changeSetId: releaseChange.id,
+    targetRef: "release",
+    checkCommands: ["false"],
+    now: () => now
+  });
+  assert.equal(releaseQueued.entry.status, "validated");
+
+  const processed = await processQueue(fixture);
+  assert.equal(processed.length, 2);
+  assert.deepEqual(
+    processed.map(({ entry }) => entry.status),
+    ["committed", "committed"]
+  );
+  assert.deepEqual(
+    processed[1].attempt.checkCommands,
+    [],
+    "advancing master must not revoke evidence for an independent release lane"
+  );
+});
