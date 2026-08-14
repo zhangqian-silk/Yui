@@ -388,6 +388,30 @@ test("duplicate enqueue cannot silently discard a later explicit gate", async ()
   );
 });
 
+test("duplicate enqueue cannot silently discard a later explicit target", async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  git(["-C", fixture.repositoryPath, "branch", "release", fixture.baseCommit]);
+  await enqueue(fixture, changeSet, { targetRef: "master" });
+
+  let rejected = false;
+  try {
+    await enqueue(fixture, changeSet, { targetRef: "release" });
+  } catch {
+    rejected = true;
+  }
+  const active = fixture.store.listIntegrationQueueEntries(fixture.task.id)
+    .filter((entry) => entry.status !== "superseded");
+
+  assert.ok(
+    rejected || active.some((entry) => entry.targetRef === "release"),
+    "a conflicting idempotency retry must fail closed or preserve the explicit target"
+  );
+});
+
 test("enqueue converges when the ChangeSet head is already a target ancestor", async () => {
   const fixture = await createFixture();
   const changeSet = await branchChangeSet(fixture, {

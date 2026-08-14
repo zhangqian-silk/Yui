@@ -179,6 +179,63 @@ test("enqueue refuses tree convergence while the target keeps the renamed source
   assert.notEqual(result.entry.status, "committed");
 });
 
+test("a migrated manifestless rename cannot converge on its destination alone", async () => {
+  const fixture = createFixture();
+  const task = activateTask(createTask(
+    fixture.store.nextTaskId(),
+    "Legacy rename task",
+    now,
+    {
+      projectBindings: [{
+        projectId: fixture.project.id,
+        directory: fixture.project.name,
+        baseRef: "master"
+      }]
+    }
+  ), now);
+  fixture.store.saveTask(task);
+  const workItem = createWorkItem(
+    fixture.store.nextWorkItemId(task.id),
+    task.id,
+    {
+      title: "Legacy rename old to new",
+      acceptance: [],
+      dependsOn: [],
+      assignee: "leader",
+      writeProjectIds: [fixture.project.id]
+    },
+    now
+  );
+  fixture.store.saveWorkItem(task.id, workItem);
+
+  const branch = `yui/${task.id}/legacy-rename`;
+  const captured = await captureRename(fixture, branch);
+  // A valid v2 record captured before --no-renames reported only the rename
+  // destination.  The 2->3 migration preserves that path list and leaves the
+  // new manifest absent, so current code must not treat it as a complete
+  // containment proof.
+  const migrated = createWorkItemChangeSet({
+    id: "change-set-503",
+    taskId: task.id,
+    workItemId: workItem.id,
+    projectId: fixture.project.id,
+    baseCommit: fixture.baseCommit,
+    headCommit: captured.headCommit,
+    branch,
+    changedPaths: ["src/new.ts"]
+  }, now);
+  fixture.store.saveChangeSet(task.id, migrated);
+
+  writeFileSync(join(fixture.repositoryPath, "src", "new.ts"), SAME_CONTENT);
+  git(["-C", fixture.repositoryPath, "add", "-A"]);
+  git(["-C", fixture.repositoryPath, "commit", "-m", "parallel add new.ts"]);
+  assert.equal(readFileSync(join(fixture.repositoryPath, "src", "old.ts"), "utf8"), SAME_CONTENT);
+
+  const result = await enqueue(fixture, task, migrated);
+  assert.equal(result.outcome, "queued");
+  assert.notEqual(result.entry.status, "committed");
+});
+
 test("enqueue converges once the target also dropped the renamed source", async () => {
   const fixture = createFixture();
   const task = activateTask(createTask(

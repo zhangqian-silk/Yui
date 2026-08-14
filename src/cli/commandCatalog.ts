@@ -726,7 +726,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "overlap",
     summary: "Show read-only cross-Task overlap diagnostics.",
-    usage: "yui task overlap <task> [--project <project>] [--base <project>=<ref> ...] [--task <task> ...]",
+    usage: "yui task overlap [--project <project>] [--base <sha>] [--task <task> ...]",
     options: ["--project", "--base", "--task"]
   },
   {

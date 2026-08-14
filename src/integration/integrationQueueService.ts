@@ -56,6 +56,11 @@ export type IntegrationQueueGitPort = GitWorkspacePort & {
     fromCommit: string;
     toCommit: string;
   }>) => Promise<readonly string[]>;
+  deletedFilesBetween?: (input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>) => Promise<readonly string[]>;
 };
 
 export type EnqueueIntegrationQueueOutcome =
@@ -285,6 +290,20 @@ export async function enqueueIntegrationQueueEntry(
         + `a conflicting retry with [${requestedChecks.join(", ")}] is not allowed.`
       );
     }
+    // A conflicting explicit target must also fail closed: a caller that
+    // enqueues for a different branch is either mistaken or trying to land
+    // the same ChangeSet on two targets through one entry.  A retry with no
+    // explicit target is a plain idempotent lookup.
+    if (input.targetRef !== undefined) {
+      const requestedTarget = canonicalizeTargetRef(input.targetRef);
+      if (requestedTarget !== existing.targetRef) {
+        throw new Error(
+          `ChangeSet ${input.changeSetId} is already queued as ${existing.id} `
+          + `with targetRef ${existing.targetRef}; `
+          + `a conflicting retry with targetRef ${requestedTarget} is not allowed.`
+        );
+      }
+    }
     return {
       entry: existing,
       outcome: existing.status === "committed" ? "already-committed" : "already-queued"
@@ -334,6 +353,15 @@ export async function enqueueIntegrationQueueEntry(
           `ChangeSet ${input.changeSetId} is already queued as ${duplicate.id} `
           + `with checkCommands [${duplicate.checkCommands.join(", ")}]; `
           + `a conflicting retry with [${requestedChecks.join(", ")}] is not allowed.`
+        );
+      }
+      // A conflicting explicit target must also fail closed.  A retry with
+      // no explicit target is a plain idempotent lookup.
+      if (input.targetRef !== undefined && canonicalTargetRef !== duplicate.targetRef) {
+        throw new Error(
+          `ChangeSet ${input.changeSetId} is already queued as ${duplicate.id} `
+          + `with targetRef ${duplicate.targetRef}; `
+          + `a conflicting retry with targetRef ${canonicalTargetRef} is not allowed.`
         );
       }
       return {
@@ -1017,9 +1045,24 @@ async function findContainedChangeSet(
   targetHead: string
 ): Promise<string | null> {
   if (git.treesAgreeOnPaths === undefined) return null;
+  // A migrated v2 ChangeSet without a manifest has no deletedPaths.  Recover
+  // the actual deletions from git so the containment proof verifies both
+  // sides of a rename: without this, a rename whose destination already
+  // exists on the target would converge even though the source still lives
+  // there.  A ChangeSet with a manifest trusts its declared deletedPaths.
+  let extraDeleted: readonly string[] = [];
+  if (changeSet.manifest === undefined) {
+    if (git.deletedFilesBetween === undefined) return null;
+    extraDeleted = await git.deletedFilesBetween({
+      repositoryPath,
+      fromCommit: changeSet.baseCommit,
+      toCommit: changeSet.headCommit
+    });
+  }
   const paths = [...new Set([
     ...changeSet.changedPaths,
-    ...(changeSet.manifest?.deletedPaths ?? [])
+    ...(changeSet.manifest?.deletedPaths ?? []),
+    ...extraDeleted
   ])];
   if (paths.length === 0) return null;
   const agrees = await git.treesAgreeOnPaths({

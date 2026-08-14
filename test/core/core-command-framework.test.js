@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  findCommandNode,
   ROOT_COMMAND,
   listPublicCommandPaths,
   validateCommandCatalog
@@ -279,6 +280,24 @@ test("the task-16 public commands reach their registered executables", () => {
       kind: routeInvocation(args).kind
     })),
     commands.map((args) => ({ command: args.join(" "), kind: "execute" }))
+  );
+});
+
+test("task overlap help matches the executor's accepted grammar", () => {
+  const overlap = findCommandNode(["task", "overlap"]);
+  assert.ok(overlap);
+  const help = renderCommandHelp(overlap, "0.5.3");
+
+  assert.doesNotMatch(
+    help,
+    /task overlap <task>/u,
+    "the executor accepts only --task filters, not a positional Task"
+  );
+  assert.match(help, /--base <sha>/u);
+  assert.doesNotMatch(
+    help,
+    /--base <project>=<ref>/u,
+    "the executor accepts one base SHA, not a Project/ref mapping"
   );
 });
 
