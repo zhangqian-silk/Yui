@@ -169,7 +169,9 @@ function createEvidencedChangeSet(fixture, id, paths, options = {}) {
     committed.headCommit,
     now
   ), "completed", "reviewed", now, {
-    checks: [{ name: options.checkName ?? "false", outcome: "passed" }]
+    checks: [{ name: options.checkName ?? "false", outcome: "passed" }],
+    // A clean review attests that checks ran on the frozen candidate tree.
+    evidenceCommit: committed.headCommit
   });
   fixture.store.saveReviewRound(fixture.task.id, round);
   const changeSet = createWorkItemChangeSet({
@@ -486,7 +488,11 @@ function savePositiveReview(fixture, candidate, checks) {
     "leader",
     candidate.headCommit,
     now
-  ), "completed", "reviewed", now, { checks });
+  ), "completed", "reviewed", now, {
+    checks,
+    // A clean review attests that checks ran on the frozen candidate tree.
+    evidenceCommit: candidate.headCommit
+  });
   fixture.store.saveReviewRound(fixture.task.id, round);
   return round;
 }

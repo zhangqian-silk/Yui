@@ -109,9 +109,16 @@ async function start(
     if (changeSet === null) throw usageError(`ChangeSet not found: ${id}.`);
     return changeSet;
   });
-  const reviewEvidence = new Set(store.listReviewRounds(task.id)
-    .flatMap(({ evidenceCommit }) => evidenceCommit === undefined ? [] : [evidenceCommit]));
-  const reviewSource = changeSets.find(({ headCommit }) => reviewEvidence.has(headCommit));
+  // Only diagnostic evidence commits (a reviewer's own commit on top of the
+  // frozen base) are barred from becoming an Integration source.  A clean
+  // review attests the frozen base itself (evidenceCommit === reviewBaseCommit),
+  // which is the candidate's own head and a legitimate source.
+  const diagnosticEvidence = new Set(store.listReviewRounds(task.id)
+    .flatMap(({ evidenceCommit, reviewBaseCommit }) =>
+      evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit
+        ? [evidenceCommit]
+        : []));
+  const reviewSource = changeSets.find(({ headCommit }) => diagnosticEvidence.has(headCommit));
   if (reviewSource !== undefined) {
     throw usageError(
       `ReviewRound evidence commit cannot become an Integration source: ${reviewSource.id}.`

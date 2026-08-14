@@ -489,10 +489,13 @@ function canReuseEvidenceAtHead(
  * `true` (or any other unrelated check) never waives a different gate.
  *
  * A check is reusable only when it ran on the frozen candidate tree.  A
- * ReviewRound whose `evidenceCommit` differs from its `reviewBaseCommit` ran
- * its checks on a diagnostic tree (the reviewer's own commit with review-only
- * changes); those checks proved a different tree and cannot waive the
- * candidate gate.
+ * ReviewRound must attest to this by recording its `evidenceCommit` as the
+ * exact `reviewBaseCommit`.  A missing `evidenceCommit` is ambiguous: the
+ * reviewer may have run checks with uncommitted dirty diagnostics, so the
+ * absence cannot be treated as frozen-tree proof.  A round whose
+ * `evidenceCommit` differs from its `reviewBaseCommit` ran its checks on a
+ * diagnostic tree (the reviewer's own commit with review-only changes); those
+ * checks proved a different tree and cannot waive the candidate gate.
  */
 function evidenceCoversCheckCommands(
   store: TaskStore,
@@ -507,8 +510,7 @@ function evidenceCoversCheckCommands(
     if (roundId === undefined) continue;
     const round = store.getReviewRound(taskId, roundId);
     if (round === null || round.status !== "completed") continue;
-    if (round.evidenceCommit !== undefined
-      && round.evidenceCommit !== round.reviewBaseCommit) continue;
+    if (round.evidenceCommit !== round.reviewBaseCommit) continue;
     for (const check of round.checks ?? []) {
       if (check.outcome === "passed") covered.add(check.name);
     }

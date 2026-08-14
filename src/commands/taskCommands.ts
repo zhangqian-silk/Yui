@@ -2749,12 +2749,19 @@ function acceptWork(
         "A ReviewRound-owned workspace cannot be used for WorkItem acceptance."
       );
     }
-    const evidenceCommits = new Set(tx.listReviewRounds(item.taskId)
-      .flatMap(({ evidenceCommit }) => evidenceCommit === undefined ? [] : [evidenceCommit]));
+    // Only diagnostic evidence commits (a reviewer's own commit on top of the
+    // frozen base) are barred from WorkItem acceptance.  A clean review
+    // attests the frozen base itself (evidenceCommit === reviewBaseCommit),
+    // which is the candidate's own head.
+    const diagnosticEvidence = new Set(tx.listReviewRounds(item.taskId)
+      .flatMap(({ evidenceCommit, reviewBaseCommit }) =>
+        evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit
+          ? [evidenceCommit]
+          : []));
     if (options.workItemIntegrationProof?.projects.some(
-      ({ headCommit }) => evidenceCommits.has(headCommit)
+      ({ headCommit }) => diagnosticEvidence.has(headCommit)
     )) {
-      throw usageError("A ReviewRound evidence commit cannot be used for WorkItem acceptance.");
+      throw usageError("A ReviewRound diagnostic evidence commit cannot be used for WorkItem acceptance.");
     }
     const candidate = requireWorkItemCandidate(item);
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);

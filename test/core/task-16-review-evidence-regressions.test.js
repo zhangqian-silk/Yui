@@ -219,7 +219,8 @@ test("a completed review with a passed check links reusable evidence", async () 
     [
       { name: "review gate", outcome: "passed" },
       { name: "advisory", outcome: "skipped" }
-    ]
+    ],
+    candidate.headCommit
   );
 
   const [changeSet] = await new WorkItemChangeSetManager(fixture.store, () => now)
@@ -271,6 +272,51 @@ test("checks run on a diagnostic commit cannot waive the frozen candidate gate",
   assert.equal(existsSync(join(fixture.repositoryPath, "src/candidate.js")), false);
 });
 
+test("checks run with uncommitted review diagnostics cannot waive the frozen candidate gate", {
+  skip: process.env.YUI_REVIEW_DIRTY_EVIDENCE !== "1"
+}, async () => {
+  const fixture = await createFixture();
+  const candidate = createCapturedWorkItem(fixture, "candidate", {
+    "src/candidate.js": "candidate\n"
+  });
+  const reviewWorktree = join(fixture.root, "review-worktree");
+  git([
+    "-C", fixture.repositoryPath,
+    "worktree", "add", "-b", "review-dirty", reviewWorktree, candidate.headCommit
+  ]);
+  writeFileSync(join(reviewWorktree, "review-only.txt"), "diagnostic\n");
+  const gate = "test -f review-only.txt";
+  execFileSync("sh", ["-c", gate], { cwd: reviewWorktree });
+
+  // snapshotReviewRunResult intentionally permits this supported dirty
+  // Reviewer workflow and records no evidenceCommit.  That absence must not
+  // be interpreted as proof that the check ran on the frozen candidate tree.
+  saveCompletedReview(
+    fixture,
+    candidate.workItem,
+    candidate.headCommit,
+    [{ name: gate, outcome: "passed" }]
+  );
+
+  const [changeSet] = await new WorkItemChangeSetManager(fixture.store, () => now)
+    .capture(fixture.task.id, candidate.workItem.id);
+  await enqueue(fixture, changeSet, [gate]);
+  const [processed] = await processIntegrationQueue(
+    fixture.store,
+    fixture.home,
+    fixture.task.id,
+    { now: () => now }
+  );
+
+  assert.equal(
+    processed.entry.status,
+    "conflicted",
+    "a check proved only by uncommitted Reviewer diagnostics must run on the frozen candidate"
+  );
+  assert.equal(processed.attempt.checks[0].outcome, "failed");
+  assert.equal(existsSync(join(fixture.repositoryPath, "src/candidate.js")), false);
+});
+
 // --- Finding 2: evidence is not rebound across a target change --------------
 
 test("evidence for the original candidate cannot be rebound across a target change", async () => {
@@ -288,7 +334,8 @@ test("evidence for the original candidate cannot be rebound across a target chan
     fixture,
     second.workItem,
     second.headCommit,
-    [{ name: "review gate", outcome: "passed" }]
+    [{ name: "review gate", outcome: "passed" }],
+    second.headCommit
   );
   const manager = new WorkItemChangeSetManager(fixture.store, () => now);
   const [firstChangeSet] = await manager.capture(fixture.task.id, first.workItem.id);

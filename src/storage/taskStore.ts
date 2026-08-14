@@ -714,7 +714,7 @@ export class FileTaskStore implements TaskStore {
     }
     const aggregate = this.#requireTaskForWrite(taskId);
     const evidenceRound = Object.values(aggregate.reviewRounds).find(
-      ({ evidenceCommit }) => evidenceCommit === stored.headCommit
+      ({ evidenceCommit, reviewBaseCommit }) => evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit && evidenceCommit === stored.headCommit
     );
     if (evidenceRound !== undefined) {
       throw new StorageRecordError(
@@ -774,7 +774,7 @@ export class FileTaskStore implements TaskStore {
         throw new StorageRecordError(`Integration ChangeSet belongs to another Project: ${changeSetId}.`);
       }
       const evidenceRound = Object.values(aggregate.reviewRounds).find(
-        ({ evidenceCommit }) => evidenceCommit === changeSet.headCommit
+        ({ evidenceCommit, reviewBaseCommit }) => evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit && evidenceCommit === changeSet.headCommit
       );
       if (evidenceRound !== undefined) {
         throw new StorageRecordError(
@@ -2779,7 +2779,7 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
       throw new StorageRecordError(`ChangeSet Project does not match Task: ${changeSet.id}.`);
     }
     const evidenceRound = Object.values(aggregate.reviewRounds).find(
-      ({ evidenceCommit }) => evidenceCommit === changeSet.headCommit
+      ({ evidenceCommit, reviewBaseCommit }) => evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit && evidenceCommit === changeSet.headCommit
     );
     if (evidenceRound !== undefined) {
       throw new StorageRecordError(
@@ -2804,7 +2804,7 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
         );
       }
       const evidenceRound = Object.values(aggregate.reviewRounds).find(
-        ({ evidenceCommit }) => evidenceCommit === changeSet.headCommit
+        ({ evidenceCommit, reviewBaseCommit }) => evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit && evidenceCommit === changeSet.headCommit
       );
       if (evidenceRound !== undefined) {
         throw new StorageRecordError(

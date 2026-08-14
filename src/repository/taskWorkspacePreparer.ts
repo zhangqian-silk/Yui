@@ -1519,7 +1519,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (round.workspace === undefined || !isDeepStrictEqual(round.workspace, workspace)) {
       throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
     }
-    return this.#snapshotReviewWorkspaceEntries(round.id, workspace);
+    return this.#snapshotReviewWorkspaceEntries(round.id, workspace, round.reviewBaseCommit);
   }
 
   /**
@@ -1552,7 +1552,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         || !isDeepStrictEqual(round.workspace, run.workspace)) {
         throw new Error(`Review Run workspace owner does not match its ReviewRound: ${run.id}.`);
       }
-      return this.#snapshotReviewWorkspaceEntries(round.id, run.workspace);
+      return this.#snapshotReviewWorkspaceEntries(round.id, run.workspace, round.reviewBaseCommit);
     }
     if (run.workspace.owner.type !== "execution-lane"
       || run.workspace.owner.taskId !== taskId
@@ -1580,7 +1580,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       || run.workspace.entries.some(({ access }) => access !== "write")) {
       throw new Error(`Review Run Lane workspace lineage is not exact: ${run.id}.`);
     }
-    return this.#snapshotReviewWorkspaceEntries(round.id, run.workspace);
+    return this.#snapshotReviewWorkspaceEntries(round.id, run.workspace, round.reviewBaseCommit);
   }
 
   async inspectExecutionLaneWorkspace(
@@ -2037,9 +2037,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
 
   async #snapshotReviewWorkspaceEntries(
     reviewRoundId: string,
-    workspace: ManagedWorkspace
+    workspace: ManagedWorkspace,
+    reviewBaseCommit: string
   ): Promise<Readonly<{ evidenceCommit?: string }>> {
     const changed: string[] = [];
+    let dirty = false;
     for (const entry of workspace.entries) {
       if (await this.git.headRef(entry.path) !== entry.branch) {
         throw new Error(
@@ -2056,13 +2058,22 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         );
       }
       if (head !== entry.baseCommit) changed.push(head);
+      if (!await this.git.isClean(entry.path)) dirty = true;
     }
     if (changed.length > 1) {
       throw new Error(
         `Review workspace has diagnostic commits in multiple Projects; preserve it for Leader routing: ${reviewRoundId}.`
       );
     }
-    return changed.length === 0 ? {} : { evidenceCommit: changed[0]! };
+    // A dirty worktree has uncommitted diagnostics: no single commit captures
+    // the tree the checks ran on, so no evidenceCommit can attest it and the
+    // queue must re-run the gate.  A clean worktree attests that checks ran on
+    // the recorded tree: the frozen base when the reviewer made no commits, or
+    // the reviewer's single diagnostic commit otherwise.
+    if (dirty) return {};
+    return changed.length === 0
+      ? { evidenceCommit: reviewBaseCommit }
+      : { evidenceCommit: changed[0]! };
   }
 
   #projectContainer(projectName: string): string {

@@ -399,9 +399,11 @@ export class WorkItemChangeSetManager {
    * durable evidence for it.  "completed" alone is not a verdict: the
    * reviewer may have yielded with failed checks (requires-repair), so only a
    * round with an explicit positive verdict — at least one passed check and
-   * no failed one — may feed `evidenceRefs`.  The reviewer's diagnostic
-   * `evidenceCommit` intentionally differs from the reviewed base and never
-   * becomes a ChangeSet head, so it cannot serve as this link.
+   * no failed one — may feed `evidenceRefs`.  The link is by
+   * `reviewBaseCommit`, not by `evidenceCommit`: the latter records the exact
+   * tree the checks ran on (the frozen base for a clean review, a diagnostic
+   * commit for a committed-diagnostic review, absent for a dirty review), and
+   * the queue separately re-checks that tree binding before waiving a gate.
    */
   #captureEvidenceRefs(
     taskId: string,
