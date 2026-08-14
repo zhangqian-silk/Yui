@@ -494,7 +494,7 @@ test("a gate failure blocks only its item", async () => {
   assert.equal(existsSync(join(fixture.repositoryPath, "a.txt")), false);
 });
 
-test("reusable evidence validates an unaffected item without re-running its checks", async () => {
+test("evidence does not skip the gate across a target change", async () => {
   const fixture = await createFixture();
   const first = await branchChangeSet(fixture, {
     id: "change-set-1",
@@ -505,29 +505,33 @@ test("reusable evidence validates an unaffected item without re-running its chec
     paths: { "b.txt": "b\n" },
     manifest: EVIDENCE
   });
-  // The third item builds on top of the second: it touches b.txt (so the
-  // second landing affects it) but cherry-picks cleanly onto the new target.
+  // The third item is disjoint from both: it adds c.txt and carries evidence
+  // too, so it must still run its own gate against the current target.
   const third = await branchChangeSet(fixture, {
     id: "change-set-3",
-    base: second.headCommit,
-    paths: { "b.txt": "b-again\n" },
+    paths: { "c.txt": "c\n" },
     manifest: EVIDENCE
   });
   await enqueue(fixture, first, { checkCommands: ["true"] });
   await enqueue(fixture, second, { checkCommands: ["false"] });
-  await enqueue(fixture, third, { checkCommands: ["false"] });
+  await enqueue(fixture, third, { checkCommands: ["true"] });
   const processed = await processQueue(fixture);
+  assert.equal(processed.length, 3);
   assert.equal(processed[0].entry.status, "committed");
-  // The second item was validated by evidence and skipped its (failing) checks.
-  assert.equal(processed[1].entry.status, "committed");
-  assert.deepEqual(processed[1].attempt.checkCommands, []);
-  assert.deepEqual(processed[1].attempt.checks, []);
-  // The third item lost evidence coverage when the second landed b.txt, so
-  // its checks ran and the failing gate blocked it.
-  assert.equal(processed[2].entry.status, "conflicted");
-  assert.match(processed[2].entry.conflictSummary, /gate failed/);
-  const stored = fixture.store.getIntegrationQueueEntry(fixture.task.id, processed[2].entry.id);
-  assert.deepEqual(stored.affectedPaths, ["b.txt"]);
+  // The second item carries evidence, but disjoint changedPaths do not rebind
+  // it to the target the first commit produced: its gate runs against the new
+  // target and fails instead of being skipped.
+  assert.equal(processed[1].entry.status, "conflicted");
+  assert.match(processed[1].entry.conflictSummary, /gate failed/);
+  assert.deepEqual(processed[1].attempt.checkCommands, ["false"]);
+  assert.equal(processed[1].attempt.checks[0].outcome, "failed");
+  // The third item keeps its place and also runs its (passing) gate against
+  // the exact current target before committing.
+  assert.equal(processed[2].entry.status, "committed");
+  assert.deepEqual(processed[2].attempt.checkCommands, ["true"]);
+  assert.equal(processed[2].attempt.checks[0].outcome, "passed");
+  assert.equal(existsSync(join(fixture.repositoryPath, "b.txt")), false);
+  assert.equal(readFileSync(join(fixture.repositoryPath, "c.txt"), "utf8"), "c\n");
 });
 
 test("supersede closes a waiting item and frees its ChangeSet for a fresh enqueue", async () => {
@@ -617,9 +621,33 @@ test("queue entries round-trip through the store and reject an updatedAt move ba
 
 // --- task-16 review regressions --------------------------------------------
 
+test("a target commit does not rebind a waiting item's evidence to the new head", async () => {
+  const fixture = await createFixture();
+  const trigger = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "other.txt": "other\n" }
+  });
+  // The target item carries evidence but its gate reads a file it does not
+  // touch: disjoint changedPaths must not mark it validated.
+  const target = await branchChangeSet(fixture, {
+    id: "change-set-2",
+    paths: { "app.js": "app\n" },
+    manifest: EVIDENCE
+  });
+  await enqueue(fixture, trigger, { checkCommands: ["true"] });
+  await enqueue(fixture, target, { checkCommands: ["! grep -q THREE config.txt"] });
+  const first = await processQueue(fixture, { limit: 1 });
+  assert.equal(first.length, 1);
+  assert.equal(first[0].entry.status, "committed");
+  // The trigger landed, but the waiting item keeps its place: its evidence is
+  // not rebound to the new target head and no evidence boundary is recorded.
+  const waiting = fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-2");
+  assert.equal(waiting.status, "queued");
+  assert.equal(waiting.evidenceTargetHead, undefined);
+});
+
 test("an out-of-band target advance invalidates reusable evidence and re-runs the gate", async () => {
   const fixture = await createFixture();
-  // The trigger lands first so the target item is validated by evidence.
   const trigger = await branchChangeSet(fixture, {
     id: "change-set-1",
     paths: { "other.txt": "other\n" }
@@ -633,14 +661,17 @@ test("an out-of-band target advance invalidates reusable evidence and re-runs th
   });
   await enqueue(fixture, trigger, { checkCommands: ["true"] });
   await enqueue(fixture, target, { checkCommands: ["! grep -q THREE config.txt"] });
-  // First run: the trigger commits and the target is validated against the
-  // exact target head the trigger produced, without running its gate.
   const first = await processQueue(fixture, { limit: 1 });
   assert.equal(first.length, 1);
   assert.equal(first[0].entry.status, "committed");
-  const validated = fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-2");
-  assert.equal(validated.status, "validated");
-  assert.equal(validated.evidenceTargetHead, first[0].entry.targetAfter);
+  // Record an exact-target evidence binding for the head the trigger produced
+  // (the only sound form of validation: the evidence was checked against this
+  // exact head), so the out-of-band fence has something to invalidate.
+  const waiting = fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-2");
+  fixture.store.saveIntegrationQueueEntry(
+    fixture.task.id,
+    markIntegrationQueueValidated(waiting, now, first[0].entry.targetAfter)
+  );
   // Another Task advances the shared target out of band, writing THREE to the
   // file the target item's gate reads.
   writeFileSync(join(fixture.repositoryPath, "config.txt"), "THREE\n");

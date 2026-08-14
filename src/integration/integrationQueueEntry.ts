@@ -38,8 +38,8 @@ export type IntegrationQueueEntry = Readonly<{
   conflictSummary?: string;
   /**
    * Paths landed on the target after this entry was enqueued that overlap the
-   * entry's own ChangeSet.  Recomputed after every target advance; an empty
-   * set plus reusable evidence lets the entry skip re-verification.
+   * entry's own ChangeSet.  Recomputed after every target advance; a validated
+   * entry with any affected path loses its evidence coverage.
    */
   affectedPaths?: readonly string[];
   /**
@@ -187,10 +187,11 @@ export function markIntegrationQueueCommitted(
 }
 
 /**
- * A target advance proved this entry's ChangeSet unaffected, and it carries
- * reusable exact-SHA evidence: its checks need not be re-executed.  The
- * `evidenceTargetHead` records the exact target head the evidence was
- * validated against, so a later out-of-band advance can be fenced.
+ * Records that this entry's reusable evidence was checked against an exact
+ * target head.  The evidence only covers `evidenceTargetHead`; a target
+ * advance invalidates it unless the delta is provably empty.  Path
+ * disjointness alone never justifies this transition: a gate may read any
+ * file, so a non-empty target increment cannot be proven irrelevant.
  */
 export function markIntegrationQueueValidated(
   entry: IntegrationQueueEntry,

@@ -46,7 +46,7 @@ import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js"
  * identical parallel changes converge without a second commit; and the
  * dev branches, records, and lifecycles of the eight Tasks stay
  * independent.  Supplementary cases cover ancestor convergence, evidence
- * reuse, and a migrated v2 ChangeSet.
+ * target fencing, and a migrated v2 ChangeSet.
  */
 
 const now = new Date("2026-08-13T00:00:00.000Z");
@@ -525,12 +525,13 @@ test("enqueue converges when the ChangeSet head is already a target ancestor", a
   assert.equal(masterCommitCount(fixture), 2);
 });
 
-test("reusable evidence validates a waiting WorkItem without re-running its gate", async () => {
+test("review evidence does not skip the integration gate across a target change", async () => {
   const fixture = await createFixture();
   // One Task, two WorkItems with disjoint paths, captured through the
   // production capture manager.  The second carries a completed ReviewRound
   // whose reviewBaseCommit is the exact captured candidate, so its evidence
-  // is reusable; its gate is a failing command that must never run.
+  // is linked; its gate reads the first WorkItem's file, so it can only pass
+  // once the first change has landed.
   const task = activateTask(createTask(
     fixture.store.nextTaskId(),
     "Evidence task",
@@ -569,17 +570,22 @@ test("reusable evidence validates a waiting WorkItem without re-running its gate
   assert.deepEqual(firstChangeSet.manifest.evidenceRefs, []);
 
   await enqueueChange(fixture, task, firstChangeSet, { checkCommands: ["true"] });
-  await enqueueChange(fixture, task, secondChangeSet, { checkCommands: ["false"] });
+  // The gate reads the first WorkItem's file: it fails on the base target and
+  // passes only after the first change lands.  If evidence wrongly skipped
+  // the gate, no checks would run at all.
+  await enqueueChange(fixture, task, secondChangeSet, {
+    checkCommands: ["grep -q a src/feature-a.ts"]
+  });
   const processed = await processTask(fixture, task);
   assert.equal(processed.length, 2);
   assert.equal(processed[0].entry.changeSetId, firstChangeSet.id);
   assert.equal(processed[0].entry.status, "committed");
   assert.equal(processed[1].entry.changeSetId, secondChangeSet.id);
   assert.equal(processed[1].entry.status, "committed");
-  // The second WorkItem was validated by the first landing: its failing gate
-  // never ran because the reusable evidence covered the exact candidate.
-  assert.deepEqual(processed[1].attempt.checkCommands, []);
-  assert.deepEqual(processed[1].attempt.checks, []);
+  // The second WorkItem ran its gate against the target the first landing
+  // produced; the review evidence did not rebind to the new target.
+  assert.deepEqual(processed[1].attempt.checkCommands, ["grep -q a src/feature-a.ts"]);
+  assert.equal(processed[1].attempt.checks[0].outcome, "passed");
   assert.equal(masterFile(fixture, "src/feature-a.ts"), "a\n");
   assert.equal(masterFile(fixture, "src/feature-b.ts"), "b\n");
 });

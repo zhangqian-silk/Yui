@@ -16,7 +16,6 @@ import {
   markIntegrationQueueRequeued,
   markIntegrationQueueRunning,
   markIntegrationQueueSuperseded,
-  markIntegrationQueueValidated,
   recordIntegrationQueueAffectedPaths,
   recordIntegrationQueueAttempt,
   type IntegrationQueueEntry
@@ -31,8 +30,9 @@ import type { ChangeSet } from "./changeSet.js";
  * The serialized integration queue.  Every item gets a fresh apply on the
  * current target; a conflict or gate failure blocks only that item.  After
  * each target advance the remaining items recompute their overlap, and an
- * unaffected item with exact-SHA evidence is validated without re-running
- * its checks.
+ * item whose own paths became affected loses any evidence coverage.  Path
+ * disjointness never rebinds evidence to a new target: a gate may read any
+ * file, so each item runs its checks against the exact target it integrates.
  */
 
 export type IntegrationQueueGitPort = GitWorkspacePort & {
@@ -200,7 +200,8 @@ export type ProcessIntegrationQueueItem = Readonly<{
  * Process queued items in id order.  Each item gets a fresh IntegrationAttempt
  * on the exact current target; conflicts and gate failures map the item to
  * `conflicted` without touching the others.  After every commit the remaining
- * items recompute overlap, and unaffected items with evidence are validated.
+ * items recompute overlap, and an item whose own paths became affected loses
+ * its evidence coverage and runs its checks again.
  */
 export async function processIntegrationQueue(
   store: TaskStore,
@@ -450,16 +451,15 @@ function recomputeAffectedPaths(
     const beforeAffected = (entry.affectedPaths ?? []).length;
     let updated = recordIntegrationQueueAffectedPaths(entry, affected, now());
     if (updated.status === "validated" && (updated.affectedPaths?.length ?? 0) > 0) {
+      // The target advanced onto this entry's own paths: its evidence no
+      // longer covers the target, so the gate must run again.
       updated = markIntegrationQueueRequeued(updated, now());
-    } else if (
-      updated.status === "queued"
-      && (updated.affectedPaths?.length ?? 0) === 0
-      && updated.evidenceRefs.length > 0
-    ) {
-      // The evidence is validated against the exact target head this commit
-      // just produced; a later out-of-band advance is fenced at process time.
-      updated = markIntegrationQueueValidated(updated, now(), committed.targetAfter);
     }
+    // A queued entry keeps its place and runs its checks against the exact
+    // current target at process time.  Disjoint changedPaths must never
+    // rebind its evidence to the new target head: a gate may read any file,
+    // so a non-empty target increment cannot be proven irrelevant from path
+    // metadata alone.
     if (updated.status !== entry.status
       || (updated.affectedPaths?.length ?? 0) !== beforeAffected) {
       store.saveIntegrationQueueEntry(taskId, updated);
