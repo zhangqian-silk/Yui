@@ -18,6 +18,8 @@
 // ------
 //   1. Parse/serializer cost  — JSON.parse / JSON.stringify of the real document.
 //   2. Transaction cost       — full read-modify-write cycles on a temp copy.
+//   2b. Cross-process lock    — K child processes contend on .state.lock to
+//      measure real cross-process wait (not just in-process event-loop block).
 //   3. Control-plane under load — real Unix-socket Controller driven by 25+
 //      agents emitting native-turn-progress telemetry + lifecycle events +
 //      task messages, exactly as production hooks do.
@@ -46,6 +48,7 @@ import { cpus, totalmem, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { performance, monitorEventLoopDelay } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
+import { fork } from "node:child_process";
 
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { openCompatibleFileTaskStore } from "../../dist/storage/compatibleTaskStore.js";
@@ -320,6 +323,109 @@ function phaseTransactionCost(realHome, iterations) {
     };
     console.log(statsRow("full RMW transaction", result.tx));
     console.log(`  revision: ${result.revisionBefore} -> ${result.revisionAfter}`);
+    return result;
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b — cross-process lock contention
+// ---------------------------------------------------------------------------
+
+async function phaseLockContention(realHome, holdP50Ms, numChildren = 4, txPerChild = 2) {
+  console.log("\n=== Phase 2b: cross-process lock contention ===");
+  const home = makeTempHome("lock");
+  try {
+    copyRealState(realHome, home);
+    console.log(`  temp Home: ${home}`);
+    console.log(`  children: ${numChildren}, tx per child: ${txPerChild}, total: ${numChildren * txPerChild}`);
+    console.log(`  hold H (Phase 2 p50): ${fmt(holdP50Ms)} ms`);
+
+    const childScript = join(__dirname, "lock-contention-child.mjs");
+    const results = [];
+    const childErrors = [];
+
+    // Spawn all children as simultaneously as possible.
+    const childPromises = [];
+    for (let c = 0; c < numChildren; c++) {
+      const child = fork(childScript, [
+        "--home", home,
+        "--iterations", String(txPerChild),
+        "--child-id", String(c)
+      ], { silent: true });
+
+      let stdout = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { childErrors.push(`child ${c} stderr: ${chunk}`); });
+
+      childPromises.push(new Promise((resolve, reject) => {
+        child.on("exit", (code) => {
+          if (code !== 0) {
+            reject(new Error(`child ${c} exited with code ${code}: ${stdout}`));
+            return;
+          }
+          const lines = stdout.trim().split("\n").filter(Boolean);
+          for (const line of lines) {
+            try {
+              results.push(JSON.parse(line));
+            } catch {
+              childErrors.push(`child ${c}: unparseable line: ${line}`);
+            }
+          }
+          resolve();
+        });
+        child.on("error", reject);
+      }));
+    }
+
+    // Wait for all children with a generous timeout.
+    const timeoutMs = 180_000;
+    await Promise.race([
+      Promise.all(childPromises),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("lock contention probe timed out")), timeoutMs))
+    ]);
+
+    if (childErrors.length > 0) {
+      console.log(`  child errors: ${childErrors.length}`);
+      for (const e of childErrors.slice(0, 3)) console.log(`    ${e}`);
+    }
+
+    // Aggregate.
+    const successful = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    const wallTimes = successful.map((r) => r.wallMs);
+    const totalLockTimeouts = results.reduce((sum, r) => sum + (r.lockTimeouts || 0), 0);
+    const totalRevisionConflicts = results.reduce((sum, r) => sum + (r.revisionConflicts || 0), 0);
+
+    const contendedStats = stats(wallTimes);
+    // Derived wait = contended total - hold H (clamped at 0).
+    const derivedWaitTimes = wallTimes.map((t) => Math.max(0, t - holdP50Ms));
+    const waitStats = stats(derivedWaitTimes);
+
+    const result = {
+      tempHome: home,
+      children: numChildren,
+      txPerChild,
+      totalTransactions: numChildren * txPerChild,
+      successfulTransactions: successful.length,
+      failedTransactions: failed.length,
+      totalLockTimeouts,
+      totalRevisionConflicts,
+      holdMs: holdP50Ms,
+      contended: contendedStats,
+      derivedWait: waitStats,
+      perTransaction: results
+    };
+
+    console.log(`  successful: ${successful.length}/${numChildren * txPerChild}, failed: ${failed.length}`);
+    console.log(`  lock timeouts (retried): ${totalLockTimeouts}, revision conflicts (retried): ${totalRevisionConflicts}`);
+    console.log(statsRow("contended total", contendedStats));
+    console.log(statsRow("derived wait", waitStats));
+    for (const r of results) {
+      console.log(`  child ${r.childId} tx ${r.iteration}: ${fmt(r.wallMs)}ms  (timeouts=${r.lockTimeouts} revConflicts=${r.revisionConflicts} attempts=${r.attempts} ok=${r.success})`);
+    }
+
     return result;
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -697,7 +803,7 @@ function phaseControlPlaneLoad(realHome, agents, rounds) {
 // Report generation
 // ---------------------------------------------------------------------------
 
-function generateReport(args, env, phase1, phase2, phase3, realHomeSnapshot, realHomeChangedByLiveController) {
+function generateReport(args, env, phase1, phase2, phase2b, phase3, realHomeSnapshot, realHomeChangedByLiveController) {
   const reproCmd = `node --expose-gc scripts/bench/controller-baseline.mjs --real-home ${args.realHome} --rounds ${args.rounds} --agents ${args.agents}`;
   const loadShape = [
     `- **Agents**: ${args.agents} simulated agents (${Math.min(20, args.agents)} claude, ${Math.max(0, args.agents - 20)} codex), each with a unique launchId / nativeSessionId / runId.`,
@@ -710,6 +816,7 @@ function generateReport(args, env, phase1, phase2, phase3, realHomeSnapshot, rea
 
   const p1 = phase1;
   const p2 = phase2;
+  const p2b = phase2b;
   const p3 = phase3;
 
   const md = `# Controller Baseline — ${TODAY}
@@ -769,6 +876,44 @@ Full read-modify-write transactions (\`FileTaskStore.transaction\` saving one ev
 | max | ${fmt(p2.tx.max)} ms |
 
 Each transaction = read 36 MB + JSON.parse + mutate + JSON.stringify + atomic write of 36 MB, all on the main thread under a global write lock.
+
+## Phase 2b — Cross-process lock contention
+
+Phase 3 runs the Controller in-process, so all transactions are synchronous in one Node process — there is no real \`.state.lock\` contention (JS is single-threaded; sync transactions never interleave).  This phase measures the **cross-process** wait that occurs when multiple processes (e.g. the production Controller + a cleanup CLI + an integration CLI) serialise on the same \`.state.lock\`.
+
+**Method**: ${p2b.children} child processes (\`lock-contention-child.mjs\`) each open the same temp Home copy and do ${p2b.txPerChild} full RMW transactions (\`saveEvent\`, same shape as Phase 2).  All children start simultaneously.  Each child records per-transaction wall time (just before \`store.transaction\` to just after, including lock wait + retries).  Hold time H = Phase 2 uncontended p50.  Derived wait = contended total − H.
+
+| Metric | Value |
+|--------|-------|
+| Hold time H (Phase 2 p50) | ${fmt(p2b.holdMs)} ms |
+| Children | ${p2b.children} |
+| Transactions per child | ${p2b.txPerChild} |
+| Total transactions | ${p2b.totalTransactions} |
+| Successful | ${p2b.successfulTransactions} |
+| Failed | ${p2b.failedTransactions} |
+| Lock timeouts (retried) | ${p2b.totalLockTimeouts} |
+| Revision conflicts (retried) | ${p2b.totalRevisionConflicts} |
+
+### Contended total (wall time per transaction, including lock wait)
+
+| Percentile | Time |
+|------------|------|
+| **p50** | **${fmt(p2b.contended.p50)} ms** |
+| **p95** | **${fmt(p2b.contended.p95)} ms** |
+| max | ${fmt(p2b.contended.max)} ms |
+| mean | ${fmt(p2b.contended.mean)} ms |
+| samples | ${p2b.contended.count} |
+
+### Derived wait (contended total − hold H)
+
+| Percentile | Wait |
+|------------|------|
+| **p50** | **${fmt(p2b.derivedWait.p50)} ms** |
+| **p95** | **${fmt(p2b.derivedWait.p95)} ms** |
+| max | ${fmt(p2b.derivedWait.max)} ms |
+| mean | ${fmt(p2b.derivedWait.mean)} ms |
+
+Transactions from different processes interleave on \`.state.lock\`: while one process holds the lock for ~${fmt(p2b.holdMs)} ms (full 36 MB RMW), every other process blocks on \`mkdirSync(.state.lock)\` with a 5 s timeout.  The 5 s lock timeout is shorter than the serialised wait under 4-process contention, so children encounter lock timeouts and retry — adding further wall time on top of the raw wait.
 
 ## Phase 3 — Control-plane latency under load
 
@@ -846,7 +991,8 @@ setImmediate drift probe (cross-check): p50=${fmt(p3.setImmediateDrift.p50)} ms,
 2. **Under a 25-agent telemetry load, control-socket p99 latency reaches ${fmt(p3.socketLatency.p99)} ms** because the event loop is blocked by synchronous JSON.parse + JSON.stringify + write of the entire state document.
 3. **Event-loop delay peaks at ${p3.eventLoopDelay.maxMs.toFixed(0)} ms** — the main thread is fully stalled during each commit, starving all socket I/O.
 4. **RSS peaks at ${p3.rss.maxMB.toFixed(0)} MB** — each parse+stringify cycle allocates ~${p1.heapDeltaMB.toFixed(0)} MB of temporary heap.
-5. The SQLite WAL + worker-thread design moves JSON parse/stringify, SQL execution, and fsync off the main thread, so a progress event becomes a single-row upsert instead of a 36 MB document rewrite.
+5. **Cross-process lock wait (Phase 2b)**: with ${p2b.children} contending processes, derived wait p50 = ${fmt(p2b.derivedWait.p50)} ms, p95 = ${fmt(p2b.derivedWait.p95)} ms, max = ${fmt(p2b.derivedWait.max)} ms.  The 5 s lock timeout is shorter than the serialised wait, so processes retry — compounding the stall.  This is the production bottleneck the Operator described (Controller + cleanup CLI + integration CLI all serialising on \`.state.lock\`).
+6. The SQLite WAL + worker-thread design moves JSON parse/stringify, SQL execution, and fsync off the main thread, so a progress event becomes a single-row upsert instead of a 36 MB document rewrite.
 
 ## Safety assertion
 
@@ -906,13 +1052,17 @@ async function main() {
   const phase2 = phaseTransactionCost(args.realHome, args.txIterations);
   const p2Clean = assertRealHomeUnchanged(args.realHome, realHomeBefore, "Phase 2");
 
+  // Phase 2b — cross-process lock contention (uses Phase 2 p50 as hold time H)
+  const phase2b = await phaseLockContention(args.realHome, phase2.tx.p50);
+  const p2bClean = assertRealHomeUnchanged(args.realHome, realHomeBefore, "Phase 2b");
+
   // Phase 3
   const phase3 = await phaseControlPlaneLoad(args.realHome, args.agents, args.rounds);
   const p3Clean = assertRealHomeUnchanged(args.realHome, realHomeBefore, "Phase 3");
 
   // Final assertion
   const finalClean = assertRealHomeUnchanged(args.realHome, realHomeBefore, "entire benchmark");
-  const realHomeChangedByLiveController = !(p1Clean && p2Clean && p3Clean && finalClean);
+  const realHomeChangedByLiveController = !(p1Clean && p2Clean && p2bClean && p3Clean && finalClean);
   if (!realHomeChangedByLiveController) {
     console.log("\n  SAFETY: real Home unchanged (size + mtime verified).");
   } else {
@@ -922,7 +1072,7 @@ async function main() {
   }
 
   // Generate report
-  const { markdown, reproCmd } = generateReport(args, env, phase1, phase2, phase3, realHomeBefore, realHomeChangedByLiveController);
+  const { markdown, reproCmd } = generateReport(args, env, phase1, phase2, phase2b, phase3, realHomeBefore, realHomeChangedByLiveController);
 
   // Write the doc
   mkdirSync(dirname(args.outDoc), { recursive: true });
@@ -939,6 +1089,7 @@ async function main() {
     environment: env,
     phase1,
     phase2,
+    phase2b,
     phase3,
     safety: { realHomeUnchanged: !realHomeChangedByLiveController, scriptReadOnly: true }
   };
