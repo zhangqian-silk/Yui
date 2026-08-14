@@ -246,18 +246,35 @@ function abortIntegration(
   }
   const reason = parsed.one.get("--reason");
   if (reason === undefined) throw usageError(usage);
-  const aborted = updateIntegrationAttempt(integration, {
-    status: "failed",
-    checks: [
-      ...(integration.checks ?? []),
-      { name: "aborted", outcome: "failed", details: reason }
-    ]
-  }, now);
-  store.saveIntegrationAttempt(aborted.taskId, aborted);
-  return {
-    output: `Aborted Integration ${aborted.id}; start a new Integration Attempt to retry\n`,
-    data: { integration: aborted }
-  };
+  return store.transaction((tx) => {
+    // Re-read inside the transaction: a concurrent `continue` can advance the
+    // Attempt to validating (and then commit the target) after the initial
+    // read.  Aborting a validating or committed Attempt would leave the
+    // target advanced while the Attempt is failed.
+    const current = tx.getIntegrationAttempt(integration.taskId, integration.id);
+    if (current === null) {
+      throw usageError(
+        `Integration Attempt not found: ${integration.taskId}/${integration.id}.`
+      );
+    }
+    if (current.status !== "running" && current.status !== "blocked") {
+      throw usageError(
+        `Integration cannot be aborted from ${current.status}: ${current.id}.`
+      );
+    }
+    const aborted = updateIntegrationAttempt(current, {
+      status: "failed",
+      checks: [
+        ...(current.checks ?? []),
+        { name: "aborted", outcome: "failed", details: reason }
+      ]
+    }, now);
+    tx.saveIntegrationAttempt(aborted.taskId, aborted);
+    return {
+      output: `Aborted Integration ${aborted.id}; start a new Integration Attempt to retry\n`,
+      data: { integration: aborted }
+    };
+  });
 }
 
 function requireActiveIntegrationTask(

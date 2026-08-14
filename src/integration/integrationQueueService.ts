@@ -487,6 +487,12 @@ function canReuseEvidenceAtHead(
  * names of checks that passed.  A requested gate command is covered only when
  * a resolved round recorded that exact command as passed.  A review that ran
  * `true` (or any other unrelated check) never waives a different gate.
+ *
+ * A check is reusable only when it ran on the frozen candidate tree.  A
+ * ReviewRound whose `evidenceCommit` differs from its `reviewBaseCommit` ran
+ * its checks on a diagnostic tree (the reviewer's own commit with review-only
+ * changes); those checks proved a different tree and cannot waive the
+ * candidate gate.
  */
 function evidenceCoversCheckCommands(
   store: TaskStore,
@@ -501,6 +507,8 @@ function evidenceCoversCheckCommands(
     if (roundId === undefined) continue;
     const round = store.getReviewRound(taskId, roundId);
     if (round === null || round.status !== "completed") continue;
+    if (round.evidenceCommit !== undefined
+      && round.evidenceCommit !== round.reviewBaseCommit) continue;
     for (const check of round.checks ?? []) {
       if (check.outcome === "passed") covered.add(check.name);
     }

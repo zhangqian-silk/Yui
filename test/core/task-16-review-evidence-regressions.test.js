@@ -134,7 +134,13 @@ function createCapturedWorkItem(fixture, label, paths) {
   return { workItem, headCommit };
 }
 
-function saveCompletedReview(fixture, workItem, reviewBaseCommit, checks) {
+function saveCompletedReview(
+  fixture,
+  workItem,
+  reviewBaseCommit,
+  checks,
+  evidenceCommit
+) {
   const pending = createReviewRound(
     fixture.store.nextReviewRoundId(fixture.task.id),
     fixture.task.id,
@@ -150,7 +156,7 @@ function saveCompletedReview(fixture, workItem, reviewBaseCommit, checks) {
     "completed",
     "Reviewer yielded its findings.",
     now,
-    { checks }
+    { checks, ...(evidenceCommit === undefined ? {} : { evidenceCommit }) }
   );
   fixture.store.saveReviewRound(fixture.task.id, completed);
   return completed;
@@ -220,6 +226,49 @@ test("a completed review with a passed check links reusable evidence", async () 
     .capture(fixture.task.id, candidate.workItem.id);
 
   assert.deepEqual(changeSet.manifest.evidenceRefs, [`review-round:${round.id}`]);
+});
+
+test("checks run on a diagnostic commit cannot waive the frozen candidate gate", async () => {
+  const fixture = await createFixture();
+  const candidate = createCapturedWorkItem(fixture, "candidate", {
+    "src/candidate.js": "candidate\n"
+  });
+  const reviewWorktree = join(fixture.root, "review-worktree");
+  git([
+    "-C", fixture.repositoryPath,
+    "worktree", "add", "-b", "review-diagnostic", reviewWorktree, candidate.headCommit
+  ]);
+  writeFileSync(join(reviewWorktree, "review-only.txt"), "diagnostic\n");
+  git(["-C", reviewWorktree, "add", "review-only.txt"]);
+  git(["-C", reviewWorktree, "commit", "-m", "review diagnostic"]);
+  const diagnosticCommit = git(["-C", reviewWorktree, "rev-parse", "HEAD"]).trim();
+  const gate = "test -f review-only.txt";
+  execFileSync("sh", ["-c", gate], { cwd: reviewWorktree });
+  saveCompletedReview(
+    fixture,
+    candidate.workItem,
+    candidate.headCommit,
+    [{ name: gate, outcome: "passed" }],
+    diagnosticCommit
+  );
+
+  const [changeSet] = await new WorkItemChangeSetManager(fixture.store, () => now)
+    .capture(fixture.task.id, candidate.workItem.id);
+  await enqueue(fixture, changeSet, [gate]);
+  const [processed] = await processIntegrationQueue(
+    fixture.store,
+    fixture.home,
+    fixture.task.id,
+    { now: () => now }
+  );
+
+  assert.equal(
+    processed.entry.status,
+    "conflicted",
+    "a check proved only on the Reviewer's diagnostic tree must run on the frozen candidate"
+  );
+  assert.equal(processed.attempt.checks[0].outcome, "failed");
+  assert.equal(existsSync(join(fixture.repositoryPath, "src/candidate.js")), false);
 });
 
 // --- Finding 2: evidence is not rebound across a target change --------------

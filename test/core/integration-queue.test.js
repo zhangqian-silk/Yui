@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
 import { runTaskIntegrationQueueCommand } from "../../dist/commands/taskIntegrationQueueCommands.js";
 import { createChangeSetManifest } from "../../dist/integration/changeSetManifest.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
@@ -939,6 +940,114 @@ test("recovery commands cannot overtake a validating manual-resolution Attempt",
     invalidActions,
     [],
     "recovery must reject a queue entry while its manual-resolution Attempt is validating"
+  );
+});
+
+test("a stale abort cannot overtake a validating manual-resolution Attempt", async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "manual.txt": "resolved\n" }
+  });
+  const queued = await enqueue(fixture, changeSet, { checkCommands: ["true"] });
+  let attempt = createIntegrationAttempt({
+    id: fixture.store.nextIntegrationAttemptId(fixture.task.id),
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    targetRef: "master",
+    expectedHead: fixture.baseCommit,
+    changeSetIds: [changeSet.id],
+    checkCommands: ["true"]
+  }, now);
+  fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+  const running = recordIntegrationQueueAttempt(
+    markIntegrationQueueRunning(queued.entry, fixture.baseCommit, now),
+    attempt.id,
+    now
+  );
+  fixture.store.saveIntegrationQueueEntry(fixture.task.id, running);
+  attempt = requireLeaderDecision(attempt, {
+    affectedPaths: ["manual.txt"],
+    summary: "manual conflict resolution"
+  }, now);
+  fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+  fixture.store.saveIntegrationQueueEntry(
+    fixture.task.id,
+    markIntegrationQueueBlocked(running, "manual conflict resolution", now)
+  );
+  attempt = recordResolutionDecision(attempt, {
+    action: "manual-resolution",
+    rationale: "preserve the combined result"
+  }, now);
+  fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+
+  // An abort command reads the blocked Attempt, while the supported continue
+  // command advances it to validating in another process before abort saves.
+  const validating = updateIntegrationAttempt(attempt, {
+    status: "validating",
+    candidateCommit: changeSet.headCommit,
+    checks: [{ name: "true", outcome: "passed" }]
+  }, now);
+  const competingStore = new FileTaskStore(fixture.home);
+  let injectedValidating = false;
+  const racingStore = new Proxy(fixture.store, {
+    get(target, property) {
+      if (property === "getIntegrationAttempt") {
+        return (taskId, attemptId) => {
+          const observed = target.getIntegrationAttempt(taskId, attemptId);
+          if (!injectedValidating) {
+            injectedValidating = true;
+            competingStore.saveIntegrationAttempt(taskId, validating);
+          }
+          return observed;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  let abortRejected = false;
+  try {
+    await runTaskIntegrationCommand(
+      [
+        "abort", `${fixture.task.id}/${attempt.id}`,
+        "--reason", "stale operator request"
+      ],
+      racingStore,
+      fixture.home,
+      { now: () => now }
+    );
+  } catch {
+    abortRejected = true;
+  }
+
+  // Resume the exact target-CAS -> committed tail of the continuation.
+  git(["-C", fixture.repositoryPath, "merge", "--ff-only", changeSet.branch]);
+  let continuationCommitRejected = false;
+  try {
+    fixture.store.saveIntegrationAttempt(
+      fixture.task.id,
+      updateIntegrationAttempt(validating, { status: "committed" }, now)
+    );
+  } catch {
+    continuationCommitRejected = true;
+  }
+
+  assert.deepEqual(
+    {
+      abortRejected,
+      targetAdvanced: masterHead(fixture) === changeSet.headCommit,
+      attemptStatus: fixture.store.getIntegrationAttempt(fixture.task.id, attempt.id).status,
+      continuationCommitRejected
+    },
+    {
+      abortRejected: true,
+      targetAdvanced: true,
+      attemptStatus: "committed",
+      continuationCommitRejected: false
+    },
+    "a stale abort must fail closed once the continuation is validating"
   );
 });
 
