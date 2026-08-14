@@ -14,20 +14,23 @@
 // HEAD (or --ref): the source checkout is only used for git operations, so
 // uncommitted or untracked content can never enter the gated tree. The
 // runner and helper are still loaded from the caller's checkout, though, so
-// the gate first refuses to run on a dirty source checkout: modified code
-// must never produce evidence labeled with a clean HEAD SHA.
+// the gate first refuses to run on a dirty source checkout, and --ref must
+// resolve to the source HEAD: gating a different SHA would label its result
+// with code that did not produce it.
 //
 // With --base (an exact SHA) or --base-ref (a ref whose merge base with HEAD
 // is resolved, fail-closed, before any gating), on a candidate failure the
-// base is gated in a second worktree and the two records are classified at
-// failure level (the test step carries stable failing-test fingerprints
-// parsed from its TAP stream): the run exits non-zero only for introduced
-// failures, and the --record file ends up as the self-contained combined
-// record (candidate record, base SHA and record, classification,
-// disposition) rather than the candidate-only record.
+// base is gated in a second worktree and its own hermetic domain (separate
+// HOME, XDG tree, git config, TMPDIR, npm cache, and TAP file), so neither
+// side can leave writable state that changes the other's result. The two
+// records are classified at failure level (the test step carries stable
+// failing-test fingerprints parsed from its TAP stream): the run exits
+// non-zero only for introduced failures, and the --record file ends up as
+// the self-contained combined record (candidate record, base SHA and record,
+// classification, disposition) rather than the candidate-only record.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,16 +40,15 @@ import {
   assertCleanSourceCheckout,
   buildCombinedGateRecord,
   buildGateRecord,
-  buildHermeticEnvironment,
   classifyGateResults,
+  createGateSideDomain,
   gateExitCode,
   isFullSha,
   parseTapFailureFingerprints,
   planCandidateCheckout,
   recordPathPrefixes,
   resolveMergeBase,
-  shortTmpBase,
-  writeHermeticGitConfig
+  shortTmpBase
 } from "../test/helpers/gateHermetic.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -141,25 +143,6 @@ function gateCheckout({ checkout, sha, ref, hermetic, recordToStdout, npmVersion
   return buildGateRecord({ sha, ref, checks, hermetic, npmVersion });
 }
 
-function prepareHermetic(root, tmpHome, options) {
-  const hermetic = buildHermeticEnvironment(root, {
-    npmCache: options.npmCache,
-    tmpdir: tmpHome
-  });
-  for (const dir of [
-    hermetic.HOME,
-    hermetic.XDG_CONFIG_HOME,
-    hermetic.XDG_CACHE_HOME,
-    hermetic.XDG_DATA_HOME,
-    hermetic.TMPDIR,
-    hermetic.npm_config_cache
-  ]) {
-    mkdirSync(dir, { recursive: true });
-  }
-  writeHermeticGitConfig(hermetic.GIT_CONFIG_GLOBAL);
-  return hermetic;
-}
-
 function writeRecord(record, recordPath) {
   if (recordPath === "-") {
     process.stdout.write(`${JSON.stringify(record, null, 2)}\n`);
@@ -179,11 +162,21 @@ async function main() {
   // TMPDIR lives outside the (possibly deep) gate root: Unix domain sockets
   // are capped at 108 chars on Linux, and the suite's Controller/tmux sockets
   // are addressed under TMPDIR.
-  const tmpHome = mkdtempSync(join(shortTmpBase(), "yui-gate-tmp-"));
   const worktrees = [];
+  const tmpHomes = [];
 
   try {
-    const hermetic = prepareHermetic(root, tmpHome, options);
+    // The candidate and the base gate in separate hermetic domains: each
+    // side gets its own HOME, XDG tree, git config, TMPDIR, npm cache, and
+    // TAP file. A candidate must never be able to leave writable state that
+    // changes the base's result (or vice versa), because the --base
+    // classification compares the two records: shared state would let one
+    // side poison the other and misclassify an introduced failure as
+    // pre-existing.
+    const candidateRoot = join(root, "candidate");
+    const candidateTmp = mkdtempSync(join(shortTmpBase(), "yui-gate-tmp-candidate-"));
+    tmpHomes.push(candidateTmp);
+    const hermetic = createGateSideDomain(candidateRoot, candidateTmp, options, "candidate");
     const npmVersionResult = spawnSync("npm", ["--version"], {
       env: hermetic,
       encoding: "utf8"
@@ -203,6 +196,17 @@ async function main() {
     let candidateSha;
     if (options.ref !== undefined) {
       candidateSha = git(sourceCheckout, ["rev-parse", options.ref], hermetic);
+      // The runner and helper are loaded from this checkout, so gating a
+      // different SHA would label its result with code that did not produce
+      // it. Fail closed: --ref must resolve to the source HEAD.
+      const headSha = git(sourceCheckout, ["rev-parse", "HEAD"], hermetic);
+      if (candidateSha !== headSha) {
+        throw new Error(
+          `--ref ${options.ref} resolves to ${candidateSha} but the source checkout is at ${headSha}; `
+          + "the runner and helper are loaded from the source checkout, so gating a different SHA "
+          + "would label its result with code that did not produce it. Check out the SHA first, or omit --ref."
+        );
+      }
     } else {
       candidateSha = git(sourceCheckout, ["rev-parse", "HEAD"], hermetic);
     }
@@ -232,7 +236,7 @@ async function main() {
     // Always gate a fresh detached worktree at the resolved SHA: the source
     // checkout only answers git questions, so dirty or untracked content can
     // never be part of the gated tree.
-    const candidatePlan = planCandidateCheckout({ root, sha: candidateSha });
+    const candidatePlan = planCandidateCheckout({ root: candidateRoot, sha: candidateSha });
     git(sourceCheckout, candidatePlan.addArgs, hermetic);
     worktrees.push(candidatePlan.checkout);
 
@@ -271,14 +275,23 @@ async function main() {
       return 1;
     }
 
-    const baseCheckout = join(root, "worktree-base");
+    // The base gates in its own hermetic domain, isolated from the
+    // candidate's writable state: the candidate must not be able to leave
+    // state in HOME, the XDG tree, the npm cache, or TMPDIR that changes
+    // the base's result (and vice versa).
+    const baseRoot = join(root, "base");
+    const baseTmp = mkdtempSync(join(shortTmpBase(), "yui-gate-tmp-base-"));
+    tmpHomes.push(baseTmp);
+    const baseHermetic = createGateSideDomain(baseRoot, baseTmp, options, "base");
+
+    const baseCheckout = join(baseRoot, "worktree-base");
     git(sourceCheckout, ["worktree", "add", "--detach", baseCheckout, baseSha], hermetic);
     worktrees.push(baseCheckout);
     const base = gateCheckout({
       checkout: baseCheckout,
       sha: baseSha,
       ref: baseSha,
-      hermetic,
+      hermetic: baseHermetic,
       recordToStdout,
       npmVersion
     });
@@ -304,7 +317,9 @@ async function main() {
       });
     }
     rmSync(root, { recursive: true, force: true });
-    rmSync(tmpHome, { recursive: true, force: true });
+    for (const tmpHome of tmpHomes) {
+      rmSync(tmpHome, { recursive: true, force: true });
+    }
   }
 }
 

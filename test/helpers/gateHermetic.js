@@ -632,6 +632,39 @@ export function writeHermeticGitConfig(path) {
   );
 }
 
+/**
+ * Create one side's hermetic domain for a --base gate run.
+ *
+ * The candidate and the base must gate in fully isolated domains: a side
+ * that writes to HOME, the XDG tree, the npm cache, or TMPDIR must never be
+ * able to change the other side's result. The --base classification compares
+ * the two records, so shared writable state would let a candidate poison the
+ * base (or vice versa) and misclassify an introduced failure as pre-existing.
+ *
+ * Each side gets its own root (HOME, XDG, git config, npm cache) and its own
+ * TMPDIR (the test step's TAP stream lives there). `side` names the domain
+ * ("candidate" or "base") and, when a shared npm cache was requested with
+ * --npm-cache, scopes it per side so the two never share a cache either.
+ */
+export function createGateSideDomain(root, tmpHome, options = {}, side) {
+  const npmCache = options.npmCache !== undefined
+    ? join(options.npmCache, side)
+    : undefined;
+  const hermetic = buildHermeticEnvironment(root, { npmCache, tmpdir: tmpHome });
+  for (const dir of [
+    hermetic.HOME,
+    hermetic.XDG_CONFIG_HOME,
+    hermetic.XDG_CACHE_HOME,
+    hermetic.XDG_DATA_HOME,
+    hermetic.TMPDIR,
+    hermetic.npm_config_cache
+  ]) {
+    mkdirSync(dir, { recursive: true });
+  }
+  writeHermeticGitConfig(hermetic.GIT_CONFIG_GLOBAL);
+  return hermetic;
+}
+
 /** A full 40-hex commit SHA. The gate never accepts a partial or empty SHA. */
 const FULL_SHA = /^[0-9a-f]{40}$/u;
 

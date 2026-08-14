@@ -15,6 +15,7 @@ import {
   buildGateRecord,
   buildHermeticEnvironment,
   classifyGateResults,
+  createGateSideDomain,
   gateDisposition,
   gateExitCode,
   isFullSha,
@@ -251,6 +252,86 @@ test("writeHermeticGitConfig writes the gate identity", () => {
     const content = readFileSync(path, "utf8");
     assert.match(content, /name = Yui Gate/);
     assert.match(content, /email = yui-gate@example\.invalid/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("createGateSideDomain gives the candidate and base disjoint writable domains", () => {
+  // P1: the candidate and the base must gate in separate hermetic domains.
+  // A side that writes to HOME (or any other isolated path) must never be
+  // able to change the other side's result: the --base classification
+  // compares the two records, so shared writable state would let a candidate
+  // poison the base and misclassify an introduced failure as pre-existing.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-domain-"));
+  const candidateTmp = mkdtempSync(join(shortTmpBase(), "yui-gate-tmp-c-"));
+  const baseTmp = mkdtempSync(join(shortTmpBase(), "yui-gate-tmp-b-"));
+  try {
+    const candidate = createGateSideDomain(join(root, "candidate"), candidateTmp, {}, "candidate");
+    const base = createGateSideDomain(join(root, "base"), baseTmp, {}, "base");
+    // Every isolated path is distinct between the two sides.
+    const candidatePaths = [
+      candidate.HOME,
+      candidate.XDG_CONFIG_HOME,
+      candidate.XDG_CACHE_HOME,
+      candidate.XDG_DATA_HOME,
+      candidate.GIT_CONFIG_GLOBAL,
+      candidate.TMPDIR,
+      candidate.npm_config_cache
+    ];
+    const basePaths = new Set([
+      base.HOME,
+      base.XDG_CONFIG_HOME,
+      base.XDG_CACHE_HOME,
+      base.XDG_DATA_HOME,
+      base.GIT_CONFIG_GLOBAL,
+      base.TMPDIR,
+      base.npm_config_cache
+    ]);
+    for (const path of candidatePaths) {
+      assert.ok(!basePaths.has(path), `${path} must not be shared with the base`);
+    }
+    // A file written in the candidate's HOME is not visible in the base's:
+    // candidate poison cannot reach the base's result.
+    writeFileSync(join(candidate.HOME, "candidate-poison"), "poison\n");
+    assert.ok(
+      !existsSync(join(base.HOME, "candidate-poison")),
+      "candidate HOME state must not reach the base"
+    );
+    // The mirror direction holds too.
+    writeFileSync(join(base.TMPDIR, "base-marker"), "base\n");
+    assert.ok(
+      !existsSync(join(candidate.TMPDIR, "base-marker")),
+      "base TMPDIR state must not reach the candidate"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(candidateTmp, { recursive: true, force: true });
+    rmSync(baseTmp, { recursive: true, force: true });
+  }
+});
+
+test("createGateSideDomain scopes a shared --npm-cache per side", () => {
+  // When the caller asks for a shared npm cache, each side still gets its
+  // own subdirectory so the two never share a cache.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-npmcache-"));
+  const sharedCache = join(root, "shared-npm-cache");
+  try {
+    const candidate = createGateSideDomain(
+      join(root, "candidate"),
+      join(root, "ctmp"),
+      { npmCache: sharedCache },
+      "candidate"
+    );
+    const base = createGateSideDomain(
+      join(root, "base"),
+      join(root, "btmp"),
+      { npmCache: sharedCache },
+      "base"
+    );
+    assert.equal(candidate.npm_config_cache, join(sharedCache, "candidate"));
+    assert.equal(base.npm_config_cache, join(sharedCache, "base"));
+    assert.notEqual(candidate.npm_config_cache, base.npm_config_cache);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -816,6 +897,49 @@ test("the runner rejects an unresolvable --base-ref before gating (e2e)", () => 
     assert.notEqual(result.status, 0, "an unresolvable base ref must fail-closed");
     assert.match(result.stderr, /merge base/u, "the failure must name the merge-base resolution");
     assert.ok(!existsSync(recordPath), "no record may be written when the base cannot be resolved");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the runner rejects --ref that resolves to a different SHA than HEAD (e2e)", () => {
+  // P2: the runner and helper are loaded from the source checkout, so gating
+  // a different SHA would label its result with code that did not produce it.
+  // --ref must resolve to the source HEAD; anything else fails closed.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-ref-"));
+  try {
+    const source = setupRunnerRepo(root);
+    const firstSha = git(["rev-parse", "HEAD"], source);
+    // Add a second commit so HEAD differs from the first SHA.
+    writeFileSync(join(source, "second.txt"), "second\n");
+    git(["add", "second.txt"], source);
+    git(["commit", "-m", "second"], source);
+    const headSha = git(["rev-parse", "HEAD"], source);
+    assert.notEqual(firstSha, headSha);
+
+    const recordPath = join(root, "record.json");
+    const result = spawnSync(
+      process.execPath,
+      [
+        join(source, "scripts", "gate-hermetic.mjs"),
+        "--ref",
+        firstSha,
+        "--record",
+        recordPath
+      ],
+      { cwd: source, encoding: "utf8" }
+    );
+    assert.notEqual(result.status, 0, "--ref != HEAD must fail-closed");
+    assert.match(
+      result.stderr,
+      /did not produce it|different SHA/u,
+      "the failure must name the code/label mismatch"
+    );
+    // No pass record labeled with the wrong SHA.
+    if (existsSync(recordPath)) {
+      const record = JSON.parse(readFileSync(recordPath, "utf8"));
+      assert.notEqual(record.sha, firstSha, "a rejected --ref must not label evidence with its SHA");
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
