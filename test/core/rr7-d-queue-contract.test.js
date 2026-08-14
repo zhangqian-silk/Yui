@@ -623,17 +623,29 @@ test("queue processing does not land an entry after its Candidate enters retry",
   fixture.store.saveWorkItem(fixture.task.id, failed);
   fixture.store.saveWorkItem(fixture.task.id, retryFailedWorkItem(failed, now));
 
-  await processQueue(fixture, { limit: 1 }).catch(() => []);
+  const processed = await processQueue(fixture, { limit: 1 });
 
   assert.equal(
     git(["-C", fixture.repositoryPath, "rev-parse", "refs/heads/master"]).trim(),
     fixture.baseCommit,
     "a queued historical Candidate must fail closed instead of advancing the target"
   );
-  assert.notEqual(
-    fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-1").status,
-    "committed"
+  assert.deepEqual(
+    processed,
+    [],
+    "a stale entry is diagnosed at claim time without starting an Integration Attempt"
   );
+  const stale = fixture.store.getIntegrationQueueEntry(
+    fixture.task.id,
+    "integration-queue-1"
+  );
+  assert.equal(
+    stale.status,
+    "conflicted",
+    "the failed-closed diagnosis must persist so the Leader can supersede it"
+  );
+  assert.match(stale.conflictSummary, /current Candidate|superseded Candidate/);
+  assert.deepEqual(fixture.store.listIntegrationAttempts(fixture.task.id), []);
 });
 
 test("review evidence cannot waive a different queue gate", async () => {
@@ -678,6 +690,49 @@ test("exact-SHA evidence is not rebound to a cherry-picked candidate SHA", async
     assert.equal(processed.entry.status, "conflicted");
     assert.ok(processed.attempt.checks.some(({ outcome }) => outcome === "failed"));
   }
+});
+
+test("an identical-tree target advance still invalidates exact-SHA evidence", async () => {
+  const fixture = createFixture("evidence-empty-target-advance");
+  const candidate = createCandidateWorkspace(fixture, "reviewed-empty-advance", {
+    "sha.txt": "reviewed\n"
+  });
+  const exactHeadCheck = `test "$(git rev-parse HEAD)" = '${candidate.headCommit}'`;
+  savePositiveReview(fixture, candidate, [
+    { name: exactHeadCheck, outcome: "passed" }
+  ]);
+  const changeSet = await captureCandidate(fixture, candidate);
+  const enqueued = await enqueue(fixture, changeSet, [exactHeadCheck]);
+  assert.equal(enqueued.entry.status, "validated");
+
+  git([
+    "-C", fixture.repositoryPath,
+    "commit", "--allow-empty", "-m", "metadata-only target advance"
+  ]);
+  const advancedHead = git([
+    "-C", fixture.repositoryPath,
+    "rev-parse", "refs/heads/master"
+  ]).trim();
+  assert.notEqual(advancedHead, fixture.baseCommit);
+  assert.equal(
+    git(["-C", fixture.repositoryPath, "diff", "--name-only", fixture.baseCommit, advancedHead]),
+    "",
+    "the target SHA changed while its file tree stayed identical"
+  );
+
+  const [processed] = await processQueue(fixture, { limit: 1 });
+  assert.deepEqual({
+    checkCommands: processed.attempt.checkCommands,
+    status: processed.entry.status,
+    targetHead: git([
+      "-C", fixture.repositoryPath,
+      "rev-parse", "refs/heads/master"
+    ]).trim()
+  }, {
+    checkCommands: [exactHeadCheck],
+    status: "conflicted",
+    targetHead: advancedHead
+  }, "evidence for the old exact target must not waive a gate on a new commit identity");
 });
 
 test("tree or ancestor convergence still honors an explicitly requested gate", async () => {

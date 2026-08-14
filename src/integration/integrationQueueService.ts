@@ -527,8 +527,10 @@ export async function processIntegrationQueue(
         }
         assertCurrentCandidateInStore(tx, task.id, changeSet);
       } catch (error) {
+        const running = markIntegrationQueueRunning(current, targetBefore, now());
+        tx.saveIntegrationQueueEntry(task.id, running);
         tx.saveIntegrationQueueEntry(task.id, markIntegrationQueueBlocked(
-          current,
+          running,
           error instanceof Error ? error.message : String(error),
           now()
         ));
@@ -693,10 +695,11 @@ async function evidenceTargetAdvanced(
   ]);
   if (delta.some((path) => ownPaths.has(path))) return true;
   // The delta does not touch the entry's own paths, but the entry's gate may
-  // read any file: a non-empty delta means non-impact cannot be proven, so the
-  // checks must run again.  An empty delta (identical trees) cannot affect a
-  // gate, and an entry without checks has nothing to re-run.
-  return delta.length > 0 && entry.checkCommands.length > 0;
+  // read any file — including the exact target SHA the evidence is bound to.
+  // A changed target SHA invalidates exact-SHA evidence regardless of tree
+  // identity, so any entry with checks must re-run its gate.  An entry
+  // without checks has nothing to re-run and may commit directly.
+  return entry.checkCommands.length > 0;
 }
 
 /**
