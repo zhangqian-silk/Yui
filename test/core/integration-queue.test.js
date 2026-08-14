@@ -746,6 +746,108 @@ test("recovery commands cannot discard a committed manual-resolution Attempt", a
   }
 });
 
+test("recovery commands cannot race a manual-resolution Attempt commit", {
+  skip: process.env.YUI_REVIEW_ATOMIC_QUEUE_RACE !== "1"
+}, async () => {
+  const invalidActions = [];
+  for (const action of ["requeue", "supersede"]) {
+    const fixture = await createFixture();
+    const changeSet = await branchChangeSet(fixture, {
+      id: "change-set-1",
+      paths: { "manual.txt": "resolved\n" }
+    });
+    const queued = await enqueue(fixture, changeSet, { checkCommands: ["true"] });
+    let attempt = createIntegrationAttempt({
+      id: fixture.store.nextIntegrationAttemptId(fixture.task.id),
+      taskId: fixture.task.id,
+      projectId: fixture.project.id,
+      targetRef: "master",
+      expectedHead: fixture.baseCommit,
+      changeSetIds: [changeSet.id],
+      checkCommands: ["true"]
+    }, now);
+    fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+    const running = recordIntegrationQueueAttempt(
+      markIntegrationQueueRunning(queued.entry, fixture.baseCommit, now),
+      attempt.id,
+      now
+    );
+    fixture.store.saveIntegrationQueueEntry(fixture.task.id, running);
+    attempt = requireLeaderDecision(attempt, {
+      affectedPaths: ["manual.txt"],
+      summary: "manual conflict resolution"
+    }, now);
+    fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+    fixture.store.saveIntegrationQueueEntry(
+      fixture.task.id,
+      markIntegrationQueueBlocked(running, "manual conflict resolution", now)
+    );
+    attempt = recordResolutionDecision(attempt, {
+      action: "manual-resolution",
+      rationale: "preserve the combined result"
+    }, now);
+    fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+    const validating = updateIntegrationAttempt(attempt, {
+      status: "validating",
+      candidateCommit: changeSet.headCommit,
+      checks: [{ name: "true", outcome: "passed" }]
+    }, now);
+    const committed = updateIntegrationAttempt(validating, { status: "committed" }, now);
+    const competingStore = new FileTaskStore(fixture.home);
+    let injectedCommit = false;
+    const racingStore = new Proxy(fixture.store, {
+      get(target, property) {
+        if (property === "getIntegrationAttempt") {
+          return (taskId, attemptId) => {
+            const observed = target.getIntegrationAttempt(taskId, attemptId);
+            if (!injectedCommit) {
+              injectedCommit = true;
+              competingStore.saveIntegrationAttempt(taskId, validating);
+              git(["-C", fixture.repositoryPath, "merge", "--ff-only", changeSet.branch]);
+              competingStore.saveIntegrationAttempt(taskId, committed);
+            }
+            return observed;
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+
+    if (action === "requeue") {
+      requeueIntegrationQueueEntry(
+        racingStore,
+        fixture.task.id,
+        queued.entry.id,
+        () => now
+      );
+    } else {
+      supersedeIntegrationQueueEntry(
+        racingStore,
+        fixture.task.id,
+        queued.entry.id,
+        "do not discard concurrently committed provenance",
+        () => now
+      );
+    }
+
+    const finalAttempt = fixture.store.getIntegrationAttempt(fixture.task.id, attempt.id);
+    const finalEntry = fixture.store.getIntegrationQueueEntry(
+      fixture.task.id,
+      queued.entry.id
+    );
+    if (finalAttempt.status === "committed"
+      && (finalEntry.status === "queued" || finalEntry.status === "superseded")) {
+      invalidActions.push(action);
+    }
+  }
+  assert.deepEqual(
+    invalidActions,
+    [],
+    "a recovery write must not discard a concurrently committed Attempt"
+  );
+});
+
 test("queue entries round-trip through the store and reject an updatedAt move backwards", async () => {
   const fixture = await createFixture();
   const changeSet = await branchChangeSet(fixture, {

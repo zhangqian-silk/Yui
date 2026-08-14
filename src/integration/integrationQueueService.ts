@@ -884,16 +884,22 @@ export function requeueIntegrationQueueEntry(
   entryId: string,
   now: () => Date = () => new Date()
 ): IntegrationQueueEntry {
-  assertTaskActive(store, taskId);
-  const entry = store.getIntegrationQueueEntry(taskId, entryId);
-  if (entry === null) {
-    throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
-  }
-  assertNotCommittedAttempt(store, taskId, entry, "requeue");
-  resolveBlockedAttempt(store, taskId, entry, "requeue", now);
-  const waiting = markIntegrationQueueRequeued(entry, now());
-  store.saveIntegrationQueueEntry(taskId, waiting);
-  return waiting;
+  // The committed-Attempt guard, the blocked-Attempt finalization, and the
+  // queue write must be atomic: a concurrent manual-resolution continue can
+  // commit the Attempt between the guard and the write, leaving the queue
+  // entry requeued behind a committed target.
+  return store.transaction((tx) => {
+    assertTaskActive(tx, taskId);
+    const entry = tx.getIntegrationQueueEntry(taskId, entryId);
+    if (entry === null) {
+      throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
+    }
+    assertNotCommittedAttempt(tx, taskId, entry, "requeue");
+    resolveBlockedAttempt(tx, taskId, entry, "requeue", now);
+    const waiting = markIntegrationQueueRequeued(entry, now());
+    tx.saveIntegrationQueueEntry(taskId, waiting);
+    return waiting;
+  });
 }
 
 export function supersedeIntegrationQueueEntry(
@@ -903,15 +909,17 @@ export function supersedeIntegrationQueueEntry(
   reason: string,
   now: () => Date = () => new Date()
 ): IntegrationQueueEntry {
-  const entry = store.getIntegrationQueueEntry(taskId, entryId);
-  if (entry === null) {
-    throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
-  }
-  assertNotCommittedAttempt(store, taskId, entry, "supersede");
-  resolveBlockedAttempt(store, taskId, entry, "supersede", now);
-  const superseded = markIntegrationQueueSuperseded(entry, reason, now());
-  store.saveIntegrationQueueEntry(taskId, superseded);
-  return superseded;
+  return store.transaction((tx) => {
+    const entry = tx.getIntegrationQueueEntry(taskId, entryId);
+    if (entry === null) {
+      throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
+    }
+    assertNotCommittedAttempt(tx, taskId, entry, "supersede");
+    resolveBlockedAttempt(tx, taskId, entry, "supersede", now);
+    const superseded = markIntegrationQueueSuperseded(entry, reason, now());
+    tx.saveIntegrationQueueEntry(taskId, superseded);
+    return superseded;
+  });
 }
 
 /**
