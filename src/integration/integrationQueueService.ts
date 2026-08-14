@@ -202,6 +202,12 @@ export type ProcessIntegrationQueueItem = Readonly<{
  * `conflicted` without touching the others.  After every commit the remaining
  * items recompute overlap, and an item whose own paths became affected loses
  * its evidence coverage and runs its checks again.
+ *
+ * A lane (one Project/targetRef pair) integrates one item at a time: while an
+ * earlier item is `running` — claimed by this or another processor — its
+ * successors are not even selected, and the claim re-checks the barrier
+ * inside its write transaction so two store instances cannot run adjacent
+ * items of the same target concurrently.
  */
 export async function processIntegrationQueue(
   store: TaskStore,
@@ -222,10 +228,13 @@ export async function processIntegrationQueue(
     reconcileCommittedEntries(store, task.id, now);
     // The store already returns entries in numeric id order; trust it instead
     // of re-sorting with a lexicographic compare (which yields 1, 10, 2, ...).
-    const candidate = store.listIntegrationQueueEntries(task.id)
-      .filter((entry) =>
-        (options.projectId === undefined || entry.projectId === options.projectId)
-        && (entry.status === "queued" || entry.status === "validated"))[0];
+    // A running entry is the persistent head of its lane: its successors are
+    // skipped here so another processor's in-flight item is never claimed
+    // past.
+    const candidate = firstClaimableQueueEntry(
+      store.listIntegrationQueueEntries(task.id),
+      options.projectId
+    );
     if (candidate === undefined) break;
     const project = store.getProject(candidate.projectId);
     if (project === null) throw new Error(`Project not found: ${candidate.projectId}.`);
@@ -248,11 +257,16 @@ export async function processIntegrationQueue(
     }
     // CAS claim: re-read the entry inside the write transaction.  Another
     // store instance may have taken it since selection; if the status changed,
-    // do not create an Attempt and re-select instead.
+    // do not create an Attempt and re-select instead.  The running barrier is
+    // re-checked here as well: an earlier lane mate that started running
+    // between selection and claim serializes this entry behind it.
     const claimed = store.transaction((tx) => {
       const current = tx.getIntegrationQueueEntry(task.id, candidate.id);
       if (current === null
         || (current.status !== "queued" && current.status !== "validated")) {
+        return { skipped: true as const };
+      }
+      if (laneBlockedByRunningEntry(tx.listIntegrationQueueEntries(task.id), current)) {
         return { skipped: true as const };
       }
       const attempt = createIntegrationAttempt({
@@ -299,6 +313,57 @@ export async function processIntegrationQueue(
     processed.push({ entry: settled, attempt: result.attempt, result });
   }
   return processed;
+}
+
+/**
+ * A queue lane serializes one target ref: entries for the same Project and
+ * targetRef integrate one at a time in id order.  Entries of different lanes
+ * (another Project or ref) do not share a target and may integrate alongside.
+ */
+function queueLaneKey(entry: IntegrationQueueEntry): string {
+  return `${entry.projectId} ${entry.targetRef}`;
+}
+
+/**
+ * The first entry a processor may claim: the earliest queued/validated entry
+ * whose lane has no running entry ahead of it.  Entries arrive in numeric id
+ * order, so a running entry marks its lane as blocked for every successor.
+ */
+function firstClaimableQueueEntry(
+  entries: readonly IntegrationQueueEntry[],
+  projectId: string | undefined
+): IntegrationQueueEntry | undefined {
+  const blockedLanes = new Set<string>();
+  for (const entry of entries) {
+    if (projectId !== undefined && entry.projectId !== projectId) continue;
+    if (entry.status === "running") {
+      blockedLanes.add(queueLaneKey(entry));
+      continue;
+    }
+    if ((entry.status === "queued" || entry.status === "validated")
+      && !blockedLanes.has(queueLaneKey(entry))) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The claim-time re-check of the running barrier: the candidate stays
+ * claimable only while no earlier entry of its lane started running since
+ * selection.  Entries arrive in numeric id order, so reaching the candidate
+ * without meeting a same-lane running entry proves the lane is clear.
+ */
+function laneBlockedByRunningEntry(
+  entries: readonly IntegrationQueueEntry[],
+  candidate: IntegrationQueueEntry
+): boolean {
+  const lane = queueLaneKey(candidate);
+  for (const entry of entries) {
+    if (entry.id === candidate.id) return false;
+    if (entry.status === "running" && queueLaneKey(entry) === lane) return true;
+  }
+  return false;
 }
 
 /**

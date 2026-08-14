@@ -42,6 +42,7 @@ import { createProductionStorageRegistry } from "../../dist/storage/migration/pr
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { createProject } from "../../dist/repository/project.js";
+import { NodeGitWorkspace } from "../../dist/repository/gitWorkspace.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem } from "../../dist/workItem/workItem.js";
 
@@ -808,6 +809,135 @@ test("concurrent process calls claim a waiting entry exactly once across store i
   assert.equal(attempts[0].status, "committed");
   const entry = fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-1");
   assert.equal(entry.status, "committed");
+});
+
+test("a running first entry prevents another processor from claiming its successor", async () => {
+  const fixture = await createFixture();
+  const first = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  const second = await branchChangeSet(fixture, {
+    id: "change-set-2",
+    paths: { "b.txt": "b\n" }
+  });
+  await enqueue(fixture, first, { checkCommands: ["true"] });
+  await enqueue(fixture, second, { checkCommands: ["true"] });
+
+  let notifyPaused;
+  const paused = new Promise((resolve) => { notifyPaused = resolve; });
+  let releaseFirst;
+  const released = new Promise((resolve) => { releaseFirst = resolve; });
+  class PausingGitWorkspace extends NodeGitWorkspace {
+    paused = false;
+
+    async ensureIntegrationWorktree(input) {
+      if (!this.paused) {
+        this.paused = true;
+        notifyPaused();
+        await released;
+      }
+      return super.ensureIntegrationWorktree(input);
+    }
+  }
+
+  // The first processor claims the first entry and pauses mid-integration,
+  // holding the entry `running`.
+  const firstProcessor = processQueue(fixture, {
+    git: new PausingGitWorkspace(),
+    limit: 1
+  });
+  await paused;
+  assert.equal(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-1").status,
+    "running"
+  );
+  // A second processor over a fresh store instance must not claim the
+  // successor while the first entry is running.
+  const secondProcessor = await processIntegrationQueue(
+    new FileTaskStore(fixture.home),
+    fixture.home,
+    fixture.task.id,
+    { limit: 1, now: () => now }
+  );
+  releaseFirst();
+  await firstProcessor;
+
+  assert.equal(secondProcessor.length, 0);
+  assert.equal(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-2").status,
+    "queued"
+  );
+});
+
+test("the running barrier is re-checked inside the claim transaction", async () => {
+  const fixture = await createFixture();
+  const first = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  const second = await branchChangeSet(fixture, {
+    id: "change-set-2",
+    paths: { "b.txt": "b\n" }
+  });
+  await enqueue(fixture, first, { checkCommands: ["false"] });
+  await enqueue(fixture, second, { checkCommands: ["true"] });
+  // Block the first entry; with limit 1 the second stays queued behind it.
+  const blocked = await processQueue(fixture, { limit: 1 });
+  assert.equal(blocked[0].entry.status, "conflicted");
+
+  let notifyPaused;
+  const paused = new Promise((resolve) => { notifyPaused = resolve; });
+  let release;
+  const released = new Promise((resolve) => { release = resolve; });
+  class PausingInspectGit extends NodeGitWorkspace {
+    paused = false;
+
+    async inspect(repositoryPath, ref) {
+      if (!this.paused) {
+        this.paused = true;
+        notifyPaused();
+        await released;
+      }
+      return super.inspect(repositoryPath, ref);
+    }
+  }
+
+  // The processor selects the second entry (the first is conflicted) and
+  // pauses between selection and claim.
+  const processor = processQueue(fixture, { git: new PausingInspectGit() });
+  await paused;
+  // Another actor requeues and claims the first entry in the meantime.
+  requeueIntegrationQueueEntry(fixture.store, fixture.task.id, "integration-queue-1", () => now);
+  const claimed = fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-1");
+  const attempt = createIntegrationAttempt({
+    id: fixture.store.nextIntegrationAttemptId(fixture.task.id),
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    targetRef: "master",
+    expectedHead: fixture.baseCommit,
+    changeSetIds: [claimed.changeSetId],
+    checkCommands: claimed.checkCommands
+  }, now);
+  fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+  fixture.store.saveIntegrationQueueEntry(
+    fixture.task.id,
+    recordIntegrationQueueAttempt(
+      markIntegrationQueueRunning(claimed, fixture.baseCommit, now),
+      attempt.id,
+      now
+    )
+  );
+  release();
+  const processed = await processor;
+
+  // The claim transaction saw the first entry running and stood down; the
+  // second entry stays queued.
+  assert.equal(processed.length, 0);
+  assert.equal(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-2").status,
+    "queued"
+  );
 });
 
 test("process and list honor numeric id order past ten entries", async () => {
