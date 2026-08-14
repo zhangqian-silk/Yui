@@ -1241,14 +1241,34 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (this.store.getManagedWorkspace(workspace.owner) !== null) return "missing";
     const task = requireTask(this.store, workspace.owner.taskId);
     const taskSegment = this.#taskSegment(task);
-    const state = await this.#inspectEntries(
-      taskSegment,
-      managedWorktreeName(workspace.owner),
-      workspace.entries.filter(({ access }) => access === "write")
-    );
+    const writable = workspace.entries.filter(({ access }) => access === "write");
+    let state: GitWorkspaceState;
+    try {
+      state = await this.#inspectEntries(
+        taskSegment,
+        managedWorktreeName(workspace.owner),
+        writable
+      );
+    } catch (error) {
+      // A `project migrate` between preparation and compensation switches the
+      // catalog, so the worktree's common-dir no longer matches the Project's
+      // current repository. Fall back to removing the stranded worktree
+      // through its own Git identity.
+      if (!(error instanceof Error && error.message.includes("belongs to another project"))) {
+        throw error;
+      }
+      let removed = false;
+      for (const entry of writable) {
+        const result = await this.git.removeStrandedWorktree(entry.path);
+        if (result === "dirty") return "dirty";
+        removed ||= result === "removed";
+      }
+      await removeWorkspaceView(workspace.root);
+      return removed ? "removed" : "missing";
+    }
     if (state === "dirty") return "dirty";
     let removed = false;
-    for (const entry of workspace.entries.filter(({ access }) => access === "write")) {
+    for (const entry of writable) {
       const project = requireProject(this.store, entry.projectId);
       const result = await this.git.removeWorktree({
         repositoryPath: project.path,
@@ -2271,6 +2291,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         await this.#assertLegacyRefWorktreeArchivable(target);
       }
       for (const target of pending) {
+        // Re-validate under the fence: a Task reopened after classification
+        // but before this point must not have its ref deleted.
+        const current = this.store.getTask(target.taskId);
+        if (current !== null && ["draft", "active"].includes(current.status)) {
+          refused.push(`${target.project.id}:${target.ref}`);
+          continue;
+        }
         await this.#archiveLegacyRef(target);
         archived.push(`${target.project.id}:${target.ref}`);
       }

@@ -49,11 +49,12 @@ import {
   projectMaintenanceLockPath,
   ProjectMaintenanceLockedError
 } from "../../dist/repository/projectMaintenanceLock.js";
+import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, reopenTask } from "../../dist/task/task.js";
-import { createWorkItem } from "../../dist/workItem/workItem.js";
+import { createWorkItem, retireWorkItem } from "../../dist/workItem/workItem.js";
 import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
 import { installMockProviderCommands } from "../helpers/mockProviderCommands.js";
 
@@ -595,4 +596,143 @@ test("P2 migrate: a branch change between the pre-lock read and the lock fails c
   const after = store.getProject(project.id);
   assert.equal(after.ownership, "external");
   assert.equal(after.stableBranch, "main");
+});
+
+// ===========================================================================
+// ReviewRound 9 diagnostic regressions
+// ===========================================================================
+
+test("RR9: a crashed acquisition before owner publication does not wedge the Project forever", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-rr9-ownerless-lock-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const lock = projectMaintenanceLockPath(home, "project-1");
+
+  // acquireProjectMaintenanceLock publishes the directory before its owner
+  // file. A hard kill in that exact window leaves this supported crash residue.
+  mkdirSync(lock, { recursive: true, mode: 0o700 });
+  const old = new Date(Date.now() - 5_000);
+  utimesSync(lock, old, old);
+
+  // A stale acquisition must either be safely reclaimed or fail with a bounded
+  // orphan diagnosis. The current generic contention error never converges.
+  const release = acquireProjectMaintenanceLock(home, "project-1");
+  release();
+});
+
+test("RR9: reopening after archive classification cannot delete the now-active Task ref", async (t) => {
+  const fixture = await archiveFixture(t);
+  const { store, project } = fixture;
+  const created = runTaskCommand(
+    ["create", "Archive classification race", "--project", project.id],
+    store,
+    { now: () => new Date(NOW) }
+  );
+  const task = created.data.task;
+  const legacyRef = `refs/heads/yui/${task.id}/main`;
+  git(project.path, ["branch", `yui/${task.id}/main`]);
+  store.saveTask(completeTask(activateTask(task, NOW), NOW, {
+    by: "leader",
+    summary: "terminal before archive"
+  }));
+
+  // Return the terminal snapshot to archive, then perform the supported reopen
+  // immediately after that classification read. The Project fence does not
+  // serialize Task status transitions, so archive must revalidate before the
+  // ref mutation or the transition must honor the same fence.
+  let reopened = false;
+  const proxiedStore = new Proxy(store, {
+    get(target, property) {
+      if (property === "getTask") {
+        return (taskId) => {
+          const snapshot = target.getTask(taskId);
+          if (!reopened && taskId === task.id && snapshot?.status === "completed") {
+            reopened = true;
+            target.saveTask(reopenTask(snapshot, NOW));
+          }
+          return snapshot;
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  const preparer = new FileTaskWorkspacePreparer(
+    fixture.home, proxiedStore, undefined, () => new Date(NOW)
+  );
+
+  const result = await preparer.archiveLegacyTaskRefs();
+  assert.equal(reopened, true, "the supported reopen occurred after classification");
+  assert.equal(store.getTask(task.id).status, "active");
+  assert.deepEqual(result.archived, [], "an active Task ref is never archived");
+  assert.ok(
+    git(project.path, ["for-each-ref", "--format=%(refname)", legacyRef]).includes(legacyRef),
+    "the active source ref remains"
+  );
+});
+
+test("RR9: direct WorkItem cleanup honors an already-held Project maintenance fence", async (t) => {
+  const fixture = await laneFixture(t);
+  const { home, store, task, project, preparer } = fixture;
+  const item = createWorkItem(store.nextWorkItemId(task.id), task.id, {
+    title: "Cleanup fence probe",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+  const workspace = await preparer.prepareWorkItemWorkspace(task.id, item.id);
+  store.saveWorkItem(task.id, retireWorkItem(
+    store.getWorkItem(task.id, item.id),
+    { by: "leader", summary: "done" },
+    NOW
+  ));
+  const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
+    async stopTaskRoleSessions() {}
+  });
+
+  const release = acquireProjectMaintenanceLock(home, project.id);
+  try {
+    await assert.rejects(
+      coordinator.cleanupWorkItem(task.id, item.id, "abandoned"),
+      ProjectMaintenanceLockedError
+    );
+    assert.ok(existsSync(workspace.entries[0].path), "the fenced worktree remains untouched");
+  } finally {
+    release();
+  }
+});
+
+test("RR9: failed new-Lane preparation compensates before releasing its Project fence", async (t) => {
+  const fixture = await setupNewLaneDispatch(t);
+  const {
+    root, repositoryPath, store, task, project, preparer, item, groupId, laneIds
+  } = fixture;
+  const remote = join(root, "remote.git");
+  execFileSync("git", ["clone", "--quiet", "--bare", repositoryPath, remote]);
+  store.saveProject({ ...store.getProject(project.id), remoteUrl: remote });
+
+  const held = preparer.acquireTaskProjectMaintenanceLocks(task.id);
+  const workspace = await preparer.prepareExecutionLaneWorkspace(
+    task.id,
+    groupId,
+    laneIds[0],
+    { purpose: "execution", workItemId: item.id },
+    { current: held.current }
+  );
+
+  // This is the exact ordering in prepareExecutionLaneWorkspacesForCommand's
+  // catch path when a later Lane fails: release first, then compensate the
+  // already-created map. A migrate can therefore switch the catalog before
+  // compensation and make the external-backed worktree unidentifiable from
+  // the new canonical repository.
+  held.release();
+  await runProjectCommand(["migrate", project.id], store, { now: () => new Date(NOW) });
+  await assert.doesNotReject(
+    preparer.discardUnadoptedExecutionLaneWorkspaces(
+      new Map([[laneIds[0], workspace]])
+    )
+  );
+  assert.equal(
+    existsSync(workspace.entries.find(({ access }) => access === "write").path),
+    false,
+    "the unadopted external-backed Lane was removed"
+  );
 });

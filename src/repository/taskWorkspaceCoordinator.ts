@@ -107,16 +107,31 @@ export class TaskWorkspaceCoordinator {
       );
     }
     if (item.workspaceDisposition === disposition) return "missing";
-    const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
-    if (state === "dirty") return "dirty";
-    this.#assertWorkItemRuntimeQuiescent(item);
-    await this.#stopLiveRoles(item.taskId, this.#workItemRoleNames(item));
-    const laneCleanup = await this.preparer.cleanupExecutionLaneWorkspacesForWorkItem(
-      item.taskId,
-      item.id
-    );
-    if (laneCleanup === "dirty") return "dirty";
-    return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
+    // Hold the per-Project maintenance fence so a concurrent migrate/rebuild/
+    // archive cannot interleave with worktree removal.
+    const workspace = this.store.getWorkItemWorkspace(item.taskId, item.id);
+    const projectIds = workspace === null
+      ? []
+      : workspace.entries
+        .filter(({ access }) => access === "write")
+        .map(({ projectId }) => projectId);
+    const releaseMaintenance = projectIds.length === 0
+      ? () => {}
+      : acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
+    try {
+      const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
+      if (state === "dirty") return "dirty";
+      this.#assertWorkItemRuntimeQuiescent(item);
+      await this.#stopLiveRoles(item.taskId, this.#workItemRoleNames(item));
+      const laneCleanup = await this.preparer.cleanupExecutionLaneWorkspacesForWorkItem(
+        item.taskId,
+        item.id
+      );
+      if (laneCleanup === "dirty") return "dirty";
+      return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
+    } finally {
+      releaseMaintenance();
+    }
   }
 
   async cleanupWorkItemRuntime(
@@ -139,15 +154,30 @@ export class TaskWorkspaceCoordinator {
     if (round.status !== "completed" && round.status !== "failed") {
       throw new Error(`ReviewRound must be terminal before cleanup: ${round.id}.`);
     }
-    const state = await this.preparer.inspectReviewRoundWorkspace(taskId, reviewRoundId);
-    if (state === "dirty") return "dirty";
-    await this.#stopLiveRoles(taskId, this.#reviewRoundRoleNames(round));
-    const laneCleanup = await this.preparer.cleanupExecutionLaneWorkspacesForReviewRound(
-      taskId,
-      reviewRoundId
-    );
-    if (laneCleanup === "dirty") return "dirty";
-    return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
+    // Hold the per-Project maintenance fence so a concurrent migrate/rebuild/
+    // archive cannot interleave with worktree removal.
+    const workspace = this.store.getReviewRoundWorkspace(taskId, reviewRoundId);
+    const projectIds = workspace === null
+      ? []
+      : workspace.entries
+        .filter(({ access }) => access === "write")
+        .map(({ projectId }) => projectId);
+    const releaseMaintenance = projectIds.length === 0
+      ? () => {}
+      : acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
+    try {
+      const state = await this.preparer.inspectReviewRoundWorkspace(taskId, reviewRoundId);
+      if (state === "dirty") return "dirty";
+      await this.#stopLiveRoles(taskId, this.#reviewRoundRoleNames(round));
+      const laneCleanup = await this.preparer.cleanupExecutionLaneWorkspacesForReviewRound(
+        taskId,
+        reviewRoundId
+      );
+      if (laneCleanup === "dirty") return "dirty";
+      return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
+    } finally {
+      releaseMaintenance();
+    }
   }
 
   async cleanupTaskForArchive(

@@ -161,8 +161,17 @@ function reclaimStaleProjectMaintenanceLock(lock: string): void {
   try {
     expectedOwner = readFileSync(join(lock, "owner"), "utf8");
   } catch (error) {
-    if (isEnoent(error)) return; // vanished; the caller retries the O_EXCL mkdir.
-    throw error;
+    if (!isEnoent(error)) throw error;
+    // Ownerless lock: a crash between mkdir and owner publication. Reclaim
+    // only when the directory is old enough that the creator is not still
+    // initializing; a fresh lock may have its owner file written imminently.
+    try {
+      if (Date.now() - statSync(lock).mtimeMs < STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS) return;
+    } catch (statError) {
+      if (isEnoent(statError)) return;
+      throw statError;
+    }
+    expectedOwner = null;
   }
   try {
     if (Date.now() - statSync(lock).mtimeMs < STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS) return;
@@ -201,8 +210,12 @@ function reclaimStaleProjectMaintenanceLock(lock: string): void {
       try {
         currentOwner = readFileSync(join(lock, "owner"), "utf8");
       } catch (error) {
-        if (isEnoent(error)) return;
-        throw error;
+        if (!isEnoent(error)) throw error;
+        // Still ownerless: only reclaim when the initial read was also
+        // ownerless. A non-null expectedOwner means another process wrote
+        // the owner file between the two reads — leave its lock intact.
+        if (expectedOwner !== null) return;
+        currentOwner = null;
       }
       if (currentOwner !== expectedOwner) return;
       if (currentOwner !== null && lockOwnerIsAlive(lock)) return;

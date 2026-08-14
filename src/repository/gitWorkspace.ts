@@ -168,6 +168,10 @@ export interface GitWorkspacePort {
     roleName: string;
     deleteBranch?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
+  /** Remove a stranded worktree whose common-dir no longer matches the
+   * Project's current repository (e.g. after a catalog switch). Only for
+   * unadopted worktrees that are safe to discard. */
+  removeStrandedWorktree(path: string): Promise<GitWorkspaceRemoval>;
   /** Remove the exact clean worktree proven by inspectRecordedWorktree. If
    * the Project moved repositories, delete the obsolete source branch only
    * after the same commit is proven retained in the current repository. */
@@ -942,6 +946,32 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     await git(["-C", project.root, "worktree", "remove", "--", path]);
     if (input.deleteBranch === true) {
       await deleteBranchIfPresent(project.root, identity.branch);
+    }
+    return "removed";
+  }
+
+  /**
+   * Remove a stranded worktree whose Git common-dir no longer matches the
+   * Project's current repository (e.g. after a `project migrate` switched the
+   * catalog). The normal {@link removeWorktree} path rejects such worktrees
+   * via `assertOwnedWorktree`; this fallback inspects and removes through the
+   * worktree's own Git identity instead. Only call for unadopted worktrees
+   * that are safe to discard (e.g. Lane preparation compensation).
+   */
+  async removeStrandedWorktree(path: string): Promise<GitWorkspaceRemoval> {
+    const kind = await pathKind(path);
+    if (kind === undefined) return "missing";
+    if (kind === "symlink") throw new Error("Stranded worktree path must not be a symbolic link.");
+    // Inspect dirty state through the worktree's own Git, bypassing the
+    // Project ownership check that fails after a catalog switch.
+    const porcelain = await git(["-C", path, "status", "--porcelain=v1", "--untracked-files=all"]);
+    if (porcelain.length > 0) return "dirty";
+    try {
+      await git(["-C", path, "worktree", "remove", "--force", "--", path]);
+    } catch {
+      // The worktree's common-dir (old external repo) may itself be gone.
+      // Remove the directory directly; the worktree is unadopted.
+      await rm(path, { recursive: true, force: true });
     }
     return "removed";
   }

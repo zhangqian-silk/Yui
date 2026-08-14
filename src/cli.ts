@@ -1596,8 +1596,11 @@ async function prepareExecutionLaneWorkspacesForCommand(
     }
     return { workspaces: map, release: held?.release, projectPaths };
   } catch (error) {
-    if (held !== undefined) held.release();
+    // Compensate (discard unadopted Lane worktrees) BEFORE releasing the
+    // fence: a concurrent project migrate must not switch the catalog while
+    // external-backed worktrees are still identifiable for removal.
     await preparer.discardUnadoptedExecutionLaneWorkspaces(map);
+    if (held !== undefined) held.release();
     throw error;
   }
 }
