@@ -220,6 +220,11 @@ export class NodeGitWorkspace implements GitWorkspacePort {
    * An enqueued ChangeSet whose head agrees with the target on every path
    * it touched is already represented there and converges without a new
    * commit, even when other unrelated changes landed in between.
+   *
+   * The captured paths are literal filenames, so `--literal-pathspecs`
+   * disables pathspec magic: a name such as `:(exclude)*` must not exclude
+   * every path and fake a converged tree.  It is a global option and
+   * therefore must precede the `diff` subcommand.
    */
   async treesAgreeOnPaths(input: Readonly<{
     repositoryPath: string;
@@ -230,6 +235,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     if (input.paths.length === 0) return false;
     return gitSucceeds([
       "-C", input.repositoryPath,
+      "--literal-pathspecs",
       "diff", "--quiet",
       input.leftCommit, input.rightCommit,
       "--", ...input.paths
