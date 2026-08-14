@@ -751,13 +751,17 @@ test("a running entry whose attempt committed before the settle converges on res
   assert.equal(reconciled.targetAfter, first.headCommit);
   assert.ok(reconciled.endedAt !== undefined);
   // The reconciled commit replayed the downstream updates: the unaffected
-  // second entry was validated by evidence and committed without re-running
-  // its checks.
+  // second entry kept its place and committed against the advanced target.
+  // Evidence is no longer rebound in-band (the P1 fix): it runs its checks
+  // against the exact target rather than skipping them.
   assert.equal(processed.length, 1);
   assert.equal(processed[0].entry.id, "integration-queue-2");
   assert.equal(processed[0].entry.status, "committed");
-  assert.deepEqual(processed[0].attempt.checkCommands, []);
-  assert.deepEqual(processed[0].attempt.checks, []);
+  assert.deepEqual(processed[0].attempt.checkCommands, ["true"]);
+  assert.deepEqual(
+    processed[0].attempt.checks.map(({ outcome }) => outcome),
+    ["passed"]
+  );
 });
 
 test("concurrent enqueues of the same ChangeSet create a single entry across store instances", async () => {
