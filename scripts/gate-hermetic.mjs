@@ -10,20 +10,21 @@
 //                                  [--base-ref <ref>] [--record <path|->]
 //                                  [--npm-cache <path>]
 //
-// The candidate is always gated in a fresh detached worktree at the resolved
-// HEAD (or --ref): the source checkout is only used for git operations, so
-// uncommitted or untracked content can never enter the gated tree. The
-// runner and helper are still loaded from the caller's checkout, though, so
-// the gate first refuses to run on a dirty source checkout, and --ref must
-// resolve to the source HEAD: gating a different SHA would label its result
-// with code that did not produce it.
+// The candidate is always gated in a fresh clone of the source checkout,
+// detached at the resolved HEAD (or --ref): the source checkout is only
+// used for git operations, so uncommitted or untracked content can never
+// enter the gated tree. The runner and helper are still loaded from the
+// caller's checkout, though, so the gate first refuses to run on a dirty
+// source checkout, and --ref must resolve to the source HEAD: gating a
+// different SHA would label its result with code that did not produce it.
 //
 // With --base (an exact SHA) or --base-ref (a ref whose merge base with HEAD
 // is resolved, fail-closed, before any gating), on a candidate failure the
-// base is gated in a second worktree and its own hermetic domain (separate
-// HOME, XDG tree, git config, TMPDIR, npm cache, and TAP file), so neither
-// side can leave writable state that changes the other's result. The two
-// records are classified at failure level (the test step carries stable
+// base is gated in a second clone and its own hermetic domain (separate
+// HOME, XDG tree, git config, TMPDIR, npm cache, and TAP file). Each clone
+// owns its .git directory (hooks, config, refs), so neither side can leave
+// writable git state that changes the other's result. The two records are
+// classified at failure level (the test step carries stable
 // failing-test fingerprints parsed from its TAP stream): the run exits
 // non-zero only for introduced failures, and the --record file ends up as
 // the self-contained combined record (candidate record, base SHA and record,
@@ -45,7 +46,7 @@ import {
   gateExitCode,
   isFullSha,
   parseTapFailureFingerprints,
-  planCandidateCheckout,
+  planGateCheckout,
   recordPathPrefixes,
   resolveMergeBase,
   shortTmpBase
@@ -162,7 +163,6 @@ async function main() {
   // TMPDIR lives outside the (possibly deep) gate root: Unix domain sockets
   // are capped at 108 chars on Linux, and the suite's Controller/tmux sockets
   // are addressed under TMPDIR.
-  const worktrees = [];
   const tmpHomes = [];
 
   try {
@@ -233,12 +233,18 @@ async function main() {
       }
     }
 
-    // Always gate a fresh detached worktree at the resolved SHA: the source
+    // Always gate a fresh clone detached at the resolved SHA: the source
     // checkout only answers git questions, so dirty or untracked content can
-    // never be part of the gated tree.
-    const candidatePlan = planCandidateCheckout({ root: candidateRoot, sha: candidateSha });
-    git(sourceCheckout, candidatePlan.addArgs, hermetic);
-    worktrees.push(candidatePlan.checkout);
+    // never be part of the gated tree, and the clone's .git (hooks, config,
+    // refs) is private to the candidate — the base clone can never be
+    // reached through it.
+    const candidatePlan = planGateCheckout({
+      root: candidateRoot,
+      sha: candidateSha,
+      source: sourceCheckout
+    });
+    git(sourceCheckout, candidatePlan.cloneArgs, hermetic);
+    git(candidatePlan.checkout, candidatePlan.detachArgs, hermetic);
 
     const candidate = gateCheckout({
       checkout: candidatePlan.checkout,
@@ -284,16 +290,21 @@ async function main() {
     tmpHomes.push(baseTmp);
     const baseHermetic = createGateSideDomain(baseRoot, baseTmp, options, "base");
 
-    const baseCheckout = join(baseRoot, "worktree-base");
-    // The base worktree must be created with the base hermetic env, not the
-    // candidate's: a candidate GIT_CONFIG_GLOBAL hook (core.hooksPath) would
-    // otherwise run during `git worktree add` and could plant state in the
-    // base worktree, poisoning the base result and misclassifying an
-    // introduced failure as pre-existing.
-    git(sourceCheckout, ["worktree", "add", "--detach", baseCheckout, baseSha], baseHermetic);
-    worktrees.push(baseCheckout);
+    // The base gates in its own clone, created with the base hermetic env.
+    // A clone never shares the source's common dir: cloning does not copy
+    // the source's hooks or config, and the base clone's .git is unreachable
+    // from the candidate, so a candidate test that plants a post-checkout
+    // hook in its own git common dir (or flips an executable config) can
+    // never run in the base checkout or poison its result.
+    const basePlan = planGateCheckout({
+      root: baseRoot,
+      sha: baseSha,
+      source: sourceCheckout
+    });
+    git(sourceCheckout, basePlan.cloneArgs, baseHermetic);
+    git(basePlan.checkout, basePlan.detachArgs, baseHermetic);
     const base = gateCheckout({
-      checkout: baseCheckout,
+      checkout: basePlan.checkout,
       sha: baseSha,
       ref: baseSha,
       hermetic: baseHermetic,
@@ -315,12 +326,8 @@ async function main() {
     }
     return gateExitCode(candidate, classification);
   } finally {
-    for (const worktree of worktrees) {
-      spawnSync("git", ["worktree", "remove", "--force", worktree], {
-        cwd: sourceCheckout,
-        env: process.env
-      });
-    }
+    // The clones live entirely under the gate root and register no worktree
+    // metadata in the source checkout, so plain removal leaves no trace.
     rmSync(root, { recursive: true, force: true });
     for (const tmpHome of tmpHomes) {
       rmSync(tmpHome, { recursive: true, force: true });

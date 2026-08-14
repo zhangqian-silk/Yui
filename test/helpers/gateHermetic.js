@@ -198,18 +198,39 @@ function resolveNpmVersion(hermetic) {
 }
 
 /**
- * The plan for gating a candidate commit: a fresh detached worktree at the
- * resolved SHA, never the source checkout. The source checkout is only used
- * for git operations; uncommitted or untracked content there can never enter
- * the gated tree, so a dirty checkout cannot produce pass evidence labeled
- * with a clean HEAD SHA.
+ * The plan for gating one side (candidate or base) at a commit: a fresh
+ * clone of the source checkout, detached at the resolved SHA — never the
+ * source checkout itself and never a `git worktree add` of it. The source
+ * checkout only answers git questions, so uncommitted or untracked content
+ * there can never enter the gated tree, and a dirty checkout cannot produce
+ * pass evidence labeled with a clean HEAD SHA.
+ *
+ * A clone owns its .git directory: its hooks, config, and refs are private
+ * to it, unlike `git worktree add`, whose worktrees share the source's
+ * common dir. A test that resolves its git common dir and plants a hook or
+ * flips an executable config (core.hooksPath, core.fsmonitor, ...) can
+ * therefore never reach the other side's checkout. `--no-checkout` keeps
+ * the clone itself from checking out (and running hooks for) the source
+ * HEAD, and `--no-hardlinks` gives the clone its own object store, so the
+ * two sides share no writable git metadata at all.
+ *
+ * `cloneArgs` run with the source checkout as cwd and the side's hermetic
+ * env; `detachArgs` then run inside the clone with the same env.
  */
-export function planCandidateCheckout({ root, sha }) {
-  const checkout = join(root, "worktree-candidate");
+export function planGateCheckout({ root, sha, source }) {
+  const checkout = join(root, "checkout");
   return Object.freeze({
     sha,
     checkout,
-    addArgs: Object.freeze(["worktree", "add", "--detach", checkout, sha])
+    cloneArgs: Object.freeze([
+      "clone",
+      "--quiet",
+      "--no-hardlinks",
+      "--no-checkout",
+      source,
+      checkout
+    ]),
+    detachArgs: Object.freeze(["checkout", "--detach", "--quiet", sha])
   });
 }
 

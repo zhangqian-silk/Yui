@@ -20,7 +20,7 @@ import {
   gateExitCode,
   isFullSha,
   parseTapFailureFingerprints,
-  planCandidateCheckout,
+  planGateCheckout,
   recordPathPrefixes,
   resolveMergeBase,
   resolveToolDirectory,
@@ -756,27 +756,30 @@ test("buildCombinedGateRecord keeps top-level sha/result and embeds the full bas
   assert.equal(combined.base.checks[1].failures.length, 2);
 });
 
-test("planCandidateCheckout always gates a detached worktree, never the source checkout", () => {
-  const plan = planCandidateCheckout({ root: "/gate/root", sha: "abc123" });
+test("planGateCheckout plans a detached clone with a private git dir, never a shared worktree", () => {
+  const plan = planGateCheckout({ root: "/gate/root", sha: "abc123", source: "/source" });
   assert.equal(plan.sha, "abc123");
-  assert.equal(plan.checkout, "/gate/root/worktree-candidate");
-  assert.deepEqual(plan.addArgs, [
-    "worktree",
-    "add",
-    "--detach",
-    "/gate/root/worktree-candidate",
-    "abc123"
+  assert.equal(plan.checkout, "/gate/root/checkout");
+  assert.deepEqual(plan.cloneArgs, [
+    "clone",
+    "--quiet",
+    "--no-hardlinks",
+    "--no-checkout",
+    "/source",
+    "/gate/root/checkout"
   ]);
+  assert.deepEqual(plan.detachArgs, ["checkout", "--detach", "--quiet", "abc123"]);
   assert.ok(Object.isFrozen(plan));
-  assert.ok(Object.isFrozen(plan.addArgs));
+  assert.ok(Object.isFrozen(plan.cloneArgs));
+  assert.ok(Object.isFrozen(plan.detachArgs));
 });
 
 function git(args, cwd) {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-test("a dirty checkout cannot gate as HEAD: the candidate worktree excludes uncommitted content", () => {
-  // P2-3: the runner always gates `git worktree add --detach <sha>`, so a
+test("a dirty checkout cannot gate as HEAD: the candidate clone excludes uncommitted content", () => {
+  // P2-3: the runner always gates a fresh clone detached at the SHA, so a
   // tracked modification or an untracked file in the source checkout can never
   // enter the gated tree or produce pass evidence labeled with the HEAD SHA.
   const root = mkdtempSync(join(tmpdir(), "yui-gate-dirty-"));
@@ -795,9 +798,10 @@ test("a dirty checkout cannot gate as HEAD: the candidate worktree excludes unco
     writeFileSync(join(source, "tracked.txt"), "uncommitted fix\n");
     writeFileSync(join(source, "untracked.txt"), "untracked content\n");
 
-    const plan = planCandidateCheckout({ root, sha: headSha });
-    git(plan.addArgs, source);
+    const plan = planGateCheckout({ root, sha: headSha, source });
+    git(plan.cloneArgs, source);
     try {
+      git(plan.detachArgs, plan.checkout);
       // The gated tree is exactly the committed tree at HEAD.
       assert.equal(git(["rev-parse", "HEAD"], plan.checkout), headSha);
       assert.equal(readFileSync(join(plan.checkout, "tracked.txt"), "utf8"), "committed content\n");
@@ -810,7 +814,7 @@ test("a dirty checkout cannot gate as HEAD: the candidate worktree excludes unco
         "the gated tree stays clean of gate artifacts"
       );
     } finally {
-      execFileSync("git", ["worktree", "remove", "--force", plan.checkout], { cwd: source });
+      rmSync(plan.checkout, { recursive: true, force: true });
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1150,6 +1154,126 @@ test("the base worktree is created with the base hermetic env, not the candidate
     );
     // The candidate failure must be classified introduced (the base was not
     // poisoned), so the gate exits non-zero.
+    assert.notEqual(result.status, 0, "an introduced failure must exit non-zero");
+    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    assert.equal(record.disposition, "introduced-failures");
+    const fingerprint = "test: test/core/shared-state.test.js > shared-state regression";
+    assert.ok(
+      record.classification.introduced.includes(fingerprint),
+      "the candidate failure must be classified introduced"
+    );
+    assert.ok(
+      !record.classification.preExisting.includes(fingerprint),
+      "the candidate failure must not be classified pre-existing"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the candidate cannot poison the base through the shared git common dir (e2e)", () => {
+  // P1 (review-round-7): `git worktree add --detach` makes the candidate and
+  // base worktrees share the source checkout's .git common dir (hooks,
+  // config, refs). The run-33 baseHermetic fix only sealed the
+  // GIT_CONFIG_GLOBAL vector: a candidate test can still resolve its git
+  // common dir and drop a post-checkout hook in <common>/hooks, which fires
+  // when the base worktree is created and plants a marker in the base tree.
+  // The base then fails the same test as the candidate, the introduced
+  // failure is misclassified pre-existing, and the gate exits 0. Each side
+  // must gate in its own clone, whose .git no other side can reach.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-common-dir-"));
+  try {
+    const source = join(root, "source");
+    mkdirSync(join(source, "scripts"), { recursive: true });
+    mkdirSync(join(source, "test", "helpers"), { recursive: true });
+    mkdirSync(join(source, "test", "core"), { recursive: true });
+    git(["init", "-b", "master"], source);
+    git(["config", "user.name", "Yui Gate"], source);
+    git(["config", "user.email", "yui-gate@example.invalid"], source);
+    copyFileSync(
+      fileURLToPath(new URL("../../scripts/gate-hermetic.mjs", import.meta.url)),
+      join(source, "scripts", "gate-hermetic.mjs")
+    );
+    copyFileSync(
+      fileURLToPath(new URL("../helpers/gateHermetic.js", import.meta.url)),
+      join(source, "test", "helpers", "gateHermetic.js")
+    );
+    // A minimal package so install/build/lint/package-smoke pass fast; only
+    // the shared-state regression drives the gate outcome.
+    writeFileSync(join(source, "package.json"), JSON.stringify({
+      name: "gate-fixture",
+      version: "1.0.0",
+      private: true,
+      type: "module",
+      scripts: { build: "true", lint: "true" }
+    }, null, 2));
+    writeFileSync(join(source, "package-lock.json"), JSON.stringify({
+      name: "gate-fixture",
+      version: "1.0.0",
+      lockfileVersion: 3,
+      requires: true,
+      packages: { "": { name: "gate-fixture", version: "1.0.0" } }
+    }, null, 2));
+    writeFileSync(join(source, "test", "helpers", "scrubSessionEnv.js"), "// no-op for the fixture\n");
+    writeFileSync(
+      join(source, "scripts", "assemble-runtime-package.mjs"),
+      "import { mkdirSync, writeFileSync } from \"node:fs\";\n"
+        + "mkdirSync(\".release-stage\", { recursive: true });\n"
+        + "writeFileSync(\".release-stage/package.json\", JSON.stringify({ name: \"gate-fixture\", version: \"1.0.0\" }));\n"
+    );
+    writeFileSync(join(source, "scripts", "check-runtime-package-structure.mjs"), "process.exit(0);\n");
+    // A passing test directly in test/ so the test/*.test.js glob matches.
+    writeFileSync(
+      join(source, "test", "dummy.test.js"),
+      "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+        + "test(\"dummy passes\", () => { assert.ok(true); });\n"
+    );
+    // The base version of the shared-state test: passes when no marker.
+    writeFileSync(
+      join(source, "test", "core", "shared-state.test.js"),
+      "import { existsSync } from \"node:fs\";\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+        + "test(\"shared-state regression\", () => {\n"
+        + "  assert.ok(!existsSync(\".git-poison-marker\"), \"base checkout was poisoned by a candidate git hook\");\n"
+        + "});\n"
+    );
+    git(["add", "-A"], source);
+    git(["commit", "-m", "base"], source);
+    const baseSha = git(["rev-parse", "HEAD"], source);
+
+    // The candidate version: plants a post-checkout hook in its git common
+    // dir (the shared source .git under worktrees, its own clone .git under
+    // the fix), then fails so the runner gates the base.
+    writeFileSync(
+      join(source, "test", "core", "shared-state.test.js"),
+      "import { chmodSync, mkdirSync, writeFileSync } from \"node:fs\";\n"
+        + "import { execSync } from \"node:child_process\";\n"
+        + "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+        + "test(\"shared-state regression\", () => {\n"
+        + "  const commonDir = execSync(\"git rev-parse --git-common-dir\", { encoding: \"utf8\" }).trim();\n"
+        + "  const hooksDir = commonDir + \"/hooks\";\n"
+        + "  mkdirSync(hooksDir, { recursive: true });\n"
+        + "  const hook = hooksDir + \"/post-checkout\";\n"
+        + "  writeFileSync(hook, \"#!/bin/sh\\ntouch .git-poison-marker\\n\");\n"
+        + "  chmodSync(hook, 0o755);\n"
+        + "  assert.fail(\"candidate failure to trigger base gating\");\n"
+        + "});\n"
+    );
+    git(["add", "-A"], source);
+    git(["commit", "-m", "candidate"], source);
+
+    const recordPath = join(root, "record.json");
+    // Strip NODE_TEST_CONTEXT: this e2e test itself runs under `node --test`,
+    // which sets NODE_TEST_CONTEXT and would make the gate's inner
+    // `node --test` step skip its files ("recursive within a test file").
+    const gateEnv = { ...process.env, NODE_TEST_CONTEXT: undefined };
+    const result = spawnSync(
+      process.execPath,
+      [join(source, "scripts", "gate-hermetic.mjs"), "--base", baseSha, "--record", recordPath],
+      { cwd: source, encoding: "utf8", env: gateEnv }
+    );
+    // The candidate failure must be classified introduced (the base clone
+    // cannot be poisoned through the shared common dir), so the gate exits
+    // non-zero.
     assert.notEqual(result.status, 0, "an introduced failure must exit non-zero");
     const record = JSON.parse(readFileSync(recordPath, "utf8"));
     assert.equal(record.disposition, "introduced-failures");
