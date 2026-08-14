@@ -431,6 +431,15 @@ export function preflightTaskCompletion(
       `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
     );
   }
+  const unsettledQueueEntry = store.listIntegrationQueueEntries(task.id).find((entry) => (
+    entry.status !== "committed" && entry.status !== "superseded"
+  ));
+  if (unsettledQueueEntry !== undefined) {
+    throw usageError(
+      `Task ${task.id} has an unsettled integration queue entry: `
+      + `${unsettledQueueEntry.id}/${unsettledQueueEntry.status}.`
+    );
+  }
   const isolatedWorkspace = store.listManagedWorkspaces(task.id)
     .find(({ owner }) => owner.type === "work-item");
   if (isolatedWorkspace?.owner.type === "work-item") {

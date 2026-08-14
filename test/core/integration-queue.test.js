@@ -16,6 +16,8 @@ import { createChangeSetManifest } from "../../dist/integration/changeSetManifes
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import {
   createIntegrationAttempt,
+  recordResolutionDecision,
+  requireLeaderDecision,
   updateIntegrationAttempt
 } from "../../dist/integration/integrationAttempt.js";
 import {
@@ -467,6 +469,35 @@ test("enqueue converges when the identical change already landed with other work
   assert.equal(masterHead(fixture), landed);
 });
 
+test("a pre-base same-tree commit cannot swallow an intentional revert", async () => {
+  const fixture = await createFixture();
+  // The initial commit has the tree the WorkItem deliberately restores. The
+  // ChangeSet is based on the later target commit, so the old tree is history,
+  // not evidence that this new revert was integrated.
+  writeFileSync(join(fixture.repositoryPath, "base.txt"), "changed after the old tree\n");
+  git(["-C", fixture.repositoryPath, "add", "base.txt"]);
+  git(["-C", fixture.repositoryPath, "commit", "-m", "advance beyond the old tree"]);
+  const revertBase = masterHead(fixture);
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    base: revertBase,
+    paths: { "base.txt": "base\n" }
+  });
+
+  const result = await enqueue(fixture, changeSet);
+
+  assert.equal(
+    result.outcome,
+    "queued",
+    "a same-tree commit older than the ChangeSet base cannot prove the revert landed"
+  );
+  assert.equal(result.entry.status, "queued");
+  assert.equal(
+    readFileSync(join(fixture.repositoryPath, "base.txt"), "utf8"),
+    "changed after the old tree\n"
+  );
+});
+
 // --- Process semantics ------------------------------------------------------
 
 test("process commits the exact head and records the target before and after", async () => {
@@ -643,6 +674,76 @@ test("reconcile closes a conflicted item whose attempt later committed", async (
   );
   assert.equal(reconciled.status, "committed");
   assert.equal(reconciled.targetAfter, candidate);
+});
+
+test("recovery commands cannot discard a committed manual-resolution Attempt", async (t) => {
+  for (const action of ["requeue", "supersede"]) {
+    await t.test(action, async () => {
+      const fixture = await createFixture();
+      const changeSet = await branchChangeSet(fixture, {
+        id: "change-set-1",
+        paths: { "manual.txt": "resolved\n" }
+      });
+      const queued = await enqueue(fixture, changeSet, { checkCommands: ["true"] });
+      let attempt = createIntegrationAttempt({
+        id: fixture.store.nextIntegrationAttemptId(fixture.task.id),
+        taskId: fixture.task.id,
+        projectId: fixture.project.id,
+        targetRef: "master",
+        expectedHead: fixture.baseCommit,
+        changeSetIds: [changeSet.id],
+        checkCommands: ["true"]
+      }, now);
+      fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+      const running = recordIntegrationQueueAttempt(
+        markIntegrationQueueRunning(queued.entry, fixture.baseCommit, now),
+        attempt.id,
+        now
+      );
+      fixture.store.saveIntegrationQueueEntry(fixture.task.id, running);
+      attempt = requireLeaderDecision(attempt, {
+        affectedPaths: ["manual.txt"],
+        summary: "manual conflict resolution"
+      }, now);
+      fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+      fixture.store.saveIntegrationQueueEntry(
+        fixture.task.id,
+        markIntegrationQueueBlocked(running, "manual conflict resolution", now)
+      );
+      attempt = recordResolutionDecision(attempt, {
+        action: "manual-resolution",
+        rationale: "preserve the combined result"
+      }, now);
+      fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+      git(["-C", fixture.repositoryPath, "merge", "--ff-only", changeSet.branch]);
+      attempt = updateIntegrationAttempt(attempt, {
+        status: "validating",
+        candidateCommit: changeSet.headCommit,
+        checks: [{ name: "true", outcome: "passed" }]
+      }, now);
+      fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+      attempt = updateIntegrationAttempt(attempt, { status: "committed" }, now);
+      fixture.store.saveIntegrationAttempt(fixture.task.id, attempt);
+
+      assert.throws(
+        () => action === "requeue"
+          ? requeueIntegrationQueueEntry(
+              fixture.store,
+              fixture.task.id,
+              queued.entry.id,
+              () => now
+            )
+          : supersedeIntegrationQueueEntry(
+              fixture.store,
+              fixture.task.id,
+              queued.entry.id,
+              "do not discard committed provenance",
+              () => now
+            ),
+        /committed.*reconcile|reconcile.*committed/iu
+      );
+    });
+  }
 });
 
 test("queue entries round-trip through the store and reject an updatedAt move backwards", async () => {

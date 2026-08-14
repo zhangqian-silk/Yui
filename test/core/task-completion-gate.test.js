@@ -12,6 +12,7 @@ import {
   createIntegrationAttempt,
   updateIntegrationAttempt
 } from "../../dist/integration/integrationAttempt.js";
+import { enqueueIntegrationQueueEntry } from "../../dist/integration/integrationQueueService.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import {
@@ -27,6 +28,7 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
+  retireWorkItem,
   submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
@@ -513,4 +515,60 @@ test("completion preflight returns a no-op for a completed Task without inspecti
   const result = preflightTaskCompletion(fx.task.id, fx.store);
   assert.equal(result.completed, true);
   assert.equal(result.task.id, fx.task.id);
+});
+
+test("completion preflight rejects non-terminal integration queue work", async (t) => {
+  const fx = fixture(t);
+  await seedCommittedIntegration(fx);
+
+  const source = join(fx.root, "queued-source");
+  execFileSync("git", [
+    "-C", fx.checkout, "worktree", "add", "--detach", "-q", source, fx.base
+  ]);
+  git(source, ["config", "user.name", "Yui Test"]);
+  git(source, ["config", "user.email", "yui@example.invalid"]);
+  writeFileSync(join(source, "queued.txt"), "still waiting\n");
+  git(source, ["add", "queued.txt"]);
+  git(source, ["commit", "-qm", "queued but not settled"]);
+  const queuedHead = git(source, ["rev-parse", "HEAD"]);
+
+  let item = createWorkItem("work-item-2", fx.task.id, {
+    title: "Retired after enqueue",
+    writeProjectIds: [fx.project.id]
+  }, NOW);
+  item = updateWorkItemStatus(item, "running", NOW);
+  item = submitWorkItemCandidate(item, {
+    summary: "Candidate later abandoned",
+    source: { type: "direct" }
+  }, NOW);
+  fx.store.saveWorkItem(fx.task.id, item);
+  const changeSet = createWorkItemChangeSet({
+    id: "change-set-2",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    workItemId: item.id,
+    baseCommit: fx.base,
+    headCommit: queuedHead,
+    branch: "queued-source",
+    changedPaths: ["queued.txt"]
+  }, NOW);
+  fx.store.saveChangeSet(fx.task.id, changeSet);
+  const queued = await enqueueIntegrationQueueEntry({
+    store: fx.store,
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    changeSetId: changeSet.id,
+    targetRef: "main",
+    now: () => NOW
+  });
+  assert.equal(queued.entry.status, "queued");
+  fx.store.saveWorkItem(fx.task.id, retireWorkItem(item, {
+    by: "leader",
+    summary: "abandon this Candidate"
+  }, NOW));
+
+  assert.throws(
+    () => preflightTaskCompletion(fx.task.id, fx.store),
+    /integration queue|queue entry/iu
+  );
 });

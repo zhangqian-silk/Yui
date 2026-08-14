@@ -323,7 +323,8 @@ export async function enqueueIntegrationQueueEntry(
     git,
     project.path,
     changeSet.headCommit,
-    targetHead
+    targetHead,
+    changeSet.baseCommit
   );
   if (equivalent === null) {
     // The identical change may already have landed through another commit
@@ -855,6 +856,27 @@ function resolveBlockedAttempt(
   store.saveIntegrationAttempt(taskId, rejected);
 }
 
+/**
+ * A committed Integration Attempt already landed its change on the target.
+ * Requeue or supersede would discard that provenance; the caller must
+ * reconcile the queue entry against the committed Attempt instead.
+ */
+function assertNotCommittedAttempt(
+  store: TaskStore,
+  taskId: string,
+  entry: IntegrationQueueEntry,
+  action: string
+): void {
+  if (entry.integrationAttemptId === undefined) return;
+  const attempt = store.getIntegrationAttempt(taskId, entry.integrationAttemptId);
+  if (attempt !== null && attempt.status === "committed") {
+    throw new Error(
+      `Integration queue entry ${entry.id} is backed by committed Integration `
+      + `Attempt ${attempt.id}; reconcile the queue entry instead of ${action} it.`
+    );
+  }
+}
+
 /** Retry a conflicted item (for example after a gate failure was fixed). */
 export function requeueIntegrationQueueEntry(
   store: TaskStore,
@@ -867,6 +889,7 @@ export function requeueIntegrationQueueEntry(
   if (entry === null) {
     throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
   }
+  assertNotCommittedAttempt(store, taskId, entry, "requeue");
   resolveBlockedAttempt(store, taskId, entry, "requeue", now);
   const waiting = markIntegrationQueueRequeued(entry, now());
   store.saveIntegrationQueueEntry(taskId, waiting);
@@ -884,6 +907,7 @@ export function supersedeIntegrationQueueEntry(
   if (entry === null) {
     throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
   }
+  assertNotCommittedAttempt(store, taskId, entry, "supersede");
   resolveBlockedAttempt(store, taskId, entry, "supersede", now);
   const superseded = markIntegrationQueueSuperseded(entry, reason, now());
   store.saveIntegrationQueueEntry(taskId, superseded);
@@ -1021,14 +1045,27 @@ async function findEquivalentCommit(
   git: IntegrationQueueGitPort,
   repositoryPath: string,
   sourceCommit: string,
-  historyHead: string
+  historyHead: string,
+  baseCommit: string
 ): Promise<string | null> {
   if (git.findCommitWithSameTreeInHistory === undefined) {
     return (await git.isAncestor(repositoryPath, sourceCommit, historyHead))
       ? sourceCommit
       : null;
   }
-  return git.findCommitWithSameTreeInHistory({ repositoryPath, sourceCommit, historyHead });
+  const found = await git.findCommitWithSameTreeInHistory({
+    repositoryPath,
+    sourceCommit,
+    historyHead
+  });
+  if (found === null) return null;
+  // The exact source commit landing on the target is integration evidence
+  // regardless of the base relationship.  A different same-tree commit is
+  // only evidence when it is at or after the ChangeSet base: a same-tree
+  // commit older than the base is history the ChangeSet may be deliberately
+  // restoring, not proof that the restore landed.
+  if (found === sourceCommit) return found;
+  return (await git.isAncestor(repositoryPath, baseCommit, found)) ? found : null;
 }
 
 /**
