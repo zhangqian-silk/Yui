@@ -31,7 +31,7 @@ import { NodeGitWorkspace } from "../../dist/repository/gitWorkspace.js";
 import { createReviewRound, finishReviewRound } from "../../dist/review/reviewRound.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
-import { activateTask, createTask } from "../../dist/task/task.js";
+import { activateTask, createTask, retireTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
   retryFailedWorkItem,
@@ -923,5 +923,102 @@ test("a target advance recomputes overlap only within its target lane", async ()
     processed[1].attempt.checkCommands,
     [],
     "advancing master must not revoke evidence for an independent release lane"
+  );
+});
+
+test("enqueue cannot publish a queue entry after the Task retires during target inspection", async () => {
+  const fixture = createFixture("enqueue-task-lifecycle-race");
+  const changeSet = createEvidencedChangeSet(fixture, "change-set-1", {
+    "queued.txt": "queued\n"
+  }, { checkName: "true" });
+  let notifyPaused;
+  const paused = new Promise((resolve) => { notifyPaused = resolve; });
+  let release;
+  const released = new Promise((resolve) => { release = resolve; });
+  class PausingTargetInspectGit extends NodeGitWorkspace {
+    paused = false;
+
+    async inspect(repositoryPath, ref) {
+      if (!this.paused) {
+        this.paused = true;
+        notifyPaused();
+        await released;
+      }
+      return super.inspect(repositoryPath, ref);
+    }
+  }
+
+  const enqueuing = enqueueIntegrationQueueEntry({
+    store: fixture.store,
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    changeSetId: changeSet.id,
+    targetRef: "master",
+    checkCommands: ["true"],
+    git: new PausingTargetInspectGit(),
+    now: () => now
+  });
+  await paused;
+  fixture.store.saveTask(retireTask(
+    fixture.store.getTask(fixture.task.id),
+    { by: "leader", summary: "retired while enqueue inspected the target" },
+    new Date(now.getTime() + 1_000)
+  ));
+  release();
+
+  await assert.rejects(enqueuing, /Task is not active/);
+  assert.deepEqual(
+    fixture.store.listIntegrationQueueEntries(fixture.task.id),
+    [],
+    "the enqueue transaction must not mutate a terminal Task"
+  );
+});
+
+test("queue claim cannot create a running Attempt after the Task retires", async () => {
+  const fixture = createFixture("process-task-lifecycle-race");
+  const changeSet = createEvidencedChangeSet(fixture, "change-set-1", {
+    "claimed.txt": "claimed\n"
+  }, { checkName: "true" });
+  const waiting = await enqueue(fixture, changeSet, ["true"]);
+  assert.equal(waiting.entry.status, "validated");
+  let notifyPaused;
+  const paused = new Promise((resolve) => { notifyPaused = resolve; });
+  let release;
+  const released = new Promise((resolve) => { release = resolve; });
+  class PausingTargetInspectGit extends NodeGitWorkspace {
+    paused = false;
+
+    async inspect(repositoryPath, ref) {
+      if (!this.paused) {
+        this.paused = true;
+        notifyPaused();
+        await released;
+      }
+      return super.inspect(repositoryPath, ref);
+    }
+  }
+
+  const processing = processQueue(fixture, {
+    git: new PausingTargetInspectGit(),
+    limit: 1
+  });
+  await paused;
+  fixture.store.saveTask(retireTask(
+    fixture.store.getTask(fixture.task.id),
+    { by: "leader", summary: "retired before the queue claim" },
+    new Date(now.getTime() + 1_000)
+  ));
+  release();
+
+  await assert.rejects(processing, /Task is not active/);
+  assert.equal(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, waiting.entry.id).status,
+    "validated",
+    "the claim transaction must leave the waiting entry untouched"
+  );
+  assert.deepEqual(
+    fixture.store.listIntegrationAttempts(fixture.task.id),
+    [],
+    "the claim transaction must not create an Attempt for a terminal Task"
   );
 });

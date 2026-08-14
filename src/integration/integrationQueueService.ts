@@ -121,6 +121,21 @@ function assertEnqueueableProducer(
 }
 
 /**
+ * Synchronous Task-active fence usable inside a write transaction.  The Task
+ * may retire between the pre-flight read and the commit point; a terminal Task
+ * must not gain new queue entries or Integration Attempts.
+ */
+function assertTaskActive(store: TaskStore, taskId: string): void {
+  const task = store.getTask(taskId);
+  if (task === null) {
+    throw new Error(`Task not found: ${taskId}.`);
+  }
+  if (task.status !== "active") {
+    throw new Error(`Task is not active: ${task.id}/${task.status}.`);
+  }
+}
+
+/**
  * Synchronous current-Candidate fence usable inside a write transaction.
  * Rejects a running WorkItem (no current Candidate) and a ChangeSet whose
  * headCommit no longer matches the latest immutable Candidate snapshot.
@@ -288,6 +303,9 @@ export async function enqueueIntegrationQueueEntry(
         outcome: duplicate.status === "committed" ? "already-committed" : "already-queued"
       };
     }
+    // Re-verify the Task is still active inside the write transaction:
+    // the Task may have retired between the pre-flight read and this commit.
+    assertTaskActive(tx, task.id);
     // Re-verify the producer inside the write transaction: the WorkItem may
     // have retired (or been deleted) between the read above and this commit.
     assertEnqueueableProducer(tx, task.id, changeSet);
@@ -495,6 +513,7 @@ export async function processIntegrationQueue(
         git, project.path, candidate, targetBefore, store, task.id
       )) {
       store.transaction((tx) => {
+        assertTaskActive(tx, task.id);
         const current = tx.getIntegrationQueueEntry(task.id, candidate.id);
         if (current !== null && current.status === "validated") {
           tx.saveIntegrationQueueEntry(task.id, markIntegrationQueueRequeued(current, now()));
@@ -516,6 +535,11 @@ export async function processIntegrationQueue(
       if (laneBlockedByRunningEntry(tx.listIntegrationQueueEntries(task.id), current)) {
         return { skipped: true as const };
       }
+      // Task-active fence: the Task may have retired between the pre-flight
+      // read and this commit.  A terminal Task must not gain a new running
+      // Integration Attempt.  This throws (not caught by the Candidate-fence
+      // handler below) so the caller sees the rejection.
+      assertTaskActive(tx, task.id);
       // Current-Candidate fence: a queued ChangeSet whose producer WorkItem
       // entered retry (or whose latest Candidate no longer matches) must not
       // advance the target.  Mark it conflicted so the Leader can supersede
