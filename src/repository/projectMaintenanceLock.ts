@@ -229,20 +229,18 @@ function reclaimStaleProjectMaintenanceLock(lock: string): void {
 
 /**
  * Reclaim a reclaim-lock directory only when it is provably orphaned: its
- * owner pid is dead (or unrecorded) AND it is older than the age bound, so a
- * lock whose owner just mkdir'ed but has not written its pid is not stolen.
+ * owner is dead (or unrecorded) AND it is older than the age bound, so a
+ * lock whose owner just mkdir'ed but has not written its owner is not stolen.
+ * Uses the same PID + start-time identity check as the main fence, so a
+ * recycled PID with a different start identity does not keep an orphaned
+ * reclaim lock alive. An ownerless (ENOENT owner) lock is still reclaimed;
+ * an unreadable owner fails closed (treated as live).
  * Returns true when it removed the lock (caller retries), false otherwise.
  */
 function reclaimOrphanedReclaimLock(reclaimLock: string): boolean {
   try {
     if (Date.now() - statSync(reclaimLock).mtimeMs < STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS) return false;
-    let pid: number | null;
-    try {
-      pid = Number.parseInt(readFileSync(join(reclaimLock, "owner"), "utf8"), 10);
-    } catch {
-      pid = null; // no/unreadable owner on an old lock: treat as orphaned.
-    }
-    if (pid !== null && Number.isInteger(pid) && processIsAlive(pid)) return false;
+    if (lockOwnerIsAlive(reclaimLock)) return false;
     rmSync(reclaimLock, { recursive: true, force: true });
     return true;
   } catch (error) {

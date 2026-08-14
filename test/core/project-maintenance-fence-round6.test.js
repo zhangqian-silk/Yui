@@ -43,6 +43,7 @@ import test from "node:test";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
 import { NodeGitWorkspace } from "../../dist/repository/gitWorkspace.js";
 import {
   acquireProjectMaintenanceLock,
@@ -735,4 +736,107 @@ test("RR9: failed new-Lane preparation compensates before releasing its Project 
     false,
     "the unadopted external-backed Lane was removed"
   );
+});
+
+test("RR10: a recycled PID does not keep an orphaned reclaim lock alive", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-rr10-reclaim-pid-reuse-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const lock = projectMaintenanceLockPath(home, "project-1");
+  const reclaimLock = `${lock}.reclaim`;
+  const old = new Date(Date.now() - 5_000);
+
+  // Both records represent crashed processes. The reclaim lock deliberately
+  // carries this live process's PID with a different start identity, exactly
+  // the durable state produced when the original PID has been recycled.
+  mkdirSync(lock, { recursive: true, mode: 0o700 });
+  writeFileSync(join(lock, "owner"), "99999998:1\n", { mode: 0o600 });
+  utimesSync(lock, old, old);
+  mkdirSync(reclaimLock, { mode: 0o700 });
+  writeFileSync(join(reclaimLock, "owner"), `${process.pid}:stale-start-identity\n`, {
+    mode: 0o600
+  });
+  utimesSync(reclaimLock, old, old);
+
+  const release = acquireProjectMaintenanceLock(home, "project-1");
+  release();
+});
+
+test("RR10: the supported reopen command honors an already-held Project maintenance fence", async (t) => {
+  const fixture = await archiveFixture(t);
+  const { home, store, project } = fixture;
+  const created = runTaskCommand(
+    ["create", "Reopen fence", "--project", project.id],
+    store,
+    { now: () => new Date(NOW) }
+  );
+  const task = created.data.task;
+  store.saveTask(completeTask(activateTask(task, NOW), NOW, {
+    by: "leader",
+    summary: "terminal before reopen"
+  }));
+
+  const release = acquireProjectMaintenanceLock(home, project.id);
+  try {
+    assert.throws(
+      () => runTaskCommand(["reopen", task.id], store, {
+        now: () => new Date(NOW),
+        yuiHome: home
+      }),
+      ProjectMaintenanceLockedError
+    );
+    assert.equal(
+      store.getTask(task.id).status,
+      "completed",
+      "a fenced reopen cannot change Task status"
+    );
+  } finally {
+    release();
+  }
+});
+
+test("RR10: direct Integration cleanup honors an already-held Project maintenance fence", async (t) => {
+  const fixture = await archiveFixture(t);
+  const { home, store, project } = fixture;
+  const created = runTaskCommand(
+    ["create", "Integration cleanup fence", "--project", project.id],
+    store,
+    { now: () => new Date(NOW) }
+  );
+  let touched = false;
+  const realGit = new NodeGitWorkspace();
+  const proxyGit = new Proxy(realGit, {
+    get(target, property) {
+      if (property === "removeIntegrationWorktree") {
+        return async () => {
+          touched = true;
+          return "missing";
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  const service = new GitIntegrationService(
+    home,
+    store,
+    proxyGit,
+    () => new Date(NOW)
+  );
+  const integration = {
+    id: "integration-rr10",
+    taskId: created.data.task.id,
+    projectId: project.id,
+    status: "committed"
+  };
+
+  const release = acquireProjectMaintenanceLock(home, project.id);
+  try {
+    await assert.rejects(
+      service.cleanup(integration),
+      ProjectMaintenanceLockedError
+    );
+    assert.equal(touched, false, "a fenced Integration worktree is untouched");
+  } finally {
+    release();
+  }
 });
