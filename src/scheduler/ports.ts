@@ -257,6 +257,18 @@ export type LeaderDispatchFailurePersistence = Readonly<{
 }>;
 
 /**
+ * Per-Run progress facts folded from a Task's event history in one O(events)
+ * pass. The stall reconciliation uses these to avoid re-scanning the whole
+ * history per Run candidate; absent implementation falls back to per-Run
+ * scans.
+ */
+export type RunProgressFacts = Readonly<{
+  latestCheckpointAt?: string;
+  latestActivityAt?: string;
+  latestStall?: Readonly<{ progressAt: string; evidenceKey: string }>;
+}>;
+
+/**
  * FileTaskStore-facing scheduler boundary. The concrete adapter owns the exact
  * Role/session-set model and performs each multi-record persistence operation.
  */
@@ -291,6 +303,12 @@ export interface SchedulerStorePort {
   listEvents?(taskId: string): readonly TaskEvent[];
   /** Optional richer fold of WorkItem/Review/Integration progress for a Run. */
   getRunDurableProgress?(taskId: string, roleName: string, runId: string): SchedulerRunProgress | null;
+  /**
+   * Optional one-pass fold of a Task's event history for one Run. When present,
+   * stall reconciliation uses these facts instead of re-scanning the whole
+   * history per candidate. Absent implementation ⇒ per-Run scans.
+   */
+  getRunProgressFacts?(taskId: string, runId: string): RunProgressFacts | undefined;
   /** Materializes a newly observed related-record fold as one run.progress fact. */
   recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Atomically consumes one advisory resource sample for an exact Run/progress point. */

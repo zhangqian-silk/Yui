@@ -22,7 +22,7 @@ import {
   hasRecentTurnId,
   type PendingTurnCompletion
 } from "../executor/turnCompletion.js";
-import { createTaskEvent } from "../event/taskEvent.js";
+import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
 import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import {
@@ -72,6 +72,7 @@ import type {
   SchedulerRole,
   SchedulerRoleSession,
   SchedulerStorePort,
+  RunProgressFacts,
   ExitedRoleRunPersistence
 } from "../scheduler/ports.js";
 import { recordLeaderFailure } from "../scheduler/leaderFailure.js";
@@ -82,6 +83,7 @@ import {
 import { pendingWakeupsMatch } from "../scheduler/pendingWakeup.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import {
+  foldRunProgressFacts,
   latestRunDurableProgressAt,
   latestRunEventTime,
   latestStallEvidenceKey,
@@ -126,9 +128,62 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 
+/**
+ * One durable revision's read-only facts for one Task. A scheduler pass reads
+ * the same revision's large event history once per Task and folds the per-Run
+ * progress facts in a single O(events) pass; every per-Role/per-phase query is
+ * then served from this bounded projection instead of re-cloning and
+ * re-scanning the whole history per candidate. The projection is rebuilt as
+ * soon as the durable revision advances (own commit or external writer), so it
+ * is never dispatch/claim/complete authority: every mutation re-reads the
+ * exact records under the storage lock/CAS.
+ */
+type TaskReadProjection = Readonly<{
+  events: readonly TaskEvent[];
+  runFacts: ReadonlyMap<string, RunProgressFacts>;
+  reviewRounds: ReturnType<TaskStore["listReviewRounds"]>;
+  changeSets: ReturnType<TaskStore["listChangeSets"]>;
+  integrationAttempts: ReturnType<TaskStore["listIntegrationAttempts"]>;
+  inputRequests: ReturnType<TaskStore["listInputRequests"]>;
+}>;
+
 /** Maps the authoritative FileTaskStore records to the scheduler's narrow port. */
 export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   constructor(readonly store: TaskStore) {}
+
+  /**
+   * Revision-scoped read projection. Keyed by the store's durable revision;
+   * any committed mutation (ours or an external writer's) advances it and the
+   * next read rebuilds. A store without getStateRevision disables caching.
+   */
+  #readProjection: { revision: number; tasks: Map<string, TaskReadProjection> } | null = null;
+
+  #taskReadProjection(taskId: string): TaskReadProjection {
+    const revision = typeof this.store.getStateRevision === "function"
+      ? this.store.getStateRevision()
+      : Number.NaN;
+    if (
+      this.#readProjection === null
+      || this.#readProjection.revision !== revision
+    ) {
+      this.#readProjection = { revision, tasks: new Map() };
+    }
+    const tasks = this.#readProjection.tasks;
+    let task = tasks.get(taskId);
+    if (task === undefined) {
+      const events = this.store.listEvents(taskId);
+      task = {
+        events,
+        runFacts: foldRunProgressFacts(events),
+        reviewRounds: this.store.listReviewRounds(taskId),
+        changeSets: this.store.listChangeSets(taskId),
+        integrationAttempts: this.store.listIntegrationAttempts(taskId),
+        inputRequests: this.store.listInputRequests(taskId)
+      };
+      tasks.set(taskId, task);
+    }
+    return task;
+  }
 
   withRuntimeEventTransaction<T>(execute: () => T): T {
     return this.store.withRuntimeEventTransaction(execute);
@@ -228,7 +283,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   listEvents(taskId: string) {
-    return this.store.listEvents(taskId);
+    return this.#taskReadProjection(taskId).events;
+  }
+
+  getRunProgressFacts(taskId: string, runId: string): RunProgressFacts | undefined {
+    return this.#taskReadProjection(taskId).runFacts.get(runId);
   }
 
   getRunDurableProgress(
@@ -236,7 +295,21 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string,
     runId: string
   ): SchedulerRunProgress | null {
-    return latestRunDurableProgressAt(this.store, taskId, roleName, runId);
+    const projected = this.#taskReadProjection(taskId);
+    // Serve the related-record fold from the same revision's projection: the
+    // event history and the WorkItem/Review/ChangeSet/Integration/Input lists
+    // are read once per Task per revision, and the per-Run checkpoint/activity
+    // facts come from the one-pass fold instead of per-candidate scans.
+    const view = {
+      getAgentRun: (id: string, agentRunId: string) => this.store.getAgentRun(id, agentRunId),
+      listEvents: () => projected.events,
+      getWorkItem: (id: string, workItemId: string) => this.store.getWorkItem(id, workItemId),
+      listReviewRounds: () => projected.reviewRounds,
+      listChangeSets: () => projected.changeSets,
+      listIntegrationAttempts: () => projected.integrationAttempts,
+      listInputRequests: () => projected.inputRequests
+    };
+    return latestRunDurableProgressAt(view, taskId, roleName, runId, projected.runFacts.get(runId));
   }
 
   recordRoleRunStall(
@@ -442,8 +515,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     // A provider-ready fact for this exact generation is proven by a folded
     // runtime.provider-session-lifecycle event with preInputReady true and a
     // matching agent/launch/nativeSession fence. This reads durable folded truth
-    // only — no liveness, screen, or pane/PID inference.
-    return this.store.listEvents(input.taskId).some((event) => (
+    // only — no liveness, screen, or pane/PID inference. Served from the
+    // revision projection: a stale miss only repeats an idempotent first push.
+    return this.listEvents(input.taskId).some((event) => (
       event.type === "runtime.provider-session-lifecycle"
       && event.payload.roleName === input.roleName
       && event.payload.agentId === input.agentId

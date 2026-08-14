@@ -312,6 +312,8 @@ export type TaskStore = {
   nextTaskId(): string;
   saveTask(task: Task): void;
   listTasks(): Task[];
+  /** Current durable state revision; advances once per committed mutation. */
+  getStateRevision(): number;
   getTask(id: string): Task | null;
   getReviewConfig(): ReviewConfig | null;
   getTaskBrief(taskId: string): TaskBrief | null;
@@ -684,7 +686,16 @@ export class FileTaskStore implements TaskStore {
       state.tasks[stored.id] = aggregate;
     });
   }
-  listTasks(): Task[] { return values(this.#state().tasks, (aggregate) => aggregate.task.id).map((entry) => clone(entry.task)); }
+  listTasks(): Task[] {
+    // Clone only the Task headers, not the whole stored aggregate (events,
+    // runs, messages): a scheduler pass lists Tasks per phase, and cloning
+    // each aggregate's full event history turned every phase into a 32 MiB
+    // projection. Callers that need a Task's events read them explicitly.
+    return Object.values(this.#state().tasks)
+      .map((aggregate) => clone(aggregate.task))
+      .sort((left, right) => numericCompare(left.id, right.id));
+  }
+  getStateRevision(): number { return this.#state().revision; }
   getTask(id: string): Task | null { return optional(this.#state().tasks[id]?.task); }
   getReviewConfig(): ReviewConfig | null {
     return optional(this.#state().config.review);
@@ -1615,7 +1626,14 @@ export class FileTaskStore implements TaskStore {
       writeCurrentStorageManifest(this.rootDir);
       this.#normalizeState = undefined;
     }
-    this.#readCache = null;
+    // Keep the state we just wrote as the warm read cache. The atomic write
+    // produced a new fingerprint, so a concurrent external writer is still
+    // detected on the next read; our own mutations no longer re-parse the
+    // whole Home to observe state they already held under the write lock.
+    this.#readCache = {
+      fingerprint: stateFileFingerprint(join(this.rootDir, STORAGE_STATE_FILE)),
+      state
+    };
   }
   #parseState(raw: string): StorageState {
     return parseState(this.#normalizeState?.(raw) ?? raw);
