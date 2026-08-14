@@ -192,33 +192,37 @@ export async function enqueueIntegrationQueueEntry(
     // have retired (or been deleted) between the read above and this commit.
     assertEnqueueableProducer(tx, task.id, changeSet);
     const id = tx.nextIntegrationQueueEntryId(task.id);
-    if (equivalent === null) {
+    const requestedChecks = input.checkCommands ?? [];
+    if (equivalent === null || requestedChecks.length > 0) {
       let entry = createIntegrationQueueEntry({
         id,
         taskId: task.id,
         projectId: input.projectId,
         changeSetId: input.changeSetId,
         targetRef,
-        checkCommands: input.checkCommands ?? [],
+        checkCommands: requestedChecks,
         evidenceRefs: changeSet.manifest?.evidenceRefs ?? []
       }, now());
       // Durable positive exact-SHA evidence on an unchanged target, at the lane
       // head, validates the entry so processing skips its checks.  The process-
       // path evidence fence still invalidates the binding if the target moves
       // before this entry runs, so a non-empty advance never rebinds old
-      // evidence.
-      if (canReuseEvidenceAtHead(tx.listIntegrationQueueEntries(task.id), entry, changeSet, targetHead)) {
+      // evidence.  A converged ChangeSet with explicit gates queues normally:
+      // the no-op apply still runs the caller's checks against the current
+      // target instead of waiving them.
+      if (canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), entry, changeSet, targetHead)) {
         entry = markIntegrationQueueValidated(entry, now(), targetHead);
       }
       tx.saveIntegrationQueueEntry(task.id, entry);
       return { entry, outcome: "queued" as const };
     }
-    // The ChangeSet is already represented on the target, so applying it would
-    // be a no-op and the target does not move.  Still record the one
-    // integration authority every acceptance and provenance consumer reads:
-    // a committed IntegrationAttempt against the exact observed target head,
-    // with the converged queue entry pointing at it.  No gate runs because
-    // there is nothing new to apply; the entry's proof string says why.
+    // The ChangeSet is already represented on the target and no gate was
+    // requested, so applying it would be a no-op and the target does not move.
+    // Still record the one integration authority every acceptance and
+    // provenance consumer reads: a committed IntegrationAttempt against the
+    // exact observed target head, with the converged queue entry pointing at
+    // it.  No gate runs because there is nothing new to apply and none was
+    // requested; the entry's proof string says why.
     const attempt = updateIntegrationAttempt(
       createIntegrationAttempt({
         id: tx.nextIntegrationAttemptId(task.id),
@@ -266,11 +270,15 @@ function findActiveQueueDuplicate(
  * Whether a freshly queued entry may start `validated` (skipping its checks):
  * its ChangeSet carries durable positive exact-SHA evidence, the target is
  * unchanged since the ChangeSet was based (so integrating fast-forwards to
- * the reviewed head), and no earlier lane entry will advance the target
- * first.  Entries behind a lane mate stay `queued`: the mate's commit moves
- * the target, so the evidence would not cover their integration anyway.
+ * the reviewed head), no earlier lane entry will advance the target first,
+ * and the evidence covers every requested check command.  Entries behind a
+ * lane mate stay `queued`: the mate's commit moves the target, so the
+ * evidence would not cover their integration anyway.  A review check that
+ * passed for command X never waives a different gate Y.
  */
 function canReuseEvidenceAtHead(
+  store: TaskStore,
+  taskId: string,
   entries: readonly IntegrationQueueEntry[],
   entry: IntegrationQueueEntry,
   changeSet: ChangeSet,
@@ -279,9 +287,41 @@ function canReuseEvidenceAtHead(
   if (entry.evidenceRefs.length === 0) return false;
   if (targetHead !== changeSet.baseCommit) return false;
   const lane = queueLaneKey(entry);
-  return !entries.some((existing) => queueLaneKey(existing) === lane
+  if (entries.some((existing) => queueLaneKey(existing) === lane
     && existing.status !== "committed"
-    && existing.status !== "superseded");
+    && existing.status !== "superseded")) return false;
+  return evidenceCoversCheckCommands(store, taskId, entry.evidenceRefs, entry.checkCommands);
+}
+
+/**
+ * Resolve each reusable evidence reference to its ReviewRound and collect the
+ * names of checks that passed.  A requested gate command is covered only when
+ * a resolved round recorded that exact command as passed.  A review that ran
+ * `true` (or any other unrelated check) never waives a different gate.
+ */
+function evidenceCoversCheckCommands(
+  store: TaskStore,
+  taskId: string,
+  evidenceRefs: readonly string[],
+  checkCommands: readonly string[]
+): boolean {
+  if (checkCommands.length === 0) return true;
+  const covered = new Set<string>();
+  for (const ref of evidenceRefs) {
+    const roundId = parseReviewRoundRef(ref);
+    if (roundId === undefined) continue;
+    const round = store.getReviewRound(taskId, roundId);
+    if (round === null || round.status !== "completed") continue;
+    for (const check of round.checks ?? []) {
+      if (check.outcome === "passed") covered.add(check.name);
+    }
+  }
+  return checkCommands.every((cmd) => covered.has(cmd));
+}
+
+function parseReviewRoundRef(ref: string): string | undefined {
+  const prefix = "review-round:";
+  return ref.startsWith(prefix) ? ref.slice(prefix.length) : undefined;
 }
 
 export type ProcessIntegrationQueueOptions = Readonly<{

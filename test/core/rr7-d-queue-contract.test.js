@@ -27,23 +27,20 @@ import {
   requeueIntegrationQueueEntry
 } from "../../dist/integration/integrationQueueService.js";
 import { createProject } from "../../dist/repository/project.js";
+import { createReviewRound, finishReviewRound } from "../../dist/review/reviewRound.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
-  retireWorkItem
+  retireWorkItem,
+  submitWorkItemCandidate,
+  updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 
 const now = new Date("2026-08-14T02:00:00.000Z");
-
-const EVIDENCE = createChangeSetManifest({
-  tags: [],
-  deletedPaths: [],
-  evidenceRefs: ["review-round:review-round-1"]
-});
 
 function git(args) {
   return execFileSync("git", args, { encoding: "utf8" });
@@ -133,6 +130,60 @@ function createStoredChangeSet(fixture, id, paths, options = {}) {
     branch: committed.branch,
     changedPaths: Object.keys(paths),
     ...(options.manifest === undefined ? {} : { manifest: options.manifest })
+  }, now);
+  fixture.store.saveChangeSet(fixture.task.id, changeSet);
+  return changeSet;
+}
+
+/**
+ * A ChangeSet whose manifest carries a real ReviewRound evidence ref.  The
+ * round's single passed check covers `options.checkName` so the queue can
+ * validate the entry and skip that exact gate.
+ */
+function createEvidencedChangeSet(fixture, id, paths, options = {}) {
+  const committed = commitOnWorktree(fixture, id, paths, options.base);
+  git(["-C", fixture.repositoryPath, "worktree", "remove", committed.worktree]);
+  const workItem = createWorkItem(
+    fixture.store.nextWorkItemId(fixture.task.id),
+    fixture.task.id,
+    { title: id, acceptance: [], dependsOn: [], writeProjectIds: [fixture.project.id] },
+    now
+  );
+  const running = updateWorkItemStatus(workItem, "running", now);
+  fixture.store.saveWorkItem(fixture.task.id, running);
+  const withCandidate = submitWorkItemCandidate(
+    running,
+    { summary: id, source: { type: "direct" } },
+    now
+  );
+  fixture.store.saveWorkItem(fixture.task.id, withCandidate);
+  const round = finishReviewRound(createReviewRound(
+    fixture.store.nextReviewRoundId(fixture.task.id),
+    fixture.task.id,
+    workItem.id,
+    withCandidate.candidates[0].id,
+    "reviewer",
+    "leader",
+    committed.headCommit,
+    now
+  ), "completed", "reviewed", now, {
+    checks: [{ name: options.checkName ?? "false", outcome: "passed" }]
+  });
+  fixture.store.saveReviewRound(fixture.task.id, round);
+  const changeSet = createWorkItemChangeSet({
+    id,
+    taskId: fixture.task.id,
+    workItemId: workItem.id,
+    projectId: fixture.project.id,
+    baseCommit: options.base ?? fixture.baseCommit,
+    headCommit: committed.headCommit,
+    branch: committed.branch,
+    changedPaths: Object.keys(paths),
+    manifest: createChangeSetManifest({
+      tags: [],
+      deletedPaths: [],
+      evidenceRefs: [`review-round:${round.id}`]
+    })
   }, now);
   fixture.store.saveChangeSet(fixture.task.id, changeSet);
   return changeSet;
@@ -262,10 +313,12 @@ test("durable exact-SHA evidence validates an unchanged-target entry and a targe
   const fixture = createFixture("evidence-reuse");
 
   // An entry with positive exact-SHA evidence on an unchanged target is
-  // validated at enqueue and commits without running its checks.
-  const first = createStoredChangeSet(fixture, "change-set-1", {
+  // validated at enqueue and commits without running its checks.  The
+  // evidence is a real ReviewRound whose passed check covers the exact
+  // queue gate command.
+  const first = createEvidencedChangeSet(fixture, "change-set-1", {
     "first.txt": "first\n"
-  }, { manifest: EVIDENCE });
+  });
   const enqueued = await enqueue(fixture, first, ["false"]);
   assert.equal(enqueued.outcome, "queued");
   assert.equal(enqueued.entry.status, "validated");
@@ -287,9 +340,9 @@ test("durable exact-SHA evidence validates an unchanged-target entry and a targe
   // target; an out-of-band advance then invalidates the evidence, so its
   // checks run against the new target instead of being skipped.
   const targetAfterFirst = processed[0].entry.targetAfter;
-  const second = createStoredChangeSet(fixture, "change-set-2", {
+  const second = createEvidencedChangeSet(fixture, "change-set-2", {
     "second.txt": "second\n"
-  }, { base: targetAfterFirst, manifest: EVIDENCE });
+  }, { base: targetAfterFirst });
   const secondEnqueued = await enqueue(fixture, second, ["false"]);
   assert.equal(secondEnqueued.entry.status, "validated");
   assert.equal(secondEnqueued.entry.evidenceTargetHead, targetAfterFirst);
@@ -311,4 +364,144 @@ test("durable exact-SHA evidence validates an unchanged-target entry and a targe
     existsSync(join(fixture.repositoryPath, "second.txt")),
     false
   );
+});
+
+// --- Task-final reviewer diagnostics ---------------------------------------
+
+function createCandidateWorkspace(fixture, label, paths, options = {}) {
+  const committed = commitOnWorktree(fixture, label, paths);
+  if (options.distinctCommitter === true) {
+    git([
+      "-C", committed.worktree,
+      "-c", "user.name=Reviewed Worker",
+      "-c", "user.email=reviewed-worker@example.com",
+      "commit", "--amend", "--no-edit"
+    ]);
+    committed.headCommit = git([
+      "-C", committed.worktree, "rev-parse", "HEAD"
+    ]).trim();
+  }
+  const workItem = submitWorkItemCandidate(
+    updateWorkItemStatus(createWorkItem(
+      fixture.store.nextWorkItemId(fixture.task.id),
+      fixture.task.id,
+      {
+        title: label,
+        acceptance: [],
+        dependsOn: [],
+        writeProjectIds: [fixture.project.id]
+      },
+      now
+    ), "running", now),
+    { summary: label, source: { type: "direct" } },
+    now
+  );
+  fixture.store.saveWorkItem(fixture.task.id, workItem);
+  fixture.store.saveManagedWorkspace(createManagedWorkspace({
+    owner: {
+      type: "work-item",
+      taskId: fixture.task.id,
+      workItemId: workItem.id
+    },
+    root: committed.worktree,
+    entries: [{
+      projectId: fixture.project.id,
+      directory: fixture.project.name,
+      access: "write",
+      path: committed.worktree,
+      branch: committed.branch,
+      baseRef: "master",
+      baseCommit: fixture.baseCommit
+    }]
+  }, now));
+  return { workItem, ...committed };
+}
+
+function savePositiveReview(fixture, candidate, checks) {
+  const round = finishReviewRound(createReviewRound(
+    fixture.store.nextReviewRoundId(fixture.task.id),
+    fixture.task.id,
+    candidate.workItem.id,
+    "candidate-1",
+    "reviewer",
+    "leader",
+    candidate.headCommit,
+    now
+  ), "completed", "reviewed", now, { checks });
+  fixture.store.saveReviewRound(fixture.task.id, round);
+  return round;
+}
+
+async function captureCandidate(fixture, candidate) {
+  const [changeSet] = await new WorkItemChangeSetManager(fixture.store, () => now)
+    .capture(fixture.task.id, candidate.workItem.id);
+  return changeSet;
+}
+
+test("review evidence cannot waive a different queue gate", async () => {
+  const fixture = createFixture("evidence-command-scope");
+  const candidate = createCandidateWorkspace(fixture, "reviewed-command", {
+    "reviewed.txt": "reviewed\n"
+  });
+  savePositiveReview(fixture, candidate, [
+    { name: "true", outcome: "passed" }
+  ]);
+  const changeSet = await captureCandidate(fixture, candidate);
+  assert.equal(changeSet.manifest.evidenceRefs.length, 1);
+
+  await enqueue(fixture, changeSet, ["false"]);
+  const [processed] = await processQueue(fixture);
+
+  assert.deepEqual(processed.attempt.checkCommands, ["false"]);
+  assert.equal(processed.entry.status, "conflicted");
+  assert.equal(existsSync(join(fixture.repositoryPath, "reviewed.txt")), false);
+});
+
+test("exact-SHA evidence is not rebound to a cherry-picked candidate SHA", async () => {
+  const fixture = createFixture("evidence-candidate-sha");
+  const candidate = createCandidateWorkspace(fixture, "reviewed-sha", {
+    "sha.txt": "reviewed\n"
+  }, { distinctCommitter: true });
+  const exactHeadCheck = `test "$(git rev-parse HEAD)" = '${candidate.headCommit}'`;
+  savePositiveReview(fixture, candidate, [
+    { name: exactHeadCheck, outcome: "passed" }
+  ]);
+  const changeSet = await captureCandidate(fixture, candidate);
+
+  await enqueue(fixture, changeSet, [exactHeadCheck]);
+  const [processed] = await processQueue(fixture);
+  if (processed.entry.status === "committed") {
+    assert.equal(
+      processed.entry.targetAfter,
+      changeSet.headCommit,
+      "evidence may skip the gate only if the integrated candidate remains the reviewed SHA"
+    );
+  } else {
+    assert.equal(processed.entry.status, "conflicted");
+    assert.ok(processed.attempt.checks.some(({ outcome }) => outcome === "failed"));
+  }
+});
+
+test("tree or ancestor convergence still honors an explicitly requested gate", async () => {
+  const fixture = createFixture("convergence-gate");
+  const candidate = createCandidateWorkspace(fixture, "already-landed", {
+    "landed.txt": "landed\n"
+  });
+  const changeSet = await captureCandidate(fixture, candidate);
+  git(["-C", fixture.repositoryPath, "merge", "--ff-only", candidate.branch]);
+  writeFileSync(join(fixture.repositoryPath, "broken.txt"), "broken\n");
+  git(["-C", fixture.repositoryPath, "add", "broken.txt"]);
+  git(["-C", fixture.repositoryPath, "commit", "-m", "break the target"]);
+
+  const enqueued = await enqueue(fixture, changeSet, ["test ! -f broken.txt"]);
+  const finalEntry = enqueued.outcome === "converged"
+    ? enqueued.entry
+    : (await processQueue(fixture))[0].entry;
+  const attempt = fixture.store.getIntegrationAttempt(
+    fixture.task.id,
+    finalEntry.integrationAttemptId
+  );
+
+  assert.deepEqual(attempt.checkCommands, ["test ! -f broken.txt"]);
+  assert.equal(finalEntry.status, "conflicted");
 });

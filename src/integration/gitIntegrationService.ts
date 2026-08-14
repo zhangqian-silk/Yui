@@ -357,6 +357,13 @@ export class GitIntegrationService {
     commits: readonly PlannedCommit[]
   ): Promise<IntegrationResult | undefined> {
     for (const { changeSetId, commit } of commits) {
+      // Fast-forward when the commit is a direct descendant of HEAD: this
+      // preserves the original commit SHA, which exact-SHA review evidence
+      // relies on.  Fall back to cherry-pick when the target moved since the
+      // ChangeSet was based (the commit is no longer a direct descendant).
+      if (await gitSucceeds(["-C", candidatePath, "merge", "--ff-only", commit])) {
+        continue;
+      }
       try {
         await git(["-C", candidatePath, "cherry-pick", commit]);
       } catch {
