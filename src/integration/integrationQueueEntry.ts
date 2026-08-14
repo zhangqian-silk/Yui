@@ -85,7 +85,10 @@ export function createIntegrationQueueEntry(
 
 /**
  * An entry whose ChangeSet is already represented on the target (an ancestor
- * or a same-tree commit) converges directly to committed with its proof.
+ * or a same-tree commit) converges directly to committed with its proof.  The
+ * entry still names the committed IntegrationAttempt that recorded the
+ * convergence, so every acceptance and provenance consumer reads one
+ * integration authority.
  */
 export function createConvergedIntegrationQueueEntry(
   input: Readonly<Pick<
@@ -94,6 +97,7 @@ export function createConvergedIntegrationQueueEntry(
   > & {
     targetHead: string;
     proof: string;
+    integrationAttemptId?: string;
   }>,
   now: Date
 ): IntegrationQueueEntry {
@@ -110,6 +114,9 @@ export function createConvergedIntegrationQueueEntry(
     targetBefore: input.targetHead,
     targetAfter: input.targetHead,
     evidenceRefs: [input.proof],
+    ...(input.integrationAttemptId === undefined
+      ? {}
+      : { integrationAttemptId: input.integrationAttemptId }),
     createdAt: timestamp,
     updatedAt: timestamp,
     endedAt: timestamp

@@ -6,6 +6,7 @@ import { workspaceProjectEntry } from "../worktree/managedWorkspace.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   createIntegrationAttempt,
+  updateIntegrationAttempt,
   type IntegrationAttempt
 } from "./integrationAttempt.js";
 import {
@@ -144,29 +145,53 @@ export async function enqueueIntegrationQueueEntry(
       };
     }
     const id = tx.nextIntegrationQueueEntryId(task.id);
-    const entry = equivalent === null
-      ? createIntegrationQueueEntry({
-          id,
-          taskId: task.id,
-          projectId: input.projectId,
-          changeSetId: input.changeSetId,
-          targetRef,
-          checkCommands: input.checkCommands ?? [],
-          evidenceRefs: changeSet.manifest?.evidenceRefs ?? []
-        }, now())
-      : createConvergedIntegrationQueueEntry({
-          id,
-          taskId: task.id,
-          projectId: input.projectId,
-          changeSetId: input.changeSetId,
-          targetRef,
-          targetHead,
-          proof: equivalent === changeSet.headCommit
-            ? `ancestor-convergence:${equivalent}`
-            : `tree-convergence:${equivalent}`
-        }, now());
+    if (equivalent === null) {
+      const entry = createIntegrationQueueEntry({
+        id,
+        taskId: task.id,
+        projectId: input.projectId,
+        changeSetId: input.changeSetId,
+        targetRef,
+        checkCommands: input.checkCommands ?? [],
+        evidenceRefs: changeSet.manifest?.evidenceRefs ?? []
+      }, now());
+      tx.saveIntegrationQueueEntry(task.id, entry);
+      return { entry, outcome: "queued" as const };
+    }
+    // The ChangeSet is already represented on the target, so applying it would
+    // be a no-op and the target does not move.  Still record the one
+    // integration authority every acceptance and provenance consumer reads:
+    // a committed IntegrationAttempt against the exact observed target head,
+    // with the converged queue entry pointing at it.  No gate runs because
+    // there is nothing new to apply; the entry's proof string says why.
+    const attempt = updateIntegrationAttempt(
+      createIntegrationAttempt({
+        id: tx.nextIntegrationAttemptId(task.id),
+        taskId: task.id,
+        projectId: input.projectId,
+        targetRef,
+        expectedHead: targetHead,
+        changeSetIds: [input.changeSetId],
+        checkCommands: []
+      }, now()),
+      { status: "committed", candidateCommit: targetHead },
+      now()
+    );
+    tx.saveIntegrationAttempt(task.id, attempt);
+    const entry = createConvergedIntegrationQueueEntry({
+      id,
+      taskId: task.id,
+      projectId: input.projectId,
+      changeSetId: input.changeSetId,
+      targetRef,
+      targetHead,
+      proof: equivalent === changeSet.headCommit
+        ? `ancestor-convergence:${equivalent}`
+        : `tree-convergence:${equivalent}`,
+      integrationAttemptId: attempt.id
+    }, now());
     tx.saveIntegrationQueueEntry(task.id, entry);
-    return { entry, outcome: equivalent === null ? "queued" : "converged" as const };
+    return { entry, outcome: "converged" as const };
   });
 }
 
@@ -225,7 +250,7 @@ export async function processIntegrationQueue(
   const processed: ProcessIntegrationQueueItem[] = [];
   for (;;) {
     if (options.limit !== undefined && processed.length >= options.limit) break;
-    reconcileCommittedEntries(store, task.id, now);
+    reconcileTerminalAttempts(store, task.id, now);
     // The store already returns entries in numeric id order; trust it instead
     // of re-sorting with a lexicographic compare (which yields 1, 10, 2, ...).
     // A running entry is the persistent head of its lane: its successors are
@@ -411,7 +436,12 @@ async function evidenceTargetAdvanced(
   return delta.length > 0 && entry.checkCommands.length > 0;
 }
 
-/** A conflicted entry whose manual-resolution Attempt committed converges. */
+/**
+ * A conflicted entry whose manual-resolution Attempt committed converges.  The
+ * settle and the downstream affected-path recompute a normal commit performs
+ * happen in one transaction, so waiting successors never observe a committed
+ * entry with stale overlap evidence.
+ */
 export function reconcileIntegrationQueueEntry(
   store: TaskStore,
   taskId: string,
@@ -433,9 +463,12 @@ export function reconcileIntegrationQueueEntry(
       `Integration Attempt has not committed: ${entry.integrationAttemptId ?? "-"}/${attempt?.status ?? "missing"}.`
     );
   }
-  const committed = markIntegrationQueueCommitted(entry, committedTargetAfter(attempt), now());
-  store.saveIntegrationQueueEntry(taskId, committed);
-  return committed;
+  return store.transaction((tx) => {
+    const committed = markIntegrationQueueCommitted(entry, committedTargetAfter(attempt), now());
+    tx.saveIntegrationQueueEntry(taskId, committed);
+    recomputeAffectedPaths(tx, taskId, committed, now);
+    return committed;
+  });
 }
 
 /** Retry a conflicted item (for example after a gate failure was fixed). */
@@ -471,30 +504,50 @@ export function supersedeIntegrationQueueEntry(
 }
 
 /**
- * Converge entries whose linked IntegrationAttempt already committed.  A
+ * Converge entries whose linked IntegrationAttempt already settled.  A
  * conflicted entry whose manual resolve committed, or a `running` entry
- * whose process crashed between the commit and the queue settle, both prove
- * their work landed through the Attempt itself; converge them idempotently
- * and replay the downstream affected/evidence updates a normal settle would
- * have performed, so the next process pass sees a consistent queue.
+ * whose process crashed between the Attempt's terminal write and the queue
+ * settle, both prove their outcome through the Attempt itself: converge
+ * them idempotently — a committed Attempt to `committed`, replaying the
+ * downstream affected/evidence updates a normal settle would, and a failed
+ * or blocked Attempt to `conflicted` carrying the Attempt's own diagnosis —
+ * so the next process pass sees a consistent queue and a wedged lane frees.
  */
-function reconcileCommittedEntries(
+function reconcileTerminalAttempts(
   store: TaskStore,
   taskId: string,
   now: () => Date
 ): void {
   for (const entry of store.listIntegrationQueueEntries(taskId)) {
-    if ((entry.status !== "conflicted" && entry.status !== "running")
-      || entry.integrationAttemptId === undefined) continue;
+    if (entry.integrationAttemptId === undefined) continue;
+    if (entry.status !== "conflicted" && entry.status !== "running") continue;
     const attempt = store.getIntegrationAttempt(taskId, entry.integrationAttemptId);
-    if (attempt?.status !== "committed") continue;
-    const committed = markIntegrationQueueCommitted(
-      entry,
-      committedTargetAfter(attempt),
-      now()
+    if (attempt === null) continue;
+    if (attempt.status === "committed") {
+      const committed = markIntegrationQueueCommitted(
+        entry,
+        committedTargetAfter(attempt),
+        now()
+      );
+      store.saveIntegrationQueueEntry(taskId, committed);
+      recomputeAffectedPaths(store, taskId, committed, now);
+      continue;
+    }
+    // Crash window: the Attempt persisted a terminal failed/blocked outcome
+    // but the process died before settling the entry.  Only a `running`
+    // entry can be wedged by it — a `conflicted` entry already carries its
+    // diagnosis — so converge the stuck lane head to `conflicted` with the
+    // Attempt's own diagnosis, after which requeue or supersede can recover
+    // it.  An Attempt still running or validating is genuinely in flight.
+    if (entry.status !== "running") continue;
+    if (attempt.status !== "failed" && attempt.status !== "blocked") continue;
+    const diagnosis = attempt.status === "blocked"
+      ? attempt.conflict?.summary ?? "Integration blocked without a conflict report."
+      : gateFailureSummary(attempt);
+    store.saveIntegrationQueueEntry(
+      taskId,
+      markIntegrationQueueBlocked(entry, diagnosis, now())
     );
-    store.saveIntegrationQueueEntry(taskId, committed);
-    recomputeAffectedPaths(store, taskId, committed, now);
   }
 }
 
