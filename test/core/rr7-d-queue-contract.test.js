@@ -555,6 +555,87 @@ test("enqueue refuses a rejected ChangeSet while its WorkItem retry has no curre
   );
 });
 
+test("enqueue rechecks the current Candidate after asynchronous target inspection", async () => {
+  const fixture = createFixture("candidate-enqueue-race");
+  const rejectedCandidate = createCandidateWorkspace(fixture, "racing-candidate", {
+    "candidate.txt": "rejected\n"
+  });
+  const rejectedChangeSet = await captureCandidate(fixture, rejectedCandidate);
+
+  let notifyPaused;
+  const paused = new Promise((resolve) => { notifyPaused = resolve; });
+  let releaseTargetInspection;
+  const released = new Promise((resolve) => { releaseTargetInspection = resolve; });
+  class PausingTargetGit extends NodeGitWorkspace {
+    async inspect(repositoryPath, baseRef) {
+      const result = await super.inspect(repositoryPath, baseRef);
+      if (repositoryPath === fixture.repositoryPath && baseRef === "refs/heads/master") {
+        notifyPaused();
+        await released;
+      }
+      return result;
+    }
+  }
+
+  const enqueueing = enqueueIntegrationQueueEntry({
+    store: fixture.store,
+    taskId: fixture.task.id,
+    projectId: fixture.project.id,
+    changeSetId: rejectedChangeSet.id,
+    targetRef: "master",
+    checkCommands: ["true"],
+    git: new PausingTargetGit(),
+    now: () => now
+  });
+  await paused;
+
+  try {
+    const concurrentStore = new FileTaskStore(fixture.home);
+    const current = concurrentStore.getWorkItem(fixture.task.id, rejectedCandidate.workItem.id);
+    const failed = updateWorkItemStatus(current, "failed", now, "candidate rejected");
+    concurrentStore.saveWorkItem(fixture.task.id, failed);
+    concurrentStore.saveWorkItem(fixture.task.id, retryFailedWorkItem(failed, now));
+  } finally {
+    releaseTargetInspection();
+  }
+
+  await assert.rejects(
+    enqueueing,
+    /current Candidate|superseded Candidate/,
+    "the enqueue transaction must not commit after the checked Candidate became historical"
+  );
+});
+
+test("queue processing does not land an entry after its Candidate enters retry", async () => {
+  const fixture = createFixture("candidate-process-retry");
+  const rejectedCandidate = createCandidateWorkspace(fixture, "queued-candidate", {
+    "candidate.txt": "rejected\n"
+  });
+  const rejectedChangeSet = await captureCandidate(fixture, rejectedCandidate);
+  await enqueue(fixture, rejectedChangeSet, ["true"]);
+
+  const failed = updateWorkItemStatus(
+    rejectedCandidate.workItem,
+    "failed",
+    now,
+    "candidate rejected"
+  );
+  fixture.store.saveWorkItem(fixture.task.id, failed);
+  fixture.store.saveWorkItem(fixture.task.id, retryFailedWorkItem(failed, now));
+
+  await processQueue(fixture, { limit: 1 }).catch(() => []);
+
+  assert.equal(
+    git(["-C", fixture.repositoryPath, "rev-parse", "refs/heads/master"]).trim(),
+    fixture.baseCommit,
+    "a queued historical Candidate must fail closed instead of advancing the target"
+  );
+  assert.notEqual(
+    fixture.store.getIntegrationQueueEntry(fixture.task.id, "integration-queue-1").status,
+    "committed"
+  );
+});
+
 test("review evidence cannot waive a different queue gate", async () => {
   const fixture = createFixture("evidence-command-scope");
   const candidate = createCandidateWorkspace(fixture, "reviewed-command", {

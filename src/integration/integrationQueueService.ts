@@ -121,19 +121,18 @@ function assertEnqueueableProducer(
 }
 
 /**
- * A ChangeSet captured from a since-superseded Candidate must not enter the
- * queue.  The fence binds to the latest immutable Candidate snapshot: a
- * running WorkItem has no current Candidate, and a ChangeSet whose headCommit
- * no longer matches the latest Candidate (or the workspace HEAD when the
- * Candidate carries no head snapshot) was captured from an earlier Candidate.
- * When the workspace exists but cannot be inspected, fail closed.
+ * Synchronous current-Candidate fence usable inside a write transaction.
+ * Rejects a running WorkItem (no current Candidate) and a ChangeSet whose
+ * headCommit no longer matches the latest immutable Candidate snapshot.
+ * Returns without error when the Candidate carries no head snapshot: the
+ * async workspace fallback in assertCurrentCandidateHead covers that case
+ * outside the transaction.
  */
-async function assertCurrentCandidateHead(
+function assertCurrentCandidateInStore(
   store: TaskStore,
   taskId: string,
-  changeSet: ChangeSet,
-  git: IntegrationQueueGitPort
-): Promise<void> {
+  changeSet: ChangeSet
+): void {
   const workItem = store.getWorkItem(taskId, changeSet.workItemId);
   if (workItem === null) {
     throw new Error(`ChangeSet producer WorkItem not found: ${changeSet.workItemId}.`);
@@ -147,18 +146,31 @@ async function assertCurrentCandidateHead(
   }
   const latestCandidate = workItem.candidates.at(-1);
   if (latestCandidate !== undefined) {
-    // Prefer the immutable Candidate head-commit snapshot when available.
     const snapshotHead = candidateHeadCommit(latestCandidate, changeSet.projectId);
-    if (snapshotHead !== undefined) {
-      if (snapshotHead !== changeSet.headCommit) {
-        throw new Error(
-          `ChangeSet ${changeSet.id} was captured from a superseded Candidate: `
-          + `current Candidate head is ${snapshotHead}, ChangeSet head is ${changeSet.headCommit}.`
-        );
-      }
-      return;
+    if (snapshotHead !== undefined && snapshotHead !== changeSet.headCommit) {
+      throw new Error(
+        `ChangeSet ${changeSet.id} was captured from a superseded Candidate: `
+        + `current Candidate head is ${snapshotHead}, ChangeSet head is ${changeSet.headCommit}.`
+      );
     }
   }
+}
+
+/**
+ * A ChangeSet captured from a since-superseded Candidate must not enter the
+ * queue.  The fence binds to the latest immutable Candidate snapshot: a
+ * running WorkItem has no current Candidate, and a ChangeSet whose headCommit
+ * no longer matches the latest Candidate (or the workspace HEAD when the
+ * Candidate carries no head snapshot) was captured from an earlier Candidate.
+ * When the workspace exists but cannot be inspected, fail closed.
+ */
+async function assertCurrentCandidateHead(
+  store: TaskStore,
+  taskId: string,
+  changeSet: ChangeSet,
+  git: IntegrationQueueGitPort
+): Promise<void> {
+  assertCurrentCandidateInStore(store, taskId, changeSet);
   // Fall back to the managed workspace HEAD when the Candidate carries no
   // head-commit snapshot.  Fail closed: a workspace that exists but cannot
   // be inspected blocks enqueue.
@@ -279,6 +291,10 @@ export async function enqueueIntegrationQueueEntry(
     // Re-verify the producer inside the write transaction: the WorkItem may
     // have retired (or been deleted) between the read above and this commit.
     assertEnqueueableProducer(tx, task.id, changeSet);
+    // Re-verify the current-Candidate fence inside the write transaction:
+    // the WorkItem may have entered retry (status running) between the
+    // async target inspection and this commit.
+    assertCurrentCandidateInStore(tx, task.id, changeSet);
     const id = tx.nextIntegrationQueueEntryId(task.id);
     const requestedChecks = input.checkCommands ?? [];
     if (equivalent === null || requestedChecks.length > 0) {
@@ -498,6 +514,24 @@ export async function processIntegrationQueue(
         return { skipped: true as const };
       }
       if (laneBlockedByRunningEntry(tx.listIntegrationQueueEntries(task.id), current)) {
+        return { skipped: true as const };
+      }
+      // Current-Candidate fence: a queued ChangeSet whose producer WorkItem
+      // entered retry (or whose latest Candidate no longer matches) must not
+      // advance the target.  Mark it conflicted so the Leader can supersede
+      // or re-enqueue a fresh ChangeSet.
+      try {
+        const changeSet = tx.getChangeSet(task.id, current.changeSetId);
+        if (changeSet === null) {
+          throw new Error(`ChangeSet not found: ${current.changeSetId}.`);
+        }
+        assertCurrentCandidateInStore(tx, task.id, changeSet);
+      } catch (error) {
+        tx.saveIntegrationQueueEntry(task.id, markIntegrationQueueBlocked(
+          current,
+          error instanceof Error ? error.message : String(error),
+          now()
+        ));
         return { skipped: true as const };
       }
       const attempt = createIntegrationAttempt({
