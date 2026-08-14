@@ -285,7 +285,12 @@ async function main() {
     const baseHermetic = createGateSideDomain(baseRoot, baseTmp, options, "base");
 
     const baseCheckout = join(baseRoot, "worktree-base");
-    git(sourceCheckout, ["worktree", "add", "--detach", baseCheckout, baseSha], hermetic);
+    // The base worktree must be created with the base hermetic env, not the
+    // candidate's: a candidate GIT_CONFIG_GLOBAL hook (core.hooksPath) would
+    // otherwise run during `git worktree add` and could plant state in the
+    // base worktree, poisoning the base result and misclassifying an
+    // introduced failure as pre-existing.
+    git(sourceCheckout, ["worktree", "add", "--detach", baseCheckout, baseSha], baseHermetic);
     worktrees.push(baseCheckout);
     const base = gateCheckout({
       checkout: baseCheckout,

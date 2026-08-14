@@ -1051,3 +1051,118 @@ test("assertCleanSourceCheckout passes clean and refuses dirty, exempting the ga
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("the base worktree is created with the base hermetic env, not the candidate's (e2e)", () => {
+  // P1 (review-round-5): the base worktree was created with the candidate's
+  // hermetic env, so a candidate GIT_CONFIG_GLOBAL hook (core.hooksPath +
+  // post-checkout) ran during `git worktree add` and planted a marker in the
+  // base worktree. The base then failed the same test as the candidate, and
+  // the introduced failure was misclassified pre-existing (exit 0). The base
+  // worktree must be created with the base env so the candidate's git config
+  // can never reach it.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-base-env-"));
+  try {
+    const source = join(root, "source");
+    mkdirSync(join(source, "scripts"), { recursive: true });
+    mkdirSync(join(source, "test", "helpers"), { recursive: true });
+    mkdirSync(join(source, "test", "core"), { recursive: true });
+    git(["init", "-b", "master"], source);
+    git(["config", "user.name", "Yui Gate"], source);
+    git(["config", "user.email", "yui-gate@example.invalid"], source);
+    copyFileSync(
+      fileURLToPath(new URL("../../scripts/gate-hermetic.mjs", import.meta.url)),
+      join(source, "scripts", "gate-hermetic.mjs")
+    );
+    copyFileSync(
+      fileURLToPath(new URL("../helpers/gateHermetic.js", import.meta.url)),
+      join(source, "test", "helpers", "gateHermetic.js")
+    );
+    // A minimal package so install/build/lint/package-smoke pass fast; only
+    // the shared-state regression drives the gate outcome.
+    writeFileSync(join(source, "package.json"), JSON.stringify({
+      name: "gate-fixture",
+      version: "1.0.0",
+      private: true,
+      type: "module",
+      scripts: { build: "true", lint: "true" }
+    }, null, 2));
+    writeFileSync(join(source, "package-lock.json"), JSON.stringify({
+      name: "gate-fixture",
+      version: "1.0.0",
+      lockfileVersion: 3,
+      requires: true,
+      packages: { "": { name: "gate-fixture", version: "1.0.0" } }
+    }, null, 2));
+    writeFileSync(join(source, "test", "helpers", "scrubSessionEnv.js"), "// no-op for the fixture\n");
+    writeFileSync(
+      join(source, "scripts", "assemble-runtime-package.mjs"),
+      "import { mkdirSync, writeFileSync } from \"node:fs\";\n"
+        + "mkdirSync(\".release-stage\", { recursive: true });\n"
+        + "writeFileSync(\".release-stage/package.json\", JSON.stringify({ name: \"gate-fixture\", version: \"1.0.0\" }));\n"
+    );
+    writeFileSync(join(source, "scripts", "check-runtime-package-structure.mjs"), "process.exit(0);\n");
+    // A passing test directly in test/ so the test/*.test.js glob matches.
+    writeFileSync(
+      join(source, "test", "dummy.test.js"),
+      "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+        + "test(\"dummy passes\", () => { assert.ok(true); });\n"
+    );
+    // The base version of the shared-state test: passes when no marker.
+    writeFileSync(
+      join(source, "test", "core", "shared-state.test.js"),
+      "import { existsSync } from \"node:fs\";\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+        + "test(\"shared-state regression\", () => {\n"
+        + "  assert.ok(!existsSync(\".git-poison-marker\"), \"base worktree was poisoned by the candidate git config\");\n"
+        + "});\n"
+    );
+    git(["add", "-A"], source);
+    git(["commit", "-m", "base"], source);
+    const baseSha = git(["rev-parse", "HEAD"], source);
+
+    // The candidate version: plants a post-checkout hook in its own
+    // GIT_CONFIG_GLOBAL, then fails so the runner gates the base.
+    writeFileSync(
+      join(source, "test", "core", "shared-state.test.js"),
+      "import { chmodSync, mkdirSync, writeFileSync } from \"node:fs\";\nimport { join } from \"node:path\";\n"
+        + "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+        + "test(\"shared-state regression\", () => {\n"
+        + "  const hooksDir = join(process.env.HOME, \"poison-hooks\");\n"
+        + "  mkdirSync(hooksDir, { recursive: true });\n"
+        + "  const hook = join(hooksDir, \"post-checkout\");\n"
+        + "  writeFileSync(hook, \"#!/bin/sh\\ntouch .git-poison-marker\\n\");\n"
+        + "  chmodSync(hook, 0o755);\n"
+        + "  writeFileSync(process.env.GIT_CONFIG_GLOBAL, \"[core]\\n\\thooksPath = \" + hooksDir + \"\\n\");\n"
+        + "  assert.fail(\"candidate failure to trigger base gating\");\n"
+        + "});\n"
+    );
+    git(["add", "-A"], source);
+    git(["commit", "-m", "candidate"], source);
+
+    const recordPath = join(root, "record.json");
+    // Strip NODE_TEST_CONTEXT: this e2e test itself runs under `node --test`,
+    // which sets NODE_TEST_CONTEXT and would make the gate's inner
+    // `node --test` step skip its files ("recursive within a test file").
+    const gateEnv = { ...process.env, NODE_TEST_CONTEXT: undefined };
+    const result = spawnSync(
+      process.execPath,
+      [join(source, "scripts", "gate-hermetic.mjs"), "--base", baseSha, "--record", recordPath],
+      { cwd: source, encoding: "utf8", env: gateEnv }
+    );
+    // The candidate failure must be classified introduced (the base was not
+    // poisoned), so the gate exits non-zero.
+    assert.notEqual(result.status, 0, "an introduced failure must exit non-zero");
+    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    assert.equal(record.disposition, "introduced-failures");
+    const fingerprint = "test: test/core/shared-state.test.js > shared-state regression";
+    assert.ok(
+      record.classification.introduced.includes(fingerprint),
+      "the candidate failure must be classified introduced"
+    );
+    assert.ok(
+      !record.classification.preExisting.includes(fingerprint),
+      "the candidate failure must not be classified pre-existing"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
