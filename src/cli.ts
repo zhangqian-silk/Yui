@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -168,7 +169,7 @@ void main().catch((error: unknown) => {
 });
 
 export async function main(): Promise<void> {
-  const taskFinalReviewContract = await preflightManagedTaskControlPlane();
+  const { contract: taskFinalReviewContract, verifiedStore } = await preflightManagedTaskControlPlane();
   if (args.length === 0) {
     emit(renderCommandHelp((await import("./cli/commandCatalog.js")).ROOT_COMMAND, VERSION));
     return;
@@ -382,7 +383,14 @@ export async function main(): Promise<void> {
   }
 
   await assertFileTaskControllerStorageCompatible(home);
-  const store = openCompatibleFileTaskStore(home);
+  // Reuse the store the exact runtime preflight already opened and read for
+  // this same Home. Opening a second store would parse the unchanged large
+  // state a second time; the per-instance fingerprint cache still invalidates
+  // on an external writer, and the storage lock + revision CAS are unchanged.
+  const store = verifiedStore !== undefined
+    && resolve(verifiedStore.rootDirectory()) === resolve(home)
+    ? verifiedStore
+    : openCompatibleFileTaskStore(home);
   const catalogs = new AgentConfigurationCatalogService(home, {
     environment: process.env
   });
@@ -1213,9 +1221,19 @@ export async function main(): Promise<void> {
   );
 }
 
-async function preflightManagedTaskControlPlane(): Promise<
-  TaskFinalReviewContract | undefined
-> {
+type ManagedTaskControlPlanePreflight = Readonly<{
+  contract: TaskFinalReviewContract | undefined;
+  /**
+   * The FileTaskStore instance the exact runtime preflight already opened and
+   * read. A same-Home command reuses it instead of opening a second store, so
+   * the unchanged large state is not parsed twice. Its per-instance fingerprint
+   * cache still invalidates on any external writer, and mutations keep their
+   * unlocked re-read and revision CAS.
+   */
+  verifiedStore: FileTaskStore | undefined;
+}>;
+
+async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPlanePreflight> {
   if (exactControlInvocation.error !== undefined) {
     throw new Error(exactControlInvocation.error);
   }
@@ -1239,7 +1257,7 @@ async function preflightManagedTaskControlPlane(): Promise<
         "Task final-review contract requires a verified exact Task control-plane invocation."
       );
     }
-    return undefined;
+    return { contract: undefined, verifiedStore: undefined };
   }
   if (process.env.YUI_SESSION_SCOPE !== "task") {
     throw new Error("Exact Task control-plane invocation requires a managed Task runtime.");
@@ -1276,15 +1294,16 @@ async function preflightManagedTaskControlPlane(): Promise<
   const preallocatedClaudeCallback = args.length === 2
     && args[0] === "internal"
     && args[1] === "claude-hook";
+  const verifiedStore = openCompatibleFileTaskStore(control.yuiHome);
   assertExactTaskRuntimeState(
     runtime,
-    openCompatibleFileTaskStore(control.yuiHome),
+    verifiedStore,
     preallocatedClaudeCallback
       ? { preallocatedNativeSessionReservation: { yuiHome: control.yuiHome } }
       : {}
   );
   const request = taskFinalReviewInvocation.request;
-  if (request === undefined) return undefined;
+  if (request === undefined) return { contract: undefined, verifiedStore };
   if (runtime.roleName !== "leader") {
     throw new Error("Only the exact Task Leader invocation may establish a final-review contract.");
   }
@@ -1293,11 +1312,14 @@ async function preflightManagedTaskControlPlane(): Promise<
       `Task final-review contract Task id mismatch: expected ${runtime.taskId}, found ${request.taskId}.`
     );
   }
-  return createTaskFinalReviewContract({
-    taskId: runtime.taskId,
-    reviewerRoleName: request.reviewerRoleName,
-    controlPlaneDigest: digest
-  });
+  return {
+    contract: createTaskFinalReviewContract({
+      taskId: runtime.taskId,
+      reviewerRoleName: request.reviewerRoleName,
+      controlPlaneDigest: digest
+    }),
+    verifiedStore
+  };
 }
 
 function cleanupCliError(error: unknown, fallbackResource: string): CliError {

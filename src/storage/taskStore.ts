@@ -2504,7 +2504,7 @@ function values<T>(records: Record<string, T>, identity: keyof T | ((value: T) =
   return Object.values(records).map(clone).sort((left, right) => numericCompare(typeof identity === "function" ? identity(left) : String(left[identity]), typeof identity === "function" ? identity(right) : String(right[identity])));
 }
 function numericCompare(left: string, right: string): number { return left.localeCompare(right, undefined, { numeric: true }); }
-function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | null {
+export function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | null {
   if (mailbox === null || mailbox.target.kind !== "role" || mailbox.target.roleName !== "leader"
     || mailbox.pending === null) {
     return null;

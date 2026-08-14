@@ -12,12 +12,12 @@ import type { AgentRun } from "../run/agentRun.js";
 import type { Role } from "../role/role.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { Task } from "../task/task.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import { pendingWakeupProjection, type TaskStore } from "../storage/taskStore.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
-  buildTaskExecutionProjection,
+  projectTaskExecutionFromFacts,
   type TaskExecutionProjection
 } from "../scheduler/taskExecutionProjection.js";
 
@@ -185,18 +185,30 @@ export function renderTaskOverview(
 
 function buildTaskOverviewEntry(task: Task, store: TaskStore): TaskOverview {
   const brief = store.getTaskBrief(task.id);
-  const leaderRole = store.getRole(task.id, "leader");
+  const roles = store.listRoles(task.id);
+  const leaderRole = roles.find((role) => role.name === "leader") ?? null;
   const workItems = store.listWorkItems(task.id);
   const inputRequests = store.listInputRequests(task.id);
   const openInputRequests = inputRequests.filter((request) => request.status === "open");
   const agentRuns = store.listAgentRuns(task.id);
   const events = store.listEvents(task.id);
+  const leaderFailure = store.getLeaderFailure(task.id);
+  const operatorNotification = store.getOperatorNotification(task.id);
+  const leaderMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
+  const pendingWakeup = pendingWakeupProjection(leaderMailbox);
+  const reviewRounds = store.listReviewRounds(task.id);
+  const changeSets = store.listChangeSets(task.id);
+  const integrations = store.listIntegrationAttempts(task.id);
+  const roleSessions = roles.flatMap((role) => {
+    const session = store.getRoleSession(task.id, role.name);
+    return session === null ? [] : [{ roleName: role.name, ...session }];
+  });
   const attention = collectAttention(
     task,
     agentRuns,
     events,
-    store.getLeaderFailure(task.id),
-    store.getOperatorNotification(task.id)
+    leaderFailure,
+    operatorNotification
   );
   const blockers = collectBlockers(workItems, openInputRequests, attention);
   const next = deriveNextAction(
@@ -205,7 +217,7 @@ function buildTaskOverviewEntry(task: Task, store: TaskStore): TaskOverview {
     workItems,
     openInputRequests,
     blockers,
-    store.getPendingWakeup(task.id)
+    pendingWakeup
   );
   const leader: TaskOverviewLeader = {
     role: "leader",
@@ -233,10 +245,25 @@ function buildTaskOverviewEntry(task: Task, store: TaskStore): TaskOverview {
     activeRunCount: runtimeRuns.length,
     pendingDeliveryCount: runtimeRuns.filter((run) => run.delivery === "pending").length
   };
-  const execution = buildTaskExecutionProjection(store, task.id, task);
-  if (execution === null) {
-    throw new Error(`Task execution projection disappeared: ${task.id}.`);
-  }
+  // Fold the execution projection from the facts already read above instead of
+  // reading the store a second time for the same unchanged revision.
+  const execution = projectTaskExecutionFromFacts({
+    task,
+    roles,
+    runs: agentRuns,
+    workItems,
+    inputRequests,
+    reviewRounds,
+    changeSets,
+    integrations,
+    events,
+    brief,
+    pendingWakeup,
+    leaderMailbox,
+    leaderFailure,
+    operatorNotification,
+    roleSessions
+  });
   return {
     ...task,
     brief,
