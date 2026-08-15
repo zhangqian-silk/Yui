@@ -165,7 +165,7 @@ test("FileTaskStore doctor reports schema, state, tools, and configured Agent ca
 
   assert.match(output, /^Yui doctor$/m);
   assert.match(output, /yui home\s+ok/);
-  assert.match(output, /storage schema\s+ok\s+current=6 latest=6/);
+  assert.match(output, /storage schema\s+ok\s+current=7 latest=7/);
   assert.match(output, /storage state\s+ok\s+readable agents=1/);
   assert.match(output, /git\s+ok\s+git: git version 2\.45\.1/);
   assert.match(output, /tmux\s+ok\s+tmux: tmux 3\.4/);

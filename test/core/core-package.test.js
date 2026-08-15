@@ -34,13 +34,13 @@ test("the source package keeps one TypeScript build and declares its Web runtime
   assert.equal("prebuild" in sourcePackage.scripts, false);
   assert.equal("node-gyp" in sourcePackage.devDependencies, false);
   assert.equal("gypfile" in sourcePackage, false);
-  assert.equal(sourcePackage.dependencies?.["better-sqlite3"], undefined);
+  assert.equal(sourcePackage.dependencies?.["better-sqlite3"], "^12.11.1");
   assert.equal(sourcePackage.dependencies?.["smol-toml"], "1.7.0");
   assert.equal(sourcePackage.dependencies?.["node-pty"], "^1.1.0");
   assert.equal(sourcePackage.dependencies?.["ws"], "^8.21.1");
   assert.equal(sourcePackage.dependencies?.["@xterm/xterm"], "^6.0.0");
   assert.equal(sourcePackage.dependencies?.["@xterm/addon-fit"], "^0.11.0");
-  assert.equal(sourcePackage.devDependencies["@types/better-sqlite3"], undefined);
+  assert.equal(sourcePackage.devDependencies["@types/better-sqlite3"], "^9.6.0");
   assert.deepEqual(sourcePackage.cpu, ["x64"]);
   assert.deepEqual(sourcePackage.files, [
     "dist",
@@ -114,6 +114,7 @@ test("runtime assembly contains only the built CLI, docs, and four generic skill
   assert.deepEqual(runtimePackage.dependencies, {
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "better-sqlite3": "^12.11.1",
     "node-pty": "^1.1.0",
     "smol-toml": "1.7.0",
     "ws": "^8.21.1"
