@@ -516,6 +516,67 @@ test("a target advance during path-containment inspection cannot publish stale c
   assert.equal(readFileSync(join(fixture.repositoryPath, "a.txt"), "utf8"), "concurrent overwrite\n");
 });
 
+test("a target advance after the convergence re-read cannot publish stale convergence", {
+  skip: process.env.YUI_REVIEW_POST_INSPECT_RACE !== "1"
+}, async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "candidate\n" }
+  });
+
+  writeFileSync(join(fixture.repositoryPath, "a.txt"), "candidate\n");
+  writeFileSync(join(fixture.repositoryPath, "other.txt"), "other\n");
+  git(["-C", fixture.repositoryPath, "add", "a.txt", "other.txt"]);
+  git(["-C", fixture.repositoryPath, "commit", "-m", "parallel landing"]);
+
+  class PostInspectAdvancingGit extends NodeGitWorkspace {
+    targetInspections = 0;
+    advancedHead;
+
+    async inspect(repositoryPath, baseRef) {
+      const observed = await super.inspect(repositoryPath, baseRef);
+      if (baseRef === "refs/heads/master") {
+        this.targetInspections += 1;
+        if (this.targetInspections === 2) {
+          writeFileSync(join(fixture.repositoryPath, "a.txt"), "concurrent overwrite\n");
+          git(["-C", fixture.repositoryPath, "add", "a.txt"]);
+          git(["-C", fixture.repositoryPath, "commit", "-m", "post-inspect target advance"]);
+          this.advancedHead = masterHead(fixture);
+        }
+      }
+      return observed;
+    }
+  }
+
+  const racingGit = new PostInspectAdvancingGit();
+  const result = await enqueue(fixture, changeSet, {
+    git: racingGit
+  });
+  const attempts = fixture.store.listIntegrationAttempts(fixture.task.id);
+
+  assert.deepEqual(
+    {
+      outcome: result.outcome,
+      entryStatus: result.entry.status,
+      currentTarget: masterHead(fixture),
+      recordedTarget: result.entry.targetAfter,
+      attemptStatus: attempts[0]?.status,
+      attemptTarget: attempts[0]?.candidateCommit
+    },
+    {
+      outcome: "queued",
+      entryStatus: "queued",
+      currentTarget: racingGit.advancedHead,
+      recordedTarget: undefined,
+      attemptStatus: undefined,
+      attemptTarget: undefined
+    },
+    "the re-read result cannot terminalize convergence after the target moved before persistence"
+  );
+  assert.equal(readFileSync(join(fixture.repositoryPath, "a.txt"), "utf8"), "concurrent overwrite\n");
+});
+
 test("a pre-base same-tree commit cannot swallow an intentional revert", async () => {
   const fixture = await createFixture();
   // The initial commit has the tree the WorkItem deliberately restores. The

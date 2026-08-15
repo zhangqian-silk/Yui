@@ -280,6 +280,12 @@ type StorageState = {
 export type TaskStore = {
   rootDirectory(): string;
   transaction<T>(execute: (store: TaskStore) => T): T;
+  /**
+   * Async variant of {@link transaction} for callers that need to await
+   * external I/O (e.g. git inspect) inside the write lock.  The same
+   * re-entrancy and revision-commit semantics apply.
+   */
+  transactionAsync<T>(execute: (store: TaskStore) => Promise<T>): Promise<T>;
   getConfig(): YuiConfig;
   /** The durable Home identity minted once for this store. */
   getHomeIdentity(): HomeIdentity;
@@ -442,6 +448,27 @@ export class FileTaskStore implements TaskStore {
         this.#transaction = null;
       }
     });
+  }
+
+  async transactionAsync<T>(execute: (store: TaskStore) => Promise<T>): Promise<T> {
+    if (this.#transaction !== null) return execute(this);
+    const release = acquireStorageLock(this.rootDir);
+    try {
+      const state = this.#readCachedState();
+      this.#transaction = { state, baseRevision: state.revision, dirty: false };
+      try {
+        const result = await execute(this);
+        if (this.#transaction.dirty) this.#commit(state, this.#transaction.baseRevision);
+        return result;
+      } catch (error) {
+        this.#readCache = null;
+        throw error;
+      } finally {
+        this.#transaction = null;
+      }
+    } finally {
+      release();
+    }
   }
 
   getConfig(): YuiConfig { return clone(this.#state().config); }

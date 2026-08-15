@@ -332,17 +332,7 @@ export async function enqueueIntegrationQueueEntry(
     // check misses it, but the touched paths already agree.
     equivalent = await findContainedChangeSet(git, project.path, changeSet, targetHead);
   }
-  if (equivalent !== null) {
-    // The async proof above observed the target before this write
-    // transaction.  A concurrent landing may have advanced it since; a
-    // stale containment proof cannot terminalize the entry against the
-    // old head, so re-read and invalidate the proof if it moved.
-    const freshTargetHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
-    if (freshTargetHead !== targetHead) {
-      equivalent = null;
-    }
-  }
-  return input.store.transaction((tx) => {
+  return input.store.transactionAsync(async (tx) => {
     const duplicate = findActiveQueueDuplicate(
       tx, task.id, input.projectId, input.changeSetId
     );
@@ -392,6 +382,28 @@ export async function enqueueIntegrationQueueEntry(
     assertCurrentCandidateInStore(tx, task.id, changeSet);
     const id = tx.nextIntegrationQueueEntryId(task.id);
     const requestedChecks = input.checkCommands ?? [];
+    // The async proof above observed the target before this write
+    // transaction.  A concurrent landing may have advanced it since; a
+    // stale containment proof cannot terminalize the entry against the
+    // old head, so re-read inside the transaction and invalidate the
+    // proof if it moved.
+    let effectiveTargetHead = targetHead;
+    if (equivalent !== null) {
+      effectiveTargetHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
+      if (effectiveTargetHead !== targetHead) {
+        equivalent = null;
+      } else {
+        // The inspect above is itself async: a concurrent landing can
+        // advance the target during the call, so the returned head may
+        // already be stale.  Verify with a second read; if it moved, the
+        // convergence proof is stale and the entry must queue.
+        const verifiedHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
+        if (verifiedHead !== effectiveTargetHead) {
+          equivalent = null;
+          effectiveTargetHead = verifiedHead;
+        }
+      }
+    }
     if (equivalent === null || requestedChecks.length > 0) {
       let entry = createIntegrationQueueEntry({
         id,
@@ -409,8 +421,8 @@ export async function enqueueIntegrationQueueEntry(
       // evidence.  A converged ChangeSet with explicit gates queues normally:
       // the no-op apply still runs the caller's checks against the current
       // target instead of waiving them.
-      if (canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), entry, changeSet, targetHead)) {
-        entry = markIntegrationQueueValidated(entry, now(), targetHead);
+      if (canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), entry, changeSet, effectiveTargetHead)) {
+        entry = markIntegrationQueueValidated(entry, now(), effectiveTargetHead);
       }
       tx.saveIntegrationQueueEntry(task.id, entry);
       return { entry, outcome: "queued" as const };
@@ -428,11 +440,11 @@ export async function enqueueIntegrationQueueEntry(
         taskId: task.id,
         projectId: input.projectId,
         targetRef: canonicalTargetRef,
-        expectedHead: targetHead,
+        expectedHead: effectiveTargetHead,
         changeSetIds: [input.changeSetId],
         checkCommands: []
       }, now()),
-      { status: "committed", candidateCommit: targetHead },
+      { status: "committed", candidateCommit: effectiveTargetHead },
       now()
     );
     tx.saveIntegrationAttempt(task.id, attempt);
@@ -442,7 +454,7 @@ export async function enqueueIntegrationQueueEntry(
       projectId: input.projectId,
       changeSetId: input.changeSetId,
       targetRef: canonicalTargetRef,
-      targetHead,
+      targetHead: effectiveTargetHead,
       proof: equivalent === changeSet.headCommit
         ? `ancestor-convergence:${equivalent}`
         : `tree-convergence:${equivalent}`,
