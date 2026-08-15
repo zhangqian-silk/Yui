@@ -310,14 +310,15 @@ function supersedeIntegrationCommand(
   // Integration: it rewrites delivery-baseline evidence and audit history.
   taskActor(environment, integration.taskId);
   // A queue-backed committed Attempt cannot be superseded: the queue entry
-  // would remain "committed" while its Attempt becomes "superseded", leaving
-  // contradictory terminal records that never converge.
+  // would remain in its current status while its Attempt becomes "superseded",
+  // leaving contradictory terminal records that never converge. This covers
+  // the crash window where the entry is still "running" or "conflicted" after
+  // the Attempt committed.
   const queueBacked = store.listIntegrationQueueEntries(integration.taskId)
-    .some((entry) => entry.integrationAttemptId === integration.id
-      && entry.status === "committed");
+    .some((entry) => entry.integrationAttemptId === integration.id);
   if (queueBacked) {
     throw usageError(
-      `Integration ${integration.id} is backed by a committed queue entry; `
+      `Integration ${integration.id} is backed by a queue entry; `
       + "reconcile the queue entry instead of superseding its Attempt."
     );
   }

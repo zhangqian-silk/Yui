@@ -760,6 +760,61 @@ test("task integration supersede rejects a queue-backed committed Attempt", asyn
   assert.equal(stored.status, "committed");
 });
 
+test("task integration supersede rejects a crash-window queue-backed committed Attempt", async (t) => {
+  const fx = fixture(t);
+  await seedCommittedIntegration(fx);
+
+  // This is the supported recovery state produced when the Integration target
+  // and Attempt commit, but the queue processor exits before settling the
+  // running entry. processIntegrationQueue normally converges it on restart.
+  const queueEntry = {
+    schemaVersion: 1,
+    id: "integration-queue-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    changeSetId: "change-set-1",
+    targetRef: fx.store.getTaskWorkspace(fx.task.id).entries[0].branch,
+    checkCommands: [],
+    evidenceRefs: [],
+    status: "running",
+    targetBefore: fx.base,
+    integrationAttemptId: "integration-1",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  };
+  fx.store.saveIntegrationQueueEntry(fx.task.id, queueEntry);
+
+  const cliEnv = { ...process.env, YUI_HOME: fx.home };
+  delete cliEnv.YUI_CONTROL_PLANE_DESCRIPTOR;
+  delete cliEnv.YUI_TASK_RUNTIME_DESCRIPTOR;
+  delete cliEnv.YUI_SESSION_SCOPE;
+  let rejected = false;
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        join(process.cwd(), "dist", "cli.js"),
+        "task", "integration", "supersede",
+        `${fx.task.id}/integration-1`,
+        "--reason", "Queue settle crash window"
+      ],
+      { cwd: process.cwd(), encoding: "utf8", env: cliEnv }
+    );
+  } catch (error) {
+    assert.match(String(error), /queue entry|backed by a committed queue/u);
+    rejected = true;
+  }
+  assert.deepEqual({
+    rejected,
+    attemptStatus: fx.store.getIntegrationAttempt(fx.task.id, "integration-1").status,
+    entryStatus: fx.store.getIntegrationQueueEntry(fx.task.id, "integration-queue-1").status
+  }, {
+    rejected: true,
+    attemptStatus: "committed",
+    entryStatus: "running"
+  });
+});
+
 test("completion reconciliation re-checks frozen baseline after async fetch", async (t) => {
   const fx = fixture(t);
   const { taskHead } = await seedCommittedIntegration(fx);
