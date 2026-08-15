@@ -263,6 +263,88 @@ test("completion reconciliation merges a moved remote only in managed Integratio
   assert.equal(fx.store.getIntegrationAttempt(fx.task.id, reconciled[0].integrationId).status, "committed");
 });
 
+test("completion reconciliation skips a moved remote after a completed Task-final Review", async (t) => {
+  const fx = fixture(t);
+  const { entry, taskHead } = await seedCommittedIntegration(fx);
+
+  // Seed a completed Task-final ReviewRound that exactly covers the current
+  // Task head.  A later remote advance must not change the reviewed head.
+  const round = createTaskReviewRound(
+    "review-round-1",
+    fx.task.id,
+    "work-item-1",
+    "candidate-1",
+    "reviewer",
+    "leader",
+    { schemaVersion: 1, projects: [{ projectId: fx.project.id, commit: taskHead }] },
+    NOW
+  );
+  fx.store.saveReviewRound(fx.task.id, {
+    ...round,
+    status: "completed",
+    summary: "Clean review",
+    report: "Clean review",
+    endedAt: NOW.toISOString()
+  });
+
+  const beforeIntegrations = fx.store.listIntegrationAttempts(fx.task.id).length;
+  const remoteHead = advanceRemote(fx);
+  assert.notEqual(remoteHead, taskHead);
+
+  const reconciled = await reconcileTaskRemoteBaselines(
+    fx.task.id,
+    fx.store,
+    fx.home,
+    { git: new NodeGitWorkspace(), now: () => new Date(NOW) }
+  );
+
+  // The completed review protects the Task head: no new Integration, no
+  // merge, no change to the reviewed commit.
+  assert.equal(reconciled.length, 0);
+  assert.equal(fx.store.listIntegrationAttempts(fx.task.id).length, beforeIntegrations);
+  assert.equal(git(entry.path, ["rev-parse", "HEAD"]), taskHead);
+  assert.equal(git(fx.checkout, ["rev-parse", "HEAD"]), fx.base);
+});
+
+test("completion reconciliation still merges a moved remote when the latest review is for a different candidate", async (t) => {
+  const fx = fixture(t);
+  const { entry, taskHead } = await seedCommittedIntegration(fx);
+
+  // Seed a completed Task-final ReviewRound for a *different* commit.  The
+  // remote reconciliation must still proceed because the reviewed candidate
+  // no longer matches the actual head.
+  const round = createTaskReviewRound(
+    "review-round-1",
+    fx.task.id,
+    "work-item-1",
+    "candidate-1",
+    "reviewer",
+    "leader",
+    { schemaVersion: 1, projects: [{ projectId: fx.project.id, commit: fx.base }] },
+    NOW
+  );
+  fx.store.saveReviewRound(fx.task.id, {
+    ...round,
+    status: "completed",
+    summary: "Clean review for different commit",
+    report: "Clean review for different commit",
+    endedAt: NOW.toISOString()
+  });
+
+  const remoteHead = advanceRemote(fx);
+
+  const reconciled = await reconcileTaskRemoteBaselines(
+    fx.task.id,
+    fx.store,
+    fx.home,
+    { git: new NodeGitWorkspace(), now: () => new Date(NOW) }
+  );
+
+  assert.equal(reconciled.length, 1);
+  assert.equal(reconciled[0].remote.commit, remoteHead);
+  assert.notEqual(git(entry.path, ["rev-parse", "HEAD"]), taskHead);
+});
+
 test("remote completion fetch and merge do not depend on shared FETCH_HEAD", async (t) => {
   const fx = fixture(t);
   const { entry } = await seedCommittedIntegration(fx);
