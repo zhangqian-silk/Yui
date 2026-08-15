@@ -6,6 +6,7 @@ import {
   overlapSubjectKey,
   type OverlapFinding
 } from "../integration/overlapDiagnostics.js";
+import { resolveProject } from "../repository/project.js";
 import type { TaskStore } from "../storage/taskStore.js";
 
 /**
@@ -18,12 +19,13 @@ export async function runTaskOverlapCommand(
   store: TaskStore
 ): Promise<Readonly<{ output: string; data?: unknown }>> {
   const parsed = parseOverlapArgs(args);
+  const projectId = resolveProjectFilter(store, parsed.project);
   const tasks = store.listTasks()
     .filter((task) => parsed.tasks.size === 0 || parsed.tasks.has(task.id));
   const latest = new Map<string, ChangeSet>();
   for (const task of tasks) {
     for (const changeSet of store.listChangeSets(task.id)) {
-      if (parsed.project !== undefined && changeSet.projectId !== parsed.project) continue;
+      if (projectId !== undefined && changeSet.projectId !== projectId) continue;
       if (parsed.base !== undefined && changeSet.baseCommit !== parsed.base) continue;
       const key = `${changeSet.taskId}/${changeSet.workItemId}/${changeSet.projectId}`;
       const current = latest.get(key);
@@ -45,6 +47,13 @@ function isNewer(candidate: ChangeSet, current: ChangeSet): boolean {
     return candidate.createdAt > current.createdAt;
   }
   return candidate.id.localeCompare(current.id) > 0;
+}
+
+function resolveProjectFilter(store: TaskStore, reference: string | undefined): string | undefined {
+  if (reference === undefined) return undefined;
+  const project = resolveProject(store.listProjects(), reference);
+  if (project === null) throw usageError(`Project not found: ${reference}.`);
+  return project.id;
 }
 
 function parseOverlapArgs(args: readonly string[]): Readonly<{

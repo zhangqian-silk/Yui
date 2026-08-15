@@ -1,5 +1,6 @@
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { resolveProject } from "../repository/project.js";
 import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
@@ -55,9 +56,10 @@ async function enqueue(
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const task = requireActiveTask(store, parsed.positionals[0]);
   requireLeader(options.environment, task.id);
-  const projectId = parsed.one.get("--project");
+  const projectRef = parsed.one.get("--project");
   const changeSetId = parsed.one.get("--change-set");
-  if (projectId === undefined || changeSetId === undefined) throw usageError(usage);
+  if (projectRef === undefined || changeSetId === undefined) throw usageError(usage);
+  const projectId = resolveProjectId(store, projectRef);
   const result: EnqueueIntegrationQueueResult = await enqueueIntegrationQueueEntry({
     store,
     taskId: task.id,
@@ -87,7 +89,8 @@ function list(
   const parsed = parseRepeatable(args, new Set(), new Set(["--project"]), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const task = requireActiveTask(store, parsed.positionals[0]);
-  const projectId = parsed.one.get("--project");
+  const projectRef = parsed.one.get("--project");
+  const projectId = projectRef === undefined ? undefined : resolveProjectId(store, projectRef);
   // The store already returns entries in numeric id order; trust it instead of
   // re-sorting with a lexicographic compare (which yields 1, 10, 2, ...).
   const entries = store.listIntegrationQueueEntries(task.id)
@@ -157,8 +160,10 @@ async function process(
   if (limitValue !== undefined && (!Number.isSafeInteger(limit) || (limit as number) < 1)) {
     throw usageError(`--limit must be a positive integer: ${limitValue}.`);
   }
+  const projectRef = parsed.one.get("--project");
+  const projectId = projectRef === undefined ? undefined : resolveProjectId(store, projectRef);
   const processed = await processIntegrationQueue(store, home, task.id, {
-    projectId: parsed.one.get("--project"),
+    projectId,
     limit,
     now: options.now,
     environment: options.environment
@@ -253,6 +258,12 @@ function requireActiveTask(store: TaskStore, taskId: string) {
     throw usageError(`Task is not active: ${task.id}/${task.status}.`);
   }
   return task;
+}
+
+function resolveProjectId(store: TaskStore, reference: string): string {
+  const project = resolveProject(store.listProjects(), reference);
+  if (project === null) throw usageError(`Project not found: ${reference}.`);
+  return project.id;
 }
 
 function requireQueueEntry(

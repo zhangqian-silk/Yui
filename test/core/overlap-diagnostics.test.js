@@ -321,7 +321,11 @@ function changeSetRecord(overrides) {
 function overlapStore(changeSetsByTask) {
   return {
     listTasks: () => Object.keys(changeSetsByTask).map((id) => ({ id })),
-    listChangeSets: (taskId) => changeSetsByTask[taskId] ?? []
+    listChangeSets: (taskId) => changeSetsByTask[taskId] ?? [],
+    listProjects: () => [
+      { id: "project-1", name: "app", aliases: [] },
+      { id: "project-2", name: "lib", aliases: [] }
+    ]
   };
 }
 
@@ -389,6 +393,32 @@ test("task overlap filters by project, base, and task", async () => {
   assert.match(otherBase.output, /No ChangeSets match/);
   const otherProject = await runTaskOverlapCommand(["--project", "project-2"], store);
   assert.match(otherProject.output, /No ChangeSets match/);
+});
+
+test("task overlap resolves --project by ID, name, and alias", async () => {
+  const manifest = createChangeSetManifest({ tags: ["contract"], deletedPaths: [] });
+  const store = overlapStore({
+    "task-1": [changeSetRecord({
+      id: "change-set-1", taskId: "task-1", changedPaths: ["src/index.ts"], manifest
+    })],
+    "task-2": [changeSetRecord({
+      id: "change-set-2", taskId: "task-2", changedPaths: ["src/index.ts"], manifest,
+      projectId: "project-2"
+    })]
+  });
+  // Filter by project name ("app" is the name of project-1 in the test store).
+  const byName = await runTaskOverlapCommand(["--project", "app"], store);
+  assert.match(byName.output, /change-set-1/);
+  assert.doesNotMatch(byName.output, /change-set-2/);
+  // Filter by project ID.
+  const byId = await runTaskOverlapCommand(["--project", "project-1"], store);
+  assert.match(byId.output, /change-set-1/);
+  assert.doesNotMatch(byId.output, /change-set-2/);
+  // Unknown project reference is rejected.
+  await assert.rejects(
+    () => runTaskOverlapCommand(["--project", "nonexistent"], store),
+    /Project not found: nonexistent/
+  );
 });
 
 test("task overlap degrades legacy ChangeSets to path-only", async () => {

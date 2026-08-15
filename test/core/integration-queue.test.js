@@ -1764,3 +1764,59 @@ test("the queue CLI refuses non-Leader actors", async () => {
     /Leader/
   );
 });
+
+test("the queue CLI resolves --project by ID, name, and alias", async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "a\n" }
+  });
+  const leader = {
+    now: () => now,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: fixture.task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  // Enqueue by project name (the fixture project name is "fixture").
+  const enqueued = await runTaskIntegrationQueueCommand(
+    [
+      "enqueue", fixture.task.id,
+      "--project", "fixture",
+      "--change-set", changeSet.id,
+      "--target", "master",
+      "--check", "true"
+    ],
+    fixture.store,
+    fixture.home,
+    leader
+  );
+  assert.match(enqueued.output, /Enqueued change-set-1 as integration-queue-1 \(queued\)/);
+  // List by project name.
+  const listedByName = await runTaskIntegrationQueueCommand(
+    ["list", fixture.task.id, "--project", "fixture"],
+    fixture.store,
+    fixture.home,
+    {}
+  );
+  assert.match(listedByName.output, /integration-queue-1/);
+  // List by project ID.
+  const listedById = await runTaskIntegrationQueueCommand(
+    ["list", fixture.task.id, "--project", fixture.project.id],
+    fixture.store,
+    fixture.home,
+    {}
+  );
+  assert.match(listedById.output, /integration-queue-1/);
+  // Unknown project reference is rejected.
+  await assert.rejects(
+    () => runTaskIntegrationQueueCommand(
+      ["list", fixture.task.id, "--project", "nonexistent"],
+      fixture.store,
+      fixture.home,
+      {}
+    ),
+    /Project not found: nonexistent/
+  );
+});
