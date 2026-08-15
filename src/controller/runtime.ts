@@ -28,6 +28,7 @@ import {
 } from "../executor/agentExecutor.js";
 import {
   effectiveLaunchSnapshotsCompatible,
+  effectiveLaunchSnapshotsCompatibleForTaskMain,
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
@@ -67,7 +68,8 @@ import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
 import {
   AsyncRuntimeEventProcessor,
   FileRuntimeEventProcessor,
-  createAsyncRuntimeObserver
+  createAsyncRuntimeObserver,
+  type TaskRuntimeAppliedInput
 } from "./runtimeEventProcessor.js";
 import {
   RuntimeLaunchCoordinator,
@@ -111,6 +113,48 @@ export type RunningFileTaskControllerRuntime = RunningFileTaskController & Reado
   runtimeIsolation: TaskRuntimeIsolationPort & Partial<TaskRuntimeLifecycleCleanupPort>;
   workspacePreparer: TaskWorkspacePreparer;
 }>;
+
+/** Refreshes only the exact Task runtime generation folded by the event transaction. */
+export function refreshAppliedTaskRuntimeDescriptor(
+  store: Pick<TaskStore, "getAgentRun" | "getTaskRoleSessionSet">,
+  planner: Pick<FileRoleLaunchPlanner, "refreshTaskRuntimeDescriptor">,
+  input: TaskRuntimeAppliedInput
+): void {
+  if (input.launchId === undefined) return;
+  const run = input.runId === undefined
+    ? null
+    : store.getAgentRun(input.taskId, input.runId);
+  if (input.runId !== undefined && run === null) {
+    throw new Error("Prepared Task runtime generation is not current.");
+  }
+  // A terminal completion has already settled this exact Run and no later
+  // prompt can use its descriptor. Acknowledge the applied provider fact
+  // without republishing a dead generation.
+  if (run !== null && run.status !== "active") return;
+  const session = store.getTaskRoleSessionSet(input.taskId, input.roleName)
+    ?.sessions[input.agentId];
+  const effective = run?.effective ?? session?.effective;
+  if (
+    effective === undefined
+    || session === undefined
+    || session.agentId !== input.agentId
+    || session.adapterId !== input.adapterId
+    || session.launchId !== input.launchId
+    || session.nativeSessionId !== input.nativeSessionId
+    || (run !== null && (
+      run.roleName !== input.roleName
+      || run.effective.agentId !== input.agentId
+      || run.effective.adapterId !== input.adapterId
+    ))
+  ) {
+    throw new Error("Prepared Task runtime generation is not current.");
+  }
+  planner.refreshTaskRuntimeDescriptor({
+    ...input,
+    launchId: input.launchId,
+    workspace: effective.workspace.root
+  });
+}
 
 /** Production composition root for the lean FileTaskStore + tmux Controller. */
 export async function startFileTaskControllerRuntime(
@@ -392,7 +436,7 @@ export async function startFileTaskControllerRuntime(
             ),
             {
               onTaskRuntimeApplied: (input) => {
-                planner.refreshTaskRuntimeDescriptor(input);
+                refreshAppliedTaskRuntimeDescriptor(store, planner, input);
               }
             }
           )
@@ -401,7 +445,7 @@ export async function startFileTaskControllerRuntime(
             schedulerStore,
             {
               onTaskRuntimeApplied: (input) => {
-                planner.refreshTaskRuntimeDescriptor(input);
+                refreshAppliedTaskRuntimeDescriptor(store, planner, input);
               }
             }
           )),
@@ -567,7 +611,12 @@ export function createRuntimeLifecycleDispatcher(
       );
     }
     validateLifecycleEnvironment(request.environment, agent);
-    const mode = roleAgentSessionResumeMode(sessions, effective.agentId, effective);
+    const mode = roleAgentSessionResumeMode(
+      sessions,
+      effective.agentId,
+      effective,
+      managedWorkspace
+    );
     const session = sessions?.sessions[effective.agentId];
     const owner = request.scope === "task"
       ? { scope: "task" as const, taskId: request.taskId, roleName: request.roleName }
@@ -716,7 +765,14 @@ function assertRuntimeLaunchRequestCurrent(
       || session.nativeSessionId !== request.nativeSessionId) {
       throw new Error(`Native session changed: ${request.owner.roleName}.`);
     }
-    if (!effectiveLaunchSnapshotsCompatible(session.effective, request.effective)) {
+    const sessionEffectiveCompatible = request.owner.scope === "task"
+      ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+          session.effective,
+          request.effective,
+          request.managedWorkspace
+        )
+      : effectiveLaunchSnapshotsCompatible(session.effective, request.effective);
+    if (!sessionEffectiveCompatible) {
       throw new Error(`Native session effective launch changed: ${request.owner.roleName}.`);
     }
   }

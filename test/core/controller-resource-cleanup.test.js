@@ -25,6 +25,7 @@ import {
   scanControllerResourceInventory
 } from "../../dist/controller/resourceInventoryLinux.js";
 import { controllerSocketPath } from "../../dist/core/controllerEndpoint.js";
+import { tmuxSocketDirectory } from "../../dist/tmux/tmuxSocketEndpoint.js";
 
 function processResource(overrides = {}) {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
@@ -261,7 +262,22 @@ test("ephemeral cleanup holds the identity fence through final inspection and si
 
 test("artifact cleanup revalidates fingerprint and socket liveness", async () => {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const path = join(tmpdir(), `tmux-${uid}`, "yui-0123456789abcdef01234567");
+  const environment = {
+    TMPDIR: join(
+      tmpdir(),
+      "ignored-node-tmpdir",
+      "nested-runtime-boundary",
+      "nested-runtime-boundary"
+    )
+  };
+  const path = join(
+    tmuxSocketDirectory(environment),
+    "yui-0123456789abcdef01234567"
+  );
+  assert.equal(
+    path,
+    join("/tmp", `tmux-${uid}`, "yui-0123456789abcdef01234567")
+  );
   const artifact = processResource({
     id: `artifact:${path}`,
     fingerprint: "before",
@@ -295,6 +311,7 @@ test("artifact cleanup revalidates fingerprint and socket liveness", async () =>
 
   await assert.rejects(
     cleanControllerResource(artifact, {
+      environment,
       ports: { ...basePorts, artifactFingerprint: () => "after" }
     }),
     /changed since scan/
@@ -303,6 +320,7 @@ test("artifact cleanup revalidates fingerprint and socket liveness", async () =>
 
   await assert.rejects(
     cleanControllerResource(artifact, {
+      environment,
       ports: {
         ...basePorts,
         artifactFingerprint: () => "before",
@@ -314,9 +332,65 @@ test("artifact cleanup revalidates fingerprint and socket liveness", async () =>
   assert.equal(removed, false);
 
   await cleanControllerResource(artifact, {
+    environment,
     ports: { ...basePorts, artifactFingerprint: () => "before" }
   });
   assert.equal(removed, true);
+});
+
+test("explicit TMUX_TMPDIR exclusively owns its tmux cleanup namespace", async (t) => {
+  const customRoot = mkdtempSync(join("/tmp", "yui-explicit-tmux-root-"));
+  t.after(() => rmSync(customRoot, { recursive: true, force: true }));
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const server = "yui-0123456789abcdef01234567";
+  const defaultDirectory = join("/tmp", `tmux-${uid}`);
+  const customDirectory = join(customRoot, `tmux-${uid}`);
+  const environment = {
+    TMUX_TMPDIR: customRoot,
+    TMPDIR: join(customRoot, "ignored-node-tmpdir")
+  };
+
+  assert.equal(tmuxSocketDirectory({ TMPDIR: environment.TMPDIR }), defaultDirectory);
+  assert.equal(tmuxSocketDirectory(environment), customDirectory);
+
+  const defaultArtifact = processResource({
+    id: `artifact:${join(defaultDirectory, server)}`,
+    fingerprint: "before",
+    kind: "artifact",
+    state: "stale",
+    disposition: "safe",
+    reasonCode: "stale-tmux-socket",
+    owner: { kind: "none" },
+    processes: [],
+    rssBytes: 0,
+    cpuTimeMs: 0,
+    ageMs: 0,
+    artifact: {
+      artifactKind: "tmux-socket",
+      path: join(defaultDirectory, server),
+      active: false,
+      fingerprint: "before"
+    }
+  });
+  let removed = false;
+
+  await assert.rejects(
+    cleanControllerResource(defaultArtifact, {
+      environment,
+      ports: {
+        processStartIdentity: () => undefined,
+        signal() {},
+        sleep: async () => {},
+        artifactFingerprint: () => "before",
+        socketActive: () => false,
+        removeArtifact() { removed = true; },
+        killPane: async () => {},
+        inspectTmuxServerPanes: async () => []
+      }
+    }),
+    /outside the Yui tmux namespace/
+  );
+  assert.equal(removed, false);
 });
 
 test("pane cleanup delegates only after the command layer revalidated the exact resource", async () => {

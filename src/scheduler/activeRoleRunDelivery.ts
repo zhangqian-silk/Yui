@@ -16,7 +16,10 @@ import {
 } from "./ports.js";
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
-import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
+import {
+  effectiveLaunchSnapshotsCompatible,
+  effectiveLaunchSnapshotsCompatibleForTaskMain
+} from "../executor/effectiveLaunch.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
 import {
   isPreInputReadinessSupported
@@ -421,7 +424,11 @@ function requireResumeSession(
   if (session === null || !hasText(session.nativeSessionId)) {
     throw new Error(`Role resume has no fixed native session: ${role.taskId}/${role.name}.`);
   }
-  if (!effectiveLaunchSnapshotsCompatible(session.effective, effective)) {
+  if (!effectiveLaunchSnapshotsCompatibleForTaskMain(
+    session.effective,
+    effective,
+    role.managedWorkspace
+  )) {
     throw new Error(`Role resume effective snapshot drifted: ${role.taskId}/${role.name}.`);
   }
   return session.nativeSessionId;
@@ -506,18 +513,35 @@ function validateRoleSession(
   if (session.agentId !== effective.agentId || session.adapterId !== effective.adapterId) {
     throw new Error(`Ready Role session identity changed: ${role.taskId}/${role.name}.`);
   }
-  if (!effectiveLaunchSnapshotsCompatible(session.effective, effective)) {
+  const compatible = mode === "resume"
+    ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+        session.effective,
+        effective,
+        role.managedWorkspace
+      )
+    : effectiveLaunchSnapshotsCompatible(session.effective, effective);
+  if (!compatible) {
     throw new Error(`Ready Role session effective snapshot changed: ${role.taskId}/${role.name}.`);
   }
   if (existing?.nativeSessionId !== undefined
-    && effectiveLaunchSnapshotsCompatible(existing.effective, effective)
+    && effectiveLaunchSnapshotsCompatibleForTaskMain(
+      existing.effective,
+      effective,
+      role.managedWorkspace
+    )
     && session.nativeSessionId !== existing.nativeSessionId) {
     throw new Error(`Ready Role session changed the fixed native session id: ${role.taskId}/${role.name}.`);
   }
   if (mode === "resume" && session.nativeSessionId !== existing?.nativeSessionId) {
     throw new Error(`Role resume changed the fixed native session id: ${role.taskId}/${role.name}.`);
   }
-  return { ...session, status: "running" };
+  return {
+    ...session,
+    status: "running",
+    ...(mode === "resume" && existing !== null
+      ? { effective: existing.effective }
+      : {})
+  };
 }
 
 function hasText(value: string | undefined): value is string {

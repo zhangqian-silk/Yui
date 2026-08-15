@@ -233,6 +233,20 @@ export function buildTaskExecutionProjection(
   });
 }
 
+/**
+ * Fold a Task projection from already-read facts. The Task overview reads each
+ * per-Task fact once and reuses it here, instead of letting
+ * buildTaskExecutionProjection read the store a second time for the same
+ * unchanged revision.
+ */
+export function projectTaskExecutionFromFacts(
+  facts: TaskExecutionFacts
+): TaskExecutionProjection {
+  const executionGroups = facts.executionGroups
+    ?? collectExecutionGroups(facts.workItems ?? [], facts.reviewRounds ?? []);
+  return projectTaskExecution({ ...facts, executionGroups });
+}
+
 /** Alias kept intentionally small for scheduler callers and external read models. */
 export const deriveTaskExecutionProjection = projectTaskExecution;
 

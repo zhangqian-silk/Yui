@@ -30,6 +30,7 @@ const registrySchemaVersion = 3;
 const recoverySchemaVersion = 1;
 const controllerDiscoveryName = "controller.json";
 const controllerProbeTimeoutMs = 500;
+const linuxUnixSocketPathBudget = 100;
 
 export function installDevLauncher(options = {}) {
   const projectRoot = resolve(options.projectRoot ?? process.cwd());
@@ -590,7 +591,12 @@ function controllerSocketPath(homePath) {
     .update(resolve(homePath))
     .digest("hex")
     .slice(0, 24);
-  return join(tmpdir(), `yui-${uid}`, `${identity}.sock`);
+  const socketName = `${identity}.sock`;
+  const isolatedPath = join(tmpdir(), `yui-${uid}`, socketName);
+  return process.platform === "linux"
+    && Buffer.byteLength(isolatedPath) >= linuxUnixSocketPathBudget
+    ? join("/tmp", `yui-${uid}`, socketName)
+    : isolatedPath;
 }
 
 function cannotVerifyController(discoveryPath, cause) {

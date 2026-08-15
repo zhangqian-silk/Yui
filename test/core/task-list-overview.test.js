@@ -262,14 +262,18 @@ test("task list builds one consistent read-only snapshot before rendering", (t) 
     "getConfig",
     "listTasks",
     "getTaskBrief",
-    "getRole",
+    "listRoles",
     "listWorkItems",
     "listInputRequests",
     "listAgentRuns",
     "listEvents",
     "getLeaderFailure",
     "getOperatorNotification",
-    "getPendingWakeup"
+    "getWorkMailbox",
+    "listReviewRounds",
+    "listChangeSets",
+    "listIntegrationAttempts",
+    "getRoleSession"
   ];
   let snapshotCount = 0;
   let outsideSnapshotReads = 0;

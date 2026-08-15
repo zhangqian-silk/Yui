@@ -19,6 +19,12 @@ import {
 import { controllerSocketPath } from "./controllerEndpoint.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 import {
+  isBuiltinControllerMethod,
+  ControllerCommandObserver,
+  ControllerEventLoopDelay,
+  type ControllerStatusTelemetry
+} from "./controllerTelemetry.js";
+import {
   removeEphemeralDomainIdentity,
   readEphemeralDomainIdentity,
   writeEphemeralDomainIdentity,
@@ -34,10 +40,13 @@ export type RunningControllerServer = Readonly<{
   discovery: ControllerDiscovery;
   closed: Promise<void>;
   close(): Promise<void>;
+  commandObserver: ControllerCommandObserver;
+  eventLoopDelay: ControllerEventLoopDelay;
 }>;
 
 export type ControllerServerOptions = Readonly<{
   domainIdentity?: EphemeralDomainIdentity;
+  status?: (telemetry: ControllerStatusTelemetry) => JsonValue;
 }>;
 
 export async function startControllerServer(
@@ -76,8 +85,21 @@ async function startControllerServerLocked(
 
   const token = randomBytes(32).toString("hex");
   let closeRunning: () => Promise<void> = async () => undefined;
+  const commandObserver = new ControllerCommandObserver();
+  const eventLoopDelay = new ControllerEventLoopDelay();
+  const telemetry: ControllerStatusTelemetry = Object.freeze({
+    commandObserver,
+    eventLoopDelay
+  });
   const netServer = createServer((socket) => {
-    receiveRequest(socket, token, dispatcher, () => closeRunning());
+    receiveRequest(
+      socket,
+      token,
+      dispatcher,
+      () => closeRunning(),
+      options.status,
+      telemetry
+    );
   });
 
   try {
@@ -93,6 +115,8 @@ async function startControllerServerLocked(
       throw retryError;
     }
   }
+
+  eventLoopDelay.start();
 
   try {
     await chmod(socketPath, 0o600);
@@ -116,6 +140,7 @@ async function startControllerServerLocked(
     closeRunning = (): Promise<void> => {
       if (closePromise !== undefined) return closePromise;
       closePromise = (async () => {
+        eventLoopDelay.stop();
         await beforeDiscoveryRemoval?.();
         await closeNetServer(netServer);
         await removeOwnedDiscovery(discoveryPath, token);
@@ -138,8 +163,15 @@ async function startControllerServerLocked(
       return closePromise;
     };
 
-    return Object.freeze({ discovery, closed, close: closeRunning });
+    return Object.freeze({
+      discovery,
+      closed,
+      close: closeRunning,
+      commandObserver,
+      eventLoopDelay
+    });
   } catch (error) {
+    eventLoopDelay.stop();
     await closeNetServer(netServer);
     throw error;
   }
@@ -167,7 +199,9 @@ function receiveRequest(
   socket: Socket,
   token: string,
   dispatcher: ControllerDispatcher | undefined,
-  stop: () => Promise<void>
+  stop: () => Promise<void>,
+  status: ((telemetry: ControllerStatusTelemetry) => JsonValue) | undefined,
+  telemetry: ControllerStatusTelemetry
 ): void {
   let buffer = Buffer.alloc(0);
   let complete = false;
@@ -197,7 +231,15 @@ function receiveRequest(
       return;
     }
     complete = true;
-    void routeRequest(socket, buffer.subarray(0, newline).toString("utf8"), token, dispatcher, stop);
+    void routeRequest(
+      socket,
+      buffer.subarray(0, newline).toString("utf8"),
+      token,
+      dispatcher,
+      stop,
+      status,
+      telemetry
+    );
   });
   socket.on("end", () => {
     if (!complete) fail("INVALID_REQUEST", "Invalid controller request.");
@@ -210,7 +252,9 @@ async function routeRequest(
   line: string,
   token: string,
   dispatcher: ControllerDispatcher | undefined,
-  stop: () => Promise<void>
+  stop: () => Promise<void>,
+  status: ((telemetry: ControllerStatusTelemetry) => JsonValue) | undefined,
+  telemetry: ControllerStatusTelemetry
 ): Promise<void> {
   let request;
   try {
@@ -238,10 +282,22 @@ async function routeRequest(
     return;
   }
 
+  // Every authenticated request is observed once at the routing layer. The
+  // observation completes when the response is handed to the socket, so a
+  // later status snapshot sees prior built-in completions and the dispatcher
+  // service-time metric stays a distinct observation.
+  const observation = telemetry.commandObserver.start();
+  const send = (response: ControllerResponse, onFlushed?: () => void): void => {
+    observation.complete(
+      isBuiltinControllerMethod(request.method) ? "builtin" : "dispatched",
+      response.ok ? "success" : "failure"
+    );
+    sendResponse(socket, response, onFlushed);
+  };
+
   if (request.method === "controller.identity") {
     if (!isEmptyParams(request.params)) {
-      sendResponse(
-        socket,
+      send(
         controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
       );
       return;
@@ -249,7 +305,7 @@ async function routeRequest(
     // This is an authenticated, private lifecycle response. Unlike the public
     // resource inventory, it retains the exact executable/argv that the socket
     // owner was launched with so an update can restore that same Controller.
-    sendResponse(socket, {
+    send({
       id: request.id,
       ok: true,
       result: {
@@ -263,13 +319,12 @@ async function routeRequest(
 
   if (request.method === "controller.status") {
     if (!isEmptyParams(request.params)) {
-      sendResponse(
-        socket,
+      send(
         controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
       );
       return;
     }
-    sendResponse(socket, {
+    send({
       id: request.id,
       ok: true,
       result: {
@@ -278,7 +333,8 @@ async function routeRequest(
         protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
         version: YUI_VERSION,
         storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,
-        aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion
+        aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion,
+        ...(status === undefined ? {} : { runtime: status(telemetry) })
       }
     });
     return;
@@ -287,15 +343,13 @@ async function routeRequest(
   if (request.method === "controller.stop") {
     const expectedPid = expectedControllerStopPid(request.params);
     if (expectedPid === null) {
-      sendResponse(
-        socket,
+      send(
         controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
       );
       return;
     }
     if (expectedPid !== undefined && expectedPid !== process.pid) {
-      sendResponse(
-        socket,
+      send(
         controllerFailure(
           request.id,
           "CONTROLLER_OWNERSHIP_MISMATCH",
@@ -304,8 +358,7 @@ async function routeRequest(
       );
       return;
     }
-    sendResponse(
-      socket,
+    send(
       {
         id: request.id,
         ok: true,
@@ -320,8 +373,7 @@ async function routeRequest(
   }
 
   if (dispatcher === undefined) {
-    sendResponse(
-      socket,
+    send(
       controllerFailure(request.id, "METHOD_NOT_FOUND", "Controller method was not found.")
     );
     return;
@@ -329,11 +381,10 @@ async function routeRequest(
 
   try {
     const result = await dispatcher(request.method, request.params);
-    sendResponse(socket, { id: request.id, ok: true, result });
+    send({ id: request.id, ok: true, result });
   } catch (error) {
     const safeError = safeDispatcherError(error);
-    sendResponse(
-      socket,
+    send(
       safeError === undefined
         ? controllerFailure(request.id, "INTERNAL_ERROR", "Controller request failed.")
         : controllerFailure(request.id, safeError.code, safeError.message)

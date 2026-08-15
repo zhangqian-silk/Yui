@@ -91,6 +91,8 @@ export type TaskClaudeStopFailureEvent = Readonly<{
 }>;
 
 export type RuntimeTurnEventObserver = Readonly<{
+  /** Batch multiple inbox folds into one authoritative aggregate commit. */
+  withRuntimeEventTransaction?<T>(execute: () => T): T;
   getTask(taskId: string): SchedulerTask | null;
   observeRuntimeTurnCompleted(
     input: TaskRuntimeTurnCompleted,
@@ -153,6 +155,19 @@ export type RuntimeEventDrainResult = Readonly<{
   acknowledgedEventIds: readonly string[];
   deferred: readonly RuntimeLifecycleEvent[];
   failed: readonly RuntimeEventDrainFailure[];
+  remainingEventCount: number;
+  metrics: RuntimeEventDrainMetrics;
+}>;
+
+export type RuntimeEventDrainMetrics = Readonly<{
+  listedEventCount: number;
+  selectedEventCount: number;
+  semanticEventsSelected: number;
+  progressEventsSelected: number;
+  progressEventsCoalesced: number;
+  stateTransactions: number;
+  remainingSemanticEventCount: number;
+  remainingProgressEventCount: number;
 }>;
 
 export interface RuntimeEventProcessorPort {
@@ -164,17 +179,47 @@ export interface AsyncRuntimeEventProcessorPort {
   drainAsync(now: Date): Promise<RuntimeEventDrainResult>;
 }
 
-export type FileRuntimeEventProcessorOptions = Readonly<{
-  onTaskRuntimeApplied?: (input: Readonly<{
-    taskId: string;
-    roleName: string;
-  }>) => void;
+export type TaskRuntimeAppliedInput = Readonly<{
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: "codex" | "claude";
+  launchId?: string;
+  nativeSessionId: string;
+  runId?: string;
 }>;
 
-/** Folds immutable Hook facts one at a time before acknowledging them. */
+export type FileRuntimeEventProcessorOptions = Readonly<{
+  onTaskRuntimeApplied?: (input: TaskRuntimeAppliedInput) => void;
+  /** Maximum folded representatives in one state transaction. */
+  maxEventsPerDrain?: number;
+}>;
+
+type RuntimeEventInboxPort = Pick<FileRuntimeEventInbox, "list" | "acknowledge">
+  & Partial<Pick<FileRuntimeEventInbox, "acknowledgeMany">>;
+
+export type CoalescedRuntimeEvent = Readonly<{
+  event: RuntimeLifecycleEvent;
+  representedEventIds: readonly string[];
+}>;
+
+export type RuntimeProgressCoalescingInstrumentation = Readonly<{
+  /** Test/diagnostic seam proving each progress fact receives bounded visits. */
+  onProgressVisit?(): void;
+}>;
+
+type FoldedRuntimeEvent = Readonly<{
+  candidate: CoalescedRuntimeEvent;
+  outcome: "applied" | "deferred" | "obsolete";
+  notifyTaskRuntime: boolean;
+}>;
+
+const DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN = 64;
+
+/** Folds immutable Hook facts in one bounded transaction before acknowledging them. */
 export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
   constructor(
-    private readonly inbox: Pick<FileRuntimeEventInbox, "list" | "acknowledge">,
+    private readonly inbox: RuntimeEventInboxPort,
     private readonly observer: RuntimeTurnEventObserver,
     private readonly options: FileRuntimeEventProcessorOptions = {}
   ) {}
@@ -187,43 +232,140 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     try {
       events = this.inbox.list();
     } catch (error) {
-      return { acknowledgedEventIds, deferred, failed: [{ error }] };
+      return emptyDrainFailure(error);
     }
-    for (const event of events) {
+    const coalesced = coalesceRuntimeProgress(events);
+    const maximum = positiveInteger(
+      this.options.maxEventsPerDrain,
+      DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN
+    );
+    const selected = selectDrainBatch(coalesced, maximum);
+    let stateTransactions = 0;
+    if (selected.length > 0 && this.observer.withRuntimeEventTransaction !== undefined) {
       try {
-        if (event.type === "native-turn-completed") {
-          const outcome = this.applyCodex(event, now);
-          if (outcome === "deferred") {
-            deferred.push(event);
-            continue;
-          }
-        } else if (event.type === "claude-stop-failure") {
-          this.applyClaudeStopFailure(event, now);
-        } else if (event.type === "native-session-lifecycle") {
-          const outcome = this.applySessionLifecycle(event, now);
-          if (outcome === "deferred") {
-            deferred.push(event);
-            continue;
-          }
-        } else if (event.type === "native-turn-progress") {
-          const outcome = this.applyProviderTurnProgress(event, now);
-          if (outcome === "deferred") {
-            deferred.push(event);
-            continue;
-          }
-        } else {
-          const outcome = this.applyPromptAccepted(event, now);
-          if (outcome === "deferred") {
-            deferred.push(event);
-            continue;
+        stateTransactions += 1;
+        const folded = this.observer.withRuntimeEventTransaction(() => (
+          selected.map((candidate) => this.foldOne(candidate, now))
+        ));
+        for (const result of folded) {
+          this.finalizeOne(result, acknowledgedEventIds, deferred, failed);
+        }
+      } catch {
+        // A failed aggregate transaction commits nothing. Retry each candidate
+        // independently so one bad event cannot strand unrelated facts.
+        for (const candidate of selected) {
+          try {
+            stateTransactions += 1;
+            const folded = this.observer.withRuntimeEventTransaction(() => (
+              this.foldOne(candidate, now)
+            ));
+            this.finalizeOne(folded, acknowledgedEventIds, deferred, failed);
+          } catch (candidateError) {
+            failed.push({ eventId: candidate.event.id, error: candidateError });
           }
         }
-        this.acknowledge(event.id, acknowledgedEventIds);
-      } catch (error) {
-        failed.push({ eventId: event.id, error });
+      }
+    } else {
+      for (const candidate of selected) {
+        try {
+          const folded = this.foldOne(candidate, now);
+          this.finalizeOne(folded, acknowledgedEventIds, deferred, failed);
+        } catch (error) {
+          failed.push({ eventId: candidate.event.id, error });
+        }
       }
     }
-    return { acknowledgedEventIds, deferred, failed };
+    const progressEventsSelected = selected.filter(({ event }) => (
+      event.type === "native-turn-progress"
+    )).length;
+    const representedEventCount = selected.reduce((count, candidate) => (
+      count + candidate.representedEventIds.length
+    ), 0);
+    const acknowledged = new Set(acknowledgedEventIds);
+    const remaining = events.filter(({ id }) => !acknowledged.has(id));
+    const remainingProgressEventCount = remaining.filter(({ type }) => (
+      type === "native-turn-progress"
+    )).length;
+    return {
+      acknowledgedEventIds,
+      deferred,
+      failed,
+      remainingEventCount: Math.max(0, events.length - acknowledgedEventIds.length),
+      metrics: {
+        listedEventCount: events.length,
+        selectedEventCount: selected.length,
+        semanticEventsSelected: selected.length - progressEventsSelected,
+        progressEventsSelected,
+        progressEventsCoalesced: representedEventCount - selected.length,
+        stateTransactions,
+        remainingSemanticEventCount: remaining.length - remainingProgressEventCount,
+        remainingProgressEventCount
+      }
+    };
+  }
+
+  private foldOne(
+    candidate: CoalescedRuntimeEvent,
+    now: Date
+  ): FoldedRuntimeEvent {
+    const event = candidate.event;
+    let outcome: "applied" | "deferred" | "obsolete" = "applied";
+    if (event.type === "native-turn-completed") {
+      outcome = this.applyCodex(event, now);
+    } else if (event.type === "claude-stop-failure") {
+      this.applyClaudeStopFailure(event, now);
+    } else if (event.type === "native-session-lifecycle") {
+      outcome = this.applySessionLifecycle(event, now);
+    } else if (event.type === "native-turn-progress") {
+      outcome = this.applyProviderTurnProgress(event, now);
+    } else {
+      outcome = this.applyPromptAccepted(event, now);
+    }
+    return {
+      candidate,
+      outcome,
+      notifyTaskRuntime: outcome === "applied" && (
+        event.type === "native-session-lifecycle"
+        || event.type === "native-prompt-accepted"
+        || (event.type === "native-turn-completed" && event.scope === "task")
+      )
+    };
+  }
+
+  private finalizeOne(
+    folded: FoldedRuntimeEvent,
+    acknowledged: string[],
+    deferred: RuntimeLifecycleEvent[],
+    failed: RuntimeEventDrainFailure[]
+  ): void {
+    const { candidate, outcome } = folded;
+    try {
+      if (outcome === "deferred") {
+        deferred.push(candidate.event);
+        this.acknowledge(
+          candidate.representedEventIds.filter((id) => id !== candidate.event.id),
+          acknowledged
+        );
+        return;
+      }
+      if (folded.notifyTaskRuntime) {
+        const event = candidate.event;
+        if (event.scope === "task" && event.taskId !== undefined) {
+          this.options.onTaskRuntimeApplied?.({
+            taskId: event.taskId,
+            roleName: event.roleName,
+            agentId: event.agentId,
+            adapterId: event.adapterId,
+            ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
+            nativeSessionId: event.nativeSessionId,
+            ...(event.runId === undefined ? {} : { runId: event.runId })
+          });
+        }
+      }
+      this.acknowledge(candidate.representedEventIds, acknowledged);
+    } catch (error) {
+      failed.push({ eventId: candidate.event.id, error });
+    }
   }
 
   private applySessionLifecycle(
@@ -244,12 +386,6 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       ...(event.runId === undefined ? {} : { runId: event.runId }),
       ...(event.sessionSource === undefined ? {} : { sessionSource: event.sessionSource })
     }, now);
-    if (outcome === "applied") {
-      this.options.onTaskRuntimeApplied?.({
-        taskId: event.taskId,
-        roleName: event.roleName
-      });
-    }
     return outcome === "deferred" ? "deferred" : outcome;
   }
 
@@ -271,12 +407,6 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       runId: event.runId,
       receiptId: event.receiptId
     }, now);
-    if (outcome === "applied") {
-      this.options.onTaskRuntimeApplied?.({
-        taskId: event.taskId,
-        roleName: event.roleName
-      });
-    }
     return outcome === "deferred" ? "deferred" : outcome;
   }
 
@@ -341,10 +471,6 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         this.recordObsolete(event, "runtime-cleanup-or-stopped-session", now);
         return "obsolete";
       }
-      this.options.onTaskRuntimeApplied?.({
-        taskId: event.taskId!,
-        roleName: event.roleName
-      });
       return "applied";
     }
     const input: GlobalRuntimeTurnCompleted = {
@@ -421,10 +547,147 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     }, now);
   }
 
-  private acknowledge(id: string, acknowledged: string[]): void {
-    this.inbox.acknowledge(id);
-    acknowledged.push(id);
+  private acknowledge(ids: readonly string[], acknowledged: string[]): void {
+    if (this.inbox.acknowledgeMany !== undefined) {
+      acknowledged.push(...this.inbox.acknowledgeMany(ids));
+      return;
+    }
+    for (const id of ids) {
+      if (this.inbox.acknowledge(id)) acknowledged.push(id);
+    }
   }
+}
+
+export function coalesceRuntimeProgress(
+  events: readonly RuntimeLifecycleEvent[],
+  instrumentation: RuntimeProgressCoalescingInstrumentation = {}
+): CoalescedRuntimeEvent[] {
+  const result: CoalescedRuntimeEvent[] = [];
+  let segment: RuntimeProviderProgressEvent[] = [];
+  const flush = (): void => {
+    if (segment.length === 0) return;
+    const frontiers = new Map<string, Readonly<{
+      latestReceivedAt: string;
+      greatestSequence?: number;
+      firstLatestIndex: number;
+      firstGreatestSequenceIndex?: number;
+    }>>();
+    for (let index = 0; index < segment.length; index += 1) {
+      instrumentation.onProgressVisit?.();
+      const event = segment[index]!;
+      const key = progressStreamKey(event);
+      const frontier = frontiers.get(key);
+      if (frontier === undefined || event.receivedAt > frontier.latestReceivedAt) {
+        frontiers.set(key, {
+          latestReceivedAt: event.receivedAt,
+          ...(event.sequence === undefined
+            ? {}
+            : {
+                greatestSequence: event.sequence,
+                firstGreatestSequenceIndex: index
+              }),
+          firstLatestIndex: index
+        });
+      } else if (
+        event.receivedAt === frontier.latestReceivedAt
+        && event.sequence !== undefined
+        && (
+          frontier.greatestSequence === undefined
+          || event.sequence > frontier.greatestSequence
+        )
+      ) {
+        frontiers.set(key, {
+          ...frontier,
+          greatestSequence: event.sequence,
+          firstGreatestSequenceIndex: index
+        });
+      }
+    }
+    const representedByIndex = new Map<number, string[]>();
+    for (let index = 0; index < segment.length; index += 1) {
+      instrumentation.onProgressVisit?.();
+      const event = segment[index]!;
+      const frontier = frontiers.get(progressStreamKey(event))!;
+      const strictlyDominated = event.receivedAt < frontier.latestReceivedAt
+        || (
+          event.receivedAt === frontier.latestReceivedAt
+          && event.sequence !== undefined
+          && frontier.greatestSequence !== undefined
+          && event.sequence < frontier.greatestSequence
+        );
+      const representativeIndex = strictlyDominated
+        ? frontier.firstGreatestSequenceIndex ?? frontier.firstLatestIndex
+        : index;
+      const represented = representedByIndex.get(representativeIndex) ?? [];
+      represented.push(event.id);
+      representedByIndex.set(representativeIndex, represented);
+    }
+    for (let index = 0; index < segment.length; index += 1) {
+      const representedEventIds = representedByIndex.get(index);
+      if (representedEventIds === undefined) continue;
+      result.push({ event: segment[index]!, representedEventIds });
+    }
+    segment = [];
+  };
+  for (const event of events) {
+    if (event.type !== "native-turn-progress") {
+      flush();
+      result.push({ event, representedEventIds: [event.id] });
+      continue;
+    }
+    segment.push(event);
+  }
+  flush();
+  return result;
+}
+
+function selectDrainBatch(
+  events: readonly CoalescedRuntimeEvent[],
+  maximum: number
+): CoalescedRuntimeEvent[] {
+  // A batch is always an arrival-order prefix. Admission and drain coalescing
+  // keep a progress flood bounded without allowing a later semantic fact to
+  // overtake an earlier progress fence from another Run.
+  return events.slice(0, maximum);
+}
+
+function progressStreamKey(event: RuntimeProviderProgressEvent): string {
+  return JSON.stringify([
+    event.taskId,
+    event.roleName,
+    event.agentId,
+    event.adapterId,
+    event.launchId,
+    event.nativeSessionId,
+    event.runId
+  ]);
+}
+
+function emptyDrainFailure(error: unknown): RuntimeEventDrainResult {
+  return {
+    acknowledgedEventIds: [],
+    deferred: [],
+    failed: [{ error }],
+    remainingEventCount: 0,
+    metrics: {
+      listedEventCount: 0,
+      selectedEventCount: 0,
+      semanticEventsSelected: 0,
+      progressEventsSelected: 0,
+      progressEventsCoalesced: 0,
+      stateTransactions: 0,
+      remainingSemanticEventCount: 0,
+      remainingProgressEventCount: 0
+    }
+  };
+}
+
+function positiveInteger(value: number | undefined, fallback: number): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved <= 0) {
+    throw new TypeError("Runtime event drain limit must be a positive integer.");
+  }
+  return resolved;
 }
 
 function isObsoleteRuntimeTurnObservation(value: unknown): boolean {
@@ -541,7 +804,7 @@ export class AsyncRuntimeEventProcessor {
     try {
       events = this.inbox.list();
     } catch (error) {
-      return { acknowledgedEventIds, deferred, failed: [{ error }] };
+      return emptyDrainFailure(error);
     }
     for (const event of events) {
       try {
@@ -577,7 +840,30 @@ export class AsyncRuntimeEventProcessor {
         failed.push({ eventId: event.id, error });
       }
     }
-    return { acknowledgedEventIds, deferred, failed };
+    const acknowledged = new Set(acknowledgedEventIds);
+    const remaining = events.filter(({ id }) => !acknowledged.has(id));
+    const progressEventsSelected = events.filter(({ type }) => (
+      type === "native-turn-progress"
+    )).length;
+    const remainingProgressEventCount = remaining.filter(({ type }) => (
+      type === "native-turn-progress"
+    )).length;
+    return {
+      acknowledgedEventIds,
+      deferred,
+      failed,
+      remainingEventCount: remaining.length,
+      metrics: {
+        listedEventCount: events.length,
+        selectedEventCount: events.length,
+        semanticEventsSelected: events.length - progressEventsSelected,
+        progressEventsSelected,
+        progressEventsCoalesced: 0,
+        stateTransactions: 0,
+        remainingSemanticEventCount: remaining.length - remainingProgressEventCount,
+        remainingProgressEventCount
+      }
+    };
   }
 
   private async applySessionLifecycle(
@@ -601,7 +887,12 @@ export class AsyncRuntimeEventProcessor {
     if (outcome === "applied") {
       this.options.onTaskRuntimeApplied?.({
         taskId: event.taskId,
-        roleName: event.roleName
+        roleName: event.roleName,
+        agentId: event.agentId,
+        adapterId: event.adapterId,
+        launchId: event.launchId,
+        nativeSessionId: event.nativeSessionId,
+        ...(event.runId === undefined ? {} : { runId: event.runId })
       });
     }
     return outcome === "deferred" ? "deferred" : outcome;
@@ -628,7 +919,12 @@ export class AsyncRuntimeEventProcessor {
     if (outcome === "applied") {
       this.options.onTaskRuntimeApplied?.({
         taskId: event.taskId,
-        roleName: event.roleName
+        roleName: event.roleName,
+        agentId: event.agentId,
+        adapterId: event.adapterId,
+        launchId: event.launchId,
+        nativeSessionId: event.nativeSessionId,
+        runId: event.runId
       });
     }
     return outcome === "deferred" ? "deferred" : outcome;
@@ -697,7 +993,12 @@ export class AsyncRuntimeEventProcessor {
       }
       this.options.onTaskRuntimeApplied?.({
         taskId: event.taskId!,
-        roleName: event.roleName
+        roleName: event.roleName,
+        agentId: event.agentId,
+        adapterId: event.adapterId,
+        ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
+        nativeSessionId: event.nativeSessionId,
+        ...(event.runId === undefined ? {} : { runId: event.runId })
       });
       return "applied";
     }

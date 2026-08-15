@@ -6,6 +6,7 @@ import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
 import {
   effectiveLaunchConfig,
   effectiveLaunchSnapshotsCompatible,
+  effectiveLaunchSnapshotsCompatibleForTaskMain,
   resolveEffectiveLaunch
 } from "../../dist/executor/effectiveLaunch.js";
 import { createRoleAgentBinding } from "../../dist/role/role.js";
@@ -171,6 +172,92 @@ test("Session compatibility compares the complete effective config except desire
   }), false);
 });
 
+test("Task-main Session compatibility permits only durable base-commit advancement", () => {
+  const role = desiredRole("codex", {
+    adapterId: "codex",
+    model: "gpt-5.6-sol",
+    permission: { strategy: "bypass" }
+  });
+  const beforeWorkspace = taskMainWorkspace("a".repeat(40));
+  const afterWorkspace = taskMainWorkspace("b".repeat(40));
+  const existing = resolveEffectiveLaunch({
+    role,
+    purpose: "execution",
+    workspace: beforeWorkspace
+  });
+  const desired = resolveEffectiveLaunch({
+    role,
+    purpose: "execution",
+    workspace: afterWorkspace
+  });
+
+  assert.equal(
+    effectiveLaunchSnapshotsCompatibleForTaskMain(
+      existing,
+      desired,
+      afterWorkspace
+    ),
+    true
+  );
+  for (const changedWorkspace of [
+    taskMainWorkspace("b".repeat(40), { path: "/fixture/other/Yui" }),
+    taskMainWorkspace("b".repeat(40), { branch: "other-main" }),
+    taskMainWorkspace("b".repeat(40), { access: "read" })
+  ]) {
+    const changed = resolveEffectiveLaunch({
+      role,
+      purpose: "execution",
+      workspace: changedWorkspace
+    });
+    assert.equal(
+      effectiveLaunchSnapshotsCompatibleForTaskMain(
+        existing,
+        changed,
+        changedWorkspace
+      ),
+      false
+    );
+  }
+  const changedConfig = resolveEffectiveLaunch({
+    role: desiredRole("codex", {
+      adapterId: "codex",
+      model: "gpt-next",
+      permission: { strategy: "bypass" }
+    }),
+    purpose: "execution",
+    workspace: afterWorkspace
+  });
+  assert.equal(
+    effectiveLaunchSnapshotsCompatibleForTaskMain(
+      existing,
+      changedConfig,
+      afterWorkspace
+    ),
+    false
+  );
+
+  const beforeWorkItem = workItemWorkspace("a".repeat(40));
+  const afterWorkItem = workItemWorkspace("b".repeat(40));
+  assert.equal(
+    effectiveLaunchSnapshotsCompatibleForTaskMain(
+      resolveEffectiveLaunch({
+        role,
+        purpose: "execution",
+        workspace: beforeWorkItem,
+        workItemWriteProjectIds: ["project-1"]
+      }),
+      resolveEffectiveLaunch({
+        role,
+        purpose: "execution",
+        workspace: afterWorkItem,
+        workItemWriteProjectIds: ["project-1"]
+      }),
+      afterWorkItem
+    ),
+    false
+  );
+});
+
 function desiredRole(adapterId, config, defaultAccess = "write") {
   const agent = createConfiguredAgent(adapterId, adapterId, adapterId, [], [], NOW);
   const binding = createRoleAgentBinding(agent, config);
@@ -207,6 +294,43 @@ function workspace(access) {
     }],
     createdAt: NOW.toISOString(),
     updatedAt: NOW.toISOString()
+  };
+}
+
+function taskMainWorkspace(baseCommit, entryOverrides = {}) {
+  return {
+    schemaVersion: 2,
+    owner: { type: "task", taskId: "task-1" },
+    root: "/fixture/task-main",
+    entries: [{
+      projectId: "project-1",
+      directory: "Yui",
+      access: "write",
+      path: "/fixture/task-main/Yui",
+      branch: "main",
+      baseRef: "main",
+      baseCommit,
+      ...entryOverrides
+    }],
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  };
+}
+
+function workItemWorkspace(baseCommit) {
+  return {
+    ...taskMainWorkspace(baseCommit),
+    owner: {
+      type: "work-item",
+      taskId: "task-1",
+      workItemId: "work-item-1"
+    },
+    root: "/fixture/work-item-1",
+    entries: taskMainWorkspace(baseCommit).entries.map((entry) => ({
+      ...entry,
+      path: "/fixture/work-item-1/Yui",
+      branch: "work-item-1"
+    }))
   };
 }
 

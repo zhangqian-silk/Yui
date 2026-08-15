@@ -52,6 +52,17 @@ export interface RoleLaunchPlanner {
     nativeSessionId?: string;
     runtimeIsolation?: TaskRuntimeIsolationDescriptor;
   }>): PlannedRoleSession;
+  /** Atomically advances every stable exact-runtime source for a reused Task Session. */
+  refreshTaskRuntimeDescriptor?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId?: string;
+    launchId: string;
+    nativeSessionId: string;
+    agentId: string;
+    adapterId: string;
+    workspace: string;
+  }>): void;
 }
 
 export type ExecutorTmuxPort = Readonly<{
@@ -114,6 +125,7 @@ export type ExecutorRuntimePorts = Readonly<{
 type PreparedRuntime = Readonly<{
   delivery: PreparedRoleDelivery;
   session: SchedulerRoleSession | null;
+  workspace: string;
   planned?: PlannedRoleSession;
   binding?: RuntimeBinding;
 }>;
@@ -249,6 +261,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     this.#prepared.set(delivery.deliveryId, {
       delivery,
       session,
+      workspace: input.workspace,
       ...(planned === undefined ? {} : { planned }),
       ...(binding === undefined ? {} : { binding })
     });
@@ -277,6 +290,29 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       const runId = input.delivery.prepared.runId;
       if (runId === undefined) {
         throw new Error("Runtime prompt delivery requires a Task-local Run id.");
+      }
+      // A reused native process retains the stable descriptor path from its
+      // original control plane. Publish only the current-control source after
+      // the Run/Session fence is durable and immediately before provider input;
+      // the reused Hook self-refreshes its own source before the volatile
+      // fence instead of the Controller scanning history to keep it fresh.
+      if (
+        prepared.binding.hostCreated === false
+        && this.planner.refreshTaskRuntimeDescriptor !== undefined
+      ) {
+        if (!hasText(prepared.binding.nativeSessionId)) {
+          throw new Error("Runtime prompt delivery requires a native Session id.");
+        }
+        this.planner.refreshTaskRuntimeDescriptor({
+          taskId: input.delivery.prepared.taskId,
+          roleName: input.delivery.prepared.roleName,
+          runId,
+          launchId: prepared.binding.launchId,
+          nativeSessionId: prepared.binding.nativeSessionId,
+          agentId: prepared.binding.agentId,
+          adapterId: prepared.binding.adapterId,
+          workspace: prepared.workspace
+        });
       }
       const outcome = await this.runtimePorts.promptPush.tryPush({
         binding: prepared.binding,

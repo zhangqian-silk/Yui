@@ -2,7 +2,10 @@ import { createAgentRun } from "../run/agentRun.js";
 import { markYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
-import { effectiveLaunchSnapshotsCompatible } from "../executor/effectiveLaunch.js";
+import {
+  effectiveLaunchSnapshotsCompatible,
+  effectiveLaunchSnapshotsCompatibleForTaskMain
+} from "../executor/effectiveLaunch.js";
 import {
   hasRuntimeLifecycleWork,
   runtimeLifecycleTarget
@@ -126,7 +129,13 @@ export async function processLeaderWakeups(
         }
       }
       const compatibleSession = existingSession !== null
-        && effectiveLaunchSnapshotsCompatible(existingSession.effective, role.effective);
+        && (reopening
+          ? effectiveLaunchSnapshotsCompatible(existingSession.effective, role.effective)
+          : effectiveLaunchSnapshotsCompatibleForTaskMain(
+              existingSession.effective,
+              role.effective,
+              role.managedWorkspace
+            ));
       const reopenIdentityDrift = reopening
         && hasNativeSession(existingSession)
         && !compatibleSession;
@@ -206,6 +215,7 @@ export async function processLeaderWakeups(
             now
           );
           effectiveSession = preflightSession(
+            role,
             run!.effective,
             existingSession,
             mode,
@@ -229,6 +239,7 @@ export async function processLeaderWakeups(
         const preparedFenceSession = prepared.session === undefined
           ? existingSession
           : validateReadySession(
+              role,
               run.effective,
               existingSession,
               mode,
@@ -261,6 +272,7 @@ export async function processLeaderWakeups(
         continue;
       }
       effectiveSession = validateReadySession(
+        role,
         run.effective,
         existingSession,
         mode,
@@ -395,6 +407,7 @@ export async function processLeaderWakeups(
 }
 
 function validateReadySession(
+  role: SchedulerRole,
   effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
   existing: SchedulerRoleSession | null,
   mode: "new" | "resume",
@@ -405,7 +418,14 @@ function validateReadySession(
   if (session.agentId !== effective.agentId || session.adapterId !== effective.adapterId) {
     throw new Error(`Ready session belongs to another Agent: ${session.agentId}.`);
   }
-  if (!effectiveLaunchSnapshotsCompatible(session.effective, effective)) {
+  const compatible = mode === "resume"
+    ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+        session.effective,
+        effective,
+        role.managedWorkspace
+      )
+    : effectiveLaunchSnapshotsCompatible(session.effective, effective);
+  if (!compatible) {
     throw new Error("Ready Leader session effective snapshot changed.");
   }
   if (!hasNativeSession(session)) {
@@ -414,7 +434,13 @@ function validateReadySession(
   if (mode === "resume" && session.nativeSessionId !== existing?.nativeSessionId) {
     throw new Error("Leader resume changed the fixed native session id.");
   }
-  return { ...session, status: "running" };
+  return {
+    ...session,
+    status: "running",
+    ...(mode === "resume" && existing !== null
+      ? { effective: existing.effective }
+      : {})
+  };
 }
 
 function persistPreStartFence(
@@ -436,7 +462,7 @@ function persistPreStartFence(
   ) {
     throw new Error(`Pre-start launch fence changed the Leader Run: ${task.id}/${role.name}.`);
   }
-  const session = preflightSession(run.effective, existingSession, mode, preflight);
+  const session = preflightSession(role, run.effective, existingSession, mode, preflight);
   store.saveRoleRunPrepared({
     task,
     role,
@@ -448,6 +474,7 @@ function persistPreStartFence(
 }
 
 function preflightSession(
+  role: SchedulerRole,
   effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
   existing: SchedulerRoleSession | null,
   mode: "new" | "resume",
@@ -463,7 +490,7 @@ function preflightSession(
         status: "ready" as const,
         effective: preflight.effective
       };
-  return validateReadySession(effective, existing, mode, session);
+  return validateReadySession(role, effective, existing, mode, session);
 }
 
 function hasNativeSession(

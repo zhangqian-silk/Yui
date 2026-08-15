@@ -4,6 +4,10 @@ import {
   type LeaderWakeupProcessingResult
 } from "../scheduler/leaderWakeupProcessor.js";
 import {
+  pendingWakeupsMatch,
+  type PendingWakeup
+} from "../scheduler/pendingWakeup.js";
+import {
   processActiveRoleRunDeliveries,
   type ActiveRoleRunDeliveryResult
 } from "../scheduler/activeRoleRunDelivery.js";
@@ -35,6 +39,11 @@ import {
   type ControllerDispatcher,
   type RunningControllerServer
 } from "../core/controllerServer.js";
+import {
+  monotonicMilliseconds,
+  type ControllerEventLoopDelayMetrics,
+  type ControllerRouteMetrics
+} from "../core/controllerTelemetry.js";
 import type { JsonValue } from "../core/protocol.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import { isProjectMaintenanceFenced } from "../repository/projectMaintenanceLock.js";
@@ -56,6 +65,7 @@ import type {
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import type {
   AsyncRuntimeEventProcessorPort,
+  RuntimeEventDrainMetrics,
   RuntimeEventDrainResult,
   RuntimeEventProcessorPort
 } from "./runtimeEventProcessor.js";
@@ -65,8 +75,10 @@ const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 const DEFAULT_SIGNAL_WINDOW_MS = 100;
 const DEFAULT_DELIVERY_RETRY_MS = 250;
 const DEFAULT_DELIVERY_RETRY_LIMIT = 60;
+const DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT = 2;
 const RUNTIME_RESERVATION_RECOVERY_AGE_MS = 120_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const CONTROLLER_LATENCY_BUCKETS_MS = [10, 50, 100, 250, 500, 1_000, 3_000] as const;
 
 class RuntimeEventApplyError extends AggregateError {}
 
@@ -93,6 +105,7 @@ export type ControllerRuntimeOptions = Readonly<{
   signalWindowMs?: number;
   deliveryRetryMs?: number;
   deliveryRetryLimit?: number;
+  taskOrchestrationRetryLimit?: number;
   stallWindowMs?: number;
   now?: () => Date;
   onError?: (error: unknown) => void;
@@ -144,6 +157,49 @@ export type RunningFileTaskController = Readonly<{
   close(): Promise<void>;
 }>;
 
+export type ControllerRuntimeMetrics = Readonly<{
+  inbox: Readonly<{
+    depth: number;
+    semanticDepth: number;
+    progressDepth: number;
+  }>;
+  drain: Readonly<{
+    passes: number;
+    listedEvents: number;
+    selectedEvents: number;
+    progressEventsCoalesced: number;
+    stateTransactions: number;
+  }>;
+  commands: Readonly<{
+    // Dispatcher service time only: measured inside the FileTask dispatcher
+    // from dispatch to completion. It does not include the socket/event-loop
+    // wait before routing, so it must not be read as end-to-end latency.
+    dispatcher: Readonly<{
+      completed: number;
+      inFlight: number;
+      maximumServiceTimeMs: number;
+      serviceTimeBuckets: Readonly<Record<string, number>>;
+    }>;
+    // Core routing observation: every authenticated request counted once at
+    // the routing layer, covering built-in and dispatcher routes.
+    routes: ControllerRouteMetrics;
+    // Bounded event-loop delay sampled by the core server: the pre-dispatch
+    // wait an already-written request experiences while the loop is busy.
+    eventLoopDelay: ControllerEventLoopDelayMetrics;
+  }>;
+}>;
+
+const ZERO_DRAIN_METRICS: RuntimeEventDrainMetrics = Object.freeze({
+  listedEventCount: 0,
+  selectedEventCount: 0,
+  semanticEventsSelected: 0,
+  progressEventsSelected: 0,
+  progressEventsCoalesced: 0,
+  stateTransactions: 0,
+  remainingSemanticEventCount: 0,
+  remainingProgressEventCount: 0
+});
+
 /**
  * Runs one lean scheduler pass. Due native Turn completions are folded before
  * liveness, so a valid Hook boundary fences destructive process reconciliation.
@@ -167,6 +223,11 @@ export async function runControllerSchedulerPass(
     ? compiledSelection
     : { ...compiledSelection, operator: false };
   queueSelectedCompletedTaskRuntimeCleanups(store, selection, now);
+  // A full-state Task projection can be individually bounded yet still starve
+  // control sockets when several scheduler phases repeat it in one native
+  // event-loop turn. Give already-written requests a poll boundary before the
+  // next durable phase; later phases retain their existing CAS fences.
+  await controlEventLoopTurn();
   const failedCleanupRoles = await processSelectedRoleRuntimeCleanups(
     store,
     delivery,
@@ -188,18 +249,72 @@ export async function runControllerSchedulerPass(
   if (selection.full) repairOrphanedActiveTasks(store, now, selection);
   const claimedTaskMailboxes = claimSelectedTaskMailboxes(store, selection, now);
   try {
-    const failedTaskMailboxes = await prepareActiveWorkspaces(
-      store, workspacePreparer, selection, maintenanceFence, onMaintenanceFenceDefer
+    // Durable Leader work that already has a ready Task workspace belongs to
+    // the control path. Dispatch it before any unrelated Task workspace I/O;
+    // the processor itself retains the fail-closed workspace-ready guard.
+    const initialWakeups = selectedPendingWakeups(store, wakeupSelection);
+    const initialWakeupResults = await processLeaderWakeups(
+      store,
+      delivery,
+      now,
+      exactTaskSelection(new Set(initialWakeups.keys()))
     );
+    // Preserve ready-Leader-first ordering, then bound the repeated state
+    // projections that follow it in this pass.
+    await controlEventLoopTurn();
+    const workspacePreparation = await prepareActiveWorkspaces(
+      store,
+      workspacePreparer,
+      selection,
+      maintenanceFence,
+      onMaintenanceFenceDefer
+    );
+    await controlEventLoopTurn();
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection
     );
+    await controlEventLoopTurn();
     const unsettledRunRefs = new Set(activeRunDeliveries.flatMap((result) => (
       result.reason === "delivery-uncertain" || result.terminalFailure !== undefined
         ? [formatTaskRecordReference(result.taskId, result.runId, "agentRun")]
         : []
     )));
     resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
+    // Every successful Task has completed the targeted phases owned by its
+    // mailbox at this boundary. Settle that exact claim before advisory
+    // cross-Task reconciliation so an unrelated failure cannot retain and
+    // retry already-progressed work.
+    for (const claim of claimedTaskMailboxes) {
+      if (!workspacePreparation.failed.has(claim.target.taskId)) {
+        store.completeWorkMailbox(claim.target, claim.processing.batchId);
+      }
+    }
+    const newlyIdleBusyTaskIds = new Set(initialWakeupResults.flatMap((result) => (
+      result.reason === "busy"
+        && store.getActiveAgentRun(result.taskId, "leader") === null
+        && (
+          typeof store.hasInFlightTurn !== "function"
+          || !store.hasInFlightTurn(result.taskId, "leader")
+        )
+        ? [result.taskId]
+        : []
+    )));
+    // Phase-one Leader Runs did not exist at the pass's liveness boundary.
+    // Keep every newly claimed Run outside destructive absence decisions until
+    // a later pass can observe its stable provider/session generation.
+    for (const result of initialWakeupResults) {
+      if (
+        result.runId !== undefined
+        && store.getActiveAgentRun(result.taskId, "leader")?.id === result.runId
+      ) {
+        unsettledRunRefs.add(
+          formatTaskRecordReference(result.taskId, result.runId, "agentRun")
+        );
+      }
+    }
+    // Let socket callbacks queued during the bounded scheduler phases run
+    // before starting a potentially large liveness inventory.
+    await controlEventLoopTurn();
     const liveStatuses = new Map<string, "present" | "absent">();
     const resourceEvidence = new Map<string, RoleRunResourceEvidence>();
     const failedRunRefs = await reconcileExitedRoleRuns(
@@ -211,6 +326,7 @@ export async function runControllerSchedulerPass(
       liveStatuses,
       resourceEvidence
     );
+    await controlEventLoopTurn();
     await reconcileStalledRoleRuns(
       store,
       delivery,
@@ -221,6 +337,7 @@ export async function runControllerSchedulerPass(
       resourceEvidence,
       resourceSuppressionKeys
     );
+    await controlEventLoopTurn();
     await reconcileDormantRuntimeOwners(
       store,
       delivery,
@@ -233,30 +350,100 @@ export async function runControllerSchedulerPass(
       : selection.taskIds.size === 0
         ? []
         : store.resolveExpiredInputRecommendations(now, selection.taskIds);
-    const wakeups = await processLeaderWakeups(store, delivery, now, wakeupSelection);
+    // Liveness and auto-resolution can durably queue new Leader work. Process
+    // only Tasks that were not part of phase one, except when a same-pass due
+    // completion made an initially busy Leader idle. Result order remains
+    // deterministic and every other retained/busy wake stays single-shot.
+    const autoResolvedTaskIds = new Set(autoResolvedInputs.map(({ taskId }) => taskId));
+    const waitingInputTaskIds = new Set(initialWakeupResults.flatMap((result) => (
+      result.reason === "waiting-input" && autoResolvedTaskIds.has(result.taskId)
+        ? [result.taskId]
+        : []
+    )));
+    const workspaceReadyTaskIds = new Set(initialWakeupResults.flatMap((result) => (
+      result.reason === "workspace-not-ready"
+        && workspacePreparation.ready.has(result.taskId)
+        ? [result.taskId]
+        : []
+    )));
+    const laterWakeupTaskIds = new Set(
+      [...selectedPendingWakeups(store, wakeupSelection)].flatMap(([taskId, wakeup]) => {
+        const initial = initialWakeups.get(taskId);
+        return initial === undefined
+          || !pendingWakeupsMatch(initial, wakeup)
+          || waitingInputTaskIds.has(taskId)
+          || workspaceReadyTaskIds.has(taskId)
+          || newlyIdleBusyTaskIds.has(taskId)
+          ? [taskId]
+          : [];
+      })
+    );
+    const laterWakeups = await processLeaderWakeups(
+      store,
+      delivery,
+      now,
+      exactTaskSelection(laterWakeupTaskIds)
+    );
     const inputNotifications = includeOperator
       ? await processOperatorInputNotifications(store, delivery, selection, now)
       : [];
-    for (const claim of claimedTaskMailboxes) {
-      if (failedTaskMailboxes.has(claim.target.taskId)) {
-        store.releaseWorkMailbox(claim.target, claim.processing.batchId);
-      } else {
-        store.completeWorkMailbox(claim.target, claim.processing.batchId);
-      }
-    }
     return {
       activeRunDeliveries,
       failedRunRefs,
-      wakeups,
+      wakeups: mergeWakeupPhaseResults(initialWakeupResults, laterWakeups),
       inputNotifications,
       autoResolvedInputs
     };
   } catch (error) {
-    for (const claim of claimedTaskMailboxes) {
-      store.releaseWorkMailbox(claim.target, claim.processing.batchId);
-    }
+    // Task orchestration retries are owned by this Controller generation.
+    // Preserve each exact processing claim in place; releasing here would
+    // rewrite the full aggregate and then immediately claim the same batch.
     throw error;
   }
+}
+
+function selectedPendingWakeups(
+  store: Pick<SchedulerStorePort, "getPendingWakeup" | "listPendingWakeups">,
+  selection: SchedulerReconcileSelection
+): Map<string, PendingWakeup> {
+  const wakeups = selection.full
+    ? store.listPendingWakeups()
+    : [...selection.taskIds].flatMap((taskId) => {
+        const wakeup = store.getPendingWakeup(taskId);
+        return wakeup === null ? [] : [wakeup];
+      });
+  return new Map(wakeups.map((wakeup) => [
+    wakeup.taskId,
+    { ...wakeup, reasons: [...wakeup.reasons] }
+  ]));
+}
+
+function exactTaskSelection(taskIds: ReadonlySet<string>): SchedulerReconcileSelection {
+  return {
+    full: false,
+    taskIds,
+    allRoleTaskIds: new Set(),
+    rolesByTask: new Map(),
+    operator: false
+  };
+}
+
+function mergeWakeupPhaseResults(
+  initial: readonly LeaderWakeupProcessingResult[],
+  later: readonly LeaderWakeupProcessingResult[]
+): LeaderWakeupProcessingResult[] {
+  const merged = [...initial];
+  const positions = new Map(initial.map(({ taskId }, index) => [taskId, index]));
+  for (const result of later) {
+    const position = positions.get(result.taskId);
+    if (position === undefined) {
+      positions.set(result.taskId, merged.length);
+      merged.push(result);
+    } else {
+      merged[position] = result;
+    }
+  }
+  return merged;
 }
 
 type ClaimedTaskMailbox = Readonly<{
@@ -756,14 +943,15 @@ async function prepareActiveWorkspaces(
   selection: ReconcileSelection,
   maintenanceFence?: (projectId: string) => boolean,
   onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"]
-): Promise<Set<string>> {
-  if (workspace === undefined) return new Set();
+): Promise<Readonly<{ failed: Set<string>; ready: Set<string> }>> {
+  if (workspace === undefined) return { failed: new Set(), ready: new Set() };
   const taskIds = selection.full
     ? new Set(store.listTasks()
       .filter((task) => task.status === "active")
       .map((task) => task.id))
-    : new Set([...selection.taskIds, ...selection.allRoleTaskIds]);
+    : new Set(selection.allRoleTaskIds);
   const failed = new Set<string>();
+  const ready = new Set<string>();
   for (const taskId of taskIds) {
     const task = store.getTask(taskId);
     if (task?.status === "active") {
@@ -782,12 +970,13 @@ async function prepareActiveWorkspaces(
       try {
         const result = await workspace.prepareTaskWorkspace(taskId);
         if (result.status === "failed") failed.add(taskId);
+        else ready.add(taskId);
       } catch {
         failed.add(taskId);
       }
     }
   }
-  return failed;
+  return { failed, ready };
 }
 
 function parseMailboxKey(key: string):
@@ -848,6 +1037,7 @@ export class FileTaskController {
     | undefined;
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
+  readonly #taskOrchestrationRetryLimit: number;
   readonly #stallWindowMs: number;
   /** Narrow-port fallback; FileSchedulerStoreAdapter durably records these keys. */
   readonly #resourceSuppressionKeys = new Set<string>();
@@ -887,6 +1077,12 @@ export class FileTaskController {
   #operatorStartupRetryArmed = false;
   #lastOperatorSignalIdentity: string | undefined;
   #stopped = false;
+  #lastRuntimeDrain: RuntimeEventDrainResult | undefined;
+  #runtimeDrainPasses = 0;
+  #runtimeListedEvents = 0;
+  #runtimeSelectedEvents = 0;
+  #runtimeProgressEventsCoalesced = 0;
+  #runtimeStateTransactions = 0;
 
   constructor(
     readonly store: SchedulerStorePort,
@@ -910,6 +1106,11 @@ export class FileTaskController {
       options.deliveryRetryLimit,
       DEFAULT_DELIVERY_RETRY_LIMIT,
       "Controller delivery retry limit"
+    );
+    this.#taskOrchestrationRetryLimit = positiveInteger(
+      options.taskOrchestrationRetryLimit,
+      DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT,
+      "Controller Task orchestration retry limit"
     );
     this.#stallWindowMs = positiveInteger(
       options.stallWindowMs,
@@ -959,6 +1160,26 @@ export class FileTaskController {
 
   get reconciliationIntervalMs(): number {
     return this.#intervalMs;
+  }
+
+  runtimeMetrics(): Pick<ControllerRuntimeMetrics, "inbox" | "drain"> {
+    const metrics = this.#lastRuntimeDrain?.metrics ?? ZERO_DRAIN_METRICS;
+    return {
+      // Status is intentionally O(1): scanning the inbox while serving the
+      // control socket would recreate the starvation this metric diagnoses.
+      inbox: {
+        depth: this.#lastRuntimeDrain?.remainingEventCount ?? 0,
+        semanticDepth: metrics.remainingSemanticEventCount,
+        progressDepth: metrics.remainingProgressEventCount
+      },
+      drain: {
+        passes: this.#runtimeDrainPasses,
+        listedEvents: this.#runtimeListedEvents,
+        selectedEvents: this.#runtimeSelectedEvents,
+        progressEventsCoalesced: this.#runtimeProgressEventsCoalesced,
+        stateTransactions: this.#runtimeStateTransactions
+      }
+    };
   }
 
   updateReconciliationInterval(intervalMs: number): void {
@@ -1092,12 +1313,14 @@ export class FileTaskController {
       inputNotifications: [],
       autoResolvedInputs: []
     };
+    let pendingRuntimeDrain = false;
     try {
-      while (this.#pendingFull || this.#pendingKeys.size > 0) {
+      while (this.#pendingFull || this.#pendingKeys.size > 0 || pendingRuntimeDrain) {
         const scope: ReconcileScope = this.#pendingFull
           ? { kind: "full" }
           : { kind: "dirty", keys: [...this.#pendingKeys] };
         const runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [];
+        pendingRuntimeDrain = false;
         this.#pendingFull = false;
         this.#pendingKeys.clear();
         try {
@@ -1137,6 +1360,13 @@ export class FileTaskController {
             this.#onMaintenanceFenceDefer
           );
           const secondRuntimeDrain = await this.#drainRuntimeEvents();
+          pendingRuntimeDrain = (
+            (secondRuntimeDrain?.remainingEventCount ?? 0) > 0
+            && (
+              (firstRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
+              || (secondRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
+            )
+          );
           this.#clearPassRetry();
           this.#scheduleRuntimeCleanupRetries(runtimeCleanupOutcomes);
           this.#scheduleDeliveryRetries(result);
@@ -1160,6 +1390,11 @@ export class FileTaskController {
           throw error;
         }
         if (this.#stopped) break;
+        if (this.#pendingFull || this.#pendingKeys.size > 0 || pendingRuntimeDrain) {
+          // A continuous Hook signal stream must yield to socket callbacks
+          // between bounded scheduler passes.
+          await eventLoopTurn();
+        }
       }
       return result;
     } finally {
@@ -1210,6 +1445,13 @@ export class FileTaskController {
     const result = "drainAsync" in processor
       ? await processor.drainAsync(this.#now())
       : processor.drain(this.#now());
+    this.#lastRuntimeDrain = result;
+    this.#runtimeDrainPasses += 1;
+    const metrics = result.metrics ?? ZERO_DRAIN_METRICS;
+    this.#runtimeListedEvents += metrics.listedEventCount;
+    this.#runtimeSelectedEvents += metrics.selectedEventCount;
+    this.#runtimeProgressEventsCoalesced += metrics.progressEventsCoalesced;
+    this.#runtimeStateTransactions += metrics.stateTransactions;
     if (result.failed.length > 0) {
       throw new RuntimeEventApplyError(
         result.failed.map((failure) => failure.error),
@@ -1383,7 +1625,9 @@ export class FileTaskController {
     for (const target of targets) {
       const key = `task:${encodeURIComponent(target.taskId)}` as const;
       const mailbox = this.store.getWorkMailbox(target);
-      const batch = mailbox?.pending ?? mailbox?.processing?.batch;
+      // A newly queued pending batch must not reset the retry identity/bound
+      // while this Controller still owns an older processing batch.
+      const batch = mailbox?.processing?.batch ?? mailbox?.pending;
       if (batch === undefined || batch === null) {
         this.#clearDeliveryRetry(key);
         continue;
@@ -1416,7 +1660,10 @@ export class FileTaskController {
       return;
     }
     const attempts = previous?.attempts ?? 0;
-    if (attempts >= this.#deliveryRetryLimit) {
+    const retryLimit = key.startsWith("task:")
+      ? this.#taskOrchestrationRetryLimit
+      : this.#deliveryRetryLimit;
+    if (attempts >= retryLimit) {
       if (key === "operator") this.#operatorStartupRetryArmed = false;
       this.#terminalizePreparedAfterRetryExhaustion(
         key,
@@ -1527,42 +1774,55 @@ export async function startFileTaskController(
   });
   let stopping = false;
   const lifecycleRequests = new Set<Promise<unknown>>();
+  const dispatcherServiceTime = new ControllerDispatcherServiceTimeMetrics();
   const server = await startControllerServer(home, async (method, params) => {
-    if (stopping) {
-      throw controllerApplicationError("METHOD_NOT_FOUND", "Controller is stopping.");
-    }
-    if (method === "scheduler.signal") {
-      runtime.signal(signalMailboxKey(params));
-      return { accepted: true };
-    }
-    if (method === "scheduler.scan") {
-      if (!isEmptyJsonObject(params)) {
-        throw controllerApplicationError("INVALID_PARAMS", "scheduler.scan params are invalid.");
-      }
-      return schedulerResultJson(await runtime.pump());
-    }
-    if (method === "scheduler.configure") {
-      requireEmptySchedulerConfigureParams(params);
-      const intervalMs = runtime.reloadReconciliationInterval();
-      return { configured: true, reconciliationIntervalMs: intervalMs };
-    }
-    if (dispatcher === undefined) {
-      throw controllerApplicationError("METHOD_NOT_FOUND", "Controller method was not found.");
-    }
-    const request = Promise.resolve(dispatcher(method, params));
-    lifecycleRequests.add(request);
+    const startedAt = monotonicMilliseconds();
+    dispatcherServiceTime.started();
     try {
-      const result = await request;
-      if (
-        method === "runtime.ensure-role-session"
-        && isGlobalOperatorSessionRequest(params)
-        && isStartedRuntimeSessionResult(result)
-      ) {
-        runtime.armOperatorStartupRetry();
+      if (stopping) {
+        throw controllerApplicationError("METHOD_NOT_FOUND", "Controller is stopping.");
       }
-      return result;
+      if (method === "scheduler.signal") {
+        runtime.signal(signalMailboxKey(params));
+        return { accepted: true };
+      }
+      if (method === "scheduler.scan") {
+        if (!isEmptyJsonObject(params)) {
+          throw controllerApplicationError(
+            "INVALID_PARAMS",
+            "scheduler.scan params are invalid."
+          );
+        }
+        return schedulerResultJson(await runtime.pump());
+      }
+      if (method === "scheduler.configure") {
+        requireEmptySchedulerConfigureParams(params);
+        const intervalMs = runtime.reloadReconciliationInterval();
+        return { configured: true, reconciliationIntervalMs: intervalMs };
+      }
+      if (dispatcher === undefined) {
+        throw controllerApplicationError(
+          "METHOD_NOT_FOUND",
+          "Controller method was not found."
+        );
+      }
+      const request = Promise.resolve(dispatcher(method, params));
+      lifecycleRequests.add(request);
+      try {
+        const result = await request;
+        if (
+          method === "runtime.ensure-role-session"
+          && isGlobalOperatorSessionRequest(params)
+          && isStartedRuntimeSessionResult(result)
+        ) {
+          runtime.armOperatorStartupRetry();
+        }
+        return result;
+      } finally {
+        lifecycleRequests.delete(request);
+      }
     } finally {
-      lifecycleRequests.delete(request);
+      dispatcherServiceTime.completed(monotonicMilliseconds() - startedAt);
     }
   }, async () => {
     stopping = true;
@@ -1570,7 +1830,15 @@ export async function startFileTaskController(
     await Promise.allSettled([...lifecycleRequests]);
     await runtime.shutdownAndDrain();
   }, {
-    domainIdentity: options.domainIdentity
+    domainIdentity: options.domainIdentity,
+    status: ({ commandObserver, eventLoopDelay }) => ({
+      ...runtime.runtimeMetrics(),
+      commands: {
+        dispatcher: dispatcherServiceTime.snapshot(),
+        routes: commandObserver.snapshot(),
+        eventLoopDelay: eventLoopDelay.snapshot()
+      }
+    })
   });
   runtime.start();
   const closed = server.closed;
@@ -1584,6 +1852,63 @@ export async function startFileTaskController(
       await runtime.shutdownAndDrain();
     }
   };
+}
+
+/**
+ * Measures dispatcher service time only: the elapsed time inside the FileTask
+ * dispatcher from dispatch to completion. It deliberately excludes the
+ * socket/event-loop wait before routing, which the core server's event-loop
+ * delay telemetry observes separately.
+ */
+class ControllerDispatcherServiceTimeMetrics {
+  #completed = 0;
+  #inFlight = 0;
+  #maximumServiceTimeMs = 0;
+  readonly #buckets = new Map<number, number>(
+    CONTROLLER_LATENCY_BUCKETS_MS.map((threshold) => [threshold, 0])
+  );
+
+  started(): void {
+    this.#inFlight += 1;
+  }
+
+  completed(serviceTimeMs: number): void {
+    this.#inFlight = Math.max(0, this.#inFlight - 1);
+    this.#completed += 1;
+    const bounded = Math.max(0, Math.ceil(serviceTimeMs));
+    this.#maximumServiceTimeMs = Math.max(this.#maximumServiceTimeMs, bounded);
+    for (const threshold of CONTROLLER_LATENCY_BUCKETS_MS) {
+      if (bounded <= threshold) {
+        this.#buckets.set(threshold, (this.#buckets.get(threshold) ?? 0) + 1);
+      }
+    }
+  }
+
+  snapshot(): ControllerRuntimeMetrics["commands"]["dispatcher"] {
+    return {
+      completed: this.#completed,
+      inFlight: this.#inFlight,
+      maximumServiceTimeMs: this.#maximumServiceTimeMs,
+      serviceTimeBuckets: Object.fromEntries(
+        CONTROLLER_LATENCY_BUCKETS_MS.map((threshold) => [
+          `le${threshold}ms`,
+          this.#buckets.get(threshold) ?? 0
+        ])
+      )
+    };
+  }
+}
+
+function eventLoopTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function controlEventLoopTurn(): Promise<void> {
+  // A setImmediate scheduled from the check phase may resume before the next
+  // poll phase. Two turns guarantee already-written socket data gets one poll
+  // opportunity before another synchronous scheduler projection starts.
+  await eventLoopTurn();
+  await eventLoopTurn();
 }
 
 function signalMailboxKey(value: JsonValue): MailboxKey {

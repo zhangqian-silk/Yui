@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -10,11 +10,15 @@ import {
 import { createProductionStorageRegistry } from "./migration/productionRegistry.js";
 import {
   FileTaskStore,
+  STORAGE_STATE_FILE,
+  stateFileFingerprint,
+  StorageRecordError,
   validateCurrentStorageStateSnapshot
 } from "./taskStore.js";
 import {
   ensureStorageSchema,
   inspectStorageSchema,
+  readStorageSchemaManifest,
   STORAGE_SCHEMA_FILE
 } from "./storageSchema.js";
 import { classifyHome } from "./upgrade/homeClassification.js";
@@ -50,6 +54,12 @@ export function initializeCompatibleFileTaskStore(
  * Open current or explicitly compatible-old storage. Compatible records are
  * normalized in memory through strict old-shape validators; FileTaskStore then
  * runs its one current parser and its existing writer emits only current bytes.
+ *
+ * A current Home is opened from a single fingerprint-fenced `state.json`
+ * snapshot: the same bytes drive the record-version inspection, the strict
+ * shape/reference validation, and the returned store's initial cache seed, so
+ * the open never re-reads the (large) state merely to construct or first use
+ * the store.
  */
 export function openCompatibleFileTaskStore(
   home: string,
@@ -57,6 +67,9 @@ export function openCompatibleFileTaskStore(
 ): FileTaskStore {
   const registry = options.registry ?? createProductionStorageRegistry();
   const latest = options.latest ?? latestStorageVersionState();
+  if (inspectStorageSchema(home).status === "current") {
+    return openCurrentFileTaskStore(home, latest);
+  }
   const classification = classifyHome({ home, registry, latest });
   switch (classification.classification.status) {
     case "current":
@@ -72,6 +85,88 @@ export function openCompatibleFileTaskStore(
     case "unsupported":
       throw new StorageCompatibilityError(describeUnsupported(classification.classification));
   }
+}
+
+/**
+ * The one-snapshot open for a Home whose manifest is already current. A single
+ * fingerprint-fenced read of `state.json` supplies:
+ *  - the record-version inspection (structural scan cross-checked against the
+ *    durable manifest, never the strict loader),
+ *  - the strict shape/reference validation (the store's own parser, run while
+ *    seeding its cache), and
+ *  - the returned store's initial cache seed under the same fingerprint.
+ *
+ * A fingerprint that drifts across the read retries once and then fails
+ * closed; a later external writer still invalidates the seeded cache on the
+ * store's next read. Corruption surfaces as the same `StorageCompatibilityError`
+ * diagnosis the classifier produced before this fast path existed.
+ */
+function openCurrentFileTaskStore(
+  home: string,
+  latest: StorageVersionState
+): FileTaskStore {
+  const statePath = join(home, STORAGE_STATE_FILE);
+  if (!existsSync(statePath)) {
+    // No state.json yet: the store's own missing-file path seeds an empty
+    // state without reading anything.
+    return new FileTaskStore(home);
+  }
+  const manifest = readStorageSchemaManifest(home);
+  const snapshot = readFingerprintFencedState(statePath);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(snapshot.raw) as unknown;
+  } catch (error) {
+    throw new StorageCompatibilityError(
+      `Invalid state.json: state.json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  if (!isRecord(parsed)) {
+    throw new StorageCompatibilityError("Invalid state.json: state.json is not a JSON object.");
+  }
+  const inspection = inspectSnapshotVersionState(
+    Object.freeze({ schemaManifest: manifest, state: parsed }),
+    latest
+  );
+  if ("corruption" in inspection) {
+    throw new StorageCompatibilityError(`Invalid state.json: ${inspection.corruption.detail}`);
+  }
+  try {
+    return new FileTaskStore(home, {
+      initialStateSnapshot: { fingerprint: snapshot.fingerprint, raw: snapshot.raw }
+    });
+  } catch (error) {
+    if (error instanceof StorageRecordError) {
+      throw new StorageCompatibilityError(`Invalid state.json: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Read `state.json` once, fenced by the same fingerprint the store's read cache
+ * is keyed on. A fingerprint that changes between the before and after stat
+ * means a concurrent writer is mid-update: retry once (bounded), then fail
+ * closed rather than seed a store from bytes that may be torn.
+ */
+export function readFingerprintFencedState(
+  statePath: string,
+  io: {
+    fingerprint?: (path: string) => string;
+    read?: (path: string) => string;
+  } = {}
+): { raw: string; fingerprint: string } {
+  const fingerprint = io.fingerprint ?? stateFileFingerprint;
+  const read = io.read ?? ((path) => readFileSync(path, "utf8"));
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const before = fingerprint(statePath);
+    const raw = read(statePath);
+    const after = fingerprint(statePath);
+    if (before === after) return { raw, fingerprint: after };
+  }
+  throw new StorageCompatibilityError(
+    "state.json changed while opening; a concurrent writer is updating the Home. Retry the command."
+  );
 }
 
 /**

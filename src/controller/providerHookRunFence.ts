@@ -6,6 +6,14 @@ import {
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
+import {
+  YUI_CONTROL_PLANE_DESCRIPTOR,
+  YUI_TASK_RUNTIME_DESCRIPTOR,
+  assertExactTaskRuntimeEnvironment,
+  exactControlPlaneDigest,
+  parseExactControlPlaneDescriptor,
+  refreshReusedTaskRuntimeDescriptorSource
+} from "../runtime/exactControlPlane.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
 export type ProviderHookRunFence = Readonly<{
@@ -47,9 +55,24 @@ export function resolveProviderHookRunFence(
   const roleName = requireIdentity(environment.YUI_ROLE, "Role name");
   const agentId = requireIdentity(environment.YUI_AGENT_ID, "Agent id");
   const workspace = requireIdentity(environment.YUI_WORKSPACE, "YUI workspace");
-  const launchId = requireIdentity(environment.YUI_LAUNCH_ID, "Launch id");
+  const runtimeSource = environment[YUI_TASK_RUNTIME_DESCRIPTOR];
+  const runtime = runtimeSource === undefined
+    ? undefined
+    : assertExactTaskRuntimeEnvironment(
+        runtimeSource,
+        environment,
+        exactControlPlaneDigest(parseExactControlPlaneDescriptor(requireIdentity(
+          environment[YUI_CONTROL_PLANE_DESCRIPTOR],
+          "Exact control-plane descriptor"
+        ))),
+        home
+      );
+  const launchId = requireIdentity(
+    runtime?.launchId ?? environment.YUI_LAUNCH_ID,
+    "Launch id"
+  );
   const nativeSessionId = requireIdentity(payloadNativeSessionId, "Provider session id");
-  const expectedNativeSessionId = environment.YUI_NATIVE_SESSION_ID;
+  const expectedNativeSessionId = runtime?.nativeSessionId ?? environment.YUI_NATIVE_SESSION_ID;
   if (expectedNativeSessionId !== undefined
     && nativeSessionId !== requireIdentity(expectedNativeSessionId, "YUI native session id")) {
     throw new Error("Provider lifecycle hook native session does not match its launch envelope.");
@@ -79,7 +102,7 @@ export function resolveProviderHookRunFence(
     && !hasRuntimeCleanupObligation(mailbox);
   const executionRef = mailbox?.processing?.executionRef;
   const startupRunId = options.allowPreallocatedClaudeStartup === true
-    ? requireIdentity(environment.YUI_RUN_ID, "Run id")
+    ? requireIdentity(runtime?.runId ?? environment.YUI_RUN_ID, "Run id")
     : undefined;
   const deterministicClaudeStartup = adapterId === "claude"
     && options.allowPreallocatedClaudeStartup === true
@@ -113,6 +136,39 @@ export function resolveProviderHookRunFence(
     throw new Error("Provider lifecycle hook has no matching durable in-flight Run.");
   }
   const runId = inFlight?.runId ?? startupRunId!;
+  let effectiveRuntime = runtime;
+  let effectiveLaunchId = launchId;
+  const sessionLaunchId = session?.launchId;
+  if (
+    runtime !== undefined
+    && session !== undefined
+    && sessionLaunchId !== undefined
+    && typeof runtimeSource === "string"
+    && !runtimeSource.trimStart().startsWith("{")
+    && (
+      runtime.runId !== runId
+      || runtime.launchId !== sessionLaunchId
+      || runtime.nativeSessionId !== session.nativeSessionId
+    )
+  ) {
+    // A reused native pane keeps its original descriptor source. Advance only
+    // that Hook-owned source to the current durable generation before the
+    // volatile fence; the Controller no longer scans history to keep it fresh.
+    effectiveRuntime = refreshReusedTaskRuntimeDescriptorSource(
+      runtimeSource,
+      home,
+      store,
+      {
+        runId,
+        launchId: sessionLaunchId,
+        nativeSessionId: session.nativeSessionId
+      }
+    );
+    effectiveLaunchId = effectiveRuntime.launchId!;
+  }
+  if (effectiveRuntime?.runId !== undefined && effectiveRuntime.runId !== runId) {
+    throw new Error("Provider lifecycle hook Run does not match its current descriptor.");
+  }
   const run = store.getActiveAgentRun(taskId, roleName);
   if (run === null
     || run.id !== runId
@@ -126,7 +182,7 @@ export function resolveProviderHookRunFence(
   }
   if (session !== undefined) {
     if (session.adapterId !== adapterId
-      || session.launchId !== launchId
+      || session.launchId !== effectiveLaunchId
       || session.nativeSessionId !== nativeSessionId
       || session.effective.workspace.root !== workspace) {
       throw new Error("Provider lifecycle hook Session does not match its durable generation.");
@@ -143,7 +199,7 @@ export function resolveProviderHookRunFence(
     taskId,
     roleName,
     agentId,
-    launchId,
+    launchId: effectiveLaunchId,
     runId,
     ...(inFlight?.receiptId === undefined ? {} : { receiptId: inFlight.receiptId }),
     nativeSessionId,
