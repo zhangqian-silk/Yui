@@ -1754,6 +1754,49 @@ test("explicit reconciliation prepares active Role worktrees before requesting a
   }
 });
 
+test("explicit reconciliation does not scan when Task workspace preparation rejects", async () => {
+  const preparationError = new Error("Role has an active Run: task-1/worker.");
+  const calls = [];
+  let observedError;
+  let errorObserved;
+  const failed = new Promise((resolve) => { errorObserved = resolve; });
+  const runtime = new FileTaskWorkflowRuntime(
+    "/tmp/yui-workspace-reconcile-rejected",
+    {
+      getTask: () => ({
+        id: "task-1",
+        status: "active",
+        projectBindings: [{ projectId: "project-1" }]
+      })
+    },
+    {},
+    {},
+    {},
+    {
+      async prepareTaskWorkspace() {
+        calls.push("prepare");
+        throw preparationError;
+      }
+    },
+    {
+      call: async (_home, method) => {
+        calls.push(method);
+        return {};
+      },
+      onError(error) {
+        observedError = error;
+        errorObserved();
+      }
+    }
+  );
+
+  runtime.reconcileTask("task-1");
+  await failed;
+
+  assert.equal(observedError, preparationError);
+  assert.deepEqual(calls, ["prepare"]);
+});
+
 test("Controller signals coalesce a burst into one delayed targeted pass", async () => {
   const taskReads = [];
   const store = emptyStore();

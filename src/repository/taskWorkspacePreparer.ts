@@ -11,7 +11,12 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { retireTaskRoleSessionsForWorkspace } from "../executor/agentExecutor.js";
-import { updateRole } from "../role/role.js";
+import { updateRole, type TaskRole } from "../role/role.js";
+import {
+  hasRuntimeCleanupObligation,
+  isRuntimeLaunchReservation,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 import {
   attachReviewRoundWorkspace,
   recordReviewWorkspaceDisposition
@@ -41,6 +46,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import type { ExecutionLaneGitSnapshot } from "../execution/executionGroup.js";
 import type { AgentRun } from "../run/agentRun.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   NodeGitWorkspace,
   worktreeIdentity,
@@ -488,17 +494,41 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           // The Role field is only a cwd/snapshot hint.  Preserve the hint for
           // an active WorkItem assignment; the durable owner is the WorkItem,
           // not this Role record.  Other Roles use Task main.
-          const assignedItem = tx.listWorkItems(task.id).find((candidate) => (
-            candidate.assignee === role.name
-              && !["completed", "failed", "retired"]
-                .includes(candidate.status)
-          ));
+          // Prefer the active Run's exact WorkItem for this Role; fall back
+          // to the first queued WorkItem only when no active Run owns the Role.
+          const activeRoleRun = tx.getActiveAgentRun(task.id, role.name);
+          const activeRunItem = activeRoleRun !== null
+            && activeRoleRun.purpose === "execution"
+            && activeRoleRun.workItemId !== undefined
+            ? tx.getWorkItem(task.id, activeRoleRun.workItemId)
+            : null;
+          const assignedItem = activeRunItem !== null
+            && activeRunItem.assignee === role.name
+            && !["completed", "failed", "retired"].includes(activeRunItem.status)
+            ? activeRunItem
+            : tx.listWorkItems(task.id).find((candidate) => (
+              candidate.assignee === role.name
+                && !["completed", "failed", "retired"]
+                  .includes(candidate.status)
+            ));
           const assignedWorkspace = assignedItem === undefined
             ? null
             : tx.getWorkItemWorkspace(task.id, assignedItem.id);
           const target = assignedWorkspace?.root ?? root;
           if (role.workspace !== target) {
-            retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
+            if (
+              assignedItem === undefined
+              || assignedWorkspace === null
+              || !canCorrectActiveWorkItemRoleWorkspaceHint(
+                tx,
+                task.id,
+                role,
+                assignedItem,
+                assignedWorkspace
+              )
+            ) {
+              retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
+            }
             tx.saveRole(task.id, updateRole(role, { workspace: target }, timestamp));
           }
         }
@@ -2798,6 +2828,17 @@ function executionLaneLineage(
     if (round === null) throw new Error(`ReviewRound not found: ${hint.reviewRoundId}.`);
     return { purpose: "review", workItemId: round.workItemId, reviewRoundId: round.id };
   }
+  // Prefer the active Run's exact WorkItem for this Lane; fall back to the
+  // first queued WorkItem only when no active Run owns the Lane.
+  const activeLaneRun = store.listAgentRuns(task.id)
+    .find((run) => run.status === "active"
+      && run.purpose === "execution"
+      && run.executionGroupId === executionGroupId
+      && run.executionLaneId === executionLaneId
+      && run.workItemId !== undefined);
+  if (activeLaneRun?.workItemId !== undefined) {
+    return { purpose: "execution", workItemId: activeLaneRun.workItemId, reviewRoundId: "" };
+  }
   for (const item of store.listWorkItems(task.id)) {
     if (workItemExecutionGroupById(item, executionGroupId)?.lanes.some(({ id }) => id === executionLaneId)) {
       return { purpose: "execution", workItemId: item.id, reviewRoundId: "" };
@@ -2882,6 +2923,93 @@ function retireWorkspaceBoundSession(
   if (sessions !== null) {
     store.saveTaskRoleSessionSet(retireTaskRoleSessionsForWorkspace(sessions, now));
   }
+}
+
+function canCorrectActiveWorkItemRoleWorkspaceHint(
+  store: TaskStore,
+  taskId: string,
+  role: TaskRole,
+  item: WorkItem,
+  workspace: ManagedWorkspace
+): boolean {
+  if (
+    role.taskId !== taskId
+    || role.status !== "running"
+    || item.taskId !== taskId
+    || item.assignee !== role.name
+    || ["completed", "failed", "retired"].includes(item.status)
+    || workspace.owner.type !== "work-item"
+    || workspace.owner.taskId !== taskId
+    || workspace.owner.workItemId !== item.id
+  ) return false;
+
+  const writableProjects = workspace.entries
+    .filter(({ access }) => access === "write")
+    .map(({ projectId }) => projectId)
+    .sort();
+  if (!isDeepStrictEqual(writableProjects, [...item.writeProjectIds].sort())) return false;
+
+  const run = store.getActiveAgentRun(taskId, role.name);
+  if (
+    run === null
+    || run.status !== "active"
+    || run.purpose !== "execution"
+    || run.workItemId !== item.id
+    || run.workspace === undefined
+    || !sameManagedWorkspaceIdentity(run.workspace, workspace)
+    || run.effective.agentId !== role.activeAgentId
+    || !sameEffectiveWorkspace(run.effective.workspace, workspace)
+  ) return false;
+
+  const sessions = store.getTaskRoleSessionSet(taskId, role.name);
+  const session = sessions?.sessions[sessions.activeAgentId];
+  if (
+    sessions === null
+    || sessions.owner.scope !== "task"
+    || sessions.owner.taskId !== taskId
+    || sessions.owner.roleName !== role.name
+    || sessions.activeAgentId !== role.activeAgentId
+    || sessions.inFlight === null
+    || sessions.inFlight.agentId !== role.activeAgentId
+    || sessions.inFlight.runId !== run.id
+    || sessions.inFlight.receiptId !== formatAgentRunReceiptId(taskId, run.id)
+    || session === undefined
+    || session.agentId !== role.activeAgentId
+    || session.adapterId !== run.effective.adapterId
+    || session.launchId === undefined
+    || session.nativeSessionId === undefined
+    || !["ready", "running"].includes(session.status)
+    || !isDeepStrictEqual(session.effective, run.effective)
+    || !sameEffectiveWorkspace(session.effective.workspace, workspace)
+  ) return false;
+
+  const lifecycleMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId,
+    roleName: role.name
+  }));
+  if (hasRuntimeCleanupObligation(lifecycleMailbox)) return false;
+  const lifecycle = lifecycleMailbox?.processing;
+  if (lifecycle !== null
+    && lifecycle !== undefined
+    && isRuntimeLaunchReservation(lifecycle)) {
+    const executionRef = lifecycle.executionRef;
+    if (
+      !isRuntimeLaunchReservation(lifecycle, session.launchId)
+      || executionRef?.type !== "run"
+      || executionRef.taskId !== taskId
+      || executionRef.id !== run.id
+    ) return false;
+  }
+  return true;
+}
+
+function sameEffectiveWorkspace(
+  effective: AgentRun["effective"]["workspace"],
+  workspace: ManagedWorkspace
+): boolean {
+  return effective.root === workspace.root
+    && isDeepStrictEqual(effective.entries, workspace.entries);
 }
 
 function sameManagedWorkspace(left: ManagedWorkspace, right: ManagedWorkspace): boolean {
