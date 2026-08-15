@@ -7,57 +7,34 @@
  * touches the db; it sends commands over a `MessageChannel` port and receives
  * results.
  *
- * Protocol (see storeRpc.ts):
- *   main -> worker: init | call | transaction | observer | cancel | shutdown
- *   worker -> main: ready | result | already-applied | error
+ * The port handshake, dispatch, cancellation observation, and error
+ * serialization are provided by the shared `core/boundedRpc` worker host
+ * (`runRpcWorker`); this module supplies the storage dialect:
  *
- * Semantics:
- *   - Writes with a `requestId` are idempotent: the worker consults the durable
- *     outbox before executing and records the effect in the same transaction
- *     (§5.4). A retried write after a crash returns `already-applied`.
- *   - `transaction` runs an ordered command batch inside one
- *     `BEGIN IMMEDIATE … COMMIT` on the writer (§3.2), yielding between commands
- *     so a `cancel` can roll back an open transaction (§3.1). Committed batches
- *     are not undone.
+ *   - `call` ......... a `TaskStore` method. Reads use the read pool; writes
+ *                      run on the writer inside a transaction and are made
+ *                      idempotent via the durable outbox (§5.4): a retried
+ *                      write after a crash returns `already-applied`.
+ *   - `transaction` .. an ordered command batch inside one
+ *                      `BEGIN IMMEDIATE … COMMIT` on the writer (§3.2),
+ *                      yielding between commands so a `cancel` can roll back an
+ *                      open transaction (§3.1). Committed batches are not undone.
+ *   - `observer` ..... a controller observer method hosted by the worker (the
+ *                      `FileSchedulerStoreAdapter` folds run here, off the main
+ *                      event loop).
  *   - `expectedRevision` enforces the global revision CAS in the same txn
- *     (§5.3); a mismatch fails with `StorageConflictError`.
- *   - `cancel` is processed immediately (bypasses the serial queue) so it can
- *     interrupt a yielding batch.
- *   - `observer` invokes a controller observer method hosted by the worker
- *     (the `FileSchedulerStoreAdapter` folds run here, off the main event loop).
+ *                      (§5.3); a mismatch fails with `StorageConflictError`.
  *
  * `synchronous=FULL` is never weakened; the worker opens the store with the same
- * pragmatics as the in-process path (WAL, FULL, busy_timeout).
+ * pragmas as the in-process path (WAL, FULL, busy_timeout).
  */
-import { parentPort } from "node:worker_threads";
-import type { MessagePort } from "node:worker_threads";
+import { runRpcWorker } from "../core/boundedRpc.js";
 import { SqliteTaskStore } from "./sqliteStore.js";
-import {
-  StorageCancelledError,
-  StorageConflictError,
-  StorageRecordError
-} from "./taskStore.js";
+import { StorageRecordError } from "./taskStore.js";
 import type {
-  SerializedError,
   WorkerRequest,
   WorkerResponse
 } from "./storeRpc.js";
-
-// -- error serialization (mirrors storeRpc.ts) -------------------------------
-
-function serializeError(error: unknown): SerializedError {
-  if (error instanceof Error) {
-    return {
-      name: error.name,
-      message: error.message,
-      ...(error.stack === undefined ? {} : { stack: error.stack }),
-      ...("code" in error && typeof (error as { code?: unknown }).code === "string"
-        ? { code: (error as { code: string }).code }
-        : {})
-    };
-  }
-  return { name: "Error", message: String(error) };
-}
 
 // -- method invocation -------------------------------------------------------
 
@@ -75,40 +52,32 @@ type ObserverHost = {
   invoke(method: string, args: readonly unknown[]): unknown;
 };
 
+/**
+ * Sentinel returned by a handler when the durable outbox already records the
+ * request's effect (§5.4). The host's `result` builder maps it to an
+ * `already-applied` response. Store results are plain JSON data, so a Symbol
+ * sentinel can never collide with a real result.
+ */
+const ALREADY_APPLIED = Symbol("already-applied");
+
 const state: {
   writer: SqliteTaskStore | undefined;
   readers: SqliteTaskStore[];
   readIndex: number;
   observer: ObserverHost | undefined;
   cancelled: Set<string>;
-  queue: Promise<void>;
-  port: MessagePort | undefined;
 } = {
   writer: undefined,
   readers: [],
   readIndex: 0,
   observer: undefined,
-  cancelled: new Set(),
-  queue: Promise.resolve(),
-  port: undefined
+  cancelled: new Set()
 };
-
-function post(message: WorkerResponse): void {
-  state.port?.postMessage(message);
-}
 
 function nextReader(): SqliteTaskStore {
   const reader = state.readers[state.readIndex % state.readers.length];
   state.readIndex += 1;
   return reader;
-}
-
-function enqueue(fn: () => Promise<void>): void {
-  state.queue = state.queue.then(fn).catch((error) => {
-    // Backstop: a handler threw without posting a response. Fail the worker
-    // rather than hang the caller.
-    console.error("[persistenceWorker] unhandled handler error:", error);
-  });
 }
 
 // -- request handlers --------------------------------------------------------
@@ -140,141 +109,118 @@ async function handleInit(request: Extract<WorkerRequest, { kind: "init" }>): Pr
       }
     };
   }
-  post({ kind: "ready" });
 }
 
-async function handleCall(request: Extract<WorkerRequest, { kind: "call" }>): Promise<void> {
+async function handleCall(request: Extract<WorkerRequest, { kind: "call" }>): Promise<unknown> {
   const { requestId, method, args, readOnly } = request;
-  try {
-    if (readOnly) {
-      const result = invokeMethod(nextReader(), method, args);
-      post({ kind: "result", requestId, result });
-      return;
-    }
-    // Write. With a requestId, make it idempotent via the durable outbox
-    // (§5.4): skip if already committed, otherwise record the effect in the
-    // same transaction. The worker is single-threaded, so the check and the
-    // write are race-free; the UNIQUE constraint is the backstop.
-    const writer = state.writer;
-    if (writer === undefined) throw new Error("Worker not initialized.");
-    if (requestId !== undefined && writer.hasOutboxEntry(requestId)) {
-      post({ kind: "already-applied", requestId });
-      return;
-    }
-    const result = writer.transaction(
-      (store) => invokeMethod(store, method, args),
-      requestId === undefined ? undefined : { requestId }
-    );
-    post({ kind: "result", requestId, result });
-  } catch (error) {
-    post({ kind: "error", requestId, error: serializeError(error) });
+  if (readOnly) {
+    return invokeMethod(nextReader(), method, args);
   }
+  // Write. With a requestId, make it idempotent via the durable outbox
+  // (§5.4): skip if already committed, otherwise record the effect in the
+  // same transaction. The worker is single-threaded, so the check and the
+  // write are race-free; the UNIQUE constraint is the backstop.
+  const writer = state.writer;
+  if (writer === undefined) throw new Error("Worker not initialized.");
+  if (writer.hasOutboxEntry(requestId)) {
+    return ALREADY_APPLIED;
+  }
+  return writer.transaction(
+    (store) => invokeMethod(store, method, args),
+    { requestId }
+  );
 }
 
 async function handleTransaction(
   request: Extract<WorkerRequest, { kind: "transaction" }>
-): Promise<void> {
+): Promise<unknown> {
   const { requestId, commands, expectedRevision } = request;
   const writer = state.writer;
   if (writer === undefined) {
-    post({ kind: "error", requestId, error: serializeError(new Error("Worker not initialized.")) });
-    return;
+    throw new Error("Worker not initialized.");
   }
+  // Idempotent replay: a batch that committed before a crash is not re-run.
+  if (writer.hasOutboxEntry(requestId)) {
+    return ALREADY_APPLIED;
+  }
+  const shouldCancel = (): boolean => state.cancelled.has(requestId);
   try {
-    // Idempotent replay: a batch that committed before a crash is not re-run.
-    if (writer.hasOutboxEntry(requestId)) {
-      post({ kind: "already-applied", requestId });
-      return;
-    }
-    const shouldCancel = () => state.cancelled.has(requestId);
-    const results = await writer.transactionAsyncBatch(commands, {
+    return await writer.transactionAsyncBatch(commands, {
       requestId,
       ...(expectedRevision === undefined ? {} : { expectedRevision }),
       shouldCancel
     });
+  } finally {
     state.cancelled.delete(requestId);
-    post({ kind: "result", requestId, result: results });
-  } catch (error) {
-    state.cancelled.delete(requestId);
-    post({ kind: "error", requestId, error: serializeError(error) });
   }
 }
 
-async function handleObserver(request: Extract<WorkerRequest, { kind: "observer" }>): Promise<void> {
-  const { requestId, method, args } = request;
-  try {
-    if (state.observer === undefined) {
-      throw new Error("Worker has no observer host (observerModule not provided at init).");
+async function handleObserver(request: Extract<WorkerRequest, { kind: "observer" }>): Promise<unknown> {
+  if (state.observer === undefined) {
+    throw new Error("Worker has no observer host (observerModule not provided at init).");
+  }
+  return state.observer.invoke(request.method, request.args);
+}
+
+// -- worker host --------------------------------------------------------------
+
+runRpcWorker<WorkerRequest, WorkerResponse>({
+  serial: true,
+  kindOf: (request) => {
+    switch (request.kind) {
+      case "init":
+        return "init";
+      case "cancel":
+        return "cancel";
+      case "shutdown":
+        return "shutdown";
+      case "call":
+      case "transaction":
+      case "observer":
+        return "request";
     }
-    const result = state.observer.invoke(method, args);
-    post({ kind: "result", requestId, result });
-  } catch (error) {
-    post({ kind: "error", requestId, error: serializeError(error) });
-  }
-}
-
-async function handleShutdown(): Promise<void> {
-  try {
+  },
+  requestIdOf: (request) => {
+    switch (request.kind) {
+      case "call":
+      case "transaction":
+      case "observer":
+      case "cancel":
+        return request.requestId;
+      case "init":
+      case "shutdown":
+        return undefined;
+    }
+  },
+  init: (request) => handleInit(request as Extract<WorkerRequest, { kind: "init" }>),
+  handle: (request) => {
+    switch (request.kind) {
+      case "call":
+        return handleCall(request);
+      case "transaction":
+        return handleTransaction(request);
+      case "observer":
+        return handleObserver(request);
+      case "init":
+      case "cancel":
+      case "shutdown":
+        throw new Error(`Unexpected request kind for handle: ${request.kind}`);
+    }
+  },
+  cancel: (requestId) => {
+    state.cancelled.add(requestId);
+  },
+  shutdown: async () => {
     for (const reader of state.readers) {
       try { reader.close(); } catch { /* already closed */ }
     }
     try { state.writer?.close(); } catch { /* already closed */ }
-  } finally {
-    process.exit(0);
-  }
-}
-
-// -- message dispatch --------------------------------------------------------
-
-function dispatch(message: WorkerRequest): void {
-  switch (message.kind) {
-    case "cancel":
-      // Process immediately so a yielding transaction batch can observe it
-      // between commands (§3.1).
-      state.cancelled.add(message.requestId);
-      return;
-    case "shutdown":
-      void handleShutdown();
-      return;
-    case "init":
-      enqueue(() => handleInit(message));
-      return;
-    case "call":
-      enqueue(() => handleCall(message));
-      return;
-    case "transaction":
-      enqueue(() => handleTransaction(message));
-      return;
-    case "observer":
-      enqueue(() => handleObserver(message));
-      return;
-    default: {
-      const exhaustive: never = message;
-      console.error("[persistenceWorker] unknown request:", exhaustive);
-    }
-  }
-}
-
-// -- bootstrap ----------------------------------------------------------------
-
-const port = parentPort;
-if (port === null) {
-  throw new Error("persistenceWorker must be run as a worker thread.");
-}
-
-port.once("message", (value: { port: MessagePort }) => {
-  const messagePort = value.port;
-  state.port = messagePort;
-  messagePort.on("message", (message: WorkerRequest) => {
-    try {
-      dispatch(message);
-    } catch (error) {
-      // A synchronous dispatch failure: surface it. Init failures crash the
-      // worker (the client restarts); request failures are posted per-handler.
-      console.error("[persistenceWorker] dispatch error:", error);
-    }
-  });
-  messagePort.on("messageerror", (error) => {
-    console.error("[persistenceWorker] message deserialization error:", error);
-  });
+  },
+  ready: () => ({ kind: "ready" }),
+  result: (requestId, value) => (
+    value === ALREADY_APPLIED
+      ? { kind: "already-applied", requestId }
+      : { kind: "result", requestId, result: value }
+  ),
+  error: (requestId, error) => ({ kind: "error", requestId, error })
 });

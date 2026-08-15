@@ -79,8 +79,10 @@ import {
 } from "./domainIdentity.js";
 import { createEphemeralResourceReaper } from "./ephemeralResourceReaper.js";
 import { scanControllerResourceInventory } from "./resourceInventoryLinux.js";
+import { ResourceInventoryClient } from "./resourceInventoryRpc.js";
 import {
   createRuntimeResourceActivityTracker,
+  type RuntimePaneFact,
   type RuntimeResourceSampleIdentity
 } from "./resourceInventory.js";
 
@@ -134,6 +136,12 @@ export async function startFileTaskControllerRuntime(
         environment: options.environment,
         observerModule: new URL("./fileSchedulerStoreAdapter.js", import.meta.url)
       })
+    : undefined;
+  // When the worker backend is active, the blocking /proc inventory scan runs
+  // in the inventory worker (off the main event loop); the scheduler and the
+  // ephemeral reaper consume the same inventory shape through this client (§3.3).
+  const inventoryClient = useWorker
+    ? new ResourceInventoryClient()
     : undefined;
   const schedulerStore = options.schedulerStore ?? new FileSchedulerStoreAdapter(store);
   const domainIdentity = options.domainIdentity
@@ -227,6 +235,26 @@ export async function startFileTaskControllerRuntime(
       runtimeIsolation
     }
   );
+  // One inventory scan per scheduler pass. When the worker backend is active
+  // the blocking /proc scan runs in the inventory worker; otherwise it runs on
+  // the main thread (file backend, unchanged).
+  const scanInventory = (panes: readonly RuntimePaneFact[]) => inventoryClient !== undefined
+    ? inventoryClient.scan({
+        currentHome: home,
+        scope: "current",
+        panes,
+        ...(options.environment === undefined
+          ? {}
+          : { environment: options.environment })
+      })
+    : scanControllerResourceInventory({
+        currentHome: home,
+        scope: "current",
+        panes,
+        ...(options.environment === undefined
+          ? {}
+          : { environment: options.environment })
+      });
   const delivery = options.delivery ?? new ExecutorRegistry(
     planner,
     tmux,
@@ -236,14 +264,7 @@ export async function startFileTaskControllerRuntime(
       promptPush,
       launchCoordinator,
       roleResourceInventory: async (panes, inputs) => {
-        const inventory = await scanControllerResourceInventory({
-          currentHome: home,
-          scope: "current",
-          panes,
-          ...(options.environment === undefined
-            ? {}
-            : { environment: options.environment })
-        });
+        const inventory = await scanInventory(panes);
         return inventory.resources.flatMap((resource) => {
           if (resource.kind !== "agent-session") return [];
           const owner = resource.owner;
@@ -318,7 +339,20 @@ export async function startFileTaskControllerRuntime(
           // recovery bounded to that domain; cross-home cleanup remains an
           // explicit `controller cleanup --all` inventory operation.
           scope: "current",
-          environment: options.environment
+          environment: options.environment,
+          // When the worker backend is active, the reaper's scan runs in the
+          // inventory worker too (same cadence, same inventory shape).
+          ...(inventoryClient === undefined
+            ? {}
+            : {
+                scan: () => inventoryClient.scan({
+                  currentHome: home,
+                  scope: "current",
+                  ...(options.environment === undefined
+                    ? {}
+                    : { environment: options.environment })
+                })
+              })
         }));
   const lifecycleDispatcher = createRuntimeLifecycleDispatcher(
     store,
@@ -393,6 +427,7 @@ export async function startFileTaskControllerRuntime(
       await running.close();
       // Release the worker's database connections when the worker backend is active.
       await asyncStoreClient?.close();
+      await inventoryClient?.close();
     },
     store,
     schedulerStore,

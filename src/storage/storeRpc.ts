@@ -2,16 +2,16 @@
  * Bounded RPC seam for the persistence Worker Thread (task-21, work-item-5).
  *
  * The main thread talks to the persistence worker (storage/persistenceWorker)
- * over a `MessageChannel` port. This module provides:
+ * over a `MessageChannel` port. The backpressure, cancellation, and
+ * fault-boundary machinery lives in the shared `core/boundedRpc` module; this
+ * module adds the storage dialect:
  *
  *   - {@link AsyncTaskStore} ........ the async counterpart to `TaskStore`
  *     (design §6): every method returns a promise; the worker owns the
  *     `SqliteTaskStore` connection, the main thread never touches the db.
- *   - {@link AsyncTaskStoreClient} .. the client: serializes requests, bounds
- *     in-flight requests (default 64) and queue depth, applies backpressure
- *     (callers await; the socket keeps draining), dedupes by `requestId`
- *     (outbox, §5.4), honours `AbortSignal` cancellation (§3.1), and restarts
- *     the worker + replays unacknowledged requests on crash (§3.1 fault boundary).
+ *   - {@link AsyncTaskStoreClient} .. the client: serializes requests, applies
+ *     the storage idempotency/dialect rules on top of the shared bounded RPC
+ *     (outbox §5.4, `AbortSignal` cancellation §3.1, restart + replay §3.1).
  *   - {@link StoreCommand} .......... one variant per `TaskStore` op, so
  *     `transactionAsync` ships an ordered batch that the worker runs inside one
  *     `BEGIN IMMEDIATE … COMMIT` (§3.2).
@@ -21,14 +21,21 @@
  * ({@link resolveStoreWorkerEnabled}). Rollback to the file store is a config
  * flip (§6).
  */
-import { Worker, MessageChannel } from "node:worker_threads";
-import type { MessagePort } from "node:worker_threads";
+import {
+  BoundedRpcClient,
+  nextRequestId,
+  type BoundedRpcProtocol,
+  type SerializedError
+} from "../core/boundedRpc.js";
 import {
   StorageCancelledError,
   StorageConflictError,
   StorageRecordError,
   type TaskStore
 } from "./taskStore.js";
+
+// Re-exported for the persistence worker and existing importers.
+export type { SerializedError };
 
 // -- Protocol ----------------------------------------------------------------
 
@@ -53,14 +60,6 @@ export type WorkerRequest =
   | { kind: "observer"; requestId: string; method: string; args: unknown[] }
   | { kind: "cancel"; requestId: string }
   | { kind: "shutdown" };
-
-/** A serialized error crossing the thread boundary. */
-export type SerializedError = Readonly<{
-  name: string;
-  message: string;
-  stack?: string;
-  code?: string;
-}>;
 
 /** Responses posted worker -> main. */
 export type WorkerResponse =
@@ -206,85 +205,7 @@ function isReadOnlyMethod(method: string): boolean {
   return READ_ONLY_STORE_METHODS.has(method);
 }
 
-// -- Bounded slot pool (backpressure) ----------------------------------------
-
-/**
- * An async semaphore with a bounded waiter queue (§3.1). `acquire` waits when
- * all permits are in flight; when the waiter queue is full, callers wait on the
- * backpressure condition instead. Callers always await (they already return
- * promises), so the socket keeps accepting and draining — the main event loop
- * is never blocked.
- */
-export class BoundedSlotPool {
-  readonly #maxInFlight: number;
-  #permits: number;
-  readonly #maxQueue: number;
-  #waiters: Array<() => void> = [];
-  #backpressure: Array<() => void> = [];
-
-  constructor(maxInFlight: number, maxQueue: number) {
-    if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1) {
-      throw new Error(`maxInFlight must be a positive integer: ${maxInFlight}`);
-    }
-    if (!Number.isSafeInteger(maxQueue) || maxQueue < 0) {
-      throw new Error(`maxQueue must be a non-negative integer: ${maxQueue}`);
-    }
-    this.#maxInFlight = maxInFlight;
-    this.#permits = maxInFlight;
-    this.#maxQueue = maxQueue;
-  }
-
-  async acquire(): Promise<void> {
-    // Backpressure: the waiter queue is full. Wait for it to drain before
-    // queueing (the socket keeps draining; callers await without blocking).
-    while (this.#waiters.length >= this.#maxQueue) {
-      await new Promise<void>((resolve) => this.#backpressure.push(resolve));
-    }
-    if (this.#permits > 0) {
-      this.#permits -= 1;
-      return;
-    }
-    await new Promise<void>((resolve) => this.#waiters.push(resolve));
-    // A released permit was handed directly to this waiter.
-  }
-
-  release(): void {
-    const waiter = this.#waiters.shift();
-    if (waiter !== undefined) {
-      waiter();
-      return;
-    }
-    this.#permits += 1;
-    const drained = this.#backpressure.shift();
-    if (drained !== null && drained !== undefined) drained();
-  }
-
-  /** Current queue depth (waiters), for tests/metrics. */
-  get queueDepth(): number {
-    return this.#waiters.length;
-  }
-
-  /** Currently in-flight permits, for tests/metrics. */
-  get inFlight(): number {
-    return this.#maxInFlight - this.#permits;
-  }
-}
-
-// -- Error serialization -----------------------------------------------------
-
-function serializeError(error: unknown): SerializedError {
-  if (error instanceof Error) {
-    return {
-      name: error.name,
-      message: error.message,
-      ...(error.stack === undefined ? {} : { stack: error.stack }),
-      ...("code" in error && typeof (error as { code?: unknown }).code === "string"
-        ? { code: (error as { code: string }).code }
-        : {})
-    };
-  }
-  return { name: "Error", message: String(error) };
-}
+// -- Error deserialization (storage dialect) ---------------------------------
 
 function deserializeError(serialized: SerializedError): Error {
   const { name, message } = serialized;
@@ -298,21 +219,53 @@ function deserializeError(serialized: SerializedError): Error {
   return error;
 }
 
-// -- Client ------------------------------------------------------------------
+// -- Storage protocol adapter -------------------------------------------------
 
-type PendingRequest = {
-  readonly resolve: (value: unknown) => void;
-  readonly reject: (error: unknown) => void;
-  readonly request: WorkerRequest;
-  readonly abortListener?: (() => void) | undefined;
-  slotReleased: boolean;
-};
-
-let requestCounter = 0;
-function nextRequestId(): string {
-  requestCounter += 1;
-  return `rpc-${process.pid}-${Date.now().toString(36)}-${requestCounter.toString(36)}`;
+function storageProtocol(
+  home: string,
+  options: RpcOptions
+): BoundedRpcProtocol<WorkerRequest, WorkerResponse> {
+  return {
+    initRequest: () => ({
+      kind: "init",
+      home,
+      ...(options.readPoolSize === undefined ? {} : { readPoolSize: options.readPoolSize }),
+      ...(options.observerModule === undefined
+        ? {}
+        : { observerModule: String(options.observerModule) })
+    }),
+    cancelRequest: (requestId) => ({ kind: "cancel", requestId }),
+    shutdownRequest: () => ({ kind: "shutdown" }),
+    isReady: (response) => response.kind === "ready",
+    responseRequestId: (response) => {
+      if (response.kind === "ready") {
+        throw new Error("ready response has no requestId.");
+      }
+      return response.requestId;
+    },
+    settle: (response, settlement) => {
+      if (response.kind === "result") {
+        settlement.resolve(response.result);
+        return;
+      }
+      if (response.kind === "already-applied") {
+        // The effect committed before a crash; the retry is deduped (§5.4). The
+        // original result is not retained; callers needing it re-read. Observer
+        // callers treat `undefined` as "applied".
+        settlement.resolve(undefined);
+        return;
+      }
+      if (response.kind === "error") {
+        settlement.reject(deserializeError(response.error));
+      }
+    },
+    abortError: (beforeSend) => new StorageCancelledError(
+      beforeSend ? "Request aborted before it was sent." : "Request aborted."
+    )
+  };
 }
+
+// -- Client ------------------------------------------------------------------
 
 /**
  * The main-thread client for the persistence worker. Implements
@@ -322,214 +275,23 @@ function nextRequestId(): string {
 export class AsyncTaskStoreClient {
   readonly #home: string;
   readonly #options: RpcOptions;
-  readonly #slots: BoundedSlotPool;
-  readonly #pending = new Map<string, PendingRequest>();
-  #worker: Worker | undefined;
-  #port: MessagePort | undefined;
-  #ready: Promise<void>;
-  #readyResolve: (() => void) | undefined;
-  #readyReject: ((error: unknown) => void) | undefined;
-  #readyFired = false;
-  #closed = false;
-  #restarting = false;
-  #generation = 0;
+  readonly #rpc: BoundedRpcClient<WorkerRequest, WorkerResponse>;
 
   constructor(home: string, options: RpcOptions = {}) {
     this.#home = home;
     this.#options = options;
-    this.#slots = new BoundedSlotPool(
-      options.maxInFlight ?? 64,
-      options.maxQueue ?? 256
-    );
-    this.#ready = this.#newReadyPromise();
-    this.#spawnWorker();
-  }
-
-  #newReadyPromise(): Promise<void> {
-    this.#readyFired = false;
-    return new Promise<void>((resolve, reject) => {
-      this.#readyResolve = resolve;
-      this.#readyReject = reject;
-    });
-  }
-
-  #workerUrl(): URL {
-    if (this.#options.workerScript !== undefined) {
-      return this.#options.workerScript instanceof URL
-        ? this.#options.workerScript
-        : new URL(this.#options.workerScript);
-    }
-    return new URL("./persistenceWorker.js", import.meta.url);
-  }
-
-  #spawnWorker(): void {
-    const generation = this.#generation;
-    const worker = new Worker(this.#workerUrl(), {
-      workerData: { home: this.#home }
-    });
-    const channel = new MessageChannel();
-    worker.postMessage({ port: channel.port2 }, [channel.port2]);
-    const port = channel.port1;
-    this.#worker = worker;
-    this.#port = port;
-
-    port.on("message", (response: WorkerResponse) => {
-      if (response.kind === "ready") {
-        if (!this.#readyFired) {
-          this.#readyFired = true;
-          this.#readyResolve?.();
-        }
-        return;
-      }
-      this.#handleResponse(response);
-    });
-    worker.on("error", (error) => {
-      // A worker-level error (e.g. uncaught exception). Before ready, fail the
-      // ready handshake; after ready, the exit handler owns restart.
-      if (!this.#readyFired) {
-        this.#readyFired = true;
-        this.#readyReject?.(error);
-      }
-    });
-    worker.on("exit", (code) => {
-      if (this.#closed || code === 0) return;
-      if (generation !== this.#generation) return; // stale worker
-      void this.#restart();
-    });
-
-    // Send init once the port is connected.
-    const init: WorkerRequest = {
-      kind: "init",
-      home: this.#home,
-      ...(this.#options.readPoolSize === undefined ? {} : { readPoolSize: this.#options.readPoolSize }),
-      ...(this.#options.observerModule === undefined
-        ? {}
-        : { observerModule: String(this.#options.observerModule) })
-    };
-    port.postMessage(init);
-  }
-
-  #handleResponse(response: WorkerResponse): void {
-    if (response.kind === "ready") return;
-    const pending = this.#pending.get(response.requestId);
-    if (pending === undefined) return; // stale/unknown (e.g. aborted)
-    this.#pending.delete(response.requestId);
-    if (!pending.slotReleased) {
-      pending.slotReleased = true;
-      this.#slots.release();
-    }
-    if (response.kind === "result") {
-      pending.resolve(response.result);
-    } else if (response.kind === "already-applied") {
-      // The effect committed before a crash; the retry is deduped (§5.4). The
-      // original result is not retained; callers needing it re-read. Observer
-      // callers treat `undefined` as "applied".
-      pending.resolve(undefined);
-    } else {
-      pending.reject(deserializeError(response.error));
-    }
-  }
-
-  async #restart(): Promise<void> {
-    if (this.#restarting || this.#closed) return;
-    this.#restarting = true;
-    try {
-      // Brief backoff to avoid a hot crash loop.
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      this.#generation += 1;
-      this.#port?.close();
-      this.#ready = this.#newReadyPromise();
-      this.#spawnWorker();
-      await this.#ready;
-      // Replay unacknowledged requests (§3.1 fault boundary). Writes are
-      // deduped by the durable outbox; reads re-execute. The original promises
-      // are still pending and resolve when the new responses arrive.
-      for (const pending of this.#pending.values()) {
-        this.#port?.postMessage(pending.request);
-      }
-    } catch (error) {
-      // Give up: fail all pending requests and release their slots.
-      const failure = error instanceof Error ? error : new Error(String(error));
-      for (const [id, pending] of this.#pending) {
-        this.#pending.delete(id);
-        if (!pending.slotReleased) {
-          pending.slotReleased = true;
-          this.#slots.release();
-        }
-        pending.reject(failure);
-      }
-    } finally {
-      this.#restarting = false;
-    }
-  }
-
-  async #doSend(
-    kind: "call" | "transaction" | "observer",
-    request: Extract<WorkerRequest, { kind: typeof kind }>,
-    options?: RpcCallOptions
-  ): Promise<unknown> {
-    if (this.#closed) return Promise.reject(new Error("AsyncTaskStoreClient is closed."));
-    await this.#ready;
-    await this.#slots.acquire();
-    if (this.#closed) {
-      this.#slots.release();
-      return Promise.reject(new Error("AsyncTaskStoreClient is closed."));
-    }
-    return new Promise<unknown>((resolve, reject) => {
-      const requestId = request.requestId;
-      let abortListener: (() => void) | undefined;
-      const signal = options?.signal;
-      if (signal !== undefined) {
-        if (signal.aborted) {
-          this.#slots.release();
-          reject(new StorageCancelledError("Request aborted before it was sent."));
-          return;
-        }
-        abortListener = () => {
-          // Best-effort cancel; the worker rolls back an open transaction if it
-          // observes the signal before commit (§3.1). Already-committed effects
-          // are not undone.
-          try {
-            this.#port?.postMessage({ kind: "cancel", requestId } satisfies WorkerRequest);
-          } catch {
-            // Port may be gone.
-          }
-          const pending = this.#pending.get(requestId);
-          if (pending !== undefined && !pending.slotReleased) {
-            pending.slotReleased = true;
-            this.#slots.release();
-          }
-          this.#pending.delete(requestId);
-          reject(new StorageCancelledError("Request aborted."));
-        };
-        signal.addEventListener("abort", abortListener, { once: true });
-      }
-      this.#pending.set(requestId, {
-        resolve: (value) => {
-          if (abortListener !== undefined && signal !== undefined) {
-            signal.removeEventListener("abort", abortListener);
-          }
-          resolve(value);
-        },
-        reject: (error) => {
-          if (abortListener !== undefined && signal !== undefined) {
-            signal.removeEventListener("abort", abortListener);
-          }
-          reject(error);
-        },
-        abortListener,
-        request,
-        slotReleased: false
-      });
-      this.#port?.postMessage(request);
+    this.#rpc = new BoundedRpcClient(storageProtocol(home, options), {
+      maxInFlight: options.maxInFlight,
+      maxQueue: options.maxQueue,
+      workerScript: options.workerScript ?? new URL("./persistenceWorker.js", import.meta.url)
     });
   }
 
   /** Invoke a TaskStore method over the RPC (used by the Proxy). */
   callStore(method: string, args: unknown[], options?: RpcCallOptions): Promise<unknown> {
     const requestId = options?.requestId ?? nextRequestId();
-    return this.#doSend(
-      "call",
+    return this.#rpc.send(
+      requestId,
       {
         kind: "call",
         requestId,
@@ -537,7 +299,7 @@ export class AsyncTaskStoreClient {
         args,
         readOnly: isReadOnlyMethod(method)
       },
-      options
+      { signal: options?.signal }
     );
   }
 
@@ -551,15 +313,15 @@ export class AsyncTaskStoreClient {
       op: command.op,
       args: command.args as unknown[]
     }));
-    return this.#doSend(
-      "transaction",
+    return this.#rpc.send(
+      requestId,
       {
         kind: "transaction",
         requestId,
         commands: wireCommands,
         ...(options?.expectedRevision === undefined ? {} : { expectedRevision: options.expectedRevision })
       },
-      options
+      { signal: options?.signal }
     ) as Promise<T[]>;
   }
 
@@ -570,54 +332,26 @@ export class AsyncTaskStoreClient {
    */
   invokeObserver(method: string, args: unknown[], options?: RpcCallOptions): Promise<unknown> {
     const requestId = options?.requestId ?? nextRequestId();
-    return this.#doSend(
-      "observer",
+    return this.#rpc.send(
+      requestId,
       { kind: "observer", requestId, method, args },
-      options
+      { signal: options?.signal }
     );
   }
 
   /** Close the worker and release its connections. */
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
-    // Fail any requests still waiting on the ready handshake.
-    if (!this.#readyFired) {
-      this.#readyFired = true;
-      this.#readyReject?.(new Error("AsyncTaskStoreClient closed before ready."));
-    }
-    // Reject all in-flight requests; their slots are released.
-    for (const [id, pending] of this.#pending) {
-      this.#pending.delete(id);
-      if (!pending.slotReleased) {
-        pending.slotReleased = true;
-        this.#slots.release();
-      }
-      pending.reject(new Error("AsyncTaskStoreClient closed."));
-    }
-    try {
-      this.#port?.postMessage({ kind: "shutdown" } satisfies WorkerRequest);
-    } catch {
-      // Worker may already be gone.
-    }
-    // Give the worker a moment to exit cleanly.
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    try {
-      await this.#worker?.terminate();
-    } catch {
-      // Already terminated.
-    }
-    this.#port?.close();
+  close(): Promise<void> {
+    return this.#rpc.close();
   }
 
   /** Currently in-flight requests (metrics/tests). */
   get inFlight(): number {
-    return this.#slots.inFlight;
+    return this.#rpc.inFlight;
   }
 
   /** Currently queued requests waiting for a slot (metrics/tests). */
   get queueDepth(): number {
-    return this.#slots.queueDepth;
+    return this.#rpc.queueDepth;
   }
 
   /**
@@ -626,8 +360,8 @@ export class AsyncTaskStoreClient {
    * (§3.1 fault boundary). The pending requests stay pending; they resolve
    * after the restart + replay.
    */
-  async crashForTest(): Promise<void> {
-    await this.#worker?.terminate();
+  crashForTest(): Promise<void> {
+    return this.#rpc.crashForTest();
   }
 }
 
