@@ -11,7 +11,12 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { retireTaskRoleSessionsForWorkspace } from "../executor/agentExecutor.js";
-import { updateRole } from "../role/role.js";
+import { updateRole, type TaskRole } from "../role/role.js";
+import {
+  hasRuntimeCleanupObligation,
+  isRuntimeLaunchReservation,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 import {
   attachReviewRoundWorkspace,
   recordReviewWorkspaceDisposition
@@ -41,6 +46,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import type { ExecutionLaneGitSnapshot } from "../execution/executionGroup.js";
 import type { AgentRun } from "../run/agentRun.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   NodeGitWorkspace,
   worktreeIdentity,
@@ -367,7 +373,19 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             : tx.getWorkItemWorkspace(task.id, assignedItem.id);
           const target = assignedWorkspace?.root ?? root;
           if (role.workspace !== target) {
-            retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
+            if (
+              assignedItem === undefined
+              || assignedWorkspace === null
+              || !canCorrectActiveWorkItemRoleWorkspaceHint(
+                tx,
+                task.id,
+                role,
+                assignedItem,
+                assignedWorkspace
+              )
+            ) {
+              retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
+            }
             tx.saveRole(task.id, updateRole(role, { workspace: target }, timestamp));
           }
         }
@@ -2442,6 +2460,93 @@ function retireWorkspaceBoundSession(
   if (sessions !== null) {
     store.saveTaskRoleSessionSet(retireTaskRoleSessionsForWorkspace(sessions, now));
   }
+}
+
+function canCorrectActiveWorkItemRoleWorkspaceHint(
+  store: TaskStore,
+  taskId: string,
+  role: TaskRole,
+  item: WorkItem,
+  workspace: ManagedWorkspace
+): boolean {
+  if (
+    role.taskId !== taskId
+    || role.status !== "running"
+    || item.taskId !== taskId
+    || item.assignee !== role.name
+    || ["completed", "failed", "retired"].includes(item.status)
+    || workspace.owner.type !== "work-item"
+    || workspace.owner.taskId !== taskId
+    || workspace.owner.workItemId !== item.id
+  ) return false;
+
+  const writableProjects = workspace.entries
+    .filter(({ access }) => access === "write")
+    .map(({ projectId }) => projectId)
+    .sort();
+  if (!isDeepStrictEqual(writableProjects, [...item.writeProjectIds].sort())) return false;
+
+  const run = store.getActiveAgentRun(taskId, role.name);
+  if (
+    run === null
+    || run.status !== "active"
+    || run.purpose !== "execution"
+    || run.workItemId !== item.id
+    || run.workspace === undefined
+    || !sameManagedWorkspaceIdentity(run.workspace, workspace)
+    || run.effective.agentId !== role.activeAgentId
+    || !sameEffectiveWorkspace(run.effective.workspace, workspace)
+  ) return false;
+
+  const sessions = store.getTaskRoleSessionSet(taskId, role.name);
+  const session = sessions?.sessions[sessions.activeAgentId];
+  if (
+    sessions === null
+    || sessions.owner.scope !== "task"
+    || sessions.owner.taskId !== taskId
+    || sessions.owner.roleName !== role.name
+    || sessions.activeAgentId !== role.activeAgentId
+    || sessions.inFlight === null
+    || sessions.inFlight.agentId !== role.activeAgentId
+    || sessions.inFlight.runId !== run.id
+    || sessions.inFlight.receiptId !== formatAgentRunReceiptId(taskId, run.id)
+    || session === undefined
+    || session.agentId !== role.activeAgentId
+    || session.adapterId !== run.effective.adapterId
+    || session.launchId === undefined
+    || session.nativeSessionId === undefined
+    || !["ready", "running"].includes(session.status)
+    || !isDeepStrictEqual(session.effective, run.effective)
+    || !sameEffectiveWorkspace(session.effective.workspace, workspace)
+  ) return false;
+
+  const lifecycleMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId,
+    roleName: role.name
+  }));
+  if (hasRuntimeCleanupObligation(lifecycleMailbox)) return false;
+  const lifecycle = lifecycleMailbox?.processing;
+  if (lifecycle !== null
+    && lifecycle !== undefined
+    && isRuntimeLaunchReservation(lifecycle)) {
+    const executionRef = lifecycle.executionRef;
+    if (
+      !isRuntimeLaunchReservation(lifecycle, session.launchId)
+      || executionRef?.type !== "run"
+      || executionRef.taskId !== taskId
+      || executionRef.id !== run.id
+    ) return false;
+  }
+  return true;
+}
+
+function sameEffectiveWorkspace(
+  effective: AgentRun["effective"]["workspace"],
+  workspace: ManagedWorkspace
+): boolean {
+  return effective.root === workspace.root
+    && isDeepStrictEqual(effective.entries, workspace.entries);
 }
 
 function sameManagedWorkspace(left: ManagedWorkspace, right: ManagedWorkspace): boolean {
