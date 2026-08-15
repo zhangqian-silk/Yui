@@ -363,11 +363,23 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           // The Role field is only a cwd/snapshot hint.  Preserve the hint for
           // an active WorkItem assignment; the durable owner is the WorkItem,
           // not this Role record.  Other Roles use Task main.
-          const assignedItem = tx.listWorkItems(task.id).find((candidate) => (
-            candidate.assignee === role.name
-              && !["completed", "failed", "retired"]
-                .includes(candidate.status)
-          ));
+          // Prefer the active Run's exact WorkItem for this Role; fall back
+          // to the first queued WorkItem only when no active Run owns the Role.
+          const activeRoleRun = tx.getActiveAgentRun(task.id, role.name);
+          const activeRunItem = activeRoleRun !== null
+            && activeRoleRun.purpose === "execution"
+            && activeRoleRun.workItemId !== undefined
+            ? tx.getWorkItem(task.id, activeRoleRun.workItemId)
+            : null;
+          const assignedItem = activeRunItem !== null
+            && activeRunItem.assignee === role.name
+            && !["completed", "failed", "retired"].includes(activeRunItem.status)
+            ? activeRunItem
+            : tx.listWorkItems(task.id).find((candidate) => (
+              candidate.assignee === role.name
+                && !["completed", "failed", "retired"]
+                  .includes(candidate.status)
+            ));
           const assignedWorkspace = assignedItem === undefined
             ? null
             : tx.getWorkItemWorkspace(task.id, assignedItem.id);
@@ -2375,6 +2387,17 @@ function executionLaneLineage(
     const round = store.getReviewRound(task.id, hint.reviewRoundId);
     if (round === null) throw new Error(`ReviewRound not found: ${hint.reviewRoundId}.`);
     return { purpose: "review", workItemId: round.workItemId, reviewRoundId: round.id };
+  }
+  // Prefer the active Run's exact WorkItem for this Lane; fall back to the
+  // first queued WorkItem only when no active Run owns the Lane.
+  const activeLaneRun = store.listAgentRuns(task.id)
+    .find((run) => run.status === "active"
+      && run.purpose === "execution"
+      && run.executionGroupId === executionGroupId
+      && run.executionLaneId === executionLaneId
+      && run.workItemId !== undefined);
+  if (activeLaneRun?.workItemId !== undefined) {
+    return { purpose: "execution", workItemId: activeLaneRun.workItemId, reviewRoundId: "" };
   }
   for (const item of store.listWorkItems(task.id)) {
     if (workItemExecutionGroupById(item, executionGroupId)?.lanes.some(({ id }) => id === executionLaneId)) {

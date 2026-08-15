@@ -6163,3 +6163,41 @@ test("explicit WorkItem base refs reject unbound, read-only, and invalid refs wi
   );
   assert.equal(store.getWorkItemWorkspace(task.id, created.data.workItem.id), null);
 });
+
+test("Role workspace hint prefers the active Run's WorkItem over the first queued one", async (t) => {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Two same-Role WorkItems", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath, ["leader", "worker"]);
+  const first = createWorkItem("work-item-1", task.id, {
+    title: "First queued WorkItem",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, first);
+  const second = createWorkItem("work-item-2", task.id, {
+    title: "Second queued WorkItem with the active Run",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, second);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  await preparer.prepareTaskWorkspace(task.id);
+  const firstWorkspace = await preparer.prepareWorkItemWorkspace(task.id, first.id);
+  const secondWorkspace = await preparer.prepareWorkItemWorkspace(task.id, second.id);
+  // The active Run is for the second WorkItem, not the first.
+  savePlannerRun(store, task.id, "worker", {
+    workItemId: second.id,
+    workspace: secondWorkspace
+  });
+  await preparer.prepareTaskWorkspace(task.id);
+  const workerRole = store.getRole(task.id, "worker");
+  assert.equal(workerRole.workspace, secondWorkspace.root);
+  assert.notEqual(workerRole.workspace, firstWorkspace.root);
+});
