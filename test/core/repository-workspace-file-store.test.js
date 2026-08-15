@@ -9,6 +9,7 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -399,7 +400,10 @@ test("workspace coordination stops a live Role only after a clean preflight", as
     listWorkItems: () => [item],
     getRole: () => ({ name: "worker" }),
     getWorkItemWorkspace: () => item.status === "completed"
-      ? { owner: { type: "work-item", taskId: item.taskId, workItemId: item.id } }
+      ? {
+        owner: { type: "work-item", taskId: item.taskId, workItemId: item.id },
+        entries: [{ projectId: "project-1", access: "write" }]
+      }
       : null,
     getTaskRoleSessionSet: () => liveSessionSet()
   };
@@ -409,6 +413,7 @@ test("workspace coordination stops a live Role only after a clean preflight", as
     }
   };
   const preparer = {
+    home: join(tmpdir(), "yui-coordinator-fence-preflight"),
     async prepareTaskWorkspace() {
       events.push(["main"]);
     },
@@ -461,6 +466,7 @@ test("workspace cleanup stops a restored Role before converging a missing worktr
     getWorkItem: () => item,
     listAgentRuns: () => [],
     listWorkItems: () => [item],
+    getWorkItemWorkspace: () => null,
     getTaskRoleSessionSet: () => liveSessionSet()
   }, {
     async inspectWorkItemWorkspace() {
@@ -546,6 +552,7 @@ test("dirty WorkItem preflight retains both runtime and worktree", async () => {
   let cleaned = false;
   const coordinator = new TaskWorkspaceCoordinator({
     getWorkItem: () => item,
+    getWorkItemWorkspace: () => null,
     getTaskRoleSessionSet: () => liveSessionSet()
   }, {
     async inspectWorkItemWorkspace() { return "dirty"; },
@@ -2161,9 +2168,12 @@ test("execution Lane snapshots freeze every writable Project before aggregate ma
     lanes: [{ roleName: "worker" }, { roleName: "worker-2" }]
   }, NOW);
   store.saveWorkItem(task.id, attachWorkItemExecutionGroup(item, group, NOW));
-  const lanes = await Promise.all(group.lanes.map(({ id }) => (
-    preparer.prepareExecutionLaneWorkspace(task.id, group.id, id)
-  )));
+  // The per-Project maintenance fence serializes concurrent lane preparation;
+  // prepare lanes sequentially to respect the fence.
+  const lanes = [];
+  for (const { id } of group.lanes) {
+    lanes.push(await preparer.prepareExecutionLaneWorkspace(task.id, group.id, id));
+  }
   for (let laneIndex = 0; laneIndex < lanes.length; laneIndex += 1) {
     const lane = lanes[laneIndex];
     for (const entry of lane.entries.filter(({ access }) => access === "write")) {

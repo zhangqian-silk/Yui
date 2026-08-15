@@ -123,6 +123,7 @@ import {
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
 import { resolveProject, type Project } from "../repository/project.js";
+import { acquireProjectMaintenanceLocks } from "../repository/projectMaintenanceLock.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
@@ -331,6 +332,14 @@ export type TaskCommandOptions = Readonly<{
   directTaskMainSnapshot?: DirectTaskMainSnapshot;
   /** Prepared by the repository/workspace lifecycle before command mutation. */
   executionLaneWorkspaces?: ReadonlyMap<string, ManagedWorkspace>;
+  /**
+   * Under-fence Project path snapshot captured when a new Group's Lane
+   * workspaces were prepared. The dispatch aggregate CAS revalidates the Task
+   * binding set and exact Project paths against it, so a project migrate in
+   * the prepare/adopt gap fails closed instead of stranding a Lane on the
+   * external checkout. Undefined when no fence is held (existing Group).
+   */
+  laneDispatchProjectPaths?: ReadonlyMap<string, string>;
   /** Frozen managed workspace heads captured immediately before Lane yield. A
    * null value is an explicit preflight result for a Gitless/read-only Lane. */
   executionLaneGitSnapshot?: ExecutionLaneGitSnapshot | null;
@@ -1157,26 +1166,41 @@ function reopenTaskCommand(
 ): string {
   exactPositionals(args, 1, "Task reopen usage: yui task reopen <id>.");
   const now = clock(options);
-  const result = store.transaction((tx) => {
-    const task = requireTask(tx, args[0]);
-    if (task.status === "active") return { task, changed: false } as const;
-    if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
-    if (task.status !== "completed") throw usageError(`Task is not completed: ${task.id}.`);
-    const active = reopenTask(task, now);
-    tx.saveTask(active);
-    tx.clearOperatorNotification(task.id);
-    enqueueWork(tx, leaderMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
-    enqueueWork(tx, taskMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
-    recordTaskEvent(tx, task.id, "task.reopened", { status: active.status }, now);
-    return { task: active, changed: true } as const;
-  });
-  if (result.changed) {
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-    notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+  // Reopen changes the Task status that archiveLegacyTaskRefs reads before
+  // deleting the legacy ref. Take the same per-Project maintenance fence so a
+  // reopen cannot commit between archive's status read and its ref deletion:
+  // the two operations are mutually exclusive per Project.
+  const existing = store.getTask(args[0]);
+  const projectIds = existing === null
+    ? []
+    : existing.projectBindings.map(({ projectId }) => projectId);
+  const release = options.yuiHome === undefined || projectIds.length === 0
+    ? () => {}
+    : acquireProjectMaintenanceLocks(options.yuiHome, projectIds);
+  try {
+    const result = store.transaction((tx) => {
+      const task = requireTask(tx, args[0]);
+      if (task.status === "active") return { task, changed: false } as const;
+      if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+      if (task.status !== "completed") throw usageError(`Task is not completed: ${task.id}.`);
+      const active = reopenTask(task, now);
+      tx.saveTask(active);
+      tx.clearOperatorNotification(task.id);
+      enqueueWork(tx, leaderMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
+      enqueueWork(tx, taskMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
+      recordTaskEvent(tx, task.id, "task.reopened", { status: active.status }, now);
+      return { task: active, changed: true } as const;
+    });
+    if (result.changed) {
+      notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+      notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+    }
+    return result.changed
+      ? `Reopened task ${result.task.id}\n`
+      : `Task ${result.task.id} is already active\n`;
+  } finally {
+    release();
   }
-  return result.changed
-    ? `Reopened task ${result.task.id}\n`
-    : `Task ${result.task.id} is already active\n`;
 }
 
 function archiveTaskCommand(
@@ -2501,6 +2525,24 @@ function dispatchWork(
           || prepared.owner.executionGroupId !== runningGroup.id
           || prepared.owner.executionLaneId !== lane.id) {
           throw usageError(`Execution Lane workspace identity does not match dispatch: ${runningGroup.id}/${lane.id}.`);
+        }
+        if (options.laneDispatchProjectPaths !== undefined) {
+          // The prepared workspaces were created under a held maintenance
+          // fence that this transaction still holds. Re-prove the Task
+          // binding set and exact Project paths match the preparation
+          // snapshot: a migrate in the prepare/adopt gap fails closed here
+          // rather than stranding a Lane on the external checkout.
+          const currentIds = task.projectBindings.map(({ projectId }) => projectId).sort();
+          const proofIds = [...options.laneDispatchProjectPaths.keys()].sort();
+          if (currentIds.length !== proofIds.length
+            || currentIds.some((projectId, index) => projectId !== proofIds[index])) {
+            throw new Error(`Task Project bindings changed during Lane dispatch: ${task.id}.`);
+          }
+          for (const [projectId, preparedPath] of options.laneDispatchProjectPaths) {
+            if (requireProject(tx, projectId).path !== preparedPath) {
+              throw new Error(`Project path changed during Lane dispatch: ${projectId}.`);
+            }
+          }
         }
         if (tx.getManagedWorkspace(prepared.owner) === null) tx.saveManagedWorkspace(prepared);
       }

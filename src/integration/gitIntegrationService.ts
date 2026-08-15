@@ -14,6 +14,7 @@ import {
 } from "../repository/gitWorkspace.js";
 import type { GitWorkspaceRemoval } from "../repository/gitWorkspace.js";
 import { resolveWorktreeRoot } from "../repository/taskWorkspacePreparer.js";
+import { acquireProjectMaintenanceLocks } from "../repository/projectMaintenanceLock.js";
 import { taskWorkspaceRefSegment } from "../repository/taskWorkspaceIdentity.js";
 import {
   FileTaskRuntimeIsolation,
@@ -109,6 +110,13 @@ export class GitIntegrationService {
     options: Readonly<{ remoteBaseline?: RemoteBaseline }> = {}
   ): Promise<IntegrationResult> {
     const initial = requireIntegration(this.store, taskId, integrationId);
+    // The whole Integration is one Git transaction against the Project's
+    // repository: worktree creation, cherry-picks, checks, and the target ref
+    // CAS. A concurrent `project migrate` must not switch the catalog path or
+    // remove the old checkout mid-Integration, so the per-Project maintenance
+    // fence is held across every Git effect and released only on exit.
+    const release = acquireProjectMaintenanceLocks(this.home, [initial.projectId]);
+    try {
     const task = this.store.getTask(initial.taskId);
     if (task === null || !task.projectBindings.some(
       ({ projectId }) => projectId === initial.projectId
@@ -262,47 +270,58 @@ export class GitIntegrationService {
       }
       return this.#fail(current, error, "integration", workspace);
     }
+    } finally {
+      release();
+    }
   }
 
   async cleanup(integration: IntegrationAttempt): Promise<GitWorkspaceRemoval> {
-    const task = this.store.getTask(integration.taskId);
-    if (task === null || !task.projectBindings.some(
-      ({ projectId }) => projectId === integration.projectId
-    )) {
-      throw new Error(`Integration Task Project is unavailable: ${integration.id}.`);
-    }
-    const project = this.store.getProject(integration.projectId);
-    if (project === null) throw new Error(`Project not found: ${integration.projectId}.`);
-    const managedWorkspace = this.store.getIntegrationWorkspace(
-      integration.taskId,
-      integration.id
-    );
-    if (managedWorkspace !== null) {
-      const runtime = this.#runtimePreparation(integration, managedWorkspace);
-      this.runtimeIsolation.cleanup(
-        runtime,
-        integration.status === "committed" ? "completion" : "failure"
+    // The whole cleanup is one Git transaction against the Project's
+    // repository, mirroring integrate(): a concurrent `project migrate` must
+    // not switch the catalog path or remove the old checkout mid-cleanup.
+    const release = acquireProjectMaintenanceLocks(this.home, [integration.projectId]);
+    try {
+      const task = this.store.getTask(integration.taskId);
+      if (task === null || !task.projectBindings.some(
+        ({ projectId }) => projectId === integration.projectId
+      )) {
+        throw new Error(`Integration Task Project is unavailable: ${integration.id}.`);
+      }
+      const project = this.store.getProject(integration.projectId);
+      if (project === null) throw new Error(`Project not found: ${integration.projectId}.`);
+      const managedWorkspace = this.store.getIntegrationWorkspace(
+        integration.taskId,
+        integration.id
       );
-    }
-    const result = await this.git.removeIntegrationWorktree({
-      repositoryPath: project.path,
-      container: join(this.worktreeRoot, project.name),
-      taskSegment: taskWorkspaceRefSegment(task),
-      integrationId: integration.id,
-      discardChanges: integration.status === "failed"
-    });
-    if (result !== "dirty") {
-      await rm(integrationCheckDirectory(this.home, task.id, integration.id), {
-        recursive: true,
-        force: true
+      if (managedWorkspace !== null) {
+        const runtime = this.#runtimePreparation(integration, managedWorkspace);
+        this.runtimeIsolation.cleanup(
+          runtime,
+          integration.status === "committed" ? "completion" : "failure"
+        );
+      }
+      const result = await this.git.removeIntegrationWorktree({
+        repositoryPath: project.path,
+        container: join(this.worktreeRoot, project.name),
+        taskSegment: taskWorkspaceRefSegment(task),
+        integrationId: integration.id,
+        discardChanges: integration.status === "failed"
       });
-      this.store.removeManagedWorkspace({
-        type: "integration-attempt",
-        taskId: integration.taskId,
-        integrationAttemptId: integration.id
-      });
+      if (result !== "dirty") {
+        await rm(integrationCheckDirectory(this.home, task.id, integration.id), {
+          recursive: true,
+          force: true
+        });
+        this.store.removeManagedWorkspace({
+          type: "integration-attempt",
+          taskId: integration.taskId,
+          integrationAttemptId: integration.id
+        });
+      }
+      return result;
+    } finally {
+      release();
     }
-    return result;
   }
 
   async #runChecks(

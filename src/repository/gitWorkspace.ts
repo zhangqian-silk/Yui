@@ -75,6 +75,20 @@ export interface GitWorkspacePort {
     sourceRef: string;
     archiveRef: string;
   }>): Promise<void>;
+  /**
+   * Fail closed when a live worktree of the repository still has `ref`
+   * checked out. `archiveRef` deletes the ref with `update-ref -d`, which
+   * bypasses git's worktree-occupancy check, so every same-repo worktree on
+   * the exact ref must be gone before the ref may be deleted.
+   * `excludeWorktreePath` names the recorded worktree the caller removes as
+   * part of the same archive flow; prunable (dead) worktree registrations
+   * are ignored.
+   */
+  assertNoForeignWorktreeOnRef(input: Readonly<{
+    repositoryPath: string;
+    ref: string;
+    excludeWorktreePath?: string;
+  }>): Promise<void>;
   isAncestor(
     repositoryPath: string,
     ancestor: string,
@@ -154,6 +168,10 @@ export interface GitWorkspacePort {
     roleName: string;
     deleteBranch?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
+  /** Remove a stranded worktree whose common-dir no longer matches the
+   * Project's current repository (e.g. after a catalog switch). Only for
+   * unadopted worktrees that are safe to discard. */
+  removeStrandedWorktree(path: string): Promise<GitWorkspaceRemoval>;
   /** Remove the exact clean worktree proven by inspectRecordedWorktree. If
    * the Project moved repositories, delete the obsolete source branch only
    * after the same commit is proven retained in the current repository. */
@@ -662,6 +680,59 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     }
   }
 
+  async assertNoForeignWorktreeOnRef(input: Readonly<{
+    repositoryPath: string;
+    ref: string;
+    excludeWorktreePath?: string;
+  }>): Promise<void> {
+    const root = (await this.inspect(input.repositoryPath)).root;
+    const wanted = safeRef(input.ref);
+    // The recorded worktree is removed in the same archive flow; it is the
+    // only same-repo worktree on the ref that may stay for now. A path that
+    // no longer exists cannot match a live worktree.
+    const excluded = input.excludeWorktreePath === undefined
+      ? undefined
+      : await realpath(resolve(input.excludeWorktreePath)).catch(() => undefined);
+    const porcelain = await git(["-C", root, "worktree", "list", "--porcelain"]);
+    const records: Array<{ path: string; branch?: string; prunable: boolean }> = [];
+    let current: { path?: string; branch?: string; prunable: boolean } = { prunable: false };
+    for (const line of porcelain.split("\n")) {
+      if (line.length === 0) {
+        const path = current.path;
+        if (path !== undefined) {
+          records.push({ path, branch: current.branch, prunable: current.prunable });
+        }
+        current = { prunable: false };
+        continue;
+      }
+      if (line.startsWith("worktree ")) {
+        current.path = line.slice("worktree ".length);
+      } else if (line.startsWith("branch ")) {
+        current.branch = line.slice("branch ".length);
+      } else if (line.startsWith("prunable")) {
+        current.prunable = true;
+      }
+    }
+    const lastPath = current.path;
+    if (lastPath !== undefined) {
+      records.push({ path: lastPath, branch: current.branch, prunable: current.prunable });
+    }
+    for (const record of records) {
+      // A dead registration (its directory is gone) occupies nothing; a
+      // worktree on another ref or a detached HEAD does not occupy this one.
+      if (record.prunable || record.branch !== wanted) continue;
+      // git reports canonical absolute paths; compare canonicals so a
+      // symlinked workspace root cannot make the recorded worktree look
+      // foreign.
+      const canonical = await realpath(record.path).catch(() => record.path);
+      if (canonical === excluded) continue;
+      throw new Error(
+        `Ref ${wanted} is checked out by a worktree outside this Home's management ` +
+        `(${record.path}); the archive refuses to delete the ref and strand that worktree.`
+      );
+    }
+  }
+
   async isAncestor(
     repositoryPath: string,
     ancestor: string,
@@ -879,6 +950,32 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     return "removed";
   }
 
+  /**
+   * Remove a stranded worktree whose Git common-dir no longer matches the
+   * Project's current repository (e.g. after a `project migrate` switched the
+   * catalog). The normal {@link removeWorktree} path rejects such worktrees
+   * via `assertOwnedWorktree`; this fallback inspects and removes through the
+   * worktree's own Git identity instead. Only call for unadopted worktrees
+   * that are safe to discard (e.g. Lane preparation compensation).
+   */
+  async removeStrandedWorktree(path: string): Promise<GitWorkspaceRemoval> {
+    const kind = await pathKind(path);
+    if (kind === undefined) return "missing";
+    if (kind === "symlink") throw new Error("Stranded worktree path must not be a symbolic link.");
+    // Inspect dirty state through the worktree's own Git, bypassing the
+    // Project ownership check that fails after a catalog switch.
+    const porcelain = await git(["-C", path, "status", "--porcelain=v1", "--untracked-files=all"]);
+    if (porcelain.length > 0) return "dirty";
+    try {
+      await git(["-C", path, "worktree", "remove", "--force", "--", path]);
+    } catch {
+      // The worktree's common-dir (old external repo) may itself be gone.
+      // Remove the directory directly; the worktree is unadopted.
+      await rm(path, { recursive: true, force: true });
+    }
+    return "removed";
+  }
+
   async inspectRecordedWorktree(input: Readonly<{
     repositoryPath: string;
     container: string;
@@ -900,7 +997,18 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     taskSegment: string;
     roleName: string;
   }>): Promise<GitWorkspaceRemoval> {
-    const inspected = await inspectExactRecordedWorktree(input);
+    let inspected: ExactRecordedWorktree | undefined;
+    try {
+      inspected = await inspectExactRecordedWorktree(input);
+    } catch (error) {
+      // A deleted external checkout takes the worktree's common dir with it,
+      // so every git op against the worktree fails. When the Project
+      // repository itself is gone, the worktree's Git identity, HEAD, index,
+      // and dirty state can no longer be proven. An extant directory is
+      // retained and the caller fails closed with a manual-cleanup diagnosis;
+      // only a directory that is also absent is treated as missing.
+      return await recordedWorktreeWithoutRepository(input, error);
+    }
     if (inspected === undefined) return "missing";
     if (inspected.state === "dirty") return "dirty";
     // Revalidate immediately before asking the worktree's own Git common-dir
@@ -1154,6 +1262,40 @@ async function resolveRefCommit(repositoryPath: string, ref: string): Promise<st
   ])).toLowerCase();
   if (!isCommit(commit)) throw new Error("Git returned an invalid ref commit.");
   return commit;
+}
+
+/**
+ * Classify a recorded worktree whose Project repository can no longer be
+ * inspected. A deleted external checkout takes the worktree's common dir with
+ * it, so the worktree's Git identity, HEAD, index, and dirty/untracked state
+ * cannot be proven. An extant directory is retained and the caller fails
+ * closed with a bounded manual-cleanup diagnosis; only a directory that is
+ * also absent is treated as missing. The exact recorded identity is
+ * re-validated so a mismatched path/branch is never classified.
+ */
+async function recordedWorktreeWithoutRepository(
+  input: Readonly<{
+    repositoryPath: string;
+    container: string;
+    path: string;
+    branch: string;
+    taskSegment: string;
+    roleName: string;
+  }>,
+  cause: unknown
+): Promise<GitWorkspaceRemoval> {
+  if (await pathKind(input.repositoryPath) !== undefined) throw cause;
+  const identity = worktreeIdentity(input.taskSegment, input.roleName);
+  const expectedPath = managedPath(resolve(input.container), identity.directory);
+  if (resolve(input.path) !== expectedPath || input.branch !== identity.branch) {
+    throw cause;
+  }
+  if (await pathKind(expectedPath) === undefined) return "missing";
+  throw new Error(
+    `Recorded worktree survives its Project repository and needs manual cleanup: ${expectedPath}. `
+    + `The Project repository is gone, so the worktree's Git state cannot be verified; `
+    + `remove the directory manually once its contents are safe.`
+  );
 }
 
 async function retainCommitRef(

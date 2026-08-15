@@ -921,12 +921,12 @@ export async function main(): Promise<void> {
         // transaction once its exact Lane ids exist.
       }
     }
-    let executionLaneWorkspaces = await prepareExecutionLaneWorkspacesForCommand(
-      resolved,
-      store,
-      workspacePreparer,
-      process.env
-    );
+    let executionLaneWorkspaces: ReadonlyMap<string, import("./worktree/managedWorkspace.js").ManagedWorkspace> | undefined;
+    // Held only for a new Group's dispatch: the per-Project maintenance fence
+    // spans Lane preparation and the adoption transaction, and projectPaths is
+    // the under-fence snapshot the adoption CAS revalidates.
+    let laneDispatchRelease: (() => void) | undefined;
+    let laneDispatchProjectPaths: ReadonlyMap<string, string> | undefined;
     let workItemIntegrationProof;
     if (resolved[1] === "work" && resolved[2] === "accept") {
       const workItemId = resolved[3];
@@ -962,6 +962,17 @@ export async function main(): Promise<void> {
     let candidateMaterialization: Awaited<ReturnType<typeof candidateMaterializationForTaskCommand>>;
     let candidateMaterializationCommitted = false;
     try {
+      const preparedLanes = await prepareExecutionLaneWorkspacesForCommand(
+        resolved,
+        store,
+        workspacePreparer,
+        process.env
+      );
+      if (preparedLanes !== undefined) {
+        executionLaneWorkspaces = preparedLanes.workspaces;
+        laneDispatchRelease = preparedLanes.release;
+        laneDispatchProjectPaths = preparedLanes.projectPaths;
+      }
       candidateMaterialization = await candidateMaterializationForTaskCommand(
         resolved,
         store,
@@ -1024,6 +1035,7 @@ export async function main(): Promise<void> {
             ? {}
             : { candidateWorkspace: candidateMaterialization.workspace ?? null }),
           ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
+          ...(laneDispatchProjectPaths === undefined ? {} : { laneDispatchProjectPaths }),
           ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),
           ...(actualTaskReviewCandidate === undefined
             ? {}
@@ -1033,6 +1045,13 @@ export async function main(): Promise<void> {
           ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
         }
       );
+      // The dispatch transaction has now adopted (or rejected) the prepared
+      // Lane workspaces. Release the held fence so later output/review
+      // handling can take the per-Project fence itself.
+      if (laneDispatchRelease !== undefined) {
+        laneDispatchRelease();
+        laneDispatchRelease = undefined;
+      }
       // The command transaction has now durably submitted the Candidate. Any
       // later output/review handling must not roll back its Git snapshot.
       candidateMaterializationCommitted = candidateMaterialization !== undefined;
@@ -1198,6 +1217,10 @@ export async function main(): Promise<void> {
       }
       if (!candidateMaterializationCommitted) {
         await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(executionLaneWorkspaces);
+      }
+      if (laneDispatchRelease !== undefined) {
+        laneDispatchRelease();
+        laneDispatchRelease = undefined;
       }
       throw error;
     }
@@ -1476,7 +1499,7 @@ async function prepareExecutionLaneWorkspacesForCommand(
   store: FileTaskStore,
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv
-): Promise<ReadonlyMap<string, import("./worktree/managedWorkspace.js").ManagedWorkspace> | undefined> {
+): Promise<PreparedExecutionLaneWorkspaces | undefined> {
   const isDispatch = args[0] === "task" && args[1] === "work" && args[2] === "dispatch" && args[3] !== undefined;
   const isRetry = args[0] === "task" && args[1] === "run" && args[2] === "retry" && args[3] !== undefined;
   if (!isDispatch && !isRetry) return undefined;
@@ -1544,20 +1567,57 @@ async function prepareExecutionLaneWorkspacesForCommand(
   if (!needsIsolation) return undefined;
   const groupId = group?.id ?? `execution-group-${store.peekNextAgentRunId(item.taskId)}`;
   const laneIds = plan.laneIds;
+  // A new Group's Lanes are not yet durable, so their worktrees would be
+  // unadopted between preparation and the dispatch transaction. Hold ONE
+  // per-Project maintenance fence across both, so a project migrate cannot
+  // switch the catalog in that gap and strand a Lane on the external
+  // checkout. An existing Group's Lanes are adopted inside their own fence,
+  // so no outer fence is held.
+  const held = group === undefined
+    ? preparer.acquireTaskProjectMaintenanceLocks(item.taskId)
+    : undefined;
   const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
   try {
+    let projectPaths: ReadonlyMap<string, string> | undefined;
+    if (held !== undefined) {
+      const paths = new Map<string, string>();
+      for (const { projectId } of held.current.projectBindings) {
+        const project = store.getProject(projectId);
+        if (project === null) throw new Error(`Project not found: ${projectId}.`);
+        paths.set(projectId, project.path);
+      }
+      projectPaths = paths;
+    }
     for (const laneId of laneIds.filter((value) => value.length > 0)) {
       map.set(laneId, await preparer.prepareExecutionLaneWorkspace(item.taskId, groupId, laneId, {
         purpose: "execution",
         workItemId: item.id
-      }));
+      }, held === undefined ? undefined : { current: held.current }));
     }
+    return { workspaces: map, release: held?.release, projectPaths };
   } catch (error) {
+    // Compensate (discard unadopted Lane worktrees) BEFORE releasing the
+    // fence: a concurrent project migrate must not switch the catalog while
+    // external-backed worktrees are still identifiable for removal.
     await preparer.discardUnadoptedExecutionLaneWorkspaces(map);
+    if (held !== undefined) held.release();
     throw error;
   }
-  return map;
 }
+
+/**
+ * The result of preparing a command's Execution Lane worktrees. For a new
+ * (not-yet-durable) Group, `release` is the held per-Project maintenance fence
+ * — the caller must keep it until the dispatch transaction adopts the
+ * worktrees, then release it — and `projectPaths` is the under-fence Project
+ * path snapshot the adoption CAS revalidates. Both are undefined for an
+ * existing Group, whose Lanes are adopted inside their own fence.
+ */
+type PreparedExecutionLaneWorkspaces = Readonly<{
+  workspaces: ReadonlyMap<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>;
+  release: (() => void) | undefined;
+  projectPaths: ReadonlyMap<string, string> | undefined;
+}>;
 
 async function prepareReviewLaneWorkspaces(
   taskId: string,

@@ -37,6 +37,7 @@ import {
 } from "../core/controllerServer.js";
 import type { JsonValue } from "../core/protocol.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
+import { isProjectMaintenanceFenced } from "../repository/projectMaintenanceLock.js";
 import { MailboxScheduler } from "../coordination/mailboxScheduler.js";
 import { nearestDeadlineBatch } from "../coordination/deadlineScheduler.js";
 import type { MailboxTarget, ProcessingBatch } from "../coordination/workMailbox.js";
@@ -107,6 +108,17 @@ export type ControllerRuntimeOptions = Readonly<{
   }>>;
   onExpiredEphemeralDomain?:
     (domain: Readonly<{ yuiHome: string; token?: string }>) => void;
+  /**
+   * Per-Project maintenance fence consulted before preparing a Task's
+   * workspaces: a Task whose Project is fenced is deferred for this pass
+   * (never marked failed), so maintenance is never interleaved.
+   */
+  maintenanceFence?: (projectId: string) => boolean;
+  /** Log hook invoked once per deferred Task with the fenced Project ids. */
+  onMaintenanceFenceDefer?: (detail: Readonly<{
+    taskId: string;
+    projectIds: readonly string[];
+  }>) => void;
 }>;
 
 export interface ControllerConfigurationPort {
@@ -146,7 +158,9 @@ export async function runControllerSchedulerPass(
   runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [],
   lifecycleHost?: RuntimeLifecycleHost,
   stallWindowMs = DEFAULT_STALL_WINDOW_MS,
-  resourceSuppressionKeys: Set<string> = new Set()
+  resourceSuppressionKeys: Set<string> = new Set(),
+  maintenanceFence?: (projectId: string) => boolean,
+  onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"]
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
@@ -175,7 +189,7 @@ export async function runControllerSchedulerPass(
   const claimedTaskMailboxes = claimSelectedTaskMailboxes(store, selection, now);
   try {
     const failedTaskMailboxes = await prepareActiveWorkspaces(
-      store, workspacePreparer, selection
+      store, workspacePreparer, selection, maintenanceFence, onMaintenanceFenceDefer
     );
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection
@@ -739,7 +753,9 @@ export function compileReconcileSelection(scope: ReconcileScope): ReconcileSelec
 async function prepareActiveWorkspaces(
   store: SchedulerStorePort,
   workspace: ControllerRuntimeOptions["workspacePreparer"],
-  selection: ReconcileSelection
+  selection: ReconcileSelection,
+  maintenanceFence?: (projectId: string) => boolean,
+  onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"]
 ): Promise<Set<string>> {
   if (workspace === undefined) return new Set();
   const taskIds = selection.full
@@ -749,7 +765,20 @@ async function prepareActiveWorkspaces(
     : new Set([...selection.taskIds, ...selection.allRoleTaskIds]);
   const failed = new Set<string>();
   for (const taskId of taskIds) {
-    if (store.getTask(taskId)?.status === "active") {
+    const task = store.getTask(taskId);
+    if (task?.status === "active") {
+      // A Project under maintenance is fenced: defer this Task's preparation
+      // for the pass. The deferral is per-Project, never a Controller stop,
+      // and a deferred Task is not marked failed.
+      if (maintenanceFence !== undefined) {
+        const fencedProjects = task.projectBindings
+          .map(({ projectId }) => projectId)
+          .filter((projectId) => maintenanceFence(projectId));
+        if (fencedProjects.length > 0) {
+          onMaintenanceFenceDefer?.({ taskId, projectIds: fencedProjects });
+          continue;
+        }
+      }
       try {
         const result = await workspace.prepareTaskWorkspace(taskId);
         if (result.status === "failed") failed.add(taskId);
@@ -845,6 +874,12 @@ export class FileTaskController {
   readonly #onExpiredEphemeralDomain:
     | ControllerRuntimeOptions["onExpiredEphemeralDomain"]
     | undefined;
+  readonly #maintenanceFence:
+    | ((projectId: string) => boolean)
+    | undefined;
+  readonly #onMaintenanceFenceDefer:
+    | ControllerRuntimeOptions["onMaintenanceFenceDefer"]
+    | undefined;
   #current: Promise<ControllerSchedulerResult> | undefined;
   #operatorCurrent: Promise<void> | undefined;
   #pendingFull = false;
@@ -886,6 +921,8 @@ export class FileTaskController {
     this.#configuration = options.configuration;
     this.#resourceReaper = options.resourceReaper;
     this.#onExpiredEphemeralDomain = options.onExpiredEphemeralDomain;
+    this.#maintenanceFence = options.maintenanceFence;
+    this.#onMaintenanceFenceDefer = options.onMaintenanceFenceDefer;
     this.#signalScheduler = new MailboxScheduler(
       async (keys) => { await this.#requestPass({ kind: "dirty", keys }); },
       {
@@ -1095,7 +1132,9 @@ export class FileTaskController {
             runtimeCleanupOutcomes,
             this.#lifecycleHost,
             this.#stallWindowMs,
-            this.#resourceSuppressionKeys
+            this.#resourceSuppressionKeys,
+            this.#maintenanceFence,
+            this.#onMaintenanceFenceDefer
           );
           const secondRuntimeDrain = await this.#drainRuntimeEvents();
           this.#clearPassRetry();
@@ -1478,7 +1517,14 @@ export async function startFileTaskController(
   dispatcher?: ControllerDispatcher,
   options: ControllerRuntimeOptions = {}
 ): Promise<RunningFileTaskController> {
-  const runtime = new FileTaskController(store, delivery, options);
+  // The Controller defers preparation for a Project while its maintenance
+  // fence is held, so migrate/rebuild/archive/cleanup never interleave with
+  // worktree creation. Callers may override the predicate (e.g. tests).
+  const runtime = new FileTaskController(store, delivery, {
+    ...options,
+    maintenanceFence: options.maintenanceFence
+      ?? ((projectId: string) => isProjectMaintenanceFenced(home, projectId))
+  });
   let stopping = false;
   const lifecycleRequests = new Set<Promise<unknown>>();
   const server = await startControllerServer(home, async (method, params) => {
