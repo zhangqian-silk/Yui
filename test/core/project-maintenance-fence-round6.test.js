@@ -599,6 +599,39 @@ test("P2 migrate: a branch change between the pre-lock read and the lock fails c
   assert.equal(after.stableBranch, "main");
 });
 
+test("diagnostic: reopen after under-lock classification does not archive the live ref", async (t) => {
+  const fixture = await archiveFixture(t);
+  const { store, project } = fixture;
+  const { task, legacyRef } = await legacyTaskWithRef(fixture);
+  store.saveTask(completeTask(activateTask(task, NOW), NOW, { by: "leader", summary: "done" }));
+
+  const realGit = new NodeGitWorkspace();
+  let reopened = false;
+  const proxyGit = new Proxy(realGit, {
+    get(target, property) {
+      if (property === "inspectRecordedWorktree") {
+        return async (input) => {
+          reopened = true;
+          store.saveTask(reopenTask(store.getTask(task.id), NOW));
+          return target.inspectRecordedWorktree(input);
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  const proxyPreparer = new FileTaskWorkspacePreparer(
+    fixture.home, store, proxyGit, () => new Date(NOW)
+  );
+
+  const result = await proxyPreparer.archiveLegacyTaskRefs();
+  assert.equal(reopened, true);
+  assert.equal(store.getTask(task.id).status, "active");
+  assert.ok(!result.archived.some((entry) => entry.endsWith(legacyRef)));
+  assert.ok(git(project.path, ["for-each-ref", "--format=%(refname)", "refs/heads/yui/"])
+    .includes(legacyRef));
+});
+
 // ===========================================================================
 // ReviewRound 9 diagnostic regressions
 // ===========================================================================
