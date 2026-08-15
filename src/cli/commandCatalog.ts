@@ -613,7 +613,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "integration",
     summary: "Safely integrate ChangeSets with Leader-owned conflict decisions.",
-    sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "list", "show", "cleanup", "queue"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "supersede", "list", "show", "cleanup", "queue"] }],
     children: [
       {
         name: "start",
@@ -637,6 +637,12 @@ const taskChildren: readonly NodeInput[] = [
         name: "abort",
         summary: "Abandon a running or blocked Integration Attempt.",
         usage: "yui task integration abort <task>/<integration> --reason <text>",
+        options: ["--reason"]
+      },
+      {
+        name: "supersede",
+        summary: "Mark a committed Integration as obsolete, retaining its evidence.",
+        usage: "yui task integration supersede <task>/<integration> --reason <text>",
         options: ["--reason"]
       },
       { name: "list", summary: "List Integration Attempts.", usage: "yui task integration list <task>" },

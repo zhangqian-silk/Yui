@@ -7,6 +7,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import {
   createIntegrationAttempt,
   recordResolutionDecision,
+  supersedeIntegration,
   updateIntegrationAttempt,
   type IntegrationAttempt
 } from "../integration/integrationAttempt.js";
@@ -36,6 +37,7 @@ export async function runTaskIntegrationCommand(
     return resolveDecision(rest, store, now, options.environment);
   }
   if (command === "abort") return abortIntegration(rest, store, now(), options.environment);
+  if (command === "supersede") return supersedeIntegrationCommand(rest, store, now(), options.environment);
   if (command === "cleanup") {
     return cleanupIntegration(rest, store, home, options.environment);
   }
@@ -61,7 +63,9 @@ async function cleanupIntegration(
     );
   }
   const integration = requireIntegration(store, args[0], environment);
-  if (integration.status !== "committed" && integration.status !== "failed") {
+  if (integration.status !== "committed"
+    && integration.status !== "superseded"
+    && integration.status !== "failed") {
     throw usageError(
       `Integration is not terminal: ${integration.id}/${integration.status}.`
     );
@@ -280,6 +284,45 @@ function abortIntegration(
     return {
       output: `Aborted Integration ${aborted.id}; start a new Integration Attempt to retry\n`,
       data: { integration: aborted }
+    };
+  });
+}
+
+function supersedeIntegrationCommand(
+  args: readonly string[],
+  store: TaskStore,
+  now: Date,
+  environment: NodeJS.ProcessEnv | undefined
+): Readonly<{ output: string; data: unknown }> {
+  const usage = "Task Integration supersede usage: yui task integration supersede <task>/<integration> --reason <text>.";
+  const parsed = parseRepeatable(args, new Set(), new Set(["--reason"]), usage);
+  if (parsed.positionals.length !== 1) throw usageError(usage);
+  const integration = requireIntegration(store, parsed.positionals[0], environment);
+  requireActiveIntegrationTask(store, integration);
+  if (integration.status !== "committed") {
+    throw usageError(
+      `Integration cannot be superseded from ${integration.status}: ${integration.id}.`
+    );
+  }
+  const reason = parsed.one.get("--reason");
+  if (reason === undefined) throw usageError(usage);
+  return store.transaction((tx) => {
+    const current = tx.getIntegrationAttempt(integration.taskId, integration.id);
+    if (current === null) {
+      throw usageError(
+        `Integration Attempt not found: ${integration.taskId}/${integration.id}.`
+      );
+    }
+    if (current.status !== "committed") {
+      throw usageError(
+        `Integration cannot be superseded from ${current.status}: ${current.id}.`
+      );
+    }
+    const superseded = supersedeIntegration(current, reason, now);
+    tx.saveIntegrationAttempt(superseded.taskId, superseded);
+    return {
+      output: `Superseded Integration ${superseded.id}; the next valid committed Integration is now the delivery baseline\n`,
+      data: { integration: superseded }
     };
   });
 }

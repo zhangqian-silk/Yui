@@ -163,6 +163,7 @@ const PUBLIC_PATHS = [
   "task integration continue",
   "task integration resolve",
   "task integration abort",
+  "task integration supersede",
   "task integration list",
   "task integration show",
   "task integration cleanup",

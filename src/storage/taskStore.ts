@@ -3012,7 +3012,8 @@ function validIntegrationTransition(
     running: ["running", "blocked", "validating", "failed"],
     blocked: ["blocked", "validating", "failed"],
     validating: ["validating", "committed", "failed"],
-    committed: ["committed"],
+    committed: ["committed", "superseded"],
+    superseded: ["superseded"],
     failed: ["failed"]
   };
   return allowed[before.status].includes(after.status);

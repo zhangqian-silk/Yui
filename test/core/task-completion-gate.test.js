@@ -10,6 +10,7 @@ import { preflightTaskCompletion } from "../../dist/commands/taskCommands.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import {
   createIntegrationAttempt,
+  supersedeIntegration,
   updateIntegrationAttempt
 } from "../../dist/integration/integrationAttempt.js";
 import { enqueueIntegrationQueueEntry } from "../../dist/integration/integrationQueueService.js";
@@ -18,6 +19,7 @@ import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import {
   attachReviewRoundWorkspace,
   createTaskReviewRound,
+  finishReviewRound,
   startReviewRound
 } from "../../dist/review/reviewRound.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
@@ -571,4 +573,119 @@ test("completion preflight rejects non-terminal integration queue work", async (
     () => preflightTaskCompletion(fx.task.id, fx.store),
     /integration queue|queue entry/iu
   );
+});
+
+test("completion reconciliation skips a moved remote for a frozen Task baseline", async (t) => {
+  const fx = fixture(t);
+  const { entry, taskHead } = await seedCommittedIntegration(fx);
+  // A completed Task-final Review for the exact current head freezes the
+  // Task baseline: the delivery has been reviewed and approved, so the
+  // completion gate must not merge unreviewed remote changes.
+  const round = finishReviewRound(
+    createTaskReviewRound(
+      "review-round-1",
+      fx.task.id,
+      "work-item-1",
+      "candidate-1",
+      "reviewer",
+      "leader",
+      { schemaVersion: 1, projects: [{ projectId: fx.project.id, commit: taskHead }] },
+      NOW
+    ),
+    "completed",
+    "Clean Task-final review",
+    NOW
+  );
+  fx.store.saveReviewRound(fx.task.id, round);
+  const beforeIntegrations = fx.store.listIntegrationAttempts(fx.task.id).length;
+  advanceRemote(fx);
+
+  const reconciled = await reconcileTaskRemoteBaselines(
+    fx.task.id,
+    fx.store,
+    fx.home,
+    { git: new NodeGitWorkspace(), now: () => new Date(NOW) }
+  );
+  assert.equal(reconciled.length, 0);
+  assert.equal(fx.store.listIntegrationAttempts(fx.task.id).length, beforeIntegrations);
+  assert.equal(git(entry.path, ["rev-parse", "HEAD"]), taskHead);
+});
+
+test("supersedeIntegration marks a committed Integration obsolete with an audit trail", (t) => {
+  const fx = fixture(t);
+  const committed = updateIntegrationAttempt(createIntegrationAttempt({
+    id: "integration-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    targetRef: "main",
+    expectedHead: fx.base,
+    changeSetIds: ["change-set-1"],
+    checkCommands: []
+  }, NOW), { status: "committed", candidateCommit: fx.base }, NOW);
+
+  const superseded = supersedeIntegration(committed, "Polluted by remote SQLite merge", NOW);
+  assert.equal(superseded.status, "superseded");
+  assert.equal(superseded.candidateCommit, fx.base);
+  assert.equal(superseded.endedAt, NOW.toISOString());
+  const audit = superseded.checks?.find((check) => check.name === "superseded");
+  assert.ok(audit);
+  assert.equal(audit.outcome, "failed");
+  assert.equal(audit.details, "Polluted by remote SQLite merge");
+});
+
+test("supersedeIntegration rejects a non-committed or already superseded Integration", (t) => {
+  const fx = fixture(t);
+  const running = createIntegrationAttempt({
+    id: "integration-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    targetRef: "main",
+    expectedHead: fx.base,
+    changeSetIds: ["change-set-1"],
+    checkCommands: []
+  }, NOW);
+  assert.throws(
+    () => supersedeIntegration(running, "not committed yet", NOW),
+    /cannot be superseded from running/u
+  );
+  const superseded = supersedeIntegration(
+    updateIntegrationAttempt(running, { status: "committed", candidateCommit: fx.base }, NOW),
+    "first",
+    NOW
+  );
+  assert.throws(
+    () => supersedeIntegration(superseded, "already obsolete", NOW),
+    /cannot be superseded from superseded/u
+  );
+});
+
+test("CLI task integration supersede marks a committed Integration obsolete", async (t) => {
+  const fx = fixture(t);
+  const { taskHead } = await seedCommittedIntegration(fx);
+
+  const cliEnv = { ...process.env, YUI_HOME: fx.home };
+  delete cliEnv.YUI_CONTROL_PLANE_DESCRIPTOR;
+  delete cliEnv.YUI_TASK_RUNTIME_DESCRIPTOR;
+  delete cliEnv.YUI_SESSION_SCOPE;
+  const output = execFileSync(
+    process.execPath,
+    [
+      join(process.cwd(), "dist", "cli.js"),
+      "task", "integration", "supersede",
+      `${fx.task.id}/integration-1`,
+      "--reason", "Polluted by remote SQLite merge"
+    ],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: cliEnv
+    }
+  );
+  assert.match(output, /Superseded Integration integration-1/u);
+  const stored = fx.store.getIntegrationAttempt(fx.task.id, "integration-1");
+  assert.equal(stored.status, "superseded");
+  assert.ok(stored.endedAt);
+  const audit = stored.checks?.find((check) => check.name === "superseded");
+  assert.ok(audit);
+  assert.equal(audit.details, "Polluted by remote SQLite merge");
 });
