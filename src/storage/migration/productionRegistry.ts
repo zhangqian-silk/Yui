@@ -11,6 +11,8 @@ const FINAL_REVIEW_AGGREGATE_FROM_VERSION = 16;
 const FINAL_REVIEW_AGGREGATE_TO_VERSION = 17;
 const HOME_IDENTITY_AGGREGATE_FROM_VERSION = 17;
 const HOME_IDENTITY_AGGREGATE_TO_VERSION = 18;
+const SQLITE_LAYOUT_FROM_VERSION = 6;
+const SQLITE_LAYOUT_TO_VERSION = 7;
 const PROJECT_FROM_VERSION = 2;
 const PROJECT_TO_VERSION = 3;
 const TASK_FROM_VERSION = 3;
@@ -42,6 +44,14 @@ const MANAGED_WORKSPACE_TO_VERSION = 2;
 export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapshot> {
   assertBaselineConsistency();
   const registry = new MigrationRegistry<HomeSnapshot>().registerOfflineMigration({
+    axis: "layout",
+    fromVersion: SQLITE_LAYOUT_FROM_VERSION,
+    toVersion: SQLITE_LAYOUT_TO_VERSION,
+    preconditions: requireLayoutV6Snapshot,
+    transform: migrateLayoutV6ToV7,
+    declaredEffects: []
+  })
+    .registerOfflineMigration({
     axis: "aggregate",
     fromVersion: FINAL_REVIEW_AGGREGATE_FROM_VERSION,
     toVersion: FINAL_REVIEW_AGGREGATE_TO_VERSION,
@@ -607,6 +617,33 @@ function asObject(value: unknown, label: string): Record<string, unknown> {
 
 /** Historical public spelling retained as an alias to the single graph. */
 export const createProductionRegistry = createProductionStorageRegistry;
+
+/**
+ * Layout 6 -> 7 is the state.json -> SQLite WAL transition (task-21 §8). The
+ * transform only advances the manifest's layout version; the staged SQLite
+ * database is populated by the migration target's `writeFreshOutput`, and the
+ * `state.json` document is retained read-only for rollback. The precondition
+ * requires a layout-6 manifest so a future layout cannot be silently regressed.
+ */
+function requireLayoutV6Snapshot(snapshot: HomeSnapshot): void {
+  if (snapshot.schemaManifest.storageVersion !== SQLITE_LAYOUT_FROM_VERSION) {
+    throw new Error(
+      `Layout ${SQLITE_LAYOUT_FROM_VERSION}->${SQLITE_LAYOUT_TO_VERSION} migration requires ` +
+      `schema.json storageVersion ${SQLITE_LAYOUT_FROM_VERSION}.`
+    );
+  }
+}
+
+function migrateLayoutV6ToV7(snapshot: HomeSnapshot): HomeSnapshot {
+  requireLayoutV6Snapshot(snapshot);
+  return {
+    schemaManifest: {
+      ...snapshot.schemaManifest,
+      storageVersion: SQLITE_LAYOUT_TO_VERSION
+    },
+    state: snapshot.state
+  };
+}
 
 /** Advance the aggregate identity after proving manifest/root agreement at v16. */
 function migrateAggregateV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {

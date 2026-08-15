@@ -1,6 +1,6 @@
 {
   "name": "@zq-silk/yui",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Local control plane for long-running native agent CLI sessions backed by tmux.",
   "license": "MIT",
   "private": true,
@@ -60,6 +60,7 @@
   },
   "homepage": "https://github.com/zhangqian-silk/Yui#readme",
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^25.9.3",
     "@types/ws": "^8.18.1",
     "typescript": "^5.8.0"
@@ -67,6 +68,7 @@
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "better-sqlite3": "^12.11.1",
     "node-pty": "^1.1.0",
     "smol-toml": "1.7.0",
     "ws": "^8.21.1"

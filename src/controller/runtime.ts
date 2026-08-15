@@ -35,6 +35,11 @@ import { isTaskOwnedWorkspace } from "../worktree/managedWorkspace.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
+import { SqliteTaskStore } from "../storage/sqliteStore.js";
+import {
+  AsyncTaskStoreClient,
+  resolveStoreWorkerEnabled
+} from "../storage/storeRpc.js";
 import {
   FileTaskWorkspacePreparer,
   type TaskWorkspacePreparer
@@ -59,7 +64,11 @@ import {
 } from "./controller.js";
 import { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
-import { FileRuntimeEventProcessor } from "./runtimeEventProcessor.js";
+import {
+  AsyncRuntimeEventProcessor,
+  FileRuntimeEventProcessor,
+  createAsyncRuntimeObserver
+} from "./runtimeEventProcessor.js";
 import {
   RuntimeLaunchCoordinator,
   type CoordinatedRuntimeLaunchRequest
@@ -70,8 +79,10 @@ import {
 } from "./domainIdentity.js";
 import { createEphemeralResourceReaper } from "./ephemeralResourceReaper.js";
 import { scanControllerResourceInventory } from "./resourceInventoryLinux.js";
+import { ResourceInventoryClient } from "./resourceInventoryRpc.js";
 import {
   createRuntimeResourceActivityTracker,
+  type RuntimePaneFact,
   type RuntimeResourceSampleIdentity
 } from "./resourceInventory.js";
 
@@ -106,7 +117,32 @@ export async function startFileTaskControllerRuntime(
   home: string,
   options: FileTaskControllerFactoryOptions = {}
 ): Promise<RunningFileTaskControllerRuntime> {
-  const store = options.store ?? openCompatibleFileTaskStore(home);
+  // The persistence worker (task-21, work-item-5) is opt-in: YUI_STORE_BACKEND
+  // must be sqlite AND YUI_STORE_WORKER=1. The file store remains the default
+  // for CLI tools and tests; rollback is a config flip (§6).
+  const useWorker = resolveStoreWorkerEnabled(options.environment ?? process.env);
+  const store = options.store
+    ?? (useWorker
+      // Transitional: the scheduler/planner still use a sync store. The worker
+      // owns the event-processing hot path; the scheduler migration is the next
+      // step (see work-item-5 remaining call sites). Both connections point at
+      // the same WAL db and serialize via BEGIN IMMEDIATE + busy_timeout.
+      ? new SqliteTaskStore(home)
+      : openCompatibleFileTaskStore(home));
+  // When the worker backend is active, the db-touching observer folds run in
+  // the worker (off the main event loop). The client is closed on shutdown.
+  const asyncStoreClient = useWorker
+    ? new AsyncTaskStoreClient(home, {
+        environment: options.environment,
+        observerModule: new URL("./fileSchedulerStoreAdapter.js", import.meta.url)
+      })
+    : undefined;
+  // When the worker backend is active, the blocking /proc inventory scan runs
+  // in the inventory worker (off the main event loop); the scheduler and the
+  // ephemeral reaper consume the same inventory shape through this client (§3.3).
+  const inventoryClient = useWorker
+    ? new ResourceInventoryClient()
+    : undefined;
   const schedulerStore = options.schedulerStore ?? new FileSchedulerStoreAdapter(store);
   const domainIdentity = options.domainIdentity
     ?? ephemeralDomainFromEnvironment(options.environment ?? process.env);
@@ -199,6 +235,26 @@ export async function startFileTaskControllerRuntime(
       runtimeIsolation
     }
   );
+  // One inventory scan per scheduler pass. When the worker backend is active
+  // the blocking /proc scan runs in the inventory worker; otherwise it runs on
+  // the main thread (file backend, unchanged).
+  const scanInventory = (panes: readonly RuntimePaneFact[]) => inventoryClient !== undefined
+    ? inventoryClient.scan({
+        currentHome: home,
+        scope: "current",
+        panes,
+        ...(options.environment === undefined
+          ? {}
+          : { environment: options.environment })
+      })
+    : scanControllerResourceInventory({
+        currentHome: home,
+        scope: "current",
+        panes,
+        ...(options.environment === undefined
+          ? {}
+          : { environment: options.environment })
+      });
   const delivery = options.delivery ?? new ExecutorRegistry(
     planner,
     tmux,
@@ -208,14 +264,7 @@ export async function startFileTaskControllerRuntime(
       promptPush,
       launchCoordinator,
       roleResourceInventory: async (panes, inputs) => {
-        const inventory = await scanControllerResourceInventory({
-          currentHome: home,
-          scope: "current",
-          panes,
-          ...(options.environment === undefined
-            ? {}
-            : { environment: options.environment })
-        });
+        const inventory = await scanInventory(panes);
         return inventory.resources.flatMap((resource) => {
           if (resource.kind !== "agent-session") return [];
           const owner = resource.owner;
@@ -290,7 +339,20 @@ export async function startFileTaskControllerRuntime(
           // recovery bounded to that domain; cross-home cleanup remains an
           // explicit `controller cleanup --all` inventory operation.
           scope: "current",
-          environment: options.environment
+          environment: options.environment,
+          // When the worker backend is active, the reaper's scan runs in the
+          // inventory worker too (same cadence, same inventory shape).
+          ...(inventoryClient === undefined
+            ? {}
+            : {
+                scan: () => inventoryClient.scan({
+                  currentHome: home,
+                  scope: "current",
+                  ...(options.environment === undefined
+                    ? {}
+                    : { environment: options.environment })
+                })
+              })
         }));
   const lifecycleDispatcher = createRuntimeLifecycleDispatcher(
     store,
@@ -322,15 +384,27 @@ export async function startFileTaskControllerRuntime(
       },
       workspacePreparer,
       runtimeEventProcessor: options.runtimeEventProcessor
-        ?? new FileRuntimeEventProcessor(
-          new FileRuntimeEventInbox(home),
-          schedulerStore,
-          {
-            onTaskRuntimeApplied: (input) => {
-              planner.refreshTaskRuntimeDescriptor(input);
+        ?? (useWorker && asyncStoreClient !== undefined
+          ? new AsyncRuntimeEventProcessor(
+            new FileRuntimeEventInbox(home),
+            createAsyncRuntimeObserver(
+              (method, args) => asyncStoreClient.invokeObserver(method, args)
+            ),
+            {
+              onTaskRuntimeApplied: (input) => {
+                planner.refreshTaskRuntimeDescriptor(input);
+              }
             }
-          }
-        ),
+          )
+          : new FileRuntimeEventProcessor(
+            new FileRuntimeEventInbox(home),
+            schedulerStore,
+            {
+              onTaskRuntimeApplied: (input) => {
+                planner.refreshTaskRuntimeDescriptor(input);
+              }
+            }
+          )),
       domainIdentity,
       ...(options.configuration !== undefined
         ? { configuration: options.configuration }
@@ -349,6 +423,12 @@ export async function startFileTaskControllerRuntime(
   runningRuntime = running.runtime;
   return {
     ...running,
+    close: async () => {
+      await running.close();
+      // Release the worker's database connections when the worker backend is active.
+      await asyncStoreClient?.close();
+      await inventoryClient?.close();
+    },
     store,
     schedulerStore,
     planner,

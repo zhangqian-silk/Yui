@@ -24,6 +24,8 @@
  * axis without letting an empty target family masquerade as current.
  */
 
+import { existsSync } from "node:fs";
+
 import {
   classifyStorage,
   type Classification,
@@ -36,6 +38,7 @@ import {
   type StorageSchemaState
 } from "../storageSchema.js";
 import { FileTaskStore, StorageRecordError } from "../taskStore.js";
+import { SqliteTaskStore } from "../sqliteStore.js";
 import {
   inspectSourceVersionState,
   type HomeSnapshot
@@ -147,23 +150,46 @@ export function classifyHome<Snapshot>(
 }
 
 /**
- * Load a Home whose every axis is already current through the strict
- * `FileTaskStore` gate to detect real structural/reference corruption. This is
- * only ever called when the source equals `latest` across all three axes, so a
- * version error cannot occur here and any throw is genuine corruption (bad
- * record shape, a broken reference graph).
+ * Load a Home whose every axis is already current through the strict store
+ * gate to detect real structural/reference corruption. This is only ever
+ * called when the source equals `latest` across all three axes, so a version
+ * error cannot occur here and any throw is genuine corruption (bad record
+ * shape, a broken reference graph, or a damaged SQLite database).
+ *
+ * A layout-7 Home whose authoritative store is `yui.db` is verified through
+ * {@link SqliteTaskStore}; a layout-7 Home that still uses the aggregate
+ * `state.json` (or a layout-6 Home in tests) is verified through
+ * {@link FileTaskStore}.
  */
 function detectCurrentHomeCorruption(home: string): CorruptionSignal | undefined {
   try {
-    const store = new FileTaskStore(home);
-    store.getConfig();
-    store.listTasks();
-    store.listProjects();
-    store.listConfiguredAgents();
-    store.listWorkMailboxes();
+    if (existsSync(`${home}/yui.db`)) {
+      const store = new SqliteTaskStore(home);
+      try {
+        store.getConfig();
+        store.listTasks();
+        store.listProjects();
+        store.listConfiguredAgents();
+        store.listWorkMailboxes();
+      } finally {
+        store.close();
+      }
+    } else {
+      const store = new FileTaskStore(home);
+      store.getConfig();
+      store.listTasks();
+      store.listProjects();
+      store.listConfiguredAgents();
+      store.listWorkMailboxes();
+    }
     return undefined;
   } catch (error) {
     if (error instanceof StorageRecordError) {
+      return { corrupted: true, detail: error.message };
+    }
+    // A SQLite-level error (corrupt database file, I/O fault) is structural
+    // damage, not a version mismatch.
+    if (error instanceof Error && (error.name === "SqliteError" || error.message.includes("SQLite"))) {
       return { corrupted: true, detail: error.message };
     }
     // A non-record error (e.g. an unexpected I/O fault) is surfaced, not

@@ -106,10 +106,19 @@ export async function reapExpiredEphemeralResources(
 }
 
 export function createEphemeralResourceReaper(
-  options: ControllerInventoryScanOptions & Pick<EphemeralResourceReaperOptions, "onExpiredDomain">
+  options: ControllerInventoryScanOptions &
+    Pick<EphemeralResourceReaperOptions, "onExpiredDomain"> & {
+      /**
+       * Override the inventory scan. The Controller runtime supplies the
+       * inventory worker RPC when the worker backend is active (§3.3); the
+       * default is the direct `/proc` scan on the main thread.
+       */
+      scan?: () => Promise<ControllerResourceInventory>;
+    }
 ): () => Promise<EphemeralResourceReapResult> {
+  const scan = options.scan ?? (() => scanControllerResourceInventory(options));
   return () => reapExpiredEphemeralResources({
-    scan: () => scanControllerResourceInventory(options),
+    scan,
     clean: (resource) => cleanControllerResource(resource, {
       environment: options.environment
     }),

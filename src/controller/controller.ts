@@ -53,7 +53,11 @@ import type {
   TaskRuntimeLifecycleCleanupPort
 } from "../runtime/taskRuntimeIsolation.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
-import type { RuntimeEventProcessorPort } from "./runtimeEventProcessor.js";
+import type {
+  AsyncRuntimeEventProcessorPort,
+  RuntimeEventDrainResult,
+  RuntimeEventProcessorPort
+} from "./runtimeEventProcessor.js";
 import type { EphemeralDomainIdentity } from "./domainIdentity.js";
 
 const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
@@ -92,7 +96,7 @@ export type ControllerRuntimeOptions = Readonly<{
   now?: () => Date;
   onError?: (error: unknown) => void;
   workspacePreparer?: Pick<TaskWorkspacePreparer, "prepareTaskWorkspace">;
-  runtimeEventProcessor?: RuntimeEventProcessorPort;
+  runtimeEventProcessor?: RuntimeEventProcessorPort | AsyncRuntimeEventProcessorPort;
   lifecycleHost?: RuntimeLifecycleHost;
   configuration?: ControllerConfigurationPort;
   domainIdentity?: EphemeralDomainIdentity;
@@ -818,7 +822,7 @@ export class FileTaskController {
   readonly #stallWindowMs: number;
   /** Narrow-port fallback; FileSchedulerStoreAdapter durably records these keys. */
   readonly #resourceSuppressionKeys = new Set<string>();
-  readonly #runtimeEventProcessor: RuntimeEventProcessorPort | undefined;
+  readonly #runtimeEventProcessor: RuntimeEventProcessorPort | AsyncRuntimeEventProcessorPort | undefined;
   readonly #lifecycleHost:
     | RuntimeLifecycleHost
     | undefined;
@@ -1080,7 +1084,7 @@ export class FileTaskController {
               }
             }
           }
-          const firstRuntimeDrain = this.#drainRuntimeEvents();
+          const firstRuntimeDrain = await this.#drainRuntimeEvents();
           result = await runControllerSchedulerPass(
             this.store,
             this.delivery,
@@ -1093,7 +1097,7 @@ export class FileTaskController {
             this.#stallWindowMs,
             this.#resourceSuppressionKeys
           );
-          const secondRuntimeDrain = this.#drainRuntimeEvents();
+          const secondRuntimeDrain = await this.#drainRuntimeEvents();
           this.#clearPassRetry();
           this.#scheduleRuntimeCleanupRetries(runtimeCleanupOutcomes);
           this.#scheduleDeliveryRetries(result);
@@ -1160,9 +1164,14 @@ export class FileTaskController {
     }
   }
 
-  #drainRuntimeEvents(): ReturnType<RuntimeEventProcessorPort["drain"]> | undefined {
-    const result = this.#runtimeEventProcessor?.drain(this.#now());
-    if (result !== undefined && result.failed.length > 0) {
+  async #drainRuntimeEvents(): Promise<RuntimeEventDrainResult | undefined> {
+    const processor = this.#runtimeEventProcessor;
+    if (processor === undefined) return undefined;
+    // The worker backend exposes drainAsync; the file backend stays sync.
+    const result = "drainAsync" in processor
+      ? await processor.drainAsync(this.#now())
+      : processor.drain(this.#now());
+    if (result.failed.length > 0) {
       throw new RuntimeEventApplyError(
         result.failed.map((failure) => failure.error),
         "One or more native Turn events could not be applied."

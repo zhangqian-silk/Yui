@@ -24,7 +24,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
   const source = {
     schemaManifest: {
       schemaVersion: 1,
-      storageVersion: 6,
+      storageVersion: 7,
       aggregateSchemaVersion: 17,
       recordVersions: Object.fromEntries(
         Object.entries(sourceRecord).map(([kind, entry]) => [kind, entry.version])
@@ -55,7 +55,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
   };
   const plan = planMigration(
     createProductionRegistry(),
-    { layout: 6, aggregate: 17, record: sourceRecord },
+    { layout: 7, aggregate: 17, record: sourceRecord },
     latestStorageVersionState()
   );
   assert.equal(plan.kind, "runnable");
@@ -109,7 +109,7 @@ test("managedWorkspace migration advances every embedded lifecycle snapshot", ()
   const source = {
     schemaManifest: {
       schemaVersion: 1,
-      storageVersion: 6,
+      storageVersion: 7,
       aggregateSchemaVersion: 17,
       recordVersions: Object.fromEntries(
         Object.entries(sourceRecord).map(([kind, entry]) => [kind, entry.version])
@@ -133,7 +133,7 @@ test("managedWorkspace migration advances every embedded lifecycle snapshot", ()
   };
   const plan = planMigration(
     createProductionRegistry(),
-    { layout: 6, aggregate: 17, record: sourceRecord },
+    { layout: 7, aggregate: 17, record: sourceRecord },
     latestStorageVersionState()
   );
   assert.equal(plan.kind, "runnable");
@@ -195,7 +195,7 @@ test("workItem v8 migration preserves its current ExecutionGroup as immutable hi
   const source = {
     schemaManifest: {
       schemaVersion: 1,
-      storageVersion: 6,
+      storageVersion: 7,
       aggregateSchemaVersion: 17,
       recordVersions: Object.fromEntries(
         Object.entries(sourceRecord).map(([kind, entry]) => [kind, entry.version])
@@ -217,7 +217,7 @@ test("workItem v8 migration preserves its current ExecutionGroup as immutable hi
   };
   const plan = planMigration(
     createProductionRegistry(),
-    { layout: 6, aggregate: 17, record: sourceRecord },
+    { layout: 7, aggregate: 17, record: sourceRecord },
     latestStorageVersionState()
   );
   assert.equal(plan.kind, "runnable");
@@ -244,7 +244,7 @@ test("active-lane pointer migration separates a legal Role containing colons", (
   const source = {
     schemaManifest: {
       schemaVersion: 1,
-      storageVersion: 6,
+      storageVersion: 7,
       aggregateSchemaVersion: 17,
       recordVersions: Object.fromEntries(
         Object.entries(sourceRecord).map(([kind, entry]) => [kind, entry.version])
@@ -278,7 +278,7 @@ test("active-lane pointer migration separates a legal Role containing colons", (
   };
   const plan = planMigration(
     createProductionRegistry(),
-    { layout: 6, aggregate: 17, record: sourceRecord },
+    { layout: 7, aggregate: 17, record: sourceRecord },
     latestStorageVersionState()
   );
   assert.equal(plan.kind, "runnable");
