@@ -73,6 +73,14 @@ export async function reconcileTaskRemoteBaselines(
     );
   }
 
+  // A completed Task-final Review that exactly covers the current frozen heads
+  // is the final review evidence.  Do not reconcile the remote after a clean
+  // review, as merging a moved remote would change the reviewed head and
+  // invalidate the review.
+  if (await hasCompletedTaskFinalReviewForCurrentCandidate(store, task, workspace, git)) {
+    return [];
+  }
+
   const plans: RemotePlan[] = [];
   for (const binding of task.projectBindings) {
     const project = store.getProject(binding.projectId);
@@ -190,6 +198,39 @@ function requireTaskWorkspace(store: TaskStore, task: Task): ManagedWorkspace {
     throw usageError(`Task ${task.id} has no authoritative managed main workspace.`);
   }
   return workspace;
+}
+
+/**
+ * Check whether the latest Task-final ReviewRound is completed and its
+ * immutable candidate exactly matches the current actual heads for every
+ * Project in the Task.  When this holds, the reviewed head is the final
+ * head and remote reconciliation must not change it.
+ */
+async function hasCompletedTaskFinalReviewForCurrentCandidate(
+  store: TaskStore,
+  task: Task,
+  workspace: ManagedWorkspace,
+  git: GitWorkspacePort
+): Promise<boolean> {
+  const rounds = store.listReviewRounds(task.id)
+    .filter((round) => (round.scope ?? "work-item") === "task")
+    .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
+  const latest = rounds.at(-1);
+  if (latest === undefined || latest.status !== "completed") return false;
+  if (latest.taskCandidate === undefined) return false;
+
+  const candidateProjects = new Map(
+    latest.taskCandidate.projects.map((entry) => [entry.projectId, entry.commit])
+  );
+  for (const binding of task.projectBindings) {
+    const reviewedCommit = candidateProjects.get(binding.projectId);
+    if (reviewedCommit === undefined) return false;
+    const entry = workspaceProjectEntry(workspace, binding.projectId);
+    if (entry === undefined || entry.access !== "write") return false;
+    const actualHead = (await git.inspect(entry.path, "HEAD")).baseCommit;
+    if (actualHead !== reviewedCommit) return false;
+  }
+  return true;
 }
 
 function latestCommittedIntegration(
