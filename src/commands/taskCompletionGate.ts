@@ -131,6 +131,13 @@ export async function reconcileTaskRemoteBaselines(
   const reconciled: RemoteReconciliation[] = [];
   for (const plan of plans) {
     const attempt = store.transaction((tx) => {
+      // Re-check the frozen baseline inside the transaction: a Task-final
+      // Review may have completed during the async remote fetch, freezing
+      // the head after the initial check.  Creating a new Integration here
+      // would move the reviewed head and invalidate the review evidence.
+      if (hasFrozenTaskBaseline(tx, task.id, plan.project.id, plan.currentCommit)) {
+        return null;
+      }
       const created = createIntegrationAttempt({
         id: tx.nextIntegrationAttemptId(task.id),
         taskId: task.id,
@@ -143,6 +150,7 @@ export async function reconcileTaskRemoteBaselines(
       tx.saveIntegrationAttempt(task.id, created);
       return created;
     });
+    if (attempt === null) continue;
     const baseline: RemoteBaseline = {
       remoteUrl: plan.project.remoteUrl!,
       branch: plan.remote.branch

@@ -32,7 +32,7 @@ export type ResolutionDecision = Readonly<{
 }>;
 
 export type IntegrationAttempt = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   taskId: string;
   projectId: string;
@@ -62,7 +62,7 @@ export function createIntegrationAttempt(
 ): IntegrationAttempt {
   const timestamp = now.toISOString();
   return validateIntegrationAttempt({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: input.id,
     taskId: input.taskId,
     projectId: input.projectId,
@@ -184,8 +184,8 @@ export function supersedeIntegration(
 }
 
 export function validateIntegrationAttempt(attempt: IntegrationAttempt): IntegrationAttempt {
-  if (attempt.schemaVersion !== 2) {
-    throw new Error("IntegrationAttempt must use schemaVersion 2.");
+  if (attempt.schemaVersion !== 3) {
+    throw new Error("IntegrationAttempt must use schemaVersion 3.");
   }
   validateTaskRecordReference({
     taskId: attempt.taskId,

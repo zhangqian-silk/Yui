@@ -75,7 +75,7 @@ test("the production registry registers every adjacent post-baseline step", () =
   const registry = createProductionRegistry();
   assert.equal(BASELINE_AGGREGATE_SCHEMA_VERSION, 16);
   assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
-  assert.equal(registry.size, 15);
+  assert.equal(registry.size, 16);
   const step = registry.lookup("aggregate", undefined, 16);
   assert.notEqual(step, undefined);
   assert.equal(step.toVersion, 17);
@@ -91,6 +91,9 @@ test("the production registry registers every adjacent post-baseline step", () =
   const changeSetManifestStep = registry.lookup("record", "changeSet", 2);
   assert.notEqual(changeSetManifestStep, undefined);
   assert.equal(changeSetManifestStep.toVersion, 3);
+  const integrationAttemptStep = registry.lookup("record", "integrationAttempt", 2);
+  assert.notEqual(integrationAttemptStep, undefined);
+  assert.equal(integrationAttemptStep.toVersion, 3);
   const integrationQueueIntroduction = registry.lookup("record", "integrationQueue", 0);
   assert.notEqual(integrationQueueIntroduction, undefined);
   assert.equal(integrationQueueIntroduction.toVersion, 1);

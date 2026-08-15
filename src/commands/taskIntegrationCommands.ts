@@ -306,6 +306,21 @@ function supersedeIntegrationCommand(
   }
   const reason = parsed.one.get("--reason");
   if (reason === undefined) throw usageError(usage);
+  // Only the Task Leader (or Operator/user) may supersede a committed
+  // Integration: it rewrites delivery-baseline evidence and audit history.
+  taskActor(environment, integration.taskId);
+  // A queue-backed committed Attempt cannot be superseded: the queue entry
+  // would remain "committed" while its Attempt becomes "superseded", leaving
+  // contradictory terminal records that never converge.
+  const queueBacked = store.listIntegrationQueueEntries(integration.taskId)
+    .some((entry) => entry.integrationAttemptId === integration.id
+      && entry.status === "committed");
+  if (queueBacked) {
+    throw usageError(
+      `Integration ${integration.id} is backed by a committed queue entry; `
+      + "reconcile the queue entry instead of superseding its Attempt."
+    );
+  }
   return store.transaction((tx) => {
     const current = tx.getIntegrationAttempt(integration.taskId, integration.id);
     if (current === null) {

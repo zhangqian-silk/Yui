@@ -35,6 +35,8 @@ const MANAGED_WORKSPACE_FROM_VERSION = 1;
 const MANAGED_WORKSPACE_TO_VERSION = 2;
 const CHANGE_SET_MANIFEST_FROM_VERSION = 2;
 const CHANGE_SET_MANIFEST_TO_VERSION = 3;
+const INTEGRATION_ATTEMPT_FROM_VERSION = 2;
+const INTEGRATION_ATTEMPT_TO_VERSION = 3;
 const INTEGRATION_QUEUE_FROM_VERSION = 0;
 const INTEGRATION_QUEUE_TO_VERSION = 1;
 
@@ -103,6 +105,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(managedWorkspaceFamilyStep())
     .registerOfflineMigration(activeRunPointerNamespaceStep())
     .registerOfflineMigration(changeSetManifestStep())
+    .registerOfflineMigration(integrationAttemptSupersededStep())
     .registerOfflineMigration(integrationQueueIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
@@ -548,6 +551,90 @@ function migrateChangeSetManifest(snapshot: HomeSnapshot): HomeSnapshot {
       };
     }
     nextTasks[taskId] = { ...task, changeSets: nextChangeSets };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * IntegrationAttempt v2->v3 adds the "superseded" terminal status for
+ * committed Integrations that are obsolete.  The migration preserves all
+ * existing fields and advances the schema version; the new status is
+ * opt-in, so old records remain valid until explicitly superseded.
+ */
+function integrationAttemptSupersededStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "integrationAttempt",
+    fromVersion: INTEGRATION_ATTEMPT_FROM_VERSION,
+    toVersion: INTEGRATION_ATTEMPT_TO_VERSION,
+    preconditions: requireIntegrationAttemptV2,
+    transform: migrateIntegrationAttemptV2ToV3,
+    declaredEffects: []
+  };
+}
+
+function requireIntegrationAttemptV2(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.integrationAttempt !== INTEGRATION_ATTEMPT_FROM_VERSION) {
+    throw new Error(
+      `Record integrationAttempt migration requires manifest version ${INTEGRATION_ATTEMPT_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.integrationAttempts === undefined) continue;
+    const attempts = asObject(task.integrationAttempts, `integrationAttempt map ${taskId}`);
+    for (const [attemptId, rawRecord] of Object.entries(attempts)) {
+      const record = asObject(rawRecord, `integrationAttempt ${taskId}/${attemptId}`);
+      if (record.schemaVersion !== INTEGRATION_ATTEMPT_FROM_VERSION) {
+        throw new Error(
+          `integrationAttempt ${taskId}/${attemptId} must use schemaVersion ${INTEGRATION_ATTEMPT_FROM_VERSION}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateIntegrationAttemptV2ToV3(snapshot: HomeSnapshot): HomeSnapshot {
+  requireIntegrationAttemptV2(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      integrationAttempt: INTEGRATION_ATTEMPT_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.integrationAttempts === undefined) {
+      nextTasks[taskId] = { ...task };
+      continue;
+    }
+    const attempts = asObject(task.integrationAttempts, `integrationAttempt map ${taskId}`);
+    const nextAttempts: Record<string, unknown> = {};
+    for (const [attemptId, rawRecord] of Object.entries(attempts)) {
+      const record = asObject(rawRecord, `integrationAttempt ${taskId}/${attemptId}`);
+      nextAttempts[attemptId] = {
+        ...record,
+        schemaVersion: INTEGRATION_ATTEMPT_TO_VERSION
+      };
+    }
+    nextTasks[taskId] = { ...task, integrationAttempts: nextAttempts };
   }
   return {
     schemaManifest,
