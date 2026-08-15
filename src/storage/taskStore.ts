@@ -1627,6 +1627,13 @@ function stateFileFingerprint(path: string): string {
 
 export class StorageRecordError extends Error { constructor(message: string) { super(message); this.name = "StorageRecordError"; } }
 export class StorageConflictError extends Error { constructor(message: string) { super(message); this.name = "StorageConflictError"; } }
+/**
+ * Raised by the persistence worker when an `AbortSignal` cancels an in-flight
+ * command batch. The open transaction is rolled back; the database is unchanged.
+ * Already-committed transactions are not undone (their effects are idempotent
+ * and semantically owned by the caller, design §3.1).
+ */
+export class StorageCancelledError extends Error { constructor(message: string) { super(message); this.name = "StorageCancelledError"; } }
 
 export function resolveYuiHome(env: NodeJS.ProcessEnv): string {
   return env.YUI_HOME === undefined || env.YUI_HOME.length === 0

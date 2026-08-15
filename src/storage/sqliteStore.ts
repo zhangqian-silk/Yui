@@ -72,6 +72,7 @@ import {
   CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
   executionLaneActiveRunKey,
   StorageConflictError,
+  StorageCancelledError,
   StorageRecordError,
   FileTaskStore,
   type ConfiguredAgentPatch,
@@ -332,6 +333,85 @@ export class SqliteTaskStore implements TaskStore {
     return row.revision;
   }
 
+  /**
+   * Run an ordered command batch inside one `BEGIN IMMEDIATE … COMMIT`, yielding
+   * to the event loop between commands so a cancellation signal can interrupt
+   * the batch (§3.1). The persistence worker uses this for `transactionAsync`:
+   * a cancelled batch rolls back (the db is unchanged); already-committed
+   * batches are not undone (their effects are idempotent and caller-owned).
+   *
+   * Each command is `{op, args}` where `op` is a `TaskStore` method name. The
+   * batch runs on the single writer connection, so writes are serialized exactly
+   * as the synchronous {@link transaction} (§3.2). The revision is bumped once
+   * at commit when the batch wrote; an optional `requestId` records the effect
+   * in the durable outbox for exactly-once replay (§5.4).
+   */
+  async transactionAsyncBatch(
+    commands: ReadonlyArray<{ op: string; args: readonly unknown[] }>,
+    options: SqliteTransactionOptions & {
+      shouldCancel?: () => boolean;
+      expectedRevision?: number;
+    } = {}
+  ): Promise<unknown[]> {
+    if (this.#inTransaction) {
+      // Nested inside a synchronous transaction: run without yielding (the
+      // caller already holds the write lock).
+      return commands.map((command) => this.#executeCommand(command.op, command.args));
+    }
+    this.#begin();
+    try {
+      // Revision CAS (§5.3): the check and the increment happen in the same
+      // write transaction, exactly as transactionWithRevisionCas.
+      if (options.expectedRevision !== undefined) {
+        const current = this.getRevision();
+        if (current !== options.expectedRevision) {
+          throw new StorageConflictError(
+            `Storage revision conflict (expected ${options.expectedRevision}, found ${current}).`
+          );
+        }
+      }
+      const results: unknown[] = [];
+      for (const command of commands) {
+        if (options.shouldCancel?.() === true) {
+          throw new StorageCancelledError(
+            `Storage command batch cancelled before op '${command.op}'.`
+          );
+        }
+        results.push(this.#executeCommand(command.op, command.args));
+        // Yield so the worker's message loop can observe a cancel signal
+        // between statements (§3.1). A single-command batch still yields once
+        // so a cancel that raced the batch start is honoured before commit.
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      if (options.shouldCancel?.() === true) {
+        throw new StorageCancelledError("Storage command batch cancelled before commit.");
+      }
+      if (this.#dirty) {
+        this.#prepareWrite();
+        if (options.requestId !== undefined) {
+          this.#insertOutbox(options.requestId, options.outboxCommand ?? commands);
+        }
+        if (!this.#migration) {
+          this.#bumpRevision();
+        }
+      }
+      this.#commit();
+      return results;
+    } catch (error) {
+      this.#rollback();
+      throw error;
+    }
+  }
+
+  /** Invoke a TaskStore method by name (used by the worker's command batches). */
+  #executeCommand(op: string, args: readonly unknown[]): unknown {
+    const method = (this as unknown as Record<string, (...callArgs: unknown[]) => unknown>)[op];
+    if (typeof method !== "function") {
+      throw new StorageRecordError(`Unknown store command: ${op}`);
+    }
+    return method.apply(this, args as unknown[]);
+  }
+
   // -- outbox (§5.4) ----------------------------------------------------------
 
   #insertOutbox(requestId: string, command: unknown): void {
@@ -370,6 +450,18 @@ export class SqliteTaskStore implements TaskStore {
       command: this.#parse(row.command),
       createdAt: row.created_at
     }));
+  }
+
+  /**
+   * True when an outbox row already exists for `requestId` (the effect committed).
+   * The persistence worker consults this before re-executing a retried write so a
+   * main-thread retry after a worker restart never double-applies (§3.1, §5.4).
+   */
+  hasOutboxEntry(requestId: string): boolean {
+    const row = this.#db.prepare(
+      "SELECT 1 FROM outbox WHERE request_id = ?"
+    ).get(requestId);
+    return row !== undefined;
   }
 
   /** Mark an outbox row as applied (idempotent). */
