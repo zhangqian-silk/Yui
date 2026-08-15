@@ -214,6 +214,127 @@ function markDelivered(store, run) {
   });
 }
 
+function bindDeliveryPending(store, run) {
+  store.transaction((tx) => {
+    const target = { kind: "role", taskId: run.taskId, roleName: run.roleName };
+    let mailbox = tx.getWorkMailbox(target) ?? createWorkMailbox(target);
+    if (mailbox.pending === null) {
+      mailbox = enqueueSignal(mailbox, {
+        reason: "fixture-run-dispatched",
+        refs: [{ type: "run", taskId: run.taskId, id: run.id }],
+        occurredAt: NOW.toISOString()
+      });
+    }
+    const batchId = formatAgentRunReceiptId(run.taskId, run.id);
+    mailbox = bindExecution(claimPending(mailbox, {
+      batchId,
+      owner: "controller",
+      startedAt: NOW.toISOString()
+    }), batchId, { type: "run", taskId: run.taskId, id: run.id });
+    tx.saveWorkMailbox(mailbox);
+  });
+}
+
+async function activeAssignedWorkspaceFixture(t, options = {}) {
+  const { home, repositoryPath, store } = fixture(t);
+  const project = await addProject(store, repositoryPath);
+  const task = activateTask(createTask("task-1", "Preserve an active WorkItem runtime", NOW, {
+    projectBindings: [{
+      projectId: project.id,
+      directory: project.name,
+      baseRef: project.developmentBranch
+    }]
+  }), NOW);
+  addTaskRoles(store, task, repositoryPath);
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Keep the exact isolated runtime",
+    assignee: "worker",
+    writeProjectIds: [project.id]
+  }, NOW);
+  store.saveWorkItem(task.id, item);
+
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => new Date(NOW));
+  const main = (await preparer.prepareTaskWorkspace(task.id)).path;
+  const isolated = await preparer.prepareWorkItemWorkspace(item.taskId, item.id);
+  store.saveWorkItem(task.id, updateWorkItemStatus(item, "running", NOW));
+
+  const isolatedRole = store.getRole(task.id, "worker");
+  const isolatedEffective = resolveEffectiveLaunch({
+    role: isolatedRole,
+    purpose: "execution",
+    workspace: isolated,
+    workItemWriteProjectIds: item.writeProjectIds
+  });
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  const mainRole = updateRole(isolatedRole, { workspace: main }, NOW);
+  const mainEffective = resolveEffectiveLaunch({
+    role: mainRole,
+    purpose: "execution",
+    workspace: taskWorkspace,
+    workItemWriteProjectIds: item.writeProjectIds
+  });
+  store.saveRole(task.id, updateRoleStatus(mainRole, "running", NOW));
+
+  const runEffective = options.runWorkspaceMismatch === true
+    ? mainEffective
+    : isolatedEffective;
+  const run = createAgentRun(
+    store.nextAgentRunId(task.id),
+    task.id,
+    "worker",
+    "resume",
+    "Continue the exact isolated WorkItem.",
+    NOW,
+    {
+      workItemId: item.id,
+      workspace: options.runWorkspaceMismatch === true ? taskWorkspace : isolated,
+      effective: runEffective
+    }
+  );
+  store.saveActiveAgentRun(run);
+  bindDeliveryPending(store, run);
+
+  let sessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: "worker"
+  }, "codex", NOW);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "native-work-item-1",
+    ...(options.missingLaunch === true ? {} : { launchId: "launch-work-item-1" }),
+    policy: "fixed",
+    status: "running",
+    effective: options.sessionWorkspaceMismatch === true ? mainEffective : runEffective
+  }, NOW);
+  sessions = bindTaskRoleRun(sessions, {
+    agentId: "codex",
+    runId: run.id,
+    receiptId: formatAgentRunReceiptId(task.id, run.id)
+  }, NOW);
+  store.saveTaskRoleSessionSet(sessions);
+
+  if (options.conflictingLaunchReservation === true) {
+    new FileSchedulerStoreAdapter(store).reserveRuntimeLaunch({
+      owner: { scope: "task", taskId: task.id, roleName: "worker" },
+      launchId: "launch-replacement",
+      runId: run.id
+    }, () => {}, NOW);
+  }
+
+  return {
+    home,
+    store,
+    task,
+    item,
+    main,
+    isolated,
+    preparer,
+    run: store.getAgentRun(task.id, run.id)
+  };
+}
+
 function spawnExactTaskCli(home, store, taskId, roleName, args) {
   const invocation = exactTaskCliInvocation({ home, store, taskId, roleName });
   return spawnSync(
@@ -2616,6 +2737,142 @@ test("a Role workspace migration retires its cwd-bound stopped native session", 
 
   assert.equal(await preparer.cleanupWorkItemWorkspace(item.taskId, item.id, "integrated"), "removed");
   assert.equal(store.getRoleSession(task.id, "worker"), null);
+});
+
+test("Task preparation corrects only an exact active WorkItem Role workspace hint", async (t) => {
+  const fx = await activeAssignedWorkspaceFixture(t);
+  const roleBefore = fx.store.getRole(fx.task.id, "worker");
+  const runBefore = fx.store.getAgentRun(fx.task.id, fx.run.id);
+  const sessionsBefore = fx.store.getTaskRoleSessionSet(fx.task.id, "worker");
+  const mailboxesBefore = fx.store.listWorkMailboxes();
+  const taskWorkspaceBefore = fx.store.getTaskWorkspace(fx.task.id);
+  const workItemWorkspaceBefore = fx.store.getWorkItemWorkspace(fx.task.id, fx.item.id);
+
+  assert.equal(roleBefore.workspace, fx.main);
+  assert.equal(runBefore.pushedAt, undefined);
+  assert.equal(runBefore.deliveredAt, undefined);
+  assert.equal(runBefore.effective.workspace.root, fx.isolated.root);
+  assert.equal(sessionsBefore.sessions.codex.effective.workspace.root, fx.isolated.root);
+  assert.equal(sessionsBefore.sessions.codex.launchId, "launch-work-item-1");
+  assert.equal(sessionsBefore.sessions.codex.nativeSessionId, "native-work-item-1");
+  assert.equal(sessionsBefore.inFlight.runId, fx.run.id);
+
+  assert.deepEqual(await fx.preparer.prepareTaskWorkspace(fx.task.id), {
+    taskId: fx.task.id,
+    status: "ready",
+    path: fx.main
+  });
+
+  const roleAfter = fx.store.getRole(fx.task.id, "worker");
+  const {
+    workspace: _beforeWorkspace,
+    launchRevision: _beforeRevision,
+    updatedAt: _beforeUpdatedAt,
+    ...roleBeforeRest
+  } = roleBefore;
+  const {
+    workspace: _afterWorkspace,
+    launchRevision: _afterRevision,
+    updatedAt: _afterUpdatedAt,
+    ...roleAfterRest
+  } = roleAfter;
+  assert.equal(roleAfter.workspace, fx.isolated.root);
+  assert.equal(roleAfter.launchRevision, roleBefore.launchRevision + 1);
+  assert.deepEqual(roleAfterRest, roleBeforeRest);
+  assert.deepEqual(fx.store.getAgentRun(fx.task.id, fx.run.id), runBefore);
+  assert.deepEqual(fx.store.getActiveAgentRun(fx.task.id, "worker"), runBefore);
+  assert.deepEqual(fx.store.getTaskRoleSessionSet(fx.task.id, "worker"), sessionsBefore);
+  assert.deepEqual(fx.store.listWorkMailboxes(), mailboxesBefore);
+  assert.deepEqual(fx.store.getTaskWorkspace(fx.task.id), taskWorkspaceBefore);
+  assert.deepEqual(
+    fx.store.getWorkItemWorkspace(fx.task.id, fx.item.id),
+    workItemWorkspaceBefore
+  );
+  assert.equal(existsSync(taskWorkspaceBefore.root), true);
+  assert.equal(existsSync(workItemWorkspaceBefore.root), true);
+
+  const bootstrap = createWorkItem("work-item-2", fx.task.id, {
+    title: "Bootstrap unrelated roleless work",
+    writeProjectIds: fx.item.writeProjectIds
+  }, NOW);
+  fx.store.saveWorkItem(fx.task.id, bootstrap);
+  const bootstrapWorkspace = await fx.preparer.prepareWorkItemWorkspace(
+    fx.task.id,
+    bootstrap.id
+  );
+  assert.deepEqual(bootstrapWorkspace.owner, {
+    type: "work-item",
+    taskId: fx.task.id,
+    workItemId: bootstrap.id
+  });
+  assert.deepEqual(fx.store.getAgentRun(fx.task.id, fx.run.id), runBefore);
+  assert.deepEqual(fx.store.getTaskRoleSessionSet(fx.task.id, "worker"), sessionsBefore);
+  assert.deepEqual(fx.store.listWorkMailboxes(), mailboxesBefore);
+});
+
+test("Task preparation rejects drifted active WorkItem runtime fences without state writes", async (t) => {
+  const scenarios = [
+    ["Run workspace owner", { runWorkspaceMismatch: true }],
+    ["Session effective workspace", { sessionWorkspaceMismatch: true }],
+    ["Session launch", { missingLaunch: true }],
+    ["Session native identity", {}, (fx) => {
+      const current = fx.store.getTaskRoleSessionSet.bind(fx.store);
+      fx.store.getTaskRoleSessionSet = (taskId, roleName) => {
+        const sessions = current(taskId, roleName);
+        if (sessions === null) return null;
+        const active = sessions.sessions[sessions.activeAgentId];
+        const { nativeSessionId: _nativeSessionId, ...withoutNative } = active;
+        return {
+          ...sessions,
+          sessions: { ...sessions.sessions, [sessions.activeAgentId]: withoutNative }
+        };
+      };
+    }],
+    ["conflicting launch reservation", { conflictingLaunchReservation: true }],
+    ["Run WorkItem assignment", {}, (fx) => {
+      const current = fx.store.getActiveAgentRun.bind(fx.store);
+      fx.store.getActiveAgentRun = (taskId, roleName) => {
+        const run = current(taskId, roleName);
+        return run === null ? null : { ...run, workItemId: "work-item-999" };
+      };
+    }],
+    ["in-flight receipt", {}, (fx) => {
+      const current = fx.store.getTaskRoleSessionSet.bind(fx.store);
+      fx.store.getTaskRoleSessionSet = (taskId, roleName) => {
+        const sessions = current(taskId, roleName);
+        return sessions === null ? null : {
+          ...sessions,
+          inFlight: {
+            ...sessions.inFlight,
+            receiptId: "agent-run:task-1/agent-run-999"
+          }
+        };
+      };
+    }],
+    ["WorkItem workspace owner", {}, (fx) => {
+      const current = fx.store.getWorkItemWorkspace.bind(fx.store);
+      fx.store.getWorkItemWorkspace = (taskId, workItemId) => {
+        const workspace = current(taskId, workItemId);
+        return workspace === null ? null : {
+          ...workspace,
+          owner: { type: "work-item", taskId, workItemId: "work-item-999" }
+        };
+      };
+    }]
+  ];
+
+  for (const [label, options, mutateRead] of scenarios) {
+    const fx = await activeAssignedWorkspaceFixture(t, options);
+    mutateRead?.(fx);
+    const statePath = join(fx.home, "state.json");
+    const stateBefore = readFileSync(statePath, "utf8");
+    await assert.rejects(
+      fx.preparer.prepareTaskWorkspace(fx.task.id),
+      /Role has an active Run: task-1\/worker/
+    );
+    assert.equal(readFileSync(statePath, "utf8"), stateBefore, label);
+    assert.equal(fx.store.getRole(fx.task.id, "worker").workspace, fx.main, label);
+  }
 });
 
 test("an inactive never-started Claude placeholder does not block isolation or disturb the active Leader", async (t) => {
