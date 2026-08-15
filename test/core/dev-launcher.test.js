@@ -937,6 +937,46 @@ test("development home reset accepts a complete stale discovery only when its ow
   assert.equal(readFileSync(join(reset.backupPath, "state.json"), "utf8"), "recoverable\n");
 });
 
+test("development home reset shares the compact Controller endpoint under a deep TMPDIR", async (t) => {
+  const fixtureRoot = mkdtempSync(join("/tmp", "yui-dev-reset-deep-tmp-"));
+  const deepTmp = join(
+    fixtureRoot,
+    "explicitly-long-temporary-root",
+    "nested-runtime-boundary",
+    "nested-runtime-boundary",
+    "nested-runtime-boundary"
+  );
+  mkdirSync(deepTmp, { recursive: true });
+  const previousTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = deepTmp;
+  t.after(() => {
+    if (previousTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpdir;
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+
+  const root = mkdtempSync(join(deepTmp, "checkout-"));
+  const outputDir = join(root, "output", "dev");
+  const home = join(outputDir, "home");
+  const discoveryPath = join(home, "runtime", "controller.json");
+  const socketPath = controllerSocketPath(home);
+  assert.ok(Buffer.byteLength(join(deepTmp, `yui-${process.getuid()}`, "x".repeat(29))) >= 100);
+  assert.match(socketPath, /^\/tmp\/yui-[0-9]+\/[a-f0-9]{24}\.sock$/u);
+  mkdirSync(dirname(discoveryPath), { recursive: true });
+  writeFileSync(join(home, "state.json"), "recoverable\n");
+  writeFileSync(discoveryPath, `${JSON.stringify({
+    pid: 2_147_483_647,
+    processStartIdentity: "1",
+    socketPath,
+    token: "d".repeat(64)
+  })}\n`, { mode: 0o600 });
+
+  const reset = await resetDevHome({ projectRoot: root, outputDir });
+
+  assert.equal(reset.moved, true);
+  assert.equal(readFileSync(join(reset.backupPath, "state.json"), "utf8"), "recoverable\n");
+});
+
 test("development home reset recognizes a reused PID from its different process identity", async () => {
   const root = mkdtempSync(join(tmpdir(), "yui-dev-reset-reused-pid-"));
   const outputDir = join(root, "output", "dev");

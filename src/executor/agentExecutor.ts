@@ -9,9 +9,11 @@ import {
 } from "./turnCompletion.js";
 import {
   effectiveLaunchSnapshotsCompatible,
+  effectiveLaunchSnapshotsCompatibleForTaskMain,
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
 } from "./effectiveLaunch.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 
 export type AgentSessionStatus = "reserved" | "ready" | "running" | "stopped" | "broken";
 
@@ -410,7 +412,8 @@ export function rememberRoleAgentCompletedTurn<TSet extends RoleSessionSet>(
 export function roleAgentSessionResumeMode(
   set: RoleSessionSet | null,
   agentId: string,
-  desired: EffectiveLaunchSnapshot
+  desired: EffectiveLaunchSnapshot,
+  workspace?: ManagedWorkspace
 ): "new" | "resume" {
   if (set === null) return "new";
   validateRoleSessionSet(set);
@@ -432,7 +435,14 @@ export function roleAgentSessionResumeMode(
     }
     return "new";
   }
-  if (effectiveLaunchSnapshotsCompatible(session.effective, desired)) return "resume";
+  const compatible = set.owner.scope === "task"
+    ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+        session.effective,
+        desired,
+        workspace
+      )
+    : effectiveLaunchSnapshotsCompatible(session.effective, desired);
+  if (compatible) return "resume";
   if (session.status !== "stopped" && session.status !== "broken") {
     throw new Error(
       `Role Agent session is incompatible with the next effective launch: ${agentId}. `

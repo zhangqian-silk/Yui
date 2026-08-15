@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync
 } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +20,8 @@ import {
 } from "../../dist/controller/resourceInventory.js";
 import {
   classifyRuntimeProcess,
+  forEachInEventLoopBatches,
+  INVENTORY_EVENT_LOOP_TURN_BUDGET_MS,
   linuxProcessEntryPid,
   parseLinuxProcessStat,
   scanControllerResourceInventory
@@ -31,6 +38,11 @@ import { MigrationRegistry } from "../../dist/storage/migration/index.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
+import { NodeCommandExecutor } from "../../dist/tmux/commandExecutor.js";
+import {
+  TmuxManager,
+  yuiTmuxServerName
+} from "../../dist/tmux/tmuxManager.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import {
   createAgentRun,
@@ -45,6 +57,129 @@ test("Linux process inventory accepts only numeric /proc entry names", () => {
   assert.equal(linuxProcessEntryPid("4916 (deleted)"), undefined);
   assert.equal(linuxProcessEntryPid("0"), undefined);
   assert.equal(linuxProcessEntryPid("42"), 42);
+});
+
+test("Linux process inventory yields between bounded entry batches", async () => {
+  let socketCallbackRan = false;
+  let callbackObservedBySecondBatch = false;
+  const visited = [];
+  setImmediate(() => { socketCallbackRan = true; });
+
+  await forEachInEventLoopBatches(
+    Array.from({ length: 65 }, (_, index) => index),
+    64,
+    (_entry, index) => {
+      visited.push(index);
+      if (index === 64) callbackObservedBySecondBatch = socketCallbackRan;
+    }
+  );
+
+  assert.equal(callbackObservedBySecondBatch, true);
+  assert.deepEqual(visited, Array.from({ length: 65 }, (_, index) => index));
+});
+
+test("Linux process inventory also yields at its wall-clock turn budget", async () => {
+  let now = 0;
+  let socketCallbackRan = false;
+  let callbackObservedAfterBudget = false;
+  const visited = [];
+  setImmediate(() => { socketCallbackRan = true; });
+
+  await forEachInEventLoopBatches(
+    [0, 1, 2],
+    64,
+    (entry) => {
+      visited.push(entry);
+      if (entry === 2) callbackObservedAfterBudget = socketCallbackRan;
+      now += INVENTORY_EVENT_LOOP_TURN_BUDGET_MS;
+    },
+    { now: () => now }
+  );
+
+  assert.equal(callbackObservedAfterBudget, true);
+  assert.deepEqual(visited, [0, 1, 2]);
+});
+
+test("Linux process inventory propagates visitor failures without revisiting entries", async () => {
+  const visited = [];
+  await assert.rejects(
+    forEachInEventLoopBatches([0, 1, 2], 64, (entry) => {
+      visited.push(entry);
+      if (entry === 1) throw new Error("inventory visit failed");
+    }),
+    /inventory visit failed/
+  );
+  assert.deepEqual(visited, [0, 1]);
+});
+
+test("Linux inventory finds the default tmux root under a deep TMPDIR", async (t) => {
+  const fixtureRoot = mkdtempSync(join("/tmp", "yui-inventory-deep-tmp-"));
+  const deepTmp = join(
+    fixtureRoot,
+    "explicitly-long-temporary-root",
+    "nested-runtime-boundary",
+    "nested-runtime-boundary",
+    "nested-runtime-boundary"
+  );
+  mkdirSync(deepTmp, { recursive: true });
+  const home = join(deepTmp, "yui-home");
+  const tmuxServer = yuiTmuxServerName(home);
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const defaultTmuxSocket = join("/tmp", `tmux-${uid}`, tmuxServer);
+  const previousTmpdir = process.env.TMPDIR;
+  const previousTmuxTmpdir = process.env.TMUX_TMPDIR;
+  process.env.TMPDIR = deepTmp;
+  delete process.env.TMUX_TMPDIR;
+  t.after(() => {
+    spawnSync(
+      process.env.YUI_TMUX_BIN ?? "tmux",
+      ["-L", tmuxServer, "kill-server"],
+      { env: { ...process.env, TMPDIR: deepTmp } }
+    );
+    rmSync(defaultTmuxSocket, { force: true });
+    if (previousTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpdir;
+    if (previousTmuxTmpdir === undefined) delete process.env.TMUX_TMPDIR;
+    else process.env.TMUX_TMPDIR = previousTmuxTmpdir;
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+
+  ensureStorageSchema(home, new Date("2026-08-14T00:00:00.000Z"));
+  const tmux = new TmuxManager(
+    process.env.YUI_TMUX_BIN ?? "tmux",
+    new NodeCommandExecutor(),
+    { yuiHome: home }
+  );
+  tmux.ensureRoleWindow(
+    "task-deep-tmp",
+    { name: "worker", workspace: home },
+    {
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 60000)"],
+      env: { YUI_HOME: home }
+    }
+  );
+  const [expectedPane] = tmux.inspectRolePaneInventory();
+  assert.notEqual(expectedPane, undefined);
+  assert.equal(existsSync(defaultTmuxSocket), true);
+  assert.equal(existsSync(join(deepTmp, `tmux-${uid}`, tmuxServer)), false);
+
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "current",
+    environment: { ...process.env, TMPDIR: deepTmp }
+  });
+  const pane = snapshot.resources.find((resource) => (
+    resource.kind === "agent-session"
+    && resource.target === expectedPane.target
+  ));
+
+  assert.notEqual(pane, undefined, JSON.stringify(snapshot.resources, null, 2));
+  assert.equal(pane.processes.some(({ pid }) => pid === expectedPane.pid), true);
+  assert.equal(snapshot.resources.some((resource) => (
+    resource.reasonCode === "unattributed-other"
+    && resource.processes.some(({ pid }) => pid === expectedPane.pid)
+  )), false);
 });
 
 function roleResource(overrides = {}) {
@@ -768,4 +903,116 @@ test("Linux process facts use start identity for cleanup fencing and classify on
     "tmux-server"
   );
   assert.equal(classifyRuntimeProcess(["node", "unrelated.js"], "node"), "other");
+});
+
+/**
+ * Builds a shared tmux directory that holds the exact current-Home server
+ * socket plus a batch of unrelated, valid yui-* server sockets. This models
+ * the production shared directory (thousands of cross-domain entries) without
+ * depending on a real tmux binary.
+ */
+async function createSharedTmuxFixture(home, unrelatedCount) {
+  // Unix socket paths are capped near 108 bytes; keep the fixture root shallow
+  // so the yui-<24hex> server names stay bindable regardless of TMPDIR.
+  const fixtureRoot = mkdtempSync(join("/tmp", "yui-shared-tmux-"));
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const tmuxDirectory = join(fixtureRoot, `tmux-${uid}`);
+  mkdirSync(tmuxDirectory, { recursive: true });
+  const servers = [];
+  const listen = (path) => new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(path, () => resolve(server));
+  });
+  const exactSocket = join(tmuxDirectory, yuiTmuxServerName(home));
+  servers.push(await listen(exactSocket));
+  const unrelatedSockets = [];
+  for (let index = 0; index < unrelatedCount; index += 1) {
+    const path = join(tmuxDirectory, `yui-${randomBytes(12).toString("hex")}`);
+    unrelatedSockets.push(path);
+    servers.push(await listen(path));
+  }
+  return {
+    fixtureRoot,
+    tmuxDirectory,
+    exactSocket,
+    unrelatedSockets,
+    async close() {
+      await Promise.all(servers.map((server) => new Promise((resolve) => {
+        server.close(() => resolve());
+      })));
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  };
+}
+
+test("current-scope inventory observes only the exact current-Home socket", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-current-scope-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home, new Date(NOW));
+  const fixture = await createSharedTmuxFixture(home, 32);
+  t.after(() => fixture.close());
+
+  let enumerations = 0;
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "current",
+    environment: { ...process.env, TMUX_TMPDIR: fixture.fixtureRoot },
+    panes: [],
+    listTmuxSocketArtifacts: () => {
+      enumerations += 1;
+      return [];
+    }
+  });
+
+  // The shared-directory enumerator must not run for scope=current; only the
+  // exact current-Home socket is observable there.
+  assert.equal(enumerations, 0);
+  // The exact current-Home socket is still observed via its exact target.
+  const exactResource = snapshot.resources.find((resource) => (
+    resource.kind === "artifact" && resource.artifact?.path === fixture.exactSocket
+  ));
+  assert.notEqual(exactResource, undefined, JSON.stringify(snapshot.resources, null, 2));
+  assert.equal(exactResource.artifact.active, true);
+  // No unrelated cross-domain socket leaks into the current-scope inventory.
+  for (const unrelated of fixture.unrelatedSockets) {
+    assert.equal(
+      snapshot.resources.some((resource) => resource.artifact?.path === unrelated),
+      false,
+      `unrelated socket ${unrelated} must not appear in scope=current`
+    );
+  }
+});
+
+test("all-scope inventory still enumerates cross-domain unassociated sockets", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-all-scope-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home, new Date(NOW));
+  const fixture = await createSharedTmuxFixture(home, 32);
+  t.after(() => fixture.close());
+
+  const snapshot = await scanControllerResourceInventory({
+    currentHome: home,
+    scope: "all",
+    environment: { ...process.env, TMUX_TMPDIR: fixture.fixtureRoot },
+    panes: []
+  });
+
+  // The exact current-Home socket stays associated with its own domain.
+  const exactResource = snapshot.resources.find((resource) => (
+    resource.artifact?.path === fixture.exactSocket
+  ));
+  assert.notEqual(exactResource, undefined);
+  assert.notEqual(exactResource.yuiHome, undefined);
+  // Every unrelated valid socket is still reported as a cross-domain global
+  // artifact so `controller cleanup --all` keeps its full cleanup authority.
+  const reportedUnrelated = fixture.unrelatedSockets.filter((path) => (
+    snapshot.resources.some((resource) => resource.artifact?.path === path)
+  ));
+  assert.equal(reportedUnrelated.length, fixture.unrelatedSockets.length);
+  const globalUnrelated = snapshot.resources.find((resource) => (
+    resource.artifact?.path === fixture.unrelatedSockets[0]
+  ));
+  assert.equal(globalUnrelated.owner.kind, "none");
+  assert.equal(globalUnrelated.yuiHome, undefined);
 });

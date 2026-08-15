@@ -6,7 +6,6 @@ import {
   readdirSync,
   type Stats
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
@@ -20,6 +19,10 @@ import {
   TmuxManager,
   yuiTmuxServerName
 } from "../tmux/tmuxManager.js";
+import {
+  tmuxSocketDirectory,
+  tmuxSocketEnvironment
+} from "../tmux/tmuxSocketEndpoint.js";
 import { readControllerDiscovery } from "../core/controllerClient.js";
 import {
   CONTROLLER_DISCOVERY_PATH
@@ -56,7 +59,19 @@ export type ControllerInventoryScanOptions = Readonly<{
   openCompatibleStore?: (
     home: string
   ) => ReturnType<typeof openCompatibleFileTaskStore>;
+  /**
+   * Test seam for the shared tmux socket directory enumeration. Production
+   * always enumerates with the real readdir+lstat path; scope=current must
+   * not reach it because only the exact current-Home socket is observable
+   * there, so a large unrelated shared directory cannot block the event loop.
+   */
+  listTmuxSocketArtifacts?: TmuxSocketArtifactLister;
 }>;
+
+export type TmuxSocketArtifactLister = (
+  directory: string,
+  activeSockets: ReadonlySet<string>
+) => RuntimeArtifactFact[];
 
 type LinuxProcessStat = Readonly<{
   ppid: number;
@@ -70,6 +85,9 @@ type LinuxProcessIo = Readonly<{
   ioWriteBytes: number;
 }>;
 
+const LINUX_PROCESS_SCAN_BATCH_SIZE = 64;
+export const INVENTORY_EVENT_LOOP_TURN_BUDGET_MS = 25;
+
 export async function scanControllerResourceInventory(
   options: ControllerInventoryScanOptions
 ): Promise<ControllerResourceInventory> {
@@ -78,7 +96,7 @@ export async function scanControllerResourceInventory(
   const observedAt = (options.now ?? (() => new Date()))();
   const warnings: string[] = [];
   const activeSockets = readActiveUnixSocketPaths(warnings);
-  const processes = listLinuxProcesses(warnings)
+  const processes = (await listLinuxProcesses(warnings))
     .filter(({ pid }) => pid !== process.pid);
   const homes = new Set<string>([currentHome]);
   if (options.scope === "all") {
@@ -87,13 +105,17 @@ export async function scanControllerResourceInventory(
     }
   }
 
-  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const rawTmuxArtifacts = listSocketArtifacts(
-    join(tmpdir(), `tmux-${uid}`),
-    /^yui-[a-f0-9]{24}$/u,
-    "tmux-socket",
-    activeSockets
-  );
+  const tmuxDirectory = tmuxSocketDirectory(environment);
+  const listTmuxSocketArtifacts = options.listTmuxSocketArtifacts
+    ?? listSharedTmuxSocketArtifacts;
+  // scope=current owns exactly one YUI_HOME, so only its exact tmux server
+  // socket is observable. Enumerating the whole shared directory (readdir +
+  // lstat per entry) blocked the event loop for seconds under a large
+  // unrelated yui-* population and starved control commands. scope=all keeps
+  // the full cross-domain enumeration for global cleanup reporting.
+  const rawTmuxArtifacts = options.scope === "all"
+    ? listTmuxSocketArtifacts(tmuxDirectory, activeSockets)
+    : inspectExactTmuxSocket(currentHome, tmuxDirectory, activeSockets);
   const homeFacts: RuntimeHomeFact[] = [];
   const associatedArtifacts = new Set<string>();
   for (const home of [...homes].sort()) {
@@ -106,13 +128,13 @@ export async function scanControllerResourceInventory(
       state.storageStatus,
       observedAt
     );
-    const tmuxSocketPath = join(tmpdir(), `tmux-${uid}`, yuiTmuxServerName(home));
+    const tmuxSocketPath = join(tmuxDirectory, yuiTmuxServerName(home));
     const tmuxArtifact = rawTmuxArtifacts.find(({ path }) => path === tmuxSocketPath);
     if (tmuxArtifact !== undefined) associatedArtifacts.add(tmuxArtifact.path);
     const panes = options.panes !== undefined
       ? options.panes
       : tmuxArtifact?.active === true
-        ? inspectHomePanes(home, environment.YUI_TMUX_BIN ?? "tmux", warnings)
+        ? inspectHomePanes(home, environment, warnings)
         : [];
     const discovery = await inspectDiscovery(home, matchingProcesses, activeSockets);
     if (
@@ -272,7 +294,7 @@ export function classifyRuntimeProcess(
   return "other";
 }
 
-function listLinuxProcesses(warnings: string[]): RuntimeProcessFact[] {
+async function listLinuxProcesses(warnings: string[]): Promise<RuntimeProcessFact[]> {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
   const clockTicks = readClockTicks();
   const uptimeMs = readSystemUptimeMs();
@@ -286,42 +308,78 @@ function listLinuxProcesses(warnings: string[]): RuntimeProcessFact[] {
     warnings.push(`Cannot enumerate Linux processes: ${message(error)}`);
     return [];
   }
-  return entries.flatMap((entryName): RuntimeProcessFact[] => {
-    try {
+  const result: RuntimeProcessFact[] = [];
+  await forEachInEventLoopBatches(
+    entries,
+    LINUX_PROCESS_SCAN_BATCH_SIZE,
+    (entryName) => {
       const pid = linuxProcessEntryPid(entryName);
-      if (pid === undefined) return [];
-      const status = readFileSync(`/proc/${pid}/status`, "utf8");
-      const processUid = parseStatusNumber(status, "Uid");
-      if (processUid !== uid) return [];
-      const parsed = parseLinuxProcessStat(
-        readFileSync(`/proc/${pid}/stat`, "utf8"),
-        clockTicks,
-        uptimeMs
-      );
-      const args = splitNullDelimited(readFileSync(`/proc/${pid}/cmdline`));
-      const command = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
-      const yuiHome = readYuiHome(pid);
-      const io = readProcessIo(pid);
-      return [{
-        pid,
-        ppid: parsed.ppid,
-        uid: processUid,
-        startIdentity: parsed.startIdentity,
-        ...(yuiHome === undefined ? {} : { yuiHome }),
-        kind: classifyRuntimeProcess(args, command),
-        command,
-        args,
-        rssBytes: parseStatusNumber(status, "VmRSS", 0) * 1024,
-        cpuTimeMs: parsed.cpuTimeMs,
-        ...(io === undefined ? {} : io),
-        ageMs: parsed.ageMs
-      }];
-    } catch {
-      // Processes commonly exit during a /proc scan. A point-in-time inventory
-      // omits those races instead of turning them into persistent warnings.
-      return [];
+      if (pid === undefined) return;
+      try {
+        const status = readFileSync(`/proc/${pid}/status`, "utf8");
+        const processUid = parseStatusNumber(status, "Uid");
+        if (processUid === uid) {
+          const parsed = parseLinuxProcessStat(
+            readFileSync(`/proc/${pid}/stat`, "utf8"),
+            clockTicks,
+            uptimeMs
+          );
+          const args = splitNullDelimited(readFileSync(`/proc/${pid}/cmdline`));
+          const command = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+          const yuiHome = readYuiHome(pid);
+          const io = readProcessIo(pid);
+          result.push({
+            pid,
+            ppid: parsed.ppid,
+            uid: processUid,
+            startIdentity: parsed.startIdentity,
+            ...(yuiHome === undefined ? {} : { yuiHome }),
+            kind: classifyRuntimeProcess(args, command),
+            command,
+            args,
+            rssBytes: parseStatusNumber(status, "VmRSS", 0) * 1024,
+            cpuTimeMs: parsed.cpuTimeMs,
+            ...(io === undefined ? {} : io),
+            ageMs: parsed.ageMs
+          });
+        }
+      } catch {
+        // Processes commonly exit during a /proc scan. A point-in-time inventory
+        // omits those races instead of turning them into persistent warnings.
+      }
     }
-  });
+  );
+  return result;
+}
+
+/** Cooperatively visits synchronous inventory entries in bounded turns. */
+export async function forEachInEventLoopBatches<T>(
+  entries: readonly T[],
+  batchSize: number,
+  visit: (entry: T, index: number) => void,
+  timing: Readonly<{ now?: () => number }> = {}
+): Promise<void> {
+  if (!Number.isSafeInteger(batchSize) || batchSize < 1) {
+    throw new Error("Event-loop batch size must be a positive integer.");
+  }
+  const now = timing.now ?? (() => performance.now());
+  let turnStartedAt = now();
+  let entriesInTurn = 0;
+  for (let index = 0; index < entries.length; index += 1) {
+    visit(entries[index]!, index);
+    entriesInTurn += 1;
+    if (
+      index + 1 < entries.length
+      && (
+        entriesInTurn >= batchSize
+        || now() - turnStartedAt >= INVENTORY_EVENT_LOOP_TURN_BUDGET_MS
+      )
+    ) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      turnStartedAt = now();
+      entriesInTurn = 0;
+    }
+  }
 }
 
 /**
@@ -423,24 +481,59 @@ function listSocketArtifacts(
   try {
     return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
       if (!pattern.test(entry.name)) return [];
-      const path = join(directory, entry.name);
-      let metadata: Stats;
-      try {
-        metadata = lstatSync(path);
-      } catch {
-        return [];
-      }
-      if (!metadata.isSocket()) return [];
-      return [{
+      return inspectSocketArtifact(
+        join(directory, entry.name),
         artifactKind,
-        path,
-        active: activeSockets.has(path),
-        fingerprint: statFingerprint(metadata)
-      }];
+        activeSockets
+      );
     });
   } catch {
     return [];
   }
+}
+
+function listSharedTmuxSocketArtifacts(
+  directory: string,
+  activeSockets: ReadonlySet<string>
+): RuntimeArtifactFact[] {
+  return listSocketArtifacts(
+    directory,
+    /^yui-[a-f0-9]{24}$/u,
+    "tmux-socket",
+    activeSockets
+  );
+}
+
+function inspectExactTmuxSocket(
+  currentHome: string,
+  tmuxDirectory: string,
+  activeSockets: ReadonlySet<string>
+): RuntimeArtifactFact[] {
+  return inspectSocketArtifact(
+    join(tmuxDirectory, yuiTmuxServerName(currentHome)),
+    "tmux-socket",
+    activeSockets
+  );
+}
+
+function inspectSocketArtifact(
+  path: string,
+  artifactKind: RuntimeArtifactFact["artifactKind"],
+  activeSockets: ReadonlySet<string>
+): RuntimeArtifactFact[] {
+  let metadata: Stats;
+  try {
+    metadata = lstatSync(path);
+  } catch {
+    return [];
+  }
+  if (!metadata.isSocket()) return [];
+  return [{
+    artifactKind,
+    path,
+    active: activeSockets.has(path),
+    fingerprint: statFingerprint(metadata)
+  }];
 }
 
 async function inspectDiscovery(
@@ -717,11 +810,22 @@ function loadHomeState(
 
 function inspectHomePanes(
   home: string,
-  tmuxBin: string,
+  environment: NodeJS.ProcessEnv,
   warnings: string[]
 ) {
   try {
-    return new TmuxManager(tmuxBin, new NodeCommandExecutor(), {
+    const executor = new NodeCommandExecutor();
+    const commandEnvironment = tmuxSocketEnvironment(environment);
+    return new TmuxManager(environment.YUI_TMUX_BIN ?? "tmux", {
+      run: (command, args, options) => executor.run(command, args, {
+        ...options,
+        environment: {
+          ...commandEnvironment,
+          ...options?.environment,
+          TMUX_TMPDIR: commandEnvironment.TMUX_TMPDIR
+        }
+      })
+    }, {
       yuiHome: home
     }).inspectRolePaneInventory();
   } catch (error) {

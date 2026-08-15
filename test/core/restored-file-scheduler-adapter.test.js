@@ -1098,6 +1098,174 @@ test("desired drift does not block a wake delivered to the still-live Leader Ses
   assert.ok(store.getRole(task.id, role.name).launchRevision > immutable.sourceDesiredRevision);
 });
 
+test("an advanced Task main workspace resumes the fixed Leader Session with fresh Run evidence", async (t) => {
+  const { store, task, role, now, adapter } = fixture(t);
+  adapter.recordRuntimeNativeSession({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-before-main-advance"
+  }, now);
+  adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-before-main-advance",
+    turnId: "turn-before-main-advance",
+    summary: "idle before Task main advanced"
+  }, now);
+  const immutableSessionEffective = structuredClone(
+    adapter.getRoleSession(task.id, role.name).effective
+  );
+  const advancedAt = new Date(now.getTime() + 1);
+  const previousWorkspace = store.getTaskWorkspace(task.id);
+  const advancedCommit = "1".repeat(40);
+  store.saveManagedWorkspace({
+    ...previousWorkspace,
+    entries: previousWorkspace.entries.map((entry) => ({
+      ...entry,
+      baseCommit: advancedCommit
+    })),
+    updatedAt: advancedAt.toISOString()
+  });
+
+  let preparedInput;
+  const [result] = await processLeaderWakeups(adapter, {
+    async prepareRoleSession(input) {
+      preparedInput = input;
+      return { ...input, deliveryId: "wake-after-main-advance", sessionStarted: false };
+    },
+    async waitUntilReady(prepared) {
+      return {
+        prepared,
+        session: {
+          ...adapter.getRoleSession(task.id, role.name),
+          status: "running",
+          effective: prepared.effective
+        }
+      };
+    },
+    async sendOnce() { return "sent"; }
+  }, advancedAt);
+
+  assert.equal(result.status, "dispatched");
+  assert.equal(preparedInput.mode, "resume");
+  assert.equal(preparedInput.nativeSessionId, "thread-before-main-advance");
+  assert.equal(preparedInput.effective.workspace.entries[0].baseCommit, advancedCommit);
+  const active = store.getActiveAgentRun(task.id, role.name);
+  assert.equal(active.workspace.entries[0].baseCommit, advancedCommit);
+  assert.equal(active.effective.workspace.entries[0].baseCommit, advancedCommit);
+  assert.deepEqual(
+    adapter.getRoleSession(task.id, role.name).effective,
+    immutableSessionEffective
+  );
+
+  adapter.observeRuntimeTurnCompleted({
+    taskId: task.id,
+    roleName: role.name,
+    agentId: role.activeAgentId,
+    adapterId: "codex",
+    nativeSessionId: "thread-before-main-advance",
+    turnId: "turn-after-main-advance",
+    runId: active.id,
+    summary: "yield after Task main advanced"
+  }, new Date(advancedAt.getTime() + 1));
+  assert.deepEqual(
+    adapter.getRoleSession(task.id, role.name).effective,
+    immutableSessionEffective
+  );
+});
+
+for (const [name, change] of [
+  ["path", ({ home, workspace }) => ({
+    workspace: {
+      ...workspace,
+      entries: workspace.entries.map((entry) => ({ ...entry, path: join(home, "other") }))
+    }
+  })],
+  ["branch", ({ workspace }) => ({
+    workspace: {
+      ...workspace,
+      entries: workspace.entries.map((entry) => ({ ...entry, branch: "other-main" }))
+    }
+  })],
+  ["access policy", ({ workspace, role }) => ({
+    workspace,
+    role: updateRole(role, { defaultAccess: "read" }, new Date(role.updatedAt))
+  })],
+  ["Agent config", ({ workspace, role }) => ({
+    workspace,
+    role: updateRole(role, {
+      agentBindings: {
+        codex: createRoleAgentBinding(
+          { id: "codex", adapterId: "codex" },
+          { adapterId: "codex", model: "gpt-next", effort: "high" }
+        )
+      }
+    }, new Date(role.updatedAt))
+  })]
+]) {
+  test(`native Session registration fails closed when Task main ${name} changes`, (t) => {
+    const { home, store, task, role, now, adapter } = fixture(t);
+    adapter.recordRuntimeNativeSession({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: "thread-before-invalid-drift"
+    }, now);
+    adapter.observeRuntimeTurnCompleted({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: "thread-before-invalid-drift",
+      turnId: "turn-before-invalid-drift"
+    }, now);
+    const immutable = structuredClone(adapter.getRoleSession(task.id, role.name).effective);
+    const { workspace, role: changedRole = role } = change({
+      home,
+      workspace: {
+        ...store.getTaskWorkspace(task.id),
+        entries: store.getTaskWorkspace(task.id).entries.map((entry) => ({
+          ...entry,
+          baseCommit: "2".repeat(40)
+        })),
+        updatedAt: new Date(now.getTime() + 1).toISOString()
+      },
+      role
+    });
+    if (changedRole !== role) store.saveRole(task.id, changedRole);
+    store.saveManagedWorkspace(workspace);
+    const runEffective = resolveEffectiveLaunch({
+      role: changedRole,
+      purpose: "execution",
+      workspace
+    });
+    const run = createTestAgentRun(
+      "agent-run-102",
+      task.id,
+      role.name,
+      "resume",
+      "Continue after invalid Task main drift.",
+      new Date(now.getTime() + 1),
+      { workspace, effective: runEffective }
+    );
+    store.saveActiveAgentRun(run);
+
+    assert.throws(() => adapter.recordRuntimeNativeSession({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: role.activeAgentId,
+      adapterId: "codex",
+      nativeSessionId: "thread-before-invalid-drift"
+    }, new Date(now.getTime() + 2)), /does not match the active Run/i);
+    assert.deepEqual(adapter.getRoleSession(task.id, role.name).effective, immutable);
+  });
+}
+
 test("Leader preparation owns its durable Run before awaiting tmux", async (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   let announcePreparation;

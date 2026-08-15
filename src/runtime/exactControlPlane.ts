@@ -502,6 +502,44 @@ export function refreshExactTaskRuntimeDescriptorSource(
   return refreshed;
 }
 
+/**
+ * Advances a reused Hook's own exact source to the current durable Run/launch
+ * generation before the volatile fence. The stable identity (control digest,
+ * Task, Role, Agent, adapter, workspace) and the native Session are preserved;
+ * only the volatile Run/launch fields advance. A source may never jump to a
+ * replacement native Session.
+ */
+export function refreshReusedTaskRuntimeDescriptorSource(
+  source: string,
+  home: string,
+  store: ExactTaskRuntimeStatePort,
+  current: Readonly<{ runId: string; launchId: string; nativeSessionId: string }>
+): ExactTaskRuntimeDescriptor {
+  const resolved = readTaskRuntimeSource(source, home);
+  if (!resolved.fromFile) {
+    throw new Error("A managed Task runtime descriptor must use its stable file source.");
+  }
+  const previous = resolved.descriptor;
+  if (previous.nativeSessionId === undefined
+    || previous.nativeSessionId !== current.nativeSessionId) {
+    throw new Error(
+      "Task runtime descriptor source cannot jump to a replacement native Session."
+    );
+  }
+  const refreshed = createExactTaskRuntimeDescriptor({
+    ...previous,
+    runId: current.runId,
+    launchId: current.launchId,
+    nativeSessionId: current.nativeSessionId
+  });
+  if (exactTaskRuntimeDescriptorPath(home, refreshed) !== resolve(source)) {
+    throw new Error("Refreshed Task runtime descriptor changed its stable identity.");
+  }
+  assertExactTaskRuntimeState(refreshed, store);
+  writeTextFileAtomically(resolve(source), `${serializeExactDescriptor(refreshed)}\n`);
+  return refreshed;
+}
+
 function readTaskRuntimeSource(
   source: string,
   home: string

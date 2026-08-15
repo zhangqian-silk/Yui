@@ -153,7 +153,12 @@ export type RuntimeLifecycleEvent =
   | RuntimeProviderProgressEvent;
 
 export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
-  Readonly<{ event: TEvent; created: boolean }>;
+  Readonly<{
+    event: TEvent;
+    created: boolean;
+    /** Superseded nonterminal progress files removed by this admission. */
+    coalescedEventCount?: number;
+  }>;
 
 /** Test-only synchronization seam; production callers leave it unset. */
 export type RuntimeEventInboxHooks = Readonly<{
@@ -233,7 +238,7 @@ export class FileRuntimeEventInbox {
     input: RuntimeProviderProgressInput
   ): RuntimeEventEnqueueResult<RuntimeProviderProgressEvent> {
     const normalized = normalizeProviderProgressInput(input);
-    return this.publish(Object.freeze({
+    return this.publishProgress(Object.freeze({
       schemaVersion: 1,
       id: runtimeEventId("native-turn-progress", normalized),
       type: "native-turn-progress",
@@ -263,10 +268,7 @@ export class FileRuntimeEventInbox {
         }
       }
     }
-    return events.sort((left, right) => (
-      left.receivedAt.localeCompare(right.receivedAt)
-      || left.id.localeCompare(right.id)
-    ));
+    return events.sort(compareRuntimeEvents);
   }
 
   read(id: string): RuntimeLifecycleEvent | null {
@@ -311,6 +313,41 @@ export class FileRuntimeEventInbox {
     }
   }
 
+  acknowledgeMany(ids: readonly string[]): string[] {
+    if (ids.length === 0) return [];
+    const acknowledged: string[] = [];
+    try {
+      for (const id of ids) {
+        assertEventId(id);
+        try {
+          unlinkSync(this.eventPath(id));
+          acknowledged.push(id);
+        } catch (error) {
+          if (!isNodeError(error, "ENOENT")) throw error;
+        }
+      }
+    } finally {
+      // Preserve the old per-event durability guarantee even when a later
+      // unlink in the batch fails after earlier entries were removed.
+      if (acknowledged.length > 0) fsyncDirectory(this.directory);
+    }
+    return acknowledged;
+  }
+
+  private publishProgress(
+    event: RuntimeProviderProgressEvent
+  ): RuntimeEventEnqueueResult<RuntimeProviderProgressEvent> {
+    return withUpgradeCoordinationLock(this.home, () => {
+      this.hooks.afterAdmission?.();
+      const result = this.publishUnlocked(event);
+      if (!result.created) return result;
+      const superseded = this.supersededProgressIds(event);
+      if (superseded.length === 0) return result;
+      this.acknowledgeMany(superseded);
+      return { ...result, coalescedEventCount: superseded.length };
+    });
+  }
+
   private publish<TEvent extends RuntimeLifecycleEvent>(
     event: TEvent
   ): RuntimeEventEnqueueResult<TEvent> {
@@ -321,53 +358,96 @@ export class FileRuntimeEventInbox {
     // UpgradeFenceError after the cutover holder releases the lock.
     return withUpgradeCoordinationLock(this.home, () => {
       this.hooks.afterAdmission?.();
-      const content = `${JSON.stringify(event)}\n`;
-      if (Buffer.byteLength(content, "utf8") > MAX_RUNTIME_EVENT_FILE_BYTES) {
-        throw new RuntimeEventInboxError(
-          "RUNTIME_EVENT_TOO_LARGE",
-          "Runtime event exceeds the durable inbox limit."
-        );
-      }
-      ensureInboxDirectory(this.directory);
-      const target = this.eventPath(event.id);
-      const temporary = join(
-        this.directory,
-        `.${event.id}.tmp-${process.pid}-${randomUUID()}`
-      );
-      let descriptor: number | null = null;
-      try {
-        descriptor = openSync(
-          temporary,
-          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-          0o600
-        );
-        writeFileSync(descriptor, content, "utf8");
-        fchmodSync(descriptor, 0o600);
-        fsyncSync(descriptor);
-        closeSync(descriptor);
-        descriptor = null;
-        try {
-          linkSync(temporary, target);
-          unlinkSync(temporary);
-          fsyncDirectory(this.directory);
-          return { event, created: true };
-        } catch (error) {
-          if (!isNodeError(error, "EEXIST")) throw error;
-          const existing = this.read(event.id);
-          if (existing === null) return { event, created: false };
-          if (!hasSameIdentity(existing, event)) {
-            throw new RuntimeEventInboxError(
-              "RUNTIME_EVENT_CONFLICT",
-              `Runtime event id conflicts with an existing file: ${event.id}`
-            );
-          }
-          return { event: existing as TEvent, created: false };
-        }
-      } finally {
-        if (descriptor !== null) closeSync(descriptor);
-        rmSync(temporary, { force: true });
-      }
+      return this.publishUnlocked(event);
     });
+  }
+
+  private publishUnlocked<TEvent extends RuntimeLifecycleEvent>(
+    event: TEvent
+  ): RuntimeEventEnqueueResult<TEvent> {
+    const content = `${JSON.stringify(event)}\n`;
+    if (Buffer.byteLength(content, "utf8") > MAX_RUNTIME_EVENT_FILE_BYTES) {
+      throw new RuntimeEventInboxError(
+        "RUNTIME_EVENT_TOO_LARGE",
+        "Runtime event exceeds the durable inbox limit."
+      );
+    }
+    ensureInboxDirectory(this.directory);
+    const target = this.eventPath(event.id);
+    const temporary = join(
+      this.directory,
+      `.${event.id}.tmp-${process.pid}-${randomUUID()}`
+    );
+    let descriptor: number | null = null;
+    try {
+      descriptor = openSync(
+        temporary,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+        0o600
+      );
+      writeFileSync(descriptor, content, "utf8");
+      fchmodSync(descriptor, 0o600);
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = null;
+      try {
+        linkSync(temporary, target);
+        unlinkSync(temporary);
+        fsyncDirectory(this.directory);
+        return { event, created: true };
+      } catch (error) {
+        if (!isNodeError(error, "EEXIST")) throw error;
+        const existing = this.read(event.id);
+        if (existing === null) return { event, created: false };
+        if (!hasSameIdentity(existing, event)) {
+          throw new RuntimeEventInboxError(
+            "RUNTIME_EVENT_CONFLICT",
+            `Runtime event id conflicts with an existing file: ${event.id}`
+          );
+        }
+        return { event: existing as TEvent, created: false };
+      }
+    } finally {
+      if (descriptor !== null) closeSync(descriptor);
+      rmSync(temporary, { force: true });
+    }
+  }
+
+  private supersededProgressIds(event: RuntimeProviderProgressEvent): string[] {
+    const events = this.list();
+    const segment = semanticSegment(events, event);
+    const candidates = events.filter((candidate): candidate is RuntimeProviderProgressEvent => (
+      candidate.type === "native-turn-progress"
+      && sameProgressStream(candidate, event)
+      && compareRuntimeEvents(candidate, segment.before) > 0
+      && (segment.after === undefined || compareRuntimeEvents(candidate, segment.after) < 0)
+    ));
+    let latestReceivedAt = "";
+    let greatestSequence: number | undefined;
+    for (const candidate of candidates) {
+      const receivedAtOrder = candidate.receivedAt.localeCompare(latestReceivedAt);
+      if (receivedAtOrder > 0) {
+        latestReceivedAt = candidate.receivedAt;
+        greatestSequence = candidate.sequence;
+      } else if (
+        receivedAtOrder === 0
+        && candidate.sequence !== undefined
+        && (greatestSequence === undefined || candidate.sequence > greatestSequence)
+      ) {
+        greatestSequence = candidate.sequence;
+      }
+    }
+    return candidates.flatMap((candidate) => (
+      candidate.receivedAt.localeCompare(latestReceivedAt) < 0
+      || (
+        candidate.receivedAt === latestReceivedAt
+        && candidate.sequence !== undefined
+        && greatestSequence !== undefined
+        && candidate.sequence < greatestSequence
+      )
+        ? [candidate.id]
+        : []
+    ));
   }
 
   private eventPath(id: string): string {
@@ -759,6 +839,72 @@ function hasSameIdentity(left: RuntimeLifecycleEvent, right: RuntimeLifecycleEve
       || !("progressId" in right)
       || left.progressId === right.progressId)
     && (!("sequence" in left) || !("sequence" in right) || left.sequence === right.sequence);
+}
+
+function compareRuntimeEvents(
+  left: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">,
+  right: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">
+): number {
+  return left.receivedAt.localeCompare(right.receivedAt)
+    || left.id.localeCompare(right.id);
+}
+
+/** Chooses one latest fact inside an already-isolated exact progress stream. */
+export function compareRuntimeProgressRecency(
+  left: Pick<RuntimeProviderProgressEvent, "receivedAt" | "id" | "sequence">,
+  right: Pick<RuntimeProviderProgressEvent, "receivedAt" | "id" | "sequence">
+): number {
+  const receivedAt = left.receivedAt.localeCompare(right.receivedAt);
+  if (receivedAt !== 0) return receivedAt;
+  if (
+    left.sequence !== undefined
+    && right.sequence !== undefined
+    && left.sequence !== right.sequence
+  ) {
+    return left.sequence - right.sequence;
+  }
+  // A content-derived event id is identity, not arrival evidence. Without two
+  // comparable provider sequences, same-timestamp facts remain incomparable.
+  return 0;
+}
+
+function semanticSegment(
+  events: readonly RuntimeLifecycleEvent[],
+  current: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">
+): Readonly<{
+  before: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">;
+  after?: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">;
+}> {
+  let before: Pick<RuntimeLifecycleEvent, "receivedAt" | "id"> = {
+    receivedAt: "",
+    id: ""
+  };
+  let after: Pick<RuntimeLifecycleEvent, "receivedAt" | "id"> | undefined;
+  for (const event of events) {
+    if (event.type === "native-turn-progress") continue;
+    const order = compareRuntimeEvents(event, current);
+    if (order < 0 && compareRuntimeEvents(event, before) > 0) {
+      before = event;
+    } else if (order > 0 && (
+      after === undefined || compareRuntimeEvents(event, after) < 0
+    )) {
+      after = event;
+    }
+  }
+  return { before, ...(after === undefined ? {} : { after }) };
+}
+
+function sameProgressStream(
+  left: RuntimeProviderProgressEvent,
+  right: RuntimeProviderProgressEvent
+): boolean {
+  return left.taskId === right.taskId
+    && left.roleName === right.roleName
+    && left.agentId === right.agentId
+    && left.adapterId === right.adapterId
+    && left.launchId === right.launchId
+    && left.nativeSessionId === right.nativeSessionId
+    && left.runId === right.runId;
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {

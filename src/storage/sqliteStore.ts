@@ -267,11 +267,17 @@ export class SqliteTaskStore implements TaskStore {
    * Nested calls join the outer transaction. The revision is bumped once, at
    * commit, only when the closure wrote.
    */
-  transaction<T>(execute: (store: SqliteTaskStore) => T, options?: SqliteTransactionOptions): T {
-    if (this.#inTransaction) return execute(this);
+  transaction<T>(execute: (store: SqliteTaskStore) => T, options?: SqliteTransactionOptions): T;
+  transaction<T>(execute: (store: TaskStore) => T, options?: SqliteTransactionOptions): T;
+  transaction<T>(
+    execute: ((store: SqliteTaskStore) => T) | ((store: TaskStore) => T),
+    options?: SqliteTransactionOptions
+  ): T {
+    const run = execute as (store: SqliteTaskStore) => T;
+    if (this.#inTransaction) return run(this);
     this.#begin();
     try {
-      const result = execute(this);
+      const result = run(this);
       if (this.#dirty) {
         this.#prepareWrite();
         if (options?.requestId !== undefined) {
@@ -289,6 +295,11 @@ export class SqliteTaskStore implements TaskStore {
       this.#rollback();
       throw error;
     }
+  }
+
+  /** Bounded runtime-event folds share the same SQLite write transaction. */
+  withRuntimeEventTransaction<T>(execute: () => T): T {
+    return this.transaction(() => execute());
   }
 
   /**
@@ -332,6 +343,8 @@ export class SqliteTaskStore implements TaskStore {
     const row = this.#db.prepare("SELECT revision FROM home_meta WHERE id = 1").get() as { revision: number };
     return row.revision;
   }
+
+  getStateRevision(): number { return this.getRevision(); }
 
   /**
    * Run an ordered command batch inside one `BEGIN IMMEDIATE … COMMIT`, yielding

@@ -14,8 +14,10 @@ import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.j
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { ExecutorRegistry } from "../../dist/executor/executorRegistry.js";
+import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import {
   bindTaskRoleRun,
+  clearTaskRoleRun,
   createRoleSessionSet,
   markTaskRoleRunDelivered,
   recordRoleAgentSession
@@ -145,10 +147,11 @@ function registry(
   coordinator,
   host,
   promptPush = async () => "busy",
-  tmux = unusedTmux()
+  tmux = unusedTmux(),
+  planner = { plan() { throw new Error("legacy planner must not run"); } }
 ) {
   return new ExecutorRegistry(
-    { plan() { throw new Error("legacy planner must not run"); } },
+    planner,
     tmux,
     undefined,
     {
@@ -1333,6 +1336,243 @@ test("an already-running Codex resume host pushes once after the prepare-to-send
   assert.equal(resumeCalls, 2);
 });
 
+test("a reused Session refreshes its exact runtime descriptor before prompt push", async (t) => {
+  const fx = fixture(t, "codex");
+  const roleName = "worker";
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  const nativeSessionId = "codex-native-refresh-before-push";
+  const run = createAgentRun(
+    "agent-run-7",
+    fx.task.id,
+    roleName,
+    "resume",
+    "deliver after descriptor refresh",
+    NOW,
+    { effective }
+  );
+  fx.store.transaction((tx) => {
+    tx.saveRole(fx.task.id, updateRoleStatus(fx.roles.get(roleName), "running", NOW));
+    tx.saveActiveAgentRun(run);
+  });
+  fx.schedulerStore.recordRuntimeNativeSession({
+    taskId: fx.task.id,
+    roleName,
+    agentId: fx.agent.id,
+    adapterId: fx.agent.adapterId,
+    nativeSessionId,
+    effective
+  }, NOW);
+  const order = [];
+  const host = {
+    async start() { throw new Error("new is not expected"); },
+    async resume(request, beforeHostStart) {
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        nativeSessionId
+      });
+      return runtimeBinding(request, { hostCreated: false, nativeSessionId });
+    },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  const delivery = registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "refresh-before-push",
+      now: () => NOW
+    }),
+    host,
+    async () => { order.push("push"); return "sent"; },
+    unusedTmux(),
+    {
+      plan() { throw new Error("legacy planner must not run"); },
+      refreshTaskRuntimeDescriptor(input) {
+        assert.deepEqual(input, {
+          taskId: fx.task.id,
+          roleName,
+          runId: run.id,
+          launchId: prepared.launchId,
+          nativeSessionId,
+          agentId: fx.agent.id,
+          adapterId: fx.agent.adapterId,
+          workspace: fx.home
+        });
+        order.push("refresh");
+      }
+    }
+  );
+  const prepared = await delivery.prepareRoleSession({
+    taskId: fx.task.id,
+    roleName,
+    agentId: fx.agent.id,
+    adapterId: fx.agent.adapterId,
+    effective,
+    workspace: fx.home,
+    mode: "resume",
+    nativeSessionId,
+    runId: run.id,
+    beforeHostStart: (preflight) => {
+      fx.schedulerStore.saveRoleRunPrepared({
+        task: fx.store.getTask(fx.task.id),
+        role: fx.store.getRole(fx.task.id, roleName),
+        run,
+        session: {
+          agentId: preflight.agentId,
+          adapterId: preflight.adapterId,
+          nativeSessionId,
+          launchId: preflight.launchId,
+          status: "ready",
+          effective: preflight.effective
+        },
+        launchId: preflight.launchId,
+        now: NOW
+      });
+    }
+  });
+  const ready = await delivery.waitUntilReady(prepared);
+  assert.equal(await delivery.sendOnce({
+    delivery: ready,
+    receiptId: `agent-run:${fx.task.id}/${run.id}`,
+    text: run.input
+  }), "sent");
+  assert.deepEqual(order, ["refresh", "push"]);
+});
+
+test("a prepared reused Session cannot push after its durable Run advances", async (t) => {
+  const fx = fixture(t, "codex");
+  const roleName = "worker";
+  const effective = fx.schedulerStore.getRole(fx.task.id, roleName).effective;
+  const nativeSessionId = "codex-native-stale-prepared-run";
+  const runA = createAgentRun(
+    "agent-run-8",
+    fx.task.id,
+    roleName,
+    "resume",
+    "stale delivery",
+    NOW,
+    { effective }
+  );
+  fx.store.transaction((tx) => {
+    tx.saveRole(fx.task.id, updateRoleStatus(fx.roles.get(roleName), "running", NOW));
+    tx.saveActiveAgentRun(runA);
+  });
+  fx.schedulerStore.recordRuntimeNativeSession({
+    taskId: fx.task.id,
+    roleName,
+    agentId: fx.agent.id,
+    adapterId: fx.agent.adapterId,
+    nativeSessionId,
+    effective
+  }, NOW);
+  const host = {
+    async start() { throw new Error("new is not expected"); },
+    async resume(request, beforeHostStart) {
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        nativeSessionId
+      });
+      return runtimeBinding(request, { hostCreated: false, nativeSessionId });
+    },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  let promptPushes = 0;
+  const delivery = registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "stale-prepared-run",
+      now: () => NOW
+    }),
+    host,
+    async () => { promptPushes += 1; return "sent"; },
+    unusedTmux(),
+    {
+      refreshTaskRuntimeDescriptor(input) {
+        new FileRoleLaunchPlanner(fx.home, fx.store)
+          .refreshTaskRuntimeDescriptor(input);
+      }
+    }
+  );
+  const prepared = await delivery.prepareRoleSession({
+    taskId: fx.task.id,
+    roleName,
+    agentId: fx.agent.id,
+    adapterId: fx.agent.adapterId,
+    effective,
+    workspace: fx.home,
+    mode: "resume",
+    nativeSessionId,
+    runId: runA.id,
+    beforeHostStart: (preflight) => {
+      fx.schedulerStore.saveRoleRunPrepared({
+        task: fx.store.getTask(fx.task.id),
+        role: fx.store.getRole(fx.task.id, roleName),
+        run: runA,
+        session: {
+          agentId: preflight.agentId,
+          adapterId: preflight.adapterId,
+          nativeSessionId,
+          launchId: preflight.launchId,
+          status: "ready",
+          effective: preflight.effective
+        },
+        launchId: preflight.launchId,
+        now: NOW
+      });
+    }
+  });
+  const readyA = await delivery.waitUntilReady(prepared);
+  const runB = createAgentRun(
+    "agent-run-9",
+    fx.task.id,
+    roleName,
+    "resume",
+    "current delivery",
+    NOW,
+    { effective }
+  );
+  const receiptA = `agent-run:${fx.task.id}/${runA.id}`;
+  const receiptB = `agent-run:${fx.task.id}/${runB.id}`;
+  fx.store.transaction((tx) => {
+    let sessions = tx.getTaskRoleSessionSet(fx.task.id, roleName);
+    sessions = clearTaskRoleRun(sessions, {
+      agentId: fx.agent.id,
+      runId: runA.id,
+      receiptId: receiptA
+    }, NOW);
+    sessions = bindTaskRoleRun(sessions, {
+      agentId: fx.agent.id,
+      runId: runB.id,
+      receiptId: receiptB
+    }, NOW);
+    tx.clearActiveAgentRun(fx.task.id, roleName);
+    tx.saveTaskRoleSessionSet(sessions);
+    tx.saveActiveAgentRun(runB);
+  });
+
+  await assert.rejects(
+    delivery.sendOnce({
+      delivery: readyA,
+      receiptId: receiptA,
+      text: runA.input
+    }),
+    /Run.*(?:current|generation)|(?:current|generation).*Run/i
+  );
+  assert.equal(promptPushes, 0);
+});
+
 test("fresh Claude SessionStart sees the durable Run fence before readiness returns", async (t) => {
   const fx = fixture(t, "claude");
   const roleName = "worker";
@@ -1550,13 +1790,14 @@ test("a launch-carried Codex prompt for another Run is fenced into cleanup", asy
 
 test("a busy retry for one delivery reuses the prepared binding without starting twice", async (t) => {
   const fx = fixture(t);
+  const nativeSessionId = "codex-native-busy-retry";
   let starts = 0;
   const host = {
     async start(request) {
       starts += 1;
       // An already-running Role pane receives this new Run through the active
       // push path; no launch argv receipt exists for the new prompt.
-      return runtimeBinding(request, { hostCreated: false });
+      return runtimeBinding(request, { hostCreated: false, nativeSessionId });
     },
     async resume() { throw new Error("resume is not expected"); },
     async stop() {},

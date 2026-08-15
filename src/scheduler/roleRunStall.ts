@@ -2,6 +2,7 @@ import type { TaskEvent } from "../event/taskEvent.js";
 import {
   selectedSchedulerRoles,
   selectedSchedulerTasks,
+  type RunProgressFacts,
   type SchedulerReconcileSelection,
   type SchedulerRoleSession,
   type SchedulerRoleResourceEvidence,
@@ -30,6 +31,23 @@ export const RUN_RESOURCE_SUPPRESSED_EVENT = "run.resource-suppressed";
 /** Structured, non-Message recovery evidence written by an explicit Leader. */
 export const RUN_RECOVERY_REQUESTED_EVENT = "run.recovery-requested";
 export const RUN_RECOVERY_APPLIED_EVENT = "run.recovery-applied";
+
+/** Event types that count as Run activity for the durable progress clock. */
+const ACTIVITY_EVENT_TYPES = new Set([
+  RUN_PROGRESS_EVENT,
+  "runtime.provider-turn-progress",
+  "message.sent",
+  "input.answered",
+  "input.auto-answered",
+  "input.cancelled",
+  "work.accepted",
+  "work.updated",
+  "review.completed",
+  "review.failed",
+  "integration.updated",
+  "integration.completed",
+  "integration.failed"
+]);
 
 /** The smallest storage boundary needed to clear a resolved Leader stall. */
 export type LeaderStallAttentionStore = Readonly<{
@@ -314,16 +332,23 @@ export function currentRoleRunProgressAt(
     richerProgress = undefined;
   }
   if (run.deliveredAt === undefined) return { progressAt: run.createdAt };
+  // The richer fold is authoritative when present; skip the per-candidate
+  // full-history scans that every stall candidate otherwise pays.
+  if (richerProgress !== undefined && richerProgress !== null) {
+    return {
+      progressAt: richerProgress.progressAt,
+      ...(richerProgress.evidence === undefined
+        ? {}
+        : { evidence: richerProgress.evidence })
+    };
+  }
   const fallbackProgressAt = latestDurableProgressAt({
     deliveredAt: run.deliveredAt,
     latestCheckpointAt: latestRunProgressAt(events, run.id),
     latestActivityAt: latestRunActivityAt(events, run.id)
   });
   return {
-    progressAt: richerProgress?.progressAt ?? fallbackProgressAt,
-    ...(richerProgress?.evidence === undefined
-      ? {}
-      : { evidence: richerProgress.evidence })
+    progressAt: fallbackProgressAt
   };
 }
 
@@ -369,13 +394,24 @@ export function latestRunDurableProgressAt(
   }>,
   taskId: string,
   roleName: string,
-  runId: string
+  runId: string,
+  precomputed?: { latestCheckpointAt?: string; latestActivityAt?: string }
 ): Readonly<{ progressAt: string; evidence?: string }> | null {
   const run = store.getAgentRun(taskId, runId);
   if (run === null || run.taskId !== taskId || run.roleName !== roleName) return null;
   const events = store.listEvents(taskId);
-  const latestCheckpointAt = latestRunProgressAt(events, run.id);
-  const latestActivityAt = latestRunActivityAt(events, run.id);
+  // The adapter folds checkpoint/activity once per revision. When the fold
+  // port exists, a missing per-Run entry is an authoritative empty fold: use
+  // its (possibly undefined) values directly and never re-scan the whole
+  // history per candidate. Legacy callers without the port omit precomputed
+  // and keep the per-candidate full-history scans.
+  const folded = precomputed !== undefined;
+  const latestCheckpointAt = folded
+    ? precomputed!.latestCheckpointAt
+    : latestRunProgressAt(events, run.id);
+  const latestActivityAt = folded
+    ? precomputed!.latestActivityAt
+    : latestRunActivityAt(events, run.id);
   const baseline = run.deliveredAt === undefined
     ? run.createdAt
     : latestDurableProgressAt({
@@ -453,25 +489,10 @@ export function latestRunActivityAt(
   events: readonly TaskEvent[],
   runId: string
 ): string | undefined {
-  const semanticTypes = new Set([
-    RUN_PROGRESS_EVENT,
-    "runtime.provider-turn-progress",
-    "message.sent",
-    "input.answered",
-    "input.auto-answered",
-    "input.cancelled",
-    "work.accepted",
-    "work.updated",
-    "review.completed",
-    "review.failed",
-    "integration.updated",
-    "integration.completed",
-    "integration.failed"
-  ]);
   let latest: string | undefined;
   for (const event of events) {
     if (
-      !semanticTypes.has(event.type)
+      !ACTIVITY_EVENT_TYPES.has(event.type)
       || event.payload.runId !== runId
       || event.type === RUN_STALLED_EVENT
       || event.type === RUN_RECOVERED_EVENT
@@ -526,6 +547,85 @@ export function latestStallEvidenceKey(
     progressAt: latest.payload.progressAt,
     evidenceKey: latest.payload.evidenceKey ?? "live-pane-no-progress"
   };
+}
+
+type MutableRunProgressFacts = {
+  latestCheckpointAt?: string;
+  latestActivityAt?: string;
+  latestStall?: { progressAt: string; evidenceKey: string };
+};
+
+/**
+ * Folds a Task's event history into per-Run progress facts in one O(events)
+ * pass. The adapter builds this once per durable revision and serves the
+ * stall reconciliation from it, replacing the per-candidate full-history
+ * clones and scans that turned one pass into an O(candidates x events) hot
+ * read. The fold mirrors latestRunProgressAt/latestRunActivityAt/
+ * latestStallProgressAt/latestStallEvidenceKey exactly.
+ */
+export function foldRunProgressFacts(
+  events: readonly TaskEvent[]
+): Map<string, RunProgressFacts> {
+  const byRun = new Map<string, MutableRunProgressFacts>();
+  const latestStallCreatedAt = new Map<string, string>();
+  for (const event of events) {
+    const runId = event.payload.runId;
+    if (typeof runId !== "string") continue;
+    let facts = byRun.get(runId) as MutableRunProgressFacts | undefined;
+    if (facts === undefined) {
+      facts = {};
+      byRun.set(runId, facts);
+    }
+    const type = event.type;
+    const isProgress = type === RUN_PROGRESS_EVENT
+      || type === "runtime.provider-turn-progress";
+    if (isProgress) {
+      const validProgress = typeof event.payload.progressAt === "string"
+        && Number.isFinite(Date.parse(event.payload.progressAt));
+      if (type === "runtime.provider-turn-progress" && !validProgress) continue;
+      const progressAt = validProgress
+        ? (event.payload.progressAt as string)
+        : event.createdAt;
+      if (facts.latestCheckpointAt === undefined
+        || Date.parse(progressAt) > Date.parse(facts.latestCheckpointAt)) {
+        facts.latestCheckpointAt = progressAt;
+      }
+      // Both progress event types are activity events; the stall/recovered
+      // exclusion in latestRunActivityAt is structural here because a progress
+      // event can never be either type.
+      if (facts.latestActivityAt === undefined
+        || Date.parse(progressAt) > Date.parse(facts.latestActivityAt)) {
+        facts.latestActivityAt = progressAt;
+      }
+    } else if (type === RUN_STALLED_EVENT) {
+      const previousCreatedAt = latestStallCreatedAt.get(runId);
+      if (previousCreatedAt === undefined
+        || Date.parse(event.createdAt) > Date.parse(previousCreatedAt)) {
+        latestStallCreatedAt.set(runId, event.createdAt);
+        facts.latestStall = typeof event.payload.progressAt === "string"
+          ? {
+              progressAt: event.payload.progressAt as string,
+              evidenceKey: typeof event.payload.evidenceKey === "string"
+                ? event.payload.evidenceKey as string
+                : "live-pane-no-progress"
+            }
+          : undefined;
+      }
+    } else if (ACTIVITY_EVENT_TYPES.has(type)
+      && type !== RUN_STALLED_EVENT
+      && type !== RUN_RECOVERED_EVENT) {
+      if (facts.latestActivityAt === undefined
+        || Date.parse(event.createdAt) > Date.parse(facts.latestActivityAt)) {
+        facts.latestActivityAt = event.createdAt;
+      }
+    }
+  }
+  return byRun as Map<string, RunProgressFacts>;
+}
+
+/** Yield the event loop so already-written control requests stay responsive. */
+function yieldEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 /**
@@ -589,6 +689,11 @@ export async function reconcileStalledRoleRuns(
   // existing mailbox work without manufacturing another episode.
   if (selection !== undefined && !selection.full) return [];
   if (store.listEvents === undefined || store.recordRoleRunStall === undefined) return [];
+  // When the fold port exists, a missing per-Run entry is an authoritative
+  // empty fold: the stall reconciliation must not re-scan the whole history
+  // per candidate. Legacy stores without the port keep the per-candidate
+  // scans.
+  const foldPortPresent = store.getRunProgressFacts !== undefined;
   const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
     task.status !== "active"
       ? []
@@ -684,7 +789,11 @@ export async function reconcileStalledRoleRuns(
     }
   }
   const raised: RoleRunStallResult[] = [];
-  for (const candidate of stallCandidates) {
+  for (const [candidateIndex, candidate] of stallCandidates.entries()) {
+    // A large Task's per-candidate reads are now bounded, but many candidates
+    // in one pass still add up. Yield periodically so already-written control
+    // requests are not starved by the whole reconciliation.
+    if (candidateIndex > 0 && candidateIndex % 16 === 0) await yieldEventLoop();
     const key = `${candidate.task.id}\0${candidate.role.name}`;
     let live: "present" | "absent";
     try {
@@ -724,6 +833,7 @@ export async function reconcileStalledRoleRuns(
     }
 
     const events = store.listEvents(candidate.task.id);
+    const progressFacts = store.getRunProgressFacts?.(candidate.task.id, candidate.run.id);
     // Before exact acceptance there is no execution progress clock. Keep the
     // delivery watch anchored to the Run creation/transport boundary even if
     // checkpoints, output, or related WorkItem/Review/Integration records are
@@ -742,7 +852,9 @@ export async function reconcileStalledRoleRuns(
       progressAt,
       now,
       windowMs,
-      lastAttentionProgressAt: latestStallProgressAt(events, candidate.run.id)
+      lastAttentionProgressAt: foldPortPresent
+        ? progressFacts?.latestStall?.progressAt
+        : latestStallProgressAt(events, candidate.run.id)
     });
     const runAgentId = candidate.run.effective.agentId;
     const runAdapterId = candidate.run.effective.adapterId;
@@ -842,8 +954,9 @@ export async function reconcileStalledRoleRuns(
   for (const current of observed.values()) {
     if (current.live !== "present" || !current.stalled || !current.stallCandidate) continue;
     const { candidate, progressAt } = current;
-    const events = store.listEvents(candidate.task.id);
-    const previous = latestStallEvidenceKey(events, candidate.run.id);
+    const previous = foldPortPresent
+      ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
+      : latestStallEvidenceKey(store.listEvents(candidate.task.id), candidate.run.id);
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)
@@ -915,8 +1028,9 @@ export async function reconcileStalledRoleRuns(
   for (const current of observed.values()) {
     if (current.live !== "present" || current.stalled || !current.stallCandidate) continue;
     const { candidate, progressAt } = current;
-    const events = store.listEvents(candidate.task.id);
-    const previous = latestStallEvidenceKey(events, candidate.run.id);
+    const previous = foldPortPresent
+      ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
+      : latestStallEvidenceKey(store.listEvents(candidate.task.id), candidate.run.id);
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)

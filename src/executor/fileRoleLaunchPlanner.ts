@@ -38,6 +38,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
+  effectiveLaunchSnapshotsCompatibleForTaskMain,
   effectiveLaunchSnapshotsCompatible,
   effectiveRoleForLaunch,
   resolveEffectiveLaunch,
@@ -141,6 +142,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   refreshTaskRuntimeDescriptor(input: Readonly<{
     taskId: string;
     roleName: string;
+    runId?: string;
+    launchId: string;
+    nativeSessionId: string;
+    agentId: string;
+    adapterId: string;
+    workspace: string;
   }>): void {
     const task = this.store.getTask(input.taskId);
     const role = this.store.getRole(input.taskId, input.roleName);
@@ -167,11 +174,22 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       launchId: session.launchId,
       nativeSessionId: session.nativeSessionId
     });
+    if (
+      descriptor.runId !== input.runId
+      || descriptor.launchId !== input.launchId
+      || descriptor.nativeSessionId !== input.nativeSessionId
+      || descriptor.agentId !== input.agentId
+      || descriptor.adapterId !== input.adapterId
+      || descriptor.workspace !== canonicalPath(input.workspace)
+    ) {
+      throw new Error("Prepared Task runtime generation is not current.");
+    }
     assertExactTaskRuntimeState(descriptor, this.store);
-    writeTextFileAtomically(
-      exactTaskRuntimeDescriptorPath(this.home, descriptor),
-      `${serializeExactDescriptor(descriptor)}\n`
-    );
+    // Publish only the current-control source. A reused native pane keeps its
+    // own stable source path; its Hook self-refreshes that source before the
+    // volatile fence instead of the Controller scanning history to find it.
+    const currentSource = exactTaskRuntimeDescriptorPath(this.home, descriptor);
+    writeTextFileAtomically(currentSource, `${serializeExactDescriptor(descriptor)}\n`);
   }
 
   plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
@@ -271,7 +289,13 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const effective = input.effective ?? resolvedEffective;
     const existing = sessionSet?.sessions[effective.agentId];
     const compatibleExisting = existing !== undefined
-      && effectiveLaunchSnapshotsCompatible(existing.effective, effective);
+      && (input.mode === "resume"
+        ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+            existing.effective,
+            effective,
+            runWorkspace ?? workspace
+          )
+        : effectiveLaunchSnapshotsCompatible(existing.effective, effective));
     if (input.mode === "resume" && !compatibleExisting) {
       throw new Error(
         `Task Role resume effective snapshot drifted: ${task.id}/${role.name}.`

@@ -163,6 +163,15 @@ export type CompletionInstallation = Readonly<{
 export type FileTaskStoreOptions = Readonly<{
   /** Read-only compatible-old -> current-model normalization before strict parse. */
   normalizeState?: (raw: string) => string;
+  /**
+   * Seed the read cache from one fingerprint-fenced `state.json` snapshot. The
+   * store runs its strict parser over the supplied bytes and caches the result
+   * under the supplied fingerprint, so the current-Home one-snapshot open never
+   * re-reads merely to construct or first use the returned store. A later
+   * external writer still changes the on-disk fingerprint and invalidates this
+   * seed on the next read.
+   */
+  initialStateSnapshot?: { fingerprint: string; raw: string };
 }>;
 export type YuiConfig = Readonly<{
   schemaVersion: typeof CURRENT_CONFIG_SCHEMA_VERSION;
@@ -273,6 +282,12 @@ type StorageState = {
 export type TaskStore = {
   rootDirectory(): string;
   transaction<T>(execute: (store: TaskStore) => T): T;
+  /**
+   * Runs a Controller runtime-inbox fold as one aggregate transaction.  The
+   * named seam lets the processor batch independent durable facts without
+   * depending on a concrete FileTaskStore.
+   */
+  withRuntimeEventTransaction<T>(execute: () => T): T;
   getConfig(): YuiConfig;
   /** The durable Home identity minted once for this store. */
   getHomeIdentity(): HomeIdentity;
@@ -306,6 +321,8 @@ export type TaskStore = {
   nextTaskId(): string;
   saveTask(task: Task): void;
   listTasks(): Task[];
+  /** Current durable state revision; advances once per committed mutation. */
+  getStateRevision(): number;
   getTask(id: string): Task | null;
   getReviewConfig(): ReviewConfig | null;
   getTaskBrief(taskId: string): TaskBrief | null;
@@ -411,6 +428,16 @@ export class FileTaskStore implements TaskStore {
   constructor(private readonly rootDir: string, options: FileTaskStoreOptions = {}) {
     this.#normalizeState = options.normalizeState;
     this.#requireReadableSchema();
+    const snapshot = options.initialStateSnapshot;
+    if (snapshot !== undefined) {
+      // The one-snapshot open already fenced these bytes; run the same strict
+      // parser the lazy path would, then warm the cache under the snapshot's
+      // fingerprint. A later external writer still invalidates it on next read.
+      this.#readCache = {
+        fingerprint: snapshot.fingerprint,
+        state: this.#parseState(snapshot.raw)
+      };
+    }
   }
 
   rootDirectory(): string { return this.rootDir; }
@@ -431,6 +458,10 @@ export class FileTaskStore implements TaskStore {
         this.#transaction = null;
       }
     });
+  }
+
+  withRuntimeEventTransaction<T>(execute: () => T): T {
+    return this.transaction(() => execute());
   }
 
   getConfig(): YuiConfig { return clone(this.#state().config); }
@@ -674,7 +705,16 @@ export class FileTaskStore implements TaskStore {
       state.tasks[stored.id] = aggregate;
     });
   }
-  listTasks(): Task[] { return values(this.#state().tasks, (aggregate) => aggregate.task.id).map((entry) => clone(entry.task)); }
+  listTasks(): Task[] {
+    // Clone only the Task headers, not the whole stored aggregate (events,
+    // runs, messages): a scheduler pass lists Tasks per phase, and cloning
+    // each aggregate's full event history turned every phase into a 32 MiB
+    // projection. Callers that need a Task's events read them explicitly.
+    return Object.values(this.#state().tasks)
+      .map((aggregate) => clone(aggregate.task))
+      .sort((left, right) => numericCompare(left.id, right.id));
+  }
+  getStateRevision(): number { return this.#state().revision; }
   getTask(id: string): Task | null { return optional(this.#state().tasks[id]?.task); }
   getReviewConfig(): ReviewConfig | null {
     return optional(this.#state().config.review);
@@ -1605,7 +1645,14 @@ export class FileTaskStore implements TaskStore {
       writeCurrentStorageManifest(this.rootDir);
       this.#normalizeState = undefined;
     }
-    this.#readCache = null;
+    // Keep the state we just wrote as the warm read cache. The atomic write
+    // produced a new fingerprint, so a concurrent external writer is still
+    // detected on the next read; our own mutations no longer re-parse the
+    // whole Home to observe state they already held under the write lock.
+    this.#readCache = {
+      fingerprint: stateFileFingerprint(join(this.rootDir, STORAGE_STATE_FILE)),
+      state
+    };
   }
   #parseState(raw: string): StorageState {
     return parseState(this.#normalizeState?.(raw) ?? raw);
@@ -1620,7 +1667,13 @@ export class FileTaskStore implements TaskStore {
   }
 }
 
-function stateFileFingerprint(path: string): string {
+/**
+ * The on-disk identity of a `state.json` the store's read cache is keyed on.
+ * The one-snapshot current-Home open fences its single read with the same
+ * fingerprint, so a writer that changes the file between the fence and the
+ * store's next read is detected exactly like a normal cache invalidation.
+ */
+export function stateFileFingerprint(path: string): string {
   const stat = statSync(path, { bigint: true });
   return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
 }
@@ -2483,7 +2536,7 @@ function values<T>(records: Record<string, T>, identity: keyof T | ((value: T) =
   return Object.values(records).map(clone).sort((left, right) => numericCompare(typeof identity === "function" ? identity(left) : String(left[identity]), typeof identity === "function" ? identity(right) : String(right[identity])));
 }
 function numericCompare(left: string, right: string): number { return left.localeCompare(right, undefined, { numeric: true }); }
-function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | null {
+export function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | null {
   if (mailbox === null || mailbox.target.kind !== "role" || mailbox.target.roleName !== "leader"
     || mailbox.pending === null) {
     return null;
