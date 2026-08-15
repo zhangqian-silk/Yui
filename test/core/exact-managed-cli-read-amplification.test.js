@@ -278,18 +278,18 @@ test("a spawned exact managed task list reads the unchanged Home state through o
     statSync(join(home, STORAGE_STATE_FILE)).size > 30 * 1024 * 1024,
     "the fixture must stay production-shaped (~32MiB state)"
   );
-  // The read budget for one managed invocation: the version scan and the
-  // corruption-detect strict load inside openCompatibleFileTaskStore's
-  // unchanged classification fence, plus the single strict parse of the
-  // preflight-verified store the command reuses. The command path opens no
-  // second store, so the unchanged revision is never parsed by a second
-  // instance. The old implementation read state.json six times (two opens,
-  // each scanning, detecting, and parsing).
+  // The read budget for one managed invocation: a single fingerprint-fenced
+  // state.json snapshot drives the version scan, the strict shape/reference
+  // validation, and the returned store's initial cache seed. The command
+  // reuses that seeded store, so the unchanged revision is never read a
+  // second time. The old implementation read state.json three times per open
+  // (version scan, corruption-detect strict load, and a separate lazy store
+  // parse), and six before the preflight-store reuse landed.
   assert.equal(
     report?.reads,
-    3,
-    `state.json was read ${report?.reads ?? 0} times; expected 3 (version scan, `
-    + `corruption-detect strict load, and one verified-store parse reused by the command).`
+    1,
+    `state.json was read ${report?.reads ?? 0} times; expected 1 (one fingerprint-fenced `
+    + `snapshot feeding version inspection, strict validation, and the store cache seed).`
   );
 });
 

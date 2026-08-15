@@ -163,6 +163,15 @@ export type CompletionInstallation = Readonly<{
 export type FileTaskStoreOptions = Readonly<{
   /** Read-only compatible-old -> current-model normalization before strict parse. */
   normalizeState?: (raw: string) => string;
+  /**
+   * Seed the read cache from one fingerprint-fenced `state.json` snapshot. The
+   * store runs its strict parser over the supplied bytes and caches the result
+   * under the supplied fingerprint, so the current-Home one-snapshot open never
+   * re-reads merely to construct or first use the returned store. A later
+   * external writer still changes the on-disk fingerprint and invalidates this
+   * seed on the next read.
+   */
+  initialStateSnapshot?: { fingerprint: string; raw: string };
 }>;
 export type YuiConfig = Readonly<{
   schemaVersion: typeof CURRENT_CONFIG_SCHEMA_VERSION;
@@ -419,6 +428,16 @@ export class FileTaskStore implements TaskStore {
   constructor(private readonly rootDir: string, options: FileTaskStoreOptions = {}) {
     this.#normalizeState = options.normalizeState;
     this.#requireReadableSchema();
+    const snapshot = options.initialStateSnapshot;
+    if (snapshot !== undefined) {
+      // The one-snapshot open already fenced these bytes; run the same strict
+      // parser the lazy path would, then warm the cache under the snapshot's
+      // fingerprint. A later external writer still invalidates it on next read.
+      this.#readCache = {
+        fingerprint: snapshot.fingerprint,
+        state: this.#parseState(snapshot.raw)
+      };
+    }
   }
 
   rootDirectory(): string { return this.rootDir; }
@@ -1648,7 +1667,13 @@ export class FileTaskStore implements TaskStore {
   }
 }
 
-function stateFileFingerprint(path: string): string {
+/**
+ * The on-disk identity of a `state.json` the store's read cache is keyed on.
+ * The one-snapshot current-Home open fences its single read with the same
+ * fingerprint, so a writer that changes the file between the fence and the
+ * store's next read is detected exactly like a normal cache invalidation.
+ */
+export function stateFileFingerprint(path: string): string {
   const stat = statSync(path, { bigint: true });
   return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
 }
