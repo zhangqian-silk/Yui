@@ -438,10 +438,13 @@ export async function enqueueIntegrationQueueEntry(
     // Each inspect above is async: a concurrent landing can advance the
     // target after the last read returns but before this transaction
     // commits.  A stale convergence proof would terminalize the entry
-    // against a head that no longer contains the candidate, so prepare the
-    // converged state in memory and do one final read before persisting.
-    // If the target moved, fall back to a normal queued entry and let the
-    // process path re-evaluate at the new head.
+    // against a head that no longer contains the candidate, so linearize
+    // with an atomic compare-and-swap on the target ref (the same
+    // `git update-ref` CAS that GitIntegrationService uses for actual
+    // landings).  The CAS succeeds only when the ref still points at the
+    // expected head; a concurrent advance between the last inspect and
+    // this call makes it fail, and the entry falls back to queued so the
+    // process path re-evaluates at the new head.
     const attempt = updateIntegrationAttempt(
       createIntegrationAttempt({
         id: tx.nextIntegrationAttemptId(task.id),
@@ -467,9 +470,10 @@ export async function enqueueIntegrationQueueEntry(
         : `tree-convergence:${equivalent}`,
       integrationAttemptId: attempt.id
     }, now());
-    const finalHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
-    if (finalHead !== effectiveTargetHead) {
-      let queuedEntry = createIntegrationQueueEntry({
+    try {
+      await git.assertRefAt(project.path, exactBranchRef(canonicalTargetRef), effectiveTargetHead);
+    } catch {
+      const queuedEntry = createIntegrationQueueEntry({
         id,
         taskId: task.id,
         projectId: input.projectId,
@@ -478,9 +482,6 @@ export async function enqueueIntegrationQueueEntry(
         checkCommands: requestedChecks,
         evidenceRefs: changeSet.manifest?.evidenceRefs ?? []
       }, now());
-      if (canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), queuedEntry, changeSet, finalHead)) {
-        queuedEntry = markIntegrationQueueValidated(queuedEntry, now(), finalHead);
-      }
       tx.saveIntegrationQueueEntry(task.id, queuedEntry);
       return { entry: queuedEntry, outcome: "queued" as const };
     }

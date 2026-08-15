@@ -55,6 +55,13 @@ export class RemoteBaselineConflictError extends Error {
 }
 export interface GitWorkspacePort {
   inspect(repositoryPath: string, baseRef?: string): Promise<GitRepositoryInspection>;
+  /**
+   * Atomically assert that a ref still points at the expected commit, using
+   * `git update-ref` as a compare-and-swap probe (same old and new value).
+   * Throws if the ref moved or does not exist.  This is the linearization
+   * point for convergence proofs that must not survive a target advance.
+   */
+  assertRefAt(repositoryPath: string, ref: string, expectedCommit: string): Promise<void>;
   /** Whether a ref (branch, tag, or other refname) resolves to a commit. */
   refExists(repositoryPath: string, ref: string): Promise<boolean>;
   /** Every ref name matching a `git for-each-ref` pattern. */
@@ -593,6 +600,24 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       baseRef: ref,
       baseCommit: baseCommit.toLowerCase()
     };
+  }
+
+  async assertRefAt(
+    repositoryPath: string,
+    ref: string,
+    expectedCommit: string
+  ): Promise<void> {
+    const root = (await this.inspect(repositoryPath)).root;
+    // `git update-ref <ref> <new> <old>` is atomic: it succeeds only when the
+    // ref still points at <old>.  Using the same commit for both new and old
+    // makes it a pure compare-and-swap probe — the ref does not move, but a
+    // concurrent advance between the last read and this call is detected.
+    await git([
+      "-C", root, "update-ref",
+      safeRef(ref),
+      expectedCommit,
+      expectedCommit
+    ]);
   }
 
   async refExists(repositoryPath: string, ref: string): Promise<boolean> {
