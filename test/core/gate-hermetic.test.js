@@ -1381,3 +1381,60 @@ test("the candidate cannot poison the base through the host Git config system en
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("the candidate cannot preseed the base Git template directory at the predictable path (e2e)", () => {
+  // The 5th P1: buildHermeticEnvironment sets GIT_TEMPLATE_DIR to
+  // join(root, "git-template"), so the base's is at <gateRoot>/base/git-template.
+  // A candidate test can compute the gate root from its own HOME
+  // (dirname(dirname(HOME))) and preseed that path with a post-checkout hook,
+  // poisoning the base checkout and causing an introduced failure to be
+  // misclassified as pre-existing (fail-open). The fix uses an unpredictable
+  // mkdtempSync directory for the base's GIT_TEMPLATE_DIR.
+  const root = mkdtempSync(join(tmpdir(), "yui-gate-base-template-"));
+  try {
+    const { source, baseSha } = setupSharedStateGateRepo(root);
+
+    writeFileSync(
+      join(source, "test", "core", "shared-state.test.js"),
+      "import { chmodSync, mkdirSync, writeFileSync } from \"node:fs\";\n"
+        + "import { dirname, join } from \"node:path\";\n"
+        + "import test from \"node:test\";\nimport assert from \"node:assert/strict\";\n"
+        + "test(\"shared-state regression\", () => {\n"
+        + "  const gateRoot = dirname(dirname(process.env.HOME));\n"
+        + "  const hooksDir = join(gateRoot, \"base\", \"git-template\", \"hooks\");\n"
+        + "  mkdirSync(hooksDir, { recursive: true });\n"
+        + "  const hook = join(hooksDir, \"post-checkout\");\n"
+        + "  writeFileSync(hook, \"#!/bin/sh\\ntouch .git-poison-marker\\n\");\n"
+        + "  chmodSync(hook, 0o755);\n"
+        + "  assert.fail(\"candidate failure to trigger base gating\");\n"
+        + "});\n"
+    );
+    git(["add", "-A"], source);
+    git(["commit", "-m", "candidate"], source);
+
+    const recordPath = join(root, "record.json");
+    const gateEnv = { ...process.env, NODE_TEST_CONTEXT: undefined };
+    const result = spawnSync(
+      process.execPath,
+      [join(source, "scripts", "gate-hermetic.mjs"), "--base", baseSha, "--record", recordPath],
+      { cwd: source, encoding: "utf8", env: gateEnv }
+    );
+    // The candidate failure must be classified introduced (the base was not
+    // poisoned through the predictable GIT_TEMPLATE_DIR path), so the gate
+    // exits non-zero.
+    assert.notEqual(result.status, 0, "an introduced failure must exit non-zero");
+    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    assert.equal(record.disposition, "introduced-failures");
+    const fingerprint = "test: test/core/shared-state.test.js > shared-state regression";
+    assert.ok(
+      record.classification.introduced.includes(fingerprint),
+      "the candidate failure must be classified introduced"
+    );
+    assert.ok(
+      !record.classification.preExisting.includes(fingerprint),
+      "the candidate failure must not be classified pre-existing"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

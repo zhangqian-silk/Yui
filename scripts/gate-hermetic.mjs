@@ -291,6 +291,15 @@ async function main() {
     const baseTmp = mkdtempSync(join(shortTmpBase(), "yui-gate-tmp-base-"));
     tmpHomes.push(baseTmp);
     const baseHermetic = createGateSideDomain(baseRoot, baseTmp, options, "base");
+    // The base's GIT_TEMPLATE_DIR must not live at a predictable path under
+    // the gate root: a candidate test can compute the gate root from its own
+    // HOME (dirname(dirname(HOME))) and preseed <gateRoot>/base/git-template
+    // with a post-checkout hook that poisons the base checkout, causing an
+    // introduced failure to be misclassified as pre-existing (fail-open).
+    // Use an unpredictable mkdtempSync directory instead.
+    const baseTemplateDir = mkdtempSync(join(shortTmpBase(), "yui-gate-base-template-"));
+    tmpHomes.push(baseTemplateDir);
+    baseHermetic.GIT_TEMPLATE_DIR = baseTemplateDir;
 
     // The base gates in its own clone, created with the base hermetic env.
     // A clone never shares the source's common dir: cloning does not copy
