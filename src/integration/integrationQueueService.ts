@@ -332,6 +332,16 @@ export async function enqueueIntegrationQueueEntry(
     // check misses it, but the touched paths already agree.
     equivalent = await findContainedChangeSet(git, project.path, changeSet, targetHead);
   }
+  if (equivalent !== null) {
+    // The async proof above observed the target before this write
+    // transaction.  A concurrent landing may have advanced it since; a
+    // stale containment proof cannot terminalize the entry against the
+    // old head, so re-read and invalidate the proof if it moved.
+    const freshTargetHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
+    if (freshTargetHead !== targetHead) {
+      equivalent = null;
+    }
+  }
   return input.store.transaction((tx) => {
     const duplicate = findActiveQueueDuplicate(
       tx, task.id, input.projectId, input.changeSetId

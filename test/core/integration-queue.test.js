@@ -470,6 +470,52 @@ test("enqueue converges when the identical change already landed with other work
   assert.equal(masterHead(fixture), landed);
 });
 
+test("a target advance during path-containment inspection cannot publish stale convergence", {
+  skip: process.env.YUI_REVIEW_CONVERGENCE_RACE !== "1"
+}, async () => {
+  const fixture = await createFixture();
+  const changeSet = await branchChangeSet(fixture, {
+    id: "change-set-1",
+    paths: { "a.txt": "candidate\n" }
+  });
+
+  // The target initially contains the candidate path together with unrelated
+  // work, so only the path-containment proof (not whole-tree equality) can
+  // converge it. Advance that same target path after the proof has observed
+  // the old head but before enqueue persists its result.
+  writeFileSync(join(fixture.repositoryPath, "a.txt"), "candidate\n");
+  writeFileSync(join(fixture.repositoryPath, "other.txt"), "other\n");
+  git(["-C", fixture.repositoryPath, "add", "a.txt", "other.txt"]);
+  git(["-C", fixture.repositoryPath, "commit", "-m", "parallel landing"]);
+
+  class AdvancingContainmentGit extends NodeGitWorkspace {
+    advanced = false;
+
+    async treesAgreeOnPaths(input) {
+      const agrees = await super.treesAgreeOnPaths(input);
+      if (agrees && !this.advanced) {
+        this.advanced = true;
+        writeFileSync(join(fixture.repositoryPath, "a.txt"), "concurrent overwrite\n");
+        git(["-C", fixture.repositoryPath, "add", "a.txt"]);
+        git(["-C", fixture.repositoryPath, "commit", "-m", "concurrent target advance"]);
+      }
+      return agrees;
+    }
+  }
+
+  const result = await enqueue(fixture, changeSet, {
+    git: new AdvancingContainmentGit()
+  });
+
+  assert.equal(
+    result.outcome,
+    "queued",
+    "a containment proof for an old target head cannot terminalize the entry after that ref moved"
+  );
+  assert.equal(result.entry.status, "queued");
+  assert.equal(readFileSync(join(fixture.repositoryPath, "a.txt"), "utf8"), "concurrent overwrite\n");
+});
+
 test("a pre-base same-tree commit cannot swallow an intentional revert", async () => {
   const fixture = await createFixture();
   // The initial commit has the tree the WorkItem deliberately restores. The
