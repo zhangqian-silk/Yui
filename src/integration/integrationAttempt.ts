@@ -16,6 +16,7 @@ export type IntegrationAttemptStatus =
   | "blocked"
   | "validating"
   | "committed"
+  | "superseded"
   | "failed";
 
 export type ConflictReport = Readonly<{
@@ -31,7 +32,7 @@ export type ResolutionDecision = Readonly<{
 }>;
 
 export type IntegrationAttempt = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   taskId: string;
   projectId: string;
@@ -61,7 +62,7 @@ export function createIntegrationAttempt(
 ): IntegrationAttempt {
   const timestamp = now.toISOString();
   return validateIntegrationAttempt({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: input.id,
     taskId: input.taskId,
     projectId: input.projectId,
@@ -126,6 +127,8 @@ export function recordResolutionDecision(
   });
 }
 
+const TERMINAL_STATUSES = ["committed", "superseded", "failed"];
+
 export function updateIntegrationAttempt(
   attempt: IntegrationAttempt,
   patch: Readonly<Partial<Pick<
@@ -136,7 +139,7 @@ export function updateIntegrationAttempt(
 ): IntegrationAttempt {
   validateIntegrationAttempt(attempt);
   const status = patch.status ?? attempt.status;
-  const terminal = ["committed", "failed"].includes(status);
+  const terminal = TERMINAL_STATUSES.includes(status);
   const updated: IntegrationAttempt = {
     ...attempt,
     ...patch,
@@ -151,9 +154,38 @@ export function updateIntegrationAttempt(
   return validateIntegrationAttempt(updated);
 }
 
+/**
+ * Mark a committed Integration as superseded (obsolete).  A superseded
+ * Integration retains its evidence but is excluded from latest-committed
+ * selection, allowing the next valid committed Integration to become the
+ * Task's delivery baseline.  Only a committed Integration may be superseded;
+ * a reason is required for the audit trail.
+ */
+export function supersedeIntegration(
+  attempt: IntegrationAttempt,
+  reason: string,
+  now: Date
+): IntegrationAttempt {
+  validateIntegrationAttempt(attempt);
+  if (attempt.status !== "committed") {
+    throw new Error(`Integration cannot be superseded from ${attempt.status}: ${attempt.id}.`);
+  }
+  const timestamp = now.toISOString();
+  return validateIntegrationAttempt({
+    ...attempt,
+    status: "superseded",
+    checks: [
+      ...(attempt.checks ?? []),
+      { name: "superseded", outcome: "failed" as const, details: requireText(reason, "Supersede reason") }
+    ],
+    updatedAt: timestamp,
+    endedAt: timestamp
+  });
+}
+
 export function validateIntegrationAttempt(attempt: IntegrationAttempt): IntegrationAttempt {
-  if (attempt.schemaVersion !== 2) {
-    throw new Error("IntegrationAttempt must use schemaVersion 2.");
+  if (attempt.schemaVersion !== 3) {
+    throw new Error("IntegrationAttempt must use schemaVersion 3.");
   }
   validateTaskRecordReference({
     taskId: attempt.taskId,
@@ -178,6 +210,7 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
     "blocked",
     "validating",
     "committed",
+    "superseded",
     "failed"
   ].includes(attempt.status)) {
     throw new Error(`Integration status is invalid: ${String(attempt.status)}.`);
@@ -202,7 +235,7 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
   attempt.checks?.forEach(normalizeCheckResult);
   requireTimestamp(attempt.createdAt, "Integration Attempt createdAt");
   requireTimestamp(attempt.updatedAt, "Integration Attempt updatedAt");
-  if (["committed", "failed"].includes(attempt.status)) {
+  if (TERMINAL_STATUSES.includes(attempt.status)) {
     requireTimestamp(attempt.endedAt ?? "", "Integration Attempt endedAt");
   }
   return attempt;

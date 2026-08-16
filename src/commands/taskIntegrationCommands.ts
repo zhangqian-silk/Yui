@@ -7,10 +7,12 @@ import type { TaskStore } from "../storage/taskStore.js";
 import {
   createIntegrationAttempt,
   recordResolutionDecision,
+  supersedeIntegration,
   updateIntegrationAttempt,
   type IntegrationAttempt
 } from "../integration/integrationAttempt.js";
 import { GitIntegrationService } from "../integration/gitIntegrationService.js";
+import { runTaskIntegrationQueueCommand } from "./taskIntegrationQueueCommands.js";
 import { taskActor } from "./taskActor.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 
@@ -35,11 +37,15 @@ export async function runTaskIntegrationCommand(
     return resolveDecision(rest, store, now, options.environment);
   }
   if (command === "abort") return abortIntegration(rest, store, now(), options.environment);
+  if (command === "supersede") return supersedeIntegrationCommand(rest, store, now(), options.environment);
   if (command === "cleanup") {
     return cleanupIntegration(rest, store, home, options.environment);
   }
   if (command === "list") return list(rest, store);
   if (command === "show") return show(rest, store, options.environment);
+  if (command === "queue") {
+    return runTaskIntegrationQueueCommand(rest, store, home, options);
+  }
   throw usageError(command === undefined
     ? "Task Integration command is required."
     : `Unknown command: task integration ${command}`);
@@ -57,7 +63,9 @@ async function cleanupIntegration(
     );
   }
   const integration = requireIntegration(store, args[0], environment);
-  if (integration.status !== "committed" && integration.status !== "failed") {
+  if (integration.status !== "committed"
+    && integration.status !== "superseded"
+    && integration.status !== "failed") {
     throw usageError(
       `Integration is not terminal: ${integration.id}/${integration.status}.`
     );
@@ -105,9 +113,16 @@ async function start(
     if (changeSet === null) throw usageError(`ChangeSet not found: ${id}.`);
     return changeSet;
   });
-  const reviewEvidence = new Set(store.listReviewRounds(task.id)
-    .flatMap(({ evidenceCommit }) => evidenceCommit === undefined ? [] : [evidenceCommit]));
-  const reviewSource = changeSets.find(({ headCommit }) => reviewEvidence.has(headCommit));
+  // Only diagnostic evidence commits (a reviewer's own commit on top of the
+  // frozen base) are barred from becoming an Integration source.  A clean
+  // review attests the frozen base itself (evidenceCommit === reviewBaseCommit),
+  // which is the candidate's own head and a legitimate source.
+  const diagnosticEvidence = new Set(store.listReviewRounds(task.id)
+    .flatMap(({ evidenceCommit, reviewBaseCommit }) =>
+      evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit
+        ? [evidenceCommit]
+        : []));
+  const reviewSource = changeSets.find(({ headCommit }) => diagnosticEvidence.has(headCommit));
   if (reviewSource !== undefined) {
     throw usageError(
       `ReviewRound evidence commit cannot become an Integration source: ${reviewSource.id}.`
@@ -242,18 +257,90 @@ function abortIntegration(
   }
   const reason = parsed.one.get("--reason");
   if (reason === undefined) throw usageError(usage);
-  const aborted = updateIntegrationAttempt(integration, {
-    status: "failed",
-    checks: [
-      ...(integration.checks ?? []),
-      { name: "aborted", outcome: "failed", details: reason }
-    ]
-  }, now);
-  store.saveIntegrationAttempt(aborted.taskId, aborted);
-  return {
-    output: `Aborted Integration ${aborted.id}; start a new Integration Attempt to retry\n`,
-    data: { integration: aborted }
-  };
+  return store.transaction((tx) => {
+    // Re-read inside the transaction: a concurrent `continue` can advance the
+    // Attempt to validating (and then commit the target) after the initial
+    // read.  Aborting a validating or committed Attempt would leave the
+    // target advanced while the Attempt is failed.
+    const current = tx.getIntegrationAttempt(integration.taskId, integration.id);
+    if (current === null) {
+      throw usageError(
+        `Integration Attempt not found: ${integration.taskId}/${integration.id}.`
+      );
+    }
+    if (current.status !== "running" && current.status !== "blocked") {
+      throw usageError(
+        `Integration cannot be aborted from ${current.status}: ${current.id}.`
+      );
+    }
+    const aborted = updateIntegrationAttempt(current, {
+      status: "failed",
+      checks: [
+        ...(current.checks ?? []),
+        { name: "aborted", outcome: "failed", details: reason }
+      ]
+    }, now);
+    tx.saveIntegrationAttempt(aborted.taskId, aborted);
+    return {
+      output: `Aborted Integration ${aborted.id}; start a new Integration Attempt to retry\n`,
+      data: { integration: aborted }
+    };
+  });
+}
+
+function supersedeIntegrationCommand(
+  args: readonly string[],
+  store: TaskStore,
+  now: Date,
+  environment: NodeJS.ProcessEnv | undefined
+): Readonly<{ output: string; data: unknown }> {
+  const usage = "Task Integration supersede usage: yui task integration supersede <task>/<integration> --reason <text>.";
+  const parsed = parseRepeatable(args, new Set(), new Set(["--reason"]), usage);
+  if (parsed.positionals.length !== 1) throw usageError(usage);
+  const integration = requireIntegration(store, parsed.positionals[0], environment);
+  requireActiveIntegrationTask(store, integration);
+  if (integration.status !== "committed") {
+    throw usageError(
+      `Integration cannot be superseded from ${integration.status}: ${integration.id}.`
+    );
+  }
+  const reason = parsed.one.get("--reason");
+  if (reason === undefined) throw usageError(usage);
+  // Only the Task Leader (or Operator/user) may supersede a committed
+  // Integration: it rewrites delivery-baseline evidence and audit history.
+  taskActor(environment, integration.taskId);
+  // A queue-backed committed Attempt cannot be superseded: the queue entry
+  // would remain in its current status while its Attempt becomes "superseded",
+  // leaving contradictory terminal records that never converge. This covers
+  // the crash window where the entry is still "running" or "conflicted" after
+  // the Attempt committed.
+  const queueBacked = store.listIntegrationQueueEntries(integration.taskId)
+    .some((entry) => entry.integrationAttemptId === integration.id);
+  if (queueBacked) {
+    throw usageError(
+      `Integration ${integration.id} is backed by a queue entry; `
+      + "reconcile the queue entry instead of superseding its Attempt."
+    );
+  }
+  return store.transaction((tx) => {
+    const current = tx.getIntegrationAttempt(integration.taskId, integration.id);
+    if (current === null) {
+      throw usageError(
+        `Integration Attempt not found: ${integration.taskId}/${integration.id}.`
+      );
+    }
+    if (current.status !== "committed") {
+      throw usageError(
+        `Integration cannot be superseded from ${current.status}: ${current.id}.`
+      );
+    }
+    const superseded = supersedeIntegration(current, reason, now);
+    tx.saveIntegrationAttempt(superseded.taskId, superseded);
+    return {
+      output: `Superseded Integration ${superseded.id}; the next valid committed Integration is now the delivery baseline\n`,
+      data: { integration: superseded }
+    };
+  });
 }
 
 function requireActiveIntegrationTask(
@@ -357,7 +444,7 @@ function requireIntegration(
   return attempt;
 }
 
-function parseRepeatable(
+export function parseRepeatable(
   args: readonly string[],
   repeatable: ReadonlySet<string>,
   singular: ReadonlySet<string>,

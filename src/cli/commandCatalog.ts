@@ -613,7 +613,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "integration",
     summary: "Safely integrate ChangeSets with Leader-owned conflict decisions.",
-    sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "list", "show", "cleanup"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "supersede", "list", "show", "cleanup", "queue"] }],
     children: [
       {
         name: "start",
@@ -639,9 +639,29 @@ const taskChildren: readonly NodeInput[] = [
         usage: "yui task integration abort <task>/<integration> --reason <text>",
         options: ["--reason"]
       },
+      {
+        name: "supersede",
+        summary: "Mark a committed Integration as obsolete, retaining its evidence.",
+        usage: "yui task integration supersede <task>/<integration> --reason <text>",
+        options: ["--reason"]
+      },
       { name: "list", summary: "List Integration Attempts.", usage: "yui task integration list <task>" },
       { name: "show", summary: "Show one Integration Attempt.", usage: "yui task integration show <task>/<integration>" },
-      { name: "cleanup", summary: "Remove a terminal Integration worktree and branch.", usage: "yui task integration cleanup <task>/<integration>" }
+      { name: "cleanup", summary: "Remove a terminal Integration worktree and branch.", usage: "yui task integration cleanup <task>/<integration>" },
+      {
+        name: "queue",
+        summary: "Manage the serialized integration queue.",
+        sections: [{ id: "queue", title: "Commands", entries: ["enqueue", "list", "show", "process", "supersede", "requeue", "reconcile"] }],
+        children: [
+          { name: "enqueue", summary: "Enqueue a ChangeSet for serialized integration.", usage: "yui task integration queue enqueue <task> --project <project> --change-set <id> [--target <ref>] [--check <command> ...]", options: ["--project", "--change-set", "--target", "--check"] },
+          { name: "list", summary: "List integration queue entries.", usage: "yui task integration queue list <task> [--project <project>]", options: ["--project"] },
+          { name: "show", summary: "Show one integration queue entry.", usage: "yui task integration queue show <task>/<entry>" },
+          { name: "process", summary: "Process queued integration entries.", usage: "yui task integration queue process <task> [--project <project>] [--limit <n>]", options: ["--project", "--limit"] },
+          { name: "supersede", summary: "Supersede a queued entry.", usage: "yui task integration queue supersede <task>/<entry> --reason <text>", options: ["--reason"] },
+          { name: "requeue", summary: "Requeue a conflicted entry.", usage: "yui task integration queue requeue <task>/<entry>" },
+          { name: "reconcile", summary: "Reconcile a blocked entry.", usage: "yui task integration queue reconcile <task>/<entry>" }
+        ]
+      }
     ]
   },
   {
@@ -707,6 +727,20 @@ const taskChildren: readonly NodeInput[] = [
     children: [
       { name: "list", summary: "List Task events.", usage: "yui task event list <task>" },
       { name: "show", summary: "Show one Task event.", usage: "yui task event show <task> <event>" }
+    ]
+  },
+  {
+    name: "overlap",
+    summary: "Show read-only cross-Task overlap diagnostics.",
+    usage: "yui task overlap [--project <project>] [--base <sha>] [--task <task> ...]",
+    options: ["--project", "--base", "--task"]
+  },
+  {
+    name: "change-set",
+    summary: "Inspect ChangeSets captured from WorkItem Candidates.",
+    sections: [{ id: "inspect", title: "Commands", entries: ["show"] }],
+    children: [
+      { name: "show", summary: "Show one ChangeSet.", usage: "yui task change-set show <task>/<change-set>" }
     ]
   },
   { name: "enter", summary: "Enter a Task Role, defaulting to Leader.", usage: "yui task enter <task> [role]" }
@@ -972,7 +1006,7 @@ export const ROOT_COMMAND = buildNode({
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "archive", "rebuild", "history", "replace", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "review", "integration", "role", "enter"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren

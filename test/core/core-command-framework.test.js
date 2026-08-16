@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  findCommandNode,
   ROOT_COMMAND,
   listPublicCommandPaths,
   validateCommandCatalog
@@ -157,9 +158,18 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task integration continue",
     "task integration resolve",
     "task integration abort",
+    "task integration supersede",
     "task integration list",
     "task integration show",
     "task integration cleanup",
+    "task integration queue",
+    "task integration queue enqueue",
+    "task integration queue list",
+    "task integration queue show",
+    "task integration queue process",
+    "task integration queue supersede",
+    "task integration queue requeue",
+    "task integration queue reconcile",
     "task brief",
     "task brief show",
     "task brief update",
@@ -175,6 +185,9 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task event",
     "task event list",
     "task event show",
+    "task overlap",
+    "task change-set",
+    "task change-set show",
     "task enter",
     "jobs",
     "jobs list",
@@ -253,6 +266,40 @@ test("the invocation router selects an executable without parsing business param
   assert.equal(invocation.kind, "execute");
   assert.deepEqual(invocation.node.path, ["yui", "task", "integration", "show"]);
   assert.equal("params" in invocation, false);
+});
+
+test("the task-16 public commands reach their registered executables", () => {
+  const commands = [
+    ["task", "overlap"],
+    ["task", "change-set", "show", "task-1/change-set-1"],
+    ["task", "integration", "queue", "list", "task-1"]
+  ];
+
+  assert.deepEqual(
+    commands.map((args) => ({
+      command: args.join(" "),
+      kind: routeInvocation(args).kind
+    })),
+    commands.map((args) => ({ command: args.join(" "), kind: "execute" }))
+  );
+});
+
+test("task overlap help matches the executor's accepted grammar", () => {
+  const overlap = findCommandNode(["task", "overlap"]);
+  assert.ok(overlap);
+  const help = renderCommandHelp(overlap, "0.5.3");
+
+  assert.doesNotMatch(
+    help,
+    /task overlap <task>/u,
+    "the executor accepts only --task filters, not a positional Task"
+  );
+  assert.match(help, /--base <sha>/u);
+  assert.doesNotMatch(
+    help,
+    /--base <project>=<ref>/u,
+    "the executor accepts one base SHA, not a Project/ref mapping"
+  );
 });
 
 test("the invocation router handles root help", () => {

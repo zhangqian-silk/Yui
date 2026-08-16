@@ -3094,7 +3094,7 @@ test("Leader can capture, integrate, and clean an isolated Role result before fo
   assert.equal(capture.status, 0, capture.stderr || capture.error?.message);
   assert.match(capture.stdout, /Captured ChangeSet/);
   const [changeSet] = store.listChangeSets(task.id);
-  assert.equal(changeSet.schemaVersion, 2);
+  assert.equal(changeSet.schemaVersion, 3);
   assert.equal(changeSet.workItemId, item.id);
   assert.deepEqual(changeSet.changedPaths, ["delivered.txt"]);
   const repeatedCapture = spawnSync(

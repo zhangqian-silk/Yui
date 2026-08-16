@@ -4,11 +4,14 @@ import {
   createWorkItemChangeSet,
   type WorkItemChangeSet
 } from "../integration/changeSet.js";
+import { createChangeSetManifest } from "../integration/changeSetManifest.js";
+import { deriveManifestTags } from "../integration/manifestTags.js";
 import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
 import {
   sameTaskFinalReviewContract,
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
+import type { ReviewCheck } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { DirectTaskMainSnapshot } from "../workItem/workItem.js";
 import type {
@@ -330,6 +333,20 @@ export class WorkItemChangeSetManager {
       result.headCommit
     );
     if (existing !== undefined) return existing;
+    const targetRef = captureTargetRef(this.store, context.taskId, entry.projectId);
+    const manifest = createChangeSetManifest({
+      tags: deriveManifestTags({
+        changedPaths: result.changedPaths,
+        deletedPaths: result.deletedPaths
+      }),
+      deletedPaths: result.deletedPaths,
+      ...(targetRef === undefined ? {} : { targetRef }),
+      evidenceRefs: this.#captureEvidenceRefs(
+        context.taskId,
+        context.workItemId,
+        result.headCommit
+      )
+    });
     return this.store.transaction((tx) => {
       assertCaptureStillCurrent(tx, context);
       const concurrent = findWorkItemChangeSet(
@@ -361,7 +378,8 @@ export class WorkItemChangeSetManager {
         baseCommit: entry.baseCommit,
         headCommit: result.headCommit,
         branch: entry.branch,
-        changedPaths: result.changedPaths
+        changedPaths: result.changedPaths,
+        manifest
       }, nextCaptureTime(
         tx,
         context.taskId,
@@ -373,6 +391,47 @@ export class WorkItemChangeSetManager {
       return changeSet;
     });
   }
+
+  /**
+   * Verified evidence for the exact reviewed candidate.  A completed
+   * ReviewRound freezes the candidate it reviewed at `reviewBaseCommit`; when
+   * the captured ChangeSet head is that commit, the round's checks are
+   * durable evidence for it.  "completed" alone is not a verdict: the
+   * reviewer may have yielded with failed checks (requires-repair), so only a
+   * round with an explicit positive verdict — at least one passed check and
+   * no failed one — may feed `evidenceRefs`.  The link is by
+   * `reviewBaseCommit`, not by `evidenceCommit`: the latter records the exact
+   * tree the checks ran on (the frozen base for a clean review, a diagnostic
+   * commit for a committed-diagnostic review, absent for a dirty review), and
+   * the queue separately re-checks that tree binding before waiving a gate.
+   */
+  #captureEvidenceRefs(
+    taskId: string,
+    workItemId: string,
+    headCommit: string
+  ): readonly string[] {
+    return this.store.listReviewRounds(taskId)
+      .filter((round) => round.status === "completed"
+        && round.workItemId === workItemId
+        && round.reviewBaseCommit === headCommit
+        && hasPositiveReviewVerdict(round.checks))
+      .map(({ id }) => `review-round:${id}`);
+  }
+}
+
+/**
+ * A ReviewRound carries reusable verification evidence only when its checks
+ * state an explicit positive verdict: at least one check passed and none
+ * failed.  A round without checks, or with only skipped checks, has no
+ * positive conclusion; a round with a failed check rejects the candidate.
+ * Neither may skip a later gate.
+ */
+function hasPositiveReviewVerdict(
+  checks: readonly ReviewCheck[] | undefined
+): boolean {
+  return checks !== undefined
+    && checks.some((check) => check.outcome === "passed")
+    && checks.every((check) => check.outcome !== "failed");
 }
 
 type CapturableContext = Readonly<{
@@ -625,9 +684,8 @@ function latestWorkItemChangeSet(
   commits?: Readonly<{ baseCommit: string; headCommit: string }>
 ): WorkItemChangeSet | undefined {
   return store.listChangeSets(taskId).filter(
-    (changeSet): changeSet is WorkItemChangeSet => (
-      changeSet.schemaVersion === 2
-      && changeSet.workItemId === workItemId
+    (changeSet) => (
+      changeSet.workItemId === workItemId
       && changeSet.projectId === projectId
       && (commits === undefined
         || (changeSet.baseCommit === commits.baseCommit
@@ -648,6 +706,24 @@ function findWorkItemChangeSet(
     baseCommit,
     headCommit
   });
+}
+
+/**
+ * The intended integration target for a captured Project change: the Task
+ * main worktree branch for that Project, matching the Integration default.
+ * Returns undefined when the Task main worktree is not ready yet.
+ */
+function captureTargetRef(
+  store: TaskStore,
+  taskId: string,
+  projectId: string
+): string | undefined {
+  const mainWorkspace = store.getTaskWorkspace(taskId);
+  if (mainWorkspace === null) return undefined;
+  const entry = mainWorkspace.entries.find(
+    (candidate) => candidate.projectId === projectId
+  );
+  return entry?.branch;
 }
 
 function compareNewestFirst(left: WorkItemChangeSet, right: WorkItemChangeSet): number {

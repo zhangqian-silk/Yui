@@ -6,6 +6,7 @@ export const TASK_RECORD_ID_PREFIXES = {
   reviewRound: "review-round",
   changeSet: "change-set",
   integrationAttempt: "integration",
+  integrationQueue: "integration-queue",
   message: "message",
   inputRequest: "input",
   decision: "decision",

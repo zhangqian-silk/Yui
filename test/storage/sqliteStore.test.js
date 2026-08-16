@@ -9,6 +9,10 @@ import { FileTaskStore, StorageConflictError, StorageRecordError } from "../../d
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { migrateSqliteSchema, SQLITE_SCHEMA_TABLES } from "../../dist/storage/sqliteSchema.js";
 import { openTaskStore, resolveTaskStoreBackend, SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
+import { createProject } from "../../dist/repository/project.js";
+import { createWorkItem } from "../../dist/workItem/workItem.js";
+import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
+import { createIntegrationQueueEntry, markIntegrationQueueRunning } from "../../dist/integration/integrationQueueEntry.js";
 
 function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "yui-sqlite-store-"));
@@ -151,6 +155,54 @@ test("CRUD: event save/list (terminal, retained)", () => {
   assert.equal(events.length, 1);
   assert.equal(events[0].id, e1.id);
   assert.equal(events[0].type, "runtime.provider-turn-progress");
+  store.close();
+});
+
+test("CRUD: SQLite integration queue round-trips and enforces transitions", () => {
+  const home = temporaryHome();
+  const store = new SqliteTaskStore(home);
+  const now = new Date("2026-08-16T00:00:00.000Z");
+  const project = createProject(
+    store.nextProjectId(),
+    "Queue Project",
+    home,
+    { stable: "main", development: "main" },
+    now
+  );
+  store.saveProject(project);
+  const task = makeTask(store, {
+    projectBindings: [{ projectId: project.id, directory: "repo", baseRef: "main" }]
+  });
+  store.saveTask(task);
+  const item = createWorkItem(store.nextWorkItemId(task.id), task.id, { title: "Queue work", writeProjectIds: [project.id] }, now);
+  store.saveWorkItem(task.id, item);
+  const baseCommit = "a".repeat(40);
+  const headCommit = "b".repeat(40);
+  const changeSet = createWorkItemChangeSet({
+    id: store.nextChangeSetId(task.id),
+    taskId: task.id,
+    projectId: project.id,
+    baseCommit,
+    headCommit,
+    branch: "feature/queue",
+    changedPaths: ["src/queue.ts"],
+    workItemId: item.id
+  }, now);
+  store.saveChangeSet(task.id, changeSet);
+  const entry = createIntegrationQueueEntry({
+    id: store.nextIntegrationQueueEntryId(task.id),
+    taskId: task.id,
+    projectId: project.id,
+    changeSetId: changeSet.id,
+    targetRef: "refs/heads/main"
+  }, now);
+  store.saveIntegrationQueueEntry(task.id, entry);
+  assert.deepEqual(store.getIntegrationQueueEntry(task.id, entry.id), entry);
+  assert.deepEqual(store.listIntegrationQueueEntries(task.id).map((value) => value.id), [entry.id]);
+  const running = markIntegrationQueueRunning(entry, baseCommit, new Date("2026-08-16T00:00:01.000Z"));
+  store.saveIntegrationQueueEntry(task.id, running);
+  assert.equal(store.getIntegrationQueueEntry(task.id, entry.id).status, "running");
+  assert.throws(() => store.saveIntegrationQueueEntry(task.id, { ...running, status: "queued" }), /transition is invalid/);
   store.close();
 });
 
