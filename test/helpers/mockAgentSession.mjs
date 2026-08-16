@@ -50,7 +50,7 @@ const SUCCESSOR = new Date("2026-08-09T00:00:03.000Z");
 const WAITING_WORKER_START = new Date("2026-08-09T00:30:00.000Z");
 const WAIT_TIMEOUT_MS = 4_000;
 const EXPLICIT_TMUX_RESOURCE_ABSENCE =
-  /can't find (?:session|window|pane)|no server running|error connecting to .+ \(No such file or directory\)/iu;
+  /can't find (?:session|window|pane)|no server running|no current target|session not found|error connecting to .+ \(No such file or directory\)/iu;
 
 export function isExplicitTmuxResourceAbsenceError(error) {
   return error instanceof CommandExecutionError

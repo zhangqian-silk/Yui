@@ -15,7 +15,16 @@ orchestration, in CI, or by another development tool.
 ## Choose proportionate Yui validation
 
 Use [`docs/testing/test-tiers.md`](../../../docs/testing/test-tiers.md) as the
-executable tier contract:
+executable tier contract, and
+[`docs/testing/verification-levels.md`](../../../docs/testing/verification-levels.md)
+for how evidence is split across local development, the PR gate, and release:
+
+- Local changes get the smallest targeted check set for their risk; ordinary
+  fixes do not repeat the full deterministic suite — the `ci.yml` PR gate owns
+  that, once per exact commit.
+- The release reuses the PR/master-gated exact commit and runs only
+  release-unique package/install smoke; never re-run the deterministic suite
+  or lint as part of a release.
 
 - Use Unit tests for pure logic and storage behavior.
 - Use Isolated Integration tests for real Yui runtime seams inside a disposable

@@ -1,11 +1,20 @@
 name: Publish npm package
 
+# Release evidence contract (see docs/testing/verification-levels.md):
+# release never re-runs the deterministic suite. The exact tagged commit already
+# passed the PR/master gate in ci.yml; this workflow only adds evidence the gate
+# cannot substitute: tag/version identity, the packaged artifact's structure and
+# executable bit, a fresh install across the supported Node matrix, and npm
+# provenance. The build job assembles one tarball from the exact tagged commit;
+# smoke and publish consume that same artifact, verified by SHA-256.
+
 on:
   push:
     tags:
       - "v*"
 
 permissions:
+  actions: read
   contents: read
   id-token: write
 
@@ -16,6 +25,44 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reuse the PR/master-gated exact commit
+        shell: bash
+        run: |
+          # A release tag must point at a master commit. Ancestry alone does
+          # not prove the Deterministic CI gate passed for this exact SHA;
+          # the next step verifies the persisted per-SHA gate record.
+          git fetch origin master
+          if ! git merge-base --is-ancestor HEAD origin/master; then
+            echo "Tag ${GITHUB_REF_NAME} points at $(git rev-parse HEAD), which is not on master." >&2
+            echo "Releases reuse the exact commit that passed the PR/master gate." >&2
+            exit 1
+          fi
+          echo "Releasing master-gated commit $(git rev-parse HEAD)"
+
+      - name: Verify the exact commit's Deterministic CI gate record
+        shell: bash
+        env:
+          # gh is not auto-authenticated by github.token in Actions; without
+          # this export every tag release stops at `gh run list` below.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ci.yml persists a per-SHA gate-record artifact for every gate run.
+          # Download the successful master run for this exact commit and verify
+          # the record binds this SHA to a pass result, before building anything.
+          # A skipped, cancelled, or bypassed gate leaves no successful run and
+          # fails the release here.
+          head_sha="$(git rev-parse HEAD)"
+          run_id="$(gh run list --workflow=ci.yml --commit "$head_sha" --branch master --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          if [ -z "$run_id" ]; then
+            echo "No successful Deterministic CI run found for $head_sha on master." >&2
+            echo "Releases reuse the exact commit that passed the PR/master gate." >&2
+            exit 1
+          fi
+          gh run download "$run_id" --name gate-record --dir gate-evidence
+          node scripts/verify-gate-record.mjs gate-evidence/gate-record.json --expected-sha "$head_sha"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -26,22 +73,11 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Install runtime dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes tmux
-
       - name: Verify release tag
         run: npm run verify:release-tag
 
       - name: Build
         run: npm run build
-
-      - name: Test
-        run: npm test
-
-      - name: Lint
-        run: npm run lint
 
       - name: Assemble and pack
         run: |
@@ -66,12 +102,27 @@ jobs:
           grep -qx 'package/skills/yui-reviewer/SKILL.md' package-files.txt
           if [ "$(grep -Ec '^package/skills/' package-files.txt)" -ne 4 ]; then exit 1; fi
           if grep -Eq '^package/(binding\.gyp|native/|build/|scripts/|test/)' package-files.txt; then exit 1; fi
+          # The executable bit must survive into the actual tarball, not only
+          # the npm pack manifest (PR #110 regression contract).
+          test "$(tar -tvf yui-runtime.tgz | awk '$NF=="package/dist/cli.js"{print $1}')" = "-rwxr-xr-x"
+
+      - name: Record artifact provenance
+        run: |
+          sha256sum yui-runtime.tgz | tee yui-runtime.sha256
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "tag=${GITHUB_REF_NAME}"
+            cat yui-runtime.sha256
+          } | tee release-provenance.txt
 
       - name: Upload tested package
         uses: actions/upload-artifact@v4
         with:
           name: yui-runtime-tarball
-          path: yui-runtime.tgz
+          path: |
+            yui-runtime.tgz
+            yui-runtime.sha256
+            release-provenance.txt
           if-no-files-found: error
           retention-days: 1
 
@@ -92,11 +143,21 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+
       - name: Download tested package
         uses: actions/download-artifact@v4
         with:
           name: yui-runtime-tarball
           path: release-artifact
+
+      - name: Verify artifact provenance
+        run: |
+          cd release-artifact
+          sha256sum -c yui-runtime.sha256
 
       - name: Install and exercise the package
         run: |
@@ -122,6 +183,11 @@ jobs:
         with:
           name: yui-runtime-tarball
           path: release-artifact
+
+      - name: Verify artifact provenance
+        run: |
+          cd release-artifact
+          sha256sum -c yui-runtime.sha256
 
       - name: Publish tested package
         run: npm publish ./release-artifact/yui-runtime.tgz --access public --provenance

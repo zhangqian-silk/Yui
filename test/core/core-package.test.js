@@ -12,6 +12,8 @@ import {
 import { join, resolve } from "node:path";
 import test from "node:test";
 
+import { GATE_STEPS } from "../helpers/gateHermetic.js";
+
 const root = resolve(import.meta.dirname, "../..");
 
 function readJson(path) {
@@ -183,9 +185,13 @@ test("CI package smoke consumes npm JSON paths relative to the package root", (t
     /runtime package is missing dist\/cli\.js/u
   );
 
+  // The package smoke moved from inline ci.yml steps into the hermetic gate
+  // runner (scripts/gate-hermetic.mjs); pin the command where it now lives.
   const workflow = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
-  assert.match(workflow, /check-runtime-package-structure\.mjs package-smoke\.json/u);
-  assert.doesNotMatch(workflow, /package\/dist\/cli\.js/u);
+  assert.match(workflow, /node scripts\/gate-hermetic\.mjs/u);
+  const smoke = GATE_STEPS.find((step) => step.name === "package-smoke").command;
+  assert.match(smoke, /check-runtime-package-structure\.mjs package-smoke\.json/u);
+  assert.doesNotMatch(smoke, /package\/dist\/cli\.js/u);
 });
 
 test("Leader and Operator keep native subagent creation inside the Leader conversation", () => {
@@ -362,14 +368,13 @@ test("Worker and Leader Skills require truthful uncertain checkpoints", () => {
   );
 });
 
-test("publish builds once and smokes the same package on Node 20, 22, and 24", () => {
+test("release reuses the gated exact commit and smokes the same package on Node 20, 22, and 24", () => {
   const workflow = readFileSync(join(root, ".github", "workflows", "publish.yml"), "utf8");
   const smoke = readFileSync(join(root, "scripts", "smoke-runtime-package.mjs"), "utf8");
 
+  // One assembly, one artifact, one Node matrix.
   assert.match(workflow, /node:\s*\[20, 22, 24\]/u);
   assert.match(workflow, /npm run build/u);
-  assert.match(workflow, /npm test/u);
-  assert.match(workflow, /npm run lint/u);
   assert.match(workflow, /npm publish \.\/release-artifact\/yui-runtime\.tgz/u);
   assert.match(workflow, /apt-get install --yes tmux/u);
   assert.match(workflow, /dist\/cli\/commandCatalog\.js/u);
@@ -382,6 +387,50 @@ test("publish builds once and smokes the same package on Node 20, 22, and 24", (
     /check-runtime-package-structure\.mjs pack-result\.json/u
   );
   assert.doesNotMatch(workflow, /native-prebuild|prebuilds\/|smoke-native|build:native/u);
+
+  // The release never re-runs the deterministic suite: the exact tagged commit
+  // already passed the ci.yml PR/master gate, and this workflow asserts that
+  // link instead of repeating build evidence.
+  assert.doesNotMatch(workflow, /npm test/u);
+  assert.doesNotMatch(workflow, /npm run lint/u);
+  assert.match(workflow, /merge-base --is-ancestor/u);
+
+  // Ancestry only proves branch membership. The release also downloads the
+  // per-SHA gate-record artifact persisted by ci.yml for this exact commit and
+  // verifies sha + result, so a skipped, cancelled, or bypassed gate blocks the
+  // release (P2-2 regression contract).
+  assert.match(workflow, /actions: read/u);
+  assert.match(workflow, /gh run list[^\n]*--commit/u);
+  assert.match(workflow, /gh run download/u);
+  assert.match(workflow, /verify-gate-record\.mjs[^\n]*--expected-sha/u);
+
+  // gh is not auto-authenticated by github.token in Actions: the step that
+  // queries and downloads the gate record must export GH_TOKEN explicitly or
+  // every tag release stops before the build (review-round-2 P1 contract).
+  const gateRecordStep = workflow.match(
+    /- name: Verify the exact commit's Deterministic CI gate record[\s\S]*?(?=\n      - name:|\n  \S|\s*$)/u
+  )?.[0];
+  assert.ok(gateRecordStep, "publish.yml must keep the exact-commit gate-record verification step");
+  assert.match(gateRecordStep, /GH_TOKEN: \$\{\{ github\.token \}\}/u);
+
+  // One tarball, provenance-pinned: its SHA-256 is recorded with the exact
+  // commit and re-verified by every consumer (smoke matrix and publish).
+  assert.match(workflow, /sha256sum yui-runtime\.tgz/u);
+  assert.match(workflow, /sha256sum -c yui-runtime\.sha256/u);
+  assert.match(workflow, /commit=\$\(git rev-parse HEAD\)/u);
+  // The checksum file must be uploaded together with the tarball: every
+  // consumer runs `sha256sum -c` on the downloaded artifact, so a missing
+  // checksum fails the release before smoke (P1-1 regression contract).
+  const uploadStep = workflow.match(
+    /- name: Upload tested package[\s\S]*?(?=\n  \S|\s*$)/u
+  )?.[0];
+  assert.ok(uploadStep, "publish.yml must keep the Upload tested package step");
+  assert.match(uploadStep, /\n\s+yui-runtime\.sha256\s*\n/u);
+
+  // The executable bit is asserted on the actual tarball, the installed file,
+  // and the executed .bin/yui (PR #110 regression contract).
+  assert.match(workflow, /tar -tvf yui-runtime\.tgz/u);
+  assert.match(smoke, /statSync\(installedCli\)\.mode/u);
   assert.match(smoke, /nested help/u);
   assert.match(smoke, /Draft Task/u);
 });

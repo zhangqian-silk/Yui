@@ -8,6 +8,7 @@ import {
   createRuntimeBinding,
   createSessionLaunchRequest
 } from "../../dist/runtime/index.js";
+import { CommandExecutionError } from "../../dist/tmux/commandExecutor.js";
 import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
 function effective(workspace = "/repo") {
@@ -367,6 +368,57 @@ test("TmuxSessionHost preserves a kill error when the stop postcondition is unav
   });
 
   await assert.rejects(host.stop(binding), (error) => error === failure);
+});
+
+test("TmuxSessionHost accepts a no-current-target kill error once the exact role is proven stopped", async () => {
+  const planner = { plan: () => fakePlan(), planGlobalRole: () => fakePlan() };
+  let status = "running";
+  const raceError = new CommandExecutionError("COMMAND_FAILED", 1, "no current target");
+  const tmux = {
+    ensureRoleWindow: () => true,
+    probeRoleStatus: () => status,
+    killRole() {
+      status = "exited";
+      throw raceError;
+    }
+  };
+  const host = new TmuxSessionHost(planner, tmux);
+  const binding = createRuntimeBinding({
+    id: "binding-1",
+    launchId: "launch-1",
+    owner: { scope: "task", taskId: "task-1", roleName: "worker" },
+    agentId: "codex",
+    adapterId: "codex",
+    hostRef: "yui-tmux:v1:eyJzY29wZSI6InRhc2siLCJob3N0SWQiOiJ0YXNrLTEiLCJyb2xlTmFtZSI6IndvcmtlciJ9"
+  });
+
+  await host.stop(binding);
+});
+
+test("TmuxSessionHost preserves a no-current-target kill error when the stop postcondition is unavailable", async () => {
+  const planner = { plan: () => fakePlan(), planGlobalRole: () => fakePlan() };
+  const raceError = new CommandExecutionError("COMMAND_FAILED", 1, "no current target");
+  let probes = 0;
+  const tmux = {
+    ensureRoleWindow: () => true,
+    probeRoleStatus() {
+      probes += 1;
+      if (probes === 1) return "running";
+      throw new Error("tmux unavailable");
+    },
+    killRole() { throw raceError; }
+  };
+  const host = new TmuxSessionHost(planner, tmux);
+  const binding = createRuntimeBinding({
+    id: "binding-1",
+    launchId: "launch-1",
+    owner: { scope: "task", taskId: "task-1", roleName: "worker" },
+    agentId: "codex",
+    adapterId: "codex",
+    hostRef: "yui-tmux:v1:eyJzY29wZSI6InRhc2siLCJob3N0SWQiOiJ0YXNrLTEiLCJyb2xlTmFtZSI6IndvcmtlciJ9"
+  });
+
+  await assert.rejects(host.stop(binding), (error) => error === raceError);
 });
 
 test("TmuxSessionHost rejects a host reference copied to a different owner", async () => {

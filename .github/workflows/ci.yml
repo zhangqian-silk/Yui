@@ -1,5 +1,24 @@
 name: Deterministic CI
 
+# The single PR/master deterministic gate (see docs/testing/verification-levels.md).
+# It runs once on the exact commit through the hermetic gate runner
+# (scripts/gate-hermetic.mjs): install, build, lint, the full deterministic
+# suite, and package structure smoke, inside an isolated HOME, XDG tree, git
+# identity, temp dir, and npm cache with a sanitized PATH. The runner persists
+# a per-SHA gate record (gate-record.json) uploaded as the `gate-record`
+# artifact: the per-commit pass/fail evidence. Local development uses
+# risk-targeted checks instead of repeating this suite; the release workflow
+# reuses its result on the exact tagged commit.
+#
+# The checkout fetches full history (fetch-depth: 0): on a pull request the
+# job passes the base branch as --base-ref, and the runner resolves the exact
+# merge base with `git merge-base` and fails closed when it cannot (a shallow
+# checkout has no common ancestor, so an empty merge base must never reach a
+# record). A red baseline is then classified automatically: the job stays
+# green for pre-existing failures and goes red only for failures the change
+# introduced. A push to master has no comparable base, so it runs without
+# --base-ref and stays fail-closed.
+
 on:
   pull_request:
     branches:
@@ -17,29 +36,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: "24"
-          cache: npm
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Safe deterministic tests
-        run: npm test
-
-      - name: Package structure smoke
-        shell: bash
+      - name: Hermetic deterministic gate
         run: |
-          rm -rf .release-stage package-smoke.json
-          node scripts/assemble-runtime-package.mjs --output .release-stage
-          npm pack ./.release-stage --dry-run --ignore-scripts --json > package-smoke.json
-          node scripts/check-runtime-package-structure.mjs package-smoke.json
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Ensure the base branch ref is available locally, then let the
+            # runner resolve the merge base (fail-closed) and classify.
+            git fetch origin master
+            node scripts/gate-hermetic.mjs --base-ref origin/master --record gate-record.json
+          else
+            node scripts/gate-hermetic.mjs --record gate-record.json
+          fi
+
+      - name: Upload gate record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-record
+          path: gate-record.json
+          if-no-files-found: error
+          retention-days: 90

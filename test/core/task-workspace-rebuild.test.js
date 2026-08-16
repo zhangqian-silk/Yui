@@ -20,6 +20,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -599,6 +600,76 @@ test("a mid-rebuild failure discards only the new worktrees and stays retryable"
     now: () => new Date(NOW)
   });
   assert.ok(fixture.store.getTask(task.id).workspaceIdentity);
+});
+
+test("the external checkout disappearing mid-rebuild leaves the old layout usable and stays retryable", async (t) => {
+  const fixture = await rebuildFixture(t);
+  const { task, legacyRef } = await legacyTask(fixture);
+  const legacyWorktree = join(fixture.workspace, "worktree", "Yui", task.id, "main");
+  const before = {
+    task: structuredClone(fixture.store.getTask(task.id)),
+    workspace: structuredClone(fixture.store.getTaskWorkspace(task.id))
+  };
+
+  // Snapshot the external checkout so the retry can restore it exactly,
+  // including the legacy branch and the worktree registration.
+  const snapshot = join(fixture.root, "checkout-snapshot");
+  cpSync(fixture.repositoryPath, snapshot, { recursive: true, preserveTimestamps: true });
+
+  // The rebuild creates the new worktree from the external checkout. Remove
+  // the checkout at that seam (the new token-bearing segment): the rebuild
+  // must fail closed with a bounded diagnosis and leave the old layout intact.
+  const real = new NodeGitWorkspace();
+  const disappearing = new Proxy(real, {
+    get(target, property) {
+      if (property === "ensureWorktree") {
+        return async (input) => {
+          if (/^task-\d+-[a-f0-9]{8}$/.test(input.taskSegment)) {
+            rmSync(input.repositoryPath, { recursive: true, force: true });
+          }
+          return target.ensureWorktree(input);
+        };
+      }
+      const value = target[property];
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  const preparer = new FileTaskWorkspacePreparer(
+    fixture.home,
+    fixture.store,
+    disappearing,
+    () => new Date(NOW)
+  );
+
+  await assert.rejects(
+    runTaskWorkspaceCommand(["rebuild", task.id], fixture.store, preparer, {
+      now: () => new Date(NOW)
+    }),
+    (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.ok(message.length > 0, "a disappearing checkout must surface a bounded diagnosis");
+      assert.match(message, /no such file|does not exist|ENOENT|not a git repository|Git command failed/i);
+      return true;
+    }
+  );
+
+  // The old layout is intact: no identity, the legacy worktree directory is
+  // still present, and the managed workspace record is unchanged.
+  assert.deepEqual(fixture.store.getTask(task.id), before.task);
+  assert.deepEqual(fixture.store.getTaskWorkspace(task.id), before.workspace);
+  assert.equal(existsSync(legacyWorktree), true, "the legacy worktree still serves the Task");
+
+  // Restore the external checkout exactly and retry: the rebuild completes.
+  cpSync(snapshot, fixture.repositoryPath, { recursive: true, preserveTimestamps: true });
+  await runTaskWorkspaceCommand(["rebuild", task.id], fixture.store, fixture.preparer, {
+    now: () => new Date(NOW)
+  });
+  assert.ok(fixture.store.getTask(task.id).workspaceIdentity, "the retry minted the workspace identity");
+  assert.equal(
+    projectBranches(fixture).includes(`refs/heads/${legacyRef}`),
+    false,
+    "the retry still archives the legacy ref"
+  );
 });
 
 test("task history lists legacy refs and archives only refs without a live owner", async (t) => {
