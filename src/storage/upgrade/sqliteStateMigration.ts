@@ -47,6 +47,8 @@ import type { ChangeSet } from "../../integration/changeSet.js";
 import type { IntegrationAttempt } from "../../integration/integrationAttempt.js";
 import type { IntegrationQueueEntry } from "../../integration/integrationQueueEntry.js";
 import type { GlobalRole, TaskRole } from "../../role/role.js";
+import type { CapabilityGrant } from "../../grant/capabilityGrant.js";
+import type { ReleaseWorkflow } from "../../release/releaseWorkflow.js";
 import type { LeaderFailure } from "../../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../../scheduler/operatorNotification.js";
 import type { Task } from "../../task/task.js";
@@ -170,6 +172,8 @@ interface StoredTaskShape {
   leaderFailure: Record<string, unknown> | null;
   operatorNotification: Record<string, unknown> | null;
   idHighWaterMarks: Record<string, number>;
+  capabilityGrants: Record<string, Record<string, unknown>>;
+  releaseWorkflows: Record<string, Record<string, unknown>>;
 }
 
 function asStoredTask(value: unknown): StoredTaskShape {
@@ -199,7 +203,9 @@ function asStoredTask(value: unknown): StoredTaskShape {
     events: asObjectMap(record.events),
     leaderFailure: asNullableObject(record.leaderFailure),
     operatorNotification: asNullableObject(record.operatorNotification),
-    idHighWaterMarks: asObject(record.idHighWaterMarks) as Record<string, number>
+    idHighWaterMarks: asObject(record.idHighWaterMarks) as Record<string, number>,
+    capabilityGrants: asObjectMap(record.capabilityGrants),
+    releaseWorkflows: asObjectMap(record.releaseWorkflows)
   };
 }
 
@@ -358,6 +364,13 @@ export function populateSqliteFromState(
             store.migrationSeedIdSequence(taskId, kind, highWater);
           }
         }
+        // Capability grants and release workflows (task-15 record families).
+        for (const grant of Object.values(stored.capabilityGrants)) {
+          store.saveCapabilityGrant(taskId, grant as unknown as CapabilityGrant);
+        }
+        for (const workflow of Object.values(stored.releaseWorkflows)) {
+          store.saveReleaseWorkflow(taskId, workflow as unknown as ReleaseWorkflow);
+        }
       }
 
       // Work mailboxes.
@@ -445,6 +458,8 @@ export function computeStateFamilyChecksums(
   const events: unknown[] = [];
   const leaderFailures: unknown[] = [];
   const operatorNotifications: unknown[] = [];
+  const capabilityGrants: unknown[] = [];
+  const releaseWorkflows: unknown[] = [];
 
   for (const stored of Object.values(tasks)) {
     taskRecords.push(stored.task);
@@ -481,6 +496,8 @@ export function computeStateFamilyChecksums(
     events.push(...Object.values(stored.events));
     if (stored.leaderFailure !== null) leaderFailures.push(stored.leaderFailure);
     if (stored.operatorNotification !== null) operatorNotifications.push(stored.operatorNotification);
+    capabilityGrants.push(...Object.values(stored.capabilityGrants));
+    releaseWorkflows.push(...Object.values(stored.releaseWorkflows));
   }
 
   checksums.task = hashRecords(taskRecords);
@@ -504,6 +521,8 @@ export function computeStateFamilyChecksums(
   checksums.event = hashRecords(events);
   checksums.leaderFailure = hashRecords(leaderFailures);
   checksums.operatorNotification = hashRecords(operatorNotifications);
+  checksums.capabilityGrant = hashRecords(capabilityGrants);
+  checksums.releaseWorkflow = hashRecords(releaseWorkflows);
 
   checksums.workMailbox = hashRecords(Object.values(asObjectMap(state.mailboxes)));
 
@@ -635,6 +654,8 @@ export function computeDbFamilyChecksums(
       db,
       "SELECT payload FROM task_projections WHERE kind = 'operator-notification' AND payload IS NOT NULL"
     );
+    checksums.capabilityGrant = hashPayloadTable(db, "SELECT payload FROM capability_grants");
+    checksums.releaseWorkflow = hashPayloadTable(db, "SELECT payload FROM release_workflows");
 
     // Mailboxes are reconstructed from typed columns (no payload column).
     const mailboxRows = db.prepare(

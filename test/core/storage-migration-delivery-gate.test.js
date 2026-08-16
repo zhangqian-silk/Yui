@@ -75,7 +75,7 @@ test("the production registry registers every adjacent post-baseline step", () =
   const registry = createProductionRegistry();
   assert.equal(BASELINE_AGGREGATE_SCHEMA_VERSION, 16);
   assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
-  assert.equal(registry.size, 20);
+  assert.equal(registry.size, 22);
   const step = registry.lookup("aggregate", undefined, 16);
   assert.notEqual(step, undefined);
   assert.equal(step.toVersion, 17);
@@ -107,6 +107,14 @@ test("the production registry registers every adjacent post-baseline step", () =
   const durableJobIntroduction = registry.lookupDeclaration("record", "durableJob", 0);
   assert.notEqual(durableJobIntroduction, undefined);
   assert.equal(durableJobIntroduction.toVersion, 1);
+  const capabilityGrantIntroduction = registry.lookup("record", "capabilityGrant", 0);
+  assert.notEqual(capabilityGrantIntroduction, undefined);
+  assert.equal(capabilityGrantIntroduction.toVersion, 1);
+  assert.equal(capabilityGrantIntroduction.introduction, true);
+  const releaseWorkflowIntroduction = registry.lookup("record", "releaseWorkflow", 0);
+  assert.notEqual(releaseWorkflowIntroduction, undefined);
+  assert.equal(releaseWorkflowIntroduction.toVersion, 1);
+  assert.equal(releaseWorkflowIntroduction.introduction, true);
 });
 
 test("a synthetic current above baseline fails closed when an adjacent step is missing", () => {

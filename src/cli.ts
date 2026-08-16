@@ -74,6 +74,9 @@ import { runTaskChangeSetCommand } from "./commands/taskChangeSetCommands.js";
 import { runTaskOverlapCommand } from "./commands/taskOverlapCommands.js";
 import { createControllerIntegrationJobPort } from "./controller/jobClient.js";
 import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
+import { runWorkflowCommandAsync } from "./commands/workflowCommands.js";
+import { createUpdatePorts } from "./cli/updatePorts.js";
+import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
 import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
@@ -631,6 +634,27 @@ export async function main(): Promise<void> {
     }
     if (resolved[1] === "overlap") {
       const result = await runTaskOverlapCommand(resolved.slice(2), store);
+      emit(result.output, false, result.data);
+      return;
+    }
+    if (resolved[1] === "workflow"
+      && (resolved[2] === "run" || resolved[2] === "resume")) {
+      const result = await runWorkflowCommandAsync(
+        resolved.slice(2),
+        store,
+        {
+          environment: process.env,
+          yuiHome: home,
+          ports: createReleaseWorkflowPorts({
+            home,
+            updatePorts: createUpdatePorts(process.env),
+            projectStore: store
+          })
+        }
+      );
+      if (result.kind !== "output") {
+        throw new Error(`Task workflow ${resolved[2]} returned an invalid control result.`);
+      }
       emit(result.output, false, result.data);
       return;
     }

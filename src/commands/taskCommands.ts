@@ -195,6 +195,8 @@ import {
   openInputRequestCount,
   runTaskInputCommand
 } from "./taskInputCommands.js";
+import { runGrantCommand } from "./grantCommands.js";
+import { runWorkflowCommand } from "./workflowCommands.js";
 import {
   taskActor as resolveTaskActor,
   taskLeaderActionRunId
@@ -525,6 +527,8 @@ export function runTaskCommand(
     case "message": return output(taskMessageCommand(rest, store, options));
     case "project": return taskProjectCommand(rest, store, options);
     case "input": return runTaskInputCommand(rest, store, options);
+    case "grant": return runGrantCommand(rest, store, options);
+    case "workflow": return runWorkflowCommand(rest, store, options);
     case "role": return taskRoleCommand(rest, store, options);
     case "work": return taskWorkCommand(rest, store, options);
     case "review": return taskReviewCommand(rest, store, options);

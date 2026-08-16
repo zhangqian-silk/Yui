@@ -108,7 +108,7 @@ export type DurableJobControlPort = Readonly<{
     taskId: string,
     jobId: string,
     now: Date,
-    caller: DurableJobCaller
+    assertion: DurableJobLeaderAssertion
   ): DurableJob | null;
 }>;
 
@@ -166,15 +166,11 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
         return next;
       });
     },
-    acknowledgeJob(taskId, jobId, now, caller) {
+    acknowledgeJob(taskId, jobId, now, assertion) {
       return store.transaction((tx) => {
+        assertLeaderActionRun(tx, taskId, assertion);
         const current = tx.getDurableJob(taskId, jobId);
         if (current === null) return null;
-        // Acknowledge is a Leader-only recovery decision. Reuse the shared
-        // caller-key, active-Run, receipt, and Session checks, but explicitly
-        // require the Leader role; start/cancel's owner binding intentionally
-        // permits a Worker to operate its own Work Item.
-        assertCallerAuthorized(tx, caller, current.owner, taskId, { leaderOnly: true });
         const next = acknowledgeUnknownDurableJob(current, now);
         if (next !== current) tx.saveDurableJob(taskId, next);
         return next;
@@ -371,8 +367,7 @@ function assertCallerAuthorized(
   >,
   caller: DurableJobCaller,
   owner: DurableJobOwner,
-  taskId: string,
-  options: Readonly<{ leaderOnly?: boolean }> = {}
+  taskId: string
 ): void {
   if (caller.scope === "user") {
     // rr13: A user-scope caller has no per-Session channel binding. Every
@@ -428,12 +423,6 @@ function assertCallerAuthorized(
     throw jobControlError(
       "UNAUTHORIZED",
       "The managed Session caller key does not match the durable hash."
-    );
-  }
-  if (options.leaderOnly && caller.role !== "leader") {
-    throw jobControlError(
-      "UNAUTHORIZED",
-      "job.acknowledge requires the current Task Leader Session."
     );
   }
   if (caller.role === "reviewer") {
@@ -645,14 +634,14 @@ export function parseDurableJobCancelParams(value: JsonValue): Readonly<{
 }
 
 /**
- * rr26: `job.acknowledge` carries the same managed task caller as
- * job.start/job.cancel.  A replayable leaderAssertion without the ephemeral
- * Session caller key is rejected by assertCallerAuthorized.
+ * rr5/f5: `job.acknowledge` params must carry a Leader assertion. The
+ * Controller verifies it against the current in-flight Leader Run; a request
+ * without one is rejected at the socket boundary.
  */
 export function parseDurableJobAcknowledgeParams(value: JsonValue): Readonly<{
   taskId: string;
   jobId: string;
-  caller: DurableJobCaller;
+  assertion: DurableJobLeaderAssertion;
 }> {
   if (
     typeof value !== "object" || value === null || Array.isArray(value)
@@ -661,10 +650,24 @@ export function parseDurableJobAcknowledgeParams(value: JsonValue): Readonly<{
     throw jobControlError("INVALID_PARAMS", "DurableJob acknowledge params are invalid.");
   }
   const record = value as Readonly<Record<string, JsonValue>>;
+  const assertion = record.leaderAssertion;
+  if (
+    typeof assertion !== "object" || assertion === null || Array.isArray(assertion)
+    || Object.keys(assertion).length !== 2
+  ) {
+    throw jobControlError(
+      "INVALID_PARAMS",
+      "job.acknowledge requires a leaderAssertion with runId and receiptId."
+    );
+  }
+  const assertionRecord = assertion as Readonly<Record<string, JsonValue>>;
   return {
     taskId: requiredId(record.taskId, "DurableJob taskId"),
     jobId: requiredId(record.jobId, "DurableJob jobId"),
-    caller: parseCaller(record.caller)
+    assertion: {
+      runId: requiredId(assertionRecord.runId, "job.acknowledge leaderAssertion runId"),
+      receiptId: requiredId(assertionRecord.receiptId, "job.acknowledge leaderAssertion receiptId")
+    }
   };
 }
 

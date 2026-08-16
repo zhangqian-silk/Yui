@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 4;
+export const SQLITE_SCHEMA_VERSION = 3;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -371,8 +371,9 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_run ON telemetry(task_id, run_id);
 `;
 
 /**
- * Migration 2: DurableJob record family (task-14). Controller-managed durable
- * check/Integration jobs that survive Leader turns and Session replacement.
+ * Migration 2: post-baseline task-scoped record families. This single
+ * migration creates the DurableJob, CapabilityGrant, and ReleaseWorkflow
+ * tables so a fresh database receives the complete merged schema atomically.
  */
 const MIGRATION_2_SQL = `
 CREATE TABLE IF NOT EXISTS durable_jobs (
@@ -388,6 +389,21 @@ CREATE INDEX IF NOT EXISTS idx_durable_jobs_task ON durable_jobs(task_id);
 CREATE INDEX IF NOT EXISTS idx_durable_jobs_status ON durable_jobs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_jobs_idempotency
   ON durable_jobs(task_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS capability_grants (
+  task_id    TEXT NOT NULL,
+  grant_id   TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, grant_id)
+);
+
+CREATE TABLE IF NOT EXISTS release_workflows (
+  task_id     TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (task_id, workflow_id)
+);
 `;
 
 /**
@@ -406,37 +422,6 @@ CREATE TABLE IF NOT EXISTS job_caller_key_hashes (
 );
 `;
 
-/**
- * Migration 4: DurableJob IDs are Task-local.  Migration 2 accidentally made
- * job_id the global primary key, so two Tasks allocating their first `job-1`
- * could overwrite one another through the upsert path.  Rebuild the table with
- * the actual record identity `(task_id, job_id)` and restore its indexes.
- * Never edit migration 2's checksum: existing Homes reach this repair through
- * this adjacent schema migration.
- */
-const MIGRATION_4_SQL = `
-CREATE TABLE durable_jobs_v4 (
-  job_id           TEXT NOT NULL,
-  task_id          TEXT NOT NULL,
-  idempotency_key  TEXT,
-  status           TEXT NOT NULL,
-  payload          TEXT NOT NULL,
-  created_at       TEXT NOT NULL,
-  updated_at       TEXT NOT NULL,
-  PRIMARY KEY (task_id, job_id)
-);
-INSERT INTO durable_jobs_v4
-  (job_id, task_id, idempotency_key, status, payload, created_at, updated_at)
-SELECT job_id, task_id, idempotency_key, status, payload, created_at, updated_at
-FROM durable_jobs;
-DROP TABLE durable_jobs;
-ALTER TABLE durable_jobs_v4 RENAME TO durable_jobs;
-CREATE INDEX idx_durable_jobs_task ON durable_jobs(task_id);
-CREATE INDEX idx_durable_jobs_status ON durable_jobs(status);
-CREATE UNIQUE INDEX idx_durable_jobs_idempotency
-  ON durable_jobs(task_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
-`;
-
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -446,9 +431,8 @@ interface Migration {
 
 const MIGRATIONS: readonly Migration[] = [
   { version: 1, axis: "layout", sql: MIGRATION_1_SQL },
-  { version: 2, axis: "record", recordKind: "durableJob", sql: MIGRATION_2_SQL },
-  { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL },
-  { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL }
+  { version: 2, axis: "record", recordKind: "durableJob+capability-grant+release-workflow", sql: MIGRATION_2_SQL },
+  { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL }
 ];
 
 function checksum(sql: string): string {
@@ -537,5 +521,7 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "milestones",
   "events",
   "task_projections",
-  "telemetry"
+  "telemetry",
+  "capability_grants",
+  "release_workflows"
 ] as const;

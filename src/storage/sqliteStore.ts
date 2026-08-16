@@ -85,11 +85,17 @@ import {
   StorageCancelledError,
   StorageRecordError,
   FileTaskStore,
+  storedCapabilityGrant,
+  storedReleaseWorkflow,
+  isValidCapabilityGrantTransition,
+  isValidReleaseWorkflowTransition,
   type ConfiguredAgentPatch,
   type ConfiguredAgentUpdateResult,
   type TaskStore,
   type YuiConfig
 } from "./taskStore.js";
+import type { CapabilityGrant } from "../grant/capabilityGrant.js";
+import type { ReleaseWorkflow } from "../release/releaseWorkflow.js";
 import {
   migrateSqliteSchema,
   SQLITE_AGGREGATE_VERSION,
@@ -1027,8 +1033,8 @@ export class SqliteTaskStore implements TaskStore {
       this.#db.prepare(
         `INSERT INTO durable_jobs (job_id, task_id, idempotency_key, status, payload, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(task_id, job_id) DO UPDATE SET idempotency_key = excluded.idempotency_key,
-           status = excluded.status,
+         ON CONFLICT(job_id) DO UPDATE SET task_id = excluded.task_id,
+           idempotency_key = excluded.idempotency_key, status = excluded.status,
            payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(
         job.id,
@@ -1268,6 +1274,83 @@ export class SqliteTaskStore implements TaskStore {
            payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(taskId, item.id, item.status, this.#json(item), this.#now());
     });
+  }
+
+  // -- capability grants ------------------------------------------------------
+
+  nextCapabilityGrantId(taskId: string): string { return this.#nextTaskRecordId(taskId, "capabilityGrant"); }
+
+  saveCapabilityGrant(taskId: string, grant: CapabilityGrant): void {
+    const stored = storedCapabilityGrant(grant);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Capability grant belongs to another Task: ${stored.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const existing = this.#getPayload<CapabilityGrant>(
+        "capability_grants", "task_id = ? AND grant_id = ?", [taskId, stored.id]
+      );
+      if (existing === null) {
+        if (stored.revokedAt !== undefined) {
+          throw new StorageRecordError(`Capability grant must start unrevoked: ${stored.id}`);
+        }
+        if (stored.usesUsed !== 0) {
+          throw new StorageRecordError(`Capability grant must start unused: ${stored.id}`);
+        }
+      } else if (!isValidCapabilityGrantTransition(existing, stored)) {
+        throw new StorageRecordError(`Capability grant cannot be overwritten: ${taskId}/${stored.id}`);
+      }
+      this.#db.prepare(
+        `INSERT INTO capability_grants (task_id, grant_id, payload, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(task_id, grant_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(taskId, stored.id, this.#json(stored), this.#now());
+    });
+  }
+
+  listCapabilityGrants(taskId: string): CapabilityGrant[] {
+    return this.#sortById(
+      this.#listPayload<CapabilityGrant>("capability_grants", "task_id = ?", [taskId]),
+      (grant) => grant.id
+    );
+  }
+
+  getCapabilityGrant(taskId: string, grantId: string): CapabilityGrant | null {
+    return this.#getPayload<CapabilityGrant>("capability_grants", "task_id = ? AND grant_id = ?", [taskId, grantId]);
+  }
+
+  // -- release workflows ------------------------------------------------------
+
+  nextReleaseWorkflowId(taskId: string): string { return this.#nextTaskRecordId(taskId, "releaseWorkflow"); }
+
+  saveReleaseWorkflow(taskId: string, workflow: ReleaseWorkflow): void {
+    const stored = storedReleaseWorkflow(workflow);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Release workflow belongs to another Task: ${stored.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const existing = this.#getPayload<ReleaseWorkflow>(
+        "release_workflows", "task_id = ? AND workflow_id = ?", [taskId, stored.id]
+      );
+      if (existing !== null && !isValidReleaseWorkflowTransition(existing, stored)) {
+        throw new StorageRecordError(`Release workflow cannot be overwritten: ${taskId}/${stored.id}`);
+      }
+      this.#db.prepare(
+        `INSERT INTO release_workflows (task_id, workflow_id, payload, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(task_id, workflow_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(taskId, stored.id, this.#json(stored), this.#now());
+    });
+  }
+
+  listReleaseWorkflows(taskId: string): ReleaseWorkflow[] {
+    return this.#sortById(
+      this.#listPayload<ReleaseWorkflow>("release_workflows", "task_id = ?", [taskId]),
+      (workflow) => workflow.id
+    );
+  }
+
+  getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null {
+    return this.#getPayload<ReleaseWorkflow>("release_workflows", "task_id = ? AND workflow_id = ?", [taskId, workflowId]);
   }
 
   // -- agent runs -------------------------------------------------------------

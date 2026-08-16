@@ -1832,10 +1832,10 @@ export async function startFileTaskController(
           return jobControlJson({ job, created });
         }
         if (method === "job.acknowledge") {
-          // rr26: acknowledge uses the same ephemeral task Session caller key
-          // as start/cancel; a replayable assertion alone is not authority.
-          const { taskId, jobId, caller } = parseDurableJobAcknowledgeParams(params);
-          const job = control.acknowledgeJob(taskId, jobId, new Date(), caller);
+          // rr5/f5: acknowledge requires a Leader assertion verified by the
+          // control port against the current in-flight Leader Run.
+          const { taskId, jobId, assertion } = parseDurableJobAcknowledgeParams(params);
+          const job = control.acknowledgeJob(taskId, jobId, new Date(), assertion);
           if (job === null) {
             throw controllerApplicationError(
               "NOT_FOUND",

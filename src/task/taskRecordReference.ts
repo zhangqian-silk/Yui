@@ -12,7 +12,9 @@ export const TASK_RECORD_ID_PREFIXES = {
   inputRequest: "input",
   decision: "decision",
   milestone: "milestone",
-  event: "event"
+  event: "event",
+  capabilityGrant: "capability-grant",
+  releaseWorkflow: "release-workflow"
 } as const;
 
 export type TaskRecordKind = keyof typeof TASK_RECORD_ID_PREFIXES;

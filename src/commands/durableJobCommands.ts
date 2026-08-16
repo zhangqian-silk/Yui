@@ -9,7 +9,8 @@ import {
 } from "../controller/jobClient.js";
 import type { DurableJobOwner, DurableJobStep } from "../job/durableJob.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { resolveJobCaller, taskActor } from "./taskActor.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { resolveJobCaller, taskActor, taskLeaderActionRunId } from "./taskActor.js";
 
 /**
  * The textual `--owner` forms accepted by `job start`. The public help text in
@@ -21,7 +22,7 @@ export type DurableJobCommandOptions = Readonly<{
   home: string;
   json?: boolean;
   environment?: NodeJS.ProcessEnv;
-  /** Required for `job acknowledge` — the managed caller key is resolved against it. */
+  /** Required for `job acknowledge` — the Leader assertion is resolved against it. */
   store?: Pick<TaskStore, "getRole" | "getActiveAgentRun" | "getTaskRoleSessionSet">;
 }>;
 
@@ -143,11 +144,25 @@ async function acknowledgeJob(
       "job acknowledge requires a Task store to resolve the Leader assertion."
     );
   }
-  // Carry the full managed task caller, including its ephemeral launch key.
-  // A durable leaderAssertion by itself is intentionally not sufficient.
-  const caller = resolveJobCaller(options.environment, ref.taskId, options.store);
+  // Resolve the current in-flight Leader Run so the Controller can verify
+  // the assertion instead of trusting a bare flag.
+  const runId = taskLeaderActionRunId(
+    options.store,
+    ref.taskId,
+    options.environment,
+    options.home
+  );
+  if (runId === undefined) {
+    throw usageError(
+      "job acknowledge requires the current in-flight Task Leader Run: "
+      + `${ref.taskId}.`
+    );
+  }
   await ensureFileTaskController(options.home, { environment: options.environment });
-  const result = await acknowledgeDurableJob(options.home, ref.taskId, ref.jobId, caller);
+  const result = await acknowledgeDurableJob(options.home, ref.taskId, ref.jobId, {
+    runId,
+    receiptId: formatAgentRunReceiptId(ref.taskId, runId)
+  });
   if (options.json === true) return `${JSON.stringify(result, null, 2)}\n`;
   return result.acknowledged
     ? `Job ${result.job.id} acknowledged (status: ${result.job.status})\n`

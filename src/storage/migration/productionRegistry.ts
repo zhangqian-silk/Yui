@@ -45,6 +45,10 @@ const STORED_TASK_DURABLE_JOBS_FROM_VERSION = 14;
 const STORED_TASK_DURABLE_JOBS_TO_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION = 16;
+const CAPABILITY_GRANT_FROM_VERSION = 0;
+const CAPABILITY_GRANT_TO_VERSION = 1;
+const RELEASE_WORKFLOW_FROM_VERSION = 0;
+const RELEASE_WORKFLOW_TO_VERSION = 1;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -123,7 +127,9 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(integrationQueueIntroductionStep())
     .registerCompatible(storedTaskDurableJobsStep())
     .registerCompatible(storedTaskJobCallerKeyHashesStep())
-    .registerCompatible(durableJobIntroductionStep());
+    .registerCompatible(durableJobIntroductionStep())
+    .registerOfflineMigration(capabilityGrantIntroductionStep())
+    .registerOfflineMigration(releaseWorkflowIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
@@ -775,6 +781,8 @@ const STORED_TASK_V14_FIELDS = [
   "changeSets",
   "integrationAttempts",
   "integrationQueue",
+  "capabilityGrants",
+  "releaseWorkflows",
   "roles",
   "managedWorkspaces",
   "roleSessionSets",
@@ -889,6 +897,8 @@ const STORED_TASK_V15_FIELDS = [
   "integrationAttempts",
   "integrationQueue",
   "durableJobs",
+  "capabilityGrants",
+  "releaseWorkflows",
   "roles",
   "managedWorkspaces",
   "roleSessionSets",
@@ -1031,6 +1041,180 @@ function durableJobIntroductionStep(): CompatibleStep<HomeSnapshot> {
  * durable and centralized, which keeps old Homes out of the strict current
  * parser until this step has run.
  */
+/**
+ * The post-baseline introduction of the task-scoped CapabilityGrant family.
+ * A pre-introduction Home names no capabilityGrant manifest version and its
+ * Task aggregates carry no `capabilityGrants` map; this explicit 0->1 step
+ * adds the empty family to every Task (plus the matching high-water mark) so
+ * the strict current parser can open the migrated state.
+ */
+function capabilityGrantIntroductionStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "capabilityGrant",
+    fromVersion: CAPABILITY_GRANT_FROM_VERSION,
+    toVersion: CAPABILITY_GRANT_TO_VERSION,
+    introduction: true,
+    preconditions: requireCapabilityGrantIntroduction,
+    transform: introduceCapabilityGrantFamily,
+    declaredEffects: []
+  };
+}
+
+function requireCapabilityGrantIntroduction(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const namedVersion = manifestVersions.capabilityGrant;
+  if (namedVersion !== undefined && namedVersion !== CAPABILITY_GRANT_FROM_VERSION) {
+    throw new Error(
+      `Record capabilityGrant introduction requires an absent manifest version or ${CAPABILITY_GRANT_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.capabilityGrants !== undefined) {
+      const grants = asObject(task.capabilityGrants, `capabilityGrant map ${taskId}`);
+      if (Object.keys(grants).length > 0) {
+        throw new Error(
+          `Capability grant introduction found existing records: ${taskId}.`
+        );
+      }
+    }
+    const marks = task.idHighWaterMarks;
+    if (marks !== undefined) {
+      const highWaterMarks = asObject(marks, `Task id high-water marks ${taskId}`);
+      const mark = highWaterMarks.capabilityGrant;
+      if (mark !== undefined && mark !== CAPABILITY_GRANT_FROM_VERSION) {
+        throw new Error(
+          `Capability grant introduction found a high-water mark: ${taskId}.`
+        );
+      }
+    }
+  }
+}
+
+function introduceCapabilityGrantFamily(snapshot: HomeSnapshot): HomeSnapshot {
+  requireCapabilityGrantIntroduction(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      capabilityGrant: CAPABILITY_GRANT_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const marks = asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`);
+    nextTasks[taskId] = {
+      ...task,
+      idHighWaterMarks: { ...marks, capabilityGrant: CAPABILITY_GRANT_FROM_VERSION },
+      capabilityGrants: {}
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * The post-baseline introduction of the task-scoped ReleaseWorkflow family.
+ * A pre-introduction Home names no releaseWorkflow manifest version and its
+ * Task aggregates carry no `releaseWorkflows` map; this explicit 0->1 step
+ * adds the empty family to every Task (plus the matching high-water mark) so
+ * the strict current parser can open the migrated state.
+ */
+function releaseWorkflowIntroductionStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "releaseWorkflow",
+    fromVersion: RELEASE_WORKFLOW_FROM_VERSION,
+    toVersion: RELEASE_WORKFLOW_TO_VERSION,
+    introduction: true,
+    preconditions: requireReleaseWorkflowIntroduction,
+    transform: introduceReleaseWorkflowFamily,
+    declaredEffects: []
+  };
+}
+
+function requireReleaseWorkflowIntroduction(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const namedVersion = manifestVersions.releaseWorkflow;
+  if (namedVersion !== undefined && namedVersion !== RELEASE_WORKFLOW_FROM_VERSION) {
+    throw new Error(
+      `Record releaseWorkflow introduction requires an absent manifest version or ${RELEASE_WORKFLOW_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.releaseWorkflows !== undefined) {
+      const workflows = asObject(task.releaseWorkflows, `releaseWorkflow map ${taskId}`);
+      if (Object.keys(workflows).length > 0) {
+        throw new Error(
+          `Release workflow introduction found existing records: ${taskId}.`
+        );
+      }
+    }
+    const marks = task.idHighWaterMarks;
+    if (marks !== undefined) {
+      const highWaterMarks = asObject(marks, `Task id high-water marks ${taskId}`);
+      const mark = highWaterMarks.releaseWorkflow;
+      if (mark !== undefined && mark !== RELEASE_WORKFLOW_FROM_VERSION) {
+        throw new Error(
+          `Release workflow introduction found a high-water mark: ${taskId}.`
+        );
+      }
+    }
+  }
+}
+
+function introduceReleaseWorkflowFamily(snapshot: HomeSnapshot): HomeSnapshot {
+  requireReleaseWorkflowIntroduction(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      releaseWorkflow: RELEASE_WORKFLOW_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const marks = asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`);
+    nextTasks[taskId] = {
+      ...task,
+      idHighWaterMarks: { ...marks, releaseWorkflow: RELEASE_WORKFLOW_FROM_VERSION },
+      releaseWorkflows: {}
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
 function recordFamilyStep(
   recordKind: string,
   fromVersion: number,

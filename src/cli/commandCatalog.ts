@@ -383,6 +383,75 @@ const taskChildren: readonly NodeInput[] = [
     ]
   },
   {
+    name: "grant",
+    summary: "Manage capability grants for a Task. Issue and revoke require the authenticated global Operator session.",
+    sections: [{ id: "manage", title: "Commands", entries: ["issue", "show", "list", "revoke"] }],
+    children: [
+      {
+        name: "issue",
+        summary: "Issue a capability grant to a Task. Requires the authenticated global Operator session; the granter is bound to it.",
+        usage: "yui task grant issue <task> --action <name> (repeatable) [--scope-project <id>...] [--scope-repo <owner/name>...] [--scope-package <name>...] [--scope-home <path>] [--param <name=v1,v2>...] [--expires-at <iso-8601>] [--max-uses <int>] [--irreversibility-ceiling <none|reversible|irreversible>]",
+        options: ["--action", "--scope-project", "--scope-repo", "--scope-package", "--scope-home", "--param", "--expires-at", "--max-uses", "--irreversibility-ceiling"]
+      },
+      {
+        name: "show",
+        summary: "Show one capability grant.",
+        usage: "yui task grant show <task> <grant-id>"
+      },
+      {
+        name: "list",
+        summary: "List capability grants for a Task.",
+        usage: "yui task grant list <task>"
+      },
+      {
+        name: "revoke",
+        summary: "Revoke a capability grant. Requires the authenticated global Operator session; the revoker is bound to it.",
+        usage: "yui task grant revoke <task> <grant-id>",
+        options: []
+      }
+    ]
+  },
+  {
+    name: "workflow",
+    summary: "Manage release workflows for a Task.",
+    sections: [{ id: "manage", title: "Commands", entries: ["create", "show", "list", "run", "resume", "status"] }],
+    children: [
+      {
+        name: "create",
+        summary: "Create a release workflow for a Task.",
+        usage: "yui task workflow create <task> --grant <grant-id> --source-repo <owner/name> --source-commit <sha> [--source-artifact <name@integrity>] --step <id>:<kind> (repeatable) [--step-irreversibility <id>=<level> (repeatable)] [--step-param <id>:<key>=<value> (repeatable)]",
+        options: ["--grant", "--source-repo", "--source-commit", "--source-artifact", "--step", "--step-irreversibility", "--step-param"]
+      },
+      {
+        name: "show",
+        summary: "Show one release workflow.",
+        usage: "yui task workflow show <task> <workflow-id>"
+      },
+      {
+        name: "list",
+        summary: "List release workflows for a Task.",
+        usage: "yui task workflow list <task>"
+      },
+      {
+        name: "run",
+        summary: "Run a release workflow from its resume cursor.",
+        usage: "yui task workflow run <task> <workflow-id> [--grant <grant-id>] [--max-steps <int>]",
+        options: ["--grant", "--max-steps"]
+      },
+      {
+        name: "resume",
+        summary: "Resume a release workflow from its first unconfirmed step.",
+        usage: "yui task workflow resume <task> <workflow-id> [--grant <grant-id>] [--max-steps <int>]",
+        options: ["--grant", "--max-steps"]
+      },
+      {
+        name: "status",
+        summary: "Show a release workflow and its step states.",
+        usage: "yui task workflow status <task> <workflow-id>"
+      }
+    ]
+  },
+  {
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
@@ -1006,7 +1075,7 @@ export const ROOT_COMMAND = buildNode({
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "archive", "rebuild", "history", "replace", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren
