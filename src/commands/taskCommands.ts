@@ -195,6 +195,8 @@ import {
   openInputRequestCount,
   runTaskInputCommand
 } from "./taskInputCommands.js";
+import { runGrantCommand } from "./grantCommands.js";
+import { runWorkflowCommand } from "./workflowCommands.js";
 import {
   taskActor as resolveTaskActor,
   taskLeaderActionRunId
@@ -419,6 +421,16 @@ export function preflightTaskCompletion(
   if (incompleteWork !== undefined) {
     throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
   }
+  const activeJob = store.listDurableJobs(task.id).find((job) => (
+    job.status === "queued"
+    || job.status === "running"
+    || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
+  ));
+  if (activeJob !== undefined) {
+    throw usageError(
+      `Task ${task.id} has an active DurableJob: ${activeJob.id}/${activeJob.status}.`
+    );
+  }
   if (task.requireIntegration) {
     if (store.listWorkItems(task.id).length === 0) {
       throw usageError(`Task ${task.id} requires at least one WorkItem before completion.`);
@@ -515,6 +527,8 @@ export function runTaskCommand(
     case "message": return output(taskMessageCommand(rest, store, options));
     case "project": return taskProjectCommand(rest, store, options);
     case "input": return runTaskInputCommand(rest, store, options);
+    case "grant": return runGrantCommand(rest, store, options);
+    case "workflow": return runWorkflowCommand(rest, store, options);
     case "role": return taskRoleCommand(rest, store, options);
     case "work": return taskWorkCommand(rest, store, options);
     case "review": return taskReviewCommand(rest, store, options);
@@ -1227,9 +1241,6 @@ function archiveTaskCommand(
       && task.status !== "retired") {
       throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
     }
-    if (task.cwd !== undefined || tx.listManagedWorkspaces(task.id).length > 0) {
-      throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
-    }
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
     const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
       integration.status === "running"
@@ -1240,6 +1251,19 @@ function archiveTaskCommand(
       throw usageError(
         `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
       );
+    }
+    const activeArchiveJob = tx.listDurableJobs(task.id).find((job) => (
+      job.status === "queued"
+      || job.status === "running"
+      || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
+    ));
+    if (activeArchiveJob !== undefined) {
+      throw usageError(
+        `Task ${task.id} has an active DurableJob: ${activeArchiveJob.id}/${activeArchiveJob.status}.`
+      );
+    }
+    if (task.cwd !== undefined || tx.listManagedWorkspaces(task.id).length > 0) {
+      throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
     }
     const activeRole = tx.listRoles(task.id)
       .find((role) => tx.getActiveAgentRun(task.id, role.name) !== null);
@@ -1319,6 +1343,16 @@ function retireTaskCommand(
     if (unresolvedIntegration !== undefined) {
       throw usageError(
         `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
+      );
+    }
+    const activeRetireJob = tx.listDurableJobs(task.id).find((job) => (
+      job.status === "queued"
+      || job.status === "running"
+      || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
+    ));
+    if (activeRetireJob !== undefined) {
+      throw usageError(
+        `Task ${task.id} has an active DurableJob: ${activeRetireJob.id}/${activeRetireJob.status}.`
       );
     }
     assertTaskRetirementProof(tx, task, options.taskRetirementProof);
@@ -3006,6 +3040,25 @@ function retireWork(
       if (replacement.id === item.id) {
         throw usageError("A Work Item cannot replace itself.");
       }
+    }
+    // rr4/finding-5: A Work Item with an active DurableJob cannot be retired —
+    // the runner may still be using its workspace. Block on queued, running,
+    // and unacknowledged unknown-needs-attention jobs owned by this Work Item.
+    const activeWorkItemJob = tx.listDurableJobs(task.id).find((job) => (
+      job.owner.kind === "work-item"
+      && job.owner.workItemId === item.id
+      && (
+        job.status === "queued"
+        || job.status === "running"
+        || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
+      )
+    ));
+    if (activeWorkItemJob !== undefined) {
+      throw usageError(
+        `Work Item ${item.id} has an active DurableJob: `
+        + `${activeWorkItemJob.id}/${activeWorkItemJob.status}. `
+        + "Cancel or acknowledge it before retiring."
+      );
     }
     for (const run of tx.listAgentRuns(task.id).filter((candidate) => (
       candidate.status === "active" && candidate.workItemId === item.id

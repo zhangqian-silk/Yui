@@ -76,12 +76,12 @@ function makeTelemetry(taskId, runId, generation, progressId, sequence) {
 // Schema migration
 // ---------------------------------------------------------------------------
 
-test("schema migration: fresh create applies migration 1 and all tables", () => {
+test("schema migration: fresh create applies every current migration and all tables", () => {
   const home = temporaryHome();
   const db = new Database(join(home, "yui.db"));
   const result = migrateSqliteSchema(db);
-  assert.deepEqual(result.applied, [1]);
-  assert.equal(result.version, 1);
+  assert.deepEqual(result.applied, [1, 2, 3]);
+  assert.equal(result.version, 3);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
   for (const table of SQLITE_SCHEMA_TABLES) {
     assert.ok(tables.includes(table), `missing table: ${table}`);
@@ -96,7 +96,7 @@ test("schema migration: idempotent re-run applies nothing", () => {
   migrateSqliteSchema(db);
   const second = migrateSqliteSchema(db);
   assert.deepEqual(second.applied, []);
-  assert.equal(second.version, 1);
+  assert.equal(second.version, 3);
   db.close();
 });
 

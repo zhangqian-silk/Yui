@@ -4,11 +4,16 @@ import test from "node:test";
 import {
   findCommandNode,
   ROOT_COMMAND,
+  findCommandNode,
   listPublicCommandPaths,
   validateCommandCatalog
 } from "../../dist/cli/commandCatalog.js";
 import { renderCommandHelp } from "../../dist/cli/helpRenderer.js";
 import { routeInvocation } from "../../dist/cli/invocationRouter.js";
+import {
+  JOB_OWNER_USAGE,
+  parseJobOwner
+} from "../../dist/commands/durableJobCommands.js";
 
 test("the declarative catalog exposes exactly the lean public command surface", () => {
   assert.doesNotThrow(() => validateCommandCatalog(ROOT_COMMAND));
@@ -112,6 +117,18 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task input show",
     "task input answer",
     "task input cancel",
+    "task grant",
+    "task grant issue",
+    "task grant show",
+    "task grant list",
+    "task grant revoke",
+    "task workflow",
+    "task workflow create",
+    "task workflow show",
+    "task workflow list",
+    "task workflow run",
+    "task workflow resume",
+    "task workflow status",
     "task role",
     "task role add",
     "task role list",
@@ -189,6 +206,11 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "task change-set",
     "task change-set show",
     "task enter",
+    "job",
+    "job start",
+    "job get",
+    "job cancel",
+    "job acknowledge",
     "jobs",
     "jobs list",
     "jobs retry"
@@ -253,6 +275,33 @@ test("help describes every supported file-input and integration-evidence option"
     assert.ok(node.options.includes(option), `${path.join(" ")} must expose ${option}`);
     assert.match(renderCommandHelp(node, "0.2.0"), new RegExp(option));
   }
+});
+
+test("job start help documents exactly the owner forms the parser accepts", () => {
+  const node = findCommandNode(["yui", "job", "start"]);
+  assert.ok(node);
+  const help = renderCommandHelp(node, "0.2.0");
+
+  // The rendered help must advertise the parser's owner grammar verbatim.
+  assert.ok(
+    help.includes(`--owner ${JOB_OWNER_USAGE}`),
+    `job start help must document --owner ${JOB_OWNER_USAGE}`
+  );
+  // The removed JSON owner shape must not resurface in the help text.
+  assert.doesNotMatch(help, /<json>/);
+
+  // Every form the help documents must round-trip through the parser.
+  assert.deepEqual(parseJobOwner("task"), { kind: "task" });
+  assert.deepEqual(parseJobOwner("work-item:work-item-1"), {
+    kind: "work-item",
+    workItemId: "work-item-1"
+  });
+  assert.deepEqual(parseJobOwner("integration-attempt:integration-1"), {
+    kind: "integration-attempt",
+    integrationAttemptId: "integration-1"
+  });
+  // The old JSON owner shape is rejected by the parser.
+  assert.throws(() => parseJobOwner('{"kind":"task"}'), /Invalid --owner/);
 });
 
 test("the invocation router selects an executable without parsing business params", () => {

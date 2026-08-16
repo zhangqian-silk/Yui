@@ -63,3 +63,13 @@ export function normalizedUniqueIdentities(
 export function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
+
+/**
+ * True for a concrete, pinnable package version — a semver-shaped `X.Y.Z` with
+ * an optional pre-release/build suffix. Rejects dist-tag sentinels (`latest`,
+ * `next`, …), empty/whitespace, and anything not anchored to a numeric
+ * `major.minor.patch` so a moving tag can never be frozen into a release plan.
+ */
+export function isConcreteVersion(value: string): boolean {
+  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(value.trim());
+}

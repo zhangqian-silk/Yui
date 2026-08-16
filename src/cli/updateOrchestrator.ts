@@ -163,8 +163,13 @@ export type StorageStateProbe = Readonly<{
  * verifiable without a destructive global install.
  */
 export type UpdatePorts = Readonly<{
-  /** Install the latest package side-by-side; never touch the live install. */
-  stage: () => StagedPackage;
+  /**
+   * Install the package side-by-side; never touch the live install. A caller
+   * that names a concrete version (the release workflow, whose plan freezes
+   * the exact version) stages THAT version; an omitted version stages latest
+   * for the interactive `yui update` flow.
+   */
+  stage: (version?: string) => StagedPackage;
   /** Run the staged binary's path-specific read-only update preflight. */
   preflight: (staged: StagedPackage, home: string) => UpdatePreflight;
   /** Promote the staged storage into place (atomic switch + backup). */
@@ -227,6 +232,18 @@ export type UpdateResult = Readonly<
         blockers?: readonly UpdateBlockerIdentity[];
         retryCommand?: string;
         sceneUnchanged?: true;
+        /**
+         * True when the replacement Controller could not be started or its
+         * ownership/identity authenticated after binary activation. This is
+         * not limited to UPDATE_CONTROLLER_UNKNOWN_ACTIVE: ANY post-verify
+         * failure to start or authenticate the replacement Controller (a
+         * generic start failure, UPDATE_CONTROLLER_IDENTITY_MISMATCH, or an
+         * unknown-active ownership failure) leaves the lifecycle handoff
+         * unresolved. The global binary may be healthy, but the Controller
+         * lifecycle handoff did not complete — a controller-home query must
+         * NOT confirm the step (P1-1, rr22).
+         */
+        controllerOwnershipUnknown?: true;
       }
     /**
      * The storage activation's outcome could not be determined: the switch may or
@@ -512,6 +529,14 @@ function activateAndVerify(
             : postSwitchRecoveryAction(home, storageBackupPath),
         recoverable: false,
         version: staged.version,
+        // P1-1 (rr22): ANY failure to start or authenticate the replacement
+        // Controller leaves the lifecycle handoff unresolved — not just
+        // UPDATE_CONTROLLER_UNKNOWN_ACTIVE. Even when the old identity is
+        // restored below, the running Controller is not the replacement the
+        // step promised, so the adapter must persist the step as unknown
+        // rather than letting a controller-home query confirm it on binary
+        // health alone.
+        controllerOwnershipUnknown: true as const,
         ...(storageBackupPath === undefined ? {} : { storageBackupPath })
       };
       // An ownership-unknown mismatch is a live-process blocker, not a

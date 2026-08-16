@@ -37,6 +37,9 @@ const CONFIGURATION_REFRESH_TIMEOUT_MS = 500;
 const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
   ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
   "YUI_TMUX_BIN",
+  // rr13/test: Forward the liveness seam so an integration test's Controller
+  // subprocess does not reap a saved active Leader Run without a real tmux role.
+  "YUI_TEST_ROLE_LIVENESS_PRESENT",
   ...EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES
 ] as const;
 

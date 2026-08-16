@@ -20,6 +20,7 @@ import Database from "better-sqlite3";
 
 import { FileTaskStore } from "../dist/storage/taskStore.js";
 import { SqliteTaskStore } from "../dist/storage/sqliteStore.js";
+import { createDurableJob } from "../dist/job/durableJob.js";
 import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
 import { runMigration } from "../dist/storage/migration/index.js";
 import { createProductionRegistry } from "../dist/storage/migration/productionRegistry.js";
@@ -344,6 +345,18 @@ function setupLayout6Home() {
     updatedAt: NOW
   };
 
+  const durableJob = createDurableJob({
+    id: "job-1",
+    taskId: task.id,
+    owner: { kind: "task" },
+    projectId: project.id,
+    head: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+    workspace: home,
+    env: { YUI_CHECK: "migration" },
+    steps: [{ name: "check", command: "true" }],
+    artifactsLocator: "artifacts/job-1"
+  }, new Date(NOW));
+
   const mailbox = {
     schemaVersion: 1,
     target: { kind: "role-runtime", taskId: task.id, roleName: "leader" },
@@ -386,6 +399,8 @@ function setupLayout6Home() {
     tx.saveEvent(task.id, event2);
     tx.saveLeaderFailure(leaderFailure);
     tx.saveOperatorNotification(operatorNotification);
+    tx.saveDurableJob(task.id, durableJob);
+    tx.setJobCallerKeyHash(task.id, "leader", "codex", "a".repeat(64));
     tx.saveWorkMailbox(mailbox);
   });
 
@@ -499,6 +514,16 @@ test("migrates a realistic state.json to SQLite with matching checksums and read
       assert.equal(brief.objective, "Build the feature");
       assert.equal(store.listChangeSets("task-alpha").length, 1);
       assert.equal(store.listIntegrationAttempts("task-alpha").length, 1);
+
+      // Durable Controller state must survive the document-to-database cutover.
+      const jobs = store.listDurableJobs("task-alpha");
+      assert.equal(jobs.length, 1);
+      assert.equal(jobs[0].id, "job-1");
+      assert.equal(jobs[0].env.YUI_CHECK, "migration");
+      assert.equal(
+        store.getJobCallerKeyHash("task-alpha", "leader", "codex"),
+        "a".repeat(64)
+      );
 
       // Leader failure and operator notification.
       const failure = store.getLeaderFailure("task-alpha");

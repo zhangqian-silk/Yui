@@ -387,7 +387,7 @@ function assertInputCancelOrigin(
   return "leader";
 }
 
-function isCurrentGlobalOperator(
+export function isCurrentGlobalOperator(
   store: Pick<TaskStore, "getGlobalRole" | "getGlobalRoleSessionSet">,
   environment: NodeJS.ProcessEnv
 ): boolean {

@@ -31,12 +31,13 @@
  */
 
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runtimeError } from "../errors/cliError.js";
+import { isConcreteVersion } from "../domain/validation.js";
 import { STORAGE_DOCTOR_CHECK_NAMES } from "../doctor/doctor.js";
 import { inspectStorageSchema } from "../storage/storageSchema.js";
 import { correlateUpgradeReceipt } from "../storage/upgrade/upgradeOrchestrator.js";
@@ -56,6 +57,33 @@ import type {
 const PACKAGE_NAME = "@zq-silk/yui";
 const PACKAGE_SPEC = `${PACKAGE_NAME}@latest`;
 
+function resolveExecutable(command: string, environmentPath: string | undefined): string | undefined {
+  if (isAbsolute(command)) return command;
+  for (const directory of (environmentPath ?? "").split(delimiter)) {
+    if (directory.length === 0) continue;
+    const candidate = resolve(directory, command);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep walking PATH; callers fail closed when no executable is found.
+    }
+  }
+  return undefined;
+}
+
+function failedSpawnResult(message: string): SpawnSyncReturns<Buffer> {
+  return {
+    pid: undefined,
+    output: [null, Buffer.alloc(0), Buffer.from(message)],
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.from(message),
+    status: 127,
+    signal: null,
+    error: new Error(message)
+  } as unknown as SpawnSyncReturns<Buffer>;
+}
+
 export type UpdateSpawner = (
   command: string,
   args: readonly string[],
@@ -68,21 +96,52 @@ export function createUpdatePorts(
   spawn: UpdateSpawner = spawnSync,
   stagingRoot: string = tmpdir()
 ): UpdatePorts {
+  // The production adapter must not let a later PATH change select a
+  // different npm during staging, activation, or recovery. Test doubles are
+  // intentionally left untouched so deterministic tests can dispatch on the
+  // stable command name `npm`.
+  const trustedNpm = spawn === spawnSync
+    ? resolveExecutable("npm", environment.PATH)
+    : "npm";
+  const run: UpdateSpawner = (command, args, options) => {
+    if (command !== "npm") return spawn(command, args, options);
+    if (trustedNpm === undefined) {
+      return failedSpawnResult("Unable to resolve trusted executable: npm");
+    }
+    return spawn(trustedNpm, args, options);
+  };
   // Keep the exact verified artifact in memory for this update attempt. This is
   // deliberately not persisted as a retry or recovery protocol.
   let verifiedActivatedBinary: string | undefined;
   let verifiedActivatedVersion: string | undefined;
   const stopReplacementController = (home: string, pid: number): UpdateControllerStopResult => (
-    stopReplacementControllerForUpdate(home, pid, environment, spawn)
+    stopReplacementControllerForUpdate(home, pid, environment, run)
   );
   return {
-    stage(): StagedPackage {
+    stage(version?: string): StagedPackage {
+      // A caller that names a version (the release workflow, which freezes the
+      // exact version in its plan) installs THAT version — never a moving
+      // `latest` that could resolve to a different build than the one the
+      // plan authorized. A non-concrete value fails closed rather than being
+      // interpolated into an install spec. An omitted version keeps the
+      // interactive `yui update` behavior of staging latest.
+      const spec = version === undefined
+        ? PACKAGE_SPEC
+        : isConcreteVersion(version)
+          ? `${PACKAGE_NAME}@${version.trim()}`
+          : null;
+      if (spec === null) {
+        throw runtimeError(
+          `Refusing to stage a non-concrete version (${String(version)}): only an exact `
+            + "major.minor.patch version can be pinned for an update."
+        );
+      }
       const stagingPath = mkdtempSync(join(stagingRoot, "yui-update-stage-"));
       let ownsStaging = true;
       try {
-        const result = spawn(
+        const result = run(
           "npm",
-          ["install", "--global", "--prefix", stagingPath, PACKAGE_SPEC],
+          ["install", "--global", "--prefix", stagingPath, spec],
           { cwd: process.cwd(), env: environment, shell: false, stdio: "inherit" }
         );
         assertSpawnOk(result, "stage the new package");
@@ -92,7 +151,7 @@ export function createUpdatePorts(
         // version, FAIL the stage (R2-F1): we must never fall back to a bare
         // `@latest`, which would let activation promote — and verify wave through —
         // a different build than the one that passed preflight.
-        const version = resolveStagedVersion(stagingPath, binaryPath, environment, spawn);
+        const version = resolveStagedVersion(stagingPath, binaryPath, environment, run);
         if (version === null) {
           throw runtimeError(
             "Failed to resolve the exact staged package version (neither the staged package.json "
@@ -111,7 +170,7 @@ export function createUpdatePorts(
     },
 
     preflight(staged: StagedPackage, home: string): UpdatePreflight {
-      const result = spawn(
+      const result = run(
         staged.binaryPath,
         ["--json", "upgrade", "--update-preflight"],
         { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
@@ -120,7 +179,7 @@ export function createUpdatePorts(
     },
 
     activateStorage(staged: StagedPackage, home: string): StorageActivation {
-      const result = spawn(
+      const result = run(
         staged.binaryPath,
         ["--json", "upgrade"],
         {
@@ -147,7 +206,7 @@ export function createUpdatePorts(
       // `@latest` (R2-F1: `stage` guarantees `staged.version` is a concrete
       // version, so there is no `latest` sentinel to fall back to).
       const spec = `${PACKAGE_NAME}@${staged.version}`;
-      const result = spawn(
+      const result = run(
         "npm",
         ["install", "--global", spec],
         { cwd: process.cwd(), env: environment, shell: false, stdio: "inherit" }
@@ -157,7 +216,7 @@ export function createUpdatePorts(
 
     verify(staged: StagedPackage, home: string): void {
       // Verify the ACTUALLY-ACTIVATED global binary, not the staging path (P1-3).
-      const activeBinary = resolveGlobalBinary(environment, spawn);
+      const activeBinary = resolveGlobalBinary(environment, run);
       if (activeBinary === null || !existsSync(activeBinary)) {
         throw runtimeError(
           "Post-update health check failed: could not locate the activated global `yui` binary."
@@ -171,7 +230,7 @@ export function createUpdatePorts(
       // "exited with status 5". We therefore parse+validate the structured storage
       // health first: only a valid success envelope with every expected storage
       // check present-and-ok, no blocking checks, AND exit 0 is healthy.
-      const doctor = spawn(
+      const doctor = run(
         activeBinary,
         ["--json", "doctor"],
         { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
@@ -869,8 +928,12 @@ function assertActivatedControllerIdentity(
   }
 }
 
-/** Resolve the Controller entrypoint beside the activated package's CLI. */
-function activatedControllerEntrypoint(activatedBinary: string): string {
+/**
+ * Resolve the Controller entrypoint beside the activated package's CLI.
+ * Exported so the release workflow's recovery query can apply the exact same
+ * entrypoint derivation as the production startup identity check (P1-1, rr23).
+ */
+export function activatedControllerEntrypoint(activatedBinary: string): string {
   let resolvedBinary: string;
   try {
     resolvedBinary = realpathSync(activatedBinary);
@@ -1198,16 +1261,6 @@ function resolveStagedVersion(
   // Fall back to asking the staged binary itself; `null` if it too cannot answer
   // with a successful, concrete version.
   return resolveBinaryVersion(binaryPath, environment, spawn);
-}
-
-/**
- * True for a concrete, pinnable package version — a semver-shaped `X.Y.Z` with an
- * optional pre-release/build suffix. Rejects dist-tag sentinels (`latest`, `next`,
- * …), empty/whitespace, and anything not anchored to a numeric `major.minor.patch`
- * so a sentinel can never be spliced into an activation spec (R3-F1).
- */
-function isConcreteVersion(value: string): boolean {
-  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(value.trim());
 }
 
 /** Read a CONCRETE `version` from a package.json, or `null` when absent/non-concrete. */

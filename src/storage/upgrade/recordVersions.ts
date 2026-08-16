@@ -24,6 +24,7 @@ import {
   CURRENT_AGENT_RUN_SCHEMA_VERSION,
   CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
   CURRENT_AGENT_PROFILE_SCHEMA_VERSION,
+  CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION,
   CURRENT_CONFIG_SCHEMA_VERSION,
   CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION,
   CURRENT_CHANGE_SET_SCHEMA_VERSION,
@@ -38,6 +39,7 @@ import {
   CURRENT_MESSAGE_SCHEMA_VERSION,
   CURRENT_MILESTONE_SCHEMA_VERSION,
   CURRENT_PROJECT_SCHEMA_VERSION,
+  CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION,
   CURRENT_REVIEW_ROUND_SCHEMA_VERSION,
   CURRENT_STORED_TASK_SCHEMA_VERSION,
   CURRENT_TASK_BRIEF_SCHEMA_VERSION,
@@ -49,6 +51,7 @@ import {
 } from "../taskStore.js";
 import { CURRENT_LEADER_FAILURE_SCHEMA_VERSION } from "../../scheduler/leaderFailure.js";
 import { CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION } from "../../scheduler/operatorNotification.js";
+import { CURRENT_DURABLE_JOB_SCHEMA_VERSION } from "../../job/durableJob.js";
 import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js";
 
 function descriptor(version: number, path: string): RecordAxisEntry {
@@ -80,12 +83,15 @@ const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object
   changeSet: "state.json#/tasks/*/changeSets",
   integrationAttempt: "state.json#/tasks/*/integrationAttempts",
   integrationQueue: "state.json#/tasks/*/integrationQueue",
+  durableJob: "state.json#/tasks/*/durableJobs",
   activeRunPointer: "state.json#/tasks/*/activeRuns",
   message: "state.json#/tasks/*/messages",
   inputRequest: "state.json#/tasks/*/inputRequests",
   decision: "state.json#/tasks/*/decisions",
   milestone: "state.json#/tasks/*/milestones",
   event: "state.json#/tasks/*/events",
+  capabilityGrant: "state.json#/tasks/*/capabilityGrants",
+  releaseWorkflow: "state.json#/tasks/*/releaseWorkflows",
   leaderFailure: "state.json#/tasks/*/leaderFailure",
   operatorNotification: "state.json#/tasks/*/operatorNotification",
   workMailbox: "state.json#/mailboxes"
@@ -152,6 +158,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
         CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION,
         "state.json#/tasks/*/integrationQueue"
       ),
+      durableJob: descriptor(
+        CURRENT_DURABLE_JOB_SCHEMA_VERSION,
+        "state.json#/tasks/*/durableJobs"
+      ),
       activeRunPointer: descriptor(
         CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
         "state.json#/tasks/*/activeRuns"
@@ -164,6 +174,14 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
       decision: descriptor(CURRENT_DECISION_SCHEMA_VERSION, "state.json#/tasks/*/decisions"),
       milestone: descriptor(CURRENT_MILESTONE_SCHEMA_VERSION, "state.json#/tasks/*/milestones"),
       event: descriptor(CURRENT_EVENT_SCHEMA_VERSION, "state.json#/tasks/*/events"),
+      capabilityGrant: descriptor(
+        CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION,
+        "state.json#/tasks/*/capabilityGrants"
+      ),
+      releaseWorkflow: descriptor(
+        CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION,
+        "state.json#/tasks/*/releaseWorkflows"
+      ),
       leaderFailure: descriptor(
         CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
         "state.json#/tasks/*/leaderFailure"

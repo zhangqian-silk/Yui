@@ -31,6 +31,7 @@ import type { WorkMailbox } from "../../coordination/workMailbox.js";
 import type { Decision } from "../../decision/decision.js";
 import type { TaskEvent } from "../../event/taskEvent.js";
 import type { InputRequest } from "../../input/inputRequest.js";
+import type { DurableJob } from "../../job/durableJob.js";
 import type {
   GlobalRoleSessionSet,
   TaskRoleSessionSet
@@ -46,6 +47,8 @@ import type { ChangeSet } from "../../integration/changeSet.js";
 import type { IntegrationAttempt } from "../../integration/integrationAttempt.js";
 import type { IntegrationQueueEntry } from "../../integration/integrationQueueEntry.js";
 import type { GlobalRole, TaskRole } from "../../role/role.js";
+import type { CapabilityGrant } from "../../grant/capabilityGrant.js";
+import type { ReleaseWorkflow } from "../../release/releaseWorkflow.js";
 import type { LeaderFailure } from "../../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../../scheduler/operatorNotification.js";
 import type { Task } from "../../task/task.js";
@@ -125,6 +128,20 @@ function asObjectMap(value: unknown): Record<string, Record<string, unknown>> {
   return result;
 }
 
+/** Read a persisted map whose values are opaque strings without silently
+ * dropping malformed entries during an offline migration. */
+function asStringMap(value: unknown, label: string): Record<string, string> {
+  const record = asObject(value);
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(record)) {
+    if (typeof entry !== "string") {
+      throw new Error(`${label}.${key} must be a string.`);
+    }
+    result[key] = entry;
+  }
+  return result;
+}
+
 function asNullableObject(value: unknown): Record<string, unknown> | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "object" || Array.isArray(value)) return null;
@@ -144,6 +161,8 @@ interface StoredTaskShape {
   changeSets: Record<string, Record<string, unknown>>;
   integrationAttempts: Record<string, Record<string, unknown>>;
   integrationQueue: Record<string, Record<string, unknown>>;
+  durableJobs: Record<string, Record<string, unknown>>;
+  jobCallerKeyHashes: Record<string, string>;
   activeRuns: Record<string, { schemaVersion: number; runId: string }>;
   messages: Record<string, Record<string, unknown>>;
   inputRequests: Record<string, Record<string, unknown>>;
@@ -153,6 +172,8 @@ interface StoredTaskShape {
   leaderFailure: Record<string, unknown> | null;
   operatorNotification: Record<string, unknown> | null;
   idHighWaterMarks: Record<string, number>;
+  capabilityGrants: Record<string, Record<string, unknown>>;
+  releaseWorkflows: Record<string, Record<string, unknown>>;
 }
 
 function asStoredTask(value: unknown): StoredTaskShape {
@@ -169,6 +190,11 @@ function asStoredTask(value: unknown): StoredTaskShape {
     changeSets: asObjectMap(record.changeSets),
     integrationAttempts: asObjectMap(record.integrationAttempts),
     integrationQueue: asObjectMap(record.integrationQueue),
+    durableJobs: asObjectMap(record.durableJobs),
+    jobCallerKeyHashes: asStringMap(
+      record.jobCallerKeyHashes,
+      "jobCallerKeyHashes"
+    ),
     activeRuns: asObjectMap(record.activeRuns) as unknown as Record<string, { schemaVersion: number; runId: string }>,
     messages: asObjectMap(record.messages),
     inputRequests: asObjectMap(record.inputRequests),
@@ -177,7 +203,9 @@ function asStoredTask(value: unknown): StoredTaskShape {
     events: asObjectMap(record.events),
     leaderFailure: asNullableObject(record.leaderFailure),
     operatorNotification: asNullableObject(record.operatorNotification),
-    idHighWaterMarks: asObject(record.idHighWaterMarks) as Record<string, number>
+    idHighWaterMarks: asObject(record.idHighWaterMarks) as Record<string, number>,
+    capabilityGrants: asObjectMap(record.capabilityGrants),
+    releaseWorkflows: asObjectMap(record.releaseWorkflows)
   };
 }
 
@@ -276,6 +304,24 @@ export function populateSqliteFromState(
         for (const entry of Object.values(stored.integrationQueue)) {
           store.saveIntegrationQueueEntry(taskId, entry as unknown as IntegrationQueueEntry);
         }
+        for (const job of Object.values(stored.durableJobs)) {
+          store.saveDurableJob(taskId, job as unknown as DurableJob);
+        }
+        for (const [key, hash] of Object.entries(stored.jobCallerKeyHashes)) {
+          const separator = key.indexOf("\0");
+          if (separator <= 0 || separator === key.length - 1
+            || key.indexOf("\0", separator + 1) !== -1) {
+            throw new Error(
+              `Job caller key hash identity is invalid: ${taskId}/${key}.`
+            );
+          }
+          store.setJobCallerKeyHash(
+            taskId,
+            key.slice(0, separator),
+            key.slice(separator + 1),
+            hash
+          );
+        }
         // Active-run pointers: the document stores { schemaVersion, runId }
         // keyed by pointer; the store derives the pointer from the Run.
         for (const [pointer, value] of Object.entries(stored.activeRuns)) {
@@ -317,6 +363,13 @@ export function populateSqliteFromState(
           if (typeof highWater === "number" && Number.isFinite(highWater)) {
             store.migrationSeedIdSequence(taskId, kind, highWater);
           }
+        }
+        // Capability grants and release workflows (task-15 record families).
+        for (const grant of Object.values(stored.capabilityGrants)) {
+          store.saveCapabilityGrant(taskId, grant as unknown as CapabilityGrant);
+        }
+        for (const workflow of Object.values(stored.releaseWorkflows)) {
+          store.saveReleaseWorkflow(taskId, workflow as unknown as ReleaseWorkflow);
         }
       }
 
@@ -395,6 +448,8 @@ export function computeStateFamilyChecksums(
   const changeSets: unknown[] = [];
   const integrationAttempts: unknown[] = [];
   const integrationQueue: unknown[] = [];
+  const durableJobs: unknown[] = [];
+  const jobCallerKeyHashes: unknown[] = [];
   const activeRunPointers: unknown[] = [];
   const messages: unknown[] = [];
   const inputRequests: unknown[] = [];
@@ -403,6 +458,8 @@ export function computeStateFamilyChecksums(
   const events: unknown[] = [];
   const leaderFailures: unknown[] = [];
   const operatorNotifications: unknown[] = [];
+  const capabilityGrants: unknown[] = [];
+  const releaseWorkflows: unknown[] = [];
 
   for (const stored of Object.values(tasks)) {
     taskRecords.push(stored.task);
@@ -416,6 +473,21 @@ export function computeStateFamilyChecksums(
     changeSets.push(...Object.values(stored.changeSets));
     integrationAttempts.push(...Object.values(stored.integrationAttempts));
     integrationQueue.push(...Object.values(stored.integrationQueue));
+    durableJobs.push(...Object.values(stored.durableJobs));
+    for (const [key, hash] of Object.entries(stored.jobCallerKeyHashes)) {
+      const separator = key.indexOf("\0");
+      if (separator <= 0 || separator === key.length - 1
+        || key.indexOf("\0", separator + 1) !== -1) {
+        throw new Error(
+          `Job caller key hash identity is invalid: ${stored.task.id}/${key}.`
+        );
+      }
+      jobCallerKeyHashes.push({
+        taskId: stored.task.id,
+        key,
+        hash
+      });
+    }
     activeRunPointers.push(...Object.values(stored.activeRuns));
     messages.push(...Object.values(stored.messages));
     inputRequests.push(...Object.values(stored.inputRequests));
@@ -424,6 +496,8 @@ export function computeStateFamilyChecksums(
     events.push(...Object.values(stored.events));
     if (stored.leaderFailure !== null) leaderFailures.push(stored.leaderFailure);
     if (stored.operatorNotification !== null) operatorNotifications.push(stored.operatorNotification);
+    capabilityGrants.push(...Object.values(stored.capabilityGrants));
+    releaseWorkflows.push(...Object.values(stored.releaseWorkflows));
   }
 
   checksums.task = hashRecords(taskRecords);
@@ -437,6 +511,8 @@ export function computeStateFamilyChecksums(
   checksums.changeSet = hashRecords(changeSets);
   checksums.integrationAttempt = hashRecords(integrationAttempts);
   checksums.integrationQueue = hashRecords(integrationQueue);
+  checksums.durableJob = hashRecords(durableJobs);
+  checksums.jobCallerKeyHash = hashRecords(jobCallerKeyHashes);
   checksums.activeRunPointer = hashRecords(activeRunPointers);
   checksums.message = hashRecords(messages);
   checksums.inputRequest = hashRecords(inputRequests);
@@ -445,6 +521,8 @@ export function computeStateFamilyChecksums(
   checksums.event = hashRecords(events);
   checksums.leaderFailure = hashRecords(leaderFailures);
   checksums.operatorNotification = hashRecords(operatorNotifications);
+  checksums.capabilityGrant = hashRecords(capabilityGrants);
+  checksums.releaseWorkflow = hashRecords(releaseWorkflows);
 
   checksums.workMailbox = hashRecords(Object.values(asObjectMap(state.mailboxes)));
 
@@ -545,6 +623,23 @@ export function computeDbFamilyChecksums(
       db,
       "SELECT payload FROM integration_queue"
     );
+    checksums.durableJob = hashPayloadTable(
+      db,
+      "SELECT payload FROM durable_jobs"
+    );
+    const callerHashRows = db.prepare(
+      "SELECT task_id, role_name, agent_id, hash FROM job_caller_key_hashes"
+    ).all() as Array<{
+      task_id: string;
+      role_name: string;
+      agent_id: string;
+      hash: string;
+    }>;
+    checksums.jobCallerKeyHash = hashRecords(callerHashRows.map((row) => ({
+      taskId: row.task_id,
+      key: `${row.role_name}\0${row.agent_id}`,
+      hash: row.hash
+    })));
     checksums.activeRunPointer = hashPayloadTable(db, "SELECT payload FROM active_runs");
     checksums.message = hashPayloadTable(db, "SELECT payload FROM messages");
     checksums.inputRequest = hashPayloadTable(db, "SELECT payload FROM input_requests");
@@ -559,6 +654,8 @@ export function computeDbFamilyChecksums(
       db,
       "SELECT payload FROM task_projections WHERE kind = 'operator-notification' AND payload IS NOT NULL"
     );
+    checksums.capabilityGrant = hashPayloadTable(db, "SELECT payload FROM capability_grants");
+    checksums.releaseWorkflow = hashPayloadTable(db, "SELECT payload FROM release_workflows");
 
     // Mailboxes are reconstructed from typed columns (no payload column).
     const mailboxRows = db.prepare(
