@@ -308,7 +308,7 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
     [
       "activeRunPointer", "agentProfile", "agentRun", "changeSet", "config",
       "configuredAgent", "decision", "event", "globalRole", "globalRoleSessionSet",
-      "inputRequest", "integrationAttempt", "leaderFailure", "managedWorkspace",
+      "inputRequest", "integrationAttempt", "integrationQueue", "leaderFailure", "managedWorkspace",
       "message", "milestone", "operatorNotification", "project", "reviewRound",
       "storedTask", "task", "taskBrief", "taskRole", "taskRoleSessionSet", "workItem",
       "workMailbox"

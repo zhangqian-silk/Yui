@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { usageError } from "../errors/cliError.js";
 import {
   GitIntegrationService,
@@ -96,6 +97,13 @@ export async function reconcileTaskRemoteBaselines(
     }
     const currentCommit = (await git.inspect(entry.path, "HEAD")).baseCommit;
     const previousIntegration = latestCommittedIntegration(store, task.id, project.id);
+    // A completed Task-final Review for the exact current head freezes the
+    // Task baseline: the delivery has been reviewed and approved, so the
+    // completion gate must not merge remote changes that would invalidate
+    // the review evidence.
+    if (hasFrozenTaskBaseline(store, task.id, project.id, currentCommit)) {
+      continue;
+    }
     // Let the existing exact-head Task-final gate report local post-
     // Integration drift before attempting any network operation.  This keeps
     // completion read-only for an already-invalid candidate and preserves its
@@ -131,6 +139,13 @@ export async function reconcileTaskRemoteBaselines(
   const reconciled: RemoteReconciliation[] = [];
   for (const plan of plans) {
     const attempt = store.transaction((tx) => {
+      // Re-check the frozen baseline inside the transaction: a Task-final
+      // Review may have completed during the async remote fetch, freezing
+      // the head after the initial check.  Creating a new Integration here
+      // would move the reviewed head and invalidate the review evidence.
+      if (hasFrozenTaskBaseline(tx, task.id, plan.project.id, plan.currentCommit)) {
+        return null;
+      }
       const created = createIntegrationAttempt({
         id: tx.nextIntegrationAttemptId(task.id),
         taskId: task.id,
@@ -143,6 +158,7 @@ export async function reconcileTaskRemoteBaselines(
       tx.saveIntegrationAttempt(task.id, created);
       return created;
     });
+    if (attempt === null) continue;
     const baseline: RemoteBaseline = {
       remoteUrl: plan.project.remoteUrl!,
       branch: plan.remote.branch
@@ -242,4 +258,27 @@ function latestCommittedIntegration(
     .filter((attempt) => attempt.projectId === projectId && attempt.status === "committed")
     .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))
     .at(-1);
+}
+
+/**
+ * A Task baseline is frozen when a completed (clean) Task-final ReviewRound
+ * reviewed the exact current head for the given Project.  Once frozen, the
+ * completion gate skips remote baseline reconciliation to prevent merging
+ * unreviewed remote changes into the approved delivery.
+ */
+function hasFrozenTaskBaseline(
+  store: TaskStore,
+  taskId: string,
+  projectId: string,
+  currentCommit: string
+): boolean {
+  return store.listReviewRounds(taskId)
+    .some((round) => (
+      (round.scope ?? "work-item") === "task"
+      && round.status === "completed"
+      && round.taskCandidate !== undefined
+      && round.taskCandidate.projects.some((entry) => (
+        entry.projectId === projectId && entry.commit === currentCommit
+      ))
+    ));
 }

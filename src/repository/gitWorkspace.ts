@@ -55,6 +55,13 @@ export class RemoteBaselineConflictError extends Error {
 }
 export interface GitWorkspacePort {
   inspect(repositoryPath: string, baseRef?: string): Promise<GitRepositoryInspection>;
+  /**
+   * Atomically assert that a ref still points at the expected commit, using
+   * `git update-ref` as a compare-and-swap probe (same old and new value).
+   * Throws if the ref moved or does not exist.  This is the linearization
+   * point for convergence proofs that must not survive a target advance.
+   */
+  assertRefAt(repositoryPath: string, ref: string, expectedCommit: string): Promise<void>;
   /** Whether a ref (branch, tag, or other refname) resolves to a commit. */
   refExists(repositoryPath: string, ref: string): Promise<boolean>;
   /** Every ref name matching a `git for-each-ref` pattern. */
@@ -231,6 +238,70 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       }
       if (lines.length < pageSize) return null;
     }
+  }
+
+  /**
+   * Whether two commits hold the same tree content on the given paths.
+   * An enqueued ChangeSet whose head agrees with the target on every path
+   * it touched is already represented there and converges without a new
+   * commit, even when other unrelated changes landed in between.
+   *
+   * The captured paths are literal filenames, so `--literal-pathspecs`
+   * disables pathspec magic: a name such as `:(exclude)*` must not exclude
+   * every path and fake a converged tree.  It is a global option and
+   * therefore must precede the `diff` subcommand.
+   */
+  async treesAgreeOnPaths(input: Readonly<{
+    repositoryPath: string;
+    leftCommit: string;
+    rightCommit: string;
+    paths: readonly string[];
+  }>): Promise<boolean> {
+    if (input.paths.length === 0) return false;
+    return gitSucceeds([
+      "-C", input.repositoryPath,
+      "--literal-pathspecs",
+      "diff", "--quiet",
+      input.leftCommit, input.rightCommit,
+      "--", ...input.paths
+    ]);
+  }
+
+  /**
+   * Every path changed between two commits.  The integration queue uses this
+   * to fence a validated entry: a target advance whose real path delta
+   * overlaps the entry's own paths (or whose impact cannot be proven)
+   * invalidates the entry's reusable evidence.
+   */
+  async changedFilesBetween(input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>): Promise<string[]> {
+    const output = await git([
+      "-C", input.repositoryPath,
+      "diff", "--name-only",
+      input.fromCommit, input.toCommit
+    ]);
+    return output.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  }
+
+  /**
+   * Files deleted between two commits.  Uses `--diff-filter=D` so a rename
+   * reports its source path here (and its destination in `changedFilesBetween`),
+   * letting the containment proof verify both sides of a rename.
+   */
+  async deletedFilesBetween(input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>): Promise<string[]> {
+    const output = await git([
+      "-C", input.repositoryPath,
+      "diff", "--name-only", "--diff-filter=D", "--no-renames",
+      input.fromCommit, input.toCommit
+    ]);
+    return output.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
   }
 
   /**
@@ -547,6 +618,24 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       baseRef: ref,
       baseCommit: baseCommit.toLowerCase()
     };
+  }
+
+  async assertRefAt(
+    repositoryPath: string,
+    ref: string,
+    expectedCommit: string
+  ): Promise<void> {
+    const root = (await this.inspect(repositoryPath)).root;
+    // `git update-ref <ref> <new> <old>` is atomic: it succeeds only when the
+    // ref still points at <old>.  Using the same commit for both new and old
+    // makes it a pure compare-and-swap probe — the ref does not move, but a
+    // concurrent advance between the last read and this call is detected.
+    await git([
+      "-C", root, "update-ref",
+      safeRef(ref),
+      expectedCommit,
+      expectedCommit
+    ]);
   }
 
   async refExists(repositoryPath: string, ref: string): Promise<boolean> {

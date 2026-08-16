@@ -396,10 +396,12 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     requireText(round.report ?? "", "Review report");
     validateChecks(round.checks ?? []);
     if (round.evidenceCommit !== undefined) {
+      // The exact commit on which the review's checks ran.  Equals the base
+      // when the reviewer ran checks on the frozen candidate tree; differs
+      // when the reviewer committed diagnostics on top of it.  A dirty
+      // review with uncommitted changes records no evidenceCommit, since no
+      // single commit captures the checked tree.
       requireCommit(round.evidenceCommit, "Review evidence commit");
-      if (round.evidenceCommit === round.reviewBaseCommit) {
-        throw new Error("Review evidence commit must differ from its review base.");
-      }
     }
     requireTimestamp(round.endedAt ?? "", "ReviewRound endedAt");
   } else if (round.summary !== undefined

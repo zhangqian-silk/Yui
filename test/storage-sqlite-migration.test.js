@@ -219,7 +219,7 @@ function setupLayout6Home() {
   };
 
   const changeSet = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "change-set-1",
     taskId: task.id,
     projectId: project.id,
@@ -232,7 +232,7 @@ function setupLayout6Home() {
   };
 
   const integrationAttempt = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "integration-1",
     taskId: task.id,
     projectId: project.id,

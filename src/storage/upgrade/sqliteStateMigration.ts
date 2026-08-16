@@ -44,6 +44,7 @@ import type { HomeIdentity } from "../../repository/homeIdentity.js";
 import type { AgentProfile } from "../../profile/agentProfile.js";
 import type { ChangeSet } from "../../integration/changeSet.js";
 import type { IntegrationAttempt } from "../../integration/integrationAttempt.js";
+import type { IntegrationQueueEntry } from "../../integration/integrationQueueEntry.js";
 import type { GlobalRole, TaskRole } from "../../role/role.js";
 import type { LeaderFailure } from "../../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../../scheduler/operatorNotification.js";
@@ -142,6 +143,7 @@ interface StoredTaskShape {
   reviewRounds: Record<string, Record<string, unknown>>;
   changeSets: Record<string, Record<string, unknown>>;
   integrationAttempts: Record<string, Record<string, unknown>>;
+  integrationQueue: Record<string, Record<string, unknown>>;
   activeRuns: Record<string, { schemaVersion: number; runId: string }>;
   messages: Record<string, Record<string, unknown>>;
   inputRequests: Record<string, Record<string, unknown>>;
@@ -166,6 +168,7 @@ function asStoredTask(value: unknown): StoredTaskShape {
     reviewRounds: asObjectMap(record.reviewRounds),
     changeSets: asObjectMap(record.changeSets),
     integrationAttempts: asObjectMap(record.integrationAttempts),
+    integrationQueue: asObjectMap(record.integrationQueue),
     activeRuns: asObjectMap(record.activeRuns) as unknown as Record<string, { schemaVersion: number; runId: string }>,
     messages: asObjectMap(record.messages),
     inputRequests: asObjectMap(record.inputRequests),
@@ -269,6 +272,9 @@ export function populateSqliteFromState(
         }
         for (const attempt of Object.values(stored.integrationAttempts)) {
           store.saveIntegrationAttempt(taskId, attempt as unknown as IntegrationAttempt);
+        }
+        for (const entry of Object.values(stored.integrationQueue)) {
+          store.saveIntegrationQueueEntry(taskId, entry as unknown as IntegrationQueueEntry);
         }
         // Active-run pointers: the document stores { schemaVersion, runId }
         // keyed by pointer; the store derives the pointer from the Run.
@@ -388,6 +394,7 @@ export function computeStateFamilyChecksums(
   const reviewRounds: unknown[] = [];
   const changeSets: unknown[] = [];
   const integrationAttempts: unknown[] = [];
+  const integrationQueue: unknown[] = [];
   const activeRunPointers: unknown[] = [];
   const messages: unknown[] = [];
   const inputRequests: unknown[] = [];
@@ -408,6 +415,7 @@ export function computeStateFamilyChecksums(
     reviewRounds.push(...Object.values(stored.reviewRounds));
     changeSets.push(...Object.values(stored.changeSets));
     integrationAttempts.push(...Object.values(stored.integrationAttempts));
+    integrationQueue.push(...Object.values(stored.integrationQueue));
     activeRunPointers.push(...Object.values(stored.activeRuns));
     messages.push(...Object.values(stored.messages));
     inputRequests.push(...Object.values(stored.inputRequests));
@@ -428,6 +436,7 @@ export function computeStateFamilyChecksums(
   checksums.reviewRound = hashRecords(reviewRounds);
   checksums.changeSet = hashRecords(changeSets);
   checksums.integrationAttempt = hashRecords(integrationAttempts);
+  checksums.integrationQueue = hashRecords(integrationQueue);
   checksums.activeRunPointer = hashRecords(activeRunPointers);
   checksums.message = hashRecords(messages);
   checksums.inputRequest = hashRecords(inputRequests);
@@ -531,6 +540,10 @@ export function computeDbFamilyChecksums(
     checksums.integrationAttempt = hashPayloadTable(
       db,
       "SELECT payload FROM integration_attempts"
+    );
+    checksums.integrationQueue = hashPayloadTable(
+      db,
+      "SELECT payload FROM integration_queue"
     );
     checksums.activeRunPointer = hashPayloadTable(db, "SELECT payload FROM active_runs");
     checksums.message = hashPayloadTable(db, "SELECT payload FROM messages");

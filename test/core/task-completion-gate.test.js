@@ -10,13 +10,16 @@ import { preflightTaskCompletion } from "../../dist/commands/taskCommands.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import {
   createIntegrationAttempt,
+  supersedeIntegration,
   updateIntegrationAttempt
 } from "../../dist/integration/integrationAttempt.js";
+import { enqueueIntegrationQueueEntry } from "../../dist/integration/integrationQueueService.js";
 import { createInputRequest } from "../../dist/input/inputRequest.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import {
   attachReviewRoundWorkspace,
   createTaskReviewRound,
+  finishReviewRound,
   startReviewRound
 } from "../../dist/review/reviewRound.js";
 import { yieldAgentRun } from "../../dist/run/agentRun.js";
@@ -27,6 +30,7 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
 import {
   createWorkItem,
+  retireWorkItem,
   submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
@@ -595,4 +599,331 @@ test("completion preflight returns a no-op for a completed Task without inspecti
   const result = preflightTaskCompletion(fx.task.id, fx.store);
   assert.equal(result.completed, true);
   assert.equal(result.task.id, fx.task.id);
+});
+
+test("completion preflight rejects non-terminal integration queue work", async (t) => {
+  const fx = fixture(t);
+  await seedCommittedIntegration(fx);
+
+  const source = join(fx.root, "queued-source");
+  execFileSync("git", [
+    "-C", fx.checkout, "worktree", "add", "--detach", "-q", source, fx.base
+  ]);
+  git(source, ["config", "user.name", "Yui Test"]);
+  git(source, ["config", "user.email", "yui@example.invalid"]);
+  writeFileSync(join(source, "queued.txt"), "still waiting\n");
+  git(source, ["add", "queued.txt"]);
+  git(source, ["commit", "-qm", "queued but not settled"]);
+  const queuedHead = git(source, ["rev-parse", "HEAD"]);
+
+  let item = createWorkItem("work-item-2", fx.task.id, {
+    title: "Retired after enqueue",
+    writeProjectIds: [fx.project.id]
+  }, NOW);
+  item = updateWorkItemStatus(item, "running", NOW);
+  item = submitWorkItemCandidate(item, {
+    summary: "Candidate later abandoned",
+    source: { type: "direct" }
+  }, NOW);
+  fx.store.saveWorkItem(fx.task.id, item);
+  const changeSet = createWorkItemChangeSet({
+    id: "change-set-2",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    workItemId: item.id,
+    baseCommit: fx.base,
+    headCommit: queuedHead,
+    branch: "queued-source",
+    changedPaths: ["queued.txt"]
+  }, NOW);
+  fx.store.saveChangeSet(fx.task.id, changeSet);
+  const queued = await enqueueIntegrationQueueEntry({
+    store: fx.store,
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    changeSetId: changeSet.id,
+    targetRef: "main",
+    now: () => NOW
+  });
+  assert.equal(queued.entry.status, "queued");
+  fx.store.saveWorkItem(fx.task.id, retireWorkItem(item, {
+    by: "leader",
+    summary: "abandon this Candidate"
+  }, NOW));
+
+  assert.throws(
+    () => preflightTaskCompletion(fx.task.id, fx.store),
+    /integration queue|queue entry/iu
+  );
+});
+
+test("completion reconciliation skips a moved remote for a frozen Task baseline", async (t) => {
+  const fx = fixture(t);
+  const { entry, taskHead } = await seedCommittedIntegration(fx);
+  // A completed Task-final Review for the exact current head freezes the
+  // Task baseline: the delivery has been reviewed and approved, so the
+  // completion gate must not merge unreviewed remote changes.
+  const round = finishReviewRound(
+    createTaskReviewRound(
+      "review-round-1",
+      fx.task.id,
+      "work-item-1",
+      "candidate-1",
+      "reviewer",
+      "leader",
+      { schemaVersion: 1, projects: [{ projectId: fx.project.id, commit: taskHead }] },
+      NOW
+    ),
+    "completed",
+    "Clean Task-final review",
+    NOW
+  );
+  fx.store.saveReviewRound(fx.task.id, round);
+  const beforeIntegrations = fx.store.listIntegrationAttempts(fx.task.id).length;
+  advanceRemote(fx);
+
+  const reconciled = await reconcileTaskRemoteBaselines(
+    fx.task.id,
+    fx.store,
+    fx.home,
+    { git: new NodeGitWorkspace(), now: () => new Date(NOW) }
+  );
+  assert.equal(reconciled.length, 0);
+  assert.equal(fx.store.listIntegrationAttempts(fx.task.id).length, beforeIntegrations);
+  assert.equal(git(entry.path, ["rev-parse", "HEAD"]), taskHead);
+});
+
+test("supersedeIntegration marks a committed Integration obsolete with an audit trail", (t) => {
+  const fx = fixture(t);
+  const committed = updateIntegrationAttempt(createIntegrationAttempt({
+    id: "integration-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    targetRef: "main",
+    expectedHead: fx.base,
+    changeSetIds: ["change-set-1"],
+    checkCommands: []
+  }, NOW), { status: "committed", candidateCommit: fx.base }, NOW);
+
+  const superseded = supersedeIntegration(committed, "Polluted by remote SQLite merge", NOW);
+  assert.equal(superseded.status, "superseded");
+  assert.equal(superseded.candidateCommit, fx.base);
+  assert.equal(superseded.endedAt, NOW.toISOString());
+  const audit = superseded.checks?.find((check) => check.name === "superseded");
+  assert.ok(audit);
+  assert.equal(audit.outcome, "failed");
+  assert.equal(audit.details, "Polluted by remote SQLite merge");
+});
+
+test("supersedeIntegration rejects a non-committed or already superseded Integration", (t) => {
+  const fx = fixture(t);
+  const running = createIntegrationAttempt({
+    id: "integration-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    targetRef: "main",
+    expectedHead: fx.base,
+    changeSetIds: ["change-set-1"],
+    checkCommands: []
+  }, NOW);
+  assert.throws(
+    () => supersedeIntegration(running, "not committed yet", NOW),
+    /cannot be superseded from running/u
+  );
+  const superseded = supersedeIntegration(
+    updateIntegrationAttempt(running, { status: "committed", candidateCommit: fx.base }, NOW),
+    "first",
+    NOW
+  );
+  assert.throws(
+    () => supersedeIntegration(superseded, "already obsolete", NOW),
+    /cannot be superseded from superseded/u
+  );
+});
+
+test("CLI task integration supersede marks a committed Integration obsolete", async (t) => {
+  const fx = fixture(t);
+  const { taskHead } = await seedCommittedIntegration(fx);
+
+  const cliEnv = { ...process.env, YUI_HOME: fx.home };
+  delete cliEnv.YUI_CONTROL_PLANE_DESCRIPTOR;
+  delete cliEnv.YUI_TASK_RUNTIME_DESCRIPTOR;
+  delete cliEnv.YUI_SESSION_SCOPE;
+  const output = execFileSync(
+    process.execPath,
+    [
+      join(process.cwd(), "dist", "cli.js"),
+      "task", "integration", "supersede",
+      `${fx.task.id}/integration-1`,
+      "--reason", "Polluted by remote SQLite merge"
+    ],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: cliEnv
+    }
+  );
+  assert.match(output, /Superseded Integration integration-1/u);
+  const stored = fx.store.getIntegrationAttempt(fx.task.id, "integration-1");
+  assert.equal(stored.status, "superseded");
+  assert.ok(stored.endedAt);
+  const audit = stored.checks?.find((check) => check.name === "superseded");
+  assert.ok(audit);
+  assert.equal(audit.details, "Polluted by remote SQLite merge");
+});
+
+test("task integration supersede rejects a managed non-Leader session", async (t) => {
+  const fx = fixture(t);
+  await seedCommittedIntegration(fx);
+
+  // Test the authorization fence directly: a managed Worker session
+  // must not be able to supersede a committed Integration
+  const { taskActor } = await import("../../dist/commands/taskActor.js");
+  assert.throws(
+    () => taskActor(
+      { YUI_SESSION_SCOPE: "task", YUI_TASK_ID: fx.task.id, YUI_ROLE: "worker" },
+      fx.task.id
+    ),
+    /only as the matching Leader|may perform this action only/u
+  );
+  // A Leader session is allowed
+  assert.equal(
+    taskActor(
+      { YUI_SESSION_SCOPE: "task", YUI_TASK_ID: fx.task.id, YUI_ROLE: "leader" },
+      fx.task.id
+    ),
+    "leader"
+  );
+  // A user session (no managed env) is allowed
+  assert.equal(taskActor({}, fx.task.id), "user");
+});
+
+test("task integration supersede rejects a queue-backed committed Attempt", async (t) => {
+  const fx = fixture(t);
+  await seedCommittedIntegration(fx);
+
+  // Create a queue entry that references the committed Integration
+  const queueEntry = {
+    schemaVersion: 1,
+    id: "integration-queue-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    changeSetId: "change-set-1",
+    targetRef: fx.store.getTaskWorkspace(fx.task.id).entries[0].branch,
+    checkCommands: [],
+    evidenceRefs: [],
+    status: "committed",
+    targetAfter: fx.store.getIntegrationAttempt(fx.task.id, "integration-1").candidateCommit,
+    integrationAttemptId: "integration-1",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString(),
+    endedAt: NOW.toISOString()
+  };
+  fx.store.saveIntegrationQueueEntry(fx.task.id, queueEntry);
+
+  const cliEnv = { ...process.env, YUI_HOME: fx.home };
+  delete cliEnv.YUI_CONTROL_PLANE_DESCRIPTOR;
+  delete cliEnv.YUI_TASK_RUNTIME_DESCRIPTOR;
+  delete cliEnv.YUI_SESSION_SCOPE;
+  assert.throws(
+    () => execFileSync(
+      process.execPath,
+      [
+        join(process.cwd(), "dist", "cli.js"),
+        "task", "integration", "supersede",
+        `${fx.task.id}/integration-1`,
+        "--reason", "Queue-backed attempt"
+      ],
+      { cwd: process.cwd(), encoding: "utf8", env: cliEnv }
+    ),
+    /queue entry|backed by a committed queue/u
+  );
+  const stored = fx.store.getIntegrationAttempt(fx.task.id, "integration-1");
+  assert.equal(stored.status, "committed");
+});
+
+test("task integration supersede rejects a crash-window queue-backed committed Attempt", async (t) => {
+  const fx = fixture(t);
+  await seedCommittedIntegration(fx);
+
+  // This is the supported recovery state produced when the Integration target
+  // and Attempt commit, but the queue processor exits before settling the
+  // running entry. processIntegrationQueue normally converges it on restart.
+  const queueEntry = {
+    schemaVersion: 1,
+    id: "integration-queue-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    changeSetId: "change-set-1",
+    targetRef: fx.store.getTaskWorkspace(fx.task.id).entries[0].branch,
+    checkCommands: [],
+    evidenceRefs: [],
+    status: "running",
+    targetBefore: fx.base,
+    integrationAttemptId: "integration-1",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString()
+  };
+  fx.store.saveIntegrationQueueEntry(fx.task.id, queueEntry);
+
+  const cliEnv = { ...process.env, YUI_HOME: fx.home };
+  delete cliEnv.YUI_CONTROL_PLANE_DESCRIPTOR;
+  delete cliEnv.YUI_TASK_RUNTIME_DESCRIPTOR;
+  delete cliEnv.YUI_SESSION_SCOPE;
+  let rejected = false;
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        join(process.cwd(), "dist", "cli.js"),
+        "task", "integration", "supersede",
+        `${fx.task.id}/integration-1`,
+        "--reason", "Queue settle crash window"
+      ],
+      { cwd: process.cwd(), encoding: "utf8", env: cliEnv }
+    );
+  } catch (error) {
+    assert.match(String(error), /queue entry|backed by a committed queue/u);
+    rejected = true;
+  }
+  assert.deepEqual({
+    rejected,
+    attemptStatus: fx.store.getIntegrationAttempt(fx.task.id, "integration-1").status,
+    entryStatus: fx.store.getIntegrationQueueEntry(fx.task.id, "integration-queue-1").status
+  }, {
+    rejected: true,
+    attemptStatus: "committed",
+    entryStatus: "running"
+  });
+});
+
+test("completion reconciliation re-checks frozen baseline after async fetch", async (t) => {
+  const fx = fixture(t);
+  const { taskHead } = await seedCommittedIntegration(fx);
+  advanceRemote(fx);
+
+  // Create a completed Task-final Review for the exact current head
+  const round = finishReviewRound(
+    createTaskReviewRound(
+      "review-round-1",
+      fx.task.id,
+      "work-item-1",
+      "candidate-1",
+      "reviewer",
+      "leader",
+      { schemaVersion: 1, projects: [{ projectId: fx.project.id, commit: taskHead }] },
+      NOW
+    ),
+    "completed",
+    "Clean review for frozen baseline",
+    NOW
+  );
+  fx.store.saveReviewRound(fx.task.id, round);
+
+  // The reconciliation should skip this Project because the baseline is frozen
+  const reconciled = await reconcileTaskRemoteBaselines(fx.task.id, fx.store, fx.home, {
+    now: () => NOW,
+    environment: { ...process.env, YUI_HOME: fx.home }
+  });
+  assert.equal(reconciled.length, 0);
 });

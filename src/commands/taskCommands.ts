@@ -440,6 +440,15 @@ export function preflightTaskCompletion(
       `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
     );
   }
+  const unsettledQueueEntry = store.listIntegrationQueueEntries(task.id).find((entry) => (
+    entry.status !== "committed" && entry.status !== "superseded"
+  ));
+  if (unsettledQueueEntry !== undefined) {
+    throw usageError(
+      `Task ${task.id} has an unsettled integration queue entry: `
+      + `${unsettledQueueEntry.id}/${unsettledQueueEntry.status}.`
+    );
+  }
   const isolatedWorkspace = store.listManagedWorkspaces(task.id)
     .find(({ owner }) => owner.type === "work-item");
   if (isolatedWorkspace?.owner.type === "work-item") {
@@ -2782,12 +2791,19 @@ function acceptWork(
         "A ReviewRound-owned workspace cannot be used for WorkItem acceptance."
       );
     }
-    const evidenceCommits = new Set(tx.listReviewRounds(item.taskId)
-      .flatMap(({ evidenceCommit }) => evidenceCommit === undefined ? [] : [evidenceCommit]));
+    // Only diagnostic evidence commits (a reviewer's own commit on top of the
+    // frozen base) are barred from WorkItem acceptance.  A clean review
+    // attests the frozen base itself (evidenceCommit === reviewBaseCommit),
+    // which is the candidate's own head.
+    const diagnosticEvidence = new Set(tx.listReviewRounds(item.taskId)
+      .flatMap(({ evidenceCommit, reviewBaseCommit }) =>
+        evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit
+          ? [evidenceCommit]
+          : []));
     if (options.workItemIntegrationProof?.projects.some(
-      ({ headCommit }) => evidenceCommits.has(headCommit)
+      ({ headCommit }) => diagnosticEvidence.has(headCommit)
     )) {
-      throw usageError("A ReviewRound evidence commit cannot be used for WorkItem acceptance.");
+      throw usageError("A ReviewRound diagnostic evidence commit cannot be used for WorkItem acceptance.");
     }
     const candidate = requireWorkItemCandidate(item);
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
@@ -3219,29 +3235,34 @@ function resolveReviewExecutionGroup(
         : selectedLaneIds === undefined ? {} : { selectedLaneIds })
     }, now);
     const withGroup = updateReviewExecutionGroup(round, resolved);
-    const laneReports = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const selectedLanes = resolved.lanes
+      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false);
+    const laneReports = selectedLanes
       .map((lane) => lane.result?.report ?? lane.result?.summary ?? "")
       .filter((report) => report.length > 0);
-    const checks = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const checks = selectedLanes
       .flatMap((lane) => lane.result?.checks ?? [])
       .map(({ name, outcome, details }) => ({
         name,
         outcome,
         ...(details === undefined ? {} : { details })
       }));
-    const findings = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const findings = selectedLanes
       .flatMap((lane) => lane.result?.findings ?? []);
-    const evidence = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const evidence = selectedLanes
       .flatMap((lane) => lane.result?.evidence ?? []);
-    const evidenceCommits = [...new Set(resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
+    const evidenceCommits = [...new Set(selectedLanes
       .map((lane) => lane.result?.evidenceCommit)
       .filter((commit): commit is string => commit !== undefined))];
-    const evidenceCommit = evidenceCommits.length === 1 ? evidenceCommits[0] : undefined;
+    // A Round attests a single tree only when EVERY selected Lane attests it.
+    // A dirty Lane (no evidenceCommit) ran checks on an uncommitted tree, so its
+    // checks cannot be covered by another Lane's base attestation.
+    const allLanesAttest = selectedLanes.every(
+      (lane) => lane.result?.evidenceCommit !== undefined
+    );
+    const evidenceCommit = allLanesAttest && evidenceCommits.length === 1
+      ? evidenceCommits[0]
+      : undefined;
     const terminal = finishReviewRound(
       withGroup,
       decision === "accept" ? "completed" : "failed",

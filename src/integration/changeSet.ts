@@ -5,6 +5,10 @@ import {
   requireTimestamp
 } from "../domain/validation.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import {
+  validateChangeSetManifest,
+  type ChangeSetManifest
+} from "./changeSetManifest.js";
 
 type ChangeSetIdentity = Readonly<{
   id: string;
@@ -18,8 +22,14 @@ type ChangeSetIdentity = Readonly<{
 }>;
 
 export type WorkItemChangeSet = ChangeSetIdentity & Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   workItemId: string;
+  /**
+   * Optional integration manifest.  ChangeSets written by older Yui releases
+   * have none and still integrate; overlap diagnostics degrade to path-only
+   * analysis for them.
+   */
+  manifest?: ChangeSetManifest;
 }>;
 
 export type ChangeSet = WorkItemChangeSet;
@@ -33,15 +43,18 @@ export function createWorkItemChangeSet(
   now: Date
 ): WorkItemChangeSet {
   return validateChangeSet({
-    schemaVersion: 2,
+    schemaVersion: 3,
     ...input,
     changedPaths: [...input.changedPaths],
+    ...(input.manifest === undefined
+      ? {}
+      : { manifest: validateChangeSetManifest(input.manifest) }),
     createdAt: now.toISOString()
   });
 }
 
 export function validateChangeSet<T extends ChangeSet>(changeSet: T): T {
-  if (changeSet.schemaVersion !== 2) throw new Error("ChangeSet must use schemaVersion 2.");
+  if (changeSet.schemaVersion !== 3) throw new Error("ChangeSet must use schemaVersion 3.");
   validateTaskRecordReference({ taskId: changeSet.taskId, localId: changeSet.id }, "changeSet");
   validateTaskRecordReference({
     taskId: changeSet.taskId,
@@ -55,6 +68,15 @@ export function validateChangeSet<T extends ChangeSet>(changeSet: T): T {
   }
   requireText(changeSet.branch, "ChangeSet branch");
   normalizedUniqueText(changeSet.changedPaths, "ChangeSet path");
+  if (changeSet.manifest !== undefined) {
+    const manifest = validateChangeSetManifest(changeSet.manifest);
+    const changed = new Set(changeSet.changedPaths);
+    for (const deleted of manifest.deletedPaths) {
+      if (!changed.has(deleted)) {
+        throw new Error(`ChangeSet manifest deleted path is not a changed path: ${deleted}.`);
+      }
+    }
+  }
   requireTimestamp(changeSet.createdAt, "ChangeSet createdAt");
   return changeSet;
 }

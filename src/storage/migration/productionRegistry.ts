@@ -35,6 +35,12 @@ const ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION = 2;
 const ACTIVE_RUN_POINTER_NAMESPACE_TO_VERSION = 3;
 const MANAGED_WORKSPACE_FROM_VERSION = 1;
 const MANAGED_WORKSPACE_TO_VERSION = 2;
+const CHANGE_SET_MANIFEST_FROM_VERSION = 2;
+const CHANGE_SET_MANIFEST_TO_VERSION = 3;
+const INTEGRATION_ATTEMPT_FROM_VERSION = 2;
+const INTEGRATION_ATTEMPT_TO_VERSION = 3;
+const INTEGRATION_QUEUE_FROM_VERSION = 0;
+const INTEGRATION_QUEUE_TO_VERSION = 1;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -107,7 +113,10 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       "activeRuns"
     ))
     .registerOfflineMigration(managedWorkspaceFamilyStep())
-    .registerOfflineMigration(activeRunPointerNamespaceStep());
+    .registerOfflineMigration(activeRunPointerNamespaceStep())
+    .registerOfflineMigration(changeSetManifestStep())
+    .registerOfflineMigration(integrationAttemptSupersededStep())
+    .registerOfflineMigration(integrationQueueIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
@@ -468,6 +477,245 @@ function migrateActiveRunPointerNamespace(snapshot: HomeSnapshot): HomeSnapshot 
       }
     }
     nextTasks[taskId] = { ...task, activeRuns: nextActiveRuns };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * ChangeSet v3 adds the optional integration manifest (tags, deleted paths,
+ * target ref, evidence references).  The manifest is optional, so the
+ * transition only rewrites the record version; legacy records without a
+ * manifest remain valid and keep integrating.
+ */
+function changeSetManifestStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "changeSet",
+    fromVersion: CHANGE_SET_MANIFEST_FROM_VERSION,
+    toVersion: CHANGE_SET_MANIFEST_TO_VERSION,
+    preconditions: requireChangeSetManifestVersion,
+    transform: migrateChangeSetManifest,
+    declaredEffects: []
+  };
+}
+
+function requireChangeSetManifestVersion(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.changeSet !== CHANGE_SET_MANIFEST_FROM_VERSION) {
+    throw new Error(
+      `Record changeSet migration requires manifest version ${CHANGE_SET_MANIFEST_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.changeSets === undefined) continue;
+    const changeSets = asObject(task.changeSets, `changeSet map ${taskId}`);
+    for (const [changeSetId, rawRecord] of Object.entries(changeSets)) {
+      const record = asObject(rawRecord, `changeSet ${taskId}/${changeSetId}`);
+      if (record.schemaVersion !== CHANGE_SET_MANIFEST_FROM_VERSION) {
+        throw new Error(
+          `changeSet ${taskId}/${changeSetId} must use schemaVersion ${CHANGE_SET_MANIFEST_FROM_VERSION}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateChangeSetManifest(snapshot: HomeSnapshot): HomeSnapshot {
+  requireChangeSetManifestVersion(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      changeSet: CHANGE_SET_MANIFEST_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.changeSets === undefined) {
+      nextTasks[taskId] = { ...task };
+      continue;
+    }
+    const changeSets = asObject(task.changeSets, `changeSet map ${taskId}`);
+    const nextChangeSets: Record<string, unknown> = {};
+    for (const [changeSetId, rawRecord] of Object.entries(changeSets)) {
+      const record = asObject(rawRecord, `changeSet ${taskId}/${changeSetId}`);
+      nextChangeSets[changeSetId] = {
+        ...record,
+        schemaVersion: CHANGE_SET_MANIFEST_TO_VERSION
+      };
+    }
+    nextTasks[taskId] = { ...task, changeSets: nextChangeSets };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * IntegrationAttempt v2->v3 adds the "superseded" terminal status for
+ * committed Integrations that are obsolete.  The migration preserves all
+ * existing fields and advances the schema version; the new status is
+ * opt-in, so old records remain valid until explicitly superseded.
+ */
+function integrationAttemptSupersededStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "integrationAttempt",
+    fromVersion: INTEGRATION_ATTEMPT_FROM_VERSION,
+    toVersion: INTEGRATION_ATTEMPT_TO_VERSION,
+    preconditions: requireIntegrationAttemptV2,
+    transform: migrateIntegrationAttemptV2ToV3,
+    declaredEffects: []
+  };
+}
+
+function requireIntegrationAttemptV2(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.integrationAttempt !== INTEGRATION_ATTEMPT_FROM_VERSION) {
+    throw new Error(
+      `Record integrationAttempt migration requires manifest version ${INTEGRATION_ATTEMPT_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.integrationAttempts === undefined) continue;
+    const attempts = asObject(task.integrationAttempts, `integrationAttempt map ${taskId}`);
+    for (const [attemptId, rawRecord] of Object.entries(attempts)) {
+      const record = asObject(rawRecord, `integrationAttempt ${taskId}/${attemptId}`);
+      if (record.schemaVersion !== INTEGRATION_ATTEMPT_FROM_VERSION) {
+        throw new Error(
+          `integrationAttempt ${taskId}/${attemptId} must use schemaVersion ${INTEGRATION_ATTEMPT_FROM_VERSION}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateIntegrationAttemptV2ToV3(snapshot: HomeSnapshot): HomeSnapshot {
+  requireIntegrationAttemptV2(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      integrationAttempt: INTEGRATION_ATTEMPT_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.integrationAttempts === undefined) {
+      nextTasks[taskId] = { ...task };
+      continue;
+    }
+    const attempts = asObject(task.integrationAttempts, `integrationAttempt map ${taskId}`);
+    const nextAttempts: Record<string, unknown> = {};
+    for (const [attemptId, rawRecord] of Object.entries(attempts)) {
+      const record = asObject(rawRecord, `integrationAttempt ${taskId}/${attemptId}`);
+      nextAttempts[attemptId] = {
+        ...record,
+        schemaVersion: INTEGRATION_ATTEMPT_TO_VERSION
+      };
+    }
+    nextTasks[taskId] = { ...task, integrationAttempts: nextAttempts };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * The integration queue is a post-baseline per-Task record family.  Its
+ * explicit 0->1 introduction adds the empty map and its id high-water mark to
+ * every Task aggregate and the family to the record manifest; old Homes keep
+ * integrating without it until the queue is first used.
+ */
+function integrationQueueIntroductionStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "integrationQueue",
+    fromVersion: INTEGRATION_QUEUE_FROM_VERSION,
+    toVersion: INTEGRATION_QUEUE_TO_VERSION,
+    introduction: true,
+    preconditions: requireIntegrationQueueIntroduction,
+    transform: introduceIntegrationQueue,
+    declaredEffects: []
+  };
+}
+
+function requireIntegrationQueueIntroduction(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.integrationQueue !== undefined) {
+    throw new Error("integrationQueue is already introduced in the record manifest.");
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.integrationQueue !== undefined) {
+      throw new Error(`Task aggregate already carries an integrationQueue map: ${taskId}.`);
+    }
+  }
+}
+
+function introduceIntegrationQueue(snapshot: HomeSnapshot): HomeSnapshot {
+  requireIntegrationQueueIntroduction(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      integrationQueue: INTEGRATION_QUEUE_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const highWaterMarks = asObject(
+      task.idHighWaterMarks ?? {},
+      `Task id high-water marks ${taskId}`
+    );
+    nextTasks[taskId] = {
+      ...task,
+      idHighWaterMarks: { ...highWaterMarks, integrationQueue: 0 },
+      integrationQueue: {}
+    };
   }
   return {
     schemaManifest,

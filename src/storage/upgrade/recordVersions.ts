@@ -33,6 +33,7 @@ import {
   CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION,
   CURRENT_INPUT_REQUEST_SCHEMA_VERSION,
   CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
+  CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION,
   CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION,
   CURRENT_MESSAGE_SCHEMA_VERSION,
   CURRENT_MILESTONE_SCHEMA_VERSION,
@@ -78,6 +79,7 @@ const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object
   reviewRound: "state.json#/tasks/*/reviewRounds",
   changeSet: "state.json#/tasks/*/changeSets",
   integrationAttempt: "state.json#/tasks/*/integrationAttempts",
+  integrationQueue: "state.json#/tasks/*/integrationQueue",
   activeRunPointer: "state.json#/tasks/*/activeRuns",
   message: "state.json#/tasks/*/messages",
   inputRequest: "state.json#/tasks/*/inputRequests",
@@ -145,6 +147,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
       integrationAttempt: descriptor(
         CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION,
         "state.json#/tasks/*/integrationAttempts"
+      ),
+      integrationQueue: descriptor(
+        CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION,
+        "state.json#/tasks/*/integrationQueue"
       ),
       activeRunPointer: descriptor(
         CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,

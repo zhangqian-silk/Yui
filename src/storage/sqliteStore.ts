@@ -57,6 +57,11 @@ import { generateHomeIdentity, type HomeIdentity } from "../repository/homeIdent
 import type { AgentProfile } from "../profile/agentProfile.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
+import {
+  validateIntegrationQueueEntry,
+  type IntegrationQueueEntry,
+  type IntegrationQueueStatus
+} from "../integration/integrationQueueEntry.js";
 import type { GlobalRole, TaskRole } from "../role/role.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
@@ -289,6 +294,25 @@ export class SqliteTaskStore implements TaskStore {
           this.#bumpRevision();
         }
       }
+      this.#commit();
+      return result;
+    } catch (error) {
+      this.#rollback();
+      throw error;
+    }
+  }
+
+  /** Async transaction seam used by queue operations that must inspect Git
+   * before committing the durable queue state. The SQLite write transaction
+   * remains open across the awaited callback, matching FileTaskStore's
+   * transactionAsync semantics and preserving the single-writer boundary. */
+  async transactionAsync<T>(execute: (store: TaskStore) => Promise<T>): Promise<T> {
+    if (this.#inTransaction) return execute(this);
+    this.#prepareWrite();
+    this.#begin();
+    try {
+      const result = await execute(this);
+      if (this.#dirty) this.#bumpRevision();
       this.#commit();
       return result;
     } catch (error) {
@@ -908,6 +932,69 @@ export class SqliteTaskStore implements TaskStore {
 
   getIntegrationAttempt(taskId: string, integrationId: string): IntegrationAttempt | null {
     return this.#getPayload<IntegrationAttempt>("integration_attempts", "task_id = ? AND integration_id = ?", [taskId, integrationId]);
+  }
+
+  // -- integration queue -----------------------------------------------------
+
+  nextIntegrationQueueEntryId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "integrationQueue");
+  }
+
+  saveIntegrationQueueEntry(taskId: string, entry: IntegrationQueueEntry): void {
+    if (entry.taskId !== taskId) {
+      throw new StorageRecordError(`Integration queue entry belongs to another Task: ${entry.taskId}`);
+    }
+    validateIntegrationQueueEntry(entry);
+    this.#requireTask(taskId);
+    const changeSet = this.getChangeSet(taskId, entry.changeSetId);
+    if (changeSet === null) {
+      throw new StorageRecordError(`Integration queue ChangeSet not found: ${entry.changeSetId}`);
+    }
+    if (changeSet.projectId !== entry.projectId) {
+      throw new StorageRecordError(`Integration queue ChangeSet belongs to another Project: ${entry.changeSetId}`);
+    }
+    const existing = this.getIntegrationQueueEntry(taskId, entry.id);
+    if (existing !== null) {
+      if (Date.parse(entry.updatedAt) < Date.parse(existing.updatedAt)) {
+        throw new StorageRecordError(`Integration queue entry updatedAt cannot move backwards: ${entry.id}`);
+      }
+      if (!validIntegrationQueueTransition(existing, entry)) {
+        throw new StorageRecordError(`Integration queue entry transition is invalid: ${entry.id}`);
+      }
+    }
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO integration_queue (queue_id, task_id, project_id, change_set, status, payload, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(queue_id) DO UPDATE SET task_id = excluded.task_id,
+           project_id = excluded.project_id, change_set = excluded.change_set,
+           status = excluded.status, payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(
+        entry.id,
+        taskId,
+        entry.projectId,
+        entry.changeSetId,
+        entry.status,
+        this.#json(entry),
+        entry.createdAt,
+        entry.updatedAt
+      );
+    });
+  }
+
+  listIntegrationQueueEntries(taskId: string): IntegrationQueueEntry[] {
+    return this.#sortById(
+      this.#listPayload<IntegrationQueueEntry>("integration_queue", "task_id = ?", [taskId]),
+      (entry) => entry.id
+    );
+  }
+
+  getIntegrationQueueEntry(taskId: string, entryId: string): IntegrationQueueEntry | null {
+    return this.#getPayload<IntegrationQueueEntry>(
+      "integration_queue",
+      "task_id = ? AND queue_id = ?",
+      [taskId, entryId]
+    );
   }
 
   // -- task roles -------------------------------------------------------------
@@ -1642,6 +1729,31 @@ export class SqliteTaskStore implements TaskStore {
       return result.changes;
     });
   }
+}
+
+function validIntegrationQueueTransition(
+  before: IntegrationQueueEntry,
+  after: IntegrationQueueEntry
+): boolean {
+  if (
+    before.id !== after.id
+    || before.taskId !== after.taskId
+    || before.projectId !== after.projectId
+    || before.changeSetId !== after.changeSetId
+    || before.targetRef !== after.targetRef
+    || !isDeepStrictEqual(before.checkCommands, after.checkCommands)
+    || !isDeepStrictEqual(before.evidenceRefs, after.evidenceRefs)
+    || before.createdAt !== after.createdAt
+  ) return false;
+  const allowed: Readonly<Record<IntegrationQueueStatus, readonly IntegrationQueueStatus[]>> = {
+    queued: ["queued", "running", "validated", "superseded"],
+    running: ["running", "conflicted", "committed"],
+    conflicted: ["conflicted", "running", "committed", "queued", "superseded"],
+    validated: ["validated", "running", "queued", "superseded"],
+    committed: ["committed"],
+    superseded: ["superseded"]
+  };
+  return allowed[before.status].includes(after.status);
 }
 
 

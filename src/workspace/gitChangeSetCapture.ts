@@ -6,6 +6,7 @@ const executeFile = promisify(execFile);
 export type ManagedGitChange = Readonly<{
   headCommit: string;
   changedPaths: readonly string[];
+  deletedPaths: readonly string[];
 }>;
 
 export async function captureManagedGitChanges(input: Readonly<{
@@ -35,13 +36,23 @@ export async function captureManagedGitChanges(input: Readonly<{
   }
   const headCommit = await assertManagedHead(input);
   if (headCommit === input.baseCommit) return null;
+  // Rename folding is disabled on purpose: a rename must record its source
+  // path as touched and deleted.  With rename detection a pure rename would
+  // surface only the destination, letting a target that added the same file
+  // in parallel (but kept the source) converge on a partial-tree proof.
   const changedPaths = (await git([
     "-C", input.path,
-    "diff", "--name-only", "-z",
+    "diff", "--no-renames", "--name-only", "-z",
     input.baseCommit,
     headCommit
   ])).split("\0").filter(Boolean);
-  return { headCommit, changedPaths };
+  const deletedPaths = (await git([
+    "-C", input.path,
+    "diff", "--no-renames", "--name-only", "-z", "--diff-filter=D",
+    input.baseCommit,
+    headCommit
+  ])).split("\0").filter(Boolean);
+  return { headCommit, changedPaths, deletedPaths };
 }
 
 async function assertManagedHead(input: Readonly<{
