@@ -21,6 +21,7 @@ import {
   CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,
   CURRENT_AGENT_RUN_SCHEMA_VERSION,
   CURRENT_CONFIG_SCHEMA_VERSION,
+  CURRENT_STORED_TASK_SCHEMA_VERSION,
   CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION
 } from "../dist/storage/taskStore.js";
 import { MigrationRegistry, createEmptyRegistry, planMigration } from "../dist/storage/migration/index.js";
@@ -307,7 +308,7 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
     Object.keys(versions).sort(),
     [
       "activeRunPointer", "agentProfile", "agentRun", "changeSet", "config",
-      "configuredAgent", "decision", "event", "globalRole", "globalRoleSessionSet",
+      "configuredAgent", "decision", "durableJob", "event", "globalRole", "globalRoleSessionSet",
       "inputRequest", "integrationAttempt", "integrationQueue", "leaderFailure", "managedWorkspace",
       "message", "milestone", "operatorNotification", "project", "reviewRound",
       "storedTask", "task", "taskBrief", "taskRole", "taskRoleSessionSet", "workItem",
@@ -995,7 +996,7 @@ test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-s
     // the strict aggregate loader must not run while this record axis is old.
     state.tasks = {
       "task-1": {
-        schemaVersion: 14,
+        schemaVersion: CURRENT_STORED_TASK_SCHEMA_VERSION,
         managedWorkspaces: {
           "task": { schemaVersion: 1 }
         }

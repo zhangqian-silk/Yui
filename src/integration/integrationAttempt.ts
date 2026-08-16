@@ -41,6 +41,13 @@ export type IntegrationAttempt = Readonly<{
   changeSetIds: readonly string[];
   checkCommands: readonly string[];
   candidateCommit?: string;
+  /**
+   * The DurableJob running the check commands, once the Controller has
+   * accepted it. A running attempt with a jobId never goes "no-check":
+   * the job is the source of truth and its terminal wakeup resumes the
+   * attempt through `integration continue`.
+   */
+  jobId?: string;
   status: IntegrationAttemptStatus;
   conflict?: ConflictReport;
   resolution?: ResolutionDecision;
@@ -73,6 +80,34 @@ export function createIntegrationAttempt(
     status: "running",
     createdAt: timestamp,
     updatedAt: timestamp
+  });
+}
+
+/**
+ * Bind the check DurableJob to a running attempt. Set-once: the job is the
+ * durable source of truth for the checks, so a retry of the start path must
+ * find the recorded job instead of spawning a second one.
+ */
+export function recordIntegrationCheckJob(
+  attempt: IntegrationAttempt,
+  jobId: string,
+  now: Date
+): IntegrationAttempt {
+  validateIntegrationAttempt(attempt);
+  if (attempt.status !== "running") {
+    throw new Error(`Integration check job can only bind a running attempt: ${attempt.status}.`);
+  }
+  if (attempt.jobId !== undefined) {
+    throw new Error(`Integration check job is already recorded: ${attempt.jobId}.`);
+  }
+  validateTaskRecordReference(
+    { taskId: attempt.taskId, localId: jobId },
+    "durableJob"
+  );
+  return validateIntegrationAttempt({
+    ...attempt,
+    jobId,
+    updatedAt: now.toISOString()
   });
 }
 
@@ -204,6 +239,12 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
   }
   if (attempt.candidateCommit !== undefined) {
     requireCommit(attempt.candidateCommit, "Integration candidate commit");
+  }
+  if (attempt.jobId !== undefined) {
+    validateTaskRecordReference(
+      { taskId: attempt.taskId, localId: attempt.jobId },
+      "durableJob"
+    );
   }
   if (![
     "running",

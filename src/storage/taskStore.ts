@@ -73,6 +73,12 @@ import {
   type IntegrationQueueStatus
 } from "../integration/integrationQueueEntry.js";
 import {
+  CURRENT_DURABLE_JOB_SCHEMA_VERSION,
+  validDurableJobTransition,
+  validateDurableJob,
+  type DurableJob
+} from "../job/durableJob.js";
+import {
   validateGlobalRole,
   validateTaskRole,
   type GlobalRole,
@@ -236,7 +242,7 @@ function executionLaneActiveRunKeyParts(key: string):
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 /** The schema version of each persisted `state.json#/tasks/*` aggregate. */
-export const CURRENT_STORED_TASK_SCHEMA_VERSION = 14 as const;
+export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
 
 /**
  * Persisted nested-record versions consumed by this store's strict parser.
@@ -255,9 +261,18 @@ type StoredTask = {
   changeSets: Record<string, ChangeSet>;
   integrationAttempts: Record<string, IntegrationAttempt>;
   integrationQueue: Record<string, IntegrationQueueEntry>;
+  durableJobs: Record<string, DurableJob>;
   roles: Record<string, TaskRole>;
   managedWorkspaces: Record<string, ManagedWorkspace>;
   roleSessionSets: Record<string, TaskRoleSessionSet>;
+  /**
+   * rr13: Per-Session DurableJob caller key hashes. Keyed by
+   * `${roleName}\0${agentId}`; the value is the SHA-256 hex digest of the
+   * `YUI_JOB_CALLER_KEY` injected at native Session launch. The plaintext key
+   * is never persisted — only the hash — so a client that reads durable state
+   * cannot replay a job.start/job.cancel caller. Absent hash = fail-closed.
+   */
+  jobCallerKeyHashes: Record<string, string>;
   workItems: Record<string, WorkItem>;
   agentRuns: Record<string, AgentRun>;
   reviewRounds: Record<string, ReviewRound>;
@@ -353,6 +368,13 @@ export type TaskStore = {
   saveIntegrationQueueEntry(taskId: string, entry: IntegrationQueueEntry): void;
   listIntegrationQueueEntries(taskId: string): IntegrationQueueEntry[];
   getIntegrationQueueEntry(taskId: string, entryId: string): IntegrationQueueEntry | null;
+  nextDurableJobId(taskId: string): string;
+  saveDurableJob(taskId: string, job: DurableJob): void;
+  listDurableJobs(taskId: string): DurableJob[];
+  getDurableJob(taskId: string, jobId: string): DurableJob | null;
+  findDurableJobByIdempotencyKey(taskId: string, key: string): DurableJob | null;
+  listAllDurableJobs(): DurableJob[];
+  hasActiveDurableJobs(): boolean;
   saveRole(taskId: string, role: TaskRole): void;
   listRoles(taskId: string): TaskRole[];
   getRole(taskId: string, name: string): TaskRole | null;
@@ -374,6 +396,10 @@ export type TaskStore = {
   saveRoleSessionSet(sessions: TaskRoleSessionSet): void;
   saveTaskRoleSessionSet(sessions: TaskRoleSessionSet): void;
   getRoleSession(taskId: string, roleName: string): RoleAgentSession | null;
+  /** rr13: Look up the durable hash for a Session's job caller key. */
+  getJobCallerKeyHash(taskId: string, roleName: string, agentId: string): string | null;
+  /** rr13: Persist the hash of a newly launched Session's job caller key. */
+  setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void;
   nextWorkItemId(taskId: string): string;
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
   listWorkItems(taskId: string): WorkItem[];
@@ -927,6 +953,73 @@ export class FileTaskStore implements TaskStore {
     return optional(this.#state().tasks[taskId]?.integrationQueue[entryId]);
   }
 
+  nextDurableJobId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "durableJob");
+  }
+  saveDurableJob(taskId: string, job: DurableJob): void {
+    const stored = identified<DurableJob>(
+      job,
+      CURRENT_DURABLE_JOB_SCHEMA_VERSION,
+      "id",
+      job.id,
+      "DurableJob"
+    );
+    validateDurableJob(stored);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`DurableJob belongs to another Task: ${stored.taskId}.`);
+    }
+    const aggregate = this.#requireTaskForWrite(taskId);
+    if (!aggregate.task.projectBindings.some(
+      ({ projectId }) => projectId === stored.projectId
+    )) {
+      throw new StorageRecordError(`DurableJob Project does not match Task: ${stored.id}.`);
+    }
+    const existing = aggregate.durableJobs[stored.id];
+    if (existing !== undefined) {
+      if (Date.parse(stored.updatedAt) < Date.parse(existing.updatedAt)) {
+        throw new StorageRecordError(
+          `DurableJob updatedAt cannot move backwards: ${stored.id}.`
+        );
+      }
+      if (!validDurableJobTransition(existing, stored)) {
+        throw new StorageRecordError(`DurableJob transition is invalid: ${stored.id}.`);
+      }
+    }
+    this.#mutate((state) => {
+      const task = state.tasks[taskId];
+      observeTaskRecordId(task, "durableJob", stored.id);
+      task.durableJobs[stored.id] = stored;
+    });
+  }
+  listDurableJobs(taskId: string): DurableJob[] {
+    return values(this.#requireTask(taskId).durableJobs, "id");
+  }
+  getDurableJob(taskId: string, jobId: string): DurableJob | null {
+    return optional(this.#state().tasks[taskId]?.durableJobs[jobId]);
+  }
+  findDurableJobByIdempotencyKey(taskId: string, key: string): DurableJob | null {
+    const aggregate = this.#state().tasks[taskId];
+    if (aggregate === undefined) return null;
+    const found = Object.values(aggregate.durableJobs)
+      .find((job) => job.idempotencyKey === key);
+    return optional(found);
+  }
+  listAllDurableJobs(): DurableJob[] {
+    const all: DurableJob[] = [];
+    for (const aggregate of Object.values(this.#state().tasks)) {
+      all.push(...Object.values(aggregate.durableJobs));
+    }
+    return all.map((job) => clone(job));
+  }
+  hasActiveDurableJobs(): boolean {
+    for (const aggregate of Object.values(this.#state().tasks)) {
+      for (const job of Object.values(aggregate.durableJobs)) {
+        if (job.status === "queued" || job.status === "running") return true;
+      }
+    }
+    return false;
+  }
+
   saveRole(taskId: string, role: TaskRole): void {
     const aggregate = this.#requireTaskForWrite(taskId);
     const stored = identified<TaskRole>(
@@ -1104,6 +1197,20 @@ export class FileTaskStore implements TaskStore {
   getRoleSession(taskId: string, roleName: string): RoleAgentSession | null {
     const set = this.getRoleSessionSet(taskId, roleName);
     return set === null ? null : optional(set.sessions[set.activeAgentId]);
+  }
+  getJobCallerKeyHash(taskId: string, roleName: string, agentId: string): string | null {
+    const hashes = this.#state().tasks[taskId]?.jobCallerKeyHashes;
+    if (hashes === undefined) return null;
+    return optional(hashes[jobCallerKeyHashKey(roleName, agentId)]);
+  }
+  setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void {
+    this.#requireTaskForWrite(taskId);
+    if (!/^[a-f0-9]{64}$/u.test(hash)) {
+      throw new StorageRecordError(`Job caller key hash is invalid: ${taskId}/${roleName}.`);
+    }
+    this.#mutate((state) => {
+      state.tasks[taskId].jobCallerKeyHashes[jobCallerKeyHashKey(roleName, agentId)] = hash;
+    });
   }
 
   nextWorkItemId(taskId: string): string {
@@ -1802,6 +1909,11 @@ function emptyState(): StorageState {
     mailboxes: {}
   };
 }
+/** rr13: Durable map key for a Session's job caller key hash. */
+function jobCallerKeyHashKey(roleName: string, agentId: string): string {
+  return `${roleName}\0${agentId}`;
+}
+
 function emptyStoredTask(task: Task): StoredTask {
   return {
     schemaVersion: CURRENT_STORED_TASK_SCHEMA_VERSION,
@@ -1811,9 +1923,11 @@ function emptyStoredTask(task: Task): StoredTask {
     changeSets: {},
     integrationAttempts: {},
     integrationQueue: {},
+    durableJobs: {},
     roles: {},
     managedWorkspaces: {},
     roleSessionSets: {},
+    jobCallerKeyHashes: {},
     workItems: {},
     agentRuns: {},
     reviewRounds: {},
@@ -1836,6 +1950,7 @@ function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
     changeSet: 0,
     integrationAttempt: 0,
     integrationQueue: 0,
+    durableJob: 0,
     message: 0,
     inputRequest: 0,
     decision: 0,
@@ -2051,9 +2166,11 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "changeSets",
     "integrationAttempts",
     "integrationQueue",
+    "durableJobs",
     "roles",
     "managedWorkspaces",
     "roleSessionSets",
+    "jobCallerKeyHashes",
     "workItems",
     "agentRuns",
     "reviewRounds",
@@ -2111,6 +2228,22 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationQueueEntry(entry);
     return entry;
   }, "integrationQueue");
+  parseMap(aggregate.durableJobs, (record, key) => {
+    const job = identified<DurableJob>(
+      record,
+      CURRENT_DURABLE_JOB_SCHEMA_VERSION,
+      "id",
+      key,
+      "DurableJob"
+    );
+    if (job.taskId !== taskId) {
+      throw new StorageRecordError(
+        `DurableJob belongs to another Task: ${job.taskId}.`
+      );
+    }
+    validateDurableJob(job);
+    return job;
+  }, "durableJobs");
   versioned(
     aggregate,
     CURRENT_STORED_TASK_SCHEMA_VERSION,
@@ -2155,6 +2288,12 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     return workspace;
   }, "managedWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
+  parseMap(aggregate.jobCallerKeyHashes, (hash, key) => {
+    if (typeof hash !== "string" || !/^[a-f0-9]{64}$/u.test(hash)) {
+      throw new StorageRecordError(`Job caller key hash is invalid: ${taskId}/${key}.`);
+    }
+    return hash;
+  }, "jobCallerKeyHashes");
   parseMap(aggregate.workItems, (record, key) => {
     const item = identified<WorkItem>(
       record,
@@ -2294,6 +2433,7 @@ function validateTaskIdHighWaterCoverage(
     changeSet: aggregate.changeSets,
     integrationAttempt: aggregate.integrationAttempts,
     integrationQueue: aggregate.integrationQueue,
+    durableJob: aggregate.durableJobs,
     message: aggregate.messages,
     inputRequest: aggregate.inputRequests,
     decision: aggregate.decisions,

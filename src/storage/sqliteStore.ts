@@ -62,6 +62,11 @@ import {
   type IntegrationQueueEntry,
   type IntegrationQueueStatus
 } from "../integration/integrationQueueEntry.js";
+import {
+  validDurableJobTransition,
+  validateDurableJob,
+  type DurableJob
+} from "../job/durableJob.js";
 import type { GlobalRole, TaskRole } from "../role/role.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
@@ -995,6 +1000,103 @@ export class SqliteTaskStore implements TaskStore {
       "task_id = ? AND queue_id = ?",
       [taskId, entryId]
     );
+  }
+
+  // -- durable jobs -----------------------------------------------------------
+
+  nextDurableJobId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "durableJob");
+  }
+
+  saveDurableJob(taskId: string, job: DurableJob): void {
+    if (job.taskId !== taskId) {
+      throw new StorageRecordError(`DurableJob belongs to another Task: ${job.taskId}`);
+    }
+    validateDurableJob(job);
+    this.#requireTask(taskId);
+    const existing = this.getDurableJob(taskId, job.id);
+    if (existing !== null) {
+      if (Date.parse(job.updatedAt) < Date.parse(existing.updatedAt)) {
+        throw new StorageRecordError(`DurableJob updatedAt cannot move backwards: ${job.id}`);
+      }
+      if (!validDurableJobTransition(existing, job)) {
+        throw new StorageRecordError(`DurableJob transition is invalid: ${job.id}`);
+      }
+    }
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO durable_jobs (job_id, task_id, idempotency_key, status, payload, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(job_id) DO UPDATE SET task_id = excluded.task_id,
+           idempotency_key = excluded.idempotency_key, status = excluded.status,
+           payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(
+        job.id,
+        taskId,
+        job.idempotencyKey ?? null,
+        job.status,
+        this.#json(job),
+        job.createdAt,
+        job.updatedAt
+      );
+    });
+  }
+
+  listDurableJobs(taskId: string): DurableJob[] {
+    return this.#sortById(
+      this.#listPayload<DurableJob>("durable_jobs", "task_id = ?", [taskId]),
+      (job) => job.id
+    );
+  }
+
+  getDurableJob(taskId: string, jobId: string): DurableJob | null {
+    return this.#getPayload<DurableJob>(
+      "durable_jobs",
+      "task_id = ? AND job_id = ?",
+      [taskId, jobId]
+    );
+  }
+
+  findDurableJobByIdempotencyKey(taskId: string, key: string): DurableJob | null {
+    return this.#getPayload<DurableJob>(
+      "durable_jobs",
+      "task_id = ? AND idempotency_key = ?",
+      [taskId, key]
+    );
+  }
+
+  listAllDurableJobs(): DurableJob[] {
+    return this.#listPayload<DurableJob>("durable_jobs", "1 = 1", []);
+  }
+
+  hasActiveDurableJobs(): boolean {
+    const row = this.#db.prepare(
+      "SELECT 1 FROM durable_jobs WHERE status IN ('queued', 'running') LIMIT 1"
+    ).get() as { 1: number } | undefined;
+    return row !== undefined;
+  }
+
+  // -- job caller key hashes (rr13) -------------------------------------------
+
+  getJobCallerKeyHash(taskId: string, roleName: string, agentId: string): string | null {
+    const row = this.#db.prepare(
+      "SELECT hash FROM job_caller_key_hashes WHERE task_id = ? AND role_name = ? AND agent_id = ?"
+    ).get(taskId, roleName, agentId) as { hash: string } | undefined;
+    return row === undefined ? null : row.hash;
+  }
+
+  setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void {
+    this.#requireTask(taskId);
+    if (!/^[a-f0-9]{64}$/u.test(hash)) {
+      throw new StorageRecordError(`Job caller key hash is invalid: ${taskId}/${roleName}.`);
+    }
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO job_caller_key_hashes (task_id, role_name, agent_id, hash, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(task_id, role_name, agent_id) DO UPDATE SET hash = excluded.hash, updated_at = excluded.updated_at`
+      ).run(taskId, roleName, agentId, hash, this.#now());
+    });
   }
 
   // -- task roles -------------------------------------------------------------

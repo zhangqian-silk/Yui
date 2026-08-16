@@ -145,12 +145,34 @@ export type RuntimeProviderProgressEvent = Readonly<{
   receivedAt: string;
 }> & RuntimeProviderProgressInput;
 
+/**
+ * f7/rr5: A DurableJob reached a terminal state. The supervisor delivers
+ * this to the runtime inbox so the Controller wakes immediately instead of
+ * waiting for the next poll. The state change already committed; this event
+ * is the durable terminal channel (dual-channel with the Leader wakeup).
+ */
+export type RuntimeDurableJobTerminalInput = Readonly<{
+  scope: "task";
+  taskId: string;
+  jobId: string;
+  status: "succeeded" | "failed" | "timed-out" | "cancelled" | "unknown-needs-attention";
+  outcome: string;
+}>;
+
+export type RuntimeDurableJobTerminalEvent = Readonly<{
+  schemaVersion: 1;
+  id: string;
+  type: "durable-job-terminal";
+  receivedAt: string;
+}> & RuntimeDurableJobTerminalInput;
+
 export type RuntimeLifecycleEvent =
   | RuntimeTurnCompletedEvent
   | RuntimeClaudeStopFailureEvent
   | RuntimeSessionLifecycleEvent
   | RuntimePromptAcceptedEvent
-  | RuntimeProviderProgressEvent;
+  | RuntimeProviderProgressEvent
+  | RuntimeDurableJobTerminalEvent;
 
 export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
   Readonly<{
@@ -242,6 +264,19 @@ export class FileRuntimeEventInbox {
       schemaVersion: 1,
       id: runtimeEventId("native-turn-progress", normalized),
       type: "native-turn-progress",
+      receivedAt: this.now().toISOString(),
+      ...normalized
+    }));
+  }
+
+  enqueueDurableJobTerminal(
+    input: RuntimeDurableJobTerminalInput
+  ): RuntimeEventEnqueueResult<RuntimeDurableJobTerminalEvent> {
+    const normalized = normalizeDurableJobTerminalInput(input);
+    return this.publish(Object.freeze({
+      schemaVersion: 1,
+      id: runtimeEventId("durable-job-terminal", normalized),
+      type: "durable-job-terminal",
       receivedAt: this.now().toISOString(),
       ...normalized
     }));
@@ -490,23 +525,39 @@ function runtimeEventId(
     | RuntimeSessionLifecycleInput
     | RuntimePromptAcceptedInput
     | RuntimeProviderProgressInput
+    | RuntimeDurableJobTerminalInput
 ): string {
+  if (type === "durable-job-terminal") {
+    const job = input as RuntimeDurableJobTerminalInput;
+    return `turn-${createHash("sha256").update(JSON.stringify([
+      1,
+      type,
+      job.scope,
+      job.taskId,
+      job.jobId,
+      job.status,
+      job.outcome
+    ])).digest("hex")}`;
+  }
+  // The durable-job-terminal branch returned above; narrow the union so
+  // provider-only identity fields are accessible without `in` guards.
+  const provider = input as Exclude<typeof input, RuntimeDurableJobTerminalInput>;
   const common = [
     1,
     type,
-    input.scope,
-    input.taskId ?? null,
-    input.roleName,
-    input.agentId,
-    input.adapterId,
-    input.launchId ?? null,
-    input.nativeSessionId,
-    "turnId" in input ? input.turnId : null,
-    input.runId ?? null,
-    "progressId" in input ? input.progressId : null,
-    "sequence" in input ? input.sequence ?? null : null,
-    "sessionSource" in input ? input.sessionSource ?? null : null,
-    "receiptId" in input ? input.receiptId ?? null : null
+    provider.scope,
+    provider.taskId ?? null,
+    provider.roleName,
+    provider.agentId,
+    provider.adapterId,
+    provider.launchId ?? null,
+    provider.nativeSessionId,
+    "turnId" in provider ? provider.turnId : null,
+    provider.runId ?? null,
+    "progressId" in provider ? provider.progressId : null,
+    "sequence" in provider ? provider.sequence ?? null : null,
+    "sessionSource" in provider ? provider.sessionSource ?? null : null,
+    "receiptId" in provider ? provider.receiptId ?? null : null
   ];
   return `turn-${createHash("sha256").update(JSON.stringify(common)).digest("hex")}`;
 }
@@ -635,6 +686,25 @@ function normalizeProviderProgressInput(
   };
 }
 
+function normalizeDurableJobTerminalInput(
+  input: RuntimeDurableJobTerminalInput
+): RuntimeDurableJobTerminalInput {
+  if (input.scope !== "task") throw invalidEvent();
+  const terminalStatuses = [
+    "succeeded", "failed", "timed-out", "cancelled", "unknown-needs-attention"
+  ] as const;
+  if (!terminalStatuses.includes(input.status as typeof terminalStatuses[number])) {
+    throw invalidEvent();
+  }
+  return {
+    scope: "task",
+    taskId: requireIdentityText(input.taskId, "Task id"),
+    jobId: requireIdentityText(input.jobId, "Job id"),
+    status: input.status,
+    outcome: requireIdentityText(input.outcome, "Job outcome")
+  };
+}
+
 function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
   if (!isObject(value)) throw invalidEvent();
   switch (value.type) {
@@ -643,6 +713,7 @@ function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
     case "native-session-lifecycle": return parseSessionLifecycleEvent(value);
     case "native-prompt-accepted": return parsePromptAcceptedEvent(value);
     case "native-turn-progress": return parseProviderProgressEvent(value);
+    case "durable-job-terminal": return parseDurableJobTerminalEvent(value);
     default: throw invalidEvent();
   }
 }
@@ -699,6 +770,26 @@ function parseProviderProgressEvent(
     schemaVersion: 1,
     id: requireIdentityText(value.id, "Event id"),
     type: "native-turn-progress",
+    receivedAt: requireTimestamp(value.receivedAt),
+    ...normalized
+  });
+}
+
+function parseDurableJobTerminalEvent(
+  value: Record<string, any>
+): RuntimeDurableJobTerminalEvent {
+  const expected = [
+    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId",
+    "jobId", "status", "outcome"
+  ];
+  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
+  const normalized = normalizeDurableJobTerminalInput(
+    value as RuntimeDurableJobTerminalInput
+  );
+  return Object.freeze({
+    schemaVersion: 1,
+    id: requireIdentityText(value.id, "Event id"),
+    type: "durable-job-terminal",
     receivedAt: requireTimestamp(value.receivedAt),
     ...normalized
   });
@@ -828,17 +919,20 @@ function hasSameIdentity(left: RuntimeLifecycleEvent, right: RuntimeLifecycleEve
     && left.type === right.type
     && left.scope === right.scope
     && left.taskId === right.taskId
-    && left.roleName === right.roleName
-    && left.agentId === right.agentId
-    && left.adapterId === right.adapterId
-    && left.launchId === right.launchId
-    && left.nativeSessionId === right.nativeSessionId
-    && left.runId === right.runId
+    && (!("roleName" in left) || !("roleName" in right) || left.roleName === right.roleName)
+    && (!("agentId" in left) || !("agentId" in right) || left.agentId === right.agentId)
+    && (!("adapterId" in left) || !("adapterId" in right) || left.adapterId === right.adapterId)
+    && (!("launchId" in left) || !("launchId" in right) || left.launchId === right.launchId)
+    && (!("nativeSessionId" in left)
+      || !("nativeSessionId" in right)
+      || left.nativeSessionId === right.nativeSessionId)
+    && (!("runId" in left) || !("runId" in right) || left.runId === right.runId)
     && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId)
     && (!("progressId" in left)
       || !("progressId" in right)
       || left.progressId === right.progressId)
-    && (!("sequence" in left) || !("sequence" in right) || left.sequence === right.sequence);
+    && (!("sequence" in left) || !("sequence" in right) || left.sequence === right.sequence)
+    && (!("jobId" in left) || !("jobId" in right) || left.jobId === right.jobId);
 }
 
 function compareRuntimeEvents(

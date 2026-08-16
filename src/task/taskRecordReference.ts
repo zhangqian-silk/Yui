@@ -7,6 +7,7 @@ export const TASK_RECORD_ID_PREFIXES = {
   changeSet: "change-set",
   integrationAttempt: "integration",
   integrationQueue: "integration-queue",
+  durableJob: "job",
   message: "message",
   inputRequest: "input",
   decision: "decision",

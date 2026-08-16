@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 
 import { selectEnvironment } from "../agent/launchEnvironment.js";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
+import type { DurableJob, DurableJobStep } from "../job/durableJob.js";
 import type { CheckResult } from "./checkResult.js";
 import {
   NodeGitWorkspace,
@@ -24,6 +25,7 @@ import {
 import type { TaskStore } from "../storage/taskStore.js";
 import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
+  recordIntegrationCheckJob,
   requireLeaderDecision,
   updateIntegrationAttempt,
   type IntegrationAttempt
@@ -68,7 +70,28 @@ const INTEGRATION_OPERATIONAL_ENVIRONMENT_NAMES = [
 export type IntegrationResult =
   | Readonly<{ status: "committed"; attempt: IntegrationAttempt; workspace: IntegrationWorkspace }>
   | Readonly<{ status: "blocked"; attempt: IntegrationAttempt; workspace: IntegrationWorkspace }>
+  | Readonly<{ status: "checks-running"; attempt: IntegrationAttempt; workspace: IntegrationWorkspace; job: DurableJob }>
   | Readonly<{ status: "failed"; attempt: IntegrationAttempt; workspace?: IntegrationWorkspace }>;
+
+/**
+ * The check DurableJob boundary. Production code asks the Controller socket
+ * (jobClient); tests supply a fake. The Controller is the sole job owner, so
+ * a Leader exit, Session replacement, or tmux pane loss never kills a
+ * running check.
+ */
+export type IntegrationJobPort = Readonly<{
+  startCheckJob(input: Readonly<{
+    taskId: string;
+    integrationId: string;
+    projectId: string;
+    head: string;
+    workspace: string;
+    env: Readonly<Record<string, string>>;
+    steps: readonly DurableJobStep[];
+  }>): Promise<DurableJob>;
+  getJob(taskId: string, jobId: string): Promise<DurableJob>;
+  cancelJob(taskId: string, jobId: string): Promise<void>;
+}>;
 
 type PlannedCommit = Readonly<{ changeSetId: string; commit: string }>;
 export const REMOTE_BASELINE_CONFLICT_PREFIX = "Remote baseline merge conflicts";
@@ -96,7 +119,8 @@ export class GitIntegrationService {
     readonly git: GitWorkspacePort = new NodeGitWorkspace(),
     readonly now: () => Date = () => new Date(),
     environment: NodeJS.ProcessEnv = process.env,
-    runtimeIsolation: TaskRuntimeIsolationPort = defaultIntegrationRuntimeIsolation(home)
+    runtimeIsolation: TaskRuntimeIsolationPort = defaultIntegrationRuntimeIsolation(home),
+    readonly jobPort?: IntegrationJobPort
   ) {
     this.home = resolve(home);
     this.worktreeRoot = resolveWorktreeRoot(home, store.getConfig().defaultWorkspace);
@@ -172,6 +196,13 @@ export class GitIntegrationService {
     }
     let current = initial;
 
+    // A check DurableJob is the source of truth for a running attempt that
+    // already bound one: never re-apply commits or spawn a second job. The
+    // job's terminal wakeup drives the resume through `integration continue`.
+    if (current.status === "running" && current.jobId !== undefined) {
+      return this.#resumeCheckJob(current, workspace, prepared.path, project.path);
+    }
+
     try {
       if (options.remoteBaseline !== undefined) {
         const mergeRemote = this.git.mergeRemoteIntoWorktree;
@@ -227,7 +258,20 @@ export class GitIntegrationService {
       // target that cannot be advanced.  advanceTargetRef re-verifies both
       // after the checks, so a move during the gate is still fenced at CAS.
       await assertTargetReadyForChecks(project.path, current.targetRef, current.expectedHead);
+      if (this.jobPort !== undefined && current.checkCommands.length > 0) {
+        return this.#startCheckJob(current, workspace, prepared.path, managedWorkspace, project.path);
+      }
+      const checkedHead = await gitLine(["-C", prepared.path, "rev-parse", "HEAD^{commit}"]);
       const checkResults = await this.#runChecks(current, managedWorkspace, prepared.path);
+      const afterHead = await gitLine(["-C", prepared.path, "rev-parse", "HEAD^{commit}"]);
+      if (afterHead !== checkedHead) {
+        return this.#fail(
+          current,
+          new Error(`Integration workspace moved during the checks: ${afterHead} != checked ${checkedHead}.`),
+          "integration",
+          workspace
+        );
+      }
       if (checkResults.some((check) => check.outcome === "failed")) {
         current = updateIntegrationAttempt(current, {
           status: "failed",
@@ -329,12 +373,117 @@ export class GitIntegrationService {
     }
   }
 
+  /**
+   * Hand the check commands to a Controller-owned DurableJob. The job runs
+   * the same isolated environment the in-process checks used; the attempt
+   * stays `running` with its jobId until the job's terminal wakeup resumes
+   * it, so a Leader exit mid-checks leaves no running/no-check zombie.
+   */
+  async #startCheckJob(
+    attempt: IntegrationAttempt,
+    workspace: IntegrationWorkspace,
+    path: string,
+    managedWorkspace: ManagedWorkspace,
+    repositoryPath: string
+  ): Promise<IntegrationResult> {
+    const runtime = this.#runtimePreparation(attempt, managedWorkspace);
+    this.runtimeIsolation.activate(runtime);
+    const environment = await integrationCheckEnvironment(this.environment, runtime);
+    const head = await gitLine(["-C", path, "rev-parse", "HEAD^{commit}"]);
+    const steps: DurableJobStep[] = attempt.checkCommands.map((command, index) => ({
+      name: `check-${index + 1}`,
+      command,
+      timeoutMs: 30 * 60_000
+    }));
+    const job = await this.jobPort!.startCheckJob({
+      taskId: attempt.taskId,
+      integrationId: attempt.id,
+      projectId: attempt.projectId,
+      head,
+      workspace: path,
+      env: environment,
+      steps
+    });
+    const bound = recordIntegrationCheckJob(attempt, job.id, this.now());
+    this.store.saveIntegrationAttempt(attempt.taskId, bound);
+    if (job.status !== "queued" && job.status !== "running") {
+      // Idempotent re-entry after a Leader exit in the bind window: the
+      // Controller returned the already-terminal job. Converge through the
+      // normal resume path instead of a checks-running zombie.
+      return this.#resumeCheckJob(bound, workspace, path, repositoryPath);
+    }
+    return { status: "checks-running", attempt: bound, workspace, job };
+  }
+
+  /**
+   * Resume a running attempt whose check job is already bound. An active job
+   * reports checks-running without side effects; a terminal job finalizes the
+   * attempt through the same validating/committed or failed path as the
+   * in-process checks. `unknown-needs-attention` fails closed: the attempt
+   * fails and the target ref never advances.
+   */
+  async #resumeCheckJob(
+    attempt: IntegrationAttempt,
+    workspace: IntegrationWorkspace,
+    path: string,
+    repositoryPath: string
+  ): Promise<IntegrationResult> {
+    const job = await this.jobPort!.getJob(attempt.taskId, attempt.jobId!);
+    if (job.status === "queued" || job.status === "running") {
+      return { status: "checks-running", attempt, workspace, job };
+    }
+    const checks = checkResultsFromJob(attempt, job);
+    const managedWorkspace = this.store.getIntegrationWorkspace(attempt.taskId, attempt.id);
+    if (managedWorkspace !== null) {
+      const runtime = this.#runtimePreparation(attempt, managedWorkspace);
+      this.runtimeIsolation.cleanup(
+        runtime,
+        checks.some((check) => check.outcome === "failed") ? "failure" : "completion"
+      );
+    }
+    if (checks.some((check) => check.outcome === "failed")) {
+      const failed = updateIntegrationAttempt(attempt, {
+        status: "failed",
+        checks
+      }, this.now());
+      this.store.saveIntegrationAttempt(attempt.taskId, failed);
+      return this.#terminalResult("failed", failed, workspace);
+    }
+    const candidateCommit = await gitLine(["-C", path, "rev-parse", "HEAD^{commit}"]);
+    if (candidateCommit !== job.head) {
+      // The job proved the checks at one SHA; the workspace has since moved.
+      // Advancing the target ref would publish unchecked code, so fail closed.
+      return this.#fail(
+        attempt,
+        new Error(
+          `Integration workspace moved since the check ran: ${candidateCommit} != checked ${job.head}.`
+        ),
+        "integration",
+        workspace
+      );
+    }
+    const validating = updateIntegrationAttempt(attempt, {
+      status: "validating",
+      candidateCommit,
+      checks
+    }, this.now());
+    this.store.saveIntegrationAttempt(attempt.taskId, validating);
+    await advanceTargetRef(
+      repositoryPath,
+      validating.targetRef,
+      candidateCommit,
+      validating.expectedHead
+    );
+    const committed = updateIntegrationAttempt(validating, { status: "committed" }, this.now());
+    this.store.saveIntegrationAttempt(attempt.taskId, committed);
+    return this.#terminalResult("committed", committed, workspace);
+  }
+
   async #runChecks(
     attempt: IntegrationAttempt,
     workspace: ManagedWorkspace,
     path: string
-  ): Promise<CheckResult[]> {
-    if (attempt.checkCommands.length === 0) return [];
+  ): Promise<CheckResult[]> {    if (attempt.checkCommands.length === 0) return [];
     const runtime = this.#runtimePreparation(attempt, workspace);
     this.runtimeIsolation.activate(runtime);
     let cleanupReason: "completion" | "failure" = "failure";
@@ -567,6 +716,72 @@ async function completeRemoteBaselineResolution(path: string): Promise<void> {
   ]);
 }
 
+/**
+ * Map a terminal check job back to the attempt's CheckResult[] shape. The
+ * runner stops at the first failing step, so unreached checks are "skipped"
+ * except for an unproven (unknown) job, which fails closed on the first
+ * missing step so the attempt never passes without evidence. A job that ended
+ * without a single failing step (cancelled before any step, or any other
+ * non-succeeded outcome) also fails closed: the target ref must never advance
+ * on an unproven check.
+ */
+function checkResultsFromJob(
+  attempt: IntegrationAttempt,
+  job: DurableJob
+): CheckResult[] {
+  const steps = new Map((job.result?.steps ?? []).map((step) => [step.name, step]));
+  const checks: CheckResult[] = attempt.checkCommands.map((command, index) => {
+    const name = `check-${index + 1}`;
+    const step = steps.get(name);
+    const logPath = step === undefined
+      ? undefined
+      : `${job.artifactsLocator}/logs/${step.logPath}`;
+    const outputReference = logPath === undefined ? {} : { logPath };
+    if (step !== undefined && !step.timedOut && step.exitCode === 0 && step.signal === null) {
+      return { name: command, outcome: "passed", ...outputReference };
+    }
+    if (step !== undefined) {
+      const reason = step.timedOut
+        ? "Command timed out after 1800 seconds."
+        : step.signal !== null
+          ? `Command terminated by ${step.signal}.`
+          : `Command exited with code ${step.exitCode}.`;
+      return { name: command, outcome: "failed", details: reason, ...outputReference };
+    }
+    if (job.result?.outcome === "unknown-needs-attention") {
+      return {
+        name: command,
+        outcome: "failed",
+        details: `Check job unknown-needs-attention: ${job.result.unknownReason ?? "runner outcome is unproven"}.`
+      };
+    }
+    return { name: command, outcome: "skipped" };
+  });
+  if (
+    checks.length > 0
+    && !checks.some((check) => check.outcome === "failed")
+    && job.result?.outcome !== "succeeded"
+  ) {
+    checks[0] = {
+      name: checks[0]!.name,
+      outcome: "failed",
+      details: failClosedJobDetails(job)
+    };
+  }
+  return checks;
+}
+
+function failClosedJobDetails(job: DurableJob): string {
+  const outcome = job.result?.outcome ?? job.status;
+  if (outcome === "cancelled") {
+    return "Check job was cancelled before it proved the checks.";
+  }
+  if (outcome === "timed-out") {
+    return "Check job timed out before it proved the checks.";
+  }
+  return `Check job ended ${outcome} without proving the checks.`;
+}
+
 async function runChecks(
   path: string,
   commands: readonly string[],
@@ -574,8 +789,7 @@ async function runChecks(
   taskId: string,
   integrationId: string,
   environment: Readonly<Record<string, string>>
-): Promise<CheckResult[]> {
-  if (commands.length === 0) return [];
+): Promise<CheckResult[]> {  if (commands.length === 0) return [];
   const outputDirectory = integrationCheckDirectory(home, taskId, integrationId);
   await rm(outputDirectory, { recursive: true, force: true });
   await mkdir(outputDirectory, { recursive: true, mode: 0o700 });

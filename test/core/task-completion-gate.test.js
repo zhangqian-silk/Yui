@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -35,13 +36,73 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
-import { createAgentRun } from "../helpers/effectiveLaunch.js";
+import { createAgentRun, testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { createConfiguredAgent } from "../../dist/agent/agent.js";
+import { startFileTaskController } from "../../dist/controller/controller.js";
+import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { createControllerIntegrationJobPort } from "../../dist/controller/jobClient.js";
+import { createDurableJobControl } from "../../dist/controller/jobControl.js";
+import {
+  createFileArtifactPort,
+  createLinuxProcessPort,
+  DurableJobSupervisor
+} from "../../dist/controller/jobSupervisor.js";
+import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
+import { isDurableJobTerminal } from "../../dist/job/durableJob.js";
+import { bindTaskRoleRun, createRoleSessionSet } from "../../dist/executor/agentExecutor.js";
+import { formatAgentRunReceiptId } from "../../dist/task/taskRecordReference.js";
+import { setTimeout as delay } from "node:timers/promises";
 
 const NOW = new Date("2026-08-12T00:00:00.000Z");
 
 function git(path, args) {
   return execFileSync("git", ["-C", path, ...args], { encoding: "utf8" }).trim();
+}
+
+/**
+ * rr12/rr13: Save an active in-flight Leader Run + Role Session + caller key
+ * hash so a managed Session job.start/job.cancel caller can be verified
+ * against durable Run state and authenticated with the per-Session caller
+ * key. The Controller's `reconcileExitedRoleRuns` must observe the role as
+ * present (see noDelivery.inspectRole) or it reaps the Run before the
+ * assertion. Returns the plaintext caller key so the test can inject it into
+ * the managed Session env as YUI_JOB_CALLER_KEY.
+ */
+function saveActiveLeaderAssertion(store, task, agent, stamp) {
+  const run = createAgentRun(
+    "agent-run-1",
+    task.id,
+    "leader",
+    "new",
+    "Leader turn.",
+    stamp,
+    { effective: testEffectiveLaunch({ agentId: agent.id, adapterId: agent.adapterId }) }
+  );
+  store.saveAgentRun(run);
+  store.saveActiveAgentRun(run);
+  let sessions = store.getTaskRoleSessionSet(task.id, "leader");
+  if (sessions === null) {
+    sessions = createRoleSessionSet({
+      scope: "task",
+      taskId: task.id,
+      roleName: "leader"
+    }, agent.id, stamp);
+  }
+  sessions = bindTaskRoleRun(sessions, {
+    agentId: agent.id,
+    runId: run.id,
+    receiptId: formatAgentRunReceiptId(task.id, run.id)
+  }, stamp);
+  store.saveTaskRoleSessionSet(sessions);
+  const callerKey = randomBytes(32).toString("hex");
+  const hash = createHash("sha256").update(callerKey).digest("hex");
+  store.setJobCallerKeyHash(task.id, "leader", agent.id, hash);
+  return {
+    runId: run.id,
+    receiptId: formatAgentRunReceiptId(task.id, run.id),
+    callerKey
+  };
 }
 
 function fixture(t) {
@@ -926,4 +987,205 @@ test("completion reconciliation re-checks frozen baseline after async fetch", as
     environment: { ...process.env, YUI_HOME: fx.home }
   });
   assert.equal(reconciled.length, 0);
+});
+
+// ─── rr6/f3: checks-running is a pending outcome with identity, not a failure ──
+
+// A no-op delivery stand-in. The f3 fixture creates a leader Role (required
+// for the terminal wakeup enqueue) and an active in-flight Leader Run (rr12:
+// the user-scope job.start caller needs a verified Leader assertion). The
+// Task has no cwd, so processLeaderWakeups skips before any tmux call, but
+// reconcileExitedRoleRuns still probes liveness: inspectRole must report
+// "present" or the startup pump reaps the assertion Run before job.start.
+const noDelivery = {
+  async prepareRoleSession(input) {
+    return {
+      deliveryId: `delivery-${input.runId ?? "pending"}`,
+      taskId: input.taskId,
+      roleName: input.roleName,
+      agentId: input.agentId,
+      adapterId: input.adapterId,
+      mode: input.mode,
+      sessionStarted: false,
+      session: undefined,
+      inputSubmittedAtLaunch: false
+    };
+  },
+  async waitUntilReady(prepared) { return { prepared, session: null }; },
+  async sendOnce() { return "unavailable"; },
+  async inspectRole() { return "present"; }
+};
+
+test("rr6/f3: task complete reports checks-running with identity and resumes after the job terminalizes", async (t) => {
+  const fx = fixture(t);
+  // The terminal wakeup enqueue targets the leader mailbox, which requires a
+  // leader Role. The Task has no cwd, so processLeaderWakeups skips before
+  // any tmux call (workspace-not-ready).
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
+  fx.store.saveConfiguredAgent(agent);
+  fx.store.saveRole(fx.task.id, createRole(
+    fx.task.id,
+    "leader",
+    [createRoleAgentBinding(agent)],
+    agent.id,
+    fx.checkout,
+    NOW
+  ));
+
+  // Seed a committed Integration with NON-EMPTY checks. The remote-baseline
+  // reconciliation reuses these check commands for the moved-remote attempt.
+  await fx.preparer.prepareTaskWorkspace(fx.task.id);
+  const main = fx.store.getTaskWorkspace(fx.task.id);
+  const entry = main.entries[0];
+  writeFileSync(join(entry.path, "task.txt"), "Task change\n");
+  git(entry.path, ["add", "task.txt"]);
+  git(entry.path, ["commit", "-qm", "Task change"]);
+  const taskHead = git(entry.path, ["rev-parse", "HEAD"]);
+  const item = updateWorkItemStatus(createWorkItem("work-item-1", fx.task.id, {
+    title: "Integrated change",
+    writeProjectIds: [fx.project.id]
+  }, NOW), "running", NOW);
+  const candidate = submitWorkItemCandidate(item, {
+    summary: "Accepted candidate",
+    source: { type: "direct" }
+  }, NOW);
+  fx.store.saveWorkItem(fx.task.id, updateWorkItemStatus(candidate, "completed", NOW, "Accepted"));
+  const changeSet = createWorkItemChangeSet({
+    id: "change-set-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    workItemId: item.id,
+    baseCommit: fx.base,
+    headCommit: taskHead,
+    branch: entry.branch,
+    changedPaths: ["task.txt"]
+  }, NOW);
+  const previous = updateIntegrationAttempt(createIntegrationAttempt({
+    id: "integration-1",
+    taskId: fx.task.id,
+    projectId: fx.project.id,
+    targetRef: entry.branch,
+    expectedHead: fx.base,
+    changeSetIds: [changeSet.id],
+    checkCommands: ["true"]
+  }, NOW), { status: "committed", candidateCommit: taskHead }, NOW);
+  fx.store.transaction((tx) => {
+    tx.saveChangeSet(fx.task.id, changeSet);
+    tx.saveIntegrationAttempt(fx.task.id, previous);
+  });
+
+  // Advance the remote so the Task head is behind.
+  advanceRemote(fx);
+
+  // rr12/rr13: The task-scope job.start caller needs a verified Leader
+  // assertion and the per-Session caller key. Save an active in-flight Leader
+  // Run the in-process Controller can verify. This must follow
+  // prepareTaskWorkspace (which retires workspace-bound sessions for roles
+  // with an active Run) and precede the Controller start so its liveness pass
+  // observes the role as present (noDelivery.inspectRole).
+  const assertion = saveActiveLeaderAssertion(fx.store, fx.task, agent, NOW);
+
+  // Start an in-process Controller with the production job control/supervisor.
+  const schedulerStore = new FileSchedulerStoreAdapter(fx.store);
+  const errors = [];
+  let runtime;
+  const jobSupervisor = new DurableJobSupervisor({
+    store: schedulerStore,
+    process: createLinuxProcessPort(),
+    artifacts: createFileArtifactPort(fx.home),
+    wake: (taskId) => {
+      try { runtime?.signal(`task:${taskId}`); } catch { /* stopped */ }
+    },
+    onError: (error) => errors.push(error)
+  });
+  const jobControl = createDurableJobControl(fx.store);
+  const controller = await startFileTaskController(fx.home, schedulerStore, noDelivery, undefined, {
+    intervalMs: 300_000,
+    jobSupervisor,
+    jobControl,
+    onError: (error) => errors.push(error)
+  });
+  t.after(async () => { await controller?.close(); });
+  runtime = controller.runtime;
+
+  // The production jobPort routes through callFileTaskController, which
+  // discovers the in-process Controller and issues job.start. rr13: pass a
+  // managed Session env so resolveJobCaller yields a task-scope Leader caller
+  // carrying the per-Session caller key instead of a bare (rejected)
+  // {scope:"user"}.
+  const managedEnv = {
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: fx.task.id,
+    YUI_ROLE: "leader",
+    YUI_LEADER_ACTION_RUN_ID: assertion.runId,
+    YUI_LEADER_ACTION_RECEIPT_ID: assertion.receiptId,
+    YUI_JOB_CALLER_KEY: assertion.callerKey
+  };
+  const jobPort = createControllerIntegrationJobPort(fx.home, {
+    environment: managedEnv,
+    store: fx.store
+  });
+
+  // Start: task complete detects the moved remote and starts a check job.
+  // The checks-running outcome is a pending completion, not a failure: the
+  // error must name the exact Integration, the DurableJob, and the exact
+  // continuation command.
+  let rejection;
+  try {
+    await reconcileTaskRemoteBaselines(fx.task.id, fx.store, fx.home, {
+      now: () => new Date(NOW),
+      jobPort,
+      environment: managedEnv
+    });
+    assert.fail("expected reconcileTaskRemoteBaselines to reject with checks-running");
+  } catch (error) {
+    rejection = error;
+  }
+  const attempt = fx.store.listIntegrationAttempts(fx.task.id)
+    .filter((a) => a.status === "running")
+    .at(-1);
+  assert.ok(attempt, "a running Integration attempt must exist");
+  assert.match(rejection.message, new RegExp(`Integration ${attempt.id}`));
+  assert.match(rejection.message, /DurableJob job-/);
+  assert.match(
+    rejection.message,
+    new RegExp(`yui task integration continue ${fx.task.id}/${attempt.id}`)
+  );
+
+  // Terminal job: wait for the supervisor to harvest the runner exit.
+  assert.ok(attempt.jobId, "the running attempt must be bound to a job");
+  const deadline = Date.now() + 15_000;
+  let job;
+  for (;;) {
+    job = fx.store.getDurableJob(fx.task.id, attempt.jobId);
+    if (job !== null && isDurableJobTerminal(job.status)) break;
+    if (Date.now() >= deadline) break;
+    await delay(50);
+  }
+  assert.ok(job && isDurableJobTerminal(job.status), "the check job must reach a terminal state");
+  assert.equal(job.status, "succeeded");
+
+  // Continuation: `task integration continue` resumes the same attempt and
+  // commits once the terminal job proves the checks passed.
+  const continued = await runTaskIntegrationCommand(
+    ["continue", `${fx.task.id}/${attempt.id}`],
+    fx.store,
+    fx.home,
+    { now: () => new Date(NOW), jobPort, environment: managedEnv }
+  );
+  assert.match(continued.output, /committed|Integrated/);
+  assert.equal(
+    fx.store.getIntegrationAttempt(fx.task.id, attempt.id).status,
+    "committed"
+  );
+
+  // Eventual completion: a second reconciliation finds the remote already
+  // merged (ancestor), so task complete is no longer blocked.
+  const reconciled = await reconcileTaskRemoteBaselines(fx.task.id, fx.store, fx.home, {
+    now: () => new Date(NOW),
+    jobPort,
+    environment: managedEnv
+  });
+  assert.deepEqual(reconciled, []);
+  assert.deepEqual(errors, []);
 });

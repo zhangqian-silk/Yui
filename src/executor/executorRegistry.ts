@@ -131,6 +131,16 @@ type PreparedRuntime = Readonly<{
 }>;
 
 /**
+ * rr13/test: Test-only liveness seam. Integration tests that spawn a real
+ * Controller subprocess cannot inject a fake TmuxDeliveryPort, and a saved
+ * active Leader Run would be reaped by the startup liveness pass without a
+ * real tmux role. When this env var is "1", every role reads "present"
+ * without probing tmux. The Controller subprocess inherits it from the
+ * test's CLI env. Never set in production.
+ */
+const TEST_ROLE_LIVENESS_PRESENT = process.env.YUI_TEST_ROLE_LIVENESS_PRESENT === "1";
+
+/**
  * Scheduler-to-tmux adapter. It retains only in-process prepared launch data;
  * durable session identity remains owned by FileTaskStore.
  */
@@ -394,6 +404,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     adapterId: string;
     nativeSessionId?: string;
   }>): Promise<"present" | "absent"> {
+    if (TEST_ROLE_LIVENESS_PRESENT) return "present";
     const status = this.tmux.probeRoleStatusAsync === undefined
       ? this.tmux.probeRoleStatus(input.taskId, input.roleName)
       : await this.tmux.probeRoleStatusAsync(input.taskId, input.roleName);
@@ -439,6 +450,13 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     status: "present" | "absent";
     resource?: SchedulerRoleResourceEntry["resource"];
   }>[]> {
+    if (TEST_ROLE_LIVENESS_PRESENT) {
+      return inputs.map((input) => ({
+        taskId: input.taskId,
+        roleName: input.roleName,
+        status: "present" as const
+      }));
+    }
     if (
       this.tmux.inspectRolePaneInventory === undefined
       && this.tmux.inspectRolePaneInventoryAsync === undefined

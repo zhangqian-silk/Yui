@@ -1,5 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
 
+import type { DurableJob } from "../job/durableJob.js";
+import type { MailboxEntityRef } from "../coordination/workMailbox.js";
+
 import {
   activeLiveRoleAgentSession,
   bindTaskRoleRun,
@@ -549,6 +552,45 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => (
       queueLeaderWakeup(store, taskId, reason, now)
     ));
+  }
+
+  listAllDurableJobs(): readonly DurableJob[] {
+    return this.store.listAllDurableJobs();
+  }
+
+  /**
+   * Apply one durable-job transition and, in the SAME transaction, enqueue
+   * the Leader wakeup. A terminal job without its wakeup enqueued is a lost
+   * wakeup, so the two writes commit together or not at all.
+   *
+   * f6: The wakeup targets the Leader role mailbox (not the Task mailbox)
+   * and also queues a pending wakeup so processLeaderWakeups dispatches
+   * the Leader Run with the exact job-finished reason.
+   */
+  transitionDurableJob(
+    taskId: string,
+    jobId: string,
+    transition: (job: DurableJob) => DurableJob,
+    now: Date,
+    wakeup?: { reason: string; refs: readonly MailboxEntityRef[] }
+  ): DurableJob | null {
+    return this.store.transaction((store) => {
+      const current = store.getDurableJob(taskId, jobId);
+      if (current === null) return null;
+      const next = transition(current);
+      store.saveDurableJob(taskId, next);
+      if (wakeup !== undefined) {
+        enqueueWork(
+          store,
+          { kind: "role", taskId, roleName: "leader" },
+          wakeup.reason,
+          now,
+          [...wakeup.refs]
+        );
+        queueLeaderWakeup(store, taskId, wakeup.reason, now);
+      }
+      return next;
+    });
   }
 
   releaseLeaderWakeupAndEnqueue(

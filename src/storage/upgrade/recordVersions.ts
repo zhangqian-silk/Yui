@@ -49,6 +49,7 @@ import {
 } from "../taskStore.js";
 import { CURRENT_LEADER_FAILURE_SCHEMA_VERSION } from "../../scheduler/leaderFailure.js";
 import { CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION } from "../../scheduler/operatorNotification.js";
+import { CURRENT_DURABLE_JOB_SCHEMA_VERSION } from "../../job/durableJob.js";
 import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js";
 
 function descriptor(version: number, path: string): RecordAxisEntry {
@@ -80,6 +81,7 @@ const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object
   changeSet: "state.json#/tasks/*/changeSets",
   integrationAttempt: "state.json#/tasks/*/integrationAttempts",
   integrationQueue: "state.json#/tasks/*/integrationQueue",
+  durableJob: "state.json#/tasks/*/durableJobs",
   activeRunPointer: "state.json#/tasks/*/activeRuns",
   message: "state.json#/tasks/*/messages",
   inputRequest: "state.json#/tasks/*/inputRequests",
@@ -151,6 +153,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
       integrationQueue: descriptor(
         CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION,
         "state.json#/tasks/*/integrationQueue"
+      ),
+      durableJob: descriptor(
+        CURRENT_DURABLE_JOB_SCHEMA_VERSION,
+        "state.json#/tasks/*/durableJobs"
       ),
       activeRunPointer: descriptor(
         CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION,

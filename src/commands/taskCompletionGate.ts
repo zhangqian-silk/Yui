@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { usageError } from "../errors/cliError.js";
 import {
   GitIntegrationService,
+  type IntegrationJobPort,
   type RemoteBaseline
 } from "../integration/gitIntegrationService.js";
 import {
@@ -26,6 +27,12 @@ type CompletionGateOptions = Readonly<{
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
   git?: GitWorkspacePort;
+  /**
+   * f7: The Controller IntegrationJobPort so non-empty checks run as
+   * DurableJobs instead of in the Leader/CLI process. Required for the
+   * remote-baseline path to avoid leaving running/no-check zombies.
+   */
+  jobPort?: IntegrationJobPort;
 }>;
 
 export type RemoteReconciliation = Readonly<{
@@ -168,8 +175,24 @@ export async function reconcileTaskRemoteBaselines(
       store,
       git,
       options.now ?? (() => new Date()),
-      options.environment
+      options.environment,
+      undefined,
+      options.jobPort
     ).integrate(task.id, attempt.id, { remoteBaseline: baseline });
+    // rr6/f3: A moved remote with non-empty checks spawns a DurableJob. This
+    // is a pending completion outcome, not a failure: name the exact
+    // Integration and Job and the exact continuation command (mirroring the
+    // `task integration` checks-running message) so the caller can resume the
+    // same remote-reconciliation attempt instead of being blocked by the
+    // preflight's active-job/unresolved-Integration gates.
+    if (result.status === "checks-running") {
+      throw usageError(
+        `Remote baseline reconciliation for ${task.id}/${plan.project.id} is running checks as `
+        + `Integration ${result.attempt.id} (DurableJob ${result.job.id}); run `
+        + `'yui task integration continue ${task.id}/${result.attempt.id}' when the job finishes, `
+        + `then retry task complete.`
+      );
+    }
     if (result.status !== "committed" || result.attempt.candidateCommit === undefined) {
       const detail = result.attempt.checks?.find(({ outcome }) => outcome === "failed")?.details
         ?? result.attempt.conflict?.summary

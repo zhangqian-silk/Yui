@@ -519,6 +519,7 @@ function safeApplicationErrorCode(code: string): string | undefined {
     case "INVALID_PARAMS":
     case "METHOD_NOT_FOUND":
     case "NOT_FOUND":
+    case "UNAUTHORIZED":
       return code;
     default:
       return undefined;

@@ -5,7 +5,7 @@ import type { HomeSnapshot } from "../upgrade/homeMigrationTarget.js";
 import { assertBaselineConsistency, baselineStorageVersionState } from "./baseline.js";
 import { planMigration } from "./planner.js";
 import { MigrationRegistry } from "./registry.js";
-import type { MigrationStep, StorageVersionState } from "./types.js";
+import type { CompatibleStep, MigrationStep, StorageVersionState } from "./types.js";
 
 const FINAL_REVIEW_AGGREGATE_FROM_VERSION = 16;
 const FINAL_REVIEW_AGGREGATE_TO_VERSION = 17;
@@ -41,6 +41,10 @@ const INTEGRATION_ATTEMPT_FROM_VERSION = 2;
 const INTEGRATION_ATTEMPT_TO_VERSION = 3;
 const INTEGRATION_QUEUE_FROM_VERSION = 0;
 const INTEGRATION_QUEUE_TO_VERSION = 1;
+const STORED_TASK_DURABLE_JOBS_FROM_VERSION = 14;
+const STORED_TASK_DURABLE_JOBS_TO_VERSION = 15;
+const STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION = 15;
+const STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION = 16;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -116,7 +120,10 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(activeRunPointerNamespaceStep())
     .registerOfflineMigration(changeSetManifestStep())
     .registerOfflineMigration(integrationAttemptSupersededStep())
-    .registerOfflineMigration(integrationQueueIntroductionStep());
+    .registerOfflineMigration(integrationQueueIntroductionStep())
+    .registerCompatible(storedTaskDurableJobsStep())
+    .registerCompatible(storedTaskJobCallerKeyHashesStep())
+    .registerCompatible(durableJobIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
@@ -739,6 +746,284 @@ function encodeLaneKeyPart(value: string): string {
 }
 
 /**
+ * The StoredTask aggregate gains the `durableJobs` record family. Every v14
+ * task defaults to an empty map; the compatible normalizer adds it in place
+ * without rewriting any other field. The strict source validator rejects
+ * unknown fields so a pre-v15 Home cannot smuggle an unrecognized shape.
+ */
+function storedTaskDurableJobsStep(): CompatibleStep<HomeSnapshot> {
+  return {
+    kind: "compatible",
+    axis: "record",
+    recordKind: "storedTask",
+    fromVersion: STORED_TASK_DURABLE_JOBS_FROM_VERSION,
+    toVersion: STORED_TASK_DURABLE_JOBS_TO_VERSION,
+    defaults: [
+      "durableJobs defaults to an empty map on every Task aggregate",
+      "idHighWaterMarks.durableJob defaults to 0 on every Task aggregate"
+    ],
+    validateSource: (snapshot) => requireStoredTaskV14Shape(snapshot),
+    normalize: (snapshot) => normalizeStoredTaskV14ToV15(snapshot)
+  };
+}
+
+const STORED_TASK_V14_FIELDS = [
+  "schemaVersion",
+  "task",
+  "idHighWaterMarks",
+  "brief",
+  "changeSets",
+  "integrationAttempts",
+  "integrationQueue",
+  "roles",
+  "managedWorkspaces",
+  "roleSessionSets",
+  "workItems",
+  "agentRuns",
+  "reviewRounds",
+  "activeRuns",
+  "messages",
+  "inputRequests",
+  "decisions",
+  "milestones",
+  "events",
+  "leaderFailure",
+  "operatorNotification"
+] as const;
+
+function requireStoredTaskV14Shape(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.storedTask !== STORED_TASK_DURABLE_JOBS_FROM_VERSION) {
+    throw new Error(
+      `Record storedTask compatible step requires manifest version ${STORED_TASK_DURABLE_JOBS_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.schemaVersion !== STORED_TASK_DURABLE_JOBS_FROM_VERSION) {
+      throw new Error(
+        `Task aggregate ${taskId} must use schemaVersion ${STORED_TASK_DURABLE_JOBS_FROM_VERSION}.`
+      );
+    }
+    const allowed = new Set<string>(STORED_TASK_V14_FIELDS);
+    const unknown = Object.keys(task).find((key) => !allowed.has(key));
+    if (unknown !== undefined) {
+      throw new Error(
+        `Task aggregate ${taskId} has an unknown v14 field: ${unknown}.`
+      );
+    }
+  }
+}
+
+function normalizeStoredTaskV14ToV15(snapshot: HomeSnapshot): HomeSnapshot {
+  requireStoredTaskV14Shape(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      storedTask: STORED_TASK_DURABLE_JOBS_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    // The v14 high-water marks have no durableJob family; the strict current
+    // parser requires every family key, so the normalizer supplies the zero
+    // default in the same pass as the empty durableJobs map.
+    const highWaterMarks = asObject(
+      task.idHighWaterMarks,
+      `Task aggregate ${taskId} idHighWaterMarks`
+    );
+    nextTasks[taskId] = {
+      ...task,
+      schemaVersion: STORED_TASK_DURABLE_JOBS_TO_VERSION,
+      idHighWaterMarks: { ...highWaterMarks, durableJob: 0 },
+      durableJobs: {}
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * rr13: The StoredTask aggregate gains the `jobCallerKeyHashes` map. Every v15
+ * task defaults to an empty map; the compatible normalizer adds it in place
+ * without rewriting any other field. A v15 task must not already carry the
+ * field. No legacy fallback: a Session whose hash is absent is rejected at the
+ * Controller boundary (fail-closed).
+ */
+function storedTaskJobCallerKeyHashesStep(): CompatibleStep<HomeSnapshot> {
+  return {
+    kind: "compatible",
+    axis: "record",
+    recordKind: "storedTask",
+    fromVersion: STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION,
+    toVersion: STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION,
+    defaults: [
+      "jobCallerKeyHashes defaults to an empty map on every Task aggregate"
+    ],
+    validateSource: (snapshot) => requireStoredTaskV15Shape(snapshot),
+    normalize: (snapshot) => normalizeStoredTaskV15ToV16(snapshot)
+  };
+}
+
+const STORED_TASK_V15_FIELDS = [
+  "schemaVersion",
+  "task",
+  "idHighWaterMarks",
+  "brief",
+  "changeSets",
+  "integrationAttempts",
+  "integrationQueue",
+  "durableJobs",
+  "roles",
+  "managedWorkspaces",
+  "roleSessionSets",
+  "workItems",
+  "agentRuns",
+  "reviewRounds",
+  "activeRuns",
+  "messages",
+  "inputRequests",
+  "decisions",
+  "milestones",
+  "events",
+  "leaderFailure",
+  "operatorNotification"
+] as const;
+
+function requireStoredTaskV15Shape(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.storedTask !== STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION) {
+    throw new Error(
+      `Record storedTask compatible step requires manifest version ${STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.schemaVersion !== STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION) {
+      throw new Error(
+        `Task aggregate ${taskId} must use schemaVersion ${STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION}.`
+      );
+    }
+    const allowed = new Set<string>(STORED_TASK_V15_FIELDS);
+    const unknown = Object.keys(task).find((key) => !allowed.has(key));
+    if (unknown !== undefined) {
+      throw new Error(
+        `Task aggregate ${taskId} has an unknown v15 field: ${unknown}.`
+      );
+    }
+  }
+}
+
+function normalizeStoredTaskV15ToV16(snapshot: HomeSnapshot): HomeSnapshot {
+  requireStoredTaskV15Shape(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      storedTask: STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    nextTasks[taskId] = {
+      ...task,
+      schemaVersion: STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION,
+      jobCallerKeyHashes: {}
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * The durableJob record family is introduced alongside the StoredTask v15
+ * aggregate. A pre-baseline Home has no durableJobs map and no manifest entry;
+ * the introduction declares the family at version 1. The StoredTask 14->15
+ * compatible step supplies the empty map; this step only advances the manifest
+ * record version so the planner can resolve the 0->1 boundary.
+ */
+function durableJobIntroductionStep(): CompatibleStep<HomeSnapshot> {
+  return {
+    kind: "compatible",
+    axis: "record",
+    recordKind: "durableJob",
+    fromVersion: 0,
+    toVersion: 1,
+    introduction: true,
+    defaults: ["durableJob family is introduced as an empty map on every Task"],
+    validateSource: (snapshot) => {
+      const manifestVersions = asObject(
+        snapshot.schemaManifest.recordVersions,
+        "schema manifest recordVersions"
+      );
+      const declared = manifestVersions.durableJob;
+      if (declared !== undefined && declared !== 0) {
+        throw new Error(
+          `Record durableJob introduction requires manifest version 0 or absent, found ${String(declared)}.`
+        );
+      }
+      if (snapshot.state === null) return;
+      const tasks = asObject(snapshot.state.tasks, "state tasks");
+      for (const [taskId, rawTask] of Object.entries(tasks)) {
+        const task = asObject(rawTask, `Task aggregate ${taskId}`);
+        if (task.durableJobs !== undefined) {
+          throw new Error(
+            `Task aggregate ${taskId} must not carry durableJobs before introduction.`
+          );
+        }
+      }
+    },
+    normalize: (snapshot) => {
+      const manifestVersions = asObject(
+        snapshot.schemaManifest.recordVersions,
+        "schema manifest recordVersions"
+      );
+      return {
+        schemaManifest: {
+          ...snapshot.schemaManifest,
+          recordVersions: {
+            ...manifestVersions,
+            durableJob: 1
+          }
+        },
+        state: snapshot.state === null
+          ? null
+          : { ...snapshot.state }
+      };
+    }
+  };
+}
+
+/**
  * Upgrade one nested Task record family without guessing fields or repairing
  * malformed state. The new execution lineage fields are optional, so legal
  * old single-lane records retain their direct shape; the next dispatch creates
@@ -750,7 +1035,7 @@ function recordFamilyStep(
   recordKind: string,
   fromVersion: number,
   toVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces" | "integrationAttempts"
 ): MigrationStep<HomeSnapshot> {
   return {
     axis: "record",
@@ -786,7 +1071,7 @@ function requireRecordFamilyVersion(
   snapshot: HomeSnapshot,
   recordKind: string,
   fromVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces" | "integrationAttempts"
 ): void {
   const manifestVersions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
   if (manifestVersions[recordKind] !== fromVersion) {
@@ -817,7 +1102,7 @@ function migrateRecordFamily(
   recordKind: string,
   fromVersion: number,
   toVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces" | "integrationAttempts"
 ): HomeSnapshot {
   // Keep the same source-shape checks in the transform so a direct caller
   // cannot bypass the migration's precondition contract.

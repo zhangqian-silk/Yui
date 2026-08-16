@@ -756,7 +756,7 @@ export const ROOT_COMMAND = buildNode({
     ] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
-    { id: "operations", title: "Operations", entries: ["web", "controller", "jobs"] },
+    { id: "operations", title: "Operations", entries: ["web", "controller", "job", "jobs"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
   children: [
@@ -1010,6 +1010,17 @@ export const ROOT_COMMAND = buildNode({
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren
+    },
+    {
+      name: "job",
+      summary: "Start, inspect, cancel, or acknowledge a Controller-managed DurableJob.",
+      sections: [{ id: "manage", title: "Commands", entries: ["start", "get", "cancel", "acknowledge"] }],
+      children: [
+        { name: "start", summary: "Start a DurableJob for build, test, package, or Integration checks.", usage: "yui job start --task <id> --project <project> --head <sha> --workspace <dir> --step <name>=<command> [--step ...] [--owner task|work-item:<id>|integration-attempt:<id>] [--env <k=v>...]" },
+        { name: "get", summary: "Show a DurableJob record and its terminal result.", usage: "yui job get --task <id> --job <job-id>" },
+        { name: "cancel", summary: "Request cancellation of a running or queued DurableJob.", usage: "yui job cancel --task <id> --job <job-id>" },
+        { name: "acknowledge", summary: "Acknowledge an unknown-needs-attention DurableJob so Task lifecycle gates can proceed.", usage: "yui job acknowledge --task <id> --job <job-id>" }
+      ]
     },
     {
       name: "jobs",

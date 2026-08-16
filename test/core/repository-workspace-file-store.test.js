@@ -99,6 +99,7 @@ import {
   resolveExecutionGroup
 } from "../../dist/execution/executionGroup.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { createDurableJob } from "../../dist/job/durableJob.js";
 import { WorkItemChangeSetManager } from "../../dist/workspace/workItemChangeSetManager.js";
 import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
 import { installMockProviderCommands } from "../helpers/mockProviderCommands.js";
@@ -858,6 +859,97 @@ test("invalid WorkItem cleanup leaves a live Role session untouched", async () =
   await assert.rejects(coordinator.cleanupWorkItem(item.taskId, item.id, "integrated"), /must be terminal/i);
   assert.equal(inspected, false);
   assert.equal(stopped, false);
+});
+
+test("rr5/f4: WorkItem cleanup is blocked by an active owned DurableJob", async () => {
+  const item = {
+    id: "work-item-1",
+    taskId: "task-1",
+    assignee: "worker",
+    writeProjectIds: ["project-1"],
+    executionGroups: [],
+    status: "completed",
+    outcome: "done"
+  };
+  const activeJob = createDurableJob({
+    id: "job-1",
+    taskId: "task-1",
+    owner: { kind: "work-item", workItemId: "work-item-1" },
+    projectId: "project-1",
+    head: "0123456789abcdef0123456789abcdef01234567",
+    workspace: "/workspace/task-1/work-item-1",
+    env: {},
+    steps: [{ name: "check", command: "true" }],
+    artifactsLocator: "artifacts/jobs/task-1/job-1"
+  }, NOW);
+  let stopped = false;
+  let cleaned = false;
+  const coordinator = new TaskWorkspaceCoordinator({
+    getWorkItem: () => item,
+    getTaskRoleSessionSet: () => liveSessionSet(),
+    listAgentRuns: () => [],
+    listDurableJobs: () => [activeJob]
+  }, {
+    async inspectWorkItemWorkspace() { return "clean"; },
+    async cleanupWorkItemWorkspace() { cleaned = true; return "removed"; },
+    async cleanupExecutionLaneWorkspacesForWorkItem() { return "missing"; }
+  }, {
+    async stopTaskRoleSessions() { stopped = true; }
+  });
+
+  await assert.rejects(
+    coordinator.cleanupWorkItem(item.taskId, item.id, "integrated"),
+    /active DurableJob|active-durable-job/iu
+  );
+  assert.equal(stopped, false, "roles must not be stopped while a job is active");
+  assert.equal(cleaned, false, "workspace must not be removed while a job is active");
+});
+
+test("rr5/f4: WorkItem cleanup proceeds when only settled jobs remain", async () => {
+  const item = {
+    id: "work-item-1",
+    taskId: "task-1",
+    assignee: "worker",
+    writeProjectIds: ["project-1"],
+    executionGroups: [],
+    status: "completed",
+    outcome: "done"
+  };
+  // A terminal (succeeded) job owned by this WorkItem — settled, not blocking.
+  const settledJob = {
+    ...createDurableJob({
+      id: "job-1",
+      taskId: "task-1",
+      owner: { kind: "work-item", workItemId: "work-item-1" },
+      projectId: "project-1",
+      head: "0123456789abcdef0123456789abcdef01234567",
+      workspace: "/workspace/task-1/work-item-1",
+      env: {},
+      steps: [{ name: "check", command: "true" }],
+      artifactsLocator: "artifacts/jobs/task-1/job-1"
+    }, NOW),
+    status: "succeeded",
+    terminalAt: NOW.toISOString()
+  };
+  let stopped = false;
+  let cleaned = false;
+  const coordinator = new TaskWorkspaceCoordinator({
+    getWorkItem: () => item,
+    getTaskRoleSessionSet: () => liveSessionSet(),
+    listAgentRuns: () => [],
+    listDurableJobs: () => [settledJob]
+  }, {
+    async inspectWorkItemWorkspace() { return "clean"; },
+    async cleanupWorkItemWorkspace() { cleaned = true; return "removed"; },
+    async cleanupExecutionLaneWorkspacesForWorkItem() { return "missing"; }
+  }, {
+    async stopTaskRoleSessions() { stopped = true; }
+  });
+
+  const result = await coordinator.cleanupWorkItem(item.taskId, item.id, "integrated");
+  assert.equal(result, "removed");
+  assert.equal(stopped, true);
+  assert.equal(cleaned, true);
 });
 
 test("Project Catalog persists aliases, remote, branches, and Yui-owned knowledge", async (t) => {

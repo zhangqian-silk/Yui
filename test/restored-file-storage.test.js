@@ -14,6 +14,7 @@ import {
 import { currentRecordVersions } from "../dist/storage/upgrade/recordVersions.js";
 import {
   FileTaskStore,
+  CURRENT_STORED_TASK_SCHEMA_VERSION,
   STORAGE_STATE_FILE
 } from "../dist/storage/taskStore.js";
 
@@ -232,7 +233,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
   assert.equal(onDisk.schemaVersion, 18);
-  assert.equal(onDisk.tasks[task.id].schemaVersion, 14);
+  assert.equal(onDisk.tasks[task.id].schemaVersion, CURRENT_STORED_TASK_SCHEMA_VERSION);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);
   assert.deepEqual(store.getGlobalRole("operator"), globalRole);
@@ -273,7 +274,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   writeFileSync(join(home, STORAGE_STATE_FILE), JSON.stringify(incompatible));
   assert.throws(
     () => new FileTaskStore(home).listTasks(),
-    /Task aggregate task-1 must use schemaVersion 14/
+    new RegExp(`Task aggregate task-1 must use schemaVersion ${CURRENT_STORED_TASK_SCHEMA_VERSION}`)
   );
 });
 
