@@ -64,6 +64,12 @@ import {
   type RunningFileTaskController
 } from "./controller.js";
 import { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
+import {
+  createFileArtifactPort,
+  createLinuxProcessPort,
+  DurableJobSupervisor
+} from "./jobSupervisor.js";
+import { createDurableJobControl } from "./jobControl.js";
 import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
 import {
   AsyncRuntimeEventProcessor,
@@ -407,6 +413,49 @@ export async function startFileTaskControllerRuntime(
     launchCoordinator,
     planner
   );
+  // f7/rr5: Share one inbox between the supervisor's terminal channel and
+  // the runtime event processor. When a Job reaches a terminal state, the
+  // supervisor enqueues a durable-job-terminal event; the processor drains
+  // it on the next pass, waking the Controller immediately instead of
+  // waiting for the poll interval.
+  const runtimeEventInbox = new FileRuntimeEventInbox(home);
+  const jobSupervisor = new DurableJobSupervisor({
+    store: schedulerStore,
+    process: createLinuxProcessPort(),
+    artifacts: createFileArtifactPort(home),
+    // rr6/f1: Bounded supervision wake. The supervisor signals the Controller
+    // after spawning a runner (queued→running adoption) and when a runner
+    // exits (terminal harvest), so a quick job converges without waiting for
+    // the recovery interval. Closes over runningRuntime, which is assigned
+    // once startFileTaskController resolves; a wake during shutdown is a
+    // no-op. The recovery interval stays the cross-restart fallback.
+    wake: (taskId) => {
+      try {
+        runningRuntime?.signal(`task:${taskId}`);
+      } catch {
+        // Controller stopped; the recovery interval remains the fallback.
+      }
+    },
+    terminalEvents: {
+      deliverTerminalEvent(notice) {
+        try {
+          runtimeEventInbox.enqueueDurableJobTerminal({
+            scope: "task",
+            taskId: notice.taskId,
+            jobId: notice.jobId,
+            status: notice.status as "succeeded" | "failed" | "timed-out" | "cancelled" | "unknown-needs-attention",
+            outcome: notice.outcome
+          });
+        } catch (error) {
+          // Best-effort terminal channel: the terminal transition already
+          // committed. A delivery failure must not fail the reconcile pass.
+          (options.onError ?? (() => undefined))(error);
+        }
+      }
+    },
+    onError: options.onError
+  });
+  const jobControl = createDurableJobControl(store);
   const running = await startFileTaskController(
     home,
     schedulerStore,
@@ -421,6 +470,8 @@ export async function startFileTaskControllerRuntime(
       now: options.now,
       onError: options.onError,
       lifecycleHost,
+      jobSupervisor,
+      jobControl,
       ...(resourceReaper === undefined ? {} : { resourceReaper }),
       onExpiredEphemeralDomain: (domain) => {
         if (domain.yuiHome !== home) return;
@@ -430,7 +481,7 @@ export async function startFileTaskControllerRuntime(
       runtimeEventProcessor: options.runtimeEventProcessor
         ?? (useWorker && asyncStoreClient !== undefined
           ? new AsyncRuntimeEventProcessor(
-            new FileRuntimeEventInbox(home),
+            runtimeEventInbox,
             createAsyncRuntimeObserver(
               (method, args) => asyncStoreClient.invokeObserver(method, args)
             ),
@@ -441,7 +492,7 @@ export async function startFileTaskControllerRuntime(
             }
           )
           : new FileRuntimeEventProcessor(
-            new FileRuntimeEventInbox(home),
+            runtimeEventInbox,
             schedulerStore,
             {
               onTaskRuntimeApplied: (input) => {

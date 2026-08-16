@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, realpathSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -571,6 +571,16 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         `${serializeExactDescriptor(runtimeDescriptor)}\n`
       );
     }
+    // rr13: Generate a per-Session DurableJob caller key for new task-scope
+    // Sessions. The plaintext key is injected into the launch env; only its
+    // SHA-256 hash is persisted, so a client that reads durable state cannot
+    // replay a job.start/job.cancel caller. Resume reuses the existing key.
+    let jobCallerKey: string | undefined;
+    if (owner.scope === "task" && input.mode === "new") {
+      jobCallerKey = randomBytes(32).toString("hex");
+      const hash = createHash("sha256").update(jobCallerKey).digest("hex");
+      this.store.setJobCallerKeyHash(owner.taskId, role.name, configured.id, hash);
+    }
     const launch = {
       command: configured.command,
       args,
@@ -583,6 +593,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         YUI_AGENT_ID: configured.id,
         YUI_ADAPTER_ID: configured.adapterId,
         YUI_WORKSPACE: effectiveWorkspace,
+        ...(jobCallerKey === undefined ? {} : { YUI_JOB_CALLER_KEY: jobCallerKey }),
         ...(runtimeDescriptor === undefined
           ? {}
           : {

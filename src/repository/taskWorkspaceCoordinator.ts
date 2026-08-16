@@ -122,6 +122,7 @@ export class TaskWorkspaceCoordinator {
       const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
       if (state === "dirty") return "dirty";
       this.#assertWorkItemRuntimeQuiescent(item);
+      this.#assertNoActiveWorkItemDurableJobs(item);
       await this.#stopLiveRoles(item.taskId, this.#workItemRoleNames(item));
       const laneCleanup = await this.preparer.cleanupExecutionLaneWorkspacesForWorkItem(
         item.taskId,
@@ -393,6 +394,37 @@ export class TaskWorkspaceCoordinator {
         `work-item:${item.taskId}/${item.id}`,
         true,
         `Work item still has an active Run: ${item.taskId}/${item.id}.`
+      );
+    }
+  }
+
+  /**
+   * rr5/f4: A WorkItem workspace must not be removed while a DurableJob it
+   * owns could still be using it. Queued, running, and unacknowledged
+   * unknown-needs-attention jobs are unsettled — the runner (or its corpse)
+   * may still hold the worktree. Acknowledged unknown jobs are settled: a
+   * human/Leader has taken responsibility for the outcome.
+   */
+  #assertNoActiveWorkItemDurableJobs(item: WorkItem): void {
+    const jobs = this.store.listDurableJobs?.(item.taskId);
+    if (jobs === undefined) return;
+    const blocking = jobs.filter((job) => (
+      job.owner.kind === "work-item"
+      && job.owner.workItemId === item.id
+      && (
+        job.status === "queued"
+        || job.status === "running"
+        || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
+      )
+    ));
+    if (blocking.length > 0) {
+      throw new WorkspaceCleanupBlockedError(
+        "active-durable-job",
+        `work-item:${item.taskId}/${item.id}`,
+        true,
+        `Work item ${item.id} still has ${blocking.length} active DurableJob(s): `
+        + `${blocking.map((job) => `${job.id}/${job.status}`).join(", ")}. `
+        + "Cancel or acknowledge them before cleanup."
       );
     }
   }

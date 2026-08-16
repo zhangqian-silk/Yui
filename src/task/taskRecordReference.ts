@@ -7,11 +7,14 @@ export const TASK_RECORD_ID_PREFIXES = {
   changeSet: "change-set",
   integrationAttempt: "integration",
   integrationQueue: "integration-queue",
+  durableJob: "job",
   message: "message",
   inputRequest: "input",
   decision: "decision",
   milestone: "milestone",
-  event: "event"
+  event: "event",
+  capabilityGrant: "capability-grant",
+  releaseWorkflow: "release-workflow"
 } as const;
 
 export type TaskRecordKind = keyof typeof TASK_RECORD_ID_PREFIXES;

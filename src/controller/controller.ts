@@ -70,6 +70,13 @@ import type {
   RuntimeEventProcessorPort
 } from "./runtimeEventProcessor.js";
 import type { EphemeralDomainIdentity } from "./domainIdentity.js";
+import type { DurableJobControlPort } from "./jobControl.js";
+import {
+  parseDurableJobAcknowledgeParams,
+  parseDurableJobCancelParams,
+  parseDurableJobRefParams,
+  parseDurableJobStartParams
+} from "./jobControl.js";
 
 const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 const DEFAULT_SIGNAL_WINDOW_MS = 100;
@@ -132,6 +139,13 @@ export type ControllerRuntimeOptions = Readonly<{
     taskId: string;
     projectIds: readonly string[];
   }>) => void;
+  /**
+   * Reconciles DurableJobs once per scheduler pass: spawns queued detached
+   * runners, harvests terminal evidence, and enqueues Leader wakeups.
+   */
+  jobSupervisor?: Readonly<{ reconcile(now: Date): void }>;
+  /** Serves the socket `job.*` methods; absent methods report METHOD_NOT_FOUND. */
+  jobControl?: DurableJobControlPort;
 }>;
 
 export interface ControllerConfigurationPort {
@@ -1070,6 +1084,7 @@ export class FileTaskController {
   readonly #onMaintenanceFenceDefer:
     | ControllerRuntimeOptions["onMaintenanceFenceDefer"]
     | undefined;
+  readonly #jobSupervisor: ControllerRuntimeOptions["jobSupervisor"];
   #current: Promise<ControllerSchedulerResult> | undefined;
   #operatorCurrent: Promise<void> | undefined;
   #pendingFull = false;
@@ -1124,6 +1139,7 @@ export class FileTaskController {
     this.#onExpiredEphemeralDomain = options.onExpiredEphemeralDomain;
     this.#maintenanceFence = options.maintenanceFence;
     this.#onMaintenanceFenceDefer = options.onMaintenanceFenceDefer;
+    this.#jobSupervisor = options.jobSupervisor;
     this.#signalScheduler = new MailboxScheduler(
       async (keys) => { await this.#requestPass({ kind: "dirty", keys }); },
       {
@@ -1345,6 +1361,10 @@ export class FileTaskController {
             }
           }
           const firstRuntimeDrain = await this.#drainRuntimeEvents();
+          // DurableJob reconciliation runs before the scheduler pass so a
+          // terminal job's Leader wakeup is enqueued in the same pass that
+          // processes Leader wakeups.
+          this.#jobSupervisor?.reconcile(this.#now());
           result = await runControllerSchedulerPass(
             this.store,
             this.delivery,
@@ -1800,6 +1820,55 @@ export async function startFileTaskController(
         const intervalMs = runtime.reloadReconciliationInterval();
         return { configured: true, reconciliationIntervalMs: intervalMs };
       }
+      if (method === "job.start" || method === "job.get" || method === "job.cancel" || method === "job.acknowledge") {
+        const control = options.jobControl;
+        if (control === undefined) {
+          throw controllerApplicationError("METHOD_NOT_FOUND", "Controller method was not found.");
+        }
+        if (method === "job.start") {
+          const input = parseDurableJobStartParams(params);
+          const { job, created } = control.startJob(input, new Date());
+          if (created) runtime.signal(`task:${job.taskId}`);
+          return jobControlJson({ job, created });
+        }
+        if (method === "job.acknowledge") {
+          // rr5/f5: acknowledge requires a Leader assertion verified by the
+          // control port against the current in-flight Leader Run.
+          const { taskId, jobId, assertion } = parseDurableJobAcknowledgeParams(params);
+          const job = control.acknowledgeJob(taskId, jobId, new Date(), assertion);
+          if (job === null) {
+            throw controllerApplicationError(
+              "NOT_FOUND",
+              `DurableJob not found: ${taskId}/${jobId}.`
+            );
+          }
+          runtime.signal(`task:${job.taskId}`);
+          return jobControlJson({ job, acknowledged: job.acknowledgedAt !== undefined });
+        }
+        if (method === "job.get") {
+          const ref = parseDurableJobRefParams(params);
+          const job = control.getJob(ref.taskId, ref.jobId);
+          if (job === null) {
+            throw controllerApplicationError(
+              "NOT_FOUND",
+              `DurableJob not found: ${ref.taskId}/${ref.jobId}.`
+            );
+          }
+          return jobControlJson({ job });
+        }
+        // rr8: job.cancel carries the caller identity so the control port can
+        // bind the cancel request to the caller's managed scope.
+        const cancel = parseDurableJobCancelParams(params);
+        const job = control.cancelJob(cancel.taskId, cancel.jobId, new Date(), cancel.caller);
+        if (job === null) {
+          throw controllerApplicationError(
+            "NOT_FOUND",
+            `DurableJob not found: ${cancel.taskId}/${cancel.jobId}.`
+          );
+        }
+        runtime.signal(`task:${job.taskId}`);
+        return jobControlJson({ job, cancelRequested: job.cancelRequestedAt !== undefined });
+      }
       if (dispatcher === undefined) {
         throw controllerApplicationError(
           "METHOD_NOT_FOUND",
@@ -1988,10 +2057,15 @@ function isStartedRuntimeSessionResult(value: JsonValue): boolean {
 }
 
 function controllerApplicationError(
-  code: "INVALID_PARAMS" | "METHOD_NOT_FOUND",
+  code: "INVALID_PARAMS" | "METHOD_NOT_FOUND" | "NOT_FOUND",
   message: string
 ): Error {
   const error = Object.assign(new Error(message), { code });
   error.name = "CoreApplicationError";
   return error;
+}
+
+/** DurableJob records are validated plain data; normalize to a JsonValue. */
+function jobControlJson(value: unknown): JsonValue {
+  return JSON.parse(JSON.stringify(value)) as JsonValue;
 }

@@ -2,6 +2,7 @@ import type { SchedulerTask } from "../scheduler/ports.js";
 import type {
   FileRuntimeEventInbox,
   RuntimeClaudeStopFailureEvent,
+  RuntimeDurableJobTerminalEvent,
   RuntimeLifecycleEvent,
   RuntimePromptAcceptedEvent,
   RuntimeProviderProgressEvent,
@@ -318,6 +319,12 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       outcome = this.applySessionLifecycle(event, now);
     } else if (event.type === "native-turn-progress") {
       outcome = this.applyProviderTurnProgress(event, now);
+    } else if (event.type === "durable-job-terminal") {
+      // f7/rr5: The supervisor already transitioned the job and
+      // enqueued the Leader wakeup. This event is the durable terminal
+      // channel: acknowledge it so the Controller's event pipeline
+      // converges without re-processing. No state change to apply.
+      this.applyDurableJobTerminal(event);
     } else {
       outcome = this.applyPromptAccepted(event, now);
     }
@@ -350,7 +357,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       }
       if (folded.notifyTaskRuntime) {
         const event = candidate.event;
-        if (event.scope === "task" && event.taskId !== undefined) {
+        if (event.scope === "task" && event.taskId !== undefined && event.type !== "durable-job-terminal") {
           this.options.onTaskRuntimeApplied?.({
             taskId: event.taskId,
             roleName: event.roleName,
@@ -408,6 +415,18 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       receiptId: event.receiptId
     }, now);
     return outcome === "deferred" ? "deferred" : outcome;
+  }
+
+  /**
+   * f7/rr5: Acknowledge a durable-job-terminal event. The supervisor
+   * already committed the terminal transition and the Leader wakeup;
+   * this event only needs to be acknowledged so it leaves the inbox.
+   */
+  private applyDurableJobTerminal(event: RuntimeDurableJobTerminalEvent): void {
+    // The event is a notification of a committed state change. No observer
+    // call is needed — the Leader wakeup was enqueued in the same
+    // transaction as the terminal transition.
+    void event;
   }
 
   private applyProviderTurnProgress(
@@ -534,6 +553,9 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
 
   private recordObsolete(event: RuntimeLifecycleEvent, reason: string, now: Date): void {
     if (event.scope !== "task" || event.taskId === undefined) return;
+    // durable-job-terminal events have no provider identity; they are never
+    // recorded as obsolete.
+    if (!("roleName" in event) || !("nativeSessionId" in event)) return;
     this.observer.observeObsoleteRuntimeEvent?.({
       eventId: event.id,
       eventType: event.type,
@@ -828,6 +850,11 @@ export class AsyncRuntimeEventProcessor {
             deferred.push(event);
             continue;
           }
+        } else if (event.type === "durable-job-terminal") {
+          // f7/rr5: The supervisor already transitioned the job and
+          // enqueued the Leader wakeup. This event is the durable terminal
+          // channel: acknowledge it so the pipeline converges without
+          // re-processing. No state change to apply.
         } else {
           const outcome = await this.applyPromptAccepted(event, now);
           if (outcome === "deferred") {
@@ -1062,7 +1089,7 @@ export class AsyncRuntimeEventProcessor {
   }
 
   private async recordObsolete(event: RuntimeLifecycleEvent, reason: string, now: Date): Promise<void> {
-    if (event.scope !== "task" || event.taskId === undefined) return;
+    if (event.scope !== "task" || event.taskId === undefined || event.type === "durable-job-terminal") return;
     await this.observer.observeObsoleteRuntimeEvent?.({
       eventId: event.id,
       eventType: event.type,

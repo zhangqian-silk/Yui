@@ -1003,3 +1003,61 @@ function memoryInbox(seed) {
     depth: () => remaining.size
   };
 }
+
+test("f7: durable-job-terminal event is enqueued, drained, and acknowledged", (t) => {
+  const { home } = fixture(t);
+  const inbox = new FileRuntimeEventInbox(home);
+
+  const { event, created } = inbox.enqueueDurableJobTerminal({
+    scope: "task",
+    taskId: "task-1",
+    jobId: "job-1",
+    status: "succeeded",
+    outcome: "succeeded"
+  });
+
+  assert.equal(created, true);
+  assert.equal(event.type, "durable-job-terminal");
+  assert.equal(event.taskId, "task-1");
+  assert.equal(event.jobId, "job-1");
+  assert.equal(event.status, "succeeded");
+  assert.equal(event.outcome, "succeeded");
+  assert.match(event.id, /^turn-[a-f0-9]{64}$/);
+
+  // The processor must acknowledge the event without applying state.
+  const processor = new FileRuntimeEventProcessor(inbox, {
+    getTask: () => ({ id: "task-1", status: "active" }),
+    observeRuntimeTurnCompleted() {
+      throw new Error("unexpected turn-completed observer call");
+    },
+    observeGlobalRuntimeTurnCompleted() {
+      throw new Error("unexpected global observer call");
+    }
+  });
+
+  const result = processor.drain(new Date("2026-07-24T01:00:02.000Z"));
+  assert.equal(result.failed.length, 0);
+  assert.equal(result.acknowledgedEventIds.length, 1);
+  assert.equal(result.acknowledgedEventIds[0], event.id);
+  assert.deepEqual(inbox.list(), []);
+});
+
+test("f7: duplicate durable-job-terminal enqueue is idempotent", (t) => {
+  const { home } = fixture(t);
+  const inbox = new FileRuntimeEventInbox(home);
+
+  const input = {
+    scope: "task",
+    taskId: "task-1",
+    jobId: "job-1",
+    status: "failed",
+    outcome: "failed"
+  };
+  const first = inbox.enqueueDurableJobTerminal(input);
+  const second = inbox.enqueueDurableJobTerminal(input);
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(second.event.id, first.event.id);
+  assert.equal(inbox.list().length, 1);
+});

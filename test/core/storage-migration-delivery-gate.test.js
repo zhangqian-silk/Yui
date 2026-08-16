@@ -75,7 +75,7 @@ test("the production registry registers every adjacent post-baseline step", () =
   const registry = createProductionRegistry();
   assert.equal(BASELINE_AGGREGATE_SCHEMA_VERSION, 16);
   assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
-  assert.equal(registry.size, 17);
+  assert.equal(registry.size, 22);
   const step = registry.lookup("aggregate", undefined, 16);
   assert.notEqual(step, undefined);
   assert.equal(step.toVersion, 17);
@@ -98,6 +98,23 @@ test("the production registry registers every adjacent post-baseline step", () =
   assert.notEqual(integrationQueueIntroduction, undefined);
   assert.equal(integrationQueueIntroduction.toVersion, 1);
   assert.equal(integrationQueueIntroduction.introduction, true);
+  const durableJobsStep = registry.lookupDeclaration("record", "storedTask", 14);
+  assert.notEqual(durableJobsStep, undefined);
+  assert.equal(durableJobsStep.toVersion, 15);
+  const jobCallerKeyHashesStep = registry.lookupDeclaration("record", "storedTask", 15);
+  assert.notEqual(jobCallerKeyHashesStep, undefined);
+  assert.equal(jobCallerKeyHashesStep.toVersion, 16);
+  const durableJobIntroduction = registry.lookupDeclaration("record", "durableJob", 0);
+  assert.notEqual(durableJobIntroduction, undefined);
+  assert.equal(durableJobIntroduction.toVersion, 1);
+  const capabilityGrantIntroduction = registry.lookup("record", "capabilityGrant", 0);
+  assert.notEqual(capabilityGrantIntroduction, undefined);
+  assert.equal(capabilityGrantIntroduction.toVersion, 1);
+  assert.equal(capabilityGrantIntroduction.introduction, true);
+  const releaseWorkflowIntroduction = registry.lookup("record", "releaseWorkflow", 0);
+  assert.notEqual(releaseWorkflowIntroduction, undefined);
+  assert.equal(releaseWorkflowIntroduction.toVersion, 1);
+  assert.equal(releaseWorkflowIntroduction.introduction, true);
 });
 
 test("a synthetic current above baseline fails closed when an adjacent step is missing", () => {
@@ -344,5 +361,72 @@ test("a target-family introduction must be declared and executable", () => {
   assert.throws(
     () => assertRegistryCoversBaselineToCurrent(declarationOnly, baseline, target),
     /no migration step/i
+  );
+});
+
+test("integrationAttempt v2 to v3 migration runs on a real snapshot", () => {
+  // rr4/finding-9: The baseline declares integrationAttempt at v2 and the
+  // production registry registers the 2→3 step. This test runs that step on a
+  // real v2 snapshot and verifies every record advances to v3.
+  const current = latestStorageVersionState();
+  const sourceRecord = Object.fromEntries(
+    Object.entries(current.record).map(([kind, entry]) => [kind, { ...entry }])
+  );
+  sourceRecord.integrationAttempt = { ...sourceRecord.integrationAttempt, version: 2 };
+
+  const source = {
+    schemaManifest: {
+      schemaVersion: 1,
+      storageVersion: 6,
+      aggregateSchemaVersion: 18,
+      recordVersions: Object.fromEntries(
+        Object.entries(sourceRecord).map(([kind, entry]) => [kind, entry.version])
+      )
+    },
+    state: {
+      schemaVersion: 18,
+      tasks: {
+        "task-1": {
+          integrationAttempts: {
+            "integration-1": {
+              schemaVersion: 2,
+              id: "integration-1",
+              taskId: "task-1",
+              projectId: "project-1",
+              status: "committed",
+              createdAt: "2026-01-01T00:00:00.000Z"
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const plan = planMigration(
+    createProductionRegistry(),
+    { layout: 6, aggregate: 18, record: sourceRecord },
+    current
+  );
+  assert.equal(plan.kind, "runnable");
+  const integrationSteps = plan.steps.filter(
+    (step) => step.recordKind === "integrationAttempt"
+  );
+  assert.equal(integrationSteps.length, 1);
+  assert.equal(integrationSteps[0].fromVersion, 2);
+  assert.equal(integrationSteps[0].toVersion, 3);
+
+  let migrated = structuredClone(source);
+  for (const planned of plan.steps) {
+    planned.step.preconditions(migrated);
+    migrated = planned.step.transform(migrated);
+  }
+
+  assert.equal(migrated.schemaManifest.recordVersions.integrationAttempt, 3);
+  const attempt = migrated.state.tasks["task-1"].integrationAttempts["integration-1"];
+  assert.equal(attempt.schemaVersion, 3);
+  // The original snapshot must not be mutated.
+  assert.equal(
+    source.state.tasks["task-1"].integrationAttempts["integration-1"].schemaVersion,
+    2
   );
 });

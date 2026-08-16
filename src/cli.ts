@@ -47,6 +47,7 @@ import {
   runInteractiveControllerCleanup
 } from "./commands/controllerCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
+import { runDurableJobCommand } from "./commands/durableJobCommands.js";
 import {
   applyOperatorSessionControl,
   runOperatorCommand,
@@ -71,7 +72,11 @@ import { taskActor } from "./commands/taskActor.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { runTaskChangeSetCommand } from "./commands/taskChangeSetCommands.js";
 import { runTaskOverlapCommand } from "./commands/taskOverlapCommands.js";
+import { createControllerIntegrationJobPort } from "./controller/jobClient.js";
 import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
+import { runWorkflowCommandAsync } from "./commands/workflowCommands.js";
+import { createUpdatePorts } from "./cli/updatePorts.js";
+import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
 import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
@@ -614,7 +619,10 @@ export async function main(): Promise<void> {
         resolved.slice(2),
         store,
         home,
-        { environment: process.env }
+        {
+          environment: process.env,
+          jobPort: createControllerIntegrationJobPort(home, { environment: process.env, store })
+        }
       );
       emit(result.output, false, result.data);
       return;
@@ -626,6 +634,27 @@ export async function main(): Promise<void> {
     }
     if (resolved[1] === "overlap") {
       const result = await runTaskOverlapCommand(resolved.slice(2), store);
+      emit(result.output, false, result.data);
+      return;
+    }
+    if (resolved[1] === "workflow"
+      && (resolved[2] === "run" || resolved[2] === "resume")) {
+      const result = await runWorkflowCommandAsync(
+        resolved.slice(2),
+        store,
+        {
+          environment: process.env,
+          yuiHome: home,
+          ports: createReleaseWorkflowPorts({
+            home,
+            updatePorts: createUpdatePorts(process.env),
+            projectStore: store
+          })
+        }
+      );
+      if (result.kind !== "output") {
+        throw new Error(`Task workflow ${resolved[2]} returned an invalid control result.`);
+      }
       emit(result.output, false, result.data);
       return;
     }
@@ -975,7 +1004,7 @@ export async function main(): Promise<void> {
           resolved[2],
           store,
           home,
-          { environment: process.env }
+          { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env, store }) }
         );
       }
     }
@@ -1247,6 +1276,15 @@ export async function main(): Promise<void> {
   }
   if (resolved[0] === "jobs") {
     emit(runJobCommand(resolved.slice(1), store, { runtime }));
+    return;
+  }
+  if (resolved[0] === "job") {
+    emit(await runDurableJobCommand(resolved.slice(1), {
+      home,
+      json: jsonOutput,
+      environment: process.env,
+      store
+    }));
     return;
   }
 

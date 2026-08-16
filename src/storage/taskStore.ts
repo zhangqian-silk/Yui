@@ -12,6 +12,15 @@ import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { validateConfiguredAgent, type ConfiguredAgent } from "../agent/agent.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
+import {
+  validateCapabilityGrant,
+  type CapabilityGrant
+} from "../grant/capabilityGrant.js";
+import {
+  validateReleaseWorkflow,
+  type ReleaseStepStatus,
+  type ReleaseWorkflow
+} from "../release/releaseWorkflow.js";
 import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
 import {
@@ -72,6 +81,12 @@ import {
   type IntegrationQueueEntry,
   type IntegrationQueueStatus
 } from "../integration/integrationQueueEntry.js";
+import {
+  CURRENT_DURABLE_JOB_SCHEMA_VERSION,
+  validDurableJobTransition,
+  validateDurableJob,
+  type DurableJob
+} from "../job/durableJob.js";
 import {
   validateGlobalRole,
   validateTaskRole,
@@ -152,6 +167,8 @@ export const CURRENT_INPUT_REQUEST_SCHEMA_VERSION = 2 as const;
 export const CURRENT_DECISION_SCHEMA_VERSION = 1 as const;
 export const CURRENT_MILESTONE_SCHEMA_VERSION = 1 as const;
 export const CURRENT_EVENT_SCHEMA_VERSION = 2 as const;
+export const CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION = 1 as const;
+export const CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION = 1 as const;
 export const CURRENT_WORK_MAILBOX_SCHEMA_VERSION = 1 as const;
 export const CURRENT_ROLE_AGENT_SESSION_SCHEMA_VERSION = 3 as const;
 export const CURRENT_PENDING_WAKEUP_SCHEMA_VERSION = 1 as const;
@@ -236,7 +253,7 @@ function executionLaneActiveRunKeyParts(key: string):
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 /** The schema version of each persisted `state.json#/tasks/*` aggregate. */
-export const CURRENT_STORED_TASK_SCHEMA_VERSION = 14 as const;
+export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
 
 /**
  * Persisted nested-record versions consumed by this store's strict parser.
@@ -255,9 +272,18 @@ type StoredTask = {
   changeSets: Record<string, ChangeSet>;
   integrationAttempts: Record<string, IntegrationAttempt>;
   integrationQueue: Record<string, IntegrationQueueEntry>;
+  durableJobs: Record<string, DurableJob>;
   roles: Record<string, TaskRole>;
   managedWorkspaces: Record<string, ManagedWorkspace>;
   roleSessionSets: Record<string, TaskRoleSessionSet>;
+  /**
+   * rr13: Per-Session DurableJob caller key hashes. Keyed by
+   * `${roleName}\0${agentId}`; the value is the SHA-256 hex digest of the
+   * `YUI_JOB_CALLER_KEY` injected at native Session launch. The plaintext key
+   * is never persisted — only the hash — so a client that reads durable state
+   * cannot replay a job.start/job.cancel caller. Absent hash = fail-closed.
+   */
+  jobCallerKeyHashes: Record<string, string>;
   workItems: Record<string, WorkItem>;
   agentRuns: Record<string, AgentRun>;
   reviewRounds: Record<string, ReviewRound>;
@@ -267,6 +293,8 @@ type StoredTask = {
   decisions: Record<string, Decision>;
   milestones: Record<string, Milestone>;
   events: Record<string, TaskEvent>;
+  capabilityGrants: Record<string, CapabilityGrant>;
+  releaseWorkflows: Record<string, ReleaseWorkflow>;
   leaderFailure: LeaderFailure | null;
   operatorNotification: OperatorNotification | null;
 };
@@ -353,6 +381,13 @@ export type TaskStore = {
   saveIntegrationQueueEntry(taskId: string, entry: IntegrationQueueEntry): void;
   listIntegrationQueueEntries(taskId: string): IntegrationQueueEntry[];
   getIntegrationQueueEntry(taskId: string, entryId: string): IntegrationQueueEntry | null;
+  nextDurableJobId(taskId: string): string;
+  saveDurableJob(taskId: string, job: DurableJob): void;
+  listDurableJobs(taskId: string): DurableJob[];
+  getDurableJob(taskId: string, jobId: string): DurableJob | null;
+  findDurableJobByIdempotencyKey(taskId: string, key: string): DurableJob | null;
+  listAllDurableJobs(): DurableJob[];
+  hasActiveDurableJobs(): boolean;
   saveRole(taskId: string, role: TaskRole): void;
   listRoles(taskId: string): TaskRole[];
   getRole(taskId: string, name: string): TaskRole | null;
@@ -374,6 +409,10 @@ export type TaskStore = {
   saveRoleSessionSet(sessions: TaskRoleSessionSet): void;
   saveTaskRoleSessionSet(sessions: TaskRoleSessionSet): void;
   getRoleSession(taskId: string, roleName: string): RoleAgentSession | null;
+  /** rr13: Look up the durable hash for a Session's job caller key. */
+  getJobCallerKeyHash(taskId: string, roleName: string, agentId: string): string | null;
+  /** rr13: Persist the hash of a newly launched Session's job caller key. */
+  setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void;
   nextWorkItemId(taskId: string): string;
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
   listWorkItems(taskId: string): WorkItem[];
@@ -420,6 +459,14 @@ export type TaskStore = {
   nextEventId(taskId: string): string;
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
+  nextCapabilityGrantId(taskId: string): string;
+  saveCapabilityGrant(taskId: string, grant: CapabilityGrant): void;
+  listCapabilityGrants(taskId: string): CapabilityGrant[];
+  getCapabilityGrant(taskId: string, grantId: string): CapabilityGrant | null;
+  nextReleaseWorkflowId(taskId: string): string;
+  saveReleaseWorkflow(taskId: string, workflow: ReleaseWorkflow): void;
+  listReleaseWorkflows(taskId: string): ReleaseWorkflow[];
+  getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null;
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   listWorkMailboxes(): WorkMailbox[];
   saveWorkMailbox(mailbox: WorkMailbox): void;
@@ -927,6 +974,73 @@ export class FileTaskStore implements TaskStore {
     return optional(this.#state().tasks[taskId]?.integrationQueue[entryId]);
   }
 
+  nextDurableJobId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "durableJob");
+  }
+  saveDurableJob(taskId: string, job: DurableJob): void {
+    const stored = identified<DurableJob>(
+      job,
+      CURRENT_DURABLE_JOB_SCHEMA_VERSION,
+      "id",
+      job.id,
+      "DurableJob"
+    );
+    validateDurableJob(stored);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`DurableJob belongs to another Task: ${stored.taskId}.`);
+    }
+    const aggregate = this.#requireTaskForWrite(taskId);
+    if (!aggregate.task.projectBindings.some(
+      ({ projectId }) => projectId === stored.projectId
+    )) {
+      throw new StorageRecordError(`DurableJob Project does not match Task: ${stored.id}.`);
+    }
+    const existing = aggregate.durableJobs[stored.id];
+    if (existing !== undefined) {
+      if (Date.parse(stored.updatedAt) < Date.parse(existing.updatedAt)) {
+        throw new StorageRecordError(
+          `DurableJob updatedAt cannot move backwards: ${stored.id}.`
+        );
+      }
+      if (!validDurableJobTransition(existing, stored)) {
+        throw new StorageRecordError(`DurableJob transition is invalid: ${stored.id}.`);
+      }
+    }
+    this.#mutate((state) => {
+      const task = state.tasks[taskId];
+      observeTaskRecordId(task, "durableJob", stored.id);
+      task.durableJobs[stored.id] = stored;
+    });
+  }
+  listDurableJobs(taskId: string): DurableJob[] {
+    return values(this.#requireTask(taskId).durableJobs, "id");
+  }
+  getDurableJob(taskId: string, jobId: string): DurableJob | null {
+    return optional(this.#state().tasks[taskId]?.durableJobs[jobId]);
+  }
+  findDurableJobByIdempotencyKey(taskId: string, key: string): DurableJob | null {
+    const aggregate = this.#state().tasks[taskId];
+    if (aggregate === undefined) return null;
+    const found = Object.values(aggregate.durableJobs)
+      .find((job) => job.idempotencyKey === key);
+    return optional(found);
+  }
+  listAllDurableJobs(): DurableJob[] {
+    const all: DurableJob[] = [];
+    for (const aggregate of Object.values(this.#state().tasks)) {
+      all.push(...Object.values(aggregate.durableJobs));
+    }
+    return all.map((job) => clone(job));
+  }
+  hasActiveDurableJobs(): boolean {
+    for (const aggregate of Object.values(this.#state().tasks)) {
+      for (const job of Object.values(aggregate.durableJobs)) {
+        if (job.status === "queued" || job.status === "running") return true;
+      }
+    }
+    return false;
+  }
+
   saveRole(taskId: string, role: TaskRole): void {
     const aggregate = this.#requireTaskForWrite(taskId);
     const stored = identified<TaskRole>(
@@ -1104,6 +1218,20 @@ export class FileTaskStore implements TaskStore {
   getRoleSession(taskId: string, roleName: string): RoleAgentSession | null {
     const set = this.getRoleSessionSet(taskId, roleName);
     return set === null ? null : optional(set.sessions[set.activeAgentId]);
+  }
+  getJobCallerKeyHash(taskId: string, roleName: string, agentId: string): string | null {
+    const hashes = this.#state().tasks[taskId]?.jobCallerKeyHashes;
+    if (hashes === undefined) return null;
+    return optional(hashes[jobCallerKeyHashKey(roleName, agentId)]);
+  }
+  setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void {
+    this.#requireTaskForWrite(taskId);
+    if (!/^[a-f0-9]{64}$/u.test(hash)) {
+      throw new StorageRecordError(`Job caller key hash is invalid: ${taskId}/${roleName}.`);
+    }
+    this.#mutate((state) => {
+      state.tasks[taskId].jobCallerKeyHashes[jobCallerKeyHashKey(roleName, agentId)] = hash;
+    });
   }
 
   nextWorkItemId(taskId: string): string {
@@ -1518,6 +1646,63 @@ export class FileTaskStore implements TaskStore {
   }
   listEvents(taskId: string): TaskEvent[] { return values(this.#requireTask(taskId).events, "id"); }
 
+  nextCapabilityGrantId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "capabilityGrant");
+  }
+  saveCapabilityGrant(taskId: string, grant: CapabilityGrant): void {
+    const stored = storedCapabilityGrant(grant);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Capability grant belongs to another Task: ${stored.taskId}`);
+    }
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      const existing = aggregate.capabilityGrants[stored.id];
+      if (existing === undefined) {
+        if (stored.revokedAt !== undefined) {
+          throw new StorageRecordError(`Capability grant must start unrevoked: ${stored.id}`);
+        }
+        if (stored.usesUsed !== 0) {
+          throw new StorageRecordError(`Capability grant must start unused: ${stored.id}`);
+        }
+      } else if (!isValidCapabilityGrantTransition(existing, stored)) {
+        throw new StorageRecordError(`Capability grant cannot be overwritten: ${taskId}/${stored.id}`);
+      }
+      observeTaskRecordId(aggregate, "capabilityGrant", stored.id);
+      aggregate.capabilityGrants[stored.id] = stored;
+    });
+  }
+  listCapabilityGrants(taskId: string): CapabilityGrant[] {
+    return values(this.#requireTask(taskId).capabilityGrants, "id");
+  }
+  getCapabilityGrant(taskId: string, grantId: string): CapabilityGrant | null {
+    return this.#requireTask(taskId).capabilityGrants[grantId] ?? null;
+  }
+
+  nextReleaseWorkflowId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "releaseWorkflow");
+  }
+  saveReleaseWorkflow(taskId: string, workflow: ReleaseWorkflow): void {
+    const stored = storedReleaseWorkflow(workflow);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Release workflow belongs to another Task: ${stored.taskId}`);
+    }
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      const existing = aggregate.releaseWorkflows[stored.id];
+      if (existing !== undefined && !isValidReleaseWorkflowTransition(existing, stored)) {
+        throw new StorageRecordError(`Release workflow cannot be overwritten: ${taskId}/${stored.id}`);
+      }
+      observeTaskRecordId(aggregate, "releaseWorkflow", stored.id);
+      aggregate.releaseWorkflows[stored.id] = stored;
+    });
+  }
+  listReleaseWorkflows(taskId: string): ReleaseWorkflow[] {
+    return values(this.#requireTask(taskId).releaseWorkflows, "id");
+  }
+  getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null {
+    return this.#requireTask(taskId).releaseWorkflows[workflowId] ?? null;
+  }
+
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null {
     return optional(this.#state().mailboxes[mailboxTargetKey(target)]);
   }
@@ -1802,6 +1987,11 @@ function emptyState(): StorageState {
     mailboxes: {}
   };
 }
+/** rr13: Durable map key for a Session's job caller key hash. */
+function jobCallerKeyHashKey(roleName: string, agentId: string): string {
+  return `${roleName}\0${agentId}`;
+}
+
 function emptyStoredTask(task: Task): StoredTask {
   return {
     schemaVersion: CURRENT_STORED_TASK_SCHEMA_VERSION,
@@ -1811,9 +2001,11 @@ function emptyStoredTask(task: Task): StoredTask {
     changeSets: {},
     integrationAttempts: {},
     integrationQueue: {},
+    durableJobs: {},
     roles: {},
     managedWorkspaces: {},
     roleSessionSets: {},
+    jobCallerKeyHashes: {},
     workItems: {},
     agentRuns: {},
     reviewRounds: {},
@@ -1823,6 +2015,8 @@ function emptyStoredTask(task: Task): StoredTask {
     decisions: {},
     milestones: {},
     events: {},
+    capabilityGrants: {},
+    releaseWorkflows: {},
     leaderFailure: null,
     operatorNotification: null
   };
@@ -1836,11 +2030,14 @@ function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
     changeSet: 0,
     integrationAttempt: 0,
     integrationQueue: 0,
+    durableJob: 0,
     message: 0,
     inputRequest: 0,
     decision: 0,
     milestone: 0,
-    event: 0
+    event: 0,
+    capabilityGrant: 0,
+    releaseWorkflow: 0
   };
 }
 
@@ -2051,9 +2248,11 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "changeSets",
     "integrationAttempts",
     "integrationQueue",
+    "durableJobs",
     "roles",
     "managedWorkspaces",
     "roleSessionSets",
+    "jobCallerKeyHashes",
     "workItems",
     "agentRuns",
     "reviewRounds",
@@ -2063,6 +2262,8 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "decisions",
     "milestones",
     "events",
+    "capabilityGrants",
+    "releaseWorkflows",
     "leaderFailure",
     "operatorNotification"
   ], `Task aggregate ${taskId}`);
@@ -2111,6 +2312,22 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateIntegrationQueueEntry(entry);
     return entry;
   }, "integrationQueue");
+  parseMap(aggregate.durableJobs, (record, key) => {
+    const job = identified<DurableJob>(
+      record,
+      CURRENT_DURABLE_JOB_SCHEMA_VERSION,
+      "id",
+      key,
+      "DurableJob"
+    );
+    if (job.taskId !== taskId) {
+      throw new StorageRecordError(
+        `DurableJob belongs to another Task: ${job.taskId}.`
+      );
+    }
+    validateDurableJob(job);
+    return job;
+  }, "durableJobs");
   versioned(
     aggregate,
     CURRENT_STORED_TASK_SCHEMA_VERSION,
@@ -2155,6 +2372,12 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     return workspace;
   }, "managedWorkspaces");
   parseMap(aggregate.roleSessionSets, (record, key) => { const set = taskSessions(record); if (set.owner.taskId !== taskId || set.owner.roleName !== key) throw new StorageRecordError(`Task Role session set identity is inconsistent: ${taskId}/${key}`); return set; }, "roleSessionSets");
+  parseMap(aggregate.jobCallerKeyHashes, (hash, key) => {
+    if (typeof hash !== "string" || !/^[a-f0-9]{64}$/u.test(hash)) {
+      throw new StorageRecordError(`Job caller key hash is invalid: ${taskId}/${key}.`);
+    }
+    return hash;
+  }, "jobCallerKeyHashes");
   parseMap(aggregate.workItems, (record, key) => {
     const item = identified<WorkItem>(
       record,
@@ -2270,6 +2493,26 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     }
     return event;
   }, "events");
+  parseMap(aggregate.capabilityGrants, (record, key) => {
+    const grant = storedCapabilityGrant(record);
+    if (grant.id !== key) {
+      throw new StorageRecordError(`Capability grant identity is inconsistent: ${key}.`);
+    }
+    if (grant.taskId !== taskId) {
+      throw new StorageRecordError(`Capability grant belongs to another Task: ${grant.taskId}`);
+    }
+    return grant;
+  }, "capabilityGrants");
+  parseMap(aggregate.releaseWorkflows, (record, key) => {
+    const workflow = storedReleaseWorkflow(record);
+    if (workflow.id !== key) {
+      throw new StorageRecordError(`Release workflow identity is inconsistent: ${key}.`);
+    }
+    if (workflow.taskId !== taskId) {
+      throw new StorageRecordError(`Release workflow belongs to another Task: ${workflow.taskId}`);
+    }
+    return workflow;
+  }, "releaseWorkflows");
   for (const [key, label] of [["leaderFailure", "Leader failure"], ["operatorNotification", "Operator notification"]] as const) {
     const record = aggregate[key];
     if (record !== null) {
@@ -2294,11 +2537,14 @@ function validateTaskIdHighWaterCoverage(
     changeSet: aggregate.changeSets,
     integrationAttempt: aggregate.integrationAttempts,
     integrationQueue: aggregate.integrationQueue,
+    durableJob: aggregate.durableJobs,
     message: aggregate.messages,
     inputRequest: aggregate.inputRequests,
     decision: aggregate.decisions,
     milestone: aggregate.milestones,
-    event: aggregate.events
+    event: aggregate.events,
+    capabilityGrant: aggregate.capabilityGrants,
+    releaseWorkflow: aggregate.releaseWorkflows
   };
   for (const kind of Object.keys(TASK_RECORD_ID_PREFIXES) as TaskRecordKind[]) {
     const pattern = new RegExp(`^${TASK_RECORD_ID_PREFIXES[kind]}-(\\d+)$`);
@@ -2535,6 +2781,375 @@ function storedTaskEvent(value: unknown): TaskEvent {
   }
   requireTimestamp(event.createdAt, "Task event createdAt");
   return event;
+}
+
+export function storedCapabilityGrant(value: unknown): CapabilityGrant {
+  const grant = versioned<CapabilityGrant>(
+    value,
+    CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION,
+    "Capability grant"
+  );
+  const fields = [
+    "schemaVersion", "id", "taskId", "granter", "scope", "actions",
+    "parameterBounds", "usesUsed", "irreversibilityCeiling", "createdAt", "updatedAt"
+  ];
+  if (grant.expiresAt !== undefined) fields.push("expiresAt");
+  if (grant.maxUses !== undefined) fields.push("maxUses");
+  if (grant.useReservations !== undefined) fields.push("useReservations");
+  if (grant.revokedAt !== undefined) fields.push("revokedAt");
+  if (grant.revokedBy !== undefined) fields.push("revokedBy");
+  exact(grant as unknown as Record<string, unknown>, fields, "Capability grant");
+  requireRecordIdentity(grant.id, "Capability grant id");
+  requireRecordIdentity(grant.taskId, "Capability grant Task id");
+  validateTaskRecordReference({ taskId: grant.taskId, localId: grant.id }, "capabilityGrant");
+  requireNormalizedText(grant.granter, "Capability grant granter");
+  storedCapabilityGrantScope(grant.scope, grant.taskId);
+  if (!Array.isArray(grant.actions) || grant.actions.length === 0) {
+    throw new StorageRecordError("Capability grant actions must be a non-empty array.");
+  }
+  const actions = grant.actions.map((action) => requireNormalizedText(action, "Capability grant action"));
+  if (new Set(actions).size !== actions.length) {
+    throw new StorageRecordError("Capability grant actions must be unique.");
+  }
+  const bounds = object(grant.parameterBounds, "Capability grant parameterBounds");
+  for (const [name, allowed] of Object.entries(bounds)) {
+    requireRecordIdentity(name, "Capability grant parameter");
+    if (!Array.isArray(allowed) || allowed.length === 0) {
+      throw new StorageRecordError(`Capability grant parameter bound must list allowed values: ${name}.`);
+    }
+    const values = allowed.map((entry) => requireNormalizedText(entry, `Capability grant parameter ${name} value`));
+    if (new Set(values).size !== values.length) {
+      throw new StorageRecordError(`Capability grant parameter bound values must be unique: ${name}.`);
+    }
+  }
+  if (grant.expiresAt !== undefined) {
+    requireTimestamp(grant.expiresAt, "Capability grant expiresAt");
+  }
+  if (grant.maxUses !== undefined
+    && (!Number.isSafeInteger(grant.maxUses) || (grant.maxUses as number) < 1)) {
+    throw new StorageRecordError("Capability grant maxUses must be a positive integer.");
+  }
+  if (!Number.isSafeInteger(grant.usesUsed) || (grant.usesUsed as number) < 0) {
+    throw new StorageRecordError("Capability grant usesUsed must be a non-negative integer.");
+  }
+  if (grant.maxUses !== undefined && (grant.usesUsed as number) > (grant.maxUses as number)) {
+    throw new StorageRecordError("Capability grant usesUsed cannot exceed maxUses.");
+  }
+  if (!["none", "reversible", "irreversible"].includes(grant.irreversibilityCeiling)) {
+    throw new StorageRecordError(
+      `Capability grant irreversibility ceiling is invalid: ${String(grant.irreversibilityCeiling)}.`
+    );
+  }
+  if ((grant.revokedAt === undefined) !== (grant.revokedBy === undefined)) {
+    throw new StorageRecordError("Capability grant revocation requires both revokedAt and revokedBy.");
+  }
+  if (grant.revokedAt !== undefined) {
+    requireTimestamp(grant.revokedAt, "Capability grant revokedAt");
+    requireNormalizedText(grant.revokedBy!, "Capability grant revokedBy");
+  }
+  requireTimestamp(grant.createdAt, "Capability grant createdAt");
+  requireTimestamp(grant.updatedAt, "Capability grant updatedAt");
+  try {
+    return validateCapabilityGrant(grant);
+  } catch (error) {
+    throw new StorageRecordError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function storedCapabilityGrantScope(scope: CapabilityGrant["scope"], taskId: string): void {
+  const value = object(scope, "Capability grant scope");
+  const fields: string[] = [];
+  if (value.taskId !== undefined) fields.push("taskId");
+  if (value.projectIds !== undefined) fields.push("projectIds");
+  if (value.repositories !== undefined) fields.push("repositories");
+  if (value.packages !== undefined) fields.push("packages");
+  if (value.homePath !== undefined) fields.push("homePath");
+  exact(value, fields, "Capability grant scope");
+  if (fields.length === 0) {
+    throw new StorageRecordError(`Capability grant scope requires at least one selector: ${taskId}.`);
+  }
+  if (value.taskId !== undefined) {
+    requireRecordIdentity(value.taskId as string, "Capability grant scope taskId");
+  }
+  if (value.projectIds !== undefined) {
+    if (!Array.isArray(value.projectIds) || value.projectIds.length === 0) {
+      throw new StorageRecordError("Capability grant scope projectIds must be a non-empty array.");
+    }
+    const projectIds = (value.projectIds as unknown[]).map(
+      (entry) => requireRecordIdentity(entry as string, "Capability grant scope Project")
+    );
+    if (new Set(projectIds).size !== projectIds.length) {
+      throw new StorageRecordError("Capability grant scope Project ids must be unique.");
+    }
+  }
+  if (value.repositories !== undefined) {
+    if (!Array.isArray(value.repositories) || value.repositories.length === 0) {
+      throw new StorageRecordError("Capability grant scope repositories must be a non-empty array.");
+    }
+    const repositories = (value.repositories as unknown[]).map((entry) => {
+      const repository = object(entry, "Capability grant scope repository");
+      exact(repository, ["owner", "name"], "Capability grant scope repository");
+      return {
+        owner: requireNormalizedText(repository.owner, "Capability grant scope repository owner"),
+        name: requireNormalizedText(repository.name, "Capability grant scope repository name")
+      };
+    });
+    const keys = new Set(repositories.map(({ owner, name }) => `${owner}/${name}`));
+    if (keys.size !== repositories.length) {
+      throw new StorageRecordError("Capability grant scope repositories must be unique.");
+    }
+  }
+  if (value.packages !== undefined) {
+    if (!Array.isArray(value.packages) || value.packages.length === 0) {
+      throw new StorageRecordError("Capability grant scope packages must be a non-empty array.");
+    }
+    const packages = (value.packages as unknown[]).map(
+      (entry) => requireNormalizedText(entry as string, "Capability grant scope package")
+    );
+    if (new Set(packages).size !== packages.length) {
+      throw new StorageRecordError("Capability grant scope packages must be unique.");
+    }
+  }
+  if (value.homePath !== undefined) {
+    requireNormalizedText(value.homePath as string, "Capability grant scope homePath");
+  }
+}
+
+export function isValidCapabilityGrantTransition(existing: CapabilityGrant, candidate: CapabilityGrant): boolean {
+  if (existing.revokedAt !== undefined) {
+    // Idempotent re-revoke: the domain returns the revoked record unchanged.
+    return isDeepStrictEqual(candidate, existing);
+  }
+  const immutable = candidate.id === existing.id
+    && candidate.taskId === existing.taskId
+    && candidate.granter === existing.granter
+    && isDeepStrictEqual(candidate.scope, existing.scope)
+    && isDeepStrictEqual(candidate.actions, existing.actions)
+    && isDeepStrictEqual(candidate.parameterBounds, existing.parameterBounds)
+    && candidate.expiresAt === existing.expiresAt
+    && candidate.maxUses === existing.maxUses
+    && candidate.irreversibilityCeiling === existing.irreversibilityCeiling
+    && candidate.createdAt === existing.createdAt;
+  if (!immutable) return false;
+  if (candidate.revokedAt !== undefined) {
+    // Revocation consumes no uses and records no reservations.
+    return (candidate.usesUsed as number) === (existing.usesUsed as number)
+      && isDeepStrictEqual(candidate.useReservations, existing.useReservations)
+      && Date.parse(candidate.updatedAt) >= Date.parse(existing.updatedAt);
+  }
+  // A use record must advance the counter (compare-and-swap): a stale equal
+  // increment from a concurrent reader is rejected, so two workflows cannot
+  // spend the same maxUses slot. Reservations are append-only, one per use.
+  return (candidate.usesUsed as number) > (existing.usesUsed as number)
+    && reservationsAppendOnly(existing.useReservations, candidate.useReservations)
+    && Date.parse(candidate.updatedAt) >= Date.parse(existing.updatedAt);
+}
+
+function reservationsAppendOnly(
+  existing: readonly string[] | undefined,
+  candidate: readonly string[] | undefined
+): boolean {
+  if (existing === undefined || existing.length === 0) return true;
+  if (candidate === undefined || candidate.length < existing.length) return false;
+  return existing.every((key, index) => candidate[index] === key);
+}
+
+export function storedReleaseWorkflow(value: unknown): ReleaseWorkflow {
+  const workflow = versioned<ReleaseWorkflow>(
+    value,
+    CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION,
+    "Release workflow"
+  );
+  const fields = [
+    "schemaVersion", "id", "taskId", "grantId", "source", "plan", "steps",
+    "createdAt", "updatedAt"
+  ];
+  exact(workflow as unknown as Record<string, unknown>, fields, "Release workflow");
+  requireRecordIdentity(workflow.id, "Release workflow id");
+  requireRecordIdentity(workflow.taskId, "Release workflow Task id");
+  validateTaskRecordReference({ taskId: workflow.taskId, localId: workflow.id }, "releaseWorkflow");
+  requireNormalizedText(workflow.grantId, "Release workflow grantId");
+  storedReleaseWorkflowSource(workflow.source);
+  if (!Array.isArray(workflow.plan) || workflow.plan.length === 0) {
+    throw new StorageRecordError("Release workflow plan must be a non-empty array.");
+  }
+  const planIds = new Set<string>();
+  for (const entry of workflow.plan) {
+    const plan = object(entry, "Release workflow plan entry");
+    const planFields = ["id", "kind", "idempotencyKey"];
+    if (plan.params !== undefined) planFields.push("params");
+    if (plan.irreversibility !== undefined) planFields.push("irreversibility");
+    exact(plan, planFields, "Release workflow plan entry");
+    const planId = requireRecordIdentity(plan.id, "Release step id");
+    if (planIds.has(planId)) {
+      throw new StorageRecordError(`Release workflow plan ids must be unique: ${planId}.`);
+    }
+    planIds.add(planId);
+    if (!RELEASE_WORKFLOW_KINDS.has(plan.kind as string)) {
+      throw new StorageRecordError(`Release step kind is invalid: ${String(plan.kind)}.`);
+    }
+    requireNormalizedText(plan.idempotencyKey, "Release step idempotencyKey");
+    if (plan.params !== undefined) {
+      const params = object(plan.params, "Release step params");
+      for (const [name, paramValue] of Object.entries(params)) {
+        requireRecordIdentity(name, "Release step param");
+        requireNormalizedText(paramValue, `Release step param ${name}`);
+      }
+    }
+    if (plan.irreversibility !== undefined
+      && !["none", "reversible", "irreversible"].includes(plan.irreversibility as string)) {
+      throw new StorageRecordError(
+        `Release step irreversibility is invalid: ${String(plan.irreversibility)}.`
+      );
+    }
+  }
+  const steps = object(workflow.steps, "Release workflow steps");
+  for (const planId of planIds) {
+    if (!Object.hasOwn(steps, planId)) {
+      throw new StorageRecordError(`Release workflow step record is missing: ${planId}.`);
+    }
+  }
+  for (const key of Object.keys(steps)) {
+    if (!planIds.has(key)) {
+      throw new StorageRecordError(`Release workflow step record has no plan entry: ${key}.`);
+    }
+  }
+  for (const planId of planIds) {
+    storedReleaseStep(steps[planId], planId);
+  }
+  requireTimestamp(workflow.createdAt, "Release workflow createdAt");
+  requireTimestamp(workflow.updatedAt, "Release workflow updatedAt");
+  try {
+    return validateReleaseWorkflow(workflow);
+  } catch (error) {
+    throw new StorageRecordError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function storedReleaseWorkflowSource(source: ReleaseWorkflow["source"]): void {
+  const value = object(source, "Release workflow source");
+  const sourceFields = ["repository", "commit"];
+  if (value.artifact !== undefined) sourceFields.push("artifact");
+  exact(value, sourceFields, "Release workflow source");
+  const repository = object(value.repository, "Release workflow source repository");
+  exact(repository, ["owner", "name"], "Release workflow source repository");
+  requireNormalizedText(repository.owner, "Release workflow source repository owner");
+  requireNormalizedText(repository.name, "Release workflow source repository name");
+  requireNormalizedText(value.commit, "Release workflow source commit");
+  if (value.artifact !== undefined) {
+    const artifact = object(value.artifact, "Release workflow source artifact");
+    exact(artifact, ["name", "integrity"], "Release workflow source artifact");
+    requireNormalizedText(artifact.name, "Release workflow source artifact name");
+    requireNormalizedText(artifact.integrity, "Release workflow source artifact integrity");
+  }
+}
+
+function storedReleaseStep(step: unknown, planId: string): void {
+  const value = object(step, `Release step record ${planId}`);
+  const stepFields = ["planId", "status", "attempts", "logs"];
+  if (value.externalId !== undefined) stepFields.push("externalId");
+  if (value.externalIdentity !== undefined) stepFields.push("externalIdentity");
+  if (value.lastAttemptAt !== undefined) stepFields.push("lastAttemptAt");
+  if (value.terminalAt !== undefined) stepFields.push("terminalAt");
+  exact(value, stepFields, `Release step record ${planId}`);
+  requireNormalizedText(value.planId, `Release step planId ${planId}`);
+  if (value.planId !== planId) {
+    throw new StorageRecordError(
+      `Release step record planId ${String(value.planId)} does not match its key: ${planId}.`
+    );
+  }
+  if (!RELEASE_WORKFLOW_STATUSES.has(value.status as string)) {
+    throw new StorageRecordError(`Release step status is invalid: ${String(value.status)}.`);
+  }
+  if (!Number.isSafeInteger(value.attempts) || (value.attempts as number) < 0) {
+    throw new StorageRecordError(`Release step attempts must be a non-negative integer: ${planId}.`);
+  }
+  if (value.externalId !== undefined) {
+    requireNormalizedText(value.externalId, `Release step externalId ${planId}`);
+  }
+  if (value.externalIdentity !== undefined) {
+    const identity = object(value.externalIdentity, `Release step externalIdentity ${planId}`);
+    exact(identity, ["kind", "value"], `Release step externalIdentity ${planId}`);
+    requireNormalizedText(identity.kind, `Release step externalIdentity kind ${planId}`);
+    requireNormalizedText(identity.value, `Release step externalIdentity value ${planId}`);
+  }
+  // An `unknown` step without an externalIdentity is a crash-recovery state:
+  // the process died during executeStep after the effect may have landed, but
+  // before an identity was recorded. The domain validation permits it and the
+  // engine fails closed (unconfirmed) on resume; the store must persist it.
+  if (!Array.isArray(value.logs)) {
+    throw new StorageRecordError(`Release step logs must be an array: ${planId}.`);
+  }
+  for (const line of value.logs) {
+    requireNormalizedText(line, `Release step log ${planId}`);
+  }
+  if (value.lastAttemptAt !== undefined) {
+    requireTimestamp(value.lastAttemptAt, `Release step lastAttemptAt ${planId}`);
+  }
+  if (value.status === "running" && value.lastAttemptAt === undefined) {
+    throw new StorageRecordError(`Release step running status requires lastAttemptAt: ${planId}.`);
+  }
+  if (value.terminalAt !== undefined) {
+    requireTimestamp(value.terminalAt, `Release step terminalAt ${planId}`);
+  }
+  if ((value.status === "succeeded" || value.status === "skipped") && value.terminalAt === undefined) {
+    throw new StorageRecordError(`Release step ${String(value.status)} status requires terminalAt: ${planId}.`);
+  }
+}
+
+const RELEASE_WORKFLOW_KINDS: ReadonlySet<string> = new Set([
+  "pr-create-or-reuse", "ci-confirm", "merge", "version-tag",
+  "npm-publish", "fresh-install-smoke", "cli-update",
+  "controller-replace", "project-migrate", "post-verify"
+]);
+
+const RELEASE_WORKFLOW_STATUSES: ReadonlySet<string> = new Set([
+  "pending", "running", "succeeded", "failed", "unknown", "skipped"
+]);
+
+/**
+ * Workflow records only move forward in time: a save with an older updatedAt
+ * than the stored record is rejected. Equal updatedAt permits idempotent
+ * re-saves of the same record. The exact source and the predeclared plan are
+ * immutable after create, and each step status may only follow the release
+ * state machine (no rewinds that could re-trigger a side effect).
+ */
+export function isValidReleaseWorkflowTransition(existing: ReleaseWorkflow, candidate: ReleaseWorkflow): boolean {
+  if (Date.parse(candidate.updatedAt) < Date.parse(existing.updatedAt)) return false;
+  if (!isDeepStrictEqual(candidate.source, existing.source)) return false;
+  if (!isDeepStrictEqual(candidate.plan, existing.plan)) return false;
+  const existingKeys = Object.keys(existing.steps);
+  const candidateKeys = Object.keys(candidate.steps);
+  if (existingKeys.length !== candidateKeys.length) return false;
+  for (const key of existingKeys) {
+    const from = existing.steps[key];
+    const to = candidate.steps[key];
+    if (from === undefined || to === undefined) return false;
+    if (!isLegalStepTransition(from.status, to.status)) return false;
+    if (to.attempts < from.attempts) return false;
+  }
+  return true;
+}
+
+/**
+ * The legal step-status transitions. Self-transitions are always allowed
+ * (idempotent re-saves). `pending -> failed` is permitted because the engine
+ * records an authorization denial atomically (start then fail in one save).
+ * `failed -> succeeded` is permitted only via an authoritative query that
+ * proves the effect landed (confirmFailedStep).
+ */
+const LEGAL_STEP_TRANSITIONS: Readonly<Record<ReleaseStepStatus, readonly ReleaseStepStatus[]>> = {
+  pending: ["running", "skipped", "failed"],
+  running: ["running", "succeeded", "failed", "unknown"],
+  failed: ["running", "succeeded"],
+  unknown: ["running", "succeeded"],
+  succeeded: [],
+  skipped: []
+};
+
+function isLegalStepTransition(from: ReleaseStepStatus, to: ReleaseStepStatus): boolean {
+  if (from === to) return true;
+  return LEGAL_STEP_TRANSITIONS[from]?.includes(to) ?? false;
 }
 
 function isValidDecisionSupersession(existing: Decision, candidate: Decision): boolean {

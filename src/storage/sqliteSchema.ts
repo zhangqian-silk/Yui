@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 1;
+export const SQLITE_SCHEMA_VERSION = 3;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -370,6 +370,58 @@ CREATE TABLE IF NOT EXISTS telemetry (
 CREATE INDEX IF NOT EXISTS idx_telemetry_run ON telemetry(task_id, run_id);
 `;
 
+/**
+ * Migration 2: post-baseline task-scoped record families. This single
+ * migration creates the DurableJob, CapabilityGrant, and ReleaseWorkflow
+ * tables so a fresh database receives the complete merged schema atomically.
+ */
+const MIGRATION_2_SQL = `
+CREATE TABLE IF NOT EXISTS durable_jobs (
+  job_id           TEXT PRIMARY KEY,
+  task_id          TEXT NOT NULL,
+  idempotency_key  TEXT,
+  status           TEXT NOT NULL,
+  payload          TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_durable_jobs_task ON durable_jobs(task_id);
+CREATE INDEX IF NOT EXISTS idx_durable_jobs_status ON durable_jobs(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_jobs_idempotency
+  ON durable_jobs(task_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS capability_grants (
+  task_id    TEXT NOT NULL,
+  grant_id   TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, grant_id)
+);
+
+CREATE TABLE IF NOT EXISTS release_workflows (
+  task_id     TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (task_id, workflow_id)
+);
+`;
+
+/**
+ * Migration 3: Job caller key hashes (task-14, rr13). Durable SHA-256 hashes of
+ * the caller key bound to each launched Session, used to fail-closed verify a
+ * DurableJob's caller against durable Run state.
+ */
+const MIGRATION_3_SQL = `
+CREATE TABLE IF NOT EXISTS job_caller_key_hashes (
+  task_id    TEXT NOT NULL,
+  role_name  TEXT NOT NULL,
+  agent_id   TEXT NOT NULL,
+  hash       TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, role_name, agent_id)
+);
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -378,7 +430,9 @@ interface Migration {
 }
 
 const MIGRATIONS: readonly Migration[] = [
-  { version: 1, axis: "layout", sql: MIGRATION_1_SQL }
+  { version: 1, axis: "layout", sql: MIGRATION_1_SQL },
+  { version: 2, axis: "record", recordKind: "durableJob+capability-grant+release-workflow", sql: MIGRATION_2_SQL },
+  { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL }
 ];
 
 function checksum(sql: string): string {
@@ -446,6 +500,8 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "id_sequences",
   "coordination_locks",
   "integration_queue",
+  "durable_jobs",
+  "job_caller_key_hashes",
   "outbox",
   "mailboxes",
   "mailbox_signals",
@@ -465,5 +521,7 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "milestones",
   "events",
   "task_projections",
-  "telemetry"
+  "telemetry",
+  "capability_grants",
+  "release_workflows"
 ] as const;

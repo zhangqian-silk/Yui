@@ -11,7 +11,7 @@ import {
   updateIntegrationAttempt,
   type IntegrationAttempt
 } from "../integration/integrationAttempt.js";
-import { GitIntegrationService } from "../integration/gitIntegrationService.js";
+import { GitIntegrationService, type IntegrationJobPort } from "../integration/gitIntegrationService.js";
 import { runTaskIntegrationQueueCommand } from "./taskIntegrationQueueCommands.js";
 import { taskActor } from "./taskActor.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
@@ -19,6 +19,7 @@ import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 export type TaskIntegrationCommandOptions = Readonly<{
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
+  jobPort?: IntegrationJobPort;
 }>;
 
 export async function runTaskIntegrationCommand(
@@ -29,14 +30,14 @@ export async function runTaskIntegrationCommand(
 ): Promise<Readonly<{ output: string; data?: unknown }>> {
   const now = options.now ?? (() => new Date());
   const [command, ...rest] = args;
-  if (command === "start") return start(rest, store, home, now, options.environment);
+  if (command === "start") return start(rest, store, home, now, options);
   if (command === "continue") {
-    return continueIntegration(rest, store, home, now, options.environment);
+    return continueIntegration(rest, store, home, now, options);
   }
   if (command === "resolve") {
     return resolveDecision(rest, store, now, options.environment);
   }
-  if (command === "abort") return abortIntegration(rest, store, now(), options.environment);
+  if (command === "abort") return abortIntegration(rest, store, now(), options);
   if (command === "supersede") return supersedeIntegrationCommand(rest, store, now(), options.environment);
   if (command === "cleanup") {
     return cleanupIntegration(rest, store, home, options.environment);
@@ -70,6 +71,25 @@ async function cleanupIntegration(
       `Integration is not terminal: ${integration.id}/${integration.status}.`
     );
   }
+  // rr4/finding-5: An Integration Attempt with an active DurableJob cannot be
+  // cleaned up — the runner may still be using its worktree. Block on queued,
+  // running, and unacknowledged unknown-needs-attention jobs owned by it.
+  const activeIntegrationJob = store.listDurableJobs(integration.taskId).find((job) => (
+    job.owner.kind === "integration-attempt"
+    && job.owner.integrationAttemptId === integration.id
+    && (
+      job.status === "queued"
+      || job.status === "running"
+      || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
+    )
+  ));
+  if (activeIntegrationJob !== undefined) {
+    throw usageError(
+      `Integration ${integration.id} has an active DurableJob: `
+      + `${activeIntegrationJob.id}/${activeIntegrationJob.status}. `
+      + "Cancel or acknowledge it before cleanup."
+    );
+  }
   const result = await new GitIntegrationService(home, store).cleanup(integration);
   if (result === "dirty") {
     throw usageError(
@@ -91,7 +111,7 @@ async function start(
   store: TaskStore,
   home: string,
   now: () => Date,
-  environment: NodeJS.ProcessEnv | undefined
+  options: TaskIntegrationCommandOptions
 ): Promise<Readonly<{ output: string; data: unknown }>> {
   const usage = "Task Integration start usage: yui task integration start <task> [--project <project>] --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...].";
   const parsed = parseRepeatable(
@@ -165,7 +185,7 @@ async function start(
     tx.saveIntegrationAttempt(task.id, created);
     return created;
   });
-  return runIntegration(store, home, integration, now, environment);
+  return runIntegration(store, home, integration, now, options);
 }
 
 async function continueIntegration(
@@ -173,15 +193,16 @@ async function continueIntegration(
   store: TaskStore,
   home: string,
   now: () => Date,
-  environment: NodeJS.ProcessEnv | undefined
+  options: TaskIntegrationCommandOptions
 ): Promise<Readonly<{ output: string; data: unknown }>> {
   const usage = "Task Integration continue usage: yui task integration continue <task>/<integration>.";
   const parsed = parseRepeatable(args, new Set(), new Set(), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
-  const integration = requireIntegration(store, parsed.positionals[0], environment);
+  const integration = requireIntegration(store, parsed.positionals[0], options.environment);
   requireActiveIntegrationTask(store, integration);
   if (
     integration.status !== "validating"
+    && integration.status !== "running"
     && (
       integration.status !== "blocked"
       || integration.resolution?.action !== "manual-resolution"
@@ -189,7 +210,7 @@ async function continueIntegration(
   ) {
     throw usageError(`Integration is not ready to continue: ${integration.id}/${integration.status}.`);
   }
-  return runIntegration(store, home, integration, now, environment);
+  return runIntegration(store, home, integration, now, options);
 }
 
 async function runIntegration(
@@ -197,15 +218,24 @@ async function runIntegration(
   home: string,
   integration: IntegrationAttempt,
   now: () => Date,
-  environment: NodeJS.ProcessEnv | undefined
+  options: TaskIntegrationCommandOptions
 ): Promise<Readonly<{ output: string; data: unknown }>> {
-  const result = await new GitIntegrationService(home, store, undefined, now, environment)
-    .integrate(integration.taskId, integration.id);
+  const result = await new GitIntegrationService(
+    home,
+    store,
+    undefined,
+    now,
+    options.environment,
+    undefined,
+    options.jobPort
+  ).integrate(integration.taskId, integration.id);
   const output = result.status === "committed"
     ? `Integrated ${result.attempt.changeSetIds.join(", ")} into ${result.attempt.targetRef} with CAS (${result.attempt.id})\n`
     : result.status === "blocked"
       ? `Integration ${result.attempt.id} requires a Leader resolution decision in ${result.workspace.path}\n`
-      : `Integration ${result.attempt.id} failed; target ref was not advanced\n`;
+      : result.status === "checks-running"
+        ? `Integration ${result.attempt.id} checks are running as DurableJob ${result.job.id}; run 'yui task integration continue ${result.attempt.taskId}/${result.attempt.id}' when the job finishes\n`
+        : `Integration ${result.attempt.id} failed; target ref was not advanced\n`;
   return { output, data: result };
 }
 
@@ -239,16 +269,16 @@ function resolveDecision(
   };
 }
 
-function abortIntegration(
+async function abortIntegration(
   args: readonly string[],
   store: TaskStore,
   now: Date,
-  environment: NodeJS.ProcessEnv | undefined
-): Readonly<{ output: string; data: unknown }> {
+  options: TaskIntegrationCommandOptions
+): Promise<Readonly<{ output: string; data: unknown }>> {
   const usage = "Task Integration abort usage: yui task integration abort <task>/<integration> --reason <text>.";
   const parsed = parseRepeatable(args, new Set(), new Set(["--reason"]), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
-  const integration = requireIntegration(store, parsed.positionals[0], environment);
+  const integration = requireIntegration(store, parsed.positionals[0], options.environment);
   requireActiveIntegrationTask(store, integration);
   if (integration.status !== "running" && integration.status !== "blocked") {
     throw usageError(
@@ -257,6 +287,9 @@ function abortIntegration(
   }
   const reason = parsed.one.get("--reason");
   if (reason === undefined) throw usageError(usage);
+  if (integration.jobId !== undefined && options.jobPort !== undefined) {
+    await options.jobPort.cancelJob(integration.taskId, integration.jobId);
+  }
   return store.transaction((tx) => {
     // Re-read inside the transaction: a concurrent `continue` can advance the
     // Attempt to validating (and then commit the target) after the initial
@@ -287,7 +320,6 @@ function abortIntegration(
     };
   });
 }
-
 function supersedeIntegrationCommand(
   args: readonly string[],
   store: TaskStore,
@@ -341,6 +373,7 @@ function supersedeIntegrationCommand(
       data: { integration: superseded }
     };
   });
+
 }
 
 function requireActiveIntegrationTask(
@@ -401,6 +434,7 @@ function show(
       `Target: ${integration.targetRef}`,
       `Expected head: ${integration.expectedHead}`,
       `Candidate: ${integration.candidateCommit ?? "-"}`,
+      `Job: ${integration.jobId ?? "-"}`,
       `ChangeSets: ${integration.changeSetIds.join(", ")}`,
       `Status: ${integration.status}`,
       `Conflict: ${integration.conflict?.summary ?? "-"}`,

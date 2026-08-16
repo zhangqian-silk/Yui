@@ -62,6 +62,11 @@ import {
   type IntegrationQueueEntry,
   type IntegrationQueueStatus
 } from "../integration/integrationQueueEntry.js";
+import {
+  validDurableJobTransition,
+  validateDurableJob,
+  type DurableJob
+} from "../job/durableJob.js";
 import type { GlobalRole, TaskRole } from "../role/role.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
@@ -80,11 +85,17 @@ import {
   StorageCancelledError,
   StorageRecordError,
   FileTaskStore,
+  storedCapabilityGrant,
+  storedReleaseWorkflow,
+  isValidCapabilityGrantTransition,
+  isValidReleaseWorkflowTransition,
   type ConfiguredAgentPatch,
   type ConfiguredAgentUpdateResult,
   type TaskStore,
   type YuiConfig
 } from "./taskStore.js";
+import type { CapabilityGrant } from "../grant/capabilityGrant.js";
+import type { ReleaseWorkflow } from "../release/releaseWorkflow.js";
 import {
   migrateSqliteSchema,
   SQLITE_AGGREGATE_VERSION,
@@ -997,6 +1008,103 @@ export class SqliteTaskStore implements TaskStore {
     );
   }
 
+  // -- durable jobs -----------------------------------------------------------
+
+  nextDurableJobId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "durableJob");
+  }
+
+  saveDurableJob(taskId: string, job: DurableJob): void {
+    if (job.taskId !== taskId) {
+      throw new StorageRecordError(`DurableJob belongs to another Task: ${job.taskId}`);
+    }
+    validateDurableJob(job);
+    this.#requireTask(taskId);
+    const existing = this.getDurableJob(taskId, job.id);
+    if (existing !== null) {
+      if (Date.parse(job.updatedAt) < Date.parse(existing.updatedAt)) {
+        throw new StorageRecordError(`DurableJob updatedAt cannot move backwards: ${job.id}`);
+      }
+      if (!validDurableJobTransition(existing, job)) {
+        throw new StorageRecordError(`DurableJob transition is invalid: ${job.id}`);
+      }
+    }
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO durable_jobs (job_id, task_id, idempotency_key, status, payload, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(job_id) DO UPDATE SET task_id = excluded.task_id,
+           idempotency_key = excluded.idempotency_key, status = excluded.status,
+           payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(
+        job.id,
+        taskId,
+        job.idempotencyKey ?? null,
+        job.status,
+        this.#json(job),
+        job.createdAt,
+        job.updatedAt
+      );
+    });
+  }
+
+  listDurableJobs(taskId: string): DurableJob[] {
+    return this.#sortById(
+      this.#listPayload<DurableJob>("durable_jobs", "task_id = ?", [taskId]),
+      (job) => job.id
+    );
+  }
+
+  getDurableJob(taskId: string, jobId: string): DurableJob | null {
+    return this.#getPayload<DurableJob>(
+      "durable_jobs",
+      "task_id = ? AND job_id = ?",
+      [taskId, jobId]
+    );
+  }
+
+  findDurableJobByIdempotencyKey(taskId: string, key: string): DurableJob | null {
+    return this.#getPayload<DurableJob>(
+      "durable_jobs",
+      "task_id = ? AND idempotency_key = ?",
+      [taskId, key]
+    );
+  }
+
+  listAllDurableJobs(): DurableJob[] {
+    return this.#listPayload<DurableJob>("durable_jobs", "1 = 1", []);
+  }
+
+  hasActiveDurableJobs(): boolean {
+    const row = this.#db.prepare(
+      "SELECT 1 FROM durable_jobs WHERE status IN ('queued', 'running') LIMIT 1"
+    ).get() as { 1: number } | undefined;
+    return row !== undefined;
+  }
+
+  // -- job caller key hashes (rr13) -------------------------------------------
+
+  getJobCallerKeyHash(taskId: string, roleName: string, agentId: string): string | null {
+    const row = this.#db.prepare(
+      "SELECT hash FROM job_caller_key_hashes WHERE task_id = ? AND role_name = ? AND agent_id = ?"
+    ).get(taskId, roleName, agentId) as { hash: string } | undefined;
+    return row === undefined ? null : row.hash;
+  }
+
+  setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void {
+    this.#requireTask(taskId);
+    if (!/^[a-f0-9]{64}$/u.test(hash)) {
+      throw new StorageRecordError(`Job caller key hash is invalid: ${taskId}/${roleName}.`);
+    }
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO job_caller_key_hashes (task_id, role_name, agent_id, hash, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(task_id, role_name, agent_id) DO UPDATE SET hash = excluded.hash, updated_at = excluded.updated_at`
+      ).run(taskId, roleName, agentId, hash, this.#now());
+    });
+  }
+
   // -- task roles -------------------------------------------------------------
 
   saveRole(taskId: string, role: TaskRole): void {
@@ -1166,6 +1274,83 @@ export class SqliteTaskStore implements TaskStore {
            payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(taskId, item.id, item.status, this.#json(item), this.#now());
     });
+  }
+
+  // -- capability grants ------------------------------------------------------
+
+  nextCapabilityGrantId(taskId: string): string { return this.#nextTaskRecordId(taskId, "capabilityGrant"); }
+
+  saveCapabilityGrant(taskId: string, grant: CapabilityGrant): void {
+    const stored = storedCapabilityGrant(grant);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Capability grant belongs to another Task: ${stored.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const existing = this.#getPayload<CapabilityGrant>(
+        "capability_grants", "task_id = ? AND grant_id = ?", [taskId, stored.id]
+      );
+      if (existing === null) {
+        if (stored.revokedAt !== undefined) {
+          throw new StorageRecordError(`Capability grant must start unrevoked: ${stored.id}`);
+        }
+        if (stored.usesUsed !== 0) {
+          throw new StorageRecordError(`Capability grant must start unused: ${stored.id}`);
+        }
+      } else if (!isValidCapabilityGrantTransition(existing, stored)) {
+        throw new StorageRecordError(`Capability grant cannot be overwritten: ${taskId}/${stored.id}`);
+      }
+      this.#db.prepare(
+        `INSERT INTO capability_grants (task_id, grant_id, payload, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(task_id, grant_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(taskId, stored.id, this.#json(stored), this.#now());
+    });
+  }
+
+  listCapabilityGrants(taskId: string): CapabilityGrant[] {
+    return this.#sortById(
+      this.#listPayload<CapabilityGrant>("capability_grants", "task_id = ?", [taskId]),
+      (grant) => grant.id
+    );
+  }
+
+  getCapabilityGrant(taskId: string, grantId: string): CapabilityGrant | null {
+    return this.#getPayload<CapabilityGrant>("capability_grants", "task_id = ? AND grant_id = ?", [taskId, grantId]);
+  }
+
+  // -- release workflows ------------------------------------------------------
+
+  nextReleaseWorkflowId(taskId: string): string { return this.#nextTaskRecordId(taskId, "releaseWorkflow"); }
+
+  saveReleaseWorkflow(taskId: string, workflow: ReleaseWorkflow): void {
+    const stored = storedReleaseWorkflow(workflow);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Release workflow belongs to another Task: ${stored.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const existing = this.#getPayload<ReleaseWorkflow>(
+        "release_workflows", "task_id = ? AND workflow_id = ?", [taskId, stored.id]
+      );
+      if (existing !== null && !isValidReleaseWorkflowTransition(existing, stored)) {
+        throw new StorageRecordError(`Release workflow cannot be overwritten: ${taskId}/${stored.id}`);
+      }
+      this.#db.prepare(
+        `INSERT INTO release_workflows (task_id, workflow_id, payload, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(task_id, workflow_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(taskId, stored.id, this.#json(stored), this.#now());
+    });
+  }
+
+  listReleaseWorkflows(taskId: string): ReleaseWorkflow[] {
+    return this.#sortById(
+      this.#listPayload<ReleaseWorkflow>("release_workflows", "task_id = ?", [taskId]),
+      (workflow) => workflow.id
+    );
+  }
+
+  getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null {
+    return this.#getPayload<ReleaseWorkflow>("release_workflows", "task_id = ? AND workflow_id = ?", [taskId, workflowId]);
   }
 
   // -- agent runs -------------------------------------------------------------
