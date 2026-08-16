@@ -16,6 +16,7 @@ import test from "node:test";
 
 import { createDurableJobControl } from "../../dist/controller/jobControl.js";
 import {
+  createDurableJob,
   isDurableJobTerminal,
   markDurableJobUnknown,
   startDurableJob
@@ -831,6 +832,63 @@ test("rr5/f5: the Controller rejects acknowledge with a stale or wrong assertion
   );
   assert.notEqual(acknowledged, null);
   assert.notEqual(acknowledged.acknowledgedAt, undefined);
+});
+
+test("rr26: job.acknowledge is Leader-only even for a Worker-owned Job", (t) => {
+  const { store, task, project, workspace, head, agent } = taskFixture(t);
+  const control = createDurableJobControl(store);
+  const item = saveWorkItemWithWorkspace(store, task, project, workspace, head, "work-item-1");
+  const owner = { kind: "work-item", workItemId: item.id };
+  const job = createDurableJob({
+    id: store.nextDurableJobId(task.id),
+    taskId: task.id,
+    owner,
+    projectId: project.id,
+    head,
+    workspace,
+    env: {},
+    steps: [{ name: "check", command: "true" }],
+    artifactsLocator: `artifacts/jobs/${task.id}/worker-owned`
+  }, NOW);
+  const running = startDurableJob(
+    job,
+    { pid: 4242, startIdentity: "worker-owned" },
+    new Date(NOW.getTime() + 100)
+  );
+  const unknown = markDurableJobUnknown(
+    running,
+    "worker-owned unknown",
+    [],
+    new Date(NOW.getTime() + 200)
+  );
+  store.saveDurableJob(task.id, unknown);
+
+  const workerRun = createAgentRun(
+    "agent-run-2",
+    task.id,
+    "worker",
+    "new",
+    "Worker turn.",
+    NOW,
+    {
+      workItemId: owner.workItemId,
+      effective: testEffectiveLaunch({ agentId: agent.id, adapterId: agent.adapterId })
+    }
+  );
+  store.saveAgentRun(workerRun);
+  store.saveActiveAgentRun(workerRun);
+  const workerKey = saveJobCallerKey(store, task, agent, "worker");
+
+  assert.throws(
+    () => control.acknowledgeJob(task.id, job.id, new Date(NOW.getTime() + 300), {
+      scope: "task",
+      taskId: task.id,
+      role: "worker",
+      runId: workerRun.id,
+      callerKey: workerKey
+    }),
+    /Leader|UNAUTHORIZED/iu
+  );
 });
 
 // ─── rr6/f1: bounded supervision wake after spawn and on runner exit ──────
