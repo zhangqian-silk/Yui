@@ -31,6 +31,7 @@ import type { WorkMailbox } from "../../coordination/workMailbox.js";
 import type { Decision } from "../../decision/decision.js";
 import type { TaskEvent } from "../../event/taskEvent.js";
 import type { InputRequest } from "../../input/inputRequest.js";
+import type { DurableJob } from "../../job/durableJob.js";
 import type {
   GlobalRoleSessionSet,
   TaskRoleSessionSet
@@ -125,6 +126,20 @@ function asObjectMap(value: unknown): Record<string, Record<string, unknown>> {
   return result;
 }
 
+/** Read a persisted map whose values are opaque strings without silently
+ * dropping malformed entries during an offline migration. */
+function asStringMap(value: unknown, label: string): Record<string, string> {
+  const record = asObject(value);
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(record)) {
+    if (typeof entry !== "string") {
+      throw new Error(`${label}.${key} must be a string.`);
+    }
+    result[key] = entry;
+  }
+  return result;
+}
+
 function asNullableObject(value: unknown): Record<string, unknown> | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "object" || Array.isArray(value)) return null;
@@ -144,6 +159,8 @@ interface StoredTaskShape {
   changeSets: Record<string, Record<string, unknown>>;
   integrationAttempts: Record<string, Record<string, unknown>>;
   integrationQueue: Record<string, Record<string, unknown>>;
+  durableJobs: Record<string, Record<string, unknown>>;
+  jobCallerKeyHashes: Record<string, string>;
   activeRuns: Record<string, { schemaVersion: number; runId: string }>;
   messages: Record<string, Record<string, unknown>>;
   inputRequests: Record<string, Record<string, unknown>>;
@@ -169,6 +186,11 @@ function asStoredTask(value: unknown): StoredTaskShape {
     changeSets: asObjectMap(record.changeSets),
     integrationAttempts: asObjectMap(record.integrationAttempts),
     integrationQueue: asObjectMap(record.integrationQueue),
+    durableJobs: asObjectMap(record.durableJobs),
+    jobCallerKeyHashes: asStringMap(
+      record.jobCallerKeyHashes,
+      "jobCallerKeyHashes"
+    ),
     activeRuns: asObjectMap(record.activeRuns) as unknown as Record<string, { schemaVersion: number; runId: string }>,
     messages: asObjectMap(record.messages),
     inputRequests: asObjectMap(record.inputRequests),
@@ -275,6 +297,24 @@ export function populateSqliteFromState(
         }
         for (const entry of Object.values(stored.integrationQueue)) {
           store.saveIntegrationQueueEntry(taskId, entry as unknown as IntegrationQueueEntry);
+        }
+        for (const job of Object.values(stored.durableJobs)) {
+          store.saveDurableJob(taskId, job as unknown as DurableJob);
+        }
+        for (const [key, hash] of Object.entries(stored.jobCallerKeyHashes)) {
+          const separator = key.indexOf("\0");
+          if (separator <= 0 || separator === key.length - 1
+            || key.indexOf("\0", separator + 1) !== -1) {
+            throw new Error(
+              `Job caller key hash identity is invalid: ${taskId}/${key}.`
+            );
+          }
+          store.setJobCallerKeyHash(
+            taskId,
+            key.slice(0, separator),
+            key.slice(separator + 1),
+            hash
+          );
         }
         // Active-run pointers: the document stores { schemaVersion, runId }
         // keyed by pointer; the store derives the pointer from the Run.
@@ -395,6 +435,8 @@ export function computeStateFamilyChecksums(
   const changeSets: unknown[] = [];
   const integrationAttempts: unknown[] = [];
   const integrationQueue: unknown[] = [];
+  const durableJobs: unknown[] = [];
+  const jobCallerKeyHashes: unknown[] = [];
   const activeRunPointers: unknown[] = [];
   const messages: unknown[] = [];
   const inputRequests: unknown[] = [];
@@ -416,6 +458,21 @@ export function computeStateFamilyChecksums(
     changeSets.push(...Object.values(stored.changeSets));
     integrationAttempts.push(...Object.values(stored.integrationAttempts));
     integrationQueue.push(...Object.values(stored.integrationQueue));
+    durableJobs.push(...Object.values(stored.durableJobs));
+    for (const [key, hash] of Object.entries(stored.jobCallerKeyHashes)) {
+      const separator = key.indexOf("\0");
+      if (separator <= 0 || separator === key.length - 1
+        || key.indexOf("\0", separator + 1) !== -1) {
+        throw new Error(
+          `Job caller key hash identity is invalid: ${stored.task.id}/${key}.`
+        );
+      }
+      jobCallerKeyHashes.push({
+        taskId: stored.task.id,
+        key,
+        hash
+      });
+    }
     activeRunPointers.push(...Object.values(stored.activeRuns));
     messages.push(...Object.values(stored.messages));
     inputRequests.push(...Object.values(stored.inputRequests));
@@ -437,6 +494,8 @@ export function computeStateFamilyChecksums(
   checksums.changeSet = hashRecords(changeSets);
   checksums.integrationAttempt = hashRecords(integrationAttempts);
   checksums.integrationQueue = hashRecords(integrationQueue);
+  checksums.durableJob = hashRecords(durableJobs);
+  checksums.jobCallerKeyHash = hashRecords(jobCallerKeyHashes);
   checksums.activeRunPointer = hashRecords(activeRunPointers);
   checksums.message = hashRecords(messages);
   checksums.inputRequest = hashRecords(inputRequests);
@@ -545,6 +604,23 @@ export function computeDbFamilyChecksums(
       db,
       "SELECT payload FROM integration_queue"
     );
+    checksums.durableJob = hashPayloadTable(
+      db,
+      "SELECT payload FROM durable_jobs"
+    );
+    const callerHashRows = db.prepare(
+      "SELECT task_id, role_name, agent_id, hash FROM job_caller_key_hashes"
+    ).all() as Array<{
+      task_id: string;
+      role_name: string;
+      agent_id: string;
+      hash: string;
+    }>;
+    checksums.jobCallerKeyHash = hashRecords(callerHashRows.map((row) => ({
+      taskId: row.task_id,
+      key: `${row.role_name}\0${row.agent_id}`,
+      hash: row.hash
+    })));
     checksums.activeRunPointer = hashPayloadTable(db, "SELECT payload FROM active_runs");
     checksums.message = hashPayloadTable(db, "SELECT payload FROM messages");
     checksums.inputRequest = hashPayloadTable(db, "SELECT payload FROM input_requests");
