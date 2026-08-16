@@ -287,7 +287,15 @@ async function main() {
     // candidate's writable state: the candidate must not be able to leave
     // state in HOME, the XDG tree, the npm cache, or TMPDIR that changes
     // the base's result (and vice versa).
-    const baseRoot = join(root, "base");
+    // The base root must not live at a predictable path under the gate
+    // root: a candidate test can compute the gate root from its own HOME
+    // (dirname(dirname(HOME))) and preseed <gateRoot>/base/home/.npmrc or
+    // .tmux.conf before the base domain is created, achieving arbitrary
+    // code execution in the base domain and causing an introduced failure
+    // to be misclassified as pre-existing (fail-open). Use an unpredictable
+    // mkdtempSync directory instead, same pattern as baseTemplateDir.
+    const baseRoot = mkdtempSync(join(shortTmpBase(), "yui-gate-base-"));
+    tmpHomes.push(baseRoot);
     const baseTmp = mkdtempSync(join(shortTmpBase(), "yui-gate-tmp-base-"));
     tmpHomes.push(baseTmp);
     const baseHermetic = createGateSideDomain(baseRoot, baseTmp, options, "base");
