@@ -1027,8 +1027,8 @@ export class SqliteTaskStore implements TaskStore {
       this.#db.prepare(
         `INSERT INTO durable_jobs (job_id, task_id, idempotency_key, status, payload, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(job_id) DO UPDATE SET task_id = excluded.task_id,
-           idempotency_key = excluded.idempotency_key, status = excluded.status,
+         ON CONFLICT(task_id, job_id) DO UPDATE SET idempotency_key = excluded.idempotency_key,
+           status = excluded.status,
            payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(
         job.id,
