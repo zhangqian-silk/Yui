@@ -138,6 +138,22 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     );
   }
 
+  /**
+   * Commit the caller key for a task Session only after the runtime host has
+   * confirmed that it created a new native process.  An ensure/resume request
+   * that reuses a live host must keep the old durable hash because its process
+   * still carries the old plaintext key.
+   */
+  commitTaskCallerKey(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    callerKey: string;
+  }>): void {
+    const hash = createHash("sha256").update(input.callerKey).digest("hex");
+    this.store.setJobCallerKeyHash(input.taskId, input.roleName, input.agentId, hash);
+  }
+
   /** Re-publishes provider-discovered native identity after its durable fold. */
   refreshTaskRuntimeDescriptor(input: Readonly<{
     taskId: string;
@@ -571,15 +587,13 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         `${serializeExactDescriptor(runtimeDescriptor)}\n`
       );
     }
-    // rr13: Generate a per-Session DurableJob caller key for new task-scope
-    // Sessions. The plaintext key is injected into the launch env; only its
-    // SHA-256 hash is persisted, so a client that reads durable state cannot
-    // replay a job.start/job.cancel caller. Resume reuses the existing key.
+    // rr13/rr26: Generate a per-Session DurableJob caller key for every
+    // task-scope launch, including resume.  Resume/ensure may reuse a live
+    // host, so its candidate hash is committed by TmuxSessionHost only when
+    // hostCreated=true; otherwise the live process keeps its existing key.
     let jobCallerKey: string | undefined;
-    if (owner.scope === "task" && input.mode === "new") {
+    if (owner.scope === "task" && (input.mode === "new" || input.mode === "resume")) {
       jobCallerKey = randomBytes(32).toString("hex");
-      const hash = createHash("sha256").update(jobCallerKey).digest("hex");
-      this.store.setJobCallerKeyHash(owner.taskId, role.name, configured.id, hash);
     }
     const launch = {
       command: configured.command,

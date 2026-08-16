@@ -10,6 +10,7 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { migrateSqliteSchema, SQLITE_SCHEMA_TABLES } from "../../dist/storage/sqliteSchema.js";
 import { openTaskStore, resolveTaskStoreBackend, SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { createProject } from "../../dist/repository/project.js";
+import { createDurableJob, startDurableJob } from "../../dist/job/durableJob.js";
 import { createWorkItem } from "../../dist/workItem/workItem.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
 import { createIntegrationQueueEntry, markIntegrationQueueRunning } from "../../dist/integration/integrationQueueEntry.js";
@@ -80,8 +81,8 @@ test("schema migration: fresh create applies every current migration and all tab
   const home = temporaryHome();
   const db = new Database(join(home, "yui.db"));
   const result = migrateSqliteSchema(db);
-  assert.deepEqual(result.applied, [1, 2, 3]);
-  assert.equal(result.version, 3);
+  assert.deepEqual(result.applied, [1, 2, 3, 4]);
+  assert.equal(result.version, 4);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
   for (const table of SQLITE_SCHEMA_TABLES) {
     assert.ok(tables.includes(table), `missing table: ${table}`);
@@ -96,7 +97,54 @@ test("schema migration: idempotent re-run applies nothing", () => {
   migrateSqliteSchema(db);
   const second = migrateSqliteSchema(db);
   assert.deepEqual(second.applied, []);
-  assert.equal(second.version, 3);
+  assert.equal(second.version, 4);
+  db.close();
+});
+
+test("schema migration: repairs the legacy global DurableJob key without losing rows", () => {
+  const home = temporaryHome();
+  const db = new Database(join(home, "yui.db"));
+  db.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      axis TEXT NOT NULL,
+      record_kind TEXT,
+      applied_at TEXT NOT NULL,
+      checksum TEXT NOT NULL
+    );
+    INSERT INTO schema_migrations(version, axis, record_kind, applied_at, checksum)
+      VALUES (1, 'layout', NULL, '2026-08-17T00:00:00.000Z', 'legacy-1'),
+             (2, 'record', 'durableJob', '2026-08-17T00:00:00.000Z', 'legacy-2'),
+             (3, 'record', 'jobCallerKeyHash', '2026-08-17T00:00:00.000Z', 'legacy-3');
+    CREATE TABLE durable_jobs (
+      job_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      idempotency_key TEXT,
+      status TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO durable_jobs
+      (job_id, task_id, idempotency_key, status, payload, created_at, updated_at)
+      VALUES ('job-7', 'task-legacy', 'key-7', 'queued', '{}',
+              '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:00.000Z');
+  `);
+
+  const result = migrateSqliteSchema(db);
+  assert.deepEqual(result.applied, [4]);
+  assert.equal(result.version, 4);
+  const columns = db.prepare("PRAGMA table_info(durable_jobs)").all();
+  assert.deepEqual(
+    columns.filter(({ pk }) => pk > 0)
+      .map(({ name, pk }) => [name, pk])
+      .sort((left, right) => left[1] - right[1]),
+    [["task_id", 1], ["job_id", 2]]
+  );
+  assert.deepEqual(
+    db.prepare("SELECT task_id, job_id, status FROM durable_jobs").get(),
+    { task_id: "task-legacy", job_id: "job-7", status: "queued" }
+  );
   db.close();
 });
 
@@ -225,6 +273,47 @@ test("CRUD: saving a record for another task is rejected", () => {
   store.saveTask(task);
   const foreign = makeMessage(store, task.id, { taskId: "task-999" });
   assert.throws(() => store.saveMessage(task.id, foreign), /belongs to another Task/);
+  store.close();
+});
+
+test("CRUD: DurableJob IDs are isolated by Task in SQLite", () => {
+  const store = new SqliteTaskStore(temporaryHome());
+  const taskA = makeTask(store);
+  store.saveTask(taskA);
+  const taskB = makeTask(store);
+  store.saveTask(taskB);
+  const now = new Date("2026-08-17T00:00:00.000Z");
+  const create = (taskId, workspace) => createDurableJob({
+    id: store.nextDurableJobId(taskId),
+    taskId,
+    owner: { kind: "task" },
+    projectId: "project-1",
+    head: "a".repeat(40),
+    workspace,
+    env: {},
+    steps: [{ name: "check", command: "true" }],
+    artifactsLocator: `artifacts/${taskId}`
+  }, now);
+  const jobA = create(taskA.id, "/tmp/task-a");
+  const jobB = create(taskB.id, "/tmp/task-b");
+
+  assert.equal(jobA.id, "job-1");
+  assert.equal(jobB.id, "job-1");
+  store.saveDurableJob(taskA.id, jobA);
+  store.saveDurableJob(taskB.id, jobB);
+  assert.deepEqual(store.listDurableJobs(taskA.id).map(({ id }) => id), ["job-1"]);
+  assert.deepEqual(store.listDurableJobs(taskB.id).map(({ id }) => id), ["job-1"]);
+  assert.equal(store.getDurableJob(taskA.id, "job-1").taskId, taskA.id);
+  assert.equal(store.getDurableJob(taskB.id, "job-1").taskId, taskB.id);
+
+  const runningA = startDurableJob(
+    jobA,
+    { pid: 101, startIdentity: "task-a" },
+    new Date(now.getTime() + 1_000)
+  );
+  store.saveDurableJob(taskA.id, runningA);
+  assert.equal(store.getDurableJob(taskA.id, "job-1").status, "running");
+  assert.equal(store.getDurableJob(taskB.id, "job-1").status, "queued");
   store.close();
 });
 

@@ -63,6 +63,13 @@ export interface RoleLaunchPlanner {
     adapterId: string;
     workspace: string;
   }>): void;
+  /** Persist a task caller key only after a native host was created. */
+  commitTaskCallerKey?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    callerKey: string;
+  }>): void;
 }
 
 export type ExecutorTmuxPort = Readonly<{
@@ -193,6 +200,18 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         planned.role,
         planned.launch
       );
+      if (
+        sessionStarted
+        && planned.launch.env.YUI_JOB_CALLER_KEY !== undefined
+        && this.planner.commitTaskCallerKey !== undefined
+      ) {
+        this.planner.commitTaskCallerKey({
+          taskId: input.taskId,
+          roleName: input.roleName,
+          agentId: input.agentId,
+          callerKey: planned.launch.env.YUI_JOB_CALLER_KEY
+        });
+      }
       session = planned.session;
     } else {
       const common = {

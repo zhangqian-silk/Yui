@@ -71,6 +71,18 @@ export interface RuntimeRoleLaunchPlannerPort {
     launchId?: string;
     environment?: Readonly<Record<string, string>>;
   }>): RuntimePlannedSession;
+  /**
+   * Persist a caller key only after the host adapter has confirmed that a
+   * native process was actually created. Resume/ensure calls may reuse a live
+   * host, in which case rotating the durable hash would invalidate the live
+   * process's key.
+   */
+  commitTaskCallerKey?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    callerKey: string;
+  }>): void;
 }
 
 /** The lifecycle subset required from TmuxManager. */
@@ -376,6 +388,19 @@ export class TmuxSessionHost implements SessionHostPort {
       planned.role,
       planned.launch
     );
+    if (
+      hostCreated
+      && request.owner.scope === "task"
+      && planned.launch.env.YUI_JOB_CALLER_KEY !== undefined
+      && this.planner.commitTaskCallerKey !== undefined
+    ) {
+      this.planner.commitTaskCallerKey({
+        taskId: request.owner.taskId,
+        roleName: request.owner.roleName,
+        agentId: request.agentId,
+        callerKey: planned.launch.env.YUI_JOB_CALLER_KEY
+      });
+    }
     return createRuntimeBinding({
       id: bindingId,
       launchId: request.launchId,
