@@ -213,6 +213,10 @@ export function createReleaseWorkflowPorts(
   const run: CommandRunner = deps.runCommand !== undefined
     ? deps.runCommand
     : createPinnedRunner(defaultRunCommand);
+  // Capture the same npm resolution used by the production pinned runner at
+  // adapter construction.  The effect target must never be re-resolved from
+  // a later PATH, which may belong to a replacement process or environment.
+  const pinnedNpmPath = resolveExecutable("npm", process.env.PATH);
   const idempotency = deps.idempotencyStore ?? createFileReleaseIdempotencyStore(deps.home);
 
   async function executeStepOnce(
@@ -741,19 +745,51 @@ export function createReleaseWorkflowPorts(
                 logs: ["npm-publish: refusing to publish a tarball that is not the frozen version"]
               };
             }
-            // P1 (rr24): persist the exact npm executable and registry
-            // BEFORE the irreversible effect. A resume in a different
-            // environment reads this durable receipt instead of invoking
-            // its own npm/registry: a different mirror serving the same
-            // version+integrity would otherwise falsely confirm this
-            // publish. Best-effort: an unpinnable target or a failed write
-            // must not block the publish.
-            try {
-              await persistNpmPublishTarget(run, deps.home, idempotencyKey);
-            } catch {
-              // Best-effort persistence; the effect may still succeed.
+            // P1 (rr25): resolve and persist the exact npm executable and
+            // registry BEFORE the irreversible effect. A resume in a
+            // different environment reads this durable receipt instead of
+            // invoking its own npm/registry: a different mirror serving the
+            // same version+integrity would otherwise falsely confirm this
+            // publish. The registry is also passed to publish explicitly so
+            // the receipt names the target the effect actually used.
+            if (pinnedNpmPath === undefined) {
+              return {
+                outcome: "failed",
+                error: "npm-publish: npm is not resolvable at adapter construction; refusing an unbound effect target",
+                logs: ["npm-publish: refusing to publish without a pinned npm executable"]
+              };
             }
-            const published = await run("npm", ["publish", "--", snapshot]);
+            const registry = await resolveNpmPublishRegistry(
+              run,
+              manifest.name,
+              manifest.publishConfig?.registry
+            );
+            if (registry === undefined) {
+              return {
+                outcome: "failed",
+                error: "npm-publish: registry target could not be resolved; refusing an unbound effect target",
+                logs: ["npm-publish: refusing to publish without a pinned registry"]
+              };
+            }
+            try {
+              await persistNpmPublishTarget(deps.home, idempotencyKey, {
+                npmPath: pinnedNpmPath,
+                registry
+              });
+            } catch (error) {
+              return {
+                outcome: "failed",
+                error: `npm-publish: cannot persist effect target before publish: ${error instanceof Error ? error.message : String(error)}`,
+                logs: ["npm-publish: refusing to publish when the durable target cannot be recorded"]
+              };
+            }
+            const published = await run("npm", [
+              "publish",
+              "--registry",
+              registry,
+              "--",
+              snapshot
+            ]);
             if (published.code !== 0) {
               // A transport failure after the upload may have actually published
               // the package. Record the identity so the engine can query npm
@@ -1474,14 +1510,31 @@ function remoteMatchesRepository(
 async function readTarballManifest(
   run: CommandRunner,
   tarball: string
-): Promise<{ name: string; version: string } | undefined> {
+): Promise<{
+  name: string;
+  version: string;
+  publishConfig?: { registry?: string };
+} | undefined> {
   const extracted = await run("tar", ["-xOf", tarball, "package/package.json"]);
   if (extracted.code !== 0) return undefined;
   try {
-    const manifest = JSON.parse(extracted.stdout) as { name?: unknown; version?: unknown };
+    const manifest = JSON.parse(extracted.stdout) as {
+      name?: unknown;
+      version?: unknown;
+      publishConfig?: unknown;
+    };
     if (typeof manifest.name !== "string" || manifest.name.length === 0) return undefined;
     if (typeof manifest.version !== "string" || manifest.version.length === 0) return undefined;
-    return { name: manifest.name, version: manifest.version };
+    const publishConfig = isRecord(manifest.publishConfig)
+      && typeof manifest.publishConfig.registry === "string"
+      && manifest.publishConfig.registry.trim().length > 0
+      ? { registry: manifest.publishConfig.registry.trim() }
+      : undefined;
+    return {
+      name: manifest.name,
+      version: manifest.version,
+      ...(publishConfig === undefined ? {} : { publishConfig })
+    };
   } catch {
     return undefined;
   }
@@ -1615,27 +1668,46 @@ function npmPublishTargetPath(home: string, idempotencyKey: string): string {
  * Persist an npm-publish's exact executable and registry BEFORE the
  * irreversible effect. A hard exit between this write and the engine's
  * identity persistence still leaves a durable receipt recovery can read.
- * Best-effort by contract: callers wrap this in try/catch and proceed with
- * the publish regardless.
  */
 async function persistNpmPublishTarget(
-  run: CommandRunner,
   home: string,
-  idempotencyKey: string
+  idempotencyKey: string,
+  targetValue: Readonly<{ npmPath: string; registry: string }>
 ): Promise<void> {
-  const npmPath = resolveExecutable("npm", process.env.PATH);
-  if (npmPath === undefined) return;
-  const registryResult = await run("npm", ["config", "get", "registry"]);
-  if (registryResult.code !== 0) return;
-  const registry = registryResult.stdout.trim();
-  if (registry.length === 0) return;
   const target = npmPublishTargetPath(home, idempotencyKey);
   await mkdir(dirname(target), { recursive: true });
   // Write to a temp file in the same directory and rename: the rename is
   // atomic on the same filesystem, so a crash never leaves a torn record.
   const temp = `${target}.${randomBytes(8).toString("hex")}.tmp`;
-  await writeFile(temp, JSON.stringify({ npmPath, registry }), { flag: "wx" });
+  await writeFile(temp, JSON.stringify(targetValue), { flag: "wx" });
   await rename(temp, target);
+}
+
+/** Resolve the registry npm publish will use for the verified package. */
+async function resolveNpmPublishRegistry(
+  run: CommandRunner,
+  packageName: string,
+  publishConfigRegistry?: string
+): Promise<string | undefined> {
+  if (publishConfigRegistry !== undefined && publishConfigRegistry.trim().length > 0) {
+    return publishConfigRegistry.trim();
+  }
+  const scope = packageName.startsWith("@")
+    ? packageName.slice(0, packageName.indexOf("/"))
+    : undefined;
+  if (scope !== undefined) {
+    const scoped = await run("npm", ["config", "get", `${scope}:registry`]);
+    const scopedRegistry = normalizeNpmRegistry(scoped.stdout, scoped.code);
+    if (scopedRegistry !== undefined) return scopedRegistry;
+  }
+  const defaultRegistry = await run("npm", ["config", "get", "registry"]);
+  return normalizeNpmRegistry(defaultRegistry.stdout, defaultRegistry.code);
+}
+
+function normalizeNpmRegistry(stdout: string, code: number): string | undefined {
+  if (code !== 0) return undefined;
+  const value = stdout.trim();
+  return value.length === 0 || value === "undefined" ? undefined : value;
 }
 
 /**

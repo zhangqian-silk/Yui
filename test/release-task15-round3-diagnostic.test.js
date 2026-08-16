@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
@@ -1284,6 +1284,8 @@ test("rr22 P1-2 regression: a pinned activation target confirms without consulti
 test("rr22 P1-3 regression: npm publish reads an immutable snapshot of the verified tarball, not the live path", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "yui-rr22-toctou-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const home = mkdtempSync(join(tmpdir(), "yui-rr22-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
   const tarball = join(dir, "widget-1.2.3.tgz");
   const verifiedBytes = Buffer.from("verified-tarball-bytes");
   writeFileSync(tarball, verifiedBytes);
@@ -1295,6 +1297,9 @@ test("rr22 P1-3 regression: npm publish reads an immutable snapshot of the verif
     if (command === "tar") {
       return { code: 0, stdout: JSON.stringify({ name: "@acme/widget", version: "1.2.3" }), stderr: "" };
     }
+    if (args[0] === "config" && args[1] === "get") {
+      return { code: 0, stdout: "https://registry.example.com/\n", stderr: "" };
+    }
     if (command === "npm" && args[0] === "publish") {
       publishedPath = args[args.length - 1];
       // Attacker replaces the original tarball AFTER the integrity check.
@@ -1303,7 +1308,7 @@ test("rr22 P1-3 regression: npm publish reads an immutable snapshot of the verif
       return { code: 0, stdout: "+ @acme/widget@1.2.3\n", stderr: "" };
     }
     return { code: 1, stdout: "", stderr: `unexpected command: ${command} ${args.join(" ")}` };
-  });
+  }, { home });
 
   const effect = await ports.executeStep({
     step: {
@@ -1884,6 +1889,82 @@ test("rr24 P1 regression: npm-publish recovery with no durable target file fails
     "a hard-exit npm-publish with no durable target file must not be confirmed");
   assert.equal(npmConsulted, false,
     "the resume environment's npm must never be consulted without a durable target");
+});
+
+test("rr25 P1 regression: publish receipt and effect share the pinned npm and effective registry", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-rr25-npm-target-"));
+  const binA = mkdtempSync(join(tmpdir(), "yui-rr25-npm-bin-a-"));
+  const binB = mkdtempSync(join(tmpdir(), "yui-rr25-npm-bin-b-"));
+  const tarball = join(home, "widget-1.2.3.tgz");
+  const verifiedBytes = Buffer.from("rr25-verified-tarball");
+  writeFileSync(tarball, verifiedBytes);
+  const integrity = `sha512-${createHash("sha512").update(verifiedBytes).digest("base64")}`;
+  const npmA = join(binA, "npm");
+  const npmB = join(binB, "npm");
+  writeFileSync(npmA, "#!/bin/sh\n");
+  writeFileSync(npmB, "#!/bin/sh\n");
+  chmodSync(npmA, 0o755);
+  chmodSync(npmB, 0o755);
+  const originalPath = process.env.PATH;
+  t.after(() => {
+    process.env.PATH = originalPath;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(binA, { recursive: true, force: true });
+    rmSync(binB, { recursive: true, force: true });
+  });
+
+  process.env.PATH = `${binA}${delimiter}${originalPath ?? ""}`;
+  const expectedNpmPath = resolveExecutable("npm", process.env.PATH);
+  assert.equal(expectedNpmPath, npmA);
+  let publishedArgs;
+  const publishRegistry = "https://publish-config.example.com/";
+  const runCommand = async (command, args) => {
+    if (command === "tar") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          name: "@acme/widget",
+          version: "1.2.3",
+          publishConfig: { registry: publishRegistry }
+        }),
+        stderr: ""
+      };
+    }
+    if (args[0] === "config" && args[1] === "get") {
+      // The package publishConfig must win over this different default.
+      return { code: 0, stdout: "https://default.example/\n", stderr: "" };
+    }
+    if (args[0] === "publish") {
+      publishedArgs = [...args];
+      return { code: 0, stdout: "+ @acme/widget@1.2.3\n", stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: `unexpected command: ${command} ${args.join(" ")}` };
+  };
+  const ports = realPorts(runCommand, { home });
+
+  // The effect runs after PATH changes to B. A receipt derived at effect time
+  // would incorrectly name npm-B; the pinned adapter target must remain npm-A.
+  process.env.PATH = `${binB}${delimiter}${originalPath ?? ""}`;
+  const fx = engineFixture({
+    source: { ...SOURCE, artifact: { name: "widget-1.2.3.tgz", integrity } },
+    plan: [{
+      id: "publish",
+      kind: "npm-publish",
+      params: { package: "@acme/widget", version: "1.2.3", tarball },
+      irreversibility: "irreversible"
+    }]
+  });
+  const result = await runReleaseWorkflow(fx.store, "task-1", "release-workflow-1", ports, { now: () => NOW });
+  assert.equal(result.outcome, "succeeded");
+
+  const persisted = JSON.parse(readFileSync(
+    join(home, "release", "npm-publish-target", "task-1/release-workflow-1/publish.json"), "utf8"));
+  assert.equal(persisted.npmPath, npmA,
+    "the durable receipt must retain the executable pinned before PATH changed");
+  assert.equal(persisted.registry, publishRegistry,
+    "publishConfig.registry must be the effective target, not npm's default registry");
+  assert.ok(publishedArgs?.includes("--registry"));
+  assert.ok(publishedArgs?.includes(publishRegistry));
 });
 
 test("rr24 P2 regression: createPinnedRunner negative cache survives a later PATH addition", async (t) => {
