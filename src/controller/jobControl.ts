@@ -108,7 +108,7 @@ export type DurableJobControlPort = Readonly<{
     taskId: string,
     jobId: string,
     now: Date,
-    assertion: DurableJobLeaderAssertion
+    caller: DurableJobCaller
   ): DurableJob | null;
 }>;
 
@@ -166,11 +166,14 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
         return next;
       });
     },
-    acknowledgeJob(taskId, jobId, now, assertion) {
+    acknowledgeJob(taskId, jobId, now, caller) {
       return store.transaction((tx) => {
-        assertLeaderActionRun(tx, taskId, assertion);
         const current = tx.getDurableJob(taskId, jobId);
         if (current === null) return null;
+        // A replayable leaderAssertion is not a channel credential. Reuse the
+        // same task-scope caller-key binding as job.start/job.cancel, while
+        // preserving the current active-Run/receipt checks for Leaders.
+        assertCallerAuthorized(tx, caller, current.owner, taskId);
         const next = acknowledgeUnknownDurableJob(current, now);
         if (next !== current) tx.saveDurableJob(taskId, next);
         return next;
@@ -634,14 +637,14 @@ export function parseDurableJobCancelParams(value: JsonValue): Readonly<{
 }
 
 /**
- * rr5/f5: `job.acknowledge` params must carry a Leader assertion. The
- * Controller verifies it against the current in-flight Leader Run; a request
- * without one is rejected at the socket boundary.
+ * rr26: `job.acknowledge` carries the same managed task caller as
+ * job.start/job.cancel.  A replayable leaderAssertion without the ephemeral
+ * Session caller key is rejected by assertCallerAuthorized.
  */
 export function parseDurableJobAcknowledgeParams(value: JsonValue): Readonly<{
   taskId: string;
   jobId: string;
-  assertion: DurableJobLeaderAssertion;
+  caller: DurableJobCaller;
 }> {
   if (
     typeof value !== "object" || value === null || Array.isArray(value)
@@ -650,24 +653,10 @@ export function parseDurableJobAcknowledgeParams(value: JsonValue): Readonly<{
     throw jobControlError("INVALID_PARAMS", "DurableJob acknowledge params are invalid.");
   }
   const record = value as Readonly<Record<string, JsonValue>>;
-  const assertion = record.leaderAssertion;
-  if (
-    typeof assertion !== "object" || assertion === null || Array.isArray(assertion)
-    || Object.keys(assertion).length !== 2
-  ) {
-    throw jobControlError(
-      "INVALID_PARAMS",
-      "job.acknowledge requires a leaderAssertion with runId and receiptId."
-    );
-  }
-  const assertionRecord = assertion as Readonly<Record<string, JsonValue>>;
   return {
     taskId: requiredId(record.taskId, "DurableJob taskId"),
     jobId: requiredId(record.jobId, "DurableJob jobId"),
-    assertion: {
-      runId: requiredId(assertionRecord.runId, "job.acknowledge leaderAssertion runId"),
-      receiptId: requiredId(assertionRecord.receiptId, "job.acknowledge leaderAssertion receiptId")
-    }
+    caller: parseCaller(record.caller)
   };
 }
 

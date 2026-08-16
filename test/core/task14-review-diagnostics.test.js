@@ -534,7 +534,7 @@ test("an acknowledged unknown-needs-attention job no longer blocks Task completi
     }
   ), /active DurableJob/iu);
   // Acknowledge the unknown job with a verified Leader assertion.
-  const assertion = saveLeaderAssertion(store, task, agent, new Date(NOW.getTime() + 2_500));
+  const assertion = leaderCaller(store, task, agent, new Date(NOW.getTime() + 2_500));
   control.acknowledgeJob(
     task.id,
     job.id,
@@ -799,10 +799,13 @@ test("rr5/f5: the Controller rejects acknowledge with a stale or wrong assertion
   saveLeaderAssertion(store, task, agent, new Date(NOW.getTime() + 2_000));
   assert.throws(
     () => control.acknowledgeJob(task.id, job.id, new Date(NOW.getTime() + 3_000), {
+      scope: "task",
+      taskId: task.id,
+      role: "leader",
       runId: "agent-run-999",
       receiptId: formatAgentRunReceiptId(task.id, "agent-run-999")
     }),
-    /UNAUTHORIZED|Leader/iu
+    /UNAUTHORIZED|Leader|active Run/iu
   );
   // A valid assertion succeeds (the job is acknowledged). First transition
   // the job to unknown-needs-attention so acknowledge is legal.
@@ -822,7 +825,7 @@ test("rr5/f5: the Controller rejects acknowledge with a stale or wrong assertion
     );
     tx.saveDurableJob(task.id, unknown);
   });
-  const assertion = saveLeaderAssertion(store, task, agent, new Date(NOW.getTime() + 4_000));
+  const assertion = leaderCaller(store, task, agent, new Date(NOW.getTime() + 4_000));
   const acknowledged = control.acknowledgeJob(
     task.id,
     job.id,

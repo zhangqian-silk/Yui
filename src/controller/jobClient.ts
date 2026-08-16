@@ -11,7 +11,7 @@ import type {
   DurableJobOwner,
   DurableJobStep
 } from "../job/durableJob.js";
-import type { DurableJobCaller, DurableJobLeaderAssertion } from "./jobControl.js";
+import type { DurableJobCaller } from "./jobControl.js";
 import { resolveJobCaller } from "../commands/taskActor.js";
 import type { JobCallerStore } from "../commands/taskActor.js";
 import {
@@ -84,7 +84,7 @@ export async function acknowledgeDurableJob(
   home: string,
   taskId: string,
   jobId: string,
-  assertion: DurableJobLeaderAssertion,
+  caller: DurableJobCaller,
   clientOptions: FileControllerClientOptions = {}
 ): Promise<ControllerDurableJobAcknowledgeResult> {
   const result = await callFileTaskController(
@@ -93,7 +93,7 @@ export async function acknowledgeDurableJob(
     {
       taskId,
       jobId,
-      leaderAssertion: assertion
+      caller
     },
     clientOptions
   );
