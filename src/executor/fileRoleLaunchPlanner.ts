@@ -594,14 +594,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     let jobCallerKey: string | undefined;
     if (owner.scope === "task" && (input.mode === "new" || input.mode === "resume")) {
       jobCallerKey = randomBytes(32).toString("hex");
-      if (input.mode === "new") {
-        this.commitTaskCallerKey({
-          taskId: owner.taskId,
-          roleName: role.name,
-          agentId: configured.id,
-          callerKey: jobCallerKey
-        });
-      }
     }
     const launch = {
       command: configured.command,

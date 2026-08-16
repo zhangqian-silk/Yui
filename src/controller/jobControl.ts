@@ -170,10 +170,11 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
       return store.transaction((tx) => {
         const current = tx.getDurableJob(taskId, jobId);
         if (current === null) return null;
-        // A replayable leaderAssertion is not a channel credential. Reuse the
-        // same task-scope caller-key binding as job.start/job.cancel, while
-        // preserving the current active-Run/receipt checks for Leaders.
-        assertCallerAuthorized(tx, caller, current.owner, taskId);
+        // Acknowledge is a Leader-only recovery decision. Reuse the shared
+        // caller-key, active-Run, receipt, and Session checks, but explicitly
+        // require the Leader role; start/cancel's owner binding intentionally
+        // permits a Worker to operate its own Work Item.
+        assertCallerAuthorized(tx, caller, current.owner, taskId, { leaderOnly: true });
         const next = acknowledgeUnknownDurableJob(current, now);
         if (next !== current) tx.saveDurableJob(taskId, next);
         return next;
@@ -370,7 +371,8 @@ function assertCallerAuthorized(
   >,
   caller: DurableJobCaller,
   owner: DurableJobOwner,
-  taskId: string
+  taskId: string,
+  options: Readonly<{ leaderOnly?: boolean }> = {}
 ): void {
   if (caller.scope === "user") {
     // rr13: A user-scope caller has no per-Session channel binding. Every
@@ -426,6 +428,12 @@ function assertCallerAuthorized(
     throw jobControlError(
       "UNAUTHORIZED",
       "The managed Session caller key does not match the durable hash."
+    );
+  }
+  if (options.leaderOnly && caller.role !== "leader") {
+    throw jobControlError(
+      "UNAUTHORIZED",
+      "job.acknowledge requires the current Task Leader Session."
     );
   }
   if (caller.role === "reviewer") {

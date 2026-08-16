@@ -109,6 +109,42 @@ test("TmuxSessionHost starts task owners through the task planner and returns an
   assert.deepEqual(calls.at(-1), ["probe-async", "task-1", "leader"]);
 });
 
+test("TmuxSessionHost does not rotate a caller key when a new-mode host is reused", async () => {
+  const committed = [];
+  const planner = {
+    plan() {
+      return {
+        ...fakePlan(),
+        launch: { command: "codex", args: [], env: { YUI_JOB_CALLER_KEY: "candidate-key" } }
+      };
+    },
+    commitTaskCallerKey(input) {
+      committed.push(input);
+    }
+  };
+  const host = new TmuxSessionHost(planner, {
+    ensureRoleWindow() { throw new Error("sync ensure must not be used"); },
+    async ensureRoleWindowAsync() { return false; },
+    probeRoleStatus() { throw new Error("sync probe must not be used"); },
+    async probeRoleStatusAsync() { return "running"; },
+    killRole() { throw new Error("unexpected kill"); }
+  }, { createBindingId: () => "binding-reused" });
+
+  const binding = await host.start(createSessionLaunchRequest({
+    mode: "new",
+    launchId: "launch-reused",
+    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+    agentId: "codex-personal",
+    adapterId: "codex",
+    effective: effective(),
+    workspace: "/repo",
+    runId: "agent-run-reused"
+  }));
+
+  assert.equal(binding.hostCreated, false);
+  assert.deepEqual(committed, []);
+});
+
 test("planner metadata cannot inject a launch prompt acknowledgement into a runtime binding", async () => {
   let queried = false;
   const host = new TmuxSessionHost({
