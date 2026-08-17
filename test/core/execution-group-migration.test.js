@@ -70,6 +70,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
       { recordKind: "activeRunPointer", fromVersion: 1, toVersion: 2 },
       { recordKind: "activeRunPointer", fromVersion: 2, toVersion: 3 },
       { recordKind: "agentRun", fromVersion: 5, toVersion: 6 },
+      { recordKind: "agentRun", fromVersion: 6, toVersion: 7 },
       { recordKind: "managedWorkspace", fromVersion: 1, toVersion: 2 },
       { recordKind: "reviewRound", fromVersion: 2, toVersion: 3 },
       { recordKind: "reviewRound", fromVersion: 3, toVersion: 4 },
@@ -85,7 +86,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
     migrated = planned.step.transform(migrated);
   }
   assert.equal(migrated.schemaManifest.recordVersions.workItem, 9);
-  assert.equal(migrated.schemaManifest.recordVersions.agentRun, 6);
+  assert.equal(migrated.schemaManifest.recordVersions.agentRun, 7);
   assert.equal(migrated.schemaManifest.recordVersions.reviewRound, 4);
   assert.equal(migrated.schemaManifest.recordVersions.activeRunPointer, 3);
   assert.equal(migrated.schemaManifest.recordVersions.managedWorkspace, 2);
@@ -93,7 +94,7 @@ test("legacy single-lane record families have an explicit upgrade path", () => {
   assert.equal(task.workItems["work-item-1"].schemaVersion, 9);
   assert.deepEqual(task.workItems["work-item-1"].executionGroups, []);
   assert.equal(task.workItems["work-item-1"].currentExecutionGroupId, undefined);
-  assert.equal(task.agentRuns["agent-run-1"].schemaVersion, 6);
+  assert.equal(task.agentRuns["agent-run-1"].schemaVersion, 7);
   assert.equal(task.reviewRounds["review-round-1"].schemaVersion, 4);
   assert.equal(task.activeRuns.leader.schemaVersion, 3);
   assert.equal(task.managedWorkspaces["work-item:task-1:work-item-1"].schemaVersion, 2);
@@ -256,12 +257,12 @@ test("active-lane pointer migration separates a legal Role containing colons", (
         "task-1": {
           agentRuns: {
             "role-run": {
-              schemaVersion: 6,
+              schemaVersion: 7,
               roleName: "lane:worker:1",
               status: "active"
             },
             "lane-run": {
-              schemaVersion: 6,
+              schemaVersion: 7,
               roleName: "worker",
               status: "active",
               executionGroupId: "group-1",

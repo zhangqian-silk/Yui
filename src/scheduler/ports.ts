@@ -294,6 +294,26 @@ export interface SchedulerStorePort {
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly string[];
+  /**
+   * Issue 04 durable in-place retry timer. Lists active Runs whose Provider
+   * retry is due; the Controller arms its deadline timer from this projection.
+   * Optional so adapters without the feature keep the old behavior.
+   */
+  listPendingProviderRetries?(): ReadonlyArray<Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    nextAttemptAt: string;
+  }>>;
+  /**
+   * Issue 04: reopens each due retry on its original Native Session, or
+   * terminalizes a Run whose Session is proven dead. Returns the reopened Run
+   * references. Optional so adapters without the feature keep the old behavior.
+   */
+  resolveDueProviderRetries?(
+    now: Date,
+    taskIds?: ReadonlySet<string>
+  ): readonly string[];
   getRoleSession(
     taskId: string,
     roleName: string,

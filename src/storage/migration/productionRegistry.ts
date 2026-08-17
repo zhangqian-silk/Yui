@@ -25,6 +25,13 @@ const WORK_ITEM_GROUP_HISTORY_FROM_VERSION = 8;
 const WORK_ITEM_GROUP_HISTORY_TO_VERSION = 9;
 const AGENT_RUN_FROM_VERSION = 5;
 const AGENT_RUN_TO_VERSION = 6;
+/**
+ * Issue 04: v7 adds the optional `providerRetry` projection and
+ * `yieldReceipt` namespace. Both fields are optional, so the transition is a
+ * version-only rewrite; legacy v6 records without them remain valid.
+ */
+const AGENT_RUN_RETRY_RECEIPT_FROM_VERSION = 6;
+const AGENT_RUN_RETRY_RECEIPT_TO_VERSION = 7;
 const REVIEW_ROUND_FROM_VERSION = 2;
 const REVIEW_ROUND_TO_VERSION = 3;
 const REVIEW_ROUND_GIT_SNAPSHOT_FROM_VERSION = 3;
@@ -100,6 +107,12 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       "agentRun",
       AGENT_RUN_FROM_VERSION,
       AGENT_RUN_TO_VERSION,
+      "agentRuns"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
+      "agentRun",
+      AGENT_RUN_RETRY_RECEIPT_FROM_VERSION,
+      AGENT_RUN_RETRY_RECEIPT_TO_VERSION,
       "agentRuns"
     ))
     .registerOfflineMigration(recordFamilyStep(

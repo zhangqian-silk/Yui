@@ -71,6 +71,8 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
+import { matchYieldReceipt } from "../run/yieldReceipt.js";
+import { providerRetryConfig } from "../run/providerRetryConfig.js";
 import {
   createReviewRound,
   createTaskReviewRound,
@@ -3832,6 +3834,7 @@ function taskRunCommand(
   if (command === "settle") return settleStaleFinalReviewRun(rest, store, options);
   if (command === "recover") return output(recoverRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
+  if (command === "yield-status") return yieldRunStatus(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
   throw usageError(command === undefined
     ? "Task run command is required."
@@ -5108,6 +5111,114 @@ function recoverRun(
   return `Recorded exact ${result.action} recovery for ${result.run?.id ?? "unknown Run"}.${followup}\n`;
 }
 
+/**
+ * Issue 04: builds the terminal yield outcome from the command inputs. The
+ * same construction feeds both the first commit and the idempotent replay, so
+ * a resend always hashes to the same digest.
+ */
+function buildYieldOutcome(
+  run: AgentRun,
+  inputSummary: string,
+  options: TaskCommandOptions
+): { summary: string; reviewResult?: Parameters<typeof terminalizeExactTaskRun>[1]["reviewResult"] } {
+  let yieldedReport;
+  if (run.purpose === "review"
+    || (run.purpose === "execution" && run.executionGroupId !== undefined)) {
+    yieldedReport = parseReviewYieldReport(inputSummary);
+  }
+  const summary = yieldedReport?.summary ?? inputSummary;
+  if (yieldedReport === undefined) return { summary };
+  return {
+    summary,
+    reviewResult: {
+      report: yieldedReport.report,
+      checks: yieldedReport.checks,
+      ...(yieldedReport.findings === undefined ? {} : { findings: yieldedReport.findings }),
+      ...(yieldedReport.evidence === undefined ? {} : { evidence: yieldedReport.evidence }),
+      ...(run.purpose === "review"
+        && options.reviewWorkspaceResult?.evidenceCommit === undefined
+        ? {}
+        : run.purpose === "review"
+          ? { evidenceCommit: options.reviewWorkspaceResult!.evidenceCommit }
+          : yieldedReport.evidenceCommit === undefined
+            ? {}
+            : { evidenceCommit: yieldedReport.evidenceCommit }),
+      ...(options.executionLaneGitSnapshot === undefined
+        || options.executionLaneGitSnapshot === null
+        ? {}
+        : { gitSnapshot: options.executionLaneGitSnapshot })
+    }
+  };
+}
+
+/**
+ * Issue 04: replays an already-committed yield. Returns the committed receipt
+ * for the same outcome, fails closed for a different outcome, or returns
+ * `null` to keep the legacy "already terminal" behavior.
+ */
+function replayYieldReceipt(
+  run: AgentRun,
+  inputSummary: string,
+  options: TaskCommandOptions
+): TaskCommandExecution | null {
+  const config = providerRetryConfig(options.environment ?? process.env);
+  if (!config.yieldReceiptReplay) return null;
+  if (run.yieldReceipt === undefined) return null;
+  const outcome = buildYieldOutcome(run, inputSummary, options);
+  const match = matchYieldReceipt(run.yieldReceipt, {
+    status: "yielded",
+    summary: outcome.summary,
+    ...(outcome.reviewResult === undefined ? {} : { reviewResult: outcome.reviewResult })
+  });
+  if (match === null) return null;
+  if (match.kind === "digest-mismatch") {
+    throw usageError(
+      `Run ${run.id} is already terminal with a different yield outcome. `
+      + `Existing receipt: ${match.existing.receiptId} (request ${match.existing.requestId}).`
+    );
+  }
+  return output(
+    `Run ${run.id} yield already committed.\n`
+    + `Receipt: ${match.receipt.receiptId}\n`
+    + `Request: ${match.receipt.requestId}\n`,
+    { receipt: match.receipt }
+  );
+}
+
+/**
+ * Issue 04: `yui task run yield-status <task>/<run>` — returns the committed
+ * yield receipt for a terminal Run, or the current status for an active Run.
+ */
+function yieldRunStatus(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task run yield-status usage: yui task run yield-status <task>/<run>.";
+  const parsed = parseTail(args, new Set(), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const run = requireRun(store, parsed.positionals[0], options);
+  if (run.status === "active") {
+    return output(`Run ${run.id} is active; no yield receipt yet.\n`, {
+      runId: run.id,
+      status: run.status
+    });
+  }
+  if (run.yieldReceipt === undefined) {
+    return output(`Run ${run.id} is ${run.status}; no yield receipt recorded.\n`, {
+      runId: run.id,
+      status: run.status
+    });
+  }
+  return output(
+    `Run ${run.id} yield receipt:\n`
+    + `Receipt: ${run.yieldReceipt.receiptId}\n`
+    + `Request: ${run.yieldReceipt.requestId}\n`
+    + `Committed: ${run.yieldReceipt.committedAt}\n`,
+    { receipt: run.yieldReceipt }
+  );
+}
+
 function yieldRun(
   args: string[],
   store: TaskWorkflowStore,
@@ -5123,6 +5234,15 @@ function yieldRun(
     usage
   );
   const now = clock(options);
+  // Issue 04: an already-terminal Run may be a lost-response resend. Match
+  // the presented outcome against the committed receipt before opening the
+  // transaction; the receipt is immutable once committed.
+  const existing = requireRun(store, parsed.positionals[0], options);
+  if (existing.status !== "active") {
+    const replayed = replayYieldReceipt(existing, inputSummary, options);
+    if (replayed !== null) return replayed;
+    throw usageError(`Run ${existing.id} is already terminal: ${existing.status}.`);
+  }
   const yielded = store.transaction((tx) => {
     const active = requireRun(tx, parsed.positionals[0], options);
     if (active.status !== "active") {
@@ -5171,7 +5291,8 @@ function yieldRun(
         );
       }
     }
-    const summary = yieldedReport?.summary ?? inputSummary;
+    const yieldOutcome = buildYieldOutcome(active, inputSummary, options);
+    const summary = yieldOutcome.summary;
     const terminalization = terminalizeExactTaskRun(tx, {
       taskId: task.id,
       roleName: role.name,
@@ -5185,28 +5306,9 @@ function yieldRun(
         ? {}
         : { launchId: options.environment.YUI_LAUNCH_ID }),
       outcome: { status: "yielded", summary },
-      ...(yieldedReport === undefined
+      ...(yieldOutcome.reviewResult === undefined
         ? {}
-        : {
-            reviewResult: {
-              report: yieldedReport.report,
-              checks: yieldedReport.checks,
-              ...(yieldedReport.findings === undefined ? {} : { findings: yieldedReport.findings }),
-              ...(yieldedReport.evidence === undefined ? {} : { evidence: yieldedReport.evidence }),
-              ...(active.purpose === "review"
-                && options.reviewWorkspaceResult?.evidenceCommit === undefined
-                ? {}
-                : active.purpose === "review"
-                  ? { evidenceCommit: options.reviewWorkspaceResult!.evidenceCommit }
-                  : yieldedReport.evidenceCommit === undefined
-                    ? {}
-                    : { evidenceCommit: yieldedReport.evidenceCommit }),
-              ...(options.executionLaneGitSnapshot === undefined
-                || options.executionLaneGitSnapshot === null
-                ? {}
-                : { gitSnapshot: options.executionLaneGitSnapshot })
-            }
-          })
+        : { reviewResult: yieldOutcome.reviewResult })
     }, now);
     if (terminalization.disposition !== "applied" || terminalization.run === null) {
       throw usageError(

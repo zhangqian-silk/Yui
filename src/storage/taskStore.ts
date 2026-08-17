@@ -261,7 +261,12 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
  * assert it is classifying the same bytes the store reads and writes.
  */
 export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
-export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 6 as const;
+/**
+ * v7 adds the optional Issue 04 `providerRetry` projection and `yieldReceipt`
+ * in their own namespace. Both fields are optional, so the v6→v7 migration is
+ * a version-only rewrite.
+ */
+export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 7 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 
 type StoredTask = {

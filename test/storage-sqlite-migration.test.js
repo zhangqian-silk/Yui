@@ -194,7 +194,7 @@ function setupLayout6Home() {
   };
 
   const run = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: "agent-run-1",
     taskId: task.id,
     roleName: "leader",
