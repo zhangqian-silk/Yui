@@ -210,7 +210,7 @@ function setupPseudoLayout7Home() {
   };
 
   const run = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: "agent-run-1",
     taskId: task.id,
     roleName: "leader",
@@ -281,7 +281,7 @@ function setupPseudoLayout7Home() {
   };
 
   const message = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: "message-1",
     taskId: task.id,
     kind: "user",

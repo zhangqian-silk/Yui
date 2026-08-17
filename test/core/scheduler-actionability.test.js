@@ -21,6 +21,7 @@ import {
   planMigration
 } from "../../dist/storage/migration/index.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import {
   currentRecordVersions,
@@ -405,6 +406,101 @@ test("E2E: read-only task queries write no Message, Event, AgentRun, or wake", (
 });
 
 // ---------------------------------------------------------------------------
+// SQLite end-to-end: the receipt survives a Controller restart (db-only path)
+// ---------------------------------------------------------------------------
+
+test("E2E (SQLite): receipt survives store reopen; 100 scans silent, new Review result wakes once", (t) => {
+  const fixture = sqliteE2eFixture(t);
+  const { root, store, task } = fixture;
+
+  // A terminal waiting Leader Run that observed the current digest.
+  const run = yieldAgentRun(
+    createAgentRun(
+      store.nextAgentRunId(task.id),
+      task.id,
+      "leader",
+      "new",
+      "Advance the Task.",
+      NOW,
+      { effective: testEffectiveLaunch({ agentId: "codex", adapterId: "codex" }) }
+    ),
+    "Waiting on delegated work.",
+    NOW
+  );
+  const observedDigest = computeActionabilityDigest(
+    collectTaskActionability(fixture.adapter, task.id)
+  );
+  store.transaction((tx) => {
+    tx.saveAgentRun({
+      ...run,
+      disposition: "waiting",
+      observedActionabilityDigest: observedDigest
+    });
+  });
+
+  // Simulate a Controller restart: close and reopen the database. The receipt
+  // must survive in yui.db so the post-restart scheduler stays quiescent.
+  store.close();
+  const reopened = new SqliteTaskStore(root);
+  t.after(() => {
+    if (reopened.databaseHandle().open) reopened.close();
+  });
+  const adapter = new FileSchedulerStoreAdapter(reopened);
+
+  // 100 scans after restart: zero new Leader Runs, zero writes.
+  for (let i = 0; i < 100; i += 1) {
+    assert.deepEqual(repairOrphanedActiveTasks(adapter, NOW), []);
+  }
+  assert.equal(adapter.getPendingWakeup(task.id), null);
+
+  // A new Review result arrives (WorkItem + Candidate + pending ReviewRound).
+  const workItem = createWorkItem(
+    reopened.nextWorkItemId(task.id),
+    task.id,
+    { title: "Implement feature", acceptance: [], dependsOn: [] },
+    NOW
+  );
+  const running = updateWorkItemStatus(workItem, "running", NOW);
+  const withCandidate = submitWorkItemCandidate(
+    running,
+    { summary: "candidate-1", source: { type: "direct" } },
+    NOW
+  );
+  reopened.transaction((tx) => {
+    tx.saveWorkItem(task.id, withCandidate);
+    tx.saveReviewRound(
+      task.id,
+      createReviewRound(
+        reopened.nextReviewRoundId(task.id),
+        task.id,
+        workItem.id,
+        withCandidate.candidates[0].id,
+        "reviewer",
+        "leader",
+        REVIEW_BASE_COMMIT,
+        NOW
+      )
+    );
+  });
+
+  // Exactly one wake.
+  assert.deepEqual(repairOrphanedActiveTasks(adapter, LATER), [task.id]);
+  const pending = adapter.getPendingWakeup(task.id);
+  assert.ok(pending);
+  assert.deepEqual(pending.reasons, ["task-orphaned"]);
+  assert.equal(pending.requestCount, 1);
+
+  // Ten concurrent scans must not create a second Leader Run.
+  for (let i = 0; i < 10; i += 1) {
+    repairOrphanedActiveTasks(adapter, LATER);
+  }
+  const stillOne = adapter.getPendingWakeup(task.id);
+  assert.ok(stillOne);
+  assert.equal(stillOne.requestCount, 1);
+  assert.deepEqual(stillOne.reasons, ["task-orphaned"]);
+});
+
+// ---------------------------------------------------------------------------
 // Force-wake escape hatch and message wake policy (CLI)
 // ---------------------------------------------------------------------------
 
@@ -700,6 +796,35 @@ function e2eFixture(t) {
   });
   const options = { now: () => NOW };
   runTaskCommand(["create", "Issue 05 quiescence Task"], store, options);
+  const task = store.listTasks()[0];
+  runTaskCommand(["activate", task.id], store, options);
+  // Activation enqueues a `task-created` wake for the first Leader Run. The
+  // fixture simulates that Run having claimed it before yielding, so every
+  // test starts from a quiescent baseline.
+  store.clearPendingWakeup(task.id);
+  const adapter = new FileSchedulerStoreAdapter(store);
+  return { root, store, adapter, task, agent };
+}
+
+/**
+ * SQLite-backed fixture (layout-7 db-only path). The store constructor creates
+ * `yui.db` and runs the schema migrations; the same `runTaskCommand` seeding
+ * flow as the file-store fixture exercises the real persistence boundary.
+ */
+function sqliteE2eFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), "yui-issue05-sqlite-"));
+  const store = new SqliteTaskStore(root);
+  t.after(() => {
+    if (store.databaseHandle().open) store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
+  store.transaction((tx) => {
+    tx.saveConfig({ schemaVersion: 1, defaultAgent: agent.id, defaultWorkspace: root });
+    tx.saveConfiguredAgent(agent);
+  });
+  const options = { now: () => NOW };
+  runTaskCommand(["create", "Issue 05 quiescence Task (SQLite)"], store, options);
   const task = store.listTasks()[0];
   runTaskCommand(["activate", task.id], store, options);
   // Activation enqueues a `task-created` wake for the first Leader Run. The
