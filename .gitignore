@@ -15,3 +15,5 @@ yarn-error.log*
 pnpm-debug.log*
 /docs/superpowers/
 /.claude/
+/tmp/
+*.tmp
