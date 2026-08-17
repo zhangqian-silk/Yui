@@ -384,9 +384,15 @@ test("exact Task contract is preserved by a no-Run final Review retry", (t) => {
 
   assert.match(retried.output, /Task-final Review retry requested/);
   const rounds = fx.store.listReviewRounds(fx.task.id);
-  assert.equal(rounds.length, 2);
-  assert.deepEqual(rounds[1].taskFinalReviewContract, fx.contract);
-  assert.deepEqual(rounds[1].taskCandidate, failed.taskCandidate);
+  // Issue 06: infrastructure retry reuses the semantic Round ID.
+  assert.equal(rounds.length, 1);
+  const retryRound = rounds[0];
+  assert.equal(retryRound.id, failed.id);
+  assert.equal(retryRound.status, "pending");
+  assert.deepEqual(retryRound.taskFinalReviewContract, fx.contract);
+  assert.deepEqual(retryRound.taskCandidate, failed.taskCandidate);
+  assert.equal(retryRound.report, undefined);
+  assert.equal(retryRound.endedAt, undefined);
 });
 
 test("completed non-Task-scoped evidence cannot satisfy the exact Task contract", (t) => {

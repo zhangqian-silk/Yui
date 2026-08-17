@@ -358,6 +358,8 @@ test("the declared StoredTask v14 to v15 compatible load supplies every new defa
   state.tasks[task.id].schemaVersion = 14;
   delete state.tasks[task.id].durableJobs;
   delete state.tasks[task.id].idHighWaterMarks.durableJob;
+  delete state.tasks[task.id].reviewFindings;
+  delete state.tasks[task.id].idHighWaterMarks.reviewFinding;
   delete state.tasks[task.id].jobCallerKeyHashes;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
@@ -376,6 +378,8 @@ test("the declared StoredTask v15 to v16 compatible load supplies every new defa
   manifest.recordVersions.storedTask = 15;
   state.tasks[task.id].schemaVersion = 15;
   delete state.tasks[task.id].jobCallerKeyHashes;
+  delete state.tasks[task.id].reviewFindings;
+  delete state.tasks[task.id].idHighWaterMarks.reviewFinding;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
 
