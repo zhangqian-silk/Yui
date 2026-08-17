@@ -1,10 +1,8 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { sessionReconcileModeFromEnvironment } from "../config/yuiConfig.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import {
-  FileSessionOwnerRegistry,
   createSessionOwnerIdentity,
   discoverProviderRootByLaunchEnv,
   isLinuxProcessLive,
@@ -16,7 +14,6 @@ import {
   type DurableSessionFact,
   type RuntimeOwner,
   type SessionPhysicalObservation,
-  type SessionReconciliationMode,
   type SessionReconciliationReport,
   type SessionTerminationEvent,
   type SessionTerminationPorts,
@@ -59,7 +56,6 @@ export class SessionOwnerReconciliation {
   readonly #environment: NodeJS.ProcessEnv;
   readonly #tmux: SessionOwnerReconciliationDeps["tmux"];
   readonly #onWarning: (message: string) => void;
-  readonly #registry: FileSessionOwnerRegistry;
 
   constructor(deps: SessionOwnerReconciliationDeps) {
     this.#home = deps.home;
@@ -67,15 +63,6 @@ export class SessionOwnerReconciliation {
     this.#environment = deps.environment ?? process.env;
     this.#tmux = deps.tmux;
     this.#onWarning = deps.onWarning ?? (() => undefined);
-    this.#registry = new FileSessionOwnerRegistry(deps.home);
-  }
-
-  get registry(): FileSessionOwnerRegistry {
-    return this.#registry;
-  }
-
-  get mode(): SessionReconciliationMode {
-    return sessionReconcileModeFromEnvironment(this.#environment);
   }
 
   /**
@@ -109,7 +96,7 @@ export class SessionOwnerReconciliation {
     }
     const owner = input.owner;
     const taskId = owner.scope === "task" ? owner.taskId : undefined;
-    this.#registry.record(createSessionOwnerIdentity({
+    this.#store.saveSessionOwner(createSessionOwnerIdentity({
       owner: {
         scope: owner.scope,
         ...(taskId === undefined ? {} : { taskId }),
@@ -150,10 +137,9 @@ export class SessionOwnerReconciliation {
   }
 
   /** Read-only bidirectional reconciliation; never mutates physical state. */
-  report(mode: SessionReconciliationMode = this.mode): SessionReconciliationReport {
+  report(): SessionReconciliationReport {
     return reconcileSessionOwners({
-      mode,
-      records: this.#registry.list(),
+      records: this.#store.listSessionOwners(),
       durable: durableSessionFacts(this.#store),
       taskStatus: (taskId) => this.#store.getTask(taskId)?.status,
       observe: (record) => observeSessionOwnerPhysical(record),
@@ -181,7 +167,7 @@ export class SessionOwnerReconciliation {
     owner: RuntimeOwner,
     options: { gracefulGraceMs?: number; forcedGraceMs?: number; pollMs?: number } = {}
   ): Promise<SessionTerminationResult> {
-    const records = this.#registry.listForOwner(owner);
+    const records = this.#store.listSessionOwnersForOwner(owner);
     const ports: SessionTerminationPorts = {
       gracefulStop: async (target) => {
         if (this.#tmux === undefined) return false;
@@ -217,7 +203,7 @@ export class SessionOwnerReconciliation {
     const result = await terminateSessionOwners(owner, records, ports, options);
     if (result.outcome === "stop-confirmed") {
       for (const record of result.confirmed) {
-        this.#registry.remove(record.launchId);
+        this.#store.removeSessionOwner(record.launchId);
       }
     }
     return result;

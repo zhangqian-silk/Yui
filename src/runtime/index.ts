@@ -113,6 +113,5 @@ export {
   type SessionReconciliationEntry,
   type SessionReconciliationInput,
   type SessionReconciliationMismatch,
-  type SessionReconciliationMode,
   type SessionReconciliationReport
 } from "./sessionReconciliation.js";

@@ -1,5 +1,3 @@
-import type { SessionReconcileMode } from "../config/yuiConfig.js";
-export type { SessionReconcileMode as SessionReconciliationMode };
 import type { SessionOwnerIdentity } from "./sessionOwnerIdentity.js";
 
 /** Durable projection of one Role session generation, read by reconciliation. */
@@ -49,7 +47,6 @@ export type SessionReconciliationEntry = Readonly<{
 
 export type SessionReconciliationReport = Readonly<{
   schemaVersion: 1;
-  mode: SessionReconcileMode;
   observedAt: string;
   entries: readonly SessionReconciliationEntry[];
   summary: Readonly<{
@@ -61,7 +58,6 @@ export type SessionReconciliationReport = Readonly<{
 }>;
 
 export type SessionReconciliationInput = Readonly<{
-  mode: SessionReconcileMode;
   records: readonly SessionOwnerIdentity[];
   durable: readonly DurableSessionFact[];
   taskStatus: (taskId: string) => "draft" | "active" | "completed" | "retired" | "archived" | undefined;
@@ -87,9 +83,9 @@ export type SessionReconciliationInput = Readonly<{
  * stays enumerable after the durable Session map or history is cleared, so a
  * live generation can always be re-attributed and reported.
  *
- * Pure: all I/O is injected. Unknown owners are reported, never cleaned. In
- * `report` mode no entry is ever archive-blocking; the archive gate exists
- * only in `exact-owner-cleanup` mode and only for terminal/archived Tasks.
+ * Pure: all I/O is injected. Unknown owners are reported, never cleaned.
+ * An entry is archive-blocking when its durable state is terminal but the
+ * physical Provider root is still live, and the Task is terminal/archived.
  */
 export function reconcileSessionOwners(
   input: SessionReconciliationInput
@@ -107,7 +103,6 @@ export function reconcileSessionOwners(
   };
   return {
     schemaVersion: 1,
-    mode: input.mode,
     observedAt: input.now.toISOString(),
     entries,
     summary
@@ -148,8 +143,7 @@ function reconcileOne(
   const terminalTask = taskStatus === "completed"
     || taskStatus === "retired"
     || taskStatus === "archived";
-  const archiveBlocked = input.mode === "exact-owner-cleanup"
-    && mismatch === "durable-terminal-physical-live"
+  const archiveBlocked = mismatch === "durable-terminal-physical-live"
     && terminalTask;
 
   return {

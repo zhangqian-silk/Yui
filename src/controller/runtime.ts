@@ -275,26 +275,23 @@ export async function startFileTaskControllerRuntime(
           ) => sessionHost.inspectOwners!(owners)
         }),
     stopOwner: (owner: Parameters<SessionHostPort["stopOwner"]>[0]) => {
-      // Issue 03: in exact-owner-cleanup mode the durable `stopped`
-      // transition is gated on physical exit proof. Report mode keeps the
-      // legacy tmux-only stop unchanged.
-      if (sessionOwners.mode === "exact-owner-cleanup") {
-        return sessionOwners.terminateOwner(owner).then((result) => {
-          if (result.outcome === "stop-blocked") {
-            (options.onError ?? (() => undefined))(
-              new Error(
-                `Role runtime cleanup could not prove physical exit: ${
-                  result.remaining
-                    .map(({ record, detail }) => `${record.launchId}: ${detail}`)
-                    .join("; ")
-                }`
-              )
-            );
-          }
-          return result.outcome === "stop-confirmed";
-        });
-      }
-      return sessionHost.stopOwner(owner);
+      // Issue 03: the durable `stopped` transition is gated on physical
+      // exit proof. A blocked result keeps the Session non-terminal and
+      // preserves owner records for Operator recovery.
+      return sessionOwners.terminateOwner(owner).then((result) => {
+        if (result.outcome === "stop-blocked") {
+          (options.onError ?? (() => undefined))(
+            new Error(
+              `Role runtime cleanup could not prove physical exit: ${
+                result.remaining
+                  .map(({ record, detail }) => `${record.launchId}: ${detail}`)
+                  .join("; ")
+              }`
+            )
+          );
+        }
+        return result.outcome === "stop-confirmed";
+      });
     },
     ...(runtimeIsolation.cleanupTaskLaunch === undefined
       ? {}
@@ -571,7 +568,7 @@ export async function startFileTaskControllerRuntime(
   // without changing stop or archive behavior. Cleanup stays an explicit
   // Operator action in exact-owner-cleanup mode.
   try {
-    const startupReport = sessionOwners.report("report");
+    const startupReport = sessionOwners.report();
     if (startupReport.summary.livePhysicalRoots > 0) {
       (options.onError ?? (() => undefined))(
         new Error(

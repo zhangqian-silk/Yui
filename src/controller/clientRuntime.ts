@@ -631,11 +631,9 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   }
 
   /**
-   * Issue 03 archive postcondition. In the default `report` mode this is a
-   * no-op: archive behavior is unchanged. In `exact-owner-cleanup` mode it
-   * re-verifies physical absence after the runtime stop and blocks archive
-   * while any owned Provider root is still live, preserving the owner
-   * records for Operator recovery.
+   * Issue 03 archive postcondition. Re-verifies physical absence after the
+   * runtime stop and blocks archive while any owned Provider root is still
+   * live, preserving the owner records for Operator recovery.
    */
   async assertTaskPhysicalResourcesReleased(taskId: string): Promise<void> {
     const reconciliation = new SessionOwnerReconciliation({
@@ -644,12 +642,11 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
       environment: this.clientOptions.environment,
       tmux: this.tmux
     });
-    if (reconciliation.mode === "report") return;
-    const records = reconciliation.registry.list().filter((record) => (
+    const records = this.store.listSessionOwners().filter((record) => (
       record.owner.scope === "task" && record.owner.taskId === taskId
     ));
     if (records.length === 0) return;
-    const report = reconciliation.report("exact-owner-cleanup");
+    const report = reconciliation.report();
     const blockers = report.entries.filter((entry) => (
       entry.owner.scope === "task"
       && entry.owner.taskId === taskId

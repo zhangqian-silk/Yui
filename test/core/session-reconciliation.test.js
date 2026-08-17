@@ -72,7 +72,6 @@ function absentPhysical() {
 function reconcile(overrides = {}) {
   const record = ownerRecord(overrides.record ?? {});
   return reconcileSessionOwners({
-    mode: "report",
     records: [record],
     durable: [durableFact(overrides.durable ?? {})],
     taskStatus: overrides.taskStatus ?? (() => "archived"),
@@ -92,19 +91,17 @@ test("a live root with a terminal durable session is a durable-terminal-physical
   assert.equal(report.summary.livePhysicalRoots, 1);
 });
 
-test("report mode never blocks archive even for a terminal-task leak", () => {
+test("archive is blocked for a terminal-task leak", () => {
   const report = reconcile({
-    mode: undefined,
     durable: { status: "stopped" }
   });
   assert.equal(report.entries[0].mismatch, "durable-terminal-physical-live");
-  assert.equal(report.entries[0].archiveBlocked, false);
-  assert.equal(report.summary.archiveBlockers, 0);
+  assert.equal(report.entries[0].archiveBlocked, true);
+  assert.equal(report.summary.archiveBlockers, 1);
 });
 
-test("exact-owner-cleanup mode blocks archive only for terminal/archived Tasks", () => {
+test("archive is blocked only for terminal/archived Tasks", () => {
   const archived = reconcileSessionOwners({
-    mode: "exact-owner-cleanup",
     records: [ownerRecord()],
     durable: [durableFact({ status: "stopped" })],
     taskStatus: () => "archived",
@@ -117,7 +114,6 @@ test("exact-owner-cleanup mode blocks archive only for terminal/archived Tasks",
   assert.equal(archived.summary.archiveBlockers, 1);
 
   const active = reconcileSessionOwners({
-    mode: "exact-owner-cleanup",
     records: [ownerRecord()],
     durable: [durableFact({ status: "stopped" })],
     taskStatus: () => "active",
@@ -158,7 +154,6 @@ test("PID reuse (identity conflict) is never a cleanup candidate", () => {
 test("a missing durable session map still attributes the physical generation", () => {
   // The audit's exact gap: durable current map is empty, physical process live.
   const report = reconcileSessionOwners({
-    mode: "report",
     records: [ownerRecord()],
     durable: [],
     taskStatus: () => "archived",

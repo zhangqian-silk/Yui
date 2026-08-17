@@ -31,7 +31,6 @@ import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner
 import { createRoleSessionSet, recordRoleAgentSession } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
-  FileSessionOwnerRegistry,
   isLinuxProcessLive,
   readLinuxProcessIdentity
 } from "../../dist/runtime/index.js";
@@ -190,12 +189,8 @@ async function waitForProcessExit(pid, timeoutMs, label) {
  * Git Project, active Task with a prepared workspace, Leader Role, and a
  * configured Agent whose command is the test Provider stand-in.
  */
-async function e2eFixture(t, { providerEnv = {}, reconcileMode } = {}) {
-  const runtime = createIsolatedRuntime(t, {
-    ...(reconcileMode === undefined
-      ? {}
-      : { environment: { YUI_SESSION_RECONCILE_MODE: reconcileMode } })
-  });
+async function e2eFixture(t, { providerEnv = {} } = {}) {
+  const runtime = createIsolatedRuntime(t);
   const { root, home } = runtime;
   const observationPath = join(root, "provider-observations.ndjson");
   const providerCommand = writeProviderScript(root);
@@ -276,13 +271,13 @@ async function e2eFixture(t, { providerEnv = {}, reconcileMode } = {}) {
         FIVE_SECONDS_MS,
         "Provider root did not start"
       );
-      const registry = new FileSessionOwnerRegistry(home);
+      const registry = new FileTaskStore(home);
       await waitFor(
-        () => registry.list().length > 0,
+        () => registry.listSessionOwners().length > 0,
         FIVE_SECONDS_MS,
         "Owner record was not written"
       );
-      const [record] = registry.list();
+      const [record] = registry.listSessionOwners();
       // Record the durable Session the way the runtime event processor would
       // once the Provider signals session-start. The mock Provider keeps
       // alive without sending notifications, so the test commits the exact
@@ -320,7 +315,7 @@ async function e2eFixture(t, { providerEnv = {}, reconcileMode } = {}) {
         FIVE_SECONDS_MS,
         "Durable session was not recorded"
       );
-      return registry.list();
+      return registry.listSessionOwners();
     },
     reconciliation() {
       const tmux = new TmuxManager(
@@ -452,7 +447,6 @@ test("Controller restart re-attributes a generation whose durable map was cleare
 
 test("exact-owner archive cleanup proves Provider root and child exit within 5s", async (t) => {
   const fx = await e2eFixture(t, {
-    reconcileMode: "exact-owner-cleanup",
     providerEnv: { E2E_TEST_FORK: "1" }
   });
   await fx.startController();
@@ -477,8 +471,8 @@ test("exact-owner archive cleanup proves Provider root and child exit within 5s"
   }
 
   // Owner records are removed only after confirmed exit.
-  const registry = new FileSessionOwnerRegistry(fx.home);
-  assert.equal(registry.list().length, 0);
+  const registry = new FileTaskStore(fx.home);
+  assert.equal(registry.listSessionOwners().length, 0);
   // The tmux pane is gone.
   const panes = new TmuxManager(
     fx.runtime.environment.YUI_TMUX_BIN ?? "tmux", new NodeCommandExecutor(), { yuiHome: fx.home }
@@ -499,7 +493,6 @@ test("exact-owner archive cleanup proves Provider root and child exit within 5s"
 
 test("a stubborn Provider is escalated SIGTERM/SIGKILL and confirmed", async (t) => {
   const fx = await e2eFixture(t, {
-    reconcileMode: "exact-owner-cleanup",
     providerEnv: { E2E_TEST_STUBBORN: "1" }
   });
   await fx.startController();
@@ -527,7 +520,6 @@ for (const [name, providerEnv] of [
 ]) {
   test(`archive race: ${name} still proves physical zero`, async (t) => {
     const fx = await e2eFixture(t, {
-      reconcileMode: "exact-owner-cleanup",
       providerEnv
     });
     await fx.startController();
@@ -554,7 +546,7 @@ for (const [name, providerEnv] of [
     for (const childPid of after.childPids) {
       await waitForProcessExit(childPid, FIVE_SECONDS_MS, "late-forked child");
     }
-    assert.equal(new FileSessionOwnerRegistry(fx.home).list().length, 0);
+    assert.equal(new FileTaskStore(fx.home).listSessionOwners().length, 0);
 
     await fx.stopController();
   });
@@ -562,7 +554,6 @@ for (const [name, providerEnv] of [
 
 test("a reused PID with a different start identity is never signaled", async (t) => {
   const fx = await e2eFixture(t, {
-    reconcileMode: "exact-owner-cleanup",
     // The guard's role-scoped gracefulStop still kills the tmux window
     // (SIGHUP); ignoring it proves the guard's PID signal path (SIGTERM/
     // SIGKILL) never touched the reused-PID Provider.
@@ -576,10 +567,10 @@ test("a reused PID with a different start identity is never signaled", async (t)
 
   // Plant a record that claims this PID with a WRONG start identity
   // (PID reuse): the guard must treat it as absent and never signal.
-  const registry = new FileSessionOwnerRegistry(fx.home);
-  const [realRecord] = registry.list();
-  registry.remove(realRecord.launchId);
-  registry.record({
+  const registry = new FileTaskStore(fx.home);
+  const [realRecord] = registry.listSessionOwners();
+  registry.removeSessionOwner(realRecord.launchId);
+  registry.saveSessionOwner({
     ...realRecord,
     providerRoot: {
       ...realRecord.providerRoot,
@@ -600,7 +591,7 @@ test("a reused PID with a different start identity is never signaled", async (t)
 
 test("a process without the launch fence is unattributed and survives cleanup", async (t) => {
   const fx = await e2eFixture(t, {
-    reconcileMode: "exact-owner-cleanup"
+    
   });
   await fx.startController();
   await fx.launchLeader();

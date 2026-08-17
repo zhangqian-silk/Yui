@@ -45,6 +45,9 @@ import {
 import { validateTaskMessage, type TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import { validateAgentRun, type AgentRun } from "../run/agentRun.js";
+import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
+import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
+import { FileSessionOwnerRegistry } from "../runtime/sessionOwnerRegistry.js";
 import {
   validateReviewConfig,
   type ReviewConfig
@@ -414,6 +417,16 @@ export type TaskStore = {
   getJobCallerKeyHash(taskId: string, roleName: string, agentId: string): string | null;
   /** rr13: Persist the hash of a newly launched Session's job caller key. */
   setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void;
+  /** Issue 03: Persist one runtime generation's exact physical owner identity. */
+  saveSessionOwner(identity: SessionOwnerIdentity): void;
+  /** Issue 03: Look up one owner record by launch id. */
+  getSessionOwner(launchId: string): SessionOwnerIdentity | null;
+  /** Issue 03: Enumerate every persisted owner record. */
+  listSessionOwners(): SessionOwnerIdentity[];
+  /** Issue 03: Enumerate owner records for one Task/global Role. */
+  listSessionOwnersForOwner(owner: RuntimeOwner): SessionOwnerIdentity[];
+  /** Issue 03: Remove a record whose physical resources were proven absent. */
+  removeSessionOwner(launchId: string): void;
   nextWorkItemId(taskId: string): string;
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
   listWorkItems(taskId: string): WorkItem[];
@@ -499,6 +512,7 @@ export class FileTaskStore implements TaskStore {
   #transaction: { state: StorageState; baseRevision: number; dirty: boolean } | null = null;
   #readCache: { fingerprint: string; state: StorageState } | null = null;
   #normalizeState: ((raw: string) => string) | undefined;
+  #sessionOwnerRegistry: FileSessionOwnerRegistry | undefined;
 
   constructor(private readonly rootDir: string, options: FileTaskStoreOptions = {}) {
     this.#normalizeState = options.normalizeState;
@@ -1243,6 +1257,28 @@ export class FileTaskStore implements TaskStore {
     this.#mutate((state) => {
       state.tasks[taskId].jobCallerKeyHashes[jobCallerKeyHashKey(roleName, agentId)] = hash;
     });
+  }
+
+  saveSessionOwner(identity: SessionOwnerIdentity): void {
+    this.#sessionOwners().record(identity);
+  }
+  getSessionOwner(launchId: string): SessionOwnerIdentity | null {
+    return this.#sessionOwners().get(launchId);
+  }
+  listSessionOwners(): SessionOwnerIdentity[] {
+    return this.#sessionOwners().list();
+  }
+  listSessionOwnersForOwner(owner: RuntimeOwner): SessionOwnerIdentity[] {
+    return this.#sessionOwners().listForOwner(owner);
+  }
+  removeSessionOwner(launchId: string): void {
+    this.#sessionOwners().remove(launchId);
+  }
+  #sessionOwners(): FileSessionOwnerRegistry {
+    if (this.#sessionOwnerRegistry === undefined) {
+      this.#sessionOwnerRegistry = new FileSessionOwnerRegistry(this.rootDir);
+    }
+    return this.#sessionOwnerRegistry;
   }
 
   nextWorkItemId(taskId: string): string {

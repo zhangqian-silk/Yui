@@ -1,6 +1,5 @@
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import { sessionReconcileModeFromEnvironment } from "../config/yuiConfig.js";
 import type { SessionOwnerReconciliation } from "../controller/sessionOwnerReconciliation.js";
 import type { SessionReconciliationReport } from "../runtime/index.js";
 
@@ -33,25 +32,15 @@ export type SessionReconcileResult = Readonly<{
 /**
  * `yui session reconcile` — read-only durable/physical reconciliation report
  * by default. `--cleanup` performs exact-owner termination of live roots
- * belonging to terminal/archived Tasks, and requires the independent
- * `session.reconcileMode=exact-owner-cleanup` switch.
+ * belonging to terminal/archived Tasks.
  */
 export async function runSessionReconcileCommand(input: Readonly<{
   reconciliation: SessionOwnerReconciliation;
   options: SessionReconcileOptions;
   environment?: NodeJS.ProcessEnv;
 }>): Promise<SessionReconcileResult> {
-  const environment = input.environment ?? process.env;
-  const mode = sessionReconcileModeFromEnvironment(environment);
-  if (input.options.cleanup && mode !== "exact-owner-cleanup") {
-    throw usageError(
-      "Session reconcile --cleanup requires session.reconcileMode=exact-owner-cleanup "
-        + "(YUI_SESSION_RECONCILE_MODE=exact-owner-cleanup)."
-    );
-  }
-
   if (input.options.cleanup) {
-    const before = input.reconciliation.report("exact-owner-cleanup");
+    const before = input.reconciliation.report();
     const targets = before.entries.filter((entry) => entry.archiveBlocked);
     for (const entry of targets) {
       const owner = entry.owner.scope === "task"
@@ -68,7 +57,7 @@ export async function runSessionReconcileCommand(input: Readonly<{
     }
   }
 
-  const report = input.reconciliation.report(mode);
+  const report = input.reconciliation.report();
   const exitCode = report.summary.archiveBlockers > 0 ? 5 : 0;
   return {
     output: renderSessionReconciliationReport(report),
@@ -82,7 +71,7 @@ export function renderSessionReconciliationReport(
   width = defaultTableWidth()
 ): string {
   const lines = [
-    `Session reconciliation (mode: ${report.mode})`,
+    "Session reconciliation",
     "",
     `Owners: ${report.summary.owners}; live physical roots: `
       + `${report.summary.livePhysicalRoots}; archive blockers: `
