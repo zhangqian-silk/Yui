@@ -43,7 +43,11 @@ const DEFAULT_EVENT_LOOP_DELAY_INTERVAL_MS = 50;
 const BUILTIN_METHODS = new Set([
   "controller.status",
   "controller.identity",
-  "controller.stop"
+  "controller.stop",
+  "controller.begin-handover",
+  "controller.commit-handover",
+  "controller.rollback-handover",
+  "controller.handover-state"
 ]);
 
 export function isBuiltinControllerMethod(method: string): boolean {
