@@ -667,11 +667,19 @@ test("rollback: a committed layout-6→7 migration leaves state.json untouched a
 // 5. Home-decided backend and worker resolution
 // ---------------------------------------------------------------------------
 
-test("backend resolution: a layout-7 Home opens SQLite without any env opt-in", () => {
+test("backend resolution: a layout-7 Home with yui.db opens SQLite without any env opt-in", () => {
   const { home } = setupPseudoLayout7Home();
+  new SqliteTaskStore(home).close();
   assert.equal(resolveTaskStoreBackendForHome(home, {}), "sqlite");
   assert.equal(resolveTaskStoreBackendForHome(home, { YUI_STORE_BACKEND: "file" }), "file");
   assert.equal(resolveTaskStoreBackendForHome(home, { YUI_STORE_BACKEND: "sqlite" }), "sqlite");
+});
+
+test("backend resolution: a pseudo-layout-7 Home (no yui.db) falls back to the file store", () => {
+  const { home } = setupPseudoLayout7Home();
+  assert.equal(resolveTaskStoreBackendForHome(home, {}), "file");
+  assert.equal(resolveTaskStoreBackendForHome(home, { YUI_STORE_BACKEND: "sqlite" }), "sqlite");
+  assert.equal(resolveTaskStoreBackendForHome(home, { YUI_STORE_BACKEND: "file" }), "file");
 });
 
 test("backend resolution: a layout-6 Home opens the file store", () => {
@@ -681,12 +689,23 @@ test("backend resolution: a layout-6 Home opens the file store", () => {
   assert.equal(resolveTaskStoreBackendForHome(home, { YUI_STORE_BACKEND: "sqlite" }), "sqlite");
 });
 
-test("worker resolution: Home-decided SQLite runs the worker by default", () => {
+test("worker resolution: Home-decided SQLite (yui.db present) runs the worker by default", () => {
   const { home } = setupPseudoLayout7Home();
+  new SqliteTaskStore(home).close();
   assert.equal(resolveStoreWorkerEnabledForHome(home, {}), true);
   assert.equal(resolveStoreWorkerEnabledForHome(home, { YUI_STORE_WORKER: "0" }), false);
   assert.equal(resolveStoreWorkerEnabledForHome(home, { YUI_STORE_WORKER: "false" }), false);
   assert.equal(resolveStoreWorkerEnabledForHome(home, { YUI_STORE_WORKER: "1" }), true);
+});
+
+test("worker resolution: a pseudo-layout-7 Home (no yui.db) keeps the worker off", () => {
+  const { home } = setupPseudoLayout7Home();
+  assert.equal(resolveStoreWorkerEnabledForHome(home, {}), false);
+  assert.equal(resolveStoreWorkerEnabledForHome(home, { YUI_STORE_WORKER: "1" }), false,
+    "worker requires SQLite; pseudo-layout-7 resolves to file");
+  assert.equal(resolveStoreWorkerEnabledForHome(home, { YUI_STORE_BACKEND: "sqlite" }), false,
+    "explicit sqlite without YUI_STORE_WORKER stays in-process (historical opt-in)");
+  assert.equal(resolveStoreWorkerEnabledForHome(home, { YUI_STORE_BACKEND: "sqlite", YUI_STORE_WORKER: "1" }), true);
 });
 
 test("worker resolution: env-decided SQLite keeps the historical opt-in", () => {
@@ -756,9 +775,9 @@ test("doctor: a pseudo-layout-7 Home is flagged needs-storage-repair with file b
   assert.equal(stateCheck.status, "ok");
   assert.match(stateCheck.detail, /needs-storage-repair/);
   const details = report.storage.details;
-  assert.equal(details.authoritativeBackend, "sqlite", "layout 7 still resolves to SQLite");
+  assert.equal(details.authoritativeBackend, "file", "pseudo-layout-7 falls back to the file store until repair");
   assert.equal(details.databasePath, null, "no database yet");
   assert.equal(details.journalMode, null);
-  assert.equal(details.workerEnabled, true);
+  assert.equal(details.workerEnabled, false, "worker stays off without yui.db");
   assert.equal(details.migrationReceipt, null);
 });

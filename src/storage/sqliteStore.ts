@@ -35,7 +35,7 @@
  * it performs the same cheap structural checks the file store relies on
  * (identity presence, taskId matching, referential lookups).
  */
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
@@ -2006,7 +2006,13 @@ export function resolveTaskStoreBackendForHome(
   const layout = schema.status === "current" || schema.status === "unsupported"
     ? schema.currentLayoutVersion
     : 0;
-  return layout >= 7 ? "sqlite" : "file";
+  if (layout < 7) return "file";
+  // Issue 01: a layout-7 Home's authoritative backend is SQLite WAL, but only
+  // when yui.db actually exists. A pseudo-layout-7 Home (manifest 7, no
+  // yui.db) is classified NEEDS_STORAGE_REPAIR; until repair runs, the file
+  // store remains the readable fallback. This keeps the Controller's backend
+  // resolution consistent with openCompatibleFileTaskStore's physical check.
+  return existsSync(join(home, "yui.db")) ? "sqlite" : "file";
 }
 
 /**
