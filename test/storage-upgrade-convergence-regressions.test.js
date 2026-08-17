@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync
 } from "node:fs";
@@ -17,9 +18,11 @@ import {
   ensureStorageSchema
 } from "../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
-import { MigrationRegistry } from "../dist/storage/migration/index.js";
-import { currentRecordVersions } from "../dist/storage/upgrade/recordVersions.js";
+import { MigrationRegistry, runMigration } from "../dist/storage/migration/index.js";
+import { createProductionRegistry } from "../dist/storage/migration/productionRegistry.js";
+import { currentRecordVersions, latestStorageVersionState } from "../dist/storage/upgrade/recordVersions.js";
 import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
+import { createSqliteMigrationTarget } from "../dist/storage/upgrade/sqliteMigrationTarget.js";
 import { createUpdatePorts } from "../dist/cli/updatePorts.js";
 
 function currentHome(prefix = "yui-convergence-") {
@@ -29,6 +32,33 @@ function currentHome(prefix = "yui-convergence-") {
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
   store.saveConfig({ ...store.getConfig(), timeZone: "UTC" });
+  return { base, home };
+}
+
+/**
+ * A healthy layout-7 Home whose authoritative backend is yui.db (built through
+ * the real 6→7 staged migration, so the fixture is a genuine post-migration
+ * Home with yui.db + persistent receipt + state.json retained). The
+ * orchestrator routes such a Home through the SQLite record migration target,
+ * which exposes the renameImpl fault-injection seam.
+ */
+function healthyLayout7Home(prefix = "yui-convergence-") {
+  const { base, home } = currentHome(prefix);
+  const manifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
+  manifest.storageVersion = 6;
+  writeFileSync(join(home, "schema.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const migrationTarget = createSqliteMigrationTarget({
+    home,
+    latest: latestStorageVersionState(),
+    registry: createProductionRegistry()
+  });
+  const migration = runMigration({
+    registry: createProductionRegistry(),
+    target: migrationTarget,
+    latest: latestStorageVersionState(),
+    mode: "execute"
+  });
+  assert.equal(migration.outcome, "migrated");
   return { base, home };
 }
 
@@ -235,7 +265,7 @@ test("successful switch starts the replacement Controller after verification", a
 });
 
 test("ambiguous switch remains fail-closed and does not restore the old Controller", async () => {
-  const { home } = currentHome("yui-convergence-ambiguous-");
+  const { home } = healthyLayout7Home("yui-convergence-ambiguous-");
   const { latest, registry } = migratableSetup(home);
   const events = [];
   const result = await runStorageUpgrade({
@@ -252,12 +282,9 @@ test("ambiguous switch remains fail-closed and does not restore the old Controll
       return { stopped: true, pid: 123 };
     },
     startController: async () => { events.push("start"); },
-    switchFaultHook: (step) => {
-      if (step === "post-backup-fsync") throw new Error("injected switch fault");
-    },
-    // The first move (Home -> backup) uses the real atomic rename. Both the
-    // promotion and rollback are forced to fail, producing the true ambiguous
-    // switch outcome without retrying either operation.
+    // The backup move (yui.db -> yui.db.backup-*) uses the real atomic rename.
+    // Both the promotion and rollback are forced to fail, producing the true
+    // ambiguous switch outcome without retrying either operation.
     renameImpl: () => { throw new Error("promotion unavailable"); }
   });
   assert.equal(result.outcome, "blocked");

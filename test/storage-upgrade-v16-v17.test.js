@@ -33,8 +33,10 @@ import { attachReviewRoundWorkspace } from "../dist/review/reviewRound.js";
 import { createEmptyRegistry } from "../dist/storage/migration/index.js";
 import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
+import { SqliteTaskStore } from "../dist/storage/sqliteStore.js";
 import { classifyHome } from "../dist/storage/upgrade/homeClassification.js";
 import { latestStorageVersionState } from "../dist/storage/upgrade/recordVersions.js";
+import { readStateFromSqlite } from "../dist/storage/upgrade/sqliteStateMigration.js";
 import { createManagedWorkspace } from "../dist/worktree/managedWorkspace.js";
 import {
   submitWorkItemCandidate,
@@ -61,6 +63,9 @@ function aggregateV16Home(t, { durableGraph = false } = {}) {
 
   const manifestPath = join(home, "schema.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  // A real aggregate-v16 Home predates the SQLite control-plane layout, so it
+  // is a layout-6 Home (Issue 01: layout 7 means yui.db is authoritative).
+  manifest.storageVersion = 6;
   manifest.aggregateSchemaVersion = 16;
   if (durableGraph) manifest.recordVersions.managedWorkspace = 1;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -86,6 +91,8 @@ function managedWorkspaceV1Home(t) {
   const durable = seedDurableGraph(base, new FileTaskStore(home));
   const manifestPath = join(home, "schema.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  // A real managedWorkspace-v1 Home predates the SQLite control-plane layout.
+  manifest.storageVersion = 6;
   manifest.recordVersions.managedWorkspace = 1;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   const statePath = join(home, "state.json");
@@ -321,6 +328,13 @@ test("production doctor and dry-run recognize an aggregate-v16 final policy Home
   assert.equal(dryRun.json.data.outcome, "dry-run");
   assert.deepEqual(dryRun.json.data.report.steps, [
     {
+      axis: "layout",
+      fromVersion: 6,
+      toVersion: 7,
+      transition: "offline-migration",
+      declaredEffects: []
+    },
+    {
       axis: "aggregate",
       fromVersion: 16,
       toVersion: 17,
@@ -335,14 +349,13 @@ test("production doctor and dry-run recognize an aggregate-v16 final policy Home
       declaredEffects: []
     }
   ]);
-  assert.equal(existsSync(`${home}.upgrade-staging`), false);
+  assert.equal(existsSync(join(home, "yui.db.staged")), false);
   assert.deepEqual(sourceSnapshot(base, home), before, "dry-run must not mutate the source Home");
 });
 
 test("normal commands refuse raw v16 while execute preserves the durable graph", (t) => {
   const { home, durable } = aggregateV16Home(t, { durableGraph: true });
   const beforeStateText = readFileSync(join(home, "state.json"), "utf8");
-  const beforeManifestText = readFileSync(join(home, "schema.json"), "utf8");
   const beforeState = JSON.parse(beforeStateText);
 
   const refused = runCli(home, ["--json", "config", "review", "show"]);
@@ -355,9 +368,10 @@ test("normal commands refuse raw v16 while execute preserves the durable graph",
   const upgraded = runCli(home, ["--json", "upgrade"]);
   assert.equal(upgraded.status, 0, upgraded.stderr);
   assert.equal(upgraded.json.data.outcome, "upgraded");
-  assert.ok(upgraded.json.data.backupPath);
   const afterManifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
-  const afterState = JSON.parse(readFileSync(join(home, "state.json"), "utf8"));
+  // Issue 01: a layout-6 Home migrates to the SQLite control-plane layout, so
+  // the migrated state lives in yui.db; state.json is retained read-only.
+  const afterState = readStateFromSqlite(home);
   assert.equal(afterManifest.aggregateSchemaVersion, 18);
   assert.equal(afterManifest.recordVersions.managedWorkspace, 2);
   assert.equal(afterState.schemaVersion, 18);
@@ -389,15 +403,13 @@ test("normal commands refuse raw v16 while execute preserves the durable graph",
   assert.equal(migratedTask.agentRuns["agent-run-1"].workspace.schemaVersion, 2);
   assert.ok(afterState.globalRoleSessionSets[durable.sessionRoleName]);
 
+  // The source state.json is retained read-only (it is the migration source,
+  // never a writable fallback); the manifest advances to the current versions.
   assert.equal(
-    readFileSync(join(upgraded.json.data.backupPath, "schema.json"), "utf8"),
-    beforeManifestText
-  );
-  assert.equal(
-    readFileSync(join(upgraded.json.data.backupPath, "state.json"), "utf8"),
+    readFileSync(join(home, "state.json"), "utf8"),
     beforeStateText
   );
-  assert.doesNotThrow(() => new FileTaskStore(home).listTasks());
+  assert.doesNotThrow(() => new SqliteTaskStore(home).listTasks());
 });
 
 test("record-only managedWorkspace upgrade preserves embedded lifecycle snapshots", (t) => {
@@ -407,6 +419,12 @@ test("record-only managedWorkspace upgrade preserves embedded lifecycle snapshot
   assert.equal(dryRun.status, 0, dryRun.stderr);
   assert.equal(dryRun.json.data.outcome, "dry-run");
   assert.deepEqual(dryRun.json.data.report.steps, [{
+    axis: "layout",
+    fromVersion: 6,
+    toVersion: 7,
+    transition: "offline-migration",
+    declaredEffects: []
+  }, {
     axis: "record",
     recordKind: "managedWorkspace",
     fromVersion: 1,
@@ -414,17 +432,17 @@ test("record-only managedWorkspace upgrade preserves embedded lifecycle snapshot
     transition: "offline-migration",
     declaredEffects: []
   }]);
-  assert.equal(existsSync(`${home}.upgrade-staging`), false);
+  assert.equal(existsSync(join(home, "yui.db.staged")), false);
   assert.deepEqual(sourceSnapshot(base, home), before);
 
   const upgraded = runCli(home, ["--json", "upgrade"]);
   assert.equal(upgraded.status, 0, upgraded.stderr);
-  const after = JSON.parse(readFileSync(join(home, "state.json"), "utf8"));
+  const after = readStateFromSqlite(home);
   const task = after.tasks[durable.taskId];
   assert.equal(task.reviewRounds[durable.reviewRoundId].workspace.schemaVersion, 2);
   assert.equal(task.agentRuns["agent-run-1"].workspace.schemaVersion, 2);
   assert.ok(Object.values(task.managedWorkspaces).every(({ schemaVersion }) => schemaVersion === 2));
-  assert.doesNotThrow(() => new FileTaskStore(home).listTasks());
+  assert.doesNotThrow(() => new SqliteTaskStore(home).listTasks());
 });
 
 test("an aggregate-v16 consumer sees migrated v18 as a future Home", (t) => {
