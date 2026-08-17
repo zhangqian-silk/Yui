@@ -37,6 +37,12 @@ const CONFIGURATION_REFRESH_TIMEOUT_MS = 500;
 const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
   ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
   "YUI_TMUX_BIN",
+  // Issue 01: YUI_STORE_BACKEND/YUI_STORE_WORKER are reserved for tests and
+  // explicit recovery commands. A Controller spawned by such a command must
+  // inherit the forced backend; otherwise a layout-7 test Home silently opens
+  // SQLite, creates yui.db, and diverges from the file store the test writes.
+  "YUI_STORE_BACKEND",
+  "YUI_STORE_WORKER",
   // rr13/test: Forward the liveness seam so an integration test's Controller
   // subprocess does not reap a saved active Leader Run without a real tmux role.
   "YUI_TEST_ROLE_LIVENESS_PRESENT",
@@ -387,9 +393,14 @@ function controllerSpawnEnvironment(
     // The Controller remains authoritative for reporting an invalid/unavailable
     // home. Environment filtering must never fall back to forwarding all names.
   }
+  // Merge with process.env so a partial source (e.g. a managed-Session env
+  // that only carries YUI_SESSION_SCOPE/YUI_TASK_ID) still forwards
+  // operational vars like YUI_STORE_BACKEND and PATH. The source wins on
+  // conflict; the whitelist still gates every forwarded name.
+  const effectiveSource: NodeJS.ProcessEnv = { ...process.env, ...source };
   const environment: NodeJS.ProcessEnv = {};
   for (const name of allowed) {
-    const value = source[name];
+    const value = effectiveSource[name];
     if (value !== undefined) environment[name] = value;
   }
   environment.YUI_HOME = home;

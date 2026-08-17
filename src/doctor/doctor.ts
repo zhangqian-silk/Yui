@@ -1,6 +1,8 @@
 import { accessSync, constants, existsSync, lstatSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
+import Database from "better-sqlite3";
+
 import {
   configuredAgentToDefinition,
   resolveAgentEnvironment,
@@ -32,8 +34,15 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
+import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
+import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
 import { classifyHome } from "../storage/upgrade/homeClassification.js";
+import {
+  readMigrationReceipt,
+  type PersistentMigrationReceipt
+} from "../storage/upgrade/migrationReceipt.js";
 import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
+import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
 import {
   CommandExecutionError,
   type CommandExecutor
@@ -87,6 +96,31 @@ export type StorageHealthSummary = Readonly<{
   healthy: boolean;
   /** The storage checks that are not `ok` (empty when healthy). */
   blocking: readonly DoctorCheck[];
+  /** Physical-backend facts for the Home (Issue 01 observability). */
+  details?: StorageDetails;
+}>;
+
+/**
+ * The physical-backend facts `doctor --json` reports so an operator can prove
+ * which backend is authoritative without inferring it from the manifest alone
+ * (Issue 01). Every field is read-only evidence; `null` means "not applicable
+ * or unreadable", never a guess.
+ */
+export type StorageDetails = Readonly<{
+  /** The layout version the manifest declares (null when unreadable). */
+  logicalLayout: number | null;
+  /** The backend ordinary startup opens for this Home. */
+  authoritativeBackend: "sqlite" | "file";
+  /** The absolute `yui.db` path when it exists, else null. */
+  databasePath: string | null;
+  /** The SQLite journal mode (null for the file store or an unreadable DB). */
+  journalMode: string | null;
+  /** Whether the persistence worker is enabled for this Home. */
+  workerEnabled: boolean;
+  /** The persistent migration receipt, when one exists and is well-formed. */
+  migrationReceipt: PersistentMigrationReceipt | null;
+  /** The last committed revision (home_meta for SQLite, state.json for file). */
+  lastCommittedRevision: number | null;
 }>;
 
 /** The full machine-readable doctor result surfaced by `yui --json doctor`. */
@@ -121,10 +155,70 @@ export function buildDoctorReport(
   storageOptions: OpenCompatibleFileTaskStoreOptions = {}
 ): DoctorReport {
   const inspection = inspectDoctor(env, executor, storageOptions);
+  const home = resolveYuiHome(env);
   return {
     checks: inspection.checks,
-    storage: summarizeStorageHealth(inspection.checks),
+    storage: {
+      ...summarizeStorageHealth(inspection.checks),
+      details: inspectStorageDetails(home, env)
+    },
     review: inspection.review
+  };
+}
+
+/**
+ * Read the physical-backend facts for a Home (Issue 01 observability). Every
+ * field is best-effort read-only evidence: an unreadable database or manifest
+ * yields `null` for that field, and the `storage state` check reports the
+ * structural problem separately.
+ */
+function inspectStorageDetails(
+  home: string,
+  env: NodeJS.ProcessEnv
+): StorageDetails {
+  const schema = inspectStorageSchema(home);
+  const logicalLayout = schema.status === "current" || schema.status === "unsupported"
+    ? schema.currentLayoutVersion
+    : null;
+  const authoritativeBackend = resolveTaskStoreBackendForHome(home, env);
+  const dbPath = join(home, COMMITTED_DATABASE_FILENAME);
+  const databasePath = existsSync(dbPath) ? dbPath : null;
+  let journalMode: string | null = null;
+  let lastCommittedRevision: number | null = null;
+  if (databasePath !== null) {
+    try {
+      const db = new Database(databasePath, { readonly: true });
+      try {
+        const mode = db.pragma("journal_mode", { simple: true });
+        journalMode = typeof mode === "string" ? mode : String(mode);
+        const row = db.prepare("SELECT revision FROM home_meta WHERE id = 1").get() as
+          | { revision?: number }
+          | undefined;
+        lastCommittedRevision = typeof row?.revision === "number" ? row.revision : null;
+      } finally {
+        db.close();
+      }
+    } catch {
+      // Leave both null; the storage state check surfaces the corruption.
+    }
+  } else {
+    try {
+      const state = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8")) as {
+        revision?: unknown;
+      };
+      lastCommittedRevision = typeof state.revision === "number" ? state.revision : null;
+    } catch {
+      lastCommittedRevision = null;
+    }
+  }
+  return {
+    logicalLayout,
+    authoritativeBackend,
+    databasePath,
+    journalMode,
+    workerEnabled: resolveStoreWorkerEnabledForHome(home, env),
+    migrationReceipt: readMigrationReceipt(home),
+    lastCommittedRevision
   };
 }
 
@@ -152,9 +246,12 @@ type StorageCompatibilityStatus =
   | "current"
   | "compatible-old"
   | "migration-required"
+  | "needs-storage-repair"
   | "unsupported";
 
-type ResolvedStorageOptions = Required<OpenCompatibleFileTaskStoreOptions>;
+type ResolvedStorageOptions = Required<
+  Pick<OpenCompatibleFileTaskStoreOptions, "registry" | "latest">
+>;
 
 type CompatibilityInspection = Readonly<{
   check: DoctorCheck;
@@ -327,7 +424,8 @@ function checkSchema(
       };
     case "unsupported":
       if (
-        compatibility.storageStatus === "compatible-old"
+        (compatibility.storageStatus === "compatible-old"
+          || compatibility.storageStatus === "needs-storage-repair")
         && compatibility.check.status === "ok"
       ) {
         return {
@@ -335,7 +433,7 @@ function checkSchema(
           status: "ok",
           detail:
             `current=${state.currentVersion} latest=${state.latestVersion} `
-            + `direction=${state.direction}; compatible-old validated`
+            + `direction=${state.direction}; ${compatibility.storageStatus} validated`
         };
       }
       return {
@@ -392,7 +490,11 @@ function inspectCompatibility(
     return { check: { name, status: "invalid", detail: errorMessage(error) } };
   }
   const storageStatus = classification.classification.status;
-  if (storageStatus === "compatible-old") {
+  // A pseudo-layout-7 Home (needs-storage-repair) opens through the same
+  // normalization path as compatible-old, so its records get the same eager
+  // validation before the schema check can treat a version mismatch as
+  // validated (Issue 01).
+  if (storageStatus === "compatible-old" || storageStatus === "needs-storage-repair") {
     try {
       validateCompatibleFileTaskStore(home, resolvedStorageOptions);
     } catch (error) {
@@ -402,7 +504,7 @@ function inspectCompatibility(
         check: {
           name,
           status: "invalid",
-          detail: `unsupported compatible-old shape: ${errorMessage(error)}`
+          detail: `unsupported ${storageStatus} shape: ${errorMessage(error)}`
         }
       };
     }
@@ -438,6 +540,22 @@ function inspectCompatibility(
           name,
           status: "ok",
           detail: `migration-required (MIGRATABLE) ${versions}; run yui update when Sessions are clear`
+        }
+      };
+    case "needs-storage-repair":
+      return {
+        storageStatus,
+        storageOptions: resolvedStorageOptions,
+        check: {
+          name,
+          // Diagnostic mode (Issue 01 rollout step 1): the Home is readable
+          // and usable, but the manifest claims layout 7 without a yui.db.
+          // Surface the repair need in the detail while keeping the Home
+          // healthy so ordinary commands keep working.
+          status: "ok",
+          detail:
+            `needs-storage-repair (NEEDS_STORAGE_REPAIR) ${versions}; `
+            + "the manifest claims layout 7 but yui.db is missing. Run `yui upgrade` to rebuild it from state.json."
         }
       };
     case "unsupported": {
@@ -477,7 +595,13 @@ function inspectState(
   }
   if (schema.status === "invalid") return blockedStorage("invalid", schema.detail);
   if (schema.status === "read-error") return blockedStorage("invalid", schema.detail);
-  if (compatibility.check.status !== "ok") {
+  // A pseudo-layout-7 Home (needs-storage-repair) has a readable state.json;
+  // the compatibility check surfaces the repair need, but the store itself is
+  // readable, so the state and review checks must still run (Issue 01).
+  if (
+    compatibility.check.status !== "ok"
+    && compatibility.storageStatus !== "needs-storage-repair"
+  ) {
     return blockedStorage(
       compatibility.check.status,
       storageBlockerDetail(compatibility.check)
@@ -486,6 +610,7 @@ function inspectState(
   if (
     compatibility.storageStatus !== "current"
     && compatibility.storageStatus !== "compatible-old"
+    && compatibility.storageStatus !== "needs-storage-repair"
   ) {
     return blockedStorage("unsupported", compatibility.check.detail);
   }
@@ -494,13 +619,23 @@ function inspectState(
   }
 
   const statePath = join(home, STORAGE_STATE_FILE);
-  if (!existsSync(statePath)) return blockedStorage("missing", "run yui setup");
-  try {
-    const metadata = lstatSync(statePath);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) {
-      return blockedStorage("invalid", `${STORAGE_STATE_FILE} must be a regular file.`);
+  // A repaired layout-7 Home archived state.json; yui.db is the authoritative
+  // backend then, so the state.json gate is skipped (Issue 01).
+  const sqliteAuthoritative = !existsSync(statePath)
+    && existsSync(join(home, COMMITTED_DATABASE_FILENAME));
+  if (!sqliteAuthoritative) {
+    if (!existsSync(statePath)) return blockedStorage("missing", "run yui setup");
+    try {
+      const metadata = lstatSync(statePath);
+      if (!metadata.isFile() || metadata.isSymbolicLink()) {
+        return blockedStorage("invalid", `${STORAGE_STATE_FILE} must be a regular file.`);
+      }
+      accessSync(statePath, constants.R_OK);
+    } catch (error) {
+      return blockedStorage("invalid", errorMessage(error));
     }
-    accessSync(statePath, constants.R_OK);
+  }
+  try {
     const store = openCompatibleFileTaskStore(home, compatibility.storageOptions);
     const config = store.getConfig();
     const agents = store.listConfiguredAgents();
@@ -514,12 +649,12 @@ function inspectState(
       check: {
         name: "storage state",
         status: "ok",
-        detail: `readable agents=${agents.length} tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoles.length} defaultAgent=${config.defaultAgent ?? "none"}`
+        detail: `${sqliteAuthoritative ? "yui.db readable" : "readable"} agents=${agents.length} tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoles.length} defaultAgent=${config.defaultAgent ?? "none"}`
       },
       agents,
       review: {
         storageReady: true,
-        storageDetail: "state.json is readable",
+        storageDetail: sqliteAuthoritative ? "yui.db is readable" : "state.json is readable",
         ...(config.review === undefined ? {} : { policy: config.review }),
         ...(config.review === undefined
           ? {}

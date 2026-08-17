@@ -1,45 +1,42 @@
 /**
- * The SQLite-backed {@link MigrationTarget} for the layout 6 -> 7 staged
- * migration (task-21 §8, work-item-4).
+ * The SQLite-backed {@link MigrationTarget} for record-family migrations on a
+ * layout-7 Home (Issue 01 Phase 2).
  *
- * This target is the seam between the generic, domain-free migration engine
- * and the SQLite writer. It stages the migrated state into a sidecar
- * `yui.db.staged` INSIDE the Home (not a sibling copy), verifies the staged
- * database against an independent re-read of `state.json`, and commits by
- * swapping `yui.db.staged` -> `yui.db` and advancing `schema.json` to layout 7
- * in the same coordination critical section.
+ * The layout 6 -> 7 target ({@link createSqliteMigrationTarget}) stages a
+ * fresh database from `state.json`. Once a Home is at layout 7 its
+ * authoritative store is `yui.db`; `state.json` may have been archived by the
+ * pseudo-layout-7 repair, so a record-only migration on such a Home cannot
+ * read its source from the document. This target closes that gap:
  *
- * Staged orchestration (§8.2):
- *  - Snapshot:  `readSource` reads `schema.json` + `state.json` read-only.
- *  - Stage:     `writeFreshOutput` populates `yui.db.staged` from the (possibly
- *               transformed) snapshot; refuses to overwrite an existing stage.
- *  - Verify:    `validateCurrentState` independently re-reads `state.json`,
- *               re-derives the expected state through the registered transforms,
- *               and compares per-family checksums against the staged database.
+ *  - Snapshot:  `readSource` reads `schema.json` and reconstructs the
+ *               state.json-shaped snapshot from `yui.db` via
+ *               {@link readStateFromSqlite} (raw payloads, so older record
+ *               versions survive with their original `schemaVersion`).
+ *  - Stage:     `writeFreshOutput` populates a sidecar `yui.db.staged` from
+ *               the (possibly transformed) snapshot; refuses to overwrite an
+ *               existing stage.
+ *  - Verify:    `validateCurrentState` independently re-reads `yui.db`,
+ *               re-derives the expected state through the registered
+ *               transforms, and compares per-family checksums against the
+ *               staged database.
  *  - Commit:    `atomicSwitchWithBackup` swaps the sidecar into `yui.db` (with
- *               a timestamped backup of any prior database) and advances
- *               `schema.json` to layout 7.
- *  - Rollback:  `rollbackSqliteMigration` quarantines `yui.db` and flips
- *               `schema.json` back to layout 6. A layout-6→7 migration retains
- *               `state.json` in place (never touched); a pseudo-layout-7 repair
- *               archived it to `state.json.backup-*`, so rollback restores the
- *               newest backup when `state.json` is absent.
+ *               a timestamped backup of the prior database) and advances
+ *               `schema.json`'s record-family versions in the same
+ *               coordination critical section. The layout version is
+ *               unchanged (this target never crosses a layout boundary).
  *
- * The source `state.json` is retained read-only throughout: it is never
+ * The source `yui.db` is retained read-only throughout: it is never
  * overwritten, truncated, or deleted by the migration. This preserves the
- * rollback path and the §8.4 invariants (no healthy Session reset, no evidence
- * deleted).
+ * rollback path (restore the timestamped backup).
  */
 import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
 
 import { writeTextFileAtomically } from "../durableFile.js";
 import {
   STORAGE_SCHEMA_FILE,
   type ParsedStorageManifest
 } from "../storageSchema.js";
-import { STORAGE_STATE_FILE } from "../taskStore.js";
 import { planMigration } from "../migration/planner.js";
 import type { MigrationRegistry } from "../migration/registry.js";
 import {
@@ -59,17 +56,17 @@ import {
   inspectSnapshotVersionState,
   type HomeSnapshot
 } from "./homeMigrationTarget.js";
+import { writeSwitchProgress } from "./switchProgress.js";
 import {
   COMMITTED_DATABASE_FILENAME,
   STAGED_DATABASE_FILENAME,
   computeDbFamilyChecksums,
   computeStateFamilyChecksums,
-  populateSqliteFromState
+  populateSqliteFromState,
+  readStateFromSqlite
 } from "./sqliteStateMigration.js";
-import { latestStateBackupPath } from "./pseudoLayoutRepair.js";
-import { migrationReceiptPath, writeMigrationReceipt } from "./migrationReceipt.js";
 
-export type SqliteMigrationTargetOptions = Readonly<{
+export type SqliteRecordMigrationTargetOptions = Readonly<{
   /** The authoritative source Home (never written until the atomic switch). */
   home: string;
   /** The latest supported version state (scalar axes + current record map). */
@@ -80,33 +77,36 @@ export type SqliteMigrationTargetOptions = Readonly<{
   now?: () => Date;
   /** This process's pid, for foreign-writer detection. */
   callerPid?: number;
+  /**
+   * Test seam for the promote and rollback renames in the atomic switch.
+   * The backup move (committed -> backup) always uses the real rename so a
+   * fault that blocks the forward rename blocks the reverse too, driving the
+   * genuine ambiguous-switch path. Production never overrides it.
+   */
+  renameImpl?: (from: string, to: string) => void;
 }>;
 
-export type SqliteMigrationTarget = MigrationTarget<HomeSnapshot> & Readonly<{
+export type SqliteRecordMigrationTarget = MigrationTarget<HomeSnapshot> & Readonly<{
   /** The sidecar staged database path this target writes/promotes/discards. */
   stagedDbPath: string;
 }>;
 
-/** Build the SQLite-backed migration target. */
-export function createSqliteMigrationTarget(
-  options: SqliteMigrationTargetOptions
-): SqliteMigrationTarget {
+/** Build the SQLite-backed record-migration target. */
+export function createSqliteRecordMigrationTarget(
+  options: SqliteRecordMigrationTargetOptions
+): SqliteRecordMigrationTarget {
   const home = options.home;
   const latest = options.latest;
   const registry = options.registry;
   const now = options.now ?? (() => new Date());
   const callerPid = options.callerPid ?? process.pid;
+  const promoteRename = options.renameImpl ?? renameSync;
   const stagedDbPath = join(home, STAGED_DATABASE_FILENAME);
   const committedDbPath = join(home, COMMITTED_DATABASE_FILENAME);
 
   // The transformed schema manifest is cached during writeFreshOutput so the
   // switch can advance schema.json without re-reading or re-deriving it.
   let stagedSchemaManifest: Record<string, unknown> | null = null;
-  // The source document's revision and sha256, cached during writeFreshOutput
-  // so the switch can certify the dual-copy state with a persistent receipt
-  // (Issue 01: a layout-7 Home that retains state.json must carry the receipt
-  // that proves yui.db was promoted from that exact document).
-  let stagedReceiptSource: { revision: number; sha256: string } | null = null;
 
   return {
     stagedDbPath,
@@ -128,10 +128,7 @@ export function createSqliteMigrationTarget(
     readSource(): HomeSnapshot {
       const manifestRaw = readFileSync(join(home, STORAGE_SCHEMA_FILE), "utf8");
       const schemaManifest = parseJsonObject(manifestRaw, STORAGE_SCHEMA_FILE);
-      const statePath = join(home, STORAGE_STATE_FILE);
-      const state = existsSync(statePath)
-        ? parseJsonObject(readFileSync(statePath, "utf8"), STORAGE_STATE_FILE)
-        : null;
+      const state = readStateFromSqlite(home);
       return Object.freeze({ schemaManifest, state });
     },
 
@@ -143,40 +140,31 @@ export function createSqliteMigrationTarget(
         );
       }
       // Cache the transformed manifest for the switch's schema.json advancement.
-      // Ensure the layout version is the latest: the orchestrator applies the
-      // 6->7 transform before calling us, but direct callers (tests, drills)
-      // may pass an untransformed snapshot. Setting it here is idempotent.
+      // The orchestrator applies the record transforms before calling us, but
+      // direct callers (tests, drills) may pass an untransformed snapshot. The
+      // record-family versions are re-derived from the latest map so the
+      // staged manifest always declares the post-migration versions.
+      const recordVersions: Record<string, number> = {};
+      for (const [kind, entry] of Object.entries(latest.record)) {
+        recordVersions[kind] = entry.version;
+      }
       stagedSchemaManifest = {
         ...snapshot.schemaManifest,
-        storageVersion: latest.layout,
+        recordVersions,
         updatedAt: now().toISOString()
       };
-      if (snapshot.state !== null) {
-        // Hash the actual on-disk bytes (the file is retained read-only
-        // throughout the migration), not a re-serialization of the parsed
-        // snapshot, so the receipt can be compared against the file itself.
-        const stateRaw = readFileSync(join(home, STORAGE_STATE_FILE), "utf8");
-        stagedReceiptSource = {
-          revision: typeof snapshot.state.revision === "number" ? snapshot.state.revision : 0,
-          sha256: createHash("sha256").update(stateRaw, "utf8").digest("hex")
-        };
-        populateSqliteFromState(home, snapshot.state, STAGED_DATABASE_FILENAME);
-      } else {
-        // An empty Home (no state.json) still gets a schema-ready database.
-        stagedReceiptSource = { revision: 0, sha256: "" };
-        populateSqliteFromState(home, {}, STAGED_DATABASE_FILENAME);
-      }
+      populateSqliteFromState(home, snapshot.state ?? {}, STAGED_DATABASE_FILENAME);
     },
 
     rebuildDerivedState(effects: readonly string[]): DerivedStateSummary {
       // The SQLite database is fully normalised by populateSqliteFromState;
       // there is no separate derived index to rebuild. Echo the declared
-      // effects for the report, mirroring the file target.
+      // effects for the report, mirroring the layout 6 -> 7 target.
       return { rebuiltEffects: [...effects] };
     },
 
     validateCurrentState(): ValidationSummary {
-      // Independently re-read state.json from disk (not the in-memory snapshot
+      // Independently re-read yui.db from disk (not the in-memory snapshot
       // used for staging) and re-derive the expected state by applying the
       // registered transforms. This catches staging corruption, a torn read,
       // or a concurrent writer that slipped past the quiesce gate.
@@ -192,7 +180,7 @@ export function createSqliteMigrationTarget(
           {
             name: "SQLite staged-database checksum verification",
             outcome: "passed",
-            detail: `verified ${familyCount} record families against an independent state.json re-read`
+            detail: `verified ${familyCount} record families against an independent yui.db re-read`
           }
         ]
       };
@@ -205,7 +193,7 @@ export function createSqliteMigrationTarget(
       const stamp = now().toISOString().replace(/[:.]/g, "-");
       let backupPath: string | undefined;
 
-      // Phase 1: back up any existing yui.db, then promote the sidecar.
+      // Phase 1: back up the existing yui.db, then promote the sidecar.
       try {
         if (existsSync(committedDbPath)) {
           backupPath = join(home, `${COMMITTED_DATABASE_FILENAME}.backup-${stamp}`);
@@ -214,7 +202,7 @@ export function createSqliteMigrationTarget(
           }
           renameSync(committedDbPath, backupPath);
         }
-        renameSync(stagedDbPath, committedDbPath);
+        promoteRename(stagedDbPath, committedDbPath);
         // The staged connection may leave empty WAL/SHM sidecars behind
         // even after a clean close; they are dead once promoted.
         rmSync(`${stagedDbPath}-wal`, { force: true });
@@ -223,8 +211,9 @@ export function createSqliteMigrationTarget(
         // Pre-promotion failure: restore the original database if we moved it.
         if (backupPath !== undefined && existsSync(backupPath)) {
           try {
-            renameSync(backupPath, committedDbPath);
+            promoteRename(backupPath, committedDbPath);
           } catch {
+            writeInterruptedMarker(home, backupPath, stagedDbPath, now);
             throw new AmbiguousSwitchError({
               homePath: home,
               backupPath,
@@ -238,7 +227,8 @@ export function createSqliteMigrationTarget(
         throw error;
       }
 
-      // Phase 2: advance schema.json to layout 7 in the same critical section.
+      // Phase 2: advance schema.json record-family versions in the same
+      // critical section. The layout version is unchanged.
       try {
         if (stagedSchemaManifest !== null) {
           writeTextFileAtomically(
@@ -246,34 +236,18 @@ export function createSqliteMigrationTarget(
             `${JSON.stringify(stagedSchemaManifest, null, 2)}\n`
           );
         }
-        // Certify the dual-copy state (Issue 01): the 6→7 migration retains
-        // state.json read-only, so the Home legitimately holds both copies.
-        // The persistent receipt is the evidence that lets the classifier and
-        // doctor distinguish this certified switch from a drifted conflict.
-        if (stagedReceiptSource !== null) {
-          const familyCount = Object.keys(
-            computeDbFamilyChecksums(home, COMMITTED_DATABASE_FILENAME)
-          ).length;
-          writeMigrationReceipt(home, {
-            kind: "layout6-to-7",
-            completedAt: now().toISOString(),
-            sourceRevision: stagedReceiptSource.revision,
-            targetLayoutVersion: latest.layout,
-            sourceStateSha256: stagedReceiptSource.sha256,
-            verifiedFamilies: familyCount
-          });
-        }
       } catch (error) {
         // The database is promoted but schema.json could not be advanced.
         // Attempt to restore the original database; if that fails, the Home
         // is ambiguous and must be recovered manually.
         try {
           if (backupPath !== undefined && existsSync(backupPath)) {
-            renameSync(backupPath, committedDbPath);
+            promoteRename(backupPath, committedDbPath);
           } else {
             rmSync(committedDbPath, { force: true });
           }
         } catch {
+          writeInterruptedMarker(home, backupPath ?? committedDbPath, stagedDbPath, now);
           throw new AmbiguousSwitchError({
             homePath: home,
             backupPath: backupPath ?? committedDbPath,
@@ -281,7 +255,7 @@ export function createSqliteMigrationTarget(
             detail:
               `SQLite database was promoted but schema.json could not be advanced (${messageOf(error)}), ` +
               `and the automatic rollback also failed. The database is at ${committedDbPath}; ` +
-              `recover by advancing schema.json storageVersion to ${latest.layout} or restoring the backup.`
+              `recover by advancing schema.json recordVersions or restoring the backup.`
           });
         }
         throw error;
@@ -290,7 +264,7 @@ export function createSqliteMigrationTarget(
       return {
         status: "switched",
         ...(backupPath === undefined ? {} : { backupPath }),
-        detail: `SQLite database promoted to ${committedDbPath} and schema.json advanced to layout ${latest.layout}.`
+        detail: `SQLite database promoted to ${committedDbPath} and schema.json record versions advanced.`
       };
     },
 
@@ -308,10 +282,7 @@ export function createSqliteMigrationTarget(
   function readSourceFresh(): HomeSnapshot {
     const manifestRaw = readFileSync(join(home, STORAGE_SCHEMA_FILE), "utf8");
     const schemaManifest = parseJsonObject(manifestRaw, STORAGE_SCHEMA_FILE);
-    const statePath = join(home, STORAGE_STATE_FILE);
-    const state = existsSync(statePath)
-      ? parseJsonObject(readFileSync(statePath, "utf8"), STORAGE_STATE_FILE)
-      : null;
+    const state = readStateFromSqlite(home);
     return Object.freeze({ schemaManifest, state });
   }
 
@@ -329,7 +300,7 @@ export function createSqliteMigrationTarget(
     const plan = planMigration(registry, inspected.source, latest);
     if (plan.kind === "blocked") {
       throw new Error(
-        `SQLite migration verification cannot derive expected state: ${plan.blocker.message}`
+        `SQLite record migration verification cannot derive expected state: ${plan.blocker.message}`
       );
     }
     if (plan.kind === "no-op") return snapshot.state;
@@ -358,68 +329,10 @@ export function createSqliteMigrationTarget(
     }
     if (mismatches.length > 0) {
       throw new Error(
-        `SQLite migration checksum mismatch for ${mismatches.length} family/families: ${mismatches.join("; ")}`
+        `SQLite record migration checksum mismatch for ${mismatches.length} family/families: ${mismatches.join("; ")}`
       );
     }
   }
-}
-
-/**
- * Roll back a committed layout-7 SQLite migration: quarantine `yui.db` and
- * flip `schema.json` back to layout 6. A layout-6→7 migration retained
- * `state.json` read-only in place, so it is untouched there. A pseudo-layout-7
- * repair archived it to `state.json.backup-*`; when `state.json` is absent the
- * newest backup is restored so the layout-6 File store recovers every
- * pre-switch committed revision. The persistent migration receipt is removed.
- *
- * Returns the quarantine path. Throws if the Home is not at layout 7, has no
- * `yui.db` to quarantine, or has neither `state.json` nor a backup to restore.
- */
-export function rollbackSqliteMigration(
-  home: string,
-  options: { now?: () => Date } = {}
-): string {
-  const now = options.now ?? (() => new Date());
-  const schemaPath = join(home, STORAGE_SCHEMA_FILE);
-  const manifest = parseJsonObject(readFileSync(schemaPath, "utf8"), STORAGE_SCHEMA_FILE) as ParsedStorageManifest;
-  if (manifest.storageVersion !== 7) {
-    throw new Error(
-      `Rollback requires a layout-7 Home; found layout ${manifest.storageVersion}.`
-    );
-  }
-  const dbPath = join(home, COMMITTED_DATABASE_FILENAME);
-  if (!existsSync(dbPath)) {
-    throw new Error(`No SQLite database to quarantine: ${dbPath}.`);
-  }
-  const stamp = now().toISOString().replace(/[:.]/g, "-");
-  const quarantinePath = join(home, `${COMMITTED_DATABASE_FILENAME}.quarantine-${stamp}`);
-  if (existsSync(quarantinePath)) {
-    throw new Error(`Refusing to overwrite an existing quarantine: ${quarantinePath}.`);
-  }
-  renameSync(dbPath, quarantinePath);
-  // Clean up WAL/SHM sidecars.
-  rmSync(`${dbPath}-wal`, { force: true });
-  rmSync(`${dbPath}-shm`, { force: true });
-
-  // Restore the file-store authoritative document when the repair archived it.
-  const statePath = join(home, STORAGE_STATE_FILE);
-  if (!existsSync(statePath)) {
-    const backupPath = latestStateBackupPath(home);
-    if (backupPath === null) {
-      throw new Error(
-        `Rollback requires ${STORAGE_STATE_FILE} or a state.json.backup-* archive; neither exists.`
-      );
-    }
-    renameSync(backupPath, statePath);
-  }
-
-  // The persistent receipt certified the switch being rolled back.
-  rmSync(migrationReceiptPath(home), { force: true });
-
-  // Flip schema.json back to layout 6.
-  const rolledBack: Record<string, unknown> = { ...manifest, storageVersion: 6 };
-  writeTextFileAtomically(schemaPath, `${JSON.stringify(rolledBack, null, 2)}\n`);
-  return quarantinePath;
 }
 
 function parseJsonObject(raw: string, label: string): Record<string, unknown> {
@@ -432,4 +345,31 @@ function parseJsonObject(raw: string, label: string): Record<string, unknown> {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Persist the durable `interrupted` switch-progress marker for an ambiguous
+ * SQLite switch (P1-4): the original database was moved to its timestamped
+ * backup and neither the promotion nor its rollback completed. The marker is
+ * the honest durable signal — a completion receipt is never written for a
+ * switch that did not commit. Best-effort: the backup and on-disk state still
+ * recover the Home even if the marker write fails.
+ */
+function writeInterruptedMarker(
+  home: string,
+  backupPath: string,
+  stagingPath: string,
+  now: () => Date
+): void {
+  try {
+    writeSwitchProgress(home, {
+      phase: "interrupted",
+      homePath: home,
+      backupPath,
+      stagingPath,
+      updatedAt: now().toISOString()
+    });
+  } catch {
+    // Marker best-effort; the backup + on-disk state still recover the Home.
+  }
 }

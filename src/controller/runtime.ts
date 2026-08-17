@@ -39,7 +39,7 @@ import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import { SqliteTaskStore } from "../storage/sqliteStore.js";
 import {
   AsyncTaskStoreClient,
-  resolveStoreWorkerEnabled
+  resolveStoreWorkerEnabledForHome
 } from "../storage/storeRpc.js";
 import {
   FileTaskWorkspacePreparer,
@@ -167,10 +167,15 @@ export async function startFileTaskControllerRuntime(
   home: string,
   options: FileTaskControllerFactoryOptions = {}
 ): Promise<RunningFileTaskControllerRuntime> {
-  // The persistence worker (task-21, work-item-5) is opt-in: YUI_STORE_BACKEND
-  // must be sqlite AND YUI_STORE_WORKER=1. The file store remains the default
-  // for CLI tools and tests; rollback is a config flip (§6).
-  const useWorker = resolveStoreWorkerEnabled(options.environment ?? process.env);
+  // The Home decides the backend (Issue 01): a layout-7 Home runs SQLite with
+  // the persistence worker on by default; YUI_STORE_WORKER=0/false forces the
+  // in-process SQLite connection. The non-worker path opens the Home-decided
+  // backend through the compatibility opener (SQLite for layout 7, file store
+  // with normalization for older layouts).
+  const useWorker = resolveStoreWorkerEnabledForHome(
+    home,
+    options.environment ?? process.env
+  );
   const store = options.store
     ?? (useWorker
       // Transitional: the scheduler/planner still use a sync store. The worker

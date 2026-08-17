@@ -20,14 +20,17 @@ import {
 import { FileTaskStore } from "../dist/storage/taskStore.js";
 import {
   MigrationRegistry,
-  createEmptyRegistry
+  createEmptyRegistry,
+  runMigration
 } from "../dist/storage/migration/index.js";
+import { createProductionRegistry } from "../dist/storage/migration/productionRegistry.js";
 import {
   latestStorageVersionState,
   currentRecordVersions
 } from "../dist/storage/upgrade/recordVersions.js";
 import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
 import { createHomeMigrationTarget } from "../dist/storage/upgrade/homeMigrationTarget.js";
+import { createSqliteMigrationTarget } from "../dist/storage/upgrade/sqliteMigrationTarget.js";
 import {
   placeUpgradeFence,
   readUpgradeFence,
@@ -89,6 +92,33 @@ function migratableSetup() {
   return { latest, registry };
 }
 
+/**
+ * Issue 01: a healthy current layout-7 Home whose authoritative backend is
+ * `yui.db` (built through the real 6→7 staged migration, so the fixture is a
+ * genuine post-migration Home with yui.db + persistent receipt + state.json
+ * retained). A layout-7 Home without `yui.db` is a pseudo-layout-7 Home, not a
+ * current Home, so tests that assert current-Home verdicts must use this.
+ */
+function healthyLayout7Home() {
+  const { base, home } = currentHome();
+  const manifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
+  manifest.storageVersion = 6;
+  writeFileSync(join(home, "schema.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const migrationTarget = createSqliteMigrationTarget({
+    home,
+    latest: latestStorageVersionState(),
+    registry: createProductionRegistry()
+  });
+  const migration = runMigration({
+    registry: createProductionRegistry(),
+    target: migrationTarget,
+    latest: latestStorageVersionState(),
+    mode: "execute"
+  });
+  assert.equal(migration.outcome, "migrated");
+  return { base, home };
+}
+
 // ===========================================================================
 // P1-1 — Complete Home content preservation contract: the atomic switch must
 // preserve runtime/inbox (authoritative), cache/, artifacts/ — no silent loss.
@@ -135,9 +165,10 @@ test("P1-1 positive: a migrated switch preserves runtime/, cache/, artifacts/", 
   assert.doesNotThrow(() => new FileTaskStore(home).listTasks());
 });
 
-test("P1-1 positive: the timestamped backup also retains the original extra content", async () => {
-  const { home } = currentHome();
+test("P1-1 positive: the timestamped backup retains the original database bytes", async () => {
+  const { home } = healthyLayout7Home();
   seedExtraHomeContent(home);
+  const originalDb = readFileSync(join(home, "yui.db"));
   const { latest, registry } = migratableSetup();
   const result = await runStorageUpgrade({
     home, registry, latest, mode: "execute",
@@ -146,9 +177,13 @@ test("P1-1 positive: the timestamped backup also retains the original extra cont
   });
   assert.equal(result.outcome, "upgraded");
   assert.ok(result.backupPath, "a backup path is reported");
+  // A layout-7 Home's authoritative store is yui.db; the SQLite record target
+  // backs up the database file (not a Home-directory copy). Extra Home content
+  // (runtime/, cache/, artifacts/) is preserved in place by the sibling test,
+  // not copied into the database backup.
   assert.equal(
-    readFileSync(join(result.backupPath, "runtime", "controller.json"), "utf8"),
-    '{"pid":999999999}\n'
+    readFileSync(result.backupPath).toString("hex"),
+    originalDb.toString("hex")
   );
 });
 
@@ -269,7 +304,7 @@ test("P1-4 negative: when rollback ALSO fails, atomicSwitchWithBackup throws Amb
 });
 
 test("P1-4 orchestrator: an ambiguous switch blocks at switch-ambiguous, records interrupted, does not claim unchanged", async () => {
-  const { home } = currentHome();
+  const { home } = healthyLayout7Home();
   const { latest, registry } = migratableSetup();
   const result = await runStorageUpgrade({
     home, registry, latest, mode: "execute",
@@ -469,7 +504,7 @@ test("P2-7 command: `yui upgrade` on an uninitialized Home exits non-zero with t
 });
 
 test("P2-7 negative: an initialized, current Home is already-current (no false setup blocker)", async () => {
-  const { home } = currentHome();
+  const { home } = healthyLayout7Home();
   const result = await runStorageUpgrade({
     home,
     registry: createEmptyRegistry(),
