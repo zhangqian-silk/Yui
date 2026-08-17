@@ -84,6 +84,7 @@ import {
 } from "./homeMigrationTarget.js";
 import { repairPseudoLayout7 } from "./pseudoLayoutRepair.js";
 import { createSqliteMigrationTarget } from "./sqliteMigrationTarget.js";
+import { createSqliteRecordMigrationTarget } from "./sqliteRecordMigrationTarget.js";
 import {
   inspectOfflineUpgradeInventory,
   type OfflineUpgradeBlocker,
@@ -444,13 +445,29 @@ export async function runStorageUpgrade(
     }
   }
 
-  // Select the migration target. A layout-6 Home migrates to the SQLite
-  // control-plane layout (7) via the staged state.json→SQLite target; all
-  // other plans (record-only on layout 7) use the file-document target.
-  const usesSqliteTarget = classification.layoutVersion === 6 && latest.layout === 7;
-  const target: MigrationTarget<HomeSnapshot> = usesSqliteTarget
+  // Select the migration target.
+  //  - A layout-6 Home migrates to the SQLite control-plane layout (7) via the
+  //    staged state.json→SQLite target.
+  //  - A layout-7 Home whose authoritative store is `yui.db` migrates
+  //    record/aggregate versions via the SQLite record target (state.json may
+  //    have been archived by the pseudo-layout-7 repair).
+  //  - A layout-6 Home with record-only migrations (no layout step) uses the
+  //    file-document target.
+  const usesSqliteLayoutTarget = classification.layoutVersion === 6 && latest.layout === 7;
+  const usesSqliteRecordTarget = classification.layoutVersion === latest.layout
+    && latest.layout >= 7;
+  const target: MigrationTarget<HomeSnapshot> = usesSqliteLayoutTarget
     ? createSqliteMigrationTarget({ home, latest, registry, now, callerPid })
-    : createHomeMigrationTarget({
+    : usesSqliteRecordTarget
+      ? createSqliteRecordMigrationTarget({
+        home,
+        latest,
+        registry,
+        now,
+        callerPid,
+        ...(options.renameImpl === undefined ? {} : { renameImpl: options.renameImpl })
+      })
+      : createHomeMigrationTarget({
         home,
         latest,
         now,
@@ -1101,6 +1118,7 @@ async function executePseudoLayout7Repair(
       }
     }
     try {
+      options.postSwitchFaultHook?.("receipt-clear");
       clearUpgradeReceipt(home);
     } catch (error) {
       return {
@@ -1208,6 +1226,7 @@ function executePseudoLayout7RepairFenced(
 
   // Write the temporary upgrade receipt (for the update flow's ambiguity
   // window); it is cleared by the caller after the Controller restarts.
+  options.postSwitchFaultHook?.("receipt-write");
   writeUpgradeReceipt(home, {
     switched: true,
     homePath: home,
