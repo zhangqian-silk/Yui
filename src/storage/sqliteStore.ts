@@ -103,6 +103,7 @@ import {
   TELEMETRY_KEEP_PER_GENERATION,
   TELEMETRY_RUN_CAP
 } from "./sqliteSchema.js";
+import { inspectStorageSchema } from "./storageSchema.js";
 
 /** Options for {@link SqliteTaskStore}. */
 export type SqliteTaskStoreOptions = Readonly<{
@@ -199,6 +200,13 @@ export class SqliteTaskStore implements TaskStore {
 
   /** Close the underlying database connection. */
   close(): void { this.#db.close(); }
+
+  /**
+   * The underlying database connection, for read-only diagnostics
+   * (`PRAGMA journal_mode`, `PRAGMA quick_check`). Callers must not mutate
+   * through this handle.
+   */
+  databaseHandle(): Database.Database { return this.#db; }
 
   // -- transaction primitives -------------------------------------------------
 
@@ -1978,14 +1986,39 @@ export function resolveTaskStoreBackend(env: NodeJS.ProcessEnv = process.env): T
 }
 
 /**
+ * Resolve the storage backend from the Home's verified manifest (Issue 01).
+ *
+ * The Home decides: a layout-7 Home's authoritative backend is SQLite WAL, so
+ * ordinary CLI/Controller startup opens SQLite without requiring
+ * `YUI_STORE_BACKEND=sqlite`. An explicit `YUI_STORE_BACKEND` env value still
+ * wins — it is reserved for tests and explicit recovery commands — and any
+ * other value (including unset) defers to the Home. A Home whose manifest
+ * cannot be read falls back to the file store; the classifier/doctor surfaces
+ * the manifest problem separately.
+ */
+export function resolveTaskStoreBackendForHome(
+  home: string,
+  env: NodeJS.ProcessEnv = process.env
+): TaskStoreBackend {
+  const explicit = env.YUI_STORE_BACKEND?.toLowerCase();
+  if (explicit === "sqlite" || explicit === "file") return explicit;
+  const schema = inspectStorageSchema(home);
+  const layout = schema.status === "current" || schema.status === "unsupported"
+    ? schema.currentLayoutVersion
+    : 0;
+  return layout >= 7 ? "sqlite" : "file";
+}
+
+/**
  * Convenience: open the store for the backend resolved from the environment
- * (`YUI_STORE_BACKEND`, default `file`). CLI/controller entry points that want
- * the env-driven switch call this instead of {@link openTaskStore} directly.
+ * and the Home's verified manifest (see {@link resolveTaskStoreBackendForHome}).
+ * CLI/controller entry points call this instead of {@link openTaskStore}
+ * directly so a layout-7 Home opens SQLite without an env opt-in.
  */
 export function openConfiguredTaskStore(
   home: string,
   options?: TaskStoreOptions,
   env: NodeJS.ProcessEnv = process.env
 ): TaskStore {
-  return openTaskStore(home, resolveTaskStoreBackend(env), options);
+  return openTaskStore(home, resolveTaskStoreBackendForHome(home, env), options);
 }

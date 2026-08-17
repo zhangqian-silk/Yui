@@ -24,7 +24,10 @@
  * axis without letting an empty target family masquerade as current.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import Database from "better-sqlite3";
 
 import {
   classifyStorage,
@@ -37,12 +40,13 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storageSchema.js";
-import { FileTaskStore, StorageRecordError } from "../taskStore.js";
+import { FileTaskStore, STORAGE_STATE_FILE, StorageRecordError } from "../taskStore.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
 import {
   inspectSourceVersionState,
   type HomeSnapshot
 } from "./homeMigrationTarget.js";
+import { readMigrationReceipt } from "./migrationReceipt.js";
 
 /** The rich, presentation-ready classification of a Home. */
 export type HomeClassification = Readonly<{
@@ -121,6 +125,28 @@ export function classifyHome<Snapshot>(
     };
   }
   const source: StorageVersionState = inspected.source;
+
+  // Layout 7 physical-backend invariant (Issue 01): the manifest claims SQLite
+  // WAL as the authoritative store, so `yui.db` must exist and be healthy. A
+  // layout-7 Home without `yui.db` is a *pseudo-layout-7* Home — repairable
+  // when `state.json` is strictly readable, corrupted otherwise. A Home with
+  // both `state.json` and `yui.db` but no persistent migration receipt is an
+  // ambiguous dual-copy conflict. These are physical-backend facts, not
+  // version verdicts, so they are decided before the pure classifier runs.
+  if (source.layout === latest.layout && latest.layout >= 7) {
+    const physical = inspectLayout7PhysicalBackend(home);
+    if (physical !== undefined) {
+      return {
+        ...base,
+        classification: physical,
+        layoutVersion: schema.currentLayoutVersion,
+        aggregateVersion: schema.currentAggregateSchemaVersion,
+        ...(incompatibleComponentOf(schema) === undefined
+          ? {}
+          : { incompatibleComponent: incompatibleComponentOf(schema) })
+      };
+    }
+  }
 
   // The reference graph can only be validated by the strict loader, which only
   // understands the current versions. So run it exactly when every axis is
@@ -225,6 +251,95 @@ function incompatibleComponentOf(
   schema: StorageSchemaState
 ): "layout" | "aggregate" | "record" | undefined {
   return schema.status === "unsupported" ? schema.incompatibleComponent : undefined;
+}
+
+/**
+ * Inspect the physical-backend invariant of a layout-7 Home (Issue 01):
+ * `yui.db` must exist and be healthy. Returns a classification verdict when
+ * the invariant is violated, or `undefined` when the Home is physically sound
+ * (the pure classifier then decides the version verdict).
+ *
+ *  - manifest=7, no `yui.db`, `state.json` strictly readable →
+ *    `NEEDS_STORAGE_REPAIR` (pseudo-layout-7);
+ *  - manifest=7, no `yui.db`, no readable `state.json` → `CORRUPTED`
+ *    (no authoritative backend);
+ *  - `yui.db` unopenable or failing `PRAGMA quick_check` → `CORRUPTED`
+ *    (damaged database);
+ *  - both `state.json` and `yui.db` without a persistent migration receipt →
+ *    `CORRUPTED` (dual-copy conflict; never guess which copy is newer).
+ */
+function inspectLayout7PhysicalBackend(home: string): Classification | undefined {
+  const dbPath = join(home, "yui.db");
+  const statePath = join(home, STORAGE_STATE_FILE);
+  if (!existsSync(dbPath)) {
+    if (isReadableStateObject(statePath)) {
+      return {
+        verdict: "NEEDS_STORAGE_REPAIR",
+        status: "needs-storage-repair",
+        detail:
+          "Storage declares layout 7 but has no yui.db; state.json is the only "
+          + "authoritative copy (pseudo-layout-7). Run `yui upgrade` to rebuild "
+          + "the SQLite database."
+      };
+    }
+    return {
+      verdict: "CORRUPTED",
+      status: "unsupported",
+      detail:
+        "Storage declares layout 7 but has neither yui.db nor a readable "
+        + "state.json; there is no authoritative backend."
+    };
+  }
+
+  // `yui.db` exists: it must open and pass an integrity check.
+  try {
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const integrity = db.pragma("quick_check", { simple: true });
+      if (integrity !== "ok") {
+        return {
+          verdict: "CORRUPTED",
+          status: "unsupported",
+          detail: `SQLite integrity check failed: ${String(integrity)}.`
+        };
+      }
+    } finally {
+      db.close();
+    }
+  } catch (error) {
+    return {
+      verdict: "CORRUPTED",
+      status: "unsupported",
+      detail:
+        `SQLite database cannot be opened: ${error instanceof Error ? error.message : String(error)}.`
+    };
+  }
+
+  // A healthy `yui.db` plus `state.json` is only legitimate right after a
+  // certified switch; without the persistent migration receipt it is a
+  // dual-copy conflict.
+  if (existsSync(statePath) && readMigrationReceipt(home) === null) {
+    return {
+      verdict: "CORRUPTED",
+      status: "unsupported",
+      detail:
+        "Both state.json and yui.db exist without a migration receipt; the "
+        + "authoritative copy is ambiguous. Restore one copy from a backup; do "
+        + "not guess which is newer."
+    };
+  }
+  return undefined;
+}
+
+/** True when `state.json` exists and parses as a strict JSON object. */
+function isReadableStateObject(statePath: string): boolean {
+  if (!existsSync(statePath)) return false;
+  try {
+    const value = JSON.parse(readFileSync(statePath, "utf8"));
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  } catch {
+    return false;
+  }
 }
 
 /** A structural corruption check over an already-read snapshot (for tests/reports). */

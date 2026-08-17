@@ -20,10 +20,13 @@ import {
 } from "../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
 import { MigrationRegistry, createEmptyRegistry } from "../dist/storage/migration/index.js";
+import { runMigration } from "../dist/storage/migration/index.js";
+import { createProductionRegistry } from "../dist/storage/migration/productionRegistry.js";
 import { latestStorageVersionState, currentRecordVersions }
   from "../dist/storage/upgrade/recordVersions.js";
 import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
 import { createHomeMigrationTarget } from "../dist/storage/upgrade/homeMigrationTarget.js";
+import { createSqliteMigrationTarget } from "../dist/storage/upgrade/sqliteMigrationTarget.js";
 import { renderUpgradeResult } from "../dist/cli/upgradeCommand.js";
 import {
   placeUpgradeFence,
@@ -51,6 +54,24 @@ function currentHome() {
   // writes schema.json; state.json is created on the first mutation).
   const store = new FileTaskStore(home);
   store.saveConfig({ ...store.getConfig(), timeZone: "UTC" });
+  // Issue 01: a current layout-7 Home's authoritative backend is yui.db. Build
+  // it through the real 6→7 staged migration so the fixture is a genuine
+  // post-migration Home (yui.db + persistent receipt, state.json retained).
+  const manifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
+  manifest.storageVersion = 6;
+  writeFileSync(join(home, "schema.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const migrationTarget = createSqliteMigrationTarget({
+    home,
+    latest: latestStorageVersionState(),
+    registry: createProductionRegistry()
+  });
+  const migration = runMigration({
+    registry: createProductionRegistry(),
+    target: migrationTarget,
+    latest: latestStorageVersionState(),
+    mode: "execute"
+  });
+  assert.equal(migration.outcome, "migrated");
   return { base, home };
 }
 

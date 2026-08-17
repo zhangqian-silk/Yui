@@ -20,7 +20,10 @@
  *               a timestamped backup of any prior database) and advances
  *               `schema.json` to layout 7.
  *  - Rollback:  `rollbackSqliteMigration` quarantines `yui.db` and flips
- *               `schema.json` back to layout 6; `state.json` is never touched.
+ *               `schema.json` back to layout 6. A layout-6→7 migration retains
+ *               `state.json` in place (never touched); a pseudo-layout-7 repair
+ *               archived it to `state.json.backup-*`, so rollback restores the
+ *               newest backup when `state.json` is absent.
  *
  * The source `state.json` is retained read-only throughout: it is never
  * overwritten, truncated, or deleted by the migration. This preserves the
@@ -29,6 +32,7 @@
  */
 import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 import { writeTextFileAtomically } from "../durableFile.js";
 import {
@@ -62,6 +66,8 @@ import {
   computeStateFamilyChecksums,
   populateSqliteFromState
 } from "./sqliteStateMigration.js";
+import { latestStateBackupPath } from "./pseudoLayoutRepair.js";
+import { migrationReceiptPath, writeMigrationReceipt } from "./migrationReceipt.js";
 
 export type SqliteMigrationTargetOptions = Readonly<{
   /** The authoritative source Home (never written until the atomic switch). */
@@ -96,6 +102,11 @@ export function createSqliteMigrationTarget(
   // The transformed schema manifest is cached during writeFreshOutput so the
   // switch can advance schema.json without re-reading or re-deriving it.
   let stagedSchemaManifest: Record<string, unknown> | null = null;
+  // The source document's revision and sha256, cached during writeFreshOutput
+  // so the switch can certify the dual-copy state with a persistent receipt
+  // (Issue 01: a layout-7 Home that retains state.json must carry the receipt
+  // that proves yui.db was promoted from that exact document).
+  let stagedReceiptSource: { revision: number; sha256: string } | null = null;
 
   return {
     stagedDbPath,
@@ -141,9 +152,18 @@ export function createSqliteMigrationTarget(
         updatedAt: now().toISOString()
       };
       if (snapshot.state !== null) {
+        // Hash the actual on-disk bytes (the file is retained read-only
+        // throughout the migration), not a re-serialization of the parsed
+        // snapshot, so the receipt can be compared against the file itself.
+        const stateRaw = readFileSync(join(home, STORAGE_STATE_FILE), "utf8");
+        stagedReceiptSource = {
+          revision: typeof snapshot.state.revision === "number" ? snapshot.state.revision : 0,
+          sha256: createHash("sha256").update(stateRaw, "utf8").digest("hex")
+        };
         populateSqliteFromState(home, snapshot.state, STAGED_DATABASE_FILENAME);
       } else {
         // An empty Home (no state.json) still gets a schema-ready database.
+        stagedReceiptSource = { revision: 0, sha256: "" };
         populateSqliteFromState(home, {}, STAGED_DATABASE_FILENAME);
       }
     },
@@ -195,6 +215,10 @@ export function createSqliteMigrationTarget(
           renameSync(committedDbPath, backupPath);
         }
         renameSync(stagedDbPath, committedDbPath);
+        // The staged connection may leave empty WAL/SHM sidecars behind
+        // even after a clean close; they are dead once promoted.
+        rmSync(`${stagedDbPath}-wal`, { force: true });
+        rmSync(`${stagedDbPath}-shm`, { force: true });
       } catch (error) {
         // Pre-promotion failure: restore the original database if we moved it.
         if (backupPath !== undefined && existsSync(backupPath)) {
@@ -221,6 +245,23 @@ export function createSqliteMigrationTarget(
             join(home, STORAGE_SCHEMA_FILE),
             `${JSON.stringify(stagedSchemaManifest, null, 2)}\n`
           );
+        }
+        // Certify the dual-copy state (Issue 01): the 6→7 migration retains
+        // state.json read-only, so the Home legitimately holds both copies.
+        // The persistent receipt is the evidence that lets the classifier and
+        // doctor distinguish this certified switch from a drifted conflict.
+        if (stagedReceiptSource !== null) {
+          const familyCount = Object.keys(
+            computeDbFamilyChecksums(home, COMMITTED_DATABASE_FILENAME)
+          ).length;
+          writeMigrationReceipt(home, {
+            kind: "layout6-to-7",
+            completedAt: now().toISOString(),
+            sourceRevision: stagedReceiptSource.revision,
+            targetLayoutVersion: latest.layout,
+            sourceStateSha256: stagedReceiptSource.sha256,
+            verifiedFamilies: familyCount
+          });
         }
       } catch (error) {
         // The database is promoted but schema.json could not be advanced.
@@ -325,12 +366,14 @@ export function createSqliteMigrationTarget(
 
 /**
  * Roll back a committed layout-7 SQLite migration: quarantine `yui.db` and
- * flip `schema.json` back to layout 6. The `state.json` document is never
- * touched — it was retained read-only during the migration and remains the
- * authoritative source after rollback.
+ * flip `schema.json` back to layout 6. A layout-6→7 migration retained
+ * `state.json` read-only in place, so it is untouched there. A pseudo-layout-7
+ * repair archived it to `state.json.backup-*`; when `state.json` is absent the
+ * newest backup is restored so the layout-6 File store recovers every
+ * pre-switch committed revision. The persistent migration receipt is removed.
  *
- * Returns the quarantine path. Throws if the Home is not at layout 7 or has
- * no `yui.db` to quarantine.
+ * Returns the quarantine path. Throws if the Home is not at layout 7, has no
+ * `yui.db` to quarantine, or has neither `state.json` nor a backup to restore.
  */
 export function rollbackSqliteMigration(
   home: string,
@@ -357,6 +400,21 @@ export function rollbackSqliteMigration(
   // Clean up WAL/SHM sidecars.
   rmSync(`${dbPath}-wal`, { force: true });
   rmSync(`${dbPath}-shm`, { force: true });
+
+  // Restore the file-store authoritative document when the repair archived it.
+  const statePath = join(home, STORAGE_STATE_FILE);
+  if (!existsSync(statePath)) {
+    const backupPath = latestStateBackupPath(home);
+    if (backupPath === null) {
+      throw new Error(
+        `Rollback requires ${STORAGE_STATE_FILE} or a state.json.backup-* archive; neither exists.`
+      );
+    }
+    renameSync(backupPath, statePath);
+  }
+
+  // The persistent receipt certified the switch being rolled back.
+  rmSync(migrationReceiptPath(home), { force: true });
 
   // Flip schema.json back to layout 6.
   const rolledBack: Record<string, unknown> = { ...manifest, storageVersion: 6 };
