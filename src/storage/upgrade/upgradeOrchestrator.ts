@@ -78,10 +78,13 @@ import {
   describeActiveRuntime,
   homeRuntimeIsActive,
   inspectHomeRuntime,
+  inspectSourceVersionState,
   type HomeSnapshot,
   type SwitchStep
 } from "./homeMigrationTarget.js";
+import { repairPseudoLayout7 } from "./pseudoLayoutRepair.js";
 import { createSqliteMigrationTarget } from "./sqliteMigrationTarget.js";
+import { createSqliteRecordMigrationTarget } from "./sqliteRecordMigrationTarget.js";
 import {
   inspectOfflineUpgradeInventory,
   type OfflineUpgradeBlocker,
@@ -300,6 +303,69 @@ export async function runStorageUpgrade(
     );
   }
 
+  // A pseudo-layout-7 Home (manifest 7, no yui.db, readable state.json) needs
+  // the deterministic staged state.json→SQLite repair, not the version
+  // migration engine (Issue 01). The update preflight reports it as
+  // migration-required so a parent update can stop the old Controller first;
+  // dry-run stages and verifies without promoting; execute runs the full
+  // fenced repair with Controller lifecycle management.
+  if (verdict === "NEEDS_STORAGE_REPAIR") {
+    if (mode === "update-preflight") {
+      return {
+        outcome: "update-preflight",
+        status: "migration-required",
+        stepCount: 1,
+        classification
+      };
+    }
+    if (mode === "dry-run") {
+      const repairResult = repairPseudoLayout7({
+        home,
+        latest,
+        mode: "dry-run",
+        ...(options.now === undefined ? {} : { now: options.now })
+      });
+      if (repairResult.outcome === "blocked") {
+        return withClassification(
+          {
+            outcome: "blocked",
+            stage: repairResult.stage,
+            message: repairResult.message,
+            action: repairResult.action
+          },
+          classification
+        );
+      }
+      const inspected = inspectSourceVersionState(home, latest);
+      const source = "corruption" in inspected ? latest : inspected.source;
+      return {
+        outcome: "dry-run",
+        classification,
+        report: {
+          outcome: "dry-run",
+          mode: "dry-run" as const,
+          source,
+          target: latest,
+          steps: [],
+          effects: [],
+          derived: { rebuiltEffects: [] },
+          validation: {
+            checks: [
+              {
+                name: "pseudo-layout-7 repair verification",
+                outcome: "passed" as const,
+                detail:
+                  `verified ${repairResult.verifiedFamilies} record families against an `
+                  + "independent state.json re-read; staged database discarded"
+              }
+            ]
+          }
+        }
+      };
+    }
+    return executePseudoLayout7Repair(options, classification, now);
+  }
+
   // An all-compatible chain is an online-load contract, not a migration plan.
   // Validate the declared old source shape and its in-memory normalization before
   // ANY mode reports compatible, including the internal update preflight. This is
@@ -379,13 +445,29 @@ export async function runStorageUpgrade(
     }
   }
 
-  // Select the migration target. A layout-6 Home migrates to the SQLite
-  // control-plane layout (7) via the staged state.json→SQLite target; all
-  // other plans (record-only on layout 7) use the file-document target.
-  const usesSqliteTarget = classification.layoutVersion === 6 && latest.layout === 7;
-  const target: MigrationTarget<HomeSnapshot> = usesSqliteTarget
+  // Select the migration target.
+  //  - A layout-6 Home migrates to the SQLite control-plane layout (7) via the
+  //    staged state.json→SQLite target.
+  //  - A layout-7 Home whose authoritative store is `yui.db` migrates
+  //    record/aggregate versions via the SQLite record target (state.json may
+  //    have been archived by the pseudo-layout-7 repair).
+  //  - A layout-6 Home with record-only migrations (no layout step) uses the
+  //    file-document target.
+  const usesSqliteLayoutTarget = classification.layoutVersion === 6 && latest.layout === 7;
+  const usesSqliteRecordTarget = classification.layoutVersion === latest.layout
+    && latest.layout >= 7;
+  const target: MigrationTarget<HomeSnapshot> = usesSqliteLayoutTarget
     ? createSqliteMigrationTarget({ home, latest, registry, now, callerPid })
-    : createHomeMigrationTarget({
+    : usesSqliteRecordTarget
+      ? createSqliteRecordMigrationTarget({
+        home,
+        latest,
+        registry,
+        now,
+        callerPid,
+        ...(options.renameImpl === undefined ? {} : { renameImpl: options.renameImpl })
+      })
+      : createHomeMigrationTarget({
         home,
         latest,
         now,
@@ -814,6 +896,377 @@ async function execute(
     }
   }
   return result;
+}
+
+/**
+ * Execute the pseudo-layout-7 repair with Controller lifecycle management
+ * (Issue 01). This mirrors the lifecycle of {@link execute} — fence, quiesce,
+ * repair, post-verify, restart — but runs the dedicated staged state.json→SQLite
+ * repair instead of the version-migration engine.
+ */
+async function executePseudoLayout7Repair(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  classification: HomeClassification,
+  now: () => Date
+): Promise<UpgradeResult> {
+  const { home, latest } = options;
+  const callerPid = options.callerPid ?? process.pid;
+
+  let releaseFence: (() => void) | undefined;
+  try {
+    releaseFence = placeUpgradeFence(home, {
+      reason: "storage repair in progress",
+      createdAt: now().toISOString(),
+      ownerPid: callerPid
+    });
+  } catch (error) {
+    if (!(error instanceof UpgradeFenceError)) throw error;
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: "coordination",
+        message: `Repair coordination could not be acquired: ${error.message}`,
+        action:
+          "Another upgrade is already coordinating this Home. Wait for it to finish, then retry."
+      },
+      classification
+    );
+  }
+
+  const externallyQuiesced = options.controllerLifecycle === "externally-quiesced";
+  let controllerWasRunning = false;
+  let controllerStopConfirmed = false;
+  let controllerIdentity: ControllerLaunchIdentity | undefined;
+  let result: UpgradeResult | undefined;
+  let unexpected: unknown;
+  const switchState: SwitchCommitState = { committed: false };
+
+  try {
+    if (!externallyQuiesced) {
+      const controllerStatus = options.controllerStatus
+        ?? ((h: string) => defaultControllerStatus(h, options.controllerOptions));
+      let status: ControllerLifecycleStatus | undefined;
+      try {
+        status = await controllerStatus(home);
+      } catch (error) {
+        result = withClassification(
+          controllerLifecycleBlocker("Controller status could not be verified", error),
+          classification
+        );
+      }
+      if (result === undefined && !isControllerLifecycleStatus(status)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller status was malformed",
+            new Error("expected a boolean running field")
+          ),
+          classification
+        );
+      }
+      if (result === undefined && status!.running && !isControllerLaunchIdentity(status!.identity)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller launch identity could not be authenticated",
+            new Error("executable/argv/version identity is unavailable")
+          ),
+          classification
+        );
+      }
+      if (result === undefined && status!.running && !isPositivePid(status!.pid)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller PID could not be authenticated",
+            new Error("a positive status PID is unavailable for fenced stop")
+          ),
+          classification
+        );
+      }
+      if (result === undefined) {
+        controllerWasRunning = status!.running;
+        controllerIdentity = status!.running ? status!.identity : undefined;
+        controllerStopConfirmed = !controllerWasRunning;
+      }
+
+      const stopController = options.stopController
+        ?? ((h: string, expectedPid: number) => defaultStopController(
+          h,
+          expectedPid,
+          options.controllerOptions
+        ));
+      if (result === undefined && controllerWasRunning) {
+        try {
+          const expectedPid = status!.pid!;
+          const stopped = await stopController(home, expectedPid);
+          if (!confirmedControllerStopped(stopped, expectedPid)) {
+            result = withClassification(
+              controllerLifecycleBlocker(
+                "Controller stop did not confirm a drained process",
+                new Error(`stop did not confirm captured PID ${expectedPid} with stopped:true`)
+              ),
+              classification
+            );
+          } else {
+            controllerStopConfirmed = true;
+          }
+        } catch (error) {
+          result = withClassification(
+            controllerLifecycleBlocker("Controller stop/drain failed", error),
+            classification
+          );
+        }
+      }
+    } else {
+      controllerStopConfirmed = true;
+    }
+
+    if (result === undefined) {
+      try {
+        repinRevision(home);
+      } catch (error) {
+        result = withClassification(
+          {
+            outcome: "blocked",
+            stage: "active-runtime",
+            message:
+              `The pre-fence writer window is undeterminable and could not be closed safely: ` +
+              `${messageOf(error)}.`,
+            action:
+              "The Home was not repaired. Inspect the exact storage-lock owner and retry only " +
+              "after it is settled."
+          },
+          classification
+        );
+      }
+    }
+
+    if (result === undefined) {
+      const inventory = await readOfflineInventory(options, home);
+      if (inventory.total > 0) {
+        result = withClassification(
+          offlineInventoryBlocker(inventory, false),
+          classification
+        );
+      }
+    }
+
+    if (result === undefined) {
+      try {
+        result = executePseudoLayout7RepairFenced(
+          options,
+          classification,
+          now,
+          switchState
+        );
+      } catch (error) {
+        if (switchState.committed) {
+          result = withClassification(
+            postSwitchAmbiguity(home, switchState.backupPath, error),
+            classification
+          );
+        } else {
+          unexpected = error;
+        }
+      }
+    }
+  } finally {
+    try {
+      releaseFence!();
+    } catch (error) {
+      if (switchState.committed && result === undefined) {
+        result = withClassification(
+          postSwitchAmbiguity(home, switchState.backupPath, error),
+          classification
+        );
+      } else if (unexpected === undefined) {
+        unexpected = error;
+      }
+    }
+  }
+
+  if (unexpected !== undefined) {
+    if (switchState.committed) {
+      return withClassification(
+        postSwitchAmbiguity(home, switchState.backupPath, unexpected),
+        classification
+      );
+    }
+    if (controllerWasRunning && controllerStopConfirmed) {
+      await restoreController(home, options, unexpected, controllerIdentity);
+    }
+    throw unexpected;
+  }
+  if (result === undefined) {
+    throw new Error("Storage repair did not produce a result.");
+  }
+
+  if (result.outcome === "upgraded") {
+    const startController = options.startController
+      ?? ((h: string) => defaultStartController(h, options.controllerOptions));
+    if (!externallyQuiesced && controllerWasRunning) {
+      try {
+        await startController(home);
+      } catch (error) {
+        return {
+          ...withClassification(
+            postSwitchAmbiguity(home, result.backupPath, new Error(
+              `The replacement Controller could not start after the committed repair: ${messageOf(error)}`
+            )),
+            classification
+          ),
+          report: result.report
+        };
+      }
+    }
+    try {
+      options.postSwitchFaultHook?.("receipt-clear");
+      clearUpgradeReceipt(home);
+    } catch (error) {
+      return {
+        ...withClassification(
+          postSwitchAmbiguity(home, result.backupPath, error),
+          classification
+        ),
+        report: result.report
+      };
+    }
+    return result;
+  }
+
+  if (
+    !externallyQuiesced
+    && controllerWasRunning
+    && controllerStopConfirmed
+    && result.outcome === "blocked"
+    && result.stage !== "post-verify"
+    && result.stage !== "switch-ambiguous"
+  ) {
+    try {
+      await restoreController(
+        home,
+        options,
+        new Error(result.message),
+        controllerIdentity
+      );
+    } catch (error) {
+      return {
+        ...withClassification(
+          {
+            outcome: "blocked",
+            stage: "active-runtime",
+            message:
+              `${result.message} The previously running Controller could not be restored: ` +
+              `${messageOf(error)}.`,
+            action:
+              "Keep the old Home quiesced and resolve the Controller startup failure; " +
+              "do not resume writes until the Controller and Home are verified."
+          },
+          classification
+        ),
+        ...(result.report === undefined ? {} : { report: result.report })
+      };
+    }
+  }
+  return result;
+}
+
+/** Run the staged state.json→SQLite repair inside the upgrade fence. */
+function executePseudoLayout7RepairFenced(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  classification: HomeClassification,
+  now: () => Date,
+  switchState: SwitchCommitState
+): UpgradeResult {
+  const { home, latest } = options;
+  const repairResult = repairPseudoLayout7({
+    home,
+    latest,
+    mode: "execute",
+    ...(options.now === undefined ? {} : { now: options.now })
+  });
+
+  if (repairResult.outcome === "blocked") {
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: repairResult.stage,
+        message: repairResult.message,
+        action: repairResult.action
+      },
+      classification
+    );
+  }
+  if (repairResult.outcome !== "repaired") {
+    // Execute mode never returns the dry-run variant; fail closed if it does.
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: "validate",
+        message: `Unexpected repair outcome: ${repairResult.outcome}`,
+        action: "Retry the repair; the Home was not changed."
+      },
+      classification
+    );
+  }
+
+  // The database was promoted (atomic rename committed). From this point the
+  // old Home is no longer authoritative; a fault is a post-switch ambiguity.
+  switchState.committed = true;
+  switchState.backupPath = repairResult.stateBackupPath;
+
+  // Post-switch health check: open the promoted database through a fresh
+  // SqliteTaskStore and verify the core families (the repair already did a
+  // read-back, but this is the orchestrator's independent verification).
+  const postVerify = postSwitchHealthCheck(home);
+  if (postVerify !== null) {
+    return withClassification(
+      postSwitchAmbiguity(home, repairResult.stateBackupPath, new Error(postVerify.message)),
+      classification
+    );
+  }
+
+  // Write the temporary upgrade receipt (for the update flow's ambiguity
+  // window); it is cleared by the caller after the Controller restarts.
+  options.postSwitchFaultHook?.("receipt-write");
+  writeUpgradeReceipt(home, {
+    switched: true,
+    homePath: home,
+    completedAt: now().toISOString(),
+    targetLayoutVersion: latest.layout,
+    targetAggregateVersion: latest.aggregate,
+    backupPath: repairResult.stateBackupPath
+  });
+
+  const inspected = inspectSourceVersionState(home, latest);
+  const source = "corruption" in inspected ? latest : inspected.source;
+  return {
+    outcome: "upgraded",
+    classification,
+    backupPath: repairResult.stateBackupPath,
+    report: {
+      outcome: "migrated",
+      mode: "execute" as const,
+      source,
+      target: latest,
+      steps: [],
+      effects: [],
+      derived: { rebuiltEffects: [] },
+      validation: {
+        checks: [
+          {
+            name: "SQLite staged-database checksum verification",
+            outcome: "passed" as const,
+            detail: `verified ${repairResult.verifiedFamilies} record families against an independent state.json re-read`
+          }
+        ]
+      },
+      switch: {
+        status: "switched" as const,
+        backupPath: repairResult.stateBackupPath,
+        detail: `SQLite database promoted and state.json backed up to ${repairResult.stateBackupPath}.`
+      },
+      completedAt: now().toISOString()
+    }
+  };
 }
 
 /** Execute the fenced, coordinated migration after Controller quiesce. */

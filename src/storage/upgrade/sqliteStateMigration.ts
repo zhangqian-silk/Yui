@@ -27,7 +27,9 @@ import Database from "better-sqlite3";
 
 import type { ConfiguredAgent } from "../../agent/agent.js";
 import type { TaskBrief } from "../../brief/taskBrief.js";
-import type { WorkMailbox } from "../../coordination/workMailbox.js";
+import { mailboxTargetKey } from "../../coordination/workMailbox.js";
+import { managedWorkspaceKey, type ManagedWorkspaceOwner } from "../../worktree/managedWorkspace.js";
+import type { MailboxTarget, WorkMailbox } from "../../coordination/workMailbox.js";
 import type { Decision } from "../../decision/decision.js";
 import type { TaskEvent } from "../../event/taskEvent.js";
 import type { InputRequest } from "../../input/inputRequest.js";
@@ -55,7 +57,8 @@ import type { Task } from "../../task/task.js";
 import type { WorkItem } from "../../workItem/workItem.js";
 import type { ManagedWorkspace } from "../../worktree/managedWorkspace.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
-import type { YuiConfig } from "../taskStore.js";
+import { readStorageSchemaManifest } from "../storageSchema.js";
+import { CURRENT_STORED_TASK_SCHEMA_VERSION, type YuiConfig } from "../taskStore.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -543,7 +546,7 @@ function hashPayloadTable(db: Database.Database, sql: string): FamilyChecksum {
 }
 
 /** Reconstruct a WorkMailbox from the normalised mailboxes table columns. */
-function rowToMailbox(row: {
+export function rowToMailbox(row: {
   target_kind: string;
   task_id: string | null;
   role_name: string | null;
@@ -709,4 +712,282 @@ export function verifySqliteChecksums(
       `SQLite migration checksum mismatch for ${mismatches.length} family/families: ${mismatches.join("; ")}`
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// SQLite -> Snapshot reconstruction (record-migration source, Issue 01 Phase 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Reconstruct the state.json-shaped snapshot from a committed SQLite database.
+ *
+ * This is the reverse of {@link populateSqliteFromState}: it reads every
+ * record family from `yui.db` and rebuilds the nested document shape the
+ * generic migration engine's record transforms operate on. Payloads are read
+ * RAW (`JSON.parse` without the strict current-version parsers) so a record
+ * family at an older persisted version survives the round-trip with its
+ * original `schemaVersion` intact — the strict parsers only understand the
+ * current version and would reject the very records the migration is meant to
+ * transform.
+ *
+ * The database is opened read-only; this function never writes.
+ */
+export function readStateFromSqlite(home: string): Record<string, unknown> {
+  const dbPath = join(home, COMMITTED_DATABASE_FILENAME);
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const manifest = readStorageSchemaManifest(home);
+    const storedTaskVersion = typeof manifest.recordVersions?.storedTask === "number"
+      ? manifest.recordVersions.storedTask
+      : CURRENT_STORED_TASK_SCHEMA_VERSION;
+
+    // Home identity + revision continuity.
+    const meta = db.prepare(
+      "SELECT home_identity, revision FROM home_meta WHERE id = 1"
+    ).get() as { home_identity: string; revision: number };
+
+    const state: Record<string, unknown> = {
+      // The state document's `schemaVersion` is the Yui aggregate version,
+      // sourced from the durable manifest (the version contract). The
+      // `home_meta.aggregate_version` column is the SQLite database's own
+      // schema version (SQLITE_AGGREGATE_VERSION), a different fact.
+      schemaVersion: manifest.aggregateSchemaVersion,
+      revision: meta.revision,
+      homeIdentity: JSON.parse(meta.home_identity) as unknown,
+      configuredAgents: {},
+      projects: {},
+      agentProfiles: {},
+      globalRoles: {},
+      globalRoleSessionSets: {},
+      tasks: {},
+      mailboxes: {}
+    };
+
+    // Config singleton (absent on a fresh, never-configured Home).
+    const configRow = db.prepare("SELECT payload FROM config WHERE id = 1").get() as
+      | { payload: string }
+      | undefined;
+    if (configRow !== undefined) {
+      state.config = JSON.parse(configRow.payload) as unknown;
+    }
+
+    // Global record families.
+    loadGlobalPayloadMap(db, "configured_agents", state, "configuredAgents", (record) => record.id as string);
+    loadGlobalPayloadMap(db, "projects", state, "projects", (record) => record.id as string);
+    loadGlobalPayloadMap(db, "agent_profiles", state, "agentProfiles", (record) => record.id as string);
+    loadGlobalPayloadMap(db, "global_roles", state, "globalRoles", (record) => record.name as string);
+    loadGlobalPayloadMap(
+      db,
+      "global_role_session_sets",
+      state,
+      "globalRoleSessionSets",
+      (record) => (record.owner as Record<string, unknown>).roleName as string
+    );
+
+    // Tasks: the StoredTask aggregate wrapper. The wrapper `schemaVersion` is
+    // not persisted in the database (records live in flat tables), so it is
+    // taken from the manifest's declared `storedTask` version — the version
+    // the database was created with — so the version scanner and the migration
+    // engine see a consistent source.
+    const tasks = state.tasks as Record<string, Record<string, unknown>>;
+    const taskRows = db.prepare(
+      "SELECT task_id, payload, brief FROM task_records"
+    ).all() as Array<{ task_id: string; payload: string; brief: string | null }>;
+    for (const row of taskRows) {
+      tasks[row.task_id] = {
+        schemaVersion: storedTaskVersion,
+        task: JSON.parse(row.payload) as unknown,
+        brief: row.brief === null ? null : (JSON.parse(row.brief) as unknown),
+        roles: {},
+        managedWorkspaces: {},
+        roleSessionSets: {},
+        workItems: {},
+        agentRuns: {},
+        reviewRounds: {},
+        changeSets: {},
+        integrationAttempts: {},
+        integrationQueue: {},
+        durableJobs: {},
+        jobCallerKeyHashes: {},
+        activeRuns: {},
+        messages: {},
+        inputRequests: {},
+        decisions: {},
+        milestones: {},
+        events: {},
+        leaderFailure: null,
+        operatorNotification: null,
+        idHighWaterMarks: {},
+        capabilityGrants: {},
+        releaseWorkflows: {}
+      };
+    }
+
+    // Per-task record families, keyed by their state.json map keys.
+    loadTaskPayloadMap(db, "task_roles", tasks, "roles", (record) => record.name as string);
+    loadTaskPayloadMap(
+      db,
+      "managed_workspaces",
+      tasks,
+      "managedWorkspaces",
+      (record) => managedWorkspaceKey(record.owner as ManagedWorkspaceOwner)
+    );
+    loadTaskPayloadMap(
+      db,
+      "role_session_sets",
+      tasks,
+      "roleSessionSets",
+      (record) => (record.owner as Record<string, unknown>).roleName as string
+    );
+    loadTaskPayloadMap(db, "work_items", tasks, "workItems", (record) => record.id as string);
+    loadTaskPayloadMap(db, "agent_runs", tasks, "agentRuns", (record) => record.id as string);
+    loadTaskPayloadMap(db, "review_rounds", tasks, "reviewRounds", (record) => record.id as string);
+    loadTaskPayloadMap(db, "change_sets", tasks, "changeSets", (record) => record.id as string);
+    loadTaskPayloadMap(
+      db,
+      "integration_attempts",
+      tasks,
+      "integrationAttempts",
+      (record) => record.id as string
+    );
+    loadTaskPayloadMap(
+      db,
+      "integration_queue",
+      tasks,
+      "integrationQueue",
+      (record) => record.id as string
+    );
+    loadTaskPayloadMap(db, "durable_jobs", tasks, "durableJobs", (record) => record.id as string);
+    loadTaskPayloadMap(db, "messages", tasks, "messages", (record) => record.id as string);
+    loadTaskPayloadMap(db, "input_requests", tasks, "inputRequests", (record) => record.id as string);
+    loadTaskPayloadMap(db, "decisions", tasks, "decisions", (record) => record.id as string);
+    loadTaskPayloadMap(db, "milestones", tasks, "milestones", (record) => record.id as string);
+    loadTaskPayloadMap(db, "events", tasks, "events", (record) => record.id as string);
+    loadTaskPayloadMap(
+      db,
+      "capability_grants",
+      tasks,
+      "capabilityGrants",
+      (record) => record.id as string
+    );
+    loadTaskPayloadMap(
+      db,
+      "release_workflows",
+      tasks,
+      "releaseWorkflows",
+      (record) => record.id as string
+    );
+
+    // Job caller key hashes: keyed by `${roleName}\0${agentId}`.
+    const callerHashRows = db.prepare(
+      "SELECT task_id, role_name, agent_id, hash FROM job_caller_key_hashes"
+    ).all() as Array<{ task_id: string; role_name: string; agent_id: string; hash: string }>;
+    for (const row of callerHashRows) {
+      const stored = requireTaskAggregate(tasks, row.task_id, "jobCallerKeyHashes");
+      (stored.jobCallerKeyHashes as Record<string, string>)[`${row.role_name}\0${row.agent_id}`] = row.hash;
+    }
+
+    // Active-run pointers: keyed by pointer, value is the persisted payload.
+    const activeRunRows = db.prepare(
+      "SELECT task_id, pointer, payload FROM active_runs"
+    ).all() as Array<{ task_id: string; pointer: string; payload: string }>;
+    for (const row of activeRunRows) {
+      const stored = requireTaskAggregate(tasks, row.task_id, "activeRuns");
+      (stored.activeRuns as Record<string, unknown>)[row.pointer] = JSON.parse(row.payload) as unknown;
+    }
+
+    // Leader failure / operator notification projections.
+    const projectionRows = db.prepare(
+      "SELECT task_id, kind, payload FROM task_projections WHERE payload IS NOT NULL"
+    ).all() as Array<{ task_id: string; kind: string; payload: string }>;
+    for (const row of projectionRows) {
+      const stored = requireTaskAggregate(tasks, row.task_id, row.kind);
+      if (row.kind === "leader-failure") {
+        stored.leaderFailure = JSON.parse(row.payload) as unknown;
+      } else {
+        stored.operatorNotification = JSON.parse(row.payload) as unknown;
+      }
+    }
+
+    // Per-task ID high-water marks.
+    const idSeqRows = db.prepare(
+      "SELECT task_id, kind, high_water FROM id_sequences"
+    ).all() as Array<{ task_id: string; kind: string; high_water: number }>;
+    for (const row of idSeqRows) {
+      const stored = requireTaskAggregate(tasks, row.task_id, "idHighWaterMarks");
+      (stored.idHighWaterMarks as Record<string, number>)[row.kind] = row.high_water;
+    }
+
+    // Work mailboxes: reconstructed from typed columns (no payload column).
+    const mailboxRows = db.prepare(
+      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending FROM mailboxes ORDER BY target_key"
+    ).all() as Array<{
+      target_kind: string;
+      task_id: string | null;
+      role_name: string | null;
+      next_sequence: number;
+      processing: string | null;
+      pending: string | null;
+    }>;
+    const mailboxes = state.mailboxes as Record<string, unknown>;
+    for (const row of mailboxRows) {
+      const mailbox = rowToMailbox(row);
+      mailboxes[mailboxTargetKey(mailbox.target as MailboxTarget)] = mailbox;
+    }
+
+    return state;
+  } finally {
+    db.close();
+  }
+}
+
+/** Load a global (non-task-scoped) payload table into a keyed map on `state`. */
+function loadGlobalPayloadMap(
+  db: Database.Database,
+  table: string,
+  state: Record<string, unknown>,
+  stateKey: string,
+  keyOf: (record: Record<string, unknown>) => string
+): void {
+  const rows = db.prepare(`SELECT payload FROM ${table}`).all() as Array<{ payload: string }>;
+  const target = state[stateKey] as Record<string, unknown>;
+  for (const row of rows) {
+    const record = JSON.parse(row.payload) as Record<string, unknown>;
+    target[keyOf(record)] = record;
+  }
+}
+
+/** Load a task-scoped payload table into the matching family map of each task. */
+function loadTaskPayloadMap(
+  db: Database.Database,
+  table: string,
+  tasks: Record<string, Record<string, unknown>>,
+  familyKey: string,
+  keyOf: (record: Record<string, unknown>) => string
+): void {
+  const rows = db.prepare(`SELECT task_id, payload FROM ${table}`).all() as Array<{
+    task_id: string;
+    payload: string;
+  }>;
+  for (const row of rows) {
+    const stored = requireTaskAggregate(tasks, row.task_id, table);
+    const family = stored[familyKey] as Record<string, unknown>;
+    const record = JSON.parse(row.payload) as Record<string, unknown>;
+    family[keyOf(record)] = record;
+  }
+}
+
+/** Resolve a task's StoredTask aggregate, or throw on an orphaned child row. */
+function requireTaskAggregate(
+  tasks: Record<string, Record<string, unknown>>,
+  taskId: string,
+  context: string
+): Record<string, unknown> {
+  const stored = tasks[taskId];
+  if (stored === undefined) {
+    throw new Error(
+      `SQLite reconstruction found ${context} row for unknown task ${taskId}.`
+    );
+  }
+  return stored;
 }

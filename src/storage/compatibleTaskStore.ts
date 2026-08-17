@@ -11,10 +11,13 @@ import { createProductionStorageRegistry } from "./migration/productionRegistry.
 import {
   FileTaskStore,
   STORAGE_STATE_FILE,
+  type TaskStore,
   stateFileFingerprint,
   StorageRecordError,
   validateCurrentStorageStateSnapshot
 } from "./taskStore.js";
+import { SqliteTaskStore } from "./sqliteStore.js";
+import { COMMITTED_DATABASE_FILENAME } from "./upgrade/sqliteStateMigration.js";
 import {
   ensureStorageSchema,
   inspectStorageSchema,
@@ -33,6 +36,14 @@ export { createProductionStorageRegistry } from "./migration/productionRegistry.
 export type OpenCompatibleFileTaskStoreOptions = Readonly<{
   registry?: MigrationRegistry<HomeSnapshot>;
   latest?: StorageVersionState;
+  /**
+   * Force the file-document (`state.json`) open path even when a layout-7
+   * Home has `yui.db`. Ordinary commands open the authoritative SQLite
+   * backend; compatible-source validation must prove the *classified source*
+   * (`state.json`) reaches the strict parser, so it never short-circuits to
+   * the database (Issue 01).
+   */
+  forceStateSource?: boolean;
 }>;
 
 /**
@@ -43,7 +54,7 @@ export type OpenCompatibleFileTaskStoreOptions = Readonly<{
 export function initializeCompatibleFileTaskStore(
   home: string,
   options: OpenCompatibleFileTaskStoreOptions = {}
-): FileTaskStore {
+): TaskStore {
   if (inspectStorageSchema(home).status === "uninitialized") {
     ensureStorageSchema(home);
   }
@@ -64,16 +75,35 @@ export function initializeCompatibleFileTaskStore(
 export function openCompatibleFileTaskStore(
   home: string,
   options: OpenCompatibleFileTaskStoreOptions = {}
-): FileTaskStore {
+): TaskStore {
   const registry = options.registry ?? createProductionStorageRegistry();
   const latest = options.latest ?? latestStorageVersionState();
-  if (inspectStorageSchema(home).status === "current") {
+  const schema = inspectStorageSchema(home);
+  // Issue 01: a layout-7 Home's authoritative backend is SQLite WAL. When
+  // `yui.db` exists, open it directly — never fall back to a FileTaskStore
+  // over a `state.json` that the repair may already have archived.
+  if (
+    !options.forceStateSource
+    &&
+    (schema.status === "current" || schema.status === "unsupported")
+    && schema.currentLayoutVersion >= 7
+    && existsSync(join(home, COMMITTED_DATABASE_FILENAME))
+  ) {
+    return new SqliteTaskStore(home);
+  }
+  if (schema.status === "current") {
     return openCurrentFileTaskStore(home, latest);
   }
   const classification = classifyHome({ home, registry, latest });
   switch (classification.classification.status) {
     case "current":
-      return new FileTaskStore(home);
+    case "needs-storage-repair":
+      // A pseudo-layout-7 Home (manifest 7, no yui.db) may also carry
+      // compatible-old record versions, so open with the same normalization
+      // path as `compatible-old` rather than the strict current gate.
+      return new FileTaskStore(home, {
+        normalizeState: (raw) => normalizeState(home, raw, registry, latest)
+      });
     case "compatible-old":
       return new FileTaskStore(home, {
         normalizeState: (raw) => normalizeState(home, raw, registry, latest)
@@ -178,7 +208,7 @@ export function validateCompatibleFileTaskStore(
   home: string,
   options: OpenCompatibleFileTaskStoreOptions = {}
 ): void {
-  openCompatibleFileTaskStore(home, options).getConfig();
+  openCompatibleFileTaskStore(home, { ...options, forceStateSource: true }).getConfig();
 }
 
 function normalizeState(

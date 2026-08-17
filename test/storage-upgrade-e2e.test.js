@@ -19,11 +19,15 @@ import {
   CURRENT_AGGREGATE_SCHEMA_VERSION
 } from "../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
+import { SqliteTaskStore } from "../dist/storage/sqliteStore.js";
 import { MigrationRegistry, createEmptyRegistry } from "../dist/storage/migration/index.js";
+import { runMigration } from "../dist/storage/migration/index.js";
+import { createProductionRegistry } from "../dist/storage/migration/productionRegistry.js";
 import { latestStorageVersionState, currentRecordVersions }
   from "../dist/storage/upgrade/recordVersions.js";
 import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
 import { createHomeMigrationTarget } from "../dist/storage/upgrade/homeMigrationTarget.js";
+import { createSqliteMigrationTarget } from "../dist/storage/upgrade/sqliteMigrationTarget.js";
 import { renderUpgradeResult } from "../dist/cli/upgradeCommand.js";
 import {
   placeUpgradeFence,
@@ -51,6 +55,24 @@ function currentHome() {
   // writes schema.json; state.json is created on the first mutation).
   const store = new FileTaskStore(home);
   store.saveConfig({ ...store.getConfig(), timeZone: "UTC" });
+  // Issue 01: a current layout-7 Home's authoritative backend is yui.db. Build
+  // it through the real 6→7 staged migration so the fixture is a genuine
+  // post-migration Home (yui.db + persistent receipt, state.json retained).
+  const manifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
+  manifest.storageVersion = 6;
+  writeFileSync(join(home, "schema.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const migrationTarget = createSqliteMigrationTarget({
+    home,
+    latest: latestStorageVersionState(),
+    registry: createProductionRegistry()
+  });
+  const migration = runMigration({
+    registry: createProductionRegistry(),
+    target: migrationTarget,
+    latest: latestStorageVersionState(),
+    mode: "execute"
+  });
+  assert.equal(migration.outcome, "migrated");
   return { base, home };
 }
 
@@ -384,7 +406,9 @@ test("an empty registry makes any strictly-older Home NEEDS_NEW_VERSION", async 
 test("a migratable Home switches atomically with a timestamped backup", async () => {
   const { base, home } = currentHome();
   const { latest, registry } = migratableSetup();
-  const originalState = readFileSync(join(home, "state.json"), "utf8");
+  // A layout-7 Home's authoritative store is yui.db; the SQLite record target
+  // backs up the database file (not a Home-directory copy).
+  const originalDb = readFileSync(join(home, "yui.db")).toString("hex");
   const result = await runStorageUpgrade({
     home, registry, latest, mode: "execute",
     stopController: async () => {},
@@ -392,31 +416,58 @@ test("a migratable Home switches atomically with a timestamped backup", async ()
   });
   assert.equal(result.outcome, "upgraded");
   assert.ok(result.backupPath, "a backup path is reported");
-  // The timestamped backup holds the original bytes.
-  assert.equal(readFileSync(join(result.backupPath, "state.json"), "utf8"), originalState);
+  // The timestamped backup holds the original database bytes.
+  assert.equal(readFileSync(result.backupPath).toString("hex"), originalDb);
   // The promoted Home loads through the real gate.
-  assert.doesNotThrow(() => new FileTaskStore(home).listTasks());
-  // Staging directory consumed by the switch.
-  assert.equal(existsSync(`${home}.upgrade-staging`), false);
+  assert.doesNotThrow(() => new SqliteTaskStore(home).listTasks());
+  // Staged database consumed by the switch.
+  assert.equal(existsSync(join(home, "yui.db.staged")), false);
   void base;
 });
 
 test("post-switch health-check failure is reported and aborts", async () => {
   const { home } = currentHome();
   const { latest } = migratableSetup();
-  // A registry whose transform corrupts the fresh output so the loader gate
-  // fails: the engine's validate stage catches it and never switches.
+  // Seed a task through the real SQLite store so the transform has a record
+  // family to corrupt.
+  const seedStore = new SqliteTaskStore(home);
+  seedStore.saveTask({
+    schemaVersion: 4,
+    id: "task-1",
+    title: "Seed",
+    projectBindings: [],
+    status: "active",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  seedStore.close();
+  // A registry whose transform injects an active-run pointer referencing a
+  // missing agent run. populateSqliteFromState rejects this at write-fresh-output,
+  // so the engine reports a validate-stage failure without switching.
   const registry = new MigrationRegistry();
   registry.register({
     axis: "aggregate",
     fromVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
     toVersion: CURRENT_AGGREGATE_SCHEMA_VERSION + 1,
     preconditions: () => {},
-    transform: (snapshot) => ({
-      schemaManifest: snapshot.schemaManifest,
-      // Break the state so parseState throws at the validate gate.
-      state: { ...snapshot.state, schemaVersion: 999 }
-    }),
+    transform: (snapshot) => {
+      const state = snapshot.state;
+      if (state === null) return snapshot;
+      const tasks = { ...state.tasks };
+      const stored = tasks["task-1"];
+      if (stored === undefined) return snapshot;
+      tasks["task-1"] = {
+        ...stored,
+        activeRuns: {
+          ...stored.activeRuns,
+          corrupt: { schemaVersion: 3, runId: "agent-run-missing" }
+        }
+      };
+      return {
+        schemaManifest: snapshot.schemaManifest,
+        state: { ...state, tasks }
+      };
+    },
     declaredEffects: []
   });
   const result = await runStorageUpgrade({
@@ -425,9 +476,9 @@ test("post-switch health-check failure is reported and aborts", async () => {
   });
   assert.equal(result.outcome, "blocked");
   assert.equal(result.stage, "validate");
-  // Never switched: the original still loads and no backup was made.
-  assert.doesNotThrow(() => new FileTaskStore(home).listTasks());
-  assert.equal(existsSync(`${home}.upgrade-staging`), false);
+  // Never switched: the original still loads and no staged database remains.
+  assert.doesNotThrow(() => new SqliteTaskStore(home).listTasks());
+  assert.equal(existsSync(join(home, "yui.db.staged")), false);
 });
 
 test("update keeps the old binary+Home when preflight is blocked", () => {

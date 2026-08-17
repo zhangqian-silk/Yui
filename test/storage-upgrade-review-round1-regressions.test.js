@@ -20,10 +20,12 @@ import {
   CURRENT_AGGREGATE_SCHEMA_VERSION
 } from "../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../dist/storage/taskStore.js";
-import { MigrationRegistry } from "../dist/storage/migration/index.js";
-import { currentRecordVersions } from "../dist/storage/upgrade/recordVersions.js";
+import { MigrationRegistry, runMigration } from "../dist/storage/migration/index.js";
+import { createProductionRegistry } from "../dist/storage/migration/productionRegistry.js";
+import { currentRecordVersions, latestStorageVersionState } from "../dist/storage/upgrade/recordVersions.js";
 import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
 import { createHomeMigrationTarget } from "../dist/storage/upgrade/homeMigrationTarget.js";
+import { createSqliteMigrationTarget } from "../dist/storage/upgrade/sqliteMigrationTarget.js";
 import {
   placeUpgradeFence,
   readUpgradeFence,
@@ -47,6 +49,33 @@ function currentHome(prefix = "yui-rr1-") {
   ensureStorageSchema(home);
   const store = new FileTaskStore(home);
   store.saveConfig({ ...store.getConfig(), timeZone: "UTC" });
+  return { base, home };
+}
+
+/**
+ * A healthy layout-7 Home whose authoritative backend is yui.db (built through
+ * the real 6→7 staged migration, so the fixture is a genuine post-migration
+ * Home with yui.db + persistent receipt + state.json retained). The
+ * orchestrator routes such a Home through the SQLite record migration target,
+ * which exposes the renameImpl fault-injection seam.
+ */
+function healthyLayout7Home(prefix = "yui-rr1-") {
+  const { base, home } = currentHome(prefix);
+  const manifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
+  manifest.storageVersion = 6;
+  writeFileSync(join(home, "schema.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const migrationTarget = createSqliteMigrationTarget({
+    home,
+    latest: latestStorageVersionState(),
+    registry: createProductionRegistry()
+  });
+  const migration = runMigration({
+    registry: createProductionRegistry(),
+    target: migrationTarget,
+    latest: latestStorageVersionState(),
+    mode: "execute"
+  });
+  assert.equal(migration.outcome, "migrated");
   return { base, home };
 }
 
@@ -235,13 +264,15 @@ test("F2 negative: post-PROMOTE fsync failure does NOT fail the switch (new Home
 });
 
 test("F2 orchestrator: a phase-aware post-backup failure surfaces switch-ambiguous (not failed/unchanged)", async () => {
-  const { home } = currentHome("yui-rr1-f2o-");
+  const { home } = healthyLayout7Home("yui-rr1-f2o-");
   const { latest, registry } = migratableSetup();
   const result = await runStorageUpgrade({
     home, registry, latest, mode: "execute",
     stopController: async () => {},
     now: () => new Date("2026-08-06T12:00:00.000Z"),
-    switchFaultHook: (step) => { if (step === "post-backup-fsync") throw new Error("injected post-backup fsync"); },
+    // The backup move (yui.db -> yui.db.backup-*) uses the real atomic rename.
+    // Both the promotion and rollback are forced to fail, producing the true
+    // ambiguous switch outcome without retrying either operation.
     renameImpl: () => { throw new Error("injected rollback fault"); }
   });
   assert.equal(result.outcome, "blocked");

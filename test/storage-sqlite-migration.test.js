@@ -445,6 +445,8 @@ test("migrates a realistic state.json to SQLite with matching checksums and read
     // yui.db exists; the sidecar is gone.
     assert.ok(existsSync(join(home, COMMITTED_DATABASE_FILENAME)), "yui.db should exist");
     assert.ok(!existsSync(join(home, STAGED_DATABASE_FILENAME)), "yui.db.staged should be removed");
+    assert.ok(!existsSync(join(home, `${STAGED_DATABASE_FILENAME}-wal`)), "staged WAL sidecar should be removed");
+    assert.ok(!existsSync(join(home, `${STAGED_DATABASE_FILENAME}-shm`)), "staged SHM sidecar should be removed");
 
     // state.json is retained (read-only) and unchanged.
     const stateAfter = JSON.parse(readFileSync(join(home, "state.json"), "utf8"));
