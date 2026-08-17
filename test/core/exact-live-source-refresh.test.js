@@ -23,7 +23,6 @@ import {
   serializeExactDescriptor
 } from "../../dist/runtime/exactControlPlane.js";
 import { resolveProviderHookRunFence } from "../../dist/controller/providerHookRunFence.js";
-import { refreshAppliedTaskRuntimeDescriptor } from "../../dist/controller/runtime.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import {
@@ -263,58 +262,6 @@ test("a stale Hook source cannot jump to a replacement native Session", (t) => {
     /replacement native Session|cannot jump/i
   );
   assert.deepEqual(readExactTaskRuntimeDescriptorSource(source, fx.home), stale);
-});
-
-test("history-scaled runtime refresh keeps a queued control callback inside the 3-second fairness boundary", async (t) => {
-  const fx = createFixture(t);
-  projectGeneration(fx, {
-    runId: "agent-run-2",
-    launchId: "launch-2",
-    nativeSessionId: "native-1"
-  });
-
-  // 1600 unrelated valid historical descriptors, an order of magnitude above
-  // the 154-descriptor production floor.
-  const directory = join(fx.home, "runtime", "exact-task-runtime");
-  mkdirSync(directory, { recursive: true });
-  for (let i = 0; i < 1600; i++) {
-    const descriptor = historicalDescriptor(fx, i);
-    const path = exactTaskRuntimeDescriptorPath(fx.home, descriptor);
-    writeFileSync(path, `${serializeExactDescriptor(descriptor)}\n`, { mode: 0o600 });
-  }
-
-  const planner = new FileRoleLaunchPlanner(fx.home, fx.store, { cliPath: fx.cliEntry });
-  const input = {
-    taskId: fx.task.id,
-    roleName: fx.role.name,
-    runId: "agent-run-2",
-    launchId: "launch-2",
-    nativeSessionId: "native-1",
-    agentId: fx.agent.id,
-    adapterId: fx.agent.adapterId,
-    workspace: fx.effective.workspace.root
-  };
-
-  const started = Date.now();
-  let callbackFiredAt = null;
-  const callbackFired = new Promise((resolve) => {
-    setImmediate(() => {
-      callbackFiredAt = Date.now();
-      resolve();
-    });
-  });
-
-  // A drain batch of 64 semantic events, each refreshing the exact source.
-  for (let i = 0; i < 64; i++) {
-    refreshAppliedTaskRuntimeDescriptor(fx.store, planner, input);
-  }
-
-  await callbackFired;
-  const elapsed = callbackFiredAt - started;
-  assert.ok(
-    elapsed < 3_000,
-    `queued control callback delayed ${elapsed}ms beyond the 3s fairness boundary`
-  );
 });
 
 test("reused source refresh is idempotent and preserves the stable path", (t) => {

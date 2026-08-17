@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   findCommandNode,
   ROOT_COMMAND,
-  findCommandNode,
   listPublicCommandPaths,
   validateCommandCatalog
 } from "../../dist/cli/commandCatalog.js";
