@@ -22,6 +22,7 @@ import {
   type GcPlan,
   type GcResult
 } from "../resources/resourceGc.js";
+import { createResourceRegistryStore } from "../resources/resourceRegistryStore.js";
 import {
   resourceKindLabel,
   resourceOwnerLabel
@@ -86,6 +87,7 @@ async function runGcCommand(
 
   const plan = await planResourceGc({
     home,
+    registryStore: createResourceRegistryStore(home),
     projects,
     managedWorkspaces,
     taskStatusById,

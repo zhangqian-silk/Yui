@@ -21,6 +21,13 @@ import {
   upsertResourceRecord
 } from "../../dist/resources/resourceRegistry.js";
 import {
+  createResourceRegistryStore,
+  FileResourceRegistryStore
+} from "../../dist/resources/resourceRegistryStore.js";
+import { SqliteResourceRegistry } from "../../dist/resources/sqliteResourceRegistry.js";
+import { migrateSqliteSchema } from "../../dist/storage/sqliteSchema.js";
+import Database from "better-sqlite3";
+import {
   parseGitWorktreePorcelain,
   extractTaskIdFromPath
 } from "../../dist/resources/resourceDiscovery.js";
@@ -205,5 +212,89 @@ test("scanProcessPathRefs detects live cwd", () => {
     assert.ok(found, "expected a live cwd reference from the spawned process");
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite resource registry round-trips records", () => {
+  const home = mkdtempSync(join(tmpdir(), "yui-gc-sqlite-"));
+  try {
+    // Create and migrate a yui.db so the resource_registry table exists.
+    const db = new Database(join(home, "yui.db"));
+    migrateSqliteSchema(db);
+    db.close();
+
+    const store = new SqliteResourceRegistry(home);
+    const record = createResourceRecord({
+      kind: "deployment",
+      path: join(home, "runtime", "deployments", "combined-test"),
+      owner: { home, taskId: "task-1", basis: "naming-convention" },
+      sizeBytes: 1024,
+      cleanliness: "n/a",
+      activeRefs: [],
+      disposition: "quarantined"
+    }, now);
+
+    const state = upsertResourceRecord(emptyResourceRegistry(), record);
+    store.save(state);
+
+    const loaded = store.load();
+    assert.equal(loaded.schemaVersion, 1);
+    assert.ok(loaded.records[record.id], "expected the record to be loaded");
+    assert.equal(loaded.records[record.id].disposition, "quarantined");
+    store.close();
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("SQLite resource registry removes records that disappeared from state", () => {
+  const home = mkdtempSync(join(tmpdir(), "yui-gc-sqlite-rm-"));
+  try {
+    const db = new Database(join(home, "yui.db"));
+    migrateSqliteSchema(db);
+    db.close();
+
+    const store = new SqliteResourceRegistry(home);
+    const record = createResourceRecord({
+      kind: "runtime-artifact",
+      path: join(home, "runtime", "exact-task-runtime", "abc.json"),
+      owner: { home, taskId: "task-2", basis: "descriptor" },
+      sizeBytes: 512,
+      cleanliness: "n/a",
+      activeRefs: [],
+      disposition: "releasable"
+    }, now);
+
+    // Save with the record.
+    store.save(upsertResourceRecord(emptyResourceRegistry(), record));
+    assert.ok(store.load().records[record.id]);
+
+    // Save without the record — the row should be deleted.
+    store.save(emptyResourceRegistry());
+    assert.equal(Object.keys(store.load().records).length, 0);
+    store.close();
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("createResourceRegistryStore selects SQLite when yui.db exists", () => {
+  const sqliteHome = mkdtempSync(join(tmpdir(), "yui-gc-factory-sqlite-"));
+  const fileHome = mkdtempSync(join(tmpdir(), "yui-gc-factory-file-"));
+  try {
+    const db = new Database(join(sqliteHome, "yui.db"));
+    migrateSqliteSchema(db);
+    db.close();
+
+    const sqliteStore = createResourceRegistryStore(sqliteHome);
+    assert.ok(sqliteStore instanceof SqliteResourceRegistry);
+    sqliteStore.close();
+
+    const fileStore = createResourceRegistryStore(fileHome);
+    assert.ok(fileStore instanceof FileResourceRegistryStore);
+    fileStore.close();
+  } finally {
+    rmSync(sqliteHome, { recursive: true, force: true });
+    rmSync(fileHome, { recursive: true, force: true });
   }
 });

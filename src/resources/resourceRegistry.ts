@@ -1,10 +1,12 @@
 /**
  * Persistent Resource registry (Issue 10).
  *
- * The registry lives at `$YUI_HOME/runtime/resource-registry/registry.json`
- * and is GC's own state. It is written atomically and never shares a Home with
- * another session: each Home derives its own registry path.
+ * The registry is GC's own state.  When the Home is SQLite-backed it lives in
+ * the `resource_registry` table inside `yui.db`; otherwise it falls back to a
+ * JSON file at `$YUI_HOME/runtime/resource-registry/registry.json`.
  */
+
+import type { ResourceRegistryStore } from "./resourceRegistryStore.js";
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -99,7 +101,7 @@ export function listResourceRecords(state: ResourceRegistryState): ResourceRecor
   return Object.values(state.records);
 }
 
-function parseResourceRegistryState(value: unknown): ResourceRegistryState {
+export function parseResourceRegistryState(value: unknown): ResourceRegistryState {
   if (typeof value !== "object" || value === null) return emptyResourceRegistry();
   const record = value as Record<string, unknown>;
   if (record.schemaVersion !== RESOURCE_REGISTRY_SCHEMA_VERSION) {

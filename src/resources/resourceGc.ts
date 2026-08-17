@@ -26,6 +26,8 @@ import {
   saveResourceRegistry,
   upsertResourceRecord
 } from "./resourceRegistry.js";
+import type { ResourceRegistryStore } from "./resourceRegistryStore.js";
+import { createResourceRegistryStore } from "./resourceRegistryStore.js";
 import {
   isReleasable,
   isTerminalTaskStatus,
@@ -66,6 +68,8 @@ export type GcResult = Readonly<{
 
 export type ResourceGcInput = Readonly<{
   home: string;
+  /** Registry store; when omitted the GC engine creates one from the Home. */
+  registryStore?: ResourceRegistryStore;
   projects: readonly import("../repository/project.js").Project[];
   managedWorkspaces: readonly import("../worktree/managedWorkspace.js").ManagedWorkspace[];
   taskStatusById: ReadonlyMap<string, string>;
@@ -82,6 +86,7 @@ export type ResourceGcInput = Readonly<{
  */
 export async function planResourceGc(input: ResourceGcInput): Promise<GcPlan> {
   const home = resolve(input.home);
+  const registryStore = input.registryStore ?? createDefaultRegistryStore(home);
   const discovered = await discoverResources({
     home,
     projects: input.projects,
@@ -92,7 +97,7 @@ export async function planResourceGc(input: ResourceGcInput): Promise<GcPlan> {
   const paths = discovered.map(({ record }) => record.path);
   // Also scan original paths of quarantined records so a new reference can
   // trigger a restore.
-  const registry = loadResourceRegistry(home);
+  const registry = registryStore.load();
   for (const record of Object.values(registry.records) as ResourceRecord[]) {
     if (record.disposition === "quarantined" && record.quarantine !== undefined) {
       paths.push(record.quarantine.originalPath);
@@ -131,7 +136,7 @@ export async function planResourceGc(input: ResourceGcInput): Promise<GcPlan> {
   // by an external flow): keep deleted receipts, drop stale active records.
   const reconciled = reconcileRegistry(registry, records, input.now);
   if (reconciled !== registry) {
-    saveResourceRegistry(home, reconciled);
+    registryStore.save(reconciled);
   }
 
   return Object.freeze({
@@ -286,7 +291,8 @@ export async function applyResourceGc(plan: GcPlan): Promise<GcResult> {
 
   const home = plan.home;
   const now = new Date(plan.generatedAt);
-  let registry = loadResourceRegistry(home);
+  const registryStore = createDefaultRegistryStore(home);
+  let registry = registryStore.load();
   const applied: ResourceRecord[] = [];
   const failed: ResourceRecord[] = [];
   const restored: ResourceRecord[] = [];
@@ -309,7 +315,8 @@ export async function applyResourceGc(plan: GcPlan): Promise<GcResult> {
     }
   }
 
-  saveResourceRegistry(home, registry);
+  registryStore.save(registry);
+  registryStore.close();
   return Object.freeze({
     planned: plan,
     applied: Object.freeze(applied),
@@ -413,7 +420,8 @@ export async function purgeResourceQuarantine(
   const resolvedHome = resolve(home);
   const ttlHours = options.ttlHours ?? DEFAULT_QUARANTINE_TTL_HOURS;
   const ttlMs = ttlHours * 3_600_000;
-  const registry = loadResourceRegistry(resolvedHome);
+  const registryStore = createDefaultRegistryStore(resolvedHome);
+  const registry = registryStore.load();
   const quarantined = Object.values(registry.records)
     .filter((record) => record.disposition === "quarantined");
 
@@ -475,7 +483,8 @@ export async function purgeResourceQuarantine(
     }
   }
 
-  saveResourceRegistry(resolvedHome, state);
+  registryStore.save(state);
+  registryStore.close();
   return Object.freeze({
     planned: Object.freeze({
       home: resolvedHome,
@@ -493,4 +502,13 @@ export async function purgeResourceQuarantine(
     restored: Object.freeze(restored),
     purged: Object.freeze(purged)
   });
+}
+
+/**
+ * Create a registry store for the given Home.  SQLite-backed Homes use the
+ * `resource_registry` table in `yui.db`; File-store Homes fall back to the
+ * JSON file.
+ */
+function createDefaultRegistryStore(home: string): ResourceRegistryStore {
+  return createResourceRegistryStore(home);
 }
