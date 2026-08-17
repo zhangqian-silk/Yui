@@ -1224,6 +1224,88 @@ function executePseudoLayout7RepairFenced(
     );
   }
 
+  // Multi-phase (Issue 01 cross-issue handoff): the repair promoted yui.db but
+  // the database may still carry older record/aggregate versions. Re-classify
+  // the Home and, when MIGRATABLE, run the record-family migration in the same
+  // fenced window so one upgrade attempt reaches the current version. The
+  // Controller is already stopped and the fence is held, so no writer can
+  // observe the intermediate state.
+  const postRepairClassification = classifyHome({
+    home,
+    registry: options.registry,
+    latest
+  });
+  if (postRepairClassification.classification.verdict === "MIGRATABLE") {
+    const callerPid = options.callerPid ?? process.pid;
+    const target = createSqliteRecordMigrationTarget({
+      home,
+      latest,
+      registry: options.registry,
+      now,
+      callerPid,
+      ...(options.renameImpl === undefined ? {} : { renameImpl: options.renameImpl })
+    });
+    const report = runMigration({
+      registry: options.registry,
+      target,
+      latest,
+      mode: "execute"
+    });
+    if (report.outcome === "failed") {
+      target.discardFreshOutput();
+      return {
+        ...blockedFromFailedReport(report, postRepairClassification),
+        report
+      };
+    }
+    if (report.outcome === "switch-ambiguous") {
+      return {
+        ...blockedFromSwitchAmbiguous(report, postRepairClassification),
+        report
+      };
+    }
+    if (report.outcome !== "migrated") {
+      target.discardFreshOutput();
+      return {
+        ...blockedFromEngineReport(report, postRepairClassification),
+        report
+      };
+    }
+    // The record migration committed its own atomic switch. Verify the fully
+    // migrated database before writing the completion receipt.
+    switchState.backupPath = report.switch.backupPath ?? repairResult.stateBackupPath;
+    const postRecordVerify = postSwitchHealthCheck(home);
+    if (postRecordVerify !== null) {
+      return withClassification(
+        postSwitchAmbiguity(
+          home,
+          report.switch.backupPath,
+          new Error(postRecordVerify.message)
+        ),
+        postRepairClassification
+      );
+    }
+    options.postSwitchFaultHook?.("receipt-write");
+    writeUpgradeReceipt(home, {
+      switched: true,
+      homePath: home,
+      completedAt: now().toISOString(),
+      targetLayoutVersion: latest.layout,
+      targetAggregateVersion: latest.aggregate,
+      ...(report.switch.backupPath === undefined
+        ? {}
+        : { backupPath: report.switch.backupPath })
+    });
+    return {
+      outcome: "upgraded",
+      classification: postRepairClassification,
+      ...(report.switch.backupPath === undefined
+        ? {}
+        : { backupPath: report.switch.backupPath }),
+      report
+    };
+  }
+
   // Write the temporary upgrade receipt (for the update flow's ambiguity
   // window); it is cleared by the caller after the Controller restarts.
   options.postSwitchFaultHook?.("receipt-write");
