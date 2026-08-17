@@ -15,6 +15,10 @@ import { GitIntegrationService, type IntegrationJobPort } from "../integration/g
 import { runTaskIntegrationQueueCommand } from "./taskIntegrationQueueCommands.js";
 import { taskActor } from "./taskActor.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
+import {
+  runDeliveryGuardPreflight,
+  withGuardWarnings
+} from "./deliveryGuardPreflight.js";
 
 export type TaskIntegrationCommandOptions = Readonly<{
   now?: () => Date;
@@ -163,6 +167,11 @@ async function start(
   if (!task.projectBindings.some(({ projectId }) => projectId === project.id)) {
     throw usageError(`Project does not belong to Task: ${project.id}.`);
   }
+  const guard = runDeliveryGuardPreflight(store, task.id, {
+    kind: "integration-start",
+    projectId: project.id,
+    changeSetIds
+  }, { environment: options.environment, budget: true });
   const mainWorkspace = store.getTaskWorkspace(task.id);
   const mainEntry = mainWorkspace === null
     ? undefined
@@ -185,7 +194,11 @@ async function start(
     tx.saveIntegrationAttempt(task.id, created);
     return created;
   });
-  return runIntegration(store, home, integration, now, options);
+  const result = await runIntegration(store, home, integration, now, options);
+  return {
+    ...result,
+    output: withGuardWarnings(guard, result.output)
+  };
 }
 
 async function continueIntegration(

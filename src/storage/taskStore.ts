@@ -21,7 +21,10 @@ import {
   type ReleaseStepStatus,
   type ReleaseWorkflow
 } from "../release/releaseWorkflow.js";
-import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
+import {
+  reconciliationIntervalMilliseconds,
+  resolveLeaderNextActionMode
+} from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
 import {
   mailboxTargetKey,
@@ -209,6 +212,11 @@ export type YuiConfig = Readonly<{
   lastTaskId?: string;
   reconciliationIntervalSeconds?: number;
   review?: ReviewConfig;
+  /**
+   * Issue 07 (Leader convergence) feature mode. Optional additive field;
+   * Homes without it default to `display`, so no config migration is needed.
+   */
+  leaderNextActionMode?: "display" | "warn" | "enforce";
   completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
 }>;
 export type ConfiguredAgentPatch = Readonly<Partial<
@@ -2697,6 +2705,7 @@ function validateYuiConfig(config: YuiConfig): void {
     reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
     resolveTimeZone(config.timeZone);
     if (config.review !== undefined) validateReviewConfig(config.review);
+    resolveLeaderNextActionMode(config.leaderNextActionMode);
   } catch (error) {
     throw new StorageRecordError(
       error instanceof Error ? error.message : "Yui reconciliation interval is invalid."
