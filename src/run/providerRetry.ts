@@ -147,3 +147,15 @@ export function providerRetryIsDue(
   return value.nextAttemptAt !== undefined
     && Date.parse(value.nextAttemptAt) <= now.getTime();
 }
+
+/**
+ * One active Run whose in-place Provider retry is pending. The Controller
+ * arms its wake timer from these entries and re-pushes the original input
+ * when the deadline fires.
+ */
+export type PendingProviderRetry = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  nextAttemptAt: string;
+}>;

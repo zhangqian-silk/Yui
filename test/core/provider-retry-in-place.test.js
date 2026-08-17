@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
@@ -21,16 +24,22 @@ import {
 } from "../../dist/role/role.js";
 import {
   createAgentRun,
-  markAgentRunDelivered
+  markAgentRunDelivered,
+  withProviderRetry
 } from "../../dist/run/agentRun.js";
-import { nextProviderRetryDelayMs } from "../../dist/run/providerRetry.js";
+import {
+  nextProviderRetryDelayMs,
+  scheduleProviderRetry
+} from "../../dist/run/providerRetry.js";
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
+import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
 import { createIsolatedRuntime } from "../helpers/isolatedRuntime.js";
+import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 import { installMockProviderCommands } from "../helpers/mockProviderCommands.js";
 
 /**
@@ -384,4 +393,65 @@ test("a Controller restart resumes the same retry attempt lineage from durable s
   assert.equal(after.status, "active");
   assert.equal(after.providerRetry.attempt, 2, "restart must continue the same lineage");
   assert.equal(after.providerRetry.firstFailureAt, before.providerRetry.firstFailureAt);
+});
+
+test("SQLite stores answer pending retry scans with a native query", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-provider-retry-sqlite-"));
+  const store = new SqliteTaskStore(home);
+  t.after(() => {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const now = new Date("2026-08-17T00:00:00.000Z");
+  const task = activateTask(createTask("task-sqlite", "SQLite retry", now, { cwd: home }), now);
+  store.saveTask(task);
+
+  const retry = scheduleProviderRetry(undefined, {
+    errorClass: "transient-provider",
+    launchId: "launch-sqlite",
+    nativeSessionId: "native-sqlite",
+    lastErrorSummary: "upstream 500"
+  }, now);
+  const pendingRun = withProviderRetry(createAgentRun(
+    "agent-run-1",
+    task.id,
+    "worker",
+    "new",
+    "Do the work",
+    now,
+    { effective: testEffectiveLaunch({ adapterId: "claude" }) }
+  ), retry);
+  const inFlightRun = createAgentRun(
+    "agent-run-2",
+    task.id,
+    "worker",
+    "new",
+    "Also do the work",
+    now,
+    { effective: testEffectiveLaunch({ adapterId: "claude" }) }
+  );
+  store.saveAgentRun(pendingRun);
+  store.saveAgentRun(inFlightRun);
+
+  const draftTask = createTask("task-draft", "Draft retry", now, { cwd: home });
+  store.saveTask(draftTask);
+  store.saveAgentRun(withProviderRetry(createAgentRun(
+    "agent-run-1",
+    draftTask.id,
+    "worker",
+    "new",
+    "Draft work",
+    now,
+    { effective: testEffectiveLaunch({ adapterId: "claude" }) }
+  ), retry));
+
+  const expected = [{
+    taskId: task.id,
+    roleName: "worker",
+    runId: pendingRun.id,
+    nextAttemptAt: retry.nextAttemptAt
+  }];
+  assert.deepEqual(store.listPendingProviderRetries(), expected);
+  assert.deepEqual(new FileSchedulerStoreAdapter(store).listPendingProviderRetries(), expected);
 });

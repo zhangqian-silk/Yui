@@ -50,6 +50,7 @@ import {
   isRetryableProviderErrorClass
 } from "../lifecycle/providerErrorClass.js";
 import {
+  type PendingProviderRetry,
   providerRetryIsDue,
   scheduleProviderRetry
 } from "../run/providerRetry.js";
@@ -2470,12 +2471,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    * due. The Controller arms its deadline timer from this projection, so a
    * Controller restart resumes the same attempt lineage.
    */
-  listPendingProviderRetries(): ReadonlyArray<Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    nextAttemptAt: string;
-  }>> {
+  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
+    // SQLite-native stores answer with a single indexed query; the file
+    // store falls back to the per-Task in-memory sweep.
+    if (typeof this.store.listPendingProviderRetries === "function") {
+      return this.store.listPendingProviderRetries();
+    }
     const pending: Array<{
       taskId: string;
       roleName: string;

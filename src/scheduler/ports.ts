@@ -9,6 +9,7 @@ import type {
 } from "./operatorNotification.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { AgentRun } from "../run/agentRun.js";
+import type { PendingProviderRetry } from "../run/providerRetry.js";
 import type {
   MailboxEntityRef,
   MailboxTarget,
@@ -299,12 +300,7 @@ export interface SchedulerStorePort {
    * retry is due; the Controller arms its deadline timer from this projection.
    * Optional so adapters without the feature keep the old behavior.
    */
-  listPendingProviderRetries?(): ReadonlyArray<Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    nextAttemptAt: string;
-  }>>;
+  listPendingProviderRetries?(): ReadonlyArray<PendingProviderRetry>;
   /**
    * Issue 04: reopens each due retry on its original Native Session, or
    * terminalizes a Run whose Session is proven dead. Returns the reopened Run

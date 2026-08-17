@@ -45,6 +45,7 @@ import {
 import { validateTaskMessage, type TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import { validateAgentRun, type AgentRun } from "../run/agentRun.js";
+import type { PendingProviderRetry } from "../run/providerRetry.js";
 import {
   validateReviewConfig,
   type ReviewConfig
@@ -427,6 +428,11 @@ export type TaskStore = {
   getAgentRun(taskId: string, runId: string): AgentRun | null;
   listAgentRuns(taskId: string): AgentRun[];
   saveAgentRun(run: AgentRun): void;
+  /**
+   * Issue 04: SQLite-native pending retry query.  Optional so the file store
+   * keeps its in-memory scan; the adapter delegates here when available.
+   */
+  listPendingProviderRetries?(): ReadonlyArray<PendingProviderRetry>;
   nextReviewRoundId(taskId: string): string;
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
