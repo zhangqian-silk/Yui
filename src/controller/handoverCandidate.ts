@@ -16,7 +16,8 @@
 import { fileURLToPath } from "node:url";
 
 import { buildRuntimeIdentityReceipt } from "../core/controllerServer.js";
-import { resolveStoreWorkerEnabled } from "../storage/storeRpc.js";
+import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
+import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
 import {
   detectRunningRelease,
   isOwnerLive,
@@ -103,8 +104,8 @@ export async function runHandoverCandidate(
   writeRuntimeIdentity(home, buildRuntimeIdentityReceipt({
     home,
     release,
-    storageBackend: environment.YUI_STORE_BACKEND?.toLowerCase() === "sqlite" ? "sqlite" : "file",
-    workerEnabled: resolveStoreWorkerEnabled(environment),
+    storageBackend: resolveTaskStoreBackendForHome(home, environment),
+    workerEnabled: resolveStoreWorkerEnabledForHome(home, environment),
     processStartIdentity: startIdentity,
     mode: "candidate",
     dualOwner: false
@@ -141,8 +142,8 @@ export async function runHandoverCandidate(
       writeRuntimeIdentity(home, buildRuntimeIdentityReceipt({
         home,
         release,
-        storageBackend: environment.YUI_STORE_BACKEND?.toLowerCase() === "sqlite" ? "sqlite" : "file",
-        workerEnabled: resolveStoreWorkerEnabled(environment),
+        storageBackend: resolveTaskStoreBackendForHome(home, environment),
+        workerEnabled: resolveStoreWorkerEnabledForHome(home, environment),
         processStartIdentity: startIdentity,
         mode: "candidate",
         dualOwner: true
