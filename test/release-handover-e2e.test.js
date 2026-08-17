@@ -27,6 +27,8 @@ import test from "node:test";
 
 import { buildReleaseManifest, RELEASE_MANIFEST_FILE } from "../scripts/lib/runtime-package.mjs";
 import { createIsolatedRuntime } from "./helpers/isolatedRuntime.js";
+import { FileTaskStore } from "../dist/storage/taskStore.js";
+import { SqliteTaskStore } from "../dist/storage/sqliteStore.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const devCli = join(repoRoot, "dist", "cli.js");
@@ -95,6 +97,12 @@ function releaseIdOf(manifest) {
 
 test("release handover E2E: immutable releases, atomic handover, launcher shim", async (t) => {
   const runtime = createIsolatedRuntime(t);
+  // Issue 01: a manifest-only Home (schema.json without state.json or yui.db)
+  // is classified CORRUPTED by doctor, so the release preflight rejects it.
+  // Force a store write so state.json exists and the Home is a valid
+  // file-store fallback Home (layout 7, no yui.db yet).
+  const store = new FileTaskStore(runtime.home);
+  store.saveConfig({ ...store.getConfig(), timeZone: "UTC" });
   const stageRoot = createStageRoot("release-e2e-");
   try {
     // 1. Assemble release A from the current build and install it.
@@ -235,6 +243,37 @@ test("release install rejects a drifted or worktree-linked package", async (t) =
     const worktree = runYuiJsonAborted(["release", "install", stage2], runtime.environment);
     assert.equal(worktree.outcome, "aborted");
     assert.ok(worktree.message.includes("integrity"));
+  } finally {
+    await runtime.teardown();
+    rmSync(stageRoot, { recursive: true, force: true });
+  }
+});
+
+test("release identity reports the Home-decided SQLite backend and worker", async (t) => {
+  const runtime = createIsolatedRuntime(t);
+  const stageRoot = createStageRoot("release-e2e-sqlite-");
+  try {
+    // Promote the isolated Home to a genuine SQLite Home (layout 7 + yui.db)
+    // so the identity receipt exercises the DB-only provenance path.
+    const sqlite = new SqliteTaskStore(runtime.home);
+    sqlite.close();
+
+    const stage = join(stageRoot, "release-sqlite");
+    const manifest = assembleRelease(stage);
+    const releaseId = releaseIdOf(manifest);
+
+    const install = runYuiJson(["release", "install", stage], runtime.environment);
+    assert.equal(install.outcome, "installed");
+
+    const activate = runYuiJson(["release", "activate", releaseId], runtime.environment);
+    assert.equal(activate.outcome, "activated");
+
+    const identity = runYuiJson(["controller", "identity"], runtime.environment);
+    assert.equal(identity.buildId, manifest.buildId);
+    assert.equal(identity.storageBackend, "sqlite");
+    assert.equal(identity.workerEnabled, true);
+    assert.equal(identity.mode, "primary");
+    assert.equal(identity.dualOwner, false);
   } finally {
     await runtime.teardown();
     rmSync(stageRoot, { recursive: true, force: true });
