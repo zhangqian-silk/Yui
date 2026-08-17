@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 5;
+export const SQLITE_SCHEMA_VERSION = 6;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -483,9 +483,9 @@ BEGIN
   VALUES
     (NEW.task_id, NEW.role_name, NEW.run_id, NEW.generation, NEW.received_at, NEW.received_at, 1, NEW.sequence,
      CASE WHEN json_valid(NEW.payload)
-           AND (COALESCE(json_extract(NEW.payload, '$.error'), '') <> ''
-                OR COALESCE(json_extract(NEW.payload, '$.errorKind'), '') <> '')
-          THEN 1 ELSE 0 END,
+          AND (COALESCE(json_extract(NEW.payload, '$.error'), '') <> ''
+               OR COALESCE(json_extract(NEW.payload, '$.errorKind'), '') <> '')
+         THEN 1 ELSE 0 END,
      NEW.received_at)
   ON CONFLICT(task_id, role_name, run_id, generation) DO UPDATE SET
     first_at = MIN(telemetry_aggregate.first_at, excluded.first_at),
@@ -512,6 +512,25 @@ BEGIN
 END;
 `;
 
+/**
+ * Migration 6: Issue 06 ReviewFinding ledger. Cross-Round semantic review
+ * findings with stable keys and Leader dispositions. Failed execution attempts
+ * never create rows; only completed Rounds feed the ledger.
+ */
+const MIGRATION_6_SQL = `
+CREATE TABLE IF NOT EXISTS review_findings (
+  task_id     TEXT NOT NULL,
+  finding_id  TEXT NOT NULL,
+  stable_key  TEXT NOT NULL,
+  severity    TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (task_id, finding_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id);
+CREATE INDEX IF NOT EXISTS idx_review_findings_stable_key ON review_findings(task_id, stable_key);
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -525,6 +544,8 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL },
   { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL },
   { version: 5, axis: "record", recordKind: "telemetryAggregate", sql: MIGRATION_5_SQL }
+  { version: 5, axis: "record", recordKind: "telemetryAggregate", sql: MIGRATION_5_SQL },
+  { version: 6, axis: "record", recordKind: "reviewFinding", sql: MIGRATION_6_SQL }
 ];
 
 function checksum(sql: string): string {
@@ -605,6 +626,7 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "agent_runs",
   "active_runs",
   "review_rounds",
+  "review_findings",
   "change_sets",
   "integration_attempts",
   "messages",

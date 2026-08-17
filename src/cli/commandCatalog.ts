@@ -651,7 +651,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "review",
     summary: "Control Task-final ReviewRounds.",
-    sections: [{ id: "manage", title: "Commands", entries: ["request", "group", "retry"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "group", "retry", "finding"] }],
     children: [
       {
         name: "request",
@@ -676,6 +676,39 @@ const taskChildren: readonly NodeInput[] = [
         name: "retry",
         summary: "Retry a failed Task-final ReviewRound without a Reviewer Run.",
         usage: "yui task review retry <task>/<review-round>"
+      },
+      {
+        name: "finding",
+        summary: "Inspect and disposition the cross-Round Review finding ledger.",
+        executable: true,
+        sections: [{ id: "manage", title: "Commands", entries: ["list", "dispose", "repair-wave", "extract"] }],
+        children: [
+          {
+            name: "list",
+            summary: "List the Task's review findings with disposition and repair lineage.",
+            usage: "yui task review finding list <task>"
+          },
+          {
+            name: "dispose",
+            summary: "Record one Leader disposition for a review finding.",
+            usage: "yui task review finding dispose <task>/<finding> --disposition <fixed-pending-review|verified-fixed|accepted-risk|not-actionable|superseded> [--work-item <id>] [--commit <sha>] [--verification <text>] [--note <text>] [--superseded-by <stable-key>]",
+            options: ["--disposition", "--work-item", "--commit", "--verification", "--note", "--superseded-by"],
+            optionValues: {
+              "--disposition": ["fixed-pending-review", "verified-fixed", "accepted-risk", "not-actionable", "superseded"]
+            }
+          },
+          {
+            name: "repair-wave",
+            summary: "Group open P1/P2 findings into parallel repair groups by overlap.",
+            usage: "yui task review finding repair-wave <task> [--create]",
+            options: ["--create"]
+          },
+          {
+            name: "extract",
+            summary: "Reconcile findings from one completed ReviewRound into the ledger.",
+            usage: "yui task review finding extract <task>/<review-round>"
+          }
+        ]
       }
     ]
   },
@@ -916,13 +949,16 @@ export const ROOT_COMMAND = buildNode({
           sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
           children: [
             { name: "show", summary: "Show the global review rule." },
-            {
-              name: "set",
-              summary: "Enable review with a Global Role.",
-              usage: "yui config review set --role <global-role> --trigger <always|leader|final>",
-              options: ["--role", "--trigger"],
-              optionValues: { "--trigger": ["always", "leader", "final"] }
-            },
+          {
+            name: "set",
+            summary: "Enable review with a Global Role.",
+            usage: "yui config review set --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>]",
+            options: ["--role", "--trigger", "--finding-ledger"],
+            optionValues: {
+              "--trigger": ["always", "leader", "final"],
+              "--finding-ledger": ["shadow", "enforce"]
+            }
+          },
             { name: "clear", summary: "Disable global review." }
           ]
         }

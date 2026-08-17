@@ -53,6 +53,10 @@ import {
   validateReviewRound,
   type ReviewRound
 } from "../review/reviewRound.js";
+import {
+  validateReviewFinding,
+  type ReviewFinding
+} from "../review/reviewFinding.js";
 import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
 import {
   assertProjectCatalog,
@@ -160,6 +164,7 @@ export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 9 as const;
 export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 4 as const;
+export const CURRENT_REVIEW_FINDING_SCHEMA_VERSION = 1 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
@@ -253,7 +258,7 @@ function executionLaneActiveRunKeyParts(key: string):
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 /** The schema version of each persisted `state.json#/tasks/*` aggregate. */
-export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
+export const CURRENT_STORED_TASK_SCHEMA_VERSION = 17 as const;
 
 /**
  * Persisted nested-record versions consumed by this store's strict parser.
@@ -287,6 +292,7 @@ type StoredTask = {
   workItems: Record<string, WorkItem>;
   agentRuns: Record<string, AgentRun>;
   reviewRounds: Record<string, ReviewRound>;
+  reviewFindings: Record<string, ReviewFinding>;
   activeRuns: Record<string, ActiveRunPointer>;
   messages: Record<string, TaskMessage>;
   inputRequests: Record<string, InputRequest>;
@@ -426,6 +432,10 @@ export type TaskStore = {
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
   saveReviewRound(taskId: string, round: ReviewRound): void;
+  nextReviewFindingId(taskId: string): string;
+  getReviewFinding(taskId: string, reviewFindingId: string): ReviewFinding | null;
+  listReviewFindings(taskId: string): ReviewFinding[];
+  saveReviewFinding(taskId: string, finding: ReviewFinding): void;
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null;
   saveActiveAgentRun(run: AgentRun): void;
   clearActiveAgentRun(taskId: string, roleName: string): void;
@@ -1393,6 +1403,34 @@ export class FileTaskStore implements TaskStore {
       task.reviewRounds[stored.id] = stored;
     });
   }
+  nextReviewFindingId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "reviewFinding");
+  }
+  getReviewFinding(taskId: string, reviewFindingId: string): ReviewFinding | null {
+    return optional(this.#state().tasks[taskId]?.reviewFindings[reviewFindingId]);
+  }
+  listReviewFindings(taskId: string): ReviewFinding[] {
+    return values(this.#requireTask(taskId).reviewFindings, "id");
+  }
+  saveReviewFinding(taskId: string, finding: ReviewFinding): void {
+    const stored = identified<ReviewFinding>(
+      finding,
+      CURRENT_REVIEW_FINDING_SCHEMA_VERSION,
+      "id",
+      finding.id,
+      "ReviewFinding"
+    );
+    validateReviewFinding(stored);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`ReviewFinding belongs to another Task: ${stored.taskId}.`);
+    }
+    this.#requireTaskForWrite(taskId);
+    this.#mutate((state) => {
+      const task = state.tasks[taskId];
+      observeTaskRecordId(task, "reviewFinding", stored.id);
+      task.reviewFindings[stored.id] = stored;
+    });
+  }
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
     const aggregate = this.#state().tasks[taskId];
     const pointer = aggregate?.activeRuns[roleName];
@@ -2030,6 +2068,7 @@ function emptyStoredTask(task: Task): StoredTask {
     workItems: {},
     agentRuns: {},
     reviewRounds: {},
+    reviewFindings: {},
     activeRuns: {},
     messages: {},
     inputRequests: {},
@@ -2048,6 +2087,7 @@ function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
     workItem: 0,
     agentRun: 0,
     reviewRound: 0,
+    reviewFinding: 0,
     changeSet: 0,
     integrationAttempt: 0,
     integrationQueue: 0,
@@ -2277,6 +2317,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "workItems",
     "agentRuns",
     "reviewRounds",
+    "reviewFindings",
     "activeRuns",
     "messages",
     "inputRequests",
@@ -2441,6 +2482,20 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateReviewRound(round);
     return round;
   }, "reviewRounds");
+  parseMap(aggregate.reviewFindings, (record, key) => {
+    const finding = identified<ReviewFinding>(
+      record,
+      CURRENT_REVIEW_FINDING_SCHEMA_VERSION,
+      "id",
+      key,
+      "ReviewFinding"
+    );
+    if (finding.taskId !== taskId) {
+      throw new StorageRecordError(`ReviewFinding belongs to another Task: ${finding.taskId}.`);
+    }
+    validateReviewFinding(finding);
+    return finding;
+  }, "reviewFindings");
   parseMap(aggregate.activeRuns, (record, key) => {
     const pointer = versioned<ActiveRunPointer>(
       record,
@@ -2555,6 +2610,7 @@ function validateTaskIdHighWaterCoverage(
     workItem: aggregate.workItems,
     agentRun: aggregate.agentRuns,
     reviewRound: aggregate.reviewRounds,
+    reviewFinding: aggregate.reviewFindings,
     changeSet: aggregate.changeSets,
     integrationAttempt: aggregate.integrationAttempts,
     integrationQueue: aggregate.integrationQueue,
@@ -4099,7 +4155,13 @@ function validReviewRoundTransition(
       candidate.taskFinalReviewContract
     )
     || !compatibleExecutionGroups(existing.executionGroup, candidate.executionGroup)
-    || existing.requestedBy !== candidate.requestedBy
+    // Issue 06: a Leader retry resets a failed Task-final Round to pending;
+    // the retry is itself a Leader request, so requestedBy may change from
+    // the original policy/contract value to "leader".
+    || (existing.requestedBy !== candidate.requestedBy
+      && !(existing.status === "failed"
+        && candidate.status === "pending"
+        && (candidate.scope ?? "work-item") === "task"))
     || existing.createdAt !== candidate.createdAt
   ) return false;
   if (existing.status === "pending") {
@@ -4139,6 +4201,27 @@ function validReviewRoundTransition(
     return ["completed", "failed"].includes(candidate.status)
       && existing.reviewerRunId === candidate.reviewerRunId
       && isDeepStrictEqual(existing.workspace, candidate.workspace);
+  }
+  // Issue 06: a failed Task-final execution attempt may be reset to pending
+  // under the same semantic Round ID. AgentRun history remains the attempt
+  // trail; terminal Review metadata is cleared by retryTaskReviewRound.
+  if (existing.status === "failed"
+    && candidate.status === "pending"
+    && (candidate.scope ?? "work-item") === "task") {
+    return candidate.reviewerRunId === undefined
+      && candidate.summary === undefined
+      && candidate.report === undefined
+      && candidate.checks === undefined
+      && candidate.evidenceCommit === undefined
+      && candidate.endedAt === undefined
+      && candidate.workspaceDisposition === undefined
+      && (existing.workspace === undefined
+        || candidate.workspace === undefined
+        || isDeepStrictEqual(existing.workspace, candidate.workspace))
+      && compatibleExecutionGroups(
+        existing.executionGroup,
+        candidate.executionGroup
+      );
   }
   if (existing.status === candidate.status
     && (existing.status === "completed" || existing.status === "failed")) {

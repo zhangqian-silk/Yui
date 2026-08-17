@@ -40,6 +40,7 @@ import {
   CURRENT_MILESTONE_SCHEMA_VERSION,
   CURRENT_PROJECT_SCHEMA_VERSION,
   CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION,
+  CURRENT_REVIEW_FINDING_SCHEMA_VERSION,
   CURRENT_REVIEW_ROUND_SCHEMA_VERSION,
   CURRENT_STORED_TASK_SCHEMA_VERSION,
   CURRENT_TASK_BRIEF_SCHEMA_VERSION,
@@ -80,6 +81,7 @@ const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object
   workItem: "state.json#/tasks/*/workItems",
   agentRun: "state.json#/tasks/*/agentRuns",
   reviewRound: "state.json#/tasks/*/reviewRounds",
+  reviewFinding: "state.json#/tasks/*/reviewFindings",
   changeSet: "state.json#/tasks/*/changeSets",
   integrationAttempt: "state.json#/tasks/*/integrationAttempts",
   integrationQueue: "state.json#/tasks/*/integrationQueue",
@@ -148,6 +150,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
       reviewRound: descriptor(
         CURRENT_REVIEW_ROUND_SCHEMA_VERSION,
         "state.json#/tasks/*/reviewRounds"
+      ),
+      reviewFinding: descriptor(
+        CURRENT_REVIEW_FINDING_SCHEMA_VERSION,
+        "state.json#/tasks/*/reviewFindings"
       ),
       changeSet: descriptor(CURRENT_CHANGE_SET_SCHEMA_VERSION, "state.json#/tasks/*/changeSets"),
       integrationAttempt: descriptor(

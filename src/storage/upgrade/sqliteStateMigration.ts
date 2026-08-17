@@ -42,6 +42,7 @@ import type { TaskMessage } from "../../message/message.js";
 import type { Milestone } from "../../milestone/milestone.js";
 import type { AgentRun } from "../../run/agentRun.js";
 import type { ReviewRound } from "../../review/reviewRound.js";
+import type { ReviewFinding } from "../../review/reviewFinding.js";
 import type { Project } from "../../repository/project.js";
 import type { HomeIdentity } from "../../repository/homeIdentity.js";
 import type { AgentProfile } from "../../profile/agentProfile.js";
@@ -161,6 +162,7 @@ interface StoredTaskShape {
   workItems: Record<string, Record<string, unknown>>;
   agentRuns: Record<string, Record<string, unknown>>;
   reviewRounds: Record<string, Record<string, unknown>>;
+  reviewFindings: Record<string, Record<string, unknown>>;
   changeSets: Record<string, Record<string, unknown>>;
   integrationAttempts: Record<string, Record<string, unknown>>;
   integrationQueue: Record<string, Record<string, unknown>>;
@@ -190,6 +192,7 @@ function asStoredTask(value: unknown): StoredTaskShape {
     workItems: asObjectMap(record.workItems),
     agentRuns: asObjectMap(record.agentRuns) as Record<string, Record<string, unknown>>,
     reviewRounds: asObjectMap(record.reviewRounds),
+    reviewFindings: asObjectMap(record.reviewFindings),
     changeSets: asObjectMap(record.changeSets),
     integrationAttempts: asObjectMap(record.integrationAttempts),
     integrationQueue: asObjectMap(record.integrationQueue),
@@ -297,6 +300,9 @@ export function populateSqliteFromState(
         }
         for (const round of Object.values(stored.reviewRounds)) {
           store.saveReviewRound(taskId, round as unknown as ReviewRound);
+        }
+        for (const finding of Object.values(stored.reviewFindings)) {
+          store.saveReviewFinding(taskId, finding as unknown as ReviewFinding);
         }
         for (const changeSet of Object.values(stored.changeSets)) {
           store.saveChangeSet(taskId, changeSet as unknown as ChangeSet);
@@ -448,6 +454,7 @@ export function computeStateFamilyChecksums(
   const workItems: unknown[] = [];
   const agentRuns: unknown[] = [];
   const reviewRounds: unknown[] = [];
+  const reviewFindings: unknown[] = [];
   const changeSets: unknown[] = [];
   const integrationAttempts: unknown[] = [];
   const integrationQueue: unknown[] = [];
@@ -473,6 +480,7 @@ export function computeStateFamilyChecksums(
     workItems.push(...Object.values(stored.workItems));
     agentRuns.push(...Object.values(stored.agentRuns));
     reviewRounds.push(...Object.values(stored.reviewRounds));
+    reviewFindings.push(...Object.values(stored.reviewFindings));
     changeSets.push(...Object.values(stored.changeSets));
     integrationAttempts.push(...Object.values(stored.integrationAttempts));
     integrationQueue.push(...Object.values(stored.integrationQueue));
@@ -511,6 +519,7 @@ export function computeStateFamilyChecksums(
   checksums.workItem = hashRecords(workItems);
   checksums.agentRun = hashRecords(agentRuns);
   checksums.reviewRound = hashRecords(reviewRounds);
+  checksums.reviewFinding = hashRecords(reviewFindings);
   checksums.changeSet = hashRecords(changeSets);
   checksums.integrationAttempt = hashRecords(integrationAttempts);
   checksums.integrationQueue = hashRecords(integrationQueue);
@@ -617,6 +626,7 @@ export function computeDbFamilyChecksums(
     checksums.workItem = hashPayloadTable(db, "SELECT payload FROM work_items");
     checksums.agentRun = hashPayloadTable(db, "SELECT payload FROM agent_runs");
     checksums.reviewRound = hashPayloadTable(db, "SELECT payload FROM review_rounds");
+    checksums.reviewFinding = hashPayloadTable(db, "SELECT payload FROM review_findings");
     checksums.changeSet = hashPayloadTable(db, "SELECT payload FROM change_sets");
     checksums.integrationAttempt = hashPayloadTable(
       db,

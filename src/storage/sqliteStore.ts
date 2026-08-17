@@ -52,6 +52,10 @@ import type { Milestone } from "../milestone/milestone.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { ReviewRound } from "../review/reviewRound.js";
+import {
+  validateReviewFinding,
+  type ReviewFinding
+} from "../review/reviewFinding.js";
 import type { Project } from "../repository/project.js";
 import { generateHomeIdentity, type HomeIdentity } from "../repository/homeIdentity.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
@@ -1412,6 +1416,37 @@ export class SqliteTaskStore implements TaskStore {
          ON CONFLICT(task_id, review_round_id) DO UPDATE SET status = excluded.status,
            payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(taskId, round.id, round.status, this.#json(round), this.#now());
+    });
+  }
+
+  // -- review findings --------------------------------------------------------
+
+  nextReviewFindingId(taskId: string): string { return this.#nextTaskRecordId(taskId, "reviewFinding"); }
+
+  getReviewFinding(taskId: string, findingId: string): ReviewFinding | null {
+    return this.#getPayload<ReviewFinding>("review_findings", "task_id = ? AND finding_id = ?", [taskId, findingId]);
+  }
+
+  listReviewFindings(taskId: string): ReviewFinding[] {
+    return this.#sortById(
+      this.#listPayload<ReviewFinding>("review_findings", "task_id = ?", [taskId]),
+      (finding) => finding.id
+    );
+  }
+
+  saveReviewFinding(taskId: string, finding: ReviewFinding): void {
+    validateReviewFinding(finding);
+    if (finding.taskId !== taskId) {
+      throw new StorageRecordError(`Review finding belongs to another Task: ${finding.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO review_findings (task_id, finding_id, stable_key, severity, payload, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(task_id, finding_id) DO UPDATE SET stable_key = excluded.stable_key,
+           severity = excluded.severity, payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(taskId, finding.id, finding.stableKey, finding.severity, this.#json(finding), this.#now());
     });
   }
 

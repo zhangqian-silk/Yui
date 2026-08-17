@@ -878,18 +878,22 @@ test("a failed Task-final Round with no Reviewer Run has an explicit Leader retr
     fx.leaderOptions
   );
   assert.equal(retried.data.reviewRound.status, "pending");
-  assert.notEqual(retried.data.reviewRound.id, failed.id);
-  assert.deepEqual(fx.store.getReviewRound(fx.task.id, failed.id), oldRound);
+  assert.equal(retried.data.reviewRound.id, failed.id);
+  assert.deepEqual(retried.data.reviewRound.taskCandidate, oldRound.taskCandidate);
+  assert.notDeepEqual(fx.store.getReviewRound(fx.task.id, failed.id), oldRound);
   assert.equal(
     runTaskCommand(["review", "retry", `${fx.task.id}/${failed.id}`], fx.store, fx.leaderOptions)
       .data.reviewRound.id,
     retried.data.reviewRound.id
   );
   const retriedRun = dispatchFinal(fx, retried.data.reviewRound);
-  assert.equal(
-    runTaskCommand(["review", "retry", `${fx.task.id}/${failed.id}`], fx.store, fx.leaderOptions)
-      .data.reviewRound.id,
-    retried.data.reviewRound.id
+  assert.throws(
+    () => runTaskCommand(
+      ["review", "retry", `${fx.task.id}/${failed.id}`],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /has Reviewer Run .*use task run retry/i
   );
   assert.equal(fx.store.getReviewRound(fx.task.id, retriedRun.reviewRoundId).status, "running");
 });
@@ -958,9 +962,10 @@ test("failed Task-final retry is one-transaction and idempotent before and after
   const firstRoundSnapshot = structuredClone(fx.store.getReviewRound(fx.task.id, firstRound.id));
   const firstRetry = runTaskCommand(["run", "retry", firstRun.id], fx.store, fx.leaderOptions);
   const retryRound = firstRetry.data.reviewRound;
+  assert.equal(retryRound.id, firstRound.id);
   assert.equal(retryRound.requestedBy, "leader");
   assert.deepEqual(retryRound.taskCandidate, firstRoundSnapshot.taskCandidate);
-  assert.deepEqual(fx.store.getReviewRound(fx.task.id, firstRound.id), firstRoundSnapshot);
+  assert.notDeepEqual(fx.store.getReviewRound(fx.task.id, firstRound.id), firstRoundSnapshot);
   assert.equal(runTaskCommand(["run", "retry", firstRun.id], fx.store, fx.leaderOptions).data.reviewRound.id, retryRound.id);
   const retryRun = dispatchFinal(fx, retryRound);
   fx.store.transaction((tx) => {
@@ -1181,13 +1186,11 @@ test("running retry is reusable only with its exact active pointer and mailbox e
     tx.saveWorkMailbox(bindExecution(claimed, "retry-batch", {
       type: "run", taskId: fx.task.id, id: retryRun.id
     }));
-    tx.clearActiveAgentRun(fx.task.id, retryRun.roleName);
   });
   const before = taskStateSnapshot(fx);
-  assert.throws(
-    () => runTaskCommand(["run", "retry", firstRun.id], fx.store, fx.leaderOptions),
-    /active|execution|mailbox/i
-  );
+  const repeated = runTaskCommand(["run", "retry", firstRun.id], fx.store, fx.leaderOptions);
+  assert.equal(repeated.data.reviewRound.id, retryRound.id);
+  assert.equal(repeated.data.reviewRound.status, "running");
   assert.deepEqual(taskStateSnapshot(fx), before);
 });
 
@@ -1628,7 +1631,7 @@ test("explicit failed Task-final evidence keeps no-Run and failed-Run retries se
     failedRun.leaderOptions
   ).data.reviewRound;
   assert.equal(failedRunRetry.requestedBy, "leader");
-  assert.notEqual(failedRunRetry.id, failedRunRound.id);
+  assert.equal(failedRunRetry.id, failedRunRound.id);
 });
 
 test("explicit Task-final Review request rejects moved evidence during final dispatch", (t) => {
