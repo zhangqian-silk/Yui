@@ -108,7 +108,7 @@ import {
   ReviewRoundWorkspaceEvidenceError
 } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema } from "./storage/storageSchema.js";
-import { type FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
+import { type TaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import {
   openCompatibleFileTaskStore,
   validateCompatibleFileTaskStore
@@ -1303,7 +1303,7 @@ type ManagedTaskControlPlanePreflight = Readonly<{
    * cache still invalidates on any external writer, and mutations keep their
    * unlocked re-read and revision CAS.
    */
-  verifiedStore: FileTaskStore | undefined;
+  verifiedStore: TaskStore | undefined;
 }>;
 
 async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPlanePreflight> {
@@ -1461,7 +1461,7 @@ function cliTaskRecordReference(
 
 async function candidateSnapshotForTaskCommand(
   args: readonly string[],
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv,
   taskFinalReviewContract?: TaskFinalReviewContract
@@ -1538,7 +1538,7 @@ async function candidateSnapshotForTaskCommand(
 
 async function candidateMaterializationForTaskCommand(
   args: readonly string[],
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv,
   taskFinalReviewContract?: TaskFinalReviewContract
@@ -1568,7 +1568,7 @@ async function candidateMaterializationForTaskCommand(
 
 async function prepareExecutionLaneWorkspacesForCommand(
   args: readonly string[],
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv
 ): Promise<PreparedExecutionLaneWorkspaces | undefined> {
@@ -1694,7 +1694,7 @@ type PreparedExecutionLaneWorkspaces = Readonly<{
 async function prepareReviewLaneWorkspaces(
   taskId: string,
   reviewRoundId: string,
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer
 ): Promise<ReadonlyMap<string, import("./worktree/managedWorkspace.js").ManagedWorkspace> | undefined> {
   const round = store.getReviewRound(taskId, reviewRoundId);
@@ -1718,7 +1718,7 @@ async function prepareReviewLaneWorkspaces(
 
 async function directTaskMainSnapshotForTaskCommand(
   args: readonly string[],
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv,
   taskFinalReviewContract?: TaskFinalReviewContract
@@ -1754,7 +1754,7 @@ async function directTaskMainSnapshotForTaskCommand(
 
 async function actualTaskReviewCandidateForTaskCommand(
   args: readonly string[],
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv,
   taskFinalReviewContract?: TaskFinalReviewContract
@@ -1816,7 +1816,7 @@ async function actualTaskReviewCandidateForTaskCommand(
 
 async function snapshotActualTaskReviewCandidate(
   taskId: string,
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer
 ): Promise<TaskReviewCandidate> {
   const task = store.getTask(taskId);
@@ -1858,7 +1858,7 @@ async function snapshotActualTaskReviewCandidate(
 
 async function reviewWorkspaceResultForTaskCommand(
   args: readonly string[],
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv
 ) {
@@ -1874,7 +1874,7 @@ async function reviewWorkspaceResultForTaskCommand(
 
 async function executionLaneGitSnapshotForTaskCommand(
   args: readonly string[],
-  store: FileTaskStore,
+  store: TaskStore,
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv
 ) {
@@ -1943,7 +1943,7 @@ function reviewRoundFromCommandData(data: unknown): Readonly<{
 async function executeOperatorSessionControl(
   control: OperatorSessionControl,
   home: string,
-  store: FileTaskStore,
+  store: TaskStore,
   runtime: FileTaskWorkflowRuntime,
   tmux: TmuxManager,
   catalogs: AgentConfigurationCatalogService
@@ -2122,7 +2122,7 @@ function completionShell(value: string | undefined): "bash" | "zsh" | "fish" | u
 async function resolveTerminalArguments(
   commandArgs: readonly string[],
   node: import("./cli/commandCatalog.js").CommandNode,
-  store: FileTaskStore,
+  store: TaskStore,
   catalogs: AgentConfigurationCatalogService
 ): Promise<string[] | null> {
   const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
@@ -2187,7 +2187,7 @@ function terminalIo(): Readonly<{ io: SelectionIo; close(): void }> {
 }
 
 function selectionPorts(
-  store: FileTaskStore,
+  store: TaskStore,
   catalogs: AgentConfigurationCatalogService
 ): SelectionPorts {
   return {
@@ -2197,7 +2197,7 @@ function selectionPorts(
 
 async function preflightAgentConfigurationMutation(
   commandArgs: readonly string[],
-  store: FileTaskStore,
+  store: TaskStore,
   catalogs: AgentConfigurationCatalogService
 ): Promise<void> {
   if (!hasModelOrEffortMutation(commandArgs)) return;
@@ -2221,7 +2221,7 @@ function hasModelOrEffortMutation(args: readonly string[]): boolean {
 
 function configurationMutationAgentId(
   args: readonly string[],
-  store: FileTaskStore
+  store: TaskStore
 ): string | undefined {
   const explicit = optionValue(args, "--agent");
   if (explicit !== undefined) return explicit;
@@ -2244,7 +2244,7 @@ function optionValue(args: readonly string[], option: string): string | undefine
 }
 
 function selectionCall(
-  store: FileTaskStore,
+  store: TaskStore,
   catalogs: AgentConfigurationCatalogService,
   method: string,
   params: Readonly<Record<string, unknown>>
@@ -2302,7 +2302,7 @@ function selectionCall(
   }
 }
 
-function presentSelectionTimes(value: unknown, store: FileTaskStore): unknown {
+function presentSelectionTimes(value: unknown, store: TaskStore): unknown {
   if (!Array.isArray(value)) return value;
   const timeZone = store.getConfig().timeZone;
   return value.map((record) => {
@@ -2326,7 +2326,7 @@ function callOptional(
   return operation === undefined ? [] : Reflect.apply(operation, reader, args);
 }
 
-function readableStore(home: string): FileTaskStore {
+function readableStore(home: string): TaskStore {
   return openCompatibleFileTaskStore(home);
 }
 

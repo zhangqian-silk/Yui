@@ -33,6 +33,7 @@ import {
   StorageRecordError,
   type TaskStore
 } from "./taskStore.js";
+import { resolveTaskStoreBackendForHome } from "./sqliteStore.js";
 
 // Re-exported for the persistence worker and existing importers.
 export type { SerializedError };
@@ -414,4 +415,23 @@ export function resolveStoreWorkerEnabled(env: NodeJS.ProcessEnv = process.env):
   if (env.YUI_STORE_BACKEND?.toLowerCase() !== "sqlite") return false;
   const flag = env.YUI_STORE_WORKER;
   return flag === "1" || flag?.toLowerCase() === "true";
+}
+
+/**
+ * Resolve whether the persistence worker is enabled, from the Home's verified
+ * manifest (Issue 01). A Home-decided SQLite backend (layout 7, no explicit
+ * `YUI_STORE_BACKEND`) runs the worker by default — that is the product
+ * commitment layout 7 makes. An env-decided SQLite backend keeps the
+ * historical opt-in (`YUI_STORE_WORKER=1`). `YUI_STORE_WORKER=0/false`
+ * disables the worker in both cases (in-process SQLite still applies).
+ */
+export function resolveStoreWorkerEnabledForHome(
+  home: string,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  if (resolveTaskStoreBackendForHome(home, env) !== "sqlite") return false;
+  const flag = env.YUI_STORE_WORKER?.toLowerCase();
+  if (flag === "1" || flag === "true") return true;
+  if (flag === "0" || flag === "false") return false;
+  return env.YUI_STORE_BACKEND?.toLowerCase() !== "sqlite";
 }

@@ -40,6 +40,7 @@ export type Classification = Readonly<
   | { verdict: "COMPATIBLE"; status: "compatible-old"; stepCount: number }
   | { verdict: "MIGRATABLE"; status: "migration-required"; stepCount: number }
   | { verdict: "NEEDS_NEW_VERSION"; status: "unsupported"; blocker: MigrationBlocker }
+  | { verdict: "NEEDS_STORAGE_REPAIR"; status: "needs-storage-repair"; detail: string }
   | { verdict: "CORRUPTED"; status: "unsupported"; detail: string }
 >;
 
