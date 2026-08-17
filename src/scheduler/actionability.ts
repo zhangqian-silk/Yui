@@ -12,25 +12,6 @@ import type { InputRequest } from "../input/inputRequest.js";
 import type { TaskMessage } from "../message/message.js";
 
 /**
- * Scheduler actionability admission mode (Issue 05).
- *
- * - `shadow`: compute the digest and record would-suppress observations, but
- *   never change the existing wake decision. This is the default.
- * - `enforce`: suppress `task-orphaned` wakes when the last Leader Run
- *   observed the same actionability digest.
- */
-export type ActionabilityMode = "shadow" | "enforce";
-
-export const ACTIONABILITY_MODE_ENV = "YUI_SCHEDULER_ACTIONABILITY_MODE";
-
-export function resolveActionabilityMode(
-  env: NodeJS.ProcessEnv = process.env
-): ActionabilityMode {
-  const raw = env[ACTIONABILITY_MODE_ENV]?.toLowerCase();
-  return raw === "enforce" ? "enforce" : "shadow";
-}
-
-/**
  * Machine-derived disposition of a terminal Leader Run. The Scheduler uses it
  * (together with the observed digest) to decide whether a later scan brings
  * any new actionable fact.
@@ -221,14 +202,11 @@ export function deriveLeaderRunDisposition(
  *
  * - `wake`: the digest changed (or no prior observation exists); queue one wake.
  * - `suppress`: the last Leader Run observed the same digest while
- *   waiting/blocked; stay silent.
- * - `fail-open`: the digest could not be computed; wake once and record the
- *   error so the Task can never be silently starved.
+ *   waiting/blocked; stay silent and write nothing.
  */
 export type OrphanWakeDecision =
   | Readonly<{ kind: "wake"; digest: string }>
-  | Readonly<{ kind: "suppress"; digest: string; observedDigest: string }>
-  | Readonly<{ kind: "fail-open"; error: string }>;
+  | Readonly<{ kind: "suppress"; digest: string; observedDigest: string }>;
 
 /**
  * Decide whether a `task-orphaned` scan should create a new Leader Run.

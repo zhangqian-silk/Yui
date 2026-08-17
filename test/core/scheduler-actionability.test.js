@@ -13,8 +13,7 @@ import {
   collectTaskActionability,
   computeActionabilityDigest,
   decideOrphanWake,
-  deriveLeaderRunDisposition,
-  resolveActionabilityMode
+  deriveLeaderRunDisposition
 } from "../../dist/scheduler/actionability.js";
 import { repairOrphanedActiveTasks } from "../../dist/scheduler/activeTaskProgress.js";
 import {
@@ -161,14 +160,6 @@ test("decideOrphanWake suppresses only a waiting/blocked Leader Run with the sam
   }
 });
 
-test("resolveActionabilityMode defaults to shadow and only accepts enforce", () => {
-  assert.equal(resolveActionabilityMode({}), "shadow");
-  assert.equal(resolveActionabilityMode({ YUI_SCHEDULER_ACTIONABILITY_MODE: "enforce" }), "enforce");
-  assert.equal(resolveActionabilityMode({ YUI_SCHEDULER_ACTIONABILITY_MODE: "ENFORCE" }), "enforce");
-  assert.equal(resolveActionabilityMode({ YUI_SCHEDULER_ACTIONABILITY_MODE: "shadow" }), "shadow");
-  assert.equal(resolveActionabilityMode({ YUI_SCHEDULER_ACTIONABILITY_MODE: "bogus" }), "shadow");
-});
-
 // ---------------------------------------------------------------------------
 // collectTaskActionability folding
 // ---------------------------------------------------------------------------
@@ -248,45 +239,21 @@ test("collectTaskActionability fails closed when the Task is missing", () => {
 // repairOrphanedActiveTasks suppression (fake store, scheduler-level)
 // ---------------------------------------------------------------------------
 
-test("enforce: 100 scans of an unchanged waiting Task create zero Leader wakes", () => {
+test("100 scans of an unchanged waiting Task are fully silent: zero wakes, zero writes", () => {
   const store = orphanFakeStore();
   seedWaitingLeaderRun(store, "agent-run-1", NOW);
-  const suppressions = [];
   for (let i = 0; i < 100; i += 1) {
-    const repaired = repairOrphanedActiveTasks(store, NOW, undefined, {
-      actionabilityMode: "enforce",
-      onSuppression: (entry) => suppressions.push(entry)
-    });
+    const repaired = repairOrphanedActiveTasks(store, NOW);
     assert.deepEqual(repaired, []);
   }
   assert.equal(store.pending, null);
-  assert.equal(suppressions.length, 100);
-  assert.ok(
-    suppressions.every((entry) => entry.suppressed === true && entry.taskId === "task-1")
-  );
+  assert.deepEqual(store.progressCalls, []);
 });
 
-test("shadow mode records would-suppress but still wakes the Leader", () => {
+test("a new actionable fact wakes exactly once; later scans do not duplicate it", () => {
   const store = orphanFakeStore();
   seedWaitingLeaderRun(store, "agent-run-1", NOW);
-  const suppressions = [];
-  const repaired = repairOrphanedActiveTasks(store, NOW, undefined, {
-    actionabilityMode: "shadow",
-    onSuppression: (entry) => suppressions.push(entry)
-  });
-  assert.deepEqual(repaired, ["task-1"]);
-  assert.equal(suppressions.length, 1);
-  assert.equal(suppressions[0].suppressed, false);
-  assert.deepEqual(store.pending.reasons, ["task-orphaned"]);
-});
-
-test("enforce: a new actionable fact wakes exactly once; later scans do not duplicate it", () => {
-  const store = orphanFakeStore();
-  seedWaitingLeaderRun(store, "agent-run-1", NOW);
-  assert.deepEqual(
-    repairOrphanedActiveTasks(store, NOW, undefined, { actionabilityMode: "enforce" }),
-    []
-  );
+  assert.deepEqual(repairOrphanedActiveTasks(store, NOW), []);
 
   // A new user directive changes the digest.
   store.messages.push({
@@ -296,9 +263,7 @@ test("enforce: a new actionable fact wakes exactly once; later scans do not dupl
     wakePolicy: "leader",
     createdAt: LATER.toISOString()
   });
-  const repaired = repairOrphanedActiveTasks(store, LATER, undefined, {
-    actionabilityMode: "enforce"
-  });
+  const repaired = repairOrphanedActiveTasks(store, LATER);
   assert.deepEqual(repaired, ["task-1"]);
   assert.deepEqual(store.pending.reasons, ["task-orphaned"]);
   assert.equal(store.pending.requestCount, 1);
@@ -306,21 +271,19 @@ test("enforce: a new actionable fact wakes exactly once; later scans do not dupl
   // Ten more scans of the same digest must not create a second wake: the
   // pending wakeup is the single durable claim, so later scans skip the Task.
   for (let i = 0; i < 10; i += 1) {
-    repairOrphanedActiveTasks(store, LATER, undefined, { actionabilityMode: "enforce" });
+    repairOrphanedActiveTasks(store, LATER);
   }
   assert.equal(store.pending.requestCount, 1);
   assert.deepEqual(store.pending.reasons, ["task-orphaned"]);
 });
 
-test("enforce: a failing actionability computation fails open and records the error", () => {
+test("a failing actionability computation fails open and records the error", () => {
   const store = orphanFakeStore();
   seedWaitingLeaderRun(store, "agent-run-1", NOW);
   store.listAgentRuns = () => {
     throw new Error("projection boom");
   };
-  const repaired = repairOrphanedActiveTasks(store, NOW, undefined, {
-    actionabilityMode: "enforce"
-  });
+  const repaired = repairOrphanedActiveTasks(store, NOW);
   assert.deepEqual(repaired, ["task-1"]);
   assert.deepEqual(
     store.progressCalls.map((call) => call.reason),
@@ -329,12 +292,10 @@ test("enforce: a failing actionability computation fails open and records the er
   assert.deepEqual(store.pending.reasons, ["task-orphaned"]);
 });
 
-test("enforce: a progress disposition always wakes even with a matching digest", () => {
+test("a progress disposition always wakes even with a matching digest", () => {
   const store = orphanFakeStore();
   seedWaitingLeaderRun(store, "agent-run-1", NOW, { disposition: "progress" });
-  const repaired = repairOrphanedActiveTasks(store, NOW, undefined, {
-    actionabilityMode: "enforce"
-  });
+  const repaired = repairOrphanedActiveTasks(store, NOW);
   assert.deepEqual(repaired, ["task-1"]);
   assert.deepEqual(store.pending.reasons, ["task-orphaned"]);
 });
@@ -372,18 +333,10 @@ test("E2E: waiting Task stays silent for 100 scans, then a new Review result wak
   });
 
   // 100 scans: zero new Leader Runs.
-  const suppressions = [];
   for (let i = 0; i < 100; i += 1) {
-    assert.deepEqual(
-      repairOrphanedActiveTasks(adapter, NOW, undefined, {
-        actionabilityMode: "enforce",
-        onSuppression: (entry) => suppressions.push(entry)
-      }),
-      []
-    );
+    assert.deepEqual(repairOrphanedActiveTasks(adapter, NOW), []);
   }
   assert.equal(adapter.getPendingWakeup(task.id), null);
-  assert.equal(suppressions.length, 100);
 
   // A new Review result arrives (WorkItem + Candidate + pending ReviewRound).
   const workItem = createWorkItem(
@@ -416,10 +369,7 @@ test("E2E: waiting Task stays silent for 100 scans, then a new Review result wak
   });
 
   // Exactly one wake.
-  assert.deepEqual(
-    repairOrphanedActiveTasks(adapter, LATER, undefined, { actionabilityMode: "enforce" }),
-    [task.id]
-  );
+  assert.deepEqual(repairOrphanedActiveTasks(adapter, LATER), [task.id]);
   const pending = adapter.getPendingWakeup(task.id);
   assert.ok(pending);
   assert.deepEqual(pending.reasons, ["task-orphaned"]);
@@ -427,7 +377,7 @@ test("E2E: waiting Task stays silent for 100 scans, then a new Review result wak
 
   // Ten concurrent scans must not create a second Leader Run.
   for (let i = 0; i < 10; i += 1) {
-    repairOrphanedActiveTasks(adapter, LATER, undefined, { actionabilityMode: "enforce" });
+    repairOrphanedActiveTasks(adapter, LATER);
   }
   const stillOne = adapter.getPendingWakeup(task.id);
   assert.ok(stillOne);
