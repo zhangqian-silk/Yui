@@ -23,7 +23,12 @@ import {
   type ReleaseIdempotencyStore
 } from "./releaseIdempotencyStore.js";
 import { isConcreteVersion } from "../domain/validation.js";
+import { resolveProject } from "../repository/project.js";
 import type { ReleaseStepPlan, ReleaseWorkflowSource } from "./releaseWorkflow.js";
+import {
+  resolveVerificationGate
+} from "../verification/verificationGateService.js";
+import { findL2ArtifactForCommit } from "../verification/gateArtifactStore.js";
 
 /**
  * The outcome of one external step attempt. A `timeout` means the request may
@@ -470,6 +475,38 @@ export function createReleaseWorkflowPorts(
           };
         }
         case "ci-confirm": {
+          // Issue 08: when the step binds a Project with a VerificationPlan,
+          // a local hermetic L2 GateArtifact for the exact frozen commit is
+          // first-class release evidence. It is recorded as local evidence
+          // (never disguised as CI); when absent or unverifiable, the step
+          // falls back to the predeclared CI query below.
+          const gateProjectId = params.projectId;
+          if (gateProjectId !== undefined && gateProjectId !== "" && !gateProjectId.startsWith("-")) {
+            const project = resolveProject(deps.projectStore.listProjects(), gateProjectId);
+            if (project !== null) {
+              const gate = resolveVerificationGate(project, process.env);
+              if (gate !== undefined) {
+                const artifact = await findL2ArtifactForCommit(deps.home, {
+                  projectId: project.id,
+                  commit: source.commit,
+                  planDigest: gate.planDigest,
+                  toolchainDigest: gate.toolchainDigest,
+                  targetRef: params.targetRef ?? "master"
+                });
+                if (artifact !== null) {
+                  return {
+                    outcome: "succeeded",
+                    externalId: `gate:${artifact.key}`,
+                    logs: [
+                      `ci-confirm: local hermetic L2 gate artifact ${artifact.key} `
+                        + `for ${source.commit} (plan ${gate.plan.id}@${gate.plan.version}); `
+                        + `not CI evidence`
+                    ]
+                  };
+                }
+              }
+            }
+          }
           // Bind the CI query to the exact frozen source commit AND a
           // predeclared workflow + branch, so an unrelated successful
           // workflow run on the same SHA cannot satisfy the release gate.
