@@ -429,10 +429,11 @@ export type TaskStore = {
   listAgentRuns(taskId: string): AgentRun[];
   saveAgentRun(run: AgentRun): void;
   /**
-   * Issue 04: SQLite-native pending retry query.  Optional so the file store
-   * keeps its in-memory scan; the adapter delegates here when available.
+   * Issue 04: pending Provider retry scan. Layout 7's authoritative SQLite
+   * store answers this with one indexed query; the legacy File store fails
+   * closed because in-place retry is a db-only control-plane capability.
    */
-  listPendingProviderRetries?(): ReadonlyArray<PendingProviderRetry>;
+  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry>;
   nextReviewRoundId(taskId: string): string;
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
@@ -1306,6 +1307,22 @@ export class FileTaskStore implements TaskStore {
   }
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
+  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
+    // The legacy File store can answer the empty case without a scan fallback.
+    // If durable retry state exists, the db-only capability must fail closed
+    // instead of silently losing the Controller's wake deadline.
+    for (const task of this.listTasks()) {
+      if (task.status !== "active") continue;
+      for (const run of this.listAgentRuns(task.id)) {
+        if (run.status === "active" && run.providerRetry?.nextAttemptAt !== undefined) {
+          throw new StorageRecordError(
+            "Provider retry in place requires the SQLite backend; run `yui update` to migrate this Home."
+          );
+        }
+      }
+    }
+    return [];
+  }
   saveAgentRun(run: AgentRun): void {
     const stored = identified<AgentRun>(
       run,

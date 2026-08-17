@@ -17,8 +17,8 @@ import {
   markAgentRunDelivered
 } from "../../dist/run/agentRun.js";
 import { computeYieldOutcomeDigest } from "../../dist/run/yieldReceipt.js";
+import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
-import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 import {
@@ -49,7 +49,8 @@ function fixture(t) {
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const home = join(root, "yui-home");
   ensureStorageSchema(home, FIRST);
-  const store = new FileTaskStore(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
   const agent = createConfiguredAgent("claude-primary", "claude", "claude", [], [], FIRST);
   const task = activateTask(createTask("task-1", "Yield receipt", FIRST, {
     cwd: home
@@ -84,6 +85,7 @@ function fixture(t) {
     tx.saveRole(task.id, leader);
     tx.saveRole(task.id, updateRoleStatus(worker, "running", FIRST));
     tx.saveWorkItem(task.id, item);
+    tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     let sessions = createRoleSessionSet(
       { scope: "task", taskId: task.id, roleName: worker.name },
@@ -216,7 +218,8 @@ test("a Controller restart after the commit replays the same receipt from durabl
   const committed = store.getAgentRun(task.id, run.id).yieldReceipt;
 
   // Simulate a Controller restart: a brand-new store over the same Home.
-  const restarted = new FileTaskStore(home);
+  const restarted = new SqliteTaskStore(home);
+  t.after(() => restarted.close());
   const replayed = yieldRun(restarted, task, run, summary);
   assert.equal(replayed.kind, "output");
   assert.equal(replayed.data.receipt.receiptId, committed.receiptId);

@@ -70,7 +70,8 @@ function fixture(t) {
   const { home } = createIsolatedRuntime(t);
   installMockProviderCommands(home, ["claude"]);
   ensureStorageSchema(home, BASE);
-  const store = new FileTaskStore(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
   const first = new Date(BASE.getTime());
   const second = new Date(BASE.getTime() + 1_000);
   const agent = createConfiguredAgent("claude-primary", "claude", "claude", [], [], first);
@@ -107,6 +108,7 @@ function fixture(t) {
     tx.saveRole(task.id, leader);
     tx.saveRole(task.id, updateRoleStatus(worker, "running", first));
     tx.saveWorkItem(task.id, item);
+    tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     let sessions = createRoleSessionSet(
       { scope: "task", taskId: task.id, roleName: worker.name },
@@ -363,7 +365,8 @@ test("a Controller restart resumes the same retry attempt lineage from durable s
   const nextAttemptAt = before.providerRetry.nextAttemptAt;
 
   // Simulate a Controller restart: a brand-new adapter over the same Home.
-  const restartedStore = new FileTaskStore(fx.home);
+  const restartedStore = new SqliteTaskStore(fx.home);
+  t.after(() => restartedStore.close());
   const restartedAdapter = new FileSchedulerStoreAdapter(restartedStore);
   const pending = restartedAdapter.listPendingProviderRetries();
   assert.equal(pending.length, 1);
@@ -454,4 +457,36 @@ test("SQLite stores answer pending retry scans with a native query", (t) => {
   }];
   assert.deepEqual(store.listPendingProviderRetries(), expected);
   assert.deepEqual(new FileSchedulerStoreAdapter(store).listPendingProviderRetries(), expected);
+});
+
+test("legacy File store fails closed only when durable retry state exists", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-provider-retry-file-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home, BASE);
+  const store = new FileTaskStore(home);
+  const task = activateTask(createTask("task-file", "File retry", BASE, { cwd: home }), BASE);
+  store.saveTask(task);
+  assert.deepEqual(new FileSchedulerStoreAdapter(store).listPendingProviderRetries(), []);
+
+  const retry = scheduleProviderRetry(undefined, {
+    errorClass: "transient-provider",
+    launchId: "launch-file",
+    nativeSessionId: "native-file",
+    lastErrorSummary: "upstream 500"
+  }, BASE);
+  const run = withProviderRetry(createAgentRun(
+    "agent-run-1",
+    task.id,
+    "worker",
+    "new",
+    "Do the work",
+    BASE,
+    { effective: testEffectiveLaunch({ adapterId: "claude" }) }
+  ), retry);
+  store.saveAgentRun(run);
+
+  assert.throws(
+    () => new FileSchedulerStoreAdapter(store).listPendingProviderRetries(),
+    /Provider retry in place requires the SQLite backend/
+  );
 });

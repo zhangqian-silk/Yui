@@ -27,8 +27,8 @@ import {
   markAgentRunDelivered
 } from "../../dist/run/agentRun.js";
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
+import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
-import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 import {
@@ -76,7 +76,8 @@ function fixture(t) {
   const { home } = createIsolatedRuntime(t);
   installMockProviderCommands(home, ["claude"]);
   ensureStorageSchema(home, BASE);
-  const store = new FileTaskStore(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
   const first = new Date(BASE.getTime());
   const second = new Date(BASE.getTime() + 1_000);
   const agent = createConfiguredAgent("claude-primary", "claude", "claude", [], [], first);
@@ -170,6 +171,7 @@ function fixture(t) {
     tx.saveWorkItem(task.id, item);
     tx.saveReviewRound(task.id, round);
     tx.saveManagedWorkspace(workspace);
+    tx.saveAgentRun(run);
     tx.saveActiveAgentRun(run);
     let sessions = createRoleSessionSet(
       { scope: "task", taskId: task.id, roleName: reviewer.name },

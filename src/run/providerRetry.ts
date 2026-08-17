@@ -130,8 +130,8 @@ export function markProviderRetryInFlight(
   now: Date
 ): AgentRunProviderRetry {
   if (value.nextAttemptAt === undefined) return value;
-  // Omit `nextAttemptAt` entirely (not `undefined`, which the file store
-  // rejects) so the projection is durably in-flight until the next outcome.
+  // Omit `nextAttemptAt` entirely so the projection is durably in-flight
+  // until the next outcome.
   const { nextAttemptAt: _nextAttemptAt, ...rest } = value;
   return validateAgentRunProviderRetry({
     ...rest,

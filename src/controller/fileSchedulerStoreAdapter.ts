@@ -2472,32 +2472,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    * Controller restart resumes the same attempt lineage.
    */
   listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
-    // SQLite-native stores answer with a single indexed query; the file
-    // store falls back to the per-Task in-memory sweep.
-    if (typeof this.store.listPendingProviderRetries === "function") {
-      return this.store.listPendingProviderRetries();
-    }
-    const pending: Array<{
-      taskId: string;
-      roleName: string;
-      runId: string;
-      nextAttemptAt: string;
-    }> = [];
-    for (const task of this.store.listTasks()) {
-      if (task.status !== "active") continue;
-      for (const run of this.store.listAgentRuns(task.id)) {
-        if (run.status !== "active" || run.providerRetry?.nextAttemptAt === undefined) {
-          continue;
-        }
-        pending.push({
-          taskId: task.id,
-          roleName: run.roleName,
-          runId: run.id,
-          nextAttemptAt: run.providerRetry.nextAttemptAt
-        });
-      }
-    }
-    return pending;
+    return this.store.listPendingProviderRetries();
   }
 
   /**
