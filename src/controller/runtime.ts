@@ -94,6 +94,7 @@ import {
   type RuntimePaneFact,
   type RuntimeResourceSampleIdentity
 } from "./resourceInventory.js";
+import { SessionOwnerReconciliation } from "./sessionOwnerReconciliation.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
   store?: TaskStore;
@@ -227,7 +228,27 @@ export async function startFileTaskControllerRuntime(
           })
     }
   );
-  const sessionHost = options.sessionHost ?? new TmuxSessionHost(planner, tmux);
+  const sessionOwners = new SessionOwnerReconciliation({
+    home,
+    store,
+    environment: options.environment,
+    tmux,
+    onWarning: options.onError
+  });
+  const sessionHost = options.sessionHost ?? new TmuxSessionHost(planner, tmux, {
+    onHostCreated: ({ binding, pane }) => {
+      sessionOwners.recordHostOwner({
+        owner: binding.owner,
+        agentId: binding.agentId,
+        adapterId: binding.adapterId,
+        launchId: binding.launchId,
+        ...(binding.nativeSessionId === undefined
+          ? {}
+          : { nativeSessionId: binding.nativeSessionId }),
+        ...(pane.pid === undefined ? {} : { panePid: pane.pid })
+      });
+    }
+  });
   const promptPush = options.promptPush
     ?? new TmuxPromptPushAdapter(tmux, agentProcessReadinessProbe);
   const runtimeIsolation = options.runtimeIsolation
@@ -253,9 +274,28 @@ export async function startFileTaskControllerRuntime(
             owners: Parameters<NonNullable<SessionHostPort["inspectOwners"]>>[0]
           ) => sessionHost.inspectOwners!(owners)
         }),
-    stopOwner: (owner: Parameters<SessionHostPort["stopOwner"]>[0]) => (
-      sessionHost.stopOwner(owner)
-    ),
+    stopOwner: (owner: Parameters<SessionHostPort["stopOwner"]>[0]) => {
+      // Issue 03: in exact-owner-cleanup mode the durable `stopped`
+      // transition is gated on physical exit proof. Report mode keeps the
+      // legacy tmux-only stop unchanged.
+      if (sessionOwners.mode === "exact-owner-cleanup") {
+        return sessionOwners.terminateOwner(owner).then((result) => {
+          if (result.outcome === "stop-blocked") {
+            (options.onError ?? (() => undefined))(
+              new Error(
+                `Role runtime cleanup could not prove physical exit: ${
+                  result.remaining
+                    .map(({ record, detail }) => `${record.launchId}: ${detail}`)
+                    .join("; ")
+                }`
+              )
+            );
+          }
+          return result.outcome === "stop-confirmed";
+        });
+      }
+      return sessionHost.stopOwner(owner);
+    },
     ...(runtimeIsolation.cleanupTaskLaunch === undefined
       ? {}
       : {
@@ -526,6 +566,24 @@ export async function startFileTaskControllerRuntime(
   );
   runningController = running;
   runningRuntime = running.runtime;
+  // Issue 03: read-only startup reconciliation. Surfaces durable/physical
+  // Session mismatches (including generations whose durable map was cleared)
+  // without changing stop or archive behavior. Cleanup stays an explicit
+  // Operator action in exact-owner-cleanup mode.
+  try {
+    const startupReport = sessionOwners.report("report");
+    if (startupReport.summary.livePhysicalRoots > 0) {
+      (options.onError ?? (() => undefined))(
+        new Error(
+          `Session reconciliation: ${startupReport.summary.livePhysicalRoots} `
+            + `live physical root(s) across ${startupReport.summary.owners} owner record(s); `
+            + "run `yui session reconcile --report` for details."
+        )
+      );
+    }
+  } catch (error) {
+    (options.onError ?? (() => undefined))(error);
+  }
   return {
     ...running,
     close: async () => {

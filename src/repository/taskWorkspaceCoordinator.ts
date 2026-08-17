@@ -32,6 +32,14 @@ export type TaskRoleRuntimeStopper = Readonly<{
     roleName: string;
     dead: boolean;
   }>[];
+  /**
+   * Issue 03 archive postcondition. Proves the Task owns no live physical
+   * Session resources (Provider roots, tmux panes) before its workspaces are
+   * deleted. Implementations must no-op in the default `report` reconcile
+   * mode; in `exact-owner-cleanup` mode they throw
+   * {@link WorkspaceCleanupBlockedError} while owned resources remain live.
+   */
+  assertTaskPhysicalResourcesReleased?(taskId: string): Promise<void>;
 }>;
 
 type TaskArchiveSnapshot = Readonly<{
@@ -303,6 +311,7 @@ export class TaskWorkspaceCoordinator {
       if (roleNames.length > 0) {
         await this.runtime.stopTaskRoleSessions(taskId, roleNames);
       }
+      await this.runtime.assertTaskPhysicalResourcesReleased?.(task.id);
       this.#assertTaskArchiveSnapshot(snapshot);
       for (const workspace of laneWorkspaces) {
         this.#assertTaskArchiveLifecycle(task);

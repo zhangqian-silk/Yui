@@ -25,6 +25,8 @@ import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
 import { assertControllerStatusIdentity } from "../runtime/exactControlPlane.js";
 import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
+import { SessionOwnerReconciliation } from "./sessionOwnerReconciliation.js";
+import { WorkspaceCleanupBlockedError } from "../repository/taskWorkspacePreparer.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 // A lifecycle RPC may legitimately occupy the Controller for 30 seconds.
@@ -626,6 +628,44 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
         );
       }
     }
+  }
+
+  /**
+   * Issue 03 archive postcondition. In the default `report` mode this is a
+   * no-op: archive behavior is unchanged. In `exact-owner-cleanup` mode it
+   * re-verifies physical absence after the runtime stop and blocks archive
+   * while any owned Provider root is still live, preserving the owner
+   * records for Operator recovery.
+   */
+  async assertTaskPhysicalResourcesReleased(taskId: string): Promise<void> {
+    const reconciliation = new SessionOwnerReconciliation({
+      home: this.home,
+      store: this.store,
+      environment: this.clientOptions.environment,
+      tmux: this.tmux
+    });
+    if (reconciliation.mode === "report") return;
+    const records = reconciliation.registry.list().filter((record) => (
+      record.owner.scope === "task" && record.owner.taskId === taskId
+    ));
+    if (records.length === 0) return;
+    const report = reconciliation.report("exact-owner-cleanup");
+    const blockers = report.entries.filter((entry) => (
+      entry.owner.scope === "task"
+      && entry.owner.taskId === taskId
+      && entry.archiveBlocked
+    ));
+    if (blockers.length === 0) return;
+    throw new WorkspaceCleanupBlockedError(
+      "physical-resource-live",
+      `task:${taskId}`,
+      true,
+      `Task archive blocked: ${blockers.length} owned physical resource(s) still live: `
+        + blockers.map((entry) => (
+          `${entry.owner.roleName}/${entry.launchId}`
+            + ` (pid ${entry.physical?.alive === true ? entry.physical.pid : "?"})`
+        )).join("; ")
+    );
   }
 
   async stopGlobalRoleSession(roleName: string): Promise<void> {
