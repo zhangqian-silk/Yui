@@ -1,7 +1,6 @@
 import { leaderNextActionMode } from "../config/yuiConfig.js";
 import { usageError } from "../errors/cliError.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { collectNextActionFacts } from "../task/nextAction.js";
 import {
   detectDeliveryDuplicates,
   evaluateDeliveryGuard,
@@ -43,7 +42,7 @@ export function runDeliveryGuardPreflight(
     options.environment
   );
   if (mode === "display") return { warnings: [] };
-  const facts = collectNextActionFacts(store, taskId);
+  const facts = store.readNextActionFacts(taskId);
   if (facts === null) return { warnings: [] };
   const outcome = evaluateDeliveryGuard(
     detectDeliveryDuplicates(facts, intent),

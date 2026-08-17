@@ -167,11 +167,6 @@ async function start(
   if (!task.projectBindings.some(({ projectId }) => projectId === project.id)) {
     throw usageError(`Project does not belong to Task: ${project.id}.`);
   }
-  const guard = runDeliveryGuardPreflight(store, task.id, {
-    kind: "integration-start",
-    projectId: project.id,
-    changeSetIds
-  }, { environment: options.environment, budget: true });
   const mainWorkspace = store.getTaskWorkspace(task.id);
   const mainEntry = mainWorkspace === null
     ? undefined
@@ -181,7 +176,16 @@ async function start(
     throw usageError(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
   const expectedHead = (await new NodeGitWorkspace().inspect(project.path, targetRef)).baseCommit;
+  // The duplicate/budget preflight runs inside the same transaction as the
+  // attempt insert: on the single-writer SQLite backend the check and the
+  // record creation are atomic, so a concurrent Leader cannot sneak a
+  // duplicate Integration between the guard and the write.
   const integration = store.transaction((tx) => {
+    const guard = runDeliveryGuardPreflight(tx, task.id, {
+      kind: "integration-start",
+      projectId: project.id,
+      changeSetIds
+    }, { environment: options.environment, budget: true });
     const created = createIntegrationAttempt({
       id: tx.nextIntegrationAttemptId(task.id),
       taskId: task.id,
@@ -192,12 +196,12 @@ async function start(
       checkCommands: parsed.many.get("--check") ?? []
     }, now());
     tx.saveIntegrationAttempt(task.id, created);
-    return created;
+    return { attempt: created, guard };
   });
-  const result = await runIntegration(store, home, integration, now, options);
+  const result = await runIntegration(store, home, integration.attempt, now, options);
   return {
     ...result,
-    output: withGuardWarnings(guard, result.output)
+    output: withGuardWarnings(integration.guard, result.output)
   };
 }
 

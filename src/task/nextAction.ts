@@ -70,42 +70,6 @@ export type NextActionFacts = Readonly<{
   leaderRuns: readonly AgentRun[];
 }>;
 
-/** The smallest read-only store surface the projection needs. */
-export type NextActionReadStore = Readonly<{
-  getTask(taskId: string): Task | null;
-  listWorkItems(taskId: string): readonly WorkItem[];
-  listChangeSets(taskId: string): readonly ChangeSet[];
-  listIntegrationAttempts(taskId: string): readonly IntegrationAttempt[];
-  listReviewRounds(taskId: string): readonly ReviewRound[];
-  listInputRequests(taskId: string): readonly InputRequest[];
-  listAgentRuns(taskId: string): readonly AgentRun[];
-}>;
-
-export function collectNextActionFacts(
-  store: NextActionReadStore,
-  taskId: string
-): NextActionFacts | null {
-  const task = store.getTask(taskId);
-  if (task === null) return null;
-  return {
-    task: {
-      id: task.id,
-      status: task.status,
-      projectBindings: task.projectBindings
-    },
-    workItems: store.listWorkItems(taskId),
-    changeSets: store.listChangeSets(taskId),
-    integrations: store.listIntegrationAttempts(taskId),
-    reviewRounds: store.listReviewRounds(taskId),
-    openInputRequests: store.listInputRequests(taskId)
-      .filter((request) => request.status === "open"),
-    activeRuns: store.listAgentRuns(taskId)
-      .filter((run) => run.status === "active"),
-    leaderRuns: store.listAgentRuns(taskId)
-      .filter((run) => run.roleName === "leader")
-  };
-}
-
 const OPEN_WORK_ITEM_STATUSES = new Set(["pending", "running", "awaiting_acceptance"]);
 
 export function projectNextAction(facts: NextActionFacts): NextAction {

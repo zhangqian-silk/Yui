@@ -43,6 +43,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     const reviewRounds = chronological(reader.listReviewRounds(task.id));
     const changeSets = chronological(reader.listChangeSets(task.id));
     const integrations = chronological(reader.listIntegrationAttempts(task.id));
+    const nextActionFacts = reader.readNextActionFacts(task.id);
+    if (nextActionFacts === null) {
+      throw new Error(`Task next-action facts disappeared: ${task.id}.`);
+    }
     return {
       task,
       execution,
@@ -66,20 +70,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       openInputRequests: inputRequests.filter((request) => request.status === "open"),
       resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
       events: reader.listEvents(task.id),
-      nextAction: projectNextAction({
-        task: {
-          id: task.id,
-          status: task.status,
-          projectBindings: task.projectBindings
-        },
-        workItems,
-        changeSets,
-        integrations,
-        reviewRounds,
-        openInputRequests: inputRequests.filter((request) => request.status === "open"),
-        activeRuns: agentRuns.filter((run) => run.status === "active"),
-        leaderRuns: agentRuns.filter((run) => run.roleName === "leader")
-      })
+      nextAction: projectNextAction(nextActionFacts)
     };
   });
   const {

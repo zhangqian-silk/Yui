@@ -111,6 +111,7 @@ import {
 } from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import { validateTask, type Task } from "../task/task.js";
+import type { NextActionFacts } from "../task/nextAction.js";
 import {
   formatAgentRunReceiptId,
   TASK_RECORD_ID_PREFIXES,
@@ -383,6 +384,12 @@ export type TaskStore = {
   /** Current durable state revision; advances once per committed mutation. */
   getStateRevision(): number;
   getTask(id: string): Task | null;
+  /**
+   * Issue 07 (Leader convergence): load exactly the records the next-action
+   * projection consumes, filtered at the storage boundary (open Inputs,
+   * active/leader Runs). Returns null when the Task does not exist.
+   */
+  readNextActionFacts(taskId: string): NextActionFacts | null;
   getReviewConfig(): ReviewConfig | null;
   getTaskBrief(taskId: string): TaskBrief | null;
   saveTaskBrief(taskId: string, brief: TaskBrief): void;
@@ -846,6 +853,26 @@ export class FileTaskStore implements TaskStore {
   }
   getStateRevision(): number { return this.#state().revision; }
   getTask(id: string): Task | null { return optional(this.#state().tasks[id]?.task); }
+  readNextActionFacts(taskId: string): NextActionFacts | null {
+    const aggregate = this.#state().tasks[taskId];
+    if (aggregate === undefined) return null;
+    const agentRuns = values(aggregate.agentRuns, "id");
+    return {
+      task: {
+        id: aggregate.task.id,
+        status: aggregate.task.status,
+        projectBindings: aggregate.task.projectBindings
+      },
+      workItems: values(aggregate.workItems, "id"),
+      changeSets: values(aggregate.changeSets, "id"),
+      integrations: values(aggregate.integrationAttempts, "id"),
+      reviewRounds: values(aggregate.reviewRounds, "id"),
+      openInputRequests: values(aggregate.inputRequests, "id")
+        .filter((request) => request.status === "open"),
+      activeRuns: agentRuns.filter((run) => run.status === "active"),
+      leaderRuns: agentRuns.filter((run) => run.roleName === "leader")
+    };
+  }
   getReviewConfig(): ReviewConfig | null {
     return optional(this.#state().config.review);
   }

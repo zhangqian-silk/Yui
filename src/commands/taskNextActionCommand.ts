@@ -1,7 +1,6 @@
 import { taskNotFound, usageError } from "../errors/cliError.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
-  collectNextActionFacts,
   projectNextAction,
   type NextAction,
   type NextActionFacts
@@ -31,7 +30,7 @@ export function runTaskNextActionCommand(
   }
   const taskId = positionals[0].trim();
   const data = store.transaction((reader) => {
-    const facts = collectNextActionFacts(reader, taskId);
+    const facts = reader.readNextActionFacts(taskId);
     if (facts === null) throw taskNotFound(taskId);
     const action = projectNextAction(facts);
     const repairWave = repairWaveFor(action, facts);
