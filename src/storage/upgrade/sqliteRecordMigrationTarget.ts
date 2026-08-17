@@ -56,6 +56,7 @@ import {
   inspectSnapshotVersionState,
   type HomeSnapshot
 } from "./homeMigrationTarget.js";
+import { writeSwitchProgress } from "./switchProgress.js";
 import {
   COMMITTED_DATABASE_FILENAME,
   STAGED_DATABASE_FILENAME,
@@ -212,6 +213,7 @@ export function createSqliteRecordMigrationTarget(
           try {
             promoteRename(backupPath, committedDbPath);
           } catch {
+            writeInterruptedMarker(home, backupPath, stagedDbPath, now);
             throw new AmbiguousSwitchError({
               homePath: home,
               backupPath,
@@ -245,6 +247,7 @@ export function createSqliteRecordMigrationTarget(
             rmSync(committedDbPath, { force: true });
           }
         } catch {
+          writeInterruptedMarker(home, backupPath ?? committedDbPath, stagedDbPath, now);
           throw new AmbiguousSwitchError({
             homePath: home,
             backupPath: backupPath ?? committedDbPath,
@@ -342,4 +345,31 @@ function parseJsonObject(raw: string, label: string): Record<string, unknown> {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Persist the durable `interrupted` switch-progress marker for an ambiguous
+ * SQLite switch (P1-4): the original database was moved to its timestamped
+ * backup and neither the promotion nor its rollback completed. The marker is
+ * the honest durable signal — a completion receipt is never written for a
+ * switch that did not commit. Best-effort: the backup and on-disk state still
+ * recover the Home even if the marker write fails.
+ */
+function writeInterruptedMarker(
+  home: string,
+  backupPath: string,
+  stagingPath: string,
+  now: () => Date
+): void {
+  try {
+    writeSwitchProgress(home, {
+      phase: "interrupted",
+      homePath: home,
+      backupPath,
+      stagingPath,
+      updatedAt: now().toISOString()
+    });
+  } catch {
+    // Marker best-effort; the backup + on-disk state still recover the Home.
+  }
 }

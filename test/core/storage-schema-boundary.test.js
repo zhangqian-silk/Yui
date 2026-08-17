@@ -13,7 +13,8 @@ import {
 } from "../../dist/storage/storageSchema.js";
 import {
   createEmptyRegistry,
-  createProductionRegistry
+  createProductionRegistry,
+  runMigration
 } from "../../dist/storage/migration/index.js";
 import { classifyHome } from "../../dist/storage/upgrade/homeClassification.js";
 import {
@@ -21,6 +22,7 @@ import {
   latestStorageVersionState
 } from "../../dist/storage/upgrade/recordVersions.js";
 import { inspectSourceVersionState } from "../../dist/storage/upgrade/homeMigrationTarget.js";
+import { createSqliteMigrationTarget } from "../../dist/storage/upgrade/sqliteMigrationTarget.js";
 import { runStorageUpgrade } from "../../dist/storage/upgrade/upgradeOrchestrator.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 
@@ -139,6 +141,39 @@ function currentHome() {
   return home;
 }
 
+/**
+ * A healthy current Home whose authoritative backend is `yui.db` (Issue 01):
+ * built through the real 6→7 staged migration, so the fixture is a genuine
+ * post-migration Home with `yui.db` + persistent receipt + `state.json`
+ * retained. A layout-7 Home without `yui.db` is a pseudo-layout-7 Home, not a
+ * current Home, so tests that assert current-Home verdicts must use this.
+ * `configure` optionally adjusts the config before it rides through the
+ * migration into `yui.db`.
+ */
+function healthyLayout7Home(configure) {
+  const home = temporaryHome();
+  ensureStorageSchema(home);
+  const store = new FileTaskStore(home);
+  const config = store.getConfig();
+  store.saveConfig(configure ? configure(config) : config);
+  const manifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
+  manifest.storageVersion = 6;
+  writeFileSync(join(home, "schema.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const migrationTarget = createSqliteMigrationTarget({
+    home,
+    latest: latestStorageVersionState(),
+    registry: createProductionRegistry()
+  });
+  const migration = runMigration({
+    registry: createProductionRegistry(),
+    target: migrationTarget,
+    latest: latestStorageVersionState(),
+    mode: "execute"
+  });
+  assert.equal(migration.outcome, "migrated");
+  return home;
+}
+
 function setConfiguredAgentMemberVersions(home, versions) {
   const store = new FileTaskStore(home);
   store.saveConfig(store.getConfig());
@@ -160,20 +195,17 @@ function classify(home) {
 }
 
 test("a current Home classifies USABLE under the empty registry", () => {
-  const result = classify(currentHome());
+  const result = classify(healthyLayout7Home());
   assert.equal(result.classification.verdict, "USABLE");
   assert.equal(result.layoutVersion, CURRENT_STORAGE_LAYOUT_VERSION);
   assert.equal(result.aggregateVersion, CURRENT_AGGREGATE_SCHEMA_VERSION);
 });
 
 test("final review policy is fenced from aggregate-v16 consumers", () => {
-  const home = temporaryHome();
-  ensureStorageSchema(home);
-  const store = new FileTaskStore(home);
-  store.saveConfig({
-    ...store.getConfig(),
+  const home = healthyLayout7Home((config) => ({
+    ...config,
     review: { roleName: "reviewer", trigger: "final" }
-  });
+  }));
 
   const current = latestStorageVersionState();
   const legacyV16 = { ...current, aggregate: 16 };

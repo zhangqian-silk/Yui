@@ -24,7 +24,8 @@ import {
   CURRENT_STORED_TASK_SCHEMA_VERSION,
   CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION
 } from "../dist/storage/taskStore.js";
-import { MigrationRegistry, createEmptyRegistry, planMigration } from "../dist/storage/migration/index.js";
+import { MigrationRegistry, createEmptyRegistry, planMigration, runMigration } from "../dist/storage/migration/index.js";
+import { createProductionRegistry } from "../dist/storage/migration/productionRegistry.js";
 import {
   latestStorageVersionState,
   currentRecordVersions,
@@ -32,6 +33,7 @@ import {
 } from "../dist/storage/upgrade/recordVersions.js";
 import { classifyHome } from "../dist/storage/upgrade/homeClassification.js";
 import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
+import { createSqliteMigrationTarget } from "../dist/storage/upgrade/sqliteMigrationTarget.js";
 import {
   inspectHomeRuntime,
   homeRuntimeIsActive,
@@ -80,6 +82,32 @@ function currentHome() {
   const store = new FileTaskStore(home);
   store.saveConfig({ ...store.getConfig(), timeZone: "UTC" });
   return { base, home };
+}
+
+/**
+ * Issue 01: promote a file-backend fixture Home to a healthy layout-7 Home
+ * (yui.db + persistent receipt, state.json retained) through the real 6→7
+ * staged migration, so the fixture is a genuine current Home rather than a
+ * pseudo-layout-7 one. The records already persisted to state.json ride
+ * through the migration into yui.db.
+ */
+function migrateFixtureToLayout7(home) {
+  const manifest = JSON.parse(readFileSync(join(home, "schema.json"), "utf8"));
+  manifest.storageVersion = 6;
+  writeFileSync(join(home, "schema.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const migrationTarget = createSqliteMigrationTarget({
+    home,
+    latest: latestStorageVersionState(),
+    registry: createProductionRegistry()
+  });
+  const migration = runMigration({
+    registry: createProductionRegistry(),
+    target: migrationTarget,
+    latest: latestStorageVersionState(),
+    mode: "execute"
+  });
+  assert.equal(migration.outcome, "migrated");
+  return home;
 }
 
 /**
@@ -323,7 +351,9 @@ test("P1-1 map completeness: current persisted workspace family is ManagedWorksp
 });
 
 test("P2 map guard: current non-empty StorageState and StoredTask families are USABLE", async () => {
-  const { home, taskId, roleName, runId } = currentHomeWithBoundaryRecords();
+  const fixture = currentHomeWithBoundaryRecords();
+  migrateFixtureToLayout7(fixture.home);
+  const { home, taskId, roleName, runId } = fixture;
   const store = new FileTaskStore(home);
   assert.equal(store.getConfig().schemaVersion, CURRENT_CONFIG_SCHEMA_VERSION);
   assert.equal(store.getActiveAgentRun(taskId, roleName)?.id, runId);
@@ -486,7 +516,9 @@ test("P2 map guard preserves corruption for missing boundary schemaVersion", () 
 });
 
 test("P1-1 map guard: non-empty current RoleSessionSet and AgentRun Home is USABLE", async () => {
-  const { home, taskId, roleName, runId } = currentHomeWithTaskRoleRecords();
+  const fixture = currentHomeWithTaskRoleRecords();
+  migrateFixtureToLayout7(fixture.home);
+  const { home, taskId, roleName, runId } = fixture;
   const store = new FileTaskStore(home);
   const sessions = store.getTaskRoleSessionSet(taskId, roleName);
   const run = store.getAgentRun(taskId, runId);

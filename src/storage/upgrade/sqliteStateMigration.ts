@@ -743,11 +743,15 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
 
     // Home identity + revision continuity.
     const meta = db.prepare(
-      "SELECT home_identity, revision, aggregate_version FROM home_meta WHERE id = 1"
-    ).get() as { home_identity: string; revision: number; aggregate_version: number };
+      "SELECT home_identity, revision FROM home_meta WHERE id = 1"
+    ).get() as { home_identity: string; revision: number };
 
     const state: Record<string, unknown> = {
-      schemaVersion: meta.aggregate_version,
+      // The state document's `schemaVersion` is the Yui aggregate version,
+      // sourced from the durable manifest (the version contract). The
+      // `home_meta.aggregate_version` column is the SQLite database's own
+      // schema version (SQLITE_AGGREGATE_VERSION), a different fact.
+      schemaVersion: manifest.aggregateSchemaVersion,
       revision: meta.revision,
       homeIdentity: JSON.parse(meta.home_identity) as unknown,
       configuredAgents: {},

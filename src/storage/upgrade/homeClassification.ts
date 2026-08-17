@@ -133,7 +133,15 @@ export function classifyHome<Snapshot>(
   // both `state.json` and `yui.db` but no persistent migration receipt is an
   // ambiguous dual-copy conflict. These are physical-backend facts, not
   // version verdicts, so they are decided before the pure classifier runs.
-  if (source.layout === latest.layout && latest.layout >= 7) {
+  //
+  // The invariant only binds a Home whose manifest is already current on every
+  // axis. A Home with an unsupported manifest (an older/future layout or
+  // aggregate, or a pre-baseline/older/future record family) is fenced by
+  // version policy first: the repair path itself requires a current layout-7
+  // manifest, so routing such a Home to a physical-backend verdict would both
+  // mislabel the blocker and send upgrade down a path that cannot finish. The
+  // pure classifier below owns every version verdict.
+  if (schema.status === "current" && source.layout === latest.layout && latest.layout >= 7) {
     const physical = inspectLayout7PhysicalBackend(home);
     if (physical !== undefined) {
       return {
