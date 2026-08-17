@@ -13,12 +13,14 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 
+import Database from "better-sqlite3";
+
 import {
   CURRENT_AGGREGATE_SCHEMA_VERSION,
   CURRENT_STORAGE_LAYOUT_VERSION
 } from "../storage/storageVersions.js";
-import { resolveTaskStoreBackend } from "../storage/sqliteStore.js";
-import { resolveStoreWorkerEnabled } from "../storage/storeRpc.js";
+import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
+import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
 
 export const UNSUPPORTED = "unsupported" as const;
 export type Unsupported = typeof UNSUPPORTED;
@@ -59,7 +61,7 @@ export type RuntimeBuildIdentity = Readonly<{
 
 export type StorageIdentityFinding = Readonly<{
   code: string;
-  severity: "contradiction" | "warning";
+  severity: "contradiction" | "needs-repair" | "warning";
   message: string;
   remediation: string;
 }>;
@@ -69,7 +71,7 @@ export type StorageIdentity = Readonly<{
   manifestStatus: "current" | "uninitialized" | "invalid" | "unsupported";
   logicalLayout: number | Unsupported;
   aggregateSchemaVersion: number | Unsupported;
-  /** Backend selected by THIS process environment (YUI_STORE_BACKEND). */
+  /** Backend ordinary startup opens for this Home (manifest + env aware). */
   configuredBackend: "file" | "sqlite";
   /** Worker selected by THIS process environment (YUI_STORE_WORKER). */
   workerEnabled: boolean;
@@ -79,13 +81,19 @@ export type StorageIdentity = Readonly<{
     bytes: number | Unsupported;
     wal: boolean;
     shm: boolean;
+    /** `PRAGMA quick_check` result when yui.db exists, else `unsupported`. */
+    health: "ok" | "corrupt" | "unopenable" | Unsupported;
   }>;
+  /** Whether a persistent migration receipt certifies the file→db switch. */
+  hasMigrationReceipt: boolean;
   findings: readonly StorageIdentityFinding[];
 }>;
 
 export type StorageHealth = Readonly<{
+  status: "ok" | "degraded" | "fail";
   healthy: boolean;
   contradictions: readonly StorageIdentityFinding[];
+  needsRepair: readonly StorageIdentityFinding[];
   warnings: readonly StorageIdentityFinding[];
 }>;
 
@@ -93,10 +101,18 @@ export function evaluateStorageHealth(identity: StorageIdentity): StorageHealth 
   const contradictions = identity.findings.filter(
     ({ severity }) => severity === "contradiction"
   );
+  const needsRepair = identity.findings.filter(
+    ({ severity }) => severity === "needs-repair"
+  );
   const warnings = identity.findings.filter(
     ({ severity }) => severity === "warning"
   );
-  return { healthy: contradictions.length === 0, contradictions, warnings };
+  const status = contradictions.length > 0
+    ? "fail"
+    : needsRepair.length > 0
+      ? "degraded"
+      : "ok";
+  return { status, healthy: status === "ok", contradictions, needsRepair, warnings };
 }
 
 /**
@@ -214,6 +230,8 @@ export type StorageIdentityPorts = Readonly<{
   readText(path: string): string | null;
   fileSize(path: string): number | null;
   exists(path: string): boolean;
+  /** Open yui.db read-only and run PRAGMA quick_check. Null when absent. */
+  probeDatabaseHealth(path: string): "ok" | "corrupt" | "unopenable" | null;
 }>;
 
 export function createProductionStorageIdentityPorts(
@@ -235,7 +253,21 @@ export function createProductionStorageIdentityPorts(
         return null;
       }
     },
-    exists: (path) => existsSync(path)
+    exists: (path) => existsSync(path),
+    probeDatabaseHealth: (path) => {
+      if (!existsSync(path)) return null;
+      try {
+        const db = new Database(path, { readonly: true });
+        try {
+          const integrity = db.pragma("quick_check", { simple: true });
+          return integrity === "ok" ? "ok" : "corrupt";
+        } finally {
+          db.close();
+        }
+      } catch {
+        return "unopenable";
+      }
+    }
   };
 }
 
@@ -297,24 +329,71 @@ export function collectStorageIdentity(
   const walPresent = ports.exists(`${dbPath}-wal`);
   const shmPresent = ports.exists(`${dbPath}-shm`);
 
-  const configuredBackend = resolveTaskStoreBackend(ports.env);
-  const workerEnabled = resolveStoreWorkerEnabled(ports.env);
+  const configuredBackend = resolveTaskStoreBackendForHome(home, ports.env);
+  const workerEnabled = resolveStoreWorkerEnabledForHome(home, ports.env);
+  const dbHealth = dbPresent ? ports.probeDatabaseHealth(dbPath) : null;
+  const hasMigrationReceipt = ports.exists(join(home, "migration-receipt.json"));
   const findings: StorageIdentityFinding[] = [];
 
-  if (
-    manifestStatus === "current"
+  // A readable state.json is a JSON object (the file store's record container).
+  // Pseudo-layout-7 is only repairable when state.json is a valid fallback.
+  const stateText = statePresent ? ports.readText(statePath) : null;
+  let stateReadable = false;
+  if (stateText !== null) {
+    try {
+      const parsed = JSON.parse(stateText) as unknown;
+      stateReadable = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+    } catch {
+      stateReadable = false;
+    }
+  }
+
+  const layout7 = manifestStatus === "current"
     && typeof logicalLayout === "number"
-    && logicalLayout >= CURRENT_STORAGE_LAYOUT_VERSION
-    && !dbPresent
-  ) {
+    && logicalLayout >= CURRENT_STORAGE_LAYOUT_VERSION;
+
+  if (layout7 && !dbPresent) {
+    if (stateReadable) {
+      // Pseudo-layout-7: manifest claims SQLite WAL but yui.db was never
+      // materialized. state.json is the readable fallback; `yui upgrade`
+      // rebuilds yui.db from it. This is the recognized NEEDS_STORAGE_REPAIR
+      // state, not a hard contradiction — the file store is legitimately
+      // serving until repair runs.
+      findings.push({
+        code: "pseudo-layout-7",
+        severity: "needs-repair",
+        message: `Manifest declares layout ${logicalLayout} (SQLite WAL) but `
+          + `${dbPath} does not exist; state.json is the only authoritative `
+          + "copy (pseudo-layout-7).",
+        remediation: "Run `yui upgrade` to rebuild yui.db from state.json."
+      });
+    } else {
+      findings.push({
+        code: "no-authoritative-backend",
+        severity: "contradiction",
+        message: `Manifest declares layout ${logicalLayout} but neither `
+          + "yui.db nor a readable state.json exists; there is no "
+          + "authoritative backend.",
+        remediation: "Restore one copy from a backup; do not guess which is newer."
+      });
+    }
+  }
+  if (dbPresent && dbHealth !== null && dbHealth !== "ok") {
     findings.push({
-      code: "layout7-missing-database",
+      code: "database-unhealthy",
       severity: "contradiction",
-      message: `Manifest declares layout ${logicalLayout} (SQLite WAL) but `
-        + `${dbPath} does not exist; the file store is serving a layout-7 Home.`,
-      remediation: "Run the storage migration (YUI_STORE_BACKEND=sqlite) to "
-        + "materialize yui.db, or restore the pre-layout-7 state.json backup. "
-        + "Do not trust `doctor` layout output alone until this is resolved."
+      message: `yui.db exists but failed integrity check (${dbHealth}).`,
+      remediation: "Restore yui.db from backup, or run `yui upgrade` to rebuild "
+        + "it from state.json."
+    });
+  }
+  if (dbPresent && statePresent && !hasMigrationReceipt && layout7) {
+    findings.push({
+      code: "dual-copy-conflict",
+      severity: "contradiction",
+      message: "Both state.json and yui.db exist without a migration receipt; "
+        + "the authoritative copy is ambiguous.",
+      remediation: "Restore one copy from a backup; do not guess which is newer."
     });
   }
   if (configuredBackend === "sqlite" && !dbPresent) {
@@ -323,7 +402,7 @@ export function collectStorageIdentity(
       severity: "contradiction",
       message: "YUI_STORE_BACKEND=sqlite is set but no yui.db exists; the "
         + "SQLite store cannot open this Home.",
-      remediation: "Run the storage migration to create yui.db, or unset "
+      remediation: "Run `yui upgrade` to create yui.db, or unset "
         + "YUI_STORE_BACKEND to keep using the file store explicitly."
     });
   }
@@ -335,11 +414,10 @@ export function collectStorageIdentity(
     findings.push({
       code: "database-present-but-file-backend",
       severity: "warning",
-      message: "yui.db exists but YUI_STORE_BACKEND is not sqlite; this "
-        + "process is serving state.json, not the database.",
-      remediation: "If the SQLite migration completed, set "
-        + "YUI_STORE_BACKEND=sqlite (and YUI_STORE_WORKER=1 for the worker); "
-        + "otherwise remove the stale yui.db."
+      message: "yui.db exists but the file backend is selected; this process "
+        + "is serving state.json, not the database.",
+      remediation: "Unset YUI_STORE_BACKEND to let the Home manifest select "
+        + "SQLite, or remove the stale yui.db."
     });
   }
   const rawWorkerFlag = ports.env.YUI_STORE_WORKER;
@@ -357,7 +435,15 @@ export function collectStorageIdentity(
         + "unset YUI_STORE_WORKER."
     });
   }
-  if (configuredBackend === "file" && !statePresent && manifestStatus === "current") {
+  // Only fire for pre-layout-7 Homes where the file store is the legitimate
+  // backend. A layout-7 Home without state.json is already covered by
+  // no-authoritative-backend above (the file store is just a fallback there).
+  if (
+    configuredBackend === "file"
+    && !statePresent
+    && manifestStatus === "current"
+    && !(typeof logicalLayout === "number" && logicalLayout >= CURRENT_STORAGE_LAYOUT_VERSION)
+  ) {
     findings.push({
       code: "file-store-missing-state",
       severity: "contradiction",
@@ -383,7 +469,10 @@ export function collectStorageIdentity(
       bytes: dbBytes ?? UNSUPPORTED,
       wal: walPresent,
       shm: shmPresent
+      ,
+      health: dbHealth ?? UNSUPPORTED
     },
+    hasMigrationReceipt,
     findings
   };
 }

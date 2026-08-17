@@ -243,7 +243,8 @@ export function renderExecutionAudit(
     const storage = report.storage.data;
     lines.push(
       "",
-      `Disk: state.json ${formatBytes(storage.stateJsonBytes)} · runtime/ ${formatBytes(storage.runtimeDirBytes)} · deployments ${formatBytes(storage.deploymentsBytes)}`
+      `Storage: backend ${storage.backend} · state.json ${formatBytes(storage.stateJsonBytes)} · yui.db ${formatBytes(storage.databaseBytes)}`
+      + ` · runtime/ ${formatBytes(storage.runtimeDirBytes)} · deployments ${formatBytes(storage.deploymentsBytes)}`
     );
   } else {
     lines.push("", ...sectionError("storage", report));

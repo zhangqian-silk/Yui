@@ -393,7 +393,10 @@ export async function main(): Promise<void> {
           false,
           { ...snapshot, identity: { build, storage, runtime, mismatch } }
         );
-        if (!evaluateStorageHealth(storage).healthy) process.exitCode = 5;
+        // Exit 5 only on hard contradictions (fail). A needs-repair state
+        // (pseudo-layout-7) is degraded but still readable via the file store,
+        // so it exits 0 with a DEGRADED health line and a precise repair action.
+        if (evaluateStorageHealth(storage).status === "fail") process.exitCode = 5;
         return;
       }
       emit(

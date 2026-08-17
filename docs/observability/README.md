@@ -34,28 +34,57 @@ When enabled, `yui controller status` adds a read-only identity section:
 | `storage.manifestStatus` | `schema.json` | `current`/`uninitialized`/`invalid`/`unsupported` |
 | `storage.logicalLayout` | `schema.json.storageVersion` | |
 | `storage.aggregateSchemaVersion` | `schema.json.aggregateSchemaVersion` | |
-| `storage.configuredBackend` | `YUI_STORE_BACKEND` | `file` or `sqlite` |
-| `storage.workerEnabled` | `YUI_STORE_WORKER` + backend | |
+| `storage.configuredBackend` | Home-aware resolver (manifest + `YUI_STORE_BACKEND`) | `file` or `sqlite` |
+| `storage.workerEnabled` | Home-aware worker resolver (manifest + `YUI_STORE_WORKER`) | |
 | `storage.physicalStateJson` | `state.json` existence/size | |
-| `storage.physicalDatabase` | `yui.db` existence/size/WAL/SHM | |
-| `storage.findings[]` | manifest vs physical evidence | contradictions + warnings |
-| `storage.healthy` | derived | `false` if any contradiction |
+| `storage.physicalDatabase` | `yui.db` existence/size/WAL/SHM + `PRAGMA quick_check` | health: `ok`/`corrupt`/`unopenable`/`unsupported` |
+| `storage.hasMigrationReceipt` | `migration-receipt.json` | certifies the file→db switch |
+| `storage.findings[]` | manifest vs physical evidence | contradictions + needs-repair + warnings |
+| `storage.healthy` | derived | `true` only when health status is `ok` |
 | `runtime.uptimeMs` | Controller process | |
 | `runtime.rssBytes` | `process.resourceUsage` | |
 | `runtime.droppedInboxEvents` | runtime/inbox-invalid | Count of dropped inbox events |
 
-### Contradictions (fail-closed)
+Backend and worker selection use the same Home-aware resolvers as startup
+(`resolveTaskStoreBackendForHome` / `resolveStoreWorkerEnabledForHome`), so
+status reports exactly what ordinary startup would open.
 
-| Code | Severity | Meaning |
+### Storage health classification
+
+Findings have three severities, rolled up into a health status:
+
+| Status | Meaning | Exit code |
 | --- | --- | --- |
-| `layout7-missing-database` | contradiction | Manifest declares layout 7 (SQLite WAL) but `yui.db` does not exist |
-| `backend-sqlite-without-database` | contradiction | `YUI_STORE_BACKEND=sqlite` but no `yui.db` |
-| `file-store-missing-state` | contradiction | File backend selected but `state.json` missing |
-| `database-present-but-file-backend` | warning | `yui.db` exists but backend is `file` |
-| `worker-flag-without-sqlite` | warning | `YUI_STORE_WORKER` set but backend is not `sqlite` |
+| `ok` | no findings | 0 |
+| `degraded` | needs-repair findings only | 0 |
+| `fail` | one or more contradictions | 5 |
 
-When a contradiction is detected, `controller status` exits with code 5 and
-prints the finding with a precise remediation action.
+#### Contradictions (fail-closed)
+
+| Code | Meaning |
+| --- | --- |
+| `no-authoritative-backend` | Layout 7 with neither `yui.db` nor a readable `state.json` — no authoritative data source |
+| `database-unhealthy` | `yui.db` exists but `PRAGMA quick_check` fails (corrupt or unopenable) |
+| `dual-copy-conflict` | Both `state.json` and `yui.db` exist without a `migration-receipt.json` — ambiguous authority |
+| `backend-sqlite-without-database` | `YUI_STORE_BACKEND=sqlite` forced but no `yui.db` |
+| `file-store-missing-state` | File backend (layout < 7) selected but `state.json` missing |
+
+#### Needs-repair (degraded)
+
+| Code | Meaning | Remediation |
+| --- | --- | --- |
+| `pseudo-layout-7` | Layout 7 without `yui.db` but with a readable `state.json` — the legacy file store is the rebuild source | Run `yui upgrade` to rebuild `yui.db` |
+
+#### Warnings
+
+| Code | Meaning |
+| --- | --- |
+| `database-present-but-file-backend` | `yui.db` exists but backend is `file` |
+| `worker-flag-without-sqlite` | `YUI_STORE_WORKER` set but backend is not `sqlite` |
+
+Only `fail` (contradictions) exits 5; `degraded` Homes stay operational and
+exit 0 while pointing at the exact repair command. Every finding prints with a
+precise remediation action.
 
 ## Fault classification taxonomy
 
@@ -150,7 +179,7 @@ covers 8 scenarios with characterization baselines in
 
 | Scenario | Status | What is verified |
 | --- | --- | --- |
-| `storage-identity-contradiction` | passing | `collectStorageIdentity` detects layout7-missing-database |
+| `storage-identity-contradiction` | passing | `collectStorageIdentity` classifies pseudo-layout-7 (needs-repair) vs no-authoritative-backend (fail) |
 | `provider-500-then-recover` | passing | StopFailure 500/504 classified as provider-transient |
 | `yield-crash-before-commit` | failing | Audit counts yielded-without-deliveredAt uniformly |
 | `yield-crash-after-commit` | passing | Audit counts clean yield |

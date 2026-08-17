@@ -14,6 +14,7 @@ import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
+import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentRun } from "../run/agentRun.js";
 import {
@@ -106,6 +107,9 @@ export type EventsAudit = Readonly<{
 
 export type StorageAudit = Readonly<{
   stateJsonBytes: number | Unsupported;
+  databaseBytes: number | Unsupported;
+  databaseHealth: "ok" | "corrupt" | "unopenable" | Unsupported;
+  backend: "file" | "sqlite";
   runtimeDirBytes: number | Unsupported;
   deploymentsBytes: number | Unsupported;
 }>;
@@ -574,8 +578,20 @@ export function runExecutionAudit(
       } catch {
         stateJsonBytes = UNSUPPORTED;
       }
+      let databaseBytes: number | Unsupported = UNSUPPORTED;
+      try {
+        databaseBytes = statSync(join(home, "yui.db")).size;
+      } catch {
+        databaseBytes = UNSUPPORTED;
+      }
       return ok({
         stateJsonBytes,
+        databaseBytes,
+        // The audit aggregates history; live db integrity is the status
+        // command's job (it runs PRAGMA quick_check). Report presence/size
+        // and the authoritative backend, not a duplicate health probe.
+        databaseHealth: UNSUPPORTED,
+        backend: resolveTaskStoreBackendForHome(home),
         runtimeDirBytes: ports.directorySize(join(home, "runtime")) ?? UNSUPPORTED,
         deploymentsBytes:
           ports.directorySize(join(home, "runtime", "deployments")) ?? UNSUPPORTED

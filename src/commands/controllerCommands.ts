@@ -343,16 +343,16 @@ export function renderRuntimeIdentitySection(input: Readonly<{
     `  Source commit   ${build.sourceCommit}`,
     `  Node            ${build.nodeVersion} (${build.platform})`,
     `  Storage         layout ${storage.logicalLayout} (manifest ${storage.manifestStatus}) · backend ${storage.configuredBackend} · worker ${storage.workerEnabled ? "on" : "off"}`,
-    `  Store files     state.json ${storage.physicalStateJson.present ? "present" : "absent"} · yui.db ${storage.physicalDatabase.present ? "present" : "absent"}${storage.physicalDatabase.wal ? " +WAL" : ""}`
+    `  Store files     state.json ${storage.physicalStateJson.present ? "present" : "absent"} · yui.db ${storage.physicalDatabase.present ? "present" : "absent"}${storage.physicalDatabase.wal ? " +WAL" : ""}${storage.physicalDatabase.present && storage.physicalDatabase.health !== UNSUPPORTED ? ` (${storage.physicalDatabase.health})` : ""}`
   ];
   for (const finding of storage.findings) {
     lines.push(
-      `  ! ${finding.severity === "contradiction" ? "CONTRADICTION" : "warning"} ${finding.code}: ${finding.message}`,
+      `  ! ${finding.severity === "contradiction" ? "CONTRADICTION" : finding.severity === "needs-repair" ? "NEEDS-REPAIR" : "warning"} ${finding.code}: ${finding.message}`,
       `    remediation: ${finding.remediation}`
     );
   }
   lines.push(
-    `  Health          ${health.healthy ? "ok" : "FAIL (contradictions above)"}`,
+    `  Health          ${health.status === "ok" ? "ok" : health.status === "degraded" ? "DEGRADED (needs-repair above)" : "FAIL (contradictions above)"}`,
     `  Controller      ${runtime.source === "controller.status" && runtime.pid !== undefined
       ? `PID ${runtime.pid}${runtime.uptimeMs === undefined ? "" : `, up ${formatDuration(runtime.uptimeMs)}`}${runtime.protocolVersion === undefined ? "" : `, protocol ${runtime.protocolVersion}`}`
       : "not running (unsupported)"}`,

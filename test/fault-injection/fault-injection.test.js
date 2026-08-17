@@ -71,10 +71,13 @@ function effective(workspace) {
 // Scenario 1: storage identity contradiction (layout 7 without database)
 // ---------------------------------------------------------------------------
 
-test("storage-identity-contradiction: layout 7 manifest without yui.db is a contradiction", () => {
+test("storage-identity-contradiction: layout 7 without yui.db is needs-repair when state.json is readable", () => {
   const { home, cleanup } = temporaryHome();
   try {
     ensureStorageSchema(home);
+    // ensureStorageSchema leaves no readable state.json; a pseudo-layout-7 home
+    // still has its legacy state.json as the rebuild source for `yui upgrade`.
+    writeFileSync(join(home, "state.json"), "{}");
     // Tamper: declare layout 7 (SQLite WAL) without creating yui.db.
     const schemaPath = join(home, "schema.json");
     const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
@@ -83,10 +86,34 @@ test("storage-identity-contradiction: layout 7 manifest without yui.db is a cont
 
     const identity = collectStorageIdentity(home);
     const health = evaluateStorageHealth(identity);
-    assert.equal(health.healthy, false);
+    assert.equal(health.status, "degraded");
     assert.ok(
-      health.contradictions.some((f) => f.code === "layout7-missing-database"),
-      "expected layout7-missing-database contradiction"
+      health.needsRepair.some((f) => f.code === "pseudo-layout-7"),
+      "expected pseudo-layout-7 needs-repair finding"
+    );
+    assert.equal(health.contradictions.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("storage-identity-contradiction: layout 7 without yui.db or state.json fails closed", () => {
+  const { home, cleanup } = temporaryHome();
+  try {
+    ensureStorageSchema(home);
+    const schemaPath = join(home, "schema.json");
+    const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+    schema.storageVersion = 7;
+    writeFileSync(schemaPath, JSON.stringify(schema, null, 2));
+    // Remove state.json so there is no authoritative backend at all.
+    rmSync(join(home, "state.json"), { force: true });
+
+    const identity = collectStorageIdentity(home);
+    const health = evaluateStorageHealth(identity);
+    assert.equal(health.status, "fail");
+    assert.ok(
+      health.contradictions.some((f) => f.code === "no-authoritative-backend"),
+      "expected no-authoritative-backend contradiction"
     );
   } finally {
     cleanup();

@@ -4,10 +4,10 @@
   "scenarios": [
     {
       "name": "storage-identity-contradiction",
-      "description": "Manifest declares layout 7 (SQLite WAL) but yui.db does not exist; collectStorageIdentity must flag layout7-missing-database as a contradiction and evaluateStorageHealth must fail closed.",
+      "description": "Manifest declares layout 7 (SQLite WAL) but yui.db does not exist. With readable state.json this is pseudo-layout-7 (needs-repair, degraded); without state.json it is no-authoritative-backend (contradiction, fail).",
       "status": "passing",
-      "expected": "contradiction finding with code layout7-missing-database",
-      "actual": "contradiction detected, health.healthy=false"
+      "expected": "pseudo-layout-7 needs-repair when state.json is readable; no-authoritative-backend contradiction when it is not",
+      "actual": "needs-repair/degraded with state.json; fail/contradiction without"
     },
     {
       "name": "provider-500-then-recover",
