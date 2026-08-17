@@ -2012,6 +2012,8 @@ export function resolveTaskStoreBackendForHome(
   // yui.db) is classified NEEDS_STORAGE_REPAIR; until repair runs, the file
   // store remains the readable fallback. This keeps the Controller's backend
   // resolution consistent with openCompatibleFileTaskStore's physical check.
+  // Uses the literal "yui.db" (not COMMITTED_DATABASE_FILENAME) to avoid a
+  // circular import: sqliteStateMigration.ts imports SqliteTaskStore from here.
   return existsSync(join(home, "yui.db")) ? "sqlite" : "file";
 }
 
