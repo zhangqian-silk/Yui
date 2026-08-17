@@ -49,8 +49,6 @@ const STORED_TASK_DURABLE_JOBS_FROM_VERSION = 14;
 const STORED_TASK_DURABLE_JOBS_TO_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION = 16;
-const STORED_TASK_REVIEW_FINDINGS_FROM_VERSION = 16;
-const STORED_TASK_REVIEW_FINDINGS_TO_VERSION = 17;
 const CAPABILITY_GRANT_FROM_VERSION = 0;
 const CAPABILITY_GRANT_TO_VERSION = 1;
 const RELEASE_WORKFLOW_FROM_VERSION = 0;
@@ -140,8 +138,6 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(integrationQueueIntroductionStep())
     .registerCompatible(storedTaskDurableJobsStep())
     .registerCompatible(storedTaskJobCallerKeyHashesStep())
-    .registerCompatible(reviewFindingIntroductionStep())
-    .registerCompatible(storedTaskReviewFindingsStep())
     .registerCompatible(durableJobIntroductionStep())
     .registerOfflineMigration(capabilityGrantIntroductionStep())
     .registerOfflineMigration(releaseWorkflowIntroductionStep());
@@ -1067,121 +1063,6 @@ function normalizeStoredTaskV15ToV16(snapshot: HomeSnapshot): HomeSnapshot {
 }
 
 /**
- * Issue 06: The StoredTask aggregate gains the `reviewFindings` record family.
- * Every v16 task defaults to an empty map; the compatible normalizer adds it in
- * place without rewriting any other field. A v16 task must not already carry
- * the field. The ledger starts empty: findings are extracted from new Reviews,
- * with no forced historical backfill.
- */
-function storedTaskReviewFindingsStep(): CompatibleStep<HomeSnapshot> {
-  return {
-    kind: "compatible",
-    axis: "record",
-    recordKind: "storedTask",
-    fromVersion: STORED_TASK_REVIEW_FINDINGS_FROM_VERSION,
-    toVersion: STORED_TASK_REVIEW_FINDINGS_TO_VERSION,
-    defaults: [
-      "reviewFindings defaults to an empty map on every Task aggregate",
-      "idHighWaterMarks.reviewFinding defaults to 0 on every Task aggregate"
-    ],
-    validateSource: (snapshot) => requireStoredTaskV16Shape(snapshot),
-    normalize: (snapshot) => normalizeStoredTaskV16ToV17(snapshot)
-  };
-}
-
-const STORED_TASK_V16_FIELDS = [
-  "schemaVersion",
-  "task",
-  "idHighWaterMarks",
-  "brief",
-  "changeSets",
-  "integrationAttempts",
-  "integrationQueue",
-  "durableJobs",
-  "jobCallerKeyHashes",
-  "capabilityGrants",
-  "releaseWorkflows",
-  "roles",
-  "managedWorkspaces",
-  "roleSessionSets",
-  "workItems",
-  "agentRuns",
-  "reviewRounds",
-  "activeRuns",
-  "messages",
-  "inputRequests",
-  "decisions",
-  "milestones",
-  "events",
-  "leaderFailure",
-  "operatorNotification"
-] as const;
-
-function requireStoredTaskV16Shape(snapshot: HomeSnapshot): void {
-  const manifestVersions = asObject(
-    snapshot.schemaManifest.recordVersions,
-    "schema manifest recordVersions"
-  );
-  if (manifestVersions.storedTask !== STORED_TASK_REVIEW_FINDINGS_FROM_VERSION) {
-    throw new Error(
-      `Record storedTask compatible step requires manifest version ${STORED_TASK_REVIEW_FINDINGS_FROM_VERSION}.`
-    );
-  }
-  if (snapshot.state === null) return;
-  const tasks = asObject(snapshot.state.tasks, "state tasks");
-  for (const [taskId, rawTask] of Object.entries(tasks)) {
-    const task = asObject(rawTask, `Task aggregate ${taskId}`);
-    if (task.schemaVersion !== STORED_TASK_REVIEW_FINDINGS_FROM_VERSION) {
-      throw new Error(
-        `Task aggregate ${taskId} must use schemaVersion ${STORED_TASK_REVIEW_FINDINGS_FROM_VERSION}.`
-      );
-    }
-    const allowed = new Set<string>(STORED_TASK_V16_FIELDS);
-    const unknown = Object.keys(task).find((key) => !allowed.has(key));
-    if (unknown !== undefined) {
-      throw new Error(
-        `Task aggregate ${taskId} has an unknown v16 field: ${unknown}.`
-      );
-    }
-  }
-}
-
-function normalizeStoredTaskV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {
-  requireStoredTaskV16Shape(snapshot);
-  const manifestVersions = asObject(
-    snapshot.schemaManifest.recordVersions,
-    "schema manifest recordVersions"
-  );
-  const schemaManifest = {
-    ...snapshot.schemaManifest,
-    recordVersions: {
-      ...manifestVersions,
-      storedTask: STORED_TASK_REVIEW_FINDINGS_TO_VERSION
-    }
-  };
-  if (snapshot.state === null) return { schemaManifest, state: null };
-  const tasks = asObject(snapshot.state.tasks, "state tasks");
-  const nextTasks: Record<string, unknown> = {};
-  for (const [taskId, rawTask] of Object.entries(tasks)) {
-    const task = asObject(rawTask, `Task aggregate ${taskId}`);
-    const highWaterMarks = asObject(
-      task.idHighWaterMarks,
-      `Task aggregate ${taskId} idHighWaterMarks`
-    );
-    nextTasks[taskId] = {
-      ...task,
-      schemaVersion: STORED_TASK_REVIEW_FINDINGS_TO_VERSION,
-      idHighWaterMarks: { ...highWaterMarks, reviewFinding: 0 },
-      reviewFindings: {}
-    };
-  }
-  return {
-    schemaManifest,
-    state: { ...snapshot.state, tasks: nextTasks }
-  };
-}
-
-/**
  * The durableJob record family is introduced alongside the StoredTask v15
  * aggregate. A pre-baseline Home has no durableJobs map and no manifest entry;
  * the introduction declares the family at version 1. The StoredTask 14->15
@@ -1230,66 +1111,6 @@ function durableJobIntroductionStep(): CompatibleStep<HomeSnapshot> {
           recordVersions: {
             ...manifestVersions,
             durableJob: 1
-          }
-        },
-        state: snapshot.state === null
-          ? null
-          : { ...snapshot.state }
-      };
-    }
-  };
-}
-
-/**
- * Issue 06: The reviewFinding record family is introduced alongside the
- * StoredTask v17 aggregate. A pre-introduction Home has no reviewFindings map
- * and no manifest entry; the introduction declares the family at version 1.
- * The StoredTask 16->17 compatible step supplies the empty map; this step only
- * advances the manifest record version so the planner can resolve the 0->1
- * boundary.
- */
-function reviewFindingIntroductionStep(): CompatibleStep<HomeSnapshot> {
-  return {
-    kind: "compatible",
-    axis: "record",
-    recordKind: "reviewFinding",
-    fromVersion: 0,
-    toVersion: 1,
-    introduction: true,
-    defaults: ["reviewFinding family is introduced as an empty map on every Task"],
-    validateSource: (snapshot) => {
-      const manifestVersions = asObject(
-        snapshot.schemaManifest.recordVersions,
-        "schema manifest recordVersions"
-      );
-      const declared = manifestVersions.reviewFinding;
-      if (declared !== undefined && declared !== 0) {
-        throw new Error(
-          `Record reviewFinding introduction requires manifest version 0 or absent, found ${String(declared)}.`
-        );
-      }
-      if (snapshot.state === null) return;
-      const tasks = asObject(snapshot.state.tasks, "state tasks");
-      for (const [taskId, rawTask] of Object.entries(tasks)) {
-        const task = asObject(rawTask, `Task aggregate ${taskId}`);
-        if (task.reviewFindings !== undefined) {
-          throw new Error(
-            `Task aggregate ${taskId} must not carry reviewFindings before introduction.`
-          );
-        }
-      }
-    },
-    normalize: (snapshot) => {
-      const manifestVersions = asObject(
-        snapshot.schemaManifest.recordVersions,
-        "schema manifest recordVersions"
-      );
-      return {
-        schemaManifest: {
-          ...snapshot.schemaManifest,
-          recordVersions: {
-            ...manifestVersions,
-            reviewFinding: 1
           }
         },
         state: snapshot.state === null

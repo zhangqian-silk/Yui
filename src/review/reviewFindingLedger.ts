@@ -656,9 +656,18 @@ export function buildTaskFinalReviewFindingContext(
     .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))
     .at(-1) ?? null;
   const reusableEvidence = reusableTaskReviewEvidence(store, taskId, candidate);
+  // dbonly: the finding ledger is SQLite-native.  A file-only Home (no yui.db)
+  // cannot serve findings; the Review dispatch must still proceed, so the
+  // ledger context degrades to an explicit "unavailable" note.
+  let ledgerContext: string;
+  try {
+    ledgerContext = renderFindingLedgerContext(summarizeFindingLedger(store, taskId));
+  } catch {
+    ledgerContext = "Finding ledger: unavailable (SQLite backend required; run `yui update` to migrate this Home).";
+  }
   const lines = [
     "Review convergence context:",
-    renderFindingLedgerContext(summarizeFindingLedger(store, taskId)),
+    ledgerContext,
     ...(previousSemanticRound === null
       ? ["Previous semantic Task-final ReviewRound: none."]
       : [

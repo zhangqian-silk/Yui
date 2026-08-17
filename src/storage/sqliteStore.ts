@@ -85,6 +85,7 @@ import {
   CURRENT_PENDING_WAKEUP_SCHEMA_VERSION,
   CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
   executionLaneActiveRunKey,
+  executionLaneActiveRunKeyParts,
   StorageConflictError,
   StorageCancelledError,
   StorageRecordError,
@@ -1481,11 +1482,31 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   saveActiveAgentRun(run: AgentRun): void {
+    if (run.executionGroupId !== undefined && run.executionLaneId !== undefined) {
+      this.saveActiveExecutionLaneRun(run);
+      return;
+    }
     this.#saveActiveRun(run.taskId, run.roleName, run.id);
   }
 
   clearActiveAgentRun(taskId: string, roleName: string): void {
+    // Older Controller paths only know the Role key.  When that key points
+    // at a lane-backed Run, remove the matching lane pointer too; preserve
+    // every other lane for the same Role in a multi-lane group.
+    const rolePointer = this.#getActiveRun(taskId, roleName);
     this.#clearActiveRun(taskId, roleName);
+    if (rolePointer === null) return;
+    const laneRows = this.#db.prepare(
+      "SELECT task_id, pointer FROM active_runs WHERE task_id = ?"
+    ).all(taskId) as Array<{ task_id: string; pointer: string }>;
+    for (const row of laneRows) {
+      if (executionLaneActiveRunKeyParts(row.pointer) !== null) {
+        const laneRun = this.#getActiveRun(taskId, row.pointer);
+        if (laneRun !== null && laneRun.id === rolePointer.id) {
+          this.#clearActiveRun(taskId, row.pointer);
+        }
+      }
+    }
   }
 
   getActiveExecutionLaneRun(taskId: string, executionGroupId: string, executionLaneId: string): AgentRun | null {

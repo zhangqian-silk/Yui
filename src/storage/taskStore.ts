@@ -53,10 +53,7 @@ import {
   validateReviewRound,
   type ReviewRound
 } from "../review/reviewRound.js";
-import {
-  validateReviewFinding,
-  type ReviewFinding
-} from "../review/reviewFinding.js";
+import type { ReviewFinding } from "../review/reviewFinding.js";
 import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
 import {
   assertProjectCatalog,
@@ -164,7 +161,6 @@ export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 9 as const;
 export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 4 as const;
-export const CURRENT_REVIEW_FINDING_SCHEMA_VERSION = 1 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
@@ -241,7 +237,7 @@ function encodeLaneKeyPart(value: string): string {
   return encodeURIComponent(value).replace(/:/gu, "%3A");
 }
 
-function executionLaneActiveRunKeyParts(key: string):
+export function executionLaneActiveRunKeyParts(key: string):
   { executionGroupId: string; executionLaneId: string } | null {
   const match = /^\/execution-lane\/([^:]+):([^:]+)$/u.exec(key);
   if (match === null) return null;
@@ -258,7 +254,7 @@ function executionLaneActiveRunKeyParts(key: string):
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 /** The schema version of each persisted `state.json#/tasks/*` aggregate. */
-export const CURRENT_STORED_TASK_SCHEMA_VERSION = 17 as const;
+export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
 
 /**
  * Persisted nested-record versions consumed by this store's strict parser.
@@ -292,7 +288,6 @@ type StoredTask = {
   workItems: Record<string, WorkItem>;
   agentRuns: Record<string, AgentRun>;
   reviewRounds: Record<string, ReviewRound>;
-  reviewFindings: Record<string, ReviewFinding>;
   activeRuns: Record<string, ActiveRunPointer>;
   messages: Record<string, TaskMessage>;
   inputRequests: Record<string, InputRequest>;
@@ -1404,32 +1399,24 @@ export class FileTaskStore implements TaskStore {
     });
   }
   nextReviewFindingId(taskId: string): string {
-    return this.#nextTaskRecordId(taskId, "reviewFinding");
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
   }
   getReviewFinding(taskId: string, reviewFindingId: string): ReviewFinding | null {
-    return optional(this.#state().tasks[taskId]?.reviewFindings[reviewFindingId]);
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
   }
   listReviewFindings(taskId: string): ReviewFinding[] {
-    return values(this.#requireTask(taskId).reviewFindings, "id");
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
   }
   saveReviewFinding(taskId: string, finding: ReviewFinding): void {
-    const stored = identified<ReviewFinding>(
-      finding,
-      CURRENT_REVIEW_FINDING_SCHEMA_VERSION,
-      "id",
-      finding.id,
-      "ReviewFinding"
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
     );
-    validateReviewFinding(stored);
-    if (stored.taskId !== taskId) {
-      throw new StorageRecordError(`ReviewFinding belongs to another Task: ${stored.taskId}.`);
-    }
-    this.#requireTaskForWrite(taskId);
-    this.#mutate((state) => {
-      const task = state.tasks[taskId];
-      observeTaskRecordId(task, "reviewFinding", stored.id);
-      task.reviewFindings[stored.id] = stored;
-    });
   }
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
     const aggregate = this.#state().tasks[taskId];
@@ -2068,7 +2055,6 @@ function emptyStoredTask(task: Task): StoredTask {
     workItems: {},
     agentRuns: {},
     reviewRounds: {},
-    reviewFindings: {},
     activeRuns: {},
     messages: {},
     inputRequests: {},
@@ -2317,7 +2303,6 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "workItems",
     "agentRuns",
     "reviewRounds",
-    "reviewFindings",
     "activeRuns",
     "messages",
     "inputRequests",
@@ -2482,20 +2467,6 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateReviewRound(round);
     return round;
   }, "reviewRounds");
-  parseMap(aggregate.reviewFindings, (record, key) => {
-    const finding = identified<ReviewFinding>(
-      record,
-      CURRENT_REVIEW_FINDING_SCHEMA_VERSION,
-      "id",
-      key,
-      "ReviewFinding"
-    );
-    if (finding.taskId !== taskId) {
-      throw new StorageRecordError(`ReviewFinding belongs to another Task: ${finding.taskId}.`);
-    }
-    validateReviewFinding(finding);
-    return finding;
-  }, "reviewFindings");
   parseMap(aggregate.activeRuns, (record, key) => {
     const pointer = versioned<ActiveRunPointer>(
       record,
@@ -2610,7 +2581,9 @@ function validateTaskIdHighWaterCoverage(
     workItem: aggregate.workItems,
     agentRun: aggregate.agentRuns,
     reviewRound: aggregate.reviewRounds,
-    reviewFinding: aggregate.reviewFindings,
+    // Issue 06 dbonly: review findings are SQLite-native; the file aggregate
+    // never carries them, so coverage is trivially empty.
+    reviewFinding: {},
     changeSet: aggregate.changeSets,
     integrationAttempt: aggregate.integrationAttempts,
     integrationQueue: aggregate.integrationQueue,

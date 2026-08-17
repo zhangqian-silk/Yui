@@ -37,7 +37,7 @@ import {
   finishReviewRound
 } from "../../dist/review/reviewRound.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
-import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { addTaskProjectBinding, createTask } from "../../dist/task/task.js";
 import { createProject } from "../../dist/repository/project.js";
 import {
@@ -53,7 +53,7 @@ function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "yui-review-finding-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
-  const store = new FileTaskStore(root);
+  const store = new SqliteTaskStore(root);
   store.transaction((tx) => {
     tx.saveConfig({ schemaVersion: 1 });
     const project = createProject("project-1", "one", join(root, "one"), {
@@ -497,11 +497,11 @@ test("reconcileReviewFindings flags stable-key collisions for Leader merge", (t)
   });
   // Two pre-existing records with the same stable key (simulating a bad merge).
   store.transaction((tx) => {
-    tx.saveReviewFinding("task-1", createReviewFinding("review-finding-1", "task-1", {
+    tx.saveReviewFinding("task-1", createReviewFinding(tx.nextReviewFindingId("task-1"), "task-1", {
       stableKey, severity: "p1", invariant: "at-most-once",
       title: "Duplicate job dispatch", reviewRoundId: "review-round-1"
     }, NOW));
-    tx.saveReviewFinding("task-1", createReviewFinding("review-finding-2", "task-1", {
+    tx.saveReviewFinding("task-1", createReviewFinding(tx.nextReviewFindingId("task-1"), "task-1", {
       stableKey, severity: "p1", invariant: "at-most-once",
       title: "Duplicate job dispatch (duplicate record)", reviewRoundId: "review-round-1"
     }, NOW));
@@ -757,9 +757,10 @@ test("reusableTaskReviewEvidence reuses checks only for the exact same head", (t
 // Store round-trip
 // ---------------------------------------------------------------------------
 
-test("FileTaskStore persists and retrieves review findings", (t) => {
+test("SqliteTaskStore persists and retrieves review findings", (t) => {
   const { store } = fixture(t);
-  const finding = createReviewFinding("review-finding-1", "task-1", {
+  const findingId = store.nextReviewFindingId("task-1");
+  const finding = createReviewFinding(findingId, "task-1", {
     stableKey: "rf-abc",
     severity: "p1",
     invariant: "at-most-once",
@@ -771,12 +772,8 @@ test("FileTaskStore persists and retrieves review findings", (t) => {
   }, NOW);
   store.transaction((tx) => tx.saveReviewFinding("task-1", finding));
 
-  const reloaded = new FileTaskRoundStore(store.rootDirectory());
-  assert.deepEqual(reloaded.getReviewFinding("task-1", "review-finding-1"), finding);
+  const reloaded = new SqliteTaskStore(store.rootDirectory());
+  assert.deepEqual(reloaded.getReviewFinding("task-1", findingId), finding);
   assert.equal(reloaded.listReviewFindings("task-1").length, 1);
   assert.equal(reloaded.nextReviewFindingId("task-1"), "review-finding-2");
 });
-
-function FileTaskRoundStore(root) {
-  return new FileTaskStore(root);
-}

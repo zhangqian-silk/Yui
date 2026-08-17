@@ -16,7 +16,7 @@ import {
   attachReviewRoundWorkspace
 } from "../../dist/review/reviewRound.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
-import { FileTaskStore } from "../../dist/storage/taskStore.js";
+import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { formatAgentRunReceiptId } from "../../dist/task/taskRecordReference.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import {
@@ -32,7 +32,7 @@ function fixture(t, config = {}) {
   const root = mkdtempSync(join(tmpdir(), "yui-review-finding-e2e-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   ensureStorageSchema(root, NOW);
-  const store = new FileTaskStore(root);
+  const store = new SqliteTaskStore(root);
   const codex = createConfiguredAgent("codex", "codex", "codex", [], [], NOW);
   store.transaction((tx) => {
     tx.saveConfig({

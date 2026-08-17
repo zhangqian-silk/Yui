@@ -110,13 +110,6 @@ test("the production registry registers every adjacent post-baseline step", () =
   const jobCallerKeyHashesStep = registry.lookupDeclaration("record", "storedTask", 15);
   assert.notEqual(jobCallerKeyHashesStep, undefined);
   assert.equal(jobCallerKeyHashesStep.toVersion, 16);
-  const reviewFindingsStep = registry.lookupDeclaration("record", "storedTask", 16);
-  assert.notEqual(reviewFindingsStep, undefined);
-  assert.equal(reviewFindingsStep.toVersion, 17);
-  const reviewFindingIntroduction = registry.lookupDeclaration("record", "reviewFinding", 0);
-  assert.notEqual(reviewFindingIntroduction, undefined);
-  assert.equal(reviewFindingIntroduction.toVersion, 1);
-  assert.equal(reviewFindingIntroduction.introduction, true);
   const durableJobIntroduction = registry.lookupDeclaration("record", "durableJob", 0);
   assert.notEqual(durableJobIntroduction, undefined);
   assert.equal(durableJobIntroduction.toVersion, 1);

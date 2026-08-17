@@ -543,7 +543,6 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 2, axis: "record", recordKind: "durableJob+capability-grant+release-workflow", sql: MIGRATION_2_SQL },
   { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL },
   { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL },
-  { version: 5, axis: "record", recordKind: "telemetryAggregate", sql: MIGRATION_5_SQL }
   { version: 5, axis: "record", recordKind: "telemetryAggregate", sql: MIGRATION_5_SQL },
   { version: 6, axis: "record", recordKind: "reviewFinding", sql: MIGRATION_6_SQL }
 ];
