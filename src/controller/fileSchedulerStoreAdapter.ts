@@ -289,6 +289,34 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.#taskReadProjection(taskId).events;
   }
 
+  listAgentRuns(taskId: string) {
+    return this.store.listAgentRuns(taskId);
+  }
+
+  listWorkItems(taskId: string) {
+    return this.store.listWorkItems(taskId);
+  }
+
+  listReviewRounds(taskId: string) {
+    return this.#taskReadProjection(taskId).reviewRounds;
+  }
+
+  listIntegrationAttempts(taskId: string) {
+    return this.#taskReadProjection(taskId).integrationAttempts;
+  }
+
+  listDurableJobs(taskId: string) {
+    return this.store.listDurableJobs(taskId);
+  }
+
+  listInputRequests(taskId: string) {
+    return this.#taskReadProjection(taskId).inputRequests;
+  }
+
+  listMessages(taskId: string) {
+    return this.store.listMessages(taskId);
+  }
+
   getRunProgressFacts(taskId: string, runId: string): RunProgressFacts | undefined {
     return this.#taskReadProjection(taskId).runFacts.get(runId);
   }

@@ -36,7 +36,7 @@ function makeTask(store, overrides = {}) {
 function makeMessage(store, taskId, overrides = {}) {
   const now = new Date().toISOString();
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: store.nextMessageId(taskId),
     taskId,
     kind: "role-result",
