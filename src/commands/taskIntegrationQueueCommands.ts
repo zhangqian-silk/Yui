@@ -68,7 +68,6 @@ async function enqueue(
     changeSetId,
     targetRef: parsed.one.get("--target"),
     checkCommands: parsed.many.get("--check") ?? [],
-    home,
     now: options.now
   });
   const label = {

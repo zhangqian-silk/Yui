@@ -97,6 +97,14 @@ import {
 import type { CapabilityGrant } from "../grant/capabilityGrant.js";
 import type { ReleaseWorkflow } from "../release/releaseWorkflow.js";
 import {
+  gateArtifactKey,
+  validateGateArtifact,
+  type GateArtifact,
+  type GateArtifactIdentity,
+  type GateArtifactPruneOptions,
+  type GateArtifactPruneResult
+} from "../verification/gateArtifact.js";
+import {
   migrateSqliteSchema,
   SQLITE_AGGREGATE_VERSION,
   SQLITE_LAYOUT_VERSION,
@@ -1359,6 +1367,143 @@ export class SqliteTaskStore implements TaskStore {
 
   getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null {
     return this.#getPayload<ReleaseWorkflow>("release_workflows", "task_id = ? AND workflow_id = ?", [taskId, workflowId]);
+  }
+
+  // -- gate artifacts (Issue 08) ----------------------------------------------
+
+  saveGateArtifact(artifact: GateArtifact, logs: ReadonlyMap<string, Buffer>): void {
+    validateGateArtifact(artifact);
+    this.#mutate(() => {
+      const targetRef = artifact.boundary?.targetRef ?? null;
+      const completedAt = artifact.completedAt ?? null;
+      this.#db.prepare(
+        `INSERT INTO gate_artifacts
+           (key, project_id, level, commit_sha, plan_digest, toolchain_digest,
+            target_ref, status, outcome, payload, created_at, completed_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           project_id = excluded.project_id,
+           level = excluded.level,
+           commit_sha = excluded.commit_sha,
+           plan_digest = excluded.plan_digest,
+           toolchain_digest = excluded.toolchain_digest,
+           target_ref = excluded.target_ref,
+           status = excluded.status,
+           outcome = excluded.outcome,
+           payload = excluded.payload,
+           completed_at = excluded.completed_at,
+           last_used_at = excluded.last_used_at`
+      ).run(
+        artifact.key,
+        artifact.projectId,
+        artifact.level,
+        artifact.commit,
+        artifact.planDigest,
+        artifact.toolchainDigest,
+        targetRef,
+        artifact.status,
+        artifact.outcome,
+        this.#json(artifact),
+        artifact.createdAt,
+        completedAt,
+        artifact.lastUsedAt
+      );
+      // Replace all logs for this artifact in the same transaction.
+      this.#db.prepare("DELETE FROM gate_artifact_logs WHERE artifact_key = ?").run(artifact.key);
+      const insertLog = this.#db.prepare(
+        `INSERT INTO gate_artifact_logs (artifact_key, step_name, log_content, log_digest, log_bytes)
+         VALUES (?, ?, ?, ?, ?)`
+      );
+      for (const [stepName, content] of logs) {
+        const step = artifact.steps.find((s) => s.name === stepName);
+        if (step === undefined) {
+          throw new StorageRecordError(
+            `Gate artifact log has no matching step: ${artifact.key}/${stepName}`
+          );
+        }
+        insertLog.run(artifact.key, stepName, content, step.logDigest, step.logBytes);
+      }
+    });
+  }
+
+  touchGateArtifact(artifact: GateArtifact): void {
+    validateGateArtifact(artifact);
+    this.#mutate(() => {
+      this.#db.prepare(
+        `UPDATE gate_artifacts SET payload = ?, last_used_at = ? WHERE key = ?`
+      ).run(
+        this.#json(artifact),
+        artifact.lastUsedAt,
+        artifact.key
+      );
+    });
+  }
+
+  getGateArtifact(projectId: string, key: string): GateArtifact | null {
+    return this.#getPayload<GateArtifact>(
+      "gate_artifacts",
+      "project_id = ? AND key = ?",
+      [projectId, key]
+    );
+  }
+
+  findGateArtifactByIdentity(identity: GateArtifactIdentity): GateArtifact | null {
+    return this.getGateArtifact(identity.projectId, gateArtifactKey(identity));
+  }
+
+  findL2GateArtifactsForCommit(query: Readonly<{
+    projectId: string;
+    commit: string;
+    planDigest: string;
+    toolchainDigest: string;
+    targetRef: string;
+  }>): GateArtifact[] {
+    return this.#listPayload<GateArtifact>(
+      "gate_artifacts",
+      `project_id = ? AND commit_sha = ? AND level = 'L2'
+       AND plan_digest = ? AND toolchain_digest = ? AND target_ref = ?
+       AND status = 'complete' AND outcome = 'succeeded'`,
+      [query.projectId, query.commit, query.planDigest, query.toolchainDigest, query.targetRef]
+    );
+  }
+
+  getGateArtifactLogs(artifactKey: string): ReadonlyMap<string, Buffer> {
+    const rows = this.#db.prepare(
+      "SELECT step_name, log_content FROM gate_artifact_logs WHERE artifact_key = ?"
+    ).all(artifactKey) as ReadonlyArray<{ step_name: string; log_content: Buffer }>;
+    const logs = new Map<string, Buffer>();
+    for (const row of rows) {
+      logs.set(row.step_name, Buffer.from(row.log_content));
+    }
+    return logs;
+  }
+
+  pruneGateArtifacts(projectId: string, options: GateArtifactPruneOptions): GateArtifactPruneResult {
+    return this.#mutate(() => {
+      const rows = this.#db.prepare(
+        "SELECT key, payload, last_used_at FROM gate_artifacts WHERE project_id = ?"
+      ).all(projectId) as ReadonlyArray<{ key: string; payload: string; last_used_at: string }>;
+      let retained = 0;
+      let deleted = 0;
+      const deleteArtifact = this.#db.prepare("DELETE FROM gate_artifacts WHERE key = ?");
+      for (const row of rows) {
+        let artifact: GateArtifact;
+        try {
+          artifact = validateGateArtifact(JSON.parse(row.payload) as GateArtifact);
+        } catch {
+          retained += 1;
+          continue;
+        }
+        const age = options.now.getTime() - Date.parse(artifact.lastUsedAt);
+        if (options.isReferenced(artifact.key) || age < options.ttlMs) {
+          retained += 1;
+          continue;
+        }
+        deleteArtifact.run(artifact.key);
+        deleted += 1;
+      }
+      return Object.freeze({ retained, deleted });
+    });
   }
 
   // -- agent runs -------------------------------------------------------------

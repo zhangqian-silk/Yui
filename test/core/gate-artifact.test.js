@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -25,16 +23,17 @@ import {
 import {
   findGateArtifact,
   findL2ArtifactForCommit,
-  gateArtifactLogsRoot,
   importGateArtifactSteps,
   loadGateArtifact,
   pruneGateArtifacts,
-  saveGateArtifact
+  saveGateArtifact,
+  touchGateArtifact
 } from "../../dist/verification/gateArtifactStore.js";
 import {
   gateArtifactCoversCheckCommands,
   verifyGateArtifactForReview
 } from "../../dist/verification/verificationGateService.js";
+import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 
 const now = new Date("2026-08-17T00:00:00.000Z");
 const COMMIT = "0123456789abcdef0123456789abcdef01234567";
@@ -55,10 +54,10 @@ function identity(overrides = {}) {
 }
 
 /**
- * Build and persist a complete artifact with real logs. Returns the artifact
- * and the home directory so tests can corrupt/remove logs.
+ * Build and persist a complete artifact with real logs in the SQLite store.
+ * Returns the artifact and the store so tests can corrupt/remove logs.
  */
-async function buildArtifact(home, identityValue, options = {}) {
+async function buildArtifact(store, home, identityValue, options = {}) {
   const created = createGateArtifact(identityValue, {
     planId: "yui-core",
     planVersion: "1.0.0",
@@ -87,17 +86,21 @@ async function buildArtifact(home, identityValue, options = {}) {
       logName
     };
   });
-  const imported = await importGateArtifactSteps(home, created, inputs);
+  const { steps: importedSteps, logs } = await importGateArtifactSteps(inputs);
   const succeeded = options.succeeded ?? steps.every((step) => step.exitCode === 0);
-  const artifact = completeGateArtifact(created, imported, succeeded ? "succeeded" : "failed", now);
-  saveGateArtifact(home, artifact);
+  const artifact = completeGateArtifact(created, importedSteps, succeeded ? "succeeded" : "failed", now);
+  saveGateArtifact(store, artifact, logs);
   return artifact;
 }
 
 test.beforeEach((t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-gate-artifact-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
-  t.context = { home };
+  const store = new SqliteTaskStore(home);
+  t.after(() => {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+  t.context = { store, home };
 });
 
 // --- Key identity -----------------------------------------------------------
@@ -142,9 +145,9 @@ test("an L2 artifact requires a boundary", () => {
 // --- Save/load round-trip ---------------------------------------------------
 
 test("a saved artifact loads back with its full identity and steps", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  const loaded = loadGateArtifact(home, "project-1", artifact.key);
+  const { store } = t.context;
+  const artifact = await buildArtifact(store, t.context.home, identity());
+  const loaded = loadGateArtifact(store, "project-1", artifact.key);
   assert.notEqual(loaded, null);
   assert.equal(loaded.key, artifact.key);
   assert.equal(loaded.commit, COMMIT);
@@ -157,61 +160,56 @@ test("a saved artifact loads back with its full identity and steps", async (t) =
 });
 
 test("findGateArtifact resolves an artifact by its identity tuple", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  const found = findGateArtifact(home, identity());
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
+  const found = findGateArtifact(store, identity());
   assert.notEqual(found, null);
   assert.equal(found.key, artifact.key);
-  assert.equal(findGateArtifact(home, identity({ commit: "1".repeat(40) })), null);
+  assert.equal(findGateArtifact(store, identity({ commit: "1".repeat(40) })), null);
 });
 
 // --- Log integrity ----------------------------------------------------------
 
 test("verifyGateArtifactLogs passes when every log exists and matches its digest", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  const verification = await verifyGateArtifactLogs(
-    artifact,
-    gateArtifactLogsRoot(home, "project-1", artifact.key)
-  );
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
+  const logs = store.getGateArtifactLogs(artifact.key);
+  const verification = verifyGateArtifactLogs(artifact, logs);
   assert.equal(verification.ok, true);
   assert.deepEqual([...verification.missing], []);
   assert.deepEqual([...verification.corrupted], []);
 });
 
 test("a missing log invalidates the artifact", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  rmSync(join(gateArtifactLogsRoot(home, "project-1", artifact.key), artifact.steps[0].logPath));
-  const verification = await verifyGateArtifactLogs(
-    artifact,
-    gateArtifactLogsRoot(home, "project-1", artifact.key)
-  );
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
+  store.databaseHandle()
+    .prepare("DELETE FROM gate_artifact_logs WHERE artifact_key = ? AND step_name = ?")
+    .run(artifact.key, artifact.steps[0].name);
+  const logs = store.getGateArtifactLogs(artifact.key);
+  const verification = verifyGateArtifactLogs(artifact, logs);
   assert.equal(verification.ok, false);
   assert.deepEqual([...verification.missing], ["gate-1"]);
 });
 
 test("a corrupted log invalidates the artifact", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  writeFileSync(
-    join(gateArtifactLogsRoot(home, "project-1", artifact.key), artifact.steps[1].logPath),
-    "tampered\n"
-  );
-  const verification = await verifyGateArtifactLogs(
-    artifact,
-    gateArtifactLogsRoot(home, "project-1", artifact.key)
-  );
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
+  store.databaseHandle()
+    .prepare("UPDATE gate_artifact_logs SET log_content = ? WHERE artifact_key = ? AND step_name = ?")
+    .run(Buffer.from("tampered\n"), artifact.key, artifact.steps[1].name);
+  const logs = store.getGateArtifactLogs(artifact.key);
+  const verification = verifyGateArtifactLogs(artifact, logs);
   assert.equal(verification.ok, false);
   assert.deepEqual([...verification.corrupted], ["gate-2"]);
 });
 
 test("only a complete successful artifact is reusable", async (t) => {
-  const { home } = t.context;
-  const succeeded = await buildArtifact(home, identity());
+  const { store, home } = t.context;
+  const succeeded = await buildArtifact(store, home, identity());
   assert.equal(isReusableGateArtifact(succeeded), true);
 
-  const failed = await buildArtifact(home, identity({ commit: "1".repeat(40) }), {
+  const failed = await buildArtifact(store, home, identity({ commit: "1".repeat(40) }), {
     steps: [{ name: "gate-1", command: "npm run lint", exitCode: 1, content: "lint failed\n" }]
   });
   assert.equal(isReusableGateArtifact(failed), false);
@@ -225,8 +223,8 @@ test("only a complete successful artifact is reusable", async (t) => {
 // --- Reuse counters ---------------------------------------------------------
 
 test("recordGateArtifactReuse increments the reuse counter on a successful artifact", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
   const reused = recordGateArtifactReuse(artifact, now);
   assert.equal(reused.reuseCount, 1);
   const reusedAgain = recordGateArtifactReuse(reused, now);
@@ -236,16 +234,16 @@ test("recordGateArtifactReuse increments the reuse counter on a successful artif
 });
 
 test("recordGateArtifactReuse rejects an incomplete or failed artifact", async (t) => {
-  const { home } = t.context;
-  const failed = await buildArtifact(home, identity(), {
+  const { store, home } = t.context;
+  const failed = await buildArtifact(store, home, identity(), {
     steps: [{ name: "gate-1", command: "npm run lint", exitCode: 1, content: "fail\n" }]
   });
   assert.throws(() => recordGateArtifactReuse(failed, now), /Only a complete successful/);
 });
 
 test("recordGateArtifactPotentialReuse counts shadow observations in record mode", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
   const observed = recordGateArtifactPotentialReuse(artifact, now);
   assert.equal(observed.potentialReuseCount, 1);
   assert.equal(observed.reuseCount, 0);
@@ -263,9 +261,9 @@ test("gate-artifact refs round-trip through their prefix", () => {
 // --- Review verification ----------------------------------------------------
 
 test("verifyGateArtifactForReview passes a complete artifact with intact logs", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  const verification = await verifyGateArtifactForReview(home, "project-1", artifact.key, {
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
+  const verification = await verifyGateArtifactForReview(store, "project-1", artifact.key, {
     commit: COMMIT
   });
   assert.equal(verification.ok, true);
@@ -273,9 +271,9 @@ test("verifyGateArtifactForReview passes a complete artifact with intact logs", 
 });
 
 test("verifyGateArtifactForReview rejects a commit mismatch", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  const verification = await verifyGateArtifactForReview(home, "project-1", artifact.key, {
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
+  const verification = await verifyGateArtifactForReview(store, "project-1", artifact.key, {
     commit: "1".repeat(40)
   });
   assert.equal(verification.ok, false);
@@ -283,17 +281,19 @@ test("verifyGateArtifactForReview rejects a commit mismatch", async (t) => {
 });
 
 test("verifyGateArtifactForReview rejects a missing artifact", async (t) => {
-  const { home } = t.context;
-  const verification = await verifyGateArtifactForReview(home, "project-1", "deadbeef");
+  const { store } = t.context;
+  const verification = await verifyGateArtifactForReview(store, "project-1", "deadbeef");
   assert.equal(verification.ok, false);
   assert.match(verification.reason, /not found/);
 });
 
 test("verifyGateArtifactForReview rejects an artifact whose logs were lost", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  rmSync(join(gateArtifactLogsRoot(home, "project-1", artifact.key), artifact.steps[0].logPath));
-  const verification = await verifyGateArtifactForReview(home, "project-1", artifact.key);
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
+  store.databaseHandle()
+    .prepare("DELETE FROM gate_artifact_logs WHERE artifact_key = ? AND step_name = ?")
+    .run(artifact.key, artifact.steps[0].name);
+  const verification = await verifyGateArtifactForReview(store, "project-1", artifact.key);
   assert.equal(verification.ok, false);
   assert.match(verification.reason, /logs failed verification/);
 });
@@ -301,33 +301,33 @@ test("verifyGateArtifactForReview rejects an artifact whose logs were lost", asy
 // --- Evidence coverage ------------------------------------------------------
 
 test("gateArtifactCoversCheckCommands covers exact commands on the exact commit", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
   const ref = gateArtifactRef(artifact.key);
   assert.equal(
-    await gateArtifactCoversCheckCommands(home, "project-1", ref, ["npm run lint", "npm run build"], COMMIT),
+    await gateArtifactCoversCheckCommands(store, "project-1", ref, ["npm run lint", "npm run build"], COMMIT),
     true
   );
   assert.equal(
-    await gateArtifactCoversCheckCommands(home, "project-1", ref, ["npm run lint"], COMMIT),
+    await gateArtifactCoversCheckCommands(store, "project-1", ref, ["npm run lint"], COMMIT),
     true
   );
 });
 
 test("gateArtifactCoversCheckCommands fails on a different commit or an unknown command", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
   const ref = gateArtifactRef(artifact.key);
   assert.equal(
-    await gateArtifactCoversCheckCommands(home, "project-1", ref, ["npm run lint"], "1".repeat(40)),
+    await gateArtifactCoversCheckCommands(store, "project-1", ref, ["npm run lint"], "1".repeat(40)),
     false
   );
   assert.equal(
-    await gateArtifactCoversCheckCommands(home, "project-1", ref, ["npm run deploy"], COMMIT),
+    await gateArtifactCoversCheckCommands(store, "project-1", ref, ["npm run deploy"], COMMIT),
     false
   );
   assert.equal(
-    await gateArtifactCoversCheckCommands(home, "project-1", "review-round:r1", ["npm run lint"], COMMIT),
+    await gateArtifactCoversCheckCommands(store, "project-1", "review-round:r1", ["npm run lint"], COMMIT),
     false
   );
 });
@@ -335,49 +335,49 @@ test("gateArtifactCoversCheckCommands fails on a different commit or an unknown 
 // --- Retention --------------------------------------------------------------
 
 test("pruneGateArtifacts deletes only unreferenced artifacts older than the TTL", async (t) => {
-  const { home } = t.context;
-  const old = await buildArtifact(home, identity());
-  const recent = await buildArtifact(home, identity({ commit: "1".repeat(40) }));
-  const referenced = await buildArtifact(home, identity({ commit: "2".repeat(40) }));
+  const { store, home } = t.context;
+  const old = await buildArtifact(store, home, identity());
+  const recent = await buildArtifact(store, home, identity({ commit: "1".repeat(40) }));
+  const referenced = await buildArtifact(store, home, identity({ commit: "2".repeat(40) }));
 
   // The "recent" artifact was reused yesterday, so its lastUsedAt is inside
   // the TTL window even though all three were created at the same instant.
   const yesterday = new Date(now.getTime() + 99 * 24 * 60 * 60 * 1000);
-  saveGateArtifact(home, recordGateArtifactReuse(recent, yesterday));
+  touchGateArtifact(store, recordGateArtifactReuse(recent, yesterday));
 
   const referencedKeys = new Set([referenced.key]);
-  const result = pruneGateArtifacts(home, "project-1", {
+  const result = pruneGateArtifacts(store, "project-1", {
     now: new Date(now.getTime() + 100 * 24 * 60 * 60 * 1000),
     ttlMs: 30 * 24 * 60 * 60 * 1000,
     isReferenced: (key) => referencedKeys.has(key)
   });
   assert.equal(result.deleted, 1);
   assert.equal(result.retained, 2);
-  assert.equal(loadGateArtifact(home, "project-1", old.key), null);
-  assert.notEqual(loadGateArtifact(home, "project-1", recent.key), null);
-  assert.notEqual(loadGateArtifact(home, "project-1", referenced.key), null);
+  assert.equal(loadGateArtifact(store, "project-1", old.key), null);
+  assert.notEqual(loadGateArtifact(store, "project-1", recent.key), null);
+  assert.notEqual(loadGateArtifact(store, "project-1", referenced.key), null);
 });
 
 test("pruneGateArtifacts re-checks references at deletion time", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
   // The artifact is old, but a reference appears between the sweep decision
   // and the delete: the deletion-time check must retain it.
-  const result = pruneGateArtifacts(home, "project-1", {
+  const result = pruneGateArtifacts(store, "project-1", {
     now: new Date(now.getTime() + 100 * 24 * 60 * 60 * 1000),
     ttlMs: 30 * 24 * 60 * 60 * 1000,
     isReferenced: () => true
   });
   assert.equal(result.deleted, 0);
-  assert.notEqual(loadGateArtifact(home, "project-1", artifact.key), null);
+  assert.notEqual(loadGateArtifact(store, "project-1", artifact.key), null);
 });
 
 // --- Release L2 lookup ------------------------------------------------------
 
 test("findL2ArtifactForCommit matches project, commit, plan, toolchain, and target ref", async (t) => {
-  const { home } = t.context;
-  const artifact = await buildArtifact(home, identity());
-  const found = await findL2ArtifactForCommit(home, {
+  const { store, home } = t.context;
+  const artifact = await buildArtifact(store, home, identity());
+  const found = await findL2ArtifactForCommit(store, {
     projectId: "project-1",
     commit: COMMIT,
     planDigest: PLAN_DIGEST,
@@ -389,7 +389,7 @@ test("findL2ArtifactForCommit matches project, commit, plan, toolchain, and targ
 
   // A different target ref does not match (base head is intentionally not
   // part of the release match).
-  assert.equal(await findL2ArtifactForCommit(home, {
+  assert.equal(await findL2ArtifactForCommit(store, {
     projectId: "project-1",
     commit: COMMIT,
     planDigest: PLAN_DIGEST,

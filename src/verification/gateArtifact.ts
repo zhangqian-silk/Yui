@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute } from "node:path";
 
 import {
   requireIdentity,
@@ -265,22 +264,19 @@ export type GateArtifactLogVerification = Readonly<{
 }>;
 
 /**
- * Verify that every step log still exists under the artifact's log directory
- * and matches its recorded digest. A lost or corrupted log means the artifact
- * cannot serve as complete L2 evidence: consumers must treat it as a gap.
+ * Verify that every step log is present in the log map and matches its
+ * recorded digest. A lost or corrupted log means the artifact cannot serve
+ * as complete L2 evidence: consumers must treat it as a gap.
  */
-export async function verifyGateArtifactLogs(
+export function verifyGateArtifactLogs(
   artifact: GateArtifact,
-  logsRoot: string
-): Promise<GateArtifactLogVerification> {
+  logs: ReadonlyMap<string, Buffer>
+): GateArtifactLogVerification {
   const missing: string[] = [];
   const corrupted: string[] = [];
   for (const step of artifact.steps) {
-    const logPath = join(logsRoot, step.logPath);
-    let content: Buffer;
-    try {
-      content = await readFile(logPath);
-    } catch {
+    const content = logs.get(step.name);
+    if (content === undefined) {
       missing.push(step.name);
       continue;
     }
@@ -329,3 +325,72 @@ function canonicalize(value: unknown): unknown {
   }
   return value;
 }
+
+// ---------------------------------------------------------------------------
+// Store port (Issue 08 DB-only adaptation)
+// ---------------------------------------------------------------------------
+
+/** One step's raw outcome before the store hashes and persists its log. */
+export type GateArtifactStepInput = Readonly<{
+  name: string;
+  command: string;
+  argv?: readonly string[];
+  outcome: "passed" | "failed" | "skipped";
+  exitCode: number | null;
+  signal: string | null;
+  timedOut: boolean;
+  durationMs: number;
+  /** Absolute path to the step log produced by the runner. */
+  sourceLogPath: string;
+  /** Log file name inside the artifact log directory. */
+  logName: string;
+}>;
+
+export type GateArtifactPruneOptions = Readonly<{
+  now: Date;
+  ttlMs: number;
+  /**
+   * Re-verify references before deletion. Only artifacts this reports as
+   * unreferenced AND older than the TTL window are removed.
+   */
+  isReferenced(key: string): boolean;
+}>;
+
+export type GateArtifactPruneResult = Readonly<{
+  retained: number;
+  deleted: number;
+}>;
+
+/**
+ * The persistence seam for GateArtifacts. Both the SQLite and file-backed
+ * TaskStore implementations satisfy this port. The artifact record and its
+ * step logs are saved atomically so a crash never leaves a complete record
+ * without its evidence.
+ */
+export type GateArtifactStorePort = Readonly<{
+  saveGateArtifact(
+    artifact: GateArtifact,
+    logs: ReadonlyMap<string, Buffer>
+  ): void;
+  /**
+   * Update only the artifact record (counters, timestamps) without touching
+   * its step logs.  Used for reuse/potential-reuse counter updates where the
+   * evidence is unchanged.
+   */
+  touchGateArtifact(artifact: GateArtifact): void;
+  getGateArtifact(projectId: string, key: string): GateArtifact | null;
+  findGateArtifactByIdentity(identity: GateArtifactIdentity): GateArtifact | null;
+  findL2GateArtifactsForCommit(query: Readonly<{
+    projectId: string;
+    commit: string;
+    planDigest: string;
+    toolchainDigest: string;
+    targetRef: string;
+  }>): GateArtifact[];
+  /** All step logs for an artifact, keyed by step name. */
+  getGateArtifactLogs(artifactKey: string): ReadonlyMap<string, Buffer>;
+  pruneGateArtifacts(
+    projectId: string,
+    options: GateArtifactPruneOptions
+  ): GateArtifactPruneResult;
+}>;

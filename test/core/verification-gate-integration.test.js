@@ -330,7 +330,7 @@ test("E2E: bootstrap and L2 run once, record a reusable artifact, and commit", a
   assert.equal(finished.status, "committed");
 
   const identity = f.gateIdentity();
-  const artifact = findGateArtifact(f.home, identity);
+  const artifact = findGateArtifact(f.store, identity);
   assert.notEqual(artifact, null);
   assert.equal(isReusableGateArtifact(artifact), true);
   assert.equal(artifact.commit, f.headCommit);
@@ -372,7 +372,7 @@ test("reuse mode: 5 requests for the same tuple execute the L2 gate once", async
   }
 
   const identity = f.gateIdentity();
-  const artifact = loadGateArtifact(f.home, f.project.id, gateArtifactKey(identity));
+  const artifact = loadGateArtifact(f.store, f.project.id, gateArtifactKey(identity));
   assert.equal(artifact.reuseCount, 4);
 });
 
@@ -397,7 +397,7 @@ test("record mode always runs the gate and counts potential reuses", async (t) =
   await f.integrate(attempt2);
 
   const identity = f.gateIdentity();
-  const artifact = loadGateArtifact(f.home, f.project.id, gateArtifactKey(identity));
+  const artifact = loadGateArtifact(f.store, f.project.id, gateArtifactKey(identity));
   assert.equal(artifact.potentialReuseCount, 1);
   assert.equal(artifact.reuseCount, 0);
 });
@@ -521,7 +521,7 @@ test("an incomplete artifact from a crashed gate is not reusable", async (t) => 
   assert.equal(crashed.status, "checks-running");
 
   const identity = f.gateIdentity();
-  assert.equal(findGateArtifact(f.home, identity), null);
+  assert.equal(findGateArtifact(f.store, identity), null);
 });
 
 // --- Enforce mode ------------------------------------------------------------------
@@ -560,10 +560,10 @@ test("Reviewer verifies the artifact and its logs, then runs a targeted gap chec
   await f.integrate(attempt);
 
   const identity = f.gateIdentity();
-  const artifact = findGateArtifact(f.home, identity);
+  const artifact = findGateArtifact(f.store, identity);
 
   const verification = await verifyGateArtifactForReview(
-    f.home,
+    f.store,
     f.project.id,
     artifact.key,
     { commit: f.headCommit }
@@ -590,7 +590,7 @@ test("a gate-artifact evidence ref covers the exact check commands at the exact 
   await f.integrate(attempt);
 
   const identity = f.gateIdentity();
-  const artifact = findGateArtifact(f.home, identity);
+  const artifact = findGateArtifact(f.store, identity);
   const ref = gateArtifactRef(artifact.key);
 
   // The queue reads evidenceRefs from the ChangeSet manifest. ChangeSets are
@@ -622,7 +622,6 @@ test("a gate-artifact evidence ref covers the exact check commands at the exact 
     changeSetId: "change-set-2",
     targetRef: "master",
     checkCommands: ["npm run lint", "npm run build"],
-    home: f.home,
     now: () => now
   });
   assert.equal(result.entry.status, "validated");

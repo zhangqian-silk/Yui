@@ -82,12 +82,6 @@ export type EnqueueIntegrationQueueInput = Readonly<{
   changeSetId: string;
   targetRef?: string;
   checkCommands?: readonly string[];
-  /**
-   * The Yui Home, used to resolve `gate-artifact:` evidence refs (Issue 08).
-   * When omitted, gate refs are not resolved and the entry fails closed to
-   * its explicit checks.
-   */
-  home?: string;
   git?: IntegrationQueueGitPort;
   now?: () => Date;
 }>;
@@ -428,7 +422,7 @@ export async function enqueueIntegrationQueueEntry(
       // evidence.  A converged ChangeSet with explicit gates queues normally:
       // the no-op apply still runs the caller's checks against the current
       // target instead of waiving them.
-      if (await canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), entry, changeSet, effectiveTargetHead, input.home)) {
+      if (await canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), entry, changeSet, effectiveTargetHead)) {
         entry = markIntegrationQueueValidated(entry, now(), effectiveTargetHead);
       }
       tx.saveIntegrationQueueEntry(task.id, entry);
@@ -526,8 +520,7 @@ async function canReuseEvidenceAtHead(
   entries: readonly IntegrationQueueEntry[],
   entry: IntegrationQueueEntry,
   changeSet: ChangeSet,
-  targetHead: string,
-  home?: string
+  targetHead: string
 ): Promise<boolean> {
   if (entry.evidenceRefs.length === 0) return false;
   if (targetHead !== changeSet.baseCommit) return false;
@@ -541,8 +534,7 @@ async function canReuseEvidenceAtHead(
     entry.evidenceRefs,
     entry.checkCommands,
     changeSet.headCommit,
-    entry.projectId,
-    home
+    entry.projectId
   );
 }
 
@@ -567,19 +559,17 @@ async function evidenceCoversCheckCommands(
   evidenceRefs: readonly string[],
   checkCommands: readonly string[],
   candidateCommit: string,
-  projectId: string,
-  home?: string
+  projectId: string
 ): Promise<boolean> {
   if (checkCommands.length === 0) return true;
   const covered = new Set<string>();
   for (const ref of evidenceRefs) {
     // Issue 08: a `gate-artifact:` ref covers the exact commands its L2
-    // artifact passed on the exact candidate commit. Without a Home the
-    // file-backed artifact store is unavailable, so the ref fails closed.
+    // artifact passed on the exact candidate commit. The store resolves the
+    // artifact through its persistence backend (SQLite or file).
     if (ref.startsWith("gate-artifact:")) {
-      if (home === undefined) continue;
       if (await gateArtifactCoversCheckCommands(
-        home,
+        store,
         projectId,
         ref,
         checkCommands,

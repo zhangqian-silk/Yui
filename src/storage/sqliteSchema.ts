@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 4;
+export const SQLITE_SCHEMA_VERSION = 5;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -453,6 +453,48 @@ CREATE UNIQUE INDEX idx_durable_jobs_idempotency
   ON durable_jobs(task_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 `;
 
+/**
+ * Migration 5: GateArtifact storage (Issue 08). Content-addressed gate
+ * evidence records with per-step logs stored as BLOBs. The artifact key is
+ * the SHA-256 of the identity tuple (Project + commit + plan digest +
+ * toolchain digest + L2 boundary), so the same tuple always maps to one row.
+ * Typed columns support the reuse lookup paths (exact-commit L2 search,
+ * Project-level prune) without scanning payloads.
+ */
+const MIGRATION_5_SQL = `
+CREATE TABLE IF NOT EXISTS gate_artifacts (
+  key               TEXT PRIMARY KEY,
+  project_id        TEXT NOT NULL,
+  level             TEXT NOT NULL CHECK (level IN ('L1','L2')),
+  commit_sha        TEXT NOT NULL,
+  plan_digest       TEXT NOT NULL,
+  toolchain_digest  TEXT NOT NULL,
+  target_ref        TEXT,
+  status            TEXT NOT NULL CHECK (status IN ('incomplete','complete')),
+  outcome           TEXT NOT NULL CHECK (outcome IN ('unknown','succeeded','failed')),
+  payload           TEXT NOT NULL,
+  created_at        TEXT NOT NULL,
+  completed_at      TEXT,
+  last_used_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_artifacts_project_commit
+  ON gate_artifacts(project_id, commit_sha);
+
+CREATE INDEX IF NOT EXISTS idx_gate_artifacts_project_last_used
+  ON gate_artifacts(project_id, last_used_at);
+
+CREATE TABLE IF NOT EXISTS gate_artifact_logs (
+  artifact_key  TEXT NOT NULL,
+  step_name     TEXT NOT NULL,
+  log_content   BLOB NOT NULL,
+  log_digest    TEXT NOT NULL,
+  log_bytes     INTEGER NOT NULL,
+  PRIMARY KEY (artifact_key, step_name),
+  FOREIGN KEY (artifact_key) REFERENCES gate_artifacts(key) ON DELETE CASCADE
+);
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -464,7 +506,8 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 1, axis: "layout", sql: MIGRATION_1_SQL },
   { version: 2, axis: "record", recordKind: "durableJob+capability-grant+release-workflow", sql: MIGRATION_2_SQL },
   { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL },
-  { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL }
+  { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL },
+  { version: 5, axis: "record", recordKind: "gateArtifact", sql: MIGRATION_5_SQL }
 ];
 
 function checksum(sql: string): string {
@@ -555,5 +598,7 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "task_projections",
   "telemetry",
   "capability_grants",
-  "release_workflows"
+  "release_workflows",
+  "gate_artifacts",
+  "gate_artifact_logs"
 ] as const;

@@ -29,6 +29,7 @@ import {
   resolveVerificationGate
 } from "../verification/verificationGateService.js";
 import { findL2ArtifactForCommit } from "../verification/gateArtifactStore.js";
+import type { GateArtifactStorePort } from "../verification/gateArtifact.js";
 
 /**
  * The outcome of one external step attempt. A `timeout` means the request may
@@ -194,7 +195,7 @@ export function createPinnedRunner(base: CommandRunner): CommandRunner {
 export type ReleaseWorkflowAdapterDeps = Readonly<{
   home: string;
   updatePorts: UpdatePorts;
-  projectStore: ProjectCommandStore;
+  projectStore: ProjectCommandStore & GateArtifactStorePort;
   projectOptions?: ProjectCommandOptions;
   controllerOptions?: FileControllerClientOptions;
   /** Overridable for tests; defaults to child_process execFile. */
@@ -486,7 +487,7 @@ export function createReleaseWorkflowPorts(
             if (project !== null) {
               const gate = resolveVerificationGate(project, process.env);
               if (gate !== undefined) {
-                const artifact = await findL2ArtifactForCommit(deps.home, {
+                const artifact = await findL2ArtifactForCommit(deps.projectStore, {
                   projectId: project.id,
                   commit: source.commit,
                   planDigest: gate.planDigest,

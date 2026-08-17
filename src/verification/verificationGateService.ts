@@ -17,13 +17,15 @@ import {
   verifyGateArtifactLogs,
   type GateArtifact,
   type GateArtifactIdentity,
-  type GateArtifactLevel
+  type GateArtifactLevel,
+  type GateArtifactStorePort
 } from "./gateArtifact.js";
 import {
   findGateArtifact,
   importGateArtifactSteps,
   loadGateArtifact,
   saveGateArtifact,
+  touchGateArtifact,
   type GateArtifactStepInput
 } from "./gateArtifactStore.js";
 import {
@@ -104,26 +106,14 @@ export function gateIdentityForCandidate(input: Readonly<{
  * artifact from a crashed gate is never returned.
  */
 export async function lookupReusableGateArtifact(
-  home: string,
+  store: GateArtifactStorePort,
   identity: GateArtifactIdentity
 ): Promise<GateArtifact | null> {
-  const artifact = findGateArtifact(home, identity);
+  const artifact = findGateArtifact(store, identity);
   if (artifact === null || !isReusableGateArtifact(artifact)) return null;
-  const verification = await verifyGateArtifactLogs(
-    artifact,
-    gateLogsRoot(home, artifact)
-  );
+  const logs = store.getGateArtifactLogs(artifact.key);
+  const verification = verifyGateArtifactLogs(artifact, logs);
   return verification.ok ? artifact : null;
-}
-
-function gateLogsRoot(home: string, artifact: GateArtifact): string {
-  return join(
-    resolve(home),
-    "artifacts",
-    "gates",
-    artifact.projectId,
-    artifact.key
-  );
 }
 
 /**
@@ -132,6 +122,7 @@ function gateLogsRoot(home: string, artifact: GateArtifact): string {
  * artifact is self-contained evidence after the job's own logs are cleaned.
  */
 export async function recordGateArtifactFromJob(
+  store: GateArtifactStorePort,
   home: string,
   identity: GateArtifactIdentity,
   plan: VerificationPlan,
@@ -160,7 +151,7 @@ export async function recordGateArtifactFromJob(
       logName: result.logPath
     };
   });
-  return recordGateArtifact(home, identity, plan, steps, job.result?.outcome === "succeeded", now);
+  return recordGateArtifact(store, identity, plan, steps, job.result?.outcome === "succeeded", now);
 }
 
 /** One in-process step outcome (L1 or the jobless L2 fallback). */
@@ -177,7 +168,7 @@ export type GateStepOutcome = Readonly<{
 }>;
 
 export async function recordGateArtifactFromStepOutcomes(
-  home: string,
+  store: GateArtifactStorePort,
   identity: GateArtifactIdentity,
   plan: VerificationPlan,
   outcomes: readonly GateStepOutcome[],
@@ -198,11 +189,11 @@ export async function recordGateArtifactFromStepOutcomes(
     sourceLogPath: outcome.sourceLogPath,
     logName: outcome.logName
   }));
-  return recordGateArtifact(home, identity, plan, steps, succeeded, now);
+  return recordGateArtifact(store, identity, plan, steps, succeeded, now);
 }
 
 async function recordGateArtifact(
-  home: string,
+  store: GateArtifactStorePort,
   identity: GateArtifactIdentity,
   plan: VerificationPlan,
   steps: readonly GateArtifactStepInput[],
@@ -214,17 +205,17 @@ async function recordGateArtifact(
     planVersion: plan.version,
     generator: "yui"
   }, now);
-  const imported = await importGateArtifactSteps(home, created, steps);
+  const { steps: importedSteps, logs } = await importGateArtifactSteps(steps);
   let artifact = completeGateArtifact(
     created,
-    imported,
+    importedSteps,
     succeeded ? "succeeded" : "failed",
     now
   );
   // Preserve shadow/reuse counters when re-recording the same identity tuple
   // (e.g. record mode always re-runs the gate but must not lose the potential
   // reuse observations from earlier runs).
-  const existing = findGateArtifact(home, identity);
+  const existing = findGateArtifact(store, identity);
   if (existing !== null) {
     artifact = validateGateArtifact({
       ...artifact,
@@ -232,7 +223,7 @@ async function recordGateArtifact(
       reuseCount: existing.reuseCount
     });
   }
-  saveGateArtifact(home, artifact);
+  saveGateArtifact(store, artifact, logs);
   return artifact;
 }
 
@@ -399,13 +390,12 @@ export function checkResultsFromGateJob(job: DurableJob, home: string): CheckRes
 
 /** Map a reused artifact to the attempt's CheckResult shape. */
 export function checkResultsFromGateArtifact(
-  home: string,
   artifact: GateArtifact
 ): CheckResult[] {
   const checks: CheckResult[] = artifact.steps.map((step) => ({
     name: step.name,
     outcome: step.outcome,
-    logPath: `artifacts/gates/${artifact.projectId}/${artifact.key}/${step.logPath}`
+    ...(step.logPath === undefined ? {} : { logPath: step.logPath })
   }));
   checks.push({
     name: gateArtifactRef(artifact.key),
@@ -428,12 +418,12 @@ export type GateArtifactVerification = Readonly<{
  * gap: the Reviewer runs a targeted check for it instead of trusting prose.
  */
 export async function verifyGateArtifactForReview(
-  home: string,
+  store: GateArtifactStorePort,
   projectId: string,
   key: string,
   expected: Readonly<{ commit?: string }> = {}
 ): Promise<GateArtifactVerification> {
-  const artifact = loadGateArtifact(home, projectId, key);
+  const artifact = loadGateArtifact(store, projectId, key);
   if (artifact === null) {
     return { ok: false, reason: `Gate artifact not found: ${key}.` };
   }
@@ -449,7 +439,8 @@ export async function verifyGateArtifactForReview(
       reason: `Gate artifact commit ${artifact.commit} does not match ${expected.commit}.`
     };
   }
-  const verification = await verifyGateArtifactLogs(artifact, gateLogsRoot(home, artifact));
+  const logs = store.getGateArtifactLogs(artifact.key);
+  const verification = verifyGateArtifactLogs(artifact, logs);
   if (!verification.ok) {
     const parts = [
       ...verification.missing.map((name) => `missing log: ${name}`),
@@ -470,7 +461,7 @@ export async function verifyGateArtifactForReview(
  * artifact must bind the exact candidate tree.
  */
 export async function gateArtifactCoversCheckCommands(
-  home: string,
+  store: GateArtifactStorePort,
   projectId: string,
   ref: string,
   checkCommands: readonly string[],
@@ -478,10 +469,11 @@ export async function gateArtifactCoversCheckCommands(
 ): Promise<boolean> {
   const key = parseGateArtifactRef(ref);
   if (key === undefined) return false;
-  const artifact = loadGateArtifact(home, projectId, key);
+  const artifact = loadGateArtifact(store, projectId, key);
   if (artifact === null || !isReusableGateArtifact(artifact)) return false;
   if (artifact.commit !== candidateCommit) return false;
-  const verification = await verifyGateArtifactLogs(artifact, gateLogsRoot(home, artifact));
+  const logs = store.getGateArtifactLogs(artifact.key);
+  const verification = verifyGateArtifactLogs(artifact, logs);
   if (!verification.ok) return false;
   if (checkCommands.length === 0) return true;
   const covered = new Set(
@@ -519,7 +511,7 @@ export function assertNoAdHocFullSuiteChecks(
  * successful artifact for the same tuple.
  */
 export async function runL1Gate(input: Readonly<{
-  home: string;
+  store: GateArtifactStorePort;
   projectId: string;
   gate: ResolvedVerificationGate;
   commit: string;
@@ -536,14 +528,14 @@ export async function runL1Gate(input: Readonly<{
     commit: input.commit
   });
   if (input.gate.mode !== "record") {
-    const existing = await lookupReusableGateArtifact(input.home, identity);
+    const existing = await lookupReusableGateArtifact(input.store, identity);
     if (existing !== null) {
       const reused = recordGateArtifactReuse(existing, input.now);
-      saveGateArtifact(input.home, reused);
+      touchGateArtifact(input.store, reused);
       return {
         artifact: reused,
         reused: true,
-        checks: checkResultsFromGateArtifact(input.home, reused)
+        checks: checkResultsFromGateArtifact(reused)
       };
     }
   }
@@ -558,7 +550,7 @@ export async function runL1Gate(input: Readonly<{
   const succeeded = outcomes.length > 0
     && outcomes.every((outcome) => outcome.exitCode === 0 && outcome.signal === null && !outcome.timedOut);
   const artifact = await recordGateArtifactFromStepOutcomes(
-    input.home,
+    input.store,
     identity,
     input.gate.plan,
     outcomes,
@@ -568,7 +560,7 @@ export async function runL1Gate(input: Readonly<{
   return {
     artifact,
     reused: false,
-    checks: checkResultsFromGateArtifact(input.home, artifact)
+    checks: checkResultsFromGateArtifact(artifact)
   };
 }
 

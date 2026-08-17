@@ -27,7 +27,7 @@ import {
   recordGateArtifactPotentialReuse,
   recordGateArtifactReuse
 } from "../verification/gateArtifact.js";
-import { saveGateArtifact } from "../verification/gateArtifactStore.js";
+import { touchGateArtifact } from "../verification/gateArtifactStore.js";
 import type { CheckResult } from "./checkResult.js";
 import {
   NodeGitWorkspace,
@@ -512,6 +512,7 @@ export class GitIntegrationService {
       });
       try {
         const artifact = await recordGateArtifactFromJob(
+          this.store,
           this.home,
           identity,
           gate.plan,
@@ -519,7 +520,7 @@ export class GitIntegrationService {
           this.now()
         );
         if (checks.every((check) => check.outcome !== "failed")) {
-          checks.push(...checkResultsFromGateArtifact(this.home, artifact));
+          checks.push(...checkResultsFromGateArtifact(artifact));
         }
       } catch (error) {
         // A failed artifact import (e.g. a lost job log) must not fake
@@ -640,10 +641,10 @@ export class GitIntegrationService {
       baseHead: attempt.expectedHead
     });
     if (gate.mode !== "record") {
-      const existing = await lookupReusableGateArtifact(this.home, identity);
+      const existing = await lookupReusableGateArtifact(this.store, identity);
       if (existing !== null) {
-        saveGateArtifact(this.home, recordGateArtifactReuse(existing, this.now()));
-        const checks = checkResultsFromGateArtifact(this.home, existing);
+        touchGateArtifact(this.store, recordGateArtifactReuse(existing, this.now()));
+        const checks = checkResultsFromGateArtifact(existing);
         return this.#finalizeGateSuccess(
           attempt,
           workspace,
@@ -654,12 +655,9 @@ export class GitIntegrationService {
       }
     } else {
       // Record mode: observe the potential reuse without skipping the gate.
-      const existing = await lookupReusableGateArtifact(this.home, identity);
+      const existing = await lookupReusableGateArtifact(this.store, identity);
       if (existing !== null) {
-        saveGateArtifact(
-          this.home,
-          recordGateArtifactPotentialReuse(existing, this.now())
-        );
+        touchGateArtifact(this.store, recordGateArtifactPotentialReuse(existing, this.now()));
       }
     }
     if (this.jobPort !== undefined) {
@@ -695,14 +693,14 @@ export class GitIntegrationService {
           outcome.exitCode === 0 && outcome.signal === null && !outcome.timedOut
         );
       const artifact = await recordGateArtifactFromStepOutcomes(
-        this.home,
+        this.store,
         identity,
         gate.plan,
         outcomes,
         succeeded,
         this.now()
       );
-      const checks = checkResultsFromGateArtifact(this.home, artifact);
+      const checks = checkResultsFromGateArtifact(artifact);
       cleanupReason = succeeded ? "completion" : "failure";
       if (!succeeded) {
         const failed = updateIntegrationAttempt(

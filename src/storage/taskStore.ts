@@ -126,6 +126,15 @@ import {
   type ManagedWorkspace,
   type ManagedWorkspaceOwner
 } from "../worktree/managedWorkspace.js";
+import {
+  gateArtifactKey,
+  validateGateArtifact,
+  type GateArtifact,
+  type GateArtifactIdentity,
+  type GateArtifactPruneOptions,
+  type GateArtifactPruneResult,
+  type GateArtifactStorePort
+} from "../verification/gateArtifact.js";
 import { writeTextFileAtomically } from "./durableFile.js";
 import { assertHomeWritable } from "./upgradeFence.js";
 import {
@@ -467,6 +476,20 @@ export type TaskStore = {
   saveReleaseWorkflow(taskId: string, workflow: ReleaseWorkflow): void;
   listReleaseWorkflows(taskId: string): ReleaseWorkflow[];
   getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null;
+  // -- Gate artifacts (Issue 08) ---------------------------------------------
+  saveGateArtifact(artifact: GateArtifact, logs: ReadonlyMap<string, Buffer>): void;
+  touchGateArtifact(artifact: GateArtifact): void;
+  getGateArtifact(projectId: string, key: string): GateArtifact | null;
+  findGateArtifactByIdentity(identity: GateArtifactIdentity): GateArtifact | null;
+  findL2GateArtifactsForCommit(query: Readonly<{
+    projectId: string;
+    commit: string;
+    planDigest: string;
+    toolchainDigest: string;
+    targetRef: string;
+  }>): GateArtifact[];
+  getGateArtifactLogs(artifactKey: string): ReadonlyMap<string, Buffer>;
+  pruneGateArtifacts(projectId: string, options: GateArtifactPruneOptions): GateArtifactPruneResult;
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   listWorkMailboxes(): WorkMailbox[];
   saveWorkMailbox(mailbox: WorkMailbox): void;
@@ -1701,6 +1724,141 @@ export class FileTaskStore implements TaskStore {
   }
   getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null {
     return this.#requireTask(taskId).releaseWorkflows[workflowId] ?? null;
+  }
+
+  // -- Gate artifacts (Issue 08) ---------------------------------------------
+  // FileTaskStore delegates to the file-backed artifact namespace under
+  // `<home>/artifacts/gates/`.  This is the transitional path for Homes that
+  // have not yet migrated to SQLite; the SqliteTaskStore stores the same
+  // records and logs in `gate_artifacts` / `gate_artifact_logs`.
+
+  #gateArtifactRecordPath(projectId: string, key: string): string {
+    return join(this.rootDir, "artifacts", "gates", projectId, `${key}.json`);
+  }
+
+  #gateArtifactLogsRoot(projectId: string, key: string): string {
+    return join(this.rootDir, "artifacts", "gates", projectId, key);
+  }
+
+  saveGateArtifact(artifact: GateArtifact, logs: ReadonlyMap<string, Buffer>): void {
+    validateGateArtifact(artifact);
+    const recordPath = this.#gateArtifactRecordPath(artifact.projectId, artifact.key);
+    const logsRoot = this.#gateArtifactLogsRoot(artifact.projectId, artifact.key);
+    this.#mutate(() => {
+      writeTextFileAtomically(recordPath, `${JSON.stringify(artifact, null, 2)}\n`);
+      mkdirSync(logsRoot, { recursive: true, mode: 0o700 });
+      for (const [stepName, content] of logs) {
+        writeFileSync(join(logsRoot, stepName), content, { mode: 0o600 });
+      }
+    });
+  }
+
+  touchGateArtifact(artifact: GateArtifact): void {
+    validateGateArtifact(artifact);
+    writeTextFileAtomically(
+      this.#gateArtifactRecordPath(artifact.projectId, artifact.key),
+      `${JSON.stringify(artifact, null, 2)}\n`
+    );
+  }
+
+  getGateArtifact(projectId: string, key: string): GateArtifact | null {
+    const path = this.#gateArtifactRecordPath(projectId, key);
+    if (!existsSync(path)) return null;
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as GateArtifact;
+    return validateGateArtifact(parsed);
+  }
+
+  findGateArtifactByIdentity(identity: GateArtifactIdentity): GateArtifact | null {
+    return this.getGateArtifact(identity.projectId, gateArtifactKey(identity));
+  }
+
+  findL2GateArtifactsForCommit(query: Readonly<{
+    projectId: string;
+    commit: string;
+    planDigest: string;
+    toolchainDigest: string;
+    targetRef: string;
+  }>): GateArtifact[] {
+    const root = join(this.rootDir, "artifacts", "gates", query.projectId);
+    if (!existsSync(root)) return [];
+    const results: GateArtifact[] = [];
+    for (const entry of readdirSync(root)) {
+      if (!entry.endsWith(".json")) continue;
+      let artifact: GateArtifact | null;
+      try {
+        artifact = this.getGateArtifact(query.projectId, entry.slice(0, -".json".length));
+      } catch {
+        continue;
+      }
+      if (artifact === null
+        || artifact.level !== "L2"
+        || artifact.status !== "complete"
+        || artifact.outcome !== "succeeded"
+        || artifact.commit !== query.commit
+        || artifact.planDigest !== query.planDigest
+        || artifact.toolchainDigest !== query.toolchainDigest
+        || artifact.boundary?.targetRef !== query.targetRef) {
+        continue;
+      }
+      results.push(artifact);
+    }
+    return results;
+  }
+
+  getGateArtifactLogs(artifactKey: string): ReadonlyMap<string, Buffer> {
+    // The artifact key is content-addressed; we need the projectId to build
+    // the path.  Callers that have the artifact should use
+    // getGateArtifactLogsForArtifact; this fallback scans all projects.
+    const gatesRoot = join(this.rootDir, "artifacts", "gates");
+    if (!existsSync(gatesRoot)) return new Map();
+    for (const projectId of readdirSync(gatesRoot)) {
+      const logsRoot = join(gatesRoot, projectId, artifactKey);
+      if (existsSync(logsRoot) && statSync(logsRoot).isDirectory()) {
+        return this.#readGateArtifactLogs(logsRoot);
+      }
+    }
+    return new Map();
+  }
+
+  #readGateArtifactLogs(logsRoot: string): ReadonlyMap<string, Buffer> {
+    const logs = new Map<string, Buffer>();
+    if (!existsSync(logsRoot)) return logs;
+    for (const entry of readdirSync(logsRoot)) {
+      const fullPath = join(logsRoot, entry);
+      if (statSync(fullPath).isFile()) {
+        logs.set(entry, readFileSync(fullPath));
+      }
+    }
+    return logs;
+  }
+
+  pruneGateArtifacts(projectId: string, options: GateArtifactPruneOptions): GateArtifactPruneResult {
+    const root = join(this.rootDir, "artifacts", "gates", projectId);
+    if (!existsSync(root)) return Object.freeze({ retained: 0, deleted: 0 });
+    let retained = 0;
+    let deleted = 0;
+    for (const entry of readdirSync(root)) {
+      if (!entry.endsWith(".json")) continue;
+      const key = entry.slice(0, -".json".length);
+      let artifact: GateArtifact;
+      try {
+        const loaded = this.getGateArtifact(projectId, key);
+        if (loaded === null) continue;
+        artifact = loaded;
+      } catch {
+        retained += 1;
+        continue;
+      }
+      const age = options.now.getTime() - Date.parse(artifact.lastUsedAt);
+      if (options.isReferenced(key) || age < options.ttlMs) {
+        retained += 1;
+        continue;
+      }
+      rmSync(this.#gateArtifactRecordPath(projectId, key), { force: true });
+      rmSync(this.#gateArtifactLogsRoot(projectId, key), { recursive: true, force: true });
+      deleted += 1;
+    }
+    return Object.freeze({ retained, deleted });
   }
 
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null {
