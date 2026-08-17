@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { openTaskStore } from "../../dist/storage/sqliteStore.js";
 import { createTask } from "../../dist/task/task.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
@@ -122,8 +123,7 @@ test("router: broken sink never blocks the semantic lane", () => {
 test("adapter projection merges sidecar progress in bounded mode", async () => {
   const home = temporaryHome();
   try {
-    ensureStorageSchema(home);
-    const store = new FileTaskStore(home);
+    const store = openTaskStore(home, "sqlite");
     const now = new Date("2026-08-17T00:00:00.000Z");
     store.saveTask(createTask("task-1", "Test", now));
     store.saveEvent("task-1", createTaskEvent(

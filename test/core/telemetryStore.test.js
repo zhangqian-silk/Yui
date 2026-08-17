@@ -4,11 +4,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import Database from "better-sqlite3";
+
+import { migrateSqliteSchema } from "../../dist/storage/sqliteSchema.js";
+import { COMMITTED_DATABASE_FILENAME } from "../../dist/storage/upgrade/sqliteStateMigration.js";
 import { SqliteTelemetryStore } from "../../dist/telemetry/sqliteTelemetryStore.js";
 import { NullTelemetrySink } from "../../dist/telemetry/telemetryStore.js";
+import { openSchedulerTelemetry } from "../../dist/telemetry/telemetryWiring.js";
 
+// Telemetry lives in the Home's authoritative `yui.db`; tests provision a
+// real migrated database so the store opens exactly as in production.
 function temporaryHome() {
-  return mkdtempSync(join(tmpdir(), "yui-telemetry-store-"));
+  const home = mkdtempSync(join(tmpdir(), "yui-telemetry-store-"));
+  const db = new Database(join(home, COMMITTED_DATABASE_FILENAME));
+  db.pragma("journal_mode = WAL");
+  migrateSqliteSchema(db);
+  db.close();
+  return home;
 }
 
 function entry(overrides = {}) {
@@ -120,7 +132,7 @@ test("active run hard cap trims oldest rows", async () => {
   }
 });
 
-test("sidecar failure never throws and only increments dropped", async () => {
+test("missing database fails isolated: observe never throws and only increments dropped", async () => {
   const home = join(temporaryHome(), "not-a-directory");
   writeFileSync(home, "blocking file");
   try {
@@ -131,6 +143,7 @@ test("sidecar failure never throws and only increments dropped", async () => {
     assert.equal(health.available, false);
     assert.equal(health.dropped, 2);
     assert.equal(health.lastError !== null, true);
+    assert.match(health.lastError, /Telemetry database not found/);
     assert.equal(store.count("task-1"), 0);
     assert.deepEqual(store.list("task-1").items, []);
     assert.equal(store.aggregate("task-1", "run-1"), null);
@@ -237,4 +250,32 @@ test("NullTelemetrySink is inert", async () => {
   sink.observe(entry());
   assert.equal(sink.health().available, false);
   await sink.close();
+});
+
+test("wiring returns null in legacy mode and fails closed without a database", () => {
+  const home = mkdtempSync(join(tmpdir(), "yui-telemetry-nodb-"));
+  try {
+    assert.equal(openSchedulerTelemetry(home, { YUI_TELEMETRY_MODE: "legacy" }), null);
+    assert.throws(
+      () => openSchedulerTelemetry(home, { YUI_TELEMETRY_MODE: "dual" }),
+      /requires SQLite storage/
+    );
+    assert.throws(
+      () => openSchedulerTelemetry(home, { YUI_TELEMETRY_MODE: "bounded" }),
+      /requires SQLite storage/
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("wiring opens the sidecar when the Home already has yui.db", () => {
+  const home = temporaryHome();
+  try {
+    const wired = openSchedulerTelemetry(home, { YUI_TELEMETRY_MODE: "bounded" });
+    assert.notEqual(wired, null);
+    assert.equal(wired.mode, "bounded");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

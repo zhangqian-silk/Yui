@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { TaskEvent } from "../event/taskEvent.js";
@@ -14,83 +14,26 @@ import type {
   TelemetryProgressEntry,
   TelemetryStore
 } from "./telemetryStore.js";
+import { migrateSqliteSchema } from "../storage/sqliteSchema.js";
+import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
 
 /**
- * Default sidecar implementation: `<home>/telemetry.db` in WAL mode with a
- * single serialized writer (the "WAL worker"). Writes are best-effort and
- * never block the Controller event loop: `observe` only merges into a
- * bounded in-memory queue; a background flush drains it in batches. Queue
- * overflow and database failures increment `dropped` and record a health
- * warning — the semantic lane is never affected.
+ * Default sidecar implementation: the telemetry tables live inside the Home's
+ * authoritative `yui.db` (schema migrations 1 and 5), so a database-only Home
+ * has one file to manage, back up, and migrate. The store opens its own
+ * connection to that file: the write path is a single serialized writer (the
+ * "WAL worker") and stays isolated from the business store's connection.
  *
- * The sidecar is independent of the authoritative business store: it does
- * not require `yui.db`, does not modify `sqliteSchema.ts`, and rolls back by
- * deleting `telemetry.db` (or flipping `YUI_TELEMETRY_MODE` back to legacy).
+ * Writes are best-effort and never block the Controller event loop: `observe`
+ * only merges into a bounded in-memory queue; a background flush drains it in
+ * batches. Queue overflow and database failures increment `dropped` and record
+ * a health warning — the semantic lane is never affected.
+ *
+ * The telemetry tables are maintained by the centralized schema migrations:
+ * `telemetry` (migration 1, §4.4) holds the bounded latest-per-key window and
+ * `telemetry_aggregate` (migration 5) holds the authoritative per-Run/generation
+ * summary, maintained by triggers so it survives window pruning.
  */
-
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS telemetry (
-  task_id     TEXT NOT NULL,
-  role_name   TEXT NOT NULL,
-  run_id      TEXT NOT NULL,
-  generation  TEXT NOT NULL,
-  progress_id TEXT NOT NULL,
-  sequence    INTEGER,
-  payload     TEXT NOT NULL,
-  received_at TEXT NOT NULL,
-  PRIMARY KEY (task_id, role_name, run_id, generation, progress_id)
-) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_telemetry_run ON telemetry(task_id, run_id);
-
-CREATE TABLE IF NOT EXISTS telemetry_aggregate (
-  task_id      TEXT NOT NULL,
-  role_name    TEXT NOT NULL,
-  run_id       TEXT NOT NULL,
-  generation   TEXT NOT NULL,
-  first_at     TEXT NOT NULL,
-  last_at      TEXT NOT NULL,
-  count        INTEGER NOT NULL,
-  max_sequence INTEGER,
-  error_count  INTEGER NOT NULL DEFAULT 0,
-  updated_at   TEXT NOT NULL,
-  PRIMARY KEY (task_id, role_name, run_id, generation)
-) WITHOUT ROWID;
-
-CREATE TRIGGER IF NOT EXISTS telemetry_ai AFTER INSERT ON telemetry
-BEGIN
-  INSERT INTO telemetry_aggregate
-    (task_id, role_name, run_id, generation, first_at, last_at, count, max_sequence, error_count, updated_at)
-  VALUES
-    (NEW.task_id, NEW.role_name, NEW.run_id, NEW.generation, NEW.received_at, NEW.received_at, 1, NEW.sequence,
-     CASE WHEN json_valid(NEW.payload)
-           AND (COALESCE(json_extract(NEW.payload, '$.error'), '') <> ''
-                OR COALESCE(json_extract(NEW.payload, '$.errorKind'), '') <> '')
-          THEN 1 ELSE 0 END,
-     NEW.received_at)
-  ON CONFLICT(task_id, role_name, run_id, generation) DO UPDATE SET
-    first_at = MIN(telemetry_aggregate.first_at, excluded.first_at),
-    last_at = MAX(telemetry_aggregate.last_at, excluded.last_at),
-    count = telemetry_aggregate.count + 1,
-    max_sequence = CASE
-      WHEN excluded.max_sequence IS NOT NULL
-       AND (telemetry_aggregate.max_sequence IS NULL OR excluded.max_sequence > telemetry_aggregate.max_sequence)
-      THEN excluded.max_sequence ELSE telemetry_aggregate.max_sequence END,
-    error_count = telemetry_aggregate.error_count + excluded.error_count,
-    updated_at = excluded.updated_at;
-END;
-
-CREATE TRIGGER IF NOT EXISTS telemetry_au AFTER UPDATE ON telemetry
-BEGIN
-  UPDATE telemetry_aggregate SET
-    last_at = CASE WHEN NEW.received_at > last_at THEN NEW.received_at ELSE last_at END,
-    max_sequence = CASE
-      WHEN NEW.sequence IS NOT NULL AND (max_sequence IS NULL OR NEW.sequence > max_sequence)
-      THEN NEW.sequence ELSE max_sequence END,
-    updated_at = NEW.received_at
-  WHERE task_id = NEW.task_id AND role_name = NEW.role_name
-    AND run_id = NEW.run_id AND generation = NEW.generation;
-END;
-`;
 
 const MAX_PAGE_LIMIT = 500;
 
@@ -120,7 +63,7 @@ export class SqliteTelemetryStore implements TelemetryStore {
 
   constructor(home: string, options: SqliteTelemetryStoreOptions = {}) {
     this.mode = options.mode ?? "dual";
-    this.#path = join(home, "telemetry.db");
+    this.#path = join(home, COMMITTED_DATABASE_FILENAME);
     this.#terminalKeep = options.terminalKeep ?? DEFAULT_TERMINAL_KEEP;
     this.#runCap = options.runCap ?? DEFAULT_RUN_CAP;
     this.#maxPending = options.maxPending ?? 10_000;
@@ -389,11 +332,19 @@ export class SqliteTelemetryStore implements TelemetryStore {
     if (this.#db !== null) return this.#db;
     if (this.#failed || this.#closed) return null;
     try {
-      if (!existsSync(join(this.#path, ".."))) mkdirSync(join(this.#path, ".."), { recursive: true });
+      // The telemetry tables live in the Home's authoritative database; the
+      // store never creates `yui.db` itself. Wiring fails closed on Homes
+      // without a database instead of silently materializing an empty one.
+      if (!existsSync(this.#path)) {
+        throw new Error(`Telemetry database not found: ${this.#path}`);
+      }
       const db = new Database(this.#path);
       db.pragma("journal_mode = WAL");
-      db.pragma("synchronous = NORMAL");
-      db.exec(SCHEMA);
+      db.pragma("synchronous = FULL");
+      db.pragma("foreign_keys = ON");
+      db.pragma("busy_timeout = 5000");
+      db.pragma("wal_autocheckpoint = 1000");
+      migrateSqliteSchema(db);
       this.#db = db;
       return db;
     } catch (error) {

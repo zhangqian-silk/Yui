@@ -7,12 +7,13 @@ import type { TelemetryAggregate, TelemetryProgressEntry, TelemetryStore } from 
  * Issue 09 — historical compaction.
  *
  * Progress events that were appended to semantic Task event history (legacy
- * behavior) are folded into the telemetry sidecar: the newest `keep` rows per
- * Run/generation become the retained window, and every Run/generation gets an
- * accurate aggregate (count/first/last/maxSequence/errorCount). The semantic
- * progress events are then removed through the store's public transaction
- * adapter. Semantic evidence (Run dispatch/delivery/terminal receipts,
- * Session lifecycle, Review, Decision, Integration, ...) is never touched.
+ * behavior) are folded into the telemetry tables inside the Home's `yui.db`:
+ * the newest `keep` rows per Run/generation become the retained window, and
+ * every Run/generation gets an accurate aggregate
+ * (count/first/last/maxSequence/errorCount). The semantic progress events are
+ * then removed through the store's public transaction adapter. Semantic
+ * evidence (Run dispatch/delivery/terminal receipts, Session lifecycle,
+ * Review, Decision, Integration, ...) is never touched.
  *
  * Compaction runs on a staged copy of a Home. The caller promotes the staged
  * copy only after this module validates the result; a validation failure
@@ -225,9 +226,12 @@ function progressAt(event: TaskEvent): string {
 
 /**
  * Apply a plan to a staged Home. The telemetry windows/aggregates are imported
- * first, then the semantic progress events are removed inside one store
- * transaction, then the result is validated. Throws on any validation
- * failure; the caller must discard the staged Home in that case.
+ * first and validated, then the semantic progress events are removed inside
+ * one store transaction and validated again. Throws on any validation
+ * failure; the caller must discard the staged Home in that case. A crash
+ * between the two phases leaves the staged Home in the equivalent of
+ * dual-write state (telemetry imported, semantic progress still present),
+ * which is harmless and re-runnable.
  */
 export function applyTelemetryCompaction(
   store: TaskStore,

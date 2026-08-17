@@ -1,11 +1,17 @@
 /**
  * Issue 09 — telemetry retention & compaction configuration.
  *
- * The telemetry sidecar is backend-neutral: it works next to the File store
- * and the SQLite store without requiring `yui.db`. Its activation is an
- * explicit per-Home switch so the feature can be rolled out (legacy → dual →
- * bounded) and rolled back independently of every other Issue.
+ * Telemetry lives in the Home's authoritative `yui.db` (database-only
+ * direction). Its activation is an explicit per-Home switch so the feature
+ * can be rolled out (legacy → dual → bounded) and rolled back independently
+ * of every other Issue. Retention defaults are the schema's own constants
+ * (§4.4); the environment only overrides them.
  */
+
+import {
+  TELEMETRY_KEEP_PER_GENERATION,
+  TELEMETRY_RUN_CAP
+} from "../storage/sqliteSchema.js";
 
 /**
  * - `legacy`  — progress is written only to semantic Task events (master
@@ -20,10 +26,10 @@ export type TelemetryMode = "legacy" | "dual" | "bounded";
 export const DEFAULT_TELEMETRY_MODE: TelemetryMode = "legacy";
 
 /** Terminal Run/generation progress rows retained after prune. */
-export const DEFAULT_TERMINAL_KEEP = 200;
+export const DEFAULT_TERMINAL_KEEP = TELEMETRY_KEEP_PER_GENERATION;
 
 /** Hard cap of progress rows per Run while it is still active. */
-export const DEFAULT_RUN_CAP = 50_000;
+export const DEFAULT_RUN_CAP = TELEMETRY_RUN_CAP;
 
 /**
  * Absolute ceiling for the configurable Run cap. Retention can be tuned but

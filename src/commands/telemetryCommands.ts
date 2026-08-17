@@ -3,8 +3,9 @@ import { join } from "node:path";
 
 import { usageError } from "../errors/cliError.js";
 import { STORAGE_SCHEMA_FILE } from "../storage/storageSchema.js";
-import { STORAGE_STATE_FILE, type TaskStore } from "../storage/taskStore.js";
+import type { TaskStore } from "../storage/taskStore.js";
 import { openTaskStore } from "../storage/sqliteStore.js";
+import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
 import {
   DEFAULT_RUN_CAP,
   DEFAULT_TERMINAL_KEEP,
@@ -21,10 +22,10 @@ import { SqliteTelemetryStore } from "../telemetry/sqliteTelemetryStore.js";
 
 /**
  * `yui telemetry status|prune|compact|read` — operational surface for the
- * Issue 09 telemetry sidecar. The sidecar is backend-neutral: these commands
- * work next to the File store and the SQLite store, and never touch the
- * authoritative semantic records except `compact`, which removes only
- * `runtime.provider-turn-progress` events from a staged copy.
+ * Issue 09 telemetry sidecar. Telemetry lives in the Home's authoritative
+ * `yui.db`; these commands never touch the authoritative semantic records
+ * except `compact`, which removes only `runtime.provider-turn-progress`
+ * events from a staged copy.
  */
 
 export type TelemetryCommandOptions = Readonly<{
@@ -77,7 +78,7 @@ function telemetryStatus(args: string[], options: TelemetryCommandOptions): stri
         }));
     const report = {
       mode,
-      sidecar: join(options.home, "telemetry.db"),
+      database: join(options.home, COMMITTED_DATABASE_FILENAME),
       available: health.available,
       dropped: health.dropped,
       coalesced: health.coalesced,
@@ -90,7 +91,7 @@ function telemetryStatus(args: string[], options: TelemetryCommandOptions): stri
     if (options.json || flags.has("json")) return JSON.stringify(report, null, 2);
     const lines = [
       `Mode:            ${mode}`,
-      `Sidecar:         ${report.sidecar}`,
+      `Database:        ${report.database}`,
       `Available:       ${health.available ? "yes" : "no"}`,
       `Rows:            ${health.rows}`,
       `Dropped:         ${health.dropped}`,
@@ -230,9 +231,19 @@ function telemetryCompact(args: string[], options: TelemetryCommandOptions): str
   if (existsSync(resolvedStaged) && dryRun === false) {
     throw usageError(`--staged already exists; refuse to overwrite: ${resolvedStaged}`);
   }
-  const backend = existsSync(join(resolvedFrom, "yui.db")) ? "sqlite" : "file";
+  // Database-only direction: compaction folds semantic progress into the
+  // telemetry tables inside `yui.db`. A Home without a database has not
+  // reached SQLite storage yet; migrate it first (yui setup/doctor) instead
+  // of silently compacting a file-only copy that telemetry cannot join.
+  if (!existsSync(join(resolvedFrom, COMMITTED_DATABASE_FILENAME))) {
+    throw usageError(
+      `--from is not a SQLite Home (missing ${COMMITTED_DATABASE_FILENAME}): ${resolvedFrom}. `
+      + "Migrate it to the database backend before compaction."
+    );
+  }
+  const backend = "sqlite" as const;
   mkdirSync(resolvedStaged, { recursive: true });
-  copyStoreFiles(resolvedFrom, resolvedStaged, backend);
+  copyStoreFiles(resolvedFrom, resolvedStaged);
   const store = openTaskStore(resolvedStaged, backend);
   const telemetry = new SqliteTelemetryStore(resolvedStaged, {
     mode: "bounded",
@@ -322,13 +333,12 @@ function resolvePath(value: string): string {
   return value.startsWith("/") ? value : join(process.cwd(), value);
 }
 
-function copyStoreFiles(from: string, staged: string, backend: "file" | "sqlite"): void {
-  if (backend === "file") {
-    copyFile(join(from, STORAGE_STATE_FILE), join(staged, STORAGE_STATE_FILE));
-    copyFile(join(from, STORAGE_SCHEMA_FILE), join(staged, STORAGE_SCHEMA_FILE));
-    return;
-  }
-  for (const filename of ["yui.db", "yui.db-wal", "yui.db-shm"]) {
+function copyStoreFiles(from: string, staged: string): void {
+  for (const filename of [
+    COMMITTED_DATABASE_FILENAME,
+    `${COMMITTED_DATABASE_FILENAME}-wal`,
+    `${COMMITTED_DATABASE_FILENAME}-shm`
+  ]) {
     const source = join(from, filename);
     if (existsSync(source)) copyFile(source, join(staged, filename));
   }

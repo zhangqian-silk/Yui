@@ -2,15 +2,14 @@ import assert from "node:assert/strict";
 import {
   cpSync,
   mkdtempSync,
-  readFileSync,
   rmSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { FileTaskStore, STORAGE_STATE_FILE } from "../../dist/storage/taskStore.js";
-import { ensureStorageSchema, STORAGE_SCHEMA_FILE } from "../../dist/storage/storageSchema.js";
+import { openTaskStore } from "../../dist/storage/sqliteStore.js";
+import { COMMITTED_DATABASE_FILENAME } from "../../dist/storage/upgrade/sqliteStateMigration.js";
 import { createTask } from "../../dist/task/task.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { createWorkItem } from "../../dist/workItem/workItem.js";
@@ -54,8 +53,7 @@ function semanticEvent(store, taskId, type, payload, now) {
 
 function buildFixtureHome() {
   const home = temporaryHome("yui-telemetry-compaction-");
-  ensureStorageSchema(home);
-  const store = new FileTaskStore(home);
+  const store = openTaskStore(home, "sqlite");
   const now = new Date("2026-08-17T00:00:00.000Z");
   for (const taskId of ["task-1", "task-2"]) {
     store.saveTask(createTask(taskId, `Test ${taskId}`, now));
@@ -89,13 +87,24 @@ function buildFixtureHome() {
   for (let i = 1; i <= 30; i++) {
     store.saveEvent("task-2", progressEvent(store, "task-2", "task-2-run-1", i, now, i === 30 ? { error: "provider-500" } : {}));
   }
+  store.close();
   return home;
 }
 
 function copyHome(source) {
   const staged = temporaryHome("yui-telemetry-staged-");
-  cpSync(join(source, STORAGE_STATE_FILE), join(staged, STORAGE_STATE_FILE));
-  cpSync(join(source, STORAGE_SCHEMA_FILE), join(staged, STORAGE_SCHEMA_FILE));
+  for (const filename of [
+    COMMITTED_DATABASE_FILENAME,
+    `${COMMITTED_DATABASE_FILENAME}-wal`,
+    `${COMMITTED_DATABASE_FILENAME}-shm`
+  ]) {
+    const sourcePath = join(source, filename);
+    try {
+      cpSync(sourcePath, join(staged, filename));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
   return staged;
 }
 
@@ -110,7 +119,7 @@ function eventFingerprint(events) {
 test("plan identifies progress events, windows, and aggregates", () => {
   const home = buildFixtureHome();
   try {
-    const store = new FileTaskStore(home);
+    const store = openTaskStore(home, "sqlite");
     const plan = planTelemetryCompaction(store, { terminalKeep: 200 });
     assert.equal(plan.totals.tasks, 2);
     assert.equal(plan.totals.progressEvents, 330);
@@ -134,9 +143,9 @@ test("dry-run changes nothing", () => {
   const home = buildFixtureHome();
   const staged = copyHome(home);
   try {
-    const store = new FileTaskStore(staged);
+    const store = openTaskStore(staged, "sqlite");
     const telemetry = new SqliteTelemetryStore(staged, { mode: "bounded" });
-    const before = readFileSync(join(staged, STORAGE_STATE_FILE), "utf8");
+    const before = eventFingerprint(store.listEvents("task-1"));
     const plan = planTelemetryCompaction(store, { terminalKeep: 200 });
     const receipt = applyTelemetryCompaction(store, telemetry, plan, {
       dryRun: true,
@@ -145,8 +154,9 @@ test("dry-run changes nothing", () => {
     });
     assert.equal(receipt.dryRun, true);
     assert.equal(receipt.totals.progressEvents, 330);
-    assert.equal(readFileSync(join(staged, STORAGE_STATE_FILE), "utf8"), before);
+    assert.equal(eventFingerprint(store.listEvents("task-1")), before);
     assert.equal(store.listEvents("task-1").filter((event) => event.type === PROGRESS_EVENT_TYPE).length, 300);
+    assert.equal(telemetry.count("task-1"), 0);
   } finally {
     rmSync(home, { recursive: true, force: true });
     rmSync(staged, { recursive: true, force: true });
@@ -157,11 +167,11 @@ test("staged compaction keeps semantic records and validates aggregates", () => 
   const home = buildFixtureHome();
   const staged = copyHome(home);
   try {
-    const sourceStore = new FileTaskStore(home);
+    const sourceStore = openTaskStore(home, "sqlite");
     const semanticBefore = new Map(
       sourceStore.listTasks().map((task) => [task.id, eventFingerprint(sourceStore.listEvents(task.id))])
     );
-    const store = new FileTaskStore(staged);
+    const store = openTaskStore(staged, "sqlite");
     const telemetry = new SqliteTelemetryStore(staged, { mode: "bounded" });
     const plan = planTelemetryCompaction(store, { terminalKeep: 200 });
     const receipt = applyTelemetryCompaction(store, telemetry, plan, {
@@ -215,7 +225,7 @@ test("validation failure throws and leaves semantic history intact", () => {
   const home = buildFixtureHome();
   const staged = copyHome(home);
   try {
-    const store = new FileTaskStore(staged);
+    const store = openTaskStore(staged, "sqlite");
     // A sidecar that accepts imports but cannot serve aggregates: validation
     // must fail before semantic history is touched.
     const plan = planTelemetryCompaction(store, { terminalKeep: 200 });
@@ -245,8 +255,7 @@ test("validation failure throws and leaves semantic history intact", () => {
 test("malformed progress events are kept semantic and reported", () => {
   const home = temporaryHome("yui-telemetry-malformed-");
   try {
-    ensureStorageSchema(home);
-    const store = new FileTaskStore(home);
+    const store = openTaskStore(home, "sqlite");
     const now = new Date("2026-08-17T00:00:00.000Z");
     store.saveTask(createTask("task-1", "Test", now));
     store.saveEvent("task-1", createTaskEvent(
