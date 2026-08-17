@@ -11,6 +11,11 @@ import {
 } from "node:fs";
 import { basename, dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import {
+  buildReleaseManifest,
+  RELEASE_MANIFEST_FILE
+} from "./lib/runtime-package.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const RUNTIME_SKILLS = [
@@ -122,6 +127,13 @@ writeFileSync(
 );
 chmodSync(resolve(output, "package.json"), 0o644);
 
+// Issue 02: an immutable release must be self-contained. Copy the production
+// dependency tree (the exact set `npm install --production` would place) so
+// the release never resolves a package from the assembler's checkout or a
+// global link. The manifest below pins every copied file, so dependency drift
+// changes the package digest and fails closed on verify.
+copyProductionDependencies(root, output);
+
 const forbidden = [
   "binding.gyp",
   "native",
@@ -151,7 +163,79 @@ if (JSON.stringify(stagedRuntime) !== JSON.stringify(expectedRuntime)) {
   throw new Error("Runtime package must contain exactly the current compiled TypeScript files.");
 }
 
+// Issue 02: pin the immutable release identity. The manifest lists every
+// regular file with its SHA-256 and byte length; the package digest is derived
+// from that inventory, so the manifest file itself is excluded from the
+// digest. The source commit is recorded when the assembler runs inside a Git
+// checkout and stays optional for source-archive builds.
+const sourceCommit = readSourceCommit(root);
+const manifest = buildReleaseManifest(output, {
+  version: sourcePackage.version,
+  ...(sourceCommit === undefined ? {} : { sourceCommit })
+});
+writeFileSync(
+  resolve(output, RELEASE_MANIFEST_FILE),
+  `${JSON.stringify(manifest, null, 2)}\n`,
+  { mode: 0o644 }
+);
+
 console.log(`Assembled runtime package: ${output}`);
+
+function readSourceCommit(root) {
+  try {
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "ignore"]
+    }).toString().trim();
+    return /^[0-9a-f]{7,40}$/u.test(commit) ? commit : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Copies the production dependency tree from the checkout's node_modules into
+ * the staged package. The package list is the exact set npm reports for
+ * `--production`, so the release is self-contained without a network install.
+ */
+function copyProductionDependencies(root, output) {
+  const nodeModules = resolve(root, "node_modules");
+  if (!existsSync(nodeModules)) {
+    throw new Error(
+      "Runtime assembly requires installed dependencies (node_modules). Run `npm ci` first."
+    );
+  }
+  let listed;
+  try {
+    listed = execFileSync(
+      "npm",
+      ["ls", "--production", "--all", "--parseable", "--no-unicode"],
+      { cwd: root, stdio: ["ignore", "pipe", "ignore"] }
+    ).toString();
+  } catch (error) {
+    throw new Error(
+      `Runtime assembly could not list production dependencies: ${error.message}`
+    );
+  }
+  const packages = listed
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && resolve(line) !== resolve(root))
+    .map((line) => resolve(line));
+  if (packages.length === 0) {
+    throw new Error("Runtime assembly found no production dependencies to copy.");
+  }
+  const targetRoot = resolve(output, "node_modules");
+  for (const source of packages) {
+    const packageRelative = relative(nodeModules, source);
+    if (packageRelative.startsWith("..") || packageRelative === "") {
+      throw new Error(`Production dependency is outside node_modules: ${source}.`);
+    }
+    const target = resolve(targetRoot, packageRelative);
+    mkdirSync(dirname(target), { recursive: true, mode: 0o755 });
+    cpSync(source, target, { recursive: true });
+  }
+}
 
 function listRegularFiles(directory) {
   const files = [];

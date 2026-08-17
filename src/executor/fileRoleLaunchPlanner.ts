@@ -56,6 +56,7 @@ import {
   serializeExactDescriptor,
   type ExactControlPlaneDescriptor
 } from "../runtime/exactControlPlane.js";
+import { readActiveReleasePointer } from "../release/runtimeRelease.js";
 import {
   parseTaskRuntimeIsolationDescriptor,
   taskRuntimeIsolationEnvironment,
@@ -118,10 +119,19 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     // Freeze the complete control identity before any native process exists.
     // This value is immutable for the planner/Controller lifetime and is never
     // rewritten through a shared PATH launcher.
+    // Issue 02: bind the active release build ID so a Session created after a
+    // handover cannot mutate a different control plane.
+    const activeRelease = readActiveReleasePointer(this.home);
     this.#controlPlane = createExactControlPlaneDescriptor({
       executable: process.execPath,
       cliEntry: this.#cliPath,
-      yuiHome: this.home
+      yuiHome: this.home,
+      ...(activeRelease === null
+        ? {}
+        : {
+            buildId: activeRelease.buildId,
+            activeReleaseDigest: activeRelease.packageDigest
+          })
     });
   }
 

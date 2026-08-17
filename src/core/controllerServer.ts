@@ -1,7 +1,9 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFileSync, realpathSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   CONTROLLER_DISCOVERY_PATH,
@@ -18,6 +20,19 @@ import {
 } from "./protocol.js";
 import { controllerSocketPath } from "./controllerEndpoint.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
+import { resolveStoreWorkerEnabled } from "../storage/storeRpc.js";
+import {
+  detectRunningRelease,
+  readActiveReleasePointer,
+  readHandoverFence,
+  writeHandoverFence,
+  writeRuntimeIdentity,
+  type ActiveReleasePointer,
+  type HandoverFence,
+  type HandoverOwner,
+  type RuntimeIdentityReceipt,
+  type RuntimeReleaseManifest
+} from "../release/runtimeRelease.js";
 import {
   isBuiltinControllerMethod,
   ControllerCommandObserver,
@@ -47,7 +62,27 @@ export type RunningControllerServer = Readonly<{
 export type ControllerServerOptions = Readonly<{
   domainIdentity?: EphemeralDomainIdentity;
   status?: (telemetry: ControllerStatusTelemetry) => JsonValue;
+  /** Test seam: override the detected running release (null = dev checkout). */
+  release?: { releaseDir: string; manifest: RuntimeReleaseManifest } | null;
+  /** Test seam: override the storage backend reported in the identity receipt. */
+  storageBackend?: "file" | "sqlite";
+  /** Test seam: override the worker-enabled flag reported in the identity receipt. */
+  workerEnabled?: boolean;
 }>;
+
+/** In-memory handover fence for one Controller process. */
+export type ControllerHandoverState = {
+  fence: { handoverId: string; fencedAt: string } | null;
+};
+
+/** Methods that stay available while a handover fence is active. */
+const HANDOVER_ALLOWED_METHODS = new Set([
+  "controller.identity",
+  "controller.status",
+  "controller.handover-state",
+  "controller.commit-handover",
+  "controller.rollback-handover"
+]);
 
 export async function startControllerServer(
   home: string,
@@ -91,6 +126,14 @@ async function startControllerServerLocked(
     commandObserver,
     eventLoopDelay
   });
+  const handover: ControllerHandoverState = { fence: null };
+  const release = options.release === undefined
+    ? detectRunningRelease(fileURLToPath(import.meta.url))
+    : options.release;
+  const storageBackend = options.storageBackend
+    ?? (process.env.YUI_STORE_BACKEND?.toLowerCase() === "sqlite" ? "sqlite" : "file");
+  const workerEnabled = options.workerEnabled
+    ?? resolveStoreWorkerEnabled(process.env);
   const netServer = createServer((socket) => {
     receiveRequest(
       socket,
@@ -98,7 +141,9 @@ async function startControllerServerLocked(
       dispatcher,
       () => closeRunning(),
       options.status,
-      telemetry
+      telemetry,
+      handover,
+      home
     );
   });
 
@@ -131,6 +176,18 @@ async function startControllerServerLocked(
       writeEphemeralDomainIdentity(home, options.domainIdentity);
     }
     await writeDiscoveryAtomically(discoveryPath, discovery);
+    // Issue 02: every Controller start publishes its provenance. The receipt
+    // is the stable, file-based identity that survives a Controller stop and
+    // backs the read-only `controller identity --json` command.
+    writeRuntimeIdentity(home, buildRuntimeIdentityReceipt({
+      home,
+      release,
+      storageBackend,
+      workerEnabled,
+      processStartIdentity,
+      mode: "primary",
+      dualOwner: false
+    }));
 
     let resolveClosed: () => void = () => undefined;
     const closed = new Promise<void>((resolve) => {
@@ -201,7 +258,9 @@ function receiveRequest(
   dispatcher: ControllerDispatcher | undefined,
   stop: () => Promise<void>,
   status: ((telemetry: ControllerStatusTelemetry) => JsonValue) | undefined,
-  telemetry: ControllerStatusTelemetry
+  telemetry: ControllerStatusTelemetry,
+  handover: ControllerHandoverState,
+  home: string
 ): void {
   let buffer = Buffer.alloc(0);
   let complete = false;
@@ -238,7 +297,9 @@ function receiveRequest(
       dispatcher,
       stop,
       status,
-      telemetry
+      telemetry,
+      handover,
+      home
     );
   });
   socket.on("end", () => {
@@ -254,7 +315,9 @@ async function routeRequest(
   dispatcher: ControllerDispatcher | undefined,
   stop: () => Promise<void>,
   status: ((telemetry: ControllerStatusTelemetry) => JsonValue) | undefined,
-  telemetry: ControllerStatusTelemetry
+  telemetry: ControllerStatusTelemetry,
+  handover: ControllerHandoverState,
+  home: string
 ): Promise<void> {
   let request;
   try {
@@ -295,6 +358,21 @@ async function routeRequest(
     sendResponse(socket, response, onFlushed);
   };
 
+  // Issue 02: a fenced Controller is mid-handover. It stops accepting new
+  // mutations and only answers the handover control methods plus read-only
+  // identity/status queries until the candidate promotes or the handover
+  // rolls back.
+  if (handover.fence !== null && !HANDOVER_ALLOWED_METHODS.has(request.method)) {
+    send(
+      controllerFailure(
+        request.id,
+        "CONTROLLER_HANDOVER_FENCED",
+        "Controller is fenced for a release handover; retry after the handover completes."
+      )
+    );
+    return;
+  }
+
   if (request.method === "controller.identity") {
     if (!isEmptyParams(request.params)) {
       send(
@@ -305,13 +383,45 @@ async function routeRequest(
     // This is an authenticated, private lifecycle response. Unlike the public
     // resource inventory, it retains the exact executable/argv that the socket
     // owner was launched with so an update can restore that same Controller.
+    // Issue 02 extends it with the release provenance the handover and the
+    // exact control-plane gate consume.
+    // The pid + process start identity let `release activate` fence this exact
+    // owner as the old Controller during a handover; without them the
+    // activator cannot distinguish a live owner from an empty Home and would
+    // bypass the handover sequence.
+    const release = detectRunningRelease(fileURLToPath(import.meta.url));
+    let processStartIdentity: string | undefined;
+    try {
+      processStartIdentity = readLinuxProcessStartIdentitySync(process.pid);
+    } catch {
+      // Non-Linux or an unreadable /proc: the owner cannot be fenced, so the
+      // handover path treats it as absent. The rest of the identity stays
+      // available for read-only consumers.
+    }
     send({
       id: request.id,
       ok: true,
       result: {
         executablePath: process.execPath,
         args: process.argv.slice(1),
-        version: YUI_VERSION
+        version: YUI_VERSION,
+        buildId: release?.manifest.buildId ?? "dev",
+        packageDigest: release?.manifest.packageDigest ?? null,
+        sourceCommit: release?.manifest.sourceCommit ?? null,
+        cliRealpath: controllerCliRealpath(),
+        controllerRealpath: realpathSync(fileURLToPath(import.meta.url)),
+        controllerProtocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        storageBackend: process.env.YUI_STORE_BACKEND?.toLowerCase() === "sqlite"
+          ? "sqlite"
+          : "file",
+        workerEnabled: resolveStoreWorkerEnabled(process.env),
+        mode: "primary",
+        dualOwner: false,
+        activeRelease: readActiveReleasePointer(home) ?? null,
+        pid: process.pid,
+        ...(processStartIdentity === undefined
+          ? {}
+          : { processStartIdentity })
       }
     });
     return;
@@ -372,6 +482,138 @@ async function routeRequest(
     return;
   }
 
+  if (request.method === "controller.begin-handover") {
+    const params = parseBeginHandoverParams(request.params);
+    if (params === null) {
+      send(
+        controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
+      );
+      return;
+    }
+    if (handover.fence !== null) {
+      send(
+        controllerFailure(
+          request.id,
+          "CONTROLLER_HANDOVER_ACTIVE",
+          "Controller is already fenced for a release handover."
+        )
+      );
+      return;
+    }
+    handover.fence = { handoverId: params.handoverId, fencedAt: new Date().toISOString() };
+    const owner = currentHandoverOwner();
+    const fence: HandoverFence = Object.freeze({
+      schemaVersion: 1,
+      handoverId: params.handoverId,
+      phase: "fenced",
+      old: owner,
+      candidate: null,
+      fromReleaseId: params.fromReleaseId,
+      toReleaseId: params.toReleaseId,
+      createdAt: handover.fence.fencedAt,
+      updatedAt: handover.fence.fencedAt
+    });
+    writeHandoverFence(home, fence);
+    send({
+      id: request.id,
+      ok: true,
+      result: handoverFenceResult(fence)
+    });
+    return;
+  }
+
+  if (request.method === "controller.commit-handover") {
+    const handoverId = parseHandoverIdParam(request.params);
+    if (handoverId === null) {
+      send(
+        controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
+      );
+      return;
+    }
+    if (handover.fence === null || handover.fence.handoverId !== handoverId) {
+      send(
+        controllerFailure(
+          request.id,
+          "CONTROLLER_HANDOVER_MISMATCH",
+          "Controller handover fence does not match the requested handover."
+        )
+      );
+      return;
+    }
+    const committedAt = new Date().toISOString();
+    const existing = readHandoverFenceOrNull(home);
+    if (existing !== null) {
+      writeHandoverFence(home, Object.freeze({
+        ...existing,
+        phase: "committed",
+        updatedAt: committedAt
+      }));
+    }
+    handover.fence = null;
+    send({
+      id: request.id,
+      ok: true,
+      result: { committed: true, pid: process.pid }
+    }, () => void stop());
+    return;
+  }
+
+  if (request.method === "controller.rollback-handover") {
+    const handoverId = parseHandoverIdParam(request.params);
+    if (handoverId === null) {
+      send(
+        controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
+      );
+      return;
+    }
+    if (handover.fence === null || handover.fence.handoverId !== handoverId) {
+      send(
+        controllerFailure(
+          request.id,
+          "CONTROLLER_HANDOVER_MISMATCH",
+          "Controller handover fence does not match the requested handover."
+        )
+      );
+      return;
+    }
+    const rolledBackAt = new Date().toISOString();
+    const existing = readHandoverFenceOrNull(home);
+    if (existing !== null) {
+      writeHandoverFence(home, Object.freeze({
+        ...existing,
+        phase: "rolled-back",
+        updatedAt: rolledBackAt
+      }));
+    }
+    handover.fence = null;
+    send({
+      id: request.id,
+      ok: true,
+      result: { resumed: true, pid: process.pid }
+    });
+    return;
+  }
+
+  if (request.method === "controller.handover-state") {
+    if (!isEmptyParams(request.params)) {
+      send(
+        controllerFailure(request.id, "INVALID_PARAMS", "Controller params are invalid.")
+      );
+      return;
+    }
+    const fence = readHandoverFenceOrNull(home);
+    send({
+      id: request.id,
+      ok: true,
+      result: {
+        fenced: handover.fence !== null,
+        ...(handover.fence === null ? {} : { handoverId: handover.fence.handoverId }),
+        ...(fence === null ? {} : { phase: fence.phase })
+      }
+    });
+    return;
+  }
+
   if (dispatcher === undefined) {
     send(
       controllerFailure(request.id, "METHOD_NOT_FOUND", "Controller method was not found.")
@@ -390,6 +632,159 @@ async function routeRequest(
         : controllerFailure(request.id, safeError.code, safeError.message)
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Issue 02: release handover helpers
+
+type BeginHandoverParams = Readonly<{
+  handoverId: string;
+  fromReleaseId: string | null;
+  toReleaseId: string;
+}>;
+
+function parseBeginHandoverParams(value: JsonValue): BeginHandoverParams | null {
+  if (
+    typeof value !== "object"
+    || value === null
+    || Array.isArray(value)
+  ) {
+    return null;
+  }
+  const record = value as Record<string, JsonValue>;
+  const handoverId = record.handoverId;
+  const toReleaseId = record.toReleaseId;
+  if (
+    typeof handoverId !== "string"
+    || handoverId.length === 0
+    || handoverId.length > 128
+    || typeof toReleaseId !== "string"
+    || toReleaseId.length === 0
+    || toReleaseId.length > 256
+  ) {
+    return null;
+  }
+  const fromReleaseId = record.fromReleaseId;
+  if (
+    fromReleaseId !== undefined
+    && (typeof fromReleaseId !== "string" || fromReleaseId.length > 256)
+  ) {
+    return null;
+  }
+  return {
+    handoverId,
+    fromReleaseId: typeof fromReleaseId === "string" ? fromReleaseId : null,
+    toReleaseId
+  };
+}
+
+function parseHandoverIdParam(value: JsonValue): string | null {
+  if (
+    typeof value !== "object"
+    || value === null
+    || Array.isArray(value)
+  ) {
+    return null;
+  }
+  const handoverId = (value as Record<string, JsonValue>).handoverId;
+  return typeof handoverId === "string" && handoverId.length > 0 && handoverId.length <= 128
+    ? handoverId
+    : null;
+}
+
+function currentHandoverOwner(): HandoverOwner {
+  const release = detectRunningRelease(fileURLToPath(import.meta.url));
+  return Object.freeze({
+    pid: process.pid,
+    processStartIdentity: readLinuxProcessStartIdentitySync(process.pid),
+    buildId: release?.manifest.buildId ?? "dev",
+    version: YUI_VERSION
+  });
+}
+
+function handoverFenceResult(fence: HandoverFence): JsonValue {
+  return {
+    handoverId: fence.handoverId,
+    phase: fence.phase,
+    old: {
+      pid: fence.old.pid,
+      processStartIdentity: fence.old.processStartIdentity,
+      buildId: fence.old.buildId,
+      version: fence.old.version
+    },
+    toReleaseId: fence.toReleaseId
+  };
+}
+
+function readHandoverFenceOrNull(home: string): HandoverFence | null {
+  try {
+    return readHandoverFence(home);
+  } catch {
+    return null;
+  }
+}
+
+function readLinuxProcessStartIdentitySync(pid: number): string {
+  // The async /proc reader is used at startup; handover RPCs need a sync
+  // identity to keep the request handler simple. Both parse the same field.
+  const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  const closingParenthesis = stat.lastIndexOf(")");
+  if (closingParenthesis < 0) {
+    throw new Error(`Cannot read Controller process identity for PID ${pid}.`);
+  }
+  const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
+  const processStartIdentity = fieldsAfterCommand[19];
+  if (
+    processStartIdentity === undefined
+    || !/^[0-9]{1,32}$/u.test(processStartIdentity)
+  ) {
+    throw new Error(`Cannot read Controller process identity for PID ${pid}.`);
+  }
+  return processStartIdentity;
+}
+
+function controllerCliRealpath(): string {
+  return realpathSync(fileURLToPath(new URL("../cli.js", import.meta.url)));
+}
+
+type RuntimeIdentityInput = Readonly<{
+  home: string;
+  release: { releaseDir: string; manifest: RuntimeReleaseManifest } | null;
+  storageBackend: "file" | "sqlite";
+  workerEnabled: boolean;
+  processStartIdentity: string;
+  mode: "primary" | "candidate";
+  dualOwner: boolean;
+}>;
+
+export function buildRuntimeIdentityReceipt(input: RuntimeIdentityInput): RuntimeIdentityReceipt {
+  const activeRelease: ActiveReleasePointer | null = (() => {
+    try {
+      return readActiveReleasePointer(input.home);
+    } catch {
+      return null;
+    }
+  })();
+  return Object.freeze({
+    schemaVersion: 1,
+    version: YUI_VERSION,
+    buildId: input.release?.manifest.buildId ?? "dev",
+    packageDigest: input.release?.manifest.packageDigest ?? null,
+    sourceCommit: input.release?.manifest.sourceCommit ?? null,
+    cliRealpath: controllerCliRealpath(),
+    controllerRealpath: realpathSync(fileURLToPath(import.meta.url)),
+    controllerProtocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+    storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,
+    aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion,
+    storageBackend: input.storageBackend,
+    workerEnabled: input.workerEnabled,
+    pid: process.pid,
+    processStartIdentity: input.processStartIdentity,
+    mode: input.mode,
+    dualOwner: input.dualOwner,
+    activeRelease,
+    writtenAt: new Date().toISOString()
+  });
 }
 
 /**
