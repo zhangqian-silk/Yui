@@ -886,6 +886,7 @@ test("rr5/f4: WorkItem cleanup is blocked by an active owned DurableJob", async 
   let cleaned = false;
   const coordinator = new TaskWorkspaceCoordinator({
     getWorkItem: () => item,
+    getWorkItemWorkspace: () => null,
     getTaskRoleSessionSet: () => liveSessionSet(),
     listAgentRuns: () => [],
     listDurableJobs: () => [activeJob]
@@ -935,6 +936,7 @@ test("rr5/f4: WorkItem cleanup proceeds when only settled jobs remain", async ()
   let cleaned = false;
   const coordinator = new TaskWorkspaceCoordinator({
     getWorkItem: () => item,
+    getWorkItemWorkspace: () => null,
     getTaskRoleSessionSet: () => liveSessionSet(),
     listAgentRuns: () => [],
     listDurableJobs: () => [settledJob]
@@ -4373,6 +4375,7 @@ test("exact Task complete resumes one durably pending final Review after the pri
 test("resumed pending Task-final Review preserves history when the dispatch HEAD fence drifts", async (t) => {
   const fx = await pendingExactTaskReviewFixture(t, "Reject a late Task HEAD drift");
   const taskEntry = fx.store.getTaskWorkspace(fx.task.id).entries[0];
+  mkdirSync(join(fx.repositoryPath, ".git", "hooks"), { recursive: true });
   const trigger = join(fx.repositoryPath, ".git", "hooks", "late-head-drift.trigger");
   const hook = join(fx.repositoryPath, ".git", "hooks", "post-checkout");
   writeFileSync(trigger, "advance Task main during Review workspace preparation\n");
@@ -4457,6 +4460,7 @@ test("late drift after exact Leader terminalization fails the resumed final Revi
   assert.notEqual(leaderRun.deliveredAt, undefined);
 
   const taskEntry = fx.store.getTaskWorkspace(fx.task.id).entries[0];
+  mkdirSync(join(fx.repositoryPath, ".git", "hooks"), { recursive: true });
   const trigger = join(fx.repositoryPath, ".git", "hooks", "late-leader-drift.trigger");
   const hook = join(fx.repositoryPath, ".git", "hooks", "post-checkout");
   writeFileSync(trigger, "advance Task main after exact Leader terminalization\n");
