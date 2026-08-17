@@ -38,6 +38,8 @@ const PUBLIC_PATHS = [
   "release install",
   "release list",
   "release activate",
+  "resources",
+  "resources gc",
   "config",
   "config show",
   "config set",

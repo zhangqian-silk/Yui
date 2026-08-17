@@ -212,6 +212,13 @@ export type YuiConfig = Readonly<{
   currentTaskId?: string;
   lastTaskId?: string;
   reconciliationIntervalSeconds?: number;
+  /**
+   * Resource GC mode (Issue 10). `report` (default) only reports candidates;
+   * `quarantine` allows `yui resources gc --apply` to quarantine releasable
+   * resources. Permanent deletion is always delayed behind the observation
+   * window.
+   */
+  resourcesGcMode?: "report" | "quarantine";
   review?: ReviewConfig;
   /**
    * Issue 07 (Leader convergence) feature mode. Optional additive field;

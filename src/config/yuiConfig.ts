@@ -2,6 +2,20 @@ export const DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 120;
 export const MIN_RECONCILIATION_INTERVAL_SECONDS = 5;
 export const MAX_RECONCILIATION_INTERVAL_SECONDS = 300;
 
+export type ResourcesGcMode = "report" | "quarantine";
+export const DEFAULT_RESOURCES_GC_MODE: ResourcesGcMode = "report";
+
+/**
+ * Resolves the Resource GC mode. `report` (default) only reports candidates;
+ * `quarantine` allows `yui resources gc --apply` to quarantine releasable
+ * resources.
+ */
+export function resolveResourcesGcMode(value?: unknown): ResourcesGcMode {
+  if (value === undefined) return DEFAULT_RESOURCES_GC_MODE;
+  if (value === "report" || value === "quarantine") return value;
+  throw new TypeError("resourcesGcMode must be 'report' or 'quarantine'.");
+}
+
 /**
  * Resolves the durable Yui setting used for low-frequency recovery
  * reconciliation. Normal durable state changes wake the Controller through
