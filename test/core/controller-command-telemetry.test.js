@@ -303,6 +303,27 @@ test("command observer counts each route once without double counting", () => {
   assert.equal(snapshot.completed, 2);
   assert.equal(snapshot.failed, 1);
   assert.equal(snapshot.inFlight, 0);
+  assert.equal(snapshot.oldestInFlightAgeMs, null);
   assert.deepEqual(snapshot.builtin, { completed: 1, failed: 0 });
   assert.deepEqual(snapshot.dispatched, { completed: 0, failed: 1 });
+});
+
+test("command observer exposes the oldest in-flight request age", () => {
+  let now = 1_000;
+  const observer = new ControllerCommandObserver(() => now);
+  const first = observer.start();
+  now = 1_250;
+  const second = observer.start();
+  now = 1_400;
+  let snapshot = observer.snapshot();
+  assert.equal(snapshot.inFlight, 2);
+  assert.equal(snapshot.oldestInFlightAgeMs, 400);
+  first.complete("dispatched", "success");
+  snapshot = observer.snapshot();
+  assert.equal(snapshot.inFlight, 1);
+  assert.equal(snapshot.oldestInFlightAgeMs, 150);
+  second.complete("dispatched", "success");
+  snapshot = observer.snapshot();
+  assert.equal(snapshot.inFlight, 0);
+  assert.equal(snapshot.oldestInFlightAgeMs, null);
 });

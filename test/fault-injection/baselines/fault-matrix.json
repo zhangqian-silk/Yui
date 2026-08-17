@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "description": "Characterization baselines for the Issue 11 fault-injection matrix. Scenarios with status 'failing' reproduce the fault but the production fix is not yet implemented; update the baseline to 'passing' when the fix lands.",
+  "scenarios": [
+    {
+      "name": "storage-identity-contradiction",
+      "description": "Manifest declares layout 7 (SQLite WAL) but yui.db does not exist; collectStorageIdentity must flag layout7-missing-database as a contradiction and evaluateStorageHealth must fail closed.",
+      "status": "passing",
+      "expected": "contradiction finding with code layout7-missing-database",
+      "actual": "contradiction detected, health.healthy=false"
+    },
+    {
+      "name": "provider-500-then-recover",
+      "description": "AgentRun summaries containing StopFailure 500/504/connection-lost/rate-limit must classify as provider-transient with basis text-historical.",
+      "status": "passing",
+      "expected": "faultClass=provider-transient, basis=text-historical",
+      "actual": "classified correctly"
+    },
+    {
+      "name": "yield-crash-before-commit",
+      "description": "A yielded AgentRun without deliveredAt (Controller crashed before the durable acceptance fold) must still be counted as yielded by the audit. The production state machine should eventually distinguish uncertain yields; the audit currently counts them uniformly.",
+      "status": "failing",
+      "expected": "audit should flag yielded-without-deliveredAt as delivery-yield-uncertain",
+      "actual": "audit counts all yielded runs uniformly; no uncertain-yield distinction yet"
+    },
+    {
+      "name": "yield-crash-after-commit",
+      "description": "A yielded AgentRun with deliveredAt (Controller crashed after the durable acceptance fold) must be counted as a clean yield.",
+      "status": "passing",
+      "expected": "audit counts yielded=1",
+      "actual": "counted correctly"
+    },
+    {
+      "name": "pane-dead-provider-alive",
+      "description": "When a tmux pane is dead but the Provider child process survives, the resource inventory must detect the residual process tree. Full attribution requires the sandbox-home acceptance with fake residual processes.",
+      "status": "failing",
+      "expected": "inventory attributes residual Provider tree to the dead pane's owner",
+      "actual": "inventory scanner runs and returns structured resources; residual-tree attribution verified in sandbox-home acceptance only"
+    },
+    {
+      "name": "unchanged-scheduler-scan-x100",
+      "description": "100 scheduler.signal calls with no state change must not create any new Leader AgentRun.",
+      "status": "passing",
+      "expected": "runsAfter === runsBefore",
+      "actual": "no new runs created"
+    },
+    {
+      "name": "handover-candidate-failure",
+      "description": "An IntegrationAttempt with a conflict (stale base target) must classify as stale-base-target-cas with basis structured.",
+      "status": "passing",
+      "expected": "faultClass=stale-base-target-cas, basis=structured",
+      "actual": "classified correctly"
+    },
+    {
+      "name": "archive-live-reference-fail-closed",
+      "description": "An archived Task with an active AgentRun must be surfaced by the audit so the contradiction is visible. The production archive flow should fail closed on live references; the audit currently reports the state without blocking.",
+      "status": "failing",
+      "expected": "archive flow should refuse to archive a Task with active runs",
+      "actual": "audit surfaces active=1 on archived task; archive flow does not yet block"
+    }
+  ]
+}

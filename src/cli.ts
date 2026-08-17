@@ -43,9 +43,17 @@ import { runConfigCommand } from "./commands/configCommands.js";
 import {
   parseControllerCleanupOptions,
   parseControllerStatusOptions,
+  parseControllerRuntimeSnapshot,
   renderControllerResourceStatus,
+  renderRuntimeIdentitySection,
+  summarizeDurablePhysicalMismatch,
+  type ControllerRuntimeSnapshot,
   runInteractiveControllerCleanup
 } from "./commands/controllerCommands.js";
+import {
+  parseExecutionAuditOptions,
+  runExecutionAuditCommand
+} from "./commands/executionAuditCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runDurableJobCommand } from "./commands/durableJobCommands.js";
 import {
@@ -108,6 +116,14 @@ import {
   ReviewRoundWorkspaceEvidenceError
 } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema } from "./storage/storageSchema.js";
+import {
+  collectRuntimeBuildIdentity,
+  collectStorageIdentity,
+  countDroppedInboxEvents,
+  createProductionRuntimeIdentityPorts,
+  evaluateStorageHealth,
+  resolveStatusIdentityEnabled
+} from "./observability/runtimeIdentity.js";
 import { type FileTaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import {
   openCompatibleFileTaskStore,
@@ -262,6 +278,19 @@ export async function main(): Promise<void> {
     emit(renderDoctor(report.checks, report.review));
     return;
   }
+  if (args[0] === "execution") {
+    // Issue 11 read-only audit: opens the Home read-only, never writes state,
+    // never wakes a Leader.
+    if (args[1] !== "audit") {
+      throw usageError(
+        "Execution usage: yui execution audit [--task <id>] [--since <iso>] [--until <iso>]."
+      );
+    }
+    const options = parseExecutionAuditOptions(args.slice(2));
+    const result = runExecutionAuditCommand(home, options);
+    emit(result.output, false, result.report);
+    return;
+  }
   if (args[0] === "upgrade") {
     // Mirror doctor/controller: needs a Home but self-manages the schema check,
     // because upgrade must run against a non-current Home.
@@ -328,6 +357,45 @@ export async function main(): Promise<void> {
         scope: options.scope,
         environment: process.env
       });
+      if (resolveStatusIdentityEnabled(process.env)) {
+        // Issue 11 read-only identity/metrics section. Every fact is observed;
+        // missing producers render `unsupported` and storage contradictions
+        // fail closed with exit code 5.
+        const cliEntry = fileURLToPath(import.meta.url);
+        const packageRoot = resolve(cliEntry, "..", "..");
+        const build = collectRuntimeBuildIdentity(
+          createProductionRuntimeIdentityPorts(packageRoot, cliEntry, process.env)
+        );
+        const storage = collectStorageIdentity(home);
+        const droppedEvents = countDroppedInboxEvents(home);
+        let runtime: ControllerRuntimeSnapshot;
+        try {
+          const result = await callController(
+            home,
+            "controller.status",
+            {},
+            { timeoutMs: 2_000 }
+          );
+          runtime = parseControllerRuntimeSnapshot(result, droppedEvents);
+        } catch {
+          runtime = { source: "unsupported", droppedEvents };
+        }
+        const mismatch = summarizeDurablePhysicalMismatch(snapshot);
+        const identitySection = renderRuntimeIdentitySection({
+          build,
+          storage,
+          runtime,
+          mismatch,
+          inventoryRssBytes: snapshot.summary.rssBytes
+        });
+        emit(
+          `${renderControllerResourceStatus(snapshot, options.verbose)}\n\n${identitySection}`,
+          false,
+          { ...snapshot, identity: { build, storage, runtime, mismatch } }
+        );
+        if (!evaluateStorageHealth(storage).healthy) process.exitCode = 5;
+        return;
+      }
       emit(
         renderControllerResourceStatus(snapshot, options.verbose),
         false,

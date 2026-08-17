@@ -7,6 +7,13 @@ import type {
   RuntimeResource
 } from "../controller/resourceInventory.js";
 import { DEFAULT_RECONCILIATION_INTERVAL_SECONDS } from "../config/yuiConfig.js";
+import {
+  evaluateStorageHealth,
+  UNSUPPORTED,
+  type RuntimeBuildIdentity,
+  type StorageIdentity
+} from "../observability/runtimeIdentity.js";
+import type { JsonValue } from "../core/protocol.js";
 
 export type ControllerStatusOptions = Readonly<{
   scope: ControllerInventoryScope;
@@ -213,6 +220,163 @@ export function renderControllerResourceStatus(
     }
   }
 
+  return lines.join("\n");
+}
+
+/**
+ * Issue 11 read-only identity/metrics section for `controller status`.
+ * Everything here is observed: build provenance, durable-vs-physical storage
+ * evidence, Controller runtime metrics (when the socket answers), and the
+ * durable/physical Session mismatch. Missing producers render `unsupported`;
+ * storage contradictions fail closed (see {@link evaluateStorageHealth}).
+ */
+export type ControllerRuntimeSnapshot = Readonly<{
+  source: "controller.status" | "unsupported";
+  pid?: number;
+  uptimeMs?: number;
+  rssBytes?: number;
+  protocolVersion?: number;
+  inbox?: Readonly<{ depth: number; semanticDepth: number; progressDepth: number }>;
+  coalescedEvents?: number;
+  droppedEvents?: number | "unsupported";
+  queueDepth?: number;
+  oldestInFlightAgeMs?: number | null;
+  eventLoopMaxLagMs?: number;
+  error?: string;
+}>;
+
+export type DurablePhysicalMismatch = Readonly<{
+  durableActiveSessions: number;
+  residualProcesses: number;
+  liveResidualResources: number;
+  protectedWithoutProcess: number;
+}>;
+
+export function summarizeDurablePhysicalMismatch(
+  snapshot: ControllerResourceInventory
+): DurablePhysicalMismatch {
+  let durableActiveSessions = 0;
+  let residualProcesses = 0;
+  let liveResidualResources = 0;
+  let protectedWithoutProcess = 0;
+  for (const resource of snapshot.resources) {
+    if (resource.kind === "agent-session") {
+      if (resource.disposition === "protected") {
+        durableActiveSessions += 1;
+        if (resource.processes.length === 0) protectedWithoutProcess += 1;
+      } else if (resource.processes.length > 0) {
+        liveResidualResources += 1;
+      }
+    }
+    if (resource.disposition !== "protected") {
+      residualProcesses += resource.processes.length;
+    }
+  }
+  return {
+    durableActiveSessions,
+    residualProcesses,
+    liveResidualResources,
+    protectedWithoutProcess
+  };
+}
+
+export function parseControllerRuntimeSnapshot(
+  result: JsonValue | null,
+  droppedEvents: number | "unsupported"
+): ControllerRuntimeSnapshot {
+  if (result === null || typeof result !== "object" || Array.isArray(result)) {
+    return { source: "unsupported", droppedEvents };
+  }
+  const record = result as Record<string, unknown>;
+  const runtime = (record.runtime ?? {}) as Record<string, unknown>;
+  const inbox = runtime.inbox as Record<string, unknown> | undefined;
+  const drain = runtime.drain as Record<string, unknown> | undefined;
+  const commands = runtime.commands as Record<string, unknown> | undefined;
+  const routes = commands?.routes as Record<string, unknown> | undefined;
+  const dispatcher = commands?.dispatcher as Record<string, unknown> | undefined;
+  const eventLoopDelay = commands?.eventLoopDelay as Record<string, unknown> | undefined;
+  const queueDepth =
+    (typeof routes?.inFlight === "number" ? routes.inFlight : 0)
+    + (typeof dispatcher?.inFlight === "number" ? dispatcher.inFlight : 0);
+  return {
+    source: "controller.status",
+    pid: typeof record.pid === "number" ? record.pid : undefined,
+    uptimeMs: typeof record.uptimeMs === "number" ? record.uptimeMs : undefined,
+    rssBytes: typeof record.rssBytes === "number" ? record.rssBytes : undefined,
+    protocolVersion: typeof record.protocolVersion === "number"
+      ? record.protocolVersion
+      : undefined,
+    inbox: inbox === undefined ? undefined : {
+      depth: typeof inbox.depth === "number" ? inbox.depth : 0,
+      semanticDepth: typeof inbox.semanticDepth === "number" ? inbox.semanticDepth : 0,
+      progressDepth: typeof inbox.progressDepth === "number" ? inbox.progressDepth : 0
+    },
+    coalescedEvents: typeof drain?.progressEventsCoalesced === "number"
+      ? drain.progressEventsCoalesced
+      : undefined,
+    droppedEvents,
+    queueDepth,
+    oldestInFlightAgeMs: typeof routes?.oldestInFlightAgeMs === "number"
+      ? routes.oldestInFlightAgeMs
+      : null,
+    eventLoopMaxLagMs: typeof eventLoopDelay?.maximumLagMs === "number"
+      ? eventLoopDelay.maximumLagMs
+      : undefined
+  };
+}
+
+export function renderRuntimeIdentitySection(input: Readonly<{
+  build: RuntimeBuildIdentity;
+  storage: StorageIdentity;
+  runtime: ControllerRuntimeSnapshot;
+  mismatch: DurablePhysicalMismatch;
+  inventoryRssBytes: number;
+}>): string {
+  const { build, storage, runtime, mismatch, inventoryRssBytes } = input;
+  const health = evaluateStorageHealth(storage);
+  const lines = [
+    "Runtime identity",
+    `  Package         ${build.packageName} ${build.packageVersion}`,
+    `  Package digest  ${build.packageDigest}`,
+    `  Entry           ${build.entryPath}`,
+    `  Entry digest    ${build.entryDigest}`,
+    `  Source commit   ${build.sourceCommit}`,
+    `  Node            ${build.nodeVersion} (${build.platform})`,
+    `  Storage         layout ${storage.logicalLayout} (manifest ${storage.manifestStatus}) · backend ${storage.configuredBackend} · worker ${storage.workerEnabled ? "on" : "off"}`,
+    `  Store files     state.json ${storage.physicalStateJson.present ? "present" : "absent"} · yui.db ${storage.physicalDatabase.present ? "present" : "absent"}${storage.physicalDatabase.wal ? " +WAL" : ""}`
+  ];
+  for (const finding of storage.findings) {
+    lines.push(
+      `  ! ${finding.severity === "contradiction" ? "CONTRADICTION" : "warning"} ${finding.code}: ${finding.message}`,
+      `    remediation: ${finding.remediation}`
+    );
+  }
+  lines.push(
+    `  Health          ${health.healthy ? "ok" : "FAIL (contradictions above)"}`,
+    `  Controller      ${runtime.source === "controller.status" && runtime.pid !== undefined
+      ? `PID ${runtime.pid}${runtime.uptimeMs === undefined ? "" : `, up ${formatDuration(runtime.uptimeMs)}`}${runtime.protocolVersion === undefined ? "" : `, protocol ${runtime.protocolVersion}`}`
+      : "not running (unsupported)"}`,
+    `  Controller RSS  ${runtime.rssBytes !== undefined ? formatBytes(runtime.rssBytes) : UNSUPPORTED} (inventory ${formatBytes(inventoryRssBytes)})`,
+    `  Command queue   depth ${runtime.queueDepth ?? UNSUPPORTED} · oldest ${
+      runtime.oldestInFlightAgeMs === undefined
+        ? UNSUPPORTED
+        : runtime.oldestInFlightAgeMs === null
+          ? "—"
+          : formatDuration(runtime.oldestInFlightAgeMs)
+    }`,
+    `  Runtime inbox   ${runtime.inbox === undefined
+      ? UNSUPPORTED
+      : `depth ${runtime.inbox.depth} (semantic ${runtime.inbox.semanticDepth}, progress ${runtime.inbox.progressDepth})`} · coalesced ${runtime.coalescedEvents ?? UNSUPPORTED} · dropped ${runtime.droppedEvents ?? UNSUPPORTED}`,
+    `  Event loop      ${runtime.eventLoopMaxLagMs === undefined
+      ? UNSUPPORTED
+      : `max lag ${runtime.eventLoopMaxLagMs.toFixed(0)}ms`}`,
+    // Persistence latency/lock-wait have no producer in the current
+    // controller.status RPC; render the documented `unsupported` fallback
+    // rather than silently dropping the field. A future capability provider
+    // can register a persistence observer without changing this schema.
+    `  Persistence     latency ${UNSUPPORTED} · lock/busy wait ${UNSUPPORTED}`,
+    `  Durable/physical ${mismatch.durableActiveSessions} active sessions · ${mismatch.residualProcesses} residual processes · ${mismatch.liveResidualResources} live residual · ${mismatch.protectedWithoutProcess} protected without process`
+  );
   return lines.join("\n");
 }
 

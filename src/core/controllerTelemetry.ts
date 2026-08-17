@@ -17,6 +17,12 @@ export type ControllerRouteMetrics = Readonly<{
   completed: number;
   failed: number;
   inFlight: number;
+  /**
+   * Age of the oldest in-flight request in milliseconds, or null when nothing
+   * is in flight. Issue 11 status answers "how old is the queued work" without
+   * persisting anything.
+   */
+  oldestInFlightAgeMs: number | null;
   builtin: Readonly<{ completed: number; failed: number }>;
   dispatched: Readonly<{ completed: number; failed: number }>;
 }>;
@@ -90,24 +96,33 @@ export type ControllerCommandObservation = Readonly<{
  * for end-to-end latency and is never double-counted.
  */
 export class ControllerCommandObserver {
+  readonly #clock: () => number;
   #received = 0;
   #completed = 0;
   #failed = 0;
   #inFlight = 0;
+  /** Monotonic arrival timestamps of in-flight observations (FIFO). */
+  readonly #inFlightStarted: number[] = [];
   #builtinCompleted = 0;
   #builtinFailed = 0;
   #dispatchedCompleted = 0;
   #dispatchedFailed = 0;
 
+  constructor(clock: () => number = monotonicMilliseconds) {
+    this.#clock = clock;
+  }
+
   start(): ControllerCommandObservation {
     this.#received += 1;
     this.#inFlight += 1;
+    this.#inFlightStarted.push(this.#clock());
     let completed = false;
     return {
       complete: (kind, outcome) => {
         if (completed) return;
         completed = true;
         this.#inFlight = Math.max(0, this.#inFlight - 1);
+        this.#inFlightStarted.shift();
         this.#completed += 1;
         if (outcome === "failure") this.#failed += 1;
         if (kind === "builtin") {
@@ -123,11 +138,15 @@ export class ControllerCommandObserver {
   }
 
   snapshot(): ControllerRouteMetrics {
+    const oldest = this.#inFlightStarted.length === 0
+      ? null
+      : Math.max(0, this.#clock() - this.#inFlightStarted[0]!);
     return {
       received: this.#received,
       completed: this.#completed,
       failed: this.#failed,
       inFlight: this.#inFlight,
+      oldestInFlightAgeMs: oldest,
       builtin: {
         completed: this.#builtinCompleted,
         failed: this.#builtinFailed

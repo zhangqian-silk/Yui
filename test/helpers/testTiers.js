@@ -83,6 +83,22 @@ export const TEST_TIERS = Object.freeze({
       + "Mock Agent process. Exercises real lifecycle/runtime seams without any "
       + `model or network dependency. ${MOCK_TRANSPORT_DISCLAIMER}`
   }),
+  "fault-injection": Object.freeze({
+    id: "fault-injection",
+    title: "Fault Injection",
+    createsSession: true,
+    callsModel: false,
+    createsDisposableRuntime: true,
+    requiresIsolationPreflight: false,
+    optInEnv: null,
+    description:
+      "Deterministic fault-injection regression matrix (Issue 11). Seeds "
+      + "synthetic failures — storage identity contradictions, provider "
+      + "transient errors, yield ambiguity, process residuals, duplicate "
+      + "wakes — against disposable Homes and asserts the fault is reproduced. "
+      + "Scenarios whose production fix is not yet implemented carry a "
+      + "characterization baseline that fails until the fix lands."
+  }),
   "provider-e2e": Object.freeze({
     id: "provider-e2e",
     title: "Provider E2E",
