@@ -38,7 +38,14 @@ export const CONTROLLER_CANDIDATE_ENV = "YUI_CONTROLLER_CANDIDATE";
 export const CONTROLLER_HANDOVER_ID_ENV = "YUI_CONTROLLER_HANDOVER_ID";
 
 const DEFAULT_POLL_INTERVAL_MS = 100;
-const DEFAULT_DUAL_OWNER_GRACE_MS = 30_000;
+/**
+ * The grace a committed candidate waits for the old owner to exit before it
+ * latches `dualOwner: true`. This is the single authoritative old-owner exit
+ * grace: the activator trusts the candidate's latched signal and does not add
+ * a second independent grace (see `DEFAULT_DUAL_OWNER_GRACE_MS` in
+ * `releaseHandover.ts`, which is only an optional confirmation debounce).
+ */
+export const DEFAULT_DUAL_OWNER_GRACE_MS = 30_000;
 
 export type HandoverCandidateOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;

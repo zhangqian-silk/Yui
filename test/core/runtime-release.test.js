@@ -31,6 +31,7 @@ import {
   writeHandoverFence,
   writeRuntimeIdentity
 } from "../../dist/release/runtimeRelease.js";
+import { createReleaseActivatePorts } from "../../dist/commands/releaseCommands.js";
 
 function makeRelease(root, { version = "0.6.0", content = "#!/usr/bin/env node\n", extra = {} } = {}) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -199,4 +200,25 @@ test("handover fence round-trips and is removable", () => {
 
   removeHandoverFence(home);
   assert.equal(readHandoverFence(home), null);
+});
+
+test("spawnCandidate fails closed on a drifted release before spawning", () => {
+  const releaseDir = mkdtempSync(join(tmpdir(), "yui-release-drift-"));
+  makeRelease(releaseDir);
+  // Drift the release after installation: the manifest still lists the
+  // original digest, but the file content changed on disk.
+  writeFileSync(join(releaseDir, "dist", "cli.js"), "#!/usr/bin/env node\n// drifted\n", {
+    mode: 0o755
+  });
+  const home = mkdtempSync(join(tmpdir(), "yui-release-drift-home-"));
+  try {
+    const ports = createReleaseActivatePorts();
+    assert.throws(
+      () => ports.spawnCandidate(home, releaseDir, "drift-test-handover"),
+      /drifted|manifest/i
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(releaseDir, { recursive: true, force: true });
+  }
 });

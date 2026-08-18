@@ -36,7 +36,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   describeReport,
@@ -85,6 +85,7 @@ import {
 import { repairPseudoLayout7 } from "./pseudoLayoutRepair.js";
 import { createSqliteMigrationTarget } from "./sqliteMigrationTarget.js";
 import { createSqliteRecordMigrationTarget } from "./sqliteRecordMigrationTarget.js";
+import { COMMITTED_DATABASE_FILENAME } from "./sqliteStateMigration.js";
 import {
   inspectOfflineUpgradeInventory,
   type OfflineUpgradeBlocker,
@@ -1706,12 +1707,35 @@ function blockedFromSwitchAmbiguous(
       message: `Storage switch is AMBIGUOUS and partially applied: ${report.error}`,
       action:
         `Do NOT assume the Home is unchanged. The original Home is at ${report.backupPath}; `
-        + `restore it to recover: mv "${report.backupPath}" "${report.homePath}". The interrupted `
+        + `restore it to recover: ${switchAmbiguousRestoreCommand(report)}. The interrupted `
         + `switch marker "${switchProgressPath(report.homePath)}" records this ambiguity; verify `
         + `with "yui doctor" after restoring.`
     },
     classification
   );
+}
+
+/**
+ * The exact restore command for an ambiguous switch. A file-layout backup is a
+ * sibling directory moved back over the Home; a SQLite backup is the committed
+ * `yui.db` file moved aside *inside* the Home and must be renamed back onto the
+ * database path, not onto the Home directory (which would nest the file).
+ */
+function switchAmbiguousRestoreCommand(
+  report: Extract<MigrationReport, { outcome: "switch-ambiguous" }>
+): string {
+  const committedDbPath = join(report.homePath, COMMITTED_DATABASE_FILENAME);
+  // The degenerate SQLite case: no prior database existed, so there is no
+  // backup to move back; the promoted database is already in place and the
+  // recovery is to advance schema.json (or restore externally).
+  if (report.backupPath === committedDbPath) {
+    return `the database is already at ${committedDbPath}; advance schema.json `
+      + "record-family versions or restore from an external backup";
+  }
+  const restoreTarget = dirname(report.backupPath) === report.homePath
+    ? committedDbPath
+    : report.homePath;
+  return `mv "${report.backupPath}" "${restoreTarget}"`;
 }
 
 /**

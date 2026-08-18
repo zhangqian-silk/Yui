@@ -455,6 +455,12 @@ function spawnDetachedController(
   releaseDir: string,
   extraEnv: Readonly<Record<string, string>>
 ): void {
+  // Fail closed before launching: a release that drifted from its manifest
+  // (corrupted or partially-deleted files) must never spawn a Controller.
+  // `runReleaseActivate` verifies at resolve time; this closes the window
+  // where the tree drifts between resolve and spawn and covers direct port
+  // callers that bypass `resolveInstalledRelease`.
+  verifyReleaseIntegrity(releaseDir);
   const environment: NodeJS.ProcessEnv = {};
   for (const name of CONTROLLER_OPERATIONAL_ENV) {
     const value = process.env[name];
