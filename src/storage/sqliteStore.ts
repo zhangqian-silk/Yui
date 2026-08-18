@@ -79,6 +79,7 @@ import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { Task } from "../task/task.js";
+import type { NextActionFacts } from "../task/nextAction.js";
 import { TASK_RECORD_ID_PREFIXES, type TaskRecordKind } from "../task/taskRecordReference.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import { managedWorkspaceKey, type ManagedWorkspace, type ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
@@ -874,6 +875,54 @@ export class SqliteTaskStore implements TaskStore {
 
   getTask(id: string): Task | null {
     return this.#getPayload<Task>("task_records", "task_id = ?", [id]);
+  }
+
+  readNextActionFacts(taskId: string): NextActionFacts | null {
+    const task = this.#getPayload<Task>("task_records", "task_id = ?", [taskId]);
+    if (task === null) return null;
+    // One indexed query (idx_agent_runs_role_status) covers both the active
+    // Runs the projection waits on and the Leader Runs the budget consumes.
+    const runs = this.#sortById(
+      this.#listPayload<AgentRun>(
+        "agent_runs",
+        "task_id = ? AND (status = 'active' OR role_name = 'leader')",
+        [taskId]
+      ),
+      (run) => run.id
+    );
+    return {
+      task: {
+        id: task.id,
+        status: task.status,
+        projectBindings: task.projectBindings
+      },
+      workItems: this.#sortById(
+        this.#listPayload<WorkItem>("work_items", "task_id = ?", [taskId]),
+        (item) => item.id
+      ),
+      changeSets: this.#sortById(
+        this.#listPayload<ChangeSet>("change_sets", "task_id = ?", [taskId]),
+        (changeSet) => changeSet.id
+      ),
+      integrations: this.#sortById(
+        this.#listPayload<IntegrationAttempt>("integration_attempts", "task_id = ?", [taskId]),
+        (attempt) => attempt.id
+      ),
+      reviewRounds: this.#sortById(
+        this.#listPayload<ReviewRound>("review_rounds", "task_id = ?", [taskId]),
+        (round) => round.id
+      ),
+      openInputRequests: this.#sortById(
+        this.#listPayload<InputRequest>(
+          "input_requests",
+          "task_id = ? AND status = 'open'",
+          [taskId]
+        ),
+        (request) => request.id
+      ),
+      activeRuns: runs.filter((run) => run.status === "active"),
+      leaderRuns: runs.filter((run) => run.roleName === "leader")
+    };
   }
 
   /** Task ids flagged active in the catalog projection (the global active index). */

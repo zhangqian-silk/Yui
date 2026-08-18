@@ -187,7 +187,7 @@ test("task context aggregates complete records and renders a compact recent summ
   }
 
   const result = output(["context", task.id], store, options);
-  const { execution, ...legacyData } = result.data;
+  const { execution, nextAction, ...legacyData } = result.data;
   assert.deepEqual(legacyData, {
     task,
     reviewConfig: null,
@@ -213,6 +213,8 @@ test("task context aggregates complete records and renders a compact recent summ
     resolvedInputRequests: [],
     events: store.listEvents(task.id)
   });
+  assert.equal(nextAction.taskId, task.id);
+  assert.ok(typeof nextAction.kind === "string" && nextAction.kind.length > 0);
   assert.deepEqual(execution, {
     taskId: task.id,
     taskStatus: task.status,

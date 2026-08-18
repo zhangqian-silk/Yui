@@ -11,6 +11,12 @@ import {
   type ReviewFindingLedgerMode,
   type ReviewTrigger
 } from "../review/reviewConfig.js";
+import {
+  DEFAULT_LEADER_NEXT_ACTION_MODE,
+  LEADER_NEXT_ACTION_MODES,
+  resolveLeaderNextActionMode,
+  type LeaderNextActionMode
+} from "../config/yuiConfig.js";
 
 type ConfigCommandStore = Readonly<{
   transaction<T>(execute: (store: ConfigCommandStore) => T): T;
@@ -26,6 +32,7 @@ const CONFIG_SET_USAGE = "Config set usage: yui config set "
 export function runConfigCommand(args: string[], store: ConfigCommandStore): string {
   const [command, ...rest] = args;
   if (command === "review") return runReviewConfigCommand(rest, store);
+  if (command === "leader-next-action") return runLeaderNextActionConfigCommand(rest, store);
   if (command === "show") {
     if (rest.length !== 0) throw usageError("Config show usage: yui config show.");
     const config = store.getConfig();
@@ -35,6 +42,7 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
     return [
       `Time zone: ${resolveTimeZone(config.timeZone)}`,
       `Reconciliation interval: ${reconciliationIntervalSeconds} seconds`,
+      `Leader next-action mode: ${resolveLeaderNextActionMode(config.leaderNextActionMode)}`,
       ""
     ].join("\n");
   }
@@ -62,6 +70,50 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
   throw usageError(command === undefined
     ? "Config command is required."
     : `Unknown command: config ${command}`);
+}
+
+function runLeaderNextActionConfigCommand(
+  args: string[],
+  store: ConfigCommandStore
+): string {
+  const [command, ...rest] = args;
+  if (command === "show") {
+    if (rest.length !== 0) {
+      throw usageError("Config leader-next-action show usage: yui config leader-next-action show.");
+    }
+    return `Leader next-action mode: ${resolveLeaderNextActionMode(store.getConfig().leaderNextActionMode)}\n`;
+  }
+  if (command === "set") {
+    const usage = "Config leader-next-action set usage: "
+      + `yui config leader-next-action set <${LEADER_NEXT_ACTION_MODES.join("|")}>.`;
+    if (rest.length !== 1) throw usageError(usage);
+    let mode: LeaderNextActionMode;
+    try {
+      mode = resolveLeaderNextActionMode(rest[0]);
+    } catch (error) {
+      throw usageError(
+        error instanceof Error ? error.message : String(error),
+        usage
+      );
+    }
+    store.transaction((tx) => {
+      tx.saveConfig({ ...tx.getConfig(), leaderNextActionMode: mode });
+    });
+    return `Leader next-action mode set to ${mode}\n`;
+  }
+  if (command === "clear") {
+    if (rest.length !== 0) {
+      throw usageError("Config leader-next-action clear usage: yui config leader-next-action clear.");
+    }
+    store.transaction((tx) => {
+      const { leaderNextActionMode: _mode, ...config } = tx.getConfig();
+      tx.saveConfig(config);
+    });
+    return `Leader next-action mode reset to ${DEFAULT_LEADER_NEXT_ACTION_MODE}\n`;
+  }
+  throw usageError(command === undefined
+    ? "Config leader-next-action command is required."
+    : `Unknown command: config leader-next-action ${command}`);
 }
 
 function runReviewConfigCommand(args: string[], store: ConfigCommandStore): string {

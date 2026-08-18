@@ -200,6 +200,11 @@ import {
 } from "./roleSkillValidation.js";
 import { assertRoleRuntimeMutationAllowed } from "./roleRuntimeGuard.js";
 import { runTaskContextCommand } from "./taskContextCommand.js";
+import { runTaskNextActionCommand } from "./taskNextActionCommand.js";
+import {
+  runDeliveryGuardPreflight,
+  withGuardWarnings
+} from "./deliveryGuardPreflight.js";
 import {
   inspectTaskRoleRuntimeStatuses,
   renderTaskRoleRuntimeStatus,
@@ -543,6 +548,7 @@ export function runTaskCommand(
     case "list": return listTaskCommand(rest, store);
     case "show": return showTaskCommand(rest, store);
     case "context": return runTaskContextCommand(rest, store);
+    case "next-action": return runTaskNextActionCommand(rest, store);
     case "activate": return output(activateTaskCommand(rest, store, options));
     case "complete": return completeTaskCommand(rest, store, options);
     case "reopen": return output(reopenTaskCommand(rest, store, options));
@@ -2204,6 +2210,15 @@ function createWork(
     if (new Set(baseRefs.map(({ projectId }) => projectId)).size !== baseRefs.length) {
       throw usageError("Each Work Item Project may specify at most one base ref.");
     }
+    const guard = runDeliveryGuardPreflight(tx, task.id, {
+      kind: "create-work-item",
+      scope: {
+        title: parsed.positionals[1]!,
+        objective: parsed.objective ?? parsed.positionals[1]!,
+        acceptance: parsed.acceptance,
+        writeProjectIds
+      }
+    }, { environment: options.environment, budget: true });
     const created = createWorkItem(tx.nextWorkItemId(task.id), task.id, {
       title: parsed.positionals[1],
       objective: parsed.objective ?? parsed.positionals[1],
@@ -2215,10 +2230,13 @@ function createWork(
     }, now);
     tx.saveWorkItem(task.id, created);
     enqueueWork(tx, taskMailbox(task.id), "work-created", now, [workItemRef(task.id, created.id)]);
-    return created;
+    return { item: created, guard };
   });
-  notifyMailbox(options.runtime, taskMailbox(item.taskId), item.taskId);
-  return output(`Created work item ${item.id} for ${item.taskId}\n`, { workItem: item });
+  notifyMailbox(options.runtime, taskMailbox(item.item.taskId), item.item.taskId);
+  return output(
+    withGuardWarnings(item.guard, `Created work item ${item.item.id} for ${item.item.taskId}\n`),
+    { workItem: item.item }
+  );
 }
 
 function updateWorkScope(

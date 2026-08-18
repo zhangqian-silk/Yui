@@ -6,6 +6,7 @@ import { formatTimestamp } from "../output/timePresentation.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
+import { projectNextAction } from "../task/nextAction.js";
 import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 import {
   summarizeExecutionGroup,
@@ -38,6 +39,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       throw new Error(`Task execution projection disappeared: ${task.id}.`);
     }
     const roleSessionSets = reader.listRoleSessionSets(task.id);
+    const agentRuns = chronological(reader.listAgentRuns(task.id));
+    const reviewRounds = chronological(reader.listReviewRounds(task.id));
+    const changeSets = chronological(reader.listChangeSets(task.id));
+    const integrations = chronological(reader.listIntegrationAttempts(task.id));
+    const nextActionFacts = reader.readNextActionFacts(task.id);
+    if (nextActionFacts === null) {
+      throw new Error(`Task next-action facts disappeared: ${task.id}.`);
+    }
     return {
       task,
       execution,
@@ -53,14 +62,15 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
         inspectTaskRoleSessionRecovery(task.id, role.name, reader)
       )),
       workItems,
-      agentRuns: chronological(reader.listAgentRuns(task.id)),
-      reviewRounds: chronological(reader.listReviewRounds(task.id)),
-      changeSets: chronological(reader.listChangeSets(task.id)),
-      integrations: chronological(reader.listIntegrationAttempts(task.id)),
+      agentRuns,
+      reviewRounds,
+      changeSets,
+      integrations,
       messages: reader.listMessages(task.id),
       openInputRequests: inputRequests.filter((request) => request.status === "open"),
       resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
-      events: reader.listEvents(task.id)
+      events: reader.listEvents(task.id),
+      nextAction: projectNextAction(nextActionFacts)
     };
   });
   const {
@@ -82,7 +92,8 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     messages,
     openInputRequests,
     resolvedInputRequests,
-    events
+    events,
+    nextAction
   } = data;
   const timeZone = store.getConfig().timeZone;
   const displayedActiveDecisions = activeDecisions.slice(-RECENT_RECORD_LIMIT);
@@ -97,6 +108,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     `Task context: ${task.id}`,
     `Title: ${compactText(task.title)}`,
     `Status: ${task.status}`,
+    "Next action:",
+    `  ${nextAction.kind}: ${nextAction.reason}`,
+    ...(nextAction.refs.length === 0
+      ? []
+      : [`  Refs: ${nextAction.refs.map(({ kind, id }) => `${kind} ${id}`).join(", ")}`]),
+    ...(nextAction.recommendedCommand === undefined
+      ? []
+      : [`  Recommended: ${nextAction.recommendedCommand}`]),
     ...(task.description === undefined ? [] : [`Description: ${compactText(task.description)}`]),
     ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),

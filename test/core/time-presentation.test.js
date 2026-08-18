@@ -37,6 +37,7 @@ test("config commands expose effective recovery settings and persist overrides",
   assert.equal(
     runConfigCommand(["show"], store),
     "Time zone: Asia/Shanghai\nReconciliation interval: 120 seconds\n"
+      + "Leader next-action mode: display\n"
   );
   assert.equal(
     runConfigCommand(["set", "--time-zone", "Europe/London"], store),
@@ -51,6 +52,7 @@ test("config commands expose effective recovery settings and persist overrides",
   assert.equal(
     runConfigCommand(["show"], store),
     "Time zone: Europe/London\nReconciliation interval: 45 seconds\n"
+      + "Leader next-action mode: display\n"
   );
 });
 
