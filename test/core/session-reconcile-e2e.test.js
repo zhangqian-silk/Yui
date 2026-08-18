@@ -559,7 +559,7 @@ for (const [name, providerEnv] of [
     const before = rootPidAndChildPids(fx);
 
     const cleanup = await fx.archiveTask();
-    assert.equal(cleanup.status, "removed");
+    assert.equal(cleanup.status, "removed", cleanup.error ?? JSON.stringify(cleanup));
 
     await waitForProcessExit(before.rootPid, FIVE_SECONDS_MS, "Provider root");
     for (const childPid of before.childPids) {
