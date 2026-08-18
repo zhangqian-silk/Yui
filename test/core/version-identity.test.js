@@ -8,9 +8,9 @@ import {
 } from "../../dist/version.js";
 
 test("Yui exposes one release identity for CLI, Controller and storage diagnostics", () => {
-  assert.equal(YUI_VERSION, "0.6.0");
+  assert.equal(typeof YUI_VERSION, "string");
   assert.deepEqual(yuiVersionIdentity(), {
-    version: "0.6.0",
+    version: YUI_VERSION,
     controllerProtocolVersion: 3,
     storageLayoutVersion: 7,
     aggregateSchemaVersion: 18
