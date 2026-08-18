@@ -896,6 +896,18 @@ function fakeStore(options = {}) {
     getLeaderFailure: () => null,
     getOperatorNotification: () => null,
     listEvents: () => store.events,
+    // Issue 05: the actionability admission reads durable Runs and records
+    // progress notes on fail-open. This fixture has no terminal Run history,
+    // so the digest admission always decides "wake" and preserves the
+    // pre-Issue-05 recovery behavior under test.
+    listAgentRuns: () => [],
+    listWorkItems: () => [],
+    listReviewRounds: () => [],
+    listIntegrationAttempts: () => [],
+    listDurableJobs: () => [],
+    listInputRequests: () => [],
+    listMessages: () => [],
+    queueTaskProgress: () => {},
     getTaskBrief: () => options.brief ?? null,
     listDecisions: () => options.decisions ?? [],
     listMilestones: () => options.milestones ?? [],

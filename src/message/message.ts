@@ -11,12 +11,21 @@ export type TaskMessageAuthor =
   | Readonly<{ type: "system" }>;
 
 export type TaskMessage = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   taskId: string;
   kind: TaskMessageKind;
   author: TaskMessageAuthor;
   body: string;
+  /**
+   * Machine-readable wake policy for user/operator messages (Issue 05).
+   * - `leader`: the message is a directive that should wake the Leader.
+   * - `none`: the message is informational context only; it must not wake
+   *   the Leader or create a Leader Run.
+   * Absent on older messages and on role-result/system messages, which keep
+   * their existing routing.
+   */
+  wakePolicy?: "leader" | "none";
   runId?: string;
   workItemId?: string;
   createdAt: string;
@@ -25,6 +34,7 @@ export type TaskMessage = {
 export type TaskMessageContext = Readonly<{
   runId?: string;
   workItemId?: string;
+  wakePolicy?: "leader" | "none";
 }>;
 
 export function createTaskMessage(
@@ -38,12 +48,15 @@ export function createTaskMessage(
 ): TaskMessage {
   validateKindAndAuthor(kind, author);
   const message: TaskMessage = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireSafeIdentity(id, "Message id"),
     taskId: requireSafeIdentity(taskId, "Message Task id"),
     kind,
     author: normalizeAuthor(author),
     body: requireBody(body),
+    ...(context.wakePolicy === undefined
+      ? {}
+      : { wakePolicy: context.wakePolicy }),
     ...(context.runId === undefined
       ? {}
       : { runId: requireSafeIdentity(context.runId, "Message Run id") }),
@@ -61,11 +74,21 @@ export function taskMessageAuthorLabel(author: TaskMessageAuthor): string {
 }
 
 export function validateTaskMessage(message: TaskMessage): void {
-  if (message.schemaVersion !== 2) throw new Error("Task Message must use schemaVersion 2.");
+  if (message.schemaVersion !== 3) throw new Error("Task Message must use schemaVersion 3.");
   validateTaskRecordReference({ taskId: message.taskId, localId: message.id }, "message");
   requireText(message.body, "Message body");
   validateKindAndAuthor(message.kind, message.author);
   normalizeAuthor(message.author);
+  if (message.wakePolicy !== undefined
+    && message.wakePolicy !== "leader"
+    && message.wakePolicy !== "none") {
+    throw new Error(`Message wakePolicy is invalid: ${String(message.wakePolicy)}.`);
+  }
+  if (message.wakePolicy !== undefined
+    && message.kind !== "user"
+    && message.kind !== "operator") {
+    throw new Error("Message wakePolicy is only valid for user/operator messages.");
+  }
   if (message.runId !== undefined) requireSafeIdentity(message.runId, "Message Run id");
   if (message.workItemId !== undefined) {
     validateTaskRecordReference({
