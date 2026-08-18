@@ -401,47 +401,6 @@ function rootPidAndChildPids(fixture) {
   return { rootPid: root?.pid, childPids: [...new Set(children)] };
 }
 
-/**
- * Dumps the durable lifecycle state for a role so a CI failure can reveal
- * exactly what the post-scan mailbox check observed.
- */
-function dumpLifecycleState(home, taskId, roleName) {
-  const store = new FileTaskStore(home);
-  const mailbox = store.getWorkMailbox({ kind: "role-runtime", taskId, roleName });
-  const sessionSet = store.getTaskRoleSessionSet(taskId, roleName);
-  const activeSession = sessionSet === null
-    ? null
-    : sessionSet.sessions[sessionSet.activeAgentId] ?? null;
-  const owners = store.listSessionOwners().map((o) => ({
-    launchId: o.launchId,
-    pid: o.providerRoot?.pid,
-    alive: o.providerRoot !== undefined
-  }));
-  const terminationEvents = store.listEvents(taskId)
-    .filter((e) => e.type === "runtime.session-termination")
-    .map((e) => ({ outcome: e.payload.outcome, detail: e.payload.detail }));
-  return JSON.stringify({
-    mailbox: mailbox === null ? null : {
-      processing: mailbox.processing === null ? null : {
-        batchId: mailbox.processing.batchId,
-        owner: mailbox.processing.owner,
-        reasons: mailbox.processing.batch.reasons
-      },
-      pending: mailbox.pending === null ? null : {
-        reasons: mailbox.pending.reasons,
-        fromSequence: mailbox.pending.fromSequence,
-        toSequence: mailbox.pending.toSequence
-      }
-    },
-    session: activeSession === null ? null : {
-      status: activeSession.status,
-      launchId: activeSession.launchId
-    },
-    owners,
-    terminationEvents
-  }, null, 2);
-}
-
 test("a launched Provider root is recorded and attributed in the reconcile report", async (t) => {
   const fx = await e2eFixture(t);
   await fx.startController();
@@ -564,26 +523,8 @@ test("a stubborn Provider is escalated SIGTERM/SIGKILL and confirmed", async (t)
   await fx.launchLeader();
   const { rootPid } = rootPidAndChildPids(fx);
 
-  // Under CI full-suite load the post-escalation cleanup state check can
-  // transiently observe a not-yet-settled mailbox (scheduler contention,
-  // zombie reaping).  Retry the archive once: completeTask is idempotent and
-  // a second stopTaskRoleSessions is a no-op once the Session is stopped.
-  let cleanup = await fx.archiveTask();
-  if (cleanup.status !== "removed") {
-    await delay(1000);
-    cleanup = await fx.archiveTask();
-  }
-  if (cleanup.status !== "removed") {
-    let controllerLog = "";
-    try {
-      controllerLog = readFileSync(fx.runtime.controllerLogPath, "utf8").trim();
-    } catch { /* log may not exist */ }
-    assert.fail(
-      `${cleanup.error ?? JSON.stringify(cleanup)}\n`
-      + `Lifecycle state:\n${dumpLifecycleState(fx.home, fx.task.id, fx.role.name)}\n`
-      + `Controller log:\n${controllerLog || "(empty)"}`
-    );
-  }
+  const cleanup = await fx.archiveTask();
+  assert.equal(cleanup.status, "removed", cleanup.error ?? JSON.stringify(cleanup));
   await waitForProcessExit(rootPid, FIVE_SECONDS_MS, "Stubborn Provider root");
 
   const events = new FileTaskStore(fx.home)
