@@ -15,6 +15,10 @@ import { GitIntegrationService, type IntegrationJobPort } from "../integration/g
 import { runTaskIntegrationQueueCommand } from "./taskIntegrationQueueCommands.js";
 import { taskActor } from "./taskActor.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
+import {
+  runDeliveryGuardPreflight,
+  withGuardWarnings
+} from "./deliveryGuardPreflight.js";
 
 export type TaskIntegrationCommandOptions = Readonly<{
   now?: () => Date;
@@ -172,7 +176,16 @@ async function start(
     throw usageError(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
   const expectedHead = (await new NodeGitWorkspace().inspect(project.path, targetRef)).baseCommit;
+  // The duplicate/budget preflight runs inside the same transaction as the
+  // attempt insert: on the single-writer SQLite backend the check and the
+  // record creation are atomic, so a concurrent Leader cannot sneak a
+  // duplicate Integration between the guard and the write.
   const integration = store.transaction((tx) => {
+    const guard = runDeliveryGuardPreflight(tx, task.id, {
+      kind: "integration-start",
+      projectId: project.id,
+      changeSetIds
+    }, { environment: options.environment, budget: true });
     const created = createIntegrationAttempt({
       id: tx.nextIntegrationAttemptId(task.id),
       taskId: task.id,
@@ -183,9 +196,13 @@ async function start(
       checkCommands: parsed.many.get("--check") ?? []
     }, now());
     tx.saveIntegrationAttempt(task.id, created);
-    return created;
+    return { attempt: created, guard };
   });
-  return runIntegration(store, home, integration, now, options);
+  const result = await runIntegration(store, home, integration.attempt, now, options);
+  return {
+    ...result,
+    output: withGuardWarnings(integration.guard, result.output)
+  };
 }
 
 async function continueIntegration(

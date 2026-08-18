@@ -21,7 +21,10 @@ import {
   type ReleaseStepStatus,
   type ReleaseWorkflow
 } from "../release/releaseWorkflow.js";
-import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
+import {
+  reconciliationIntervalMilliseconds,
+  resolveLeaderNextActionMode
+} from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
 import {
   mailboxTargetKey,
@@ -108,6 +111,7 @@ import {
 } from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import { validateTask, type Task } from "../task/task.js";
+import type { NextActionFacts } from "../task/nextAction.js";
 import {
   formatAgentRunReceiptId,
   TASK_RECORD_ID_PREFIXES,
@@ -218,6 +222,11 @@ export type YuiConfig = Readonly<{
   lastTaskId?: string;
   reconciliationIntervalSeconds?: number;
   review?: ReviewConfig;
+  /**
+   * Issue 07 (Leader convergence) feature mode. Optional additive field;
+   * Homes without it default to `display`, so no config migration is needed.
+   */
+  leaderNextActionMode?: "display" | "warn" | "enforce";
   completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
 }>;
 export type ConfiguredAgentPatch = Readonly<Partial<
@@ -384,6 +393,12 @@ export type TaskStore = {
   /** Current durable state revision; advances once per committed mutation. */
   getStateRevision(): number;
   getTask(id: string): Task | null;
+  /**
+   * Issue 07 (Leader convergence): load exactly the records the next-action
+   * projection consumes, filtered at the storage boundary (open Inputs,
+   * active/leader Runs). Returns null when the Task does not exist.
+   */
+  readNextActionFacts(taskId: string): NextActionFacts | null;
   getReviewConfig(): ReviewConfig | null;
   getTaskBrief(taskId: string): TaskBrief | null;
   saveTaskBrief(taskId: string, brief: TaskBrief): void;
@@ -861,6 +876,26 @@ export class FileTaskStore implements TaskStore {
   }
   getStateRevision(): number { return this.#state().revision; }
   getTask(id: string): Task | null { return optional(this.#state().tasks[id]?.task); }
+  readNextActionFacts(taskId: string): NextActionFacts | null {
+    const aggregate = this.#state().tasks[taskId];
+    if (aggregate === undefined) return null;
+    const agentRuns = values(aggregate.agentRuns, "id");
+    return {
+      task: {
+        id: aggregate.task.id,
+        status: aggregate.task.status,
+        projectBindings: aggregate.task.projectBindings
+      },
+      workItems: values(aggregate.workItems, "id"),
+      changeSets: values(aggregate.changeSets, "id"),
+      integrations: values(aggregate.integrationAttempts, "id"),
+      reviewRounds: values(aggregate.reviewRounds, "id"),
+      openInputRequests: values(aggregate.inputRequests, "id")
+        .filter((request) => request.status === "open"),
+      activeRuns: agentRuns.filter((run) => run.status === "active"),
+      leaderRuns: agentRuns.filter((run) => run.roleName === "leader")
+    };
+  }
   getReviewConfig(): ReviewConfig | null {
     return optional(this.#state().config.review);
   }
@@ -2855,6 +2890,7 @@ function validateYuiConfig(config: YuiConfig): void {
     reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
     resolveTimeZone(config.timeZone);
     if (config.review !== undefined) validateReviewConfig(config.review);
+    resolveLeaderNextActionMode(config.leaderNextActionMode);
   } catch (error) {
     throw new StorageRecordError(
       error instanceof Error ? error.message : "Yui reconciliation interval is invalid."
