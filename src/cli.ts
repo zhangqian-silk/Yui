@@ -43,9 +43,17 @@ import { runConfigCommand } from "./commands/configCommands.js";
 import {
   parseControllerCleanupOptions,
   parseControllerStatusOptions,
+  parseControllerRuntimeSnapshot,
   renderControllerResourceStatus,
+  renderRuntimeIdentitySection,
+  summarizeDurablePhysicalMismatch,
+  type ControllerRuntimeSnapshot,
   runInteractiveControllerCleanup
 } from "./commands/controllerCommands.js";
+import {
+  parseExecutionAuditOptions,
+  runExecutionAuditCommand
+} from "./commands/executionAuditCommands.js";
 import {
   parseSessionReconcileOptions,
   runSessionReconcileCommand
@@ -125,6 +133,14 @@ import {
   ReviewRoundWorkspaceEvidenceError
 } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema } from "./storage/storageSchema.js";
+import {
+  collectRuntimeBuildIdentity,
+  collectStorageIdentity,
+  countDroppedInboxEvents,
+  createProductionRuntimeIdentityPorts,
+  evaluateStorageHealth,
+  resolveStatusIdentityEnabled
+} from "./observability/runtimeIdentity.js";
 import { type TaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import {
   openCompatibleFileTaskStore,
@@ -313,6 +329,19 @@ export async function main(): Promise<void> {
     emit(renderDoctor(report.checks, report.review));
     return;
   }
+  if (args[0] === "execution") {
+    // Issue 11 read-only audit: opens the Home read-only, never writes state,
+    // never wakes a Leader.
+    if (args[1] !== "audit") {
+      throw usageError(
+        "Execution usage: yui execution audit [--task <id>] [--since <iso>] [--until <iso>]."
+      );
+    }
+    const options = parseExecutionAuditOptions(args.slice(2));
+    const result = runExecutionAuditCommand(home, options);
+    emit(result.output, false, result.report);
+    return;
+  }
   if (args[0] === "upgrade") {
     // Mirror doctor/controller: needs a Home but self-manages the schema check,
     // because upgrade must run against a non-current Home.
@@ -423,6 +452,48 @@ export async function main(): Promise<void> {
         scope: options.scope,
         environment: process.env
       });
+      if (resolveStatusIdentityEnabled(process.env)) {
+        // Issue 11 read-only identity/metrics section. Every fact is observed;
+        // missing producers render `unsupported` and storage contradictions
+        // fail closed with exit code 5.
+        const cliEntry = fileURLToPath(import.meta.url);
+        const packageRoot = resolve(cliEntry, "..", "..");
+        const build = collectRuntimeBuildIdentity(
+          createProductionRuntimeIdentityPorts(packageRoot, cliEntry, process.env)
+        );
+        const storage = collectStorageIdentity(home);
+        const droppedEvents = countDroppedInboxEvents(home);
+        let runtime: ControllerRuntimeSnapshot;
+        try {
+          const result = await callController(
+            home,
+            "controller.status",
+            {},
+            { timeoutMs: 2_000 }
+          );
+          runtime = parseControllerRuntimeSnapshot(result, droppedEvents);
+        } catch {
+          runtime = { source: "unsupported", droppedEvents };
+        }
+        const mismatch = summarizeDurablePhysicalMismatch(snapshot);
+        const identitySection = renderRuntimeIdentitySection({
+          build,
+          storage,
+          runtime,
+          mismatch,
+          inventoryRssBytes: snapshot.summary.rssBytes
+        });
+        emit(
+          `${renderControllerResourceStatus(snapshot, options.verbose)}\n\n${identitySection}`,
+          false,
+          { ...snapshot, identity: { build, storage, runtime, mismatch } }
+        );
+        // Exit 5 only on hard contradictions (fail). A needs-repair state
+        // (pseudo-layout-7) is degraded but still readable via the file store,
+        // so it exits 0 with a DEGRADED health line and a precise repair action.
+        if (evaluateStorageHealth(storage).status === "fail") process.exitCode = 5;
+        return;
+      }
       emit(
         renderControllerResourceStatus(snapshot, options.verbose),
         false,

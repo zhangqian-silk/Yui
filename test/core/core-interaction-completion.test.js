@@ -34,6 +34,8 @@ const PUBLIC_PATHS = [
   "controller cleanup",
   "controller stop",
   "controller restart",
+  "execution",
+  "execution audit",
   "release",
   "release install",
   "release list",

@@ -864,7 +864,7 @@ export const ROOT_COMMAND = buildNode({
     ] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
-    { id: "operations", title: "Operations", entries: ["web", "controller", "job", "jobs", "telemetry", "release"] },
+    { id: "operations", title: "Operations", entries: ["web", "controller", "execution", "job", "jobs", "telemetry", "release"] },
     { id: "resources", title: "Resources", entries: ["resources"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
@@ -936,6 +936,23 @@ export const ROOT_COMMAND = buildNode({
         },
         { name: "stop", summary: "Stop the Controller." },
         { name: "restart", summary: "Restart internal services without stopping tmux sessions." }
+      ]
+    },
+    {
+      name: "execution",
+      summary: "Read-only execution history audit.",
+      sections: [{
+        id: "reports",
+        title: "Commands",
+        entries: ["audit"]
+      }],
+      children: [
+        {
+          name: "audit",
+          summary: "Report Runs, wakes, Sessions, Reviews, Integrations, and telemetry volume.",
+          usage: "yui execution audit [--task <id>] [--since <iso>] [--until <iso>]",
+          options: ["--task", "--since", "--until"]
+        }
       ]
     },
     {

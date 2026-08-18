@@ -460,6 +460,9 @@ async function routeRequest(
       result: {
         pid: process.pid,
         running: true,
+        // Issue 11: process identity facts for status/audit. Read-only.
+        uptimeMs: Math.round(process.uptime() * 1000),
+        rssBytes: process.memoryUsage().rss,
         protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
         version: YUI_VERSION,
         storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,
