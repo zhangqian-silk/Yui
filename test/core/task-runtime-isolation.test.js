@@ -29,6 +29,7 @@ import {
 } from "../../dist/runtime/exactControlPlane.js";
 import { RuntimeLaunchCoordinator } from "../../dist/controller/runtimeLaunchCoordinator.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
+import { loadResourceRegistry } from "../../dist/resources/resourceRegistry.js";
 
 const NOW = new Date("2026-08-09T00:00:00.000Z");
 const COMMIT = "a".repeat(40);
@@ -177,12 +178,32 @@ test("compact runtime paths retain exact marker ownership and launch cleanup", (
   assert.doesNotMatch(preparation.descriptor.roots.generation, /task-15/u);
 
   service.activate(preparation);
+  const activeRegistry = loadResourceRegistry(fx.controlHome);
+  const activePaths = [
+    preparation.descriptor.roots.generation,
+    preparation.descriptor.roots.data,
+    preparation.descriptor.roots.cache,
+    preparation.descriptor.roots.temporary
+  ];
+  assert.equal(
+    Object.values(activeRegistry.records).filter((record) =>
+      activePaths.includes(record.path) && record.disposition === "active").length,
+    activePaths.length
+  );
   assert.equal(service.cleanupTaskLaunch({
     taskId: "task-15",
     launchId: preparation.descriptor.generation.launchId,
     reason: "completion"
   }), "cleaned");
   assert.equal(existsSync(preparation.descriptor.roots.generation), false);
+  const deletedRegistry = loadResourceRegistry(fx.controlHome);
+  assert.equal(
+    Object.values(deletedRegistry.records).filter((record) =>
+      activePaths.includes(record.path)
+      && record.disposition === "deleted"
+      && record.cleanupReceipt?.method === "runtime-cleanup").length,
+    activePaths.length
+  );
 });
 
 test("an unknown Task runtime path layout fails closed", (t) => {

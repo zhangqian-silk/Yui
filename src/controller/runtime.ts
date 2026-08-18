@@ -89,6 +89,7 @@ import {
 import { createEphemeralResourceReaper } from "./ephemeralResourceReaper.js";
 import { scanControllerResourceInventory } from "./resourceInventoryLinux.js";
 import { ResourceInventoryClient } from "./resourceInventoryRpc.js";
+import { createResourceAutoGc } from "../resources/autoResourceGc.js";
 import {
   createRuntimeResourceActivityTracker,
   type RuntimePaneFact,
@@ -451,6 +452,15 @@ export async function startFileTaskControllerRuntime(
                 })
               })
         }));
+  // Issue 10: automatic Resource GC. The runner self-skips unless
+  // resourcesGcMode=quarantine and resourcesGcAutoQuarantine=true, so wiring
+  // it unconditionally costs one config read per full pass when disabled.
+  const resourceAutoGc = options.resourceAutoGc
+    ?? createResourceAutoGc({
+      home,
+      store,
+      environment: options.environment
+    });
   const lifecycleDispatcher = createRuntimeLifecycleDispatcher(
     store,
     schedulerStore,
@@ -520,6 +530,7 @@ export async function startFileTaskControllerRuntime(
       jobSupervisor,
       jobControl,
       ...(resourceReaper === undefined ? {} : { resourceReaper }),
+      resourceAutoGc,
       onExpiredEphemeralDomain: (domain) => {
         if (domain.yuiHome !== home) return;
         void runningController?.close().catch(options.onError ?? (() => undefined));
