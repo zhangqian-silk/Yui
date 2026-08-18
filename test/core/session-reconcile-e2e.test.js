@@ -208,6 +208,18 @@ async function ensureRoleSessionWithRetry(home, taskId, roleName, environment, a
       const transient = error?.code === "SERVICE_ERROR" || error?.code === "INTERNAL_ERROR";
       if (!transient || attempt === attempts - 1) throw error;
       await delay(200);
+      // The first attempt may have launched the Provider and written its owner
+      // record even though the response was lost (a transient tmux/Controller
+      // error). Retrying would launch a second Provider and leave a stale
+      // launch reservation that fails cleanup with "launch identity is
+      // ambiguous". The owner record is written only after the tmux window is
+      // created, so its presence proves the launch landed.
+      const owners = new FileTaskStore(home).listSessionOwnersForOwner({
+        scope: "task",
+        taskId,
+        roleName
+      });
+      if (owners.length > 0) return;
     }
   }
   throw lastError;
