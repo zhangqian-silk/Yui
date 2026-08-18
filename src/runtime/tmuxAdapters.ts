@@ -114,6 +114,25 @@ export interface RuntimeTmuxHostPort {
     roleName: string;
     dead: boolean;
   }>[]>;
+  /** Reads one Role pane's exact process state after host creation. */
+  inspectRolePane?(
+    hostId: string,
+    roleName: string
+  ): Readonly<{
+    pid?: number;
+    target: string;
+    dead: boolean;
+    currentCommand: string;
+  }>;
+  inspectRolePaneAsync?(
+    hostId: string,
+    roleName: string
+  ): Promise<Readonly<{
+    pid?: number;
+    target: string;
+    dead: boolean;
+    currentCommand: string;
+  }>>;
 }
 
 export type RuntimeTmuxPaneState = Readonly<{
@@ -158,6 +177,22 @@ export type TmuxSessionHostOptions = Readonly<{
   /** Current global Operator topology uses one synthetic tmux Task session. */
   globalHostId?: string;
   createBindingId?: () => string;
+  /**
+   * Invoked after this host created a new external Role process, with the
+   * binding and the fresh pane state. Issue 03 uses it to persist the exact
+   * physical owner identity (Provider root PID + start identity) so a later
+   * reconciliation can prove exit even after the durable Session map is
+   * cleared. Never invoked for a reused live host.
+   */
+  onHostCreated?: (input: Readonly<{
+    binding: RuntimeBinding;
+    pane: Readonly<{
+      pid?: number;
+      target: string;
+      dead: boolean;
+      currentCommand: string;
+    }>;
+  }>) => void;
 }>;
 
 /**
@@ -167,6 +202,7 @@ export type TmuxSessionHostOptions = Readonly<{
 export class TmuxSessionHost implements SessionHostPort {
   readonly #globalHostId: string;
   readonly #createBindingId: () => string;
+  readonly #onHostCreated: TmuxSessionHostOptions["onHostCreated"];
   readonly #launchTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -179,6 +215,7 @@ export class TmuxSessionHost implements SessionHostPort {
       "Global tmux host id"
     );
     this.#createBindingId = options.createBindingId ?? randomUUID;
+    this.#onHostCreated = options.onHostCreated;
   }
 
   async start(
@@ -401,7 +438,7 @@ export class TmuxSessionHost implements SessionHostPort {
         callerKey: planned.launch.env.YUI_JOB_CALLER_KEY
       });
     }
-    return createRuntimeBinding({
+    const binding = createRuntimeBinding({
       id: bindingId,
       launchId: request.launchId,
       owner: request.owner,
@@ -418,6 +455,13 @@ export class TmuxSessionHost implements SessionHostPort {
         : {}),
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
+    if (hostCreated && this.#onHostCreated !== undefined) {
+      const pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
+      if (pane !== undefined) {
+        this.#onHostCreated({ binding, pane });
+      }
+    }
+    return binding;
   }
 }
 
@@ -473,6 +517,28 @@ async function probeRoleStatus(
   return tmux.probeRoleStatusAsync === undefined
     ? tmux.probeRoleStatus(hostId, roleName)
     : tmux.probeRoleStatusAsync(hostId, roleName);
+}
+
+async function inspectRolePane(
+  tmux: RuntimeTmuxHostPort,
+  hostId: string,
+  roleName: string
+): Promise<Readonly<{
+  pid?: number;
+  target: string;
+  dead: boolean;
+  currentCommand: string;
+}> | undefined> {
+  try {
+    return tmux.inspectRolePaneAsync === undefined
+      ? tmux.inspectRolePane?.(hostId, roleName)
+      : await tmux.inspectRolePaneAsync(hostId, roleName);
+  } catch {
+    // The pane may have exited between creation and inspection; the owner
+    // recorder treats a missing pane as a verification gap, not a launch
+    // failure.
+    return undefined;
+  }
 }
 
 async function killRole(

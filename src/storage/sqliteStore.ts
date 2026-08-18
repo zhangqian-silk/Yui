@@ -50,6 +50,8 @@ import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from 
 import type { TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { AgentRun } from "../run/agentRun.js";
+import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
+import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import {
@@ -1115,6 +1117,67 @@ export class SqliteTaskStore implements TaskStore {
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(task_id, role_name, agent_id) DO UPDATE SET hash = excluded.hash, updated_at = excluded.updated_at`
       ).run(taskId, roleName, agentId, hash, this.#now());
+    });
+  }
+
+  // -- session owners (Issue 03) ----------------------------------------------
+
+  saveSessionOwner(identity: SessionOwnerIdentity): void {
+    const owner = identity.owner;
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO session_owners
+           (launch_id, scope, task_id, role_name, agent_id, native_session_id,
+            provider_root_pid, payload, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(launch_id) DO UPDATE SET
+           scope = excluded.scope, task_id = excluded.task_id,
+           role_name = excluded.role_name, agent_id = excluded.agent_id,
+           native_session_id = excluded.native_session_id,
+           provider_root_pid = excluded.provider_root_pid,
+           payload = excluded.payload, recorded_at = excluded.recorded_at`
+      ).run(
+        identity.launchId,
+        owner.scope,
+        owner.scope === "task" ? owner.taskId : null,
+        owner.roleName,
+        identity.agentId,
+        identity.nativeSessionId ?? null,
+        identity.providerRoot.pid,
+        this.#json(identity),
+        identity.recordedAt
+      );
+    });
+  }
+
+  getSessionOwner(launchId: string): SessionOwnerIdentity | null {
+    const row = this.#db.prepare(
+      "SELECT payload FROM session_owners WHERE launch_id = ?"
+    ).get(launchId) as { payload: string } | undefined;
+    return row === undefined ? null : this.#parse<SessionOwnerIdentity>(row.payload);
+  }
+
+  listSessionOwners(): SessionOwnerIdentity[] {
+    return this.#listPayload<SessionOwnerIdentity>(
+      "session_owners", "1=1", []
+    ).sort((left, right) => left.recordedAt.localeCompare(right.recordedAt));
+  }
+
+  listSessionOwnersForOwner(owner: RuntimeOwner): SessionOwnerIdentity[] {
+    if (owner.scope === "global") {
+      return this.#listPayload<SessionOwnerIdentity>(
+        "session_owners", "scope = 'global' AND role_name = ?", [owner.roleName]
+      );
+    }
+    return this.#listPayload<SessionOwnerIdentity>(
+      "session_owners", "scope = 'task' AND task_id = ? AND role_name = ?",
+      [owner.taskId, owner.roleName]
+    );
+  }
+
+  removeSessionOwner(launchId: string): void {
+    this.#mutate(() => {
+      this.#db.prepare("DELETE FROM session_owners WHERE launch_id = ?").run(launchId);
     });
   }
 
