@@ -22,6 +22,7 @@ import { controllerSocketPath } from "./controllerEndpoint.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
 import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
+import { CommandExecutionError } from "../tmux/commandExecutor.js";
 import {
   detectRunningRelease,
   readActiveReleasePointer,
@@ -963,6 +964,17 @@ function safeDispatcherError(
         return { code: "SERVICE_ERROR", message };
       case "CoreJobError":
         return { code: "JOB_ERROR", message };
+      case "CommandExecutionError": {
+        // Transient tmux/process launch failures (e.g. under CI load) carry
+        // the real stderr; surface it instead of the generic fallback so the
+        // caller can distinguish a retryable infrastructure failure from a
+        // permanent contract violation.
+        if (error instanceof CommandExecutionError && error.stderr.length > 0) {
+          const detail = safeErrorMessage(error.stderr);
+          if (detail !== undefined) return { code: "SERVICE_ERROR", message: detail };
+        }
+        return { code: "SERVICE_ERROR", message };
+      }
       default:
         return undefined;
     }

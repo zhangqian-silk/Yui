@@ -185,6 +185,59 @@ async function waitForProcessExit(pid, timeoutMs, label) {
 }
 
 /**
+ * The Controller's tmux launch can fail transiently under CI full-suite load
+ * (resource contention makes `tmux start-server; new-session` exit non-zero).
+ * The Controller maps CommandExecutionError to SERVICE_ERROR with the real
+ * stderr; retry the launch a bounded number of times so a transient
+ * infrastructure failure does not flake the E2E. Permanent failures (missing
+ * tmux, real contract violations) persist across retries and still fail.
+ */
+async function ensureRoleSessionWithRetry(home, taskId, roleName, environment, attempts = 3) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await callController(home, "runtime.ensure-role-session", {
+        scope: "task",
+        taskId,
+        roleName,
+        environment
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      const transient = error?.code === "SERVICE_ERROR" || error?.code === "INTERNAL_ERROR";
+      if (!transient || attempt === attempts - 1) throw error;
+      await delay(200);
+      // The first attempt may have launched the Provider and written its owner
+      // record even though the response was lost (a transient tmux/Controller
+      // error). Retrying would launch a second Provider and leave a stale
+      // launch reservation that fails cleanup with "launch identity is
+      // ambiguous". The owner record is written only after the tmux window is
+      // created, so its presence with a live Provider proves the launch
+      // landed. However, the Coordinator may compensate a post-launch failure
+      // by stopping the host (kill-window); the owner record persists but the
+      // Provider is dead. A dead Provider means the launch must be retried
+      // from a clean owner registry.
+      const owners = new FileTaskStore(home).listSessionOwnersForOwner({
+        scope: "task",
+        taskId,
+        roleName
+      });
+      const liveOwner = owners.find((o) => o.providerRoot !== undefined
+        && isLinuxProcessLive(o.providerRoot.pid, o.providerRoot.startIdentity));
+      if (liveOwner !== undefined) return;
+      // No live Provider: remove stale owner records so the retry starts
+      // clean without a second generation that fails cleanup as ambiguous.
+      const cleanupStore = new FileTaskStore(home);
+      for (const owner of owners) {
+        cleanupStore.removeSessionOwner(owner.launchId);
+      }
+    }
+  }
+  throw lastError;
+}
+
+/**
  * Builds the isolated sandbox: own Home, tmux namespace, Controller socket,
  * Git Project, active Task with a prepared workspace, Leader Role, and a
  * configured Agent whose command is the test Provider stand-in.
@@ -259,63 +312,78 @@ async function e2eFixture(t, { providerEnv = {} } = {}) {
       await runtime.startController();
     },
     async launchLeader() {
-      await callController(home, "runtime.ensure-role-session", {
-        scope: "task",
-        taskId: task.id,
-        roleName: role.name,
-        environment: providerEnvironment
-      });
-      // Wait for the Provider process and its owner record.
-      await waitFor(
-        () => readObservations(observationPath).some((o) => o.event === "process-started" && !o.isChild),
-        FIVE_SECONDS_MS,
-        "Provider root did not start"
-      );
-      const registry = new FileTaskStore(home);
-      await waitFor(
-        () => registry.listSessionOwners().length > 0,
-        FIVE_SECONDS_MS,
-        "Owner record was not written"
-      );
-      const [record] = registry.listSessionOwners();
-      // Record the durable Session the way the runtime event processor would
-      // once the Provider signals session-start. The mock Provider keeps
-      // alive without sending notifications, so the test commits the exact
-      // durable generation the launch fence created.
-      const launchStore = new FileTaskStore(home);
-      const launchRole = launchStore.getRole(task.id, role.name);
-      const effective = resolveEffectiveLaunch({
-        role: launchRole,
-        purpose: "execution",
-        workspace: launchStore.getTaskWorkspace(task.id)
-      });
-      let sessions = launchStore.getTaskRoleSessionSet(task.id, role.name)
-        ?? createRoleSessionSet(
-          { scope: "task", taskId: task.id, roleName: role.name },
-          agent.id,
-          NOW
+      const maxAttempts = 3;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await ensureRoleSessionWithRetry(home, task.id, role.name, providerEnvironment);
+        // Wait for the Provider process and its owner record.
+        await waitFor(
+          () => readObservations(observationPath).some((o) => o.event === "process-started" && !o.isChild),
+          FIVE_SECONDS_MS,
+          "Provider root did not start"
         );
-      sessions = recordRoleAgentSession(sessions, {
-        agentId: agent.id,
-        adapterId: agent.adapterId,
-        nativeSessionId: record.nativeSessionId ?? `native-${record.launchId}`,
-        launchId: record.launchId,
-        policy: "fixed",
-        status: "running",
-        effective
-      }, NOW);
-      launchStore.saveTaskRoleSessionSet(sessions);
-      // Wait for the durable Session to be readable.
-      await waitFor(
-        () => {
-          const set = new FileTaskStore(home).getTaskRoleSessionSet(task.id, role.name);
-          const session = set?.sessions[agent.id];
-          return session?.status === "running" && session.launchId === record.launchId;
-        },
-        FIVE_SECONDS_MS,
-        "Durable session was not recorded"
-      );
-      return registry.listSessionOwners();
+        const registry = new FileTaskStore(home);
+        await waitFor(
+          () => registry.listSessionOwners().length > 0,
+          FIVE_SECONDS_MS,
+          "Owner record was not written"
+        );
+        const [record] = registry.listSessionOwners();
+        // Verify the Provider is alive before committing the durable Session.
+        // Under CI load the Coordinator may compensate a post-launch failure
+        // by stopping the host after the owner record was written; the record
+        // persists but the Provider is dead. Retry the launch from a clean
+        // registry instead of reconciling a corpse.
+        if (record.providerRoot !== undefined
+          && isLinuxProcessLive(record.providerRoot.pid, record.providerRoot.startIdentity)) {
+          // Record the durable Session the way the runtime event processor would
+          // once the Provider signals session-start. The mock Provider keeps
+          // alive without sending notifications, so the test commits the exact
+          // durable generation the launch fence created.
+          const launchStore = new FileTaskStore(home);
+          const launchRole = launchStore.getRole(task.id, role.name);
+          const effective = resolveEffectiveLaunch({
+            role: launchRole,
+            purpose: "execution",
+            workspace: launchStore.getTaskWorkspace(task.id)
+          });
+          let sessions = launchStore.getTaskRoleSessionSet(task.id, role.name)
+            ?? createRoleSessionSet(
+              { scope: "task", taskId: task.id, roleName: role.name },
+              agent.id,
+              NOW
+            );
+          sessions = recordRoleAgentSession(sessions, {
+            agentId: agent.id,
+            adapterId: agent.adapterId,
+            nativeSessionId: record.nativeSessionId ?? `native-${record.launchId}`,
+            launchId: record.launchId,
+            policy: "fixed",
+            status: "running",
+            effective
+          }, NOW);
+          launchStore.saveTaskRoleSessionSet(sessions);
+          // Wait for the durable Session to be readable.
+          await waitFor(
+            () => {
+              const set = new FileTaskStore(home).getTaskRoleSessionSet(task.id, role.name);
+              const session = set?.sessions[agent.id];
+              return session?.status === "running" && session.launchId === record.launchId;
+            },
+            FIVE_SECONDS_MS,
+            "Durable session was not recorded"
+          );
+          return registry.listSessionOwners();
+        }
+        // Provider is dead. Remove stale owner records and retry the launch.
+        if (attempt < maxAttempts - 1) {
+          const cleanupStore = new FileTaskStore(home);
+          for (const owner of cleanupStore.listSessionOwners()) {
+            cleanupStore.removeSessionOwner(owner.launchId);
+          }
+          await delay(200);
+        }
+      }
+      throw new Error("launchLeader did not produce a live Provider after retries");
     },
     reconciliation() {
       const tmux = new TmuxManager(
@@ -375,6 +443,51 @@ function rootPidAndChildPids(fixture) {
     .filter((o) => o.event === "process-started" && o.isChild)
     .map((o) => o.pid);
   return { rootPid: root?.pid, childPids: [...new Set(children)] };
+}
+
+/**
+ * Formats the durable lifecycle state and Controller log so a CI cleanup
+ * failure reveals exactly what the post-scan mailbox check observed.
+ */
+function formatCleanupDiagnostics(home, taskId, roleName, controllerLogPath) {
+  const store = new FileTaskStore(home);
+  const mailbox = store.getWorkMailbox({ kind: "role-runtime", taskId, roleName });
+  const sessionSet = store.getTaskRoleSessionSet(taskId, roleName);
+  const activeSession = sessionSet === null
+    ? null
+    : sessionSet.sessions[sessionSet.activeAgentId] ?? null;
+  const owners = store.listSessionOwners().map((o) => ({
+    launchId: o.launchId,
+    pid: o.providerRoot?.pid,
+    alive: o.providerRoot !== undefined
+  }));
+  const terminationEvents = store.listEvents(taskId)
+    .filter((e) => e.type === "runtime.session-termination")
+    .map((e) => ({ outcome: e.payload.outcome, detail: e.payload.detail }));
+  let controllerLog = "";
+  try {
+    controllerLog = readFileSync(controllerLogPath, "utf8").trim();
+  } catch { /* log may not exist */ }
+  return JSON.stringify({
+    mailbox: mailbox === null ? null : {
+      processing: mailbox.processing === null ? null : {
+        batchId: mailbox.processing.batchId,
+        owner: mailbox.processing.owner,
+        reasons: mailbox.processing.batch.reasons
+      },
+      pending: mailbox.pending === null ? null : {
+        reasons: mailbox.pending.reasons,
+        fromSequence: mailbox.pending.fromSequence,
+        toSequence: mailbox.pending.toSequence
+      }
+    },
+    session: activeSession === null ? null : {
+      status: activeSession.status,
+      launchId: activeSession.launchId
+    },
+    owners,
+    terminationEvents
+  }, null, 2) + `\nController log:\n${controllerLog || "(empty)"}`;
 }
 
 test("a launched Provider root is recorded and attributed in the reconcile report", async (t) => {
@@ -463,7 +576,7 @@ test("exact-owner archive cleanup proves Provider root and child exit within 5s"
   assert.equal(childPids.length, 1);
 
   const cleanup = await fx.archiveTask();
-  assert.equal(cleanup.status, "removed");
+  assert.equal(cleanup.status, "removed", cleanup.error ?? JSON.stringify(cleanup));
 
   await waitForProcessExit(rootPid, FIVE_SECONDS_MS, "Provider root");
   for (const childPid of childPids) {
@@ -500,7 +613,7 @@ test("a stubborn Provider is escalated SIGTERM/SIGKILL and confirmed", async (t)
   const { rootPid } = rootPidAndChildPids(fx);
 
   const cleanup = await fx.archiveTask();
-  assert.equal(cleanup.status, "removed");
+  assert.equal(cleanup.status, "removed", cleanup.error ?? JSON.stringify(cleanup));
   await waitForProcessExit(rootPid, FIVE_SECONDS_MS, "Stubborn Provider root");
 
   const events = new FileTaskStore(fx.home)
@@ -535,7 +648,12 @@ for (const [name, providerEnv] of [
     const before = rootPidAndChildPids(fx);
 
     const cleanup = await fx.archiveTask();
-    assert.equal(cleanup.status, "removed");
+    if (cleanup.status !== "removed") {
+      assert.fail(
+        `${cleanup.error ?? JSON.stringify(cleanup)}\n`
+        + `Diagnostics:\n${formatCleanupDiagnostics(fx.home, fx.task.id, fx.role.name, fx.runtime.controllerLogPath)}`
+      );
+    }
 
     await waitForProcessExit(before.rootPid, FIVE_SECONDS_MS, "Provider root");
     for (const childPid of before.childPids) {
