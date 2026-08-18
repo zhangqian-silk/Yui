@@ -162,7 +162,7 @@ export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 9 as const;
 export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 4 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 3 as const;
-export const CURRENT_MESSAGE_SCHEMA_VERSION = 2 as const;
+export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INPUT_REQUEST_SCHEMA_VERSION = 2 as const;
 export const CURRENT_DECISION_SCHEMA_VERSION = 1 as const;
 export const CURRENT_MILESTONE_SCHEMA_VERSION = 1 as const;
@@ -261,7 +261,7 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
  * assert it is classifying the same bytes the store reads and writes.
  */
 export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
-export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 6 as const;
+export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 7 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 
 type StoredTask = {

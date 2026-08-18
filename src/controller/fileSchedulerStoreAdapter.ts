@@ -149,14 +149,24 @@ import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.j
  * soon as the durable revision advances (own commit or external writer), so it
  * is never dispatch/claim/complete authority: every mutation re-reads the
  * exact records under the storage lock/CAS.
+ *
+ * All seven record families the actionability digest folds (agentRuns,
+ * workItems, reviewRounds, integrationAttempts, inputRequests, durableJobs,
+ * messages) are read in the same projection build, so a single digest
+ * computation sees a consistent per-revision snapshot even under concurrent
+ * writers (Issue 05).
  */
 type TaskReadProjection = Readonly<{
   events: readonly TaskEvent[];
   runFacts: ReadonlyMap<string, RunProgressFacts>;
+  agentRuns: ReturnType<TaskStore["listAgentRuns"]>;
+  workItems: ReturnType<TaskStore["listWorkItems"]>;
   reviewRounds: ReturnType<TaskStore["listReviewRounds"]>;
   changeSets: ReturnType<TaskStore["listChangeSets"]>;
   integrationAttempts: ReturnType<TaskStore["listIntegrationAttempts"]>;
   inputRequests: ReturnType<TaskStore["listInputRequests"]>;
+  durableJobs: ReturnType<TaskStore["listDurableJobs"]>;
+  messages: ReturnType<TaskStore["listMessages"]>;
 }>;
 
 const NULL_TELEMETRY_SINK = new NullTelemetrySink();
@@ -213,10 +223,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       task = {
         events,
         runFacts: foldRunProgressFacts(events),
+        agentRuns: this.store.listAgentRuns(taskId),
+        workItems: this.store.listWorkItems(taskId),
         reviewRounds: this.store.listReviewRounds(taskId),
         changeSets: this.store.listChangeSets(taskId),
         integrationAttempts: this.store.listIntegrationAttempts(taskId),
-        inputRequests: this.store.listInputRequests(taskId)
+        inputRequests: this.store.listInputRequests(taskId),
+        durableJobs: this.store.listDurableJobs(taskId),
+        messages: this.store.listMessages(taskId)
       };
       tasks.set(taskId, task);
     }
@@ -322,6 +336,34 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   listEvents(taskId: string) {
     return this.#taskReadProjection(taskId).events;
+  }
+
+  listAgentRuns(taskId: string) {
+    return this.#taskReadProjection(taskId).agentRuns;
+  }
+
+  listWorkItems(taskId: string) {
+    return this.#taskReadProjection(taskId).workItems;
+  }
+
+  listReviewRounds(taskId: string) {
+    return this.#taskReadProjection(taskId).reviewRounds;
+  }
+
+  listIntegrationAttempts(taskId: string) {
+    return this.#taskReadProjection(taskId).integrationAttempts;
+  }
+
+  listDurableJobs(taskId: string) {
+    return this.#taskReadProjection(taskId).durableJobs;
+  }
+
+  listInputRequests(taskId: string) {
+    return this.#taskReadProjection(taskId).inputRequests;
+  }
+
+  listMessages(taskId: string) {
+    return this.#taskReadProjection(taskId).messages;
   }
 
   getRunProgressFacts(taskId: string, runId: string): RunProgressFacts | undefined {

@@ -3,6 +3,10 @@ import {
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import type {
+  LeaderRunDisposition,
+  LeaderWaitReason
+} from "../scheduler/actionability.js";
 import {
   validateManagedWorkspace,
   type ManagedWorkspace
@@ -13,7 +17,7 @@ export type AgentRunStatus = "active" | "yielded" | "failed";
 export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
-  schemaVersion: 6;
+  schemaVersion: 7;
   id: string;
   taskId: string;
   roleName: string;
@@ -43,6 +47,20 @@ export type AgentRun = {
    */
   deliveredAt?: string;
   summary?: string;
+  /**
+   * Machine-derived disposition of a terminal Leader Run (Issue 05). Set at
+   * yield/fail time so the Scheduler can tell whether a later scan brings any
+   * new actionable fact. Absent on older Runs and on non-Leader Runs.
+   */
+  disposition?: LeaderRunDisposition;
+  /**
+   * Actionability digest observed by a terminal Leader Run. When the last
+   * Leader Run ended waiting/blocked and a later scan computes the same
+   * digest, the Scheduler stays silent instead of creating a new Run.
+   */
+  observedActionabilityDigest?: string;
+  /** Optional structured wait reference for a waiting/blocked Leader Run. */
+  waitReason?: LeaderWaitReason;
   createdAt: string;
   updatedAt: string;
   endedAt?: string;
@@ -70,7 +88,7 @@ export function createAgentRun(
   }
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: requireSafeIdentity(id, "Agent run id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -129,7 +147,7 @@ export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
-  if (run.schemaVersion !== 6) throw new Error("Agent run must use schemaVersion 6.");
+  if (run.schemaVersion !== 7) throw new Error("Agent run must use schemaVersion 7.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "agentRun");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {
@@ -255,9 +273,27 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     if (run.summary !== undefined || run.endedAt !== undefined) {
       throw new Error("An active Agent run cannot have terminal metadata.");
     }
+    if (run.disposition !== undefined
+      || run.observedActionabilityDigest !== undefined
+      || run.waitReason !== undefined) {
+      throw new Error("An active Agent run cannot carry Leader receipt metadata.");
+    }
   } else {
     requireText(run.summary ?? "", "Agent run summary");
     requireTimestamp(run.endedAt ?? "", "Agent run endedAt");
+    if (run.disposition !== undefined
+      && !["progress", "waiting", "blocked", "completed"].includes(run.disposition)) {
+      throw new Error(`Agent run disposition is invalid: ${String(run.disposition)}.`);
+    }
+    if (run.observedActionabilityDigest !== undefined) {
+      requireText(run.observedActionabilityDigest, "Agent run observedActionabilityDigest");
+    }
+    if (run.waitReason !== undefined) {
+      requireText(run.waitReason.kind, "Agent run waitReason kind");
+      if (run.waitReason.ref !== undefined) {
+        requireText(run.waitReason.ref, "Agent run waitReason ref");
+      }
+    }
   }
   return run;
 }
