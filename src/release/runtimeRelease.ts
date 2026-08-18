@@ -423,8 +423,15 @@ export type HandoverLock = Readonly<{ release: () => void }>;
 export function acquireHandoverLock(home: string): HandoverLock {
   const lockPath = join(resolve(home), "runtime", "handover.lock");
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const startIdentity = readLinuxProcessStartIdentity(process.pid);
+  if (startIdentity === undefined) {
+    throw new Error(
+      `Cannot read Linux process start identity for activator PID ${process.pid}.`
+    );
+  }
   const owner = Object.freeze({
     pid: process.pid,
+    processStartIdentity: startIdentity,
     token: randomBytes(16).toString("hex"),
     createdAt: new Date().toISOString()
   });
@@ -459,7 +466,7 @@ export function acquireHandoverLock(home: string): HandoverLock {
       typeof existing.pid === "number"
       && Number.isSafeInteger(existing.pid)
       && existing.pid > 0
-      && readLinuxProcessStartIdentity(existing.pid) !== undefined
+      && isHandoverLockLive(existing)
     ) {
       throw new Error(
         `Another Controller handover is already running (owner PID ${existing.pid}, `
@@ -472,6 +479,32 @@ export function acquireHandoverLock(home: string): HandoverLock {
     `Cannot safely acquire the Controller handover lock because its owner changed repeatedly: `
       + lockPath
   );
+}
+
+/**
+ * A handover lock is live only when its owner process is still the same
+ * generation that wrote it. A PID that exists but with a different start
+ * identity was reused by an unrelated process, so the lock is stale.
+ * Locks written before the start-identity field existed fall back to the
+ * PID-exists check for backward compatibility.
+ */
+function isHandoverLockLive(existing: {
+  pid?: unknown;
+  processStartIdentity?: unknown;
+}): boolean {
+  if (
+    typeof existing.pid !== "number"
+    || !Number.isSafeInteger(existing.pid)
+    || existing.pid <= 0
+  ) {
+    return false;
+  }
+  const currentIdentity = readLinuxProcessStartIdentity(existing.pid);
+  if (currentIdentity === undefined) return false;
+  if (typeof existing.processStartIdentity === "string") {
+    return currentIdentity === existing.processStartIdentity;
+  }
+  return true;
 }
 
 export function newHandoverId(): string {
