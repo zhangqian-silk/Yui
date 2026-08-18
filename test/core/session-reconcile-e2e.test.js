@@ -574,9 +574,14 @@ test("a stubborn Provider is escalated SIGTERM/SIGKILL and confirmed", async (t)
     cleanup = await fx.archiveTask();
   }
   if (cleanup.status !== "removed") {
+    let controllerLog = "";
+    try {
+      controllerLog = readFileSync(fx.runtime.controllerLogPath, "utf8").trim();
+    } catch { /* log may not exist */ }
     assert.fail(
       `${cleanup.error ?? JSON.stringify(cleanup)}\n`
-      + `Lifecycle state:\n${dumpLifecycleState(fx.home, fx.task.id, fx.role.name)}`
+      + `Lifecycle state:\n${dumpLifecycleState(fx.home, fx.task.id, fx.role.name)}\n`
+      + `Controller log:\n${controllerLog || "(empty)"}`
     );
   }
   await waitForProcessExit(rootPid, FIVE_SECONDS_MS, "Stubborn Provider root");

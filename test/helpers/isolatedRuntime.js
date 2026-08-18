@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, openSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   createEphemeralDomainIdentity,
@@ -72,11 +73,30 @@ export function createIsolatedRuntime(testContext, options = {}) {
     root,
     home,
     environment,
+    /** Path to the captured Controller stderr log (best-effort debug aid). */
+    controllerLogPath: join(root, "controller-stderr.log"),
     get identity() {
       return currentIdentity;
     },
     async startController() {
-      const status = await ensureFileTaskController(home, { environment });
+      const controllerEntry = fileURLToPath(
+        new URL("../../dist/controller/controllerMain.js", import.meta.url)
+      );
+      const status = await ensureFileTaskController(home, {
+        environment,
+        spawnController: (controllerHome, controllerEnv) => {
+          const child = spawn(
+            process.execPath,
+            [controllerEntry],
+            {
+              env: controllerEnv,
+              detached: true,
+              stdio: ["ignore", "ignore", openSync(runtime.controllerLogPath, "a")]
+            }
+          );
+          child.unref();
+        }
+      });
       if (!Number.isSafeInteger(status?.pid) || status.pid <= 1) {
         throw new Error("isolated Controller did not report a valid process identity");
       }
