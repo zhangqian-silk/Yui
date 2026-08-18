@@ -869,6 +869,16 @@ const STORED_TASK_V14_FIELDS = [
   "changeSets",
   "integrationAttempts",
   "integrationQueue",
+  // durableJobs may already be present on a v14 task when the Home was
+  // written by a build that had the family before the storedTask version
+  // advanced (or after a state.json→SQLite repair round-trip, which
+  // reconstructs every current family map). The 14→15 normalizer preserves
+  // existing records instead of overwriting them with an empty map.
+  "durableJobs",
+  // jobCallerKeyHashes is introduced at v16 but the state.json→SQLite repair
+  // round-trip reconstructs every current family map, so a v14 task may carry
+  // an empty map after the repair. The 14→15 normalizer preserves it.
+  "jobCallerKeyHashes",
   "capabilityGrants",
   "releaseWorkflows",
   "roles",
@@ -941,11 +951,18 @@ function normalizeStoredTaskV14ToV15(snapshot: HomeSnapshot): HomeSnapshot {
       task.idHighWaterMarks,
       `Task aggregate ${taskId} idHighWaterMarks`
     );
+    const existingJobs = task.durableJobs === undefined
+      ? {}
+      : asObject(task.durableJobs, `Task aggregate ${taskId} durableJobs`);
+    const existingJobMark = highWaterMarks.durableJob;
     nextTasks[taskId] = {
       ...task,
       schemaVersion: STORED_TASK_DURABLE_JOBS_TO_VERSION,
-      idHighWaterMarks: { ...highWaterMarks, durableJob: 0 },
-      durableJobs: {}
+      idHighWaterMarks: {
+        ...highWaterMarks,
+        durableJob: typeof existingJobMark === "number" ? existingJobMark : 0
+      },
+      durableJobs: existingJobs
     };
   }
   return {
@@ -985,6 +1002,10 @@ const STORED_TASK_V15_FIELDS = [
   "integrationAttempts",
   "integrationQueue",
   "durableJobs",
+  // May already be present after a state.json→SQLite repair round-trip (the
+  // reverse reader reconstructs every current family map). The 15→16
+  // normalizer preserves existing hashes instead of overwriting them.
+  "jobCallerKeyHashes",
   "capabilityGrants",
   "releaseWorkflows",
   "roles",
@@ -1050,10 +1071,13 @@ function normalizeStoredTaskV15ToV16(snapshot: HomeSnapshot): HomeSnapshot {
   const nextTasks: Record<string, unknown> = {};
   for (const [taskId, rawTask] of Object.entries(tasks)) {
     const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const existingHashes = task.jobCallerKeyHashes === undefined
+      ? {}
+      : asObject(task.jobCallerKeyHashes, `Task aggregate ${taskId} jobCallerKeyHashes`);
     nextTasks[taskId] = {
       ...task,
       schemaVersion: STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION,
-      jobCallerKeyHashes: {}
+      jobCallerKeyHashes: existingHashes
     };
   }
   return {
@@ -1094,9 +1118,12 @@ function durableJobIntroductionStep(): CompatibleStep<HomeSnapshot> {
       for (const [taskId, rawTask] of Object.entries(tasks)) {
         const task = asObject(rawTask, `Task aggregate ${taskId}`);
         if (task.durableJobs !== undefined) {
-          throw new Error(
-            `Task aggregate ${taskId} must not carry durableJobs before introduction.`
-          );
+          const jobs = asObject(task.durableJobs, `durableJobs map ${taskId}`);
+          if (Object.keys(jobs).length > 0) {
+            throw new Error(
+              `Task aggregate ${taskId} must not carry durableJobs before introduction.`
+            );
+          }
         }
       }
     },

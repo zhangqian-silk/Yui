@@ -223,13 +223,12 @@ test("final review policy is fenced from aggregate-v16 consumers", () => {
 });
 
 test("an aggregate-v16 Home containing final fails at the storage gate", () => {
-  const home = temporaryHome();
-  ensureStorageSchema(home);
-  const store = new FileTaskStore(home);
-  store.saveConfig({
-    ...store.getConfig(),
+  // A real layout-7 Home (yui.db + receipt) so the physical-backend check
+  // passes and the pure version classifier under test is reached.
+  const home = healthyLayout7Home((config) => ({
+    ...config,
     review: { roleName: "reviewer", trigger: "final" }
-  });
+  }));
 
   const manifestPath = join(home, "schema.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -251,7 +250,7 @@ test("an aggregate-v16 Home containing final fails at the storage gate", () => {
 });
 
 test("a persisted manifest omission becomes explicit record-family version 0", () => {
-  const home = currentHome();
+  const home = healthyLayout7Home();
   const recordVersions = currentRecordVersionManifest();
   delete recordVersions.operatorNotification;
   writeManifest(home, { recordVersions });
@@ -288,7 +287,7 @@ test("record-version manifests fail closed on malformed, unknown, and future fam
   });
   assert.equal(classify(unknown).classification.verdict, "CORRUPTED");
 
-  const future = currentHome();
+  const future = healthyLayout7Home();
   writeManifest(future, {
     recordVersions: {
       ...currentRecordVersionManifest(),
@@ -349,7 +348,7 @@ test("the compatible store seam never bypasses a future record version", () => {
 });
 
 test("a strictly-older Home fails closed as NEEDS_NEW_VERSION/missing-step", () => {
-  const home = currentHome();
+  const home = healthyLayout7Home();
   writeManifest(home, { aggregateSchemaVersion: 7 });
   const result = classify(home);
   assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
@@ -360,7 +359,7 @@ test("a strictly-older Home fails closed as NEEDS_NEW_VERSION/missing-step", () 
 });
 
 test("a future Home fails closed as NEEDS_NEW_VERSION/future-version", () => {
-  const home = currentHome();
+  const home = healthyLayout7Home();
   writeManifest(home, { aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION + 1 });
   const result = classify(home);
   assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
@@ -387,23 +386,16 @@ test("real structural damage classifies CORRUPTED, not a version verdict", () =>
 });
 
 function preBaselineHome() {
-  const home = temporaryHome();
+  // Build on a healthy layout-7 Home (yui.db + receipt) so the physical-backend
+  // check passes; then strip the durable record-version manifest to simulate a
+  // pre-baseline Home. The classifier reads the missing recordVersions field as
+  // explicit version 0 for every family.
+  const home = healthyLayout7Home();
   writeFileSync(join(home, "schema.json"), JSON.stringify({
     schemaVersion: 1,
     storageVersion: CURRENT_STORAGE_LAYOUT_VERSION,
     aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
     updatedAt: "2026-07-20T00:00:00.000Z"
-  }));
-  writeFileSync(join(home, "state.json"), JSON.stringify({
-    schemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    config: { schemaVersion: 1, defaultAgent: "codex" },
-    configuredAgents: {},
-    projects: {},
-    agentProfiles: {},
-    globalRoles: {},
-    globalRoleSessionSets: {},
-    tasks: {},
-    mailboxes: {}
   }));
   return home;
 }

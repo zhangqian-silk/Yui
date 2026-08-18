@@ -226,6 +226,9 @@ const LATEST = () => latestStorageVersionState();
 
 test("P1-1 positive: a record-only-older Home is NEEDS_NEW_VERSION, not CORRUPTED", () => {
   const { home } = currentHome();
+  // Promote to a real layout-7 Home (yui.db + receipt) so the physical-backend
+  // check passes and the version classifier under test is reached.
+  migrateFixtureToLayout7(home);
   setConfiguredAgent(home, 1); // configuredAgent latest is 2; scalar axes current.
   const result = classifyHome({ home, registry: EMPTY(), latest: LATEST() });
   assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
@@ -238,6 +241,7 @@ test("P1-1 positive: a record-only-older Home is NEEDS_NEW_VERSION, not CORRUPTE
 
 test("P1-1 positive: a record-only-older Home with a registered step is MIGRATABLE", () => {
   const { home } = currentHome();
+  migrateFixtureToLayout7(home);
   setConfiguredAgent(home, 1);
   // A synthetic registry that supplies exactly the record step configuredAgent 1->2.
   const registry = new MigrationRegistry();
@@ -314,6 +318,7 @@ test("P1-1 negative: a record with a missing/invalid schemaVersion is CORRUPTED"
 
 test("P1-1 negative: a record family NEWER than supported is future-version, not CORRUPTED", () => {
   const { home } = currentHome();
+  migrateFixtureToLayout7(home);
   setConfiguredAgent(home, 99);
   const result = classifyHome({ home, registry: EMPTY(), latest: LATEST() });
   assert.equal(result.classification.verdict, "NEEDS_NEW_VERSION");
@@ -444,6 +449,7 @@ test("P2 map guard rejects a changed default locator before classification", () 
 
 test("P2 map guard: future config and active-run pointer versions are future-version blockers", () => {
   const futureConfig = currentHomeWithBoundaryRecords();
+  migrateFixtureToLayout7(futureConfig.home);
   editState(futureConfig.home, (state) => {
     state.config.schemaVersion = CURRENT_CONFIG_SCHEMA_VERSION + 1;
   });
@@ -464,6 +470,7 @@ test("P2 map guard: future config and active-run pointer versions are future-ver
   assert.equal(configResult.classification.blocker.supported, CURRENT_CONFIG_SCHEMA_VERSION);
 
   const futurePointer = currentHomeWithBoundaryRecords();
+  migrateFixtureToLayout7(futurePointer.home);
   editState(futurePointer.home, (state) => {
     state.tasks[futurePointer.taskId].activeRuns[futurePointer.roleName].schemaVersion =
       CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION + 1;
@@ -556,6 +563,7 @@ test("P1-1 map guard: non-empty current RoleSessionSet and AgentRun Home is USAB
 
 test("P1-1 map guard preserves older/future/corrupt record outcomes", () => {
   const older = currentHomeWithTaskRoleRecords();
+  migrateFixtureToLayout7(older.home);
   editState(older.home, (state) => {
     state.tasks[older.taskId].roleSessionSets[older.roleName].schemaVersion =
       CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION - 1;
@@ -573,6 +581,7 @@ test("P1-1 map guard preserves older/future/corrupt record outcomes", () => {
   assert.equal(oldResult.classification.blocker.to, CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION);
 
   const future = currentHomeWithTaskRoleRecords();
+  migrateFixtureToLayout7(future.home);
   editState(future.home, (state) => {
     state.tasks[future.taskId].agentRuns[future.runId].schemaVersion =
       CURRENT_AGENT_RUN_SCHEMA_VERSION + 1;
@@ -590,6 +599,7 @@ test("P1-1 map guard preserves older/future/corrupt record outcomes", () => {
   assert.equal(futureResult.classification.blocker.supported, CURRENT_AGENT_RUN_SCHEMA_VERSION);
 
   const corrupt = currentHomeWithTaskRoleRecords();
+  migrateFixtureToLayout7(corrupt.home);
   editState(corrupt.home, (state) => {
     delete state.tasks[corrupt.taskId].roleSessionSets[corrupt.roleName].schemaVersion;
   });
@@ -599,6 +609,7 @@ test("P1-1 map guard preserves older/future/corrupt record outcomes", () => {
 
 test("P1-1 aggregate family: StoredTask 14->13 is a record missing-step, not corruption", () => {
   const { home } = currentHome();
+  migrateFixtureToLayout7(home);
   const store = new FileTaskStore(home);
   store.saveTask(createTask("task-1", "Aggregate scan", new Date("2026-08-07T00:00:00.000Z")));
   editState(home, (state) => {
@@ -1039,6 +1050,7 @@ test("storage upgrade default restore accepts the captured Controller identity",
 
 test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-step", () => {
   const { home } = currentHome();
+  migrateFixtureToLayout7(home);
   editState(home, (state) => {
     // The scanner intentionally needs only the record's schemaVersion here;
     // the strict aggregate loader must not run while this record axis is old.
@@ -1074,6 +1086,7 @@ test("P1-1 managed workspace record-only mismatch is NEEDS_NEW_VERSION/missing-s
 
 test("P1-1 upgrade: a record-only-older Home blocks with missing-step and never switches", async () => {
   const { home } = currentHome();
+  migrateFixtureToLayout7(home);
   setConfiguredAgent(home, 1);
   const result = await runStorageUpgrade({
     home, registry: EMPTY(), latest: LATEST(), mode: "execute",
