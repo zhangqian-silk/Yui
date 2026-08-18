@@ -67,6 +67,7 @@ import {
   validateTaskWorkspaceIdentity,
   type TaskWorkspaceIdentity
 } from "./taskWorkspaceIdentity.js";
+import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
 
 const MAIN_WORKTREE = "main";
 const LEADER_ROLE = "leader";
@@ -180,6 +181,16 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     readonly now: () => Date = () => new Date()
   ) {}
 
+  #resourceRegistrarValue: ResourceRegistrar | undefined;
+
+  #resourceRegistrar(): ResourceRegistrar {
+    return this.#resourceRegistrarValue ??= new ResourceRegistrar(this.home, this.now);
+  }
+
+  #registerWorkspace(workspace: ManagedWorkspace): void {
+    this.#resourceRegistrar().registerManagedWorkspace(workspace);
+  }
+
   async prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation> {
     // The per-Project maintenance fence makes prepare mutually exclusive with
     // migrate/rebuild/archive: a concurrent migration must not switch the
@@ -284,6 +295,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         root,
         entries: []
       }, this.now());
+      this.#registerWorkspace(workspace);
       this.store.transaction((tx) => {
         const latest = requireTask(tx, task.id);
         if (!['draft', 'active'].includes(latest.status)
@@ -420,6 +432,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         root,
         entries: prepared.map(({ entry }) => entry)
       }, this.now());
+      this.#registerWorkspace(workspace);
       this.store.transaction((tx) => {
         const latest = requireTask(tx, task.id);
         if (!["draft", "active"].includes(latest.status)) {
@@ -843,6 +856,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           root,
           entries: prepared.map(({ entry }) => entry)
         }, this.now());
+        this.#registerWorkspace(workspace);
         return this.store.transaction((tx) => {
           const latestTask = requireTask(tx, lockedTask.id);
           const latestItem = tx.getWorkItem(lockedTask.id, item.id);
@@ -948,6 +962,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         throw new Error(`Execution Lane managed workspace identity changed: ${taskId}/${executionLaneId}.`);
       }
       await ensureWorkspaceView(existing.root, existing.entries);
+      this.#registerWorkspace(existing);
       for (const entry of existing.entries.filter(({ access }) => access === "write")) {
         const project = requireProject(this.store, entry.projectId);
         const physical = await this.git.ensureWorktree({
@@ -1004,6 +1019,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         root,
         entries: prepared.map(({ entry }) => entry)
       }, this.now());
+      this.#registerWorkspace(workspace);
       const durableLane = this.store.listWorkItems(taskId).some((item) => (
         workItemExecutionGroupById(item, executionGroupId)?.lanes.some(({ id }) => id === executionLaneId)
       )) || this.store.listReviewRounds(taskId).some((round) => (
@@ -1259,6 +1275,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       removed ||= result === "removed";
     }
     await removeWorkspaceView(workspace.root);
+    this.#resourceRegistrar().markWorkspaceDeleted(workspace);
     this.store.removeManagedWorkspace(workspace.owner);
     return removed ? "removed" : "missing";
   }
@@ -1561,6 +1578,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       if (adopted && missing.size === 0) {
         try {
           await ensureWorkspaceView(reviewRoot, existing.entries);
+          this.#registerWorkspace(existing);
         } catch (error) {
           throw new ReviewRoundWorkspaceEvidenceError(
             `ReviewRound workspace view cannot be reused for ${round.id}: `
@@ -1663,6 +1681,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         root: reviewRoot,
         entries
       }, this.now());
+      this.#registerWorkspace(stored);
       return this.store.transaction((tx) => {
         const currentRound = tx.getReviewRound(task.id, round.id);
         const currentItem = tx.getWorkItem(task.id, item.id);
@@ -1894,6 +1913,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       removed ||= result === "removed";
     }
     await removeWorkspaceView(workspace.root);
+    this.#resourceRegistrar().markWorkspaceDeleted(workspace);
     this.store.transaction((tx) => {
       const currentRound = tx.getReviewRound(task.id, round.id);
       const currentWorkspace = tx.getReviewRoundWorkspace(task.id, round.id);
@@ -1969,6 +1989,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       removed ||= result === "removed";
     }
     await removeWorkspaceView(workspace.root);
+    this.#resourceRegistrar().markWorkspaceDeleted(workspace);
     try {
       this.#recordWorkspaceRemoval(task, workspace, this.#fallbackWorkspace(), {
         workItemId: item.id,
@@ -2035,6 +2056,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       }
       assertTaskArchiveState(requireTask(this.store, task.id), task);
       await removeWorkspaceView(main.root);
+      this.#resourceRegistrar().markWorkspaceDeleted(main);
       assertTaskArchiveState(requireTask(this.store, task.id), task);
       this.#recordWorkspaceRemoval(task, main, this.#fallbackWorkspace());
     }
@@ -2192,6 +2214,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         root,
         entries: prepared.map(({ entry }) => entry)
       }, this.now());
+      this.#registerWorkspace(workspace);
       // Switch the durable record only now that every new ref/worktree exists.
       this.store.transaction((tx) => {
         const latest = requireTask(tx, task.id);
@@ -2467,6 +2490,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           `Unadopted managed worktree is dirty and was retained at ${entry.path}; inspect it and retry.`
         );
       }
+      this.#resourceRegistrar().markPathsDeleted([entry.path]);
     }
   }
 
@@ -2577,6 +2601,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           `Legacy Task worktree is dirty and blocks the archive: ${target.taskId}/${target.project.id}.`
         );
       }
+      this.#resourceRegistrar().markPathsDeleted([worktree.path]);
     }
     await this.git.archiveRef({
       repositoryPath: target.project.path,
@@ -2609,6 +2634,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       if (removal === "dirty") {
         throw new Error(`Legacy Task worktree is dirty and blocks the rebuild: ${task.id}/${project.id}.`);
       }
+      this.#resourceRegistrar().markPathsDeleted([join(container, task.id, MAIN_WORKTREE)]);
     }
   }
 
@@ -2656,6 +2682,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             `Orphaned Task worktree is dirty and blocks the rebuild: ${task.id}/${project.id}.`
           );
         }
+        this.#resourceRegistrar().markPathsDeleted([worktreePath]);
         // The worktree is gone; archive+delete its now-unchecked-out branch.
         // A deleted external checkout takes the branch with it, so a missing
         // repository or an already-absent branch is a no-op.

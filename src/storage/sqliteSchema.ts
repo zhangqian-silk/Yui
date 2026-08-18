@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 7;
+export const SQLITE_SCHEMA_VERSION = 8;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -554,6 +554,31 @@ CREATE INDEX IF NOT EXISTS idx_session_owners_task
   ON session_owners(task_id, role_name);
 `;
 
+/**
+ * Migration 8: Resource GC registry (Issue 10).
+ *
+ * GC-owned table for resource lifecycle records.  The registry is GC's own
+ * state — it is not part of the aggregate and never participates in aggregate
+ * versioning.  Records are stored as full versioned JSON in `payload`, with
+ * typed columns for the fields GC queries (disposition, kind, task_id).
+ */
+const MIGRATION_8_SQL = `
+CREATE TABLE IF NOT EXISTS resource_registry (
+  id          TEXT PRIMARY KEY,
+  kind        TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  disposition TEXT NOT NULL,
+  task_id     TEXT,
+  payload     TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_resource_registry_disposition
+  ON resource_registry(disposition);
+CREATE INDEX IF NOT EXISTS idx_resource_registry_task
+  ON resource_registry(task_id);
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -567,8 +592,9 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL },
   { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL },
   { version: 5, axis: "record", recordKind: "telemetryAggregate", sql: MIGRATION_5_SQL },
-  { version: 6, axis: "record", recordKind: "reviewFinding", sql: MIGRATION_6_SQL }
-  ,{ version: 7, axis: "record", recordKind: "sessionOwner", sql: MIGRATION_7_SQL }
+  { version: 6, axis: "record", recordKind: "reviewFinding", sql: MIGRATION_6_SQL },
+  { version: 7, axis: "record", recordKind: "sessionOwner", sql: MIGRATION_7_SQL },
+  { version: 8, axis: "record", recordKind: "resource-registry", sql: MIGRATION_8_SQL }
 ];
 
 function checksum(sql: string): string {
@@ -662,5 +688,6 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "telemetry_aggregate",
   "capability_grants",
   "release_workflows",
-  "session_owners"
+  "session_owners",
+  "resource_registry"
 ] as const;

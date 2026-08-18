@@ -62,6 +62,7 @@ import { SessionOwnerReconciliation } from "./controller/sessionOwnerReconciliat
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runDurableJobCommand } from "./commands/durableJobCommands.js";
 import { runTelemetryCommand } from "./commands/telemetryCommands.js";
+import { runResourcesCommand } from "./commands/resourcesCommands.js";
 import {
   applyOperatorSessionControl,
   runOperatorCommand,
@@ -551,6 +552,14 @@ export async function main(): Promise<void> {
       false,
       controllerMethod === "restart" ? result : undefined
     );
+    return;
+  }
+
+  if (args[0] === "resources") {
+    await assertFileTaskControllerStorageCompatible(home);
+    const resourcesStore = openCompatibleFileTaskStore(home);
+    const result = await runResourcesCommand(args.slice(1), resourcesStore);
+    emit(result.output, false, result.data);
     return;
   }
 

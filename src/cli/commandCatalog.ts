@@ -865,6 +865,7 @@ export const ROOT_COMMAND = buildNode({
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
     { id: "operations", title: "Operations", entries: ["web", "controller", "execution", "job", "jobs", "telemetry", "release"] },
+    { id: "resources", title: "Resources", entries: ["resources"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
   children: [
@@ -977,6 +978,19 @@ export const ROOT_COMMAND = buildNode({
       ]
     },
     {
+      name: "resources",
+      summary: "Inspect and garbage-collect managed worktrees, deployments, and runtime artifacts.",
+      sections: [{ id: "gc", title: "Commands", entries: ["gc"] }],
+      children: [
+        {
+          name: "gc",
+          summary: "Plan or apply resource garbage collection.",
+          usage: "yui resources gc [--dry-run|--apply|--purge|--restore] [--quarantine-ttl-hours <hours>]",
+          options: ["--dry-run", "--apply", "--purge", "--restore", "--quarantine-ttl-hours"]
+        }
+      ]
+    },
+    {
       name: "config",
       summary: "Inspect or update Yui configuration.",
       sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "review", "leader-next-action"] }],
@@ -985,8 +999,12 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "set",
           summary: "Update Yui configuration.",
-          usage: "yui config set <--time-zone <IANA timezone> | --reconciliation-interval-seconds <5-300>>",
-          options: ["--time-zone", "--reconciliation-interval-seconds"]
+          usage: "yui config set <--time-zone <IANA timezone> | --reconciliation-interval-seconds <5-300> | --resources-gc-mode <report|quarantine> | --resources-gc-auto-quarantine <true|false>>",
+          options: ["--time-zone", "--reconciliation-interval-seconds", "--resources-gc-mode", "--resources-gc-auto-quarantine"],
+          optionValues: {
+            "--resources-gc-mode": ["report", "quarantine"],
+            "--resources-gc-auto-quarantine": ["true", "false"]
+          }
         },
         {
           name: "review",
