@@ -97,6 +97,18 @@ export async function runHandoverCandidate(
       `Handover fence for ${handoverId} is missing or does not match; aborting candidate.`
     );
   }
+  // A candidate only starts from the `fenced` phase. If the activator already
+  // rolled the handover back (fence written as `rolled-back`, old Controller
+  // restored), a slow-starting candidate must not resurrect the fence to
+  // `candidate-ready`: that would leak the candidate process and could lead a
+  // later `release activate` recovery into a split-brain commit.
+  if (fence.phase !== "fenced") {
+    removeCandidateDiscovery(home);
+    return {
+      outcome: "aborted",
+      reason: `Handover fence is in phase '${fence.phase}', not 'fenced'; the handover was rolled back.`
+    };
+  }
 
   // Publish the candidate identity so the activator can read back build ID,
   // backend, and worker state before committing the handover.
@@ -122,6 +134,13 @@ export async function runHandoverCandidate(
       return {
         outcome: "aborted",
         reason: "Handover fence disappeared; the handover was rolled back."
+      };
+    }
+    if (current.phase === "rolled-back") {
+      removeCandidateDiscovery(home);
+      return {
+        outcome: "aborted",
+        reason: "Handover was rolled back while the candidate was polling."
       };
     }
     const oldDead = !isOwnerLive(current.old);

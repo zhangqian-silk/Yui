@@ -201,7 +201,16 @@ export function resolveInstalledRelease(
     if (!entry.isDirectory()) continue;
     if (entry.name === releaseId) {
       const releaseDir = join(directory, entry.name);
-      return { releaseDir, manifest: verifyReleaseIntegrity(releaseDir) };
+      try {
+        return { releaseDir, manifest: verifyReleaseIntegrity(releaseDir) };
+      } catch (error) {
+        throw new Error(
+          `Release ${releaseId} failed integrity verification and may have drifted: `
+          + `${error instanceof Error ? error.message : String(error)}. `
+          + "Reinstall it with `yui release install <source-dir>` before activating.",
+          { cause: error }
+        );
+      }
     }
     try {
       const manifest = readReleaseManifest(join(directory, entry.name));
@@ -226,7 +235,18 @@ export async function runReleaseActivate(
     dualOwnerGraceMs?: number;
   }> = {}
 ): Promise<ReleaseActivateResult> {
-  const resolved = resolveInstalledRelease(home, releaseId);
+  let resolved: ReturnType<typeof resolveInstalledRelease>;
+  try {
+    resolved = resolveInstalledRelease(home, releaseId);
+  } catch (error) {
+    return {
+      outcome: "aborted",
+      phase: "resolve",
+      message: error instanceof Error ? error.message : String(error),
+      action: "Reinstall the release; a drifted release cannot be activated.",
+      recoverable: true
+    };
+  }
   if (resolved === null) {
     return {
       outcome: "aborted",
@@ -329,10 +349,22 @@ export function createReleaseActivatePorts(
       ?? (async (home, releaseDir) => {
         spawnDetachedController(home, releaseDir, {});
         const deadline = Date.now() + 30_000;
+        const expectedBuildId = readReleaseManifest(releaseDir).buildId;
         for (;;) {
           try {
             const status = await callController(home, "controller.status", {});
             if (typeof status === "object" && status !== null && (status as { running?: unknown }).running === true) {
+              // Verify the running Controller is the target release, not a
+              // stale/previous Controller that happened to answer.
+              const identity = await callController(home, "controller.identity", {}) as {
+                buildId?: unknown;
+              };
+              if (identity.buildId !== expectedBuildId) {
+                throw new Error(
+                  `Controller is running build ${String(identity.buildId)}, `
+                  + `not the target release build ${expectedBuildId}.`
+                );
+              }
               return;
             }
           } catch (error) {
@@ -415,9 +447,7 @@ const CONTROLLER_OPERATIONAL_ENV = [
   "TZ",
   "LANG",
   "TERM",
-  "YUI_TMUX_BIN",
-  "YUI_STORE_BACKEND",
-  "YUI_STORE_WORKER"
+  "YUI_TMUX_BIN"
 ] as const;
 
 function spawnDetachedController(

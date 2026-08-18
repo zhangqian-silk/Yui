@@ -26,6 +26,7 @@ import {
   detectRunningRelease,
   readActiveReleasePointer,
   readHandoverFence,
+  verifyReleaseIntegrity,
   writeHandoverFence,
   writeRuntimeIdentity,
   type ActiveReleasePointer,
@@ -395,6 +396,17 @@ async function routeRequest(
     // activator cannot distinguish a live owner from an empty Home and would
     // bypass the handover sequence.
     const release = detectRunningRelease(fileURLToPath(import.meta.url));
+    // Verify the running release's integrity so a drifted Controller can be
+    // refused by a handover activator. The Controller stays alive; the flag
+    // lets the activator fail closed without killing the serving process.
+    let releaseDrifted = false;
+    if (release !== null) {
+      try {
+        verifyReleaseIntegrity(release.releaseDir);
+      } catch {
+        releaseDrifted = true;
+      }
+    }
     let processStartIdentity: string | undefined;
     try {
       processStartIdentity = readLinuxProcessStartIdentitySync(process.pid);
@@ -420,7 +432,11 @@ async function routeRequest(
         workerEnabled: resolveStoreWorkerEnabledForHome(home, process.env),
         mode: "primary",
         dualOwner: false,
-        activeRelease: readActiveReleasePointer(home) ?? null,
+        ...(releaseDrifted ? { releaseDrifted: true } : {}),
+        // A corrupted pointer file must not kill the serving Controller with
+        // an unhandled rejection; surface a degraded identity so the caller
+        // can diagnose, and let `release activate` fail on its own read.
+        activeRelease: readActiveReleasePointerSafe(home),
         pid: process.pid,
         ...(processStartIdentity === undefined
           ? {}
@@ -503,7 +519,7 @@ async function routeRequest(
       );
       return;
     }
-    handover.fence = { handoverId: params.handoverId, fencedAt: new Date().toISOString() };
+    const fencedAt = new Date().toISOString();
     const owner = currentHandoverOwner();
     const fence: HandoverFence = Object.freeze({
       schemaVersion: 1,
@@ -513,10 +529,27 @@ async function routeRequest(
       candidate: null,
       fromReleaseId: params.fromReleaseId,
       toReleaseId: params.toReleaseId,
-      createdAt: handover.fence.fencedAt,
-      updatedAt: handover.fence.fencedAt
+      createdAt: fencedAt,
+      updatedAt: fencedAt
     });
-    writeHandoverFence(home, fence);
+    // Write the durable fence BEFORE setting the in-memory fence. If the
+    // durable write fails, the Controller must not be left permanently fenced
+    // in memory (retry would get CONTROLLER_HANDOVER_ACTIVE with no durable
+    // state to roll back).
+    try {
+      writeHandoverFence(home, fence);
+    } catch (error) {
+      const detail = error instanceof Error ? safeErrorMessage(error.message) : undefined;
+      send(
+        controllerFailure(
+          request.id,
+          "INTERNAL_ERROR",
+          `Failed to write the handover fence${detail === undefined ? "" : `: ${detail}`}`
+        )
+      );
+      return;
+    }
+    handover.fence = { handoverId: params.handoverId, fencedAt };
     send({
       id: request.id,
       ok: true,
@@ -546,13 +579,28 @@ async function routeRequest(
     const committedAt = new Date().toISOString();
     const existing = readHandoverFenceOrNull(home);
     if (existing !== null) {
-      writeHandoverFence(home, Object.freeze({
-        ...existing,
-        phase: "committed",
-        updatedAt: committedAt
-      }));
+      try {
+        writeHandoverFence(home, Object.freeze({
+          ...existing,
+          phase: "committed",
+          updatedAt: committedAt
+        }));
+      } catch (error) {
+        const detail = error instanceof Error ? safeErrorMessage(error.message) : undefined;
+        send(
+          controllerFailure(
+            request.id,
+            "INTERNAL_ERROR",
+            `Failed to commit the handover fence${detail === undefined ? "" : `: ${detail}`}`
+          )
+        );
+        return;
+      }
     }
-    handover.fence = null;
+    // Keep the in-memory fence set until this process exits. The pointer has
+    // switched and the Controller is draining; clearing the fence here would
+    // reopen the mutation window on the old release before stop() completes.
+    // The in-memory state dies with the process.
     send({
       id: request.id,
       ok: true,
@@ -722,6 +770,15 @@ function handoverFenceResult(fence: HandoverFence): JsonValue {
 function readHandoverFenceOrNull(home: string): HandoverFence | null {
   try {
     return readHandoverFence(home);
+  } catch {
+    return null;
+  }
+}
+
+/** Read the active release pointer without letting a corrupted file kill the Controller. */
+function readActiveReleasePointerSafe(home: string): ActiveReleasePointer | null {
+  try {
+    return readActiveReleasePointer(home);
   } catch {
     return null;
   }

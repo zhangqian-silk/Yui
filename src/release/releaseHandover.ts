@@ -346,6 +346,12 @@ async function readOldController(
       return null;
     }
     const record = identity as Record<string, unknown>;
+    if (record.releaseDrifted === true) {
+      throw new Error(
+        "The old Controller's release has drifted from its installed manifest; "
+        + "refusing to hand over. Reinstall or restore the active release before activating."
+      );
+    }
     const startIdentity = typeof record.processStartIdentity === "string"
       ? record.processStartIdentity
       : undefined;
