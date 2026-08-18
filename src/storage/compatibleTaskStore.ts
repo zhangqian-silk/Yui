@@ -98,6 +98,22 @@ export function openCompatibleFileTaskStore(
   switch (classification.classification.status) {
     case "current":
     case "needs-storage-repair":
+      // A pseudo-layout-7 Home whose aggregate axis is also older cannot be
+      // normalized in memory: the compatible loader (requireCompatibleStorageSchema)
+      // only bypasses record-axis mismatches, not aggregate/layout ones. Such a
+      // Home needs the offline migration path (repair + aggregate migration in
+      // one upgrade), so surface the same migration-required error the pure
+      // version classifier would have produced, rather than a lazy strict-schema
+      // error from the first store read.
+      if (
+        classification.classification.status === "needs-storage-repair"
+        && classification.aggregateVersion !== undefined
+        && classification.aggregateVersion < latest.aggregate
+      ) {
+        throw new StorageCompatibilityError(
+          "Storage requires an offline migration. Re-run `yui update` when active Sessions are clear."
+        );
+      }
       // A pseudo-layout-7 Home (manifest 7, no yui.db) may also carry
       // compatible-old record versions, so open with the same normalization
       // path as `compatible-old` rather than the strict current gate.

@@ -50,8 +50,20 @@ import {
   failAgentRun,
   markAgentRunDelivered,
   markAgentRunPushed,
+  reopenRunForProviderRetry,
+  withProviderRetry,
   type AgentRun
 } from "../run/agentRun.js";
+import {
+  classifyProviderError,
+  isRetryableProviderErrorClass
+} from "../lifecycle/providerErrorClass.js";
+import {
+  type PendingProviderRetry,
+  providerRetryIsDue,
+  scheduleProviderRetry
+} from "../run/providerRetry.js";
+import { providerRetryConfig } from "../run/providerRetryConfig.js";
 import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
 import {
   createCanonicalLifecycleEvent,
@@ -2259,6 +2271,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return { disposition: "obsolete", runId: input.runId };
       }
       const summary = claudeStopFailureSummary(input);
+      // Issue 04: a classified transient Provider failure keeps the exact Run
+      // and Native Session and is retried in place instead of terminalizing.
+      const retryDecision = this.providerRetryDecision(store, input, summary, now);
+      if (retryDecision !== null) return retryDecision;
       const result = terminalizeExactTaskRun(store, {
         taskId: input.taskId,
         roleName: input.roleName,
@@ -2361,6 +2377,272 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       return { disposition: "applied", runId: input.runId };
     });
+  }
+
+  /**
+   * Issue 04 in-place retry decision for one classified Provider failure.
+   * Returns an observation when the failure was handled without terminalizing
+   * the Run, or `null` to fall through to the existing terminalization path.
+   */
+  private providerRetryDecision(
+    store: TaskStore,
+    input: TaskClaudeStopFailureEvent,
+    summary: string,
+    now: Date
+  ): Readonly<{ disposition: "applied"; runId: string }> | null {
+    const config = providerRetryConfig();
+    if (config.mode === "off") return null;
+    const classification = classifyProviderError({
+      adapterId: input.adapterId,
+      error: input.error,
+      errorDetails: input.errorDetails,
+      summary: input.lastAssistantMessage
+    });
+    const adapterEnabled = config.adapters.includes(input.adapterId);
+    const retryable = adapterEnabled
+      && isRetryableProviderErrorClass(classification.errorClass);
+    const shadow = config.mode === "shadow";
+
+    // Shadow mode records the classification and "would retry" fact without
+    // changing any behavior; the Run still terminalizes below.
+    if (shadow || !retryable) {
+      if (adapterEnabled) {
+    this.recordProviderRetryClassified(store, input, classification.errorClass, {
+          wouldRetry: String(retryable),
+          shadow: String(shadow)
+        }, now);
+      }
+      if (!shadow && classification.errorClass === "policy-denied") {
+        const blocked = this.applyProviderPolicyBlock(store, input, summary, now);
+        if (blocked !== null) return blocked;
+      }
+      return null;
+    }
+
+    // transport-uncertain: the Provider may have accepted the turn. If a
+    // native completion is already durable, the completion path owns the
+    // yield; do not resend.
+    if (classification.errorClass === "transport-uncertain") {
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const pending = sessions?.pendingTurnCompletion;
+      if (pending !== null
+        && pending !== undefined
+        && pending.runId === input.runId
+        && pending.agentId === input.agentId) {
+        this.recordProviderRetryClassified(store, input, classification.errorClass, {
+          wouldRetry: "false",
+          shadow: "false",
+          note: "native-turn-completion-durable"
+        }, now);
+        return { disposition: "applied", runId: input.runId };
+      }
+    }
+
+    const run = store.getAgentRun(input.taskId, input.runId);
+    if (run === null || run.status !== "active") return null;
+    const retry = scheduleProviderRetry(run.providerRetry, {
+      errorClass: classification.errorClass,
+      launchId: input.launchId,
+      nativeSessionId: input.nativeSessionId,
+      lastErrorSummary: summary
+    }, now);
+    store.saveAgentRun(withProviderRetry(run, retry));
+
+    // Clear the in-flight fence so the original Session can be re-bound and
+    // re-pushed by the delivery path; the Session itself stays alive.
+    const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+    if (sessions !== null) {
+      store.saveTaskRoleSessionSet(clearTaskRoleRun(sessions, {
+        agentId: input.agentId,
+        runId: input.runId,
+        receiptId: `agent-run:${input.taskId}/${input.runId}`
+      }, now));
+    }
+    // Settle the delivery claim so the retry push can re-claim the mailbox.
+    const target = runtimeLifecycleTarget({
+      scope: "task",
+      taskId: input.taskId,
+      roleName: input.roleName
+    });
+    const mailbox = store.getWorkMailbox(target);
+    if (mailbox !== null && mailbox.processing !== null) {
+      const settled = completeProcessing(mailbox, mailbox.processing.batchId);
+      if (settled.processing === null && settled.pending === null) {
+        store.removeWorkMailbox(target);
+      } else {
+        store.saveWorkMailbox(settled);
+      }
+    }
+    this.recordProviderRetryClassified(store, input, classification.errorClass, {
+      wouldRetry: "true",
+      shadow: "false",
+      attempt: String(retry.attempt),
+      nextAttemptAt: retry.nextAttemptAt
+    }, now);
+    return { disposition: "applied", runId: input.runId };
+  }
+
+  /**
+   * Issue 04 policy-denied handling: the Run stays active on its original
+   * Session, no retry is scheduled, and the Leader receives a bounded blocker.
+   * Yui never works around a policy denial by switching Session or widening
+   * permission.
+   */
+  private applyProviderPolicyBlock(
+    store: TaskStore,
+    input: TaskClaudeStopFailureEvent,
+    summary: string,
+    now: Date
+  ): Readonly<{ disposition: "applied"; runId: string }> | null {
+    const run = store.getAgentRun(input.taskId, input.runId);
+    if (run === null || run.status !== "active") return null;
+    const retry = scheduleProviderRetry(run.providerRetry, {
+      errorClass: "policy-denied",
+      launchId: input.launchId,
+      nativeSessionId: input.nativeSessionId,
+      lastErrorSummary: summary,
+      scheduleNextAttempt: false
+    }, now);
+    store.saveAgentRun(withProviderRetry(run, retry));
+    this.recordProviderRetryClassified(store, input, "policy-denied", {
+      wouldRetry: "false",
+      shadow: "false",
+      note: "policy-denied-blocker"
+    }, now);
+    if (input.roleName !== "leader") {
+      enqueueWork(
+        store,
+        { kind: "role", taskId: input.taskId, roleName: "leader" },
+        "provider-policy-blocked",
+        now,
+        [{ type: "run", taskId: input.taskId, id: input.runId }]
+      );
+    }
+    return { disposition: "applied", runId: input.runId };
+  }
+
+  private recordProviderRetryClassified(
+    store: TaskStore,
+    input: TaskClaudeStopFailureEvent,
+    errorClass: string,
+    extra: Readonly<Record<string, string | undefined>>,
+    now: Date
+  ): void {
+    store.saveEvent(input.taskId, createTaskEvent(
+      store.nextEventId(input.taskId),
+      input.taskId,
+      "runtime.provider-retry-classified",
+      {
+        eventId: input.eventId,
+        runId: input.runId,
+        roleName: input.roleName,
+        errorClass,
+        ...extra
+      },
+      now
+    ));
+  }
+
+  /**
+   * Issue 04 durable retry timer: lists active Runs whose in-place retry is
+   * due. The Controller arms its deadline timer from this projection, so a
+   * Controller restart resumes the same attempt lineage.
+   */
+  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
+    return this.store.listPendingProviderRetries();
+  }
+
+  /**
+   * Issue 04: reopens each due retry on its original Native Session. A Run
+   * whose Session is proven dead terminalizes with an exact replacement
+   * blocker; a live Session is reset for the existing delivery path, which
+   * re-pushes the exact same input in the same pass.
+   */
+  resolveDueProviderRetries(
+    now: Date,
+    taskIds?: ReadonlySet<string>
+  ): readonly string[] {
+    const due = this.listPendingProviderRetries().filter((entry) => (
+      Date.parse(entry.nextAttemptAt) <= now.getTime()
+      && (taskIds === undefined || taskIds.has(entry.taskId))
+    ));
+    const reopened: string[] = [];
+    for (const entry of due) {
+      this.store.transaction((store) => {
+        const run = store.getAgentRun(entry.taskId, entry.runId);
+        if (run === null
+          || run.status !== "active"
+          || run.providerRetry === undefined
+          || run.providerRetry.nextAttemptAt === undefined
+          || !providerRetryIsDue(run.providerRetry, now)) {
+          return;
+        }
+        const sessions = store.getTaskRoleSessionSet(entry.taskId, entry.roleName);
+        const session = sessions?.sessions[run.effective.agentId];
+        const identityMatches = session !== undefined
+          && session.adapterId === run.effective.adapterId
+          && (run.providerRetry.nativeSessionId === undefined
+            || session.nativeSessionId === run.providerRetry.nativeSessionId)
+          && (run.providerRetry.launchId === undefined
+            || session.launchId === run.providerRetry.launchId);
+        const sessionAlive = identityMatches
+          && session.status !== "stopped"
+          && session.status !== "broken";
+        if (!sessionAlive) {
+          // Session-dead: stop in-place retry and raise a precise, actionable
+          // replacement blocker for the Leader.
+          const summary = `Provider retry stopped: the original Session is gone `
+            + `(run ${run.id}, attempt ${run.providerRetry.attempt}, `
+            + `last error: ${run.providerRetry.lastErrorSummary}). `
+            + `A replacement Session requires an explicit Leader recovery decision.`;
+          const result = terminalizeExactTaskRun(store, {
+            taskId: entry.taskId,
+            roleName: entry.roleName,
+            agentId: run.effective.agentId,
+            runId: run.id,
+            receiptId: formatAgentRunReceiptId(entry.taskId, run.id),
+            ...(run.providerRetry.nativeSessionId === undefined
+              ? {}
+              : { nativeSessionId: run.providerRetry.nativeSessionId }),
+            ...(run.providerRetry.launchId === undefined
+              ? {}
+              : { launchId: run.providerRetry.launchId }),
+            outcome: { status: "failed", summary }
+          }, now);
+          if (result.disposition !== "applied") return;
+          store.saveEvent(entry.taskId, createTaskEvent(
+            store.nextEventId(entry.taskId),
+            entry.taskId,
+            "runtime.provider-retry-session-dead",
+            { runId: run.id, attempt: String(run.providerRetry.attempt) },
+            now
+          ));
+          enqueueWork(
+            store,
+            { kind: "role", taskId: entry.taskId, roleName: "leader" },
+            "role-run-failed",
+            now,
+            [{ type: "run", taskId: entry.taskId, id: run.id }]
+          );
+          return;
+        }
+        // Reopen the Run on its original Session: reset transport markers,
+        // switch to resume, and mark the projection in-flight. The delivery
+        // pass re-pushes the exact same input in this same pass.
+        store.saveAgentRun(reopenRunForProviderRetry(run, now));
+        // The retry decision settled the original delivery claim; re-queue the
+        // Role mailbox so the delivery pass can claim and re-push the Run.
+        enqueueWork(
+          store,
+          { kind: "role", taskId: entry.taskId, roleName: entry.roleName },
+          "provider-retry-repush",
+          now,
+          [{ type: "run", taskId: entry.taskId, id: run.id }]
+        );
+        reopened.push(formatTaskRecordReference(entry.taskId, run.id, "agentRun"));
+      });
+    }
+    return reopened;
   }
 
   /**

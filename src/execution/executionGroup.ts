@@ -270,7 +270,8 @@ export function assertExecutionTargetUnchanged(
  * Enforce the only durable Group/Lane evolution accepted by both domain
  * helpers and storage. Identity, target, prior results, and a final Leader
  * resolution never move backwards. A terminal Lane may only reopen as an
- * explicit retry with a fresh Run identity.
+ * explicit retry with a fresh Run identity, or reset to pending for a
+ * Task-final Review execution retry.
  */
 export function assertExecutionGroupTransition(
   existing: ExecutionGroup,
@@ -301,7 +302,7 @@ export function assertExecutionGroupTransition(
     if (next === undefined) {
       throw new Error(`ExecutionGroup cannot remove Lane: ${lane.id}.`);
     }
-    assertExecutionLaneTransition(lane, next, existing.id);
+    assertExecutionLaneTransition(lane, next, existing.id, existing.purpose);
   }
 }
 
@@ -405,6 +406,42 @@ export function restartExecutionLane(
     lanes: group.lanes.map((lane) => lane.id === id ? next : lane),
     updatedAt: timestamp
   });
+}
+
+/**
+ * Resets a terminal Reviewer Lane to pending without replacing its ExecutionGroup.
+ * The old AgentRun remains the attempt trail; clearing the Lane's Run/session and
+ * result lets the same semantic ReviewRound be dispatched again.
+ */
+export function resetReviewExecutionLane(
+  group: ExecutionGroup,
+  laneId: string,
+  now: Date
+): ExecutionLane {
+  validateExecutionGroup(group);
+  if (group.purpose !== "review") {
+    throw new Error(`Only Review ExecutionLanes can reset to pending: ${group.id}/${laneId}.`);
+  }
+  if (group.resolution !== undefined) {
+    throw new Error(`ExecutionGroup is already resolved: ${group.id}.`);
+  }
+  const existing = group.lanes.find((lane) => lane.id === laneId);
+  if (existing === undefined) throw new Error(`ExecutionLane not found: ${group.id}/${laneId}.`);
+  if (!isTerminalLane(existing.status)) return existing;
+  const timestamp = now.toISOString();
+  const {
+    effective: _effective,
+    runId: _runId,
+    sessionId: _sessionId,
+    result: _result,
+    endedAt: _endedAt,
+    ...base
+  } = existing;
+  return validateExecutionLane({
+    ...base,
+    status: "pending",
+    updatedAt: timestamp
+  }, group);
 }
 
 export function recordExecutionLaneResult(
@@ -748,7 +785,8 @@ function validateResolution(resolution: ExecutionResolution, group: ExecutionGro
 function assertExecutionLaneTransition(
   existing: ExecutionLane,
   candidate: ExecutionLane,
-  groupId: string
+  groupId: string,
+  groupPurpose: ExecutionPurpose
 ): void {
   if (existing.id !== candidate.id
     || existing.groupId !== candidate.groupId
@@ -764,6 +802,16 @@ function assertExecutionLaneTransition(
   }
   if (isTerminalLane(existing.status)) {
     if (isDeepStrictEqual(existing, candidate)) return;
+    if (groupPurpose === "review"
+      && candidate.status === "pending"
+      && candidate.effective === undefined
+      && candidate.runId === undefined
+      && candidate.sessionId === undefined
+      && candidate.result === undefined
+      && candidate.endedAt === undefined
+      && isDeepStrictEqual(existing.workspace, candidate.workspace)) {
+      return;
+    }
     if (candidate.status !== "running"
       || candidate.runId === undefined
       || candidate.runId === existing.runId) {

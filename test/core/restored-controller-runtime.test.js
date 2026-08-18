@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { readLinuxProcessStartIdentity } from "../../dist/controller/domainIdentity.js";
 import {
   compileReconcileSelection,
   FileTaskController,
@@ -40,6 +42,33 @@ import {
 import { startFileTaskControllerRuntime } from "../../dist/controller/runtime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
+
+// Issue 02: the authenticated identity carries the full release provenance.
+// A dev checkout has no release manifest, so the release fields report the
+// dev fallback; the process identity is the live owner's.
+function expectedDevIdentity() {
+  const startIdentity = readLinuxProcessStartIdentity(process.pid);
+  return {
+    executablePath: process.execPath,
+    args: process.argv.slice(1),
+    version: YUI_VERSION,
+    buildId: "dev",
+    packageDigest: null,
+    sourceCommit: null,
+    cliRealpath: realpathSync(fileURLToPath(new URL("../../dist/cli.js", import.meta.url))),
+    controllerRealpath: realpathSync(
+      fileURLToPath(new URL("../../dist/core/controllerServer.js", import.meta.url))
+    ),
+    controllerProtocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+    storageBackend: "file",
+    workerEnabled: false,
+    mode: "primary",
+    dualOwner: false,
+    activeRelease: null,
+    pid: process.pid,
+    ...(startIdentity === undefined ? {} : { processStartIdentity: startIdentity })
+  };
+}
 
 function currentControllerStatus(pid) {
   const identity = yuiVersionIdentity();
@@ -1657,7 +1686,7 @@ test("controller delivers a queued Work AgentRun through tmux before liveness", 
     status: "running"
   };
   const run = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: "agent-run-1",
     taskId: task.id,
     roleName: role.name,
@@ -1818,7 +1847,7 @@ test("dirty Role reconciliation inspects only that Role while retaining the Task
     (role) => role.taskId === taskId && role.name === roleName
   ) ?? null;
   store.getActiveAgentRun = (_taskId, roleName) => ({
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: roleName === "worker" ? "agent-run-1" : "agent-run-2",
     taskId: task.id,
     roleName,
@@ -1947,7 +1976,7 @@ test("controller pump coalesces overlap into one non-overlapping follow-up pass"
     taskId: "task-1", name: "worker", activeAgentId: "codex", adapterId: "codex", status: "running"
   }];
   store.getActiveAgentRun = () => ({
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: "agent-run-1",
     taskId: "task-1",
     roleName: "worker",
@@ -3962,7 +3991,7 @@ function deliveredRun(taskId, roleName) {
   const at = new Date(0).toISOString();
   const agentId = `codex-${roleName}`;
   return {
-    schemaVersion: 6, id: "agent-run-1", taskId, roleName,
+    schemaVersion: 7, id: "agent-run-1", taskId, roleName,
     mode: "new", input: "work", purpose: "execution", status: "active",
     pushedAt: at, deliveredAt: at,
     effective: testEffectiveLaunch({ agentId }),
@@ -4122,11 +4151,7 @@ test("background FileTask controller exposes status, scan and stop on one privat
   assert.deepEqual(Object.keys(status.runtime.commands.eventLoopDelay.lagBuckets), [
     "le10ms", "le50ms", "le100ms", "le250ms", "le500ms", "le1000ms", "le3000ms"
   ]);
-  assert.deepEqual(await callController(home, "controller.identity", {}), {
-    executablePath: process.execPath,
-    args: process.argv.slice(1),
-    version: YUI_VERSION
-  });
+  assert.deepEqual(await callController(home, "controller.identity", {}), expectedDevIdentity());
   assert.deepEqual(
     await callController(home, "scheduler.signal", { key: "task:task-1" }),
     { accepted: true }

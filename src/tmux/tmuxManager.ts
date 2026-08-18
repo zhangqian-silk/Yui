@@ -910,6 +910,43 @@ export class TmuxManager {
     return snapshot.names.includes(roleName) ? "running" : "exited";
   }
 
+  /** Exact pane process state for one Role, used by owner-identity recording. */
+  inspectRolePane(
+    taskId: string,
+    roleName: string
+  ): Readonly<{
+    pid?: number;
+    target: string;
+    dead: boolean;
+    currentCommand: string;
+  }> {
+    const pane = this.inspectPane(taskId, roleName);
+    return {
+      ...(pane.pid === undefined ? {} : { pid: pane.pid }),
+      target: pane.target,
+      dead: pane.dead,
+      currentCommand: pane.currentCommand
+    };
+  }
+
+  async inspectRolePaneAsync(
+    taskId: string,
+    roleName: string
+  ): Promise<Readonly<{
+    pid?: number;
+    target: string;
+    dead: boolean;
+    currentCommand: string;
+  }>> {
+    const pane = await this.inspectPaneAsync(taskId, roleName);
+    return {
+      ...(pane.pid === undefined ? {} : { pid: pane.pid }),
+      target: pane.target,
+      dead: pane.dead,
+      currentCommand: pane.currentCommand
+    };
+  }
+
   stopTask(taskId: string): boolean {
     const taskSession = this.sessionName(taskId);
     const sessions = this.taskSessionGroupNames(taskId);

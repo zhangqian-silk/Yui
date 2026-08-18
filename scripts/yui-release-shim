@@ -1,0 +1,42 @@
+#!/bin/sh
+# Yui stable launcher shim (Issue 02).
+#
+# This shim is the single stable `yui` entrypoint. It resolves the Home's
+# active release pointer and execs that release's CLI, so `which yui` never
+# resolves into a Git worktree or npm link. When no active release pointer
+# exists (a legacy Home that has never activated a release), it falls back to
+# the legacy `yui-legacy` binary on PATH.
+#
+# Rollback: `yui release activate <previous-release>` atomically switches the
+# pointer; the next invocation resolves the previous release.
+
+set -eu
+
+YUI_HOME_RESOLVED="${YUI_HOME:-$HOME/.yui}"
+POINTER="$YUI_HOME_RESOLVED/runtime/active-release.json"
+
+if [ -f "$POINTER" ]; then
+  RELEASE_ID=$(YUI_POINTER="$POINTER" node -e '
+    const fs = require("node:fs");
+    const pointer = JSON.parse(fs.readFileSync(process.env.YUI_POINTER, "utf8"));
+    if (
+      pointer === null
+      || typeof pointer !== "object"
+      || typeof pointer.releaseId !== "string"
+      || pointer.releaseId.length === 0
+    ) {
+      process.stderr.write("Yui active release pointer is invalid.\n");
+      process.exit(5);
+    }
+    process.stdout.write(pointer.releaseId);
+  ')
+  RELEASE_DIR="$YUI_HOME_RESOLVED/runtime/releases/$RELEASE_ID"
+  if [ ! -f "$RELEASE_DIR/dist/cli.js" ]; then
+    printf 'Yui active release %s is not installed.\n' "$RELEASE_ID" >&2
+    exit 5
+  fi
+  exec node "$RELEASE_DIR/dist/cli.js" "$@"
+fi
+
+# Legacy fallback: no active release pointer.
+exec yui-legacy "$@"

@@ -45,6 +45,10 @@ import {
 import { validateTaskMessage, type TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import { validateAgentRun, type AgentRun } from "../run/agentRun.js";
+import type { PendingProviderRetry } from "../run/providerRetry.js";
+import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
+import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
+import { FileSessionOwnerRegistry } from "../runtime/sessionOwnerRegistry.js";
 import {
   validateReviewConfig,
   type ReviewConfig
@@ -53,6 +57,7 @@ import {
   validateReviewRound,
   type ReviewRound
 } from "../review/reviewRound.js";
+import type { ReviewFinding } from "../review/reviewFinding.js";
 import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
 import {
   assertProjectCatalog,
@@ -245,7 +250,7 @@ function encodeLaneKeyPart(value: string): string {
   return encodeURIComponent(value).replace(/:/gu, "%3A");
 }
 
-function executionLaneActiveRunKeyParts(key: string):
+export function executionLaneActiveRunKeyParts(key: string):
   { executionGroupId: string; executionLaneId: string } | null {
   const match = /^\/execution-lane\/([^:]+):([^:]+)$/u.exec(key);
   if (match === null) return null;
@@ -270,6 +275,11 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
  * assert it is classifying the same bytes the store reads and writes.
  */
 export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
+/**
+ * v7 combines optional Issue 04 retry/receipt fields and Issue 05 Leader
+ * actionability fields. All are optional, so the v6→v7 migration is a
+ * version-only rewrite.
+ */
 export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 7 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 
@@ -422,6 +432,16 @@ export type TaskStore = {
   getJobCallerKeyHash(taskId: string, roleName: string, agentId: string): string | null;
   /** rr13: Persist the hash of a newly launched Session's job caller key. */
   setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void;
+  /** Issue 03: Persist one runtime generation's exact physical owner identity. */
+  saveSessionOwner(identity: SessionOwnerIdentity): void;
+  /** Issue 03: Look up one owner record by launch id. */
+  getSessionOwner(launchId: string): SessionOwnerIdentity | null;
+  /** Issue 03: Enumerate every persisted owner record. */
+  listSessionOwners(): SessionOwnerIdentity[];
+  /** Issue 03: Enumerate owner records for one Task/global Role. */
+  listSessionOwnersForOwner(owner: RuntimeOwner): SessionOwnerIdentity[];
+  /** Issue 03: Remove a record whose physical resources were proven absent. */
+  removeSessionOwner(launchId: string): void;
   nextWorkItemId(taskId: string): string;
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
   listWorkItems(taskId: string): WorkItem[];
@@ -431,10 +451,20 @@ export type TaskStore = {
   getAgentRun(taskId: string, runId: string): AgentRun | null;
   listAgentRuns(taskId: string): AgentRun[];
   saveAgentRun(run: AgentRun): void;
+  /**
+   * Issue 04: pending Provider retry scan. Layout 7's authoritative SQLite
+   * store answers this with one indexed query; the legacy File store fails
+   * closed because in-place retry is a db-only control-plane capability.
+   */
+  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry>;
   nextReviewRoundId(taskId: string): string;
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
   saveReviewRound(taskId: string, round: ReviewRound): void;
+  nextReviewFindingId(taskId: string): string;
+  getReviewFinding(taskId: string, reviewFindingId: string): ReviewFinding | null;
+  listReviewFindings(taskId: string): ReviewFinding[];
+  saveReviewFinding(taskId: string, finding: ReviewFinding): void;
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null;
   saveActiveAgentRun(run: AgentRun): void;
   clearActiveAgentRun(taskId: string, roleName: string): void;
@@ -517,6 +547,7 @@ export class FileTaskStore implements TaskStore {
   #transaction: { state: StorageState; baseRevision: number; dirty: boolean } | null = null;
   #readCache: { fingerprint: string; state: StorageState } | null = null;
   #normalizeState: ((raw: string) => string) | undefined;
+  #sessionOwnerRegistry: FileSessionOwnerRegistry | undefined;
 
   constructor(private readonly rootDir: string, options: FileTaskStoreOptions = {}) {
     this.#normalizeState = options.normalizeState;
@@ -1263,6 +1294,28 @@ export class FileTaskStore implements TaskStore {
     });
   }
 
+  saveSessionOwner(identity: SessionOwnerIdentity): void {
+    this.#sessionOwners().record(identity);
+  }
+  getSessionOwner(launchId: string): SessionOwnerIdentity | null {
+    return this.#sessionOwners().get(launchId);
+  }
+  listSessionOwners(): SessionOwnerIdentity[] {
+    return this.#sessionOwners().list();
+  }
+  listSessionOwnersForOwner(owner: RuntimeOwner): SessionOwnerIdentity[] {
+    return this.#sessionOwners().listForOwner(owner);
+  }
+  removeSessionOwner(launchId: string): void {
+    this.#sessionOwners().remove(launchId);
+  }
+  #sessionOwners(): FileSessionOwnerRegistry {
+    if (this.#sessionOwnerRegistry === undefined) {
+      this.#sessionOwnerRegistry = new FileSessionOwnerRegistry(this.rootDir);
+    }
+    return this.#sessionOwnerRegistry;
+  }
+
   nextWorkItemId(taskId: string): string {
     return this.#nextTaskRecordId(taskId, "workItem");
   }
@@ -1324,6 +1377,22 @@ export class FileTaskStore implements TaskStore {
   }
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
+  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
+    // The legacy File store can answer the empty case without a scan fallback.
+    // If durable retry state exists, the db-only capability must fail closed
+    // instead of silently losing the Controller's wake deadline.
+    for (const task of this.listTasks()) {
+      if (task.status !== "active") continue;
+      for (const run of this.listAgentRuns(task.id)) {
+        if (run.status === "active" && run.providerRetry?.nextAttemptAt !== undefined) {
+          throw new StorageRecordError(
+            "Provider retry in place requires the SQLite backend; run `yui update` to migrate this Home."
+          );
+        }
+      }
+    }
+    return [];
+  }
   saveAgentRun(run: AgentRun): void {
     const stored = identified<AgentRun>(
       run,
@@ -1415,6 +1484,26 @@ export class FileTaskStore implements TaskStore {
       observeTaskRecordId(task, "reviewRound", stored.id);
       task.reviewRounds[stored.id] = stored;
     });
+  }
+  nextReviewFindingId(taskId: string): string {
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
+  }
+  getReviewFinding(taskId: string, reviewFindingId: string): ReviewFinding | null {
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
+  }
+  listReviewFindings(taskId: string): ReviewFinding[] {
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
+  }
+  saveReviewFinding(taskId: string, finding: ReviewFinding): void {
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
   }
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
     const aggregate = this.#state().tasks[taskId];
@@ -2206,6 +2295,7 @@ function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
     workItem: 0,
     agentRun: 0,
     reviewRound: 0,
+    reviewFinding: 0,
     changeSet: 0,
     integrationAttempt: 0,
     integrationQueue: 0,
@@ -2713,6 +2803,9 @@ function validateTaskIdHighWaterCoverage(
     workItem: aggregate.workItems,
     agentRun: aggregate.agentRuns,
     reviewRound: aggregate.reviewRounds,
+    // Issue 06 dbonly: review findings are SQLite-native; the file aggregate
+    // never carries them, so coverage is trivially empty.
+    reviewFinding: {},
     changeSet: aggregate.changeSets,
     integrationAttempt: aggregate.integrationAttempts,
     integrationQueue: aggregate.integrationQueue,
@@ -4257,7 +4350,13 @@ function validReviewRoundTransition(
       candidate.taskFinalReviewContract
     )
     || !compatibleExecutionGroups(existing.executionGroup, candidate.executionGroup)
-    || existing.requestedBy !== candidate.requestedBy
+    // Issue 06: a Leader retry resets a failed Task-final Round to pending;
+    // the retry is itself a Leader request, so requestedBy may change from
+    // the original policy/contract value to "leader".
+    || (existing.requestedBy !== candidate.requestedBy
+      && !(existing.status === "failed"
+        && candidate.status === "pending"
+        && (candidate.scope ?? "work-item") === "task"))
     || existing.createdAt !== candidate.createdAt
   ) return false;
   if (existing.status === "pending") {
@@ -4297,6 +4396,27 @@ function validReviewRoundTransition(
     return ["completed", "failed"].includes(candidate.status)
       && existing.reviewerRunId === candidate.reviewerRunId
       && isDeepStrictEqual(existing.workspace, candidate.workspace);
+  }
+  // Issue 06: a failed Task-final execution attempt may be reset to pending
+  // under the same semantic Round ID. AgentRun history remains the attempt
+  // trail; terminal Review metadata is cleared by retryTaskReviewRound.
+  if (existing.status === "failed"
+    && candidate.status === "pending"
+    && (candidate.scope ?? "work-item") === "task") {
+    return candidate.reviewerRunId === undefined
+      && candidate.summary === undefined
+      && candidate.report === undefined
+      && candidate.checks === undefined
+      && candidate.evidenceCommit === undefined
+      && candidate.endedAt === undefined
+      && candidate.workspaceDisposition === undefined
+      && (existing.workspace === undefined
+        || candidate.workspace === undefined
+        || isDeepStrictEqual(existing.workspace, candidate.workspace))
+      && compatibleExecutionGroups(
+        existing.executionGroup,
+        candidate.executionGroup
+      );
   }
   if (existing.status === candidate.status
     && (existing.status === "completed" || existing.status === "failed")) {

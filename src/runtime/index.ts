@@ -82,3 +82,36 @@ export {
   type TaskRuntimeResourceObservation,
   type TaskRuntimeWorkspaceOwner
 } from "./taskRuntimeIsolation.js";
+export {
+  createSessionOwnerIdentity,
+  discoverProviderRootByLaunchEnv,
+  isLinuxProcessLive,
+  listLaunchFencedProcesses,
+  listOwnedProcessTree,
+  readLinuxProcessIdentity,
+  type LinuxProcessIdentity,
+  type SessionOwnerIdentity,
+  type SessionOwnerIdentityInput
+} from "./sessionOwnerIdentity.js";
+export {
+  FileSessionOwnerRegistry
+} from "./sessionOwnerRegistry.js";
+export {
+  DEFAULT_FORCED_GRACE_MS,
+  DEFAULT_GRACEFUL_GRACE_MS,
+  terminateSessionOwners,
+  type SessionTerminationEvent,
+  type SessionTerminationOptions,
+  type SessionTerminationPorts,
+  type SessionTerminationResult,
+  type SessionTerminationStage
+} from "./sessionTerminationGuard.js";
+export {
+  reconcileSessionOwners,
+  type DurableSessionFact,
+  type SessionPhysicalObservation,
+  type SessionReconciliationEntry,
+  type SessionReconciliationInput,
+  type SessionReconciliationMismatch,
+  type SessionReconciliationReport
+} from "./sessionReconciliation.js";
