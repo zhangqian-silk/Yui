@@ -25,8 +25,13 @@ const WORK_ITEM_GROUP_HISTORY_FROM_VERSION = 8;
 const WORK_ITEM_GROUP_HISTORY_TO_VERSION = 9;
 const AGENT_RUN_FROM_VERSION = 5;
 const AGENT_RUN_TO_VERSION = 6;
-const AGENT_RUN_ACTIONABILITY_FROM_VERSION = 6;
-const AGENT_RUN_ACTIONABILITY_TO_VERSION = 7;
+/**
+ * v7 combines the optional Issue 04 `providerRetry`/`yieldReceipt` fields and
+ * Issue 05 Leader actionability fields. All are optional, so the transition is
+ * a version-only rewrite; legacy v6 records without them remain valid.
+ */
+const AGENT_RUN_OPTIONAL_FIELDS_FROM_VERSION = 6;
+const AGENT_RUN_OPTIONAL_FIELDS_TO_VERSION = 7;
 const MESSAGE_WAKE_POLICY_FROM_VERSION = 2;
 const MESSAGE_WAKE_POLICY_TO_VERSION = 3;
 const REVIEW_ROUND_FROM_VERSION = 2;
@@ -108,8 +113,8 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     ))
     .registerOfflineMigration(recordFamilyStep(
       "agentRun",
-      AGENT_RUN_ACTIONABILITY_FROM_VERSION,
-      AGENT_RUN_ACTIONABILITY_TO_VERSION,
+      AGENT_RUN_OPTIONAL_FIELDS_FROM_VERSION,
+      AGENT_RUN_OPTIONAL_FIELDS_TO_VERSION,
       "agentRuns"
     ))
     .registerOfflineMigration(messageWakePolicyStep())

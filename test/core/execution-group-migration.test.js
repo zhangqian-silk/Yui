@@ -257,12 +257,12 @@ test("active-lane pointer migration separates a legal Role containing colons", (
         "task-1": {
           agentRuns: {
             "role-run": {
-              schemaVersion: 6,
+              schemaVersion: 7,
               roleName: "lane:worker:1",
               status: "active"
             },
             "lane-run": {
-              schemaVersion: 6,
+              schemaVersion: 7,
               roleName: "worker",
               status: "active",
               executionGroupId: "group-1",

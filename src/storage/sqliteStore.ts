@@ -50,6 +50,7 @@ import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from 
 import type { TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { AgentRun } from "../run/agentRun.js";
+import type { PendingProviderRetry } from "../run/providerRetry.js";
 import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
 import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
@@ -1454,6 +1455,24 @@ export class SqliteTaskStore implements TaskStore {
            payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(run.taskId, run.id, run.roleName, run.status, this.#json(run), this.#now());
     });
+  }
+
+  /**
+   * Issue 04: SQLite-native pending retry query.  A single indexed scan
+   * replaces the adapter's per-Task in-memory sweep, so Controller deadline
+   * arming no longer materializes every Task and Run in JavaScript.
+   */
+  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
+    const rows = this.#db.prepare(
+      `SELECT ar.task_id AS taskId, ar.run_id AS runId, ar.role_name AS roleName,
+              json_extract(ar.payload, '$.providerRetry.nextAttemptAt') AS nextAttemptAt
+       FROM agent_runs ar
+       JOIN tasks_catalog tc ON tc.task_id = ar.task_id
+       WHERE ar.status = 'active'
+         AND tc.is_active = 1
+         AND json_extract(ar.payload, '$.providerRetry.nextAttemptAt') IS NOT NULL`
+    ).all() as Array<{ taskId: string; runId: string; roleName: string; nextAttemptAt: string }>;
+    return rows;
   }
 
   // -- review rounds ----------------------------------------------------------

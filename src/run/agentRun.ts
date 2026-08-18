@@ -8,6 +8,15 @@ import type {
   LeaderWaitReason
 } from "../scheduler/actionability.js";
 import {
+  markProviderRetryInFlight,
+  validateAgentRunProviderRetry,
+  type AgentRunProviderRetry
+} from "./providerRetry.js";
+import {
+  validateYieldReceipt,
+  type YieldReceipt
+} from "./yieldReceipt.js";
+import {
   validateManagedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
@@ -17,6 +26,10 @@ export type AgentRunStatus = "active" | "yielded" | "failed";
 export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
+  /**
+   * v7 adds optional Issue 04 retry/receipt fields and Issue 05 Leader
+   * actionability fields in their own namespaces; older readers ignore them.
+   */
   schemaVersion: 7;
   id: string;
   taskId: string;
@@ -47,6 +60,17 @@ export type AgentRun = {
    */
   deliveredAt?: string;
   summary?: string;
+  /**
+   * Issue 04 durable in-place retry projection. Present only while an active
+   * Run is being retried on its original Native Session; cleared at
+   * terminalization.
+   */
+  providerRetry?: AgentRunProviderRetry;
+  /**
+   * Issue 04 idempotent yield receipt. Present only on a yielded Run, written
+   * in the same transaction as its terminal state.
+   */
+  yieldReceipt?: YieldReceipt;
   /**
    * Machine-derived disposition of a terminal Leader Run (Issue 05). Set at
    * yield/fail time so the Scheduler can tell whether a later scan brings any
@@ -295,6 +319,18 @@ export function validateAgentRun(run: AgentRun): AgentRun {
       }
     }
   }
+  if (run.providerRetry !== undefined) {
+    validateAgentRunProviderRetry(run.providerRetry);
+    if (run.status !== "active") {
+      throw new Error("A terminal Agent run cannot carry a providerRetry projection.");
+    }
+  }
+  if (run.yieldReceipt !== undefined) {
+    validateYieldReceipt(run.yieldReceipt);
+    if (run.status !== "yielded") {
+      throw new Error("An Agent run yield receipt requires a yielded Run.");
+    }
+  }
   return run;
 }
 
@@ -316,13 +352,71 @@ function finishAgentRun(
     throw new Error(`Agent run is already terminal: ${run.id}.`);
   }
   const timestamp = now.toISOString();
-  return {
+  const terminal = {
     ...run,
     status,
     summary,
     updatedAt: timestamp,
     endedAt: timestamp
-  };
+  } as AgentRun;
+  // A terminal Run no longer waits for a retry; the projection is cleared so
+  // old and new readers agree the Run is settled.
+  if (terminal.providerRetry !== undefined) {
+    delete terminal.providerRetry;
+  }
+  return terminal;
+}
+
+/**
+ * Attaches (or advances) the Issue 04 in-place retry projection on an active
+ * Run. The Run stays `active`; only the projection changes.
+ */
+export function withProviderRetry(
+  run: AgentRun,
+  retry: AgentRunProviderRetry
+): AgentRun {
+  if (run.status !== "active") {
+    throw new Error(`Cannot schedule provider retry on a terminal Agent run: ${run.id}.`);
+  }
+  return validateAgentRun({ ...run, providerRetry: retry });
+}
+
+/**
+ * Reopens an active retry-waiting Run for another in-place attempt on its
+ * original Native Session: transport markers are reset so the existing
+ * delivery path re-pushes the exact same input, the dispatch mode becomes
+ * `resume`, and the projection is marked in-flight.
+ */
+export function reopenRunForProviderRetry(
+  run: AgentRun,
+  now: Date
+): AgentRun {
+  if (run.status !== "active" || run.providerRetry === undefined) {
+    throw new Error(`Agent run is not waiting for a provider retry: ${run.id}.`);
+  }
+  const timestamp = now.toISOString();
+  // Omit the transport markers entirely (not `undefined`, which the file
+  // store rejects) so the delivery path sees an un-pushed Run.
+  const {
+    providerRetry,
+    pushedAt: _pushedAt,
+    deliveredAt: _deliveredAt,
+    ...rest
+  } = run;
+  return validateAgentRun({
+    ...rest,
+    mode: "resume",
+    updatedAt: timestamp,
+    providerRetry: markProviderRetryInFlight(providerRetry, now)
+  });
+}
+
+/** Attaches the Issue 04 yield receipt to a yielded Run. */
+export function withYieldReceipt(run: AgentRun, receipt: YieldReceipt): AgentRun {
+  if (run.status !== "yielded") {
+    throw new Error(`Cannot attach a yield receipt to a non-yielded Agent run: ${run.id}.`);
+  }
+  return validateAgentRun({ ...run, yieldReceipt: receipt });
 }
 
 function requireSafeIdentity(value: string, label: string): string {
