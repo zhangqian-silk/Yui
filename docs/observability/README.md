@@ -124,7 +124,9 @@ Sections:
 - **runs** — total/active/yielded/failed, failure rate, cumulative duration,
   by-role and by-purpose distribution, fault class counts.
 - **wakes** — leader runs with wake reasons, orphan wakes, orphan yield-only.
-  `suppressedWakes` is `unsupported` until the counter is implemented (Issue 09).
+  `suppressedWakes` is `unsupported`: quiescence suppression (Issue 05) is
+  silent by design and writes no durable counter, so the audit cannot report
+  a count without guessing.
 - **sessions** — generations, broken/stopped, resets, lifecycle events, stop
   failures.
 - **reviews** — total/completed/failed, infra vs semantic-negative.
