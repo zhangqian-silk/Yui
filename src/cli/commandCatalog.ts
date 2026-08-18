@@ -294,6 +294,12 @@ const taskChildren: readonly NodeInput[] = [
     usage: "yui task context <task>"
   },
   {
+    name: "next-action",
+    summary: "Project the durable Task records into one protocol-level next action.",
+    usage: "yui task next-action <task> [--json]",
+    options: ["--json"]
+  },
+  {
     name: "archive",
     summary: "Archive a Task after confirming the main worktree outcome.",
     usage: "yui task archive <id> (--integrated|--abandon)",
@@ -973,7 +979,7 @@ export const ROOT_COMMAND = buildNode({
     {
       name: "config",
       summary: "Inspect or update Yui configuration.",
-      sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "review"] }],
+      sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "review", "leader-next-action"] }],
       children: [
         { name: "show", summary: "Show effective Yui configuration." },
         {
@@ -999,6 +1005,20 @@ export const ROOT_COMMAND = buildNode({
             }
           },
             { name: "clear", summary: "Disable global review." }
+          ]
+        },
+        {
+          name: "leader-next-action",
+          summary: "Configure the Leader next-action/duplicate-guard mode.",
+          sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
+          children: [
+            { name: "show", summary: "Show the Leader next-action mode." },
+            {
+              name: "set",
+              summary: "Set the Leader next-action mode (display|warn|enforce).",
+              usage: "yui config leader-next-action set <display|warn|enforce>"
+            },
+            { name: "clear", summary: "Reset to the default display mode." }
           ]
         }
       ]
@@ -1149,7 +1169,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "archive", "rebuild", "history", "replace", "reconcile"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],

@@ -21,3 +21,43 @@ export function reconciliationIntervalMilliseconds(value?: unknown): number {
   }
   return seconds * 1_000;
 }
+
+/**
+ * Issue 07 (Leader convergence) feature mode. `display` only shows the
+ * read-only next-action projection; `warn` additionally reports duplicate
+ * deliveries; `enforce` hard-blocks exact duplicates and exhausted semantic
+ * budgets. The mode is additive and optional — Homes without it keep the
+ * `display` default, so no config migration is required.
+ */
+export const LEADER_NEXT_ACTION_MODES = ["display", "warn", "enforce"] as const;
+export type LeaderNextActionMode = typeof LEADER_NEXT_ACTION_MODES[number];
+export const DEFAULT_LEADER_NEXT_ACTION_MODE: LeaderNextActionMode = "display";
+
+export function resolveLeaderNextActionMode(value?: unknown): LeaderNextActionMode {
+  if (value === undefined || value === null) return DEFAULT_LEADER_NEXT_ACTION_MODE;
+  if (typeof value !== "string") {
+    throw new TypeError("leaderNextActionMode must be display, warn, or enforce.");
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized.length === 0) return DEFAULT_LEADER_NEXT_ACTION_MODE;
+  if (!(LEADER_NEXT_ACTION_MODES as readonly string[]).includes(normalized)) {
+    throw new TypeError("leaderNextActionMode must be display, warn, or enforce.");
+  }
+  return normalized as LeaderNextActionMode;
+}
+
+/**
+ * Resolve the effective mode. An explicit environment override
+ * (`YUI_LEADER_NEXT_ACTION_MODE`) wins over the durable config value so a
+ * single CLI invocation can be tightened or loosened without a config write.
+ */
+export function leaderNextActionMode(
+  configured: unknown,
+  env: NodeJS.ProcessEnv = process.env
+): LeaderNextActionMode {
+  const override = env.YUI_LEADER_NEXT_ACTION_MODE;
+  if (override !== undefined && override.trim().length > 0) {
+    return resolveLeaderNextActionMode(override);
+  }
+  return resolveLeaderNextActionMode(configured);
+}
