@@ -285,9 +285,10 @@ export function verificationPlanDigest(plan: VerificationPlan): string {
 }
 
 /** Resolve the runtime toolchain identity from the current process. */
-export function resolveToolchain(_environment: NodeJS.ProcessEnv = process.env): ResolvedToolchain {
+export function resolveToolchain(): ResolvedToolchain {
   return Object.freeze({
     node: process.version,
+    ...(process.env.npm_version === undefined ? {} : { npm: process.env.npm_version }),
     platform: process.platform,
     arch: process.arch
   });
@@ -413,7 +414,7 @@ function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (typeof value === "object" && value !== null) {
     const entries = Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right));
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
     return Object.fromEntries(entries.map(([key, entry]) => [key, canonicalize(entry)]));
   }
   return value;

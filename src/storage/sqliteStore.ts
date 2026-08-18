@@ -1547,22 +1547,26 @@ export class SqliteTaskStore implements TaskStore {
   touchGateArtifact(artifact: GateArtifact): void {
     validateGateArtifact(artifact);
     this.#mutate(() => {
-      this.#db.prepare(
+      const result = this.#db.prepare(
         `UPDATE gate_artifacts SET payload = ?, last_used_at = ? WHERE key = ?`
       ).run(
         this.#json(artifact),
         artifact.lastUsedAt,
         artifact.key
       );
+      if (result.changes === 0) {
+        throw new StorageRecordError(`Gate artifact not found for touch: ${artifact.key}`);
+      }
     });
   }
 
   getGateArtifact(projectId: string, key: string): GateArtifact | null {
-    return this.#getPayload<GateArtifact>(
+    const artifact = this.#getPayload<GateArtifact>(
       "gate_artifacts",
       "project_id = ? AND key = ?",
       [projectId, key]
     );
+    return artifact === null ? null : validateGateArtifact(artifact);
   }
 
   findGateArtifactByIdentity(identity: GateArtifactIdentity): GateArtifact | null {
@@ -1576,13 +1580,22 @@ export class SqliteTaskStore implements TaskStore {
     toolchainDigest: string;
     targetRef: string;
   }>): GateArtifact[] {
-    return this.#listPayload<GateArtifact>(
+    const rows = this.#listPayload<GateArtifact>(
       "gate_artifacts",
       `project_id = ? AND commit_sha = ? AND level = 'L2'
        AND plan_digest = ? AND toolchain_digest = ? AND target_ref = ?
        AND status = 'complete' AND outcome = 'succeeded'`,
       [query.projectId, query.commit, query.planDigest, query.toolchainDigest, query.targetRef]
     );
+    const valid: GateArtifact[] = [];
+    for (const row of rows) {
+      try {
+        valid.push(validateGateArtifact(row));
+      } catch {
+        // Skip corrupt rows; a direct lookup fails closed.
+      }
+    }
+    return valid;
   }
 
   getGateArtifactLogs(artifactKey: string): ReadonlyMap<string, Buffer> {
@@ -1597,30 +1610,37 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   pruneGateArtifacts(projectId: string, options: GateArtifactPruneOptions): GateArtifactPruneResult {
-    return this.#mutate(() => {
-      const rows = this.#db.prepare(
-        "SELECT key, payload, last_used_at FROM gate_artifacts WHERE project_id = ?"
-      ).all(projectId) as ReadonlyArray<{ key: string; payload: string; last_used_at: string }>;
-      let retained = 0;
-      let deleted = 0;
-      const deleteArtifact = this.#db.prepare("DELETE FROM gate_artifacts WHERE key = ?");
-      for (const row of rows) {
-        let artifact: GateArtifact;
-        try {
-          artifact = validateGateArtifact(JSON.parse(row.payload) as GateArtifact);
-        } catch {
-          retained += 1;
-          continue;
-        }
-        const age = options.now.getTime() - Date.parse(artifact.lastUsedAt);
-        if (options.isReferenced(artifact.key) || age < options.ttlMs) {
-          retained += 1;
-          continue;
-        }
-        deleteArtifact.run(artifact.key);
-        deleted += 1;
+    // Snapshot candidates outside the write transaction so the isReferenced
+    // callback never holds the SQLite write lock.
+    const rows = this.#db.prepare(
+      "SELECT key, payload, last_used_at FROM gate_artifacts WHERE project_id = ?"
+    ).all(projectId) as ReadonlyArray<{ key: string; payload: string; last_used_at: string }>;
+    const toDelete: string[] = [];
+    let retained = 0;
+    for (const row of rows) {
+      let artifact: GateArtifact;
+      try {
+        artifact = validateGateArtifact(JSON.parse(row.payload) as GateArtifact);
+      } catch {
+        retained += 1;
+        continue;
       }
-      return Object.freeze({ retained, deleted });
+      const age = options.now.getTime() - Date.parse(artifact.lastUsedAt);
+      if (options.isReferenced(artifact.key) || age < options.ttlMs) {
+        retained += 1;
+        continue;
+      }
+      toDelete.push(artifact.key);
+    }
+    if (toDelete.length === 0) {
+      return Object.freeze({ retained, deleted: 0 });
+    }
+    return this.#mutate(() => {
+      const deleteArtifact = this.#db.prepare("DELETE FROM gate_artifacts WHERE key = ?");
+      for (const key of toDelete) {
+        deleteArtifact.run(key);
+      }
+      return Object.freeze({ retained, deleted: toDelete.length });
     });
   }
 

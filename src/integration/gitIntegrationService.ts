@@ -442,6 +442,16 @@ export class GitIntegrationService {
             timeoutMs: 30 * 60_000
           }))
         ];
+    // Persist the gate identity before starting the job so a plan edit
+    // during the gate never misattributes the evidence on resume.
+    let persisted = attempt;
+    if (gate !== undefined) {
+      persisted = updateIntegrationAttempt(attempt, {
+        gatePlanDigest: gate.planDigest,
+        gateToolchainDigest: gate.toolchainDigest
+      }, this.now());
+      this.store.saveIntegrationAttempt(attempt.taskId, persisted);
+    }
     const job = await this.jobPort!.startCheckJob({
       taskId: attempt.taskId,
       integrationId: attempt.id,
@@ -451,13 +461,13 @@ export class GitIntegrationService {
       env: environment,
       steps
     });
-    const bound = recordIntegrationCheckJob(attempt, job.id, this.now());
+    const bound = recordIntegrationCheckJob(persisted, job.id, this.now());
     this.store.saveIntegrationAttempt(attempt.taskId, bound);
     if (job.status !== "queued" && job.status !== "running") {
       // Idempotent re-entry after a Leader exit in the bind window: the
       // Controller returned the already-terminal job. Converge through the
       // normal resume path instead of a checks-running zombie.
-      return this.#resumeCheckJob(bound, workspace, path, repositoryPath);
+      return this.#resumeCheckJob(bound, workspace, path, repositoryPath, gate);
     }
     return { status: "checks-running", attempt: bound, workspace, job };
   }
@@ -502,9 +512,18 @@ export class GitIntegrationService {
     // still converges from the job's own evidence).
     if (gate !== undefined
       && (job.result?.outcome === "succeeded" || job.result?.outcome === "failed")) {
+      // Use the digests captured at job start so a plan edit during the
+      // gate never misattributes the evidence.
+      const recordGate = attempt.gatePlanDigest !== undefined
+        ? Object.freeze({
+            ...gate,
+            planDigest: attempt.gatePlanDigest,
+            toolchainDigest: attempt.gateToolchainDigest ?? gate.toolchainDigest
+          })
+        : gate;
       const identity = gateIdentityForCandidate({
         projectId: attempt.projectId,
-        gate,
+        gate: recordGate,
         level: "L2",
         commit: job.head,
         targetRef: attempt.targetRef,
@@ -644,7 +663,7 @@ export class GitIntegrationService {
       const existing = await lookupReusableGateArtifact(this.store, identity);
       if (existing !== null) {
         touchGateArtifact(this.store, recordGateArtifactReuse(existing, this.now()));
-        const checks = checkResultsFromGateArtifact(existing);
+        const checks = checkResultsFromGateArtifact(existing, true);
         return this.#finalizeGateSuccess(
           attempt,
           workspace,

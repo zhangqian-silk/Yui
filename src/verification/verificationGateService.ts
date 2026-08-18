@@ -62,11 +62,11 @@ export type ResolvedVerificationGate = Readonly<{
 /** Resolve a Project's active plan and the runtime toolchain it gates under. */
 export function resolveVerificationGate(
   project: Project,
-  environment: NodeJS.ProcessEnv = process.env
+  _environment: NodeJS.ProcessEnv = process.env
 ): ResolvedVerificationGate | undefined {
   const plan = resolveProjectVerificationPlan(project);
   if (plan === undefined) return undefined;
-  const toolchain = resolveToolchain(environment);
+  const toolchain = resolveToolchain();
   return Object.freeze({
     plan,
     mode: plan.mode,
@@ -217,10 +217,16 @@ async function recordGateArtifact(
   // reuse observations from earlier runs).
   const existing = findGateArtifact(store, identity);
   if (existing !== null) {
+    if (isReusableGateArtifact(existing) && !succeeded) {
+      // A failed re-run must not downgrade a proven successful artifact.
+      touchGateArtifact(store, existing);
+      return existing;
+    }
     artifact = validateGateArtifact({
       ...artifact,
       potentialReuseCount: existing.potentialReuseCount,
-      reuseCount: existing.reuseCount
+      reuseCount: existing.reuseCount,
+      createdAt: existing.createdAt
     });
   }
   saveGateArtifact(store, artifact, logs);
@@ -228,6 +234,7 @@ async function recordGateArtifact(
 }
 
 const GATE_STEP_TIMEOUT_MS = 30 * 60_000;
+const SIGKILL_GRACE_MS = 2_000;
 
 /**
  * Run structured gate steps in-process (L1 targeted checks and the jobless
@@ -240,7 +247,7 @@ export async function runGateStepsInProcess(
   steps: readonly DurableJobStep[],
   environment: Readonly<Record<string, string>>,
   logsDirectory: string,
-  head: string
+  _head: string
 ): Promise<readonly GateStepOutcome[]> {
   await rm(logsDirectory, { recursive: true, force: true });
   await mkdir(logsDirectory, { recursive: true, mode: 0o700 });
@@ -301,11 +308,19 @@ export async function runGateStepsInProcess(
     const timeout = setTimeout(() => {
       timedOut = true;
       if (child.pid !== undefined) {
+        const pid = child.pid;
         try {
-          process.kill(-child.pid, "SIGTERM");
+          process.kill(-pid, "SIGTERM");
         } catch {
           // The process group may already be gone.
         }
+        setTimeout(() => {
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch {
+            // The process group may already be gone.
+          }
+        }, SIGKILL_GRACE_MS).unref();
       }
     }, GATE_STEP_TIMEOUT_MS);
     timeout.unref();
@@ -377,31 +392,38 @@ export function checkResultsFromGateJob(job: DurableJob, home: string): CheckRes
   ) {
     // Fail closed: a job that ended without proving the gate (cancelled,
     // timed-out, unknown) must never pass the Integration gate.
+    const firstName = checks[0]!.name;
+    const isBootstrap = firstName.startsWith("bootstrap-");
     checks[0] = {
-      name: checks[0]!.name,
+      name: firstName,
       outcome: "failed",
       details: job.result?.outcome === "unknown-needs-attention"
         ? `[bootstrap] Check job unknown-needs-attention: ${job.result.unknownReason ?? "runner outcome is unproven"}.`
-        : `Check job ended ${job.result?.outcome ?? job.status} without proving the checks.`
+        : `${isBootstrap ? "[bootstrap] " : ""}Check job ended ${job.result?.outcome ?? job.status} without proving the checks.`
     };
   }
   return checks;
 }
 
-/** Map a reused artifact to the attempt's CheckResult shape. */
+/** Map an artifact to the attempt's CheckResult shape. The reuse-ref entry
+ * is only included when the artifact was actually reused (not freshly
+ * recorded), so a fresh run never claims "Reused exact-SHA". */
 export function checkResultsFromGateArtifact(
-  artifact: GateArtifact
+  artifact: GateArtifact,
+  reused = false
 ): CheckResult[] {
   const checks: CheckResult[] = artifact.steps.map((step) => ({
     name: step.name,
     outcome: step.outcome,
     ...(step.logPath === undefined ? {} : { logPath: step.logPath })
   }));
-  checks.push({
-    name: gateArtifactRef(artifact.key),
-    outcome: "passed",
-    details: `Reused exact-SHA ${artifact.level} gate artifact (commit ${artifact.commit}).`
-  });
+  if (reused) {
+    checks.push({
+      name: gateArtifactRef(artifact.key),
+      outcome: "passed",
+      details: `Reused exact-SHA ${artifact.level} gate artifact (commit ${artifact.commit}).`
+    });
+  }
   return checks;
 }
 
@@ -535,7 +557,7 @@ export async function runL1Gate(input: Readonly<{
       return {
         artifact: reused,
         reused: true,
-        checks: checkResultsFromGateArtifact(reused)
+        checks: checkResultsFromGateArtifact(reused, true)
       };
     }
   }
@@ -560,7 +582,7 @@ export async function runL1Gate(input: Readonly<{
   return {
     artifact,
     reused: false,
-    checks: checkResultsFromGateArtifact(artifact)
+    checks: checkResultsFromGateArtifact(artifact, false)
   };
 }
 

@@ -14,9 +14,9 @@ import {
  * A GateArtifact binds one gate run to its full identity tuple: Project,
  * candidate commit, VerificationPlan digest, toolchain digest, and (for L2)
  * the source/base/target boundary. The same tuple reuses the same successful
- * artifact; any tuple change invalidates it. Artifacts live in their own
- * file namespace under the Home (`artifacts/gates/`), backend-neutral, so
- * no aggregate schema change is involved.
+ * artifact; any tuple change invalidates it. Artifacts are stored in the
+ * SQLite `gate_artifacts` / `gate_artifact_logs` tables, backend-neutral
+ * through the GateArtifactStorePort.
  */
 
 export const GATE_ARTIFACT_SCHEMA_VERSION = 1 as const;
@@ -320,7 +320,7 @@ function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (typeof value === "object" && value !== null) {
     const entries = Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right));
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
     return Object.fromEntries(entries.map(([key, entry]) => [key, canonicalize(entry)]));
   }
   return value;

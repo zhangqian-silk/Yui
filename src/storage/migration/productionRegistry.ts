@@ -48,6 +48,8 @@ const CHANGE_SET_MANIFEST_FROM_VERSION = 2;
 const CHANGE_SET_MANIFEST_TO_VERSION = 3;
 const INTEGRATION_ATTEMPT_FROM_VERSION = 2;
 const INTEGRATION_ATTEMPT_TO_VERSION = 3;
+const INTEGRATION_ATTEMPT_GATE_IDENTITY_FROM_VERSION = 3;
+const INTEGRATION_ATTEMPT_GATE_IDENTITY_TO_VERSION = 4;
 const INTEGRATION_QUEUE_FROM_VERSION = 0;
 const INTEGRATION_QUEUE_TO_VERSION = 1;
 const STORED_TASK_DURABLE_JOBS_FROM_VERSION = 14;
@@ -140,6 +142,12 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(activeRunPointerNamespaceStep())
     .registerOfflineMigration(changeSetManifestStep())
     .registerOfflineMigration(integrationAttemptSupersededStep())
+    .registerOfflineMigration(recordFamilyStep(
+      "integrationAttempt",
+      INTEGRATION_ATTEMPT_GATE_IDENTITY_FROM_VERSION,
+      INTEGRATION_ATTEMPT_GATE_IDENTITY_TO_VERSION,
+      "integrationAttempts"
+    ))
     .registerOfflineMigration(integrationQueueIntroductionStep())
     .registerCompatible(storedTaskDurableJobsStep())
     .registerCompatible(storedTaskJobCallerKeyHashesStep())

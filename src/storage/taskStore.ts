@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync
@@ -179,7 +180,7 @@ export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 9 as const;
 export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 4 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 3 as const;
-export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 3 as const;
+export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 4 as const;
 export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INPUT_REQUEST_SCHEMA_VERSION = 2 as const;
 export const CURRENT_DECISION_SCHEMA_VERSION = 1 as const;
@@ -1893,15 +1894,22 @@ export class FileTaskStore implements TaskStore {
       writeTextFileAtomically(recordPath, `${JSON.stringify(artifact, null, 2)}\n`);
       mkdirSync(logsRoot, { recursive: true, mode: 0o700 });
       for (const [stepName, content] of logs) {
-        writeFileSync(join(logsRoot, stepName), content, { mode: 0o600 });
+        const logPath = join(logsRoot, stepName);
+        const tmpPath = `${logPath}.tmp-${process.pid}`;
+        writeFileSync(tmpPath, content, { mode: 0o600 });
+        renameSync(tmpPath, logPath);
       }
     });
   }
 
   touchGateArtifact(artifact: GateArtifact): void {
     validateGateArtifact(artifact);
+    const recordPath = this.#gateArtifactRecordPath(artifact.projectId, artifact.key);
+    if (!existsSync(recordPath)) {
+      throw new StorageRecordError(`Gate artifact not found for touch: ${artifact.key}`);
+    }
     writeTextFileAtomically(
-      this.#gateArtifactRecordPath(artifact.projectId, artifact.key),
+      recordPath,
       `${JSON.stringify(artifact, null, 2)}\n`
     );
   }
