@@ -459,6 +459,12 @@ export type TaskStore = {
   nextEventId(taskId: string): string;
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
+  /**
+   * Remove events by id. Used by telemetry compaction to fold legacy
+   * `runtime.provider-turn-progress` rows into the sidecar while keeping
+   * every semantic event. Returns the number of events actually removed.
+   */
+  removeEvents(taskId: string, eventIds: readonly string[]): number;
   nextCapabilityGrantId(taskId: string): string;
   saveCapabilityGrant(taskId: string, grant: CapabilityGrant): void;
   listCapabilityGrants(taskId: string): CapabilityGrant[];
@@ -1645,6 +1651,21 @@ export class FileTaskStore implements TaskStore {
     });
   }
   listEvents(taskId: string): TaskEvent[] { return values(this.#requireTask(taskId).events, "id"); }
+
+  removeEvents(taskId: string, eventIds: readonly string[]): number {
+    if (eventIds.length === 0) return 0;
+    let removed = 0;
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      for (const id of eventIds) {
+        if (aggregate.events[id] !== undefined) {
+          delete aggregate.events[id];
+          removed++;
+        }
+      }
+    });
+    return removed;
+  }
 
   nextCapabilityGrantId(taskId: string): string {
     return this.#nextTaskRecordId(taskId, "capabilityGrant");
