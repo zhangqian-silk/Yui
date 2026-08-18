@@ -858,7 +858,7 @@ export const ROOT_COMMAND = buildNode({
     ] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
-    { id: "operations", title: "Operations", entries: ["web", "controller", "job", "jobs", "telemetry"] },
+    { id: "operations", title: "Operations", entries: ["web", "controller", "job", "jobs", "telemetry", "release"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
   children: [
@@ -924,11 +924,33 @@ export const ROOT_COMMAND = buildNode({
         },
         {
           name: "identity",
-          summary: "Read the authenticated Controller launch identity.",
+          summary: "Read the stable runtime identity receipt (build, backend, worker).",
           hidden: true
         },
         { name: "stop", summary: "Stop the Controller." },
         { name: "restart", summary: "Restart internal services without stopping tmux sessions." }
+      ]
+    },
+    {
+      name: "release",
+      summary: "Install and activate immutable local runtime releases.",
+      sections: [{
+        id: "commands",
+        title: "Commands",
+        entries: ["install", "list", "activate"]
+      }],
+      children: [
+        {
+          name: "install",
+          summary: "Install a runtime package as an immutable release.",
+          usage: "yui release install <source-dir>"
+        },
+        { name: "list", summary: "List installed releases and the active pointer." },
+        {
+          name: "activate",
+          summary: "Activate a release via atomic Controller handover.",
+          usage: "yui release activate [release-id]"
+        }
       ]
     },
     {

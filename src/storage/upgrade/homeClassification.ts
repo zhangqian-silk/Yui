@@ -134,14 +134,15 @@ export function classifyHome<Snapshot>(
   // ambiguous dual-copy conflict. These are physical-backend facts, not
   // version verdicts, so they are decided before the pure classifier runs.
   //
-  // The invariant only binds a Home whose manifest is already current on every
-  // axis. A Home with an unsupported manifest (an older/future layout or
-  // aggregate, or a pre-baseline/older/future record family) is fenced by
-  // version policy first: the repair path itself requires a current layout-7
-  // manifest, so routing such a Home to a physical-backend verdict would both
-  // mislabel the blocker and send upgrade down a path that cannot finish. The
-  // pure classifier below owns every version verdict.
-  if (schema.status === "current" && source.layout === latest.layout && latest.layout >= 7) {
+  // The invariant binds a Home whose *layout* is current (7), regardless of
+  // whether the record/aggregate axes are also current. A layout-7 Home with
+  // older record versions and no yui.db is still a pseudo-layout-7 Home: it
+  // needs the state.json→SQLite repair first, then the record-family migration
+  // (multi-phase orchestration in the upgrade executor). Routing it to the
+  // pure version classifier would select the SQLite record target, which
+  // cannot read a yui.db that does not exist yet. A Home with an older/future
+  // *layout* is fenced by version policy below, as before.
+  if (schema.currentLayoutVersion === latest.layout && latest.layout >= 7) {
     const physical = inspectLayout7PhysicalBackend(home);
     if (physical !== undefined) {
       return {
