@@ -32,7 +32,7 @@ export function openSchedulerTelemetry(
   if (!existsSync(dbPath)) {
     throw new Error(
       `YUI_TELEMETRY_MODE=${mode} requires SQLite storage, but ${dbPath} does not exist. `
-      + "Migrate this Home to the database backend first (yui setup/doctor)."
+      + "Migrate this Home to the database backend first (yui upgrade)."
     );
   }
   const store = new SqliteTelemetryStore(home, {

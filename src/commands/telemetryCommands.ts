@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { usageError } from "../errors/cliError.js";
 import { STORAGE_SCHEMA_FILE } from "../storage/storageSchema.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { openTaskStore } from "../storage/sqliteStore.js";
+import { openTaskStore, SqliteTaskStore } from "../storage/sqliteStore.js";
 import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
 import {
   DEFAULT_RUN_CAP,
@@ -140,7 +140,12 @@ function telemetryPrune(args: string[], options: TelemetryCommandOptions): strin
           .filter((run) => run.status !== "active")
           .map((run) => run.id)
       );
-      const entry = { taskId: id, terminalPruned: 0, activeCapped: 0, generations: [] as any[] };
+      const entry: {
+        taskId: string;
+        terminalPruned: number;
+        activeCapped: number;
+        generations: { runId: string; generation: string; kept: number; deleted: number }[];
+      } = { taskId: id, terminalPruned: 0, activeCapped: 0, generations: [] };
       for (const aggregate of telemetry.listRunAggregates(id)) {
         if (terminalRuns.has(aggregate.runId)) {
           const before = telemetry.count(id, aggregate.runId);
@@ -233,7 +238,7 @@ function telemetryCompact(args: string[], options: TelemetryCommandOptions): str
   }
   // Database-only direction: compaction folds semantic progress into the
   // telemetry tables inside `yui.db`. A Home without a database has not
-  // reached SQLite storage yet; migrate it first (yui setup/doctor) instead
+  // reached SQLite storage yet; migrate it first (yui upgrade) instead
   // of silently compacting a file-only copy that telemetry cannot join.
   if (!existsSync(join(resolvedFrom, COMMITTED_DATABASE_FILENAME))) {
     throw usageError(
@@ -276,6 +281,7 @@ function telemetryCompact(args: string[], options: TelemetryCommandOptions): str
     ].join("\n");
   } finally {
     void telemetry.close();
+    if (store instanceof SqliteTaskStore) store.close();
   }
 }
 
