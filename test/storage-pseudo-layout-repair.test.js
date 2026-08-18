@@ -250,7 +250,7 @@ function setupPseudoLayout7Home() {
   };
 
   const integrationAttempt = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "integration-1",
     taskId: task.id,
     projectId: project.id,
