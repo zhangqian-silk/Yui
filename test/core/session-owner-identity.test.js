@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -93,6 +96,46 @@ test("isLinuxProcessLive pairs PID with start identity (PID reuse)", { skip: !is
   assert.equal(isLinuxProcessLive(999999, identity.startIdentity), false);
 });
 
+test("isLinuxProcessLive treats a zombie as already exited", { skip: !isLinux }, async () => {
+  // Spawn a Python parent that forks a child which exits immediately. The
+  // parent never calls waitpid, so the child remains a zombie (state "Z" in
+  // /proc) until the parent is killed. This reproduces the CI condition
+  // where tmux is slow to reap a killed Provider under load.
+  const pidFile = join(tmpdir(), `yui-zombie-${process.pid}-${Date.now()}.pid`);
+  const script = [
+    "import os, sys, time",
+    "pid = os.fork()",
+    "if pid == 0:",
+    "    os._exit(0)",
+    "with open(sys.argv[1], \"w\") as f:",
+    "    f.write(str(pid))",
+    "time.sleep(30)"
+  ].join("\n");
+  const child = spawn("python3", [
+    "-c",
+    script,
+    pidFile
+  ], {
+    stdio: "ignore"
+  });
+  try {
+    const zombiePid = await waitForFileContent(pidFile);
+    await waitFor(
+      () => readLinuxProcessIdentity(zombiePid)?.state === "Z",
+      2_000,
+      "child did not become a zombie"
+    );
+    const identity = readLinuxProcessIdentity(zombiePid);
+    assert.ok(identity);
+    assert.equal(identity.state, "Z");
+    assert.equal(isLinuxProcessLive(zombiePid, identity.startIdentity), false);
+  } finally {
+    child.kill("SIGKILL");
+    await new Promise((resolve) => child.on("exit", resolve));
+    rmSync(pidFile, { force: true });
+  }
+});
+
 test("discoverProviderRootByLaunchEnv finds the exact launch fence", { skip: !isLinux }, async () => {
   const launchId = `test-launch-${process.pid}-${Date.now()}`;
   const child = spawn(process.execPath, [
@@ -155,6 +198,45 @@ function waitForProcess(pid, timeoutMs = 2_000) {
       }
       if (Date.now() - start > timeoutMs) {
         reject(new Error(`Process ${pid} did not appear in /proc within ${timeoutMs}ms`));
+        return;
+      }
+      setTimeout(check, 25);
+    };
+    check();
+  });
+}
+
+function waitFor(condition, timeoutMs, label) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (condition()) {
+        resolve();
+        return;
+      }
+      if (Date.now() - start > timeoutMs) {
+        reject(new Error(`${label} within ${timeoutMs}ms`));
+        return;
+      }
+      setTimeout(check, 25);
+    };
+    check();
+  });
+}
+
+function waitForFileContent(path, timeoutMs = 2_000) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      try {
+        const content = readFileSync(path, "utf8").trim();
+        if (content.length > 0) {
+          resolve(Number(content));
+          return;
+        }
+      } catch { /* file not written yet */ }
+      if (Date.now() - start > timeoutMs) {
+        reject(new Error(`File ${path} did not appear within ${timeoutMs}ms`));
         return;
       }
       setTimeout(check, 25);
