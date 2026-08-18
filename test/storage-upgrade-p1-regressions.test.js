@@ -691,7 +691,12 @@ test("binary-only restore rejects a same-version wrong executable or argv", asyn
     () => ports.restoreController(home, wrong),
     /Failed to restore the previously running Controller identity: exited with status 1/i
   );
-  assert.deepEqual(await callController(home, "controller.identity", {}), captured);
+  // Issue 02: the identity also carries the live pid/start identity, which a
+  // restart legitimately changes. The restore contract is the launch vector.
+  assert.deepEqual(
+    launchVectorOf(await callController(home, "controller.identity", {})),
+    launchVectorOf(captured)
+  );
 });
 
 test("binary-only restore accepts the exact captured executable, argv, and version", async (t) => {
@@ -700,8 +705,19 @@ test("binary-only restore accepts the exact captured executable, argv, and versi
   const captured = await callController(home, "controller.identity", {});
   const ports = createUpdatePorts(process.env, spawnSync);
   assert.doesNotThrow(() => ports.restoreController(home, captured));
-  assert.deepEqual(await callController(home, "controller.identity", {}), captured);
+  assert.deepEqual(
+    launchVectorOf(await callController(home, "controller.identity", {})),
+    launchVectorOf(captured)
+  );
 });
+
+function launchVectorOf(identity) {
+  return {
+    executablePath: identity.executablePath,
+    args: identity.args,
+    version: identity.version
+  };
+}
 
 test("Controller restore inherits environment without serializing credentials into child argv", () => {
   const secret = "restore-secret-do-not-leak";

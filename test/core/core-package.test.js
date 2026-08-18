@@ -79,7 +79,7 @@ test("runtime assembly contains only the built CLI, docs, and four generic skill
 
   assert.deepEqual(
     readdirSync(output).sort(),
-    ["ARCHITECTURE.md", "LICENSE", "README.md", "dist", "docs", "i18n", "package.json", "skills"]
+    ["ARCHITECTURE.md", "LICENSE", "README.md", "dist", "docs", "i18n", "node_modules", "package.json", "release-manifest.json", "skills"]
   );
   assert.deepEqual(readdirSync(join(output, "docs")), ["task-local-identity.md"]);
   assert.deepEqual(readdirSync(join(output, "i18n")), ["README.zh-CN.md"]);

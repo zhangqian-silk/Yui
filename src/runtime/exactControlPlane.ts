@@ -23,6 +23,7 @@ import {
 import { nativeSessionIdForLaunch } from "./preallocatedNativeSession.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
+import { readActiveReleasePointer } from "../release/runtimeRelease.js";
 
 export const EXACT_CONTROL_ARGUMENT = "--yui-control";
 export const YUI_CONTROL_PLANE_DESCRIPTOR = "YUI_CONTROL_PLANE_DESCRIPTOR";
@@ -35,6 +36,14 @@ export type ExactControlPlaneDescriptor = Readonly<{
   cliEntry: string;
   yuiHome: string;
   identity: YuiVersionIdentity;
+  /**
+   * Issue 02: the release build ID this control plane runs. Present when the
+   * Controller runs from an installed release; absent for a dev checkout.
+   * When present, the preflight gates on the Home's active release pointer.
+   */
+  buildId?: string;
+  /** Package SHA-256 of the active release, when known. */
+  activeReleaseDigest?: string;
 }>;
 
 export type ExactTaskRuntimeDescriptor = Readonly<{
@@ -77,6 +86,8 @@ export type ExactControlPlanePreflightOptions = Readonly<{
     params: JsonValue
   ) => Promise<JsonValue>;
   checkController?: boolean;
+  /** Issue 02: reads the Home's active release pointer for build-ID gating. */
+  readActiveRelease?: (home: string) => { buildId: string; packageDigest: string } | null;
 }>;
 
 export function createExactControlPlaneDescriptor(input: Readonly<{
@@ -84,6 +95,8 @@ export function createExactControlPlaneDescriptor(input: Readonly<{
   cliEntry: string;
   yuiHome: string;
   identity?: YuiVersionIdentity;
+  buildId?: string;
+  activeReleaseDigest?: string;
 }>): ExactControlPlaneDescriptor {
   const identity = validateVersionIdentity(input.identity ?? yuiVersionIdentity());
   return Object.freeze({
@@ -92,7 +105,11 @@ export function createExactControlPlaneDescriptor(input: Readonly<{
     executable: canonicalPath(input.executable),
     cliEntry: canonicalPath(input.cliEntry),
     yuiHome: canonicalPath(input.yuiHome),
-    identity: Object.freeze({ ...identity })
+    identity: Object.freeze({ ...identity }),
+    ...(input.buildId === undefined ? {} : { buildId: input.buildId }),
+    ...(input.activeReleaseDigest === undefined
+      ? {}
+      : { activeReleaseDigest: input.activeReleaseDigest })
   });
 }
 
@@ -142,7 +159,11 @@ export function parseExactControlPlaneDescriptor(value: string): ExactControlPla
     executable: requireText(record.executable, "Control-plane executable"),
     cliEntry: requireText(record.cliEntry, "Control-plane CLI entry"),
     yuiHome: requireText(record.yuiHome, "Control-plane YUI_HOME"),
-    identity: validateVersionIdentity(record.identity)
+    identity: validateVersionIdentity(record.identity),
+    ...(typeof record.buildId !== "string" ? {} : { buildId: record.buildId }),
+    ...(typeof record.activeReleaseDigest !== "string"
+      ? {}
+      : { activeReleaseDigest: record.activeReleaseDigest })
   });
 }
 
@@ -285,6 +306,41 @@ export async function assertExactControlPlanePreflight(
       "Exact control-plane aggregate schema does not match its frozen descriptor "
         + `(expected ${descriptor.identity.aggregateSchemaVersion}, found `
         + `${storage.currentAggregateSchemaVersion ?? "unknown"}).`
+    );
+  }
+
+  // Issue 02: bind the descriptor to the active release. A descriptor that
+  // carries a build ID must match the Home's active release pointer; a
+  // descriptor without a build ID is rejected once a Home has an active
+  // release (old Sessions cannot mutate a released control plane). Homes
+  // without an active release pointer keep the legacy continuity contract.
+  const readActiveRelease = options.readActiveRelease ?? defaultReadActiveRelease;
+  const activeRelease = readActiveRelease(descriptor.yuiHome);
+  if (descriptor.buildId !== undefined) {
+    if (activeRelease === null) {
+      throw new Error(
+        "Exact control-plane descriptor names a release build but the Home has "
+          + "no active release pointer."
+      );
+    }
+    if (activeRelease.buildId !== descriptor.buildId) {
+      throw new Error(
+        "Exact control-plane release changed since the descriptor was frozen "
+          + `(expected ${descriptor.buildId}, active ${activeRelease.buildId}).`
+      );
+    }
+    if (
+      descriptor.activeReleaseDigest !== undefined
+      && activeRelease.packageDigest !== descriptor.activeReleaseDigest
+    ) {
+      throw new Error(
+        "Exact control-plane release digest does not match the active release pointer."
+      );
+    }
+  } else if (activeRelease !== null) {
+    throw new Error(
+      "Exact control-plane descriptor predates the active release; old Sessions "
+        + "cannot mutate a released control plane. Re-launch through the current release."
     );
   }
 
@@ -756,4 +812,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isDefinitelyNotRunning(error: unknown): boolean {
   return isRecord(error) && error.code === "CONTROLLER_NOT_RUNNING";
+}
+
+function defaultReadActiveRelease(
+  home: string
+): { buildId: string; packageDigest: string } | null {
+  try {
+    const pointer = readActiveReleasePointer(home);
+    return pointer === null
+      ? null
+      : { buildId: pointer.buildId, packageDigest: pointer.packageDigest };
+  } catch {
+    // A damaged pointer fails closed: treat it as an active release the
+    // descriptor cannot match, rather than silently skipping the gate.
+    return { buildId: "unknown", packageDigest: "unknown" };
+  }
 }

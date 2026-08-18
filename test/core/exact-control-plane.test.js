@@ -49,6 +49,7 @@ import {
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
+import { writeActiveReleasePointer } from "../../dist/release/runtimeRelease.js";
 import { yuiVersionIdentity } from "../../dist/version.js";
 import {
   TASK_FINAL_REVIEW_ARGUMENT,
@@ -641,6 +642,123 @@ test("central preflight fences digest, Home, storage, and running Controller ide
       throw new ControllerClientError("CONTROLLER_NOT_RUNNING", "not running");
     }
   }));
+});
+
+test("Issue 02 release build gate binds descriptors to the active release", async (t) => {
+  const { home, cliEntry } = fixture(t);
+  const current = yuiVersionIdentity();
+  const status = {
+    running: true,
+    pid: 42,
+    protocolVersion: current.controllerProtocolVersion,
+    version: current.version,
+    storageLayoutVersion: current.storageLayoutVersion,
+    aggregateSchemaVersion: current.aggregateSchemaVersion
+  };
+  const buildId = "0.6.0-abcdef123456";
+  const packageDigest = "a".repeat(64);
+  const released = createExactControlPlaneDescriptor({
+    executable: process.execPath,
+    cliEntry,
+    yuiHome: home,
+    identity: current,
+    buildId,
+    activeReleaseDigest: packageDigest
+  });
+  const releasedInput = {
+    serializedDescriptor: serializeExactDescriptor(released),
+    digest: exactControlPlaneDigest(released),
+    actualExecutable: process.execPath,
+    actualCliEntry: cliEntry,
+    actualHome: home
+  };
+  const legacy = createExactControlPlaneDescriptor({
+    executable: process.execPath,
+    cliEntry,
+    yuiHome: home,
+    identity: current
+  });
+  const legacyInput = {
+    serializedDescriptor: serializeExactDescriptor(legacy),
+    digest: exactControlPlaneDigest(legacy),
+    actualExecutable: process.execPath,
+    actualCliEntry: cliEntry,
+    actualHome: home
+  };
+  const pointer = Object.freeze({
+    schemaVersion: 1,
+    releaseId: `0.6.0-${packageDigest}`,
+    version: "0.6.0",
+    buildId,
+    packageDigest,
+    activatedAt: "2026-08-17T00:00:00.000Z"
+  });
+
+  // No active release: a release-bound descriptor fails closed (it names a
+  // build the Home cannot resolve), while a legacy descriptor keeps the
+  // pre-release continuity contract.
+  await assert.rejects(
+    assertExactControlPlanePreflight(releasedInput, {
+      callController: async () => status
+    }),
+    /names a release build but the Home has no active release pointer/i
+  );
+  await assert.doesNotReject(assertExactControlPlanePreflight(legacyInput, {
+    callController: async () => status
+  }));
+
+  writeActiveReleasePointer(home, pointer);
+
+  // Matching build ID + digest: the released descriptor passes.
+  await assert.doesNotReject(assertExactControlPlanePreflight(releasedInput, {
+    callController: async () => status
+  }));
+  // A stale digest fails closed even when the build ID matches.
+  const staleDigest = createExactControlPlaneDescriptor({
+    executable: process.execPath,
+    cliEntry,
+    yuiHome: home,
+    identity: current,
+    buildId,
+    activeReleaseDigest: "b".repeat(64)
+  });
+  await assert.rejects(
+    assertExactControlPlanePreflight({
+      serializedDescriptor: serializeExactDescriptor(staleDigest),
+      digest: exactControlPlaneDigest(staleDigest),
+      actualExecutable: process.execPath,
+      actualCliEntry: cliEntry,
+      actualHome: home
+    }, { callController: async () => status }),
+    /release digest does not match/i
+  );
+  // A different build ID fails closed.
+  const otherBuild = createExactControlPlaneDescriptor({
+    executable: process.execPath,
+    cliEntry,
+    yuiHome: home,
+    identity: current,
+    buildId: "0.6.0-ffffffffffff",
+    activeReleaseDigest: packageDigest
+  });
+  await assert.rejects(
+    assertExactControlPlanePreflight({
+      serializedDescriptor: serializeExactDescriptor(otherBuild),
+      digest: exactControlPlaneDigest(otherBuild),
+      actualExecutable: process.execPath,
+      actualCliEntry: cliEntry,
+      actualHome: home
+    }, { callController: async () => status }),
+    /release changed since the descriptor was frozen/i
+  );
+  // A legacy descriptor (no build ID) fails closed once a release is active:
+  // old Sessions cannot mutate a released control plane.
+  await assert.rejects(
+    assertExactControlPlanePreflight(legacyInput, {
+      callController: async () => status
+    }),
+    /predates the active release/i
+  );
 });
 
 test("managed compatible continuity ignores only package-version drift", async (t) => {
