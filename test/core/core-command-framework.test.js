@@ -214,7 +214,12 @@ test("the declarative catalog exposes exactly the lean public command surface", 
     "job acknowledge",
     "jobs",
     "jobs list",
-    "jobs retry"
+    "jobs retry",
+    "telemetry",
+    "telemetry status",
+    "telemetry prune",
+    "telemetry compact",
+    "telemetry read"
   ]);
 
   const internal = ROOT_COMMAND.children.find((child) => child.name === "internal");

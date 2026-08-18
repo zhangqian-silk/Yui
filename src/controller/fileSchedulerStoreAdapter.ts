@@ -2,6 +2,15 @@ import { isDeepStrictEqual } from "node:util";
 
 import type { DurableJob } from "../job/durableJob.js";
 import type { MailboxEntityRef } from "../coordination/workMailbox.js";
+import type { TelemetryMode } from "../telemetry/telemetryConfig.js";
+import { routeProviderProgress } from "../telemetry/telemetryRouter.js";
+import {
+  NullTelemetrySink,
+  type SchedulerTelemetry,
+  type TelemetryProgressEntry,
+  type TelemetryReader,
+  type TelemetrySink
+} from "../telemetry/telemetryStore.js";
 
 import {
   activeLiveRoleAgentSession,
@@ -140,48 +149,88 @@ import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.j
  * soon as the durable revision advances (own commit or external writer), so it
  * is never dispatch/claim/complete authority: every mutation re-reads the
  * exact records under the storage lock/CAS.
+ *
+ * All seven record families the actionability digest folds (agentRuns,
+ * workItems, reviewRounds, integrationAttempts, inputRequests, durableJobs,
+ * messages) are read in the same projection build, so a single digest
+ * computation sees a consistent per-revision snapshot even under concurrent
+ * writers (Issue 05).
  */
 type TaskReadProjection = Readonly<{
   events: readonly TaskEvent[];
   runFacts: ReadonlyMap<string, RunProgressFacts>;
+  agentRuns: ReturnType<TaskStore["listAgentRuns"]>;
+  workItems: ReturnType<TaskStore["listWorkItems"]>;
   reviewRounds: ReturnType<TaskStore["listReviewRounds"]>;
   changeSets: ReturnType<TaskStore["listChangeSets"]>;
   integrationAttempts: ReturnType<TaskStore["listIntegrationAttempts"]>;
   inputRequests: ReturnType<TaskStore["listInputRequests"]>;
+  durableJobs: ReturnType<TaskStore["listDurableJobs"]>;
+  messages: ReturnType<TaskStore["listMessages"]>;
 }>;
+
+const NULL_TELEMETRY_SINK = new NullTelemetrySink();
 
 /** Maps the authoritative FileTaskStore records to the scheduler's narrow port. */
 export class FileSchedulerStoreAdapter implements SchedulerStorePort {
-  constructor(readonly store: TaskStore) {}
+  /**
+   * @param telemetry Optional sidecar wiring (Issue 09). Absent or `legacy`
+   * keeps master behavior (semantic progress events only); `dual` also
+   * upserts progress to the sidecar; `bounded` routes progress to the
+   * sidecar only and feeds the scheduler projection synthesized latest
+   * progress from the reader.
+   */
+  constructor(
+    readonly store: TaskStore,
+    private readonly telemetry: SchedulerTelemetry | null = null
+  ) {}
 
   /**
    * Revision-scoped read projection. Keyed by the store's durable revision;
    * any committed mutation (ours or an external writer's) advances it and the
    * next read rebuilds. A store without getStateRevision disables caching.
    */
-  #readProjection: { revision: number; tasks: Map<string, TaskReadProjection> } | null = null;
+  #readProjection: {
+    revision: number;
+    telemetryRevision: number;
+    tasks: Map<string, TaskReadProjection>;
+  } | null = null;
 
   #taskReadProjection(taskId: string): TaskReadProjection {
     const revision = typeof this.store.getStateRevision === "function"
       ? this.store.getStateRevision()
       : Number.NaN;
+    const telemetryRevision = this.telemetry?.mode === "bounded"
+      ? this.telemetry.reader.revision()
+      : 0;
     if (
       this.#readProjection === null
       || this.#readProjection.revision !== revision
+      || this.#readProjection.telemetryRevision !== telemetryRevision
     ) {
-      this.#readProjection = { revision, tasks: new Map() };
+      this.#readProjection = { revision, telemetryRevision, tasks: new Map() };
     }
     const tasks = this.#readProjection.tasks;
     let task = tasks.get(taskId);
     if (task === undefined) {
-      const events = this.store.listEvents(taskId);
+      const semanticEvents = this.store.listEvents(taskId);
+      // In bounded mode progress lives only in the sidecar; merge the latest
+      // observation per Run so liveness/stall folds keep working. In legacy
+      // and dual modes semantic history already carries progress.
+      const events = this.telemetry?.mode === "bounded"
+        ? [...semanticEvents, ...this.telemetry.reader.latestProgressEvents(taskId)]
+        : semanticEvents;
       task = {
         events,
         runFacts: foldRunProgressFacts(events),
+        agentRuns: this.store.listAgentRuns(taskId),
+        workItems: this.store.listWorkItems(taskId),
         reviewRounds: this.store.listReviewRounds(taskId),
         changeSets: this.store.listChangeSets(taskId),
         integrationAttempts: this.store.listIntegrationAttempts(taskId),
-        inputRequests: this.store.listInputRequests(taskId)
+        inputRequests: this.store.listInputRequests(taskId),
+        durableJobs: this.store.listDurableJobs(taskId),
+        messages: this.store.listMessages(taskId)
       };
       tasks.set(taskId, task);
     }
@@ -287,6 +336,34 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   listEvents(taskId: string) {
     return this.#taskReadProjection(taskId).events;
+  }
+
+  listAgentRuns(taskId: string) {
+    return this.#taskReadProjection(taskId).agentRuns;
+  }
+
+  listWorkItems(taskId: string) {
+    return this.#taskReadProjection(taskId).workItems;
+  }
+
+  listReviewRounds(taskId: string) {
+    return this.#taskReadProjection(taskId).reviewRounds;
+  }
+
+  listIntegrationAttempts(taskId: string) {
+    return this.#taskReadProjection(taskId).integrationAttempts;
+  }
+
+  listDurableJobs(taskId: string) {
+    return this.#taskReadProjection(taskId).durableJobs;
+  }
+
+  listInputRequests(taskId: string) {
+    return this.#taskReadProjection(taskId).inputRequests;
+  }
+
+  listMessages(taskId: string) {
+    return this.#taskReadProjection(taskId).messages;
   }
 
   getRunProgressFacts(taskId: string, runId: string): RunProgressFacts | undefined {
@@ -2478,29 +2555,37 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           return "applied";
         case "apply":
           if (decision.outcome.outcome !== "advance-progress") return "obsolete";
-          if (store.listEvents(input.taskId).some((event) => (
-            event.type === "runtime.provider-turn-progress"
-            && event.payload.eventId === input.eventId
-          ))) return "applied";
-          store.saveEvent(input.taskId, createTaskEvent(
-            store.nextEventId(input.taskId),
-            input.taskId,
-            "runtime.provider-turn-progress",
-            {
-              eventId: input.eventId,
-              roleName: input.roleName,
-              agentId: input.agentId,
-              adapterId: input.adapterId,
-              launchId: input.launchId,
-              nativeSessionId: input.nativeSessionId,
-              runId: input.runId,
-              progressId: input.progressId,
-              progressAt: input.receivedAt,
-              ...(input.sequence === undefined ? {} : { sequence: String(input.sequence) })
+          return routeProviderProgress({
+            mode: this.telemetry?.mode ?? "legacy",
+            entry: toTelemetryEntry(input),
+            semanticExists: this.telemetry?.mode === "bounded"
+              ? false
+              : store.listEvents(input.taskId).some((event) => (
+                event.type === "runtime.provider-turn-progress"
+                && event.payload.eventId === input.eventId
+              )),
+            writeSemantic: () => {
+              store.saveEvent(input.taskId, createTaskEvent(
+                store.nextEventId(input.taskId),
+                input.taskId,
+                "runtime.provider-turn-progress",
+                {
+                  eventId: input.eventId,
+                  roleName: input.roleName,
+                  agentId: input.agentId,
+                  adapterId: input.adapterId,
+                  launchId: input.launchId,
+                  nativeSessionId: input.nativeSessionId,
+                  runId: input.runId,
+                  progressId: input.progressId,
+                  progressAt: input.receivedAt,
+                  ...(input.sequence === undefined ? {} : { sequence: String(input.sequence) })
+                },
+                now
+              ));
             },
-            now
-          ));
-          return "applied";
+            sink: this.telemetry?.sink ?? NULL_TELEMETRY_SINK
+          });
       }
     });
   }
@@ -3701,5 +3786,34 @@ function runLaunchEventPayload(run: AgentRun): Record<string, string> {
     profileAccess: run.effective.profileAccess,
     effectivePermission: run.effective.permission.strategy,
     writeProjectIds: run.effective.writeProjectIds.join(",") || "none"
+  };
+}
+
+/**
+ * Maps a provider progress observation to the telemetry sidecar entry. The
+ * payload mirrors the semantic event payload so sidecar rows and legacy
+ * events carry identical evidence.
+ */
+function toTelemetryEntry(input: TaskProviderTurnProgress): TelemetryProgressEntry {
+  return {
+    taskId: input.taskId,
+    roleName: input.roleName,
+    runId: input.runId,
+    generation: input.launchId !== "" ? input.launchId : input.nativeSessionId,
+    progressId: input.progressId,
+    ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
+    payload: {
+      eventId: input.eventId,
+      roleName: input.roleName,
+      agentId: input.agentId,
+      adapterId: input.adapterId,
+      launchId: input.launchId,
+      nativeSessionId: input.nativeSessionId,
+      runId: input.runId,
+      progressId: input.progressId,
+      progressAt: input.receivedAt,
+      ...(input.sequence === undefined ? {} : { sequence: String(input.sequence) })
+    },
+    receivedAt: input.receivedAt
   };
 }

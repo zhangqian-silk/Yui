@@ -825,7 +825,7 @@ export const ROOT_COMMAND = buildNode({
     ] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
-    { id: "operations", title: "Operations", entries: ["web", "controller", "execution", "job", "jobs"] },
+    { id: "operations", title: "Operations", entries: ["web", "controller", "execution", "job", "jobs", "telemetry"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
   children: [
@@ -1115,6 +1115,17 @@ export const ROOT_COMMAND = buildNode({
       children: [
         { name: "list", summary: "List scheduler wake and recovery records." },
         { name: "retry", summary: "Retry a failed Leader recovery.", usage: "yui jobs retry <id>" }
+      ]
+    },
+    {
+      name: "telemetry",
+      summary: "Inspect and compact the bounded provider-progress sidecar.",
+      sections: [{ id: "manage", title: "Commands", entries: ["status", "prune", "compact", "read"] }],
+      children: [
+        { name: "status", summary: "Show sidecar health, row counts, and retention settings.", usage: "yui telemetry status" },
+        { name: "prune", summary: "Apply terminal retention and active-Run caps.", usage: "yui telemetry prune [--task <id>] [--keep <n>] [--dry-run]" },
+        { name: "compact", summary: "Fold legacy semantic progress events into a staged Home's sidecar.", usage: "yui telemetry compact --from <home> --staged <dir> [--keep <n>] [--dry-run]" },
+        { name: "read", summary: "Page through retained progress rows or read a Run aggregate.", usage: "yui telemetry read --task <id> [--run <id>] [--aggregate] [--limit <n>] [--offset <n>]" }
       ]
     },
     {

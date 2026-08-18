@@ -179,7 +179,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
     updatedAt: timestamp
   };
   const run = {
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: "agent-run-1",
     taskId: task.id,
     roleName: "leader",

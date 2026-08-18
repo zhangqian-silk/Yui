@@ -56,6 +56,7 @@ import {
 } from "./commands/executionAuditCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runDurableJobCommand } from "./commands/durableJobCommands.js";
+import { runTelemetryCommand } from "./commands/telemetryCommands.js";
 import {
   applyOperatorSessionControl,
   runOperatorCommand,
@@ -102,6 +103,7 @@ import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapte
 import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
+import { openSchedulerTelemetry } from "./telemetry/telemetryWiring.js";
 import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.js";
 import { runCodexLifecycleHookCommand } from "./controller/codexLifecycleHook.js";
 import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
@@ -489,7 +491,10 @@ export async function main(): Promise<void> {
       onWarning: (message) => process.stderr.write(`Warning: ${message}\n`)
     }
   );
-  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  const schedulerStore = new FileSchedulerStoreAdapter(
+    store,
+    openSchedulerTelemetry(home, process.env)
+  );
   const planner = new FileRoleLaunchPlanner(home, store, { environment: process.env });
   const workspacePreparer = new FileTaskWorkspacePreparer(home, store);
   const runtime = new FileTaskWorkflowRuntime(
@@ -1351,6 +1356,15 @@ export async function main(): Promise<void> {
   }
   if (resolved[0] === "job") {
     emit(await runDurableJobCommand(resolved.slice(1), {
+      home,
+      json: jsonOutput,
+      environment: process.env,
+      store
+    }));
+    return;
+  }
+  if (resolved[0] === "telemetry") {
+    emit(await runTelemetryCommand(resolved.slice(1), {
       home,
       json: jsonOutput,
       environment: process.env,
