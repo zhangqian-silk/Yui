@@ -213,13 +213,25 @@ async function ensureRoleSessionWithRetry(home, taskId, roleName, environment, a
       // error). Retrying would launch a second Provider and leave a stale
       // launch reservation that fails cleanup with "launch identity is
       // ambiguous". The owner record is written only after the tmux window is
-      // created, so its presence proves the launch landed.
+      // created, so its presence with a live Provider proves the launch
+      // landed. However, the Coordinator may compensate a post-launch failure
+      // by stopping the host (kill-window); the owner record persists but the
+      // Provider is dead. A dead Provider means the launch must be retried
+      // from a clean owner registry.
       const owners = new FileTaskStore(home).listSessionOwnersForOwner({
         scope: "task",
         taskId,
         roleName
       });
-      if (owners.length > 0) return;
+      const liveOwner = owners.find((o) => o.providerRoot !== undefined
+        && isLinuxProcessLive(o.providerRoot.pid, o.providerRoot.startIdentity));
+      if (liveOwner !== undefined) return;
+      // No live Provider: remove stale owner records so the retry starts
+      // clean without a second generation that fails cleanup as ambiguous.
+      const cleanupStore = new FileTaskStore(home);
+      for (const owner of owners) {
+        cleanupStore.removeSessionOwner(owner.launchId);
+      }
     }
   }
   throw lastError;
@@ -300,58 +312,78 @@ async function e2eFixture(t, { providerEnv = {} } = {}) {
       await runtime.startController();
     },
     async launchLeader() {
-      await ensureRoleSessionWithRetry(home, task.id, role.name, providerEnvironment);
-      // Wait for the Provider process and its owner record.
-      await waitFor(
-        () => readObservations(observationPath).some((o) => o.event === "process-started" && !o.isChild),
-        FIVE_SECONDS_MS,
-        "Provider root did not start"
-      );
-      const registry = new FileTaskStore(home);
-      await waitFor(
-        () => registry.listSessionOwners().length > 0,
-        FIVE_SECONDS_MS,
-        "Owner record was not written"
-      );
-      const [record] = registry.listSessionOwners();
-      // Record the durable Session the way the runtime event processor would
-      // once the Provider signals session-start. The mock Provider keeps
-      // alive without sending notifications, so the test commits the exact
-      // durable generation the launch fence created.
-      const launchStore = new FileTaskStore(home);
-      const launchRole = launchStore.getRole(task.id, role.name);
-      const effective = resolveEffectiveLaunch({
-        role: launchRole,
-        purpose: "execution",
-        workspace: launchStore.getTaskWorkspace(task.id)
-      });
-      let sessions = launchStore.getTaskRoleSessionSet(task.id, role.name)
-        ?? createRoleSessionSet(
-          { scope: "task", taskId: task.id, roleName: role.name },
-          agent.id,
-          NOW
+      const maxAttempts = 3;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await ensureRoleSessionWithRetry(home, task.id, role.name, providerEnvironment);
+        // Wait for the Provider process and its owner record.
+        await waitFor(
+          () => readObservations(observationPath).some((o) => o.event === "process-started" && !o.isChild),
+          FIVE_SECONDS_MS,
+          "Provider root did not start"
         );
-      sessions = recordRoleAgentSession(sessions, {
-        agentId: agent.id,
-        adapterId: agent.adapterId,
-        nativeSessionId: record.nativeSessionId ?? `native-${record.launchId}`,
-        launchId: record.launchId,
-        policy: "fixed",
-        status: "running",
-        effective
-      }, NOW);
-      launchStore.saveTaskRoleSessionSet(sessions);
-      // Wait for the durable Session to be readable.
-      await waitFor(
-        () => {
-          const set = new FileTaskStore(home).getTaskRoleSessionSet(task.id, role.name);
-          const session = set?.sessions[agent.id];
-          return session?.status === "running" && session.launchId === record.launchId;
-        },
-        FIVE_SECONDS_MS,
-        "Durable session was not recorded"
-      );
-      return registry.listSessionOwners();
+        const registry = new FileTaskStore(home);
+        await waitFor(
+          () => registry.listSessionOwners().length > 0,
+          FIVE_SECONDS_MS,
+          "Owner record was not written"
+        );
+        const [record] = registry.listSessionOwners();
+        // Verify the Provider is alive before committing the durable Session.
+        // Under CI load the Coordinator may compensate a post-launch failure
+        // by stopping the host after the owner record was written; the record
+        // persists but the Provider is dead. Retry the launch from a clean
+        // registry instead of reconciling a corpse.
+        if (record.providerRoot !== undefined
+          && isLinuxProcessLive(record.providerRoot.pid, record.providerRoot.startIdentity)) {
+          // Record the durable Session the way the runtime event processor would
+          // once the Provider signals session-start. The mock Provider keeps
+          // alive without sending notifications, so the test commits the exact
+          // durable generation the launch fence created.
+          const launchStore = new FileTaskStore(home);
+          const launchRole = launchStore.getRole(task.id, role.name);
+          const effective = resolveEffectiveLaunch({
+            role: launchRole,
+            purpose: "execution",
+            workspace: launchStore.getTaskWorkspace(task.id)
+          });
+          let sessions = launchStore.getTaskRoleSessionSet(task.id, role.name)
+            ?? createRoleSessionSet(
+              { scope: "task", taskId: task.id, roleName: role.name },
+              agent.id,
+              NOW
+            );
+          sessions = recordRoleAgentSession(sessions, {
+            agentId: agent.id,
+            adapterId: agent.adapterId,
+            nativeSessionId: record.nativeSessionId ?? `native-${record.launchId}`,
+            launchId: record.launchId,
+            policy: "fixed",
+            status: "running",
+            effective
+          }, NOW);
+          launchStore.saveTaskRoleSessionSet(sessions);
+          // Wait for the durable Session to be readable.
+          await waitFor(
+            () => {
+              const set = new FileTaskStore(home).getTaskRoleSessionSet(task.id, role.name);
+              const session = set?.sessions[agent.id];
+              return session?.status === "running" && session.launchId === record.launchId;
+            },
+            FIVE_SECONDS_MS,
+            "Durable session was not recorded"
+          );
+          return registry.listSessionOwners();
+        }
+        // Provider is dead. Remove stale owner records and retry the launch.
+        if (attempt < maxAttempts - 1) {
+          const cleanupStore = new FileTaskStore(home);
+          for (const owner of cleanupStore.listSessionOwners()) {
+            cleanupStore.removeSessionOwner(owner.launchId);
+          }
+          await delay(200);
+        }
+      }
+      throw new Error("launchLeader did not produce a live Provider after retries");
     },
     reconciliation() {
       const tmux = new TmuxManager(
