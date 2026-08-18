@@ -38,6 +38,15 @@ export class ResourceRegistrar {
   }
 
   registerManagedWorkspace(workspace: ManagedWorkspace): void {
+    try {
+      this.#registerManagedWorkspace(workspace);
+    } catch {
+      // A failed registry receipt must never block workspace creation.
+      // Discovery remains the authority for historical resources.
+    }
+  }
+
+  #registerManagedWorkspace(workspace: ManagedWorkspace): void {
     const records: ResourceRecord[] = [];
     const root = resolve(workspace.root);
     if (existsSync(root)
@@ -66,6 +75,14 @@ export class ResourceRegistrar {
   }
 
   registerTaskRuntimeIsolation(descriptor: TaskRuntimeIsolationDescriptor): void {
+    try {
+      this.#registerTaskRuntimeIsolation(descriptor);
+    } catch {
+      // Best-effort receipt; runtime isolation must proceed regardless.
+    }
+  }
+
+  #registerTaskRuntimeIsolation(descriptor: TaskRuntimeIsolationDescriptor): void {
     const owner = ownerFromManagedWorkspace(this.#home, descriptor.workspace.owner);
     this.#save([
       descriptor.roots.generation,
@@ -85,6 +102,17 @@ export class ResourceRegistrar {
     descriptor: ExactTaskRuntimeDescriptor,
     sourcePath: string
   ): void {
+    try {
+      this.#registerExactTaskRuntimeDescriptor(descriptor, sourcePath);
+    } catch {
+      // Best-effort receipt; descriptor writes must proceed regardless.
+    }
+  }
+
+  #registerExactTaskRuntimeDescriptor(
+    descriptor: ExactTaskRuntimeDescriptor,
+    sourcePath: string
+  ): void {
     const path = resolve(sourcePath);
     if (!existsSync(path) || isReleaseNamespacePath(this.#home, path)) return;
     this.#save([this.#record({
@@ -100,6 +128,14 @@ export class ResourceRegistrar {
   }
 
   registerSessionContext(path: string, owner: ResourceOwner): void {
+    try {
+      this.#registerSessionContext(path, owner);
+    } catch {
+      // Best-effort receipt; session launch must proceed regardless.
+    }
+  }
+
+  #registerSessionContext(path: string, owner: ResourceOwner): void {
     const resolved = resolve(path);
     if (!existsSync(resolved) || isReleaseNamespacePath(this.#home, resolved)) return;
     this.#save([this.#record({
@@ -111,13 +147,25 @@ export class ResourceRegistrar {
   }
 
   markWorkspaceDeleted(workspace: ManagedWorkspace): void {
-    this.markPathsDeleted([
-      workspace.root,
-      ...workspace.entries.map((entry) => entry.path)
-    ]);
+    try {
+      this.markPathsDeleted([
+        workspace.root,
+        ...workspace.entries.map((entry) => entry.path)
+      ]);
+    } catch {
+      // Best-effort receipt; workspace deletion must proceed regardless.
+    }
   }
 
   markPathsDeleted(paths: readonly string[]): void {
+    try {
+      this.#markPathsDeleted(paths);
+    } catch {
+      // Best-effort receipt; path deletion must proceed regardless.
+    }
+  }
+
+  #markPathsDeleted(paths: readonly string[]): void {
     const targets = new Set(paths.map((path) => resolve(path)));
     const store = createResourceRegistryStore(this.#home);
     try {
