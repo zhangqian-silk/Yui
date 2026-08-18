@@ -50,7 +50,7 @@ import {
 } from "../../dist/workItem/workItem.js";
 import { stopFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { writeActiveReleasePointer } from "../../dist/release/runtimeRelease.js";
-import { yuiVersionIdentity } from "../../dist/version.js";
+import { YUI_VERSION, yuiVersionIdentity } from "../../dist/version.js";
 import {
   TASK_FINAL_REVIEW_ARGUMENT,
   createTaskFinalReviewContract
@@ -453,7 +453,7 @@ test("managed Task invocation rejects bare, candidate, and mismatched runtime co
     "version"
   ], { encoding: "utf8", env: environment });
   assert.equal(exact.status, 0, exact.stderr);
-  assert.match(exact.stdout, /0\.6\.0/u);
+  assert.equal(exact.stdout.trim(), YUI_VERSION);
   assert.equal(readFileSync(schemaPath, "utf8"), before);
   assert.equal(readFileSync(statePath, "utf8"), stateBefore);
 });
