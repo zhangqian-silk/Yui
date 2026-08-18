@@ -14,6 +14,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import {
   assertExecutionGroupTransition,
+  resetReviewExecutionLane,
   validateExecutionGroup,
   type ExecutionFinding,
   type ExecutionGroup
@@ -200,6 +201,60 @@ export function finishReviewRound(
       ? {}
       : { evidenceCommit: requireCommit(result.evidenceCommit, "Review evidence commit") }),
     endedAt: now.toISOString()
+  });
+}
+
+/**
+ * Issue 06: retry a failed Task-final execution attempt under the same semantic
+ * Round identity. AgentRun history remains the attempt trail; the Round itself
+ * returns to pending so infrastructure retries do not manufacture a new
+ * semantic ReviewRound or duplicate findings.
+ */
+export function retryTaskReviewRound(round: ReviewRound): ReviewRound {
+  validateReviewRound(round);
+  if ((round.scope ?? "work-item") !== "task") {
+    throw new Error(`Only a Task-final ReviewRound can be retried in place: ${round.id}.`);
+  }
+  if (round.status !== "failed") {
+    throw new Error(`ReviewRound ${round.id} is not retryable from ${round.status}.`);
+  }
+  const retryExecutionGroup = round.executionGroup === undefined
+    ? undefined
+    : retryReviewExecutionGroup(round);
+  return validateReviewRound({
+    schemaVersion: round.schemaVersion,
+    id: round.id,
+    taskId: round.taskId,
+    workItemId: round.workItemId,
+    candidateId: round.candidateId,
+    reviewerRoleName: round.reviewerRoleName,
+    reviewBaseCommit: round.reviewBaseCommit,
+    scope: "task",
+    ...(round.taskCandidate === undefined ? {} : { taskCandidate: round.taskCandidate }),
+    ...(round.taskFinalReviewContract === undefined
+      ? {}
+      : { taskFinalReviewContract: round.taskFinalReviewContract }),
+    // Keep the historical attempt Group and Lane addressable from AgentRun
+    // history while resetting the Lane for another dispatch attempt.
+    ...(retryExecutionGroup === undefined ? {} : { executionGroup: retryExecutionGroup }),
+    requestedBy: "leader",
+    status: "pending",
+    ...(round.workspace === undefined ? {} : { workspace: round.workspace }),
+    createdAt: round.createdAt
+  });
+}
+
+function retryReviewExecutionGroup(round: ReviewRound): ExecutionGroup {
+  const previous = round.executionGroup!;
+  const attemptTime = Date.parse(round.endedAt ?? round.createdAt);
+  const now = new Date(attemptTime);
+  const lanes = previous.lanes.map((lane) => (
+    resetReviewExecutionLane(previous, lane.id, now)
+  ));
+  return validateExecutionGroup({
+    ...previous,
+    lanes,
+    updatedAt: now.toISOString()
   });
 }
 

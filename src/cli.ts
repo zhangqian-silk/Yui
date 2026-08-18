@@ -46,6 +46,11 @@ import {
   renderControllerResourceStatus,
   runInteractiveControllerCleanup
 } from "./commands/controllerCommands.js";
+import {
+  parseSessionReconcileOptions,
+  runSessionReconcileCommand
+} from "./commands/sessionCommands.js";
+import { SessionOwnerReconciliation } from "./controller/sessionOwnerReconciliation.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runDurableJobCommand } from "./commands/durableJobCommands.js";
 import { runTelemetryCommand } from "./commands/telemetryCommands.js";
@@ -292,6 +297,35 @@ export async function main(): Promise<void> {
       return;
     }
     throw usageError("Internal lifecycle callback usage is invalid.");
+  }
+
+  if (args[0] === "session") {
+    if (args[1] !== "reconcile") {
+      throw usageError(
+        "Session usage: yui session reconcile [--report] [--cleanup]."
+      );
+    }
+    const options = parseSessionReconcileOptions(args.slice(2));
+    const store = openCompatibleFileTaskStore(home);
+    const tmux = new TmuxManager(
+      process.env.YUI_TMUX_BIN ?? "tmux",
+      new NodeCommandExecutor(),
+      { yuiHome: home }
+    );
+    const reconciliation = new SessionOwnerReconciliation({
+      home,
+      store,
+      environment: process.env,
+      tmux
+    });
+    const result = await runSessionReconcileCommand({
+      reconciliation,
+      options,
+      environment: process.env
+    });
+    process.exitCode = result.exitCode;
+    emit(result.output, false, result.data);
+    return;
   }
 
   if (args[0] === "controller") {

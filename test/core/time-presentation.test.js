@@ -73,7 +73,7 @@ test("review configuration stays small and reuses an existing Global Role", () =
       ["review", "set", "--role", "reviewer", "--trigger", "always"],
       store
     ),
-    "Review set to reviewer (always)\n"
+    "Review set to reviewer (always; finding ledger: shadow)\n"
   );
   assert.deepEqual(config.review, {
     roleName: "reviewer",
@@ -81,7 +81,7 @@ test("review configuration stays small and reuses an existing Global Role", () =
   });
   assert.equal(
     runConfigCommand(["review", "show"], store),
-    "Review: reviewer (always)\n"
+    "Review: reviewer (always; finding ledger: shadow)\n"
   );
   assert.equal(
     runConfigCommand(["review", "clear"], store),

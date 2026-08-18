@@ -56,7 +56,16 @@ function makeEvent(id, taskId, overrides = {}) {
   };
 }
 
-const setImmediateAsync = () => new Promise((resolve) => setImmediate(resolve));
+/** Poll a condition on the event loop until it holds or the deadline passes. */
+async function waitFor(condition, { timeoutMs = 5000, label = "condition" } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${label}.`);
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
 
 /** Open a client and register its close on the test context. */
 function openClient(home, options = {}) {
@@ -192,10 +201,11 @@ test("cancellation: abort rolls back an open transaction (db unchanged)", async 
     requestId: "cancel-batch"
   });
 
-  // Let the request reach the worker and the batch start (it yields between
-  // commands via setImmediate), then abort. The cancel is observed mid-batch;
-  // the worker rolls back the open transaction.
-  await setImmediateAsync();
+  // Wait until the batch request is in flight on the worker, then abort. The
+  // worker checks shouldCancel before each command and before commit, so a
+  // cancel that arrives before the batch starts (or mid-batch) always rolls
+  // back. A blind setImmediate wait could race the commit under CI load.
+  await waitFor(() => store.inFlight === 1, { label: "batch in flight" });
   controller.abort();
 
   await assert.rejects(promise, /abort|cancel/i);

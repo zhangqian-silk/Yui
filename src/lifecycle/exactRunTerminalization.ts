@@ -15,6 +15,7 @@ import {
   type ReviewCheck,
   type ReviewRound
 } from "../review/reviewRound.js";
+import { reconcileReviewFindingsAfterReview } from "../review/reviewFindingLedger.js";
 import { failAgentRun, withYieldReceipt, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
 import { createYieldReceipt } from "../run/yieldReceipt.js";
 import {
@@ -253,6 +254,11 @@ export function terminalizeExactRunReviewRound(
     input.reviewResult
   );
   store.saveReviewRound(input.taskId, terminal);
+  // Issue 06: a completed (semantic) Round feeds the finding ledger; a failed
+  // execution attempt is skipped by the classifier and never creates findings.
+  if (terminal.status === "completed") {
+    reconcileReviewFindingsAfterReview(store, input.taskId, terminal.id, now);
+  }
   return { disposition: "applied", round: terminal };
 }
 
