@@ -81,8 +81,8 @@ test("schema migration: fresh create applies every current migration and all tab
   const home = temporaryHome();
   const db = new Database(join(home, "yui.db"));
   const result = migrateSqliteSchema(db);
-  assert.deepEqual(result.applied, [1, 2, 3, 4, 5]);
-  assert.equal(result.version, 5);
+  assert.deepEqual(result.applied, [1, 2, 3, 4, 5, 6]);
+  assert.equal(result.version, 6);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
   for (const table of SQLITE_SCHEMA_TABLES) {
     assert.ok(tables.includes(table), `missing table: ${table}`);
@@ -97,7 +97,7 @@ test("schema migration: idempotent re-run applies nothing", () => {
   migrateSqliteSchema(db);
   const second = migrateSqliteSchema(db);
   assert.deepEqual(second.applied, []);
-  assert.equal(second.version, 5);
+  assert.equal(second.version, 6);
   db.close();
 });
 
@@ -143,8 +143,8 @@ test("schema migration: repairs the legacy global DurableJob key without losing 
   `);
 
   const result = migrateSqliteSchema(db);
-  assert.deepEqual(result.applied, [4, 5]);
-  assert.equal(result.version, 5);
+  assert.deepEqual(result.applied, [4, 5, 6]);
+  assert.equal(result.version, 6);
   const columns = db.prepare("PRAGMA table_info(durable_jobs)").all();
   assert.deepEqual(
     columns.filter(({ pk }) => pk > 0)
@@ -157,6 +157,39 @@ test("schema migration: repairs the legacy global DurableJob key without losing 
     { task_id: "task-legacy", job_id: "job-7", status: "queued" }
   );
   db.close();
+});
+
+test("CRUD: review findings round-trip with Task isolation and stable lookup", () => {
+  const store = new SqliteTaskStore(temporaryHome());
+  const task = makeTask(store);
+  store.saveTask(task);
+  const now = new Date("2026-08-17T00:00:00.000Z");
+  const finding = {
+    schemaVersion: 1,
+    id: store.nextReviewFindingId(task.id),
+    taskId: task.id,
+    stableKey: "rf-test",
+    severity: "p1",
+    invariant: "at-most-once",
+    title: "Duplicate job dispatch",
+    affectedPaths: ["src/job.ts"],
+    affectedSymbols: ["dispatch"],
+    evidence: ["repro: run twice"],
+    firstReviewRoundId: "review-round-1",
+    lastReviewRoundId: "review-round-1",
+    disposition: "open",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString()
+  };
+  store.saveReviewFinding(task.id, finding);
+  assert.deepEqual(store.getReviewFinding(task.id, "review-finding-1"), finding);
+  assert.deepEqual(store.listReviewFindings(task.id).map(({ id }) => id), ["review-finding-1"]);
+  assert.equal(store.nextReviewFindingId(task.id), "review-finding-2");
+  assert.throws(
+    () => store.saveReviewFinding(task.id, { ...finding, taskId: "task-999" }),
+    /belongs to another Task/
+  );
+  store.close();
 });
 
 test("schema migration: store constructor runs migration and sets WAL", () => {

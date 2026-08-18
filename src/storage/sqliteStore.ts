@@ -52,6 +52,10 @@ import type { Milestone } from "../milestone/milestone.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { ReviewRound } from "../review/reviewRound.js";
+import {
+  validateReviewFinding,
+  type ReviewFinding
+} from "../review/reviewFinding.js";
 import type { Project } from "../repository/project.js";
 import { generateHomeIdentity, type HomeIdentity } from "../repository/homeIdentity.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
@@ -81,6 +85,7 @@ import {
   CURRENT_PENDING_WAKEUP_SCHEMA_VERSION,
   CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
   executionLaneActiveRunKey,
+  executionLaneActiveRunKeyParts,
   StorageConflictError,
   StorageCancelledError,
   StorageRecordError,
@@ -1415,6 +1420,37 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
+  // -- review findings --------------------------------------------------------
+
+  nextReviewFindingId(taskId: string): string { return this.#nextTaskRecordId(taskId, "reviewFinding"); }
+
+  getReviewFinding(taskId: string, findingId: string): ReviewFinding | null {
+    return this.#getPayload<ReviewFinding>("review_findings", "task_id = ? AND finding_id = ?", [taskId, findingId]);
+  }
+
+  listReviewFindings(taskId: string): ReviewFinding[] {
+    return this.#sortById(
+      this.#listPayload<ReviewFinding>("review_findings", "task_id = ?", [taskId]),
+      (finding) => finding.id
+    );
+  }
+
+  saveReviewFinding(taskId: string, finding: ReviewFinding): void {
+    validateReviewFinding(finding);
+    if (finding.taskId !== taskId) {
+      throw new StorageRecordError(`Review finding belongs to another Task: ${finding.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO review_findings (task_id, finding_id, stable_key, severity, payload, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(task_id, finding_id) DO UPDATE SET stable_key = excluded.stable_key,
+           severity = excluded.severity, payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(taskId, finding.id, finding.stableKey, finding.severity, this.#json(finding), this.#now());
+    });
+  }
+
   // -- active runs ------------------------------------------------------------
 
   #saveActiveRun(taskId: string, pointer: string, runId: string): void {
@@ -1446,11 +1482,31 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   saveActiveAgentRun(run: AgentRun): void {
+    if (run.executionGroupId !== undefined && run.executionLaneId !== undefined) {
+      this.saveActiveExecutionLaneRun(run);
+      return;
+    }
     this.#saveActiveRun(run.taskId, run.roleName, run.id);
   }
 
   clearActiveAgentRun(taskId: string, roleName: string): void {
+    // Older Controller paths only know the Role key.  When that key points
+    // at a lane-backed Run, remove the matching lane pointer too; preserve
+    // every other lane for the same Role in a multi-lane group.
+    const rolePointer = this.#getActiveRun(taskId, roleName);
     this.#clearActiveRun(taskId, roleName);
+    if (rolePointer === null) return;
+    const laneRows = this.#db.prepare(
+      "SELECT task_id, pointer FROM active_runs WHERE task_id = ?"
+    ).all(taskId) as Array<{ task_id: string; pointer: string }>;
+    for (const row of laneRows) {
+      if (executionLaneActiveRunKeyParts(row.pointer) !== null) {
+        const laneRun = this.#getActiveRun(taskId, row.pointer);
+        if (laneRun !== null && laneRun.id === rolePointer.id) {
+          this.#clearActiveRun(taskId, row.pointer);
+        }
+      }
+    }
   }
 
   getActiveExecutionLaneRun(taskId: string, executionGroupId: string, executionLaneId: string): AgentRun | null {

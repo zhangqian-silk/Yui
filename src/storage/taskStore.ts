@@ -53,6 +53,7 @@ import {
   validateReviewRound,
   type ReviewRound
 } from "../review/reviewRound.js";
+import type { ReviewFinding } from "../review/reviewFinding.js";
 import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
 import {
   assertProjectCatalog,
@@ -236,7 +237,7 @@ function encodeLaneKeyPart(value: string): string {
   return encodeURIComponent(value).replace(/:/gu, "%3A");
 }
 
-function executionLaneActiveRunKeyParts(key: string):
+export function executionLaneActiveRunKeyParts(key: string):
   { executionGroupId: string; executionLaneId: string } | null {
   const match = /^\/execution-lane\/([^:]+):([^:]+)$/u.exec(key);
   if (match === null) return null;
@@ -426,6 +427,10 @@ export type TaskStore = {
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
   saveReviewRound(taskId: string, round: ReviewRound): void;
+  nextReviewFindingId(taskId: string): string;
+  getReviewFinding(taskId: string, reviewFindingId: string): ReviewFinding | null;
+  listReviewFindings(taskId: string): ReviewFinding[];
+  saveReviewFinding(taskId: string, finding: ReviewFinding): void;
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null;
   saveActiveAgentRun(run: AgentRun): void;
   clearActiveAgentRun(taskId: string, roleName: string): void;
@@ -1393,6 +1398,26 @@ export class FileTaskStore implements TaskStore {
       task.reviewRounds[stored.id] = stored;
     });
   }
+  nextReviewFindingId(taskId: string): string {
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
+  }
+  getReviewFinding(taskId: string, reviewFindingId: string): ReviewFinding | null {
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
+  }
+  listReviewFindings(taskId: string): ReviewFinding[] {
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
+  }
+  saveReviewFinding(taskId: string, finding: ReviewFinding): void {
+    throw new StorageRecordError(
+      `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+    );
+  }
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
     const aggregate = this.#state().tasks[taskId];
     const pointer = aggregate?.activeRuns[roleName];
@@ -2048,6 +2073,7 @@ function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
     workItem: 0,
     agentRun: 0,
     reviewRound: 0,
+    reviewFinding: 0,
     changeSet: 0,
     integrationAttempt: 0,
     integrationQueue: 0,
@@ -2555,6 +2581,9 @@ function validateTaskIdHighWaterCoverage(
     workItem: aggregate.workItems,
     agentRun: aggregate.agentRuns,
     reviewRound: aggregate.reviewRounds,
+    // Issue 06 dbonly: review findings are SQLite-native; the file aggregate
+    // never carries them, so coverage is trivially empty.
+    reviewFinding: {},
     changeSet: aggregate.changeSets,
     integrationAttempt: aggregate.integrationAttempts,
     integrationQueue: aggregate.integrationQueue,
@@ -4099,7 +4128,13 @@ function validReviewRoundTransition(
       candidate.taskFinalReviewContract
     )
     || !compatibleExecutionGroups(existing.executionGroup, candidate.executionGroup)
-    || existing.requestedBy !== candidate.requestedBy
+    // Issue 06: a Leader retry resets a failed Task-final Round to pending;
+    // the retry is itself a Leader request, so requestedBy may change from
+    // the original policy/contract value to "leader".
+    || (existing.requestedBy !== candidate.requestedBy
+      && !(existing.status === "failed"
+        && candidate.status === "pending"
+        && (candidate.scope ?? "work-item") === "task"))
     || existing.createdAt !== candidate.createdAt
   ) return false;
   if (existing.status === "pending") {
@@ -4139,6 +4174,27 @@ function validReviewRoundTransition(
     return ["completed", "failed"].includes(candidate.status)
       && existing.reviewerRunId === candidate.reviewerRunId
       && isDeepStrictEqual(existing.workspace, candidate.workspace);
+  }
+  // Issue 06: a failed Task-final execution attempt may be reset to pending
+  // under the same semantic Round ID. AgentRun history remains the attempt
+  // trail; terminal Review metadata is cleared by retryTaskReviewRound.
+  if (existing.status === "failed"
+    && candidate.status === "pending"
+    && (candidate.scope ?? "work-item") === "task") {
+    return candidate.reviewerRunId === undefined
+      && candidate.summary === undefined
+      && candidate.report === undefined
+      && candidate.checks === undefined
+      && candidate.evidenceCommit === undefined
+      && candidate.endedAt === undefined
+      && candidate.workspaceDisposition === undefined
+      && (existing.workspace === undefined
+        || candidate.workspace === undefined
+        || isDeepStrictEqual(existing.workspace, candidate.workspace))
+      && compatibleExecutionGroups(
+        existing.executionGroup,
+        candidate.executionGroup
+      );
   }
   if (existing.status === candidate.status
     && (existing.status === "completed" || existing.status === "failed")) {

@@ -523,12 +523,9 @@ function withoutAnchorCandidate(store, taskId, workItemId) {
   });
 }
 
-test("Leader retries one failed no-Run final ReviewRound without changing old evidence", (t) => {
+test("Leader retries one failed no-Run final ReviewRound under the same Round ID", (t) => {
   const fx = fixture(t);
   const { globalReviewer, round: failedRound } = failFinalReviewBeforeRun(fx);
-  const frozenFailedRound = JSON.stringify(
-    fx.store.getReviewRound(fx.task.id, failedRound.id)
-  );
   fx.store.saveGlobalRole(globalReviewer);
 
   const retried = runTaskCommand(
@@ -540,18 +537,19 @@ test("Leader retries one failed no-Run final ReviewRound without changing old ev
   assert.equal(retried.kind, "output");
   assert.match(retried.output, /Task-final Review retry requested/);
   const rounds = fx.store.listReviewRounds(fx.task.id);
-  assert.equal(rounds.length, 2);
-  const retryRound = rounds[1];
+  // Issue 06: infra retry reuses the same semantic Round ID; no new Round row.
+  assert.equal(rounds.length, 1);
+  const retryRound = rounds[0];
+  assert.equal(retryRound.id, failedRound.id);
   assert.equal(retryRound.status, "pending");
   assert.equal(retryRound.requestedBy, "leader");
   assert.deepEqual(retryRound.taskCandidate, failedRound.taskCandidate);
   assert.equal(retryRound.workItemId, failedRound.workItemId);
   assert.equal(retryRound.candidateId, failedRound.candidateId);
   assert.equal(retryRound.reviewerRoleName, failedRound.reviewerRoleName);
-  assert.equal(
-    JSON.stringify(fx.store.getReviewRound(fx.task.id, failedRound.id)),
-    frozenFailedRound
-  );
+  // The failed attempt's terminal metadata is cleared; candidate identity is preserved.
+  assert.equal(retryRound.report, undefined);
+  assert.equal(retryRound.endedAt, undefined);
 
   const repeated = runTaskCommand(
     ["work", "review", "retry", failedRound.id],
@@ -560,7 +558,7 @@ test("Leader retries one failed no-Run final ReviewRound without changing old ev
   );
   assert.match(repeated.output, /already requested/);
   assert.equal(repeated.data.reviewRound.id, retryRound.id);
-  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
 
   const retryRun = dispatchFinalReview(fx, retryRound);
   assert.equal(retryRun.purpose, "review");
@@ -570,18 +568,17 @@ test("Leader retries one failed no-Run final ReviewRound without changing old ev
     fx.store.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length,
     1
   );
-  const repeatedAfterDispatch = runTaskCommand(
-    ["work", "review", "retry", failedRound.id],
-    fx.store,
-    fx.leaderOptions
+  // After dispatch the Round carries a Reviewer Run; `task review retry`
+  // correctly defers to `task run retry` for that path.
+  assert.throws(
+    () => runTaskCommand(
+      ["work", "review", "retry", failedRound.id],
+      fx.store,
+      fx.leaderOptions
+    ),
+    /has Reviewer Run .*use task run retry/i
   );
-  assert.match(repeatedAfterDispatch.output, /already requested/);
-  assert.equal(repeatedAfterDispatch.data.reviewRound.id, retryRound.id);
-  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
-  assert.equal(
-    JSON.stringify(fx.store.getReviewRound(fx.task.id, failedRound.id)),
-    frozenFailedRound
-  );
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
 });
 
 test("no-Run final Review retry is exact-Leader-only and rejects nonfailed or nonfinal Rounds", (t) => {
@@ -616,13 +613,38 @@ test("no-Run final Review retry is exact-Leader-only and rejects nonfailed or no
     pending.leaderOptions
   );
   const pendingRound = pending.store.listReviewRounds(pending.task.id)[0];
+  // Issue 06: a pending Round is the idempotent retry result, not an error.
+  const pendingRetry = runTaskCommand(
+    ["work", "review", "retry", pendingRound.id],
+    pending.store,
+    pending.leaderOptions
+  );
+  assert.equal(pendingRetry.kind, "output");
+  assert.match(pendingRetry.output, /already requested/);
+  assert.equal(pendingRetry.data.reviewRound.id, pendingRound.id);
+  assert.equal(pending.store.listReviewRounds(pending.task.id).length, 1);
+
+  const completed = fixture(t);
+  runTaskCommand(
+    ["complete", completed.task.id, "--summary", "request completed review"],
+    completed.store,
+    completed.leaderOptions
+  );
+  const completedRound = completed.store.listReviewRounds(completed.task.id)[0];
+  finishFinalReviewRun(
+    completed,
+    dispatchFinalReview(completed, completedRound),
+    "yielded",
+    "green",
+    { report: "green", checks: [] }
+  );
   assert.throws(
     () => runTaskCommand(
-      ["work", "review", "retry", pendingRound.id],
-      pending.store,
-      pending.leaderOptions
+      ["work", "review", "retry", completedRound.id],
+      completed.store,
+      completed.leaderOptions
     ),
-    /not retryable from pending/i
+    /not retryable from completed/i
   );
 
   const withRun = fixture(t);
@@ -1510,7 +1532,7 @@ test("an unchanged failed final ReviewRound does not duplicate or unblock comple
   assert.equal(store.getTask(task.id).status, "active");
 });
 
-test("retrying an exact failed final Review Run creates one independent Round for the unchanged candidate", (t) => {
+test("retrying an exact failed final Review Run reuses the same Round ID for the unchanged candidate", (t) => {
   const fx = fixture(t);
   runTaskCommand(
     ["complete", fx.task.id, "--summary", "request final review"],
@@ -1519,6 +1541,7 @@ test("retrying an exact failed final Review Run creates one independent Round fo
   );
   const firstRound = fx.store.listReviewRounds(fx.task.id)[0];
   const firstRun = dispatchFinalReview(fx, firstRound);
+  const dispatchedRound = fx.store.getReviewRound(fx.task.id, firstRound.id);
   finishFinalReviewRun(
     fx,
     firstRun,
@@ -1529,12 +1552,6 @@ test("retrying an exact failed final Review Run creates one independent Round fo
       checks: [{ name: "focused review", outcome: "failed" }],
       evidenceCommit: "f".repeat(40)
     }
-  );
-  const frozenFailedRound = structuredClone(
-    fx.store.getReviewRound(fx.task.id, firstRound.id)
-  );
-  const frozenFailedWorkspace = structuredClone(
-    fx.store.getReviewRoundWorkspace(fx.task.id, firstRound.id)
   );
   const retryOptions = {
     ...fx.leaderOptions,
@@ -1550,21 +1567,20 @@ test("retrying an exact failed final Review Run creates one independent Round fo
   assert.equal(retried.kind, "output");
   assert.match(retried.output, /Review retry requested/);
   const rounds = fx.store.listReviewRounds(fx.task.id);
-  assert.equal(rounds.length, 2);
-  const retryRound = rounds[1];
+  // Issue 06: infra retry reuses the same semantic Round ID; no new Round row.
+  assert.equal(rounds.length, 1);
+  const retryRound = rounds[0];
+  assert.equal(retryRound.id, firstRound.id);
   assert.equal(retryRound.status, "pending");
-  assert.notEqual(retryRound.id, firstRound.id);
   assert.equal(retryRound.requestedBy, "leader");
   assert.deepEqual(retryRound.taskCandidate, firstRound.taskCandidate);
-  assert.equal(retryRound.workspace, undefined);
-  assert.deepEqual(
-    fx.store.getReviewRound(fx.task.id, firstRound.id),
-    frozenFailedRound
-  );
-  assert.deepEqual(
-    fx.store.getReviewRoundWorkspace(fx.task.id, firstRound.id),
-    frozenFailedWorkspace
-  );
+  assert.deepEqual(retryRound.workspace, dispatchedRound.workspace);
+  assert.equal(retryRound.executionGroup?.id, dispatchedRound.executionGroup?.id);
+  assert.equal(retryRound.executionGroup?.lanes[0]?.status, "pending");
+  assert.equal(retryRound.executionGroup?.lanes[0]?.runId, undefined);
+  // The failed attempt's terminal metadata is cleared; candidate identity is preserved.
+  assert.equal(retryRound.report, undefined);
+  assert.equal(retryRound.endedAt, undefined);
 
   const repeated = runTaskCommand(
     ["run", "retry", firstRun.id],
@@ -1573,11 +1589,10 @@ test("retrying an exact failed final Review Run creates one independent Round fo
   );
   assert.equal(repeated.kind, "output");
   assert.equal(repeated.data.reviewRound.id, retryRound.id);
-  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
 
   const retryRun = dispatchFinalReview(fx, retryRound);
   const runningRetryRound = fx.store.getReviewRound(fx.task.id, retryRound.id);
-  assert.notEqual(runningRetryRound.workspace.root, frozenFailedRound.workspace.root);
   assert.deepEqual(runningRetryRound.workspace.owner, {
     type: "review-round",
     taskId: fx.task.id,
@@ -1590,7 +1605,7 @@ test("retrying an exact failed final Review Run creates one independent Round fo
   );
   assert.equal(repeatedAfterDispatch.kind, "output");
   assert.equal(repeatedAfterDispatch.data.reviewRound.id, retryRound.id);
-  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
   finishFinalReviewRun(fx, retryRun, "yielded", "final review passed");
   assert.equal(fx.store.getTask(fx.task.id).status, "active");
   const completed = runTaskCommand(
@@ -1601,10 +1616,6 @@ test("retrying an exact failed final Review Run creates one independent Round fo
   assert.equal(completed.kind, "output");
   assert.match(completed.output, /Completed task/);
   assert.equal(fx.store.getTask(fx.task.id).status, "completed");
-  assert.deepEqual(
-    fx.store.getReviewRound(fx.task.id, firstRound.id),
-    frozenFailedRound
-  );
 });
 
 test("retrying a failed final Review Run repairs its exact stranded running Round", (t) => {
@@ -1642,25 +1653,19 @@ test("retrying a failed final Review Run repairs its exact stranded running Roun
   assert.equal(retried.kind, "output");
   assert.match(retried.output, /Review retry requested/);
   const rounds = fx.store.listReviewRounds(fx.task.id);
-  assert.equal(rounds.length, 2);
+  // Issue 06: the stranded running Round is terminalized and reset to pending
+  // under the same semantic Round ID; no new Round row is created.
+  assert.equal(rounds.length, 1);
   const repairedRound = fx.store.getReviewRound(fx.task.id, firstRound.id);
-  assert.deepEqual(repairedRound, {
-    ...frozenRunningRound,
-    status: "failed",
-    summary: EXITED_REVIEW_SUMMARY,
-    report: EXITED_REVIEW_SUMMARY,
-    checks: [],
-    endedAt: retryNow.toISOString()
-  });
-  assert.deepEqual(
-    fx.store.getReviewRoundWorkspace(fx.task.id, firstRound.id),
-    frozenWorkspace
-  );
-  const retryRound = rounds[1];
+  assert.equal(repairedRound.id, firstRound.id);
+  assert.equal(repairedRound.status, "pending");
+  assert.equal(repairedRound.requestedBy, "leader");
+  assert.deepEqual(repairedRound.taskCandidate, frozenRunningRound.taskCandidate);
+  assert.deepEqual(repairedRound.workspace, frozenRunningRound.workspace);
+  assert.equal(repairedRound.report, undefined);
+  assert.equal(repairedRound.endedAt, undefined);
+  const retryRound = repairedRound;
   assert.equal(retryRound.status, "pending");
-  assert.equal(retryRound.requestedBy, "leader");
-  assert.deepEqual(retryRound.taskCandidate, frozenRunningRound.taskCandidate);
-  assert.equal(retryRound.workspace, undefined);
 
   const repeated = runTaskCommand(
     ["run", "retry", firstRun.id],
@@ -1669,11 +1674,7 @@ test("retrying a failed final Review Run repairs its exact stranded running Roun
   );
   assert.equal(repeated.kind, "output");
   assert.equal(repeated.data.reviewRound.id, retryRound.id);
-  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 2);
-  assert.deepEqual(
-    fx.store.getReviewRound(fx.task.id, firstRound.id),
-    repairedRound
-  );
+  assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
 });
 
 test("settling an obsolete stranded final Review closes it without retrying before latest-head review", (t) => {
@@ -1917,7 +1918,7 @@ test("stranded final Review retry fails closed for a nonmatching failed Run", (t
   assert.equal(fx.store.listReviewRounds(fx.task.id).length, 1);
 });
 
-test("stranded final Review retry preserves the old Round when a newer Reviewer Run is active", (t) => {
+test("stranded final Review retry preserves the old Round when a newer Reviewer Run or Round is active", (t) => {
   const fx = fixture(t);
   runTaskCommand(
     ["complete", fx.task.id, "--summary", "request final review"],
@@ -1943,7 +1944,7 @@ test("stranded final Review retry preserves the old Round when a newer Reviewer 
       fx.store,
       fx.leaderOptions
     ),
-    /already has an active run/i
+    /already has an active run|active Task-final ReviewRound/i
   );
   assert.deepEqual(
     fx.store.getReviewRound(fx.task.id, firstRound.id),

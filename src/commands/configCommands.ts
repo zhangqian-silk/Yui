@@ -6,7 +6,9 @@ import {
 import { resolveTimeZone } from "../output/timePresentation.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 import {
+  REVIEW_FINDING_LEDGER_MODES,
   REVIEW_TRIGGERS,
+  type ReviewFindingLedgerMode,
   type ReviewTrigger
 } from "../review/reviewConfig.js";
 
@@ -69,7 +71,7 @@ function runReviewConfigCommand(args: string[], store: ConfigCommandStore): stri
     const review = store.getConfig().review;
     return review === undefined
       ? "Review: disabled\n"
-      : `Review: ${review.roleName} (${review.trigger})\n`;
+      : `Review: ${review.roleName} (${review.trigger}; finding ledger: ${review.findingLedger ?? "shadow"})\n`;
   }
   if (command === "clear") {
     if (rest.length !== 0) throw usageError("Config review clear usage: yui config review clear.");
@@ -81,13 +83,14 @@ function runReviewConfigCommand(args: string[], store: ConfigCommandStore): stri
   }
   if (command === "set") {
     const usage = "Config review set usage: "
-      + "yui config review set --role <global-role> --trigger <always|leader|final>.";
-    if (rest.length !== 4) throw usageError(usage);
+      + "yui config review set --role <global-role> --trigger <always|leader|final> "
+      + "[--finding-ledger <shadow|enforce>].";
+    if (rest.length !== 4 && rest.length !== 6) throw usageError(usage);
     const options = new Map<string, string>();
     for (let index = 0; index < rest.length; index += 2) {
       const name = rest[index];
       const value = rest[index + 1];
-      if (!["--role", "--trigger"].includes(name)
+      if (!["--role", "--trigger", "--finding-ledger"].includes(name)
         || value === undefined
         || options.has(name)) {
         throw usageError(usage);
@@ -105,13 +108,25 @@ function runReviewConfigCommand(args: string[], store: ConfigCommandStore): stri
       throw usageError(`Global Role not found: ${roleName}.`);
     }
     const trigger = rawTrigger as ReviewTrigger;
+    const rawLedgerMode = options.get("--finding-ledger")?.trim();
+    let findingLedger: ReviewFindingLedgerMode | undefined;
+    if (rawLedgerMode !== undefined) {
+      if (!REVIEW_FINDING_LEDGER_MODES.includes(rawLedgerMode as ReviewFindingLedgerMode)) {
+        throw usageError(usage);
+      }
+      findingLedger = rawLedgerMode as ReviewFindingLedgerMode;
+    }
     store.transaction((tx) => {
       tx.saveConfig({
         ...tx.getConfig(),
-        review: { roleName, trigger }
+        review: {
+          roleName,
+          trigger,
+          ...(findingLedger === undefined ? {} : { findingLedger })
+        }
       });
     });
-    return `Review set to ${roleName} (${trigger})\n`;
+    return `Review set to ${roleName} (${trigger}; finding ledger: ${findingLedger ?? "shadow"})\n`;
   }
   throw usageError(command === undefined
     ? "Config review command is required."
