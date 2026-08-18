@@ -325,6 +325,29 @@ test("P1-4 orchestrator: an ambiguous switch blocks at switch-ambiguous, records
     "no completion receipt is written for a switch that did not commit");
 });
 
+test("P1-4 SQLite ambiguous switch restore command targets yui.db, not the Home directory", async () => {
+  const { home } = healthyLayout7Home();
+  const { latest, registry } = migratableSetup();
+  const result = await runStorageUpgrade({
+    home, registry, latest, mode: "execute",
+    stopController: async () => {},
+    now: () => new Date("2026-08-06T12:00:00.000Z"),
+    renameImpl: () => { throw new Error("injected two-way rename failure"); }
+  });
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.stage, "switch-ambiguous");
+  // A SQLite backup is the committed yui.db file moved aside INSIDE the Home;
+  // the restore command must rename it back onto yui.db, not onto the Home
+  // directory (which would nest the file).
+  const stamp = "2026-08-06T12-00-00-000Z";
+  const backupPath = join(home, `yui.db.backup-${stamp}`);
+  const committedDbPath = join(home, "yui.db");
+  assert.ok(
+    result.action.includes(`mv "${backupPath}" "${committedDbPath}"`),
+    `expected SQLite restore command targeting yui.db, got: ${result.action}`
+  );
+});
+
 test("P1-4 update: a switch-ambiguous activation is NOT reported recoverable; it points at the backup", () => {
   // The staged binary's `yui upgrade` returns a switch-ambiguous blocked result;
   // `yui update` must treat it as ambiguous (restore the backup), never a clean

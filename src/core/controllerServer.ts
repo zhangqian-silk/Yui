@@ -43,6 +43,7 @@ import {
   type ControllerStatusTelemetry
 } from "./controllerTelemetry.js";
 import {
+  parseLinuxProcessStartIdentity,
   removeEphemeralDomainIdentity,
   readEphemeralDomainIdentity,
   writeEphemeralDomainIdentity,
@@ -141,6 +142,12 @@ async function startControllerServerLocked(
     ?? resolveTaskStoreBackendForHome(home, process.env);
   const workerEnabled = options.workerEnabled
     ?? resolveStoreWorkerEnabledForHome(home, process.env);
+  // The primary identity receipt is captured at startup and re-published on a
+  // handover rollback: the candidate overwrites runtime-identity.json while it
+  // runs, and after the rollback kills the candidate the file must not keep
+  // pointing at the dead candidate's release/PID. The old Controller is still
+  // the live primary, so its startup identity is still truthful.
+  let primaryIdentity: RuntimeIdentityReceipt | null = null;
   const netServer = createServer((socket) => {
     receiveRequest(
       socket,
@@ -150,7 +157,8 @@ async function startControllerServerLocked(
       options.status,
       telemetry,
       handover,
-      home
+      home,
+      () => primaryIdentity
     );
   });
 
@@ -186,7 +194,7 @@ async function startControllerServerLocked(
     // Issue 02: every Controller start publishes its provenance. The receipt
     // is the stable, file-based identity that survives a Controller stop and
     // backs the read-only `controller identity --json` command.
-    writeRuntimeIdentity(home, buildRuntimeIdentityReceipt({
+    primaryIdentity = buildRuntimeIdentityReceipt({
       home,
       release,
       storageBackend,
@@ -194,7 +202,8 @@ async function startControllerServerLocked(
       processStartIdentity,
       mode: "primary",
       dualOwner: false
-    }));
+    });
+    writeRuntimeIdentity(home, primaryIdentity);
 
     let resolveClosed: () => void = () => undefined;
     const closed = new Promise<void>((resolve) => {
@@ -267,7 +276,8 @@ function receiveRequest(
   status: ((telemetry: ControllerStatusTelemetry) => JsonValue) | undefined,
   telemetry: ControllerStatusTelemetry,
   handover: ControllerHandoverState,
-  home: string
+  home: string,
+  getPrimaryIdentity: () => RuntimeIdentityReceipt | null
 ): void {
   let buffer = Buffer.alloc(0);
   let complete = false;
@@ -306,7 +316,8 @@ function receiveRequest(
       status,
       telemetry,
       handover,
-      home
+      home,
+      getPrimaryIdentity
     );
   });
   socket.on("end", () => {
@@ -324,7 +335,8 @@ async function routeRequest(
   status: ((telemetry: ControllerStatusTelemetry) => JsonValue) | undefined,
   telemetry: ControllerStatusTelemetry,
   handover: ControllerHandoverState,
-  home: string
+  home: string,
+  getPrimaryIdentity: () => RuntimeIdentityReceipt | null
 ): Promise<void> {
   let request;
   try {
@@ -641,6 +653,14 @@ async function routeRequest(
       }));
     }
     handover.fence = null;
+    // The candidate overwrote runtime-identity.json while it ran; now that the
+    // handover is rolled back and the candidate is dead, restore this
+    // Controller's primary identity so the file does not keep pointing at the
+    // dead candidate's release/PID.
+    const primaryIdentity = getPrimaryIdentity();
+    if (primaryIdentity !== null) {
+      writeRuntimeIdentity(home, primaryIdentity);
+    }
     send({
       id: request.id,
       ok: true,
@@ -791,17 +811,10 @@ function readActiveReleasePointerSafe(home: string): ActiveReleasePointer | null
 function readLinuxProcessStartIdentitySync(pid: number): string {
   // The async /proc reader is used at startup; handover RPCs need a sync
   // identity to keep the request handler simple. Both parse the same field.
-  const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-  const closingParenthesis = stat.lastIndexOf(")");
-  if (closingParenthesis < 0) {
-    throw new Error(`Cannot read Controller process identity for PID ${pid}.`);
-  }
-  const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
-  const processStartIdentity = fieldsAfterCommand[19];
-  if (
-    processStartIdentity === undefined
-    || !/^[0-9]{1,32}$/u.test(processStartIdentity)
-  ) {
+  const processStartIdentity = parseLinuxProcessStartIdentity(
+    readFileSync(`/proc/${pid}/stat`, "utf8")
+  );
+  if (processStartIdentity === undefined) {
     throw new Error(`Cannot read Controller process identity for PID ${pid}.`);
   }
   return processStartIdentity;
@@ -1113,17 +1126,10 @@ function isProcessAlive(pid: number): boolean {
 }
 
 async function readLinuxProcessStartIdentity(pid: number): Promise<string> {
-  const stat = await readFile(`/proc/${pid}/stat`, "utf8");
-  const closingParenthesis = stat.lastIndexOf(")");
-  if (closingParenthesis < 0) {
-    throw new Error(`Cannot read Controller process identity for PID ${pid}.`);
-  }
-  const fieldsAfterCommand = stat.slice(closingParenthesis + 1).trim().split(/\s+/u);
-  const processStartIdentity = fieldsAfterCommand[19];
-  if (
-    processStartIdentity === undefined
-    || !/^[0-9]{1,32}$/u.test(processStartIdentity)
-  ) {
+  const processStartIdentity = parseLinuxProcessStartIdentity(
+    await readFile(`/proc/${pid}/stat`, "utf8")
+  );
+  if (processStartIdentity === undefined) {
     throw new Error(`Cannot read Controller process identity for PID ${pid}.`);
   }
   return processStartIdentity;

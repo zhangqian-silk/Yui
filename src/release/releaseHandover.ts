@@ -38,7 +38,15 @@ import {
 export const DEFAULT_CANDIDATE_READY_TIMEOUT_MS = 30_000;
 export const DEFAULT_PROMOTION_TIMEOUT_MS = 45_000;
 export const DEFAULT_POLL_INTERVAL_MS = 100;
-export const DEFAULT_DUAL_OWNER_GRACE_MS = 5_000;
+/**
+ * Optional confirmation debounce after the candidate latches `dualOwner:
+ * true`. Defaults to 0: the candidate's own exit grace
+ * (`DEFAULT_DUAL_OWNER_GRACE_MS` in `handoverCandidate.ts`, 30s) is the single
+ * authoritative old-owner exit window, and the activator trusts the candidate's
+ * latched signal. A non-zero value only adds a short extra confirmation before
+ * reporting dual-owner; it must never be used to re-litigate the exit grace.
+ */
+export const DEFAULT_DUAL_OWNER_GRACE_MS = 0;
 
 export type ReleaseActivatePorts = Readonly<{
   /** Authenticated Controller RPC. */
@@ -63,8 +71,9 @@ export type ReleaseActivateOptions = Readonly<{
   promotionTimeoutMs?: number;
   pollIntervalMs?: number;
   /**
-   * Grace window a committed candidate waits for a stuck old owner before
-   * declaring dual-owner. Defaults to 5s.
+   * Optional confirmation debounce after the candidate latches dual-owner.
+   * Defaults to 0 (trust the candidate's latched signal immediately). The
+   * candidate's own 30s exit grace is the authoritative old-owner window.
    */
   dualOwnerGraceMs?: number;
 }>;

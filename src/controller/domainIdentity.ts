@@ -381,16 +381,25 @@ export function ephemeralDomainFingerprint(
   ].join(":");
 }
 
+/**
+ * Parses the process start identity (field 20, `starttime`) from the content
+ * of a Linux `/proc/<pid>/stat` file. Shared by every reader so the parsing
+ * (including the `comm` field's embedded spaces/parentheses) is defined once.
+ * Returns undefined when the content is not a recognizable stat line.
+ */
+export function parseLinuxProcessStartIdentity(statContent: string): string | undefined {
+  const closing = statContent.lastIndexOf(")");
+  if (closing < 0) return undefined;
+  const identity = statContent.slice(closing + 1).trim().split(/\s+/u)[19];
+  return identity !== undefined && /^[0-9]{1,32}$/u.test(identity)
+    ? identity
+    : undefined;
+}
+
 export function readLinuxProcessStartIdentity(pid: number): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const closing = stat.lastIndexOf(")");
-    if (closing < 0) return undefined;
-    const identity = stat.slice(closing + 1).trim().split(/\s+/u)[19];
-    return identity !== undefined && /^[0-9]{1,32}$/u.test(identity)
-      ? identity
-      : undefined;
+    return parseLinuxProcessStartIdentity(readFileSync(`/proc/${pid}/stat`, "utf8"));
   } catch {
     return undefined;
   }

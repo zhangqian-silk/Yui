@@ -17,6 +17,8 @@ import { join } from "node:path";
 import test, { after } from "node:test";
 
 import { readLinuxProcessStartIdentity } from "../../dist/controller/domainIdentity.js";
+import { startFileTaskControllerRuntime } from "../../dist/controller/runtime.js";
+import { callController } from "../../dist/core/controllerClient.js";
 import { activateRelease } from "../../dist/release/releaseHandover.js";
 import {
   isOwnerLive,
@@ -32,6 +34,8 @@ import {
   writeHandoverReceipt,
   writeRuntimeIdentity
 } from "../../dist/release/runtimeRelease.js";
+import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { FileTaskStore } from "../../dist/storage/taskStore.js";
 
 const liveProcesses = [];
 
@@ -551,3 +555,52 @@ function writeActiveReleasePointerFixture(home, releaseId, manifest) {
     activatedAt: new Date().toISOString()
   }));
 }
+
+test("rollback-handover restores the primary runtime identity after a candidate overwrote it", async () => {
+  const home = mkdtempSync(join(tmpdir(), "yui-handover-identity-"));
+  ensureStorageSchema(home);
+  new FileTaskStore(home).saveConfig({
+    schemaVersion: 1,
+    defaultWorkspace: `${home}-workspace`
+  });
+  const controller = await startFileTaskControllerRuntime(home, {
+    intervalMs: 60_000
+  });
+  const candidateProc = spawnLiveProcess();
+  try {
+    // The Controller published its primary identity at startup.
+    const before = readRuntimeIdentity(home);
+    assert.equal(before.mode, "primary");
+    assert.equal(before.pid, process.pid);
+
+    // A handover candidate overwrites the identity while it runs.
+    writeRuntimeIdentity(home, identityReceipt({
+      pid: candidateProc.pid,
+      startIdentity: candidateProc.startIdentity,
+      buildId: "0.6.0-candidate",
+      version: "0.6.0",
+      mode: "candidate",
+      dualOwner: false
+    }));
+    assert.equal(readRuntimeIdentity(home).mode, "candidate");
+
+    // The activator rolls the handover back; the old Controller must restore
+    // its primary identity so the file does not point at the dead candidate.
+    const handoverId = "test-rollback-identity";
+    await callController(home, "controller.begin-handover", {
+      handoverId,
+      fromReleaseId: "0.6.0-old",
+      toReleaseId: "0.6.0-candidate"
+    });
+    await callController(home, "controller.rollback-handover", { handoverId });
+
+    const after = readRuntimeIdentity(home);
+    assert.equal(after.mode, "primary");
+    assert.equal(after.pid, process.pid);
+    assert.equal(after.buildId, before.buildId);
+  } finally {
+    candidateProc.kill();
+    await controller.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
