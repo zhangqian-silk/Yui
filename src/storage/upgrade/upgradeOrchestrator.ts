@@ -1306,6 +1306,38 @@ function executePseudoLayout7RepairFenced(
     };
   }
 
+  // Fail closed: the repair promoted a healthy yui.db, but the pure version
+  // classifier still fences this Home (a future/pre-baseline record axis, or
+  // structural damage). Reporting "upgraded" would hide a blocker the old
+  // pure-classifier route surfaced before the physical-backend check moved
+  // ahead of it; the Controller's strict schema gate would then fail at
+  // startup with a less precise diagnosis. The repaired database is healthy,
+  // so a newer build (or a restored backup) can still proceed from here.
+  const postRepairVerdict = postRepairClassification.classification.verdict;
+  if (
+    postRepairVerdict === "NEEDS_NEW_VERSION"
+    || postRepairVerdict === "CORRUPTED"
+  ) {
+    const detail = postRepairVerdict === "CORRUPTED"
+      ? postRepairClassification.classification.detail
+      : postRepairClassification.classification.blocker.message;
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: postRepairVerdict === "CORRUPTED" ? "post-verify" : "missing-step",
+        message:
+          postRepairVerdict === "CORRUPTED"
+            ? `The repaired database is structurally damaged: ${detail}`
+            : `The repaired database still cannot be migrated by this build: ${detail}`,
+        action:
+          postRepairVerdict === "CORRUPTED"
+            ? "Restore the Home from a backup; do not start a Controller against the repaired database."
+            : "Install a newer Yui release and re-run `yui upgrade`; the repaired database is healthy and ready for the record migration."
+      },
+      postRepairClassification
+    );
+  }
+
   // Write the temporary upgrade receipt (for the update flow's ambiguity
   // window); it is cleared by the caller after the Controller restarts.
   options.postSwitchFaultHook?.("receipt-write");
