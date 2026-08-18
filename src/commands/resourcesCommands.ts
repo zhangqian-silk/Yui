@@ -71,6 +71,7 @@ async function runGcCommand(
   const projects = store.listProjects();
   const managedWorkspaces = collectManagedWorkspaces(store);
   const taskStatusById = collectTaskStatuses(store);
+  const activeWorkspaceOwnerPaths = collectActiveWorkspaceOwnerPaths(store);
 
   if (action === "restore") {
     const result = await restoreAllResourceGc(home, { now });
@@ -103,7 +104,8 @@ async function runGcCommand(
     taskStatusById,
     mode,
     now,
-    quarantineTtlHours: ttlHours
+    quarantineTtlHours: ttlHours,
+    activeWorkspaceOwnerPaths
   });
 
   if (action === "apply" && mode === "quarantine") {
@@ -115,7 +117,8 @@ async function runGcCommand(
       taskStatusById,
       mode,
       now,
-      quarantineTtlHours: ttlHours
+      quarantineTtlHours: ttlHours,
+      activeWorkspaceOwnerPaths
     }, plan);
     return {
       output: renderApplyResult(result),
@@ -165,6 +168,20 @@ function collectTaskStatuses(store: TaskStore): Map<string, string> {
     statuses.set(task.id, task.status);
   }
   return statuses;
+}
+
+/** Workspace paths claimed by active durable Jobs (AgentRuns). */
+function collectActiveWorkspaceOwnerPaths(store: TaskStore): string[] {
+  const paths: string[] = [];
+  for (const task of store.listTasks()) {
+    for (const run of store.listAgentRuns(task.id)) {
+      if (run.status !== "active") continue;
+      const workspace = run.workspace;
+      if (workspace === undefined) continue;
+      paths.push(workspace.root, ...workspace.entries.map((entry) => entry.path));
+    }
+  }
+  return paths;
 }
 
 function renderPlan(plan: GcPlan, action: GcAction): string {

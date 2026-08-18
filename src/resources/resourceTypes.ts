@@ -79,7 +79,7 @@ export type ResourceQuarantineState = Readonly<{
 
 export type ResourceCleanupReceipt = Readonly<{
   removedAt: string;
-  method: "git-worktree-remove" | "quarantine-purge";
+  method: "git-worktree-remove" | "quarantine-purge" | "runtime-cleanup";
 }>;
 
 export type ResourceRecord = Readonly<{

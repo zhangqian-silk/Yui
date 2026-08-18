@@ -34,6 +34,7 @@ import {
   createManagedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
+import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
 
 const executeFile = promisify(execFile);
 
@@ -112,6 +113,7 @@ export class GitIntegrationService {
   readonly worktreeRoot: string;
   readonly environment: NodeJS.ProcessEnv;
   readonly runtimeIsolation: TaskRuntimeIsolationPort;
+  #resourceRegistrarValue: ResourceRegistrar | undefined;
 
   constructor(
     home: string,
@@ -126,6 +128,10 @@ export class GitIntegrationService {
     this.worktreeRoot = resolveWorktreeRoot(home, store.getConfig().defaultWorkspace);
     this.environment = { ...environment };
     this.runtimeIsolation = runtimeIsolation;
+  }
+
+  #resourceRegistrar(): ResourceRegistrar {
+    return this.#resourceRegistrarValue ??= new ResourceRegistrar(this.home, this.now);
   }
 
   async integrate(
@@ -187,6 +193,7 @@ export class GitIntegrationService {
           baseCommit: prepared.baseCommit
         }]
       }, this.now());
+      this.#resourceRegistrar().registerManagedWorkspace(managedWorkspace);
       this.store.saveManagedWorkspace(managedWorkspace);
     } catch (error) {
       return this.#fail(initial, error, "integration-preparation");
@@ -357,6 +364,9 @@ export class GitIntegrationService {
         discardChanges: integration.status === "failed"
       });
       if (result !== "dirty") {
+        if (managedWorkspace !== null) {
+          this.#resourceRegistrar().markWorkspaceDeleted(managedWorkspace);
+        }
         await rm(integrationCheckDirectory(this.home, task.id, integration.id), {
           recursive: true,
           force: true

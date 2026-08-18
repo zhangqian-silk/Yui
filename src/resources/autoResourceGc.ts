@@ -18,7 +18,10 @@ import {
   planResourceGc,
   type GcResult
 } from "./resourceGc.js";
-import { resolveResourcesGcAutoQuarantine } from "../config/yuiConfig.js";
+import {
+  resolveResourcesGcAutoQuarantine,
+  resolveResourcesGcMode
+} from "../config/yuiConfig.js";
 
 export type ResourceAutoGcHook = () => Promise<Readonly<{
   skipped: boolean;
@@ -40,7 +43,7 @@ export function createResourceAutoGc(options: {
   return async () => {
     const config = store.getConfig();
     const autoQuarantine = resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine);
-    if (!autoQuarantine || config.resourcesGcMode !== "quarantine") {
+    if (!autoQuarantine || resolveResourcesGcMode(config.resourcesGcMode) !== "quarantine") {
       return { skipped: true, applied: 0, failed: 0, restored: 0 };
     }
     const now = new Date();
@@ -54,7 +57,8 @@ export function createResourceAutoGc(options: {
       taskStatusById,
       mode: "quarantine" as const,
       now,
-      environment
+      environment,
+      activeWorkspaceOwnerPaths: collectActiveWorkspaceOwnerPaths(store)
     };
     const plan = await planResourceGc(input);
     const result = await applyResourceGc(input, plan);
@@ -87,7 +91,7 @@ export async function runAutoResourceGc(
   if (!autoQuarantine) {
     return { ran: false, reason: "auto-quarantine is disabled" };
   }
-  const gcMode = config.resourcesGcMode ?? "report";
+  const gcMode = resolveResourcesGcMode(config.resourcesGcMode);
   if (gcMode !== "quarantine") {
     return { ran: false, reason: "resources.gcMode is not quarantine" };
   }
@@ -104,7 +108,8 @@ export async function runAutoResourceGc(
     managedWorkspaces,
     taskStatusById,
     mode: "quarantine" as const,
-    now
+    now,
+    activeWorkspaceOwnerPaths: collectActiveWorkspaceOwnerPaths(store)
   };
 
   const plan = await planResourceGc(input);
@@ -126,4 +131,22 @@ function collectTaskStatuses(store: TaskStore): Map<string, string> {
     statuses.set(task.id, task.status);
   }
   return statuses;
+}
+
+/**
+ * Workspace paths claimed by active durable Jobs. An active AgentRun still
+ * holds its workspace even after the managed workspace record is gone, so
+ * those paths stay protected until the Run finishes.
+ */
+function collectActiveWorkspaceOwnerPaths(store: TaskStore): string[] {
+  const paths: string[] = [];
+  for (const task of store.listTasks()) {
+    for (const run of store.listAgentRuns(task.id)) {
+      if (run.status !== "active") continue;
+      const workspace = run.workspace;
+      if (workspace === undefined) continue;
+      paths.push(workspace.root, ...workspace.entries.map((entry) => entry.path));
+    }
+  }
+  return paths;
 }

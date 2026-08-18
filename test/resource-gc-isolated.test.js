@@ -9,7 +9,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
@@ -23,7 +23,20 @@ import {
   restoreAllResourceGc
 } from "../dist/resources/resourceGc.js";
 import { runAutoResourceGc } from "../dist/resources/autoResourceGc.js";
-import { loadResourceRegistry } from "../dist/resources/resourceRegistry.js";
+import {
+  emptyResourceRegistry,
+  loadResourceRegistry,
+  saveResourceRegistry,
+  upsertResourceRecord
+} from "../dist/resources/resourceRegistry.js";
+import { createResourceRecord } from "../dist/resources/resourceTypes.js";
+import { writeRuntimeIdentity } from "../dist/release/runtimeRelease.js";
+import { readLinuxProcessStartIdentity } from "../dist/controller/domainIdentity.js";
+import {
+  createExactTaskRuntimeDescriptor,
+  exactTaskRuntimeDescriptorPath,
+  serializeExactDescriptor
+} from "../dist/runtime/exactControlPlane.js";
 
 const now = new Date("2026-08-17T00:00:00.000Z");
 
@@ -101,6 +114,7 @@ test("GC quarantines clean unreferenced worktree and purges after TTL", async ()
     assert.equal(result.applied.length, 1);
     assert.equal(result.applied[0].disposition, "quarantined");
     assert.ok(!existsSync(wtPath), "worktree should be removed from original path");
+    assert.ok(existsSync(result.applied[0].quarantine.path), "worktree should be moved to quarantine");
 
     // Purge before TTL: should not delete.
     const earlyPurge = await purgeResourceQuarantine(home, {
@@ -116,6 +130,8 @@ test("GC quarantines clean unreferenced worktree and purges after TTL", async ()
     });
     assert.equal(latePurge.purged.length, 1);
     assert.equal(latePurge.purged[0].disposition, "deleted");
+    assert.ok(!existsSync(result.applied[0].quarantine.path), "quarantined worktree should be removed");
+    assert.ok(!git(["worktree", "list", "--porcelain"], repo).includes(result.applied[0].quarantine.path));
 
     // Registry should record the deletion.
     const registry = loadResourceRegistry(home);
@@ -266,6 +282,204 @@ test("GC blocks on live process cwd", async () => {
   }
 });
 
+test("GC retains candidates when a live-reference source fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-tmux-fail-"));
+  try {
+    const repo = createGitRepo(join(root, "repo"));
+    const { home, store } = createHomeWithStore(root);
+    const project = createProject("project-1", "Test", repo, {
+      stable: "main",
+      development: "main"
+    }, now, { ownership: "external" });
+    store.transaction((tx) => tx.saveProject(project));
+    const task = createTask("task-1", "Test task", now, { projectBindings: [{ projectId: project.id, directory: "repo", baseRef: "main" }] });
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+
+    const wtPath = join(root, "worktrees", "task-1", "main");
+    mkdirSync(join(root, "worktrees", "task-1"), { recursive: true });
+    git(["worktree", "add", wtPath, "-b", "yui/task-1-abcdef12/main"], repo);
+
+    const gcInput = {
+      home,
+      projects: store.listProjects(),
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now,
+      liveReferencePorts: {
+        tmuxPaneCwds: async () => {
+          throw new Error("tmux namespace unavailable");
+        }
+      }
+    };
+    const plan = await planResourceGc(gcInput);
+    const wtRecord = plan.records.find((record) => record.path === wtPath);
+    assert.ok(wtRecord);
+    assert.equal(wtRecord.disposition, "retained-unproven");
+    assert.ok(plan.scan.diagnostics.some((diagnostic) => diagnostic.severity === "error"));
+    const result = await applyResourceGc(gcInput, plan);
+    assert.equal(result.applied.length, 0);
+    assert.ok(existsSync(wtPath));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GC protects runtime identity resolved paths", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-runtime-identity-"));
+  try {
+    const { home, store } = createHomeWithStore(root);
+    const task = createTask("task-1", "Test task", now);
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+    const deployment = join(home, "runtime", "deployments", "combined-active");
+    mkdirSync(deployment, { recursive: true });
+    writeRuntimeIdentity(home, {
+      schemaVersion: 1,
+      version: "0.0.0",
+      executablePath: process.execPath,
+      args: [process.execPath, "controller"],
+      buildId: "dev",
+      packageDigest: null,
+      sourceCommit: null,
+      cliRealpath: deployment,
+      controllerRealpath: deployment,
+      controllerProtocolVersion: 1,
+      storageLayoutVersion: 7,
+      aggregateSchemaVersion: 18,
+      storageBackend: "file",
+      workerEnabled: false,
+      pid: process.pid,
+      processStartIdentity: readLinuxProcessStartIdentity(process.pid) ?? "missing",
+      mode: "primary",
+      dualOwner: false,
+      activeRelease: null,
+      writtenAt: now.toISOString()
+    });
+
+    const plan = await planResourceGc({
+      home,
+      projects: [],
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now,
+      liveReferencePorts: {
+        processCwdRefs: () => new Map(),
+        tmuxPaneCwds: async () => []
+      }
+    });
+    const record = plan.records.find((candidate) => candidate.path === deployment);
+    assert.ok(record);
+    assert.equal(record.disposition, "active");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GC protects the workspace named by an exact Task descriptor", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-exact-descriptor-"));
+  try {
+    const repo = createGitRepo(join(root, "repo"));
+    const { home, store } = createHomeWithStore(root);
+    const project = createProject("project-1", "Test", repo, {
+      stable: "main",
+      development: "main"
+    }, now, { ownership: "external" });
+    store.transaction((tx) => tx.saveProject(project));
+    const task = createTask("task-1", "Test task", now, { projectBindings: [{ projectId: project.id, directory: "repo", baseRef: "main" }] });
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+    const wtPath = join(root, "worktrees", "task-1", "main");
+    mkdirSync(join(root, "worktrees", "task-1"), { recursive: true });
+    git(["worktree", "add", wtPath, "-b", "yui/task-1-abcdef12/main"], repo);
+    const descriptor = createExactTaskRuntimeDescriptor({
+      controlPlaneDigest: "a".repeat(64),
+      taskId: "task-1",
+      roleName: "worker",
+      agentId: "agent-1",
+      adapterId: "codex",
+      workspace: wtPath
+    });
+    const descriptorPath = exactTaskRuntimeDescriptorPath(home, descriptor);
+    mkdirSync(dirname(descriptorPath), { recursive: true, mode: 0o700 });
+    writeFileSync(descriptorPath, `${serializeExactDescriptor(descriptor)}\n`, "utf8");
+
+    const plan = await planResourceGc({
+      home,
+      projects: store.listProjects(),
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now,
+      liveReferencePorts: {
+        processCwdRefs: () => new Map(),
+        tmuxPaneCwds: async () => []
+      }
+    });
+    const record = plan.records.find((candidate) => candidate.path === wtPath);
+    assert.ok(record);
+    assert.equal(record.disposition, "active");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GC fails closed when the active release pointer is unreadable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-active-release-corrupt-"));
+  try {
+    const { home, store } = createHomeWithStore(root);
+    const task = createTask("task-1", "Test task", now);
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+    mkdirSync(join(home, "runtime"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, "runtime", "active-release.json"), "{not-json", "utf8");
+    const deployment = join(home, "runtime", "deployments", "combined-task1-corrupt");
+    mkdirSync(deployment, { recursive: true });
+    const input = {
+      home,
+      projects: [],
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now,
+      liveReferencePorts: {
+        processCwdRefs: () => new Map(),
+        tmuxPaneCwds: async () => []
+      }
+    };
+    const plan = await planResourceGc(input);
+    assert.ok(plan.scan.diagnostics.some((diagnostic) =>
+      diagnostic.severity === "error"
+        && diagnostic.message.includes("active release is unreadable")));
+    const candidate = plan.records.find((record) => record.path === deployment);
+    assert.ok(candidate);
+    assert.equal(candidate.disposition, "retained-unproven");
+    const result = await applyResourceGc(input, plan);
+    assert.equal(result.applied.length, 0);
+    assert.ok(existsSync(deployment));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("GC is idempotent across repeated runs", async () => {
   const root = mkdtempSync(join(tmpdir(), "yui-gc-idem-"));
   try {
@@ -310,6 +524,237 @@ test("GC is idempotent across repeated runs", async () => {
     // Git metadata should not be corrupted.
     const worktrees = git(["worktree", "list", "--porcelain"], repo);
     assert.ok(!worktrees.includes(wtPath));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GC move-quarantine restores a Git worktree at its recorded HEAD", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-git-restore-"));
+  try {
+    const repo = createGitRepo(join(root, "repo"));
+    const { home, store } = createHomeWithStore(root);
+    const project = createProject("project-1", "Test", repo, {
+      stable: "main",
+      development: "main"
+    }, now, { ownership: "external" });
+    store.transaction((tx) => tx.saveProject(project));
+    const task = createTask("task-1", "Test task", now, { projectBindings: [{ projectId: project.id, directory: "repo", baseRef: "main" }] });
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+
+    const wtPath = join(root, "worktrees", "task-1", "main");
+    mkdirSync(join(root, "worktrees", "task-1"), { recursive: true });
+    git(["worktree", "add", "--detach", wtPath], repo);
+    const recordedHead = git(["-C", wtPath, "rev-parse", "HEAD^{commit}"], wtPath);
+    const newerHead = git(["-C", repo, "commit-tree", `${recordedHead}^{tree}`, "-p", recordedHead, "-m", "newer"], repo);
+
+    const input = {
+      home,
+      projects: store.listProjects(),
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now,
+      liveReferencePorts: {
+        processCwdRefs: () => new Map(),
+        tmuxPaneCwds: async () => []
+      }
+    };
+    const applied = await applyResourceGc(input, await planResourceGc(input));
+    assert.equal(applied.applied.length, 1);
+    assert.equal(applied.applied[0].quarantine.method, "move");
+    assert.ok(!existsSync(wtPath));
+
+    // A branch/ref can advance while the worktree is quarantined; restore must
+    // preserve the exact checkout that was quarantined.
+    git(["-C", repo, "update-ref", "refs/heads/yui/task-1-newer", newerHead], repo);
+    const restored = await restoreAllResourceGc(home, { now });
+    assert.equal(restored.restored.length, 1);
+    assert.ok(existsSync(wtPath));
+    assert.equal(git(["-C", wtPath, "rev-parse", "HEAD^{commit}"], wtPath), recordedHead);
+    assert.ok(git(["worktree", "list", "--porcelain"], repo).includes(wtPath));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GC retries restore after a cleanup failure", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-restore-retry-"));
+  try {
+    const { home, store } = createHomeWithStore(root);
+    const task = createTask("task-1", "Test task", now);
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+    const artifact = join(home, "runtime", "deployments", "combined-task1-retry");
+    mkdirSync(artifact, { recursive: true });
+    const input = {
+      home,
+      projects: [],
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now
+    };
+    await applyResourceGc(input, await planResourceGc(input));
+    assert.ok(!existsSync(artifact));
+
+    mkdirSync(artifact, { recursive: true });
+    const failed = await restoreAllResourceGc(home, { now });
+    assert.equal(failed.failed.length, 1);
+    assert.equal(failed.failed[0].disposition, "cleanup-failed");
+    assert.ok(failed.failed[0].blocker?.includes("already exists"));
+
+    rmSync(artifact, { recursive: true, force: true });
+    const retried = await restoreAllResourceGc(home, { now });
+    assert.equal(retried.restored.length, 1);
+    assert.ok(existsSync(artifact));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GC discovers registry-only resources that still exist", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-registry-only-"));
+  try {
+    const { home, store } = createHomeWithStore(root);
+    const task = createTask("task-1", "Test task", now);
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+    const runtimeRoot = join(root, "yi-runtime-only");
+    mkdirSync(runtimeRoot, { recursive: true });
+    const record = createResourceRecord({
+      kind: "runtime-artifact",
+      path: runtimeRoot,
+      owner: { home, taskId: "task-1", basis: "marker" },
+      cleanliness: "n/a",
+      activeRefs: [],
+      disposition: "active"
+    }, now);
+    saveResourceRegistry(home, upsertResourceRecord(emptyResourceRegistry(), record));
+
+    const input = {
+      home,
+      projects: [],
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now
+    };
+    const plan = await planResourceGc(input);
+    const planned = plan.records.find((candidate) => candidate.path === runtimeRoot);
+    assert.ok(planned);
+    assert.equal(planned.disposition, "releasable");
+    const applied = await applyResourceGc(input, plan);
+    assert.equal(applied.applied.length, 1);
+    assert.ok(!existsSync(runtimeRoot));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GC protects workspaces claimed by an active AgentRun Job", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-active-job-"));
+  try {
+    const repo = createGitRepo(join(root, "repo"));
+    const { home, store } = createHomeWithStore(root);
+    const project = createProject("project-1", "Test", repo, {
+      stable: "main",
+      development: "main"
+    }, now, { ownership: "external" });
+    store.transaction((tx) => tx.saveProject(project));
+    const task = createTask("task-1", "Test task", now, { projectBindings: [{ projectId: project.id, directory: "repo", baseRef: "main" }] });
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+
+    const wtPath = join(root, "worktrees", "task-1", "main");
+    mkdirSync(join(root, "worktrees", "task-1"), { recursive: true });
+    git(["worktree", "add", wtPath, "-b", "yui/task-1-job/main"], repo);
+
+    // An active AgentRun still claims this workspace path.
+    const input = {
+      home,
+      projects: store.listProjects(),
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now,
+      activeWorkspaceOwnerPaths: [wtPath],
+      liveReferencePorts: {
+        processCwdRefs: () => new Map(),
+        tmuxPaneCwds: async () => []
+      }
+    };
+    const plan = await planResourceGc(input);
+    const record = plan.records.find((candidate) => candidate.path === wtPath);
+    assert.ok(record);
+    assert.equal(record.disposition, "active");
+    const result = await applyResourceGc(input, plan);
+    assert.equal(result.applied.length, 0);
+    assert.ok(existsSync(wtPath));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GC purge fails closed when a live-reference source is untrusted", async () => {
+  const root = mkdtempSync(join(tmpdir(), "yui-gc-purge-failclosed-"));
+  try {
+    const { home, store } = createHomeWithStore(root);
+    const task = createTask("task-1", "Test task", now);
+    store.transaction((tx) => tx.saveTask(task));
+    store.transaction((tx) => {
+      const active = activateTask(task, now);
+      const completed = completeTask(active, now, { by: "user", summary: "done" });
+      tx.saveTask(archiveTask(completed, now));
+    });
+    const artifact = join(home, "runtime", "deployments", "combined-task1-purge");
+    mkdirSync(artifact, { recursive: true });
+    const input = {
+      home,
+      projects: [],
+      managedWorkspaces: [],
+      taskStatusById: new Map([["task-1", "archived"]]),
+      mode: "quarantine",
+      now
+    };
+    await applyResourceGc(input, await planResourceGc(input));
+    assert.ok(!existsSync(artifact));
+
+    // After the TTL, a scan with an untrusted source must not purge.
+    const later = new Date(now.getTime() + 25 * 3_600_000);
+    const purge = await purgeResourceQuarantine(home, {
+      now: later,
+      ttlHours: 24,
+      managedWorkspaces: [],
+      liveReferencePorts: {
+        processCwdRefs: () => new Map(),
+        tmuxPaneCwds: async () => {
+          throw new Error("tmux namespace unavailable");
+        }
+      }
+    });
+    assert.equal(purge.purged.length, 0);
+    const registry = loadResourceRegistry(home);
+    const record = Object.values(registry.records).find((candidate) => candidate.path === artifact);
+    assert.ok(record);
+    assert.equal(record.disposition, "quarantined");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -439,11 +884,9 @@ test("GC retains worktree with unknown cleanliness", async () => {
     mkdirSync(join(root, "worktrees", "task-1"), { recursive: true });
     git(["worktree", "add", wtPath, "-b", "yui/task-1-abcdef12/main"], repo);
 
-    // Simulate unknown cleanliness by using a prunable worktree.
-    // Remove the worktree's gitdir to make it prunable.
-    const gitdirMatch = git(["worktree", "list", "--porcelain"], repo)
-      .split("\n").find((line) => line.startsWith("worktree ") && line.includes(wtPath));
-    assert.ok(gitdirMatch);
+    // Corrupt the worktree's .git pointer so Git still enumerates it but
+    // `git status` can no longer prove its state. GC must retain it.
+    writeFileSync(join(wtPath, ".git"), "gitdir: /nonexistent/yui-gc-gitdir\n", "utf8");
 
     const gcInput = {
       home,
@@ -456,8 +899,8 @@ test("GC retains worktree with unknown cleanliness", async () => {
     const plan = await planResourceGc(gcInput);
     const wtRecord = plan.records.find((r) => r.path === wtPath);
     assert.ok(wtRecord);
-    // A clean worktree should be releasable.
-    assert.equal(wtRecord.disposition, "releasable");
+    assert.equal(wtRecord.cleanliness, "unknown");
+    assert.equal(wtRecord.disposition, "retained-unproven");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

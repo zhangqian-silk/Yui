@@ -16,6 +16,7 @@ import { createResourceAutoGc } from "../../dist/resources/autoResourceGc.js";
 import { scanLiveReferences } from "../../dist/resources/liveReferences.js";
 import { loadResourceRegistry } from "../../dist/resources/resourceRegistry.js";
 import { createProject } from "../../dist/repository/project.js";
+import { readLinuxProcessStartIdentity } from "../../dist/controller/domainIdentity.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import {
@@ -275,7 +276,8 @@ test("live Controller discovery protects only its own record, not legacy deploym
     mkdirSync(join(home, "runtime"), { recursive: true, mode: 0o700 });
     // A live Controller: the record points at this very process.
     writeFileSync(join(home, "runtime", "controller.json"), JSON.stringify({
-      pid: process.pid
+      pid: process.pid,
+      processStartIdentity: readLinuxProcessStartIdentity(process.pid) ?? "missing"
     }), "utf8");
     const deployment = join(home, "runtime", "deployments", "legacy-combined");
     mkdirSync(deployment, { recursive: true });

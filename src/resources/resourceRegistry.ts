@@ -39,6 +39,13 @@ export function resourceQuarantineRoot(home: string): string {
   );
 }
 
+/** True when `path` lives in this Home's Resource GC quarantine namespace. */
+export function isResourceQuarantinePath(home: string, path: string): boolean {
+  const root = resolve(resourceQuarantineRoot(home));
+  const resolved = resolve(path);
+  return resolved === root || resolved.startsWith(`${root}/`);
+}
+
 export function emptyResourceRegistry(): ResourceRegistryState {
   return Object.freeze({
     schemaVersion: RESOURCE_REGISTRY_SCHEMA_VERSION,

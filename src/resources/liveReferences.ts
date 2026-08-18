@@ -12,6 +12,12 @@ import { existsSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
+import { parseExactTaskRuntimeDescriptor } from "../runtime/exactControlPlane.js";
+import {
+  readRuntimeIdentity,
+  releasesDirectory,
+  resolveActiveRelease
+} from "../release/runtimeRelease.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 
 const executeFile = promisify(execFile);
@@ -72,18 +78,52 @@ export async function scanLiveReferences(
   };
 
   // 1. Physical process inventory: cwd and open file descriptors.
-  const processResult = input.ports?.processCwdRefs !== undefined
-    ? { refs: input.ports.processCwdRefs(paths), diagnostics: [] as LiveReferenceDiagnostic[] }
-    : scanProcessPathRefs(paths);
+  let processResult: ProcessScanResult;
+  if (input.ports?.processCwdRefs !== undefined) {
+    try {
+      processResult = Object.freeze({
+        refs: input.ports.processCwdRefs(paths),
+        diagnostics: Object.freeze([])
+      });
+    } catch (error) {
+      processResult = Object.freeze({
+        refs: new Map<string, readonly string[]>(),
+        diagnostics: Object.freeze([{
+          source: "proc" as const,
+          severity: "error" as const,
+          message: `process cwd scan failed: ${error instanceof Error ? error.message : "unknown error"}`
+        }])
+      });
+    }
+  } else {
+    processResult = scanProcessPathRefs(paths);
+  }
   for (const [path, tokens] of processResult.refs) {
     for (const token of tokens) addRef(path, token);
   }
   diagnostics.push(...processResult.diagnostics);
 
   // 2. tmux pane working directories (best effort; tmux may be absent).
-  const tmuxResult = input.ports?.tmuxPaneCwds !== undefined
-    ? { cwds: await input.ports.tmuxPaneCwds(), diagnostics: [] as LiveReferenceDiagnostic[] }
-    : await scanTmuxPaneCwds(home, input.tmuxServerName, input.environment ?? process.env);
+  let tmuxResult: TmuxScanResult;
+  if (input.ports?.tmuxPaneCwds !== undefined) {
+    try {
+      tmuxResult = Object.freeze({
+        cwds: Object.freeze(await input.ports.tmuxPaneCwds()),
+        diagnostics: Object.freeze([])
+      });
+    } catch (error) {
+      tmuxResult = Object.freeze({
+        cwds: Object.freeze([]),
+        diagnostics: Object.freeze([{
+          source: "tmux" as const,
+          severity: "error" as const,
+          message: `tmux scan failed: ${error instanceof Error ? error.message : "unknown error"}`
+        }])
+      });
+    }
+  } else {
+    tmuxResult = await scanTmuxPaneCwds(home, input.tmuxServerName, input.environment ?? process.env);
+  }
   for (const cwd of tmuxResult.cwds) {
     for (const path of paths) {
       if (isPathWithin(cwd, path)) addRef(path, `tmux-pane:${cwd}`);
@@ -108,7 +148,32 @@ export async function scanLiveReferences(
   }
   if (discovery.diagnostic !== undefined) diagnostics.push(discovery.diagnostic);
 
-  // 4. Durable managed workspaces: their roots and entries are claimed while
+  // 4. Runtime identity and exact Task descriptors are durable live-ownership
+  //    claims. Resolved runtime paths and descriptor workspaces stay protected
+  //    while their owning process identity is alive.
+  const runtimeClaims = readRuntimeIdentityClaims(home);
+  diagnostics.push(...runtimeClaims.diagnostics);
+  const descriptorClaims = readExactTaskRuntimeClaims(home);
+  diagnostics.push(...descriptorClaims.diagnostics);
+  const activeReleaseClaims = readActiveReleaseClaims(home);
+  diagnostics.push(...activeReleaseClaims.diagnostics);
+  const sessionOwnerClaims = readSessionOwnerClaims(home);
+  diagnostics.push(...sessionOwnerClaims.diagnostics);
+  for (const claim of [
+    ...runtimeClaims.claims,
+    ...descriptorClaims.claims,
+    ...activeReleaseClaims.claims,
+    ...sessionOwnerClaims.claims
+  ]) {
+    protectedPaths.add(claim.path);
+    for (const path of paths) {
+      if (isPathWithin(claim.path, path) || isPathWithin(path, claim.path)) {
+        addRef(path, claim.token);
+      }
+    }
+  }
+
+  // 5. Durable managed workspaces: their roots and entries are claimed while
   //    the durable record exists, regardless of Task terminal state.
   const workspaces = input.ports?.managedWorkspaces !== undefined
     ? input.ports.managedWorkspaces()
@@ -125,7 +190,7 @@ export async function scanLiveReferences(
     }
   }
 
-  // 5. Active durable workspace owners (e.g. an active AgentRun launch).
+  // 6. Active durable workspace owners (e.g. an active AgentRun launch).
   const activeOwners = input.ports?.activeWorkspaceOwners !== undefined
     ? input.ports.activeWorkspaceOwners()
     : [];
@@ -143,6 +208,208 @@ export async function scanLiveReferences(
   return Object.freeze({
     refsByPath,
     protectedPaths: Object.freeze([...protectedPaths]),
+    diagnostics: Object.freeze(diagnostics)
+  });
+}
+
+type PathClaim = Readonly<{ path: string; token: string }>;
+
+type ClaimReadResult = Readonly<{
+  claims: readonly PathClaim[];
+  diagnostics: readonly LiveReferenceDiagnostic[];
+}>;
+
+function readRuntimeIdentityClaims(home: string): ClaimReadResult {
+  try {
+    const identity = readRuntimeIdentity(home);
+    if (identity === null) {
+      return Object.freeze({ claims: Object.freeze([]), diagnostics: Object.freeze([]) });
+    }
+    if (!isProcessAlive(identity.pid)) {
+      return Object.freeze({ claims: Object.freeze([]), diagnostics: Object.freeze([]) });
+    }
+    const currentIdentity = readLinuxProcessStartIdentity(identity.pid);
+    if (currentIdentity === undefined || currentIdentity !== identity.processStartIdentity) {
+      return Object.freeze({
+        claims: Object.freeze([]),
+        diagnostics: Object.freeze([{
+          source: "controller" as const,
+          severity: "error" as const,
+          message: `runtime-identity pid ${identity.pid} start identity mismatch (PID reuse?)`
+        }])
+      });
+    }
+    const claims: PathClaim[] = [
+      { path: resolve(identity.cliRealpath), token: `runtime-identity:cli:${identity.pid}` },
+      { path: resolve(identity.controllerRealpath), token: `runtime-identity:controller:${identity.pid}` }
+    ];
+    if (identity.activeRelease !== null) {
+      claims.push({
+        path: join(releasesDirectory(home), identity.activeRelease.releaseId),
+        token: `runtime-identity:active-release:${identity.pid}`
+      });
+    }
+    return Object.freeze({ claims: Object.freeze(claims), diagnostics: Object.freeze([]) });
+  } catch (error) {
+    return Object.freeze({
+      claims: Object.freeze([]),
+      diagnostics: Object.freeze([{
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `runtime-identity is unreadable: ${error instanceof Error ? error.message : "unknown error"}`
+      }])
+    });
+  }
+}
+
+function readExactTaskRuntimeClaims(home: string): ClaimReadResult {
+  const directory = join(home, "runtime", "exact-task-runtime");
+  let entries: readonly import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return Object.freeze({ claims: Object.freeze([]), diagnostics: Object.freeze([]) });
+    }
+    return Object.freeze({
+      claims: Object.freeze([]),
+      diagnostics: Object.freeze([{
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `exact Task runtime descriptors are unreadable: ${error instanceof Error ? error.message : "unknown error"}`
+      }])
+    });
+  }
+
+  const claims: PathClaim[] = [];
+  const diagnostics: LiveReferenceDiagnostic[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const path = join(directory, entry.name);
+    try {
+      const descriptor = parseExactTaskRuntimeDescriptor(readFileSync(path, "utf8"));
+      claims.push({ path, token: `exact-task-runtime:${descriptor.taskId}` });
+      claims.push({
+        path: resolve(descriptor.workspace),
+        token: `exact-task-runtime:workspace:${descriptor.taskId}`
+      });
+    } catch (error) {
+      diagnostics.push({
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `exact Task runtime descriptor is unreadable at ${path}: ${error instanceof Error ? error.message : "unknown error"}`
+      });
+    }
+  }
+  return Object.freeze({
+    claims: Object.freeze(claims),
+    diagnostics: Object.freeze(diagnostics)
+  });
+}
+
+function readActiveReleaseClaims(home: string): ClaimReadResult {
+  try {
+    const active = resolveActiveRelease(home);
+    if (active === null) {
+      return Object.freeze({ claims: Object.freeze([]), diagnostics: Object.freeze([]) });
+    }
+    return Object.freeze({
+      claims: Object.freeze([{
+        path: active.releaseDir,
+        token: "active-release"
+      }]),
+      diagnostics: Object.freeze([])
+    });
+  } catch (error) {
+    return Object.freeze({
+      claims: Object.freeze([]),
+      diagnostics: Object.freeze([{
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `active release is unreadable: ${error instanceof Error ? error.message : "unknown error"}`
+      }])
+    });
+  }
+}
+
+/**
+ * Read Session owner records (`runtime/session-owners/<launchId>.json`). A
+ * record whose Provider root is physically alive with a matching start
+ * identity protects its runtime root. A dead PID is stale (reconciliation
+ * removes those records); an identity conflict or unreadable record fails
+ * closed because liveness can no longer be proven.
+ */
+function readSessionOwnerClaims(home: string): ClaimReadResult {
+  const directory = join(home, "runtime", "session-owners");
+  let entries: readonly import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return Object.freeze({ claims: Object.freeze([]), diagnostics: Object.freeze([]) });
+    }
+    return Object.freeze({
+      claims: Object.freeze([]),
+      diagnostics: Object.freeze([{
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `session owner records are unreadable: ${error instanceof Error ? error.message : "unknown error"}`
+      }])
+    });
+  }
+
+  const claims: PathClaim[] = [];
+  const diagnostics: LiveReferenceDiagnostic[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const path = join(directory, entry.name);
+    let record: {
+      launchId?: unknown;
+      runtimeRoot?: unknown;
+      providerRoot?: { pid?: unknown; startIdentity?: unknown };
+    };
+    try {
+      record = JSON.parse(readFileSync(path, "utf8")) as typeof record;
+    } catch (error) {
+      diagnostics.push({
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `session owner record is unreadable at ${path}: ${error instanceof Error ? error.message : "unknown error"}`
+      });
+      continue;
+    }
+    const pid = record.providerRoot?.pid;
+    const startIdentity = record.providerRoot?.startIdentity;
+    if (typeof pid !== "number" || pid <= 0 || typeof startIdentity !== "string") {
+      diagnostics.push({
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `session owner record at ${path} has no valid provider root identity`
+      });
+      continue;
+    }
+    if (!isProcessAlive(pid)) {
+      // Dead Provider root: the record is stale; reconciliation removes it.
+      continue;
+    }
+    const currentIdentity = readLinuxProcessStartIdentity(pid);
+    if (currentIdentity === undefined || currentIdentity !== startIdentity) {
+      diagnostics.push({
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `session owner record pid ${pid} start identity mismatch (PID reuse?)`
+      });
+      continue;
+    }
+    if (typeof record.runtimeRoot === "string" && record.runtimeRoot.length > 0) {
+      claims.push({
+        path: resolve(record.runtimeRoot),
+        token: `session-owner:${typeof record.launchId === "string" ? record.launchId : entry.name}`
+      });
+    }
+  }
+  return Object.freeze({
+    claims: Object.freeze(claims),
     diagnostics: Object.freeze(diagnostics)
   });
 }
@@ -288,8 +555,8 @@ export type ControllerDiscoveryResult = Readonly<{
 /**
  * Read the Controller discovery record. A live Controller process protects
  * only its own discovery record; the process's cwd and open files are proven
- * by the /proc scan. When the record exists but the PID is dead or the start
- * identity does not match, the record is stale and does not protect.
+ * by the /proc scan. When the record exists but the PID is dead the record is
+ * stale. A live PID without a provable start identity is fail-closed.
  */
 export function readControllerDiscovery(home: string): ControllerDiscoveryResult {
   const path = join(resolve(home), "runtime", "controller.json");
@@ -325,28 +592,47 @@ export function readControllerDiscovery(home: string): ControllerDiscoveryResult
     // PID is dead: the Controller is not running; no protection, no diagnostic.
     return Object.freeze({ protects: false, token: "", protectedPaths: Object.freeze([]) });
   }
+  if (typeof record.processStartIdentity !== "string") {
+    return Object.freeze({
+      protects: false,
+      token: "",
+      protectedPaths: Object.freeze([]),
+      diagnostic: {
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `controller.json pid ${record.pid} has no processStartIdentity`
+      }
+    });
+  }
   // PID is alive. When a start identity is recorded, verify it to guard
   // against PID reuse.
-  if (typeof record.processStartIdentity === "string") {
-    const currentIdentity = readLinuxProcessStartIdentity(record.pid);
-    if (currentIdentity !== undefined && currentIdentity !== record.processStartIdentity) {
-      return Object.freeze({
-        protects: false,
-        token: "",
-        protectedPaths: Object.freeze([]),
-        diagnostic: {
-          source: "controller" as const,
-          severity: "warning" as const,
-          message: `controller.json pid ${record.pid} start identity mismatch (PID reuse?)`
-        }
-      });
-    }
+  const currentIdentity = readLinuxProcessStartIdentity(record.pid);
+  if (currentIdentity === undefined || currentIdentity !== record.processStartIdentity) {
+    return Object.freeze({
+      protects: false,
+      token: "",
+      protectedPaths: Object.freeze([]),
+      diagnostic: {
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `controller.json pid ${record.pid} start identity mismatch (PID reuse?)`
+      }
+    });
   }
   return Object.freeze({
     protects: true,
     token: `controller:${record.pid}`,
     protectedPaths: Object.freeze([path])
   });
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Read /proc/<pid>/stat start time (field 22), the Linux process identity. */

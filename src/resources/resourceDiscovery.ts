@@ -19,8 +19,8 @@ import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { managedProjectPath, type Project } from "../repository/project.js";
-import { readActiveReleasePointer } from "../release/runtimeRelease.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import { isResourceQuarantinePath } from "./resourceRegistry.js";
 import {
   createResourceRecord,
   isReleaseNamespacePath,
@@ -102,8 +102,12 @@ async function listGitWorktrees(repositoryPath: string): Promise<GitWorktreeEntr
       { timeout: 10_000 }
     );
     return parseGitWorktreePorcelain(stdout);
-  } catch {
-    return [];
+  } catch (error) {
+    throw new Error(
+      `Failed to list Git worktrees for ${repositoryPath}: `
+        + `${error instanceof Error ? error.message : "unknown error"}`,
+      { cause: error }
+    );
   }
 }
 
@@ -138,6 +142,7 @@ export async function discoverResources(
     for (const worktree of worktrees) {
       if (resolve(worktree.path) === resolve(repositoryPath)) continue;
       if (isReleaseNamespacePath(home, worktree.path)) continue;
+      if (isResourceQuarantinePath(home, worktree.path)) continue;
       const owner = attributeWorktreeOwner(home, project, worktree, input.managedWorkspaces);
       // A prunable worktree's gitdir points to a non-existent location; its
       // cleanliness cannot be proven, so it is retained, not released.
@@ -170,7 +175,6 @@ export async function discoverResources(
   }
 
   // 2. Legacy deployments (historical runtime; no current-master creator).
-  const activeRelease = readActiveReleasePointerSafe(home);
   for (const kind of ["deployment", "deployment-backup"] as const) {
     const directory = kind === "deployment"
       ? join(home, "runtime", "deployments")
@@ -179,13 +183,11 @@ export async function discoverResources(
     for (const entry of safeReaddir(directory)) {
       const path = join(directory, entry.name);
       if (isReleaseNamespacePath(home, path)) continue;
+      if (isResourceQuarantinePath(home, path)) continue;
       const owner = attributeDeploymentOwner(home, entry.name, input.taskStatusById);
       const isGit = existsSync(join(path, ".git"));
       const cleanliness = isGit ? await gitWorktreeCleanliness(path) : "n/a";
       const gitMetadata = isGit ? readDeploymentGitMetadata(path) : undefined;
-      // A resolved active deployment is permanently protected.
-      const isActiveDeployment = activeRelease !== null
-        && activeRelease.releaseId === entry.name;
       const taskStatus = owner.taskId === undefined
         ? undefined
         : input.taskStatusById.get(owner.taskId);
@@ -198,15 +200,10 @@ export async function discoverResources(
           ...(sizeOf(path) === undefined ? {} : { sizeBytes: sizeOf(path) }),
           cleanliness,
           activeRefs: [],
-          disposition: isActiveDeployment ? "active" : "active",
-          ...(isActiveDeployment ? {
-            blocker: "Resolved active deployment; permanently retained."
-          } : {})
+          disposition: "active"
         }, input.now),
-        ownerTerminal: isActiveDeployment
+        ownerTerminal: owner.taskId === undefined
           ? false
-          : owner.taskId === undefined
-            ? false
           : isTerminalTaskStatus(taskStatus as never)
       });
     }
@@ -396,18 +393,6 @@ function projectRepositoryPath(home: string, project: Project): string | undefin
     return existsSync(path) ? path : undefined;
   }
   return existsSync(project.path) ? project.path : undefined;
-}
-
-/** Read the active release pointer, returning null when absent or unreadable. */
-function readActiveReleasePointerSafe(
-  home: string
-): { releaseId: string } | null {
-  try {
-    const pointer = readActiveReleasePointer(home);
-    return pointer === null ? null : { releaseId: pointer.releaseId };
-  } catch {
-    return null;
-  }
 }
 
 /**
