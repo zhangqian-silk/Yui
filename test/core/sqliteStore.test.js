@@ -81,8 +81,8 @@ test("schema migration: fresh create applies every current migration and all tab
   const home = temporaryHome();
   const db = new Database(join(home, "yui.db"));
   const result = migrateSqliteSchema(db);
-  assert.deepEqual(result.applied, [1, 2, 3, 4, 5, 6, 7, 8]);
-  assert.equal(result.version, 8);
+  assert.deepEqual(result.applied, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  assert.equal(result.version, 9);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
   for (const table of SQLITE_SCHEMA_TABLES) {
     assert.ok(tables.includes(table), `missing table: ${table}`);
@@ -97,7 +97,7 @@ test("schema migration: idempotent re-run applies nothing", () => {
   migrateSqliteSchema(db);
   const second = migrateSqliteSchema(db);
   assert.deepEqual(second.applied, []);
-  assert.equal(second.version, 8);
+  assert.equal(second.version, 9);
   db.close();
 });
 
@@ -143,8 +143,8 @@ test("schema migration: repairs the legacy global DurableJob key without losing 
   `);
 
   const result = migrateSqliteSchema(db);
-  assert.deepEqual(result.applied, [4, 5, 6, 7, 8]);
-  assert.equal(result.version, 8);
+  assert.deepEqual(result.applied, [4, 5, 6, 7, 8, 9]);
+  assert.equal(result.version, 9);
   const columns = db.prepare("PRAGMA table_info(durable_jobs)").all();
   assert.deepEqual(
     columns.filter(({ pk }) => pk > 0)
@@ -309,6 +309,32 @@ test("CRUD: config and home identity", () => {
   assert.ok(identity.homeId);
   assert.equal(identity.schemaVersion, 1);
   store.close();
+});
+
+test("config: malformed durable values fail closed on save and load", () => {
+  const home = temporaryHome();
+  const store = new SqliteTaskStore(home);
+  // Invalid GC mode is rejected on save.
+  assert.throws(
+    () => store.saveConfig({ schemaVersion: 1, resourcesGcMode: "bogus" }),
+    /resourcesGcMode/
+  );
+  // Invalid auto-quarantine flag is rejected on save.
+  assert.throws(
+    () => store.saveConfig({ schemaVersion: 1, resourcesGcAutoQuarantine: "yes" }),
+    /resourcesGcAutoQuarantine/
+  );
+  store.close();
+
+  // A corrupted durable config row fails closed on read instead of silently
+  // falling back to defaults.
+  const db = new Database(join(home, "yui.db"));
+  db.prepare("UPDATE config SET payload = ? WHERE id = 1")
+    .run(JSON.stringify({ schemaVersion: 1, resourcesGcMode: 42 }));
+  db.close();
+  const reopened = new SqliteTaskStore(home);
+  assert.throws(() => reopened.getConfig(), /resourcesGcMode/);
+  reopened.close();
 });
 
 test("CRUD: saving a record for another task is rejected", () => {

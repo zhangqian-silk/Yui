@@ -679,14 +679,17 @@ function probeController(discovery) {
           || response.ok !== true
           || typeof result !== "object" || result === null
           || resultKeys.length < 2
-          || resultKeys.length > 6
+          || resultKeys.length > 9
           || resultKeys.some((key) => ![
             "pid",
             "running",
+            "uptimeMs",
+            "rssBytes",
             "protocolVersion",
             "version",
             "storageLayoutVersion",
-            "aggregateSchemaVersion"
+            "aggregateSchemaVersion",
+            "runtime"
           ].includes(key))
           || result.running !== true
           || !Number.isSafeInteger(result.pid) || result.pid <= 0
@@ -702,6 +705,15 @@ function probeController(discovery) {
             Object.hasOwn(result, key)
             && (!Number.isSafeInteger(result[key]) || result[key] <= 0)
           ))
+          || ["uptimeMs", "rssBytes"].some((key) => (
+            Object.hasOwn(result, key)
+            && (!Number.isSafeInteger(result[key]) || result[key] < 0)
+          ))
+          || (
+            Object.hasOwn(result, "runtime")
+            && (typeof result.runtime !== "object" || result.runtime === null
+              || Array.isArray(result.runtime))
+          )
         ) {
           finish({ status: "invalid" });
           return;

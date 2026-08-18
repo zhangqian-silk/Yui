@@ -24,7 +24,9 @@ import {
 } from "../release/releaseWorkflow.js";
 import {
   reconciliationIntervalMilliseconds,
-  resolveLeaderNextActionMode
+  resolveLeaderNextActionMode,
+  resolveResourcesGcAutoQuarantine,
+  resolveResourcesGcMode
 } from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
 import {
@@ -222,6 +224,19 @@ export type YuiConfig = Readonly<{
   currentTaskId?: string;
   lastTaskId?: string;
   reconciliationIntervalSeconds?: number;
+  /**
+   * Resource GC mode (Issue 10). `report` (default) only reports candidates;
+   * `quarantine` allows `yui resources gc --apply` to quarantine releasable
+   * resources. Permanent deletion is always delayed behind the observation
+   * window.
+   */
+  resourcesGcMode?: "report" | "quarantine";
+  /**
+   * Whether the Controller may automatically quarantine resources for
+   * terminal Tasks (Issue 10). Defaults to false; permanent deletion is
+   * always manual and delayed.
+   */
+  resourcesGcAutoQuarantine?: boolean;
   review?: ReviewConfig;
   /**
    * Issue 07 (Leader convergence) feature mode. Optional additive field;
@@ -2893,12 +2908,14 @@ function observeTaskRecordId(
   );
 }
 
-function validateYuiConfig(config: YuiConfig): void {
+export function validateYuiConfig(config: YuiConfig): void {
   try {
     reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
     resolveTimeZone(config.timeZone);
     if (config.review !== undefined) validateReviewConfig(config.review);
     resolveLeaderNextActionMode(config.leaderNextActionMode);
+    resolveResourcesGcMode(config.resourcesGcMode);
+    resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine);
   } catch (error) {
     throw new StorageRecordError(
       error instanceof Error ? error.message : "Yui reconciliation interval is invalid."

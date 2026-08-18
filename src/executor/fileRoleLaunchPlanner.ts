@@ -54,7 +54,8 @@ import {
   exactControlPlaneDigest,
   exactTaskRuntimeDescriptorPath,
   serializeExactDescriptor,
-  type ExactControlPlaneDescriptor
+  type ExactControlPlaneDescriptor,
+  type ExactTaskRuntimeDescriptor
 } from "../runtime/exactControlPlane.js";
 import { readActiveReleasePointer } from "../release/runtimeRelease.js";
 import {
@@ -62,6 +63,7 @@ import {
   taskRuntimeIsolationEnvironment,
   type TaskRuntimeIsolationDescriptor
 } from "../runtime/taskRuntimeIsolation.js";
+import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -93,6 +95,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
   readonly #controlPlane: ExactControlPlaneDescriptor;
+  #resourceRegistrarValue: ResourceRegistrar | undefined;
 
   constructor(
     readonly home: string,
@@ -133,6 +136,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             activeReleaseDigest: activeRelease.packageDigest
           })
     });
+  }
+
+  #resourceRegistrar(): ResourceRegistrar {
+    return this.#resourceRegistrarValue ??= new ResourceRegistrar(this.home);
   }
 
   refreshAgentEnvironment(refresh: AgentEnvironmentRefresh): void {
@@ -215,7 +222,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     // own stable source path; its Hook self-refreshes that source before the
     // volatile fence instead of the Controller scanning history to find it.
     const currentSource = exactTaskRuntimeDescriptorPath(this.home, descriptor);
-    writeTextFileAtomically(currentSource, `${serializeExactDescriptor(descriptor)}\n`);
+    this.#writeExactTaskRuntimeDescriptor(descriptor, currentSource);
   }
 
   plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
@@ -518,6 +525,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           nativeSessionId: resumeNativeSessionId!
         })
       : adapter.compileNew(compileInput);
+    if (owner.scope === "task" && sessionContext.managedContextFile !== undefined) {
+      this.#resourceRegistrar().registerSessionContext(
+        sessionContext.managedContextFile,
+        { home: resolve(this.home), taskId: owner.taskId, basis: "descriptor" }
+      );
+    }
 
     let args = [...compiled.argv];
     let session: SchedulerRoleSession | null;
@@ -592,10 +605,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       ? undefined
       : exactTaskRuntimeDescriptorPath(this.home, runtimeDescriptor);
     if (runtimeDescriptor !== undefined && runtimeDescriptorSource !== undefined) {
-      writeTextFileAtomically(
-        runtimeDescriptorSource,
-        `${serializeExactDescriptor(runtimeDescriptor)}\n`
-      );
+      this.#writeExactTaskRuntimeDescriptor(runtimeDescriptor, runtimeDescriptorSource);
     }
     // rr13/rr26: Generate a per-Session DurableJob caller key for every
     // task-scope launch, including resume.  Resume/ensure may reuse a live
@@ -691,6 +701,14 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...workspaceScopeEnvironment(launch.env, workspace)
       }
     };
+  }
+
+  #writeExactTaskRuntimeDescriptor(
+    descriptor: ExactTaskRuntimeDescriptor,
+    sourcePath: string
+  ): void {
+    writeTextFileAtomically(sourcePath, `${serializeExactDescriptor(descriptor)}\n`);
+    this.#resourceRegistrar().registerExactTaskRuntimeDescriptor(descriptor, sourcePath);
   }
 
   #selectConfiguredAgentEnvironment(

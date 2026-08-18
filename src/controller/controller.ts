@@ -126,6 +126,19 @@ export type ControllerRuntimeOptions = Readonly<{
     failed: readonly Readonly<{ id: string; message: string }>[];
     expiredDomains?: readonly Readonly<{ yuiHome: string; token?: string }>[];
   }>>;
+  /**
+   * Issue 10: optional automatic Resource GC hook, invoked once per full
+   * reconciliation pass after the scheduler pass settles. The production
+   * runner self-skips unless `resourcesGcMode=quarantine` and
+   * `resourcesGcAutoQuarantine=true`; errors are routed to `onError` and
+   * never break the scheduler.
+   */
+  resourceAutoGc?: () => Promise<Readonly<{
+    skipped: boolean;
+    applied: number;
+    failed: number;
+    restored: number;
+  }>>;
   onExpiredEphemeralDomain?:
     (domain: Readonly<{ yuiHome: string; token?: string }>) => void;
   /**
@@ -1096,6 +1109,9 @@ export class FileTaskController {
   readonly #resourceReaper:
     | ControllerRuntimeOptions["resourceReaper"]
     | undefined;
+  readonly #resourceAutoGc:
+    | ControllerRuntimeOptions["resourceAutoGc"]
+    | undefined;
   readonly #onExpiredEphemeralDomain:
     | ControllerRuntimeOptions["onExpiredEphemeralDomain"]
     | undefined;
@@ -1157,6 +1173,7 @@ export class FileTaskController {
     this.#lifecycleHost = options.lifecycleHost;
     this.#configuration = options.configuration;
     this.#resourceReaper = options.resourceReaper;
+    this.#resourceAutoGc = options.resourceAutoGc;
     this.#onExpiredEphemeralDomain = options.onExpiredEphemeralDomain;
     this.#maintenanceFence = options.maintenanceFence;
     this.#onMaintenanceFenceDefer = options.onMaintenanceFenceDefer;
@@ -1408,6 +1425,24 @@ export class FileTaskController {
               || (secondRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
             )
           );
+          // Issue 10: automatic Resource GC runs only on full passes, after
+          // the scheduler pass and both runtime drains have settled Task
+          // terminal state. It is default-off and self-skipping; a failed
+          // pass is logged and retried next time, never breaking the
+          // scheduler.
+          if (scope.kind === "full" && this.#resourceAutoGc !== undefined) {
+            try {
+              const gc = await this.#resourceAutoGc();
+              if (!gc.skipped && gc.failed > 0) {
+                this.#onError(new Error(
+                  `Resource auto-GC failed to quarantine ${gc.failed} `
+                    + "resource(s); they stay in place and retry next pass."
+                ));
+              }
+            } catch (error) {
+              this.#onError(error);
+            }
+          }
           this.#clearPassRetry();
           this.#scheduleRuntimeCleanupRetries(runtimeCleanupOutcomes);
           this.#scheduleDeliveryRetries(result);

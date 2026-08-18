@@ -101,7 +101,8 @@ import {
   type ConfiguredAgentPatch,
   type ConfiguredAgentUpdateResult,
   type TaskStore,
-  type YuiConfig
+  type YuiConfig,
+  validateYuiConfig
 } from "./taskStore.js";
 import type { CapabilityGrant } from "../grant/capabilityGrant.js";
 import type { ReleaseWorkflow } from "../release/releaseWorkflow.js";
@@ -650,10 +651,15 @@ export class SqliteTaskStore implements TaskStore {
 
   getConfig(): YuiConfig {
     const row = this.#db.prepare("SELECT payload FROM config WHERE id = 1").get() as { payload: string };
-    return this.#parse<YuiConfig>(row.payload);
+    const config = this.#parse<YuiConfig>(row.payload);
+    // Fail closed on malformed durable config, matching the File store:
+    // GC mode and other settings must never silently fall back to defaults.
+    validateYuiConfig(config);
+    return config;
   }
 
   saveConfig(config: YuiConfig): void {
+    validateYuiConfig(config);
     this.#mutate(() => {
       this.#db.prepare(
         "UPDATE config SET payload = ?, updated_at = ? WHERE id = 1"

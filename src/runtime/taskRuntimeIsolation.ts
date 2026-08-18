@@ -16,6 +16,7 @@ import {
   type ManagedWorkspace,
   type ManagedWorkspaceOwner
 } from "../worktree/managedWorkspace.js";
+import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
 
 export const YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR =
   "YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR";
@@ -153,12 +154,17 @@ export class FileTaskRuntimeIsolation implements
   readonly #inspectResources:
     | ((descriptor: TaskRuntimeIsolationDescriptor) => readonly TaskRuntimeResourceObservation[])
     | undefined;
+  #resourceRegistrarValue: ResourceRegistrar | undefined;
 
   constructor(options: FileTaskRuntimeIsolationOptions) {
     this.#runtimeRoot = canonicalPath(options.runtimeRoot, "Task runtime root");
     this.#controlPlane = normalizeControlBoundary(options.controlPlane);
     this.#pathLayout = taskRuntimePathLayout(options.pathLayout);
     this.#inspectResources = options.inspectResources;
+  }
+
+  #resourceRegistrar(): ResourceRegistrar {
+    return this.#resourceRegistrarValue ??= new ResourceRegistrar(this.#controlPlane.yuiHome);
   }
 
   preflight(input: TaskRuntimeIsolationPreflightInput): TaskRuntimeIsolationPreparation {
@@ -200,6 +206,7 @@ export class FileTaskRuntimeIsolation implements
         throw new Error(`Task runtime generation is not exactly owned: ${root}.`);
       }
       ensureOwnedDirectories(descriptor);
+      this.#resourceRegistrar().registerTaskRuntimeIsolation(descriptor);
       return;
     }
     ensureDirectoryChain(this.#runtimeRoot, dirname(root));
@@ -216,6 +223,7 @@ export class FileTaskRuntimeIsolation implements
         mode: 0o600
       });
       ensureOwnedDirectories(descriptor);
+      this.#resourceRegistrar().registerTaskRuntimeIsolation(descriptor);
     } catch (error) {
       const current = inspectGenerationRoot(descriptor, fingerprint);
       if (current[0]?.ownership === "owned") throw error;
@@ -261,6 +269,12 @@ export class FileTaskRuntimeIsolation implements
         throw new Error("Task runtime resources changed during cleanup claim.");
       }
       rmSync(claimed, { recursive: true });
+      this.#resourceRegistrar().markPathsDeleted([
+        descriptor.roots.generation,
+        descriptor.roots.data,
+        descriptor.roots.cache,
+        descriptor.roots.temporary
+      ]);
     } catch (error) {
       // Preserve a claimed-but-unverified resource. Restore its exact path only
       // when no concurrent generation has appeared there; never delete it.

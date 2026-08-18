@@ -37,6 +37,8 @@ import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { yuiVersionIdentity } from "../../dist/version.js";
 import { createAgentRun } from "../helpers/effectiveLaunch.js";
+import { loadResourceRegistry } from "../../dist/resources/resourceRegistry.js";
+import { taskOwnedWorkspace } from "../helpers/taskWorkspace.js";
 
 function createFixture(t) {
   const home = mkdtempSync(join(tmpdir(), "yui-live-source-"));
@@ -60,6 +62,7 @@ function createFixture(t) {
     tx.saveConfiguredAgent(agent);
     tx.saveTask(task);
     tx.saveRole(task.id, role);
+    tx.saveManagedWorkspace(taskOwnedWorkspace(task, now));
   });
   return { home, cliEntry, control, digest, store, task, role, agent, now, effective };
 }
@@ -233,12 +236,46 @@ test("the Controller refresh writes only the current-control source and never re
   const current = readExactTaskRuntimeDescriptorSource(currentSource, fx.home);
   assert.equal(current.runId, "agent-run-2");
   assert.equal(current.launchId, "launch-2");
+  const registry = loadResourceRegistry(fx.home);
+  assert.equal(
+    Object.values(registry.records).some((record) =>
+      record.path === currentSource && record.disposition === "active"),
+    true
+  );
   for (const { path, bytes } of historical) {
     assert.equal(readFileSync(path, "utf8"), bytes, `historical source ${path} must not be rewritten`);
   }
   for (const { path, bytes } of malformed) {
     assert.equal(readFileSync(path, "utf8"), bytes, `malformed source ${path} must not be read or rewritten`);
   }
+});
+
+test("Role launch planning registers its exact descriptor and session context", (t) => {
+  const fx = createFixture(t);
+  const planner = new FileRoleLaunchPlanner(fx.home, fx.store, { cliPath: fx.cliEntry });
+  const plan = planner.plan({
+    taskId: fx.task.id,
+    roleName: fx.role.name,
+    agentId: fx.agent.id,
+    adapterId: fx.agent.adapterId,
+    effective: fx.effective,
+    mode: "new",
+    launchId: "launch-plan"
+  });
+
+  const descriptorSource = plan.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
+  assert.ok(descriptorSource);
+  const registry = loadResourceRegistry(fx.home);
+  const records = Object.values(registry.records);
+  assert.equal(records.some((record) =>
+    record.path === descriptorSource
+    && record.disposition === "active"
+    && record.owner.taskId === fx.task.id), true);
+  assert.equal(records.some((record) =>
+    record.path.endsWith(".md")
+    && record.path.includes("/runtime/session-contexts/")
+    && record.disposition === "active"
+    && record.owner.taskId === fx.task.id), true);
 });
 
 test("a stale Hook source cannot jump to a replacement native Session", (t) => {
