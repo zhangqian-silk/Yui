@@ -22,6 +22,7 @@ export type ResourceKind = "worktree" | "deployment" | "runtime-artifact";
  * - `deleted`           permanently removed after the observation window.
  * - `retained-dirty`    a Git worktree with uncommitted changes; kept.
  * - `retained-unowned`  ownership cannot be proven; reported, never removed.
+ * - `retained-unproven` cleanliness or liveness cannot be proven; kept.
  * - `cleanup-failed`    a removal attempt failed; the resource stayed in
  *                       place and the step is retryable.
  */
@@ -32,6 +33,7 @@ export type ResourceDisposition =
   | "deleted"
   | "retained-dirty"
   | "retained-unowned"
+  | "retained-unproven"
   | "cleanup-failed";
 
 /** How the owner of a resource was established. */
@@ -65,6 +67,14 @@ export type ResourceQuarantineState = Readonly<{
   path: string;
   originalPath: string;
   movedAt: string;
+  /** How the resource was quarantined, so restore can reverse it. */
+  method: "move" | "git-worktree-remove";
+  /** Git metadata needed to rebuild a linked worktree on restore. */
+  gitRestore?: Readonly<{
+    repositoryPath: string;
+    branch?: string;
+    head?: string;
+  }>;
 }>;
 
 export type ResourceCleanupReceipt = Readonly<{
@@ -121,7 +131,8 @@ export function createResourceRecord(
 export function isReleasable(record: ResourceRecord): boolean {
   return record.disposition === "releasable"
     && record.activeRefs.length === 0
-    && record.cleanliness !== "dirty";
+    && record.cleanliness !== "dirty"
+    && record.cleanliness !== "unknown";
 }
 
 /** Terminal Task statuses: a terminal owner keeps no active runtime claim. */

@@ -125,13 +125,12 @@ test("registry upsert and remove", () => {
   assert.equal(removeResourceRecord(state, record.id), state);
 });
 
-test("registry load degrades to empty on corrupt file", () => {
+test("registry load fails closed on corrupt file", () => {
   const home = mkdtempSync(join(tmpdir(), "yui-resource-registry-corrupt-"));
   try {
     mkdirSync(join(home, "runtime", "resource-registry"), { recursive: true });
     writeFileSync(resourceRegistryPath(home), "not json", "utf8");
-    const loaded = loadResourceRegistry(home);
-    assert.deepEqual(loaded.records, {});
+    assert.throws(() => loadResourceRegistry(home), /corrupt or unreadable/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -182,7 +181,7 @@ test("scanProcessPathRefs finds cwd references", () => {
     const proc = spawnSync("sleep", ["0.1"], { cwd: child, timeout: 5_000 });
     assert.equal(proc.status, 0);
     // The process exited; no refs should remain.
-    const refs = scanProcessPathRefs([child]);
+    const { refs } = scanProcessPathRefs([child]);
     assert.equal(refs.get(child)?.length ?? 0, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -199,7 +198,7 @@ test("scanProcessPathRefs detects live cwd", () => {
     const deadline = Date.now() + 2_000;
     let found = false;
     while (Date.now() < deadline) {
-      const refs = scanProcessPathRefs([child]);
+      const { refs } = scanProcessPathRefs([child]);
       if ((refs.get(child)?.length ?? 0) > 0) {
         found = true;
         break;

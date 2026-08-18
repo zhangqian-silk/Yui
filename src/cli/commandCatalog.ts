@@ -968,8 +968,8 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "gc",
           summary: "Plan or apply resource garbage collection.",
-          usage: "yui resources gc [--dry-run|--apply|--purge] [--quarantine-ttl-hours <hours>]",
-          options: ["--dry-run", "--apply", "--purge", "--quarantine-ttl-hours"]
+          usage: "yui resources gc [--dry-run|--apply|--purge|--restore] [--quarantine-ttl-hours <hours>]",
+          options: ["--dry-run", "--apply", "--purge", "--restore", "--quarantine-ttl-hours"]
         }
       ]
     },
@@ -982,9 +982,12 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "set",
           summary: "Update Yui configuration.",
-          usage: "yui config set <--time-zone <IANA timezone> | --reconciliation-interval-seconds <5-300> | --resources-gc-mode <report|quarantine>>",
-          options: ["--time-zone", "--reconciliation-interval-seconds", "--resources-gc-mode"],
-          optionValues: { "--resources-gc-mode": ["report", "quarantine"] }
+          usage: "yui config set <--time-zone <IANA timezone> | --reconciliation-interval-seconds <5-300> | --resources-gc-mode <report|quarantine> | --resources-gc-auto-quarantine <true|false>>",
+          options: ["--time-zone", "--reconciliation-interval-seconds", "--resources-gc-mode", "--resources-gc-auto-quarantine"],
+          optionValues: {
+            "--resources-gc-mode": ["report", "quarantine"],
+            "--resources-gc-auto-quarantine": ["true", "false"]
+          }
         },
         {
           name: "review",

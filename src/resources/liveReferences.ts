@@ -16,11 +16,20 @@ import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 
 const executeFile = promisify(execFile);
 
+/** A diagnostic explaining why a source could not be fully trusted. */
+export type LiveReferenceDiagnostic = Readonly<{
+  source: "proc" | "tmux" | "controller" | "durable";
+  severity: "error" | "warning";
+  message: string;
+}>;
+
 export type LiveReferenceScan = Readonly<{
   /** Per-path reference tokens; a path is live when its list is non-empty. */
   refsByPath: ReadonlyMap<string, readonly string[]>;
   /** Paths explicitly protected by Controller/descriptor ownership. */
   protectedPaths: readonly string[];
+  /** Source-level diagnostics; an error means the scan is fail-closed. */
+  diagnostics: readonly LiveReferenceDiagnostic[];
 }>;
 
 export type LiveReferencePorts = Readonly<{
@@ -54,6 +63,7 @@ export async function scanLiveReferences(
   const paths = input.paths.map((path) => resolve(path));
   const refs = new Map<string, Set<string>>();
   const protectedPaths = new Set<string>();
+  const diagnostics: LiveReferenceDiagnostic[] = [];
 
   const addRef = (path: string, token: string): void => {
     const set = refs.get(path) ?? new Set<string>();
@@ -62,33 +72,44 @@ export async function scanLiveReferences(
   };
 
   // 1. Physical process inventory: cwd and open file descriptors.
-  const processRefs = input.ports?.processCwdRefs !== undefined
-    ? input.ports.processCwdRefs(paths)
+  const processResult = input.ports?.processCwdRefs !== undefined
+    ? { refs: input.ports.processCwdRefs(paths), diagnostics: [] as LiveReferenceDiagnostic[] }
     : scanProcessPathRefs(paths);
-  for (const [path, tokens] of processRefs) {
+  for (const [path, tokens] of processResult.refs) {
     for (const token of tokens) addRef(path, token);
   }
+  diagnostics.push(...processResult.diagnostics);
 
   // 2. tmux pane working directories (best effort; tmux may be absent).
-  const paneCwds = input.ports?.tmuxPaneCwds !== undefined
-    ? await input.ports.tmuxPaneCwds()
+  const tmuxResult = input.ports?.tmuxPaneCwds !== undefined
+    ? { cwds: await input.ports.tmuxPaneCwds(), diagnostics: [] as LiveReferenceDiagnostic[] }
     : await scanTmuxPaneCwds(home, input.tmuxServerName, input.environment ?? process.env);
-  for (const cwd of paneCwds) {
+  for (const cwd of tmuxResult.cwds) {
     for (const path of paths) {
       if (isPathWithin(cwd, path)) addRef(path, `tmux-pane:${cwd}`);
     }
   }
+  diagnostics.push(...tmuxResult.diagnostics);
 
-  // 3. Controller discovery: a running Controller protects its Home.
+  // 3. Controller discovery: a running Controller protects only its own
+  //    discovery record. Its cwd and open files are covered by the /proc
+  //    scan above, so a live Controller does not blanket-protect legacy
+  //    deployments and worktrees that no descriptor references — automatic
+  //    GC (which runs inside the Controller) would otherwise be a no-op.
   const discovery = readControllerDiscovery(home);
-  if (discovery !== undefined) {
+  if (discovery.protects) {
     for (const path of paths) {
-      if (isPathWithin(home, path)) addRef(path, discovery);
+      if (discovery.protectedPaths.some(
+        (claim) => isPathWithin(claim, path) || isPathWithin(path, claim)
+      )) {
+        addRef(path, discovery.token);
+      }
     }
   }
+  if (discovery.diagnostic !== undefined) diagnostics.push(discovery.diagnostic);
 
   // 4. Durable managed workspaces: their roots and entries are claimed while
-    // the durable record exists, regardless of Task terminal state.
+  //    the durable record exists, regardless of Task terminal state.
   const workspaces = input.ports?.managedWorkspaces !== undefined
     ? input.ports.managedWorkspaces()
     : [];
@@ -121,21 +142,27 @@ export async function scanLiveReferences(
   }
   return Object.freeze({
     refsByPath,
-    protectedPaths: Object.freeze([...protectedPaths])
+    protectedPaths: Object.freeze([...protectedPaths]),
+    diagnostics: Object.freeze(diagnostics)
   });
 }
 
+export type ProcessScanResult = Readonly<{
+  refs: ReadonlyMap<string, readonly string[]>;
+  diagnostics: readonly LiveReferenceDiagnostic[];
+}>;
+
 /**
  * Scan /proc for processes whose cwd or open fd is within one of the paths.
- * A process we cannot inspect (permission, race) is ignored for cwd/fd
- * matching but does not by itself protect a path: the caller layers durable
- * and descriptor references on top, and an unreadable store degrades owners
- * to "unproven" upstream.
+ * The current process is included: an operator running GC from inside a
+ * candidate directory must protect it. When /proc itself cannot be read the
+ * scan fails closed: every candidate path receives a protective ref.
  */
 export function scanProcessPathRefs(
   paths: readonly string[]
-): ReadonlyMap<string, readonly string[]> {
+): ProcessScanResult {
   const refs = new Map<string, Set<string>>();
+  const diagnostics: LiveReferenceDiagnostic[] = [];
   const add = (path: string, token: string): void => {
     const set = refs.get(path) ?? new Set<string>();
     set.add(token);
@@ -144,13 +171,16 @@ export function scanProcessPathRefs(
   let entries: readonly string[];
   try {
     entries = readdirSync("/proc");
-  } catch {
-    return freezeRefs(refs);
+  } catch (error) {
+    // /proc is unreadable: fail closed — protect every candidate path.
+    const message = `/proc cannot be read: ${error instanceof Error ? error.message : "unknown error"}`;
+    diagnostics.push({ source: "proc" as const, severity: "error" as const, message });
+    for (const path of paths) add(path, "proc:unreadable");
+    return freezeResult(refs, diagnostics);
   }
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const pid = Number(entry);
-    if (pid === process.pid) continue;
     let cwd: string | undefined;
     try {
       cwd = readlinkSync(`/proc/${pid}/cwd`);
@@ -186,23 +216,32 @@ export function scanProcessPathRefs(
       }
     }
   }
-  return freezeRefs(refs);
+  return freezeResult(refs, diagnostics);
 }
 
-function freezeRefs(
-  refs: ReadonlyMap<string, Set<string>>
-): ReadonlyMap<string, readonly string[]> {
+function freezeResult(
+  refs: ReadonlyMap<string, Set<string>>,
+  diagnostics: readonly LiveReferenceDiagnostic[]
+): ProcessScanResult {
   const frozen = new Map<string, readonly string[]>();
   for (const [path, tokens] of refs) frozen.set(path, Object.freeze([...tokens]));
-  return frozen;
+  return Object.freeze({
+    refs: frozen,
+    diagnostics: Object.freeze(diagnostics)
+  });
 }
 
-/** Best-effort tmux pane cwd enumeration for the Home's namespace. */
+export type TmuxScanResult = Readonly<{
+  cwds: readonly string[];
+  diagnostics: readonly LiveReferenceDiagnostic[];
+}>;
+
+/** Enumerate tmux pane cwds for the Home's namespace. */
 export async function scanTmuxPaneCwds(
   home: string,
   tmuxServerName: string | undefined,
   environment: NodeJS.ProcessEnv
-): Promise<readonly string[]> {
+): Promise<TmuxScanResult> {
   const server = tmuxServerName ?? defaultTmuxServerName(home);
   try {
     const { stdout } = await executeFile(
@@ -210,32 +249,114 @@ export async function scanTmuxPaneCwds(
       ["-L", server, "list-panes", "-a", "-F", "#{pane_current_path}"],
       { env: environment, timeout: 5_000 }
     );
-    return stdout.split("\n").map((line) => line.trim()).filter(Boolean);
-  } catch {
-    return Object.freeze([]);
+    return Object.freeze({
+      cwds: Object.freeze(stdout.split("\n").map((line) => line.trim()).filter(Boolean)),
+      diagnostics: Object.freeze([])
+    });
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    // tmux binary not found or no server: the namespace is genuinely absent.
+    if (code === "ENOENT" || isNoServerError(error)) {
+      return Object.freeze({ cwds: Object.freeze([]), diagnostics: Object.freeze([]) });
+    }
+    // Any other failure (permission, timeout, unexpected exit) is untrusted.
+    const message = `tmux scan failed: ${error instanceof Error ? error.message : "unknown error"}`;
+    return Object.freeze({
+      cwds: Object.freeze([]),
+      diagnostics: Object.freeze([{ source: "tmux" as const, severity: "error" as const, message }])
+    });
   }
+}
+
+function isNoServerError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("no server") || message.includes("error connecting to");
 }
 
 function defaultTmuxServerName(home: string): string {
   return `yui-${createHash("sha256").update(resolve(home)).digest("hex").slice(0, 24)}`;
 }
 
-/** Read the Controller discovery record when its process is alive. */
-export function readControllerDiscovery(home: string): string | undefined {
+export type ControllerDiscoveryResult = Readonly<{
+  protects: boolean;
+  token: string;
+  /** Precise paths owned by the live Controller (the discovery record). */
+  protectedPaths: readonly string[];
+  diagnostic?: LiveReferenceDiagnostic;
+}>;
+
+/**
+ * Read the Controller discovery record. A live Controller process protects
+ * only its own discovery record; the process's cwd and open files are proven
+ * by the /proc scan. When the record exists but the PID is dead or the start
+ * identity does not match, the record is stale and does not protect.
+ */
+export function readControllerDiscovery(home: string): ControllerDiscoveryResult {
   const path = join(resolve(home), "runtime", "controller.json");
-  if (!existsSync(path)) return undefined;
+  if (!existsSync(path)) {
+    return Object.freeze({ protects: false, token: "", protectedPaths: Object.freeze([]) });
+  }
+  let record: { pid?: number; processStartIdentity?: string };
   try {
-    const record = JSON.parse(readFileSync(path, "utf8")) as {
-      pid?: number;
-      processStartIdentity?: string;
-    };
-    if (typeof record.pid !== "number" || record.pid <= 0) return undefined;
-    try {
-      process.kill(record.pid, 0);
-    } catch {
-      return undefined;
+    record = JSON.parse(readFileSync(path, "utf8")) as typeof record;
+  } catch (error) {
+    return Object.freeze({
+      protects: false,
+      token: "",
+      protectedPaths: Object.freeze([]),
+      diagnostic: {
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `controller.json is unreadable: ${error instanceof Error ? error.message : "unknown error"}`
+      }
+    });
+  }
+  if (typeof record.pid !== "number" || record.pid <= 0) {
+    return Object.freeze({
+      protects: false,
+      token: "",
+      protectedPaths: Object.freeze([]),
+      diagnostic: { source: "controller" as const, severity: "error" as const, message: "controller.json has no valid pid" }
+    });
+  }
+  try {
+    process.kill(record.pid, 0);
+  } catch {
+    // PID is dead: the Controller is not running; no protection, no diagnostic.
+    return Object.freeze({ protects: false, token: "", protectedPaths: Object.freeze([]) });
+  }
+  // PID is alive. When a start identity is recorded, verify it to guard
+  // against PID reuse.
+  if (typeof record.processStartIdentity === "string") {
+    const currentIdentity = readLinuxProcessStartIdentity(record.pid);
+    if (currentIdentity !== undefined && currentIdentity !== record.processStartIdentity) {
+      return Object.freeze({
+        protects: false,
+        token: "",
+        protectedPaths: Object.freeze([]),
+        diagnostic: {
+          source: "controller" as const,
+          severity: "warning" as const,
+          message: `controller.json pid ${record.pid} start identity mismatch (PID reuse?)`
+        }
+      });
     }
-    return `controller:${record.pid}`;
+  }
+  return Object.freeze({
+    protects: true,
+    token: `controller:${record.pid}`,
+    protectedPaths: Object.freeze([path])
+  });
+}
+
+/** Read /proc/<pid>/stat start time (field 22), the Linux process identity. */
+function readLinuxProcessStartIdentity(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The comm field (2) can contain spaces and parentheses, so find the last ")".
+    const afterComm = stat.slice(stat.lastIndexOf(")") + 2);
+    const fields = afterComm.split(" ");
+    return fields[19]; // field 22 (1-indexed) = index 20 after comm; fields[19]
   } catch {
     return undefined;
   }

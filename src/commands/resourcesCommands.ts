@@ -3,10 +3,10 @@
  *
  * Dry-run by default. `--apply` quarantines releasable resources only when
  * `resources.gcMode=quarantine` is set; `--purge` permanently deletes
- * quarantined resources after the observation window.
+ * quarantined resources after the observation window; `--restore` rolls back
+ * every quarantined resource to its original path.
  */
 
-import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { usageError } from "../errors/cliError.js";
@@ -18,6 +18,7 @@ import {
   applyResourceGc,
   planResourceGc,
   purgeResourceQuarantine,
+  restoreAllResourceGc,
   type GcMode,
   type GcPlan,
   type GcResult
@@ -27,6 +28,7 @@ import {
   resourceKindLabel,
   resourceOwnerLabel
 } from "../resources/resourceDiscovery.js";
+import { resolveResourcesGcMode } from "../config/yuiConfig.js";
 import type { ResourceRecord } from "../resources/resourceTypes.js";
 
 export type ResourcesCommandResult = Readonly<{
@@ -34,7 +36,7 @@ export type ResourcesCommandResult = Readonly<{
   data?: unknown;
 }>;
 
-type GcAction = "dry-run" | "apply" | "purge";
+type GcAction = "dry-run" | "apply" | "purge" | "restore";
 
 export type ResourcesCommandOptions = Readonly<{
   now?: () => Date;
@@ -49,7 +51,7 @@ export async function runResourcesCommand(
   if (command !== "gc") {
     throw usageError(
       "Unknown resources command. Available: yui resources gc "
-        + "[--dry-run|--apply|--purge] [--quarantine-ttl-hours <hours>]."
+        + "[--dry-run|--apply|--purge|--restore] [--quarantine-ttl-hours <hours>]."
     );
   }
   return runGcCommand(rest, store, options);
@@ -70,6 +72,14 @@ async function runGcCommand(
   const managedWorkspaces = collectManagedWorkspaces(store);
   const taskStatusById = collectTaskStatuses(store);
 
+  if (action === "restore") {
+    const result = await restoreAllResourceGc(home, { now });
+    return {
+      output: renderRestoreResult(result),
+      data: result
+    };
+  }
+
   if (action === "purge") {
     if (mode !== "quarantine") {
       return {
@@ -78,7 +88,7 @@ async function runGcCommand(
         data: { mode, action: "purge", skipped: true }
       };
     }
-    const result = await purgeResourceQuarantine(home, { now, ttlHours });
+    const result = await purgeResourceQuarantine(home, { now, ttlHours, managedWorkspaces });
     return {
       output: renderPurgeResult(result),
       data: result
@@ -97,7 +107,16 @@ async function runGcCommand(
   });
 
   if (action === "apply" && mode === "quarantine") {
-    const result = await applyResourceGc(plan);
+    const result = await applyResourceGc({
+      home,
+      registryStore: createResourceRegistryStore(home),
+      projects,
+      managedWorkspaces,
+      taskStatusById,
+      mode,
+      now,
+      quarantineTtlHours: ttlHours
+    }, plan);
     return {
       output: renderApplyResult(result),
       data: result
@@ -114,6 +133,7 @@ function parseGcAction(args: readonly string[]): GcAction {
   const flags = new Set(args);
   if (flags.has("--apply")) return "apply";
   if (flags.has("--purge")) return "purge";
+  if (flags.has("--restore")) return "restore";
   return "dry-run";
 }
 
@@ -128,8 +148,7 @@ function parseTtlHours(args: readonly string[]): number {
 }
 
 function resolveGcMode(store: TaskStore): GcMode {
-  const value = store.getConfig().resourcesGcMode;
-  return value === "quarantine" ? "quarantine" : "report";
+  return resolveResourcesGcMode(store.getConfig().resourcesGcMode);
 }
 
 function collectManagedWorkspaces(store: TaskStore): ManagedWorkspace[] {
@@ -157,6 +176,14 @@ function renderPlan(plan: GcPlan, action: GcAction): string {
   lines.push(`${modeNotice}Resource GC plan (${plan.mode}, ${action}) at ${plan.generatedAt}`);
   lines.push(`Home: ${plan.home}`);
   lines.push("");
+
+  if (plan.scan.diagnostics.length > 0) {
+    lines.push("Scan diagnostics:");
+    for (const diag of plan.scan.diagnostics) {
+      lines.push(`  [${diag.severity}] ${diag.source}: ${diag.message}`);
+    }
+    lines.push("");
+  }
 
   if (plan.records.length === 0) {
     lines.push("No resources discovered.");
@@ -226,6 +253,29 @@ function renderApplyResult(result: GcResult): string {
   return lines.join("\n");
 }
 
+function renderRestoreResult(result: GcResult): string {
+  const lines: string[] = [];
+  lines.push(`Resource GC restore at ${result.planned.generatedAt}`);
+  lines.push(`Home: ${result.planned.home}`);
+  lines.push("");
+  if (result.restored.length > 0) {
+    lines.push(`Restored ${result.restored.length} resource(s):`);
+    for (const record of result.restored) {
+      lines.push(`  ${record.id} ${resourceKindLabel(record.kind)} ${record.path}`);
+    }
+  }
+  if (result.failed.length > 0) {
+    lines.push(`Failed ${result.failed.length} resource(s):`);
+    for (const record of result.failed) {
+      lines.push(`  ${record.id}: ${record.blocker ?? "unknown"}`);
+    }
+  }
+  if (result.restored.length === 0 && result.failed.length === 0) {
+    lines.push("No quarantined resources to restore.");
+  }
+  return lines.join("\n");
+}
+
 function renderPurgeResult(result: GcResult): string {
   const lines: string[] = [];
   lines.push(`Resource GC purge at ${result.planned.generatedAt}`);
@@ -263,5 +313,3 @@ function formatSize(bytes: number | undefined): string {
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `…${value.slice(-(max - 1))}`;
 }
-
-export { existsSync as resourceExistsSync };

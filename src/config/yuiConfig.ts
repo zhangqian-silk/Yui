@@ -17,6 +17,17 @@ export function resolveResourcesGcMode(value?: unknown): ResourcesGcMode {
 }
 
 /**
+ * Whether the Controller may automatically quarantine resources for terminal
+ * Tasks. Defaults to false: automatic GC is always opt-in, and permanent
+ * deletion remains a manual, delayed step.
+ */
+export function resolveResourcesGcAutoQuarantine(value?: unknown): boolean {
+  if (value === undefined) return false;
+  if (typeof value === "boolean") return value;
+  throw new TypeError("resourcesGcAutoQuarantine must be a boolean.");
+}
+
+/**
  * Resolves the durable Yui setting used for low-frequency recovery
  * reconciliation. Normal durable state changes wake the Controller through
  * its event queue and do not wait for this interval.

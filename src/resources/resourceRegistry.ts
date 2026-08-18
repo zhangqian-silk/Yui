@@ -47,9 +47,10 @@ export function emptyResourceRegistry(): ResourceRegistryState {
 }
 
 /**
- * Load the registry. A missing or unreadable registry degrades to an empty
- * one: GC must never invent ownership from a corrupt registry, and a fresh
- * Home simply has no records yet.
+ * Load the registry. A missing registry is an empty Home. A corrupt or
+ * unreadable registry fails closed: GC must never invent ownership from a
+ * corrupt registry, and silently dropping quarantine receipts could let a
+ * resource be released twice.
  */
 export function loadResourceRegistry(home: string): ResourceRegistryState {
   const path = resourceRegistryPath(home);
@@ -57,8 +58,13 @@ export function loadResourceRegistry(home: string): ResourceRegistryState {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return emptyResourceRegistry();
+  } catch (error) {
+    throw new Error(
+      `Resource registry is corrupt or unreadable at ${path}: `
+        + `${error instanceof Error ? error.message : "unknown error"}. `
+        + "Fix or remove the registry file before running GC.",
+      { cause: error }
+    );
   }
   return parseResourceRegistryState(parsed);
 }
@@ -102,18 +108,31 @@ export function listResourceRecords(state: ResourceRegistryState): ResourceRecor
 }
 
 export function parseResourceRegistryState(value: unknown): ResourceRegistryState {
-  if (typeof value !== "object" || value === null) return emptyResourceRegistry();
+  if (typeof value !== "object" || value === null) {
+    throw new Error("Resource registry root is not an object.");
+  }
   const record = value as Record<string, unknown>;
   if (record.schemaVersion !== RESOURCE_REGISTRY_SCHEMA_VERSION) {
-    return emptyResourceRegistry();
+    throw new Error(
+      `Resource registry schemaVersion is ${String(record.schemaVersion)}; `
+        + `expected ${RESOURCE_REGISTRY_SCHEMA_VERSION}.`
+    );
   }
   if (typeof record.records !== "object" || record.records === null) {
-    return emptyResourceRegistry();
+    throw new Error("Resource registry records is not an object.");
   }
   const records: Record<string, ResourceRecord> = {};
   for (const [key, entry] of Object.entries(record.records)) {
     const parsed = parseResourceRecord(entry);
-    if (parsed !== undefined && parsed.id === key) records[key] = parsed;
+    if (parsed === undefined) {
+      throw new Error(`Resource registry record ${key} is malformed.`);
+    }
+    if (parsed.id !== key) {
+      throw new Error(
+        `Resource registry record key ${key} does not match id ${parsed.id}.`
+      );
+    }
+    records[key] = parsed;
   }
   return Object.freeze({
     schemaVersion: RESOURCE_REGISTRY_SCHEMA_VERSION,

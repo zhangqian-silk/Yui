@@ -60,8 +60,12 @@ export class SqliteResourceRegistry {
       let parsed: unknown;
       try {
         parsed = JSON.parse(row.payload);
-      } catch {
-        continue;
+      } catch (error) {
+        throw new Error(
+          `SQLite resource registry has a corrupt payload: `
+            + `${error instanceof Error ? error.message : "unknown error"}.`,
+          { cause: error }
+        );
       }
       const state = parseResourceRegistryState({
         schemaVersion: RESOURCE_REGISTRY_SCHEMA_VERSION,

@@ -311,6 +311,32 @@ test("CRUD: config and home identity", () => {
   store.close();
 });
 
+test("config: malformed durable values fail closed on save and load", () => {
+  const home = temporaryHome();
+  const store = new SqliteTaskStore(home);
+  // Invalid GC mode is rejected on save.
+  assert.throws(
+    () => store.saveConfig({ schemaVersion: 1, resourcesGcMode: "bogus" }),
+    /resourcesGcMode/
+  );
+  // Invalid auto-quarantine flag is rejected on save.
+  assert.throws(
+    () => store.saveConfig({ schemaVersion: 1, resourcesGcAutoQuarantine: "yes" }),
+    /resourcesGcAutoQuarantine/
+  );
+  store.close();
+
+  // A corrupted durable config row fails closed on read instead of silently
+  // falling back to defaults.
+  const db = new Database(join(home, "yui.db"));
+  db.prepare("UPDATE config SET payload = ? WHERE id = 1")
+    .run(JSON.stringify({ schemaVersion: 1, resourcesGcMode: 42 }));
+  db.close();
+  const reopened = new SqliteTaskStore(home);
+  assert.throws(() => reopened.getConfig(), /resourcesGcMode/);
+  reopened.close();
+});
+
 test("CRUD: saving a record for another task is rejected", () => {
   const store = new SqliteTaskStore(temporaryHome());
   const task = makeTask(store);

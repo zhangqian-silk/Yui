@@ -3,6 +3,7 @@ import {
   DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
   DEFAULT_RESOURCES_GC_MODE,
   reconciliationIntervalMilliseconds
+  , resolveResourcesGcAutoQuarantine
   , resolveResourcesGcMode
 } from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
@@ -30,7 +31,8 @@ type ConfigCommandStore = Readonly<{
 const CONFIG_SET_USAGE = "Config set usage: yui config set "
   + "<--time-zone <IANA timezone> | "
   + "--reconciliation-interval-seconds <seconds> | "
-  + "--resources-gc-mode <report|quarantine>>.";
+  + "--resources-gc-mode <report|quarantine> | "
+  + "--resources-gc-auto-quarantine <true|false>>.";
 
 export function runConfigCommand(args: string[], store: ConfigCommandStore): string {
   const [command, ...rest] = args;
@@ -47,6 +49,7 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
       `Reconciliation interval: ${reconciliationIntervalSeconds} seconds`,
       `Leader next-action mode: ${resolveLeaderNextActionMode(config.leaderNextActionMode)}`,
       `Resources GC mode: ${resolveResourcesGcMode(config.resourcesGcMode)}`,
+      `Resources GC auto-quarantine: ${resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine) ? "on" : "off"}`,
       ""
     ].join("\n");
   }
@@ -75,6 +78,15 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
         tx.saveConfig({ ...tx.getConfig(), resourcesGcMode });
       });
       return `Resources GC mode set to ${resourcesGcMode}\n`;
+    }
+    if (rest[0] === "--resources-gc-auto-quarantine") {
+      const resourcesGcAutoQuarantine = validatedConfigValue(
+        () => resolveResourcesGcAutoQuarantine(rest[1] === "true" ? true : rest[1] === "false" ? false : rest[1])
+      );
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), resourcesGcAutoQuarantine });
+      });
+      return `Resources GC auto-quarantine set to ${resourcesGcAutoQuarantine ? "on" : "off"}\n`;
     }
     throw configSetUsageError();
   }

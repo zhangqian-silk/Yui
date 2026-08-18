@@ -19,6 +19,7 @@ import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { managedProjectPath, type Project } from "../repository/project.js";
+import { readActiveReleasePointer } from "../release/runtimeRelease.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import {
   createResourceRecord,
@@ -138,8 +139,10 @@ export async function discoverResources(
       if (resolve(worktree.path) === resolve(repositoryPath)) continue;
       if (isReleaseNamespacePath(home, worktree.path)) continue;
       const owner = attributeWorktreeOwner(home, project, worktree, input.managedWorkspaces);
+      // A prunable worktree's gitdir points to a non-existent location; its
+      // cleanliness cannot be proven, so it is retained, not released.
       const cleanliness = worktree.prunable
-        ? "clean"
+        ? "unknown"
         : await gitWorktreeCleanliness(worktree.path);
       const taskStatus = owner.taskId === undefined
         ? undefined
@@ -167,6 +170,7 @@ export async function discoverResources(
   }
 
   // 2. Legacy deployments (historical runtime; no current-master creator).
+  const activeRelease = readActiveReleasePointerSafe(home);
   for (const kind of ["deployment", "deployment-backup"] as const) {
     const directory = kind === "deployment"
       ? join(home, "runtime", "deployments")
@@ -178,6 +182,10 @@ export async function discoverResources(
       const owner = attributeDeploymentOwner(home, entry.name, input.taskStatusById);
       const isGit = existsSync(join(path, ".git"));
       const cleanliness = isGit ? await gitWorktreeCleanliness(path) : "n/a";
+      const gitMetadata = isGit ? readDeploymentGitMetadata(path) : undefined;
+      // A resolved active deployment is permanently protected.
+      const isActiveDeployment = activeRelease !== null
+        && activeRelease.releaseId === entry.name;
       const taskStatus = owner.taskId === undefined
         ? undefined
         : input.taskStatusById.get(owner.taskId);
@@ -186,16 +194,19 @@ export async function discoverResources(
           kind: "deployment",
           path: resolve(path),
           owner,
-          ...(isGit ? {
-            git: { repositoryPath: path }
-          } : {}),
+          ...(gitMetadata !== undefined ? { git: gitMetadata } : {}),
           ...(sizeOf(path) === undefined ? {} : { sizeBytes: sizeOf(path) }),
           cleanliness,
           activeRefs: [],
-          disposition: "active"
+          disposition: isActiveDeployment ? "active" : "active",
+          ...(isActiveDeployment ? {
+            blocker: "Resolved active deployment; permanently retained."
+          } : {})
         }, input.now),
-        ownerTerminal: owner.taskId === undefined
+        ownerTerminal: isActiveDeployment
           ? false
+          : owner.taskId === undefined
+            ? false
           : isTerminalTaskStatus(taskStatus as never)
       });
     }
@@ -385,6 +396,72 @@ function projectRepositoryPath(home: string, project: Project): string | undefin
     return existsSync(path) ? path : undefined;
   }
   return existsSync(project.path) ? project.path : undefined;
+}
+
+/** Read the active release pointer, returning null when absent or unreadable. */
+function readActiveReleasePointerSafe(
+  home: string
+): { releaseId: string } | null {
+  try {
+    const pointer = readActiveReleasePointer(home);
+    return pointer === null ? null : { releaseId: pointer.releaseId };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read Git metadata for a deployment that is a linked worktree. The .git
+ * file points to the worktree's gitdir, which records the common dir and
+ * the original branch/head needed for a controlled restore.
+ */
+function readDeploymentGitMetadata(
+  path: string
+): { repositoryPath: string; commonDir?: string; branch?: string; head?: string } | undefined {
+  try {
+    const gitFile = join(path, ".git");
+    const gitStat = lstatSync(gitFile);
+    let gitDir: string;
+    if (gitStat.isFile()) {
+      const content = readFileSync(gitFile, "utf8").trim();
+      if (!content.startsWith("gitdir: ")) return { repositoryPath: path };
+      gitDir = content.slice("gitdir: ".length);
+    } else if (gitStat.isDirectory()) {
+      gitDir = gitFile;
+    } else {
+      return { repositoryPath: path };
+    }
+    const resolvedGitDir = resolve(gitDir);
+    const commonDirFile = join(resolvedGitDir, "commondir");
+    let commonDir: string | undefined;
+    if (existsSync(commonDirFile)) {
+      const raw = readFileSync(commonDirFile, "utf8").trim();
+      commonDir = resolve(resolvedGitDir, raw);
+    }
+    const headFile = join(resolvedGitDir, "HEAD");
+    let head: string | undefined;
+    let branch: string | undefined;
+    if (existsSync(headFile)) {
+      const headContent = readFileSync(headFile, "utf8").trim();
+      if (headContent.startsWith("ref: refs/heads/")) {
+        branch = headContent.slice("ref: ".length);
+        const refPath = join(commonDir ?? resolvedGitDir, headContent.slice("ref: ".length));
+        if (existsSync(refPath)) {
+          head = readFileSync(refPath, "utf8").trim();
+        }
+      } else if (/^[0-9a-f]{40}$/u.test(headContent)) {
+        head = headContent;
+      }
+    }
+    return {
+      repositoryPath: path,
+      ...(commonDir === undefined ? {} : { commonDir }),
+      ...(branch === undefined ? {} : { branch }),
+      ...(head === undefined ? {} : { head })
+    };
+  } catch {
+    return { repositoryPath: path };
+  }
 }
 
 function readTaskRuntimeMarker(

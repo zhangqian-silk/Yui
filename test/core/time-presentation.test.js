@@ -39,6 +39,7 @@ test("config commands expose effective recovery settings and persist overrides",
     "Time zone: Asia/Shanghai\nReconciliation interval: 120 seconds\n"
       + "Leader next-action mode: display\n"
       + "Resources GC mode: report\n"
+      + "Resources GC auto-quarantine: off\n"
   );
   assert.equal(
     runConfigCommand(["set", "--time-zone", "Europe/London"], store),
@@ -55,6 +56,7 @@ test("config commands expose effective recovery settings and persist overrides",
     "Time zone: Europe/London\nReconciliation interval: 45 seconds\n"
       + "Leader next-action mode: display\n"
       + "Resources GC mode: report\n"
+      + "Resources GC auto-quarantine: off\n"
   );
 });
 
