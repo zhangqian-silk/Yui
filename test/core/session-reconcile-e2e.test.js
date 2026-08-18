@@ -185,6 +185,35 @@ async function waitForProcessExit(pid, timeoutMs, label) {
 }
 
 /**
+ * The Controller's tmux launch can fail transiently under CI full-suite load
+ * (resource contention makes `tmux start-server; new-session` exit non-zero).
+ * The Controller maps CommandExecutionError to SERVICE_ERROR with the real
+ * stderr; retry the launch a bounded number of times so a transient
+ * infrastructure failure does not flake the E2E. Permanent failures (missing
+ * tmux, real contract violations) persist across retries and still fail.
+ */
+async function ensureRoleSessionWithRetry(home, taskId, roleName, environment, attempts = 3) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await callController(home, "runtime.ensure-role-session", {
+        scope: "task",
+        taskId,
+        roleName,
+        environment
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      const transient = error?.code === "SERVICE_ERROR" || error?.code === "INTERNAL_ERROR";
+      if (!transient || attempt === attempts - 1) throw error;
+      await delay(200);
+    }
+  }
+  throw lastError;
+}
+
+/**
  * Builds the isolated sandbox: own Home, tmux namespace, Controller socket,
  * Git Project, active Task with a prepared workspace, Leader Role, and a
  * configured Agent whose command is the test Provider stand-in.
@@ -259,12 +288,7 @@ async function e2eFixture(t, { providerEnv = {} } = {}) {
       await runtime.startController();
     },
     async launchLeader() {
-      await callController(home, "runtime.ensure-role-session", {
-        scope: "task",
-        taskId: task.id,
-        roleName: role.name,
-        environment: providerEnvironment
-      });
+      await ensureRoleSessionWithRetry(home, task.id, role.name, providerEnvironment);
       // Wait for the Provider process and its owner record.
       await waitFor(
         () => readObservations(observationPath).some((o) => o.event === "process-started" && !o.isChild),
