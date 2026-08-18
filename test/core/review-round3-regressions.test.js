@@ -541,9 +541,9 @@ test("f8: archiveTaskCommand rejects a Task with an active job", (t) => {
   );
 });
 
-// ─── f9: IntegrationAttempt schema v3 ──────────────────────────────────────
+// ─── f9: IntegrationAttempt schema v4 ──────────────────────────────────────
 
-test("f9: IntegrationAttempt uses schemaVersion 3", (t) => {
+test("f9: IntegrationAttempt uses schemaVersion 4", (t) => {
   const attempt = createIntegrationAttempt({
     id: "integration-1",
     taskId: "task-1",
@@ -552,16 +552,16 @@ test("f9: IntegrationAttempt uses schemaVersion 3", (t) => {
     expectedHead: HEAD,
     changeSetIds: ["change-set-1"]
   }, NOW);
-  assert.equal(attempt.schemaVersion, 3);
+  assert.equal(attempt.schemaVersion, 4);
   assert.doesNotThrow(() => validateIntegrationAttempt(attempt));
   assert.throws(
-    () => validateIntegrationAttempt({ ...attempt, schemaVersion: 2 }),
-    /schemaVersion 3/
+    () => validateIntegrationAttempt({ ...attempt, schemaVersion: 3 }),
+    /schemaVersion 4/
   );
 });
 
-test("f9: CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION is 3", (t) => {
-  assert.equal(CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION, 3);
+test("f9: CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION is 4", (t) => {
+  assert.equal(CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION, 4);
 });
 
 // ─── f10: idempotent terminal cancel ───────────────────────────────────────

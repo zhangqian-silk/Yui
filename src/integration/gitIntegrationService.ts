@@ -7,6 +7,27 @@ import { promisify } from "node:util";
 import { selectEnvironment } from "../agent/launchEnvironment.js";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import type { DurableJob, DurableJobStep } from "../job/durableJob.js";
+import {
+  planBootstrapJobSteps,
+  planL2JobSteps
+} from "../verification/verificationPlan.js";
+import {
+  assertNoAdHocFullSuiteChecks,
+  checkResultsFromGateArtifact,
+  checkResultsFromGateJob,
+  gateIdentityForCandidate,
+  lookupReusableGateArtifact,
+  recordGateArtifactFromJob,
+  recordGateArtifactFromStepOutcomes,
+  resolveVerificationGate,
+  runGateStepsInProcess,
+  type ResolvedVerificationGate
+} from "../verification/verificationGateService.js";
+import {
+  recordGateArtifactPotentialReuse,
+  recordGateArtifactReuse
+} from "../verification/gateArtifact.js";
+import { touchGateArtifact } from "../verification/gateArtifactStore.js";
 import type { CheckResult } from "./checkResult.js";
 import {
   NodeGitWorkspace,
@@ -158,6 +179,10 @@ export class GitIntegrationService {
     }
     const project = this.store.getProject(initial.projectId);
     if (project === null) throw new Error(`Project not found: ${initial.projectId}.`);
+    // Issue 08: a Project with a VerificationPlan gates through its plan
+    // (bootstrap + L2) and reuses exact-SHA artifacts; an unconfigured
+    // Project keeps the existing explicit check path unchanged.
+    const gate = resolveVerificationGate(project, this.environment);
     let prepared: Readonly<{ path: string; branch: string; baseCommit: string }>;
     let workspace: IntegrationWorkspace;
     let managedWorkspace: ManagedWorkspace;
@@ -207,7 +232,7 @@ export class GitIntegrationService {
     // already bound one: never re-apply commits or spawn a second job. The
     // job's terminal wakeup drives the resume through `integration continue`.
     if (current.status === "running" && current.jobId !== undefined) {
-      return this.#resumeCheckJob(current, workspace, prepared.path, project.path);
+      return this.#resumeCheckJob(current, workspace, prepared.path, project.path, gate);
     }
 
     try {
@@ -265,6 +290,16 @@ export class GitIntegrationService {
       // target that cannot be advanced.  advanceTargetRef re-verifies both
       // after the checks, so a move during the gate is still fenced at CAS.
       await assertTargetReadyForChecks(project.path, current.targetRef, current.expectedHead);
+      if (gate !== undefined) {
+        return this.#runVerificationGate(
+          current,
+          workspace,
+          prepared.path,
+          managedWorkspace,
+          project.path,
+          gate
+        );
+      }
       if (this.jobPort !== undefined && current.checkCommands.length > 0) {
         return this.#startCheckJob(current, workspace, prepared.path, managedWorkspace, project.path);
       }
@@ -394,17 +429,39 @@ export class GitIntegrationService {
     workspace: IntegrationWorkspace,
     path: string,
     managedWorkspace: ManagedWorkspace,
-    repositoryPath: string
+    repositoryPath: string,
+    gate?: ResolvedVerificationGate
   ): Promise<IntegrationResult> {
     const runtime = this.#runtimePreparation(attempt, managedWorkspace);
     this.runtimeIsolation.activate(runtime);
     const environment = await integrationCheckEnvironment(this.environment, runtime);
     const head = await gitLine(["-C", path, "rev-parse", "HEAD^{commit}"]);
-    const steps: DurableJobStep[] = attempt.checkCommands.map((command, index) => ({
-      name: `check-${index + 1}`,
-      command,
-      timeoutMs: 30 * 60_000
-    }));
+    const steps: DurableJobStep[] = gate === undefined
+      ? attempt.checkCommands.map((command, index) => ({
+          name: `check-${index + 1}`,
+          command,
+          timeoutMs: 30 * 60_000
+        }))
+      : [
+          ...planBootstrapJobSteps(gate.plan).map((step) => ({
+            ...step,
+            timeoutMs: 30 * 60_000
+          })),
+          ...planL2JobSteps(gate.plan).map((step) => ({
+            ...step,
+            timeoutMs: 30 * 60_000
+          }))
+        ];
+    // Persist the gate identity before starting the job so a plan edit
+    // during the gate never misattributes the evidence on resume.
+    let persisted = attempt;
+    if (gate !== undefined) {
+      persisted = updateIntegrationAttempt(attempt, {
+        gatePlanDigest: gate.planDigest,
+        gateToolchainDigest: gate.toolchainDigest
+      }, this.now());
+      this.store.saveIntegrationAttempt(attempt.taskId, persisted);
+    }
     const job = await this.jobPort!.startCheckJob({
       taskId: attempt.taskId,
       integrationId: attempt.id,
@@ -414,13 +471,13 @@ export class GitIntegrationService {
       env: environment,
       steps
     });
-    const bound = recordIntegrationCheckJob(attempt, job.id, this.now());
+    const bound = recordIntegrationCheckJob(persisted, job.id, this.now());
     this.store.saveIntegrationAttempt(attempt.taskId, bound);
     if (job.status !== "queued" && job.status !== "running") {
       // Idempotent re-entry after a Leader exit in the bind window: the
       // Controller returned the already-terminal job. Converge through the
       // normal resume path instead of a checks-running zombie.
-      return this.#resumeCheckJob(bound, workspace, path, repositoryPath);
+      return this.#resumeCheckJob(bound, workspace, path, repositoryPath, gate);
     }
     return { status: "checks-running", attempt: bound, workspace, job };
   }
@@ -436,13 +493,20 @@ export class GitIntegrationService {
     attempt: IntegrationAttempt,
     workspace: IntegrationWorkspace,
     path: string,
-    repositoryPath: string
+    repositoryPath: string,
+    gate?: ResolvedVerificationGate
   ): Promise<IntegrationResult> {
     const job = await this.jobPort!.getJob(attempt.taskId, attempt.jobId!);
     if (job.status === "queued" || job.status === "running") {
       return { status: "checks-running", attempt, workspace, job };
     }
-    const checks = checkResultsFromJob(attempt, job);
+    const planStyle = gate !== undefined
+      || (job.steps?.some((step) =>
+        step.name.startsWith("bootstrap-") || step.name.startsWith("gate-")
+      ) ?? false);
+    const checks = planStyle
+      ? checkResultsFromGateJob(job, this.home)
+      : checkResultsFromJob(attempt, job);
     const managedWorkspace = this.store.getIntegrationWorkspace(attempt.taskId, attempt.id);
     if (managedWorkspace !== null) {
       const runtime = this.#runtimePreparation(attempt, managedWorkspace);
@@ -450,6 +514,53 @@ export class GitIntegrationService {
         runtime,
         checks.some((check) => check.outcome === "failed") ? "failure" : "completion"
       );
+    }
+    // Issue 08: record the GateArtifact for a plan-gated attempt. The
+    // identity is recomputed from the current plan and the job's exact
+    // checked head; a plan/toolchain change since the job started yields a
+    // different key, so the artifact is never misattributed (the attempt
+    // still converges from the job's own evidence).
+    if (gate !== undefined
+      && (job.result?.outcome === "succeeded" || job.result?.outcome === "failed")) {
+      // Use the digests captured at job start so a plan edit during the
+      // gate never misattributes the evidence.
+      const recordGate = attempt.gatePlanDigest !== undefined
+        ? Object.freeze({
+            ...gate,
+            planDigest: attempt.gatePlanDigest,
+            toolchainDigest: attempt.gateToolchainDigest ?? gate.toolchainDigest
+          })
+        : gate;
+      const identity = gateIdentityForCandidate({
+        projectId: attempt.projectId,
+        gate: recordGate,
+        level: "L2",
+        commit: job.head,
+        targetRef: attempt.targetRef,
+        baseHead: attempt.expectedHead
+      });
+      try {
+        const artifact = await recordGateArtifactFromJob(
+          this.store,
+          this.home,
+          identity,
+          gate.plan,
+          job,
+          this.now()
+        );
+        if (checks.every((check) => check.outcome !== "failed")) {
+          checks.push(...checkResultsFromGateArtifact(artifact));
+        }
+      } catch (error) {
+        // A failed artifact import (e.g. a lost job log) must not fake
+        // evidence: the attempt fails closed without a reusable artifact.
+        return this.#fail(
+          attempt,
+          error instanceof Error ? error : new Error(String(error)),
+          "gate-artifact",
+          workspace
+        );
+      }
     }
     if (checks.some((check) => check.outcome === "failed")) {
       const failed = updateIntegrationAttempt(attempt, {
@@ -514,6 +625,155 @@ export class GitIntegrationService {
     } finally {
       this.runtimeIsolation.cleanup(runtime, cleanupReason);
     }
+  }
+
+  /**
+   * Issue 08: the VerificationPlan gate for a configured Project.
+   *
+   * Enforce mode rejects ad-hoc full-suite checks before the gate. Reuse mode
+   * returns an existing successful artifact for the same identity tuple
+   * (project + exact commit + plan digest + toolchain digest + target
+   * boundary); record mode always runs and only counts shadow potential
+   * reuses. The gate itself runs as bootstrap + L2 DurableJob steps (or
+   * in-process when no Controller job port is available) and records a
+   * self-contained GateArtifact. The final CAS in
+   * {@link #finalizeGateSuccess} still fences a target that moves during the
+   * gate.
+   */
+  async #runVerificationGate(
+    attempt: IntegrationAttempt,
+    workspace: IntegrationWorkspace,
+    path: string,
+    managedWorkspace: ManagedWorkspace,
+    repositoryPath: string,
+    gate: ResolvedVerificationGate
+  ): Promise<IntegrationResult> {
+    if (gate.mode === "enforce") {
+      try {
+        assertNoAdHocFullSuiteChecks(gate.plan, attempt.checkCommands);
+      } catch (error) {
+        return this.#fail(
+          attempt,
+          error instanceof Error ? error : new Error(String(error)),
+          "verification-plan",
+          workspace
+        );
+      }
+    }
+    const candidateCommit = await gitLine(["-C", path, "rev-parse", "HEAD^{commit}"]);
+    const identity = gateIdentityForCandidate({
+      projectId: attempt.projectId,
+      gate,
+      level: "L2",
+      commit: candidateCommit,
+      targetRef: attempt.targetRef,
+      baseHead: attempt.expectedHead
+    });
+    if (gate.mode !== "record") {
+      const existing = await lookupReusableGateArtifact(this.store, identity);
+      if (existing !== null) {
+        touchGateArtifact(this.store, recordGateArtifactReuse(existing, this.now()));
+        const checks = checkResultsFromGateArtifact(existing, true);
+        return this.#finalizeGateSuccess(
+          attempt,
+          workspace,
+          repositoryPath,
+          candidateCommit,
+          checks
+        );
+      }
+    } else {
+      // Record mode: observe the potential reuse without skipping the gate.
+      const existing = await lookupReusableGateArtifact(this.store, identity);
+      if (existing !== null) {
+        touchGateArtifact(this.store, recordGateArtifactPotentialReuse(existing, this.now()));
+      }
+    }
+    if (this.jobPort !== undefined) {
+      return this.#startCheckJob(
+        attempt,
+        workspace,
+        path,
+        managedWorkspace,
+        repositoryPath,
+        gate
+      );
+    }
+    // Jobless fallback (queue processing without a Controller): run the
+    // plan gate in-process and record the artifact directly.
+    const runtime = this.#runtimePreparation(attempt, managedWorkspace);
+    this.runtimeIsolation.activate(runtime);
+    let cleanupReason: "completion" | "failure" = "failure";
+    try {
+      const environment = await integrationCheckEnvironment(this.environment, runtime);
+      const steps = [
+        ...planBootstrapJobSteps(gate.plan),
+        ...planL2JobSteps(gate.plan)
+      ];
+      const outcomes = await runGateStepsInProcess(
+        path,
+        steps,
+        environment,
+        integrationCheckDirectory(this.home, attempt.taskId, attempt.id),
+        candidateCommit
+      );
+      const succeeded = outcomes.length === steps.length
+        && outcomes.every((outcome) =>
+          outcome.exitCode === 0 && outcome.signal === null && !outcome.timedOut
+        );
+      const artifact = await recordGateArtifactFromStepOutcomes(
+        this.store,
+        identity,
+        gate.plan,
+        outcomes,
+        succeeded,
+        this.now()
+      );
+      const checks = checkResultsFromGateArtifact(artifact);
+      cleanupReason = succeeded ? "completion" : "failure";
+      if (!succeeded) {
+        const failed = updateIntegrationAttempt(
+          attempt,
+          { status: "failed", checks },
+          this.now()
+        );
+        this.store.saveIntegrationAttempt(attempt.taskId, failed);
+        return this.#terminalResult("failed", failed, workspace);
+      }
+      return this.#finalizeGateSuccess(
+        attempt,
+        workspace,
+        repositoryPath,
+        candidateCommit,
+        checks
+      );
+    } finally {
+      this.runtimeIsolation.cleanup(runtime, cleanupReason);
+    }
+  }
+
+  async #finalizeGateSuccess(
+    attempt: IntegrationAttempt,
+    workspace: IntegrationWorkspace,
+    repositoryPath: string,
+    candidateCommit: string,
+    checks: CheckResult[]
+  ): Promise<IntegrationResult> {
+    const validating = updateIntegrationAttempt(attempt, {
+      status: "validating",
+      candidateCommit,
+      checks
+    }, this.now());
+    this.store.saveIntegrationAttempt(attempt.taskId, validating);
+    await advanceTargetRef(
+      repositoryPath,
+      validating.targetRef,
+      candidateCommit,
+      validating.expectedHead
+    );
+    const committed = updateIntegrationAttempt(validating, { status: "committed" }, this.now());
+    this.store.saveIntegrationAttempt(attempt.taskId, committed);
+    return this.#terminalResult("committed", committed, workspace);
   }
 
   #runtimePreparation(

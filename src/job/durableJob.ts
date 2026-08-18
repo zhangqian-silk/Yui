@@ -34,6 +34,17 @@ export type DurableJobOwner =
 export type DurableJobStep = Readonly<{
   name: string;
   command: string;
+  /**
+   * Structured argv form (Issue 08 VerificationPlan steps). When present,
+   * the runner executes the argv directly without a shell, so a path or flag
+   * can never be misinterpreted as a shell token. `command` stays as the
+   * human-readable shell-equivalent for display and evidence matching.
+   */
+  argv?: readonly string[];
+  /** Working directory override; absolute. Defaults to the job workspace. */
+  cwd?: string;
+  /** Extra environment merged over the job environment for this step. */
+  env?: Readonly<Record<string, string>>;
   timeoutMs?: number;
 }>;
 
@@ -420,6 +431,23 @@ export function validateDurableJob(job: DurableJob): DurableJob {
     }
     stepNames.add(name);
     requireText(step.command, `DurableJob step command (${name})`);
+    if (step.argv !== undefined) {
+      if (!Array.isArray(step.argv) || step.argv.length === 0) {
+        throw new Error(`DurableJob step argv must be a non-empty array (${name}).`);
+      }
+      for (const value of step.argv) {
+        requireText(value, `DurableJob step argv (${name})`);
+      }
+    }
+    if (step.cwd !== undefined) {
+      requireText(step.cwd, `DurableJob step cwd (${name})`);
+      if (!step.cwd.startsWith("/")) {
+        throw new Error(`DurableJob step cwd must be absolute (${name}).`);
+      }
+    }
+    if (step.env !== undefined) {
+      validateEnvMap(step.env);
+    }
     if (step.timeoutMs !== undefined) {
       requirePositiveInteger(step.timeoutMs, `DurableJob step timeout (${name})`);
     }

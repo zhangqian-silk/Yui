@@ -75,7 +75,7 @@ test("the production registry registers every adjacent post-baseline step", () =
   const registry = createProductionRegistry();
   assert.equal(BASELINE_AGGREGATE_SCHEMA_VERSION, 16);
   assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
-  assert.equal(registry.size, 24);
+  assert.equal(registry.size, 25);
   const agentRunOptionalFieldsStep = registry.lookup("record", "agentRun", 6);
   assert.notEqual(agentRunOptionalFieldsStep, undefined);
   assert.equal(agentRunOptionalFieldsStep.toVersion, 7);
@@ -417,9 +417,11 @@ test("integrationAttempt v2 to v3 migration runs on a real snapshot", () => {
   const integrationSteps = plan.steps.filter(
     (step) => step.recordKind === "integrationAttempt"
   );
-  assert.equal(integrationSteps.length, 1);
+  assert.equal(integrationSteps.length, 2);
   assert.equal(integrationSteps[0].fromVersion, 2);
   assert.equal(integrationSteps[0].toVersion, 3);
+  assert.equal(integrationSteps[1].fromVersion, 3);
+  assert.equal(integrationSteps[1].toVersion, 4);
 
   let migrated = structuredClone(source);
   for (const planned of plan.steps) {
@@ -427,9 +429,9 @@ test("integrationAttempt v2 to v3 migration runs on a real snapshot", () => {
     migrated = planned.step.transform(migrated);
   }
 
-  assert.equal(migrated.schemaManifest.recordVersions.integrationAttempt, 3);
+  assert.equal(migrated.schemaManifest.recordVersions.integrationAttempt, 4);
   const attempt = migrated.state.tasks["task-1"].integrationAttempts["integration-1"];
-  assert.equal(attempt.schemaVersion, 3);
+  assert.equal(attempt.schemaVersion, 4);
   // The original snapshot must not be mutated.
   assert.equal(
     source.state.tasks["task-1"].integrationAttempts["integration-1"].schemaVersion,

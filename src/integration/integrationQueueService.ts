@@ -27,6 +27,7 @@ import {
   GitIntegrationService,
   type IntegrationResult
 } from "./gitIntegrationService.js";
+import { gateArtifactCoversCheckCommands } from "../verification/verificationGateService.js";
 import type { ChangeSet } from "./changeSet.js";
 import type { WorkItemCandidate } from "../workItem/workItem.js";
 
@@ -421,7 +422,7 @@ export async function enqueueIntegrationQueueEntry(
       // evidence.  A converged ChangeSet with explicit gates queues normally:
       // the no-op apply still runs the caller's checks against the current
       // target instead of waiving them.
-      if (canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), entry, changeSet, effectiveTargetHead)) {
+      if (await canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), entry, changeSet, effectiveTargetHead)) {
         entry = markIntegrationQueueValidated(entry, now(), effectiveTargetHead);
       }
       tx.saveIntegrationQueueEntry(task.id, entry);
@@ -513,21 +514,28 @@ function findActiveQueueDuplicate(
  * evidence would not cover their integration anyway.  A review check that
  * passed for command X never waives a different gate Y.
  */
-function canReuseEvidenceAtHead(
+async function canReuseEvidenceAtHead(
   store: TaskStore,
   taskId: string,
   entries: readonly IntegrationQueueEntry[],
   entry: IntegrationQueueEntry,
   changeSet: ChangeSet,
   targetHead: string
-): boolean {
+): Promise<boolean> {
   if (entry.evidenceRefs.length === 0) return false;
   if (targetHead !== changeSet.baseCommit) return false;
   const lane = queueLaneKey(entry);
   if (entries.some((existing) => queueLaneKey(existing) === lane
     && existing.status !== "committed"
     && existing.status !== "superseded")) return false;
-  return evidenceCoversCheckCommands(store, taskId, entry.evidenceRefs, entry.checkCommands);
+  return evidenceCoversCheckCommands(
+    store,
+    taskId,
+    entry.evidenceRefs,
+    entry.checkCommands,
+    changeSet.headCommit,
+    entry.projectId
+  );
 }
 
 /**
@@ -545,15 +553,32 @@ function canReuseEvidenceAtHead(
  * diagnostic tree (the reviewer's own commit with review-only changes); those
  * checks proved a different tree and cannot waive the candidate gate.
  */
-function evidenceCoversCheckCommands(
+async function evidenceCoversCheckCommands(
   store: TaskStore,
   taskId: string,
   evidenceRefs: readonly string[],
-  checkCommands: readonly string[]
-): boolean {
+  checkCommands: readonly string[],
+  candidateCommit: string,
+  projectId: string
+): Promise<boolean> {
   if (checkCommands.length === 0) return true;
   const covered = new Set<string>();
   for (const ref of evidenceRefs) {
+    // Issue 08: a `gate-artifact:` ref covers the exact commands its L2
+    // artifact passed on the exact candidate commit. The store resolves the
+    // artifact through its persistence backend (SQLite or file).
+    if (ref.startsWith("gate-artifact:")) {
+      if (await gateArtifactCoversCheckCommands(
+        store,
+        projectId,
+        ref,
+        checkCommands,
+        candidateCommit
+      )) {
+        for (const command of checkCommands) covered.add(command);
+      }
+      continue;
+    }
     const roundId = parseReviewRoundRef(ref);
     if (roundId === undefined) continue;
     const round = store.getReviewRound(taskId, roundId);

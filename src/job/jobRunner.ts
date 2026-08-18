@@ -150,14 +150,31 @@ export async function runDurableJobRunner(
       let timedOut = false;
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn("/bin/sh", ["-lc", step.command], {
-          cwd: spec.workspace,
-          env: spec.env,
-          stdio: ["ignore", logFd, logFd],
-          // f4: New process group so the runner can kill the entire tree
-          // (shell + descendants) on timeout or cancel.
-          detached: true
-        });
+        // Issue 08: a structured argv step executes without a shell so its
+        // tokens can never be reinterpreted; a legacy command step keeps the
+        // shell form. A per-step cwd/env override applies to either form.
+        const stepCwd = step.cwd ?? spec.workspace;
+        const stepEnv = step.env === undefined
+          ? spec.env
+          : { ...spec.env, ...step.env };
+        // f4: a new process group (detached) lets the runner kill the whole
+        // step tree on timeout or cancel, for both argv and shell forms.
+        if (step.argv !== undefined) {
+          const [file, ...args] = step.argv;
+          child = spawn(file, args, {
+            cwd: stepCwd,
+            env: stepEnv,
+            stdio: ["ignore", logFd, logFd],
+            detached: true
+          });
+        } else {
+          child = spawn("/bin/sh", ["-lc", step.command], {
+            cwd: stepCwd,
+            env: stepEnv,
+            stdio: ["ignore", logFd, logFd],
+            detached: true
+          });
+        }
       } catch (error) {
         closeSync(logFd);
         completedSteps.push({
@@ -290,6 +307,20 @@ function readSpec(specPath: string): DurableJobSpec {
     }
     if (typeof step.command !== "string" || step.command.length === 0) {
       throw new Error(`DurableJob spec step ${step.name} is missing command.`);
+    }
+    if (step.argv !== undefined) {
+      if (!Array.isArray(step.argv) || step.argv.length === 0
+        || step.argv.some((value: unknown) => typeof value !== "string" || (value as string).length === 0)) {
+        throw new Error(`DurableJob spec step ${step.name} argv is invalid.`);
+      }
+    }
+    if (step.cwd !== undefined
+      && (typeof step.cwd !== "string" || !step.cwd.startsWith("/"))) {
+      throw new Error(`DurableJob spec step ${step.name} cwd must be absolute.`);
+    }
+    if (step.env !== undefined
+      && (typeof step.env !== "object" || step.env === null || Array.isArray(step.env))) {
+      throw new Error(`DurableJob spec step ${step.name} env must be a map.`);
     }
     if (step.timeoutMs !== undefined
       && (!Number.isSafeInteger(step.timeoutMs) || step.timeoutMs < 1)) {

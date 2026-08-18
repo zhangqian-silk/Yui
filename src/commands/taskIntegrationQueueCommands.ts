@@ -29,7 +29,7 @@ export async function runTaskIntegrationQueueCommand(
   options: TaskIntegrationCommandOptions = {}
 ): Promise<Readonly<{ output: string; data?: unknown }>> {
   const [command, ...rest] = args;
-  if (command === "enqueue") return enqueue(rest, store, options);
+  if (command === "enqueue") return enqueue(rest, store, options, home);
   if (command === "list") return list(rest, store);
   if (command === "show") return show(rest, store, options.environment);
   if (command === "process") return process(rest, store, home, options);
@@ -44,7 +44,8 @@ export async function runTaskIntegrationQueueCommand(
 async function enqueue(
   args: readonly string[],
   store: TaskStore,
-  options: TaskIntegrationCommandOptions
+  options: TaskIntegrationCommandOptions,
+  home: string
 ): Promise<Readonly<{ output: string; data?: unknown }>> {
   const usage = "Task Integration queue enqueue usage: yui task integration queue enqueue <task> --project <project> --change-set <id> [--target <ref>] [--check <command> ...].";
   const parsed = parseRepeatable(

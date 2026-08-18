@@ -32,7 +32,7 @@ export type ResolutionDecision = Readonly<{
 }>;
 
 export type IntegrationAttempt = Readonly<{
-  schemaVersion: 3;
+  schemaVersion: 4;
   id: string;
   taskId: string;
   projectId: string;
@@ -41,6 +41,14 @@ export type IntegrationAttempt = Readonly<{
   changeSetIds: readonly string[];
   checkCommands: readonly string[];
   candidateCommit?: string;
+  /**
+   * The VerificationPlan digests captured when the gate job started.
+   * On resume, the artifact is recorded under this identity (not the
+   * current plan's), so a plan edit during the gate never misattributes
+   * the evidence.
+   */
+  gatePlanDigest?: string;
+  gateToolchainDigest?: string;
   /**
    * The DurableJob running the check commands, once the Controller has
    * accepted it. A running attempt with a jobId never goes "no-check":
@@ -69,7 +77,7 @@ export function createIntegrationAttempt(
 ): IntegrationAttempt {
   const timestamp = now.toISOString();
   return validateIntegrationAttempt({
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: input.id,
     taskId: input.taskId,
     projectId: input.projectId,
@@ -169,6 +177,7 @@ export function updateIntegrationAttempt(
   patch: Readonly<Partial<Pick<
     IntegrationAttempt,
     "candidateCommit" | "status" | "conflict" | "checks"
+    | "gatePlanDigest" | "gateToolchainDigest"
   >>>,
   now: Date
 ): IntegrationAttempt {
@@ -219,8 +228,8 @@ export function supersedeIntegration(
 }
 
 export function validateIntegrationAttempt(attempt: IntegrationAttempt): IntegrationAttempt {
-  if (attempt.schemaVersion !== 3) {
-    throw new Error("IntegrationAttempt must use schemaVersion 3.");
+  if (attempt.schemaVersion !== 4) {
+    throw new Error("IntegrationAttempt must use schemaVersion 4.");
   }
   validateTaskRecordReference({
     taskId: attempt.taskId,
