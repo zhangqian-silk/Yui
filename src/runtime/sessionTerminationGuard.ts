@@ -218,6 +218,10 @@ function rootVerdict(
     // /proc unreadable or entry gone. Gone is absent; unreadable is a gap.
     return ports.procEntryExists(pid) ? { kind: "gap" } : { kind: "absent" };
   }
+  // A zombie has already exited; only the unreaped task struct remains. It
+  // cannot execute or hold resources, so it counts as absent for physical
+  // exit proof (the parent reaping the zombie does not change liveness).
+  if (current.state === "Z") return { kind: "absent" };
   return current.startIdentity === startIdentity
     ? { kind: "live" }
     : { kind: "absent" };

@@ -336,6 +336,19 @@ export function observeSessionOwnerPhysical(
       childCount: 0
     };
   }
+  if (current.state === "Z") {
+    // Zombie: the process has exited and only the unreaped task struct
+    // remains. It cannot execute or hold resources, so it is not alive.
+    return {
+      alive: false,
+      identityConflict: false,
+      pid,
+      startIdentity,
+      rssBytes: 0,
+      ageMs: 0,
+      childCount: 0
+    };
+  }
   const tree = listOwnedProcessTree(pid, current.processGroupId);
   return {
     alive: true,

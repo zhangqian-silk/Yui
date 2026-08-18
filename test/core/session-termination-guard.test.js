@@ -159,6 +159,33 @@ test("a reused PID with a different start identity is treated as absent", async 
   assert.deepEqual(harness.signals, []);
 });
 
+test("a zombie root is treated as absent (already exited, awaiting reap)", async () => {
+  const harness = fakePorts();
+  // Simulate a zombie: /proc entry exists with state "Z" and the matching
+  // start identity. The process has exited but its parent (tmux) has not
+  // reaped it yet, which is common under CI load.
+  harness.ports.processIdentity = (pid) => ({
+    pid,
+    startIdentity: "1000",
+    state: "Z",
+    rssBytes: 0
+  });
+  harness.ports.procEntryExists = () => true;
+  const result = await terminateSessionOwners(
+    owner,
+    [ownerRecord()],
+    harness.ports,
+    { gracefulGraceMs: 20, pollMs: 5 }
+  );
+  assert.equal(result.outcome, "stop-confirmed");
+  assert.deepEqual(result.confirmed.map((record) => record.launchId), ["launch-1"]);
+  assert.deepEqual(result.remaining, []);
+  // A zombie is already dead: it must never be signaled.
+  assert.deepEqual(harness.signals, []);
+  const stages = harness.events.map((event) => event.stage);
+  assert.deepEqual(stages, ["stop-requested", "graceful-stop", "stop-confirmed"]);
+});
+
 test("an unreadable /proc is a verification gap, not a confirmation", async () => {
   const harness = fakePorts({ procEntryExists: () => true });
   harness.ports.processIdentity = () => undefined;

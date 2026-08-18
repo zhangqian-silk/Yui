@@ -56,6 +56,8 @@ export type SessionOwnerIdentity = Readonly<{
 export type LinuxProcessIdentity = Readonly<{
   pid: number;
   startIdentity: string;
+  /** /proc state field (e.g. "R", "S", "Z"); absent on non-Linux or older callers. */
+  state?: string;
   processGroupId?: number;
   processSessionId?: number;
   rssBytes: number;
@@ -172,6 +174,7 @@ export function readLinuxProcessIdentity(pid: number): LinuxProcessIdentity | un
     const closing = stat.lastIndexOf(")");
     if (closing < 0) return undefined;
     const fields = stat.slice(closing + 1).trim().split(/\s+/u);
+    const state = fields[0];
     const processGroupId = Number(fields[2]);
     const processSessionId = Number(fields[3]);
     const startIdentity = fields[19];
@@ -182,6 +185,7 @@ export function readLinuxProcessIdentity(pid: number): LinuxProcessIdentity | un
     return {
       pid,
       startIdentity,
+      ...(typeof state === "string" && state.length > 0 ? { state } : {}),
       ...(Number.isSafeInteger(processGroupId) && processGroupId > 0
         ? { processGroupId }
         : {}),
@@ -219,7 +223,11 @@ export function isLinuxProcessLive(
   startIdentity: string
 ): boolean {
   const current = readLinuxProcessIdentity(pid);
-  return current !== undefined && current.startIdentity === startIdentity;
+  if (current === undefined) return false;
+  // A zombie has already exited; only the task struct remains for the parent
+  // to reap. It cannot execute or hold resources, so it is not live.
+  if (current.state === "Z") return false;
+  return current.startIdentity === startIdentity;
 }
 
 /**
