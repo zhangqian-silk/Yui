@@ -87,6 +87,8 @@ function identityReceipt({ pid, startIdentity, buildId, version, mode, dualOwner
   return Object.freeze({
     schemaVersion: 1,
     version,
+    executablePath: "/usr/bin/node",
+    args: [`/opt/yui/releases/${version}/dist/controller/controllerMain.js`],
     buildId,
     packageDigest: "0".repeat(64),
     sourceCommit: null,

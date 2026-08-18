@@ -62,6 +62,10 @@ export type ActiveReleasePointer = Readonly<{
 export type RuntimeIdentityReceipt = Readonly<{
   schemaVersion: 1;
   version: string;
+  /** Executable that owns the Controller process (for example `node`). */
+  executablePath: string;
+  /** Exact launch arguments for that executable, including the Controller entrypoint. */
+  args: string[];
   /** Manifest build ID, or `dev` for a non-release (checkout) runtime. */
   buildId: string;
   /** Package SHA-256, or null when the runtime is not an installed release. */
@@ -649,6 +653,9 @@ function validateRuntimeIdentity(value: unknown): RuntimeIdentityReceipt {
     || typeof value !== "object"
     || (value as { schemaVersion?: unknown }).schemaVersion !== 1
     || typeof (value as { version?: unknown }).version !== "string"
+    || typeof (value as { executablePath?: unknown }).executablePath !== "string"
+    || (value as { executablePath?: unknown }).executablePath === ""
+    || !isStringArray((value as { args?: unknown }).args)
     || typeof (value as { buildId?: unknown }).buildId !== "string"
     || typeof (value as { cliRealpath?: unknown }).cliRealpath !== "string"
     || typeof (value as { controllerRealpath?: unknown }).controllerRealpath !== "string"
@@ -681,6 +688,10 @@ function isHandoverPhase(value: unknown): value is HandoverFencePhase {
     || value === "candidate-ready"
     || value === "committed"
     || value === "rolled-back";
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
 function isEexist(error: unknown): boolean {

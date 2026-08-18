@@ -150,6 +150,8 @@ test("runtime identity receipt round-trips", () => {
   const receipt = Object.freeze({
     schemaVersion: 1,
     version: "0.6.0",
+    executablePath: "/usr/bin/node",
+    args: ["/opt/yui/releases/0.6.0-" + "a".repeat(64) + "/dist/controller/controllerMain.js"],
     buildId: "0.6.0-" + "a".repeat(12),
     packageDigest: "a".repeat(64),
     sourceCommit: null,

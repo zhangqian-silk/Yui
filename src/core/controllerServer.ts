@@ -828,6 +828,8 @@ export function buildRuntimeIdentityReceipt(input: RuntimeIdentityInput): Runtim
   return Object.freeze({
     schemaVersion: 1,
     version: YUI_VERSION,
+    executablePath: process.execPath,
+    args: process.argv.slice(1),
     buildId: input.release?.manifest.buildId ?? "dev",
     packageDigest: input.release?.manifest.packageDigest ?? null,
     sourceCommit: input.release?.manifest.sourceCommit ?? null,

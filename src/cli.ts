@@ -83,7 +83,7 @@ import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
 import { runWorkflowCommandAsync } from "./commands/workflowCommands.js";
 import { createUpdatePorts } from "./cli/updatePorts.js";
 import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
-import { readRuntimeIdentity } from "./release/runtimeRelease.js";
+import { readRuntimeIdentity, type RuntimeIdentityReceipt } from "./release/runtimeRelease.js";
 import {
   renderReleaseActivateResult,
   renderReleaseInstallResult,
@@ -380,7 +380,14 @@ export async function main(): Promise<void> {
       // (a Controller that predates this feature), fall back to the
       // authenticated socket identity so the command stays useful during
       // rollout step 1.
-      const receipt = readRuntimeIdentity(home);
+      let receipt: RuntimeIdentityReceipt | null = null;
+      try {
+        receipt = readRuntimeIdentity(home);
+      } catch {
+        // A corrupt or stale receipt (for example one written by an older
+        // Controller that predates the launch-identity fields) falls back to
+        // the live socket identity, which always carries the exact argv.
+      }
       if (receipt !== null) {
         emit("", false, receipt);
         return;
