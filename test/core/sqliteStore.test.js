@@ -36,7 +36,7 @@ function makeTask(store, overrides = {}) {
 function makeMessage(store, taskId, overrides = {}) {
   const now = new Date().toISOString();
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: store.nextMessageId(taskId),
     taskId,
     kind: "role-result",
@@ -81,8 +81,8 @@ test("schema migration: fresh create applies every current migration and all tab
   const home = temporaryHome();
   const db = new Database(join(home, "yui.db"));
   const result = migrateSqliteSchema(db);
-  assert.deepEqual(result.applied, [1, 2, 3, 4]);
-  assert.equal(result.version, 4);
+  assert.deepEqual(result.applied, [1, 2, 3, 4, 5]);
+  assert.equal(result.version, 5);
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
   for (const table of SQLITE_SCHEMA_TABLES) {
     assert.ok(tables.includes(table), `missing table: ${table}`);
@@ -97,7 +97,7 @@ test("schema migration: idempotent re-run applies nothing", () => {
   migrateSqliteSchema(db);
   const second = migrateSqliteSchema(db);
   assert.deepEqual(second.applied, []);
-  assert.equal(second.version, 4);
+  assert.equal(second.version, 5);
   db.close();
 });
 
@@ -125,6 +125,17 @@ test("schema migration: repairs the legacy global DurableJob key without losing 
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE telemetry (
+      task_id     TEXT NOT NULL,
+      role_name   TEXT NOT NULL,
+      run_id      TEXT NOT NULL,
+      generation  TEXT NOT NULL,
+      progress_id TEXT NOT NULL,
+      sequence    INTEGER,
+      payload     TEXT NOT NULL,
+      received_at TEXT NOT NULL,
+      PRIMARY KEY (task_id, role_name, run_id, generation, progress_id)
+    ) WITHOUT ROWID;
     INSERT INTO durable_jobs
       (job_id, task_id, idempotency_key, status, payload, created_at, updated_at)
       VALUES ('job-7', 'task-legacy', 'key-7', 'queued', '{}',
@@ -132,8 +143,8 @@ test("schema migration: repairs the legacy global DurableJob key without losing 
   `);
 
   const result = migrateSqliteSchema(db);
-  assert.deepEqual(result.applied, [4]);
-  assert.equal(result.version, 4);
+  assert.deepEqual(result.applied, [4, 5]);
+  assert.equal(result.version, 5);
   const columns = db.prepare("PRAGMA table_info(durable_jobs)").all();
   assert.deepEqual(
     columns.filter(({ pk }) => pk > 0)

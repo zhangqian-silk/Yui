@@ -1342,6 +1342,12 @@ test("orphan recovery uses the store's atomic Leader enqueue operation", () => {
     getOperatorNotification: () => null,
     getPendingWakeup: () => null,
     getWorkMailbox: () => null,
+    // Issue 05: the actionability admission reads durable Runs and records
+    // progress notes on fail-open. This fixture has no Run history, so the
+    // digest admission always decides "wake" and preserves the atomic
+    // enqueue path under test.
+    listAgentRuns: () => [],
+    queueTaskProgress: () => {},
     releaseWorkMailbox: () => false,
     enqueueLeaderWakeup(taskId, reason, now) {
       queued.push({ taskId, reason, now });

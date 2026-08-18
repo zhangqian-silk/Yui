@@ -1619,6 +1619,19 @@ export class SqliteTaskStore implements TaskStore {
     );
   }
 
+  removeEvents(taskId: string, eventIds: readonly string[]): number {
+    if (eventIds.length === 0) return 0;
+    this.#requireTask(taskId);
+    return this.#mutate(() => {
+      const deleteEvent = this.#db.prepare("DELETE FROM events WHERE task_id = ? AND event_id = ?");
+      let removed = 0;
+      for (const eventId of eventIds) {
+        removed += deleteEvent.run(taskId, eventId).changes;
+      }
+      return removed;
+    });
+  }
+
   // -- high-water maintenance ---------------------------------------------------
 
   /** Extract the numeric suffix of a `<prefix>-<n>` record id. */

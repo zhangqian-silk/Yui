@@ -317,6 +317,18 @@ export interface SchedulerStorePort {
   ): SchedulerRoleSession | null;
   /** Immutable runtime facts used by the low-frequency stall projection. */
   listEvents?(taskId: string): readonly TaskEvent[];
+  /**
+   * Optional durable-record reads used by the actionability projection
+   * (Issue 05). Absent implementations fall back to an empty family, which
+   * yields a coarser digest; the fail-open rule covers computation errors.
+   */
+  listAgentRuns?(taskId: string): readonly SchedulerAgentRun[];
+  listWorkItems?(taskId: string): readonly import("../workItem/workItem.js").WorkItem[];
+  listReviewRounds?(taskId: string): readonly import("../review/reviewRound.js").ReviewRound[];
+  listIntegrationAttempts?(taskId: string): readonly import("../integration/integrationAttempt.js").IntegrationAttempt[];
+  listDurableJobs?(taskId: string): readonly import("../job/durableJob.js").DurableJob[];
+  listInputRequests?(taskId: string): readonly import("../input/inputRequest.js").InputRequest[];
+  listMessages?(taskId: string): readonly import("../message/message.js").TaskMessage[];
   /** Optional richer fold of WorkItem/Review/Integration progress for a Run. */
   getRunDurableProgress?(taskId: string, roleName: string, runId: string): SchedulerRunProgress | null;
   /**

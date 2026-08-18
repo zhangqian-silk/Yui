@@ -204,6 +204,13 @@ import {
   taskLeaderActionRunId
 } from "./taskActor.js";
 import { createTaskTerminalNotification } from "../scheduler/operatorNotification.js";
+import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import {
+  collectTaskActionability,
+  computeActionabilityDigest,
+  deriveLeaderRunDisposition
+} from "../scheduler/actionability.js";
+import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import {
   buildTaskOverview,
   parseTaskListOptions,
@@ -527,6 +534,7 @@ export function runTaskCommand(
     case "retire": return retireTaskCommand(rest, store, options);
     case "reconcile": return output(reconcileTaskCommand(rest, store, options));
     case "message": return output(taskMessageCommand(rest, store, options));
+    case "wake": return output(taskWakeCommand(rest, store, options));
     case "project": return taskProjectCommand(rest, store, options);
     case "input": return runTaskInputCommand(rest, store, options);
     case "grant": return runGrantCommand(rest, store, options);
@@ -1542,8 +1550,8 @@ function taskMessageCommand(
 ): string {
   const [command, ...rest] = args;
   if (command === "send") {
-    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->).";
-    const parsed = parseTail(rest, new Set(["--body-file"]), usage);
+    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none].";
+    const parsed = parseTail(rest, new Set(["--body-file", "--wake-policy"]), usage);
     if (parsed.positionals.length < 1 || parsed.positionals.length > 2) throw usageError(usage);
     const body = readCommandText(
       parsed.positionals[1],
@@ -1551,6 +1559,15 @@ function taskMessageCommand(
       "--body",
       usage
     );
+    const wakePolicyRaw = parsed.options.get("--wake-policy");
+    let wakePolicy: "leader" | "none" | undefined;
+    if (wakePolicyRaw === undefined) {
+      wakePolicy = undefined;
+    } else if (wakePolicyRaw === "leader" || wakePolicyRaw === "none") {
+      wakePolicy = wakePolicyRaw;
+    } else {
+      throw usageError(`--wake-policy must be 'leader' or 'none': ${wakePolicyRaw}.`);
+    }
     const now = clock(options);
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
@@ -1566,9 +1583,14 @@ function taskMessageCommand(
             now
           )
         : actor === "operator"
-          ? appendMessage(tx, task.id, body, "operator", { type: "operator" }, now)
-          : appendMessage(tx, task.id, body, "user", { type: "user" }, now);
-      if (task.status === "active" && actor !== "leader") {
+          ? appendMessage(tx, task.id, body, "operator", { type: "operator" }, now, { wakePolicy })
+          : appendMessage(tx, task.id, body, "user", { type: "user" }, now, { wakePolicy });
+      // Issue 05: only `wakePolicy=leader` (the default for backward
+      // compatibility) enqueues Leader work. `wakePolicy=none` persists the
+      // message as context without waking the Leader.
+      if (task.status === "active"
+        && actor !== "leader"
+        && wakePolicy !== "none") {
         enqueueWork(
           tx,
           leaderMailbox(task.id),
@@ -1616,6 +1638,35 @@ function taskMessageCommand(
   throw usageError(command === undefined
     ? "Task message command is required."
     : `Unknown command: task message ${command}`);
+}
+
+/**
+ * Issue 05: force-wake escape hatch. Bypasses the actionability digest and
+ * enqueues exactly one Leader wakeup with an auditable reason. The reason is
+ * truncated to keep the event payload compact.
+ */
+function taskWakeCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task wake usage: yui task wake <id> --force --reason <text>.";
+  const parsed = parseTail(args, new Set(["--reason"]), usage, new Set(["--force"]));
+  exactPositionals(parsed.positionals, 1, usage);
+  if (!parsed.options.has("--force")) {
+    throw usageError("--force is required to wake a Task.", usage);
+  }
+  const reason = requiredOption(parsed.options, "--reason");
+  const now = clock(options);
+  const task = requireTask(store, parsed.positionals[0]);
+  assertTaskOpen(task);
+  const wakeReason = `force-wake:${truncateEventNote(reason)}`;
+  store.transaction((tx) => {
+    queueLeaderWakeup(tx, task.id, wakeReason, now);
+    recordTaskEvent(tx, task.id, "task.wake-forced", { reason: wakeReason }, now);
+  });
+  notifyMailbox(options.runtime, leaderMailbox(task.id), task.id);
+  return `Woke ${task.id} (${wakeReason})\n`;
 }
 
 function taskRoleCommand(
@@ -5485,6 +5536,21 @@ function yieldRun(
         ...(terminal.workItemId === undefined ? [] : [workItemRef(task.id, terminal.workItemId)])
       ]);
     }
+    // Issue 05: record the Leader's terminal receipt so the Scheduler can
+    // suppress no-change `task-orphaned` wakes. The disposition and digest are
+    // machine-derived from the post-yield projection; the Leader does not
+    // need to cooperate for the admission check to work.
+    if (role.name === LEADER_ROLE) {
+      const receipt = leaderYieldReceipt(tx, task, terminal, now);
+      if (receipt !== null) {
+        tx.saveAgentRun(receipt);
+        return {
+          run: receipt,
+          reviewDispatch,
+          notifyLeader: leaderHandoff !== null
+        };
+      }
+    }
     return {
       run: terminal,
       reviewDispatch,
@@ -5512,6 +5578,56 @@ function yieldRun(
       ? {}
       : { reviewRound: yielded.reviewDispatch.round })
   });
+}
+
+/**
+ * Issue 05: compute the Leader Run terminal receipt (disposition + observed
+ * actionability digest) from the post-yield projection. Returns the updated
+ * Run, or null when the receipt cannot be computed (the caller keeps the
+ * unmodified terminal Run in that case; the Scheduler fails open).
+ */
+function leaderYieldReceipt(
+  tx: TaskWorkflowStore,
+  task: Task,
+  terminal: AgentRun,
+  now: Date
+): AgentRun | null {
+  try {
+    const projection = buildTaskExecutionProjection(tx, task.id, task);
+    if (projection === null) return null;
+    const disposition = deriveLeaderRunDisposition(projection.status, task.status);
+    const digest = computeActionabilityDigest(
+      collectTaskActionability(tx, task.id)
+    );
+    const waitReason = disposition === "waiting" || disposition === "blocked"
+      ? leaderWaitReason(projection)
+      : undefined;
+    return {
+      ...terminal,
+      disposition,
+      observedActionabilityDigest: digest,
+      ...(waitReason === undefined ? {} : { waitReason }),
+      updatedAt: now.toISOString()
+    };
+  } catch {
+    return null;
+  }
+}
+
+function leaderWaitReason(
+  projection: import("../scheduler/taskExecutionProjection.js").TaskExecutionProjection
+): import("../scheduler/actionability.js").LeaderWaitReason | undefined {
+  const blocker = projection.blockers[0];
+  if (blocker !== undefined) {
+    return { kind: blocker.kind, ref: blocker.id };
+  }
+  if (projection.status === "waiting-on-agents") {
+    return { kind: "delegated-work" };
+  }
+  if (projection.status === "waiting-user") {
+    return { kind: "input" };
+  }
+  return undefined;
 }
 
 /**

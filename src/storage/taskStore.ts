@@ -163,7 +163,7 @@ export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 9 as const;
 export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 4 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 3 as const;
-export const CURRENT_MESSAGE_SCHEMA_VERSION = 2 as const;
+export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INPUT_REQUEST_SCHEMA_VERSION = 2 as const;
 export const CURRENT_DECISION_SCHEMA_VERSION = 1 as const;
 export const CURRENT_MILESTONE_SCHEMA_VERSION = 1 as const;
@@ -263,9 +263,9 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
  */
 export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
 /**
- * v7 adds the optional Issue 04 `providerRetry` projection and `yieldReceipt`
- * in their own namespace. Both fields are optional, so the v6→v7 migration is
- * a version-only rewrite.
+ * v7 combines optional Issue 04 retry/receipt fields and Issue 05 Leader
+ * actionability fields. All are optional, so the v6→v7 migration is a
+ * version-only rewrite.
  */
 export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 7 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
@@ -471,6 +471,12 @@ export type TaskStore = {
   nextEventId(taskId: string): string;
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
+  /**
+   * Remove events by id. Used by telemetry compaction to fold legacy
+   * `runtime.provider-turn-progress` rows into the sidecar while keeping
+   * every semantic event. Returns the number of events actually removed.
+   */
+  removeEvents(taskId: string, eventIds: readonly string[]): number;
   nextCapabilityGrantId(taskId: string): string;
   saveCapabilityGrant(taskId: string, grant: CapabilityGrant): void;
   listCapabilityGrants(taskId: string): CapabilityGrant[];
@@ -1673,6 +1679,21 @@ export class FileTaskStore implements TaskStore {
     });
   }
   listEvents(taskId: string): TaskEvent[] { return values(this.#requireTask(taskId).events, "id"); }
+
+  removeEvents(taskId: string, eventIds: readonly string[]): number {
+    if (eventIds.length === 0) return 0;
+    let removed = 0;
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      for (const id of eventIds) {
+        if (aggregate.events[id] !== undefined) {
+          delete aggregate.events[id];
+          removed++;
+        }
+      }
+    });
+    return removed;
+  }
 
   nextCapabilityGrantId(taskId: string): string {
     return this.#nextTaskRecordId(taskId, "capabilityGrant");

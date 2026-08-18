@@ -64,6 +64,7 @@ import {
   type RunningFileTaskController
 } from "./controller.js";
 import { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
+import { openSchedulerTelemetry } from "../telemetry/telemetryWiring.js";
 import {
   createFileArtifactPort,
   createLinuxProcessPort,
@@ -198,7 +199,11 @@ export async function startFileTaskControllerRuntime(
   const inventoryClient = useWorker
     ? new ResourceInventoryClient()
     : undefined;
-  const schedulerStore = options.schedulerStore ?? new FileSchedulerStoreAdapter(store);
+  const schedulerStore = options.schedulerStore
+    ?? new FileSchedulerStoreAdapter(
+      store,
+      openSchedulerTelemetry(home, options.environment ?? process.env)
+    );
   const domainIdentity = options.domainIdentity
     ?? ephemeralDomainFromEnvironment(options.environment ?? process.env);
   const planner = options.planner ?? new FileRoleLaunchPlanner(home, store, {

@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 4;
+export const SQLITE_SCHEMA_VERSION = 5;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -453,6 +453,65 @@ CREATE UNIQUE INDEX idx_durable_jobs_idempotency
   ON durable_jobs(task_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 `;
 
+/**
+ * Migration 5: telemetry aggregate (Issue 09). The `telemetry` table (migration
+ * 1, §4.4) stores the bounded latest-per-key progress window; this companion
+ * table holds the authoritative per-Run/generation summary (count, first/last,
+ * max sequence, error count) so aggregates stay accurate after the window is
+ * pruned. Triggers maintain it on telemetry INSERT/UPDATE; DELETE intentionally
+ * leaves it untouched because pruned rows were still observed.
+ */
+const MIGRATION_5_SQL = `
+CREATE TABLE IF NOT EXISTS telemetry_aggregate (
+  task_id      TEXT NOT NULL,
+  role_name    TEXT NOT NULL,
+  run_id       TEXT NOT NULL,
+  generation   TEXT NOT NULL,
+  first_at     TEXT NOT NULL,
+  last_at      TEXT NOT NULL,
+  count        INTEGER NOT NULL,
+  max_sequence INTEGER,
+  error_count  INTEGER NOT NULL DEFAULT 0,
+  updated_at   TEXT NOT NULL,
+  PRIMARY KEY (task_id, role_name, run_id, generation)
+) WITHOUT ROWID;
+
+CREATE TRIGGER IF NOT EXISTS telemetry_ai AFTER INSERT ON telemetry
+BEGIN
+  INSERT INTO telemetry_aggregate
+    (task_id, role_name, run_id, generation, first_at, last_at, count, max_sequence, error_count, updated_at)
+  VALUES
+    (NEW.task_id, NEW.role_name, NEW.run_id, NEW.generation, NEW.received_at, NEW.received_at, 1, NEW.sequence,
+     CASE WHEN json_valid(NEW.payload)
+           AND (COALESCE(json_extract(NEW.payload, '$.error'), '') <> ''
+                OR COALESCE(json_extract(NEW.payload, '$.errorKind'), '') <> '')
+          THEN 1 ELSE 0 END,
+     NEW.received_at)
+  ON CONFLICT(task_id, role_name, run_id, generation) DO UPDATE SET
+    first_at = MIN(telemetry_aggregate.first_at, excluded.first_at),
+    last_at = MAX(telemetry_aggregate.last_at, excluded.last_at),
+    count = telemetry_aggregate.count + 1,
+    max_sequence = CASE
+      WHEN excluded.max_sequence IS NOT NULL
+       AND (telemetry_aggregate.max_sequence IS NULL OR excluded.max_sequence > telemetry_aggregate.max_sequence)
+      THEN excluded.max_sequence ELSE telemetry_aggregate.max_sequence END,
+    error_count = telemetry_aggregate.error_count + excluded.error_count,
+    updated_at = excluded.updated_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS telemetry_au AFTER UPDATE ON telemetry
+BEGIN
+  UPDATE telemetry_aggregate SET
+    last_at = CASE WHEN NEW.received_at > last_at THEN NEW.received_at ELSE last_at END,
+    max_sequence = CASE
+      WHEN NEW.sequence IS NOT NULL AND (max_sequence IS NULL OR NEW.sequence > max_sequence)
+      THEN NEW.sequence ELSE max_sequence END,
+    updated_at = NEW.received_at
+  WHERE task_id = NEW.task_id AND role_name = NEW.role_name
+    AND run_id = NEW.run_id AND generation = NEW.generation;
+END;
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -464,7 +523,8 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 1, axis: "layout", sql: MIGRATION_1_SQL },
   { version: 2, axis: "record", recordKind: "durableJob+capability-grant+release-workflow", sql: MIGRATION_2_SQL },
   { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL },
-  { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL }
+  { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL },
+  { version: 5, axis: "record", recordKind: "telemetryAggregate", sql: MIGRATION_5_SQL }
 ];
 
 function checksum(sql: string): string {
@@ -554,6 +614,7 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "events",
   "task_projections",
   "telemetry",
+  "telemetry_aggregate",
   "capability_grants",
   "release_workflows"
 ] as const;

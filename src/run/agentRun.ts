@@ -3,6 +3,10 @@ import {
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import type {
+  LeaderRunDisposition,
+  LeaderWaitReason
+} from "../scheduler/actionability.js";
 import {
   markProviderRetryInFlight,
   validateAgentRunProviderRetry,
@@ -23,8 +27,8 @@ export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
   /**
-   * v7 adds the optional Issue 04 `providerRetry` projection and `yieldReceipt`
-   * in their own namespace; older readers ignore both fields.
+   * v7 adds optional Issue 04 retry/receipt fields and Issue 05 Leader
+   * actionability fields in their own namespaces; older readers ignore them.
    */
   schemaVersion: 7;
   id: string;
@@ -67,6 +71,20 @@ export type AgentRun = {
    * in the same transaction as its terminal state.
    */
   yieldReceipt?: YieldReceipt;
+  /**
+   * Machine-derived disposition of a terminal Leader Run (Issue 05). Set at
+   * yield/fail time so the Scheduler can tell whether a later scan brings any
+   * new actionable fact. Absent on older Runs and on non-Leader Runs.
+   */
+  disposition?: LeaderRunDisposition;
+  /**
+   * Actionability digest observed by a terminal Leader Run. When the last
+   * Leader Run ended waiting/blocked and a later scan computes the same
+   * digest, the Scheduler stays silent instead of creating a new Run.
+   */
+  observedActionabilityDigest?: string;
+  /** Optional structured wait reference for a waiting/blocked Leader Run. */
+  waitReason?: LeaderWaitReason;
   createdAt: string;
   updatedAt: string;
   endedAt?: string;
@@ -279,9 +297,27 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     if (run.summary !== undefined || run.endedAt !== undefined) {
       throw new Error("An active Agent run cannot have terminal metadata.");
     }
+    if (run.disposition !== undefined
+      || run.observedActionabilityDigest !== undefined
+      || run.waitReason !== undefined) {
+      throw new Error("An active Agent run cannot carry Leader receipt metadata.");
+    }
   } else {
     requireText(run.summary ?? "", "Agent run summary");
     requireTimestamp(run.endedAt ?? "", "Agent run endedAt");
+    if (run.disposition !== undefined
+      && !["progress", "waiting", "blocked", "completed"].includes(run.disposition)) {
+      throw new Error(`Agent run disposition is invalid: ${String(run.disposition)}.`);
+    }
+    if (run.observedActionabilityDigest !== undefined) {
+      requireText(run.observedActionabilityDigest, "Agent run observedActionabilityDigest");
+    }
+    if (run.waitReason !== undefined) {
+      requireText(run.waitReason.kind, "Agent run waitReason kind");
+      if (run.waitReason.ref !== undefined) {
+        requireText(run.waitReason.ref, "Agent run waitReason ref");
+      }
+    }
   }
   if (run.providerRetry !== undefined) {
     validateAgentRunProviderRetry(run.providerRetry);

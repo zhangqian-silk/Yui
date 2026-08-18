@@ -26,12 +26,14 @@ const WORK_ITEM_GROUP_HISTORY_TO_VERSION = 9;
 const AGENT_RUN_FROM_VERSION = 5;
 const AGENT_RUN_TO_VERSION = 6;
 /**
- * Issue 04: v7 adds the optional `providerRetry` projection and
- * `yieldReceipt` namespace. Both fields are optional, so the transition is a
- * version-only rewrite; legacy v6 records without them remain valid.
+ * v7 combines the optional Issue 04 `providerRetry`/`yieldReceipt` fields and
+ * Issue 05 Leader actionability fields. All are optional, so the transition is
+ * a version-only rewrite; legacy v6 records without them remain valid.
  */
-const AGENT_RUN_RETRY_RECEIPT_FROM_VERSION = 6;
-const AGENT_RUN_RETRY_RECEIPT_TO_VERSION = 7;
+const AGENT_RUN_OPTIONAL_FIELDS_FROM_VERSION = 6;
+const AGENT_RUN_OPTIONAL_FIELDS_TO_VERSION = 7;
+const MESSAGE_WAKE_POLICY_FROM_VERSION = 2;
+const MESSAGE_WAKE_POLICY_TO_VERSION = 3;
 const REVIEW_ROUND_FROM_VERSION = 2;
 const REVIEW_ROUND_TO_VERSION = 3;
 const REVIEW_ROUND_GIT_SNAPSHOT_FROM_VERSION = 3;
@@ -111,10 +113,11 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     ))
     .registerOfflineMigration(recordFamilyStep(
       "agentRun",
-      AGENT_RUN_RETRY_RECEIPT_FROM_VERSION,
-      AGENT_RUN_RETRY_RECEIPT_TO_VERSION,
+      AGENT_RUN_OPTIONAL_FIELDS_FROM_VERSION,
+      AGENT_RUN_OPTIONAL_FIELDS_TO_VERSION,
       "agentRuns"
     ))
+    .registerOfflineMigration(messageWakePolicyStep())
     .registerOfflineMigration(recordFamilyStep(
       "reviewRound",
       REVIEW_ROUND_FROM_VERSION,
@@ -162,6 +165,83 @@ function workItemExecutionGroupHistoryStep(): MigrationStep<HomeSnapshot> {
     ),
     transform: migrateWorkItemExecutionGroupHistory,
     declaredEffects: []
+  };
+}
+
+/**
+ * Task Messages gain an optional `wakePolicy` field (Issue 05). The field is
+ * absent on every older record, so this adjacent step only advances the
+ * family version; the strict current parser treats the omitted field as
+ * "no explicit policy" and preserves the existing routing.
+ */
+function messageWakePolicyStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "message",
+    fromVersion: MESSAGE_WAKE_POLICY_FROM_VERSION,
+    toVersion: MESSAGE_WAKE_POLICY_TO_VERSION,
+    preconditions: (snapshot) => requireMessageFamilyVersion(
+      snapshot,
+      MESSAGE_WAKE_POLICY_FROM_VERSION
+    ),
+    transform: migrateMessageWakePolicy,
+    declaredEffects: []
+  };
+}
+
+function requireMessageFamilyVersion(snapshot: HomeSnapshot, version: number): void {
+  const manifestVersions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (manifestVersions.message !== version) {
+    throw new Error(`Message migration requires manifest version ${version}.`);
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const messages = task.messages;
+    if (messages === undefined) continue;
+    const map = asObject(messages, `message map ${taskId}`);
+    for (const [messageId, rawMessage] of Object.entries(map)) {
+      const message = asObject(rawMessage, `message ${taskId}/${messageId}`);
+      if (message.schemaVersion !== version) {
+        throw new Error(`Message ${taskId}/${messageId} must use schemaVersion ${version}.`);
+      }
+    }
+  }
+}
+
+function migrateMessageWakePolicy(snapshot: HomeSnapshot): HomeSnapshot {
+  requireMessageFamilyVersion(snapshot, MESSAGE_WAKE_POLICY_FROM_VERSION);
+  const manifestVersions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      message: MESSAGE_WAKE_POLICY_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.messages === undefined) {
+      nextTasks[taskId] = { ...task };
+      continue;
+    }
+    const messages = asObject(task.messages, `message map ${taskId}`);
+    const nextMessages: Record<string, unknown> = {};
+    for (const [messageId, rawMessage] of Object.entries(messages)) {
+      nextMessages[messageId] = {
+        ...asObject(rawMessage, `message ${taskId}/${messageId}`),
+        schemaVersion: MESSAGE_WAKE_POLICY_TO_VERSION
+      };
+    }
+    nextTasks[taskId] = { ...task, messages: nextMessages };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
   };
 }
 
