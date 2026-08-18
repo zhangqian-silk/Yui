@@ -71,6 +71,8 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
+import { matchYieldReceipt } from "../run/yieldReceipt.js";
+import { providerRetryConfig } from "../run/providerRetryConfig.js";
 import {
   createReviewRound,
   createTaskReviewRound,
@@ -78,6 +80,7 @@ import {
   finishReviewRound,
   parseReviewYieldReport,
   recordReviewWorkspaceDisposition,
+  retryTaskReviewRound,
   startReviewRound,
   updateReviewExecutionGroup,
   validateTaskReviewCandidate,
@@ -85,6 +88,21 @@ import {
   type TaskReviewCandidate,
   type ReviewRequestSource
 } from "../review/reviewRound.js";
+import {
+  blockingOpenFindings,
+  buildTaskFinalReviewFindingContext,
+  completionGateBlocked,
+  dispositionReviewFinding,
+  planRepairGroups,
+  reconcileReviewFindings,
+  reconcileReviewFindingsAfterReview,
+  reviewFindingLedgerWriteFailed,
+  type ReviewFindingDispositionCommand
+} from "../review/reviewFindingLedger.js";
+import {
+  LEADER_FINDING_DISPOSITIONS,
+  type ReviewFindingDisposition
+} from "../review/reviewFinding.js";
 import { markYuiRunInput, retagYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
@@ -1125,6 +1143,27 @@ function completeTaskCommand(
         resumedPendingFinalReview: pendingFinalReviewIds.has(finalReview.id),
         terminalizedLeaderRun
       } as const;
+    }
+
+    // Issue 06: under `review.findingLedger=enforce`, Task completion fails
+    // closed on undispositioned open P1/P2 findings. Run this after final-review
+    // preparation so `fixed-pending-review` findings can still request the one
+    // re-review for a changed frozen head; once no Review is needed, the gate
+    // blocks final completion.
+    if (completionGateBlocked(tx, task.id)) {
+      const blocking = blockingOpenFindings(tx, task.id);
+      if (reviewFindingLedgerWriteFailed(tx, task.id)) {
+        throw usageError(
+          `Task ${task.id} cannot complete: the Review finding ledger was unavailable `
+          + "while reconciling a semantic Review. Recover the ledger and reconcile the Round "
+          + "before completing the Task."
+        );
+      }
+      throw usageError(
+        `Task ${task.id} has ${blocking.length} undispositioned open P1/P2 finding(s): `
+        + `${blocking.map(({ id }) => id).join(", ")}. `
+        + "Disposition each finding (yui task review finding dispose) before completing the Task."
+      );
     }
 
     const completed = completeTask(task, now, { by: actor, summary });
@@ -3289,6 +3328,7 @@ function taskReviewCommand(
   if (command === "request") return requestTaskReviewRound(rest, store, options);
   if (command === "retry") return retryFailedTaskReviewRound(rest, store, options);
   if (command === "group") return resolveReviewExecutionGroup(rest, store, options);
+  if (command === "finding") return reviewFindingCommand(rest, store, options);
   throw usageError(command === undefined
     ? "Task review command is required."
     : `Unknown command: task review ${command}`);
@@ -3388,6 +3428,11 @@ function resolveReviewExecutionGroup(
       }
     );
     tx.saveReviewRound(task.id, terminal);
+    // Issue 06: a panel-resolved completed Round feeds the finding ledger;
+    // a rejected Round is an execution-attempt failure and is skipped.
+    if (terminal.status === "completed") {
+      reconcileReviewFindingsAfterReview(tx, task.id, terminal.id, now);
+    }
     enqueueWork(tx, leaderMailbox(task.id), "review-group-resolved", now, [
       workItemRef(task.id, round.workItemId)
     ]);
@@ -3397,6 +3442,204 @@ function resolveReviewExecutionGroup(
     `Resolved Review ExecutionGroup ${result.executionGroup?.id ?? "unknown"} as ${decision}; ReviewRound ${result.id} is ${result.status}.\n`,
     { reviewRound: result }
   );
+}
+
+/**
+ * Issue 06: `yui task review finding` — the cross-Round finding ledger CLI.
+ * Findings are extracted automatically from completed Rounds; these commands
+ * let the Leader inspect the ledger, disposition each finding, and plan the
+ * parallel repair wave.
+ */
+function reviewFindingCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const [command, ...rest] = args;
+  if (command === "list") return listReviewFindings(rest, store, options);
+  if (command === "dispose") return disposeReviewFindingCommand(rest, store, options);
+  if (command === "repair-wave") return planReviewRepairWave(rest, store, options);
+  if (command === "extract") return extractReviewFindingsCommand(rest, store, options);
+  throw usageError(command === undefined
+    ? "Task review finding command is required."
+    : `Unknown command: task review finding ${command}`);
+}
+
+function listReviewFindings(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task review finding list usage: yui task review finding list <task>.";
+  exactPositionals(args, 1, usage);
+  const task = requireTask(store, args[0]!);
+  const findings = store.listReviewFindings(task.id);
+  if (findings.length === 0) {
+    return output(`No review findings recorded for ${task.id}.\n`);
+  }
+  const lines = findings.map((finding) => {
+    const repair = finding.repair === undefined
+      ? ""
+      : `; repair: ${finding.repair.workItemId ?? "?"}${finding.repair.commit === undefined ? "" : `@${finding.repair.commit.slice(0, 12)}`}`;
+    const merge = finding.mergeRequired === true ? " [merge-required]" : "";
+    return `${finding.id} [${finding.severity}/${finding.disposition}] ${finding.title}`
+      + ` (invariant: ${finding.invariant}; first: ${finding.firstReviewRoundId}; last: ${finding.lastReviewRoundId})${repair}${merge}`;
+  });
+  return output(`Review findings for ${task.id}:\n${lines.join("\n")}\n`);
+}
+
+function disposeReviewFindingCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task review finding dispose usage: yui task review finding dispose <task>/<finding> "
+    + "--disposition <fixed-pending-review|verified-fixed|accepted-risk|not-actionable|superseded> "
+    + "[--work-item <id>] [--commit <sha>] [--verification <text>] [--note <text>] [--superseded-by <stable-key>].";
+  const parsed = parseTail(
+    args,
+    new Set(["--disposition", "--work-item", "--commit", "--verification", "--note", "--superseded-by"]),
+    usage
+  );
+  exactPositionals(parsed.positionals, 1, usage);
+  const disposition = requiredOption(parsed.options, "--disposition") as ReviewFindingDisposition;
+  if (!LEADER_FINDING_DISPOSITIONS.includes(disposition)) {
+    throw usageError(`Review finding disposition is invalid: ${disposition}.`);
+  }
+  const now = clock(options);
+  const reference = resolveTaskRecordReference(parsed.positionals[0]!, {
+    kind: "reviewFinding",
+    label: "Review finding"
+  });
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, reference.taskId);
+    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "dispositioning a review finding"));
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may disposition a review finding.");
+    }
+    const command: ReviewFindingDispositionCommand = {
+      disposition,
+      by: taskLeaderActionRunId(tx, task.id, options.environment, options.yuiHome) ?? "leader",
+      ...(parsed.options.get("--note") === undefined ? {} : { note: parsed.options.get("--note")! }),
+      ...(parsed.options.get("--work-item") === undefined ? {} : { workItemId: parsed.options.get("--work-item")! }),
+      ...(parsed.options.get("--commit") === undefined ? {} : { commit: parsed.options.get("--commit")! }),
+      ...(parsed.options.get("--verification") === undefined ? {} : { verification: parsed.options.get("--verification")! }),
+      ...(parsed.options.get("--superseded-by") === undefined ? {} : { supersededBy: parsed.options.get("--superseded-by")! }),
+      now
+    };
+    return dispositionReviewFinding(tx, task.id, reference.localId, command);
+  });
+  return output(`Dispositioned ${result.id} as ${result.disposition}.\n`);
+}
+
+function planReviewRepairWave(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task review finding repair-wave usage: yui task review finding repair-wave <task> [--create].";
+  const parsed = parseTail(args, new Set(), usage, new Set(["--create"]));
+  exactPositionals(parsed.positionals, 1, usage);
+  const task = requireTask(store, parsed.positionals[0]!);
+  const groups = planRepairGroups(store, task.id);
+  if (groups.length === 0) {
+    return output(`No open P1/P2 findings need repair for ${task.id}.\n`);
+  }
+  if (parsed.options.has("--create")) {
+    const now = clock(options);
+    const created = store.transaction((tx) => {
+      const currentTask = requireTask(tx, task.id);
+      if (currentTask.status !== "active") {
+        throw usageError(inactiveTaskMessage(currentTask, "creating a review repair wave"));
+      }
+      if (taskActor(options, currentTask.id) !== "leader") {
+        throw usageError("Only the Task Leader may create a review repair wave.");
+      }
+      const openItems = tx.listWorkItems(currentTask.id)
+        .filter((item) => item.status === "pending" || item.status === "running");
+      return groups.map((group) => {
+        const findingMarkers = group.findingIds.map((id) => `review-finding:${id}`);
+        const existing = openItems.find((item) => isDeepStrictEqual(
+          [...item.acceptance].sort(),
+          [...findingMarkers].sort()
+        ));
+        if (existing !== undefined) return { group, item: existing, changed: false } as const;
+        const item = createWorkItem(tx.nextWorkItemId(currentTask.id), currentTask.id, {
+          title: `Repair review findings ${group.findingIds.join(", ")}`,
+          objective: [
+            "Repair the following Task-final Review findings as one overlapping group:",
+            ...group.findings.map((finding) => (
+              `- ${finding.id} [${finding.severity}] ${finding.title} `
+              + `(invariant: ${finding.invariant}; evidence: ${finding.evidence.join(" | ") || "see ReviewRound"})`
+            )),
+            "Integrate this repair with the rest of the Task before requesting another Task-final Review."
+          ].join("\n"),
+          acceptance: findingMarkers,
+          writeProjectIds: reviewRepairProjectIds(currentTask, group.affectedPaths)
+        }, now);
+        tx.saveWorkItem(currentTask.id, item);
+        enqueueWork(tx, taskMailbox(currentTask.id), "work-created", now, [
+          workItemRef(currentTask.id, item.id)
+        ]);
+        return { group, item, changed: true } as const;
+      });
+    });
+    const lines = created.map(({ group, item, changed }) => (
+      `wave ${group.groupKey}: ${item.id} ${changed ? "created" : "already open"} `
+      + `(${group.findingIds.join(", ")})`
+    ));
+    return output(
+      `Review repair wave for ${task.id} (${groups.length} group(s)):\n${lines.join("\n")}\n`,
+      { groups: created }
+    );
+  }
+  const lines = groups.map((group, index) => {
+    const findings = group.findings
+      .map((finding) => `${finding.id} [${finding.severity}] ${finding.title}`)
+      .join("; ");
+    return `wave ${index + 1}: ${findings}`
+      + ` (paths: ${group.affectedPaths.join(", ") || "none"}; invariants: ${group.invariants.join(", ")})`;
+  });
+  return output(`Repair wave for ${task.id} (${groups.length} group(s), run disjoint groups in parallel):\n${lines.join("\n")}\n`);
+}
+
+function reviewRepairProjectIds(
+  task: Task,
+  affectedPaths: readonly string[]
+): readonly string[] {
+  const bindings = task.projectBindings;
+  const matched = bindings.filter((binding) => affectedPaths.some((path) => pathWithinProject(path, binding.directory)));
+  const projectIds = (matched.length > 0 ? matched : bindings).map(({ projectId }) => projectId);
+  return [...new Set(projectIds)];
+}
+
+function pathWithinProject(path: string, directory: string): boolean {
+  const normalizedPath = path.replace(/^\.\//u, "").replace(/^\/+/u, "");
+  const normalizedDirectory = directory.replace(/^\.\//u, "").replace(/^\/+|\/+$/gu, "");
+  if (normalizedDirectory.length === 0 || normalizedDirectory === ".") return true;
+  return normalizedPath === normalizedDirectory
+    || normalizedPath.startsWith(`${normalizedDirectory}/`);
+}
+
+function extractReviewFindingsCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task review finding extract usage: yui task review finding extract <task>/<review-round>.";
+  exactPositionals(args, 1, usage);
+  const reference = resolveTaskRecordReference(args[0]!, {
+    kind: "reviewRound",
+    label: "ReviewRound"
+  });
+  const now = clock(options);
+  const result = store.transaction((tx) =>
+    reconcileReviewFindings(tx, reference.taskId, reference.localId, now));
+  if (result.skipped) {
+    return output(`ReviewRound ${result.roundId} produced no findings: ${result.reason ?? "skipped"}\n`);
+  }
+  return output(`Reconciled ${result.created.length + result.updated.length + result.conflicts.length} finding(s) from ${result.roundId}: `
+    + `${result.created.length} created, ${result.updated.length} updated, ${result.conflicts.length} conflict(s).\n`);
 }
 
 function requestTaskReviewRound(
@@ -3686,11 +3929,14 @@ function retryFailedTaskReviewRound(
       throw usageError(`ReviewRound ${round.id} is not a failed Task-final ReviewRound.`);
     }
     if (round.reviewerRunId !== undefined) {
+      if (round.status === "completed") {
+        throw usageError(`ReviewRound ${round.id} is not retryable from ${round.status}.`);
+      }
       throw usageError(
         `ReviewRound ${round.id} has Reviewer Run ${round.reviewerRunId}; use task run retry instead.`
       );
     }
-    if (round.status !== "failed") {
+    if (round.status !== "failed" && round.status !== "pending") {
       throw usageError(`ReviewRound ${round.id} is not retryable from ${round.status}.`);
     }
     if (round.taskCandidate === undefined) {
@@ -3731,30 +3977,18 @@ function retryFailedTaskReviewRound(
     if (roundIndex < 0) {
       throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
     }
-    const laterRounds = reviewerRounds.slice(roundIndex + 1);
-    const existingRetry = reviewerRounds.filter((entry) => (
-      entry.id !== round.id
-      && (entry.scope ?? "work-item") === "task"
-      && entry.requestedBy === "leader"
-      && entry.workItemId === round.workItemId
-      && entry.candidateId === round.candidateId
-      && entry.reviewerRoleName === round.reviewerRoleName
-      && entry.reviewBaseCommit === round.reviewBaseCommit
-      && sameTaskFinalReviewContract(entry.taskFinalReviewContract, taskFinalContract)
-      && isSameTaskReviewCandidate(entry.taskCandidate, round.taskCandidate!)
-      && entry.status !== "failed"
-    )).at(-1);
-    const conflictingLater = laterRounds.find((entry) => entry.id !== existingRetry?.id);
+    // Issue 06: infra retries reuse the same semantic Round ID. Any later
+    // Round supersedes this one; an active Round for the same Reviewer blocks.
+    const conflictingLater = reviewerRounds.slice(roundIndex + 1).at(-1);
     if (conflictingLater !== undefined) {
       throw usageError(
         `A newer conflicting final ReviewRound already exists after ${round.id}: `
         + `${conflictingLater.id}/${conflictingLater.status}.`
       );
     }
-    assertNoConflictingTaskReviewRound(reviewerRounds, existingRetry?.id);
+    assertNoConflictingTaskReviewRound(reviewerRounds, round.id);
     const activeRound = reviewerRounds.find((entry) => (
       entry.id !== round.id
-      && entry.id !== existingRetry?.id
       && entry.reviewerRoleName === round.reviewerRoleName
       && (entry.status === "pending" || entry.status === "running")
     ));
@@ -3788,55 +4022,6 @@ function retryFailedTaskReviewRound(
     ));
     const activePointer = tx.getActiveAgentRun(task.id, reviewer.name);
 
-    // An exact already-created retry is the idempotent result. The identity
-    // fences are intentionally as strict as the failed-Run retry path: pending
-    // is reusable only while every Reviewer lane is idle; running is reusable
-    // only with its exact active Run/mailbox; completed is a no-write result.
-    if (existingRetry !== undefined) {
-      if (existingRetry.status === "pending") {
-        if (activePointer !== null || activeReviewerRuns.length > 0
-          || hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-          throw usageError(`Reviewer has unrelated active execution: ${reviewer.name}.`);
-        }
-        return { round: existingRetry, created: false } as const;
-      }
-      if (existingRetry.status === "running") {
-        const reviewerRunId = existingRetry.reviewerRunId;
-        const activeMatches = reviewerRunId !== undefined
-          && activePointer !== null
-          && activePointer.id === reviewerRunId
-          && activePointer.status === "active"
-          && activeReviewerRuns.length === 1
-          && activeReviewerRuns[0]!.id === reviewerRunId;
-        const processingMatches = reviewerRunId !== undefined
-          && reviewerMailbox?.processing?.executionRef !== undefined
-          && isDeepStrictEqual(
-            reviewerMailbox.processing.executionRef,
-            runRef(task.id, reviewerRunId)
-          )
-          && reviewerMailbox.pending === null;
-        const pendingMatches = reviewerRunId !== undefined
-          && reviewerMailbox?.pending?.requestCount === 1
-          && reviewerMailbox.pending.refs.some((ref) => (
-            isDeepStrictEqual(ref, runRef(task.id, reviewerRunId))
-          ));
-        if (!activeMatches || (!processingMatches && !pendingMatches) || hasMailboxWork(runtimeMailbox)) {
-          throw usageError(
-            `Existing retry ${existingRetry.id} is running without its exact active Reviewer execution.`
-          );
-        }
-        return { round: existingRetry, created: false } as const;
-      }
-      if (existingRetry.status === "completed") {
-        if (activePointer !== null || activeReviewerRuns.length > 0
-          || hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-          throw usageError(`Reviewer has unrelated active execution: ${reviewer.name}.`);
-        }
-        return { round: existingRetry, created: false } as const;
-      }
-      throw usageError(`Existing retry ${existingRetry.id} is not reusable from ${existingRetry.status}.`);
-    }
-
     if (activePointer !== null || activeReviewerRuns.length > 0) {
       throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
     }
@@ -3844,25 +4029,22 @@ function retryFailedTaskReviewRound(
       throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
     }
 
-    const nextRound = createTaskReviewRound(
-      tx.nextReviewRoundId(task.id),
-      task.id,
-      round.workItemId,
-      round.candidateId,
-      round.reviewerRoleName,
-      "leader",
-      round.taskCandidate,
-      now,
-      taskFinalContract
-    );
-    tx.saveReviewRound(task.id, nextRound);
+    // Issue 06: an already-pending Round is the idempotent retry result.
+    if (round.status === "pending") {
+      return { round, created: false } as const;
+    }
+
+    // Issue 06: infra retry resets the same semantic Round to pending instead
+    // of manufacturing a new Round, so Round count and finding identity stay
+    // stable across execution-attempt failures.
+    const resetRound = retryTaskReviewRound(round);
+    tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "review.task-final-retried", {
-      previousReviewRoundId: round.id,
-      nextReviewRoundId: nextRound.id,
+      reviewRoundId: round.id,
       workItemId: round.workItemId,
       candidateId: round.candidateId
     }, now);
-    return { round: nextRound, created: true } as const;
+    return { round: resetRound, created: true } as const;
   });
   return output(
     result.created
@@ -3883,6 +4065,7 @@ function taskRunCommand(
   if (command === "settle") return settleStaleFinalReviewRun(rest, store, options);
   if (command === "recover") return output(recoverRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
+  if (command === "yield-status") return yieldRunStatus(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
   throw usageError(command === undefined
     ? "Task run command is required."
@@ -4787,11 +4970,9 @@ function latestTaskReviewContractAnchor(
 
 /**
  * Leader-only retry of an exact failed Task-final review Run. The old failed
- * Run/Round/workspace/evidence are preserved verbatim: the old Round is
- * terminalized as failed (idempotent if already failed) and a new independent
- * ReviewRound bound to the same frozen Candidate is created (or reused if a
- * prior retry already produced one). Every identity and frozen-head fence is
- * checked inside one transaction so a partial fail-old-without-new state can
+ * Run remains the attempt trail, while the semantic ReviewRound is reset to
+ * pending under its existing identity. Every identity and frozen-head fence is
+ * checked inside one transaction so a partial fail-old-without-reset state can
  * never be committed.
  */
 function retryFailedReviewRun(
@@ -4827,14 +5008,11 @@ function retryFailedReviewRun(
     if (!sameTaskFinalReviewContract(round.taskFinalReviewContract, taskFinalContract)) {
       throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
     }
-    if (round.status !== "failed" && round.status !== "running") {
+    if (round.status !== "failed"
+      && round.status !== "running"
+      && round.status !== "pending"
+      && round.status !== "completed") {
       throw usageError(`ReviewRound ${round.id} is not retryable from ${round.status}.`);
-    }
-    const validation = validateExactRunReviewRound(tx, run, { allowTerminal: true });
-    if (validation.disposition !== "applied" || validation.round === null) {
-      throw usageError(
-        `Review Run ${run.id} identity does not match its ReviewRound or frozen Task state changed: ${validation.reason ?? "mismatch"}.`
-      );
     }
     const currentTaskCandidate = actualTaskReviewCandidateForMutation(tx, task, options);
     if (!isSameTaskReviewCandidate(currentTaskCandidate, round.taskCandidate!)) {
@@ -4865,41 +5043,14 @@ function retryFailedReviewRun(
         `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
       );
     }
-    const reviewerRounds = reviewRoundsByIdentity(
-      tx.listReviewRounds(task.id).filter((entry) => (
-        entry.workItemId === item.id
-        && entry.candidateId === candidate.id
-        && entry.reviewerRoleName === round.reviewerRoleName
-      ))
-    );
     const allReviewerRounds = reviewRoundsByIdentity(
       tx.listReviewRounds(task.id).filter((entry) => (
         entry.reviewerRoleName === round.reviewerRoleName
       ))
     );
-    const existingRetry = reviewerRounds.filter((entry) => (
-      entry.id !== round.id
-      && entry.status !== "failed"
-      && entry.requestedBy === "leader"
-      && (entry.scope ?? "work-item") === "task"
-      && entry.candidateId === candidate.id
-      && entry.workItemId === item.id
-      && entry.reviewerRoleName === round.reviewerRoleName
-      && entry.reviewBaseCommit === round.reviewBaseCommit
-      && sameTaskFinalReviewContract(entry.taskFinalReviewContract, taskFinalContract)
-      && isSameTaskReviewCandidate(entry.taskCandidate, round.taskCandidate!)
-    )).at(-1);
-    if (round.status === "running"
-      && tx.getActiveAgentRun(task.id, round.reviewerRoleName) !== null) {
-      throw usageError(`${task.id}/${round.reviewerRoleName} already has an active run.`);
-    }
-    assertNoConflictingTaskReviewRound(
-      tx.listReviewRounds(task.id),
-      [round.id, ...(existingRetry === undefined ? [] : [existingRetry.id])]
-    );
+    assertNoConflictingTaskReviewRound(tx.listReviewRounds(task.id), round.id);
     const activeRound = allReviewerRounds.find((entry) => (
       entry.id !== round.id
-      && entry.id !== existingRetry?.id
       && (entry.status === "pending" || entry.status === "running")
     ));
     if (activeRound !== undefined) {
@@ -4926,42 +5077,23 @@ function retryFailedReviewRun(
     const activeReviewerRuns = tx.listAgentRuns(task.id).filter((entry) => (
       entry.roleName === reviewer.name && entry.status === "active"
     ));
-    if (round.status === "running"
-      && (activePointer !== null || activeReviewerRuns.length > 0)) {
-      throw usageError(`${task.id}/${reviewer.name} already has an active run.`);
-    }
 
-    // A completed identical retry is terminal evidence and is a no-write
-    // idempotent read only when no unrelated Reviewer state is live. Keep the
-    // same fail-closed fences as pending/running retries.
-    if (existingRetry?.status === "completed") {
-      if (activePointer !== null || activeReviewerRuns.length > 0) {
-        throw usageError(`Reviewer Role already has an active run: ${round.reviewerRoleName}.`);
-      }
-      if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-        throw usageError(`Reviewer has unrelated mailbox work: ${round.reviewerRoleName}.`);
-      }
-      return { round: existingRetry, previousRun: run };
-    }
+   // Issue 06: a completed same-Round retry is a no-write idempotent result.
+   if (round.status === "completed") {
+     if (activePointer !== null || activeReviewerRuns.length > 0) {
+       throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
+     }
+     if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
+       throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
+     }
+      return { round, previousRun: run, created: false };
+   }
 
-    if (existingRetry?.status === "pending") {
-      // A pending retry is reusable only while every Reviewer lane is idle.
-      // In particular, never return it to the CLI while another Round/Run or
-      // mailbox batch could cause the CLI to dispatch or fail it.
-      if (activePointer !== null || activeReviewerRuns.length > 0) {
-        throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
-      }
-      if (hasMailboxWork(reviewerMailbox)) {
-        throw usageError(`Reviewer mailbox has unrelated work: ${reviewer.name}.`);
-      }
-      if (hasMailboxWork(runtimeMailbox)) {
-        throw usageError(`Reviewer runtime lifecycle is pending: ${reviewer.name}.`);
-      }
-      return { round: existingRetry, previousRun: run };
-    }
-
-    if (existingRetry?.status === "running") {
-      const reviewerRunId = existingRetry.reviewerRunId;
+    // Issue 06: a running same Round is reusable only with its exact active
+    // Run and mailbox execution. A stranded Run (no active pointer) falls
+    // through and resets the Round after the identity fences below.
+    if (round.status === "running") {
+      const reviewerRunId = round.reviewerRunId;
       const activeMatches = reviewerRunId !== undefined
         && activePointer !== null
         && activePointer.id === reviewerRunId
@@ -4981,15 +5113,27 @@ function retryFailedReviewRun(
         && reviewerMailbox.pending.refs.some((ref) => (
           isDeepStrictEqual(ref, runRef(task.id, reviewerRunId))
         ));
-      if (!activeMatches
-        || (!processingMatches && !pendingMatches)
-        || hasMailboxWork(runtimeMailbox)) {
+      if (activePointer !== null
+        && (!activeMatches
+          || (!processingMatches && !pendingMatches)
+          || hasMailboxWork(runtimeMailbox))) {
         throw usageError(
-          `Existing retry ${existingRetry.id} is running without its exact active Reviewer execution.`
+          `Existing running ReviewRound ${round.id} lacks its exact active Reviewer execution.`
         );
       }
-      return { round: existingRetry, previousRun: run };
-    }
+      if (activeMatches) return { round, previousRun: run, created: false };
+   }
+
+   // Issue 06: an already-pending Round is the idempotent retry result.
+   if (round.status === "pending") {
+     if (activePointer !== null || activeReviewerRuns.length > 0) {
+       throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
+     }
+     if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
+       throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
+     }
+      return { round, previousRun: run, created: false };
+   }
 
     if (activePointer !== null || activeReviewerRuns.length > 0) {
       throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
@@ -4999,6 +5143,13 @@ function retryFailedReviewRun(
     }
     if (runtimeMailbox?.pending !== null && runtimeMailbox?.pending !== undefined) {
       throw usageError(`Reviewer runtime lifecycle has pending work: ${reviewer.name}.`);
+    }
+
+    const validation = validateExactRunReviewRound(tx, run, { allowTerminal: true });
+    if (validation.disposition !== "applied" || validation.round === null) {
+      throw usageError(
+        `Review Run ${run.id} identity does not match its ReviewRound or frozen Task state changed: ${validation.reason ?? "mismatch"}.`
+      );
     }
 
     // A stranded pre-delivery Run can leave its exact pending or processing
@@ -5026,11 +5177,12 @@ function retryFailedReviewRun(
     }
     // Terminalize the old stranded Round only after every identity and mailbox
     // fence has passed. The outer transaction rolls back if Round creation fails.
+    let roundToReset = round;
     if (round.status !== "failed") {
       const summary = round.summary
         ?? run.summary
         ?? `Review Run ${run.id} failed before delivery.`;
-      tx.saveReviewRound(task.id, finishReviewRound(
+      roundToReset = finishReviewRound(
         round,
         "failed",
         summary,
@@ -5040,30 +5192,23 @@ function retryFailedReviewRun(
           checks: round.checks ?? [],
           ...(round.evidenceCommit === undefined ? {} : { evidenceCommit: round.evidenceCommit })
         }
-      ));
+      );
+      tx.saveReviewRound(task.id, roundToReset);
     }
-    const nextRound = createTaskReviewRound(
-      tx.nextReviewRoundId(task.id),
-      task.id,
-      item.id,
-      candidate.id,
-      round.reviewerRoleName,
-      "leader",
-      round.taskCandidate!,
-      now,
-      taskFinalContract
-    );
-    tx.saveReviewRound(task.id, nextRound);
+    // Issue 06: infra retry resets the same semantic Round to pending instead
+    // of manufacturing a new Round, so Round count and finding identity stay
+    // stable across execution-attempt failures.
+    const resetRound = retryTaskReviewRound(roundToReset);
+    tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "run.review-retried", {
       runId: run.id,
       reviewRoundId: round.id,
-      nextReviewRoundId: nextRound.id,
       candidateId: candidate.id
     }, now);
-    return { round: nextRound, previousRun: run };
+    return { round: resetRound, previousRun: run, created: true };
   });
   return output(
-    result.round.status === "pending"
+    result.created
       ? `Review retry requested as ${result.round.id}\n`
       : `Review retry already requested as ${result.round.id} (${result.round.status})\n`,
     { reviewRound: result.round }
@@ -5159,6 +5304,114 @@ function recoverRun(
   return `Recorded exact ${result.action} recovery for ${result.run?.id ?? "unknown Run"}.${followup}\n`;
 }
 
+/**
+ * Issue 04: builds the terminal yield outcome from the command inputs. The
+ * same construction feeds both the first commit and the idempotent replay, so
+ * a resend always hashes to the same digest.
+ */
+function buildYieldOutcome(
+  run: AgentRun,
+  inputSummary: string,
+  options: TaskCommandOptions
+): { summary: string; reviewResult?: Parameters<typeof terminalizeExactTaskRun>[1]["reviewResult"] } {
+  let yieldedReport;
+  if (run.purpose === "review"
+    || (run.purpose === "execution" && run.executionGroupId !== undefined)) {
+    yieldedReport = parseReviewYieldReport(inputSummary);
+  }
+  const summary = yieldedReport?.summary ?? inputSummary;
+  if (yieldedReport === undefined) return { summary };
+  return {
+    summary,
+    reviewResult: {
+      report: yieldedReport.report,
+      checks: yieldedReport.checks,
+      ...(yieldedReport.findings === undefined ? {} : { findings: yieldedReport.findings }),
+      ...(yieldedReport.evidence === undefined ? {} : { evidence: yieldedReport.evidence }),
+      ...(run.purpose === "review"
+        && options.reviewWorkspaceResult?.evidenceCommit === undefined
+        ? {}
+        : run.purpose === "review"
+          ? { evidenceCommit: options.reviewWorkspaceResult!.evidenceCommit }
+          : yieldedReport.evidenceCommit === undefined
+            ? {}
+            : { evidenceCommit: yieldedReport.evidenceCommit }),
+      ...(options.executionLaneGitSnapshot === undefined
+        || options.executionLaneGitSnapshot === null
+        ? {}
+        : { gitSnapshot: options.executionLaneGitSnapshot })
+    }
+  };
+}
+
+/**
+ * Issue 04: replays an already-committed yield. Returns the committed receipt
+ * for the same outcome, fails closed for a different outcome, or returns
+ * `null` to keep the legacy "already terminal" behavior.
+ */
+function replayYieldReceipt(
+  run: AgentRun,
+  inputSummary: string,
+  options: TaskCommandOptions
+): TaskCommandExecution | null {
+  const config = providerRetryConfig(options.environment ?? process.env);
+  if (!config.yieldReceiptReplay) return null;
+  if (run.yieldReceipt === undefined) return null;
+  const outcome = buildYieldOutcome(run, inputSummary, options);
+  const match = matchYieldReceipt(run.yieldReceipt, {
+    status: "yielded",
+    summary: outcome.summary,
+    ...(outcome.reviewResult === undefined ? {} : { reviewResult: outcome.reviewResult })
+  });
+  if (match === null) return null;
+  if (match.kind === "digest-mismatch") {
+    throw usageError(
+      `Run ${run.id} is already terminal with a different yield outcome. `
+      + `Existing receipt: ${match.existing.receiptId} (request ${match.existing.requestId}).`
+    );
+  }
+  return output(
+    `Run ${run.id} yield already committed.\n`
+    + `Receipt: ${match.receipt.receiptId}\n`
+    + `Request: ${match.receipt.requestId}\n`,
+    { receipt: match.receipt }
+  );
+}
+
+/**
+ * Issue 04: `yui task run yield-status <task>/<run>` — returns the committed
+ * yield receipt for a terminal Run, or the current status for an active Run.
+ */
+function yieldRunStatus(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task run yield-status usage: yui task run yield-status <task>/<run>.";
+  const parsed = parseTail(args, new Set(), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const run = requireRun(store, parsed.positionals[0], options);
+  if (run.status === "active") {
+    return output(`Run ${run.id} is active; no yield receipt yet.\n`, {
+      runId: run.id,
+      status: run.status
+    });
+  }
+  if (run.yieldReceipt === undefined) {
+    return output(`Run ${run.id} is ${run.status}; no yield receipt recorded.\n`, {
+      runId: run.id,
+      status: run.status
+    });
+  }
+  return output(
+    `Run ${run.id} yield receipt:\n`
+    + `Receipt: ${run.yieldReceipt.receiptId}\n`
+    + `Request: ${run.yieldReceipt.requestId}\n`
+    + `Committed: ${run.yieldReceipt.committedAt}\n`,
+    { receipt: run.yieldReceipt }
+  );
+}
+
 function yieldRun(
   args: string[],
   store: TaskWorkflowStore,
@@ -5174,6 +5427,15 @@ function yieldRun(
     usage
   );
   const now = clock(options);
+  // Issue 04: an already-terminal Run may be a lost-response resend. Match
+  // the presented outcome against the committed receipt before opening the
+  // transaction; the receipt is immutable once committed.
+  const existing = requireRun(store, parsed.positionals[0], options);
+  if (existing.status !== "active") {
+    const replayed = replayYieldReceipt(existing, inputSummary, options);
+    if (replayed !== null) return replayed;
+    throw usageError(`Run ${existing.id} is already terminal: ${existing.status}.`);
+  }
   const yielded = store.transaction((tx) => {
     const active = requireRun(tx, parsed.positionals[0], options);
     if (active.status !== "active") {
@@ -5222,7 +5484,8 @@ function yieldRun(
         );
       }
     }
-    const summary = yieldedReport?.summary ?? inputSummary;
+    const yieldOutcome = buildYieldOutcome(active, inputSummary, options);
+    const summary = yieldOutcome.summary;
     const terminalization = terminalizeExactTaskRun(tx, {
       taskId: task.id,
       roleName: role.name,
@@ -5236,28 +5499,9 @@ function yieldRun(
         ? {}
         : { launchId: options.environment.YUI_LAUNCH_ID }),
       outcome: { status: "yielded", summary },
-      ...(yieldedReport === undefined
+      ...(yieldOutcome.reviewResult === undefined
         ? {}
-        : {
-            reviewResult: {
-              report: yieldedReport.report,
-              checks: yieldedReport.checks,
-              ...(yieldedReport.findings === undefined ? {} : { findings: yieldedReport.findings }),
-              ...(yieldedReport.evidence === undefined ? {} : { evidence: yieldedReport.evidence }),
-              ...(active.purpose === "review"
-                && options.reviewWorkspaceResult?.evidenceCommit === undefined
-                ? {}
-                : active.purpose === "review"
-                  ? { evidenceCommit: options.reviewWorkspaceResult!.evidenceCommit }
-                  : yieldedReport.evidenceCommit === undefined
-                    ? {}
-                    : { evidenceCommit: yieldedReport.evidenceCommit }),
-              ...(options.executionLaneGitSnapshot === undefined
-                || options.executionLaneGitSnapshot === null
-                ? {}
-                : { gitSnapshot: options.executionLaneGitSnapshot })
-            }
-          })
+        : { reviewResult: yieldOutcome.reviewResult })
     }, now);
     if (terminalization.disposition !== "applied" || terminalization.run === null) {
       throw usageError(
@@ -5828,6 +6072,9 @@ export function dispatchPreparedReviewRound(
         .map(({ projectId, commit }) => `${projectId}@${commit}`)
         .join(", ")
       : `candidate@${round.reviewBaseCommit}`;
+    const findingContext = taskScope
+      ? buildTaskFinalReviewFindingContext(tx, taskId, round.taskCandidate!).context
+      : "";
     const scopeLabel = taskScope ? "Task-final" : "WorkItem";
     const projectPolicyPointers = task.projectBindings
       .map(({ projectId }) => (
@@ -5846,6 +6093,7 @@ export function dispatchPreparedReviewRound(
       `Review workspace source: exact workspace attached to this Reviewer Lane`,
       `Candidate summary: ${candidate.summary}`,
       `Acceptance criteria: ${item.acceptance.length === 0 ? "none" : item.acceptance.join("; ")}`,
+      ...(taskScope ? [findingContext] : []),
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
       "Keep Yui Core lifecycle safety, generic Reviewer behavior, Project Policy/Knowledge, and the Task Contract separate. Follow Project Policy pointers from the dispatch context for project-specific checks.",
       ...(round.scope === "task"

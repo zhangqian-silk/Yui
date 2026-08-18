@@ -1,16 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { startFileTaskController } from "../../dist/controller/controller.js";
+import { readLinuxProcessStartIdentity } from "../../dist/controller/domainIdentity.js";
 import {
   callController,
   readControllerDiscovery
 } from "../../dist/core/controllerClient.js";
 import {
+  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
   encodeControllerRequest,
   parseControllerResponse
 } from "../../dist/core/protocol.js";
@@ -19,6 +22,33 @@ import {
   ControllerEventLoopDelay
 } from "../../dist/core/controllerTelemetry.js";
 import { YUI_VERSION } from "../../dist/version.js";
+
+// Issue 02: the authenticated identity carries the full release provenance.
+// A dev checkout has no release manifest, so the release fields report the
+// dev fallback; the process identity is the live owner's.
+function expectedDevIdentity() {
+  const startIdentity = readLinuxProcessStartIdentity(process.pid);
+  return {
+    executablePath: process.execPath,
+    args: process.argv.slice(1),
+    version: YUI_VERSION,
+    buildId: "dev",
+    packageDigest: null,
+    sourceCommit: null,
+    cliRealpath: realpathSync(fileURLToPath(new URL("../../dist/cli.js", import.meta.url))),
+    controllerRealpath: realpathSync(
+      fileURLToPath(new URL("../../dist/core/controllerServer.js", import.meta.url))
+    ),
+    controllerProtocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+    storageBackend: "file",
+    workerEnabled: false,
+    mode: "primary",
+    dualOwner: false,
+    activeRelease: null,
+    pid: process.pid,
+    ...(startIdentity === undefined ? {} : { processStartIdentity: startIdentity })
+  };
+}
 
 function emptyStore() {
   return {
@@ -175,11 +205,7 @@ test("built-in status, identity and stop routes are counted once by core stats",
     { intervalMs: 60_000 }
   );
   try {
-    assert.deepEqual(await callController(home, "controller.identity", {}), {
-      executablePath: process.execPath,
-      args: process.argv.slice(1),
-      version: YUI_VERSION
-    });
+    assert.deepEqual(await callController(home, "controller.identity", {}), expectedDevIdentity());
     await callController(home, "controller.status", {});
 
     const snapshot = await callController(home, "controller.status", {});

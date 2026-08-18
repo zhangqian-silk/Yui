@@ -32,6 +32,7 @@ import { createProductionStorageRegistry } from "../dist/storage/migration/produ
 import { latestStorageVersionState } from "../dist/storage/upgrade/recordVersions.js";
 import { classifyHome } from "../dist/storage/upgrade/homeClassification.js";
 import { repairPseudoLayout7 } from "../dist/storage/upgrade/pseudoLayoutRepair.js";
+import { runStorageUpgrade } from "../dist/storage/upgrade/upgradeOrchestrator.js";
 import {
   latestStateBackupPath,
   listStateBackups
@@ -596,6 +597,92 @@ test("execute: malformed state.json blocks the repair and leaves the Home unchan
   assert.equal(result.stage, "validate");
   assert.ok(!existsSync(join(home, COMMITTED_DATABASE_FILENAME)));
   assert.ok(!existsSync(join(home, STAGED_DATABASE_FILENAME)));
+});
+
+// ---------------------------------------------------------------------------
+// 3b. Multi-phase: repair + record migration in one fenced upgrade
+// ---------------------------------------------------------------------------
+
+/**
+ * Pin a task record family to a chosen version in both state.json and the
+ * manifest, simulating a Home whose records never reached the current family.
+ * The record shape is left untouched: the generic adjacent steps only declare
+ * the version transition, so a current-shape record with an older version
+ * label is a faithful migration source.
+ */
+function pinRecordVersion(home, taskMapKey, recordKind, version) {
+  const statePath = join(home, "state.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  for (const task of Object.values(state.tasks)) {
+    const records = task[taskMapKey];
+    if (records === undefined) continue;
+    for (const record of Object.values(records)) {
+      record.schemaVersion = version;
+    }
+  }
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.recordVersions[recordKind] = version;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+test("upgrade: a pseudo-layout-7 Home with an offline-older record family reaches current in one pass", async () => {
+  const { home } = setupPseudoLayout7Home();
+  // agentRun 5->6 is a registered offline step, so the post-repair classifier
+  // returns MIGRATABLE and the multi-phase branch runs the record migration in
+  // the same fenced window as the state.json->SQLite repair.
+  pinRecordVersion(home, "agentRuns", "agentRun", 5);
+  assert.equal(classify(home).classification.verdict, "NEEDS_STORAGE_REPAIR");
+
+  const result = await runStorageUpgrade({
+    home,
+    registry: REGISTRY,
+    latest: LATEST,
+    mode: "execute",
+    stopController: async () => {},
+    inspectOfflineInventory: async () => ({ total: 0, blockers: [] })
+  });
+
+  // One upgrade attempt repairs the SQLite backend AND runs the agentRun 5->6
+  // record migration in the same fenced window.
+  assert.equal(result.outcome, "upgraded");
+  assert.ok(existsSync(join(home, COMMITTED_DATABASE_FILENAME)), "yui.db promoted");
+  assert.ok(!existsSync(join(home, "state.json")), "state.json archived by the repair");
+  const after = classify(home);
+  assert.equal(after.classification.verdict, "USABLE");
+
+  // The migrated database carries the current task aggregate and its records.
+  const store = new SqliteTaskStore(home);
+  try {
+    assert.equal(store.listTasks().length, 1);
+    assert.equal(store.listProjects().length, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test("upgrade: a pseudo-layout-7 Home with a future record version is blocked, not falsely upgraded", async () => {
+  const { home } = setupPseudoLayout7Home();
+  pinRecordVersion(home, "agentRuns", "agentRun", 99);
+
+  const result = await runStorageUpgrade({
+    home,
+    registry: REGISTRY,
+    latest: LATEST,
+    mode: "execute",
+    stopController: async () => {},
+    inspectOfflineInventory: async () => ({ total: 0, blockers: [] })
+  });
+
+  // The repair promotes a healthy yui.db, but the pure classifier still fences
+  // the future record axis; the upgrade must surface that blocker rather than
+  // report a false success.
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.classification.classification.verdict, "NEEDS_NEW_VERSION");
+  assert.equal(result.classification.classification.blocker.reason, "future-version");
+  assert.ok(existsSync(join(home, COMMITTED_DATABASE_FILENAME)), "repair still promoted yui.db");
 });
 
 // ---------------------------------------------------------------------------

@@ -284,6 +284,10 @@ export async function runControllerSchedulerPass(
       onMaintenanceFenceDefer
     );
     await controlEventLoopTurn();
+    // Issue 04: reopen due in-place Provider retries on their original
+    // Sessions before delivery, so the existing delivery path re-pushes the
+    // exact same input in this same pass.
+    resolveDueProviderRetries(store, roleSelection, now);
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection
     );
@@ -741,6 +745,23 @@ function resolveDueRuntimeTurnCompletions(
       runId: completion.runId
     });
   }
+}
+
+/**
+ * Issue 04: reopens due in-place Provider retries on their original Native
+ * Sessions before the active-run delivery pass, so the existing delivery
+ * path re-pushes the exact same input in the same pass. A Run whose Session
+ * is proven dead terminalizes with a replacement blocker instead.
+ */
+function resolveDueProviderRetries(
+  store: SchedulerStorePort,
+  selection: ReconcileSelection,
+  now: Date
+): void {
+  if (typeof store.resolveDueProviderRetries !== "function") return;
+  const selectedTaskIds = selection.full ? undefined : selection.taskIds;
+  if (selectedTaskIds?.size === 0) return;
+  store.resolveDueProviderRetries(now, selectedTaskIds);
 }
 
 function selectedRuntimeLifecycleTargets(
@@ -1525,6 +1546,16 @@ export class FileTaskController {
         : []).map((completion) => ({
         key: `role:${encodeURIComponent(completion.taskId)}/${encodeURIComponent(completion.roleName)}` as MailboxKey,
         at: Date.parse(completion.dueAt)
+      }))
+      ,
+      // Issue 04 durable in-place retry timer: arm the Controller wake at the
+      // earliest `nextAttemptAt` so a due retry re-pushes on its original
+      // Session. The projection is durable, so a restart resumes the lineage.
+      ...(typeof this.store.listPendingProviderRetries === "function"
+        ? this.store.listPendingProviderRetries()
+        : []).map((retry) => ({
+        key: `role:${encodeURIComponent(retry.taskId)}/${encodeURIComponent(retry.roleName)}` as MailboxKey,
+        at: Date.parse(retry.nextAttemptAt)
       }))
     ];
     const nearest = nearestDeadlineBatch(deadlines);

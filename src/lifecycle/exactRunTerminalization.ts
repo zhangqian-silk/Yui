@@ -15,7 +15,9 @@ import {
   type ReviewCheck,
   type ReviewRound
 } from "../review/reviewRound.js";
-import { failAgentRun, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
+import { reconcileReviewFindingsAfterReview } from "../review/reviewFindingLedger.js";
+import { failAgentRun, withYieldReceipt, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
+import { createYieldReceipt } from "../run/yieldReceipt.js";
 import {
   recordExecutionLaneResult,
   type ExecutionLaneGitSnapshot
@@ -252,6 +254,11 @@ export function terminalizeExactRunReviewRound(
     input.reviewResult
   );
   store.saveReviewRound(input.taskId, terminal);
+  // Issue 06: a completed (semantic) Round feeds the finding ledger; a failed
+  // execution attempt is skipped by the classifier and never creates findings.
+  if (terminal.status === "completed") {
+    reconcileReviewFindingsAfterReview(store, input.taskId, terminal.id, now);
+  }
   return { disposition: "applied", round: terminal };
 }
 
@@ -414,7 +421,25 @@ export function terminalizeExactTaskRun(
   }
 
   const terminal = input.outcome.status === "yielded"
-    ? yieldAgentRun(run, input.outcome.summary, now)
+    ? withYieldReceipt(
+        yieldAgentRun(run, input.outcome.summary, now),
+        createYieldReceipt(input.taskId, input.runId, {
+          status: "yielded",
+          summary: input.outcome.summary,
+          ...(input.reviewResult === undefined
+            ? {}
+            : {
+                reviewResult: {
+                  ...(input.reviewResult.report === undefined ? {} : { report: input.reviewResult.report }),
+                  ...(input.reviewResult.checks === undefined ? {} : { checks: input.reviewResult.checks }),
+                  ...(input.reviewResult.findings === undefined ? {} : { findings: input.reviewResult.findings }),
+                  ...(input.reviewResult.evidence === undefined ? {} : { evidence: input.reviewResult.evidence }),
+                  ...(input.reviewResult.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit }),
+                  ...(input.reviewResult.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot })
+                }
+              })
+        }, now)
+      )
     : failAgentRun(run, input.outcome.summary, now);
   if (run.executionGroupId !== undefined
     && run.executionLaneId !== undefined

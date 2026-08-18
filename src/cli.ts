@@ -54,6 +54,11 @@ import {
   parseExecutionAuditOptions,
   runExecutionAuditCommand
 } from "./commands/executionAuditCommands.js";
+import {
+  parseSessionReconcileOptions,
+  runSessionReconcileCommand
+} from "./commands/sessionCommands.js";
+import { SessionOwnerReconciliation } from "./controller/sessionOwnerReconciliation.js";
 import { runJobCommand } from "./commands/jobCommands.js";
 import { runDurableJobCommand } from "./commands/durableJobCommands.js";
 import { runTelemetryCommand } from "./commands/telemetryCommands.js";
@@ -86,6 +91,15 @@ import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
 import { runWorkflowCommandAsync } from "./commands/workflowCommands.js";
 import { createUpdatePorts } from "./cli/updatePorts.js";
 import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
+import { readRuntimeIdentity, type RuntimeIdentityReceipt } from "./release/runtimeRelease.js";
+import {
+  renderReleaseActivateResult,
+  renderReleaseInstallResult,
+  renderReleaseList,
+  runReleaseActivate,
+  runReleaseInstall,
+  runReleaseList
+} from "./commands/releaseCommands.js";
 import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
@@ -231,6 +245,40 @@ export async function main(): Promise<void> {
   }
 
   const home = resolveYuiHome(process.env);
+  if (args[0] === "release") {
+    const subcommand = args[1];
+    if (subcommand === "install" && args.length === 3) {
+      const result = runReleaseInstall(home, args[2]);
+      emit(renderReleaseInstallResult(result), false, result);
+      if (result.outcome === "aborted") process.exitCode = 5;
+      return;
+    }
+    if (subcommand === "list" && args.length === 2) {
+      const result = runReleaseList(home);
+      emit(renderReleaseList(result), false, result);
+      return;
+    }
+    if (subcommand === "activate" && (args.length === 2 || args.length === 3)) {
+      const releaseId = args.length === 3
+        ? args[2]
+        : runReleaseList(home).active ?? undefined;
+      if (releaseId === undefined) {
+        throw usageError(
+          "Release activate usage: yui release activate <release-id> "
+            + "(or activate the active release when exactly one is installed)."
+        );
+      }
+      const result = await runReleaseActivate(home, releaseId);
+      emit(renderReleaseActivateResult(result), false, result);
+      if (result.outcome === "aborted" || result.outcome === "dual-owner") {
+        process.exitCode = 5;
+      }
+      return;
+    }
+    throw usageError(
+      "Release usage: yui release install <source-dir> | list | activate [release-id]."
+    );
+  }
   if (args[0] === "completion") {
     await completionCommand(home, invocation.node);
     return;
@@ -323,12 +371,56 @@ export async function main(): Promise<void> {
     throw usageError("Internal lifecycle callback usage is invalid.");
   }
 
+  if (args[0] === "session") {
+    if (args[1] !== "reconcile") {
+      throw usageError(
+        "Session usage: yui session reconcile [--report] [--cleanup]."
+      );
+    }
+    const options = parseSessionReconcileOptions(args.slice(2));
+    const store = openCompatibleFileTaskStore(home);
+    const tmux = new TmuxManager(
+      process.env.YUI_TMUX_BIN ?? "tmux",
+      new NodeCommandExecutor(),
+      { yuiHome: home }
+    );
+    const reconciliation = new SessionOwnerReconciliation({
+      home,
+      store,
+      environment: process.env,
+      tmux
+    });
+    const result = await runSessionReconcileCommand({
+      reconciliation,
+      options,
+      environment: process.env
+    });
+    process.exitCode = result.exitCode;
+    emit(result.output, false, result.data);
+    return;
+  }
+
   if (args[0] === "controller") {
     const method = args[1];
     if (method === "identity" && args.length === 2) {
-      // Internal lifecycle seam used by update/upgrade. The Controller socket
-      // authenticates this exact launch identity; public `controller status`
-      // intentionally redacts argv in its resource inventory.
+      // Issue 02: the stable, read-only runtime identity receipt. It survives
+      // a Controller stop and answers build ID, package digest, backend, and
+      // worker state without a socket round-trip. When no receipt exists yet
+      // (a Controller that predates this feature), fall back to the
+      // authenticated socket identity so the command stays useful during
+      // rollout step 1.
+      let receipt: RuntimeIdentityReceipt | null = null;
+      try {
+        receipt = readRuntimeIdentity(home);
+      } catch {
+        // A corrupt or stale receipt (for example one written by an older
+        // Controller that predates the launch-identity fields) falls back to
+        // the live socket identity, which always carries the exact argv.
+      }
+      if (receipt !== null) {
+        emit("", false, receipt);
+        return;
+      }
       try {
         const identity = await callController(home, "controller.identity", {});
         emit("", false, identity);
