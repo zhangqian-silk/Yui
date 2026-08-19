@@ -170,6 +170,7 @@ export class TmuxManager {
     if (this.windowNames(taskId).includes(role.name)) {
       this.recordRoleTarget(taskId, role.name);
       this.configureServerHistory();
+      this.configureRoleWindowSizing(taskId, role.name);
       return false;
     }
     if (launch === undefined) {
@@ -206,6 +207,7 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     }
+    this.configureRoleWindowSizing(taskId, role.name);
     return true;
   }
 
@@ -218,6 +220,7 @@ export class TmuxManager {
     if (snapshot.names.includes(role.name)) {
       this.recordRoleTarget(taskId, role.name);
       await this.configureServerHistoryAsync();
+      await this.configureRoleWindowSizingAsync(taskId, role.name);
       return false;
     }
     if (launch === undefined) {
@@ -252,6 +255,7 @@ export class TmuxManager {
         ...launchCommand(launch)
       ]);
     }
+    await this.configureRoleWindowSizingAsync(taskId, role.name);
     return true;
   }
 
@@ -1137,6 +1141,33 @@ export class TmuxManager {
       "start-server",
       ";",
       "set-option", "-g", "history-limit", String(this.#historyLimit)
+    ]);
+  }
+
+  /**
+   * Pin the Role window to the largest attached client. The tmux default
+   * `window-size latest` lets a later-attaching smaller client (e.g. the Web
+   * terminal or a second `task enter` from a smaller pane) shrink the shared
+   * Role window, leaving the primary viewer with a TUI pinned to the top of a
+   * large terminal and no scrollback. `largest` keeps the window at the
+   * biggest attached client so a compact viewer cannot compress it.
+   */
+  private configureRoleWindowSizing(taskId: string, roleName: string): void {
+    this.run([
+      "set-option", "-w",
+      "-t", `${this.sessionName(taskId)}:${safeValue(roleName, "Role name")}`,
+      "window-size", "largest"
+    ]);
+  }
+
+  private async configureRoleWindowSizingAsync(
+    taskId: string,
+    roleName: string
+  ): Promise<void> {
+    await this.runAsync([
+      "set-option", "-w",
+      "-t", `${this.sessionName(taskId)}:${safeValue(roleName, "Role name")}`,
+      "window-size", "largest"
     ]);
   }
 

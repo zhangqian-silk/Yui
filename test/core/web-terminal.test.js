@@ -11,7 +11,8 @@ import {
   TmuxWebTerminalService
 } from "../../dist/web/tmuxWebTerminal.js";
 import {
-  yuiTmuxServerName
+  yuiTmuxServerName,
+  yuiTmuxSessionName
 } from "../../dist/tmux/tmuxManager.js";
 
 function fakePty() {
@@ -459,6 +460,15 @@ test("real web terminals keep independent Role windows and native tmux scrolling
       assert.equal(runTmux(yuiHome, [
         "show-options", "-v", "-t", clientSession, "status"
       ]), "off");
+    }
+    // `window-size largest` is pinned on the Role window itself so a compact
+    // viewer cannot shrink the shared window for the primary terminal.
+    for (const roleName of ["leader", "worker"]) {
+      assert.equal(runTmux(yuiHome, [
+        "show-options", "-w", "-v",
+        "-t", `${yuiTmuxSessionName(yuiHome, "task-1")}:${roleName}`,
+        "window-size"
+      ]), "largest");
     }
 
     for (const connection of connections) connection.close();
