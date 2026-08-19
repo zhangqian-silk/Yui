@@ -7,8 +7,8 @@ import type { NextActionFacts, NextActionRef } from "./nextAction.js";
  * The guard is pure and exact-evidence based: it hard-blocks only on exact
  * matches (same IDs, same commits, same scope). Suspected semantic
  * duplicates are warnings, never blocks. The budget derives entirely from
- * existing records — consecutive Leader turns that changed no durable
- * delivery fact are refused new record-creating mutations.
+ * existing records — an exhausted budget is a warning for the Leader, not a
+ * mutation block.
  */
 
 export type LeaderNextActionMode = "display" | "warn" | "enforce";

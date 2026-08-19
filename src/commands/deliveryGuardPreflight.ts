@@ -16,8 +16,8 @@ import {
  *
  * - `display`: no interference (read-only projection only).
  * - `warn`: every match is returned as a warning line; the mutation proceeds.
- * - `enforce`: exact duplicates and an exhausted budget hard-block the
- *   mutation; suspected duplicates remain warnings.
+ * - `enforce`: exact duplicates hard-block the mutation; suspected duplicates
+ *   and an exhausted semantic-progress budget remain warnings for the Leader.
  *
  * The preflight is read-only and never writes records.
  */
@@ -58,13 +58,6 @@ export function runDeliveryGuardPreflight(
   if (options.budget === true) {
     const budget = evaluateSemanticBudget(facts);
     if (budget.exhausted) {
-      if (mode === "enforce") {
-        throw usageError(
-          `Semantic progress budget exhausted: ${budget.reason} `
-          + `Evidence: ${budget.evidence.join(", ")}. `
-          + "Record a diagnosis/yield and wait for new facts instead of creating more records."
-        );
-      }
       warnings.push(`Semantic progress budget: ${budget.reason}`);
     }
   }

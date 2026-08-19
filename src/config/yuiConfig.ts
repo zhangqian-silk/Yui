@@ -49,10 +49,12 @@ export function reconciliationIntervalMilliseconds(value?: unknown): number {
 
 /**
  * Issue 07 (Leader convergence) feature mode. `display` only shows the
- * read-only next-action projection; `warn` additionally reports duplicate
- * deliveries; `enforce` hard-blocks exact duplicates and exhausted semantic
- * budgets. The mode is additive and optional — Homes without it keep the
- * `display` default, so no config migration is required.
+ * read-only next-action decision support; `warn` additionally reports
+ * duplicate deliveries and semantic-budget warnings; `enforce` hard-blocks
+ * only exact duplicates, while semantic-budget exhaustion remains a warning
+ * because it must not override Leader judgment. The mode is additive and
+ * optional — Homes without it keep the `display` default, so no config
+ * migration is required.
  */
 export const LEADER_NEXT_ACTION_MODES = ["display", "warn", "enforce"] as const;
 export type LeaderNextActionMode = typeof LEADER_NEXT_ACTION_MODES[number];

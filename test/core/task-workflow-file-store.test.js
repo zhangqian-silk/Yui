@@ -1608,6 +1608,54 @@ test("leader-triggered review starts only when the Leader requests it", (t) => {
   assert.equal(store.getActiveAgentRun(task.id, "reviewer")?.purpose, "review");
 });
 
+test("a repeated Leader review request resumes a pending Round that never launched", (t) => {
+  const { root, store, options } = fixture(t);
+  store.transaction((tx) => {
+    tx.saveGlobalRole(createGlobalRole(
+      "reviewer",
+      [createRoleAgentBinding(tx.getConfiguredAgent("codex"))],
+      "codex",
+      root,
+      NOW
+    ));
+    tx.saveConfig({
+      ...tx.getConfig(),
+      review: { roleName: "reviewer", trigger: "leader" }
+    });
+  });
+  const task = createTask(store, options, "Resumable Leader review");
+  run(["activate", task.id], store, options);
+  run(["role", "add", task.id, "worker"], store, options);
+  run(["work", "create", task.id, "candidate", "--role", "worker"], store, options);
+  const item = store.listWorkItems(task.id)[0];
+  run(["work", "dispatch", item.id], store, options);
+  const execution = store.getActiveAgentRun(task.id, "worker");
+  markDelivered(store, execution);
+  run(["run", "yield", execution.id, "--summary", "candidate ready"], store, options);
+
+  const leaderOptions = {
+    ...options,
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: task.id,
+      YUI_ROLE: "leader"
+    }
+  };
+  const first = runTaskCommand(["work", "review", item.id], store, leaderOptions);
+  assert.match(first.output, /Review requested/);
+  const round = store.listReviewRounds(task.id)[0];
+  assert.equal(round.status, "pending");
+  assert.equal(round.reviewerRunId, undefined);
+  assert.equal(store.getActiveAgentRun(task.id, "reviewer"), null);
+
+  const second = runTaskCommand(["work", "review", item.id], store, leaderOptions);
+  assert.match(second.output, /Review request .* is pending; resuming dispatch/);
+  assert.deepEqual(store.listReviewRounds(task.id), [round]);
+
+  dispatchSyntheticPendingReviews(store, task.id, options);
+  assert.equal(store.getActiveAgentRun(task.id, "reviewer")?.purpose, "review");
+});
+
 test("the latest ReviewRound stays authoritative when timestamps tie", (t) => {
   const { root, store, options } = fixture(t);
   store.transaction((tx) => {

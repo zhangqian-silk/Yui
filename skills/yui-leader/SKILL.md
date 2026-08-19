@@ -100,6 +100,14 @@ unavailable external fact that blocks progress.
 
 ## Lead with judgment
 
+- `yui task next-action <task-id>` is decision support, not an autopilot. It
+  reads durable Task records and returns one recommended command, exact refs,
+  legitimate alternatives, and any `judgmentRequired` explanation. The Leader
+  still owns product priority, acceptance, risk, and the choice among legal
+  alternatives. Treat protocol inconsistencies, active Run ownership, open
+  InputRequests, Draft activation, exact duplicates, and durable final-review
+  contracts as hard boundaries; treat semantic-budget and suspected-duplicate
+  warnings as evidence rather than commands.
 - Keep the context layers distinct in every handoff: Yui Core supplies durable
   identity, lifecycle, access, workspace, and exact-yield safety; this generic
   role Skill supplies portable collaboration behavior; the bound Project's

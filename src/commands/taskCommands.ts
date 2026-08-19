@@ -3302,15 +3302,19 @@ function reviewWork(
         && (round.status === "pending" || round.status === "running")
       ))).at(-1);
     if (activeRound !== undefined) {
+      if (activeRound.status === "pending" && activeRound.reviewerRunId === undefined) {
+        return { round: activeRound, run: null, resumed: true as const };
+      }
       throw usageError(`ReviewRound is already active: ${activeRound.id}/${activeRound.status}.`);
     }
-    return queueReviewRound(
+    const queued = queueReviewRound(
       tx,
       item,
       config,
       "leader",
       now
     );
+    return { ...queued, resumed: false as const };
   });
   if (result.run !== null) {
     notifyReviewMailbox(
@@ -3318,6 +3322,12 @@ function reviewWork(
       options.runtime,
       roleMailbox(result.run.taskId, result.run.roleName),
       result.run.taskId
+    );
+  }
+  if (result.resumed) {
+    return output(
+      `Review request ${result.round.id} is pending; resuming dispatch.\n`,
+      { reviewRound: result.round }
     );
   }
   return result.round.status === "failed"

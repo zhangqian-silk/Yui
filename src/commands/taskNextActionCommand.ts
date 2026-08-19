@@ -14,7 +14,8 @@ import {
 /**
  * Issue 07 (Leader convergence): read-only `yui task next-action <task>`.
  * Folds the existing durable records into exactly one protocol-level next
- * action with exact refs, preconditions, and the single recommended command.
+ * action with exact refs, preconditions, recommended command, alternatives, and
+ * the judgment that remains owned by the Leader.
  * The command never mutates state; when the action is `route-review-findings`
  * it also prints the minimal repair wave for the failing Review.
  */
@@ -82,6 +83,20 @@ function renderNextAction(action: NextAction, repairWave: RepairWave | null): st
     ...(action.recommendedCommand === undefined
       ? []
       : [`Recommended: ${action.recommendedCommand}`]),
+    ...(action.judgmentRequired === undefined
+      ? []
+      : [`Judgment: ${action.judgmentRequired}`]),
+    ...(action.alternatives === undefined || action.alternatives.length === 0
+      ? []
+      : [
+          "Alternatives:",
+          ...action.alternatives.map((alternative) => {
+            const command = alternative.recommendedCommand === undefined
+              ? ""
+              : ` — ${alternative.recommendedCommand}`;
+            return `  ${alternative.kind}: ${alternative.reason}${command}`;
+          })
+        ]),
     ...(action.conflicts === undefined || action.conflicts.length === 0
       ? []
       : [
