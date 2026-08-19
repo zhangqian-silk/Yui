@@ -207,6 +207,17 @@ export function buildHermeticEnvironment(root, options = {}) {
 export const TEST_STEP_TAP_BASENAME = "test-gate.tap";
 
 /**
+ * Top-level test files excluded from the hermetic gate's `test` step.
+ *
+ * These are diagnostic tools and one-time storage-upgrade regressions for
+ * already-validated migrations. They remain in `npm test` for local
+ * development but are skipped in CI to keep the PR gate fast. The gate
+ * still runs every `test/core/*.test.js` file plus the E2E, mock-agent,
+ * and storage-lifecycle suites that guard active behavior.
+ */
+const GATE_EXCLUDED_TEST_PATTERN = "diagnostic|storage-upgrade-.*-regressions";
+
+/**
  * The ordered gate steps. Each step has a stable `name` (used by the record
  * and by failure classification) and the exact shell command to run. The
  * `test` step additionally names its TAP destination (relative to the gate
@@ -230,7 +241,8 @@ export const GATE_STEPS = Object.freeze([
       + " --test-reporter=spec --test-reporter-destination=stdout"
       + " --test-reporter=tap --test-reporter-destination=\"$TMPDIR/"
       + TEST_STEP_TAP_BASENAME + "\""
-      + " test/*.test.js test/core/*.test.js"
+      + " $(ls test/*.test.js | grep -v -E '" + GATE_EXCLUDED_TEST_PATTERN + "')"
+      + " test/core/*.test.js"
   }),
   Object.freeze({
     name: "package-smoke",
