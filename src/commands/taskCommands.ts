@@ -334,6 +334,7 @@ export type TaskCommandExecution =
       kind: "enter";
       taskId: string;
       roleName: string;
+      access: "read-only" | "read-write";
       output?: string;
     }>;
 
@@ -2118,20 +2119,70 @@ function unbindTaskRole(
 function enterTaskRole(
   args: string[],
   store: TaskWorkflowStore,
-  options: TaskCommandOptions
+  _options: TaskCommandOptions
 ): TaskCommandExecution {
-  exactPositionals(args, 2, "Task role enter usage: yui task role enter <task> <role>.");
-  const task = requireTask(store, args[0]);
+  const usage = "Task role enter usage: yui task role enter <task> <role> "
+    + "[--read-only | --read-write].";
+  const parsed = parseTail(
+    args,
+    new Set(),
+    usage,
+    new Set(["--read-only", "--read-write"])
+  );
+  exactPositionals(parsed.positionals, 2, usage);
+  if (parsed.options.has("--read-only") && parsed.options.has("--read-write")) {
+    throw usageError("--read-only and --read-write are mutually exclusive.", usage);
+  }
+  const task = requireTask(store, parsed.positionals[0]);
   if (task.status !== "active") {
     throw usageError(inactiveTaskMessage(task, "entering a role session"));
   }
-  const role = requireRole(store, task.id, args[1]);
+  const role = requireRole(store, task.id, parsed.positionals[1]);
+  const access = parsed.options.has("--read-write") ? "read-write" : "read-only";
+  if (access === "read-write") {
+    assertTaskRoleWritableAttachAvailable(store, task.id, role.name);
+  }
   return {
     kind: "enter",
     taskId: task.id,
     roleName: role.name,
-    output: `Prepared role ${role.name} for ${task.id}\n`
+    access,
+    output: `Attaching to ${role.name} for ${task.id} (${access})\n`
   };
+}
+
+/** Re-run after the tmux writer lease exists to close attach/launch races. */
+export function assertTaskRoleWritableAttachAvailable(
+  store: TaskWorkflowStore,
+  taskId: string,
+  roleName: string,
+  options: Readonly<{
+    /** Exact pane probe used after the tmux writer lease is visible. */
+    isManagedProcessRunning?: () => boolean;
+  }> = {}
+): void {
+  const role = requireRole(store, taskId, roleName);
+  if (store.getActiveAgentRun(taskId, roleName) !== null) {
+    throw usageError(
+      `Role has an active managed Run; writable attach is unavailable: ${taskId}/${roleName}.`
+    );
+  }
+  const session = store.getRoleSession(taskId, roleName);
+  if (
+    activeRoleAgentBinding(role).adapterId === "claude"
+    && (
+      (
+        session !== null
+        && session.status !== "stopped"
+        && session.status !== "broken"
+      )
+      || options.isManagedProcessRunning?.() === true
+    )
+  ) {
+    throw usageError(
+      `A managed Claude process is still running; writable attach is unavailable: ${taskId}/${roleName}.`
+    );
+  }
 }
 
 function enterTaskRoleAlias(
@@ -2139,10 +2190,24 @@ function enterTaskRoleAlias(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  if (args.length < 1 || args.length > 2 || args.some((value) => value.trim().length === 0)) {
-    throw usageError("Task enter usage: yui task enter <task> [role].");
+  const usage = "Task enter usage: yui task enter <task> [role] "
+    + "[--read-only | --read-write].";
+  const parsed = parseTail(
+    args,
+    new Set(),
+    usage,
+    new Set(["--read-only", "--read-write"])
+  );
+  if (parsed.positionals.length < 1 || parsed.positionals.length > 2
+    || parsed.positionals.some((value) => value.trim().length === 0)) {
+    throw usageError(usage);
   }
-  return enterTaskRole([args[0], args[1] ?? LEADER_ROLE], store, options);
+  return enterTaskRole([
+    parsed.positionals[0],
+    parsed.positionals[1] ?? LEADER_ROLE,
+    ...(parsed.options.has("--read-only") ? ["--read-only"] : []),
+    ...(parsed.options.has("--read-write") ? ["--read-write"] : [])
+  ], store, options);
 }
 
 function taskWorkCommand(

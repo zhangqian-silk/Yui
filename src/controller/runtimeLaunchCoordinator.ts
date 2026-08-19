@@ -6,6 +6,7 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import {
   createRuntimeBinding,
+  RuntimeHostContentionError,
   RuntimeLaunchError,
   type RuntimeBinding,
   type RuntimeLaunchPersistence as RuntimeLaunchPersistencePort,
@@ -87,9 +88,17 @@ class RuntimeBindingContractError extends Error {
   }
 }
 
+class LaunchSubmittedHostBusyError extends RuntimeBindingContractError {
+  constructor(message: string) {
+    super(message);
+    this.name = "LaunchSubmittedHostBusyError";
+  }
+}
+
 /**
  * One application service owns the reservation -> host -> persistence
- * protocol for both foreground enter and scheduler-driven Role launches.
+ * protocol for Controller/scheduler-driven Role launches. Foreground Task
+ * attach is deliberately outside this lifecycle boundary.
  */
 export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
   readonly #createGenerationId: () => string;
@@ -217,7 +226,12 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       ...(request.runId === undefined ? {} : { runId: request.runId })
     }, assertLaunchCurrent, this.#now());
     let reusedConfirmedRunningHost = false;
-    let launchPromptAcknowledgementRequired = false;
+    const launchCarriesExactRunPrompt = carriesExactRunPrompt(request);
+    // Preserve the existing Codex recovery path; managed Claude is the one
+    // finite-process protocol that must never fall back to tmux key delivery
+    // when a newly-reserved Run encounters an older live pane.
+    let launchPromptAcknowledgementRequired = request.adapterId === "claude"
+      && launchCarriesExactRunPrompt;
 
     if (reservation.status === "existing") {
       if (!reservation.launchId.startsWith(generationPrefix)) {
@@ -298,13 +312,12 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           );
         }
         reusedConfirmedRunningHost = true;
-        // Only a fresh Codex generation can carry the exact Run prompt in its
-        // launch argv. A resume request targets an existing native Session and
-        // must use the normal receipt-backed prompt push, even when the
-        // Controller is recovering the same launch reservation.
+        // A fresh Codex generation carries the prompt in its launch argv. A
+        // managed Claude generation carries it through stream-json stdin for
+        // both new and native-resume modes. Only recovery of the exact same
+        // reserved Run may bridge a lost in-memory launch acknowledgement.
         launchPromptAcknowledgementRequired = sameRunReservation
-          && request.mode === "new"
-          && request.adapterId === "codex";
+          && launchCarriesExactRunPrompt;
         runtimeIsolation = this.#preflightRuntimeIsolation(
           request,
           reservation.launchId,
@@ -370,9 +383,6 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
               "Native session id"
             )
           }, beforeHostStart === undefined ? undefined : observePreflight);
-      if (!preflightObserved) {
-        throw new Error("Runtime session host did not expose a pre-host-start launch fence.");
-      }
       binding = requireMatchingRuntimeBinding(
         rawBinding,
         request,
@@ -380,7 +390,70 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         launchPromptAcknowledgementRequired,
         reusedConfirmedRunningHost
       );
+      if (
+        !preflightObserved
+        && !(
+          binding.hostCreated === false
+          && request.adapterId === "claude"
+          && launchCarriesExactRunPrompt
+        )
+      ) {
+        throw new Error("Runtime session host did not expose a pre-host-start launch fence.");
+      }
     } catch (error) {
+      if (error instanceof RuntimeHostContentionError && reusedConfirmedRunningHost) {
+        // The exact recovered generation remains authoritative. A late human
+        // writer is transient backpressure and must not settle, clean, or
+        // terminalize that reservation.
+        throw new RuntimeLaunchError(
+          true,
+          launchId,
+          error.message,
+          error.reason
+        );
+      }
+      if (
+        (error instanceof LaunchSubmittedHostBusyError
+          || error instanceof RuntimeHostContentionError)
+        && !reusedConfirmedRunningHost
+      ) {
+        let exactCleanupAttempted = false;
+        let completed = false;
+        try {
+          completed = this.reservations.completeRuntimeLaunchReservation(
+            request.owner,
+            launchId,
+            undefined,
+            runtimeIsolation === undefined
+              ? undefined
+              : () => {
+                  exactCleanupAttempted = true;
+                  this.#runtimeIsolation!.cleanup(runtimeIsolation, "failure");
+                }
+          );
+        } catch (cleanupError) {
+          if (exactCleanupAttempted) this.#requireCleanup(request.owner);
+          throw cleanupError;
+        }
+        if (!completed) {
+          this.#requireCleanup(request.owner);
+          throw new Error("Busy managed runtime launch reservation changed during retry release.");
+        }
+        if (error instanceof LaunchSubmittedHostBusyError) {
+          // A terminal Run no longer owns its finite provider process. Move
+          // that exact Role owner through the durable cleanup lane before a
+          // later retry creates the successor generation.
+          this.#requireCleanup(request.owner);
+        }
+        throw new RuntimeLaunchError(
+          true,
+          launchId,
+          error.message,
+          error instanceof RuntimeHostContentionError
+            ? error.reason
+            : "previous-process"
+        );
+      }
       if (error instanceof RuntimeBindingContractError) {
         // Never pass an untrusted hostRef to stop(). Reconcile the requested
         // owner through the durable, owner-addressed cleanup lane instead.
@@ -448,18 +521,16 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       );
     }
     if (
-      request.owner.scope === "task"
-      && request.adapterId === "codex"
-      && request.runId !== undefined
+      launchCarriesExactRunPrompt
       && binding.hostCreated !== false
       && reservationConfirmation !== "provider-bound"
       && binding.initialPromptRunId !== request.runId
     ) {
-      // Fresh Codex has no pre-input Provider event. It may return before its
-      // matching lifecycle Hook, but only an exact launch-carried Run marker
-      // can bridge that asynchronous interval. This is transport evidence,
-      // never Provider acceptance; the reservation remains fenced until the
-      // matching Hook binds the native Session.
+      // A launch-carried prompt may return before its matching lifecycle Hook,
+      // but only an exact Run marker can bridge that asynchronous interval.
+      // This is transport evidence, never Provider acceptance; the
+      // reservation remains fenced until the matching Hook binds the native
+      // Session.
       this.#requireCleanup(request.owner);
       throw new RuntimeBindingContractError(
         `Session host cannot acknowledge the exact launch-carried prompt: ${
@@ -696,17 +767,6 @@ function requireMatchingRuntimeBinding(
     );
   }
   if (
-    launchPromptAcknowledgementRequired
-    && binding.initialPromptRunId !== request.runId
-    && !(launchPromptUncertaintyAllowed && binding.hostCreated === false)
-  ) {
-    throw new RuntimeBindingContractError(
-      `Session host cannot acknowledge the exact launch-carried prompt: ${
-        request.owner.roleName
-      }.`
-    );
-  }
-  if (
     binding.launchId !== launchId
     || !ownerMatches
     || binding.agentId !== request.agentId
@@ -724,13 +784,28 @@ function requireMatchingRuntimeBinding(
   }
   if (
     launchPromptAcknowledgementRequired
+    && binding.initialPromptRunId !== request.runId
+    && !(launchPromptUncertaintyAllowed && binding.hostCreated === false)
+  ) {
+    throw binding.hostCreated === false
+      ? new LaunchSubmittedHostBusyError(
+          `An earlier managed runtime is still exiting: ${request.owner.roleName}.`
+        )
+      : new RuntimeBindingContractError(
+          `Session host cannot acknowledge the exact launch-carried prompt: ${
+            request.owner.roleName
+          }.`
+        );
+  }
+  if (
+    launchPromptAcknowledgementRequired
     && launchPromptUncertaintyAllowed
     && binding.hostCreated === false
     && request.runId !== undefined
     && binding.initialPromptRunId !== request.runId
   ) {
     // A Controller restart can lose only the in-memory fact that a still-
-    // running Codex generation carried this Run in its launch argv. Keep the
+    // running generation carried this Run at process launch. Keep the
     // uncertainty explicitly tied to the exact reservation/Run; the matching
     // Provider Hook remains the sole acceptance authority.
     return {
@@ -739,6 +814,14 @@ function requireMatchingRuntimeBinding(
     };
   }
   return binding;
+}
+
+function carriesExactRunPrompt(
+  request: CoordinatedRuntimeLaunchRequest
+): boolean {
+  if (request.owner.scope !== "task" || request.runId === undefined) return false;
+  return request.adapterId === "claude"
+    || (request.adapterId === "codex" && request.mode === "new");
 }
 
 function defaultLaunchFingerprint(

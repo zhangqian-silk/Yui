@@ -16,6 +16,7 @@ import {
   releaseProcessing
 } from "../../dist/coordination/workMailbox.js";
 import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
+import { RuntimeLaunchError } from "../../dist/runtime/ports.js";
 
 const NOW = new Date("2026-07-19T12:00:00.000Z");
 
@@ -177,6 +178,45 @@ test("an idle Leader starts a real wakeup run, waits for readiness, sends once, 
     store.operations.slice(-3),
     ["save-prepared", "save-prepared", "save-delivery"]
   );
+});
+
+test("a Leader Run waits for an earlier managed process to exit without becoming a Leader failure", async () => {
+  const store = fakeStore();
+  const delivery = fakeDelivery({
+    prepareError: new RuntimeLaunchError(
+      true,
+      "runtime-old-pane",
+      "An earlier managed runtime is still exiting: leader."
+    )
+  });
+
+  const [result] = await processLeaderWakeups(store, delivery, NOW);
+
+  assert.equal(result.status, "skipped");
+  assert.equal(result.reason, "not-ready");
+  assert.match(result.error, /earlier managed runtime is still exiting/i);
+  assert.equal(store.pending.has("task-1"), false);
+  assert.equal(store.activeRuns.get(key("task-1", "leader")).id, "agent-run-1");
+  assert.equal(store.savedFailures.length, 0);
+  assert.deepEqual(delivery.calls.map(({ type }) => type), ["prepare"]);
+});
+
+test("a Leader Run waits for a writable human without consuming bounded delivery retries", async () => {
+  const store = fakeStore();
+  const error = new RuntimeLaunchError(
+    true,
+    "runtime-human-writer",
+    "A writable human is attached to task-1/leader."
+  );
+  error.reason = "writable-client";
+  const delivery = fakeDelivery({ prepareError: error });
+
+  const [result] = await processLeaderWakeups(store, delivery, NOW);
+
+  assert.equal(result.status, "skipped");
+  assert.equal(result.reason, "writer-attached");
+  assert.equal(store.activeRuns.get(key("task-1", "leader")).id, "agent-run-1");
+  assert.equal(store.savedFailures.length, 0);
 });
 
 test("a launch-carried Codex Leader prompt records transport without a duplicate push", async () => {

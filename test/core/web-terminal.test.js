@@ -65,7 +65,7 @@ async function waitFor(value, predicate) {
   return current;
 }
 
-test("web terminal prepares and attaches the exact Task Role through a PTY", async () => {
+test("web terminal attaches the exact existing Task Role without preparing a runtime", async () => {
   const calls = [];
   const processes = [];
   const home = "/tmp/yui-home";
@@ -73,7 +73,6 @@ test("web terminal prepares and attaches the exact Task Role through a PTY", asy
     yuiHome: home,
     tmuxBin: "tmux-test",
     tmux: fakeTmux(),
-    async prepareTaskRole(input) { calls.push(["prepare-task", input]); },
     async prepareGlobalRole(roleName) { calls.push(["prepare-global", roleName]); },
     spawnPty(command, args, options) {
       const process = fakePty();
@@ -92,17 +91,13 @@ test("web terminal prepares and attaches the exact Task Role through a PTY", asy
     rows: 30
   });
 
-  assert.equal(connection.readOnly, false);
+  assert.equal(connection.readOnly, true);
   assert.deepEqual(calls[0], [
-    "prepare-task",
-    { taskId: "task-1", roleName: "leader" }
-  ]);
-  assert.deepEqual(calls[1], [
     "spawn",
     "tmux-test",
     [
       "-L", yuiTmuxServerName(home),
-      "attach-session", "-t",
+      "attach-session", "-r", "-t",
       "yui-client-test:leader"
     ],
     {
@@ -128,7 +123,7 @@ test("web terminal prepares and attaches the exact Task Role through a PTY", asy
   connection.resize(120, 40);
   assert.deepEqual(data, ["native output"]);
   assert.deepEqual(exits, [{ exitCode: 0 }]);
-  assert.deepEqual(processes[0].writes, ["/status\r"]);
+  assert.deepEqual(processes[0].writes, []);
   assert.deepEqual(processes[0].resizes, [[120, 40]]);
 
   stopData();
@@ -154,7 +149,6 @@ test("web terminal attaches through an isolated interactive client session", asy
         calls.push(["destroy-client", sessionName]);
       }
     },
-    async prepareTaskRole() {},
     async prepareGlobalRole() {},
     spawnPty(_command, args) {
       calls.push(["spawn", args]);
@@ -175,7 +169,7 @@ test("web terminal attaches through an isolated interactive client session", asy
       "spawn",
       [
         "-L", yuiTmuxServerName("/tmp/yui-home"),
-        "attach-session", "-t",
+        "attach-session", "-r", "-t",
         "yui-client-000000000000000000000001:leader"
       ]
     ]
@@ -201,7 +195,6 @@ test("web terminal cleanup failures are reported without escaping or leaking the
         throw new Error("tmux cleanup failed");
       }
     },
-    async prepareTaskRole() {},
     async prepareGlobalRole() {},
     spawnPty() { return process; },
     onError(error) { errors.push(error); }
@@ -228,7 +221,6 @@ test("web terminal exposes an existing pane history limit to the browser", async
         return { actual: 2_000, configured: 100_000, limited: true };
       }
     },
-    async prepareTaskRole() {},
     async prepareGlobalRole() {},
     spawnPty() { return fakePty(); }
   });
@@ -245,14 +237,27 @@ test("web terminal exposes an existing pane history limit to the browser", async
   connection.close();
 });
 
-test("only the first web terminal for one tmux host is writable", async () => {
+test("only the first global web terminal for one tmux host is writable", async () => {
   const spawnedArgs = [];
   const processes = [];
+  const clientAccesses = [];
+  const writerChecks = [];
   const service = new TmuxWebTerminalService({
     yuiHome: "/tmp/yui-home",
     tmuxBin: "tmux-test",
-    tmux: fakeTmux(),
-    async prepareTaskRole() {},
+    tmux: {
+      hasWritableClient(hostId, roleName, excludedLease) {
+        writerChecks.push({ hostId, roleName, excludedLease });
+        return false;
+      },
+      createInteractiveClientSession(_hostId, _notice, access = "read-only") {
+        clientAccesses.push(access);
+        return access === "read-write"
+          ? `yui-writer-test-${clientAccesses.length}`
+          : `yui-client-test-${clientAccesses.length}`;
+      },
+      destroyInteractiveClientSession() {}
+    },
     async prepareGlobalRole() {},
     spawnPty(_command, args) {
       const process = fakePty();
@@ -262,9 +267,8 @@ test("only the first web terminal for one tmux host is writable", async () => {
     }
   });
   const request = {
-    scope: "task",
-    taskId: "task-1",
-    roleName: "leader",
+    scope: "global",
+    roleName: "operator",
     columns: 80,
     rows: 24
   };
@@ -283,6 +287,19 @@ test("only the first web terminal for one tmux host is writable", async () => {
   second.close();
   third.close();
   assert.deepEqual(processes.map((process) => process.killed), [1, 1, 1]);
+  assert.deepEqual(clientAccesses, ["read-write", "read-only", "read-write"]);
+  assert.deepEqual(writerChecks, [
+    {
+      hostId: "operator",
+      roleName: undefined,
+      excludedLease: "yui-writer-test-1"
+    },
+    {
+      hostId: "operator",
+      roleName: undefined,
+      excludedLease: "yui-writer-test-3"
+    }
+  ]);
 });
 
 test("an existing terminal client makes a web terminal read-only", async () => {
@@ -292,7 +309,6 @@ test("an existing terminal client makes a web terminal read-only", async () => {
     yuiHome: "/tmp/yui-home",
     tmuxBin: "tmux-test",
     tmux: fakeTmux(true),
-    async prepareTaskRole() {},
     async prepareGlobalRole(roleName) { prepared = roleName; },
     spawnPty(_command, inputArgs) {
       args = inputArgs;
@@ -330,7 +346,6 @@ test("web terminal replays PTY output and exit produced before browser listeners
     yuiHome: "/tmp/yui-home",
     tmuxBin: "tmux-test",
     tmux: fakeTmux(),
-    async prepareTaskRole() {},
     async prepareGlobalRole() {},
     spawnPty() { return process; }
   });
@@ -371,7 +386,6 @@ test("real web PTY detaches without stopping its tmux Agent", async () => {
       yuiHome,
       tmuxBin: "tmux",
       tmux: manager,
-      async prepareTaskRole() {},
       async prepareGlobalRole() {}
     });
     const connection = await service.open({
@@ -428,7 +442,6 @@ test("real web terminals keep independent Role windows and native tmux scrolling
       yuiHome,
       tmuxBin: "tmux",
       tmux: manager,
-      async prepareTaskRole() {},
       async prepareGlobalRole() {}
     });
     for (const roleName of ["leader", "worker"]) {

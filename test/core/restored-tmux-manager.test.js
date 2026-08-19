@@ -63,7 +63,7 @@ test("all tmux lifecycle operations use the dedicated YUI_HOME server", () => {
   manager.ensureRoleWindow("task-1", { name: "worker", workspace: "/tmp/work" }, {
     command: "codex", args: [], env: {}
   });
-  manager.attachRole("task-1", "worker");
+  manager.attachRole("task-1", "worker", "read-write");
   manager.captureRole("task-1", "worker");
   manager.detachRole("task-1");
   manager.stopRole("task-1", "worker");
@@ -398,25 +398,29 @@ test("restored tmux attach isolates the native session in tmux scrollback", () =
     closeInteractiveInput: () => input.events.push("close")
   });
 
-  manager.attachRole("task-1", "leader");
+  manager.attachRole("task-1", "leader", "read-write");
 
   assert.deepEqual(input.events, ["close", "raw:false", "pause"]);
   const session = yuiTmuxSessionName("/tmp/yui-home", "task-1");
   const clientSession = calls
     .find(({ args }) => tmuxCommand(args) === "new-session")
     .args.at(-1);
-  assert.match(clientSession, /^yui-client-[a-f0-9]{24}$/);
+  assert.match(clientSession, /^yui-writer-role-[a-f0-9]{24}-[a-f0-9]{24}$/);
   assert.deepEqual(calls.map(({ args }) => args.slice(2)), [
-    [
-      "list-clients", "-F",
-      "#{session_name}\u001f#{session_group}\u001f#{client_readonly}"
-    ],
     ["new-session", "-d", "-t", session, "-s", clientSession],
     ["set-option", "-t", clientSession, "status", "off"],
     ["set-option", "-t", clientSession, "mouse", "on"],
     [
       "set-hook", "-t", clientSession, "client-detached",
       `kill-session -t ${clientSession}`
+    ],
+    [
+      "list-sessions", "-F",
+      "#{session_name}\u001f#{session_group}"
+    ],
+    [
+      "list-clients", "-F",
+      "#{session_name}\u001f#{session_group}\u001f#{client_readonly}"
     ],
     ["attach-session", "-t", `${clientSession}:leader`],
     ["kill-session", "-t", clientSession]
@@ -443,7 +447,7 @@ test("attaching an existing pane reports when its history cannot be enlarged liv
     onWarning(message) { warnings.push(message); }
   });
 
-  manager.attachRole("task-1", "leader");
+  manager.attachRole("task-1", "leader", "read-write");
 
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /existing Role.*2,000-line tmux history/u);
@@ -506,21 +510,19 @@ test("a real legacy pane stays limited while a re-entered Role receives the conf
   });
 });
 
-test("a second interactive tmux client attaches read-only", () => {
+test("an explicit read-only tmux client cannot write even when it is the first viewer", () => {
   const calls = [];
   const manager = new TmuxManager("tmux-test", {
     run(command, args, options) {
       calls.push({ command, args, options });
-      return tmuxCommand(args) === "list-clients"
-        ? `${yuiTmuxSessionName("/tmp/yui-home", "task-1")}\u001f\u001f0\n`
-        : "";
+      return "";
     }
   }, {
     yuiHome: "/tmp/yui-home",
     terminalInput: new TtyInput()
   });
 
-  manager.attachRole("task-1", "leader");
+  manager.attachRole("task-1", "leader", "read-only");
 
   const attach = calls.find(({ args }) => tmuxCommand(args) === "attach-session");
   const clientSession = calls
@@ -530,6 +532,80 @@ test("a second interactive tmux client attaches read-only", () => {
     "attach-session", "-r", "-t",
     `${clientSession}:leader`
   ]);
+  assert.equal(calls.some(({ args }) => tmuxCommand(args) === "list-clients"), false);
+});
+
+test("an explicit read-write tmux client refuses to create a second writer", () => {
+  const manager = new TmuxManager("tmux-test", {
+    run(_command, args) {
+      return tmuxCommand(args) === "list-clients"
+        ? `${yuiTmuxSessionName("/tmp/yui-home", "task-1")}\u001f\u001f0\n`
+        : "";
+    }
+  }, {
+    yuiHome: "/tmp/yui-home",
+    terminalInput: new TtyInput()
+  });
+
+  assert.throws(
+    () => manager.attachRole("task-1", "leader", "read-write"),
+    /writable tmux client.*already attached/i
+  );
+});
+
+test("an automatic tmux client becomes read-only when another writer exists", () => {
+  const calls = [];
+  const manager = new TmuxManager("tmux-test", {
+    run(command, args, options) {
+      calls.push({ command, args, options });
+      return tmuxCommand(args) === "list-clients"
+        ? `${yuiTmuxSessionName("/tmp/yui-home", "operator")}\u001f\u001f0\n`
+        : "";
+    }
+  }, {
+    yuiHome: "/tmp/yui-home",
+    terminalInput: new TtyInput()
+  });
+
+  manager.attachRole("operator", "operator", "auto");
+
+  const attach = calls.find(({ args }) => tmuxCommand(args) === "attach-session");
+  assert.deepEqual(attach.args.slice(-4), [
+    "attach-session", "-r", "-t",
+    `${attach.args.at(-1).split(":")[0]}:operator`
+  ]);
+});
+
+test("a writable attach publishes its lease before final Run revalidation", () => {
+  const calls = [];
+  let manager;
+  let leaseObserved = false;
+  manager = new TmuxManager("tmux-test", {
+    run(command, args, options) {
+      calls.push({ command, args, options });
+      if (tmuxCommand(args) !== "list-sessions") return "";
+      const writer = calls
+        .filter(({ args: candidate }) => tmuxCommand(candidate) === "new-session")
+        .map(({ args: candidate }) => candidate.at(-1))
+        .find((name) => name.startsWith("yui-writer-"));
+      return writer === undefined
+        ? ""
+        : `${writer}\u001f${yuiTmuxSessionName("/tmp/yui-home", "task-1")}\n`;
+    }
+  }, {
+    yuiHome: "/tmp/yui-home",
+    terminalInput: new TtyInput()
+  });
+
+  manager.attachRole("task-1", "leader", "read-write", {
+    revalidateWritableAttach() {
+      leaseObserved = manager.hasWritableClient("task-1");
+      assert.equal(manager.hasWritableClient("task-1", "leader"), true);
+      assert.equal(manager.hasWritableClient("task-1", "worker"), false);
+    }
+  });
+
+  assert.equal(leaseObserved, true);
 });
 
 test("interactive clients use an isolated grouped session with native scrolling", () => {

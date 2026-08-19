@@ -11,6 +11,8 @@ import type {
 
 export type SessionRuntimeState = "starting" | "running" | "stopped" | "unavailable";
 
+export type RuntimeLaunchRetryReason = "previous-process" | "writable-client";
+
 /** A persisted launch is either temporarily unavailable or permanently lost. */
 export class RuntimeLaunchError extends Error {
   readonly name = "RuntimeLaunchError";
@@ -18,6 +20,19 @@ export class RuntimeLaunchError extends Error {
   constructor(
     readonly retryable: boolean,
     readonly launchId: string,
+    message: string,
+    readonly reason?: RuntimeLaunchRetryReason
+  ) {
+    super(message);
+  }
+}
+
+/** A host-side contention check that occurs before planning or process start. */
+export class RuntimeHostContentionError extends Error {
+  readonly name = "RuntimeHostContentionError";
+
+  constructor(
+    readonly reason: Extract<RuntimeLaunchRetryReason, "writable-client">,
     message: string
   ) {
     super(message);

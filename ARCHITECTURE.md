@@ -201,10 +201,34 @@ context.
 
 ## Runtime ownership
 
-tmux owns native Agent terminals. The Controller owns mailbox delivery,
-wakeups, Role liveness, reconciliation, and read-only Web observation. Operator
-and Leader Sessions are fixed Task/global Roles; Task Worker Sessions are
-selected through Role Agent bindings.
+tmux owns Agent process lifetimes and observable output. The Controller owns
+mailbox delivery, wakeups, Role liveness, and reconciliation. Task attachment
+surfaces only attach to an existing pane and cannot create, resume, wake, or
+deliver to a managed runtime. Global interactive entry remains an explicit
+session-lifecycle operation.
+
+Task observation is read-only by default. Explicit write access publishes a
+Role-scoped tmux lease before revalidating durable Run state. The managed host
+also checks that lease before planning or process creation, so either the Run
+claim or the writer lease wins and they never share a pane. Writer contention
+is transient backpressure rather than a delivery failure: it does not consume
+bounded delivery retries, and lease release signals only existing durable work.
+Global interactive entry uses the same mechanism at tmux-host scope and
+automatically falls back to read-only when another writer already exists.
+
+Managed Task Claude execution is process-per-Run: the exact Run input is a
+stream-json stdin frame submitted at process launch, while native session IDs
+carry conversation continuity across processes. The lifecycle binding records
+the exact Run submitted at launch. A Controller restart may recover only the
+same reserved launch/Run as uncertain until its Provider Hook arrives; a newly
+reserved Run cannot reuse an older live Role pane, so its provisional launch
+is released, the old owner is fenced through the durable cleanup lane, and the
+same Run is retried only after cleanup; pending cleanup prevents a successor
+generation from starting early.
+Terminal key injection is therefore an interactive compatibility mechanism,
+not a managed Claude delivery protocol. Operator and Leader Sessions remain
+fixed Task/global Roles; Task Worker Sessions are selected through Role Agent
+bindings.
 
 Role desired revisions and Run/Session effective snapshots keep configuration
 history explicit. Resume compares the complete effective snapshot and

@@ -436,7 +436,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
         dependsOn: 3,
         actionTarget: true
       }
-    ]
+    ],
+    trailingOptions: { "--read-only": "flag", "--read-write": "flag" }
   },
   {
     commandPath: ["task", "work", "create"],
@@ -599,7 +600,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
   })),
   {
     commandPath: ["task", "enter"],
-    selectors: [{ argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }]
+    selectors: [{ argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }],
+    trailingOptions: { "--read-only": "flag", "--read-write": "flag" }
   },
   {
     commandPath: ["jobs", "retry"],

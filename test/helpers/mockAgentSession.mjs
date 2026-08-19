@@ -322,6 +322,19 @@ export async function createMockAgentSession(
     }, workerRunStart);
     tx.saveTaskRoleSessionSet(sessions);
   });
+  if (binding.initialPromptRunId !== run.id) {
+    throw new Error("Mock Claude launch did not carry the exact managed Run input.");
+  }
+  scheduler.saveRoleRunDelivery({
+    task,
+    role,
+    run,
+    session: schedulerSession,
+    launchId,
+    now: waitingLeader
+      ? new Date(workerRunStart.getTime() + 1_000)
+      : PUSHED
+  });
   writeFileSync(readyPath, "ready\n", "utf8");
 
   let leaderBinding;
@@ -590,25 +603,6 @@ export async function createMockAgentSession(
       });
       return successor;
     },
-    async pushPrompt() {
-      const outcome = await tmux.sendRoleInputOnceIfReadyAsync(
-        task.id,
-        role.name,
-        receiptId,
-        run.input,
-        () => true
-      );
-      if (outcome === "sent" || outcome === "already-sent") {
-        scheduler.saveRoleRunDelivery({
-          task,
-          role,
-          run,
-          session: schedulerSession,
-          launchId,
-          now: PUSHED
-        });
-      }
-      return outcome;
-    }
+    inputSubmittedAtLaunch: binding.initialPromptRunId === run.id
   };
 }

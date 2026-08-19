@@ -15,6 +15,9 @@ const DEFAULT_READINESS_POLL_MS = 50;
 const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_HISTORY_LIMIT = 100_000;
 const PANE_STATE_MARKER = "__YUI_PANE_STATE__";
+const WRITABLE_CLIENT_SESSION_PREFIX = "yui-writer-";
+const HOST_WRITABLE_CLIENT_SESSION_PREFIX = `${WRITABLE_CLIENT_SESSION_PREFIX}host-`;
+const ROLE_WRITABLE_CLIENT_SESSION_PREFIX = `${WRITABLE_CLIENT_SESSION_PREFIX}role-`;
 
 export type TmuxRole = Readonly<{
   name: string;
@@ -58,6 +61,11 @@ export type TmuxRoleHistory = Readonly<{
 }>;
 
 export type TmuxReadinessProbe = (pane: TmuxPaneState) => boolean;
+export type TmuxAttachAccess = "auto" | "read-only" | "read-write";
+export type TmuxAttachOptions = Readonly<{
+  /** Runs after the writer lease is visible, immediately before terminal handoff. */
+  revalidateWritableAttach?: () => void;
+}>;
 
 export type TmuxManagerOptions = Readonly<{
   yuiHome?: string;
@@ -159,7 +167,7 @@ export class TmuxManager {
     launch?: TmuxLaunchPlan
   ): void {
     this.ensureRoleWindow(taskId, role, launch);
-    this.attachRole(taskId, role.name);
+    this.attachRole(taskId, role.name, "auto");
   }
 
   ensureRoleWindow(
@@ -259,7 +267,15 @@ export class TmuxManager {
     return true;
   }
 
-  attachRole(taskId: string, roleName: string): void {
+  attachRole(
+    taskId: string,
+    roleName: string,
+    access: TmuxAttachAccess,
+    options: TmuxAttachOptions = {}
+  ): "read-only" | "read-write" {
+    if (access !== "auto" && access !== "read-only" && access !== "read-write") {
+      throw runtimeError("Tmux attach access must be auto, read-only, or read-write.");
+    }
     let historyNotice: string | undefined;
     if (this.#onWarning !== undefined) {
       const history = this.inspectRoleHistory(taskId, roleName);
@@ -268,18 +284,48 @@ export class TmuxManager {
         this.#onWarning(historyNotice);
       }
     }
-    const readOnly = this.hasWritableClient(taskId);
-    const clientSession = this.createInteractiveClientSession(taskId, historyNotice);
+    let resolvedAccess: "read-only" | "read-write" = access === "read-only"
+      ? "read-only"
+      : "read-write";
+    // Automatic entry is used by global Roles and retains one writer for the
+    // whole tmux host. Explicit Task write access is scoped to the selected
+    // Role so a human in one pane cannot pause unrelated Role launches.
+    const writerRoleName = access === "read-write" ? roleName : undefined;
+    let clientSession = this.createInteractiveClientSession(
+      taskId,
+      historyNotice,
+      resolvedAccess,
+      writerRoleName
+    );
     try {
+      if (
+        resolvedAccess === "read-write"
+        && this.hasWritableClient(taskId, writerRoleName, clientSession)
+      ) {
+        if (access !== "auto") {
+          throw runtimeError(
+            `A writable tmux client is already attached to ${taskId}; use read-only access.`
+          );
+        }
+        this.destroyInteractiveClientSession(clientSession);
+        resolvedAccess = "read-only";
+        clientSession = this.createInteractiveClientSession(
+          taskId,
+          historyNotice,
+          resolvedAccess
+        );
+      }
+      if (resolvedAccess === "read-write") options.revalidateWritableAttach?.();
       handoffTerminal(this.#terminalInput, this.#closeInteractiveInput);
       this.run([
         "attach-session",
-        ...(readOnly ? ["-r"] : []),
+        ...(resolvedAccess === "read-only" ? ["-r"] : []),
         "-t", `${clientSession}:${safeValue(roleName, "Role name")}`
       ], {
         inheritStdio: true,
         environment: { TERM: this.#terminalType }
       });
+      return resolvedAccess;
     } finally {
       this.destroyInteractiveClientSession(clientSession);
     }
@@ -289,8 +335,16 @@ export class TmuxManager {
    * A grouped session shares the Agent windows while keeping the selected
    * window and terminal options local to this one human client.
    */
-  createInteractiveClientSession(taskId: string, attachedNotice?: string): string {
-    const clientSession = `yui-client-${randomBytes(12).toString("hex")}`;
+  createInteractiveClientSession(
+    taskId: string,
+    attachedNotice?: string,
+    access: Exclude<TmuxAttachAccess, "auto"> = "read-only",
+    writerRoleName?: string
+  ): string {
+    const prefix = access === "read-write"
+      ? writableClientSessionPrefix(writerRoleName)
+      : "yui-client-";
+    const clientSession = `${prefix}${randomBytes(12).toString("hex")}`;
     this.run([
       "new-session", "-d",
       "-t", this.sessionName(taskId),
@@ -344,8 +398,18 @@ export class TmuxManager {
     };
   }
 
-  /** Multiple viewers are safe, but only the first attached human may type. */
-  hasWritableClient(taskId: string): boolean {
+  /** Multiple viewers are safe, but one pane may have only one writer. */
+  hasWritableClient(
+    taskId: string,
+    roleName?: string,
+    excludedLease?: string
+  ): boolean {
+    if (this.taskSessionGroupNames(taskId).some((sessionName) => (
+      sessionName !== excludedLease
+      && writableLeaseMatchesRole(sessionName, roleName)
+    ))) {
+      return true;
+    }
     const formatSeparator = "\u001f";
     const encodedSeparator = "\\037";
     const taskSession = this.sessionName(taskId);
@@ -355,20 +419,48 @@ export class TmuxManager {
         "-F",
         `#{session_name}${formatSeparator}#{session_group}${formatSeparator}#{client_readonly}`
       ]);
-      return clients.split("\n").some((line) => {
-        if (line.length === 0) return false;
-        const separator = line.includes(encodedSeparator) ? encodedSeparator : formatSeparator;
-        const [sessionName, sessionGroup, readOnly, ...extra] = line.split(separator);
-        if (
-          sessionName === undefined
-          || sessionGroup === undefined
-          || readOnly === undefined
-          || extra.length > 0
-        ) {
-          throw runtimeError("Tmux returned an invalid client state row.");
-        }
-        return (sessionName === taskSession || sessionGroup === taskSession) && readOnly === "0";
-      });
+      return writableClientRowsContainMatch(
+        clients,
+        taskSession,
+        roleName,
+        excludedLease,
+        formatSeparator,
+        encodedSeparator
+      );
+    } catch (error) {
+      if (isExplicitlyAbsentTmuxSession(error)) return false;
+      throw error;
+    }
+  }
+
+  async hasWritableClientAsync(
+    taskId: string,
+    roleName?: string,
+    excludedLease?: string
+  ): Promise<boolean> {
+    if ((await this.taskSessionGroupNamesAsync(taskId)).some((sessionName) => (
+      sessionName !== excludedLease
+      && writableLeaseMatchesRole(sessionName, roleName)
+    ))) {
+      return true;
+    }
+    const formatSeparator = "\u001f";
+    const encodedSeparator = "\\037";
+    const taskSession = this.sessionName(taskId);
+    try {
+      const clients = await this.runAsync([
+        "list-clients",
+        "-F",
+        `#{session_name}${formatSeparator}#{session_group}${formatSeparator}#{client_readonly}`
+      ]);
+      return writableClientRowsContainMatch(
+        clients,
+        taskSession,
+        roleName,
+        excludedLease,
+        formatSeparator,
+        encodedSeparator
+      );
     } catch (error) {
       if (isExplicitlyAbsentTmuxSession(error)) return false;
       throw error;
@@ -1251,6 +1343,65 @@ function parseTaskSessionGroupNames(
       throw runtimeError("Tmux returned an invalid session group row.");
     }
     return sessionName === taskSession || sessionGroup === taskSession ? [sessionName] : [];
+  });
+}
+
+function writableClientSessionPrefix(roleName?: string): string {
+  if (roleName === undefined) return HOST_WRITABLE_CLIENT_SESSION_PREFIX;
+  const digest = createHash("sha256")
+    .update(safeValue(roleName, "Role name"))
+    .digest("hex")
+    .slice(0, 24);
+  return `${ROLE_WRITABLE_CLIENT_SESSION_PREFIX}${digest}-`;
+}
+
+function writableLeaseMatchesRole(
+  sessionName: string,
+  roleName?: string
+): boolean {
+  if (!sessionName.startsWith(WRITABLE_CLIENT_SESSION_PREFIX)) return false;
+  if (roleName === undefined) return true;
+  if (sessionName.startsWith(HOST_WRITABLE_CLIENT_SESSION_PREFIX)) return true;
+  if (sessionName.startsWith(ROLE_WRITABLE_CLIENT_SESSION_PREFIX)) {
+    return sessionName.startsWith(writableClientSessionPrefix(roleName));
+  }
+  // Conservative compatibility for writer leases created before Role-scoped
+  // lease names existed.
+  return true;
+}
+
+function writableClientRowsContainMatch(
+  clients: string,
+  taskSession: string,
+  roleName: string | undefined,
+  excludedLease: string | undefined,
+  formatSeparator: string,
+  encodedSeparator: string
+): boolean {
+  return clients.split("\n").some((line) => {
+    if (line.length === 0) return false;
+    const separator = line.includes(encodedSeparator) ? encodedSeparator : formatSeparator;
+    const [sessionName, sessionGroup, readOnly, ...extra] = line.split(separator);
+    if (
+      sessionName === undefined
+      || sessionGroup === undefined
+      || readOnly === undefined
+      || extra.length > 0
+    ) {
+      throw runtimeError("Tmux returned an invalid client state row.");
+    }
+    if (
+      sessionName === excludedLease
+      || (sessionName !== taskSession && sessionGroup !== taskSession)
+      || readOnly !== "0"
+    ) {
+      return false;
+    }
+    // Current Yui clients publish a lease before attach. A direct or legacy
+    // writable tmux client has no Role identity, so conservatively fence every
+    // Role in that host.
+    return !sessionName.startsWith(WRITABLE_CLIENT_SESSION_PREFIX)
+      || writableLeaseMatchesRole(sessionName, roleName);
   });
 }
 

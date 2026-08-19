@@ -338,9 +338,12 @@ async function lifecycleDispatchAfterTaskMainChange(t, change) {
   const host = new TmuxSessionHost(planner, {
     async ensureRoleWindowAsync(_taskId, _plannedRole, launch) {
       planned.push(launch);
-      return false;
+      return true;
     },
-    async probeRoleStatusAsync() { return "running"; },
+    // This scenario verifies creation of a fresh per-Run Claude process. A
+    // running pane would belong to the preceding finite process and must now
+    // produce retryable backpressure instead of being reused.
+    async probeRoleStatusAsync() { return "exited"; },
     killRole() {}
   }, { createBindingId: () => "binding-after-main-advance" });
   const dispatch = createRuntimeLifecycleDispatcher(store, new FileSchedulerStoreAdapter(store), host);
@@ -361,7 +364,7 @@ async function lifecycleDispatchAfterTaskMainChange(t, change) {
   };
 }
 
-test("a fixed Leader Session resumes through the real planner after Task main advances", async (t) => {
+test("a fixed Leader native Session starts a managed resume process after Task main advances", async (t) => {
   const fx = await lifecycleDispatchAfterTaskMainChange(t, ({ workspace }) => ({ workspace }));
 
   await fx.dispatch();
@@ -1014,7 +1017,7 @@ test("Controller startup forwards only operational names and declared Agent envi
   assert.equal(existsSync(join(home, "controller.log")), false);
 });
 
-test("foreground enter sends only fresh declared environment sources to an existing Controller", async (t) => {
+test("global foreground enter sends only fresh declared environment sources to an existing Controller", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-foreground-env-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
@@ -1032,9 +1035,7 @@ test("foreground enter sends only fresh declared environment sources to an exist
     }],
     FIRST
   );
-  const task = activateTask(createTask("task-1", "Foreground environment", FIRST), FIRST);
-  const role = createRole(
-    task.id,
+  const role = createGlobalRole(
     "leader",
     [createRoleAgentBinding(agent)],
     agent.id,
@@ -1043,8 +1044,7 @@ test("foreground enter sends only fresh declared environment sources to an exist
   );
   store.transaction((tx) => {
     tx.saveConfiguredAgent(agent);
-    tx.saveTask(task);
-    tx.saveRole(task.id, role);
+    tx.saveGlobalRole(role);
   });
   const calls = [];
   const runtime = new FileTaskWorkflowRuntime(
@@ -1069,13 +1069,12 @@ test("foreground enter sends only fresh declared environment sources to an exist
     }
   );
 
-  await runtime.prepareTaskRoleEnter({ taskId: task.id, roleName: role.name });
+  await runtime.prepareGlobalRoleEnter(role.name);
 
   assert.deepEqual(calls, [[
     "runtime.ensure-role-session",
     {
-      scope: "task",
-      taskId: task.id,
+      scope: "global",
       roleName: role.name,
       environment: {
         PATH: `${dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,

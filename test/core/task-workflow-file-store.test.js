@@ -9,6 +9,7 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import { runOperatorCommand } from "../../dist/commands/operatorCommands.js";
 import {
+  assertTaskRoleWritableAttachAvailable,
   dispatchPreparedReviewRound,
   runTaskCommand
 } from "../../dist/commands/taskCommands.js";
@@ -2266,9 +2267,65 @@ test("Role bind switches the active Agent while enter remains a foreground CLI a
     kind: "enter",
     taskId: task.id,
     roleName: "leader",
-    output: `Prepared role leader for ${task.id}\n`
+    access: "read-only",
+    output: `Attaching to leader for ${task.id} (read-only)\n`
   });
   assert.deepEqual(calls.enter, []);
+
+  assert.deepEqual(
+    runTaskCommand(["role", "enter", task.id, "leader", "--read-write"], store, options),
+    {
+      kind: "enter",
+      taskId: task.id,
+      roleName: "leader",
+      access: "read-write",
+      output: `Attaching to leader for ${task.id} (read-write)\n`
+    }
+  );
+  let claudeSessions = createRoleSessionSet({
+    scope: "task",
+    taskId: task.id,
+    roleName: "leader"
+  }, "claude", NOW);
+  claudeSessions = recordRoleAgentSession(claudeSessions, {
+    agentId: "claude",
+    adapterId: "claude",
+    nativeSessionId: "claude-process-still-exiting",
+    launchId: "claude-old-launch",
+    policy: "fixed",
+    status: "running"
+  }, NOW);
+  store.saveTaskRoleSessionSet(claudeSessions);
+  assert.throws(
+    () => runTaskCommand([
+      "role", "enter", task.id, "leader", "--read-write"
+    ], store, options),
+    /managed Claude process.*still running/i
+  );
+  claudeSessions = recordRoleAgentSession(claudeSessions, {
+    agentId: "claude",
+    adapterId: "claude",
+    nativeSessionId: "claude-process-still-exiting",
+    launchId: "claude-old-launch",
+    policy: "fixed",
+    status: "stopped"
+  }, new Date(NOW.getTime() + 1_000));
+  store.saveTaskRoleSessionSet(claudeSessions);
+  assert.throws(
+    () => assertTaskRoleWritableAttachAvailable(
+      store,
+      task.id,
+      "leader",
+      { isManagedProcessRunning: () => true }
+    ),
+    /managed Claude process.*still running/i
+  );
+  assert.throws(
+    () => runTaskCommand([
+      "enter", task.id, "--read-only", "--read-write"
+    ], store, options),
+    /mutually exclusive/i
+  );
 });
 
 test("Task Role add, update, show, and remove preserve lean field-level configuration", (t) => {

@@ -23,12 +23,13 @@ import type {
 } from "./ports.js";
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
+import { RuntimeLaunchError } from "../runtime/ports.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
   runId?: string;
   status: "dispatched" | "skipped" | "failed";
-  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed" | "not-ready" | "delivery-uncertain";
+  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed" | "not-ready" | "writer-attached" | "delivery-uncertain";
   error?: string;
 }>;
 
@@ -224,8 +225,9 @@ export async function processLeaderWakeups(
           preStartFencePersisted = true;
         }
       });
-      // A fresh Codex host may already carry the exact Run prompt in its
-      // launch argv. Once preparation returns that transport fact, any
+      // A managed host may already have submitted the exact Run prompt as
+      // part of process launch. Once preparation returns that transport
+      // fact, any
       // later readiness or aggregate-write failure is delivery uncertainty,
       // not a launch failure: preserve the Run and its reservation for the
       // matching provider Hook instead of terminalizing it.
@@ -346,6 +348,23 @@ export async function processLeaderWakeups(
       const detail = error instanceof Error ? error.message : String(error);
       const message = `Leader dispatch failed: ${detail}`;
       if (claimed && run !== null) {
+        // A finite managed provider from the preceding Run may still be
+        // exiting after its durable yield. Keep this newly-claimed Run as the
+        // sole owner of the Role mailbox; active-Run delivery will retry it
+        // after the old host disappears. This is runtime backpressure, not a
+        // Leader failure and not grounds for allocating another Run.
+        if (error instanceof RuntimeLaunchError && error.retryable) {
+          results.push({
+            taskId: task.id,
+            runId: run.id,
+            status: "skipped",
+            reason: error.reason === "writable-client"
+              ? "writer-attached"
+              : "not-ready",
+            error: message
+          });
+          continue;
+        }
         // Once delivery begins, a send may have succeeded even when receipt
         // observation or the aggregate write failed. Preserve the exact
         // durable Run and let receipt-backed active delivery recover it.

@@ -180,10 +180,40 @@ function savePlannerRun(store, taskId, roleName, context = {}) {
 }
 
 function markDelivered(store, run) {
+  const preparedAt = store.getTaskRoleSessionSet(run.taskId, run.roleName)
+    ?.inFlight?.preparedAt;
   const deliveredAt = new Date(Math.max(
     NOW.getTime(),
-    Date.parse(run.createdAt)
+    Date.parse(run.createdAt),
+    preparedAt === undefined ? 0 : Date.parse(preparedAt),
+    Date.now()
   ));
+  // Some public-CLI fixtures let the isolated Controller reach managed
+  // launch preparation before they quiesce it. When this helper stands in for
+  // transport delivery, settle that exact launch reservation through the same
+  // aggregate operation as production; otherwise the low-level Run rewrite
+  // would leave a false runtime-lifecycle blocker behind.
+  const runtimeMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId: run.taskId,
+    roleName: run.roleName
+  }));
+  const session = store.getRoleSession(run.taskId, run.roleName);
+  if (
+    isRuntimeLaunchReservation(runtimeMailbox?.processing)
+    && runtimeMailbox.processing.executionRef?.type === "run"
+    && runtimeMailbox.processing.executionRef.id === run.id
+    && session?.launchId === runtimeMailbox.processing.batchId
+  ) {
+    new FileSchedulerStoreAdapter(store).saveRoleRunDelivery({
+      task: store.getTask(run.taskId),
+      role: store.getRole(run.taskId, run.roleName),
+      run,
+      session,
+      launchId: session.launchId,
+      now: deliveredAt
+    });
+  }
   store.transaction((tx) => {
     const target = { kind: "role", taskId: run.taskId, roleName: run.roleName };
     let mailbox = tx.getWorkMailbox(target) ?? createWorkMailbox(target);

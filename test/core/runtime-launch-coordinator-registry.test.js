@@ -29,6 +29,7 @@ import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
+import { RuntimeHostContentionError } from "../../dist/runtime/ports.js";
 import { FileTaskRuntimeIsolation } from "../../dist/runtime/taskRuntimeIsolation.js";
 import {
   createRole,
@@ -114,6 +115,8 @@ function assertReservation(fx, roleName, launchId, runId) {
 
 function runtimeBinding(request, options = {}) {
   const hostCreated = options.hostCreated ?? false;
+  const initialPromptRunId = options.initialPromptRunId
+    ?? (hostCreated && request.adapterId === "claude" ? request.runId : undefined);
   return {
     id: `binding-${options.index ?? 1}`,
     launchId: request.launchId,
@@ -122,9 +125,9 @@ function runtimeBinding(request, options = {}) {
     adapterId: request.adapterId,
     hostRef: `host-${request.owner.roleName}`,
     hostCreated,
-    ...(options.initialPromptRunId === undefined
+    ...(initialPromptRunId === undefined
       ? {}
-      : { initialPromptRunId: options.initialPromptRunId }),
+      : { initialPromptRunId }),
     ...(options.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: options.nativeSessionId })
@@ -323,20 +326,41 @@ async function controllerRecoveryFixture(t, persistPrepared) {
   let launchId;
   let session;
   if (persistPrepared) {
-    const initialDelivery = registry(
-      initialCoordinator,
-      host,
-      async () => "busy",
-      unusedTmux("running")
-    );
-    const [initial] = await processActiveRoleRunDeliveries(
-      fx.schedulerStore,
-      initialDelivery,
-      NOW
-    );
-    assert.equal(initial.reason, "not-ready");
+    const claim = fx.schedulerStore.claimWorkMailbox({
+      target,
+      batchId: `agent-run:${fx.task.id}/${run.id}`,
+      owner: "controller",
+      now: NOW,
+      executionRef: { type: "run", taskId: fx.task.id, id: run.id }
+    });
+    assert.equal(claim.status, "claimed");
+    const binding = await initialCoordinator.prepare({
+      owner: owner(fx, roleName),
+      agentId: fx.agent.id,
+      adapterId: fx.agent.adapterId,
+      effective: run.effective,
+      workspace: fx.home,
+      mode: "new",
+      runId: run.id
+    }, "deferred", undefined, (preflight) => {
+      fx.schedulerStore.saveRoleRunPrepared({
+        task: fx.schedulerStore.getTask(fx.task.id),
+        role: fx.schedulerStore.getRole(fx.task.id, roleName),
+        run,
+        session: {
+          agentId: preflight.agentId,
+          adapterId: preflight.adapterId,
+          nativeSessionId: preflight.nativeSessionId,
+          launchId: preflight.launchId,
+          status: "ready",
+          effective: preflight.effective
+        },
+        launchId: preflight.launchId,
+        now: NOW
+      });
+    });
     session = fx.store.getRoleSession(fx.task.id, roleName);
-    launchId = session.launchId;
+    launchId = binding.launchId;
     assert.equal(session.nativeSessionId, "claude-native-recovery");
   } else {
     const claim = fx.schedulerStore.claimWorkMailbox({
@@ -1745,6 +1769,163 @@ test("a fresh Codex argv prompt without provider acknowledgement retains the res
     0
   );
   assert.equal(fx.store.getWorkItem(fx.task.id, item.id).candidates.length, 0);
+});
+
+test("a managed Claude Run queues exact old-owner cleanup before retrying a new generation", async (t) => {
+  const fx = fixture(t, "claude");
+  let pushes = 0;
+  let earlierPanePresent = true;
+  let starts = 0;
+  let ownerStops = 0;
+  const host = {
+    async start(request, beforeHostStart) {
+      starts += 1;
+      // Tmux reports an existing live Role window. It cannot have consumed the
+      // new Run's stream-json stdin frame, even if its native session matches.
+      if (earlierPanePresent) return runtimeBinding(request, { hostCreated: false });
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        nativeSessionId: "claude-native-new-generation",
+        initialPromptRunId: request.runId
+      });
+      return runtimeBinding(request, {
+        hostCreated: true,
+        nativeSessionId: "claude-native-new-generation"
+      });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { throw new Error("an untrusted existing host must not be stopped by hostRef"); },
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() {
+      ownerStops += 1;
+      earlierPanePresent = false;
+      return true;
+    }
+  };
+  const delivery = registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "claude-old-pane-generation",
+      now: () => NOW
+    }),
+    host,
+    async () => {
+      pushes += 1;
+      return "delivered";
+    }
+  );
+
+  await assert.rejects(
+    delivery.prepareRoleSession(prepareInput(fx, "worker", "agent-run-1")),
+    (error) => {
+      assert.equal(error.name, "RuntimeLaunchError");
+      assert.equal(error.retryable, true);
+      assert.match(error.message, /earlier managed runtime is still exiting/i);
+      return true;
+    }
+  );
+  assert.equal(pushes, 0);
+  assert.equal(hasRuntimeCleanupObligation(reservationMailbox(fx, "worker")), true);
+  assert.equal(fx.store.getTaskRoleSessionSet(fx.task.id, "worker"), null);
+  assert.equal(fx.store.getAgentRun(fx.task.id, "agent-run-1").pushedAt, undefined);
+
+  await assert.rejects(
+    delivery.prepareRoleSession(prepareInput(fx, "worker", "agent-run-1")),
+    /runtime lifecycle work is already pending/i
+  );
+  assert.equal(starts, 1, "pending cleanup must fence a successor host start");
+
+  const controller = new FileTaskController(fx.schedulerStore, delivery, {
+    lifecycleHost: host,
+    now: () => NOW
+  });
+  t.after(() => controller.stop());
+  await controller.pump();
+  assert.equal(ownerStops, 1);
+  assert.equal(reservationMailbox(fx, "worker"), null);
+
+  const prepared = await delivery.prepareRoleSession(
+    prepareInput(fx, "worker", "agent-run-1")
+  );
+  assert.equal(prepared.sessionStarted, true);
+  assert.equal(prepared.inputSubmittedAtLaunch, true);
+  assert.notEqual(prepared.launchId, undefined);
+  assertReservation(fx, "worker", prepared.launchId, "agent-run-1");
+});
+
+test("same-Run recovery retains its reservation when a late human writer is detected", async (t) => {
+  const fx = fixture(t, "codex");
+  const input = prepareInput(fx, "worker", "agent-run-1");
+  let launchId;
+  const firstHost = {
+    async start(request, beforeHostStart) {
+      launchId = request.launchId;
+      beforeHostStart?.({
+        owner: request.owner,
+        launchId: request.launchId,
+        runId: request.runId,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        effective: request.effective,
+        initialPromptRunId: request.runId
+      });
+      return runtimeBinding(request, {
+        hostCreated: true,
+        initialPromptRunId: request.runId
+      });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() {},
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { return true; }
+  };
+  await registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, firstHost, {
+      createGenerationId: () => "existing-writer-generation",
+      now: () => NOW
+    }),
+    firstHost
+  ).prepareRoleSession(input);
+  assert.notEqual(launchId, undefined);
+  assertReservation(fx, "worker", launchId, "agent-run-1");
+  const host = {
+    async start() {
+      throw new RuntimeHostContentionError(
+        "writable-client",
+        "A writable human is attached to task-1/worker."
+      );
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { throw new Error("writer contention must not stop the recovered host"); },
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; },
+    async stopOwner() { throw new Error("writer contention must not queue cleanup"); }
+  };
+  const delivery = registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "unused-writer-generation",
+      now: () => NOW
+    }),
+    host
+  );
+
+  await assert.rejects(
+    delivery.prepareRoleSession(input),
+    (error) => {
+      assert.equal(error.name, "RuntimeLaunchError");
+      assert.equal(error.retryable, true);
+      assert.equal(error.reason, "writable-client");
+      return true;
+    }
+  );
+  assertReservation(fx, "worker", launchId, "agent-run-1");
+  assert.equal(hasRuntimeCleanupObligation(reservationMailbox(fx, "worker")), false);
 });
 
 test("a launch-carried Codex prompt for another Run is fenced into cleanup", async (t) => {

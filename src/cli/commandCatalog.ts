@@ -495,7 +495,12 @@ const taskChildren: readonly NodeInput[] = [
         usage: "yui task role reset <task> <role> --reason <text>",
         options: ["--reason"]
       },
-      { name: "enter", summary: "Enter a Task Role's native session.", usage: "yui task role enter <task> <role>" }
+      {
+        name: "enter",
+        summary: "Attach to an existing Task Role session without starting it.",
+        usage: "yui task role enter <task> <role> [--read-only | --read-write]",
+        options: ["--read-only", "--read-write"]
+      }
     ]
   },
   {
@@ -851,7 +856,12 @@ const taskChildren: readonly NodeInput[] = [
       { name: "show", summary: "Show one ChangeSet.", usage: "yui task change-set show <task>/<change-set>" }
     ]
   },
-  { name: "enter", summary: "Enter a Task Role, defaulting to Leader.", usage: "yui task enter <task> [role]" }
+  {
+    name: "enter",
+    summary: "Attach to an existing Task Role, defaulting to Leader and read-only.",
+    usage: "yui task enter <task> [role] [--read-only | --read-write]",
+    options: ["--read-only", "--read-write"]
+  }
 ];
 
 export const ROOT_COMMAND = buildNode({
@@ -1228,7 +1238,7 @@ export const ROOT_COMMAND = buildNode({
       name: "internal",
       summary: "Internal Yui callbacks.",
       hidden: true,
-      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "claude-hook", "codex-hook"] }],
+      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "claude-hook", "codex-hook", "managed-claude-run"] }],
       children: [
         {
           name: "session-notify",
@@ -1244,6 +1254,11 @@ export const ROOT_COMMAND = buildNode({
           name: "codex-hook",
           summary: "Record managed Codex provider lifecycle evidence from stdin.",
           usage: "yui internal codex-hook"
+        },
+        {
+          name: "managed-claude-run",
+          summary: "Run one managed Claude turn over the stream-json protocol.",
+          usage: "yui internal managed-claude-run -- <command> [args...]"
         }
       ]
     }
