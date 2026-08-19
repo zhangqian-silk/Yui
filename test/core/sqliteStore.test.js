@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 
 import { FileTaskStore, StorageConflictError, StorageRecordError } from "../../dist/storage/taskStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { StorageSchemaError } from "../../dist/storage/storageSchema.js";
 import { migrateSqliteSchema, SQLITE_SCHEMA_TABLES } from "../../dist/storage/sqliteSchema.js";
 import { openTaskStore, resolveTaskStoreBackend, SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { createProject } from "../../dist/repository/project.js";
@@ -763,4 +764,39 @@ test("pending wakeup: sequence range extends with each save", () => {
   assert.equal(mailbox.pending.toSequence, 5);
   assert.equal(mailbox.nextSequence, 6);
   store.close();
+});
+
+test("existing database missing home_meta/config rows fails closed instead of silently seeding", () => {
+  // Issue 01 cross-issue handoff: INSERT OR IGNORE seeding could mask a
+  // truncated or partially migrated database by silently inserting fresh
+  // defaults. An existing database opened in production mode must fail closed.
+  const home = temporaryHome();
+  const bootstrap = new SqliteTaskStore(home);
+  bootstrap.close();
+
+  // Simulate corruption: drop the singleton rows a healthy database always has.
+  const db = new Database(join(home, "yui.db"));
+  try {
+    db.prepare("DELETE FROM home_meta WHERE id = 1").run();
+    db.prepare("DELETE FROM config WHERE id = 1").run();
+  } finally {
+    db.close();
+  }
+
+  assert.throws(
+    () => new SqliteTaskStore(home),
+    (err) => err instanceof StorageSchemaError
+      && err.code === "STORAGE_SCHEMA_INVALID"
+      && /home_meta/.test(err.message)
+      && /config/.test(err.message)
+  );
+
+  // The migration bulk-load path is still allowed to seed a database it is
+  // actively populating (the staged state.json→SQLite load).
+  const migrated = new SqliteTaskStore(home, { migration: true });
+  try {
+    assert.equal(migrated.getConfig() !== undefined, true);
+  } finally {
+    migrated.close();
+  }
 });
