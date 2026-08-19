@@ -926,6 +926,7 @@ export class SqliteTaskStore implements TaskStore {
         this.#listPayload<ReviewRound>("review_rounds", "task_id = ?", [taskId]),
         (round) => round.id
       ),
+      reviewConfig: this.getReviewConfig(),
       openInputRequests: this.#sortById(
         this.#listPayload<InputRequest>(
           "input_requests",

@@ -116,6 +116,16 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     ...(nextAction.recommendedCommand === undefined
       ? []
       : [`  Recommended: ${nextAction.recommendedCommand}`]),
+    ...(nextAction.judgmentRequired === undefined
+      ? []
+      : [`  Judgment: ${nextAction.judgmentRequired}`]),
+    ...(nextAction.alternatives === undefined || nextAction.alternatives.length === 0
+      ? []
+      : [
+          "  Alternatives:",
+          ...nextAction.alternatives.map((alternative) =>
+            `    ${alternative.kind}: ${alternative.reason}`)
+        ]),
     ...(task.description === undefined ? [] : [`Description: ${compactText(task.description)}`]),
     ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),

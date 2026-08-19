@@ -50,6 +50,34 @@ test("TaskBrief is one replaceable snapshot that can be cleared and reloaded", (
   assert.equal(new FileTaskStore(root).getTaskBrief("task-1"), null);
 });
 
+test("TaskBrief snapshots are isolated by Task", (t) => {
+  const { root, store } = fixture(t);
+  const first = createTaskBrief({
+    objective: "Ship the first Task",
+    boundaries: ["Only project-1"],
+    currentFocus: "First focus",
+    leaderSummary: "First summary",
+    updatedBy: "leader"
+  }, NOW);
+  const second = createTaskBrief({
+    objective: "Ship the second Task",
+    boundaries: ["Only project-2"],
+    currentFocus: "Second focus",
+    leaderSummary: "Second summary",
+    updatedBy: "leader"
+  }, NOW);
+
+  store.saveTaskBrief("task-1", first);
+  store.saveTaskBrief("task-2", second);
+
+  assert.deepEqual(store.getTaskBrief("task-1"), first);
+  assert.deepEqual(new FileTaskStore(root).getTaskBrief("task-2"), second);
+
+  store.clearTaskBrief("task-1");
+  assert.equal(store.getTaskBrief("task-1"), null);
+  assert.deepEqual(new FileTaskStore(root).getTaskBrief("task-2"), second);
+});
+
 test("Decision IDs are generated per Task and only allow active to superseded updates", (t) => {
   const { root, store } = fixture(t);
   const decision = createDecision(

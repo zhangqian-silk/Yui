@@ -145,6 +145,7 @@ function assertFacts(store, records) {
   assert.deepEqual(facts.changeSets, []);
   assert.deepEqual(facts.integrations, []);
   assert.deepEqual(facts.reviewRounds, []);
+  assert.deepEqual(facts.reviewConfig, { roleName: "reviewer", trigger: "final" });
   // The pure projection stays consistent over store-loaded facts.
   const action = projectNextAction(facts);
   assert.equal(action.kind, "resolve-input");

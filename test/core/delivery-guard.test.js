@@ -8,6 +8,7 @@ import {
   evaluateSemanticBudget,
   formatDeliveryDuplicate
 } from "../../dist/task/deliveryGuard.js";
+import { runDeliveryGuardPreflight } from "../../dist/commands/deliveryGuardPreflight.js";
 import {
   createWorkItem,
   updateWorkItemStatus
@@ -48,6 +49,7 @@ function facts(overrides = {}) {
     changeSets: overrides.changeSets ?? [],
     integrations: overrides.integrations ?? [],
     reviewRounds: overrides.reviewRounds ?? [],
+    reviewConfig: overrides.reviewConfig ?? null,
     openInputRequests: overrides.openInputRequests ?? [],
     activeRuns: overrides.activeRuns ?? [],
     leaderRuns: overrides.leaderRuns ?? []
@@ -406,4 +408,33 @@ test("budget: only yielded Leader Runs count toward the threshold", () => {
     ]
   }));
   assert.equal(budget.exhausted, false);
+});
+
+test("budget: enforce mode warns instead of overriding Leader judgment", () => {
+  const store = {
+    getConfig: () => ({ leaderNextActionMode: "enforce" }),
+    readNextActionFacts: () => facts({
+      leaderRuns: [
+        yieldedLeaderRun("run-1"),
+        yieldedLeaderRun("run-2"),
+        yieldedLeaderRun("run-3")
+      ]
+    })
+  };
+  const result = runDeliveryGuardPreflight(
+    store,
+    "task-1",
+    {
+      kind: "create-work-item",
+      scope: {
+        title: "A genuinely new repair",
+        objective: "Repair the newly discovered failure",
+        acceptance: ["failure is fixed"],
+        writeProjectIds: ["project-1"]
+      }
+    },
+    { budget: true }
+  );
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0], /Semantic progress budget/);
 });

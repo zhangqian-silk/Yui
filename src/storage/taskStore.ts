@@ -906,6 +906,7 @@ export class FileTaskStore implements TaskStore {
       changeSets: values(aggregate.changeSets, "id"),
       integrations: values(aggregate.integrationAttempts, "id"),
       reviewRounds: values(aggregate.reviewRounds, "id"),
+      reviewConfig: this.getReviewConfig(),
       openInputRequests: values(aggregate.inputRequests, "id")
         .filter((request) => request.status === "open"),
       activeRuns: agentRuns.filter((run) => run.status === "active"),
