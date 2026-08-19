@@ -96,11 +96,10 @@ test("verifyGateRecord pure verdict only reads sha and result", () => {
     verifyGateRecord({ sha: expectedSha, result: "pass" }, expectedSha),
     { ok: true }
   );
-  // Extra fields (e.g. a combined --base record's classification evidence)
-  // neither help nor hurt the verdict.
+  // Extra diagnostic fields neither help nor hurt the verdict.
   assert.deepEqual(
     verifyGateRecord(
-      { sha: expectedSha, result: "pass", checks: [], classification: {} },
+      { sha: expectedSha, result: "pass", checks: [], note: "diagnostic" },
       expectedSha
     ),
     { ok: true }

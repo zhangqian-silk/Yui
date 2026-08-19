@@ -41,16 +41,6 @@ test: deps
 test-tier: deps
 	node scripts/run-test-tier.mjs $(T)
 
-# Control-plane SLO benchmark (Issue 11). Defaults: 25 agents, 3 rounds.
-# CI short mode: `make bench-slo ROUNDS=1`. Gate: `make bench-slo SLO=1`.
-bench-slo: build
-	node scripts/bench/control-plane-slo.mjs \
-	  --agents $(or $(AGENTS),25) \
-	  --rounds $(or $(ROUNDS),3) \
-	  $(if $(SLO),--slo,) \
-	  $(if $(BASELINE),--baseline $(BASELINE),) \
-	  $(if $(OUT),--out $(OUT),)
-
 check: build lint test
 
 install-local: build

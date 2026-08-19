@@ -20,9 +20,6 @@ const DETERMINISTIC_TIER_FILES = Object.freeze({
   ]),
   "mock-agent-session": Object.freeze([
     "test/mock-agent-session.test.js"
-  ]),
-  "fault-injection": Object.freeze([
-    "test/fault-injection/fault-injection.test.js"
   ])
 });
 

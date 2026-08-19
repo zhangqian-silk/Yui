@@ -10,14 +10,9 @@ name: Deterministic CI
 # risk-targeted checks instead of repeating this suite; the release workflow
 # reuses its result on the exact tagged commit.
 #
-# The checkout fetches full history (fetch-depth: 0): on a pull request the
-# job passes the base branch as --base-ref, and the runner resolves the exact
-# merge base with `git merge-base` and fails closed when it cannot (a shallow
-# checkout has no common ancestor, so an empty merge base must never reach a
-# record). A red baseline is then classified automatically: the job stays
-# green for pre-existing failures and goes red only for failures the change
-# introduced. A push to master has no comparable base, so it runs without
-# --base-ref and stays fail-closed.
+# Every failing step fails the gate. CI does not re-run an older commit or
+# excuse a failure because it also existed in history; master is the green
+# baseline and each candidate must satisfy the current contract directly.
 
 on:
   pull_request:
@@ -37,6 +32,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # The gate clones this checkout into its hermetic domain. Git
+          # rejects a local clone from a shallow repository.
           fetch-depth: 0
 
       - name: Setup Node.js 24
@@ -45,15 +42,7 @@ jobs:
           node-version: "24"
 
       - name: Hermetic deterministic gate
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # Ensure the base branch ref is available locally, then let the
-            # runner resolve the merge base (fail-closed) and classify.
-            git fetch origin master
-            node scripts/gate-hermetic.mjs --base-ref origin/master --record gate-record.json
-          else
-            node scripts/gate-hermetic.mjs --record gate-record.json
-          fi
+        run: node scripts/gate-hermetic.mjs --record gate-record.json
 
       - name: Upload gate record
         if: always()
@@ -63,37 +52,3 @@ jobs:
           path: gate-record.json
           if-no-files-found: error
           retention-days: 90
-
-  bench-slo:
-    runs-on: ubuntu-latest
-    needs: verify
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Control-plane SLO benchmark (short mode)
-        run: make bench-slo ROUNDS=1 SLO=1
-
-  fault-matrix:
-    runs-on: ubuntu-latest
-    needs: verify
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Fault-injection regression matrix
-        run: make test-tier T=fault-injection

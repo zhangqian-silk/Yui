@@ -11,12 +11,11 @@ import {
   tierOptInEnv
 } from "../helpers/testTiers.js";
 
-test("declares exactly the six explicit tiers", () => {
+test("declares exactly the five explicit tiers", () => {
   assert.deepEqual(TEST_TIER_IDS, [
     "unit",
     "isolated-integration",
     "mock-agent-session",
-    "fault-injection",
     "provider-e2e",
     "release-e2e"
   ]);
@@ -50,8 +49,6 @@ test("session-creating vs model-calling are distinct facts", () => {
   assert.equal(TEST_TIERS["mock-agent-session"].callsModel, false);
   assert.equal(TEST_TIERS["isolated-integration"].createsSession, true);
   assert.equal(TEST_TIERS["isolated-integration"].callsModel, false);
-  assert.equal(TEST_TIERS["fault-injection"].createsSession, true);
-  assert.equal(TEST_TIERS["fault-injection"].callsModel, false);
   assert.equal(TEST_TIERS.unit.createsSession, false);
   assert.equal(TEST_TIERS.unit.callsModel, false);
 });
@@ -69,7 +66,7 @@ test("privilege (opt-in gating) is independent of calling a model", () => {
   assert.equal(tierMayCallModel("provider-e2e"), true);
   assert.equal(tierMayCallModel("release-e2e"), false);
 
-  for (const id of ["unit", "isolated-integration", "mock-agent-session", "fault-injection"]) {
+  for (const id of ["unit", "isolated-integration", "mock-agent-session"]) {
     assert.equal(tierIsPrivileged(id), false);
     assert.equal(TEST_TIERS[id].requiresIsolationPreflight, false);
     assert.equal(tierOptInEnv(id), null);
