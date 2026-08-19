@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
   CONTROLLER_DISCOVERY_PATH,
@@ -15,7 +15,8 @@ import {
   type JsonValue
 } from "./protocol.js";
 import { isControllerSocketPathForHome } from "./controllerEndpoint.js";
-import { readCompatibleHomeIdentity } from "../storage/compatibleTaskStore.js";
+import { readHomeFilesystemId } from "./homeFilesystemIdentity.js";
+import { inspectLiveControllerProcess } from "./controllerProcessIdentity.js";
 
 export class ControllerClientError extends Error {
   constructor(readonly code: string, message: string) {
@@ -43,9 +44,11 @@ export async function readControllerDiscovery(home: string): Promise<ControllerD
       throw invalidDiscovery();
     }
     const value: unknown = JSON.parse(await readFile(discoveryPath, "utf8"));
-    const homeId = readCompatibleHomeIdentity(home).homeId;
-    const socketPath = discoverySocketPath(homeId, value);
-    return parseControllerDiscovery(value, { homeId, socketPath });
+    const socketPath = discoverySocketPath(value);
+    return parseControllerDiscovery(value, {
+      homeFilesystemId: readHomeFilesystemId(home),
+      socketPath
+    });
   } catch (error) {
     if (error instanceof ControllerClientError) throw error;
     if (isNodeError(error) && error.code === "ENOENT") {
@@ -58,13 +61,15 @@ export async function readControllerDiscovery(home: string): Promise<ControllerD
   }
 }
 
-function discoverySocketPath(homeId: string, value: unknown): string {
+function discoverySocketPath(value: unknown): string {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw invalidDiscovery();
   }
+  const homeId = Reflect.get(value, "homeId");
   const socketPath = Reflect.get(value, "socketPath");
   if (
-    typeof socketPath !== "string"
+    typeof homeId !== "string"
+    || typeof socketPath !== "string"
     || !isControllerSocketPathForHome(homeId, socketPath)
   ) {
     throw invalidDiscovery();
@@ -91,6 +96,7 @@ export async function callController(
       token: discovery.token,
       protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
       homeId: discovery.homeId,
+      homeFilesystemId: discovery.homeFilesystemId,
       controllerInstanceId: discovery.controllerInstanceId,
       method,
       params
@@ -102,6 +108,133 @@ export async function callController(
     throw new ControllerClientError("INVALID_REQUEST", "Invalid controller request.");
   }
   return exchange(discovery.socketPath, requestLine, id, timeoutMs);
+}
+
+type PreviousControllerDiscovery = Readonly<{
+  pid: number;
+  processStartIdentity: string;
+  socketPath: string;
+  token: string;
+}>;
+
+/**
+ * One-generation transition used only by the documented `controller restart`
+ * upgrade path from the last released protocol (v3). Ordinary calls never
+ * accept or dispatch through this legacy shape.
+ */
+export async function stopPreviousFileTaskController(
+  home: string,
+  timeoutMs: number
+): Promise<Readonly<{ pid: number }>> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new TypeError("Controller timeout must be a positive integer.");
+  }
+  const discovery = await readPreviousControllerDiscovery(home);
+  const homeFilesystemId = readHomeFilesystemId(home);
+  if (
+    inspectLiveControllerProcess(
+      discovery.pid,
+      homeFilesystemId,
+      discovery.processStartIdentity
+    ) === undefined
+  ) throw invalidDiscovery();
+
+  const id = randomUUID();
+  const requestLine = `${JSON.stringify({
+    id,
+    token: discovery.token,
+    method: "controller.stop",
+    params: { expectedPid: discovery.pid }
+  })}\n`;
+  const deadline = Date.now() + timeoutMs;
+  await exchange(discovery.socketPath, requestLine, id, timeoutMs);
+  while (
+    inspectLiveControllerProcess(
+      discovery.pid,
+      homeFilesystemId,
+      discovery.processStartIdentity
+    ) !== undefined
+  ) {
+    if (Date.now() >= deadline) {
+      throw new ControllerClientError(
+        "CONTROLLER_TIMEOUT",
+        `Previous Controller did not stop within ${timeoutMs} ms.`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return Object.freeze({ pid: discovery.pid });
+}
+
+async function readPreviousControllerDiscovery(
+  home: string
+): Promise<PreviousControllerDiscovery> {
+  const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
+  try {
+    const metadata = await lstat(discoveryPath);
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (
+      !metadata.isFile()
+      || (metadata.mode & 0o077) !== 0
+      || metadata.size > 4_096
+      || (uid !== undefined && metadata.uid !== uid)
+    ) throw invalidDiscovery();
+    const value: unknown = JSON.parse(await readFile(discoveryPath, "utf8"));
+    if (
+      typeof value !== "object"
+      || value === null
+      || Array.isArray(value)
+      || !hasExactStringKeys(value, [
+        "pid",
+        "processStartIdentity",
+        "socketPath",
+        "token"
+      ])
+    ) throw invalidDiscovery();
+    const record = value as Record<string, unknown>;
+    if (
+      !Number.isSafeInteger(record.pid)
+      || (record.pid as number) < 1
+      || typeof record.processStartIdentity !== "string"
+      || !/^[0-9]{1,32}$/u.test(record.processStartIdentity)
+      || typeof record.socketPath !== "string"
+      || !isPreviousControllerSocketPath(record.socketPath)
+      || typeof record.token !== "string"
+      || !/^[a-f0-9]{64}$/u.test(record.token)
+    ) throw invalidDiscovery();
+    return Object.freeze({
+      pid: record.pid as number,
+      processStartIdentity: record.processStartIdentity,
+      socketPath: record.socketPath,
+      token: record.token
+    });
+  } catch (error) {
+    if (error instanceof ControllerClientError) throw error;
+    if (isNodeError(error) && error.code === "ENOENT") {
+      throw new ControllerClientError(
+        "CONTROLLER_NOT_RUNNING",
+        "Controller is not running."
+      );
+    }
+    throw invalidDiscovery();
+  }
+}
+
+function hasExactStringKeys(
+  value: object,
+  expected: readonly string[]
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.length === expected.length
+    && keys.every((key) => typeof key === "string")
+    && expected.every((key) => Object.hasOwn(value, key));
+}
+
+function isPreviousControllerSocketPath(candidate: string): boolean {
+  if (!isAbsolute(candidate) || resolve(candidate) !== candidate) return false;
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  return basename(dirname(candidate)) === `yui-${uid}`
+    && /^[a-f0-9]{24}\.sock$/u.test(basename(candidate));
 }
 
 function exchange(

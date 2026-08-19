@@ -1,4 +1,5 @@
 import { validateHomeId } from "../repository/homeIdentity.js";
+import { validateHomeFilesystemId } from "./homeFilesystemIdentity.js";
 
 export const MAX_CONTROLLER_MESSAGE_BYTES = 1_048_576;
 export const CONTROLLER_DISCOVERY_PATH = "runtime/controller.json";
@@ -18,6 +19,7 @@ export type ControllerRequest = Readonly<{
   token: string;
   protocolVersion: number;
   homeId: string;
+  homeFilesystemId: string;
   controllerInstanceId: string;
   method: string;
   params: JsonValue;
@@ -46,6 +48,7 @@ export type ControllerDiscovery = Readonly<{
   schemaVersion: 1;
   protocolVersion: number;
   homeId: string;
+  homeFilesystemId: string;
   controllerInstanceId: string;
   pid: number;
   processStartIdentity: string;
@@ -78,6 +81,7 @@ export function parseControllerRequest(line: string): ControllerRequest {
       "token",
       "protocolVersion",
       "homeId",
+      "homeFilesystemId",
       "controllerInstanceId",
       "method",
       "params"
@@ -91,6 +95,7 @@ export function parseControllerRequest(line: string): ControllerRequest {
       || !Number.isSafeInteger(value.protocolVersion)
       || (value.protocolVersion as number) < 1
       || !isHomeId(value.homeId)
+      || !isHomeFilesystemId(value.homeFilesystemId)
       || typeof value.controllerInstanceId !== "string"
       || !/^[a-f0-9]{32}$/u.test(value.controllerInstanceId)
       || typeof value.method !== "string"
@@ -105,6 +110,7 @@ export function parseControllerRequest(line: string): ControllerRequest {
       token: value.token,
       protocolVersion: value.protocolVersion as number,
       homeId: value.homeId,
+      homeFilesystemId: value.homeFilesystemId,
       controllerInstanceId: value.controllerInstanceId,
       method: value.method,
       params: value.params
@@ -182,7 +188,7 @@ export function controllerFailure(
 
 export function parseControllerDiscovery(
   value: unknown,
-  expected: Readonly<{ homeId: string; socketPath: string }>
+  expected: Readonly<{ homeFilesystemId: string; socketPath: string }>
 ): ControllerDiscovery {
   if (
     !isRecord(value)
@@ -190,6 +196,7 @@ export function parseControllerDiscovery(
       "schemaVersion",
       "protocolVersion",
       "homeId",
+      "homeFilesystemId",
       "controllerInstanceId",
       "pid",
       "processStartIdentity",
@@ -198,8 +205,9 @@ export function parseControllerDiscovery(
     ])
     || value.schemaVersion !== 1
     || value.protocolVersion !== FILE_TASK_CONTROLLER_PROTOCOL_VERSION
-    || value.homeId !== expected.homeId
     || !isHomeId(value.homeId)
+    || value.homeFilesystemId !== expected.homeFilesystemId
+    || !isHomeFilesystemId(value.homeFilesystemId)
     || typeof value.controllerInstanceId !== "string"
     || !/^[a-f0-9]{32}$/u.test(value.controllerInstanceId)
     || !Number.isSafeInteger(value.pid)
@@ -219,6 +227,7 @@ export function parseControllerDiscovery(
     schemaVersion: 1,
     protocolVersion: value.protocolVersion,
     homeId: value.homeId,
+    homeFilesystemId: value.homeFilesystemId,
     controllerInstanceId: value.controllerInstanceId,
     pid: value.pid as number,
     processStartIdentity: value.processStartIdentity,
@@ -257,6 +266,15 @@ function isHomeId(value: unknown): value is string {
   if (typeof value !== "string") return false;
   try {
     validateHomeId(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isHomeFilesystemId(value: unknown): value is string {
+  try {
+    validateHomeFilesystemId(value);
     return true;
   } catch {
     return false;

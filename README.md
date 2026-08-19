@@ -928,9 +928,12 @@ make install-local
 `make install-local` writes a self-contained launcher at `output/dev/bin/yui`
 and never touches the user-level `yui` command. The launcher resolves its own
 checkout and defaults `YUI_HOME` to this checkout's `output/dev/home`. The
-Controller socket is derived from that Home's durable `homeId`; the tmux server
-namespace and state remain scoped to the selected Home, so the checkout stays
-separate from other checkouts and the global install.
+Controller socket is derived from that Home's durable `homeId` at the fixed
+Linux path `/tmp/yui-<uid>/<homeId>.sock`; discovery also binds the physical
+Home directory, so caller `TMPDIR`, path aliases, and copied runtime records
+cannot redirect control requests. The tmux server namespace and state remain
+scoped to the selected Home, so the checkout stays separate from other
+checkouts and the global install.
 It is idempotent, so re-run it after pulling new code (then run
 `./output/dev/bin/yui controller restart` if a Controller is already running).
 Call the launcher by its absolute path for a stable per-checkout entry point;

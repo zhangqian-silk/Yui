@@ -12,10 +12,11 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -30,7 +31,6 @@ const registrySchemaVersion = 3;
 const recoverySchemaVersion = 1;
 const controllerDiscoveryName = "controller.json";
 const controllerProbeTimeoutMs = 500;
-const linuxUnixSocketPathBudget = 100;
 const controllerProtocolVersion = 4;
 
 export function installDevLauncher(options = {}) {
@@ -298,7 +298,11 @@ export async function resetDevHome(options = {}) {
       const homeId = await readHomeIdForReset(homePath).catch((error) => {
         throw cannotVerifyController(discoveryPath, error);
       });
-      const discovery = readControllerDiscoveryForReset(homeId, discoveryPath);
+      const discovery = readControllerDiscoveryForReset(
+        homePath,
+        homeId,
+        discoveryPath
+      );
       const probe = await probeController(discovery);
       if (probe.status === "running") {
         if (probe.pid !== discovery.pid) {
@@ -560,7 +564,7 @@ function releaseRegistryLock(lockPath, token) {
   if (owner?.token === token) rmSync(lockPath, { force: true });
 }
 
-function readControllerDiscoveryForReset(homeId, discoveryPath) {
+function readControllerDiscoveryForReset(homePath, homeId, discoveryPath) {
   try {
     const metadata = lstatSync(discoveryPath);
     if (
@@ -572,12 +576,14 @@ function readControllerDiscoveryForReset(homeId, discoveryPath) {
     }
     const discovery = JSON.parse(readFileSync(discoveryPath, "utf8"));
     const expectedSocketPath = controllerSocketPath(homeId);
+    const expectedHomeFilesystemId = readHomeFilesystemId(homePath);
     if (
       typeof discovery !== "object" || discovery === null
-      || Reflect.ownKeys(discovery).length !== 8
+      || Reflect.ownKeys(discovery).length !== 9
       || discovery.schemaVersion !== 1
       || discovery.protocolVersion !== controllerProtocolVersion
       || discovery.homeId !== homeId
+      || discovery.homeFilesystemId !== expectedHomeFilesystemId
       || typeof discovery.controllerInstanceId !== "string"
       || !/^[a-f0-9]{32}$/u.test(discovery.controllerInstanceId)
       || !Object.hasOwn(discovery, "pid")
@@ -633,12 +639,13 @@ function controllerSocketPath(homeId) {
     throw new Error("Development Home identity is invalid.");
   }
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const socketName = `${homeId}.sock`;
-  const isolatedPath = join(tmpdir(), `yui-${uid}`, socketName);
-  return process.platform === "linux"
-    && Buffer.byteLength(isolatedPath) >= linuxUnixSocketPathBudget
-    ? join("/tmp", `yui-${uid}`, socketName)
-    : isolatedPath;
+  return join("/tmp", `yui-${uid}`, `${homeId}.sock`);
+}
+
+function readHomeFilesystemId(homePath) {
+  const metadata = statSync(homePath, { bigint: true });
+  if (!metadata.isDirectory()) throw new Error("Development Home is not a directory.");
+  return `${metadata.dev}:${metadata.ino}`;
 }
 
 function cannotVerifyController(discoveryPath, cause) {
@@ -679,6 +686,7 @@ function probeController(discovery) {
       token: discovery.token,
       protocolVersion: controllerProtocolVersion,
       homeId: discovery.homeId,
+      homeFilesystemId: discovery.homeFilesystemId,
       controllerInstanceId: discovery.controllerInstanceId,
       method: "controller.status",
       params: {}
@@ -723,8 +731,8 @@ function probeController(discovery) {
           || response.id !== requestId
           || response.ok !== true
           || typeof result !== "object" || result === null
-          || resultKeys.length < 10
-          || resultKeys.length > 11
+          || resultKeys.length < 11
+          || resultKeys.length > 12
           || resultKeys.some((key) => ![
             "pid",
             "running",
@@ -732,6 +740,7 @@ function probeController(discovery) {
             "rssBytes",
             "protocolVersion",
             "homeId",
+            "homeFilesystemId",
             "controllerInstanceId",
             "version",
             "storageLayoutVersion",
@@ -741,6 +750,7 @@ function probeController(discovery) {
           || result.running !== true
           || result.protocolVersion !== controllerProtocolVersion
           || result.homeId !== discovery.homeId
+          || result.homeFilesystemId !== discovery.homeFilesystemId
           || result.controllerInstanceId !== discovery.controllerInstanceId
           || !Number.isSafeInteger(result.pid) || result.pid <= 0
           || (

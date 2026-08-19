@@ -19,6 +19,8 @@ import {
   type JsonValue
 } from "./protocol.js";
 import { controllerSocketPath } from "./controllerEndpoint.js";
+import { readHomeFilesystemId } from "./homeFilesystemIdentity.js";
+import { findLiveControllerProcessForHome } from "./controllerProcessIdentity.js";
 import { validateHomeId } from "../repository/homeIdentity.js";
 import { readCompatibleHomeIdentity } from "../storage/compatibleTaskStore.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
@@ -117,7 +119,11 @@ async function startControllerServerLocked(
 ): Promise<RunningControllerServer> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
   const homeId = validateHomeId(readCompatibleHomeIdentity(home).homeId);
+  const homeFilesystemId = readHomeFilesystemId(home);
   await assertExistingDiscoveryReplaceable(discoveryPath);
+  if (findLiveControllerProcessForHome(homeFilesystemId) !== undefined) {
+    throw controllerAlreadyRunning();
+  }
   const controllerInstanceId = randomBytes(16).toString("hex");
   const socketPath = controllerSocketPath(homeId);
   const runtimeDirectory = dirname(discoveryPath);
@@ -164,6 +170,7 @@ async function startControllerServerLocked(
       handover,
       home,
       homeId,
+      homeFilesystemId,
       controllerInstanceId,
       () => primaryIdentity
     );
@@ -192,6 +199,7 @@ async function startControllerServerLocked(
       schemaVersion: 1,
       protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
       homeId,
+      homeFilesystemId,
       controllerInstanceId,
       pid: process.pid,
       processStartIdentity,
@@ -341,6 +349,7 @@ function receiveRequest(
   handover: ControllerHandoverState,
   home: string,
   homeId: string,
+  homeFilesystemId: string,
   controllerInstanceId: string,
   getPrimaryIdentity: () => RuntimeIdentityReceipt | null
 ): void {
@@ -383,6 +392,7 @@ function receiveRequest(
       handover,
       home,
       homeId,
+      homeFilesystemId,
       controllerInstanceId,
       getPrimaryIdentity
     );
@@ -404,6 +414,7 @@ async function routeRequest(
   handover: ControllerHandoverState,
   home: string,
   homeId: string,
+  homeFilesystemId: string,
   controllerInstanceId: string,
   getPrimaryIdentity: () => RuntimeIdentityReceipt | null
 ): Promise<void> {
@@ -447,6 +458,7 @@ async function routeRequest(
 
   if (
     request.homeId !== homeId
+    || request.homeFilesystemId !== homeFilesystemId
     || request.controllerInstanceId !== controllerInstanceId
   ) {
     sendResponse(
@@ -538,6 +550,7 @@ async function routeRequest(
         controllerRealpath: realpathSync(fileURLToPath(import.meta.url)),
         controllerProtocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
         homeId,
+        homeFilesystemId,
         controllerInstanceId,
         storageBackend: resolveTaskStoreBackendForHome(home, process.env),
         workerEnabled: resolveStoreWorkerEnabledForHome(home, process.env),
@@ -575,6 +588,7 @@ async function routeRequest(
         rssBytes: process.memoryUsage().rss,
         protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
         homeId,
+        homeFilesystemId,
         controllerInstanceId,
         version: YUI_VERSION,
         storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,

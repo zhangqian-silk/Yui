@@ -102,6 +102,7 @@ export type ControllerDiscoveryFact =
       status: "valid";
       protocolVersion: number;
       homeId: string;
+      homeFilesystemId: string;
       controllerInstanceId: string;
       pid: number;
       processStartIdentity: string;

@@ -73,21 +73,31 @@ active) Task is refused; complete or retire the Task first.
 
 ### Controller identity model
 
-The same durable `homeId` is the Controller's logical Home identity. Its Unix
-socket is named `yui-<uid>/<homeId>.sock`; raw `YUI_HOME` spelling, symlink
-aliases, mount prefixes, and path length do not participate in endpoint
-identity. Every Controller start additionally generates a random
-`controllerInstanceId`, and its discovery record carries the current protocol
-version, `homeId`, instance id, process identity, endpoint, and secret token.
-Clients bind discovery to the authoritative Home identity before connecting,
-and every authenticated request repeats the protocol/Home/instance fence for
-server-side verification.
+The same durable `homeId` is the Controller's logical Home identity. On Linux
+its Unix socket is always `/tmp/yui-<uid>/<homeId>.sock`; raw `YUI_HOME`
+spelling, caller `TMPDIR`, symlink aliases, mount prefixes, and path length do
+not participate in endpoint identity. Every Controller start additionally
+generates a random `controllerInstanceId` and reads the physical Home
+directory's runtime-only device/inode identity. Its discovery record carries
+the current protocol version, logical and physical Home identities, instance
+id, process identity, endpoint, and secret token. Clients verify the physical
+directory before connecting, and every authenticated request repeats the
+protocol/logical-Home/physical-Home/instance fence for server-side
+verification. Reading the discovery therefore does not parse the complete
+Home aggregate on every Controller request.
 
 Path canonicalization is still required for storage containment and lifecycle
 locks, but it is no longer the Controller's identity source. Copying a Home
-also copies its `homeId` and therefore represents the same logical Home; two
-such copies must not be run as independent concurrent Homes. A copied backup is
-a replacement/restore of the original identity, not a new Home.
+also copies its `homeId` and therefore represents the same logical Home, while
+the new directory receives a different physical identity. A copied discovery
+cannot route requests back to the original Controller, and same-host concurrent
+startup is refused by the shared logical endpoint. A copied backup remains a
+replacement/restore of the original identity, not a new independent Home.
+
+The explicit `yui controller restart` operation recognizes only the immediately
+previous released Controller discovery shape (protocol v3), authenticates its
+PID/start identity and physical Home, stops that exact owner, and then starts
+the current Controller. Ordinary requests never fall back to the old protocol.
 
 The archive step is idempotent: re-running it is a no-op for already-archived
 refs.

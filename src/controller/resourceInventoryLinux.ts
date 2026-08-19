@@ -554,6 +554,7 @@ async function inspectDiscovery(
       status: "valid",
       protocolVersion: discovery.protocolVersion,
       homeId: discovery.homeId,
+      homeFilesystemId: discovery.homeFilesystemId,
       controllerInstanceId: discovery.controllerInstanceId,
       pid: discovery.pid,
       processStartIdentity: discovery.processStartIdentity,
