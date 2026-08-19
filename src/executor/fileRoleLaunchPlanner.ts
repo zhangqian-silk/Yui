@@ -533,6 +533,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     }
 
     let args = [...compiled.argv];
+    let command = configured.command;
     let session: SchedulerRoleSession | null;
     if (binding.adapterId === "codex") {
       args = addCodexSessionNotify(args, launchMode, this.#cliPath);
@@ -559,6 +560,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     } else if (launchMode === "new") {
       if (owner.scope === "task" && input.runId !== undefined) {
         args.push(
+          "-p",
+          "--output-format", "stream-json",
+          "--input-format", "stream-json",
+          "--verbose"
+        );
+        args.push(
           "--plugin-dir",
           ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
         );
@@ -579,11 +586,31 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     } else {
       if (owner.scope === "task" && input.runId !== undefined) {
         args.push(
+          "-p",
+          "--output-format", "stream-json",
+          "--input-format", "stream-json",
+          "--verbose"
+        );
+        args.push(
           "--plugin-dir",
           ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
         );
       }
       session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective);
+    }
+    const managedClaudeRun = binding.adapterId === "claude"
+      && owner.scope === "task"
+      && input.runId !== undefined;
+    if (managedClaudeRun) {
+      command = process.execPath;
+      args = [
+        this.#cliPath,
+        "internal",
+        "managed-claude-run",
+        "--",
+        configured.command,
+        ...args
+      ];
     }
 
     const runtimeDescriptor = owner.scope === "task"
@@ -616,7 +643,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       jobCallerKey = randomBytes(32).toString("hex");
     }
     const launch = {
-      command: configured.command,
+      command,
       args,
       env: {
         ...launchEnvironment,
@@ -666,7 +693,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       },
       launch: scopedLaunch,
       session,
-      ...(binding.adapterId === "codex" && input.runId !== undefined
+      ...((binding.adapterId === "codex" || managedClaudeRun) && input.runId !== undefined
         ? { initialPromptRunId: input.runId }
         : {})
     };

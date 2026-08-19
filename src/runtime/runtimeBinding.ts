@@ -11,9 +11,9 @@ export type RuntimeBinding = Readonly<{
   hostRef: string;
   /** True only when this lifecycle request created the external Role host. */
   hostCreated?: boolean;
-  /** Exact Task Run whose prompt was carried by the newly-created host command. */
+  /** Exact Task Run whose prompt was submitted by the newly-created host. */
   initialPromptRunId?: string;
-  /** Controller-derived recovery fence for a reused running Codex host. */
+  /** Controller-derived recovery fence for a reused launch-submitted host. */
   launchPromptUncertainRunId?: string;
   nativeSessionId?: string;
 }>;

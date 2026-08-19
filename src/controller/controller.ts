@@ -1618,6 +1618,7 @@ export class FileTaskController {
       terminalFailure?: RoleRunDeliveryFailureIdentity;
     }>>();
     const settled = new Set<MailboxKey>();
+    const writerBlocked = new Set<MailboxKey>();
     const resignal = new Set<MailboxKey>();
     for (const delivery of result.activeRunDeliveries) {
       const key = `role:${encodeURIComponent(delivery.taskId)}/${encodeURIComponent(delivery.roleName)}` as const;
@@ -1625,6 +1626,7 @@ export class FileTaskController {
         settled.add(key);
         resignal.add(key);
       }
+      else if (delivery.reason === "writer-attached") writerBlocked.add(key);
       else if (delivery.reason === "not-ready"
         || delivery.reason === "runtime-unavailable"
         || delivery.reason === "delivery-uncertain") {
@@ -1640,6 +1642,11 @@ export class FileTaskController {
     for (const wakeup of result.wakeups) {
       const key = `role:${encodeURIComponent(wakeup.taskId)}/leader` as const;
       if (
+        wakeup.reason === "writer-attached"
+      ) {
+        writerBlocked.add(key);
+      }
+      else if (
         wakeup.reason === "not-ready"
         || wakeup.reason === "delivery-uncertain"
       ) {
@@ -1674,6 +1681,7 @@ export class FileTaskController {
       settled.add("operator");
     }
     for (const key of settled) this.#clearDeliveryRetry(key);
+    for (const key of writerBlocked) this.#clearDeliveryRetry(key);
     for (const key of resignal) this.signal(key);
     for (const [key, candidate] of retry) {
       this.#scheduleDeliveryRetry(

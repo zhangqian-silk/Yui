@@ -243,7 +243,7 @@ test("the declarative catalog exposes exactly the lean public command surface", 
   assert.equal(internal.hidden, true);
   assert.deepEqual(
     internal.children.map((child) => child.name),
-    ["session-notify", "claude-hook", "codex-hook"]
+    ["session-notify", "claude-hook", "codex-hook", "managed-claude-run"]
   );
   const completion = ROOT_COMMAND.children.find((child) => child.name === "completion");
   assert.ok(completion);

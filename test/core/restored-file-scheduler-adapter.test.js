@@ -48,6 +48,7 @@ import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../../dist/runtime/lifecycleReservation.js";
+import { RuntimeLaunchError } from "../../dist/runtime/ports.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, archiveTask, completeTask, createTask } from "../../dist/task/task.js";
@@ -1044,6 +1045,87 @@ test("a busy Leader claim is retried through active Run delivery without another
   // exact provider-accepted fold, so it stays undefined after the push alone.
   assert.notEqual(store.getActiveAgentRun(task.id, role.name).pushedAt, undefined);
   assert.equal(store.getActiveAgentRun(task.id, role.name).deliveredAt, undefined);
+});
+
+test("same-Run launch recovery retains the durable Claude Session when the live host returns no identity", async (t) => {
+  const { home, store, task, now, adapter } = fixture(t);
+  const worker = createRole(
+    task.id,
+    "worker",
+    [createRoleAgentBinding({ id: "claude", adapterId: "claude" })],
+    "claude",
+    home,
+    now
+  );
+  const effective = resolveEffectiveLaunch({ role: worker, purpose: "execution" });
+  const run = createAgentRun(
+    adapter,
+    "agent-run-106",
+    task.id,
+    worker.name,
+    "new",
+    "recover exactly once",
+    now,
+    { effective }
+  );
+  const launchId = "runtime-claude-recovery:generation:one";
+  const nativeSessionId = "claude-native-recovery";
+  const target = { kind: "role", taskId: task.id, roleName: worker.name };
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: worker.name },
+    worker.activeAgentId,
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: worker.activeAgentId,
+    adapterId: "claude",
+    nativeSessionId,
+    launchId,
+    policy: "fixed",
+    status: "running",
+    effective
+  }, now);
+  store.transaction((tx) => {
+    tx.saveRole(task.id, updateRoleStatus(worker, "running", now));
+    tx.saveAgentRun(run);
+    tx.saveActiveAgentRun(run);
+    tx.saveTaskRoleSessionSet(sessions);
+    enqueueWork(tx, target, "run-dispatched", now, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
+  });
+  assert.equal(adapter.reserveRuntimeLaunch({
+    owner: { scope: "task", taskId: task.id, roleName: worker.name },
+    launchId,
+    runId: run.id
+  }, () => {}, now).status, "reserved");
+  const delivery = {
+    async prepareRoleSession(input) {
+      return {
+        ...input,
+        deliveryId: "delivery-claude-recovery",
+        launchId,
+        sessionStarted: false,
+        session: null,
+        inputSubmittedAtLaunch: true
+      };
+    },
+    async waitUntilReady(prepared) { return { prepared, session: null }; },
+    async sendOnce() { throw new Error("a recovered launch-submitted prompt must not be sent twice"); },
+    forgetPrepared() {}
+  };
+
+  const [result] = await processActiveRoleRunDeliveries(adapter, delivery, now);
+
+  assert.equal(result.status, "delivered", result.error);
+  assert.equal(store.getRoleSession(task.id, worker.name).nativeSessionId, nativeSessionId);
+  assert.equal(store.getRoleSession(task.id, worker.name).launchId, launchId);
+  assert.notEqual(store.getActiveAgentRun(task.id, worker.name).pushedAt, undefined);
+  assert.equal(store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId: task.id,
+    roleName: worker.name
+  })), null);
 });
 
 test("desired drift does not block a wake delivered to the still-live Leader Session", async (t) => {
@@ -2273,6 +2355,62 @@ test("Worker delivery claims and binds its mailbox before external work, then fa
   assert.equal(store.getActiveAgentRun(task.id, worker.name), null);
   assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
   assert.ok(store.getPendingWakeup(task.id).reasons.includes("role-run-failed"));
+});
+
+test("Worker delivery waits behind its Role writer lease without consuming failure retries", async (t) => {
+  const { store, task, now, adapter } = fixture(t);
+  const worker = createRole(
+    task.id,
+    "worker",
+    [createRoleAgentBinding({ id: "codex", adapterId: "codex" })],
+    "codex",
+    "/repo",
+    now
+  );
+  const run = createAgentRun(
+    adapter,
+    "agent-run-123",
+    task.id,
+    worker.name,
+    "new",
+    "work",
+    now,
+    { effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
+  );
+  const target = { kind: "role", taskId: task.id, roleName: worker.name };
+  store.transaction((tx) => {
+    tx.saveRole(task.id, worker);
+    tx.saveActiveAgentRun(run);
+    enqueueWork(tx, target, "run-dispatched", now, [
+      { type: "run", taskId: task.id, id: run.id }
+    ]);
+  });
+  const delivery = {
+    async prepareRoleSession() {
+      throw new RuntimeLaunchError(
+        true,
+        "launch-writer-blocked",
+        "A writable human is attached to task-1/worker.",
+        "writable-client"
+      );
+    },
+    async waitUntilReady() { throw new Error("unexpected readiness"); },
+    async sendOnce() { throw new Error("unexpected send"); },
+    async inspectRole() { return "present"; },
+    async stopTask() { return true; }
+  };
+
+  const [result] = await processActiveRoleRunDeliveries(adapter, delivery, now);
+
+  assert.equal(result.status, "skipped");
+  assert.equal(result.reason, "writer-attached");
+  assert.equal(result.terminalFailure, undefined);
+  assert.equal(store.getActiveAgentRun(task.id, worker.name)?.id, run.id);
+  assert.deepEqual(store.getWorkMailbox(target).processing.executionRef, {
+    type: "run",
+    taskId: task.id,
+    id: run.id
+  });
 });
 
 test("Worker busy retry persists and reuses the hosted native session before delivery", async (t) => {

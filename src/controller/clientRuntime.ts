@@ -568,29 +568,6 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     void this.#prepareAndScan(taskId).catch(this.clientOptions.onError ?? (() => {}));
   }
 
-  async prepareTaskRoleEnter(
-    input: Readonly<{ taskId: string; roleName: string }>
-  ): Promise<void> {
-    const task = this.store.getTask(input.taskId);
-    if (task?.status === "active" && this.workspacePreparer !== undefined) {
-      await this.workspacePreparer.prepareTaskWorkspace(task.id);
-    }
-    const environment = foregroundRoleEnvironment(
-      this.store,
-      { scope: "task", taskId: input.taskId, roleName: input.roleName },
-      this.clientOptions.environment ?? process.env
-    );
-    await callFileTaskController(this.home, "runtime.ensure-role-session", {
-      scope: "task",
-      taskId: input.taskId,
-      roleName: input.roleName,
-      ...(environment === undefined ? {} : { environment })
-    }, {
-      ...this.clientOptions,
-      requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
-    });
-  }
-
   async stopTaskRoleSessions(taskId: string, roleNames: readonly string[]): Promise<void> {
     const targets = [];
     for (const roleName of [...new Set(roleNames)]) {
@@ -695,9 +672,9 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   }
 
   async prepareGlobalRoleEnter(roleName: string): Promise<void> {
-    const environment = foregroundRoleEnvironment(
+    const environment = foregroundGlobalRoleEnvironment(
       this.store,
-      { scope: "global", roleName },
+      roleName,
       this.clientOptions.environment ?? process.env
     );
     await callFileTaskController(this.home, "runtime.ensure-role-session", {
@@ -731,22 +708,16 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   }
 }
 
-type ForegroundRoleOwner =
-  | Readonly<{ scope: "task"; taskId: string; roleName: string }>
-  | Readonly<{ scope: "global"; roleName: string }>;
-
 const MANAGED_RUNTIME_ENVIRONMENT = new Set<string>(
   YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
 );
 
-function foregroundRoleEnvironment(
+function foregroundGlobalRoleEnvironment(
   store: TaskStore,
-  owner: ForegroundRoleOwner,
+  roleName: string,
   source: NodeJS.ProcessEnv
 ): Readonly<Record<string, string>> | undefined {
-  const role = owner.scope === "task"
-    ? store.getRole?.(owner.taskId, owner.roleName)
-    : store.getGlobalRole?.(owner.roleName);
+  const role = store.getGlobalRole?.(roleName);
   if (role === null || role === undefined) return undefined;
   const agent = store.getConfiguredAgent?.(role.activeAgentId);
   if (agent === null || agent === undefined) return undefined;

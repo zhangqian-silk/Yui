@@ -152,7 +152,16 @@ async function main() {
     buffered += chunk;
     const newline = buffered.indexOf("\n");
     if (newline < 0) continue;
-    const prompt = buffered.slice(0, newline).replaceAll("\r", "");
+    const frame = JSON.parse(buffered.slice(0, newline).replaceAll("\r", ""));
+    const prompt = frame?.type === "user"
+      && frame?.message?.role === "user"
+      && Array.isArray(frame?.message?.content)
+      && frame.message.content.length === 1
+      && frame.message.content[0]?.type === "text"
+      && typeof frame.message.content[0]?.text === "string"
+      ? frame.message.content[0].text
+      : undefined;
+    if (prompt === undefined) throw new Error("Mock Claude received an invalid stream-json user frame.");
     observe("transport-received", { prompt });
     if (input.scenario === "normal" || input.scenario === "late-event") {
       if (input.delayMs > 0) await delay(input.delayMs);

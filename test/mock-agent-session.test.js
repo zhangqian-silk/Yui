@@ -55,9 +55,7 @@ test("normal Mock Agent Session separates tmux transport from provider acceptanc
   assert.ok(session.home.startsWith(`${session.ownedRoot}/`));
   await session.waitForEvent("session-start");
   session.drainEvents();
-  assert.equal(session.currentRun().deliveredAt, undefined);
-
-  assert.equal(await session.pushPrompt(), "sent");
+  assert.equal(session.inputSubmittedAtLaunch, true);
   assert.notEqual(session.currentRun().pushedAt, undefined);
   assert.equal(session.currentRun().deliveredAt, undefined);
 
@@ -73,7 +71,7 @@ test("transport-only Mock Agent Session never claims provider acceptance", async
 
   await session.waitForEvent("session-start");
   session.drainEvents();
-  assert.equal(await session.pushPrompt(), "sent");
+  assert.equal(session.inputSubmittedAtLaunch, true);
   assert.notEqual(session.currentRun().pushedAt, undefined);
 
   const observation = await session.waitForObservation("transport-received");
@@ -89,7 +87,7 @@ test("no-progress Mock Agent Session stays observable until exact teardown", asy
   assert.equal(started.nativeSessionId, session.nativeSessionId);
   assert.equal(await session.inspect(), "running");
   await session.expectNoRuntimeEvents(100);
-  assert.equal(session.currentRun().pushedAt, undefined);
+  assert.notEqual(session.currentRun().pushedAt, undefined);
   assert.equal(session.currentRun().deliveredAt, undefined);
 
   await session.teardown();
@@ -103,7 +101,7 @@ test("crashed Mock Agent Session exits visibly without forging lifecycle progres
   assert.equal(crashed.exitCode, 23);
   assert.equal(await session.waitForState("stopped"), "stopped");
   assert.deepEqual(session.inboxEvents(), []);
-  assert.equal(session.currentRun().pushedAt, undefined);
+  assert.notEqual(session.currentRun().pushedAt, undefined);
   assert.equal(session.currentRun().deliveredAt, undefined);
 });
 
@@ -128,7 +126,6 @@ test("a late Mock Agent event cannot cross into a successor launch generation", 
 
   await session.waitForEvent("session-start");
   session.drainEvents();
-  assert.equal(await session.pushPrompt(), "sent");
   await session.waitForObservation("transport-received");
 
   const successor = session.advanceGeneration();

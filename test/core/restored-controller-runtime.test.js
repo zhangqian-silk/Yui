@@ -2108,7 +2108,7 @@ test("state changes enqueue a Controller signal without waiting for a full scan"
   assert.deepEqual(params, [{ key: "task:task-1" }]);
 });
 
-test("foreground enter asks the Controller to own session creation", async () => {
+test("global foreground enter asks the Controller to own Operator session creation", async () => {
   const calls = [];
   const runtime = new FileTaskWorkflowRuntime(
     "/tmp/yui-controller-owned-session",
@@ -2125,16 +2125,9 @@ test("foreground enter asks the Controller to own session creation", async () =>
     }
   );
 
-  await runtime.prepareTaskRoleEnter({ taskId: "task-1", roleName: "leader" });
   await runtime.prepareGlobalRoleEnter("operator");
 
   assert.deepEqual(calls, [
-    ["prepare-task-workspace"],
-    ["runtime.ensure-role-session", {
-      scope: "task",
-      taskId: "task-1",
-      roleName: "leader"
-    }],
     ["runtime.ensure-role-session", {
       scope: "global",
       roleName: "operator"

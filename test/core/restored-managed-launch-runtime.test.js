@@ -1065,6 +1065,24 @@ test("managed Claude Task Runs inject the lifecycle hooks and exact explicit-yie
   assert.ok(!allowed.includes("Bash(yui task run yield *)"));
   assert.ok(!allowed.includes("Bash(yui --json task context *)"));
   assert.ok(!allowed.includes("Bash(yui:*)"));
+  assert.equal(plan.launch.command, process.execPath);
+  assert.deepEqual(plan.launch.args.slice(0, 4), [
+    "/dist/cli.js", "internal", "managed-claude-run", "--"
+  ]);
+  const providerArgs = plan.launch.args.slice(5);
+  assert.equal(plan.launch.args[4], "claude-test");
+  assert.ok(providerArgs.includes("-p"));
+  assert.deepEqual(
+    providerArgs.slice(providerArgs.indexOf("--output-format"), providerArgs.indexOf("--output-format") + 2),
+    ["--output-format", "stream-json"]
+  );
+  assert.deepEqual(
+    providerArgs.slice(providerArgs.indexOf("--input-format"), providerArgs.indexOf("--input-format") + 2),
+    ["--input-format", "stream-json"]
+  );
+  assert.ok(providerArgs.includes("--verbose"));
+  assert.equal(plan.launch.args.includes(run.input), false);
+  assert.equal(plan.initialPromptRunId, run.id);
 });
 
 test("Codex notify payload is strictly converted to one durable runtime event", async (t) => {

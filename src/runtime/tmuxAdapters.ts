@@ -13,13 +13,14 @@ import type {
   ResumeSessionLaunchRequest,
   SessionLaunchRequest
 } from "./sessionLaunchRequest.js";
-import type {
-  ActivePromptPushPort,
-  ActivePromptPushRequest,
-  PromptPushResult,
-  RuntimeLaunchPreStart,
-  SessionHostPort,
-  SessionInspection
+import {
+  RuntimeHostContentionError,
+  type ActivePromptPushPort,
+  type ActivePromptPushRequest,
+  type PromptPushResult,
+  type RuntimeLaunchPreStart,
+  type SessionHostPort,
+  type SessionInspection
 } from "./ports.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
@@ -42,7 +43,7 @@ export type RuntimePlannedSession = Readonly<{
   role: RuntimeTmuxRole;
   launch: RuntimeTmuxLaunchPlan;
   session: Readonly<{ nativeSessionId?: string }> | null;
-  /** Exact Run whose first prompt is carried by a fresh Codex launch argv. */
+  /** Exact Run whose first prompt is submitted by the fresh host process. */
   initialPromptRunId?: string;
 }>;
 
@@ -87,6 +88,9 @@ export interface RuntimeRoleLaunchPlannerPort {
 
 /** The lifecycle subset required from TmuxManager. */
 export interface RuntimeTmuxHostPort {
+  /** Human writer lease; managed Task launches must not share its pane. */
+  hasWritableClient?(hostId: string, roleName?: string): boolean;
+  hasWritableClientAsync?(hostId: string, roleName?: string): Promise<boolean>;
   ensureRoleWindow(
     hostId: string,
     role: RuntimeTmuxRole,
@@ -371,6 +375,47 @@ export class TmuxSessionHost implements SessionHostPort {
   ): Promise<RuntimeBinding> {
     // Validate generated identity before starting an external process.
     const bindingId = requireSafeIdentity(this.#createBindingId(), "Runtime binding id");
+    const writableHumanAttached = request.owner.scope === "task"
+      && request.runId !== undefined
+      && (this.tmux.hasWritableClientAsync !== undefined
+        ? await this.tmux.hasWritableClientAsync(hostId, request.owner.roleName)
+        : this.tmux.hasWritableClient?.(hostId, request.owner.roleName) === true);
+    if (
+      writableHumanAttached
+    ) {
+      throw new RuntimeHostContentionError(
+        "writable-client",
+        `A writable human is attached to ${request.owner.taskId}/${request.owner.roleName}.`
+      );
+    }
+    if (
+      request.owner.scope === "task"
+      && request.adapterId === "claude"
+      && request.runId !== undefined
+      && await probeRoleStatus(this.tmux, hostId, request.owner.roleName) === "running"
+    ) {
+      // Managed Claude is process-per-Run. A live Role window here belongs to
+      // an earlier process (or to recovery of the exact reserved Run); never
+      // plan, persist pre-start state, or inject input into it. The coordinator
+      // decides between same-generation recovery and a retry after natural
+      // exit from the durable reservation identity.
+      return createRuntimeBinding({
+        id: bindingId,
+        launchId: request.launchId,
+        owner: request.owner,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        hostRef: encodeHostRef({
+          scope: request.owner.scope,
+          hostId,
+          roleName: request.owner.roleName
+        }),
+        hostCreated: false,
+        ...(request.mode === "resume"
+          ? { nativeSessionId: request.nativeSessionId }
+          : {})
+      });
+    }
     const input = {
       roleName: request.owner.roleName,
       agentId: request.agentId,

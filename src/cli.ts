@@ -73,6 +73,7 @@ import { runProfileCommand } from "./commands/profileCommands.js";
 import {
   dispatchPreparedReviewRound,
   failPendingReviewRound,
+  assertTaskRoleWritableAttachAvailable,
   RESUMED_PENDING_FINAL_REVIEW,
   TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
   TaskFinalReviewDispatchDriftError,
@@ -124,6 +125,7 @@ import { runCodexLifecycleHookCommand } from "./controller/codexLifecycleHook.js
 import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
+import { runManagedClaudeProcess } from "./executor/managedClaudeRunner.js";
 import {
   TaskWorkspaceCoordinator,
   WorkspaceCleanupBlockedError
@@ -367,6 +369,36 @@ export async function main(): Promise<void> {
     }
     if (args[1] === "codex-hook" && args.length === 2) {
       await runCodexLifecycleHookCommand(readFileSync(0, "utf8"), process.env);
+      return;
+    }
+    if (args[1] === "managed-claude-run"
+      && args[2] === "--"
+      && args.length >= 4
+      && verifiedStore !== undefined) {
+      const taskId = process.env.YUI_TASK_ID;
+      const runId = process.env.YUI_RUN_ID;
+      const agentId = process.env.YUI_AGENT_ID;
+      if (taskId === undefined || runId === undefined || agentId === undefined) {
+        throw new Error("Managed Claude run identity is incomplete.");
+      }
+      const run = verifiedStore.getActiveAgentRun(taskId, process.env.YUI_ROLE ?? "");
+      if (run === null || run.id !== runId || run.effective.agentId !== agentId
+        || run.effective.adapterId !== "claude") {
+        throw new Error("Managed Claude run is not the exact active generation.");
+      }
+      const configured = verifiedStore.getConfiguredAgent(agentId);
+      if (configured === null || configured.adapterId !== "claude" || args[3] !== configured.command) {
+        throw new Error("Managed Claude command does not match the active Agent.");
+      }
+      if (!configured.baseArgs.every((value, index) => args[index + 4] === value)) {
+        throw new Error("Managed Claude arguments do not start with the configured base arguments.");
+      }
+      process.exitCode = await runManagedClaudeProcess({
+        command: configured.command,
+        args: args.slice(4),
+        prompt: run.input,
+        environment: process.env
+      });
       return;
     }
     throw usageError("Internal lifecycle callback usage is invalid.");
@@ -622,7 +654,6 @@ export async function main(): Promise<void> {
       yuiHome: home,
       tmuxBin: process.env.YUI_TMUX_BIN ?? "tmux",
       tmux,
-      prepareTaskRole: (input) => runtime.prepareTaskRoleEnter(input),
       prepareGlobalRole: (roleName) => runtime.prepareGlobalRoleEnter(roleName),
       environment: process.env,
       onError: (error) => {
@@ -761,7 +792,7 @@ export async function main(): Promise<void> {
     }
     await ensureFileTaskController(home, { environment: process.env });
     await runtime.prepareGlobalRoleEnter(result.role.name);
-    tmux.attachRole("operator", result.role.name);
+    tmux.attachRole("operator", result.role.name, "auto");
     return;
   }
   if (resolved[0] === "operator") {
@@ -769,7 +800,7 @@ export async function main(): Promise<void> {
       if (resolved.length !== 2) throw usageError("Operator enter usage: yui operator enter.");
       await ensureFileTaskController(home, { environment: process.env });
       await runtime.prepareGlobalRoleEnter("operator");
-      tmux.attachRole("operator", "operator");
+      tmux.attachRole("operator", "operator", "auto");
       return;
     }
     const result = runOperatorCommand(resolved.slice(1), store, { runtime, environment: process.env });
@@ -845,17 +876,6 @@ export async function main(): Promise<void> {
       );
       emit(result.output, false, result.data);
       return;
-    }
-    const enteringTask =
-      (resolved[1] === "enter")
-      || (resolved[1] === "role" && resolved[2] === "enter");
-    if (enteringTask) {
-      await ensureFileTaskController(home, { environment: process.env });
-      const taskId = resolved[1] === "enter" ? resolved[2] : resolved[3];
-      const task = taskId === undefined ? null : store.getTask(taskId);
-      if (task?.status === "active") {
-        await workspacePreparer.prepareTaskWorkspace(task.id);
-      }
     }
     if (resolved[1] === "work" && resolved[2] === "isolate") {
       const workItemId = resolved[3];
@@ -1428,12 +1448,38 @@ export async function main(): Promise<void> {
           : { command: result.data, ...reviewData as object });
         return;
       }
-      await runtime.prepareTaskRoleEnter({
-        taskId: result.taskId,
-        roleName: result.roleName
-      });
       if (result.output !== undefined) emit(result.output);
-      tmux.attachRole(result.taskId, result.roleName);
+      try {
+        tmux.attachRole(result.taskId, result.roleName, result.access, {
+          ...(result.access === "read-write"
+            ? {
+                revalidateWritableAttach: () => {
+                  assertTaskRoleWritableAttachAvailable(
+                    store,
+                    result.taskId,
+                    result.roleName,
+                    {
+                      isManagedProcessRunning: () => (
+                        tmux.probeRoleStatus(result.taskId, result.roleName) === "running"
+                      )
+                    }
+                  );
+                }
+              }
+            : {})
+        });
+      } finally {
+        if (result.access === "read-write") {
+          // A Run claimed while the writer lease was visible is intentionally
+          // paused. Releasing the lease only signals that existing durable
+          // work may be reconsidered; it never creates or wakes a Run.
+          runtime.notifyMailboxChanged({
+            kind: "role",
+            taskId: result.taskId,
+            roleName: result.roleName
+          });
+        }
+      }
       return;
     } catch (error) {
       if (candidateMaterialization !== undefined && !candidateMaterializationCommitted) {
@@ -1550,9 +1596,8 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     digest,
     control.yuiHome
   );
-  const preallocatedClaudeCallback = args.length === 2
-    && args[0] === "internal"
-    && args[1] === "claude-hook";
+  const preallocatedClaudeCallback = args[0] === "internal"
+    && (args[1] === "claude-hook" || args[1] === "managed-claude-run");
   const verifiedStore = openCompatibleFileTaskStore(control.yuiHome);
   assertExactTaskRuntimeState(
     runtime,
@@ -2156,7 +2201,7 @@ async function executeOperatorSessionControl(
     && active !== undefined
     && operatorSessionRef(active) === control.ref
   ) {
-    tmux.attachRole("operator", "operator");
+    tmux.attachRole("operator", "operator", "auto");
     return;
   }
 
@@ -2226,7 +2271,7 @@ async function executeOperatorSessionControl(
   }
   applyOperatorSessionControl(control, store);
   await runtime.prepareGlobalRoleEnter(role.name);
-  tmux.attachRole("operator", role.name);
+  tmux.attachRole("operator", role.name, "auto");
 }
 
 function adapterLabel(adapterId: string): string {

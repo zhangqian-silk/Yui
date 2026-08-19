@@ -618,28 +618,48 @@ Task lifecycle completion/selection only suggests valid source states: Draft for
 
 ## Sessions and tmux
 
-tmux owns every long-lived interactive Agent process. Before `operator enter`,
-`role enter`, or `task enter` attaches, Yui closes readline, leaves raw mode,
-pauses its stdin, and synchronously hands the terminal to tmux. The attach uses
-the real outer terminal capabilities and a clean alternate screen; mouse
-scrolling stays in the Agent pane's 100,000-line tmux history instead of mixing
-with the shell or IDE terminal history that preceded the attach. Native Agent
-features such as `/model`, slash-command suggestions, full-screen rendering,
-and key handling remain available.
+tmux owns Agent process lifetimes and their observable output. Global Operator
+and global Role sessions remain native interactive CLIs. A managed Task Claude
+Run instead starts one finite Claude process with `--print`, stream-json input
+and stream-json output. Yui writes the exact Run prompt as one newline-delimited
+JSON user frame on stdin, drains output concurrently, and carries native
+continuity with Claude's session ID. Startup and delivery therefore never
+depend on a TUI composer, readiness glyph, paste delay, or a synthetic Enter
+key. Codex keeps its adapter-native launch-prompt and structured callback path.
+
+`task enter` and `task role enter` are pure attachments to an existing Task
+Role pane. They do not start the Controller, prepare a workspace, create or
+resume an Agent, wake a Role, or deliver input. Task attachments default to
+`--read-only`; `--read-write` is explicit and is rejected while that Role owns
+an active managed Run, a managed Claude process is still exiting, or another
+writer owns the same pane. A read-write attach first publishes a Role-scoped
+tmux writer lease and then revalidates durable Run state, closing the race with
+Controller launch. While the lease exists, managed delivery for that Role is
+paused without consuming its bounded delivery retries; detach releases the
+lease and signals only already-durable Role work for reconsideration. Other
+Roles in the same Task continue independently. Before any attach Yui closes
+readline, leaves raw mode, pauses its stdin, and synchronously hands the terminal
+to tmux. The attach uses the real outer terminal capabilities and a clean alternate
+screen; mouse scrolling stays in the Agent pane's
+100,000-line tmux history instead of mixing with earlier shell or IDE terminal
+history. A read-write attachment exposes whatever native interaction the
+existing pane supports, but it is never part of managed startup or delivery.
 
 tmux fixes a pane's history capacity when that pane is created. Roles created
 before this limit was configured keep their earlier capacity; Yui warns on
 Terminal attach and in Web so the user can exit and re-enter that Role once to
 create a 100,000-line pane while retaining the native Agent conversation.
 
-The first terminal attached to one Operator or Task tmux session is writable.
-Additional Terminal or Web viewers attach read-only, preventing two surfaces
-from typing into the same Agent at once.
+Global interactive entry remains writable when no writer exists and
+automatically downgrades to read-only when another writer is present; global
+Web keeps one writer per tmux session. Task Web is always read-only. Task CLI
+entry is read-only unless `--read-write` is requested, preventing observation
+from changing Agent execution.
 
 ```sh
 yui role enter <global-role>
-yui task enter <task-id> [role]
-yui task role enter <task-id> <role>
+yui task enter <task-id> [role] [--read-only | --read-write]
+yui task role enter <task-id> <role> [--read-only | --read-write]
 ```
 
 Each Role, including a Task-bound Worker instance, can bind multiple configured Agents, has one active Agent, and keeps
@@ -663,7 +683,12 @@ snapshot instead of applying desired drift as a hot change.
 
 Use `yui role unbind <global-role> <agent-id>` or `yui task role unbind <task-id> <role> <agent-id>` to retire a dormant binding. The active binding and any non-stopped native session are rejected; a stopped session record is removed atomically with the binding.
 
-Claude session IDs are preallocated at launch. Managed Codex launches use Codex's structured `notify` callback; after a completed turn, the callback records the native thread ID without injecting a session-binding prompt into the model conversation.
+Claude session IDs are preallocated at launch. Every managed Task Claude Run
+uses a new finite process; resume starts a new process against the fixed native
+session instead of reusing an interactive pane. Managed Codex launches use
+Codex's structured `notify` callback; after a completed turn, the callback
+records the native thread ID without injecting a session-binding prompt into
+the model conversation.
 
 Automated lifecycle and delivery decisions use structured Hook payloads,
 persisted identities, tmux process state, receipts, and pane fences. Yui never

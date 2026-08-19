@@ -1,6 +1,5 @@
 import type {
   PreparedRoleDelivery,
-  ReadyRoleDelivery,
   SchedulerAgentRun,
   RoleRunDeliveryFailurePersistence,
   SchedulerRole,
@@ -32,7 +31,7 @@ export type ActiveRoleRunDeliveryResult = Readonly<{
   roleName: string;
   runId: string;
   status: "delivered" | "already-delivered" | "skipped" | "failed";
-  reason?: "workspace-not-ready" | "launch-failed" | "generation-lost" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "delivery-uncertain";
+  reason?: "workspace-not-ready" | "launch-failed" | "generation-lost" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "writer-attached" | "delivery-uncertain";
   error?: string;
   terminalFailure?: Omit<RoleRunDeliveryFailurePersistence, "now">;
   terminalized?: boolean;
@@ -152,8 +151,9 @@ export async function processActiveRoleRunDeliveries(
             preStartFencePersisted = true;
           }
         });
-        // A fresh Codex host may already carry the exact Run prompt in its
-        // launch argv. Once preparation returns that transport fact, any
+        // A managed host may already have submitted the exact Run prompt as
+        // part of process launch. Once preparation returns that transport
+        // fact, any
         // later readiness or aggregate-write failure is delivery uncertainty,
         // not a launch failure: preserve the Run and its reservation for the
         // matching provider Hook instead of terminalizing it.
@@ -166,15 +166,14 @@ export async function processActiveRoleRunDeliveries(
         // pre-readiness Session falls back to the existing durable Session;
         // fresh runtime-discovered providers intentionally persist `null`.
         if (!preStartFencePersisted) {
-          const preparedFenceSession = prepared.session === undefined
-            ? existingSession
-            : validateReadySession(
-                role,
-                run.effective,
-                existingSession,
-                run.mode,
-                { prepared, session: prepared.session }
-              );
+          const preparedFenceSession = validateLaunchSubmittedRecoverySession(
+            role,
+            run.effective,
+            existingSession,
+            run.mode,
+            prepared,
+            prepared.session
+          );
           preparedSession = preparedFenceSession;
           store.saveRoleRunPrepared({
             task,
@@ -188,12 +187,13 @@ export async function processActiveRoleRunDeliveries(
         const ready = await delivery.waitUntilReady(prepared);
         deliveryAttempted = deliveryAttempted
           || ready.prepared.inputSubmittedAtLaunch === true;
-        const session = validateReadySession(
+        const session = validateLaunchSubmittedRecoverySession(
           role,
           run.effective,
           existingSession,
           run.mode,
-          ready
+          ready.prepared,
+          ready.session
         );
         preparedSession = session;
         store.saveRoleRunPrepared({
@@ -312,14 +312,15 @@ export async function processActiveRoleRunDeliveries(
             error.launchId
           );
           if (error.retryable) {
+            const writerAttached = error.reason === "writable-client";
             results.push({
               taskId: task.id,
               roleName: role.name,
               runId: run.id,
               status: "skipped",
-              reason: "runtime-unavailable",
+              reason: writerAttached ? "writer-attached" : "runtime-unavailable",
               error: message,
-              terminalFailure
+              ...(writerAttached ? {} : { terminalFailure })
             });
             continue;
           }
@@ -489,14 +490,32 @@ function preflightSession(
   return validateRoleSession(role, effective, existing, mode, session);
 }
 
-function validateReadySession(
+/**
+ * A Controller restart can recover an exact launch-submitted Run while its
+ * finite provider process is still alive. The host intentionally does not
+ * re-plan or re-submit that Run and therefore may return no native identity;
+ * retain only the durable Session fenced to the same launch generation.
+ */
+function validateLaunchSubmittedRecoverySession(
   role: SchedulerRole,
   effective: import("../executor/effectiveLaunch.js").EffectiveLaunchSnapshot,
   existing: SchedulerRoleSession | null,
   mode: "new" | "resume",
-  ready: ReadyRoleDelivery
+  prepared: PreparedRoleDelivery,
+  session: SchedulerRoleSession | null | undefined
 ): SchedulerRoleSession | null {
-  return validateRoleSession(role, effective, existing, mode, ready.session);
+  if (
+    session === null
+    && prepared.inputSubmittedAtLaunch === true
+    && prepared.sessionStarted === false
+    && existing?.launchId !== undefined
+    && existing.launchId === prepared.launchId
+  ) {
+    return validateRoleSession(role, effective, existing, mode, existing);
+  }
+  return session === undefined
+    ? existing
+    : validateRoleSession(role, effective, existing, mode, session);
 }
 
 function validateRoleSession(

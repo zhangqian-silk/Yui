@@ -36,12 +36,20 @@ export type TmuxWebTerminalOptions = Readonly<{
   yuiHome: string;
   tmuxBin: string;
   tmux: Readonly<{
-    hasWritableClient(hostId: string): boolean;
-    createInteractiveClientSession(hostId: string): string;
+    hasWritableClient(
+      hostId: string,
+      roleName?: string,
+      excludedLease?: string
+    ): boolean;
+    createInteractiveClientSession(
+      hostId: string,
+      attachedNotice?: string,
+      access?: "read-only" | "read-write",
+      writerRoleName?: string
+    ): string;
     destroyInteractiveClientSession(sessionName: string): void;
     inspectRoleHistory?(hostId: string, roleName: string): TmuxRoleHistory;
   }>;
-  prepareTaskRole(input: Readonly<{ taskId: string; roleName: string }>): Promise<void>;
   prepareGlobalRole(roleName: string): Promise<void>;
   spawnPty?: PtySpawner;
   environment?: NodeJS.ProcessEnv;
@@ -64,24 +72,34 @@ export class TmuxWebTerminalService {
 
   async open(request: WebTerminalRequest): Promise<WebTerminalConnection> {
     const hostId = request.scope === "task" ? request.taskId : "operator";
-    if (request.scope === "task") {
-      await this.options.prepareTaskRole({
-        taskId: request.taskId,
-        roleName: request.roleName
-      });
-    } else {
+    if (request.scope === "global") {
       await this.options.prepareGlobalRole(request.roleName);
     }
     const roleHistory = this.options.tmux.inspectRoleHistory?.(hostId, request.roleName);
 
-    const readOnly = this.#writers.has(hostId)
-      || this.options.tmux.hasWritableClient(hostId);
-    if (!readOnly) this.#writers.add(hostId);
+    let readOnly = request.scope === "task" || this.#writers.has(hostId);
 
     let clientSession: string | undefined;
     let process: PtyProcess;
     try {
-      clientSession = this.options.tmux.createInteractiveClientSession(hostId);
+      if (!readOnly) {
+        // Publish the same host-scoped lease used by Terminal auto-attach
+        // before deciding that this Web client may write. This closes the
+        // cross-surface gap where neither client was visible to list-clients.
+        clientSession = this.options.tmux.createInteractiveClientSession(
+          hostId,
+          undefined,
+          "read-write"
+        );
+        if (this.options.tmux.hasWritableClient(hostId, undefined, clientSession)) {
+          this.options.tmux.destroyInteractiveClientSession(clientSession);
+          clientSession = undefined;
+          readOnly = true;
+        } else {
+          this.#writers.add(hostId);
+        }
+      }
+      clientSession ??= this.options.tmux.createInteractiveClientSession(hostId);
       process = this.#spawnPty(
         this.options.tmuxBin,
         [

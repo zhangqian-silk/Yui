@@ -145,6 +145,83 @@ test("TmuxSessionHost does not rotate a caller key when a new-mode host is reuse
   assert.deepEqual(committed, []);
 });
 
+test("TmuxSessionHost does not plan or persist a new managed Claude Run while an older pane is live", async () => {
+  let planned = false;
+  let preflighted = false;
+  const host = new TmuxSessionHost({
+    plan() {
+      planned = true;
+      throw new Error("a busy managed Claude pane must be checked before planning");
+    },
+    planGlobalRole() { throw new Error("unexpected global plan"); }
+  }, {
+    ensureRoleWindow() { throw new Error("busy managed Claude must not ensure"); },
+    async probeRoleStatusAsync() { return "running"; },
+    probeRoleStatus() { throw new Error("sync probe must not be used"); },
+    killRole() { throw new Error("busy managed Claude must not be killed"); }
+  }, { createBindingId: () => "binding-claude-busy" });
+  const effectiveClaude = testEffectiveLaunch({
+    agentId: "claude-personal",
+    adapterId: "claude",
+    workspaceRoot: "/repo"
+  });
+
+  const binding = await host.start(createSessionLaunchRequest({
+    mode: "new",
+    launchId: "launch-claude-busy",
+    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+    agentId: "claude-personal",
+    adapterId: "claude",
+    effective: effectiveClaude,
+    workspace: "/repo",
+    runId: "agent-run-claude-busy"
+  }), () => { preflighted = true; });
+
+  assert.equal(binding.hostCreated, false);
+  assert.equal(planned, false);
+  assert.equal(preflighted, false);
+  assert.equal("initialPromptRunId" in binding, false);
+});
+
+test("TmuxSessionHost refuses to launch a Task Run while a writable human lease exists", async () => {
+  let planned = false;
+  const writerChecks = [];
+  const host = new TmuxSessionHost({
+    plan() {
+      planned = true;
+      throw new Error("a writer-blocked Run must not be planned");
+    },
+    planGlobalRole() { throw new Error("unexpected global plan"); }
+  }, {
+    hasWritableClient() {
+      throw new Error("sync writer inspection must not run");
+    },
+    async hasWritableClientAsync(hostId, roleName) {
+      writerChecks.push({ hostId, roleName });
+      return true;
+    },
+    ensureRoleWindow() { throw new Error("a writer-blocked Run must not start"); },
+    probeRoleStatus() { return "running"; },
+    killRole() {}
+  });
+
+  await assert.rejects(
+    host.start(createSessionLaunchRequest({
+      mode: "new",
+      launchId: "launch-writer-blocked",
+      owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+      agentId: "codex-personal",
+      adapterId: "codex",
+      effective: effective(),
+      workspace: "/repo",
+      runId: "agent-run-writer-blocked"
+    })),
+    /writable human.*attached/i
+  );
+  assert.equal(planned, false);
+  assert.deepEqual(writerChecks, [{ hostId: "task-1", roleName: "leader" }]);
+});
+
 test("planner metadata cannot inject a launch prompt acknowledgement into a runtime binding", async () => {
   let queried = false;
   const host = new TmuxSessionHost({
