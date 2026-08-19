@@ -192,6 +192,7 @@ export async function startFileTaskControllerRuntime(
       // the same WAL db and serialize via BEGIN IMMEDIATE + busy_timeout.
       ? new SqliteTaskStore(home)
       : openCompatibleFileTaskStore(home));
+  const homeId = store.getHomeIdentity().homeId;
   // When the worker backend is active, the db-touching observer folds run in
   // the worker (off the main event loop). The client is closed on shutdown.
   const asyncStoreClient = useWorker
@@ -264,7 +265,7 @@ export async function startFileTaskControllerRuntime(
       runtimeRoot: `${resolve(home)}.task-runtimes`,
       controlPlane: {
         yuiHome: home,
-        controllerSocketPath: controllerSocketPath(home),
+        controllerSocketPath: controllerSocketPath(homeId),
         tmuxNamespace: yuiTmuxServerName(home),
         globalInstallPaths: [process.execPath]
       }

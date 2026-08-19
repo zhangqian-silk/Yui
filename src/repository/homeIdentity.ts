@@ -18,6 +18,13 @@ export type HomeIdentity = Readonly<{
 export const HOME_IDENTITY_PATTERN = /^home-[a-f0-9]{16}$/;
 const HOME_ENTROPY_BYTES = 16;
 
+export function validateHomeId(homeId: string): string {
+  if (typeof homeId !== "string" || !HOME_IDENTITY_PATTERN.test(homeId)) {
+    throw new Error("Home identity id is invalid.");
+  }
+  return homeId;
+}
+
 export function generateHomeIdentity(
   now: Date,
   source: () => Buffer = () => randomBytes(HOME_ENTROPY_BYTES)
@@ -36,9 +43,7 @@ export function validateHomeIdentity(identity: HomeIdentity): HomeIdentity {
   if (identity.schemaVersion !== 1) {
     throw new Error("Home identity must use schemaVersion 1.");
   }
-  if (typeof identity.homeId !== "string" || !HOME_IDENTITY_PATTERN.test(identity.homeId)) {
-    throw new Error("Home identity id is invalid.");
-  }
+  validateHomeId(identity.homeId);
   if (typeof identity.entropy !== "string" || !/^[a-f0-9]{32}$/.test(identity.entropy)) {
     throw new Error("Home identity entropy is invalid.");
   }

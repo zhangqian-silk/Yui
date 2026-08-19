@@ -19,6 +19,9 @@ import {
   resolveActiveRelease
 } from "../release/runtimeRelease.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import { isControllerSocketPathForHome } from "../core/controllerEndpoint.js";
+import { parseControllerDiscovery } from "../core/protocol.js";
+import { readCompatibleHomeIdentity } from "../storage/compatibleTaskStore.js";
 
 const executeFile = promisify(execFile);
 
@@ -563,9 +566,13 @@ export function readControllerDiscovery(home: string): ControllerDiscoveryResult
   if (!existsSync(path)) {
     return Object.freeze({ protects: false, token: "", protectedPaths: Object.freeze([]) });
   }
-  let record: { pid?: number; processStartIdentity?: string };
+  let record: Record<string, unknown>;
   try {
-    record = JSON.parse(readFileSync(path, "utf8")) as typeof record;
+    const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("controller.json is not an object");
+    }
+    record = value as Record<string, unknown>;
   } catch (error) {
     return Object.freeze({
       protects: false,
@@ -619,9 +626,34 @@ export function readControllerDiscovery(home: string): ControllerDiscoveryResult
       }
     });
   }
+  let discovery;
+  try {
+    const homeId = readCompatibleHomeIdentity(home).homeId;
+    const socketPath = record.socketPath;
+    if (
+      typeof socketPath !== "string"
+      || !isControllerSocketPathForHome(homeId, socketPath)
+    ) {
+      throw new Error("Controller endpoint identity is invalid.");
+    }
+    discovery = parseControllerDiscovery(record, { homeId, socketPath });
+  } catch (error) {
+    return Object.freeze({
+      protects: false,
+      token: "",
+      protectedPaths: Object.freeze([]),
+      diagnostic: {
+        source: "controller" as const,
+        severity: "error" as const,
+        message: `controller.json identity is invalid: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`
+      }
+    });
+  }
   return Object.freeze({
     protects: true,
-    token: `controller:${record.pid}`,
+    token: `controller:${discovery.homeId}:${discovery.controllerInstanceId}:${record.pid}`,
     protectedPaths: Object.freeze([path])
   });
 }

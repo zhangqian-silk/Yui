@@ -362,8 +362,9 @@ function assertOwnedArtifactPath(
   const home = resource.yuiHome;
   if (
     home !== undefined
+    && resource.homeId !== undefined
     && artifact.artifactKind === "controller-socket"
-    && path === controllerSocketPath(home)
+    && path === controllerSocketPath(resource.homeId)
   ) {
     return;
   }

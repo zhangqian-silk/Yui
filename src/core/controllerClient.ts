@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   CONTROLLER_DISCOVERY_PATH,
+  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
   MAX_CONTROLLER_MESSAGE_BYTES,
   ControllerProtocolError,
   encodeControllerRequest,
@@ -14,6 +15,7 @@ import {
   type JsonValue
 } from "./protocol.js";
 import { isControllerSocketPathForHome } from "./controllerEndpoint.js";
+import { readCompatibleHomeIdentity } from "../storage/compatibleTaskStore.js";
 
 export class ControllerClientError extends Error {
   constructor(readonly code: string, message: string) {
@@ -41,8 +43,9 @@ export async function readControllerDiscovery(home: string): Promise<ControllerD
       throw invalidDiscovery();
     }
     const value: unknown = JSON.parse(await readFile(discoveryPath, "utf8"));
-    const socketPath = discoverySocketPath(home, value);
-    return parseControllerDiscovery(value, socketPath);
+    const homeId = readCompatibleHomeIdentity(home).homeId;
+    const socketPath = discoverySocketPath(homeId, value);
+    return parseControllerDiscovery(value, { homeId, socketPath });
   } catch (error) {
     if (error instanceof ControllerClientError) throw error;
     if (isNodeError(error) && error.code === "ENOENT") {
@@ -55,14 +58,14 @@ export async function readControllerDiscovery(home: string): Promise<ControllerD
   }
 }
 
-function discoverySocketPath(home: string, value: unknown): string {
+function discoverySocketPath(homeId: string, value: unknown): string {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw invalidDiscovery();
   }
   const socketPath = Reflect.get(value, "socketPath");
   if (
     typeof socketPath !== "string"
-    || !isControllerSocketPathForHome(home, socketPath)
+    || !isControllerSocketPathForHome(homeId, socketPath)
   ) {
     throw invalidDiscovery();
   }
@@ -86,6 +89,9 @@ export async function callController(
     requestLine = encodeControllerRequest({
       id,
       token: discovery.token,
+      protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+      homeId: discovery.homeId,
+      controllerInstanceId: discovery.controllerInstanceId,
       method,
       params
     });

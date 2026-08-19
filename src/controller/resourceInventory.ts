@@ -100,6 +100,9 @@ export type ControllerDiscoveryFact =
     }>
   | Readonly<{
       status: "valid";
+      protocolVersion: number;
+      homeId: string;
+      controllerInstanceId: string;
       pid: number;
       processStartIdentity: string;
       socketPath: string;
@@ -109,6 +112,7 @@ export type ControllerDiscoveryFact =
 
 export type RuntimeHomeFact = Readonly<{
   yuiHome: string;
+  homeId?: string;
   exists: boolean;
   storageStatus: "current" | "uninitialized" | "invalid" | "unsupported";
   discovery: ControllerDiscoveryFact;
@@ -151,6 +155,7 @@ export type RuntimeResource = Readonly<{
   disposition: CleanupDisposition;
   reasonCode: string;
   yuiHome?: string;
+  homeId?: string;
   owner: RuntimeOwner;
   processes: readonly RuntimeProcessInfo[];
   rssBytes: number;
@@ -267,6 +272,7 @@ export function createRuntimeResourceActivityTracker(): RuntimeResourceActivityT
 
 export type RuntimeDomainSummary = Readonly<{
   yuiHome: string;
+  homeId?: string;
   storageStatus: RuntimeHomeFact["storageStatus"];
   resourceCount: number;
   liveProcessCount: number;
@@ -427,7 +433,12 @@ export function buildControllerResourceInventory(
           artifact.path !== discoveryArtifact.path
         ))];
     for (const artifact of artifacts) {
-      resources.push(artifactResource(artifact, yuiHome, homeFact.domain));
+      resources.push(artifactResource(
+        artifact,
+        yuiHome,
+        homeFact.domain,
+        homeFact.homeId
+      ));
     }
   }
 
@@ -441,6 +452,7 @@ export function buildControllerResourceInventory(
     const owned = ordered.filter((resource) => resource.yuiHome === yuiHome);
     return {
       yuiHome,
+      ...(home.homeId === undefined ? {} : { homeId: home.homeId }),
       storageStatus: home.storageStatus,
       resourceCount: owned.length,
       liveProcessCount: uniqueProcesses(owned).length,
@@ -624,7 +636,8 @@ function processResource(input: Readonly<{
 function artifactResource(
   artifact: RuntimeArtifactFact,
   yuiHome?: string,
-  domain?: RuntimeDomainFact
+  domain?: RuntimeDomainFact,
+  homeId?: string
 ): RuntimeResource {
   const stale = !artifact.active;
   const baseDisposition: CleanupDisposition = stale ? "safe" : "report-only";
@@ -643,6 +656,7 @@ function artifactResource(
       disposition
     ),
     ...(yuiHome === undefined ? {} : { yuiHome }),
+    ...(homeId === undefined ? {} : { homeId }),
     owner: yuiHome === undefined
       ? { kind: "none" }
       : { kind: "controller-domain", yuiHome },

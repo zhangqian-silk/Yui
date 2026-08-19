@@ -44,6 +44,7 @@ import {
   type TaskRuntimeIsolationPreparation
 } from "../runtime/taskRuntimeIsolation.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { readCompatibleHomeIdentity } from "../storage/compatibleTaskStore.js";
 import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
   recordIntegrationCheckJob,
@@ -1207,7 +1208,9 @@ function defaultIntegrationRuntimeIsolation(home: string): TaskRuntimeIsolationP
     pathLayout: "compact",
     controlPlane: {
       yuiHome: controlHome,
-      controllerSocketPath: controllerSocketPath(controlHome),
+      controllerSocketPath: controllerSocketPath(
+        readCompatibleHomeIdentity(controlHome).homeId
+      ),
       tmuxNamespace: yuiTmuxServerName(controlHome),
       globalInstallPaths: [process.execPath]
     }

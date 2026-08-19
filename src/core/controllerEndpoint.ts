@@ -1,12 +1,14 @@
-import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+import { validateHomeId } from "../repository/homeIdentity.js";
+
 const LINUX_UNIX_SOCKET_PATH_BUDGET = 100;
 
-export function controllerSocketPath(home: string): string {
+export function controllerSocketPath(homeId: string): string {
+  const identity = validateHomeId(homeId);
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const socketName = `${controllerSocketIdentity(home)}.sock`;
+  const socketName = `${identity}.sock`;
   const isolatedPath = join(tmpdir(), `yui-${uid}`, socketName);
   if (
     process.platform !== "linux"
@@ -29,18 +31,17 @@ export function controllerSocketPath(home: string): string {
  * without recomputing the Controller process's temporary root.
  */
 export function isControllerSocketPathForHome(
-  home: string,
+  homeId: string,
   candidate: string
 ): boolean {
+  let identity: string;
+  try {
+    identity = validateHomeId(homeId);
+  } catch {
+    return false;
+  }
   if (!isAbsolute(candidate) || resolve(candidate) !== candidate) return false;
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
   return basename(dirname(candidate)) === `yui-${uid}`
-    && basename(candidate) === `${controllerSocketIdentity(home)}.sock`;
-}
-
-function controllerSocketIdentity(home: string): string {
-  return createHash("sha256")
-    .update(resolve(home))
-    .digest("hex")
-    .slice(0, 24);
+    && basename(candidate) === `${identity}.sock`;
 }

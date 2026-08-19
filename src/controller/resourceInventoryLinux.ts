@@ -186,7 +186,9 @@ export async function scanControllerResourceInventory(
         )
       );
     const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
-    const expectedControllerSocketPath = controllerSocketPath(home);
+    const expectedControllerSocketPath = state.homeId === undefined
+      ? undefined
+      : controllerSocketPath(state.homeId);
     if (
       discovery.status === "valid"
       && !validDiscoveryProcess
@@ -195,7 +197,8 @@ export async function scanControllerResourceInventory(
       artifacts.push(fileArtifact(discoveryPath, "controller-discovery", false));
     }
     if (
-      existsSync(expectedControllerSocketPath)
+      expectedControllerSocketPath !== undefined
+      && existsSync(expectedControllerSocketPath)
       && !activeSockets.has(expectedControllerSocketPath)
       && !validDiscoveryProcess
     ) {
@@ -204,6 +207,7 @@ export async function scanControllerResourceInventory(
 
     homeFacts.push({
       yuiHome: home,
+      ...(state.homeId === undefined ? {} : { homeId: state.homeId }),
       exists: existsSync(home),
       storageStatus: state.storageStatus,
       discovery,
@@ -548,6 +552,9 @@ async function inspectDiscovery(
     const discovery = await readControllerDiscovery(home);
     return {
       status: "valid",
+      protocolVersion: discovery.protocolVersion,
+      homeId: discovery.homeId,
+      controllerInstanceId: discovery.controllerInstanceId,
       pid: discovery.pid,
       processStartIdentity: discovery.processStartIdentity,
       socketPath: discovery.socketPath,
@@ -752,6 +759,7 @@ function loadHomeState(
   options: Pick<ControllerInventoryScanOptions, "inspectStorage" | "openCompatibleStore">
 ): Readonly<{
   storageStatus: RuntimeHomeFact["storageStatus"];
+  homeId?: string;
   roles: RuntimeRoleFact[];
 }> {
   const schema = (options.inspectStorage ?? inspectStorageSchema)(home);
@@ -857,7 +865,11 @@ function loadHomeState(
         }
       }
     }
-    return { storageStatus: schema.status, roles };
+    return {
+      storageStatus: schema.status,
+      homeId: store.getHomeIdentity().homeId,
+      roles
+    };
   } catch (error) {
     warnings.push(`Cannot load runtime ownership for ${home}: ${message(error)}`);
     return { storageStatus: "invalid", roles: [] };

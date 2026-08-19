@@ -71,6 +71,24 @@ archiving the same legacy ref in a shared repository never collide because the
 Home identity is part of the archive path. A ref owned by an open (draft or
 active) Task is refused; complete or retire the Task first.
 
+### Controller identity model
+
+The same durable `homeId` is the Controller's logical Home identity. Its Unix
+socket is named `yui-<uid>/<homeId>.sock`; raw `YUI_HOME` spelling, symlink
+aliases, mount prefixes, and path length do not participate in endpoint
+identity. Every Controller start additionally generates a random
+`controllerInstanceId`, and its discovery record carries the current protocol
+version, `homeId`, instance id, process identity, endpoint, and secret token.
+Clients bind discovery to the authoritative Home identity before connecting,
+and every authenticated request repeats the protocol/Home/instance fence for
+server-side verification.
+
+Path canonicalization is still required for storage containment and lifecycle
+locks, but it is no longer the Controller's identity source. Copying a Home
+also copies its `homeId` and therefore represents the same logical Home; two
+such copies must not be run as independent concurrent Homes. A copied backup is
+a replacement/restore of the original identity, not a new Home.
+
 The archive step is idempotent: re-running it is a no-op for already-archived
 refs.
 
