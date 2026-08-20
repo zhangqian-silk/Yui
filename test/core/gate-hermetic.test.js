@@ -101,10 +101,10 @@ test("buildHermeticEnvironment strips Git variables that can redirect the clone"
   }
 });
 
-test("GATE_STEPS is one strict install/build/lint/test/package gate", () => {
+test("GATE_STEPS keeps process lifecycle E2E isolated inside one strict gate", () => {
   assert.deepEqual(
     GATE_STEPS.map(({ name }) => name),
-    ["install", "build", "lint", "test", "package-smoke"]
+    ["install", "build", "lint", "test", "test-process-lifecycle", "package-smoke"]
   );
   assert.ok(Object.isFrozen(GATE_STEPS));
   for (const step of GATE_STEPS) {
@@ -117,8 +117,18 @@ test("GATE_STEPS is one strict install/build/lint/test/package gate", () => {
     testStep.command,
     /grep -v -E 'diagnostic\|storage-upgrade-\.\*-regressions'/u
   );
-  assert.match(testStep.command, /test\/core\/\*\.test\.js/u);
+  assert.match(
+    testStep.command,
+    /ls test\/core\/\*\.test\.js \| grep -v -F 'test\/core\/session-reconcile-e2e\.test\.js'/u
+  );
   assert.doesNotMatch(testStep.command, /TAP|test-reporter|base/u);
+  const lifecycleStep = GATE_STEPS.find(({ name }) => name === "test-process-lifecycle");
+  assert.match(lifecycleStep.command, /scrubSessionEnv\.js/u);
+  assert.match(
+    lifecycleStep.command,
+    /--test --test-concurrency=1 test\/core\/session-reconcile-e2e\.test\.js/u
+  );
+  assert.doesNotMatch(lifecycleStep.command, /ls test\/|test-reporter/u);
   const packageStep = GATE_STEPS.find(({ name }) => name === "package-smoke");
   assert.match(packageStep.command, /assemble-runtime-package\.mjs/u);
   assert.match(packageStep.command, /check-runtime-package-structure\.mjs package-smoke\.json/u);

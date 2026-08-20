@@ -109,6 +109,16 @@ export function buildHermeticEnvironment(root, options = {}) {
  * and storage-lifecycle suites that guard active behavior.
  */
 const GATE_EXCLUDED_TEST_PATTERN = "diagnostic|storage-upgrade-.*-regressions";
+const GATE_TEST_RUNNER =
+  "env -u FORCE_COLOR -u YUI_TEST_KEEP_SESSION_ENV -u YUI_TEST_TIER"
+  + " -u YUI_TEST_PRIVILEGED_MANIFEST NO_COLOR=1 node"
+  + " --import ./test/helpers/scrubSessionEnv.js --test";
+
+// This file asserts bounded process-exit timing against real local processes.
+// Running it beside the full parallel suite makes host scheduling contention
+// part of the assertion, so keep it visible as a separate, serial gate step.
+const GATE_PROCESS_LIFECYCLE_TEST = "test/core/session-reconcile-e2e.test.js";
+
 export const GATE_STEPS = Object.freeze([
   Object.freeze({ name: "install", command: "npm ci" }),
   Object.freeze({ name: "build", command: "npm run build" }),
@@ -118,11 +128,13 @@ export const GATE_STEPS = Object.freeze([
     // The build step already established the src -> dist boundary, so invoke
     // the test command directly instead of triggering package pretest again.
     command:
-      "env -u FORCE_COLOR -u YUI_TEST_KEEP_SESSION_ENV -u YUI_TEST_TIER"
-      + " -u YUI_TEST_PRIVILEGED_MANIFEST NO_COLOR=1 node"
-      + " --import ./test/helpers/scrubSessionEnv.js --test"
+      GATE_TEST_RUNNER
       + " $(ls test/*.test.js | grep -v -E '" + GATE_EXCLUDED_TEST_PATTERN + "')"
-      + " test/core/*.test.js"
+      + " $(ls test/core/*.test.js | grep -v -F '" + GATE_PROCESS_LIFECYCLE_TEST + "')"
+  }),
+  Object.freeze({
+    name: "test-process-lifecycle",
+    command: GATE_TEST_RUNNER + " --test-concurrency=1 " + GATE_PROCESS_LIFECYCLE_TEST
   }),
   Object.freeze({
     name: "package-smoke",

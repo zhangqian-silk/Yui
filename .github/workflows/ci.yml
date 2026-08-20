@@ -3,7 +3,8 @@ name: Deterministic CI
 # The single PR/master deterministic gate (see docs/testing/verification-levels.md).
 # It runs once on the exact commit through the hermetic gate runner
 # (scripts/gate-hermetic.mjs): install, build, lint, the full deterministic
-# suite, and package structure smoke, inside an isolated HOME, XDG tree, git
+# suite with process-lifecycle E2E isolated, and package structure smoke,
+# inside an isolated HOME, XDG tree, git
 # identity, temp dir, and npm cache with a sanitized PATH. The runner persists
 # a per-SHA gate record (gate-record.json) uploaded as the `gate-record`
 # artifact: the per-commit pass/fail evidence. Local development uses

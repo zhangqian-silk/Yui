@@ -52,6 +52,11 @@ local checkout, a CI checkout, and any exact SHA:
   the durable, per-commit pass/fail evidence. A later PR or release consumes
   the record for that exact SHA instead of re-running the gate; repeating the
   same suite on the same SHA is not higher confidence.
+- **Load-aware scheduling.** Ordinary deterministic files retain Node's
+  parallel execution. The process-lifecycle E2E runs as the separate
+  `test-process-lifecycle` step with file concurrency fixed at one, so its
+  bounded process-exit assertions measure Yui behavior rather than contention
+  with the rest of the suite. The assertion timeout is not relaxed or retried.
 - **Strict current baseline.** Every failing step fails the gate. The runner
   does not execute an older commit or classify a failure as pre-existing;
   master remains green and every candidate satisfies the current contract.
