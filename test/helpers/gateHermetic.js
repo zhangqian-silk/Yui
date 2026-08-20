@@ -115,7 +115,8 @@ const GATE_TEST_RUNNER =
   + " --import ./test/helpers/scrubSessionEnv.js --test";
 
 // This file asserts bounded process-exit timing against real local processes.
-// CI runs it on its own fresh runner, so the hermetic core gate must exclude it.
+// Running it beside the full parallel suite makes host scheduling contention
+// part of the assertion, so keep it visible as a separate, serial gate step.
 const GATE_PROCESS_LIFECYCLE_TEST = "test/core/session-reconcile-e2e.test.js";
 
 export const GATE_STEPS = Object.freeze([
@@ -130,6 +131,10 @@ export const GATE_STEPS = Object.freeze([
       GATE_TEST_RUNNER
       + " $(ls test/*.test.js | grep -v -E '" + GATE_EXCLUDED_TEST_PATTERN + "')"
       + " $(ls test/core/*.test.js | grep -v -F '" + GATE_PROCESS_LIFECYCLE_TEST + "')"
+  }),
+  Object.freeze({
+    name: "test-process-lifecycle",
+    command: GATE_TEST_RUNNER + " --test-concurrency=1 " + GATE_PROCESS_LIFECYCLE_TEST
   }),
   Object.freeze({
     name: "package-smoke",

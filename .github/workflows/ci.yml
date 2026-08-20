@@ -1,15 +1,15 @@
 name: Deterministic CI
 
-# The PR/master workflow has two responsibility-aligned jobs (see
-# docs/testing/verification-levels.md). The hermetic core gate runs install,
-# build, lint, the parallel deterministic suite, and package structure smoke
-# inside an isolated HOME/XDG/git/temp/npm domain. The process-lifecycle E2E
-# runs on a fresh runner because its bounded physical-exit checks must not
-# inherit load or leaked process state from the large parallel suite.
-#
-# The core job uploads its per-SHA gate record. A release accepts that record
-# only from a successful whole workflow run, which also proves the independent
-# lifecycle job passed for the same commit.
+# The single PR/master deterministic gate (see docs/testing/verification-levels.md).
+# It runs once on the exact commit through the hermetic gate runner
+# (scripts/gate-hermetic.mjs): install, build, lint, the full deterministic
+# suite with process-lifecycle E2E isolated, and package structure smoke,
+# inside an isolated HOME, XDG tree, git
+# identity, temp dir, and npm cache with a sanitized PATH. The runner persists
+# a per-SHA gate record (gate-record.json) uploaded as the `gate-record`
+# artifact: the per-commit pass/fail evidence. Local development uses
+# risk-targeted checks instead of repeating this suite; the release workflow
+# reuses its result on the exact tagged commit.
 #
 # Every failing step fails the gate. CI does not re-run an older commit or
 # excuse a failure because it also existed in history; master is the green
@@ -53,27 +53,3 @@ jobs:
           path: gate-record.json
           if-no-files-found: error
           retention-days: 90
-
-  process-lifecycle:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Install
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Verify process lifecycle
-        run: >-
-          env -u FORCE_COLOR -u YUI_TEST_KEEP_SESSION_ENV -u YUI_TEST_TIER
-          -u YUI_TEST_PRIVILEGED_MANIFEST NO_COLOR=1
-          node --import ./test/helpers/scrubSessionEnv.js
-          --test --test-concurrency=1 test/core/session-reconcile-e2e.test.js

@@ -32,13 +32,12 @@ Release E2E) stay opt-in and are never routine local verification.
 
 ## L2: the PR gate owns the full suite
 
-`ci.yml` runs two mandatory jobs once on the exact PR commit. The hermetic gate
-runner (`scripts/gate-hermetic.mjs`) owns install, build, lint, the parallel
+`ci.yml` runs exactly once on the exact PR commit through the hermetic gate
+runner (`scripts/gate-hermetic.mjs`): install, build, lint, the full
 deterministic suite (Unit + Isolated Integration + Mock Agent Session, no real
 model), and package structure smoke including the `dist/cli.js` `0755`
-assertion. A second job owns the process-lifecycle E2E on a fresh runner. The
-gate runner remains the executable form of the core L2 evidence — the same
-command gates a local checkout, a CI checkout, and any exact SHA:
+assertion. The runner is the L2 executable form — the same command gates a
+local checkout, a CI checkout, and any exact SHA:
 
 - **Hermetic environment.** Every run isolates `HOME`, the XDG config/cache/
   data tree, the global git identity (`GIT_CONFIG_GLOBAL`), `TMPDIR`, and the
@@ -47,17 +46,17 @@ command gates a local checkout, a CI checkout, and any exact SHA:
   The gate cannot silently depend on a developer's `~/.gitconfig`, a global
   npm cache, or a machine-specific `PATH` (a missing `tsc` or a fixture
   reading host config fails the gate instead of corrupting it).
-- **Per-SHA workflow evidence.** The core job writes `gate-record.json`: the exact
+- **Per-SHA gate record.** Each run writes `gate-record.json`: the exact
   commit SHA, the per-step pass/fail results with durations, and the
   environment the steps ran in. CI uploads it as the `gate-record` artifact —
-  the durable core evidence. A later release accepts it only from a successful
-  whole `ci.yml` run, so the same SHA is also bound to a passing lifecycle job.
-  Repeating either suite on the same SHA is not higher confidence.
-- **Load-aware isolation.** Ordinary deterministic files retain Node's
-  parallel execution. The process-lifecycle E2E uses a separate fresh runner
-  with file concurrency fixed at one, so its bounded physical-exit assertions
-  measure Yui behavior rather than load or leaked process state from the large
-  suite. The assertion timeout is not relaxed or retried.
+  the durable, per-commit pass/fail evidence. A later PR or release consumes
+  the record for that exact SHA instead of re-running the gate; repeating the
+  same suite on the same SHA is not higher confidence.
+- **Load-aware scheduling.** Ordinary deterministic files retain Node's
+  parallel execution. The process-lifecycle E2E runs as the separate
+  `test-process-lifecycle` step with file concurrency fixed at one, so its
+  bounded process-exit assertions measure Yui behavior rather than contention
+  with the rest of the suite. The assertion timeout is not relaxed or retried.
 - **Strict current baseline.** Every failing step fails the gate. The runner
   does not execute an older commit or classify a failure as pre-existing;
   master remains green and every candidate satisfies the current contract.

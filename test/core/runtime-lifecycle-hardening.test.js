@@ -488,6 +488,55 @@ test("a Role host created after Task archival is stopped without a false cleanup
   );
 });
 
+test("ManagedWorkspace timestamp refresh does not invalidate a runtime launch", async (t) => {
+  const { store, task, role } = fixture(t);
+  const schedulerStore = new FileSchedulerStoreAdapter(store);
+  let releaseStart;
+  let announceStart;
+  const startBlocked = new Promise((resolve) => { releaseStart = resolve; });
+  const startEntered = new Promise((resolve) => { announceStart = resolve; });
+  const launchIds = [];
+  const stopped = [];
+  const sessionHost = {
+    async start(request) {
+      launchIds.push(request.launchId);
+      if (launchIds.length === 1) {
+        announceStart();
+        await startBlocked;
+      }
+      return {
+        id: `binding-${launchIds.length}`,
+        launchId: request.launchId,
+        owner: request.owner,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        hostRef: "opaque",
+        hostCreated: launchIds.length === 1
+      };
+    },
+    async resume() { throw new Error("unexpected resume"); },
+    async stop(binding) { stopped.push(binding); },
+    async inspect() { return { state: "running" }; },
+    async inspectOwner() { return { state: "running" }; }
+  };
+  const dispatch = createRuntimeLifecycleDispatcher(store, schedulerStore, sessionHost);
+  const request = {
+    scope: "task",
+    taskId: task.id,
+    roleName: role.name
+  };
+  const entering = dispatch("runtime.ensure-role-session", request);
+  await startEntered;
+  const workspace = store.getTaskWorkspace(task.id);
+  store.saveManagedWorkspace({ ...workspace, updatedAt: SECOND.toISOString() });
+  releaseStart();
+
+  await assert.doesNotReject(entering);
+  await assert.doesNotReject(dispatch("runtime.ensure-role-session", request));
+  assert.deepEqual(launchIds, [launchIds[0], launchIds[0]]);
+  assert.deepEqual(stopped, []);
+});
+
 test("failed stale-host cleanup is durable and fences a replacement launch", async (t) => {
   const { store, task, role } = fixture(t);
   const schedulerStore = new FileSchedulerStoreAdapter(store);
