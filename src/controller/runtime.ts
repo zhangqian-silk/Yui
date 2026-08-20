@@ -32,7 +32,11 @@ import {
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
-import { isTaskOwnedWorkspace } from "../worktree/managedWorkspace.js";
+import {
+  isTaskOwnedWorkspace,
+  managedWorkspaceIdentity,
+  sameManagedWorkspaceIdentity
+} from "../worktree/managedWorkspace.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
@@ -868,7 +872,10 @@ function assertRuntimeLaunchRequestCurrent(
         request.owner.taskId,
         request.owner.roleName
       );
-    if (!isDeepStrictEqual(expectedWorkspace, request.managedWorkspace)) {
+    if (
+      expectedWorkspace === undefined
+      || !sameManagedWorkspaceIdentity(expectedWorkspace, request.managedWorkspace)
+    ) {
       throw new Error(
         `Managed workspace launch state changed: ${request.owner.roleName}.`
       );
@@ -941,7 +948,9 @@ function runtimeLaunchFingerprint(
   return createHash("sha256").update(JSON.stringify([
     request.owner,
     request.effective,
-    request.managedWorkspace,
+    request.managedWorkspace === undefined
+      ? undefined
+      : managedWorkspaceIdentity(request.managedWorkspace),
     request.runtimePolicy,
     agent
   ])).digest("hex");

@@ -1,6 +1,6 @@
 # Yui test tiers
 
-Yui's own tests are organized into six **explicit, executable tiers**. The goal
+Yui's own tests are organized into five **explicit, executable tiers**. The goal
 is that a reader never has to guess what a test actually did: for every tier you
 can tell, up front, whether it creates a Yui/native Session, whether it calls a
 real model, and whether it creates a disposable real runtime. Historically many
@@ -22,7 +22,6 @@ explicit contract `<tier> -- <extra node --test args>`.
 | **Unit** | no | no | no | no | — |
 | **Isolated Integration** | yes | no | yes | no | — |
 | **Mock Agent Session** | yes | no | yes | no | — |
-| **Fault Injection** | yes | no | yes | no | — |
 | **Provider E2E** | yes | **yes** | yes | **required** | `YUI_ALLOW_PROVIDER_E2E=1` |
 | **Release E2E** | **no** | **no** | yes | **required** | `YUI_ALLOW_RELEASE_E2E=1` |
 
@@ -34,13 +33,6 @@ explicit contract `<tier> -- <extra node --test args>`.
 - **Mock Agent Session** — creates an observable native Session driven by a
   deterministic local Mock Agent process, exercising real lifecycle/runtime
   seams with no model or network dependency.
-- **Fault Injection** — deterministic fault-injection regression matrix
-  (Issue 11). Seeds synthetic failures — storage identity contradictions,
-  provider transient errors, yield ambiguity, process residuals, duplicate
-  wakes — against disposable Homes and asserts the observability layer
-  detects and classifies them. Scenarios whose production fix is not yet
-  implemented carry a characterization baseline that fails until the fix
-  lands. No real model or network dependency.
 - **Provider E2E** — drives a real Codex/Claude provider. This is the **only**
   tier that calls a real model; reserved for provider-specific behavior; gated
   behind opt-in and the isolation preflight.

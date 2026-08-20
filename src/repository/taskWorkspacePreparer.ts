@@ -41,6 +41,7 @@ import {
   createManagedWorkspace,
   managedWorkspaceKey,
   managedWorktreeName,
+  sameManagedWorkspaceIdentity,
   type ManagedWorkspace,
   type WorkspaceProjectEntry
 } from "../worktree/managedWorkspace.js";
@@ -3052,13 +3053,6 @@ function sameEffectiveWorkspace(
 
 function sameManagedWorkspace(left: ManagedWorkspace, right: ManagedWorkspace): boolean {
   return isDeepStrictEqual(left, right);
-}
-
-function sameManagedWorkspaceIdentity(left: ManagedWorkspace, right: ManagedWorkspace): boolean {
-  return isDeepStrictEqual(
-    { owner: left.owner, root: left.root, entries: left.entries },
-    { owner: right.owner, root: right.root, entries: right.entries }
-  );
 }
 
 function isMissingPath(error: unknown): boolean {

@@ -235,7 +235,7 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   assert.equal(readFileSync(join(workerEntry.path, "candidate.txt"), "utf8"), candidateBytes);
 
   now = new Date(START.getTime() + 2_000);
-  const committedYield = yieldReviewThroughCli(home, store, task.id, reviewRun.id, {
+  const committedYield = yieldReview(store, task.id, reviewRun.id, {
     summary: "Diagnostic reproduction committed; Candidate remains immutable.",
     checks: [
       {
@@ -250,8 +250,8 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
       }
     ],
     evidenceCommit
-  });
-  assert.equal(committedYield.status, 0, committedYield.stderr || committedYield.error?.message);
+  }, reviewResult, runtime, now);
+  assert.equal(committedYield.kind, "output");
   const completedRound = store.getReviewRound(task.id, pendingRound.id);
   assert.equal(completedRound.status, "completed");
   assert.equal(
@@ -400,8 +400,9 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
   execFileSync("npm", ["run", "build"], { cwd: dirtyReviewEntry.path, stdio: "pipe" });
   execFileSync("npm", ["test"], { cwd: dirtyReviewEntry.path, stdio: "pipe" });
   assert.notEqual(git(dirtyReviewEntry.path, "status", "--porcelain=v1"), "");
+  const dirtyReviewResult = await preparer.snapshotReviewRoundResult(task.id, secondRound.id);
 
-  const dirtyYield = yieldReviewThroughCli(home, store, task.id, dirtyReviewRun.id, {
+  const dirtyYield = yieldReview(store, task.id, dirtyReviewRun.id, {
     summary: "Uncommitted diagnosis reproduced the behavior; preserve for Leader judgment.",
     checks: [
       {
@@ -415,8 +416,8 @@ test("managed ReviewRound isolates writable diagnostic evidence from Candidate d
         details: "dirty reproduction and base tests passed"
       }
     ]
-  });
-  assert.equal(dirtyYield.status, 0, dirtyYield.stderr || dirtyYield.error?.message);
+  }, dirtyReviewResult, runtime, now);
+  assert.equal(dirtyYield.kind, "output");
   const dirtyCompletedRound = store.getReviewRound(task.id, secondRound.id);
   assert.equal(dirtyCompletedRound.status, "completed");
   assert.equal(dirtyCompletedRound.evidenceCommit, undefined);
@@ -580,35 +581,19 @@ function noOpRuntime() {
   };
 }
 
-function yieldReviewThroughCli(home, store, taskId, runId, result) {
-  return yieldRunThroughCli(
-    home,
-    store,
-    taskId,
-    "reviewer",
-    runId,
-    `${JSON.stringify(result, null, 2)}\n`
-  );
-}
-
-function yieldRunThroughCli(home, store, taskId, roleName, runId, summary) {
-  const invocation = exactTaskCliInvocation({ home, store, taskId, roleName });
-  const result = spawnSync(
-    process.execPath,
-    [
-      invocation.cliEntry,
-      ...invocation.prefix,
-      "task", "run", "yield", runId, "--summary-file", "-"
-    ],
-    {
-      encoding: "utf8",
-      input: summary,
-      env: invocation.environment,
-      timeout: 10_000
-    }
-  );
-  if (result.status === 0) invocation.completeFixtureRuntimeReservation();
-  return result;
+function yieldReview(store, taskId, runId, result, reviewWorkspaceResult, runtime, now) {
+  // This E2E owns Review workspace/result isolation, not managed CLI transport.
+  // Keep its state transitions on the fixture clock; exact CLI and
+  // --summary-file transport have dedicated regression coverage.
+  return runTaskCommand([
+    "run", "yield", runId,
+    "--summary", JSON.stringify(result)
+  ], store, {
+    now: () => now,
+    runtime,
+    environment: { YUI_TASK_ID: taskId },
+    reviewWorkspaceResult
+  });
 }
 
 function reviewWorkspaceCommand(home, store, taskId, command, reviewRoundId) {

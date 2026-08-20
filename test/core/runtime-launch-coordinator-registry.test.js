@@ -512,6 +512,41 @@ test("fresh Claude Leader and Worker reserve before start and their first matchi
   );
 });
 
+test("post-host currentness failures expose the compensated launch cause", async (t) => {
+  const fx = fixture(t, "claude");
+  let stopped = false;
+  const host = {
+    async start(request) {
+      return runtimeBinding(request, { hostCreated: true });
+    },
+    async resume() { throw new Error("resume is not expected"); },
+    async stop() { stopped = true; },
+    async inspect() { return { state: stopped ? "stopped" : "running" }; },
+    async inspectOwner() { return { state: stopped ? "stopped" : "running" }; },
+    async stopOwner() { return true; }
+  };
+  fx.schedulerStore.confirmRuntimeLaunchReservation = () => {
+    throw new Error("confirmation currentness changed");
+  };
+  const delivery = registry(
+    new RuntimeLaunchCoordinator(fx.schedulerStore, host, {
+      createGenerationId: () => "compensated-generation",
+      now: () => NOW
+    }),
+    host
+  );
+
+  await assert.rejects(
+    delivery.prepareRoleSession(prepareInput(fx, "worker", "agent-run-1")),
+    (error) => {
+      assert.equal(error.name, "RuntimeLaunchStateChangedError");
+      assert.match(error.message, /confirmation currentness changed/u);
+      return true;
+    }
+  );
+  assert.equal(stopped, true);
+});
+
 test("fresh Claude SessionStart inside host start sees a durable pre-host fence", async (t) => {
   const fx = fixture(t, "claude");
   const roleName = "worker";

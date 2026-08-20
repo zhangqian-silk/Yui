@@ -265,6 +265,35 @@ test("a root that exits first still reaps its fenced child", async () => {
   assert.deepEqual(stages, ["stop-requested", "graceful-stop", "forced-stop", "stop-confirmed"]);
 });
 
+test("a previously observed fenced child survives a transient fence-scan miss", async () => {
+  const harness = fakePorts({
+    dieOnSignal: true,
+    gracefulStop: async () => {
+      harness.kill(100);
+      return true;
+    }
+  });
+  harness.addFencedChild("launch-1", 101, "1010");
+  let scans = 0;
+  harness.ports.listLaunchFencedProcesses = () => {
+    scans += 1;
+    return scans === 1 ? [101] : [];
+  };
+
+  const result = await terminateSessionOwners(
+    owner,
+    [ownerRecord()],
+    harness.ports,
+    { gracefulGraceMs: 20, forcedGraceMs: 20, pollMs: 5 }
+  );
+
+  assert.equal(result.outcome, "stop-confirmed");
+  assert.ok(
+    harness.signals.some(([pid, signal]) => pid === 101 && signal === "SIGTERM"),
+    "the exact child identity must remain tracked after a later scan omits it"
+  );
+});
+
 test("a child without the launch fence is unattributed and never signaled", async () => {
   const harness = fakePorts({
     gracefulStop: async () => {

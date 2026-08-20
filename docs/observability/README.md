@@ -1,9 +1,8 @@
 # Observability (Issue 11)
 
 Read-only observability for the Yui control plane: runtime/storage identity in
-`controller status`, a stable fault classification taxonomy, an `execution
-audit` read-only aggregation command, a 25-agent SLO benchmark, and a
-fault-injection regression matrix.
+`controller status`, a stable fault classification taxonomy, and an
+`execution audit` read-only aggregation command.
 
 All observability features are **read-only**: they never wake a Leader, write
 Task state, or change business behavior. Collection failures degrade to
@@ -139,67 +138,6 @@ Sections:
 Each section degrades independently: a read failure produces an `error` section
 with the error location, without blocking completed sections.
 
-## SLO benchmark
-
-`scripts/bench/control-plane-slo.mjs` drives the real file-backed Controller
-over its Unix socket under synthetic 25-agent telemetry load.
-
-```
-node scripts/bench/control-plane-slo.mjs [--agents 25] [--rounds 3] [--slo]
-  [--baseline <path>] [--write-baseline <path>] [--out <path>]
-```
-
-Or via Make:
-
-```
-make bench-slo              # 25 agents, 3 rounds
-make bench-slo ROUNDS=1     # CI short mode
-make bench-slo SLO=1        # gate on thresholds
-```
-
-### Thresholds (Issue 11 §4)
-
-| Metric | Threshold |
-| --- | --- |
-| command p99 | < 50 ms |
-| event-loop delay max | < 500 ms |
-| persistence p99 | < 100 ms |
-| command timeouts | 0 |
-| semantic events lost | 0 |
-
-`--slo` exits 1 on any violation and prints the comparison. Thresholds are
-adjusted only against a stable baseline, never relaxed for a single flaky run.
-
-The benchmark is hermetic: it seeds a fresh disposable temp Home and never
-touches the real Yui Home.
-
-## Fault-injection matrix
-
-`test/fault-injection/fault-injection.test.js` (tier: `fault-injection`)
-covers 8 scenarios with characterization baselines in
-`test/fault-injection/baselines/fault-matrix.json`:
-
-| Scenario | Status | What is verified |
-| --- | --- | --- |
-| `storage-identity-contradiction` | passing | `collectStorageIdentity` classifies pseudo-layout-7 (needs-repair) vs no-authoritative-backend (fail) |
-| `provider-500-then-recover` | passing | StopFailure 500/504 classified as provider-transient |
-| `yield-crash-before-commit` | failing | Audit counts yielded-without-deliveredAt uniformly |
-| `yield-crash-after-commit` | passing | Audit counts clean yield |
-| `pane-dead-provider-alive` | failing | Inventory scanner runs; full attribution in sandbox acceptance |
-| `unchanged-scheduler-scan-x100` | passing | 100 signals create no new Leader Runs |
-| `handover-candidate-failure` | passing | Stale CAS classified as stale-base-target-cas |
-| `archive-live-reference-fail-closed` | failing | Audit surfaces active run on archived task |
-
-Scenarios with status `failing` reproduce the fault but the production fix is
-not yet implemented. The baseline documents the gap; update it to `passing`
-when the fix lands.
-
-Run with:
-
-```
-make test-tier T=fault-injection
-```
-
 ## Rollout
 
 1. Ship the read-only status fields behind `YUI_STATUS_IDENTITY` (default on).
@@ -208,9 +146,7 @@ make test-tier T=fault-injection
    manual `ps`/filesystem checks.
 3. Classify existing outcomes/receipts using the taxonomy; future structured
    fields plug in via capability providers.
-4. Gate the SLO benchmark as a release check. Adjust thresholds only against a
-   stable baseline.
-5. If collection overhead exceeds budget, disable high-cost inventory/fault
+4. If collection overhead exceeds budget, disable high-cost inventory
    gates; the basic identity and audit remain. No business-state rollback is
    needed.
 
@@ -220,10 +156,5 @@ make test-tier T=fault-injection
   removed from `controller status` output; no state is affected.
 - **Audit command**: the command is read-only and additive; removing it is a
   code revert, not a state rollback.
-- **SLO benchmark**: a CI-only script; removing it from the workflow is the
-  rollback. No runtime state is involved.
-- **Fault-injection tier**: a test-only tier; removing it from the tier
-  manifest is the rollback. No runtime state is involved.
-
 No persistent schema, state machine, or business behavior is changed by this
 Issue. Rollback is always a config flip or code revert.

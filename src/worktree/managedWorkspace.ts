@@ -48,6 +48,30 @@ export type ManagedWorkspaceIdentity = Readonly<Pick<
   "owner" | "root" | "entries"
 >>;
 
+/**
+ * Launch-stable workspace identity. Audit timestamps describe persistence
+ * activity, not a change to the workspace a runtime is authorized to use.
+ */
+export function managedWorkspaceIdentity(
+  workspace: ManagedWorkspace
+): ManagedWorkspaceIdentity {
+  return {
+    owner: workspace.owner,
+    root: workspace.root,
+    entries: workspace.entries
+  };
+}
+
+export function sameManagedWorkspaceIdentity(
+  left: ManagedWorkspace,
+  right: ManagedWorkspace
+): boolean {
+  return isDeepStrictEqual(
+    managedWorkspaceIdentity(left),
+    managedWorkspaceIdentity(right)
+  );
+}
+
 /** Stable Project identity required for a Task-owned runtime workspace. */
 export type TaskWorkspaceBindingIdentity = Readonly<{
   projectId: string;

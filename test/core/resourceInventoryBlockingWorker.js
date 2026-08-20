@@ -2,7 +2,7 @@
 //
 // Speaks the inventory protocol but does a controlled synchronous busy-wait
 // before returning a minimal inventory, so the event-loop-delay, backpressure,
-// cancellation, and fault-injection tests are deterministic. The block length
+// cancellation and worker-failure tests are deterministic. The block length
 // is taken from the scan options (`busyMs`, default 250ms) so a single worker
 // URL serves every test.
 import { runRpcWorker } from "../../dist/core/boundedRpc.js";

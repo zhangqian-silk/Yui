@@ -52,19 +52,14 @@ local checkout, a CI checkout, and any exact SHA:
   the durable, per-commit pass/fail evidence. A later PR or release consumes
   the record for that exact SHA instead of re-running the gate; repeating the
   same suite on the same SHA is not higher confidence.
-- **Failure baseline.** When the gate fails, re-run with `--base <sha>` (the
-  merge base). The runner gates the base in its own hermetic domain, isolated
-  from the candidate's so neither side can leave writable state that changes
-  the other's result. Classification is at the test-identity level: the `test`
-  step streams TAP and the runner parses stable failing-test fingerprints
-  (file plus nested test path) from it. A candidate failure is **pre-existing**
-  only when its fingerprint is proven present on the base; a fingerprint the
-  base does not have is **introduced**, and a base fingerprint the candidate
-  no longer has is **fixed**. The other steps carry no comparable identity, so
-  a failure on both sides is introduced (fail-closed). The run exits
-  non-zero only for introduced failures, so a red base never blocks a change
-  that did not cause the failure, and a new failure is never blamed on
-  history.
+- **Load-aware scheduling.** Ordinary deterministic files retain Node's
+  parallel execution. The process-lifecycle E2E runs as the separate
+  `test-process-lifecycle` step with file concurrency fixed at one, so its
+  bounded process-exit assertions measure Yui behavior rather than contention
+  with the rest of the suite. The assertion timeout is not relaxed or retried.
+- **Strict current baseline.** Every failing step fails the gate. The runner
+  does not execute an older commit or classify a failure as pre-existing;
+  master remains green and every candidate satisfies the current contract.
 
 Agents and humans do not re-run the suite to "approve" a change — the gate
 record is the completion evidence. A flaky failure is fixed at its source; CI

@@ -17,8 +17,7 @@ import { fileURLToPath } from "node:url";
 /**
  * Pure verdict for a parsed gate record against the expected commit SHA.
  * Only the record contract's two top-level fields are read: `sha` (the gated
- * exact commit) and `result` ("pass" | "fail"); combined --base records keep
- * the same two fields.
+ * exact commit) and `result` ("pass" | "fail").
  * @param {unknown} record
  * @param {string} expectedSha
  * @returns {{ ok: true } | { ok: false, reason: string }}
