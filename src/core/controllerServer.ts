@@ -1030,7 +1030,19 @@ type HomeLifecycleLockOwner = Readonly<{
   createdAt: string;
 }>;
 
-async function acquireHomeLifecycleLock(home: string): Promise<() => Promise<void>> {
+export type HomeLifecycleLockOptions = Readonly<{
+  /**
+   * Update reconciliation may remove a parsed lock whose exact owner PID is
+   * definitively gone. Ordinary Controller startup keeps the long-standing
+   * fail-closed behavior and asks the user to inspect a stale lock instead.
+   */
+  removeStaleOwner?: boolean;
+}>;
+
+export async function acquireHomeLifecycleLock(
+  home: string,
+  options: HomeLifecycleLockOptions = {}
+): Promise<() => Promise<void>> {
   const lockPath = homeLifecycleLockPath(home);
   await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
   const owner: HomeLifecycleLockOwner = Object.freeze({
@@ -1060,6 +1072,12 @@ async function acquireHomeLifecycleLock(home: string): Promise<() => Promise<voi
       throw new Error(
         `Another Yui home lifecycle operation is already running (${ownerDescription}): ${lockPath}`
       );
+    }
+    if (options.removeStaleOwner === true) {
+      // The token comparison in releaseHomeLifecycleLock is the CAS fence: a
+      // replacement owner that appeared after the read is never removed.
+      await releaseHomeLifecycleLock(lockPath, existing);
+      continue;
     }
     throw new Error(
       `A previous Yui home lifecycle operation left a stale lock `

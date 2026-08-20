@@ -445,6 +445,26 @@ export async function main(): Promise<void> {
 
   if (args[0] === "controller") {
     const method = args[1];
+    if (method === "live-identity" && args.length === 2) {
+      try {
+        const identity = await callController(home, "controller.identity", {});
+        emit("", false, identity);
+      } catch (error) {
+        if (!(error instanceof ControllerClientError)) throw error;
+        if (jsonOutput) {
+          process.stderr.write(`${JSON.stringify({
+            ok: false,
+            code: error.code,
+            message: error.message,
+            details: {}
+          })}\n`);
+        } else {
+          process.stderr.write(`RUNTIME_ERROR: ${error.message}\n`);
+        }
+        process.exitCode = 5;
+      }
+      return;
+    }
     if (method === "identity" && args.length === 2) {
       // Issue 02: the stable, read-only runtime identity receipt. It survives
       // a Controller stop and answers build ID, package digest, backend, and

@@ -324,10 +324,12 @@ export function createUpdatePorts(
     },
 
     // `runUpdate` is intentionally synchronous because the npm/staged-binary
-    // ports use spawnSync. Keep Controller ownership in this same owner by
-    // using the CLI's structured lifecycle commands; tests can replace these
-    // seams with deterministic fakes without touching a real Controller.
+    // ports use spawnSync. A short-lived child owns the async, exactly fenced
+    // reconciliation first; lifecycle capture then uses structured live
+    // Controller commands. Tests can replace these seams with deterministic
+    // fakes without touching a real Controller.
     controllerStatus(home: string): UpdateControllerLifecycleStatus {
+      reconcileControllerResourcesForUpdate(home, environment, spawn);
       return readControllerLifecycle(home, environment, spawn);
     },
     stopController(home: string, expectedPid: number): UpdateControllerStopResult {
@@ -358,6 +360,9 @@ export function createUpdatePorts(
 
 const UPDATE_CLI_PATH = fileURLToPath(new URL("../cli.js", import.meta.url));
 const UPDATE_CLIENT_RUNTIME_PATH = fileURLToPath(new URL("../controller/clientRuntime.js", import.meta.url));
+const UPDATE_CONTROLLER_RECONCILIATION_PATH = fileURLToPath(
+  new URL("../controller/updateReconciliation.js", import.meta.url)
+);
 
 /**
  * Capture running state plus an authenticated exact process identity before
@@ -429,10 +434,10 @@ function readControllerLifecycle(
         "Controller inventory is current but has no process proof; treating ownership as unknown-active."
       );
     }
-    return proveControllerAbsent(home, environment, spawn);
+    return proveControllerAbsent(home, environment, spawn, cliBinary);
   }
   const identity = parseControllerIdentity(
-    runControllerCommand(home, environment, spawn, "identity", cliBinary)
+    runControllerCommand(home, environment, spawn, "live-identity", cliBinary)
   );
   return {
     running: true,
@@ -444,10 +449,11 @@ function readControllerLifecycle(
 function proveControllerAbsent(
   home: string,
   environment: NodeJS.ProcessEnv,
-  spawn: UpdateSpawner
+  spawn: UpdateSpawner,
+  cliBinary?: string
 ): UpdateControllerLifecycleStatus {
   try {
-    runControllerCommand(home, environment, spawn, "identity");
+    runControllerCommand(home, environment, spawn, "live-identity", cliBinary);
   } catch (error) {
     if (controllerErrorCode(error) === "CONTROLLER_NOT_RUNNING") {
       return { running: false };
@@ -458,7 +464,7 @@ function proveControllerAbsent(
     );
   }
   throw new Error(
-    "Controller identity is reachable but inventory is currentless; treating ownership as unknown-active."
+    "A live Controller identity is reachable but inventory is currentless; treating ownership as unknown-active."
   );
 }
 
@@ -615,7 +621,7 @@ function restartControllerForUpdate(
   let identityFailure: unknown;
   try {
     const identity = parseControllerIdentity(
-      runControllerCommand(home, environment, spawn, "identity", activatedBinary)
+      runControllerCommand(home, environment, spawn, "live-identity", activatedBinary)
     );
     assertActivatedControllerIdentity(identity, activatedBinary, activatedVersion);
   } catch (error) {
@@ -777,7 +783,7 @@ function runControllerCommand(
   home: string,
   environment: NodeJS.ProcessEnv,
   spawn: UpdateSpawner,
-  method: "status" | "identity",
+  method: "status" | "live-identity",
   cliBinary?: string
 ): Record<string, unknown> {
   const command = cliBinary ?? process.execPath;
@@ -800,6 +806,71 @@ function runControllerCommand(
     throw new Error(`Controller ${method} returned an invalid structured result.`);
   }
   return parsed.data;
+}
+
+function reconcileControllerResourcesForUpdate(
+  home: string,
+  environment: NodeJS.ProcessEnv,
+  spawn: UpdateSpawner
+): void {
+  const helper = [
+    "const values = process.argv.slice(1);",
+    "const home = values.pop();",
+    "const reconciliationModule = values.pop();",
+    "(async () => {",
+    "  const { reconcileControllerResourcesForUpdate } = await import(reconciliationModule);",
+    "  const data = await reconcileControllerResourcesForUpdate(home, process.env);",
+    "  process.stdout.write(JSON.stringify({ ok: true, data }));",
+    "})().catch((error) => {",
+    "  const message = error instanceof Error ? error.message : String(error);",
+    "  process.stderr.write(JSON.stringify({ ok: false, code: 'RUNTIME_ERROR', message }));",
+    "  process.exitCode = 5;",
+    "});"
+  ].join(" ");
+  const result = spawn(
+    process.execPath,
+    ["-e", helper, UPDATE_CONTROLLER_RECONCILIATION_PATH, home],
+    { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
+  );
+  if (result.error !== undefined || result.status !== 0) {
+    const detail = structuredErrorMessage(result) ?? result.stderr.toString("utf8").trim();
+    throw new Error(
+      `Controller reconciliation failed (exit ${result.status ?? "null"})${
+        detail.length === 0 ? "." : `: ${detail}`
+      }`
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout.toString("utf8"));
+  } catch (error) {
+    throw new Error("Controller reconciliation returned an invalid structured result.", {
+      cause: error
+    });
+  }
+  if (
+    !isRecord(parsed)
+    || parsed.ok !== true
+    || !isRecord(parsed.data)
+    || !Array.isArray(parsed.data.cleaned)
+    || parsed.data.cleaned.some((id) => typeof id !== "string")
+  ) {
+    throw new Error("Controller reconciliation returned an invalid structured result.");
+  }
+}
+
+function structuredErrorMessage(result: SpawnSyncReturns<Buffer>): string | undefined {
+  for (const buffer of [result.stderr, result.stdout]) {
+    try {
+      const value: unknown = JSON.parse(buffer.toString("utf8"));
+      if (isRecord(value) && typeof value.message === "string" && value.message.length > 0) {
+        return value.message;
+      }
+    } catch {
+      // Fall back to the child's raw stderr below.
+    }
+  }
+  return undefined;
 }
 
 function parseControllerIdentity(value: Record<string, unknown>): ControllerIdentity {
