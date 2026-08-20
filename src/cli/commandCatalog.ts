@@ -924,7 +924,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [{
         id: "lifecycle",
         title: "Commands",
-        entries: ["status", "cleanup", "identity", "stop", "restart"]
+        entries: ["status", "cleanup", "identity", "live-identity", "stop", "restart"]
       }],
       children: [
         {
@@ -942,6 +942,11 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "identity",
           summary: "Read the stable runtime identity receipt (build, backend, worker).",
+          hidden: true
+        },
+        {
+          name: "live-identity",
+          summary: "Read the authenticated live Controller launch identity.",
           hidden: true
         },
         { name: "stop", summary: "Stop the Controller." },
