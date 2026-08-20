@@ -12,7 +12,13 @@ import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerSt
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
-import { runClaudeLifecycleHookCommand } from "../../dist/controller/claudeLifecycleHook.js";
+import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
+const runClaudeLifecycleHookCommand = (payload, environment, ...rest) => (
+  runRuntimeObservationHookCommand(payload, {
+    ...environment,
+    YUI_DRIVER_ID: "anthropic/claude-code"
+  }, ...rest)
+);
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
@@ -193,11 +199,11 @@ function yieldThroughCli(home, runId, summary) {
   );
 }
 
-test("ordinary Claude Stop is rejected and cannot become a managed lifecycle event", async (t) => {
+test("Claude Stop becomes a canonical turn completion without leaking the native event name", async (t) => {
   const { home, environment } = fixture(t);
   const signals = [];
 
-  await assert.rejects(runClaudeLifecycleHookCommand(JSON.stringify({
+  await assert.doesNotReject(runClaudeLifecycleHookCommand(JSON.stringify({
     ...currentClaudeHookCommon("Stop"),
     stop_hook_active: false,
     last_assistant_message: "A peer Stop hook can still block this response.",
@@ -206,10 +212,13 @@ test("ordinary Claude Stop is rejected and cannot become a managed lifecycle eve
   }), environment, async (...args) => {
     signals.push(args);
     return {};
-  }), /unsupported hook event/i);
+  }));
 
-  assert.deepEqual(new FileRuntimeEventInbox(home).list(), []);
-  assert.deepEqual(signals, []);
+  const [event] = new FileRuntimeEventInbox(home).list();
+  assert.equal(event.type, "runtime-observation");
+  assert.equal(event.observation.kind, "turn.completed");
+  assert.equal(event.observation.payload.summary, "A peer Stop hook can still block this response.");
+  assert.equal(signals.length, 1);
 });
 
 test("Claude StopFailure captures structured evidence and remains durable when wake fails", async (t) => {
@@ -224,17 +233,18 @@ test("Claude StopFailure captures structured evidence and remains durable when w
     last_assistant_message: "API Error: upstream 503"
   }), environment, async () => {
     const [durable] = new FileRuntimeEventInbox(home).list();
-    assert.equal(durable.type, "claude-stop-failure");
-    assert.equal(durable.runId, "agent-run-1");
+    assert.equal(durable.type, "runtime-observation");
+    assert.equal(durable.observation.kind, "turn.failed");
+    assert.equal(durable.observation.fence.runId, "agent-run-1");
     throw new Error("Controller offline");
   }));
 
   const [event] = new FileRuntimeEventInbox(home).list();
-  assert.equal(event.type, "claude-stop-failure");
-  assert.equal(event.error, "server_error");
-  assert.equal(event.errorDetails, "upstream 503\nrequest-id: abc");
-  assert.equal(event.lastAssistantMessage, "API Error: upstream 503");
-  assert.equal(event.agentId, "claude-primary");
+  assert.equal(event.type, "runtime-observation");
+  assert.equal(event.observation.payload.failure.code, "server_error");
+  assert.equal(event.observation.payload.failure.details, "upstream 503\nrequest-id: abc");
+  assert.equal(event.observation.payload.failure.lastOutput, "API Error: upstream 503");
+  assert.equal(event.observation.fence.agentId, "claude-primary");
 });
 
 test("Claude StopFailure accepts provider evolution but never infers a managed identity", async (t) => {
@@ -271,7 +281,7 @@ test("Claude StopFailure accepts provider evolution but never infers a managed i
     /native session/i
   );
   const [event] = new FileRuntimeEventInbox(home).list();
-  assert.equal(event.error, "future_provider_error");
+  assert.equal(event.observation.payload.failure.code, "future_provider_error");
 });
 
 test("Claude StopFailure fails the exact Run and WorkItem without a Candidate or retry", async (t) => {
@@ -294,7 +304,7 @@ test("Claude StopFailure fails the exact Run and WorkItem without a Candidate or
     YUI_LAUNCH_ID: "launch-1",
     YUI_RUN_ID: run.id,
     YUI_NATIVE_SESSION_ID: "native-1"
-  }, async () => ({}));
+  }, async () => ({}), second);
   const inbox = new FileRuntimeEventInbox(home);
   const [durable] = inbox.list();
   const drained = new FileRuntimeEventProcessor(inbox, adapter).drain(second);
@@ -302,17 +312,17 @@ test("Claude StopFailure fails the exact Run and WorkItem without a Candidate or
   assert.deepEqual(drained.acknowledgedEventIds, [durable.id]);
   const event = {
     eventId: durable.id,
-    type: durable.type,
+    eventType: durable.observation.kind,
     taskId: durable.taskId,
-    roleName: durable.roleName,
-    agentId: durable.agentId,
-    adapterId: durable.adapterId,
-    launchId: durable.launchId,
-    nativeSessionId: durable.nativeSessionId,
-    runId: durable.runId,
-    error: durable.error,
-    errorDetails: durable.errorDetails,
-    lastAssistantMessage: durable.lastAssistantMessage
+    roleName: durable.observation.fence.roleName,
+    agentId: durable.observation.fence.agentId,
+    adapterId: "claude",
+    launchId: durable.observation.fence.launchId,
+    nativeSessionId: durable.observation.fence.nativeSessionId,
+    runId: durable.observation.fence.runId,
+    error: durable.observation.payload.failure.code,
+    errorDetails: durable.observation.payload.failure.details,
+    lastAssistantMessage: durable.observation.payload.failure.lastOutput
   };
 
   const failed = store.getAgentRun(task.id, run.id);
@@ -328,11 +338,11 @@ test("Claude StopFailure fails the exact Run and WorkItem without a Candidate or
   assert.ok(leaderMailbox.pending.refs.every((ref) => ref.type !== "message"));
   assert.deepEqual(store.listMessages(task.id), messagesBeforeFailure);
   assert.ok(store.listEvents(task.id).some((entry) => (
-    entry.type === "runtime.claude-stop-failure"
+    entry.type === "runtime.turn-failed"
     && entry.payload.runId === run.id
   )));
-  assert.equal(adapter.classifyClaudeStopFailureEvent(event), "obsolete");
-  assert.equal(adapter.observeClaudeStopFailureEvent(event, second).disposition, "obsolete");
+  assert.equal(adapter.classifyRuntimeTurnFailed(event), "obsolete");
+  assert.equal(adapter.observeRuntimeTurnFailed(event, second).disposition, "obsolete");
   assert.equal(store.getWorkItem(task.id, item.id).candidates.length, 0);
   assert.equal(store.listAgentRuns(task.id).length, 1);
 });
@@ -416,12 +426,16 @@ test("exact stdin yield preserves multiline UTF-8, rejects wrong or repeated Run
   );
   assert.deepEqual(
     Object.keys(resumeHooks.hooks).sort(),
-    ["PostToolUse", "SessionStart", "StopFailure", "UserPromptSubmit"]
+    [
+      "MessageDisplay", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreToolUse",
+      "SessionEnd", "SessionStart", "Stop", "StopFailure", "SubagentStart",
+      "SubagentStop", "UserPromptSubmit"
+    ]
   );
 
   const late = {
     eventId: "late-stop-failure-old-run",
-    type: "claude-stop-failure",
+    eventType: "turn.failed",
     taskId: task.id,
     roleName: worker.name,
     agentId: agent.id,
@@ -432,8 +446,8 @@ test("exact stdin yield preserves multiline UTF-8, rejects wrong or repeated Run
     error: "server_error",
     errorDetails: "Late provider failure"
   };
-  assert.equal(adapter.classifyClaudeStopFailureEvent(late), "obsolete");
-  assert.equal(adapter.observeClaudeStopFailureEvent(late, third).disposition, "obsolete");
+  assert.equal(adapter.classifyRuntimeTurnFailed(late), "obsolete");
+  assert.equal(adapter.observeRuntimeTurnFailed(late, third).disposition, "obsolete");
   assert.equal(store.getAgentRun(task.id, run.id).summary, summary);
   assert.equal(store.getActiveAgentRun(task.id, worker.name).id, successor.id);
   assert.equal(store.getWorkItem(task.id, item.id).candidates.length, 1);

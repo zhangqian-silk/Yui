@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,14 +11,27 @@ import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
-import { runClaudeLifecycleHookCommand } from "../../dist/controller/claudeLifecycleHook.js";
-import { runCodexLifecycleHookCommand } from "../../dist/controller/codexLifecycleHook.js";
+import { AgentRuntimeObserver } from "../../dist/controller/agentRuntimeObserver.js";
+import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
+const runClaudeLifecycleHookCommand = (payload, environment, ...rest) => (
+  runRuntimeObservationHookCommand(payload, {
+    ...environment,
+    YUI_DRIVER_ID: "anthropic/claude-code"
+  }, ...rest)
+);
+const runCodexLifecycleHookCommand = (payload, environment, ...rest) => (
+  runRuntimeObservationHookCommand(payload, {
+    ...environment,
+    YUI_DRIVER_ID: "openai/codex"
+  }, ...rest)
+);
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   bindTaskRoleRun,
   createRoleSessionSet,
   markTaskRoleRunPushed,
-  recordRoleAgentSession
+  recordRoleAgentSession,
+  terminalizeTaskRoleRunSession
 } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
@@ -42,12 +55,19 @@ import {
   createRoleAgentBinding,
   updateRoleStatus
 } from "../../dist/role/role.js";
-import { createAgentRun, markAgentRunPushed } from "../../dist/run/agentRun.js";
+import {
+  createAgentRun,
+  markAgentRunPushed,
+  yieldAgentRun
+} from "../../dist/run/agentRun.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { writeTextFileAtomically } from "../../dist/storage/durableFile.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
+import { createRuntimeObservation } from "../../dist/runtime/runtimeObservation.js";
+import { projectRuntimeTaskEvents } from "../../dist/runtime/runtimeProjection.js";
+import { formatAgentRunReceiptId } from "../../dist/task/taskRecordReference.js";
 
 // ---------------------------------------------------------------------------
 // LAYER 2b — Production-path acceptance boundary (adapter mapping evidence).
@@ -128,6 +148,7 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   const environment = {
     YUI_HOME: home, YUI_SESSION_SCOPE: "task", YUI_TASK_ID: task.id,
     YUI_ROLE: worker.name, YUI_AGENT_ID: agent.id, YUI_ADAPTER_ID: adapterId,
+    YUI_DRIVER_ID: adapterId === "codex" ? "openai/codex" : "anthropic/claude-code",
     YUI_WORKSPACE: run.effective.workspace.root,
     YUI_LAUNCH_ID: "launch-1", YUI_RUN_ID: run.id,
     ...(options.runtimeDiscovered === true ? {} : { YUI_NATIVE_SESSION_ID: nativeSessionId })
@@ -137,6 +158,277 @@ function fixture(t, adapterId, sessionStatus = "running", options = {}) {
   ).drain(drainNow);
   return { home, store, adapter, task, worker, run, agent, nativeSessionId, environment, drain };
 }
+
+test("generic Driver Hook is the production acceptance ingress for Claude and Codex", async (t) => {
+  for (const adapterId of ["claude", "codex"]) {
+    const fx = fixture(t, adapterId);
+    await runRuntimeObservationHookCommand(
+      JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: fx.nativeSessionId,
+        prompt: "Do the work"
+      }),
+      fx.environment,
+      async () => ({}),
+      new Date("2026-08-06T02:00:02.000Z")
+    );
+    const [queued] = new FileRuntimeEventInbox(fx.home).list();
+    assert.equal(queued.type, "runtime-observation");
+    assert.equal(queued.observation.kind, "turn.accepted");
+    assert.equal(
+      queued.observation.fence.driverId,
+      adapterId === "codex" ? "openai/codex" : "anthropic/claude-code"
+    );
+
+    const drained = fx.drain(new Date("2026-08-06T02:00:03.000Z"));
+    assert.deepEqual(drained.failed, []);
+    assert.notEqual(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
+    const [stored] = fx.store.listEvents(fx.task.id).filter(
+      (event) => event.type === "runtime.observation"
+    );
+    assert.equal(JSON.parse(stored.payload.observation).kind, "turn.accepted");
+  }
+});
+
+test("a late terminal Hook stays bound to its accepted Turn after a successor Run starts", async (t) => {
+  const fx = fixture(t, "claude");
+  await runClaudeLifecycleHookCommand(JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: fx.nativeSessionId,
+    prompt_id: "turn-a",
+    prompt: "Do the work"
+  }), fx.environment, async () => ({}), new Date("2026-08-06T02:00:02.000Z"));
+  fx.drain(new Date("2026-08-06T02:00:03.000Z"));
+
+  const terminalAt = new Date("2026-08-06T02:00:04.000Z");
+  const acceptedA = fx.store.getAgentRun(fx.task.id, fx.run.id);
+  let sessions = terminalizeTaskRoleRunSession(
+    fx.store.getTaskRoleSessionSet(fx.task.id, fx.worker.name),
+    {
+      agentId: fx.agent.id,
+      runId: acceptedA.id,
+      receiptId: formatAgentRunReceiptId(fx.task.id, acceptedA.id)
+    },
+    terminalAt
+  );
+  let runB = createAgentRun(
+    "agent-run-2",
+    fx.task.id,
+    fx.worker.name,
+    "resume",
+    "Successor work",
+    new Date("2026-08-06T02:00:05.000Z"),
+    { effective: acceptedA.effective }
+  );
+  runB = markAgentRunPushed(runB, new Date("2026-08-06T02:00:06.000Z"));
+  fx.store.transaction((tx) => {
+    tx.saveAgentRun(yieldAgentRun(acceptedA, "Run A yielded", terminalAt));
+    tx.clearActiveAgentRun(fx.task.id, fx.worker.name);
+    tx.saveTaskRoleSessionSet(sessions);
+    tx.saveActiveAgentRun(runB);
+    sessions = bindTaskRoleRun(sessions, {
+      agentId: fx.agent.id,
+      runId: runB.id,
+      receiptId: formatAgentRunReceiptId(fx.task.id, runB.id)
+    }, new Date("2026-08-06T02:00:05.000Z"));
+    sessions = markTaskRoleRunPushed(sessions, {
+      agentId: fx.agent.id,
+      runId: runB.id,
+      receiptId: formatAgentRunReceiptId(fx.task.id, runB.id)
+    }, new Date("2026-08-06T02:00:06.000Z"));
+    tx.saveTaskRoleSessionSet(sessions);
+  });
+
+  await runClaudeLifecycleHookCommand(JSON.stringify({
+    hook_event_name: "StopFailure",
+    session_id: fx.nativeSessionId,
+    prompt_id: "turn-a",
+    error: "late_server_error"
+  }), {
+    ...fx.environment,
+    // The reused process descriptor/environment may already identify B. The
+    // accepted native Turn is the authoritative durable ownership binding.
+    YUI_RUN_ID: runB.id
+  }, async () => ({}), new Date("2026-08-06T02:00:07.000Z"));
+
+  const [late] = new FileRuntimeEventInbox(fx.home).list();
+  assert.equal(late.observation.fence.runId, acceptedA.id);
+  assert.equal(late.observation.fence.nativeTurnId, "turn-a");
+  const drained = fx.drain(new Date("2026-08-06T02:00:08.000Z"));
+  assert.deepEqual(drained.failed, []);
+  assert.equal(fx.store.getActiveAgentRun(fx.task.id, fx.worker.name).id, runB.id);
+  assert.equal(fx.store.getAgentRun(fx.task.id, runB.id).status, "active");
+  assert.equal(
+    fx.store.getTaskRoleSessionSet(fx.task.id, fx.worker.name).pendingTurnCompletion,
+    null
+  );
+});
+
+test("a terminal Session observation cannot bypass the exact Run receipt fence", (t) => {
+  const fx = fixture(t, "claude");
+  const outcome = fx.adapter.observeRuntimeObservation(createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: "session-end-forged-receipt",
+    kind: "session.ended",
+    authority: "provider-structured",
+    receivedAt: "2026-08-06T02:00:02.000Z",
+    fence: {
+      taskId: fx.task.id,
+      roleName: fx.worker.name,
+      runId: fx.run.id,
+      agentId: fx.agent.id,
+      driverId: "anthropic/claude-code",
+      launchId: "launch-1",
+      sessionGenerationId: "launch-1",
+      nativeSessionId: fx.nativeSessionId,
+      nativeTurnId: fx.run.id,
+      receiptId: "agent-run:task-1/another-run"
+    },
+    payload: {}
+  }), new Date("2026-08-06T02:00:03.000Z"));
+
+  assert.equal(outcome, "obsolete");
+  assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name).status, "running");
+});
+
+test("generic Driver tool boundaries are runtime activity, not semantic Run progress", async (t) => {
+  const fx = fixture(t, "claude");
+  await runRuntimeObservationHookCommand(JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: fx.nativeSessionId,
+    prompt: "Do the work"
+  }), fx.environment, async () => ({}), new Date("2026-08-06T02:00:02.000Z"));
+  fx.drain(new Date("2026-08-06T02:00:03.000Z"));
+
+  await runRuntimeObservationHookCommand(JSON.stringify({
+    hook_event_name: "PreToolUse",
+    session_id: fx.nativeSessionId,
+    tool_use_id: "toolu_runtime_1",
+    tool_name: "Read"
+  }), fx.environment, async () => ({}), new Date("2026-08-06T02:00:04.000Z"));
+  const drained = fx.drain(new Date("2026-08-06T02:00:05.000Z"));
+  assert.deepEqual(drained.failed, []);
+  const runtime = fx.store.listEvents(fx.task.id).filter(
+    (event) => event.type === "runtime.observation"
+  ).map((event) => JSON.parse(event.payload.observation));
+  assert.equal(runtime.at(-1).kind, "operation.started");
+  assert.equal(runtime.at(-1).payload.operation, "tool");
+});
+
+test("token usage observations update one bounded runtime snapshot without workflow progress", async (t) => {
+  const fx = fixture(t, "codex");
+  await runRuntimeObservationHookCommand(JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: fx.nativeSessionId,
+    prompt: "Do the work"
+  }), fx.environment, async () => ({}), new Date("2026-08-06T02:00:02.000Z"));
+  fx.drain(new Date("2026-08-06T02:00:03.000Z"));
+  const fence = {
+    taskId: fx.task.id,
+    roleName: fx.worker.name,
+    runId: fx.run.id,
+    agentId: fx.agent.id,
+    driverId: "openai/codex",
+    launchId: "launch-1",
+    sessionGenerationId: "launch-1",
+    nativeSessionId: fx.nativeSessionId,
+    nativeTurnId: fx.run.id,
+    receiptId: formatAgentRunReceiptId(fx.task.id, fx.run.id)
+  };
+  for (const [index, outputTokens] of [4, 9, 9].entries()) {
+    new FileRuntimeEventInbox(fx.home).enqueueObservation(createRuntimeObservation({
+      schemaVersion: 1,
+      eventId: `usage-${index}`,
+      kind: "activity.observed",
+      authority: "provider-structured",
+      receivedAt: `2026-08-06T02:00:0${4 + index}.000Z`,
+      sequence: index,
+      fence,
+      payload: {
+        activity: "model",
+        usage: { inputTokens: 20, outputTokens }
+      }
+    }));
+    fx.drain(new Date("2026-08-06T02:00:07.000Z"));
+  }
+  new FileRuntimeEventInbox(fx.home).enqueueObservation(createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: "usage-delayed-stale",
+    kind: "activity.observed",
+    authority: "provider-structured",
+    receivedAt: "2026-08-06T02:00:04.500Z",
+    sequence: 99,
+    fence,
+    payload: {
+      activity: "model",
+      usage: { inputTokens: 20, outputTokens: 7 }
+    }
+  }));
+  fx.drain(new Date("2026-08-06T02:00:07.000Z"));
+  const activity = fx.store.listEvents(fx.task.id).filter((event) => (
+    event.type === "runtime.observation"
+    && JSON.parse(event.payload.observation).kind === "activity.observed"
+  ));
+  assert.equal(activity.length, 2, "one usage baseline plus one confirmed activity boundary");
+  const usage = activity.map((event) => JSON.parse(event.payload.observation))
+    .find((event) => event.payload.usage !== undefined);
+  assert.equal(usage.payload.usage.outputTokens, 9);
+  assert.equal(
+    projectRuntimeTaskEvents(fence, fx.run.createdAt, fx.store.listEvents(fx.task.id))
+      .lastRuntimeActivityAt,
+    "2026-08-06T02:00:05.000Z"
+  );
+  assert.equal(
+    fx.store.listEvents(fx.task.id).some((event) => event.type === "run.progress"),
+    false
+  );
+});
+
+test("the independent Driver observer samples transcript token growth as runtime-only activity", async (t) => {
+  const fx = fixture(t, "codex");
+  const transcriptPath = join(fx.home, "codex-rollout.jsonl");
+  writeFileSync(transcriptPath, `${JSON.stringify({
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: { total_token_usage: {
+        input_tokens: 250,
+        cached_input_tokens: 200,
+        output_tokens: 15,
+        reasoning_output_tokens: 4
+      } }
+    }
+  })}\n`);
+  await runRuntimeObservationHookCommand(JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: fx.nativeSessionId,
+    turn_id: fx.run.id,
+    transcript_path: transcriptPath,
+    prompt: "Do the work"
+  }), fx.environment, async () => ({}), new Date("2026-08-06T02:00:02.000Z"));
+  fx.drain(new Date("2026-08-06T02:00:03.000Z"));
+  const observer = new AgentRuntimeObserver(
+    fx.store,
+    new FileRuntimeEventInbox(fx.home)
+  );
+  await observer.sample(new Date("2026-08-06T02:00:04.000Z"));
+  const drained = fx.drain(new Date("2026-08-06T02:00:05.000Z"));
+  assert.deepEqual(drained.failed, []);
+  const observations = fx.store.listEvents(fx.task.id).filter((event) => (
+    event.type === "runtime.observation"
+  )).map((event) => JSON.parse(event.payload.observation));
+  const activity = observations.find((event) => event.kind === "activity.observed");
+  assert.deepEqual(activity.payload.usage, {
+    inputTokens: 250,
+    outputTokens: 15,
+    cachedInputTokens: 200,
+    reasoningTokens: 4
+  });
+  assert.equal(
+    fx.store.listEvents(fx.task.id).some((event) => event.type === "run.progress"),
+    false
+  );
+});
 
 test("Claude UserPromptSubmit hook folds to provider-accepted and only then writes delivered", async (t) => {
   const fx = fixture(t, "claude");
@@ -152,7 +444,8 @@ test("Claude UserPromptSubmit hook folds to provider-accepted and only then writ
   );
   const before = new FileRuntimeEventInbox(fx.home).list();
   assert.equal(before.length, 1);
-  assert.equal(before[0].type, "native-prompt-accepted");
+  assert.equal(before[0].type, "runtime-observation");
+  assert.equal(before[0].observation.kind, "turn.accepted");
 
   // Draining folds the acceptance through the canonical contract -> delivered.
   fx.drain();
@@ -161,7 +454,7 @@ test("Claude UserPromptSubmit hook folds to provider-accepted and only then writ
   assert.ok(fx.store.listEvents(fx.task.id).some((e) => e.type === "run.delivered"));
 });
 
-test("Claude PostToolUse hook records exact in-turn provider progress without acceptance", async (t) => {
+test("Claude PostToolUse records exact Driver activity without claiming acceptance", async (t) => {
   const fx = fixture(t, "claude");
   const acceptance = JSON.stringify({
     hook_event_name: "UserPromptSubmit",
@@ -181,25 +474,27 @@ test("Claude PostToolUse hook records exact in-turn provider progress without ac
     tool_input: { file_path: "/managed/workspace/input.txt" }
   }), fx.environment, async () => ({}));
   const [queued] = new FileRuntimeEventInbox(fx.home).list();
-  assert.equal(queued.type, "native-turn-progress");
-  assert.equal(queued.progressId, "toolu_01_progress");
-  assert.equal(queued.runId, fx.run.id);
-  assert.equal(queued.nativeSessionId, fx.nativeSessionId);
+  assert.equal(queued.type, "runtime-observation");
+  assert.equal(queued.observation.kind, "operation.completed");
+  assert.equal(queued.observation.payload.operationId, "toolu_01_progress");
+  assert.equal(queued.observation.fence.runId, fx.run.id);
+  assert.equal(queued.observation.fence.nativeSessionId, fx.nativeSessionId);
 
   fx.drain();
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, deliveredAt);
-  const progress = fx.store.listEvents(fx.task.id).filter(
-    (event) => event.type === "runtime.provider-turn-progress"
-  );
+  const progress = fx.store.listEvents(fx.task.id)
+    .filter((event) => event.type === "runtime.observation")
+    .map((event) => JSON.parse(event.payload.observation))
+    .filter((observation) => observation.kind === "operation.completed");
   assert.equal(progress.length, 1);
-  assert.equal(progress[0].payload.progressId, "toolu_01_progress");
-  assert.equal(progress[0].payload.roleName, fx.worker.name);
-  assert.equal(progress[0].payload.agentId, fx.agent.id);
-  assert.equal(progress[0].payload.adapterId, "claude");
-  assert.equal(progress[0].payload.launchId, "launch-1");
+  assert.equal(progress[0].payload.operationId, "toolu_01_progress");
+  assert.equal(progress[0].fence.roleName, fx.worker.name);
+  assert.equal(progress[0].fence.agentId, fx.agent.id);
+  assert.equal(progress[0].fence.driverId, "anthropic/claude-code");
+  assert.equal(progress[0].fence.launchId, "launch-1");
 });
 
-test("delayed provider progress keeps its immutable inbox receivedAt as the activity fence", async (t) => {
+test("delayed Driver activity keeps its immutable inbox receivedAt as the activity fence", async (t) => {
   const fx = fixture(t, "claude");
   await runClaudeLifecycleHookCommand(
     JSON.stringify({
@@ -214,30 +509,39 @@ test("delayed provider progress keeps its immutable inbox receivedAt as the acti
 
   const receivedAt = new Date("2026-08-06T01:00:00.000Z");
   const inbox = new FileRuntimeEventInbox(fx.home, () => receivedAt);
-  inbox.enqueueProviderProgress({
-    scope: "task",
-    taskId: fx.task.id,
-    roleName: fx.worker.name,
-    agentId: fx.agent.id,
-    adapterId: "claude",
-    launchId: "launch-1",
-    nativeSessionId: fx.nativeSessionId,
-    runId: fx.run.id,
-    progressId: "toolu_delayed"
-  });
+  inbox.enqueueObservation(createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: "toolu_delayed",
+    kind: "operation.completed",
+    authority: "provider-structured",
+    receivedAt: receivedAt.toISOString(),
+    fence: {
+      taskId: fx.task.id,
+      roleName: fx.worker.name,
+      runId: fx.run.id,
+      agentId: fx.agent.id,
+      driverId: "anthropic/claude-code",
+      launchId: "launch-1",
+      sessionGenerationId: "launch-1",
+      nativeSessionId: fx.nativeSessionId,
+      nativeTurnId: fx.run.id,
+      receiptId: `agent-run:${fx.task.id}/${fx.run.id}`
+    },
+    payload: { operation: "tool", operationId: "toolu_delayed" }
+  }));
   const drain = new FileRuntimeEventProcessor(
     new FileRuntimeEventInbox(fx.home),
     new FileSchedulerStoreAdapter(fx.store)
   ).drain(new Date("2026-08-06T02:00:00.000Z"));
   assert.equal(drain.failed.length, 0);
-  const [progress] = fx.store.listEvents(fx.task.id).filter(
-    (event) => event.type === "runtime.provider-turn-progress"
-  );
-  assert.equal(progress.payload.progressAt, receivedAt.toISOString());
-  assert.notEqual(progress.createdAt, progress.payload.progressAt);
+  const progress = fx.store.listEvents(fx.task.id)
+    .filter((event) => event.type === "runtime.observation")
+    .map((event) => JSON.parse(event.payload.observation))
+    .find((observation) => observation.payload.operationId === "toolu_delayed");
+  assert.equal(progress.receivedAt, receivedAt.toISOString());
 });
 
-test("future provider progress is rejected at the drain boundary", async (t) => {
+test("future Driver activity is rejected at the drain boundary", async (t) => {
   const fx = fixture(t, "claude");
   await runClaudeLifecycleHookCommand(
     JSON.stringify({
@@ -252,17 +556,26 @@ test("future provider progress is rejected at the drain boundary", async (t) => 
 
   const future = new Date("2026-08-06T03:00:00.000Z");
   const inbox = new FileRuntimeEventInbox(fx.home, () => future);
-  inbox.enqueueProviderProgress({
-    scope: "task",
-    taskId: fx.task.id,
-    roleName: fx.worker.name,
-    agentId: fx.agent.id,
-    adapterId: "claude",
-    launchId: "launch-1",
-    nativeSessionId: fx.nativeSessionId,
-    runId: fx.run.id,
-    progressId: "toolu_future"
-  });
+  inbox.enqueueObservation(createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: "toolu_future",
+    kind: "operation.completed",
+    authority: "provider-structured",
+    receivedAt: future.toISOString(),
+    fence: {
+      taskId: fx.task.id,
+      roleName: fx.worker.name,
+      runId: fx.run.id,
+      agentId: fx.agent.id,
+      driverId: "anthropic/claude-code",
+      launchId: "launch-1",
+      sessionGenerationId: "launch-1",
+      nativeSessionId: fx.nativeSessionId,
+      nativeTurnId: fx.run.id,
+      receiptId: `agent-run:${fx.task.id}/${fx.run.id}`
+    },
+    payload: { operation: "tool", operationId: "toolu_future" }
+  }));
   const drain = new FileRuntimeEventProcessor(
     new FileRuntimeEventInbox(fx.home),
     new FileSchedulerStoreAdapter(fx.store)
@@ -270,8 +583,8 @@ test("future provider progress is rejected at the drain boundary", async (t) => 
   assert.equal(drain.failed.length, 0);
   assert.equal(
     fx.store.listEvents(fx.task.id).some((event) => (
-      event.type === "runtime.provider-turn-progress"
-      && event.payload.progressId === "toolu_future"
+      event.type === "runtime.observation"
+      && JSON.parse(event.payload.observation).payload.operationId === "toolu_future"
     )),
     false
   );
@@ -285,7 +598,7 @@ test("Claude PostToolUse without its provider event identity fails closed", asyn
       session_id: fx.nativeSessionId,
       tool_name: "Read"
     }), fx.environment, async () => ({})),
-    /PostToolUse id/i
+    /Tool operation id/i
   );
   assert.deepEqual(new FileRuntimeEventInbox(fx.home).list(), []);
 });
@@ -301,7 +614,8 @@ test("Codex UserPromptSubmit hook folds to provider-accepted and writes delivere
   );
   const events = new FileRuntimeEventInbox(fx.home).list();
   assert.equal(events.length, 1);
-  assert.equal(events[0].type, "native-prompt-accepted");
+  assert.equal(events[0].type, "runtime-observation");
+  assert.equal(events[0].observation.kind, "turn.accepted");
 
   fx.drain();
   assert.notEqual(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
@@ -379,8 +693,8 @@ test("hook resolves the current in-flight Run instead of a stale process YUI_RUN
     async () => ({})
   );
   const [event] = new FileRuntimeEventInbox(fx.home).list();
-  assert.equal(event.runId, fx.run.id);
-  assert.equal(event.receiptId, `agent-run:${fx.task.id}/${fx.run.id}`);
+  assert.equal(event.observation.fence.runId, fx.run.id);
+  assert.equal(event.observation.fence.receiptId, `agent-run:${fx.task.id}/${fx.run.id}`);
   fx.drain();
   assert.notEqual(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
 });
@@ -440,10 +754,11 @@ test("hook resolves a resumed Session generation from its stable runtime descrip
   );
 
   const [event] = new FileRuntimeEventInbox(fx.home).list();
-  assert.equal(event.type, "native-turn-progress");
-  assert.equal(event.runId, fx.run.id);
-  assert.equal(event.launchId, "launch-2");
-  assert.equal(event.nativeSessionId, fx.nativeSessionId);
+  assert.equal(event.type, "runtime-observation");
+  assert.equal(event.observation.kind, "operation.completed");
+  assert.equal(event.observation.fence.runId, fx.run.id);
+  assert.equal(event.observation.fence.launchId, "launch-2");
+  assert.equal(event.observation.fence.nativeSessionId, fx.nativeSessionId);
 });
 
 test("Claude SessionStart hook folds to a session-lifecycle event, never delivered", async (t) => {
@@ -455,18 +770,19 @@ test("Claude SessionStart hook folds to a session-lifecycle event, never deliver
   );
   const events = new FileRuntimeEventInbox(fx.home).list();
   assert.equal(events.length, 1);
-  assert.equal(events[0].type, "native-session-lifecycle");
-  assert.equal(events[0].sessionSource, "startup");
+  assert.equal(events[0].type, "runtime-observation");
+  assert.equal(events[0].observation.kind, "session.ready");
 
   fx.drain();
   // A readiness/session-started fact never advances acceptance.
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
-  assert.ok(fx.store.listEvents(fx.task.id).some(
-    (e) => e.type === "runtime.provider-session-lifecycle" && e.payload.preInputReady === "true"
-  ));
+  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
+    event.type === "runtime.observation"
+      && JSON.parse(event.payload.observation).kind === "session.ready"
+  )));
 });
 
-test("exact internal Claude startup is queued before its preallocated Session is durable and folds only afterward", (t) => {
+test("exact internal Claude readiness is durable under its preallocated launch reservation", (t) => {
   const fx = fixture(t, "claude", "reserved", {
     runtimeDiscovered: true,
     transportPushed: false,
@@ -530,7 +846,7 @@ test("exact internal Claude startup is queued before its preallocated Session is
     nativeSessionId: forgedNativeSessionId
   });
   writeTextFileAtomically(runtimeSource, `${serializeExactDescriptor(forgedRuntime)}\n`);
-  const forged = invoke(["internal", "claude-hook"], {
+  const forged = invoke(["internal", "runtime-hook"], {
     hook_event_name: "SessionStart",
     source: "startup",
     session_id: forgedNativeSessionId
@@ -561,12 +877,12 @@ test("exact internal Claude startup is queued before its preallocated Session is
       session_id: nativeSessionId
     }
   ]) {
-    const rejected = invoke(["internal", "claude-hook"], payload);
+    const rejected = invoke(["internal", "runtime-hook"], payload);
     assert.notEqual(rejected.status, 0, payload.hook_event_name);
     assert.equal(inbox.list().length, 0);
   }
 
-  const invoked = invoke(["internal", "claude-hook"], {
+  const invoked = invoke(["internal", "runtime-hook"], {
     hook_event_name: "SessionStart",
     source: "startup",
     session_id: nativeSessionId
@@ -575,10 +891,10 @@ test("exact internal Claude startup is queued before its preallocated Session is
 
   assert.equal(inbox.list().length, 1);
   const beforeSession = fx.drain();
-  assert.equal(beforeSession.acknowledgedEventIds.length, 0);
-  assert.equal(beforeSession.deferred.length, 1);
+  assert.equal(beforeSession.acknowledgedEventIds.length, 1);
+  assert.equal(beforeSession.deferred.length, 0);
   assert.equal(beforeSession.failed.length, 0);
-  assert.equal(inbox.list().length, 1);
+  assert.equal(inbox.list().length, 0);
   assert.equal(fx.store.getRoleSession(fx.task.id, fx.worker.name), null);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
@@ -599,14 +915,14 @@ test("exact internal Claude startup is queued before its preallocated Session is
     now: new Date("2026-08-06T02:00:01.500Z")
   });
   const afterSession = fx.drain();
-  assert.equal(afterSession.acknowledgedEventIds.length, 1);
+  assert.equal(afterSession.acknowledgedEventIds.length, 0);
   assert.equal(afterSession.deferred.length, 0);
   assert.equal(afterSession.failed.length, 0);
   assert.equal(inbox.list().length, 0);
-  assert.equal(fx.store.listEvents(fx.task.id).filter((event) => (
-    event.type === "runtime.provider-session-lifecycle"
-      && event.payload.preInputReady === "true"
-  )).length, 1);
+  assert.equal(fx.store.listEvents(fx.task.id).filter((event) => {
+    if (event.type !== "runtime.observation") return false;
+    return JSON.parse(event.payload.observation).kind === "session.ready";
+  }).length, 1);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).pushedAt, undefined);
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
   assert.equal(isRuntimeLaunchReservation(fx.store.getWorkMailbox(runtimeLifecycleTarget({
@@ -754,10 +1070,10 @@ test("Codex SessionStart hook records session-lifecycle without pre-input readin
   );
   fx.drain();
   assert.equal(fx.store.getAgentRun(fx.task.id, fx.run.id).deliveredAt, undefined);
-  // Codex SessionStart is provider-session-started only — preInputReady stays false.
-  assert.ok(fx.store.listEvents(fx.task.id).some(
-    (e) => e.type === "runtime.provider-session-lifecycle" && e.payload.preInputReady === "false"
-  ));
+  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
+    event.type === "runtime.observation"
+      && JSON.parse(event.payload.observation).kind === "session.started"
+  )));
 });
 
 test("runtime-discovered Codex SessionStart binds the provider session without a native id in launch env", async (t) => {
@@ -772,10 +1088,10 @@ test("runtime-discovered Codex SessionStart binds the provider session without a
   const session = fx.store.getRoleSession(fx.task.id, fx.worker.name);
   assert.equal(session.nativeSessionId, fx.nativeSessionId);
   assert.equal(session.launchId, "launch-1");
-  assert.ok(fx.store.listEvents(fx.task.id).some(
-    (event) => event.type === "runtime.provider-session-lifecycle"
-      && event.payload.outcome === "bind-native-session"
-  ));
+  assert.ok(fx.store.listEvents(fx.task.id).some((event) => (
+    event.type === "runtime.observation"
+      && JSON.parse(event.payload.observation).kind === "session.started"
+  )));
 });
 
 test("a UserPromptSubmit hook whose native session mismatches the launch fence fails closed", async (t) => {

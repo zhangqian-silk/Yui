@@ -25,9 +25,10 @@ Goals:
   and lightweight scheduling. JSON parse/stringify of record payloads, record
   schema validation, SQL execution, and resource inventory run off the main
   event loop.
-- A high-frequency `runtime.provider-turn-progress` event appends/upserts one
-  row in one task's telemetry table. It never rewrites global state and never
-  touches another task's rows.
+- High-frequency Agent Driver diagnostics upsert one row in one task's
+  telemetry table. Canonical `runtime.observation` state is compacted by exact
+  Run/generation instead of retained as an append-only history. Neither path
+  rewrites global state or touches another task's rows.
 - Task-local reads (messages, runs, events, work items, reviews, integrations)
   are indexed lookups scoped by `task_id`, not scans of a 36 MB document.
 - Cross-task coordination (Project locks, Integration queue, runtime cleanup,
@@ -447,9 +448,9 @@ CREATE TABLE task_projections (
 
 ### 4.4 Telemetry (bounded, latest-per-key)
 
-High-frequency `runtime.provider-turn-progress` events do **not** go to
-`events`. They go to a telemetry table that keeps only the latest row per
-`(task_id, role_name, run_id, generation, progress_id)` key:
+High-frequency Agent Driver diagnostic observations do **not** go to
+append-only semantic history. They go to a telemetry table that keeps only the
+latest row per `(task_id, role_name, run_id, generation, progress_id)` key:
 
 ```sql
 CREATE TABLE telemetry (

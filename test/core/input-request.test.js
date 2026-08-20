@@ -361,7 +361,7 @@ test("Leader request releases its active fence and answer durably queues a resum
       {
         runId: active.id,
         roleName: "leader",
-        kind: "execution-stalled",
+        kind: "workflow-not-progressing",
         classification: "truly-stalled",
         progressAt: active.createdAt,
         idleMs: "1800000",

@@ -1,4 +1,4 @@
-import type { AgentAdapterId } from "../agent/adapterCatalog.js";
+import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
 
 /**
  * Issue 04 feature flags.
@@ -16,30 +16,33 @@ export type ProviderRetryMode = "off" | "shadow" | "enforce";
 export type ProviderRetryConfig = Readonly<{
   mode: ProviderRetryMode;
   /** Adapters with in-place retry enabled (shadow or enforce). */
-  adapters: readonly AgentAdapterId[];
+  adapters: readonly string[];
   /** Idempotent yield receipt replay on resend. */
   yieldReceiptReplay: boolean;
 }>;
 
-const KNOWN_ADAPTERS: readonly AgentAdapterId[] = ["claude", "codex"];
-
-function parseAdapters(value: string | undefined): AgentAdapterId[] {
+function parseAdapters(value: string | undefined): string[] {
   if (value === undefined) return [];
-  const adapters: AgentAdapterId[] = [];
+  const supported = supportedAgentAdapterIds();
+  const supportedSet = new Set<string>(supported);
+  const adapters: string[] = [];
   for (const raw of value.split(",")) {
     const token = raw.trim().toLowerCase();
     if (token === "") continue;
     if (token === "all") {
-      for (const adapter of KNOWN_ADAPTERS) {
+      for (const adapter of supported) {
         if (!adapters.includes(adapter)) adapters.push(adapter);
       }
       continue;
     }
-    if (!KNOWN_ADAPTERS.includes(token as AgentAdapterId)) {
+    if (!/^[a-z0-9][a-z0-9._-]*$/u.test(token)) {
+      throw new Error(`Invalid Provider retry adapter: ${token}.`);
+    }
+    if (!supportedSet.has(token)) {
       throw new Error(`Unknown Provider retry adapter: ${token}.`);
     }
-    if (!adapters.includes(token as AgentAdapterId)) {
-      adapters.push(token as AgentAdapterId);
+    if (!adapters.includes(token)) {
+      adapters.push(token);
     }
   }
   return adapters;
@@ -85,5 +88,5 @@ export function providerRetryEnabledForAdapter(
   mode: Exclude<ProviderRetryMode, "off">
 ): boolean {
   return config.mode === mode
-    && config.adapters.includes(adapterId as AgentAdapterId);
+    && config.adapters.includes(adapterId);
 }

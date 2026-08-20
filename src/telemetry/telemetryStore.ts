@@ -1,8 +1,7 @@
-import type { TaskEvent } from "../event/taskEvent.js";
 import type { TelemetryMode } from "./telemetryConfig.js";
 
 /**
- * One provider progress observation routed to the telemetry sidecar.
+ * One high-volume Agent Driver observation routed to the telemetry sidecar.
  * `generation` is the launch/session generation the progress belongs to;
  * `sequence` is the provider's monotonic per-turn counter when known.
  */
@@ -95,12 +94,6 @@ export interface TelemetryReader {
    * in their cache key so bounded-mode liveness stays fresh.
    */
   revision(): number;
-  /**
-   * One synthesized `runtime.provider-turn-progress` TaskEvent per Run (the
-   * latest observation), so existing liveness/stall projections keep working
-   * when progress is no longer appended to semantic events (bounded mode).
-   */
-  latestProgressEvents(taskId: string): TaskEvent[];
 }
 
 export interface TelemetryStore extends TelemetrySink, TelemetryReader {

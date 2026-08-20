@@ -22,7 +22,7 @@ import {
   refreshReusedTaskRuntimeDescriptorSource,
   serializeExactDescriptor
 } from "../../dist/runtime/exactControlPlane.js";
-import { resolveProviderHookRunFence } from "../../dist/controller/providerHookRunFence.js";
+import { resolveRuntimeHookRunFence } from "../../dist/controller/runtimeHookRunFence.js";
 import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import {
@@ -171,7 +171,7 @@ test("a reused Hook advances its own stale exact source before the volatile fenc
     nativeSessionId: "native-1"
   });
 
-  const fence = resolveProviderHookRunFence(hookEnvironment(fx, source), "claude", "native-1");
+  const fence = resolveRuntimeHookRunFence(hookEnvironment(fx, source), "claude", "native-1");
   assert.equal(fence.runId, "agent-run-2");
   assert.equal(fence.launchId, "launch-2");
   assert.equal(fence.nativeSessionId, "native-1");
@@ -295,7 +295,7 @@ test("a stale Hook source cannot jump to a replacement native Session", (t) => {
   });
 
   assert.throws(
-    () => resolveProviderHookRunFence(hookEnvironment(fx, source), "claude", "native-1"),
+    () => resolveRuntimeHookRunFence(hookEnvironment(fx, source), "claude", "native-1"),
     /replacement native Session|cannot jump/i
   );
   assert.deepEqual(readExactTaskRuntimeDescriptorSource(source, fx.home), stale);

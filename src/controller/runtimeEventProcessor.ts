@@ -1,53 +1,14 @@
 import type { SchedulerTask } from "../scheduler/ports.js";
 import type {
   FileRuntimeEventInbox,
-  RuntimeClaudeStopFailureEvent,
   RuntimeDurableJobTerminalEvent,
   RuntimeLifecycleEvent,
-  RuntimePromptAcceptedEvent,
-  RuntimeProviderProgressEvent,
-  RuntimeSessionLifecycleEvent,
+  RuntimeObservationInboxEvent,
   RuntimeTurnCompletedEvent
 } from "./runtimeEventInbox.js";
-
-export type TaskProviderSessionLifecycle = Readonly<{
-  eventId: string;
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: "codex" | "claude";
-  launchId: string;
-  nativeSessionId: string;
-  runId?: string;
-  sessionSource?: string;
-}>;
-
-export type TaskProviderPromptAccepted = Readonly<{
-  eventId: string;
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: "codex" | "claude";
-  launchId: string;
-  nativeSessionId: string;
-  runId: string;
-  receiptId: string;
-}>;
-
-export type TaskProviderTurnProgress = Readonly<{
-  eventId: string;
-  /** Immutable inbox admission time; provider activity must not use drain time. */
-  receivedAt: string;
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: "codex" | "claude";
-  launchId: string;
-  nativeSessionId: string;
-  runId: string;
-  progressId: string;
-  sequence?: number;
-}>;
+import type { RuntimeObservation } from "../runtime/runtimeObservation.js";
+import type { AgentDriverRegistry } from "../runtime/agentDriver.js";
+import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 
 export type ProviderLifecycleObservation = "applied" | "obsolete" | "deferred";
 
@@ -76,25 +37,15 @@ export type GlobalRuntimeTurnCompleted = Readonly<{
   summary: string;
 }>;
 
-export type TaskClaudeStopFailureEvent = Readonly<{
-  eventId: string;
-  type: "claude-stop-failure";
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: "claude";
-  launchId: string;
-  nativeSessionId: string;
-  runId: string;
-  error: string;
-  errorDetails?: string;
-  lastAssistantMessage?: string;
-}>;
-
 export type RuntimeTurnEventObserver = Readonly<{
   /** Batch multiple inbox folds into one authoritative aggregate commit. */
   withRuntimeEventTransaction?<T>(execute: () => T): T;
   getTask(taskId: string): SchedulerTask | null;
+  /** Applies one provider-neutral runtime state/activity observation. */
+  observeRuntimeObservation?(
+    input: RuntimeObservation,
+    now?: Date
+  ): ProviderLifecycleObservation;
   observeRuntimeTurnCompleted(
     input: TaskRuntimeTurnCompleted,
     now?: Date
@@ -109,13 +60,6 @@ export type RuntimeTurnEventObserver = Readonly<{
   classifyGlobalRuntimeTurnCompleted?(
     input: GlobalRuntimeTurnCompleted
   ): "apply" | "obsolete";
-  classifyClaudeStopFailureEvent?(
-    input: TaskClaudeStopFailureEvent
-  ): "apply" | "obsolete";
-  observeClaudeStopFailureEvent?(
-    input: TaskClaudeStopFailureEvent,
-    now?: Date
-  ): unknown;
   observeObsoleteRuntimeEvent?(
     input: Readonly<{
       eventId: string;
@@ -130,21 +74,6 @@ export type RuntimeTurnEventObserver = Readonly<{
     }>,
     now?: Date
   ): unknown;
-  /** Folds a provider session-lifecycle fact through the canonical contract. */
-  observeProviderSessionLifecycle?(
-    input: TaskProviderSessionLifecycle,
-    now?: Date
-  ): ProviderLifecycleObservation;
-  /** Folds a provider prompt-acceptance fact; only this may advance delivered. */
-  observeProviderPromptAccepted?(
-    input: TaskProviderPromptAccepted,
-    now?: Date
-  ): ProviderLifecycleObservation;
-  /** Folds a provider-native in-turn progress fact through the canonical contract. */
-  observeProviderTurnProgress?(
-    input: TaskProviderTurnProgress,
-    now?: Date
-  ): ProviderLifecycleObservation;
 }>;
 
 export type RuntimeEventDrainFailure = Readonly<{
@@ -184,13 +113,15 @@ export type TaskRuntimeAppliedInput = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
-  adapterId: "codex" | "claude";
+  adapterId: string;
   launchId?: string;
   nativeSessionId: string;
   runId?: string;
 }>;
 
 export type FileRuntimeEventProcessorOptions = Readonly<{
+  /** Runtime-observation Driver catalog used to resolve Driver/adapter identity. */
+  drivers?: AgentDriverRegistry;
   onTaskRuntimeApplied?: (input: TaskRuntimeAppliedInput) => void;
   /** Maximum folded representatives in one state transaction. */
   maxEventsPerDrain?: number;
@@ -219,11 +150,15 @@ const DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN = 64;
 
 /** Folds immutable Hook facts in one bounded transaction before acknowledging them. */
 export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
+  private readonly drivers: AgentDriverRegistry;
+
   constructor(
     private readonly inbox: RuntimeEventInboxPort,
     private readonly observer: RuntimeTurnEventObserver,
     private readonly options: FileRuntimeEventProcessorOptions = {}
-  ) {}
+  ) {
+    this.drivers = options.drivers ?? builtinAgentDriverRegistry();
+  }
 
   drain(now: Date): RuntimeEventDrainResult {
     const acknowledgedEventIds: string[] = [];
@@ -277,16 +212,14 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       }
     }
     const progressEventsSelected = selected.filter(({ event }) => (
-      event.type === "native-turn-progress"
+      isRuntimeActivityEvent(event)
     )).length;
     const representedEventCount = selected.reduce((count, candidate) => (
       count + candidate.representedEventIds.length
     ), 0);
     const acknowledged = new Set(acknowledgedEventIds);
     const remaining = events.filter(({ id }) => !acknowledged.has(id));
-    const remainingProgressEventCount = remaining.filter(({ type }) => (
-      type === "native-turn-progress"
-    )).length;
+    const remainingProgressEventCount = remaining.filter(isRuntimeActivityEvent).length;
     return {
       acknowledgedEventIds,
       deferred,
@@ -313,30 +246,37 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     let outcome: "applied" | "deferred" | "obsolete" = "applied";
     if (event.type === "native-turn-completed") {
       outcome = this.applyCodex(event, now);
-    } else if (event.type === "claude-stop-failure") {
-      this.applyClaudeStopFailure(event, now);
-    } else if (event.type === "native-session-lifecycle") {
-      outcome = this.applySessionLifecycle(event, now);
-    } else if (event.type === "native-turn-progress") {
-      outcome = this.applyProviderTurnProgress(event, now);
-    } else if (event.type === "durable-job-terminal") {
+    } else if (event.type === "runtime-observation") {
+      outcome = this.applyRuntimeObservation(event, now);
+    } else {
       // f7/rr5: The supervisor already transitioned the job and
       // enqueued the Leader wakeup. This event is the durable terminal
       // channel: acknowledge it so the Controller's event pipeline
       // converges without re-processing. No state change to apply.
       this.applyDurableJobTerminal(event);
-    } else {
-      outcome = this.applyPromptAccepted(event, now);
     }
     return {
       candidate,
       outcome,
       notifyTaskRuntime: outcome === "applied" && (
-        event.type === "native-session-lifecycle"
-        || event.type === "native-prompt-accepted"
+        (event.type === "runtime-observation" && event.scope === "task"
+          && ["session.started", "session.ready", "turn.accepted", "turn.completed"]
+            .includes(event.observation.kind))
         || (event.type === "native-turn-completed" && event.scope === "task")
       )
     };
+  }
+
+  private applyRuntimeObservation(
+    event: RuntimeObservationInboxEvent,
+    now: Date
+  ): "applied" | "deferred" | "obsolete" {
+    const taskId = event.observation.fence.taskId;
+    if (taskId !== undefined) {
+      const task = this.observer.getTask(taskId);
+      if (task === null || task.status !== "active") return "obsolete";
+    }
+    return this.observer.observeRuntimeObservation?.(event.observation, now) ?? "obsolete";
   }
 
   private finalizeOne(
@@ -357,64 +297,39 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       }
       if (folded.notifyTaskRuntime) {
         const event = candidate.event;
-        if (event.scope === "task" && event.taskId !== undefined && event.type !== "durable-job-terminal") {
-          this.options.onTaskRuntimeApplied?.({
-            taskId: event.taskId,
-            roleName: event.roleName,
-            agentId: event.agentId,
-            adapterId: event.adapterId,
-            ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
-            nativeSessionId: event.nativeSessionId,
-            ...(event.runId === undefined ? {} : { runId: event.runId })
-          });
+        if (event.scope === "task"
+          && event.taskId !== undefined
+          && event.type !== "durable-job-terminal") {
+          if (event.type === "runtime-observation") {
+            const fence = event.observation.fence;
+            if (fence.taskId !== undefined && fence.nativeSessionId !== undefined) {
+              this.options.onTaskRuntimeApplied?.({
+                taskId: fence.taskId,
+                roleName: fence.roleName,
+                agentId: fence.agentId,
+                adapterId: this.drivers.require(fence.driverId).adapterId,
+                launchId: fence.launchId,
+                nativeSessionId: fence.nativeSessionId,
+                ...(fence.runId === undefined ? {} : { runId: fence.runId })
+              });
+            }
+          } else if (event.type === "native-turn-completed") {
+            this.options.onTaskRuntimeApplied?.({
+              taskId: event.taskId,
+              roleName: event.roleName,
+              agentId: event.agentId,
+              adapterId: event.adapterId,
+              ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
+              nativeSessionId: event.nativeSessionId,
+              ...(event.runId === undefined ? {} : { runId: event.runId })
+            });
+          }
         }
       }
       this.acknowledge(candidate.representedEventIds, acknowledged);
     } catch (error) {
       failed.push({ eventId: candidate.event.id, error });
     }
-  }
-
-  private applySessionLifecycle(
-    event: RuntimeSessionLifecycleEvent,
-    now: Date
-  ): "applied" | "deferred" | "obsolete" {
-    const task = this.observer.getTask(event.taskId);
-    if (task === null || task.status !== "active") return "obsolete";
-    if (this.observer.observeProviderSessionLifecycle === undefined) return "obsolete";
-    const outcome = this.observer.observeProviderSessionLifecycle({
-      eventId: event.id,
-      taskId: event.taskId,
-      roleName: event.roleName,
-      agentId: event.agentId,
-      adapterId: event.adapterId,
-      launchId: event.launchId,
-      nativeSessionId: event.nativeSessionId,
-      ...(event.runId === undefined ? {} : { runId: event.runId }),
-      ...(event.sessionSource === undefined ? {} : { sessionSource: event.sessionSource })
-    }, now);
-    return outcome === "deferred" ? "deferred" : outcome;
-  }
-
-  private applyPromptAccepted(
-    event: RuntimePromptAcceptedEvent,
-    now: Date
-  ): "applied" | "deferred" | "obsolete" {
-    const task = this.observer.getTask(event.taskId);
-    if (task === null || task.status !== "active") return "obsolete";
-    if (this.observer.observeProviderPromptAccepted === undefined) return "obsolete";
-    const outcome = this.observer.observeProviderPromptAccepted({
-      eventId: event.id,
-      taskId: event.taskId,
-      roleName: event.roleName,
-      agentId: event.agentId,
-      adapterId: event.adapterId,
-      launchId: event.launchId,
-      nativeSessionId: event.nativeSessionId,
-      runId: event.runId,
-      receiptId: event.receiptId
-    }, now);
-    return outcome === "deferred" ? "deferred" : outcome;
   }
 
   /**
@@ -427,29 +342,6 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     // call is needed — the Leader wakeup was enqueued in the same
     // transaction as the terminal transition.
     void event;
-  }
-
-  private applyProviderTurnProgress(
-    event: RuntimeProviderProgressEvent,
-    now: Date
-  ): "applied" | "deferred" | "obsolete" {
-    const task = this.observer.getTask(event.taskId);
-    if (task === null || task.status !== "active") return "obsolete";
-    if (this.observer.observeProviderTurnProgress === undefined) return "obsolete";
-    const outcome = this.observer.observeProviderTurnProgress({
-      eventId: event.id,
-      receivedAt: event.receivedAt,
-      taskId: event.taskId,
-      roleName: event.roleName,
-      agentId: event.agentId,
-      adapterId: event.adapterId,
-      launchId: event.launchId,
-      nativeSessionId: event.nativeSessionId,
-      runId: event.runId,
-      progressId: event.progressId,
-      ...(event.sequence === undefined ? {} : { sequence: event.sequence })
-    }, now);
-    return outcome === "deferred" ? "deferred" : "applied";
   }
 
   private applyCodex(
@@ -510,49 +402,24 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     return "obsolete";
   }
 
-  private applyClaudeStopFailure(
-    event: RuntimeClaudeStopFailureEvent,
-    now: Date
-  ): void {
-    const task = this.observer.getTask(event.taskId);
-    if (task === null) return;
-    const input: TaskClaudeStopFailureEvent = {
-      eventId: event.id,
-      type: event.type,
-      taskId: event.taskId,
-      roleName: event.roleName,
-      agentId: event.agentId,
-      adapterId: event.adapterId,
-      launchId: event.launchId,
-      nativeSessionId: event.nativeSessionId,
-      runId: event.runId,
-      error: event.error,
-      ...(event.errorDetails === undefined ? {} : { errorDetails: event.errorDetails }),
-      ...(event.lastAssistantMessage === undefined
-        ? {}
-        : { lastAssistantMessage: event.lastAssistantMessage })
-    };
-    if (task.status !== "active"
-      || this.observer.classifyClaudeStopFailureEvent?.(input) === "obsolete") {
-      this.recordObsolete(
-        event,
-        task.status === "archived"
-          ? "task-archived"
-          : task.status !== "active"
-            ? "task-retired"
-            : "identity-mismatch-or-terminal",
-        now
-      );
-      return;
-    }
-    if (this.observer.observeClaudeStopFailureEvent === undefined) {
-      throw new Error("Claude StopFailure observer is unavailable.");
-    }
-    this.observer.observeClaudeStopFailureEvent(input, now);
-  }
-
   private recordObsolete(event: RuntimeLifecycleEvent, reason: string, now: Date): void {
     if (event.scope !== "task" || event.taskId === undefined) return;
+    if (event.type === "runtime-observation") {
+      const fence = event.observation.fence;
+      if (fence.nativeSessionId === undefined) return;
+      this.observer.observeObsoleteRuntimeEvent?.({
+        eventId: event.id,
+        eventType: event.type,
+        taskId: event.taskId,
+        roleName: fence.roleName,
+        agentId: fence.agentId,
+        ...(fence.runId === undefined ? {} : { runId: fence.runId }),
+        launchId: fence.launchId,
+        nativeSessionId: fence.nativeSessionId,
+        reason
+      }, now);
+      return;
+    }
     // durable-job-terminal events have no provider identity; they are never
     // recorded as obsolete.
     if (!("roleName" in event) || !("nativeSessionId" in event)) return;
@@ -585,64 +452,43 @@ export function coalesceRuntimeProgress(
   instrumentation: RuntimeProgressCoalescingInstrumentation = {}
 ): CoalescedRuntimeEvent[] {
   const result: CoalescedRuntimeEvent[] = [];
-  let segment: RuntimeProviderProgressEvent[] = [];
+  let segment: RuntimeObservationInboxEvent[] = [];
   const flush = (): void => {
     if (segment.length === 0) return;
-    const frontiers = new Map<string, Readonly<{
-      latestReceivedAt: string;
-      greatestSequence?: number;
-      firstLatestIndex: number;
-      firstGreatestSequenceIndex?: number;
-    }>>();
+    const indicesByStream = new Map<string, number[]>();
     for (let index = 0; index < segment.length; index += 1) {
       instrumentation.onProgressVisit?.();
       const event = segment[index]!;
       const key = progressStreamKey(event);
-      const frontier = frontiers.get(key);
-      if (frontier === undefined || event.receivedAt > frontier.latestReceivedAt) {
-        frontiers.set(key, {
-          latestReceivedAt: event.receivedAt,
-          ...(event.sequence === undefined
-            ? {}
-            : {
-                greatestSequence: event.sequence,
-                firstGreatestSequenceIndex: index
-              }),
-          firstLatestIndex: index
-        });
-      } else if (
-        event.receivedAt === frontier.latestReceivedAt
-        && event.sequence !== undefined
-        && (
-          frontier.greatestSequence === undefined
-          || event.sequence > frontier.greatestSequence
-        )
-      ) {
-        frontiers.set(key, {
-          ...frontier,
-          greatestSequence: event.sequence,
-          firstGreatestSequenceIndex: index
-        });
-      }
+      const indices = indicesByStream.get(key) ?? [];
+      indices.push(index);
+      indicesByStream.set(key, indices);
     }
     const representedByIndex = new Map<number, string[]>();
-    for (let index = 0; index < segment.length; index += 1) {
-      instrumentation.onProgressVisit?.();
-      const event = segment[index]!;
-      const frontier = frontiers.get(progressStreamKey(event))!;
-      const strictlyDominated = event.receivedAt < frontier.latestReceivedAt
-        || (
-          event.receivedAt === frontier.latestReceivedAt
-          && event.sequence !== undefined
-          && frontier.greatestSequence !== undefined
-          && event.sequence < frontier.greatestSequence
+    for (const indices of indicesByStream.values()) {
+      const hasUsage = segment[indices[0]!]!.observation.payload.usage !== undefined;
+      const retainedPositions = hasUsage ? [0] : [];
+      if (hasUsage) {
+        for (let position = 1; position < indices.length; position += 1) {
+          const previous = segment[indices[position - 1]!]!.observation.payload.usage!;
+          const current = segment[indices[position]!]!.observation.payload.usage!;
+          if (runtimeUsageTotal(current) < runtimeUsageTotal(previous)) {
+            retainedPositions.push(position);
+          }
+        }
+      }
+      const lastPosition = indices.length - 1;
+      if (retainedPositions.at(-1) !== lastPosition) retainedPositions.push(lastPosition);
+      let previousRetainedPosition = -1;
+      for (const retainedPosition of retainedPositions) {
+        const retainedIndex = indices[retainedPosition]!;
+        representedByIndex.set(
+          retainedIndex,
+          indices.slice(previousRetainedPosition + 1, retainedPosition + 1)
+            .map((index) => segment[index]!.id)
         );
-      const representativeIndex = strictlyDominated
-        ? frontier.firstGreatestSequenceIndex ?? frontier.firstLatestIndex
-        : index;
-      const represented = representedByIndex.get(representativeIndex) ?? [];
-      represented.push(event.id);
-      representedByIndex.set(representativeIndex, represented);
+        previousRetainedPosition = retainedPosition;
+      }
     }
     for (let index = 0; index < segment.length; index += 1) {
       const representedEventIds = representedByIndex.get(index);
@@ -652,7 +498,7 @@ export function coalesceRuntimeProgress(
     segment = [];
   };
   for (const event of events) {
-    if (event.type !== "native-turn-progress") {
+    if (!isRuntimeActivityEvent(event)) {
       flush();
       result.push({ event, representedEventIds: [event.id] });
       continue;
@@ -667,22 +513,36 @@ function selectDrainBatch(
   events: readonly CoalescedRuntimeEvent[],
   maximum: number
 ): CoalescedRuntimeEvent[] {
-  // A batch is always an arrival-order prefix. Admission and drain coalescing
-  // keep a progress flood bounded without allowing a later semantic fact to
+  // A batch is always an arrival-order prefix. Drain-time coalescing bounds
+  // worker folds without allowing a later semantic fact to
   // overtake an earlier progress fence from another Run.
   return events.slice(0, maximum);
 }
 
-function progressStreamKey(event: RuntimeProviderProgressEvent): string {
+function progressStreamKey(event: RuntimeObservationInboxEvent): string {
+  const { fence, payload } = event.observation;
   return JSON.stringify([
-    event.taskId,
-    event.roleName,
-    event.agentId,
-    event.adapterId,
-    event.launchId,
-    event.nativeSessionId,
-    event.runId
+    fence.taskId ?? null,
+    fence.roleName,
+    fence.agentId,
+    fence.driverId,
+    fence.launchId,
+    fence.nativeSessionId ?? null,
+    fence.runId ?? null,
+    payload.activity,
+    payload.usage === undefined ? "signal" : "usage"
   ]);
+}
+
+function runtimeUsageTotal(usage: Readonly<{ inputTokens: number; outputTokens: number }>): number {
+  return usage.inputTokens + usage.outputTokens;
+}
+
+function isRuntimeActivityEvent(
+  event: RuntimeLifecycleEvent
+): event is RuntimeObservationInboxEvent {
+  return event.type === "runtime-observation"
+    && event.observation.kind === "activity.observed";
 }
 
 function emptyDrainFailure(error: unknown): RuntimeEventDrainResult {
@@ -728,6 +588,10 @@ function isObsoleteRuntimeTurnObservation(value: unknown): boolean {
  */
 export type AsyncRuntimeTurnEventObserver = Readonly<{
   getTask(taskId: string): Promise<SchedulerTask | null>;
+  observeRuntimeObservation?(
+    input: RuntimeObservation,
+    now?: Date
+  ): Promise<ProviderLifecycleObservation>;
   observeRuntimeTurnCompleted(
     input: TaskRuntimeTurnCompleted,
     now?: Date
@@ -742,13 +606,6 @@ export type AsyncRuntimeTurnEventObserver = Readonly<{
   classifyGlobalRuntimeTurnCompleted?(
     input: GlobalRuntimeTurnCompleted
   ): Promise<"apply" | "obsolete">;
-  classifyClaudeStopFailureEvent?(
-    input: TaskClaudeStopFailureEvent
-  ): Promise<"apply" | "obsolete">;
-  observeClaudeStopFailureEvent?(
-    input: TaskClaudeStopFailureEvent,
-    now?: Date
-  ): Promise<unknown>;
   observeObsoleteRuntimeEvent?(
     input: Readonly<{
       eventId: string;
@@ -763,18 +620,6 @@ export type AsyncRuntimeTurnEventObserver = Readonly<{
     }>,
     now?: Date
   ): Promise<unknown>;
-  observeProviderSessionLifecycle?(
-    input: TaskProviderSessionLifecycle,
-    now?: Date
-  ): Promise<ProviderLifecycleObservation>;
-  observeProviderPromptAccepted?(
-    input: TaskProviderPromptAccepted,
-    now?: Date
-  ): Promise<ProviderLifecycleObservation>;
-  observeProviderTurnProgress?(
-    input: TaskProviderTurnProgress,
-    now?: Date
-  ): Promise<ProviderLifecycleObservation>;
 }>;
 
 /** A generic invoker that ships an observer call to the worker (AsyncTaskStoreClient.invokeObserver). */
@@ -792,16 +637,11 @@ export function createAsyncRuntimeObserver(invoke: AsyncObserverInvoker): AsyncR
     now === undefined ? call(method, [input]) : call(method, [input, now]);
   return {
     getTask: (taskId) => call("getTask", [taskId]) as Promise<SchedulerTask | null>,
+    observeRuntimeObservation: (input, now) =>
+      withNow("observeRuntimeObservation", input, now) as Promise<ProviderLifecycleObservation>,
     observeRuntimeTurnCompleted: (input, now) => withNow("observeRuntimeTurnCompleted", input, now),
     observeGlobalRuntimeTurnCompleted: (input, now) => withNow("observeGlobalRuntimeTurnCompleted", input, now),
-    observeClaudeStopFailureEvent: (input, now) => withNow("observeClaudeStopFailureEvent", input, now),
-    observeObsoleteRuntimeEvent: (input, now) => withNow("observeObsoleteRuntimeEvent", input, now),
-    observeProviderSessionLifecycle: (input, now) =>
-      withNow("observeProviderSessionLifecycle", input, now) as Promise<ProviderLifecycleObservation>,
-    observeProviderPromptAccepted: (input, now) =>
-      withNow("observeProviderPromptAccepted", input, now) as Promise<ProviderLifecycleObservation>,
-    observeProviderTurnProgress: (input, now) =>
-      withNow("observeProviderTurnProgress", input, now) as Promise<ProviderLifecycleObservation>
+    observeObsoleteRuntimeEvent: (input, now) => withNow("observeObsoleteRuntimeEvent", input, now)
   };
 }
 
@@ -812,11 +652,15 @@ export function createAsyncRuntimeObserver(invoke: AsyncObserverInvoker): AsyncR
  * thread; only the db-touching folds are proxied to the worker.
  */
 export class AsyncRuntimeEventProcessor {
+  private readonly drivers: AgentDriverRegistry;
+
   constructor(
-    private readonly inbox: Pick<FileRuntimeEventInbox, "list" | "acknowledge">,
+    private readonly inbox: RuntimeEventInboxPort,
     private readonly observer: AsyncRuntimeTurnEventObserver,
     private readonly options: FileRuntimeEventProcessorOptions = {}
-  ) {}
+  ) {
+    this.drivers = options.drivers ?? builtinAgentDriverRegistry();
+  }
 
   async drainAsync(now: Date): Promise<RuntimeEventDrainResult> {
     const acknowledgedEventIds: string[] = [];
@@ -828,53 +672,48 @@ export class AsyncRuntimeEventProcessor {
     } catch (error) {
       return emptyDrainFailure(error);
     }
-    for (const event of events) {
+    const coalesced = coalesceRuntimeProgress(events);
+    const maximum = positiveInteger(
+      this.options.maxEventsPerDrain,
+      DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN
+    );
+    const selected = selectDrainBatch(coalesced, maximum);
+    for (const candidate of selected) {
+      const event = candidate.event;
       try {
+        let outcome: "applied" | "deferred" | "obsolete" = "applied";
         if (event.type === "native-turn-completed") {
-          const outcome = await this.applyCodex(event, now);
-          if (outcome === "deferred") {
-            deferred.push(event);
-            continue;
-          }
-        } else if (event.type === "claude-stop-failure") {
-          await this.applyClaudeStopFailure(event, now);
-        } else if (event.type === "native-session-lifecycle") {
-          const outcome = await this.applySessionLifecycle(event, now);
-          if (outcome === "deferred") {
-            deferred.push(event);
-            continue;
-          }
-        } else if (event.type === "native-turn-progress") {
-          const outcome = await this.applyProviderTurnProgress(event, now);
-          if (outcome === "deferred") {
-            deferred.push(event);
-            continue;
-          }
-        } else if (event.type === "durable-job-terminal") {
+          outcome = await this.applyCodex(event, now);
+        } else if (event.type === "runtime-observation") {
+          outcome = await this.applyRuntimeObservation(event, now);
+        } else {
           // f7/rr5: The supervisor already transitioned the job and
           // enqueued the Leader wakeup. This event is the durable terminal
           // channel: acknowledge it so the pipeline converges without
           // re-processing. No state change to apply.
-        } else {
-          const outcome = await this.applyPromptAccepted(event, now);
-          if (outcome === "deferred") {
-            deferred.push(event);
-            continue;
-          }
         }
-        this.acknowledge(event.id, acknowledgedEventIds);
+        if (outcome === "deferred") {
+          deferred.push(event);
+          this.acknowledge(
+            candidate.representedEventIds.filter((id) => id !== event.id),
+            acknowledgedEventIds
+          );
+          continue;
+        }
+        this.acknowledge(candidate.representedEventIds, acknowledgedEventIds);
       } catch (error) {
         failed.push({ eventId: event.id, error });
       }
     }
     const acknowledged = new Set(acknowledgedEventIds);
     const remaining = events.filter(({ id }) => !acknowledged.has(id));
-    const progressEventsSelected = events.filter(({ type }) => (
-      type === "native-turn-progress"
+    const progressEventsSelected = selected.filter(({ event }) => (
+      isRuntimeActivityEvent(event)
     )).length;
-    const remainingProgressEventCount = remaining.filter(({ type }) => (
-      type === "native-turn-progress"
-    )).length;
+    const representedEventCount = selected.reduce((count, candidate) => (
+      count + candidate.representedEventIds.length
+    ), 0);
+    const remainingProgressEventCount = remaining.filter(isRuntimeActivityEvent).length;
     return {
       acknowledgedEventIds,
       deferred,
@@ -882,10 +721,10 @@ export class AsyncRuntimeEventProcessor {
       remainingEventCount: remaining.length,
       metrics: {
         listedEventCount: events.length,
-        selectedEventCount: events.length,
-        semanticEventsSelected: events.length - progressEventsSelected,
+        selectedEventCount: selected.length,
+        semanticEventsSelected: selected.length - progressEventsSelected,
         progressEventsSelected,
-        progressEventsCoalesced: 0,
+        progressEventsCoalesced: representedEventCount - selected.length,
         stateTransactions: 0,
         remainingSemanticEventCount: remaining.length - remainingProgressEventCount,
         remainingProgressEventCount
@@ -893,91 +732,34 @@ export class AsyncRuntimeEventProcessor {
     };
   }
 
-  private async applySessionLifecycle(
-    event: RuntimeSessionLifecycleEvent,
+  private async applyRuntimeObservation(
+    event: RuntimeObservationInboxEvent,
     now: Date
   ): Promise<"applied" | "deferred" | "obsolete"> {
-    const task = await this.observer.getTask(event.taskId);
-    if (task === null || task.status !== "active") return "obsolete";
-    if (this.observer.observeProviderSessionLifecycle === undefined) return "obsolete";
-    const outcome = await this.observer.observeProviderSessionLifecycle({
-      eventId: event.id,
-      taskId: event.taskId,
-      roleName: event.roleName,
-      agentId: event.agentId,
-      adapterId: event.adapterId,
-      launchId: event.launchId,
-      nativeSessionId: event.nativeSessionId,
-      ...(event.runId === undefined ? {} : { runId: event.runId }),
-      ...(event.sessionSource === undefined ? {} : { sessionSource: event.sessionSource })
-    }, now);
-    if (outcome === "applied") {
+    const taskId = event.observation.fence.taskId;
+    if (taskId !== undefined) {
+      const task = await this.observer.getTask(taskId);
+      if (task === null || task.status !== "active") return "obsolete";
+    }
+    const outcome = (await this.observer.observeRuntimeObservation?.(event.observation, now))
+      ?? "obsolete";
+    const fence = event.observation.fence;
+    if (outcome === "applied"
+      && fence.taskId !== undefined
+      && fence.nativeSessionId !== undefined
+      && ["session.started", "session.ready", "turn.accepted", "turn.completed"]
+        .includes(event.observation.kind)) {
       this.options.onTaskRuntimeApplied?.({
-        taskId: event.taskId,
-        roleName: event.roleName,
-        agentId: event.agentId,
-        adapterId: event.adapterId,
-        launchId: event.launchId,
-        nativeSessionId: event.nativeSessionId,
-        ...(event.runId === undefined ? {} : { runId: event.runId })
+        taskId: fence.taskId,
+        roleName: fence.roleName,
+        agentId: fence.agentId,
+        adapterId: this.drivers.require(fence.driverId).adapterId,
+        launchId: fence.launchId,
+        nativeSessionId: fence.nativeSessionId,
+        ...(fence.runId === undefined ? {} : { runId: fence.runId })
       });
     }
-    return outcome === "deferred" ? "deferred" : outcome;
-  }
-
-  private async applyPromptAccepted(
-    event: RuntimePromptAcceptedEvent,
-    now: Date
-  ): Promise<"applied" | "deferred" | "obsolete"> {
-    const task = await this.observer.getTask(event.taskId);
-    if (task === null || task.status !== "active") return "obsolete";
-    if (this.observer.observeProviderPromptAccepted === undefined) return "obsolete";
-    const outcome = await this.observer.observeProviderPromptAccepted({
-      eventId: event.id,
-      taskId: event.taskId,
-      roleName: event.roleName,
-      agentId: event.agentId,
-      adapterId: event.adapterId,
-      launchId: event.launchId,
-      nativeSessionId: event.nativeSessionId,
-      runId: event.runId,
-      receiptId: event.receiptId
-    }, now);
-    if (outcome === "applied") {
-      this.options.onTaskRuntimeApplied?.({
-        taskId: event.taskId,
-        roleName: event.roleName,
-        agentId: event.agentId,
-        adapterId: event.adapterId,
-        launchId: event.launchId,
-        nativeSessionId: event.nativeSessionId,
-        runId: event.runId
-      });
-    }
-    return outcome === "deferred" ? "deferred" : outcome;
-  }
-
-  private async applyProviderTurnProgress(
-    event: RuntimeProviderProgressEvent,
-    now: Date
-  ): Promise<"applied" | "deferred" | "obsolete"> {
-    const task = await this.observer.getTask(event.taskId);
-    if (task === null || task.status !== "active") return "obsolete";
-    if (this.observer.observeProviderTurnProgress === undefined) return "obsolete";
-    const outcome = await this.observer.observeProviderTurnProgress({
-      eventId: event.id,
-      receivedAt: event.receivedAt,
-      taskId: event.taskId,
-      roleName: event.roleName,
-      agentId: event.agentId,
-      adapterId: event.adapterId,
-      launchId: event.launchId,
-      nativeSessionId: event.nativeSessionId,
-      runId: event.runId,
-      progressId: event.progressId,
-      ...(event.sequence === undefined ? {} : { sequence: event.sequence })
-    }, now);
-    return outcome === "deferred" ? "deferred" : "applied";
+    return outcome;
   }
 
   private async applyCodex(
@@ -1047,49 +829,24 @@ export class AsyncRuntimeEventProcessor {
     return "obsolete";
   }
 
-  private async applyClaudeStopFailure(
-    event: RuntimeClaudeStopFailureEvent,
-    now: Date
-  ): Promise<void> {
-    const task = await this.observer.getTask(event.taskId);
-    if (task === null) return;
-    const input: TaskClaudeStopFailureEvent = {
-      eventId: event.id,
-      type: event.type,
-      taskId: event.taskId,
-      roleName: event.roleName,
-      agentId: event.agentId,
-      adapterId: event.adapterId,
-      launchId: event.launchId,
-      nativeSessionId: event.nativeSessionId,
-      runId: event.runId,
-      error: event.error,
-      ...(event.errorDetails === undefined ? {} : { errorDetails: event.errorDetails }),
-      ...(event.lastAssistantMessage === undefined
-        ? {}
-        : { lastAssistantMessage: event.lastAssistantMessage })
-    };
-    if (task.status !== "active"
-      || (await this.observer.classifyClaudeStopFailureEvent?.(input)) === "obsolete") {
-      await this.recordObsolete(
-        event,
-        task.status === "archived"
-          ? "task-archived"
-          : task.status !== "active"
-            ? "task-retired"
-            : "identity-mismatch-or-terminal",
-        now
-      );
-      return;
-    }
-    if (this.observer.observeClaudeStopFailureEvent === undefined) {
-      throw new Error("Claude StopFailure observer is unavailable.");
-    }
-    await this.observer.observeClaudeStopFailureEvent(input, now);
-  }
-
   private async recordObsolete(event: RuntimeLifecycleEvent, reason: string, now: Date): Promise<void> {
     if (event.scope !== "task" || event.taskId === undefined || event.type === "durable-job-terminal") return;
+    if (event.type === "runtime-observation") {
+      const fence = event.observation.fence;
+      if (fence.nativeSessionId === undefined) return;
+      await this.observer.observeObsoleteRuntimeEvent?.({
+        eventId: event.id,
+        eventType: event.type,
+        taskId: event.taskId,
+        roleName: fence.roleName,
+        agentId: fence.agentId,
+        ...(fence.runId === undefined ? {} : { runId: fence.runId }),
+        launchId: fence.launchId,
+        nativeSessionId: fence.nativeSessionId,
+        reason
+      }, now);
+      return;
+    }
     await this.observer.observeObsoleteRuntimeEvent?.({
       eventId: event.id,
       eventType: event.type,
@@ -1103,8 +860,13 @@ export class AsyncRuntimeEventProcessor {
     }, now);
   }
 
-  private acknowledge(id: string, acknowledged: string[]): void {
-    this.inbox.acknowledge(id);
-    acknowledged.push(id);
+  private acknowledge(ids: readonly string[], acknowledged: string[]): void {
+    if (this.inbox.acknowledgeMany !== undefined) {
+      acknowledged.push(...this.inbox.acknowledgeMany(ids));
+      return;
+    }
+    for (const id of ids) {
+      if (this.inbox.acknowledge(id)) acknowledged.push(id);
+    }
   }
 }

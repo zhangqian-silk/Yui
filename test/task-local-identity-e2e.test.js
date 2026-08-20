@@ -11,7 +11,13 @@ import {
   dispatchPreparedReviewRound,
   runTaskCommand
 } from "../dist/commands/taskCommands.js";
-import { runClaudeLifecycleHookCommand } from "../dist/controller/claudeLifecycleHook.js";
+import { runRuntimeObservationHookCommand } from "../dist/controller/runtimeObservationHook.js";
+const runClaudeLifecycleHookCommand = (payload, environment, ...rest) => (
+  runRuntimeObservationHookCommand(payload, {
+    ...environment,
+    YUI_DRIVER_ID: "anthropic/claude-code"
+  }, ...rest)
+);
 import { FileSchedulerStoreAdapter } from "../dist/controller/fileSchedulerStoreAdapter.js";
 import { FileRuntimeEventInbox } from "../dist/controller/runtimeEventInbox.js";
 import { FileRuntimeEventProcessor } from "../dist/controller/runtimeEventProcessor.js";
@@ -277,18 +283,20 @@ test("isolated multi-Task identity workflow keeps local ids qualified end to end
       YUI_LAUNCH_ID: resumedLeaderSession.launchId,
       YUI_NATIVE_SESSION_ID: resumedLeaderSession.nativeSessionId
     },
-    async () => ({})
+    async () => ({}),
+    postAnswerNow
   );
   const inbox = new FileRuntimeEventInbox(home);
   const hookEvent = inbox.list().find((event) => (
     event.taskId === primaryTask.id
-    && event.runId === resumedLeaderRun.id
-    && event.type === "native-prompt-accepted"
+    && event.observation?.fence.runId === resumedLeaderRun.id
+    && event.type === "runtime-observation"
+    && event.observation.kind === "turn.accepted"
   ));
   assert.notEqual(hookEvent, undefined);
   assert.equal(hookEvent.taskId, primaryTask.id);
-  assert.equal(hookEvent.runId, resumedLeaderRun.id);
-  assert.equal(hookEvent.type, "native-prompt-accepted");
+  assert.equal(hookEvent.observation.fence.runId, resumedLeaderRun.id);
+  assert.equal(hookEvent.observation.kind, "turn.accepted");
   new FileRuntimeEventProcessor(inbox, scheduler).drain(postAnswerNow);
   assert.notEqual(
     store.getAgentRun(primaryTask.id, resumedLeaderRun.id).deliveredAt,

@@ -145,7 +145,6 @@ test("the Controller defers a fenced Project's Task and prepares it after releas
       [],
       undefined,
       undefined,
-      new Set(),
       (projectId) => isProjectMaintenanceFenced(home, projectId),
       (detail) => deferred.push(detail)
     );

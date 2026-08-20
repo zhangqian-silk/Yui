@@ -26,6 +26,10 @@ import {
   updateIntegrationAttempt
 } from "../../dist/integration/integrationAttempt.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
+import {
+  createRuntimeObservation,
+  runtimeObservationTaskEventPayload
+} from "../../dist/runtime/runtimeObservation.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { createProject } from "../../dist/repository/project.js";
 import { createWorkItemChangeSet } from "../../dist/integration/changeSet.js";
@@ -40,6 +44,35 @@ function temporaryHome() {
       rmSync(home, { recursive: true, force: true });
     }
   };
+}
+
+function runtimeObservationEvent(id, kind, now) {
+  const observation = createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: id,
+    kind,
+    authority: "provider-structured",
+    receivedAt: now.toISOString(),
+    fence: {
+      taskId: "task-1",
+      roleName: "leader",
+      ...(kind === "activity.observed" ? { runId: "run-1" } : {}),
+      agentId: "codex",
+      driverId: "openai/codex",
+      launchId: "launch-1",
+      sessionGenerationId: "launch-1",
+      nativeSessionId: "session-1",
+      ...(kind === "activity.observed" ? { nativeTurnId: "turn-1" } : {})
+    },
+    payload: kind === "activity.observed" ? { activity: "model" } : {}
+  });
+  return createTaskEvent(
+    id,
+    "task-1",
+    "runtime.observation",
+    runtimeObservationTaskEventPayload(observation),
+    now
+  );
 }
 
 function effective(workspace) {
@@ -266,11 +299,11 @@ function seedStore(home) {
 
   const events = [
     ...Array.from({ length: 12 }, (_, index) =>
-      createTaskEvent(`event-${index + 1}`, "task-1", "runtime.provider-turn-progress", {}, NOW)),
+      runtimeObservationEvent(`event-${index + 1}`, "activity.observed", NOW)),
     createTaskEvent("event-13", "task-1", "runtime.role-session-reset", {}, NOW),
     createTaskEvent("event-14", "task-1", "runtime.role-session-reset", {}, NOW),
-    createTaskEvent("event-15", "task-1", "runtime.provider-session-lifecycle", {}, NOW),
-    createTaskEvent("event-16", "task-1", "runtime.claude-stop-failure", {}, NOW),
+    runtimeObservationEvent("event-15", "session.started", NOW),
+    createTaskEvent("event-16", "task-1", "runtime.turn-failed", {}, NOW),
     createTaskEvent("event-17", "task-1", "runtime.event-obsolete", {}, NOW),
     createTaskEvent("event-18", "task-1", "runtime.event-obsolete", {}, NOW),
     createTaskEvent("event-19", "task-1", "runtime.event-obsolete", {}, NOW),

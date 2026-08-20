@@ -11,10 +11,43 @@ import {
   reconcileStalledRoleRuns
 } from "../../dist/scheduler/roleRunStall.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
+import {
+  createRuntimeObservation,
+  runtimeObservationTaskEventPayload
+} from "../../dist/runtime/runtimeObservation.js";
 import { mergePendingWakeup } from "../../dist/scheduler/pendingWakeup.js";
 
 const PROGRESS = "2026-08-05T00:00:00.000Z";
 const NOW = new Date("2026-08-05T01:00:00.000Z");
+
+function runtimeActivityEvent(id, receivedAt, payload = { activity: "model" }) {
+  const observation = createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: id,
+    kind: "activity.observed",
+    authority: "provider-structured",
+    receivedAt,
+    fence: {
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "run-1",
+      agentId: "agent-1",
+      driverId: "openai/codex",
+      launchId: "launch-1",
+      sessionGenerationId: "launch-1",
+      nativeSessionId: "native-1",
+      nativeTurnId: "turn-1"
+    },
+    payload
+  });
+  return createTaskEvent(
+    id,
+    "task-1",
+    "runtime.observation",
+    runtimeObservationTaskEventPayload(observation),
+    new Date(receivedAt)
+  );
+}
 
 test("stall evaluation treats checkpoints as progress but ignores bookkeeping timestamps", () => {
   assert.equal(
@@ -72,37 +105,20 @@ test("late stale progress events cannot move the durable progress fence backward
   );
 });
 
-test("provider-native turn progress advances the exact Run progress fence", async () => {
+test("canonical runtime activity never advances the workflow progress fence", async () => {
   const progressAt = "2026-08-05T00:55:00.000Z";
   const store = stallStore();
-  store.events.push(createTaskEvent(
-    "event-3",
-    "task-1",
-    "runtime.provider-turn-progress",
-    {
-      runId: "run-1",
-      roleName: "worker",
-      agentId: "agent-1",
-      adapterId: "codex",
-      nativeSessionId: "native-1",
-      launchId: "launch-1",
-      progressId: "tool-1",
-      progressAt
-    },
-    new Date(progressAt)
-  ));
+  store.events.push(runtimeActivityEvent("event-3", progressAt, { activity: "tool" }));
 
-  assert.equal(latestRunProgressAt(store.events, "run-1"), progressAt);
-  assert.deepEqual(
-    await reconcileStalledRoleRuns(
-      store,
-      { async inspectRole() { return "present"; } },
-      NOW,
-      undefined,
-      30 * 60_000
-    ),
-    []
+  assert.equal(latestRunProgressAt(store.events, "run-1"), undefined);
+  const [attention] = await reconcileStalledRoleRuns(
+    store,
+    { async inspectRole() { return "present"; } },
+    NOW,
+    undefined,
+    30 * 60_000
   );
+  assert.equal(attention.kind, "workflow-not-progressing");
 });
 
 test("one health projection keeps live resource activity advisory and does not advance the clock", () => {
@@ -129,7 +145,7 @@ test("one health projection keeps live resource activity advisory and does not a
 
   assert.equal(projection.candidate, true);
   assert.equal(projection.resourceActivity, true);
-  assert.equal(projection.stalled, false);
+  assert.equal(projection.stalled, true);
   assert.equal(projection.progressAt, PROGRESS);
   assert.equal(projection.idleMs, 60 * 60_000);
 });
@@ -198,7 +214,7 @@ test("an opaque SessionHost binding still routes a stalled accepted Run", async 
     30 * 60_000
   );
 
-  assert.equal(result[0]?.kind, "execution-stalled");
+  assert.equal(result[0]?.kind, "workflow-not-progressing");
   assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
   assert.equal("nativeSessionId" in inspected, false);
 });
@@ -276,7 +292,7 @@ test("an accepted Run past the candidate filter with recent progress is not stal
   assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
 });
 
-test("one scheduler resource sample suppresses an execution false positive without clearing attention", async () => {
+test("one scheduler resource sample is diagnostic and cannot hide missing workflow progress", async () => {
   const store = stallStore();
   const resourceEvidence = new Map([
     ["task-1\0worker\0run-1", {
@@ -305,18 +321,12 @@ test("one scheduler resource sample suppresses an execution false positive witho
     undefined,
     resourceEvidence
   );
-  assert.deepEqual(result, []);
-  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+  assert.equal(result[0]?.kind, "workflow-not-progressing");
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
 });
 
-test("continued resource activity is bounded by the semantic progress gap", async () => {
+test("continued resource activity does not create a second workflow-stall episode", async () => {
   const store = stallStore();
-  let recorded = false;
-  store.recordRoleRunResourceSuppression = () => {
-    if (recorded) return "already-recorded";
-    recorded = true;
-    return "recorded";
-  };
   const evidenceAt = (now) => new Map([[
     "task-1\0worker\0run-1",
     {
@@ -337,7 +347,7 @@ test("continued resource activity is bounded by the semantic progress gap", asyn
   ]]);
   const delivery = { async inspectRole() { return "present"; } };
 
-  assert.deepEqual(await reconcileStalledRoleRuns(
+  const first = await reconcileStalledRoleRuns(
     store,
     delivery,
     NOW,
@@ -345,7 +355,8 @@ test("continued resource activity is bounded by the semantic progress gap", asyn
     30 * 60_000,
     undefined,
     evidenceAt(NOW)
-  ), []);
+  );
+  assert.equal(first[0]?.kind, "workflow-not-progressing");
   const stillBounded = new Date("2026-08-05T01:20:00.000Z");
   assert.deepEqual(await reconcileStalledRoleRuns(
     store,
@@ -367,11 +378,11 @@ test("continued resource activity is bounded by the semantic progress gap", asyn
     undefined,
     evidenceAt(expired)
   );
-  assert.equal(result[0]?.runId, "run-1");
+  assert.deepEqual(result, []);
   assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
 });
 
-test("launch identity can fence advisory resource activity when native Session id is opaque", async () => {
+test("launch-fenced resource activity remains diagnostic when native Session id is opaque", async () => {
   const store = stallStore({
     session: {
       agentId: "agent-1",
@@ -405,13 +416,12 @@ test("launch identity can fence advisory resource activity when native Session i
       }
     ]])
   );
-  assert.deepEqual(result, []);
-  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 0);
+  assert.equal(result[0]?.kind, "workflow-not-progressing");
+  assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
 });
 
-test("a concurrent suppression CAS change cannot leave a stale changed sample healthy", async () => {
+test("a changed resource sample remains diagnostic and cannot hide workflow attention", async () => {
   const store = stallStore();
-  store.recordRoleRunResourceSuppression = () => "state-changed";
   const result = await reconcileStalledRoleRuns(
     store,
     { async inspectRole() { return "present"; } },
@@ -497,10 +507,6 @@ test("stale Run, Session-generation, and progress-fence samples cannot suppress 
     );
     assert.equal(result[0]?.runId, "run-1");
     assert.equal(store.events.filter((event) => event.type === "run.stalled").length, 1);
-    assert.equal(
-      store.events.filter((event) => event.type === "run.resource-suppressed").length,
-      0
-    );
   }
 });
 
@@ -973,33 +979,19 @@ test("a mailbox reason prefix cannot claim a different Leader lifecycle event", 
   );
 });
 
-test("provider activity lookup uses the immutable progress timestamp, not drain time", () => {
+test("token-backed runtime activity is excluded from the semantic activity clock", () => {
   const receivedAt = "2026-08-05T00:05:00.000Z";
-  const events = [createTaskEvent(
-    "event-3",
-    "task-1",
-    "runtime.provider-turn-progress",
-    {
-      runId: "run-1",
-      roleName: "worker",
-      agentId: "agent-1",
-      adapterId: "codex",
-      nativeSessionId: "native-1",
-      launchId: "launch-1",
-      progressAt: receivedAt
-    },
-    NOW
-  )];
-  assert.equal(latestRunActivityAt(events, "run-1"), receivedAt);
+  const events = [runtimeActivityEvent("event-3", receivedAt, {
+    activity: "model",
+    usage: { inputTokens: 100, outputTokens: 20 }
+  })];
+  assert.equal(latestRunActivityAt(events, "run-1"), undefined);
 });
 
-test("malformed provider progress cannot become durable activity through event creation time", () => {
-  const events = [createTaskEvent(
+test("runtime observation creation time cannot become workflow progress", () => {
+  const events = [runtimeActivityEvent(
     "event-4",
-    "task-1",
-    "runtime.provider-turn-progress",
-    { runId: "run-1" },
-    NOW
+    "2026-08-05T00:05:00.000Z"
   )];
   assert.equal(latestRunActivityAt(events, "run-1"), undefined);
   assert.equal(latestRunProgressAt(events, "run-1"), undefined);

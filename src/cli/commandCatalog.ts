@@ -1238,7 +1238,7 @@ export const ROOT_COMMAND = buildNode({
       name: "internal",
       summary: "Internal Yui callbacks.",
       hidden: true,
-      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "claude-hook", "codex-hook", "managed-claude-run"] }],
+      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "runtime-hook", "managed-claude-run"] }],
       children: [
         {
           name: "session-notify",
@@ -1246,14 +1246,9 @@ export const ROOT_COMMAND = buildNode({
           usage: "yui internal session-notify <payload>"
         },
         {
-          name: "claude-hook",
-          summary: "Record a managed Claude StopFailure event from stdin.",
-          usage: "yui internal claude-hook"
-        },
-        {
-          name: "codex-hook",
-          summary: "Record managed Codex provider lifecycle evidence from stdin.",
-          usage: "yui internal codex-hook"
+          name: "runtime-hook",
+          summary: "Record a managed Agent Driver observation from stdin.",
+          usage: "yui internal runtime-hook"
         },
         {
           name: "managed-claude-run",

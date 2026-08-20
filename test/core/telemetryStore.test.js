@@ -195,26 +195,6 @@ test("revision advances with applied writes", async () => {
   }
 });
 
-test("latestProgressEvents synthesizes one event per Run", async () => {
-  const home = temporaryHome();
-  try {
-    const store = new SqliteTelemetryStore(home, { mode: "bounded" });
-    store.observe(entry({ runId: "run-1", progressId: "p-1", sequence: 1, receivedAt: "2026-08-17T00:00:01.000Z" }));
-    store.observe(entry({ runId: "run-1", progressId: "p-2", sequence: 2, receivedAt: "2026-08-17T00:00:02.000Z" }));
-    store.observe(entry({ runId: "run-2", progressId: "p-3", sequence: 1, receivedAt: "2026-08-17T00:00:03.000Z" }));
-    await store.flush();
-    const events = store.latestProgressEvents("task-1");
-    assert.equal(events.length, 2);
-    const run1 = events.find((event) => event.payload.runId === "run-1");
-    assert.equal(run1.payload.progressId, "p-2");
-    assert.equal(run1.type, "runtime.provider-turn-progress");
-    assert.equal(run1.payload.progressAt, "2026-08-17T00:00:02.000Z");
-    await store.close();
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
 test("aggregate merges generations and importGeneration overrides totals", async () => {
   const home = temporaryHome();
   try {

@@ -1861,7 +1861,8 @@ function listTaskRoles(
     task.id,
     roles,
     store,
-    options.runtime?.inspectTaskRolePanes?.(task.id) ?? []
+    options.runtime?.inspectTaskRolePanes?.(task.id) ?? [],
+    options.now?.() ?? new Date()
   );
   if (statuses.length === 0) return output("No roles assigned.\n", { roles: statuses });
   return output(`${renderTable(
@@ -1900,7 +1901,8 @@ function taskRoleStatus(
     task.id,
     [role],
     store,
-    options.runtime?.inspectTaskRolePanes?.(task.id) ?? []
+    options.runtime?.inspectTaskRolePanes?.(task.id) ?? [],
+    options.now?.() ?? new Date()
   );
   if (status === undefined) throw roleNotFound(role.name);
   return output(renderTaskRoleRuntimeStatus(status), { role: status });

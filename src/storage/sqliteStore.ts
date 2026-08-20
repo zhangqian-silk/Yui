@@ -25,8 +25,8 @@
  *
  * Records are stored as full versioned JSON in `payload` columns, with typed
  * columns for the fields that are queried/filtered/used-for-CAS (§4). A
- * high-frequency `runtime.provider-turn-progress` event is a single-row
- * upsert into `telemetry` scoped by its primary key — it never rewrites global
+ * high-frequency runtime telemetry observation is a single-row upsert into
+ * `telemetry` scoped by its primary key — it never rewrites global
  * state and never touches another Task's rows (§4.4).
  *
  * The in-process store is phase 1 of §6. It does not re-run the heavy record
@@ -2206,7 +2206,7 @@ export class SqliteTaskStore implements TaskStore {
   /**
    * Upsert one progress row. The PK is (task_id, role_name, run_id, generation,
    * progress_id): a repeated progress id updates in place, so a high-frequency
-   * `runtime.provider-turn-progress` event is a single-row write that never
+   * runtime telemetry observation is a single-row write that never
    * rewrites global state or another Task's rows.
    */
   upsertTelemetryProgress(entry: TelemetryProgress): void {

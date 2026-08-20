@@ -17,6 +17,7 @@ import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentRun } from "../run/agentRun.js";
+import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import {
   classifyAgentRunFailure,
   classifyIntegrationAttempt,
@@ -417,8 +418,9 @@ export function runExecutionAudit(
         for (const event of store.listEvents(taskId)) {
           if (!inWindow(event.createdAt, options)) continue;
           if (event.type === "runtime.role-session-reset") resets += 1;
-          else if (event.type === "runtime.provider-session-lifecycle") lifecycleEvents += 1;
-          else if (event.type === "runtime.claude-stop-failure") stopFailures += 1;
+          else if (runtimeObservationFromTaskEvent(event)?.kind.startsWith("session.")) {
+            lifecycleEvents += 1;
+          } else if (event.type === "runtime.turn-failed") stopFailures += 1;
         }
       }
       return ok({
@@ -531,8 +533,9 @@ export function runExecutionAudit(
         for (const event of store.listEvents(taskId)) {
           if (!inWindow(event.createdAt, options)) continue;
           total += 1;
-          if (event.type === "runtime.provider-turn-progress") progressEvents += 1;
-          else if (event.type === "runtime.event-obsolete") obsoleteEvents += 1;
+          if (runtimeObservationFromTaskEvent(event)?.kind === "activity.observed") {
+            progressEvents += 1;
+          } else if (event.type === "runtime.event-obsolete") obsoleteEvents += 1;
         }
         messages += store.listMessages(taskId)
           .filter((message) => inWindow(message.createdAt, options))

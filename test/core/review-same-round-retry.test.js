@@ -9,7 +9,13 @@ import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
-import { runClaudeLifecycleHookCommand } from "../../dist/controller/claudeLifecycleHook.js";
+import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
+const runClaudeLifecycleHookCommand = (payload, environment, ...rest) => (
+  runRuntimeObservationHookCommand(payload, {
+    ...environment,
+    YUI_DRIVER_ID: "anthropic/claude-code"
+  }, ...rest)
+);
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
   bindTaskRoleRun,
@@ -234,7 +240,7 @@ async function injectStopFailure(fx, now) {
     YUI_LAUNCH_ID: "launch-review-1",
     YUI_RUN_ID: fx.run.id,
     YUI_NATIVE_SESSION_ID: "native-review-1"
-  }, async () => ({}));
+  }, async () => ({}), now);
   const inbox = new FileRuntimeEventInbox(fx.home);
   const adapter = new FileSchedulerStoreAdapter(fx.store);
   const drained = new FileRuntimeEventProcessor(inbox, adapter).drain(now);

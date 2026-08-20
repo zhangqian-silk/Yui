@@ -9,7 +9,13 @@ import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
-import { runClaudeLifecycleHookCommand } from "../../dist/controller/claudeLifecycleHook.js";
+import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
+const runClaudeLifecycleHookCommand = (payload, environment, ...rest) => (
+  runRuntimeObservationHookCommand(payload, {
+    ...environment,
+    YUI_DRIVER_ID: "anthropic/claude-code"
+  }, ...rest)
+);
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
   bindTaskRoleRun,
@@ -31,6 +37,7 @@ import {
   nextProviderRetryDelayMs,
   scheduleProviderRetry
 } from "../../dist/run/providerRetry.js";
+import { providerRetryConfig } from "../../dist/run/providerRetryConfig.js";
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -53,6 +60,13 @@ import { installMockProviderCommands } from "../helpers/mockProviderCommands.js"
  */
 
 const BASE = new Date("2026-08-17T00:00:00.000Z");
+
+test("Provider retry configuration rejects adapters with no registered implementation", () => {
+  assert.throws(
+    () => providerRetryConfig({ YUI_PROVIDER_RETRY_IN_PLACE: "future-agent" }),
+    /Unknown Provider retry adapter: future-agent/
+  );
+});
 
 function hookCommon(hookEventName) {
   return {
@@ -171,7 +185,7 @@ async function injectStopFailure(fx, now, error = "server_error", errorDetails =
     YUI_LAUNCH_ID: "launch-1",
     YUI_RUN_ID: fx.run.id,
     YUI_NATIVE_SESSION_ID: "native-1"
-  }, async () => ({}));
+  }, async () => ({}), now);
   const inbox = new FileRuntimeEventInbox(fx.home);
   const adapter = new FileSchedulerStoreAdapter(fx.store);
   const drained = new FileRuntimeEventProcessor(inbox, adapter).drain(now);

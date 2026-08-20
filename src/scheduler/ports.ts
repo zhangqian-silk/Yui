@@ -78,7 +78,7 @@ export type RoleRunStallPersistence = Readonly<{
     launchId?: string;
     status: SchedulerRoleSession["status"];
   }> | null;
-  kind: "delivery-stalled" | "execution-stalled";
+  kind: "delivery-stalled" | "workflow-not-progressing";
   classification: "truly-stalled";
   progressAt: string;
   idleMs: number;
@@ -142,20 +142,6 @@ export type RoleRunProgressPersistence = Readonly<{
   runId: string;
   progressAt: string;
   evidence?: string;
-  now: Date;
-}>;
-
-/** One durable advisory-resource suppression for one exact Run progress point. */
-export type RoleRunResourceSuppressionPersistence = Readonly<{
-  taskId: string;
-  roleName: string;
-  runId: string;
-  agentId: string;
-  adapterId: string;
-  nativeSessionId?: string;
-  launchId?: string;
-  progressAt: string;
-  observedAt: string;
   now: Date;
 }>;
 
@@ -339,8 +325,6 @@ export interface SchedulerStorePort {
   getRunProgressFacts?(taskId: string, runId: string): RunProgressFacts | undefined;
   /** Materializes a newly observed related-record fold as one run.progress fact. */
   recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
-  /** Atomically consumes one advisory resource sample for an exact Run/progress point. */
-  recordRoleRunResourceSuppression?(input: RoleRunResourceSuppressionPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Atomically records one new stall episode and routes its responsibility. */
   recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
   /**

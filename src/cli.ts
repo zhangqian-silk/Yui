@@ -120,8 +120,7 @@ import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
 import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
 import { openSchedulerTelemetry } from "./telemetry/telemetryWiring.js";
-import { runClaudeLifecycleHookCommand } from "./controller/claudeLifecycleHook.js";
-import { runCodexLifecycleHookCommand } from "./controller/codexLifecycleHook.js";
+import { runRuntimeObservationHookCommand } from "./controller/runtimeObservationHook.js";
 import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
@@ -174,6 +173,7 @@ import {
   extractExactControlArgument,
   parseExactControlPlaneDescriptor
 } from "./runtime/exactControlPlane.js";
+import { builtinAgentDriverRegistry } from "./runtime/builtinAgentDrivers.js";
 import {
   createTaskFinalReviewContract,
   extractTaskFinalReviewRequest,
@@ -363,12 +363,8 @@ export async function main(): Promise<void> {
       await runSessionNotifyCommand(args[2], process.env);
       return;
     }
-    if (args[1] === "claude-hook" && args.length === 2) {
-      await runClaudeLifecycleHookCommand(readFileSync(0, "utf8"), process.env);
-      return;
-    }
-    if (args[1] === "codex-hook" && args.length === 2) {
-      await runCodexLifecycleHookCommand(readFileSync(0, "utf8"), process.env);
+    if (args[1] === "runtime-hook" && args.length === 2) {
+      await runRuntimeObservationHookCommand(readFileSync(0, "utf8"), process.env);
       return;
     }
     if (args[1] === "managed-claude-run"
@@ -1596,14 +1592,24 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     digest,
     control.yuiHome
   );
-  const preallocatedClaudeCallback = args[0] === "internal"
-    && (args[1] === "claude-hook" || args[1] === "managed-claude-run");
+  const runtimeDriverCallback = args[0] === "internal"
+    && (args[1] === "runtime-hook" || args[1] === "managed-claude-run")
+    && process.env.YUI_DRIVER_ID !== undefined
+    ? builtinAgentDriverRegistry().require(process.env.YUI_DRIVER_ID)
+    : undefined;
+  const preallocatedDriverCallback = runtimeDriverCallback
+    ?.capabilities.observation.sessionBootstrap === "preallocated";
   const verifiedStore = openCompatibleFileTaskStore(control.yuiHome);
   assertExactTaskRuntimeState(
     runtime,
     verifiedStore,
-    preallocatedClaudeCallback
-      ? { preallocatedNativeSessionReservation: { yuiHome: control.yuiHome } }
+    preallocatedDriverCallback
+      ? {
+          preallocatedDriverSessionReservation: {
+            yuiHome: control.yuiHome,
+            adapterId: runtimeDriverCallback.adapterId
+          }
+        }
       : {}
   );
   const request = taskFinalReviewInvocation.request;

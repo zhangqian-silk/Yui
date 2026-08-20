@@ -17,6 +17,22 @@ import {
   isRoleRunStalled,
   latestStallProgressAt
 } from "../scheduler/roleRunStall.js";
+import {
+  createRuntimeObservation,
+  runtimeObservationFromTaskEvent,
+  type RuntimeObservation,
+  type RuntimeUsageSnapshot
+} from "../runtime/runtimeObservation.js";
+import {
+  evaluateRuntimeAttention,
+  projectRuntimeObservation,
+  projectRuntimeTaskEvents,
+  runtimeDisplayStatus,
+  type RuntimeAttention,
+  type RuntimeDisplayStatus
+} from "../runtime/runtimeProjection.js";
+import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
 export type TaskRoleHealth =
   | "idle"
@@ -24,6 +40,7 @@ export type TaskRoleHealth =
   | "awaiting-provider-acceptance"
   | "running"
   | "ready"
+  | "waiting"
   | "blocked-input"
   | "needs-attention"
   | "failed";
@@ -66,10 +83,21 @@ export type TaskRoleRuntimeStatus = Readonly<{
   freshLaunchAllowed: boolean;
   tmux: TaskRoleTmuxStatus;
   workspace: TaskRoleWorkspaceStatus;
+  runtime: Readonly<{
+    driverId: string;
+    status: RuntimeDisplayStatus;
+    attention: RuntimeAttention["runtime"];
+    lastActivityAt?: string;
+    activeOperations: readonly string[];
+    waitingReason?: "user" | "permission" | "external";
+    usage?: RuntimeUsageSnapshot;
+    observerStatus?: "healthy" | "degraded" | "unavailable";
+    observerDetail?: string;
+  }> | null;
   stall: Readonly<{
     active: boolean;
     progressAt?: string;
-    kind?: "delivery-stalled" | "execution-stalled";
+    kind?: "delivery-stalled" | "workflow-not-progressing";
   }>;
 }>;
 
@@ -77,7 +105,8 @@ export function inspectTaskRoleRuntimeStatuses(
   taskId: string,
   roles: readonly TaskRole[],
   store: TaskStore,
-  panes: readonly TmuxRolePaneState[]
+  panes: readonly TmuxRolePaneState[],
+  now = new Date()
 ): TaskRoleRuntimeStatus[] {
   const taskOpenInputRequestCount = store.listInputRequests(taskId)
     .filter((request) => request.status === "open").length;
@@ -91,7 +120,8 @@ export function inspectTaskRoleRuntimeStatuses(
     role,
     store,
     panesByRole.get(role.name),
-    role.name === "leader" ? taskOpenInputRequestCount : 0
+    role.name === "leader" ? taskOpenInputRequestCount : 0,
+    now
   ));
 }
 
@@ -123,6 +153,25 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
         }`
       ))
     : [];
+  const runtime = status.runtime === null
+    ? "not observable"
+    : [
+        `${status.runtime.driverId}: ${status.runtime.status}`,
+        `attention=${status.runtime.attention}`,
+        status.runtime.lastActivityAt === undefined
+          ? undefined
+          : `last activity=${status.runtime.lastActivityAt}`,
+        status.runtime.activeOperations.length === 0
+          ? undefined
+          : `operations=${status.runtime.activeOperations.join(",")}`,
+        status.runtime.observerStatus === undefined
+          ? undefined
+          : `observer=${status.runtime.observerStatus}${
+              status.runtime.observerDetail === undefined
+                ? ""
+                : ` (${status.runtime.observerDetail})`
+            }`
+      ].filter((value): value is string => value !== undefined).join("; ");
   return [
     `Task Role status: ${status.taskId}/${status.roleName}`,
     "",
@@ -140,9 +189,10 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Active work      ${activeWork}`,
     `  Active run       ${activeRun}`,
     `  Run attention    ${status.stall.active
-      ? `needs-attention (${status.stall.kind ?? "execution-stalled"}; no durable progress since ${status.stall.progressAt ?? "unknown"})`
+      ? `needs-attention (${status.stall.kind ?? "workflow-not-progressing"}; no workflow progress since ${status.stall.progressAt ?? "unknown"})`
       : "none"}`,
     `  Native session   ${nativeSession}`,
+    `  Agent runtime    ${runtime}`,
     `  Runtime cleanup  ${status.runtimeCleanupPending ? "pending" : "none"}`,
     `  Fresh launch     ${status.freshLaunchAllowed ? "allowed" : "blocked"}`,
     `  tmux pane        ${tmux}`,
@@ -200,7 +250,8 @@ function inspectTaskRoleRuntimeStatus(
   role: TaskRole,
   store: TaskStore,
   pane: TmuxRolePaneState | undefined,
-  openInputRequestCount: number
+  openInputRequestCount: number,
+  now: Date
 ): TaskRoleRuntimeStatus {
   const activeRun = store.getActiveAgentRun(taskId, role.name);
   const activeWork = activeRun?.workItemId === undefined
@@ -236,6 +287,7 @@ function inspectTaskRoleRuntimeStatus(
     ? { managed: false, path: role.workspace }
     : { ...managedWorkspace, managed: true };
   const events = store.listEvents(taskId);
+  const runtime = projectTaskRoleRuntime(activeRun, nativeSession, tmux, events, now);
   const stalled = activeRun !== null && isRoleRunStalled(events, activeRun.id);
   const stallProgressAt = activeRun === null
     ? undefined
@@ -250,7 +302,8 @@ function inspectTaskRoleRuntimeStatus(
     recovery.runtimeCleanupPending,
     tmux,
     openInputRequestCount,
-    stalled
+    stalled,
+    runtime
   );
   const stall = activeRun === null
     ? { active: false }
@@ -277,6 +330,7 @@ function inspectTaskRoleRuntimeStatus(
     nativeSession,
     tmux,
     workspace,
+    runtime,
     stall
   };
 }
@@ -284,11 +338,11 @@ function inspectTaskRoleRuntimeStatus(
 function latestStallKind(
   events: ReturnType<TaskStore["listEvents"]>,
   runId: string
-): "delivery-stalled" | "execution-stalled" | undefined {
+): "delivery-stalled" | "workflow-not-progressing" | undefined {
   const event = [...events]
     .filter((candidate) => candidate.type === "run.stalled" && candidate.payload.runId === runId)
     .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
-  return event?.payload.kind === "delivery-stalled" || event?.payload.kind === "execution-stalled"
+  return event?.payload.kind === "delivery-stalled" || event?.payload.kind === "workflow-not-progressing"
     ? event.payload.kind
     : undefined;
 }
@@ -300,7 +354,8 @@ function calculateHealth(
   runtimeCleanupPending: boolean,
   tmux: TaskRoleTmuxStatus,
   openInputRequestCount: number,
-  stalled: boolean
+  stalled: boolean,
+  runtime: TaskRoleRuntimeStatus["runtime"]
 ): Pick<TaskRoleRuntimeStatus, "health" | "healthReason"> {
   if (runtimeCleanupPending && nativeSession === null) {
     return {
@@ -344,6 +399,49 @@ function calculateHealth(
         healthReason: "the live active Run has no durable progress in the configured stall window"
       };
     }
+    if (activeRun.deliveredAt !== undefined) {
+      if (runtime === null
+        || runtime.status === "runtime-unobservable"
+        || runtime.attention === "unobservable") {
+        return {
+          health: "needs-attention",
+          healthReason: "the host is present but the Agent Driver exposes no current runtime state"
+        };
+      }
+      if (runtime.attention === "quiet" || runtime.attention === "active-operation-quiet") {
+        return {
+          health: "needs-attention",
+          healthReason: runtime.attention === "active-operation-quiet"
+            ? "the Agent Driver reports an open operation but no recent structured runtime activity"
+            : "the Agent Driver has not reported recent structured runtime activity"
+        };
+      }
+      if (runtime.status === "broken" || runtime.status === "stopped") {
+        return {
+          health: "failed",
+          healthReason: `the Agent Driver runtime is ${runtime.status}`
+        };
+      }
+      if (runtime.status.startsWith("waiting-")) {
+        return {
+          health: runtime.status === "waiting-user" ? "blocked-input" : "waiting",
+          healthReason: `the Agent Driver is ${runtime.status.replaceAll("-", " ")}`
+        };
+      }
+      if (runtime.status === "ready") {
+        return {
+          health: "needs-attention",
+          healthReason: "the Agent turn ended while the workflow Run is still active"
+        };
+      }
+      if (["model-active", "tool-active", "subagent-active", "active-quiet"]
+        .includes(runtime.status)) {
+        return {
+          health: "running",
+          healthReason: `the Agent Driver reports ${runtime.status.replaceAll("-", " ")}`
+        };
+      }
+    }
   }
   if (activeRun === null && role.status === "running") {
     return { health: "needs-attention", healthReason: "the Role is running without an active Run" };
@@ -361,9 +459,10 @@ function calculateHealth(
     };
   }
   if (activeRun !== null) {
-    if (activeRun.deliveredAt !== undefined) {
-      return { health: "running", healthReason: "the active Run has a live tmux pane" };
-    }
+    if (activeRun.deliveredAt !== undefined) return {
+      health: "needs-attention",
+      healthReason: "the delivered Run has no authoritative Agent Driver state"
+    };
     if (activeRun.pushedAt !== undefined) {
       return {
         health: "awaiting-provider-acceptance",
@@ -375,6 +474,122 @@ function calculateHealth(
   return tmux.state === "running"
     ? { health: "ready", healthReason: "the native Agent pane is ready without active work" }
     : { health: "idle", healthReason: "there is no active work or live tmux pane" };
+}
+
+function projectTaskRoleRuntime(
+  run: AgentRun | null,
+  session: RoleAgentSession | null,
+  tmux: TaskRoleTmuxStatus,
+  events: ReturnType<TaskStore["listEvents"]>,
+  now: Date
+): TaskRoleRuntimeStatus["runtime"] {
+  if (run === null || session?.launchId === undefined) return null;
+  let driverId: string;
+  try {
+    driverId = builtinDriverIdForAdapter(run.effective.adapterId);
+  } catch {
+    return null;
+  }
+  const fence = {
+    taskId: run.taskId,
+    roleName: run.roleName,
+    runId: run.id,
+    agentId: run.effective.agentId,
+    driverId,
+    launchId: session.launchId,
+    sessionGenerationId: session.launchId,
+    nativeSessionId: session.nativeSessionId,
+    nativeTurnId: runtimeNativeTurnId(
+      events,
+      {
+        taskId: run.taskId,
+        roleName: run.roleName,
+        runId: run.id,
+        agentId: run.effective.agentId,
+        driverId,
+        launchId: session.launchId,
+        nativeSessionId: session.nativeSessionId,
+        receiptId: formatAgentRunReceiptId(run.taskId, run.id)
+      }
+    ) ?? run.id,
+    receiptId: formatAgentRunReceiptId(run.taskId, run.id)
+  };
+  let projection = projectRuntimeTaskEvents(fence, run.createdAt, events);
+  projection = projectRuntimeObservation(projection, createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: `runtime-host-${run.id}`,
+    kind: "host.observed",
+    authority: "host",
+    receivedAt: run.updatedAt,
+    fence,
+    payload: { alive: tmux.state === "running" }
+  }));
+  const attention = evaluateRuntimeAttention(projection, now, {
+    runtimeSilenceMs: 5 * 60_000,
+    // Workflow attention has its own durable scheduler policy. This value is
+    // deliberately not consumed here; keeping it separate prevents token/tool
+    // activity from extending the workflow deadline.
+    semanticSilenceMs: 30 * 60_000
+  });
+  return {
+    driverId,
+    status: runtimeDisplayStatus(projection),
+    attention: attention.runtime,
+    ...(projection.lastRuntimeActivityAt === undefined
+      ? {}
+      : { lastActivityAt: projection.lastRuntimeActivityAt }),
+    activeOperations: Object.entries(projection.operations).map(([id, operation]) => (
+      `${operation.kind}:${id}`
+    )),
+    ...(projection.waitingReason === undefined
+      ? {}
+      : { waitingReason: projection.waitingReason }),
+    ...(projection.usage === undefined ? {} : { usage: projection.usage }),
+    ...(projection.observer.status === "unknown"
+      ? {}
+      : {
+          observerStatus: projection.observer.status,
+          ...(projection.observer.detail === undefined
+            ? {}
+            : { observerDetail: projection.observer.detail })
+        })
+  };
+}
+
+function runtimeNativeTurnId(
+  events: ReturnType<TaskStore["listEvents"]>,
+  expected: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+    driverId: string;
+    launchId: string;
+    nativeSessionId: string;
+    receiptId: string;
+  }>
+): string | undefined {
+  const observations = events
+    .map(runtimeObservationFromTaskEvent)
+    .filter((observation): observation is RuntimeObservation => observation !== null
+      && observation.fence.taskId === expected.taskId
+      && observation.fence.roleName === expected.roleName
+      && observation.fence.runId === expected.runId
+      && observation.fence.agentId === expected.agentId
+      && observation.fence.driverId === expected.driverId
+      && observation.fence.launchId === expected.launchId
+      && observation.fence.nativeSessionId === expected.nativeSessionId
+      && observation.fence.receiptId === expected.receiptId
+      && observation.fence.nativeTurnId !== undefined)
+    .sort((left, right) => (
+      left.receivedAt.localeCompare(right.receivedAt)
+      || (left.sequence ?? -1) - (right.sequence ?? -1)
+      || (left.ordinal ?? -1) - (right.ordinal ?? -1)
+      || left.eventId.localeCompare(right.eventId)
+    ));
+  return observations.filter(({ kind }) => kind === "turn.accepted").at(-1)
+    ?.fence.nativeTurnId
+    ?? observations.at(-1)?.fence.nativeTurnId;
 }
 
 function activeRunDeliveryLabel(run: AgentRun): string {

@@ -49,7 +49,7 @@ function makeEvent(id, taskId, overrides = {}) {
     schemaVersion: 2,
     id,
     taskId,
-    type: "runtime.provider-turn-progress",
+    type: "run.progress",
     payload: {},
     createdAt: now,
     ...overrides

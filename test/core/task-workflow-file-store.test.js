@@ -378,7 +378,7 @@ test("CLI yield clears matching Leader stall attention and rejects duplicate ter
       {
         runId: active.id,
         roleName: "leader",
-        kind: "execution-stalled",
+        kind: "workflow-not-progressing",
         classification: "truly-stalled",
         progressAt: active.createdAt,
         idleMs: "1800000",

@@ -21,10 +21,8 @@ import {
   discoverClaudeConfiguration,
   discoverCodexConfiguration
 } from "./agentConfigurationProbe.js";
-import {
-  preInputReadinessCapability
-} from "../lifecycle/providerLifecycleMapping.js";
 import type { PreInputReadinessCapability } from "../lifecycle/canonicalLifecycleEvent.js";
+import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 
 export type AdvancedAgentConfig = Readonly<{ rawArgs?: readonly string[] }>;
 export type PermissionStrategy = "default" | "bypass" | "configured";
@@ -215,7 +213,7 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
     recover: true,
     interrupt: true,
     nativeSessionDiscovery: "runtime",
-    preInputReadiness: preInputReadinessCapability("codex")
+    preInputReadiness: driverPreInputReadiness("codex")
   } as const;
 
   discoverConfiguration(input: AgentConfigurationDiscoveryInput): Promise<AgentConfigurationCatalog> {
@@ -329,7 +327,7 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     recover: true,
     interrupt: true,
     nativeSessionDiscovery: "preallocated",
-    preInputReadiness: preInputReadinessCapability("claude")
+    preInputReadiness: driverPreInputReadiness("claude")
   } as const;
 
   discoverConfiguration(input: AgentConfigurationDiscoveryInput): Promise<AgentConfigurationCatalog> {
@@ -423,6 +421,22 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     const launch = super.compileNew(input);
     return { ...launch, argv: [...launch.argv, "--resume", nativeId(input.nativeSessionId)] };
   }
+}
+
+function driverPreInputReadiness(adapterId: AgentAdapterId): PreInputReadinessCapability {
+  const capability = builtinAgentDriverRegistry().requireByAdapterId(adapterId)
+    .capabilities.observation.preInputReadiness;
+  return capability === "exact"
+    ? Object.freeze({
+        status: "supported",
+        nativeEvent: "Agent Driver session.ready",
+        note: "The registered Agent Driver supplies an exact pre-input readiness observation."
+      })
+    : Object.freeze({
+        status: "unsupported",
+        reason: "not-available",
+        note: "The registered Agent Driver does not expose exact pre-input readiness."
+      });
 }
 
 const ADAPTERS: Readonly<Record<AgentAdapterId, AgentAdapter<any>>> = {

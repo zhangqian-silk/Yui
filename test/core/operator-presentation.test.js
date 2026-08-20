@@ -153,7 +153,7 @@ test("Leader stall keeps the exact Run and semantic progress evidence in Operato
     runId: "agent-run-9",
     progressAt: CREATED_AT.toISOString(),
     classification: "truly-stalled",
-    evidenceKey: "execution-stalled:mailbox-pending",
+    evidenceKey: "workflow-not-progressing:mailbox-pending",
     createdAt: CREATED_AT.toISOString(),
     updatedAt: CREATED_AT.toISOString()
   });

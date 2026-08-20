@@ -2,10 +2,9 @@
  * Issue 09 — telemetry retention & compaction configuration.
  *
  * Telemetry lives in the Home's authoritative `yui.db` (database-only
- * direction). Its activation is an explicit per-Home switch so the feature
- * can be rolled out (legacy → dual → bounded) and rolled back independently
- * of every other Issue. Retention defaults are the schema's own constants
- * (§4.4); the environment only overrides them.
+ * direction). Its activation is an explicit per-Home diagnostic switch and
+ * never changes canonical runtime-state persistence. Retention defaults are
+ * the schema's own constants (§4.4); the environment only overrides them.
  */
 
 import {
@@ -14,12 +13,9 @@ import {
 } from "../storage/sqliteSchema.js";
 
 /**
- * - `legacy`  — progress is written only to semantic Task events (master
- *   behavior). The sidecar is not opened.
- * - `dual`    — progress keeps going to semantic events AND is upserted into
- *   the sidecar. Used to validate count/sequence consistency before pruning.
- * - `bounded` — progress goes only to the sidecar; semantic Task events stop
- *   carrying `runtime.provider-turn-progress` rows.
+ * These names predate Agent Drivers and now control only the optional
+ * diagnostic sidecar. Canonical `runtime.observation` state is always durable
+ * and compacted independently; no mode changes lifecycle authority.
  */
 export type TelemetryMode = "legacy" | "dual" | "bounded";
 
@@ -43,7 +39,7 @@ const TELEMETRY_MODES: readonly TelemetryMode[] = ["legacy", "dual", "bounded"];
 /**
  * Resolve `YUI_TELEMETRY_MODE` (default `legacy`). Only the three exact
  * values (case-insensitive) are accepted; anything else fails closed at
- * startup instead of silently changing progress routing.
+ * startup instead of silently changing diagnostic retention.
  */
 export function resolveTelemetryMode(env: NodeJS.ProcessEnv = process.env): TelemetryMode {
   const raw = env.YUI_TELEMETRY_MODE?.trim().toLowerCase();

@@ -696,18 +696,18 @@ test("managed Codex Task Run installs lifecycle hooks while native identity rema
   assert.equal(plan.launch.env.YUI_LAUNCH_ID, "launch-1");
   assert.equal(plan.launch.env.YUI_NATIVE_SESSION_ID, undefined);
   const hooksIndex = plan.launch.args.indexOf("--enable");
-  assert.deepEqual(
-    plan.launch.args.slice(hooksIndex, hooksIndex + 4),
-    [
-      "--enable",
-      "hooks",
-      "--config",
-      "hooks={SessionStart=[{hooks=[{type=\"command\",command=\"'"
-        + `${process.execPath}' '/dist/cli.js' internal codex-hook\"}]}],`
-        + "UserPromptSubmit=[{hooks=[{type=\"command\",command=\"'"
-        + `${process.execPath}' '/dist/cli.js' internal codex-hook\"}]}]}`
-    ]
-  );
+  assert.deepEqual(plan.launch.args.slice(hooksIndex, hooksIndex + 3), [
+    "--enable",
+    "hooks",
+    "--config"
+  ]);
+  const lifecycleConfig = plan.launch.args[hooksIndex + 3];
+  for (const event of [
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
+    "PostToolUse", "SubagentStart", "SubagentStop", "Stop"
+  ]) assert.match(lifecycleConfig, new RegExp(`${event}=\\[`));
+  assert.match(lifecycleConfig, /internal runtime-hook/);
+  assert.equal(plan.launch.env.YUI_DRIVER_ID, "openai/codex");
   assert.ok(plan.launch.args.includes("--dangerously-bypass-hook-trust"));
   assert.equal(plan.launch.args.at(-2), "--");
   assert.equal(plan.launch.args.at(-1), "test hooks");
@@ -763,8 +763,8 @@ test("managed Codex resume submits the exact first Run prompt after the native s
   assert.equal(plan.initialPromptRunId, "agent-run-1");
 });
 
-test("managed Codex launch refuses to replace an existing native notify callback", (t) => {
-  const { home, store, task, role, agent } = fixture(t);
+test("managed Codex Run preserves an existing native notify callback", (t) => {
+  const { home, store, task, role, agent, now } = fixture(t);
   const codexHome = join(home, "native-codex");
   mkdirSync(codexHome);
   writeFileSync(
@@ -776,14 +776,33 @@ test("managed Codex launch refuses to replace an existing native notify callback
     environment: { CODEX_HOME: codexHome },
     cliPath: "/dist/cli.js"
   });
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  store.saveActiveAgentRun(createAgentRun(
+    "agent-run-1",
+    task.id,
+    role.name,
+    "new",
+    "managed input",
+    now,
+    { effective }
+  ));
 
-  assert.throws(() => planner.plan({
+  const plan = planner.plan({
     taskId: task.id,
     roleName: role.name,
     agentId: agent.id,
     adapterId: agent.adapterId,
-    mode: "new"
-  }), /notify.*already configured.*exclusive ownership/i);
+    mode: "new",
+    runId: "agent-run-1",
+    launchId: "launch-native-notify",
+    effective
+  });
+
+  assert.equal(
+    plan.launch.args.some((argument) => argument.startsWith("notify=")),
+    false
+  );
+  assert.ok(plan.launch.args.some((argument) => argument.includes("internal runtime-hook")));
 });
 
 test("Claude new launch is preallocated once and persisted without a prompt", (t) => {
@@ -1039,13 +1058,18 @@ test("managed Claude Task Runs inject the lifecycle hooks and exact explicit-yie
   const hooks = JSON.parse(readFileSync(join(pluginRoot, "hooks", "hooks.json"), "utf8"));
   assert.deepEqual(
     Object.keys(hooks.hooks).sort(),
-    ["PostToolUse", "SessionStart", "StopFailure", "UserPromptSubmit"]
+    [
+      "MessageDisplay", "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreToolUse",
+      "SessionEnd", "SessionStart", "Stop", "StopFailure", "SubagentStart",
+      "SubagentStop", "UserPromptSubmit"
+    ]
   );
-  for (const eventKey of ["SessionStart", "UserPromptSubmit", "PostToolUse", "StopFailure"]) {
+  for (const eventKey of Object.keys(hooks.hooks)) {
     const command = hooks.hooks[eventKey][0].hooks[0];
     assert.equal(command.command, process.execPath, eventKey);
-    assert.deepEqual(command.args, ["/dist/cli.js", "internal", "claude-hook"], eventKey);
+    assert.deepEqual(command.args, ["/dist/cli.js", "internal", "runtime-hook"], eventKey);
   }
+  assert.equal(plan.launch.env.YUI_DRIVER_ID, "anthropic/claude-code");
   assert.equal(plan.launch.env.YUI_RUN_ID, run.id);
   assert.equal(plan.launch.env.YUI_LAUNCH_ID, "launch-1");
   assert.equal(plan.launch.env.YUI_NATIVE_SESSION_ID, plan.session.nativeSessionId);
@@ -1234,7 +1258,7 @@ test("Codex notify remains queued when the Controller is offline", async (t) => 
   assert.equal(event.turnId, "turn-offline");
 });
 
-test("Codex turn completion releases a forgotten Leader active fence exactly once", async (t) => {
+test("Codex turn completion fails a forgotten Leader workflow outcome exactly once", async (t) => {
   const { home, store, task, role, agent, now } = fixture(t);
   const run = markAgentRunDelivered(createAgentRun(
     "agent-run-1",
@@ -1290,12 +1314,9 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
   recordParsedTurnCompletion(schedulerStore, payload, environment);
 
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
-  assert.equal(store.getAgentRun(task.id, run.id).status, "yielded");
-  assert.equal(
-    store.getAgentRun(task.id, run.id).summary,
-    "Workers dispatched; waiting for their results."
-  );
-  assert.equal(store.getRole(task.id, role.name).status, "idle");
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
+  assert.match(store.getAgentRun(task.id, run.id).summary, /without a Yui workflow outcome/i);
+  assert.equal(store.getRole(task.id, role.name).status, "failed");
   assert.equal(store.getRoleSession(task.id, role.name).status, "ready");
   assert.equal(store.getTask(task.id).status, "active");
   assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["role-result"]);
@@ -1306,7 +1327,7 @@ test("Codex turn completion releases a forgotten Leader active fence exactly onc
   assert.equal(store.getRoleSession(task.id, role.name).status, "ready");
 });
 
-test("a quiescent result-driven Leader turn queues recovery when the Agent forgets", async (t) => {
+test("a quiescent result-driven Leader turn fails when the Agent omits a workflow outcome", async (t) => {
   const { home, store, task, role, agent, now } = fixture(t);
   const run = markAgentRunDelivered(createAgentRun(
     "agent-run-1",
@@ -1359,9 +1380,11 @@ test("a quiescent result-driven Leader turn queues recovery when the Agent forge
 
   assert.equal(store.getTask(task.id).status, "active");
   assert.equal(store.getTask(task.id).completionSummary, undefined);
-  assert.equal(store.getAgentRun(task.id, run.id).status, "yielded");
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
-  assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["leader-turn-unclosed"]);
+  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.equal(store.getRole(task.id, role.name).status, "failed");
+  assert.equal(store.getOperatorNotification(task.id).type, "leader-recovery-failed");
   assert.deepEqual(store.listMessages(task.id), messagesBeforeCompletion);
 });
 
@@ -1431,7 +1454,7 @@ test("a Worker turn that forgets to yield fails visibly and wakes the Leader", a
   });
 
   assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
-  assert.match(store.getAgentRun(task.id, run.id).summary, /without yui task run yield/i);
+  assert.match(store.getAgentRun(task.id, run.id).summary, /without a Yui workflow outcome/i);
   assert.equal(store.getWorkItem(task.id, item.id).status, "failed");
   assert.equal(store.getActiveAgentRun(task.id, worker.name), null);
   assert.equal(store.getRole(task.id, worker.name).status, "idle");

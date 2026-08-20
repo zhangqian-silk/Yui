@@ -320,7 +320,7 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       const card = node("article", "record-card");
       card.append(
         node("strong", "", run.roleName + " · " + run.runId),
-        node("p", "record-copy", (run.kind || "execution-stalled") + " · " + (run.classification || "truly-stalled")),
+        node("p", "record-copy", (run.kind || "workflow-not-progressing") + " · " + (run.classification || "truly-stalled")),
         node("small", "", t("detail.lastProgress") + " · " + formatDateTime(run.progressAt, locale))
       );
       runtimeHealthBody.append(card);

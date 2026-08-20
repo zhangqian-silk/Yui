@@ -19,14 +19,27 @@ import {
 import { join } from "node:path";
 
 import { withUpgradeCoordinationLock } from "../storage/upgradeCoordination.js";
+import {
+  createRuntimeObservation,
+  type RuntimeObservation
+} from "../runtime/runtimeObservation.js";
 
 export const MAX_RUNTIME_TURN_SUMMARY_BYTES = 32 * 1024;
-export const MAX_CLAUDE_HOOK_TEXT_BYTES = 4 * 1024 * 1024;
 export const MAX_RUNTIME_EVENT_FILE_BYTES = 16 * 1024 * 1024;
 
 const RUNTIME_EVENT_DIRECTORY = join("runtime", "inbox");
 const INVALID_RUNTIME_EVENT_DIRECTORY = join("runtime", "inbox-invalid");
 const EVENT_ID_PATTERN = /^turn-[a-f0-9]{64}$/;
+
+export type RuntimeObservationInboxEvent = Readonly<{
+  schemaVersion: 1;
+  id: string;
+  type: "runtime-observation";
+  receivedAt: string;
+  scope: "task" | "global";
+  taskId?: string;
+  observation: RuntimeObservation;
+}>;
 
 export type RuntimeTurnCompletedInput = Readonly<{
   scope: "task" | "global";
@@ -48,102 +61,6 @@ export type RuntimeTurnCompletedEvent = Readonly<{
   type: "native-turn-completed";
   receivedAt: string;
 }> & RuntimeTurnCompletedInput;
-
-type ClaudeEventEnvelope = Readonly<{
-  scope: "task";
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: "claude";
-  launchId: string;
-  nativeSessionId: string;
-  runId: string;
-}>;
-
-export type RuntimeClaudeStopFailureInput = ClaudeEventEnvelope & Readonly<{
-  error: string;
-  errorDetails?: string;
-  lastAssistantMessage?: string;
-}>;
-
-export type RuntimeClaudeStopFailureEvent = Readonly<{
-  schemaVersion: 1;
-  id: string;
-  type: "claude-stop-failure";
-  receivedAt: string;
-}> & RuntimeClaudeStopFailureInput;
-
-/**
- * A provider session-lifecycle fact (Claude or Codex SessionStart).
- * `sessionSource` carries the exact provider-native discriminator (Claude's
- * SessionStart `source`) so the adapter mapping can decide whether it proves
- * pre-input readiness. Provider-neutral: the ingress captures the fact and exact
- * fences; the canonical mapping owns its meaning.
- */
-export type RuntimeSessionLifecycleInput = Readonly<{
-  scope: "task";
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: "codex" | "claude";
-  launchId: string;
-  nativeSessionId: string;
-  runId?: string;
-  sessionSource?: string;
-}>;
-
-export type RuntimeSessionLifecycleEvent = Readonly<{
-  schemaVersion: 1;
-  id: string;
-  type: "native-session-lifecycle";
-  receivedAt: string;
-}> & RuntimeSessionLifecycleInput;
-
-/**
- * A provider prompt-acceptance fact (Claude or Codex UserPromptSubmit). This is
- * the only native signal that may advance a Run to
- * accepted/delivered, and only under an exact identity-matched fold.
- */
-export type RuntimePromptAcceptedInput = Readonly<{
-  scope: "task";
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: "codex" | "claude";
-  launchId: string;
-  nativeSessionId: string;
-  runId: string;
-  receiptId: string;
-}>;
-
-export type RuntimePromptAcceptedEvent = Readonly<{
-  schemaVersion: 1;
-  id: string;
-  type: "native-prompt-accepted";
-  receivedAt: string;
-}> & RuntimePromptAcceptedInput;
-
-/** A provider-native progress fact emitted during an accepted turn. */
-export type RuntimeProviderProgressInput = Readonly<{
-  scope: "task";
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: "codex" | "claude";
-  launchId: string;
-  nativeSessionId: string;
-  runId: string;
-  /** Provider-native event identity (for example Claude tool_use_id). */
-  progressId: string;
-  sequence?: number;
-}>;
-
-export type RuntimeProviderProgressEvent = Readonly<{
-  schemaVersion: 1;
-  id: string;
-  type: "native-turn-progress";
-  receivedAt: string;
-}> & RuntimeProviderProgressInput;
 
 /**
  * f7/rr5: A DurableJob reached a terminal state. The supervisor delivers
@@ -167,19 +84,14 @@ export type RuntimeDurableJobTerminalEvent = Readonly<{
 }> & RuntimeDurableJobTerminalInput;
 
 export type RuntimeLifecycleEvent =
+  | RuntimeObservationInboxEvent
   | RuntimeTurnCompletedEvent
-  | RuntimeClaudeStopFailureEvent
-  | RuntimeSessionLifecycleEvent
-  | RuntimePromptAcceptedEvent
-  | RuntimeProviderProgressEvent
   | RuntimeDurableJobTerminalEvent;
 
 export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
   Readonly<{
     event: TEvent;
     created: boolean;
-    /** Superseded nonterminal progress files removed by this admission. */
-    coalescedEventCount?: number;
   }>;
 
 /** Test-only synchronization seam; production callers leave it unset. */
@@ -204,6 +116,25 @@ export class FileRuntimeEventInbox {
     this.directory = join(home, RUNTIME_EVENT_DIRECTORY);
   }
 
+  enqueueObservation(
+    input: RuntimeObservation
+  ): RuntimeEventEnqueueResult<RuntimeObservationInboxEvent> {
+    const observation = createRuntimeObservation(input);
+    const scope = observation.fence.taskId === undefined ? "global" : "task";
+    const event = Object.freeze({
+      schemaVersion: 1 as const,
+      id: runtimeEventId("runtime-observation", { observation }),
+      type: "runtime-observation" as const,
+      receivedAt: observation.receivedAt,
+      scope,
+      ...(observation.fence.taskId === undefined
+        ? {}
+        : { taskId: observation.fence.taskId }),
+      observation
+    });
+    return this.publish(event);
+  }
+
   enqueueTurnCompleted(
     input: RuntimeTurnCompletedInput
   ): RuntimeEventEnqueueResult<RuntimeTurnCompletedEvent> {
@@ -212,58 +143,6 @@ export class FileRuntimeEventInbox {
       schemaVersion: 1,
       id: runtimeEventId("native-turn-completed", normalized),
       type: "native-turn-completed",
-      receivedAt: this.now().toISOString(),
-      ...normalized
-    }));
-  }
-
-  enqueueClaudeStopFailure(
-    input: RuntimeClaudeStopFailureInput
-  ): RuntimeEventEnqueueResult<RuntimeClaudeStopFailureEvent> {
-    const normalized = normalizeClaudeStopFailureInput(input);
-    return this.publish(Object.freeze({
-      schemaVersion: 1,
-      id: runtimeEventId("claude-stop-failure", normalized),
-      type: "claude-stop-failure",
-      receivedAt: this.now().toISOString(),
-      ...normalized
-    }));
-  }
-
-  enqueueSessionLifecycle(
-    input: RuntimeSessionLifecycleInput
-  ): RuntimeEventEnqueueResult<RuntimeSessionLifecycleEvent> {
-    const normalized = normalizeSessionLifecycleInput(input);
-    return this.publish(Object.freeze({
-      schemaVersion: 1,
-      id: runtimeEventId("native-session-lifecycle", normalized),
-      type: "native-session-lifecycle",
-      receivedAt: this.now().toISOString(),
-      ...normalized
-    }));
-  }
-
-  enqueuePromptAccepted(
-    input: RuntimePromptAcceptedInput
-  ): RuntimeEventEnqueueResult<RuntimePromptAcceptedEvent> {
-    const normalized = normalizePromptAcceptedInput(input);
-    return this.publish(Object.freeze({
-      schemaVersion: 1,
-      id: runtimeEventId("native-prompt-accepted", normalized),
-      type: "native-prompt-accepted",
-      receivedAt: this.now().toISOString(),
-      ...normalized
-    }));
-  }
-
-  enqueueProviderProgress(
-    input: RuntimeProviderProgressInput
-  ): RuntimeEventEnqueueResult<RuntimeProviderProgressEvent> {
-    const normalized = normalizeProviderProgressInput(input);
-    return this.publishProgress(Object.freeze({
-      schemaVersion: 1,
-      id: runtimeEventId("native-turn-progress", normalized),
-      type: "native-turn-progress",
       receivedAt: this.now().toISOString(),
       ...normalized
     }));
@@ -369,20 +248,6 @@ export class FileRuntimeEventInbox {
     return acknowledged;
   }
 
-  private publishProgress(
-    event: RuntimeProviderProgressEvent
-  ): RuntimeEventEnqueueResult<RuntimeProviderProgressEvent> {
-    return withUpgradeCoordinationLock(this.home, () => {
-      this.hooks.afterAdmission?.();
-      const result = this.publishUnlocked(event);
-      if (!result.created) return result;
-      const superseded = this.supersededProgressIds(event);
-      if (superseded.length === 0) return result;
-      this.acknowledgeMany(superseded);
-      return { ...result, coalescedEventCount: superseded.length };
-    });
-  }
-
   private publish<TEvent extends RuntimeLifecycleEvent>(
     event: TEvent
   ): RuntimeEventEnqueueResult<TEvent> {
@@ -448,43 +313,6 @@ export class FileRuntimeEventInbox {
     }
   }
 
-  private supersededProgressIds(event: RuntimeProviderProgressEvent): string[] {
-    const events = this.list();
-    const segment = semanticSegment(events, event);
-    const candidates = events.filter((candidate): candidate is RuntimeProviderProgressEvent => (
-      candidate.type === "native-turn-progress"
-      && sameProgressStream(candidate, event)
-      && compareRuntimeEvents(candidate, segment.before) > 0
-      && (segment.after === undefined || compareRuntimeEvents(candidate, segment.after) < 0)
-    ));
-    let latestReceivedAt = "";
-    let greatestSequence: number | undefined;
-    for (const candidate of candidates) {
-      const receivedAtOrder = candidate.receivedAt.localeCompare(latestReceivedAt);
-      if (receivedAtOrder > 0) {
-        latestReceivedAt = candidate.receivedAt;
-        greatestSequence = candidate.sequence;
-      } else if (
-        receivedAtOrder === 0
-        && candidate.sequence !== undefined
-        && (greatestSequence === undefined || candidate.sequence > greatestSequence)
-      ) {
-        greatestSequence = candidate.sequence;
-      }
-    }
-    return candidates.flatMap((candidate) => (
-      candidate.receivedAt.localeCompare(latestReceivedAt) < 0
-      || (
-        candidate.receivedAt === latestReceivedAt
-        && candidate.sequence !== undefined
-        && greatestSequence !== undefined
-        && candidate.sequence < greatestSequence
-      )
-        ? [candidate.id]
-        : []
-    ));
-  }
-
   private eventPath(id: string): string {
     return join(this.directory, `${id}.json`);
   }
@@ -521,12 +349,17 @@ export class RuntimeEventInboxError extends Error {
 function runtimeEventId(
   type: RuntimeLifecycleEvent["type"],
   input: RuntimeTurnCompletedInput
-    | RuntimeClaudeStopFailureInput
-    | RuntimeSessionLifecycleInput
-    | RuntimePromptAcceptedInput
-    | RuntimeProviderProgressInput
     | RuntimeDurableJobTerminalInput
+    | Readonly<{ observation: RuntimeObservation }>
 ): string {
+  if (type === "runtime-observation") {
+    const observation = (input as Readonly<{ observation: RuntimeObservation }>).observation;
+    return `turn-${createHash("sha256").update(JSON.stringify([
+      1,
+      type,
+      observation
+    ])).digest("hex")}`;
+  }
   if (type === "durable-job-terminal") {
     const job = input as RuntimeDurableJobTerminalInput;
     return `turn-${createHash("sha256").update(JSON.stringify([
@@ -539,9 +372,7 @@ function runtimeEventId(
       job.outcome
     ])).digest("hex")}`;
   }
-  // The durable-job-terminal branch returned above; narrow the union so
-  // provider-only identity fields are accessible without `in` guards.
-  const provider = input as Exclude<typeof input, RuntimeDurableJobTerminalInput>;
+  const provider = input as RuntimeTurnCompletedInput;
   const common = [
     1,
     type,
@@ -553,11 +384,7 @@ function runtimeEventId(
     provider.launchId ?? null,
     provider.nativeSessionId,
     "turnId" in provider ? provider.turnId : null,
-    provider.runId ?? null,
-    "progressId" in provider ? provider.progressId : null,
-    "sequence" in provider ? provider.sequence ?? null : null,
-    "sessionSource" in provider ? provider.sessionSource ?? null : null,
-    "receiptId" in provider ? provider.receiptId ?? null : null
+    provider.runId ?? null
   ];
   return `turn-${createHash("sha256").update(JSON.stringify(common)).digest("hex")}`;
 }
@@ -590,102 +417,6 @@ function normalizeCodexInput(input: RuntimeTurnCompletedInput): RuntimeTurnCompl
     : common;
 }
 
-function normalizeClaudeEnvelope(input: ClaudeEventEnvelope): ClaudeEventEnvelope {
-  if (input.scope !== "task" || input.adapterId !== "claude") throw invalidEvent();
-  return {
-    scope: "task",
-    taskId: requireIdentityText(input.taskId, "Task id"),
-    roleName: requireIdentityText(input.roleName, "Role name"),
-    agentId: requireIdentityText(input.agentId, "Agent id"),
-    adapterId: "claude",
-    launchId: requireIdentityText(input.launchId, "Launch id"),
-    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
-    runId: requireIdentityText(input.runId, "Run id")
-  };
-}
-
-function normalizeClaudeStopFailureInput(
-  input: RuntimeClaudeStopFailureInput
-): RuntimeClaudeStopFailureInput {
-  return {
-    ...normalizeClaudeEnvelope(input),
-    error: requireLongText(input.error, "Claude failure error"),
-    ...(input.errorDetails === undefined
-      ? {}
-      : { errorDetails: requireLongText(input.errorDetails, "Claude failure details") }),
-    ...(input.lastAssistantMessage === undefined
-      ? {}
-      : {
-          lastAssistantMessage: requireLongText(
-            input.lastAssistantMessage,
-            "Claude failure last assistant message"
-          )
-        })
-  };
-}
-
-function normalizeSessionLifecycleInput(
-  input: RuntimeSessionLifecycleInput
-): RuntimeSessionLifecycleInput {
-  if (input.scope !== "task") throw invalidEvent();
-  if (input.adapterId !== "codex" && input.adapterId !== "claude") throw invalidEvent();
-  return {
-    scope: "task",
-    taskId: requireIdentityText(input.taskId, "Task id"),
-    roleName: requireIdentityText(input.roleName, "Role name"),
-    agentId: requireIdentityText(input.agentId, "Agent id"),
-    adapterId: input.adapterId,
-    launchId: requireIdentityText(input.launchId, "Launch id"),
-    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
-    ...(input.runId === undefined
-      ? {}
-      : { runId: requireIdentityText(input.runId, "Run id") }),
-    ...(input.sessionSource === undefined
-      ? {}
-      : { sessionSource: requireIdentityText(input.sessionSource, "Session source") })
-  };
-}
-
-function normalizePromptAcceptedInput(
-  input: RuntimePromptAcceptedInput
-): RuntimePromptAcceptedInput {
-  if (input.scope !== "task") throw invalidEvent();
-  if (input.adapterId !== "codex" && input.adapterId !== "claude") throw invalidEvent();
-  return {
-    scope: "task",
-    taskId: requireIdentityText(input.taskId, "Task id"),
-    roleName: requireIdentityText(input.roleName, "Role name"),
-    agentId: requireIdentityText(input.agentId, "Agent id"),
-    adapterId: input.adapterId,
-    launchId: requireIdentityText(input.launchId, "Launch id"),
-    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
-    runId: requireIdentityText(input.runId, "Run id"),
-    receiptId: requireIdentityText(input.receiptId, "Receipt id")
-  };
-}
-
-function normalizeProviderProgressInput(
-  input: RuntimeProviderProgressInput
-): RuntimeProviderProgressInput {
-  if (input.scope !== "task") throw invalidEvent();
-  if (input.adapterId !== "codex" && input.adapterId !== "claude") throw invalidEvent();
-  if (input.sequence !== undefined && !Number.isSafeInteger(input.sequence)) {
-    throw invalidEvent();
-  }
-  return {
-    scope: "task",
-    taskId: requireIdentityText(input.taskId, "Task id"),
-    roleName: requireIdentityText(input.roleName, "Role name"),
-    agentId: requireIdentityText(input.agentId, "Agent id"),
-    adapterId: input.adapterId,
-    launchId: requireIdentityText(input.launchId, "Launch id"),
-    nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
-    runId: requireIdentityText(input.runId, "Run id"),
-    progressId: requireIdentityText(input.progressId, "Provider progress id"),
-    ...(input.sequence === undefined ? {} : { sequence: input.sequence })
-  };
-}
-
 function normalizeDurableJobTerminalInput(
   input: RuntimeDurableJobTerminalInput
 ): RuntimeDurableJobTerminalInput {
@@ -708,70 +439,36 @@ function normalizeDurableJobTerminalInput(
 function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
   if (!isObject(value)) throw invalidEvent();
   switch (value.type) {
+    case "runtime-observation": return parseRuntimeObservationEvent(value);
     case "native-turn-completed": return parseCodexEvent(value);
-    case "claude-stop-failure": return parseClaudeStopFailureEvent(value);
-    case "native-session-lifecycle": return parseSessionLifecycleEvent(value);
-    case "native-prompt-accepted": return parsePromptAcceptedEvent(value);
-    case "native-turn-progress": return parseProviderProgressEvent(value);
     case "durable-job-terminal": return parseDurableJobTerminalEvent(value);
     default: throw invalidEvent();
   }
 }
 
-function parseSessionLifecycleEvent(
+function parseRuntimeObservationEvent(
   value: Record<string, any>
-): RuntimeSessionLifecycleEvent {
+): RuntimeObservationInboxEvent {
   const expected = [
-    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
-    "agentId", "adapterId", "launchId", "nativeSessionId",
-    ...(value.runId === undefined ? [] : ["runId"]),
-    ...(value.sessionSource === undefined ? [] : ["sessionSource"])
+    "schemaVersion", "id", "type", "receivedAt", "scope", "observation",
+    ...(value.taskId === undefined ? [] : ["taskId"])
   ];
   if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
-  const normalized = normalizeSessionLifecycleInput(value as RuntimeSessionLifecycleInput);
+  const observation = createRuntimeObservation(value.observation as RuntimeObservation);
+  const scope = observation.fence.taskId === undefined ? "global" : "task";
+  if (value.scope !== scope
+    || (scope === "task" && value.taskId !== observation.fence.taskId)
+    || value.receivedAt !== observation.receivedAt) {
+    throw invalidEvent("Runtime observation envelope does not match its canonical fence.");
+  }
   return Object.freeze({
     schemaVersion: 1,
     id: requireIdentityText(value.id, "Event id"),
-    type: "native-session-lifecycle",
-    receivedAt: requireTimestamp(value.receivedAt),
-    ...normalized
-  });
-}
-
-function parsePromptAcceptedEvent(
-  value: Record<string, any>
-): RuntimePromptAcceptedEvent {
-  const expected = [
-    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
-    "agentId", "adapterId", "launchId", "nativeSessionId", "runId", "receiptId"
-  ];
-  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
-  const normalized = normalizePromptAcceptedInput(value as RuntimePromptAcceptedInput);
-  return Object.freeze({
-    schemaVersion: 1,
-    id: requireIdentityText(value.id, "Event id"),
-    type: "native-prompt-accepted",
-    receivedAt: requireTimestamp(value.receivedAt),
-    ...normalized
-  });
-}
-
-function parseProviderProgressEvent(
-  value: Record<string, any>
-): RuntimeProviderProgressEvent {
-  const expected = [
-    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
-    "agentId", "adapterId", "launchId", "nativeSessionId", "runId", "progressId",
-    ...(value.sequence === undefined ? [] : ["sequence"])
-  ];
-  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
-  const normalized = normalizeProviderProgressInput(value as RuntimeProviderProgressInput);
-  return Object.freeze({
-    schemaVersion: 1,
-    id: requireIdentityText(value.id, "Event id"),
-    type: "native-turn-progress",
-    receivedAt: requireTimestamp(value.receivedAt),
-    ...normalized
+    type: "runtime-observation",
+    receivedAt: observation.receivedAt,
+    scope,
+    ...(scope === "task" ? { taskId: observation.fence.taskId! } : {}),
+    observation
   });
 }
 
@@ -838,26 +535,6 @@ function parseCodexEvent(value: Record<string, any>): RuntimeTurnCompletedEvent 
   });
 }
 
-function parseClaudeStopFailureEvent(
-  value: Record<string, any>
-): RuntimeClaudeStopFailureEvent {
-  const expected = [
-    "schemaVersion", "id", "type", "receivedAt", "scope", "taskId", "roleName",
-    "agentId", "adapterId", "launchId", "nativeSessionId", "runId", "error",
-    ...(value.errorDetails === undefined ? [] : ["errorDetails"]),
-    ...(value.lastAssistantMessage === undefined ? [] : ["lastAssistantMessage"])
-  ];
-  if (value.schemaVersion !== 1 || !hasExactKeys(value, expected)) throw invalidEvent();
-  const normalized = normalizeClaudeStopFailureInput(value as RuntimeClaudeStopFailureInput);
-  return Object.freeze({
-    schemaVersion: 1,
-    id: requireIdentityText(value.id, "Event id"),
-    type: "claude-stop-failure",
-    receivedAt: requireTimestamp(value.receivedAt),
-    ...normalized
-  });
-}
-
 function requireIdentityText(value: unknown, label: string): string {
   if (typeof value !== "string" || value.includes("\0")) throw invalidEvent();
   const text = value.trim();
@@ -865,19 +542,6 @@ function requireIdentityText(value: unknown, label: string): string {
     throw invalidEvent(`${label} is invalid.`);
   }
   return text;
-}
-
-function requireLongText(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.includes("\0") || value.trim().length === 0) {
-    throw invalidEvent(`${label} is required.`);
-  }
-  if (Buffer.byteLength(value, "utf8") > MAX_CLAUDE_HOOK_TEXT_BYTES) {
-    throw new RuntimeEventInboxError(
-      "RUNTIME_EVENT_TOO_LARGE",
-      `${label} exceeds the durable inbox limit.`
-    );
-  }
-  return value;
 }
 
 function requireTimestamp(value: unknown): string {
@@ -928,77 +592,24 @@ function hasSameIdentity(left: RuntimeLifecycleEvent, right: RuntimeLifecycleEve
       || left.nativeSessionId === right.nativeSessionId)
     && (!("runId" in left) || !("runId" in right) || left.runId === right.runId)
     && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId)
-    && (!("progressId" in left)
-      || !("progressId" in right)
-      || left.progressId === right.progressId)
-    && (!("sequence" in left) || !("sequence" in right) || left.sequence === right.sequence)
     && (!("jobId" in left) || !("jobId" in right) || left.jobId === right.jobId);
 }
 
-function compareRuntimeEvents(
-  left: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">,
-  right: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">
-): number {
-  return left.receivedAt.localeCompare(right.receivedAt)
-    || left.id.localeCompare(right.id);
-}
+type RuntimeEventOrderKey = Pick<RuntimeLifecycleEvent, "receivedAt" | "id"> & Readonly<{
+  observation?: RuntimeObservation;
+}>;
 
-/** Chooses one latest fact inside an already-isolated exact progress stream. */
-export function compareRuntimeProgressRecency(
-  left: Pick<RuntimeProviderProgressEvent, "receivedAt" | "id" | "sequence">,
-  right: Pick<RuntimeProviderProgressEvent, "receivedAt" | "id" | "sequence">
+function compareRuntimeEvents(
+  left: RuntimeEventOrderKey,
+  right: RuntimeEventOrderKey
 ): number {
   const receivedAt = left.receivedAt.localeCompare(right.receivedAt);
   if (receivedAt !== 0) return receivedAt;
-  if (
-    left.sequence !== undefined
-    && right.sequence !== undefined
-    && left.sequence !== right.sequence
-  ) {
-    return left.sequence - right.sequence;
-  }
-  // A content-derived event id is identity, not arrival evidence. Without two
-  // comparable provider sequences, same-timestamp facts remain incomparable.
-  return 0;
-}
-
-function semanticSegment(
-  events: readonly RuntimeLifecycleEvent[],
-  current: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">
-): Readonly<{
-  before: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">;
-  after?: Pick<RuntimeLifecycleEvent, "receivedAt" | "id">;
-}> {
-  let before: Pick<RuntimeLifecycleEvent, "receivedAt" | "id"> = {
-    receivedAt: "",
-    id: ""
-  };
-  let after: Pick<RuntimeLifecycleEvent, "receivedAt" | "id"> | undefined;
-  for (const event of events) {
-    if (event.type === "native-turn-progress") continue;
-    const order = compareRuntimeEvents(event, current);
-    if (order < 0 && compareRuntimeEvents(event, before) > 0) {
-      before = event;
-    } else if (order > 0 && (
-      after === undefined || compareRuntimeEvents(event, after) < 0
-    )) {
-      after = event;
-    }
-  }
-  return { before, ...(after === undefined ? {} : { after }) };
-}
-
-function sameProgressStream(
-  left: RuntimeProviderProgressEvent,
-  right: RuntimeProviderProgressEvent
-): boolean {
-  return left.taskId === right.taskId
-    && left.roleName === right.roleName
-    && left.agentId === right.agentId
-    && left.adapterId === right.adapterId
-    && left.launchId === right.launchId
-    && left.nativeSessionId === right.nativeSessionId
-    && left.runId === right.runId;
+  const sequence = (left.observation?.sequence ?? -1) - (right.observation?.sequence ?? -1);
+  if (sequence !== 0) return sequence;
+  const ordinal = (left.observation?.ordinal ?? -1) - (right.observation?.ordinal ?? -1);
+  if (ordinal !== 0) return ordinal;
+  return left.id.localeCompare(right.id);
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {

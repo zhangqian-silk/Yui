@@ -76,7 +76,10 @@ test("transport-only Mock Agent Session never claims provider acceptance", async
 
   const observation = await session.waitForObservation("transport-received");
   assert.equal(observation.nativeSessionId, session.nativeSessionId);
-  assert.equal(session.inboxEvents().some((event) => event.type === "native-prompt-accepted"), false);
+  assert.equal(session.inboxEvents().some((event) => (
+    event.type === "runtime-observation"
+    && event.observation.kind === "turn.accepted"
+  )), false);
   assert.equal(session.currentRun().deliveredAt, undefined);
 });
 
@@ -132,7 +135,10 @@ test("a late Mock Agent event cannot cross into a successor launch generation", 
   const rejected = await session.waitForHook("UserPromptSubmit");
   assert.notEqual(rejected.exitCode, 0);
   assert.match(rejected.stderr, /does not match|no matching|not current/i);
-  assert.equal(session.inboxEvents().some((event) => event.type === "native-prompt-accepted"), false);
+  assert.equal(session.inboxEvents().some((event) => (
+    event.type === "runtime-observation"
+    && event.observation.kind === "turn.accepted"
+  )), false);
   assert.equal(session.activeRun().id, successor.id);
   assert.equal(session.activeRun().deliveredAt, undefined);
 });

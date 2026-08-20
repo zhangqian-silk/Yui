@@ -113,7 +113,7 @@ function buildLargeFixture(home, now) {
         const at = new Date(deliveredAt.getTime() + (index % 100) * 1_000);
         const stalled = index % 10 === 9;
         const payload = stalled
-          ? { runId, roleName, kind: "execution-stalled", classification: "truly-stalled", progressAt: at.toISOString(), idleMs: "60000", evidenceKey: "fixture-stall", status: "needs-attention", evidence: "x".repeat(EVENT_PADDING) }
+          ? { runId, roleName, kind: "workflow-not-progressing", classification: "truly-stalled", progressAt: at.toISOString(), idleMs: "60000", evidenceKey: "fixture-stall", status: "needs-attention", evidence: "x".repeat(EVENT_PADDING) }
           : { runId, roleName, kind: "durable-fold", progressAt: at.toISOString(), evidence: "x".repeat(EVENT_PADDING) };
         tx.saveEvent(taskId, createTaskEvent(tx.nextEventId(taskId), taskId, stalled ? "run.stalled" : "run.progress", payload, at));
         written += 1;
@@ -122,7 +122,7 @@ function buildLargeFixture(home, now) {
       const finalAttentionAt = new Date(deliveredAt.getTime() + 120_000);
       for (const { id, roleName } of activeRunIds) {
         tx.saveEvent(taskId, createTaskEvent(tx.nextEventId(taskId), taskId, "run.stalled",
-          { runId: id, roleName, kind: "execution-stalled", classification: "truly-stalled", progressAt: finalAttentionAt.toISOString(), idleMs: "60000", evidenceKey: "fixture-final-attention", status: "needs-attention", evidence: "x".repeat(EVENT_PADDING) },
+          { runId: id, roleName, kind: "workflow-not-progressing", classification: "truly-stalled", progressAt: finalAttentionAt.toISOString(), idleMs: "60000", evidenceKey: "fixture-final-attention", status: "needs-attention", evidence: "x".repeat(EVENT_PADDING) },
           finalAttentionAt));
       }
     });

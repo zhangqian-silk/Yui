@@ -131,6 +131,28 @@ const noTmux = {
   async stopTask() { return false; }
 };
 
+test("runtime observation uses its own bounded cadence", async () => {
+  let samples = 0;
+  let resolveSecond;
+  const second = new Promise((resolve) => { resolveSecond = resolve; });
+  const controller = new FileTaskController(emptyStore(), noTmux, {
+    intervalMs: 60_000,
+    runtimeObserverIntervalMs: 5,
+    runtimeObserver: {
+      async sample() {
+        samples += 1;
+        if (samples === 2) resolveSecond();
+        return [];
+      }
+    }
+  });
+  controller.start();
+  await second;
+  controller.stop();
+  await controller.shutdownAndDrain();
+  assert.ok(samples >= 2);
+});
+
 test("controller scheduler scans durable wakeups before and after liveness", async () => {
   const events = [];
   const result = await runControllerSchedulerPass(emptyStore(events), noTmux, new Date(0));
@@ -414,7 +436,6 @@ test("full controller liveness and stall phases reuse one Role inventory", async
     }
   };
 
-  const resourceSuppressionKeys = new Set();
   await runControllerSchedulerPass(
     store,
     delivery,
@@ -424,26 +445,10 @@ test("full controller liveness and stall phases reuse one Role inventory", async
     true,
     [],
     undefined,
-    30 * 60_000,
-    resourceSuppressionKeys
+    30 * 60_000
   );
   assert.equal(inventoryCalls, 1);
   assert.equal(singleInspections, 0);
-  assert.equal(stallRecords, 0);
-
-  // The same advisory sample cannot keep the same stale Run healthy forever.
-  await runControllerSchedulerPass(
-    store,
-    delivery,
-    new Date(31 * 60_000),
-    undefined,
-    { kind: "full" },
-    true,
-    [],
-    undefined,
-    30 * 60_000,
-    resourceSuppressionKeys
-  );
   assert.equal(stallRecords, 1);
 });
 

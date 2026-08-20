@@ -685,20 +685,29 @@ Use `yui role unbind <global-role> <agent-id>` or `yui task role unbind <task-id
 
 Claude session IDs are preallocated at launch. Every managed Task Claude Run
 uses a new finite process; resume starts a new process against the fixed native
-session instead of reusing an interactive pane. Managed Codex launches use
-Codex's structured `notify` callback; after a completed turn, the callback
-records the native thread ID without injecting a session-binding prompt into
-the model conversation.
+session instead of reusing an interactive pane. Codex discovers its native
+thread identity from structured lifecycle events. Managed Task Runs use one
+Agent Driver Hook ingress for both CLIs. Global interactive Codex sessions may
+still use its structured `notify` callback for conversation presentation.
 
 Automated lifecycle and delivery decisions use structured Hook payloads,
-persisted identities, tmux process state, receipts, and pane fences. Yui never
+persisted identities, usage snapshots, tmux process state, receipts, and pane
+fences. Yui never
 parses prompt glyphs, progress text, trust dialogs, or other Agent terminal
 output to infer readiness or success. `captureRole()` remains an explicit
 human-facing transcript read and has no lifecycle authority.
 
+The [Agent Runtime Driver architecture](docs/agent-runtime-drivers.md) keeps
+native Codex/Claude event names at the edge. Core consumes exact-fenced
+Session, Turn, operation, waiting, host, and activity observations. A positive
+token delta is evidence of recent runtime activity; an unchanged counter is
+not. A live tmux pane proves only that the host exists. Runtime activity and
+durable workflow progress use independent clocks, so token/tool/resource
+movement cannot conceal a workflow that is not advancing.
+
 Stable Role context is also launch metadata, never a bootstrap turn. Yui passes Role policy and `systemPrompt` through the Agent's native system/developer-instruction channel. Task execution Runs receive the generic Leader or Worker Skill, while review Runs receive the generic Reviewer Skill based on durable Run purpose rather than a configured Role name. These Yui-owned Role Skills define portable orchestration only. Project Skills remain ordinary versioned files in the Project and are discovered, selected, and loaded by the Agent through its native project mechanism; Yui does not scan, parse, copy, or inject them.
 
-Native Codex developer instructions carry compact absolute references only for Yui-owned Role Skills, which Codex reads on demand. Because `developer_instructions` is one scalar setting, Yui inspects every supported Linux Codex layer—`/etc/codex/config.toml`, the user config, the selected `$CODEX_HOME/<name>.config.toml`, project configs, and `/etc/codex/managed_config.toml`—and refuses to replace a value found in any of them. Managed Codex sessions also require exclusive ownership of the structured `notify` callback that records native Turn completion; Yui refuses launch when any inspected layer already defines `notify`, so neither callback can silently replace the other. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Yui-owned Role Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the purpose-specific Role path. Non-Operator global Roles stay neutral and receive no Task orchestration Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker or Reviewer Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
+Native Codex developer instructions carry compact absolute references only for Yui-owned Role Skills, which Codex reads on demand. Because `developer_instructions` is one scalar setting, Yui inspects every supported Linux Codex layer—`/etc/codex/config.toml`, the user config, the selected `$CODEX_HOME/<name>.config.toml`, project configs, and `/etc/codex/managed_config.toml`—and refuses to replace a value found in any of them. Codex sessions opened without a managed Run use Yui's structured `notify` callback for session presentation and therefore require exclusive ownership of that setting. Managed Runs instead use invocation-local Agent Driver Hooks as their sole lifecycle authority. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Yui-owned Role Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the purpose-specific Role path. Non-Operator global Roles stay neutral and receive no Task orchestration Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker or Reviewer Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
 
 ## Controller and failure handling
 
@@ -728,7 +737,7 @@ hiding the resources that remain. Use `--all` to include discovered Yui homes.
 
 `controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It does not stop or restart managed tmux/Agent sessions.
 
-Its recovery reconciliation runs every 120 seconds by default. Normal durable state changes enqueue a Task, Role, or Operator key and return immediately; keys received in the same fixed 100 ms window trigger one non-overlapping targeted pass. Operator presentation has an independent lane, so a blocked Task workspace operation cannot delay a user question. Periodic Git/worktree work is limited to Tasks with durable Task-mailbox work, while active Role liveness uses one tmux inventory. A Codex turn-complete Hook writes directly to storage without starting or waiting for the Controller, then gives a legal yield/input/completion two seconds to win before closing a forgotten Run. Durable mailboxes freeze the current batch while new signals merge into the next batch. Task-orchestration failures retain the exact Controller-owned processing batch for two bounded fast retries and later periodic recovery; a successful retry completes that batch before newer pending work is claimed. Recommended InputRequest and pending Turn deadlines share one nearest-deadline selector and therefore do not wait for the recovery interval. Explicit `task reconcile` still requests an immediate recovery pass. The retained loop is:
+Its recovery reconciliation runs every 120 seconds by default. Normal durable state changes enqueue a Task, Role, or Operator key and return immediately; keys received in the same fixed 100 ms window trigger one non-overlapping targeted pass. Operator presentation has an independent lane, so a blocked Task workspace operation cannot delay a user question. Periodic Git/worktree work is limited to Tasks with durable Task-mailbox work, while active Role liveness uses one tmux inventory. Agent Driver Hooks write exact-fenced observations to the durable runtime inbox without starting or waiting for the Controller. A terminal Turn observation gives a legal yield/input/completion two seconds to win before a forgotten Run fails its workflow contract. Durable mailboxes freeze the current batch while new signals merge into the next batch. Task-orchestration failures retain the exact Controller-owned processing batch for two bounded fast retries and later periodic recovery; a successful retry completes that batch before newer pending work is claimed. Recommended InputRequest and pending Turn deadlines share one nearest-deadline selector and therefore do not wait for the recovery interval. Explicit `task reconcile` still requests an immediate recovery pass. The retained loop is:
 
 1. dispatch pending Leader wakes whose Task workspaces are already ready;
 2. prepare active Project Task main worktrees with durable orchestration work;
@@ -736,7 +745,7 @@ Its recovery reconciliation runs every 120 seconds by default. Normal durable st
 4. resolve due Turn completions and reconcile Role liveness;
 5. dispatch Leader work created or unblocked by the later recovery phases.
 
-Automated input is sent only through tmux. Each pass performs one non-blocking process-state readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are normally woken by Codex turn-complete events. A pane-local receipt prevents the same Run from being typed twice after a Controller retry.
+Automated input is sent only through tmux. Each pass performs one non-blocking process-state readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are woken by canonical Agent Driver terminal observations. A pane-local receipt prevents the same Run from being typed twice after a Controller retry.
 
 If a Role process exits before yielding, the Controller fails that Run and running WorkItem and queues the Leader. Recovery failures are exposed through the small compatibility Jobs view:
 

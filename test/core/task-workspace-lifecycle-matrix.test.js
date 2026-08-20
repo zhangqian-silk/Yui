@@ -208,7 +208,6 @@ function controllerPass(fixture, { fence = true, onDefer } = {}) {
     [],
     undefined,
     undefined,
-    new Set(),
     fence ? (projectId) => isProjectMaintenanceFenced(fixture.home, projectId) : undefined,
     onDefer
   );
