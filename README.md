@@ -21,7 +21,7 @@ yui setup
 yui doctor
 ```
 
-`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, and probes each selected CLI for its current models. It configures the Leader and Operator, then explains that the global Worker configuration is copied into new Task Roles and asks whether Worker should reuse Leader or be configured separately. Model selection is followed by that model's supported reasoning efforts. Setup also confirms the Project workspace outside Yui home and offers shell-completion setup. The picker includes the native CLI default and a custom-value option. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes.
+`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, and probes each selected CLI for its current models. It configures the Leader and Operator, then explains that the global Worker configuration is copied into new Task Roles and asks whether Worker should reuse Leader or be configured separately. Model selection is followed by that model's supported reasoning efforts. Setup also confirms the Project workspace outside Yui home and offers shell-completion setup. The picker includes the native CLI default and a custom-value option. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes. A successful setup ensures the current Home's detached Controller is running before it returns.
 
 Model and effort are per-Agent Role settings, so Operator, Leader, and the global Worker can use different values even when they share an Agent CLI. Interactive Role flows validate those settings against the selected Agent runtime. Worker Profile model and effort fields are provider-neutral child-execution hints and therefore remain explicit, scriptable values rather than Agent capability selections.
 
@@ -737,6 +737,12 @@ hiding the resources that remain. Use `--all` to include discovered Yui homes.
 
 `controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It does not stop or restart managed tmux/Agent sessions.
 
+Successful `setup`, `upgrade`, and `update` commands ensure that the current
+Home has a running Controller, starting one when the Home was previously idle.
+Read-only commands and `upgrade --dry-run` do not start a Controller. `update`
+also replaces an already-running Controller only after the new binary passes its
+health checks.
+
 Its recovery reconciliation runs every 120 seconds by default. Normal durable state changes enqueue a Task, Role, or Operator key and return immediately; keys received in the same fixed 100 ms window trigger one non-overlapping targeted pass. Operator presentation has an independent lane, so a blocked Task workspace operation cannot delay a user question. Periodic Git/worktree work is limited to Tasks with durable Task-mailbox work, while active Role liveness uses one tmux inventory. Agent Driver Hooks write exact-fenced observations to the durable runtime inbox without starting or waiting for the Controller. A terminal Turn observation gives a legal yield/input/completion two seconds to win before a forgotten Run fails its workflow contract. Durable mailboxes freeze the current batch while new signals merge into the next batch. Task-orchestration failures retain the exact Controller-owned processing batch for two bounded fast retries and later periodic recovery; a successful retry completes that batch before newer pending work is claimed. Recommended InputRequest and pending Turn deadlines share one nearest-deadline selector and therefore do not wait for the recovery interval. Explicit `task reconcile` still requests an immediate recovery pass. The retained loop is:
 
 1. dispatch pending Leader wakes whose Task workspaces are already ready;
@@ -821,8 +827,10 @@ preflight does not create or validate a staged Home and is not
 stops the exact old Controller PID. Current and compatible-old Homes use the
 no-Home-mutation fast path; migration-required Homes first require a clear
 offline Run/Session/lifecycle inventory, then use the timestamped-backup switch.
-Both paths promote the binary only after an exact PID-fenced old-Controller stop
-and run a new-binary health check before the authenticated replacement starts.
+Both paths run a new-binary health check before the authenticated Controller
+handoff. When an old Controller exists, it is stopped with an exact PID fence;
+when no old Controller existed, the same verified new Controller is started
+before the update reports success.
 Yui promotes the **same artifact it staged**
 (binary activation pins the exact staged version, never a second bare `@latest`);
 the staged version must be a **concrete semver** — a `latest`/dist-tag sentinel,
