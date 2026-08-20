@@ -263,12 +263,30 @@ async function e2eFixture(t, { providerEnv = {} } = {}) {
       await runtime.startController();
     },
     async launchLeader() {
-      await callController(home, "runtime.ensure-role-session", {
-        scope: "task",
-        taskId: task.id,
-        roleName: role.name,
-        environment: providerEnvironment
-      });
+      try {
+        await callController(home, "runtime.ensure-role-session", {
+          scope: "task",
+          taskId: task.id,
+          roleName: role.name,
+          environment: providerEnvironment
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const code = typeof error === "object" && error !== null && "code" in error
+          ? String(error.code)
+          : "unknown";
+        throw new Error(
+          `Controller launch failed (${code}): ${message}\n`
+          + `Diagnostics:\n${formatLaunchDiagnostics(
+            home,
+            task.id,
+            role.name,
+            observationPath,
+            runtime.controllerLogPath
+          )}`,
+          { cause: error }
+        );
+      }
       // Wait for the Provider process and its owner record.
       await waitFor(
         () => readObservations(observationPath).some((o) => o.event === "process-started" && !o.isChild),
@@ -395,6 +413,40 @@ function rootPidAndChildPids(fixture) {
     rootPid: root?.pid,
     childPids: children.map((child) => child.pid)
   };
+}
+
+function formatLaunchDiagnostics(home, taskId, roleName, observationPath, controllerLogPath) {
+  const store = new FileTaskStore(home);
+  const owners = store.listSessionOwners().map((owner) => ({
+    launchId: owner.launchId,
+    pid: owner.providerRoot.pid,
+    live: isLinuxProcessLive(
+      owner.providerRoot.pid,
+      owner.providerRoot.startIdentity
+    ),
+    attribution: owner.providerRoot.attribution
+  }));
+  let panes;
+  try {
+    panes = new TmuxManager(
+      "tmux",
+      new NodeCommandExecutor(),
+      { yuiHome: home }
+    ).inspectRolePaneInventory();
+  } catch (error) {
+    panes = [{ error: error instanceof Error ? error.message : String(error) }];
+  }
+  let controllerLog = "";
+  try {
+    controllerLog = readFileSync(controllerLogPath, "utf8").trim();
+  } catch { /* log may not exist */ }
+  return JSON.stringify({
+    taskId,
+    roleName,
+    observations: readObservations(observationPath),
+    owners,
+    panes
+  }, null, 2) + `\nController log:\n${controllerLog || "(empty)"}`;
 }
 
 /**
