@@ -1,75 +1,44 @@
-# Verification levels
+# Verification policy
 
-Yui is primarily a single-user local product. Its verification policy optimizes
-for a fast feedback loop around the few failures that would make the product
-unusable. It deliberately does not try to prove the whole repository on every
-commit: users can install an earlier version, and a focused fix can be released
-quickly when a non-core regression escapes.
+Yui is a single-user local product. Permanent verification protects only the
+few happy paths whose failure would make the product unusable; it is not a
+historical catalog of every defect or edge case.
 
-| Level | Where | What it proves |
-| --- | --- | --- |
-| **L1 — targeted evidence** | local development | the behavior changed by this patch works under the smallest relevant test |
-| **L2 — core tripwire** | `ci.yml` on PRs and `master` | Yui builds, its core storage/workflow/Agent Driver paths work, and the runtime package has the expected shape |
-| **L3 — release smoke** | `publish.yml` on a tag | the exact artifact installs and starts on supported Node versions |
+## Local development
 
-## L1: the change owns its specific risk
+Use the smallest evidence needed for the current change. TDD tests, repro
+scripts, fault injection, and abnormal-data fixtures are temporary development
+tools. Remove them when the requirement is complete unless they reveal that a
+basic product path is absent from the permanent smoke.
 
-Run the smallest tests that exercise the changed behavior. A change outside the
-L2 core list must still have targeted local evidence; absence from CI does not
-mean the behavior is unimportant.
+Do not retain dedicated regression tests for malformed data, deletion,
+retirement, archive, retry, rollback, recovery, old incidents, or combinatorial
+compatibility. Revalidate those behaviors only when a change directly touches
+them. This keeps maintenance proportional to current product value instead of
+the number of bugs fixed over time.
 
-| Change touches | Minimal local evidence |
-| --- | --- |
-| pure logic, storage, parsing | affected Unit files |
-| Controller, tmux, Session, lifecycle | affected Isolated Integration or Mock Agent Session files |
-| package scripts, Skills, workflows | package smoke plus `test/core/core-package.test.js` |
-| real Provider protocol | only the explicitly authorized Provider E2E scenario |
+## Permanent core smoke
 
-`npm test` remains the broad deterministic diagnostic suite. Use it when a
-change is unusually cross-cutting or while investigating a regression; it is
-not routine completion evidence and is not a merge gate.
+`npm test` and `npm run test:core` build the checkout and run the same four
+happy-path checks:
 
-## L2: a bounded core tripwire
+1. the packaged CLI starts and exposes setup/update/upgrade/Task commands;
+2. one normal SQLite Task and Message survive a reopen;
+3. the production migration graph advances a supported aggregate version;
+4. the built-in Codex and Claude Drivers are registered.
 
-`ci.yml` uses the disposable GitHub runner directly and has a three-minute hard
-timeout. Its normal path should finish well below that limit:
+The test phase should remain below two seconds on a normal development machine;
+the TypeScript build is measured separately. Adding a permanent case requires a
+product-level primary path, and overlapping coverage must be replaced rather
+than accumulated.
 
-1. `npm ci`, using the Actions npm cache;
-2. `npm run test:core`, which builds TypeScript once and runs the explicit,
-   serial file list in `scripts/run-core-tests.mjs`;
-3. one runtime-package structure and CLI-start smoke.
+## CI and release
 
-The selected tests cover the core command framework, Task workflow and
-scheduler, durable storage/schema delivery, runtime events, Agent Driver
-registration, Codex/Claude observation adapters, and the runtime-status
-projection. They do not start tmux Sessions, real Agent CLIs, or real models.
+`ci.yml` runs the core smoke plus one package-assembly/start check. It does not
+run a second lint pass or a broader regression suite. `publish.yml` reuses that
+exact gated commit and adds only tag, artifact, install, and provenance checks
+that are unique to publishing.
 
-The list is intentionally explicit rather than a directory glob. New tests do
-not silently increase CI time. Expanding it requires a product-level reason:
-the failure must be both central to basic use and cheap, deterministic, and
-local to detect. `npm run lint` is not repeated because `npm run build` already
-runs TypeScript checking.
-
-Stale runs for the same PR are cancelled. There are no retries, historical
-baseline comparisons, or fresh-clone-within-runner. The GitHub job result is
-the gate evidence. A failure is fixed or the change is corrected; a hang is
-bounded by the job timeout.
-
-## L3: release-only evidence
-
-A release tag must point to `master`, and `publish.yml` confirms that the exact
-SHA has a successful `ci.yml` run. It does not repeat the diagnostic suite and
-adds only evidence unique to publishing:
-
-- tag/version identity and npm provenance;
-- one assembled tarball whose checksum is shared by all release jobs;
-- package contents and executable-bit checks;
-- a fresh install and `.bin/yui` start on Node 20, 22, and 24.
-
-## Accepted residual risk
-
-The core tripwire will not catch every regression, platform scheduling issue,
-or Provider CLI change. This is intentional. Process-lifecycle, large storage,
-full deterministic, Provider, and release-isolation suites remain available as
-focused diagnostics. They are run when the affected code or an observed failure
-justifies their cost, not on every commit.
+Real Agents, providers, models, paid APIs, shared Homes, and production systems
+are never implied by a request to test or validate. They require an explicit
+user request for the exact resource and effect boundary.

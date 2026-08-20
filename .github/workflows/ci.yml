@@ -1,9 +1,8 @@
 name: Core CI
 
-# A deliberately small regression tripwire for a single-user product. It builds
-# once, runs an explicit list of core storage/workflow/Agent Driver tests, and
-# checks the package structure. Broader deterministic, process-lifecycle, and
-# real-provider suites remain available on demand but are not merge blockers.
+# A seconds-scale product smoke for a single-user local tool. It builds once,
+# checks the four essential CLI/storage/migration/Driver paths, then verifies
+# the package can be assembled and started.
 
 on:
   pull_request:
@@ -37,7 +36,7 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Core regression smoke
+      - name: Core path smoke
         run: npm run test:core
 
       - name: Package structure smoke

@@ -1574,23 +1574,73 @@ function requireAggregateV17Snapshot(snapshot: HomeSnapshot): void {
 /**
  * Runtime state is now projected exclusively from canonical
  * `runtime.observation` events. Offline upgrade inventory proves there are no
- * active Runs or live Sessions, so the historical lifecycle vocabulary needs
- * no dual-read adapter after this version-only boundary.
+ * active Runs or live Sessions. A retired Task has also explicitly abandoned
+ * its runtime, so its stored runtime inconsistencies no longer block the Home;
+ * the anomalous records themselves remain available as history. Non-retired
+ * Tasks still fail closed and receive the supported retirement command.
  */
 function migrateAggregateV18ToV19(snapshot: HomeSnapshot): HomeSnapshot {
   requireAggregateV18Snapshot(snapshot);
-  return {
-    schemaManifest: {
-      ...snapshot.schemaManifest,
-      aggregateSchemaVersion: RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION
-    },
-    state: snapshot.state === null
-      ? null
-      : {
-          ...snapshot.state,
-          schemaVersion: RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION
-        }
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    aggregateSchemaVersion: RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION
   };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawStoredTask] of Object.entries(tasks)) {
+    const storedTask = asObject(rawStoredTask, `Task aggregate ${taskId}`);
+    const rawTask = storedTask.task;
+    const task = rawTask !== null && typeof rawTask === "object" && !Array.isArray(rawTask)
+      ? rawTask as Record<string, unknown>
+      : undefined;
+    if (task?.status === "retired") {
+      nextTasks[taskId] = { ...storedTask };
+      continue;
+    }
+    requireResolvableActiveRunPointers(taskId, storedTask);
+    nextTasks[taskId] = { ...storedTask };
+  }
+  return {
+    schemaManifest,
+    state: {
+      ...snapshot.state,
+      schemaVersion: RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION,
+      tasks: nextTasks
+    }
+  };
+}
+
+function requireResolvableActiveRunPointers(
+  taskId: string,
+  storedTask: Record<string, unknown>
+): void {
+  if (storedTask.activeRuns === undefined) return;
+  const activeRuns = asObject(storedTask.activeRuns, `activeRunPointer map ${taskId}`);
+  if (Object.keys(activeRuns).length === 0) return;
+  const agentRuns = asObject(storedTask.agentRuns, `agentRun map ${taskId}`);
+  for (const [pointer, rawActiveRun] of Object.entries(activeRuns)) {
+    const activeRun = asObject(rawActiveRun, `Active run ${taskId}/${pointer}`);
+    const runId = typeof activeRun.runId === "string" ? activeRun.runId.trim() : "";
+    if (runId.length === 0) {
+      throw new Error(
+        `Active run pointer ${taskId}/${pointer} has an invalid runId. `
+        + taskRetirementUpgradeHint(taskId)
+      );
+    }
+    if (agentRuns[runId] === undefined) {
+      throw new Error(
+        `Active run pointer ${taskId}/${pointer} references missing agent run ${runId}. `
+        + taskRetirementUpgradeHint(taskId)
+      );
+    }
+  }
+}
+
+function taskRetirementUpgradeHint(taskId: string): string {
+  return `Retire Task ${taskId} with `
+    + `\`yui task retire ${taskId} --summary "abandon inconsistent runtime state"\`, `
+    + "then retry `yui update`.";
 }
 
 function requireAggregateV18Snapshot(snapshot: HomeSnapshot): void {

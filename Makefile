@@ -2,7 +2,7 @@ NPM_INSTALL_STAMP := node_modules/.package-lock.json
 
 .DEFAULT_GOAL := all
 
-.PHONY: all help deps build lint test test-tier check install-local link unlink dev-reset
+.PHONY: all help deps build lint test check install-local link unlink dev-reset
 
 all: build
 
@@ -13,9 +13,8 @@ help:
 	@printf '%s\n' '  make deps          Install npm dependencies when needed'
 	@printf '%s\n' '  make build         Build dist/cli.js'
 	@printf '%s\n' '  make lint          Run TypeScript no-emit check'
-	@printf '%s\n' '  make test          Run full deterministic test suite (no real model)'
-	@printf '%s\n' '  make test-tier T=<tier>  Run one explicit test tier (see: node scripts/run-test-tier.mjs list)'
-	@printf '%s\n' '  make check         Run full build, lint, and test verification'
+	@printf '%s\n' '  make test          Build and run the seconds-scale core smoke'
+	@printf '%s\n' '  make check         Run the same lean core verification'
 	@printf '%s\n' '  make install-local Build and create only this checkout'\''s isolated yui launcher (no global change)'
 	@printf '%s\n' '  make link          Reversibly point the user-level yui command at this checkout'
 	@printf '%s\n' '  make unlink        Restore the previous user-level yui command'
@@ -35,13 +34,7 @@ lint: deps
 test: deps
 	npm test
 
-# Run a single explicit tier: `make test-tier T=unit` (or isolated-integration,
-# mock-agent-session, provider-e2e, release-e2e). Provider/Release tiers refuse
-# to run without their opt-in env var and a passing isolation preflight.
-test-tier: deps
-	node scripts/run-test-tier.mjs $(T)
-
-check: build lint test
+check: test
 
 install-local: build
 	node scripts/manage-dev-launcher.mjs install-local
