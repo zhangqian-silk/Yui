@@ -991,6 +991,11 @@ function safeDispatcherError(
         }
         return { code: "SERVICE_ERROR", message };
       }
+      case "RuntimeLaunchStateChangedError":
+        // The launch coordinator already stopped the exact host and bounded
+        // the detail to its currentness/reservation contract. Surface that
+        // actionable diagnosis instead of collapsing it to INTERNAL_ERROR.
+        return { code: "SERVICE_ERROR", message };
       default:
         return undefined;
     }

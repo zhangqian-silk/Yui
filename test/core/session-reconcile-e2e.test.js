@@ -426,6 +426,11 @@ function formatLaunchDiagnostics(home, taskId, roleName, observationPath, contro
     ),
     attribution: owner.providerRoot.attribution
   }));
+  const mailbox = store.getWorkMailbox({
+    kind: "role-runtime",
+    taskId,
+    roleName
+  });
   let panes;
   try {
     panes = new TmuxManager(
@@ -445,6 +450,7 @@ function formatLaunchDiagnostics(home, taskId, roleName, observationPath, contro
     roleName,
     observations: readObservations(observationPath),
     owners,
+    mailbox,
     panes
   }, null, 2) + `\nController log:\n${controllerLog || "(empty)"}`;
 }

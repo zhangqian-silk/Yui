@@ -95,6 +95,13 @@ class LaunchSubmittedHostBusyError extends RuntimeBindingContractError {
   }
 }
 
+class RuntimeLaunchStateChangedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "RuntimeLaunchStateChangedError";
+  }
+}
+
 /**
  * One application service owns the reservation -> host -> persistence
  * protocol for Controller/scheduler-driven Role launches. Foreground Task
@@ -630,7 +637,11 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     ) {
       this.#requireCleanup(owner);
     }
-    throw cause;
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new RuntimeLaunchStateChangedError(
+      `Runtime launch was compensated after state changed: ${detail}`,
+      { cause }
+    );
   }
 
   #preflightRuntimeIsolation(
