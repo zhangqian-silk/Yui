@@ -76,6 +76,135 @@ export const STAGED_DATABASE_FILENAME = "yui.db.staged";
 /** The committed database filename. */
 export const COMMITTED_DATABASE_FILENAME = "yui.db";
 
+/**
+ * Preserve SQLite-owned durable state that intentionally sits outside the
+ * state.json-shaped Task aggregate snapshot. Volatile coordination locks and
+ * derived projections are rebuilt or dropped at the offline boundary.
+ */
+export function copySqlitePassthroughState(
+  home: string,
+  sourceDatabaseFilename: string,
+  targetDatabaseFilename: string
+): void {
+  if (sourceDatabaseFilename === targetDatabaseFilename) {
+    throw new Error("SQLite passthrough copy requires distinct source and target databases.");
+  }
+  const source = new Database(join(home, sourceDatabaseFilename), { readonly: true });
+  const target = new Database(join(home, targetDatabaseFilename));
+  try {
+    target.pragma("foreign_keys = ON");
+    target.transaction(() => {
+      mergeGlobalSequences(source, target);
+      copyTableRows(source, target, "outbox");
+      copyMailboxSignals(source, target);
+      copyTableRows(source, target, "work_item_candidates");
+      copyTableRows(source, target, "review_findings");
+      copyTableRows(source, target, "telemetry");
+      if (sqliteTableExists(source, "telemetry_aggregate")) {
+        target.exec("DELETE FROM telemetry_aggregate");
+        copyTableRows(source, target, "telemetry_aggregate");
+      }
+      copyTableRows(source, target, "session_owners");
+      copyTableRows(source, target, "resource_registry");
+      copyTableRows(source, target, "gate_artifacts");
+      copyTableRows(source, target, "gate_artifact_logs");
+    })();
+  } finally {
+    source.close();
+    target.close();
+  }
+}
+
+function mergeGlobalSequences(source: Database.Database, target: Database.Database): void {
+  if (!sqliteTableExists(source, "global_sequences")) return;
+  const rows = source.prepare(
+    "SELECT name, high_water FROM global_sequences"
+  ).all() as Array<{ name: string; high_water: number }>;
+  const merge = target.prepare(
+    `INSERT INTO global_sequences (name, high_water) VALUES (?, ?)
+     ON CONFLICT(name) DO UPDATE SET
+       high_water = MAX(global_sequences.high_water, excluded.high_water)`
+  );
+  for (const row of rows) merge.run(row.name, row.high_water);
+}
+
+function copyMailboxSignals(source: Database.Database, target: Database.Database): void {
+  if (!sqliteTableExists(source, "mailbox_signals")) return;
+  const rows = source.prepare(
+    `SELECT m.target_key, s.sequence, s.reason, s.ref_type, s.ref_task_id,
+            s.ref_id, s.occurred_at, s.request_id
+       FROM mailbox_signals s
+       JOIN mailboxes m ON m.mailbox_id = s.mailbox_id
+      ORDER BY m.target_key, s.sequence`
+  ).iterate() as IterableIterator<Readonly<{
+    target_key: string;
+    sequence: number;
+    reason: string;
+    ref_type: string | null;
+    ref_task_id: string | null;
+    ref_id: string | null;
+    occurred_at: string;
+    request_id: string;
+  }>>;
+  const findMailbox = target.prepare(
+    "SELECT mailbox_id FROM mailboxes WHERE target_key = ?"
+  );
+  const insert = target.prepare(
+    `INSERT INTO mailbox_signals
+       (mailbox_id, sequence, reason, ref_type, ref_task_id, ref_id, occurred_at, request_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  for (const row of rows) {
+    const mailbox = findMailbox.get(row.target_key) as { mailbox_id: number } | undefined;
+    if (mailbox === undefined) {
+      throw new Error(
+        `SQLite migration cannot preserve signals for missing mailbox ${row.target_key}.`
+      );
+    }
+    insert.run(
+      mailbox.mailbox_id,
+      row.sequence,
+      row.reason,
+      row.ref_type,
+      row.ref_task_id,
+      row.ref_id,
+      row.occurred_at,
+      row.request_id
+    );
+  }
+}
+
+function copyTableRows(
+  source: Database.Database,
+  target: Database.Database,
+  table: string
+): void {
+  if (!sqliteTableExists(source, table) || !sqliteTableExists(target, table)) return;
+  const columns = source.prepare(
+    `PRAGMA table_info(${quoteSqliteIdentifier(table)})`
+  ).all().map((row) => (row as { name: string }).name);
+  if (columns.length === 0) return;
+  const quotedColumns = columns.map(quoteSqliteIdentifier);
+  const rows = source.prepare(
+    `SELECT ${quotedColumns.join(", ")} FROM ${quoteSqliteIdentifier(table)}`
+  ).iterate() as IterableIterator<Record<string, unknown>>;
+  const insert = target.prepare(
+    `INSERT INTO ${quoteSqliteIdentifier(table)} (${quotedColumns.join(", ")}) `
+    + `VALUES (${columns.map(() => "?").join(", ")})`
+  );
+  for (const row of rows) insert.run(...columns.map((column) => row[column]));
+}
+
+function sqliteTableExists(db: Database.Database, table: string): boolean {
+  return db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"
+  ).get(table) !== undefined;
+}
+
+function quoteSqliteIdentifier(value: string): string {
+  return `"${value.replaceAll("\"", "\"\"")}"`;
+}
+
 // ---------------------------------------------------------------------------
 // Canonical JSON and hashing
 // ---------------------------------------------------------------------------
@@ -242,6 +371,12 @@ export function populateSqliteFromState(
   state: Record<string, unknown>,
   databaseFilename: string
 ): void {
+  const retiredActiveRuns: Array<Readonly<{
+    taskId: string;
+    pointer: string;
+    value: Readonly<{ schemaVersion: number; runId: string }>;
+    updatedAt: string;
+  }>> = [];
   const store = new SqliteTaskStore(home, { databaseFilename, migration: true });
   try {
     store.transaction(() => {
@@ -328,6 +463,17 @@ export function populateSqliteFromState(
         // Active-run pointers: the document stores { schemaVersion, runId }
         // keyed by pointer; the store derives the pointer from the Run.
         for (const [pointer, value] of Object.entries(stored.activeRuns)) {
+          if (stored.task.status === "retired") {
+            retiredActiveRuns.push({
+              taskId,
+              pointer,
+              value,
+              updatedAt: typeof stored.task.updatedAt === "string"
+                ? stored.task.updatedAt
+                : new Date().toISOString()
+            });
+            continue;
+          }
           const run = stored.agentRuns[value.runId];
           if (run === undefined) {
             throw new Error(
@@ -386,6 +532,51 @@ export function populateSqliteFromState(
     });
   } finally {
     store.close();
+  }
+  persistRetiredActiveRunPointers(home, databaseFilename, retiredActiveRuns);
+}
+
+/**
+ * A retired Task is an explicit isolation boundary. Its active-run rows are
+ * retained byte-for-byte at the logical record level even when their Run is
+ * missing; normal Tasks continue through the referentially strict store path.
+ */
+function persistRetiredActiveRunPointers(
+  home: string,
+  databaseFilename: string,
+  pointers: readonly Readonly<{
+    taskId: string;
+    pointer: string;
+    value: Readonly<{ schemaVersion: number; runId: string }>;
+    updatedAt: string;
+  }>[]
+): void {
+  if (pointers.length === 0) return;
+  const db = new Database(join(home, databaseFilename));
+  try {
+    const insert = db.prepare(
+      `INSERT INTO active_runs (task_id, pointer, run_id, payload, updated_at)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    db.transaction(() => {
+      for (const entry of pointers) {
+        if (typeof entry.value.runId !== "string") {
+          throw new Error(
+            `Retired Task active run pointer ${entry.taskId}/${entry.pointer} `
+            + "cannot be represented because runId is not a string."
+          );
+        }
+        insert.run(
+          entry.taskId,
+          entry.pointer,
+          entry.value.runId,
+          JSON.stringify(entry.value),
+          entry.updatedAt
+        );
+      }
+    })();
+  } finally {
+    db.close();
   }
 }
 

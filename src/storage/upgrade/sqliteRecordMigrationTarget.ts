@@ -60,6 +60,7 @@ import { writeSwitchProgress } from "./switchProgress.js";
 import {
   COMMITTED_DATABASE_FILENAME,
   STAGED_DATABASE_FILENAME,
+  copySqlitePassthroughState,
   computeDbFamilyChecksums,
   computeStateFamilyChecksums,
   populateSqliteFromState,
@@ -154,6 +155,11 @@ export function createSqliteRecordMigrationTarget(
         updatedAt: now().toISOString()
       };
       populateSqliteFromState(home, snapshot.state ?? {}, STAGED_DATABASE_FILENAME);
+      copySqlitePassthroughState(
+        home,
+        COMMITTED_DATABASE_FILENAME,
+        STAGED_DATABASE_FILENAME
+      );
     },
 
     rebuildDerivedState(effects: readonly string[]): DerivedStateSummary {

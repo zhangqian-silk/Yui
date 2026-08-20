@@ -1,6 +1,0 @@
-#!/usr/bin/env node
-
-process.stderr.write(
-  "Blocked real Claude launch from an ordinary Yui test; install a test-owned Mock Agent instead.\n"
-);
-process.exit(86);

@@ -186,26 +186,16 @@ external id, so an operator can see exactly where a release stopped and why.
 
 ## Real-resource boundary
 
-The deterministic suite — `test/core/release-workflow-engine.test.js` and
-`test/release-workflow-acceptance-e2e.test.js` — drives the engine and the
-operator command surface exclusively through `createFakeReleasePorts` against
-an isolated temp `YUI_HOME`. It never touches real GitHub, npm, git, the
-Controller, or a user home, and it never issues a real grant: the grants in
-tests are fake records standing in for operator authority.
-
 Real execution happens only through the `yui` CLI, which wires the real
 adapter (`createReleaseWorkflowPorts`). The adapter is a thin shell over
-existing atomic operations — `gh`, `npm`, `git`, the CLI update
-orchestrator, Controller stop/restart, and `project migrate` — and it runs
-only when a human granter has issued an explicit CapabilityGrant that passes
-`checkGrant` for each step. The test suite never substitutes for that
-authority.
+existing atomic operations — `gh`, `npm`, `git`, the CLI update orchestrator,
+Controller stop/restart, and `project migrate` — and it runs only when a human
+granter has issued an explicit CapabilityGrant that passes `checkGrant` for
+each step. A local test request never substitutes for that authority.
 
-The privileged **Release E2E** tier (install/update/upgrade under an isolated
-npm prefix) is separate: it is opt-in (`YUI_ALLOW_RELEASE_E2E=1`), passes the
-mandatory isolation preflight, and is never part of core CI or the deterministic
-diagnostic suite. See
-[docs/testing/test-tiers.md](testing/test-tiers.md).
+The tag-triggered `publish.yml` workflow is the only maintained release smoke.
+It reuses the exact commit that passed core CI and adds only artifact assembly,
+fresh installation, and provenance checks required to publish.
 
 ## Adapter security hardening
 

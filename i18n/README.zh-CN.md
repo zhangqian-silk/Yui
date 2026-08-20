@@ -534,8 +534,6 @@ Agent 环境变量绑定只保存进程环境变量名，不保存 secret 值；
 Yui 面向一台机器上的一个受信任本地用户。它的 Web/API 仅支持 loopback，不包含远程或多用户 Web、分布式协调、backup/import/export、trash/restore、derived index、recovery journal、runtime lease、inactivity TTL、cooldown 或 recurring schedule。
 
 持久化和调度细节见 [ARCHITECTURE.md](../ARCHITECTURE.md)。
-可复用的用户视角验收方案见
-[Operator 路由与长期任务端到端测试方案](../docs/testing/operator-routing-e2e-plan.md)。
 
 ## 本地开发
 
@@ -545,6 +543,11 @@ npm run build
 npm test
 npm run lint
 ```
+
+`npm test` 只保留秒级核心 smoke：CLI 启动、正常 SQLite Task、受支持迁移和内置
+Agent Driver。针对当前修改编写的 TDD、异常数据和故障复现仅作为开发期证据，需求完成后
+删除，不累积为常驻回归测试。具体约束见
+[验证策略](../docs/testing/verification-levels.md)。
 
 如需让用户终端使用当前 checkout，可逆地接管用户级 `yui` 命令：
 

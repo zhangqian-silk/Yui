@@ -35,8 +35,9 @@
 ## Keep the main path lean
 
 - Provide migration code only for valid earlier versions of persistent Yui data. Any change to a persistent layout, aggregate, record, or configuration schema must declare its version transition and use the centralized migration mechanism.
-- For every other change, implement the current contract directly. Do not add transitional adapters, dual behavior, legacy fallbacks, or automatic repair for malformed, partially written, manually modified, or historically leaked Homes, Sessions, worktrees, configuration, or runtime artifacts. Such anomalous state must fail closed with a bounded diagnosis or cleanup recommendation; it is not a supported old data version.
+- For every other change, implement the current contract directly. Do not add transitional adapters, dual behavior, legacy fallbacks, or automatic repair for malformed, partially written, manually modified, or historically leaked Homes, Sessions, worktrees, configuration, or runtime artifacts. Such anomalous active state must fail closed with a bounded diagnosis or cleanup recommendation. An explicitly retired Task is the isolation boundary: migrations preserve its stored information, including anomalous runtime references, without letting those references block healthy Tasks; they do not rewrite or repair that history.
 - Prefer the smallest workflow that satisfies the current product commitment. Avoid speculative states, background protocols, and duplicate sources of truth.
+- Keep permanent tests to the seconds-scale core happy path. Change-specific TDD and abnormal, deletion, retirement, retry, or historical-regression fixtures are temporary development evidence and must be removed when the change is complete unless they replace a missing primary product smoke.
 
 ## Keep Yui-specific workflow in its Project Skill
 
