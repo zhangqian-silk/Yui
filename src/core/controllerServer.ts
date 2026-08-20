@@ -742,6 +742,7 @@ function parseBeginHandoverParams(value: JsonValue): BeginHandoverParams | null 
   const fromReleaseId = record.fromReleaseId;
   if (
     fromReleaseId !== undefined
+    && fromReleaseId !== null
     && (typeof fromReleaseId !== "string" || fromReleaseId.length > 256)
   ) {
     return null;

@@ -41,6 +41,7 @@ import {
 } from "../../dist/controller/clientRuntime.js";
 import { startFileTaskControllerRuntime } from "../../dist/controller/runtime.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { readHandoverFence } from "../../dist/release/runtimeRelease.js";
 import { testEffectiveLaunch } from "../helpers/effectiveLaunch.js";
 
 // Issue 02: the authenticated identity carries the full release provenance.
@@ -4169,6 +4170,43 @@ test("background FileTask controller exposes status, scan and stop on one privat
   );
   assert.deepEqual(await callController(home, "controller.stop", {}), { stopped: true });
   await controller.closed;
+});
+
+test("begin-handover accepts a null fromReleaseId for the first release activation", async (t) => {
+  // Regression for the PR #151 cross-issue handoff: activateRelease passes
+  // fromReleaseId: null when the Home has no prior active release. The old
+  // Controller must fence the handover instead of rejecting the params as
+  // invalid, which would make every first-ever release activation abort.
+  const home = mkdtempSync(join(tmpdir(), "yui-handover-null-from-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const controller = await startFileTaskController(home, emptyStore(), noTmux, undefined, {
+    intervalMs: 60_000
+  });
+  try {
+    const handoverId = "handover-null-from-release";
+    const toReleaseId = `0.6.1-${"a".repeat(64)}`;
+    const result = await callController(home, "controller.begin-handover", {
+      handoverId,
+      fromReleaseId: null,
+      toReleaseId
+    });
+    assert.equal(result.handoverId, handoverId);
+    assert.equal(result.phase, "fenced");
+    assert.equal(result.toReleaseId, toReleaseId);
+
+    // The durable fence records the absent prior release as null.
+    const fence = readHandoverFence(home);
+    assert.equal(fence.fromReleaseId, null);
+    assert.equal(fence.toReleaseId, toReleaseId);
+
+    // Roll back so the Controller leaves no fence behind.
+    const rolledBack = await callController(home, "controller.rollback-handover", { handoverId });
+    assert.deepEqual(rolledBack, { resumed: true, pid: process.pid });
+    assert.equal(readHandoverFence(home).phase, "rolled-back");
+  } finally {
+    await callController(home, "controller.stop", {}).catch(() => {});
+    await controller.closed;
+  }
 });
 
 test("a Task-isolated client follows its Home Controller discovery across TMPDIR boundaries", async () => {
