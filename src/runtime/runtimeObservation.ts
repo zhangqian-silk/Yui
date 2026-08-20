@@ -214,6 +214,31 @@ export function runtimeObservationFenceMatches(
   return true;
 }
 
+/**
+ * Matches observations that belong to one durable Run/session generation.
+ * A provider may advance its native Turn while background subagents from an
+ * earlier Turn are still active, so nativeTurnId is intentionally excluded.
+ */
+export function runtimeObservationRunFenceMatches(
+  expected: RuntimeObservationFence,
+  actual: RuntimeObservationFence
+): boolean {
+  for (const field of [
+    "taskId",
+    "roleName",
+    "runId",
+    "agentId",
+    "driverId",
+    "launchId",
+    "sessionGenerationId",
+    "nativeSessionId",
+    "receiptId"
+  ] as const) {
+    if (expected[field] !== actual[field]) return false;
+  }
+  return true;
+}
+
 /** Compact TaskEvent payload used for durable state-boundary observations. */
 export function runtimeObservationTaskEventPayload(
   input: RuntimeObservation

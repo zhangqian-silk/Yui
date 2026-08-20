@@ -97,6 +97,12 @@ also prevents a quiet model call from being mislabeled as workflow failure.
 Provider Turn completion leaves the Run open for the bounded workflow-outcome
 grace period; if no exact Yui outcome commits, the Run fails visibly.
 
+A durable AgentRun may span multiple provider Turns while provider-structured
+native subagent operations remain active. In that state, Turn completion is an
+intermediate provider boundary: the Run remains active, and later child
+completion notifications continue the parent Session under the same Run fence.
+Once native operations drain, the normal workflow-outcome grace applies again.
+
 ## Token evidence
 
 Usage is a cumulative normalized snapshot:

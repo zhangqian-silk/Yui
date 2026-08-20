@@ -2543,7 +2543,7 @@ function dispatchWork(
       throw usageError(
         `Work Item has no Task Role assignee: ${item.id}. `
         + `The Task Leader must run "yui task work update ${item.id} running", `
-        + "then execute it directly or create a native subagent in the Leader conversation."
+        + "then execute it directly or create native subagents in the Leader Session."
       );
     }
     if (expanding && taskActor(options, task.id) !== "leader") {
