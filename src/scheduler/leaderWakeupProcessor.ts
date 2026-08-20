@@ -41,8 +41,11 @@ export async function processLeaderWakeups(
 ): Promise<LeaderWakeupProcessingResult[]> {
   const results: LeaderWakeupProcessingResult[] = [];
   const wakeups = selection === undefined || selection.full
-    ? store.listPendingWakeups()
+    ? store.listPendingWakeups().filter((wakeup) => (
+        !selection?.blockedTaskIds?.has(wakeup.taskId)
+      ))
     : [...selection.taskIds].flatMap((taskId) => {
+        if (selection.blockedTaskIds?.has(taskId)) return [];
         const wakeup = store.getPendingWakeup(taskId);
         return wakeup === null ? [] : [wakeup];
       });

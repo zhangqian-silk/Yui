@@ -1,6 +1,6 @@
 import {
   selectedSchedulerRoles,
-  selectedSchedulerTasks,
+  selectedActiveSchedulerTasks,
   type SchedulerReconcileSelection,
   type SchedulerRoleResourceInput,
   type SchedulerRoleResourceEvidence,
@@ -32,10 +32,11 @@ export async function reconcileExitedRoleRuns(
   selection?: SchedulerReconcileSelection,
   excludedRunRefs: ReadonlySet<string> = new Set(),
   liveStatuses?: Map<string, RoleLiveStatus>,
-  resourceEvidence?: Map<string, SchedulerRoleResourceEvidence>
+  resourceEvidence?: Map<string, SchedulerRoleResourceEvidence>,
+  targetedInventory = selection !== undefined && !selection.full
 ): Promise<string[]> {
   const failed: string[] = [];
-  const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
+  const candidates = selectedActiveSchedulerTasks(store, selection).flatMap((task) => (
     selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
       const run = store.getActiveAgentRun(task.id, role.name);
       if (run === null) return [];
@@ -61,8 +62,10 @@ export async function reconcileExitedRoleRuns(
     })
   ));
   if (candidates.length === 0) return failed;
+  const candidateTaskIds = [...new Set(candidates.map(({ task }) => task.id))]
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
   const completing = new Set(
-    store.listPendingRuntimeTurnCompletions().map((completion) => (
+    store.listPendingRuntimeTurnCompletions(candidateTaskIds).map((completion) => (
       `${completion.taskId}\0${completion.roleName}\0${completion.runId}`
     ))
   );
@@ -70,9 +73,12 @@ export async function reconcileExitedRoleRuns(
     !excludedRunRefs.has(formatTaskRecordReference(task.id, run.id, "agentRun"))
     && !completing.has(`${task.id}\0${role.name}\0${run.id}`)
   ));
-  // Build one complete provider inventory for every active Run, including
-  // delivery-uncertain and completion-pending Runs. The stall phase reuses
-  // this snapshot so one scheduler pass never probes the same pane twice.
+  // Full reconciliation builds one complete provider inventory for every
+  // active Run, including delivery-uncertain and completion-pending Runs.
+  // The stall phase reuses that snapshot so one full pass never probes the
+  // same pane twice. When targetedInventory is true, a dirty pass instead
+  // uses exact probes below; stall reconciliation intentionally does not run
+  // for that bounded selection.
   const batchSnapshot = liveStatuses !== undefined
     && candidates.every(({ task, role }) => liveStatuses.has(`${task.id}\0${role.name}`))
     ? {
@@ -82,27 +88,30 @@ export async function reconcileExitedRoleRuns(
     : await inspectRoleStatuses(
         delivery,
         candidates,
-        candidates.flatMap(({ task, role, run, session }) => (
-          isResourceCandidate(task, run, now)
-            ? [{
-                taskId: task.id,
-                roleName: role.name,
-                runId: run.id,
-                agentId: run.effective.agentId,
-                adapterId: run.effective.adapterId,
-                progressAt: currentRoleRunProgressAt(
-                  store,
-                  task.id,
-                  role.name,
-                  run
-                ).progressAt,
-                ...(session?.nativeSessionId === undefined
-                  ? {}
-                  : { nativeSessionId: session.nativeSessionId }),
-                ...(session?.launchId === undefined ? {} : { launchId: session.launchId })
-              }]
-            : []
-        ))
+        !targetedInventory
+          ? candidates.flatMap(({ task, role, run, session }) => (
+              isResourceCandidate(task, run, now)
+                ? [{
+                    taskId: task.id,
+                    roleName: role.name,
+                    runId: run.id,
+                    agentId: run.effective.agentId,
+                    adapterId: run.effective.adapterId,
+                    progressAt: currentRoleRunProgressAt(
+                      store,
+                      task.id,
+                      role.name,
+                      run
+                    ).progressAt,
+                    ...(session?.nativeSessionId === undefined
+                      ? {}
+                      : { nativeSessionId: session.nativeSessionId }),
+                    ...(session?.launchId === undefined ? {} : { launchId: session.launchId })
+                  }]
+                : []
+            ))
+          : [],
+        targetedInventory
       );
   if (liveStatuses !== undefined) {
     for (const [key, status] of batchSnapshot.statuses) liveStatuses.set(key, status);
@@ -155,7 +164,7 @@ export async function reconcileExitedRoleRuns(
 }
 
 type RoleRunCandidate = Readonly<{
-  task: ReturnType<typeof selectedSchedulerTasks>[number];
+  task: ReturnType<typeof selectedActiveSchedulerTasks>[number];
   role: ReturnType<typeof selectedSchedulerRoles>[number];
   inspection: Readonly<{
     taskId: string;
@@ -177,8 +186,24 @@ type RoleInventorySnapshot = Readonly<{
 async function inspectRoleStatuses(
   delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
   candidates: readonly RoleRunCandidate[],
-  resourceInputs: readonly SchedulerRoleResourceInput[]
+  resourceInputs: readonly SchedulerRoleResourceInput[],
+  targeted: boolean
 ): Promise<RoleInventorySnapshot> {
+  // Dirty reconciliation already owns exact Task/Role keys. Probe those keys
+  // directly so a concurrent dirty batch does not repeat the provider's
+  // global inventory (and its optional process-resource scan) once per Task.
+  // Full reconciliation retains the adapter's batch contract below.
+  if (targeted && delivery.inspectRole !== undefined) {
+    const statuses = new Map<string, RoleLiveStatus>();
+    for (const candidate of candidates) {
+      const key = `${candidate.task.id}\0${candidate.role.name}`;
+      if (statuses.has(key)) {
+        throw new Error("Tmux Role targeted liveness selection is invalid.");
+      }
+      statuses.set(key, await delivery.inspectRole(candidate.inspection));
+    }
+    return { statuses, resources: new Map() };
+  }
   if (delivery.inspectRoles !== undefined) {
     return exactBatchInventory(
       await delivery.inspectRoles(

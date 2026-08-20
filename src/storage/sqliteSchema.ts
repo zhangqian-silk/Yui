@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 9;
+export const SQLITE_SCHEMA_VERSION = 13;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -621,6 +621,174 @@ CREATE TABLE IF NOT EXISTS gate_artifact_logs (
 );
 `;
 
+/**
+ * Migration 10: bounded ready-mailbox lookup for the Controller hot path.
+ *
+ * Historical empty mailboxes remain durable, but only mailboxes with a
+ * processing or pending batch require scheduling.  The partial index contains
+ * exactly that unsettled set in target-key order, so the Controller's recovery
+ * query is O(log H + ready) instead of scanning every historical mailbox.
+ */
+const MIGRATION_10_SQL = `
+CREATE INDEX IF NOT EXISTS idx_mailboxes_ready
+  ON mailboxes(target_key)
+  WHERE processing IS NOT NULL OR pending IS NOT NULL;
+`;
+
+/**
+ * Migration 11: bounded current-Session projection for runtime cleanup.
+ *
+ * RoleSessionSet payloads remain authoritative. This table contains only the
+ * current active Agent Session while it is non-stopped, so terminal Session
+ * history cannot enlarge Controller cleanup discovery. Runtime writes maintain
+ * it in the same transaction as the source payload; this migration performs
+ * the one-time deterministic backfill for existing layout-7 Homes.
+ */
+const MIGRATION_11_SQL = `
+CREATE TABLE IF NOT EXISTS runtime_session_candidates (
+  scope               TEXT NOT NULL CHECK (scope IN ('task','global')),
+  task_id             TEXT NOT NULL,
+  role_name           TEXT NOT NULL,
+  agent_id            TEXT NOT NULL,
+  adapter_id          TEXT NOT NULL,
+  native_session_id   TEXT NOT NULL,
+  launch_id           TEXT,
+  status              TEXT NOT NULL CHECK (status IN ('reserved','ready','running','broken')),
+  session_updated_at  TEXT NOT NULL,
+  cleanup_required    INTEGER NOT NULL CHECK (cleanup_required IN (0,1)),
+  PRIMARY KEY (scope, task_id, role_name),
+  CHECK (
+    (scope = 'task' AND length(task_id) > 0)
+    OR (scope = 'global' AND task_id = '')
+  ),
+  CHECK (
+    cleanup_required = CASE
+      WHEN status NOT IN ('stopped','broken')
+        AND (status = 'running' OR launch_id IS NOT NULL)
+      THEN 1 ELSE 0
+    END
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_session_cleanup_required
+  ON runtime_session_candidates(scope, task_id, role_name)
+  WHERE cleanup_required = 1;
+
+INSERT INTO runtime_session_candidates (
+  scope, task_id, role_name, agent_id, adapter_id, native_session_id,
+  launch_id, status, session_updated_at, cleanup_required
+)
+SELECT
+  'task', source.task_id, source.role_name,
+  json_extract(active.value, '$.agentId'),
+  json_extract(active.value, '$.adapterId'),
+  json_extract(active.value, '$.nativeSessionId'),
+  json_extract(active.value, '$.launchId'),
+  json_extract(active.value, '$.status'),
+  json_extract(active.value, '$.updatedAt'),
+  CASE
+    WHEN json_extract(active.value, '$.status') NOT IN ('stopped','broken')
+      AND (
+        json_extract(active.value, '$.status') = 'running'
+        OR json_type(active.value, '$.launchId') = 'text'
+      )
+    THEN 1 ELSE 0
+  END
+FROM role_session_sets AS source
+JOIN json_each(source.payload, '$.sessions') AS active
+  ON active.key = json_extract(source.payload, '$.activeAgentId')
+WHERE json_extract(active.value, '$.status') <> 'stopped';
+
+INSERT INTO runtime_session_candidates (
+  scope, task_id, role_name, agent_id, adapter_id, native_session_id,
+  launch_id, status, session_updated_at, cleanup_required
+)
+SELECT
+  'global', '', source.name,
+  json_extract(active.value, '$.agentId'),
+  json_extract(active.value, '$.adapterId'),
+  json_extract(active.value, '$.nativeSessionId'),
+  json_extract(active.value, '$.launchId'),
+  json_extract(active.value, '$.status'),
+  json_extract(active.value, '$.updatedAt'),
+  CASE
+    WHEN json_extract(active.value, '$.status') NOT IN ('stopped','broken')
+      AND (
+        json_extract(active.value, '$.status') = 'running'
+        OR json_type(active.value, '$.launchId') = 'text'
+      )
+    THEN 1 ELSE 0
+  END
+FROM global_role_session_sets AS source
+JOIN json_each(source.payload, '$.sessions') AS active
+  ON active.key = json_extract(source.payload, '$.activeAgentId')
+WHERE json_extract(active.value, '$.status') <> 'stopped';
+`;
+
+/**
+ * Migration 12: bounded open-InputRequest lookup for Controller deadlines.
+ *
+ * The baseline index's historical predicate predates the current
+ * open/answered/cancelled status contract and retains terminal rows. This
+ * partial index contains only the live InputRequest set, so deadline arming and
+ * targeted auto-resolution never scan terminal request history.
+ */
+const MIGRATION_12_SQL = `
+CREATE INDEX IF NOT EXISTS idx_input_requests_open_hot
+  ON input_requests(task_id, input_id)
+  WHERE status = 'open';
+`;
+
+/**
+ * Migration 13: durable pending native Turn-completion hot projection.
+ *
+ * A Task Role may have an unsettled Turn completion after the native Session
+ * has ended.  That completion is independent lifecycle state, so it cannot be
+ * discovered through the current-Session projection (which intentionally
+ * removes stopped Sessions).  Keep one typed row per Task Role and maintain it
+ * in the same transaction as `role_session_sets`; deadline discovery can then
+ * read this table without parsing a RoleSessionSet or its historical Sessions.
+ */
+const MIGRATION_13_SQL = `
+CREATE TABLE IF NOT EXISTS pending_runtime_turn_completions (
+  task_id           TEXT NOT NULL,
+  role_name         TEXT NOT NULL,
+  schema_version    INTEGER NOT NULL CHECK (schema_version = 1),
+  agent_id          TEXT NOT NULL,
+  native_session_id TEXT NOT NULL,
+  turn_id           TEXT NOT NULL,
+  run_id            TEXT NOT NULL,
+  summary           TEXT NOT NULL,
+  observed_at       TEXT NOT NULL,
+  due_at            TEXT NOT NULL,
+  PRIMARY KEY (task_id, role_name),
+  CHECK (due_at >= observed_at),
+  FOREIGN KEY (task_id, role_name)
+    REFERENCES role_session_sets(task_id, role_name) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_runtime_turn_completions_due
+  ON pending_runtime_turn_completions(task_id, due_at, role_name);
+
+INSERT INTO pending_runtime_turn_completions (
+  task_id, role_name, schema_version, agent_id, native_session_id,
+  turn_id, run_id, summary, observed_at, due_at
+)
+SELECT
+  source.task_id,
+  source.role_name,
+  json_extract(source.payload, '$.pendingTurnCompletion.schemaVersion'),
+  json_extract(source.payload, '$.pendingTurnCompletion.agentId'),
+  json_extract(source.payload, '$.pendingTurnCompletion.nativeSessionId'),
+  json_extract(source.payload, '$.pendingTurnCompletion.turnId'),
+  json_extract(source.payload, '$.pendingTurnCompletion.runId'),
+  json_extract(source.payload, '$.pendingTurnCompletion.summary'),
+  json_extract(source.payload, '$.pendingTurnCompletion.observedAt'),
+  json_extract(source.payload, '$.pendingTurnCompletion.dueAt')
+FROM role_session_sets AS source
+WHERE json_type(source.payload, '$.pendingTurnCompletion') = 'object';
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -637,11 +805,260 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 6, axis: "record", recordKind: "reviewFinding", sql: MIGRATION_6_SQL },
   { version: 7, axis: "record", recordKind: "sessionOwner", sql: MIGRATION_7_SQL },
   { version: 8, axis: "record", recordKind: "resource-registry", sql: MIGRATION_8_SQL },
-  { version: 9, axis: "record", recordKind: "gateArtifact", sql: MIGRATION_9_SQL }
+  { version: 9, axis: "record", recordKind: "gateArtifact", sql: MIGRATION_9_SQL },
+  { version: 10, axis: "layout", sql: MIGRATION_10_SQL },
+  { version: 11, axis: "layout", sql: MIGRATION_11_SQL },
+  { version: 12, axis: "layout", sql: MIGRATION_12_SQL },
+  { version: 13, axis: "layout", sql: MIGRATION_13_SQL }
 ];
+
+/** Current hot-path indexes whose absence would invalidate a current Home. */
+const REQUIRED_SCHEMA_INDEXES = [
+  "idx_mailboxes_ready",
+  "idx_runtime_session_cleanup_required",
+  "idx_input_requests_open_hot",
+  "idx_pending_runtime_turn_completions_due"
+] as const;
 
 function checksum(sql: string): string {
   return createHash("sha256").update(sql).digest("hex");
+}
+
+/**
+ * A SQLite Home is only safe to open when its migration ledger proves exactly
+ * which schema definition was applied.  The ledger is durable metadata, not a
+ * best-effort cache: a missing row, a changed checksum, or an unknown version
+ * must stop startup before any pending migration is run.
+ */
+export class SqliteSchemaMigrationError extends Error {
+  constructor(detail: string, subject = "metadata") {
+    super(`SQLite schema migration ${subject} is invalid: ${detail}`);
+    this.name = "SqliteSchemaMigrationError";
+  }
+}
+
+const SCHEMA_MIGRATIONS_SQL = `
+    CREATE TABLE schema_migrations (
+      version     INTEGER PRIMARY KEY,
+      axis        TEXT NOT NULL CHECK (axis IN ('layout','aggregate','record')),
+      record_kind TEXT,
+      applied_at  TEXT NOT NULL,
+      checksum    TEXT NOT NULL
+    )
+  `;
+
+/**
+ * Admit the migration ledger only for a genuinely empty SQLite database.
+ * Recreating an absent ledger on top of existing Yui tables would make the
+ * migration runner mistake a live Home for a fresh one and replay destructive
+ * layout migrations.  A database with any sqlite_master object is therefore
+ * diagnosed as corrupt/partially initialized and left untouched.
+ */
+function ensureMigrationLedger(db: Database.Database): boolean {
+  const objects = db.prepare(
+    "SELECT type, name FROM sqlite_master WHERE name IS NOT NULL"
+  ).all() as Array<{ type: unknown; name: unknown }>;
+  const ledger = objects.find(({ name }) => name === "schema_migrations");
+  if (ledger === undefined) {
+    if (objects.length !== 0) {
+      throw new SqliteSchemaMigrationError(
+        "schema_migrations ledger is missing from a non-empty database"
+      );
+    }
+    db.exec(SCHEMA_MIGRATIONS_SQL);
+    return true;
+  }
+  if (ledger.type !== "table") {
+    throw new SqliteSchemaMigrationError(
+      `schema_migrations has type ${String(ledger.type)} instead of table`
+    );
+  }
+  return false;
+}
+
+type AppliedMigrationRow = Readonly<{
+  version: unknown;
+  axis: unknown;
+  record_kind: unknown;
+  checksum: unknown;
+}>;
+
+/** Validate the applied prefix and return its versions for the migration loop. */
+function validateAppliedMigrations(
+  db: Database.Database,
+  ledgerWasCreated: boolean
+): Set<number> {
+  const expected = new Map(MIGRATIONS.map((migration) => [migration.version, migration]));
+  const rows = db.prepare(
+    "SELECT version, axis, record_kind, checksum FROM schema_migrations ORDER BY version"
+  ).all() as AppliedMigrationRow[];
+  if (rows.length === 0 && !ledgerWasCreated) {
+    throw new SqliteSchemaMigrationError(
+      "schema_migrations ledger is empty in an existing database"
+    );
+  }
+  const applied = new Set<number>();
+
+  for (const row of rows) {
+    if (!Number.isInteger(row.version) || (row.version as number) < 1) {
+      throw new SqliteSchemaMigrationError(`invalid migration version ${String(row.version)}`);
+    }
+    const version = row.version as number;
+    const migration = expected.get(version);
+    if (migration === undefined) {
+      throw new SqliteSchemaMigrationError(`unknown migration version ${version}`);
+    }
+    if (applied.has(version)) {
+      throw new SqliteSchemaMigrationError(`duplicate migration version ${version}`);
+    }
+    applied.add(version);
+
+    const expectedRecordKind = migration.recordKind ?? null;
+    if (row.axis !== migration.axis) {
+      throw new SqliteSchemaMigrationError(
+        `migration ${version} axis ${String(row.axis)} does not match ${migration.axis}`
+      );
+    }
+    if (row.record_kind !== expectedRecordKind) {
+      throw new SqliteSchemaMigrationError(
+        `migration ${version} record_kind ${String(row.record_kind)} does not match ${String(expectedRecordKind)}`
+      );
+    }
+    const expectedChecksum = checksum(migration.sql);
+    if (row.checksum !== expectedChecksum) {
+      throw new SqliteSchemaMigrationError(
+        `migration ${version} checksum ${String(row.checksum)} does not match current definition`
+      );
+    }
+  }
+
+  const versions = [...applied].sort((left, right) => left - right);
+  for (let index = 0; index < versions.length; index += 1) {
+    const expectedVersion = index + 1;
+    if (versions[index] !== expectedVersion) {
+      throw new SqliteSchemaMigrationError(
+        `migration ledger has a gap before version ${versions[index]}`
+      );
+    }
+  }
+  return applied;
+}
+
+/**
+ * Validate the physical objects promised by the migration ledger.  Ledger
+ * rows can be forged independently of SQLite's schema, so a complete and
+ * checksummed ledger is not enough to authorize startup when an object was
+ * manually removed or replaced.
+ */
+function validateSchemaObjects(db: Database.Database): void {
+  const objects = new Map<string, string>(
+    (db.prepare("SELECT type, name FROM sqlite_master WHERE name IS NOT NULL").all() as Array<{
+      type: unknown;
+      name: unknown;
+    }>).flatMap(({ type, name }) => (
+      typeof type === "string" && typeof name === "string" ? [[name, type]] : []
+    ))
+  );
+
+  for (const table of SQLITE_SCHEMA_TABLES) {
+    if (objects.get(table) !== "table") {
+      throw new SqliteSchemaMigrationError(
+        `required table '${table}' is missing or has the wrong type`,
+        "schema object"
+      );
+    }
+  }
+
+  for (const index of REQUIRED_SCHEMA_INDEXES) {
+    if (objects.get(index) !== "index") {
+      throw new SqliteSchemaMigrationError(
+        `required index '${index}' is missing or has the wrong type`,
+        "schema object"
+      );
+    }
+  }
+}
+
+/** Validate migration 13's source invariant before creating its hot table. */
+function validatePendingProjectionBackfillSources(db: Database.Database): void {
+  const existing = db.prepare(
+    `SELECT name
+     FROM sqlite_master
+     WHERE name IN (
+       'pending_runtime_turn_completions',
+       'idx_pending_runtime_turn_completions_due'
+     )
+     LIMIT 1`
+  ).get() as { name: string } | undefined;
+  if (existing !== undefined) {
+    throw new SqliteSchemaMigrationError(
+      `schema object '${existing.name}' exists before migration 13 is recorded`,
+      "backfill"
+    );
+  }
+  const mismatch = db.prepare(
+    `SELECT task_id, role_name
+     FROM role_session_sets
+     WHERE COALESCE(json_type(payload, '$.pendingTurnCompletion'), 'missing')
+             NOT IN ('null', 'object')
+        OR (
+          json_type(payload, '$.pendingTurnCompletion') = 'object'
+          AND (
+            json_extract(payload, '$.owner.scope') <> 'task'
+            OR json_extract(payload, '$.owner.taskId') IS NULL
+            OR json_extract(payload, '$.owner.taskId') <> task_id
+            OR json_extract(payload, '$.owner.roleName') IS NULL
+            OR json_extract(payload, '$.owner.roleName') <> role_name
+            OR json_extract(payload, '$.pendingTurnCompletion.taskId') IS NULL
+            OR json_extract(payload, '$.pendingTurnCompletion.taskId') <> task_id
+            OR json_extract(payload, '$.pendingTurnCompletion.roleName') IS NULL
+            OR json_extract(payload, '$.pendingTurnCompletion.roleName') <> role_name
+            OR json_extract(payload, '$.pendingTurnCompletion.schemaVersion') IS NOT 1
+            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.agentId'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.nativeSessionId'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.turnId'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.runId'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.summary'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.observedAt'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.dueAt'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.inFlight'), 'missing') <> 'object'
+            OR COALESCE(json_type(payload, '$.activeAgentId'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.inFlight.agentId'), 'missing') <> 'text'
+            OR COALESCE(json_type(payload, '$.inFlight.runId'), 'missing') <> 'text'
+            OR json_extract(payload, '$.activeAgentId')
+                 <> json_extract(payload, '$.pendingTurnCompletion.agentId')
+            OR json_extract(payload, '$.inFlight.agentId')
+                 <> json_extract(payload, '$.pendingTurnCompletion.agentId')
+            OR json_extract(payload, '$.inFlight.runId')
+                 <> json_extract(payload, '$.pendingTurnCompletion.runId')
+            OR COALESCE(json_type(payload, '$.inFlight.pushedAt'), 'missing') <> 'text'
+            OR COALESCE(
+                 json_type(
+                   payload,
+                   '$.sessions.' || json_quote(
+                     json_extract(payload, '$.pendingTurnCompletion.agentId')
+                   ) || '.nativeSessionId'
+                 ),
+                 'missing'
+               ) <> 'text'
+            OR json_extract(
+                 payload,
+                 '$.sessions.' || json_quote(
+                   json_extract(payload, '$.pendingTurnCompletion.agentId')
+                 ) || '.nativeSessionId'
+               ) <> json_extract(payload, '$.pendingTurnCompletion.nativeSessionId')
+            OR json_extract(payload, '$.pendingTurnCompletion.dueAt')
+                 < json_extract(payload, '$.pendingTurnCompletion.observedAt')
+          )
+        )
+     LIMIT 1`
+  ).get() as { task_id: string; role_name: string } | undefined;
+  if (mismatch !== undefined) {
+    throw new SqliteSchemaMigrationError(
+      `pending Turn completion source is invalid for ${mismatch.task_id}/${mismatch.role_name}`,
+      "backfill"
+    );
+  }
 }
 
 export interface MigrationResult {
@@ -660,22 +1077,16 @@ export interface MigrationResult {
  * database performs no work (every version is already recorded).
  */
 export function migrateSqliteSchema(db: Database.Database): MigrationResult {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version     INTEGER PRIMARY KEY,
-      axis        TEXT NOT NULL CHECK (axis IN ('layout','aggregate','record')),
-      record_kind TEXT,
-      applied_at  TEXT NOT NULL,
-      checksum    TEXT NOT NULL
-    )
-  `);
-  const applied = new Set<number>(
-    db.prepare("SELECT version FROM schema_migrations").all().map((row) => (row as { version: number }).version)
-  );
+  const ledgerWasCreated = ensureMigrationLedger(db);
+  // Validate the complete ledger before touching any pending migration.  This
+  // prevents a manually altered or partially recorded ledger from silently
+  // skipping the partial-index/projection migrations added after a valid Home.
+  const applied = validateAppliedMigrations(db, ledgerWasCreated);
   const newlyApplied: number[] = [];
   for (const migration of MIGRATIONS) {
     if (applied.has(migration.version)) continue;
     const apply = db.transaction(() => {
+      if (migration.version === 13) validatePendingProjectionBackfillSources(db);
       db.exec(migration.sql);
       db.prepare(
         `INSERT INTO schema_migrations (version, axis, record_kind, applied_at, checksum)
@@ -685,8 +1096,8 @@ export function migrateSqliteSchema(db: Database.Database): MigrationResult {
     apply();
     newlyApplied.push(migration.version);
   }
-  const version = MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0);
-  return { applied: newlyApplied, version };
+  validateSchemaObjects(db);
+  return { applied: newlyApplied, version: SQLITE_SCHEMA_VERSION };
 }
 
 /** The names of every table the schema creates (for tests/introspection). */
@@ -732,6 +1143,8 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "capability_grants",
   "release_workflows",
   "session_owners",
+  "runtime_session_candidates",
+  "pending_runtime_turn_completions",
   "resource_registry",
   "gate_artifacts",
   "gate_artifact_logs"

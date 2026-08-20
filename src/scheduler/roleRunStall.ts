@@ -1,7 +1,7 @@
 import type { TaskEvent } from "../event/taskEvent.js";
 import {
   selectedSchedulerRoles,
-  selectedSchedulerTasks,
+  selectedActiveSchedulerTasks,
   type RunProgressFacts,
   type SchedulerReconcileSelection,
   type SchedulerRoleSession,
@@ -301,11 +301,13 @@ export function currentRoleRunProgressAt(
   store: Readonly<{
     listEvents?: (taskId: string) => readonly TaskEvent[];
     getRunDurableProgress?: SchedulerStorePort["getRunDurableProgress"];
+    getRunProgressFacts?: SchedulerStorePort["getRunProgressFacts"];
   }>,
   taskId: string,
   roleName: string,
   run: Readonly<{ id: string; createdAt: string; deliveredAt?: string }>,
-  events: readonly TaskEvent[] = store.listEvents?.(taskId) ?? []
+  events?: readonly TaskEvent[],
+  progressFacts?: RunProgressFacts
 ): Readonly<{ progressAt: string; evidence?: string }> {
   let richerProgress: Readonly<{ progressAt: string; evidence?: string }> | null | undefined;
   try {
@@ -326,10 +328,28 @@ export function currentRoleRunProgressAt(
         : { evidence: richerProgress.evidence })
     };
   }
+  // A present fold port is authoritative even when this Run has no entry. Do
+  // not evaluate a default history argument or fall back to listEvents in
+  // that case: an absent entry is the folded empty fact.
+  const folded = store.getRunProgressFacts !== undefined;
+  const foldedFacts = folded
+    ? progressFacts ?? store.getRunProgressFacts?.(taskId, run.id)
+    : undefined;
+  if (folded) {
+    const fallbackProgressAt = latestDurableProgressAt({
+      deliveredAt: run.deliveredAt,
+      latestCheckpointAt: foldedFacts?.latestCheckpointAt,
+      latestActivityAt: foldedFacts?.latestActivityAt
+    });
+    return { progressAt: fallbackProgressAt };
+  }
+  // Legacy ports retain the per-Run event-history fallback. Resolve the
+  // history only in this branch so fold-backed callers perform zero scans.
+  const history = events ?? store.listEvents?.(taskId) ?? [];
   const fallbackProgressAt = latestDurableProgressAt({
     deliveredAt: run.deliveredAt,
-    latestCheckpointAt: latestRunProgressAt(events, run.id),
-    latestActivityAt: latestRunActivityAt(events, run.id)
+    latestCheckpointAt: latestRunProgressAt(history, run.id),
+    latestActivityAt: latestRunActivityAt(history, run.id)
   });
   return {
     progressAt: fallbackProgressAt
@@ -383,19 +403,19 @@ export function latestRunDurableProgressAt(
 ): Readonly<{ progressAt: string; evidence?: string }> | null {
   const run = store.getAgentRun(taskId, runId);
   if (run === null || run.taskId !== taskId || run.roleName !== roleName) return null;
-  const events = store.listEvents(taskId);
   // The adapter folds checkpoint/activity once per revision. When the fold
   // port exists, a missing per-Run entry is an authoritative empty fold: use
   // its (possibly undefined) values directly and never re-scan the whole
   // history per candidate. Legacy callers without the port omit precomputed
   // and keep the per-candidate full-history scans.
   const folded = precomputed !== undefined;
+  const events = folded ? undefined : store.listEvents(taskId);
   const latestCheckpointAt = folded
     ? precomputed!.latestCheckpointAt
-    : latestRunProgressAt(events, run.id);
+    : latestRunProgressAt(events!, run.id);
   const latestActivityAt = folded
     ? precomputed!.latestActivityAt
-    : latestRunActivityAt(events, run.id);
+    : latestRunActivityAt(events!, run.id);
   const baseline = run.deliveredAt === undefined
     ? run.createdAt
     : latestDurableProgressAt({
@@ -684,29 +704,30 @@ export async function reconcileStalledRoleRuns(
   // reconcile owns the all-active-Run scan; dirty passes may still route the
   // existing mailbox work without manufacturing another episode.
   if (selection !== undefined && !selection.full) return [];
-  if (store.listEvents === undefined || store.recordRoleRunStall === undefined) return [];
+  if (
+    (store.getRunProgressFacts === undefined && store.listEvents === undefined)
+    || store.recordRoleRunStall === undefined
+  ) return [];
   // When the fold port exists, a missing per-Run entry is an authoritative
   // empty fold: the stall reconciliation must not re-scan the whole history
   // per candidate. Legacy stores without the port keep the per-candidate
   // scans.
   const foldPortPresent = store.getRunProgressFacts !== undefined;
-  const candidates = selectedSchedulerTasks(store, selection).flatMap((task) => (
-    task.status !== "active"
-      ? []
-      : selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
-          const run = store.getActiveAgentRun(task.id, role.name);
-          if (run === null || run.status !== "active") return [];
-          return [{
-            task,
-            role,
-            run,
-            session: store.getRoleSession(
-              task.id,
-              role.name,
-              run.effective.agentId
-            )
-          }];
-        })
+  const candidates = selectedActiveSchedulerTasks(store, selection).flatMap((task) => (
+    selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
+      const run = store.getActiveAgentRun(task.id, role.name);
+      if (run === null || run.status !== "active") return [];
+      return [{
+        task,
+        role,
+        run,
+        session: store.getRoleSession(
+          task.id,
+          role.name,
+          run.effective.agentId
+        )
+      }];
+    })
   ));
   const stallCandidates = candidates.filter(({ run }) => isStallCandidate(run, now, windowMs));
   if (stallCandidates.length === 0) return [];
@@ -828,8 +849,15 @@ export async function reconcileStalledRoleRuns(
       continue;
     }
 
-    const events = store.listEvents(candidate.task.id);
-    const progressFacts = store.getRunProgressFacts?.(candidate.task.id, candidate.run.id);
+    // Fold-backed adapters expose an authoritative per-Run fact, so do not
+    // load the Task history just to satisfy currentRoleRunProgressAt or its
+    // fallback. Legacy ports retain one history read for these projections.
+    const progressFacts = foldPortPresent
+      ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)
+      : undefined;
+    const events = foldPortPresent
+      ? undefined
+      : store.listEvents?.(candidate.task.id);
     // Before exact acceptance there is no execution progress clock. Keep the
     // delivery watch anchored to the Run creation/transport boundary even if
     // checkpoints, output, or related WorkItem/Review/Integration records are
@@ -841,7 +869,8 @@ export async function reconcileStalledRoleRuns(
       candidate.task.id,
       candidate.role.name,
       candidate.run,
-      events
+      events,
+      progressFacts
     );
     const progressAt = progress.progressAt;
     const evaluation = evaluateRoleRunStall({
@@ -850,7 +879,7 @@ export async function reconcileStalledRoleRuns(
       windowMs,
       lastAttentionProgressAt: foldPortPresent
         ? progressFacts?.latestStall?.progressAt
-        : latestStallProgressAt(events, candidate.run.id)
+        : latestStallProgressAt(events ?? [], candidate.run.id)
     });
     const runAgentId = candidate.run.effective.agentId;
     const runAdapterId = candidate.run.effective.adapterId;
@@ -938,7 +967,7 @@ export async function reconcileStalledRoleRuns(
     const { candidate, progressAt } = current;
     const previous = foldPortPresent
       ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
-      : latestStallEvidenceKey(store.listEvents(candidate.task.id), candidate.run.id);
+      : latestStallEvidenceKey(store.listEvents?.(candidate.task.id) ?? [], candidate.run.id);
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)
@@ -1012,7 +1041,7 @@ export async function reconcileStalledRoleRuns(
     const { candidate, progressAt } = current;
     const previous = foldPortPresent
       ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
-      : latestStallEvidenceKey(store.listEvents(candidate.task.id), candidate.run.id);
+      : latestStallEvidenceKey(store.listEvents?.(candidate.task.id) ?? [], candidate.run.id);
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)

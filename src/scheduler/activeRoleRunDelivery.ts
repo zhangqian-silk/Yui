@@ -10,7 +10,7 @@ import type {
 } from "./ports.js";
 import {
   selectedSchedulerRoles,
-  selectedSchedulerTasks,
+  selectedActiveSchedulerTasks,
   type SchedulerReconcileSelection
 } from "./ports.js";
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
@@ -46,8 +46,7 @@ export async function processActiveRoleRunDeliveries(
   selection?: SchedulerReconcileSelection
 ): Promise<ActiveRoleRunDeliveryResult[]> {
   const results: ActiveRoleRunDeliveryResult[] = [];
-  for (const task of selectedSchedulerTasks(store, selection)) {
-    if (task.status !== "active") continue;
+  for (const task of selectedActiveSchedulerTasks(store, selection)) {
     for (const role of selectedSchedulerRoles(store, task.id, selection)) {
       const run = store.getActiveAgentRun(task.id, role.name);
       // A crash after a Leader wake is durably claimed but before tmux input

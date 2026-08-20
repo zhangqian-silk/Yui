@@ -105,6 +105,10 @@ import {
   RUN_STALLED_EVENT
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import type {
+  RuntimeSessionCandidate,
+  RuntimeSessionCandidateQuery
+} from "../runtime/runtimeSessionCandidate.js";
 import {
   currentWorkItemExecutionGroup,
   updateWorkItemExecutionGroup,
@@ -484,6 +488,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return { timeZone: this.store.getConfig().timeZone };
   }
   listTasks() { return this.store.listTasks(); }
+  listActiveTaskIds(): readonly string[] {
+    return [...this.store.listActiveTaskIds()].sort((left, right) => (
+      left.localeCompare(right, undefined, { numeric: true })
+    ));
+  }
   getTask(taskId: string) { return this.store.getTask(taskId); }
   getTaskWorkspace(taskId: string) { return this.store.getTaskWorkspace(taskId); }
   getTaskBrief(taskId: string) { return this.store.getTaskBrief(taskId); }
@@ -504,11 +513,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   hasOpenInputRequest(taskId: string): boolean {
-    return this.store.listInputRequests(taskId).some((request) => request.status === "open");
+    return this.store.listOpenInputRequests([taskId]).length > 0;
   }
 
-  listOpenInputRequests() {
-    return this.store.listAllInputRequests().filter((request) => request.status === "open");
+  listOpenInputRequests(taskIds?: readonly string[]) {
+    return this.store.listOpenInputRequests(taskIds);
   }
 
   getInputRequest(taskId: string, inputRequestId: string) {
@@ -529,11 +538,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   resolveExpiredInputRecommendations(now: Date, taskIds?: ReadonlySet<string>) {
     return this.store.transaction((store) => {
-      const expired = store.listAllInputRequests().filter((request) => (
-        request.status === "open"
-        && request.policy.kind === "recommended"
+      const selectedTaskIds = taskIds === undefined
+        ? undefined
+        : [...taskIds].sort((left, right) => (
+            left.localeCompare(right, undefined, { numeric: true })
+          ));
+      const expired = store.listOpenInputRequests(selectedTaskIds).filter((request) => (
+        request.policy.kind === "recommended"
         && Date.parse(request.policy.timeoutAt) <= now.getTime()
-        && (taskIds === undefined || taskIds.has(request.taskId))
       ));
       const resolved = [];
       for (const request of expired) {
@@ -807,6 +819,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
   getWorkMailbox(target: MailboxTarget) { return this.store.getWorkMailbox(target); }
   listWorkMailboxes() { return this.store.listWorkMailboxes(); }
+  listReadyWorkMailboxes() { return this.store.listReadyWorkMailboxes(); }
 
   queueTaskProgress(taskId: string, reason: string, now: Date): void {
     this.store.transaction((store) => {
@@ -822,8 +835,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     ));
   }
 
-  listAllDurableJobs(): readonly DurableJob[] {
-    return this.store.listAllDurableJobs();
+  listActiveDurableJobs(): readonly DurableJob[] {
+    return this.store.listActiveDurableJobs();
   }
 
   /**
@@ -986,49 +999,36 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   listDormantRuntimeOwners(): readonly DormantRuntimeOwnerCandidate[] {
-    const taskOwners = this.store.listTasks().flatMap((task) => (
-      this.store.listRoleSessionSets(task.id).flatMap((sessions) => {
-        const active = sessions.sessions[sessions.activeAgentId];
-        return active !== undefined
-          && active.status !== "stopped"
-          && !hasRuntimeLifecycleWork(
-            this.store.getWorkMailbox(runtimeLifecycleTarget(sessions.owner))
-          )
+    return this.listRuntimeSessionCandidates().flatMap((candidate) => {
+      if (
+        hasRuntimeLifecycleWork(
+          this.store.getWorkMailbox(runtimeLifecycleTarget(candidate.owner))
+        )
+        || (
+          candidate.owner.scope === "task"
           && this.store.getActiveAgentRun(
-            task.id,
-            sessions.owner.roleName
-          ) === null
-          ? [{
-              owner: sessions.owner,
-              agentId: active.agentId,
-              adapterId: active.adapterId,
-              nativeSessionId: active.nativeSessionId,
-              ...(active.launchId === undefined ? {} : { launchId: active.launchId }),
-              sessionUpdatedAt: active.updatedAt
-            }]
-          : [];
-      })
-    ));
-    const globalOwners = this.store.listGlobalRoleSessionSets().flatMap(
-      (sessions) => {
-        const active = sessions.sessions[sessions.activeAgentId];
-        return active !== undefined
-          && active.status !== "stopped"
-          && !hasRuntimeLifecycleWork(
-            this.store.getWorkMailbox(runtimeLifecycleTarget(sessions.owner))
-          )
-          ? [{
-              owner: sessions.owner,
-              agentId: active.agentId,
-              adapterId: active.adapterId,
-              nativeSessionId: active.nativeSessionId,
-              ...(active.launchId === undefined ? {} : { launchId: active.launchId }),
-              sessionUpdatedAt: active.updatedAt
-            }]
-          : [];
+            candidate.owner.taskId,
+            candidate.owner.roleName
+          ) !== null
+        )
+      ) {
+        return [];
       }
-    );
-    return [...taskOwners, ...globalOwners];
+      return [{
+        owner: candidate.owner,
+        agentId: candidate.agentId,
+        adapterId: candidate.adapterId,
+        nativeSessionId: candidate.nativeSessionId,
+        ...(candidate.launchId === undefined ? {} : { launchId: candidate.launchId }),
+        sessionUpdatedAt: candidate.sessionUpdatedAt
+      }];
+    });
+  }
+
+  listRuntimeSessionCandidates(
+    query: RuntimeSessionCandidateQuery = {}
+  ): readonly RuntimeSessionCandidate[] {
+    return this.store.listRuntimeSessionCandidates(query);
   }
 
   markRuntimeOwnerStopped(
@@ -1124,6 +1124,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         batchId,
         { type: "run", taskId: input.task.id, id: input.run.id }
       );
+      // SQLite stores the durable Run row and its active pointer separately;
+      // FileTaskStore happens to persist both from saveActiveAgentRun. Keep
+      // the adapter contract backend-neutral and make the two writes atomic.
+      store.saveAgentRun(input.run);
       store.saveActiveAgentRun(input.run);
       store.saveWorkMailbox(claimed);
       store.saveRole(input.task.id, updateRoleStatus(role, "running", input.now));
@@ -2035,7 +2039,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         nativeSessionId: input.nativeSessionId,
         ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
         policy: "fixed",
-        status: sessions.inFlight === null ? idleStatus : "running",
+        status: idleStatus === "stopped" || idleStatus === "broken"
+          ? idleStatus
+          : sessions.inFlight === null ? idleStatus : "running",
         effective
       }, now);
       if (sessions.inFlight === null) {
@@ -2078,7 +2084,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           runId: fence.runId,
           turnId: input.turnId
         }, now);
-        sessions = updateRoleAgentSessionStatus(sessions, input.agentId, "ready", now);
+        const settledStatus = sessions.sessions[input.agentId]?.status;
+        if (settledStatus !== "stopped" && settledStatus !== "broken") {
+          sessions = updateRoleAgentSessionStatus(sessions, input.agentId, "ready", now);
+        }
         store.saveTaskRoleSessionSet(sessions);
         completeRuntimeHookReservation(store, owner, input.launchId);
         return { session: sessions.sessions[input.agentId]!, duplicate: false };
@@ -2093,12 +2102,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  listPendingRuntimeTurnCompletions(): readonly PendingTurnCompletion[] {
-    return this.store.listTasks().flatMap((task) => (
-      this.store.listRoleSessionSets(task.id).flatMap((sessions) => (
-        sessions.pendingTurnCompletion === null ? [] : [sessions.pendingTurnCompletion]
-      ))
-    ));
+  listPendingRuntimeTurnCompletions(
+    taskIds?: readonly string[]
+  ): readonly PendingTurnCompletion[] {
+    return this.store.listPendingRuntimeTurnCompletions(taskIds);
   }
 
   /** Resolves only completions whose grace deadline has elapsed. */
@@ -2106,10 +2113,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly string[] {
-    const due = this.listPendingRuntimeTurnCompletions().filter((completion) => (
-      Date.parse(completion.dueAt) <= now.getTime()
-      && (taskIds === undefined || taskIds.has(completion.taskId))
-    ));
+    const selectedTaskIds = taskIds === undefined
+      ? undefined
+      : [...taskIds].sort((left, right) => (
+          left.localeCompare(right, undefined, { numeric: true })
+        ));
+    const due = this.listPendingRuntimeTurnCompletions(selectedTaskIds).filter(
+      (completion) => Date.parse(completion.dueAt) <= now.getTime()
+    );
     const finalized: string[] = [];
     for (const completion of due) {
       this.store.transaction((store) => {
@@ -2148,7 +2159,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           runId: completion.runId,
           turnId: completion.turnId
         }, now);
-        settled = updateRoleAgentSessionStatus(settled, completion.agentId, "ready", now);
+        const settledStatus = settled.sessions[completion.agentId]?.status;
+        if (settledStatus !== "stopped" && settledStatus !== "broken") {
+          settled = updateRoleAgentSessionStatus(settled, completion.agentId, "ready", now);
+        }
         store.saveTaskRoleSessionSet(settled);
       });
     }
@@ -2221,6 +2235,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         throw new Error("Runtime turn completion does not match the effective launch identity.");
       }
       const sessions = effectiveExisting?.status === "ready"
+        || effectiveExisting?.status === "stopped"
+        || effectiveExisting?.status === "broken"
         ? current
         : recordRoleAgentSession(current, {
             agentId: input.agentId,
@@ -2648,8 +2664,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    * due. The Controller arms its deadline timer from this projection, so a
    * Controller restart resumes the same attempt lineage.
    */
-  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
-    return this.store.listPendingProviderRetries();
+  listPendingProviderRetries(
+    taskIds?: readonly string[]
+  ): ReadonlyArray<PendingProviderRetry> {
+    return this.store.listPendingProviderRetries(taskIds);
   }
 
   /**
@@ -2662,10 +2680,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly string[] {
-    const due = this.listPendingProviderRetries().filter((entry) => (
-      Date.parse(entry.nextAttemptAt) <= now.getTime()
-      && (taskIds === undefined || taskIds.has(entry.taskId))
-    ));
+    const selectedTaskIds = taskIds === undefined
+      ? undefined
+      : [...taskIds].sort((left, right) => (
+          left.localeCompare(right, undefined, { numeric: true })
+        ));
+    const due = this.listPendingProviderRetries(selectedTaskIds).filter(
+      (entry) => Date.parse(entry.nextAttemptAt) <= now.getTime()
+    );
     const reopened: string[] = [];
     for (const entry of due) {
       this.store.transaction((store) => {

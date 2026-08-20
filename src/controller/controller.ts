@@ -12,6 +12,7 @@ import {
   type ActiveRoleRunDeliveryResult
 } from "../scheduler/activeRoleRunDelivery.js";
 import {
+  selectedActiveSchedulerTasks,
   selectedSchedulerRoles,
   selectedSchedulerTasks
 } from "../scheduler/ports.js";
@@ -47,9 +48,14 @@ import {
 import type { JsonValue } from "../core/protocol.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import { isProjectMaintenanceFenced } from "../repository/projectMaintenanceLock.js";
+import { KeyedWorkQueue } from "../coordination/keyedWorkQueue.js";
 import { MailboxScheduler } from "../coordination/mailboxScheduler.js";
 import { nearestDeadlineBatch } from "../coordination/deadlineScheduler.js";
-import type { MailboxTarget, ProcessingBatch } from "../coordination/workMailbox.js";
+import type {
+  MailboxTarget,
+  ProcessingBatch,
+  WorkMailbox
+} from "../coordination/workMailbox.js";
 import {
   hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
@@ -85,6 +91,8 @@ const DEFAULT_RUNTIME_OBSERVER_INTERVAL_MS = 1_000;
 const DEFAULT_DELIVERY_RETRY_MS = 250;
 const DEFAULT_DELIVERY_RETRY_LIMIT = 60;
 const DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT = 2;
+const DEFAULT_TASK_CONCURRENCY = 4;
+const MAX_TASK_CONCURRENCY = 32;
 const RUNTIME_RESERVATION_RECOVERY_AGE_MS = 120_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const CONTROLLER_LATENCY_BUCKETS_MS = [10, 50, 100, 250, 500, 1_000, 3_000] as const;
@@ -112,6 +120,7 @@ export type ControllerSchedulerResult = Readonly<{
 export type ControllerRuntimeOptions = Readonly<{
   intervalMs?: number;
   signalWindowMs?: number;
+  taskConcurrency?: number;
   deliveryRetryMs?: number;
   deliveryRetryLimit?: number;
   taskOrchestrationRetryLimit?: number;
@@ -181,6 +190,21 @@ export type ReconcileScope =
 
 export type ReconcileSelection = SchedulerReconcileSelection;
 
+type DirtyTaskReconcileScope = Readonly<{
+  taskId: string;
+  keys: readonly MailboxKey[];
+}>;
+
+type DirtyScopePartition = Readonly<{
+  taskScopes: readonly DirtyTaskReconcileScope[];
+  globalKeys: readonly MailboxKey[];
+}>;
+
+type DirtySchedulerPassResult = Readonly<{
+  result: ControllerSchedulerResult;
+  failedTaskScopes: readonly DirtyTaskReconcileScope[];
+}>;
+
 export type RunningFileTaskController = Readonly<{
   runtime: FileTaskController;
   server: RunningControllerServer;
@@ -246,12 +270,13 @@ export async function runControllerSchedulerPass(
   lifecycleHost?: RuntimeLifecycleHost,
   stallWindowMs = DEFAULT_STALL_WINDOW_MS,
   maintenanceFence?: (projectId: string) => boolean,
-  onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"]
+  onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"],
+  blockedTaskIds: ReadonlySet<string> = new Set()
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
-    ? compiledSelection
-    : { ...compiledSelection, operator: false };
+    ? { ...compiledSelection, blockedTaskIds }
+    : { ...compiledSelection, operator: false, blockedTaskIds };
   queueSelectedCompletedTaskRuntimeCleanups(store, selection, now);
   // A full-state Task projection can be individually bounded yet still starve
   // control sockets when several scheduler phases repeat it in one native
@@ -264,7 +289,8 @@ export async function runControllerSchedulerPass(
     lifecycleHost,
     scope,
     now,
-    runtimeCleanupOutcomes
+    runtimeCleanupOutcomes,
+    blockedTaskIds
   );
   const roleSelection = selectionWithoutFailedCleanupRoles(
     store,
@@ -358,7 +384,8 @@ export async function runControllerSchedulerPass(
       roleSelection,
       unsettledRunRefs,
       liveStatuses,
-      resourceEvidence
+      resourceEvidence,
+      scope.kind === "dirty"
     );
     await controlEventLoopTurn();
     await reconcileStalledRoleRuns(
@@ -376,13 +403,15 @@ export async function runControllerSchedulerPass(
       delivery,
       lifecycleHost,
       scope,
-      now
+      now,
+      selection.blockedTaskIds
     );
-    const autoResolvedInputs = selection.full
+    const selectedInputTaskIds = selectedTaskIdsForBoundedPass(store, selection);
+    const autoResolvedInputs = selectedInputTaskIds === undefined
       ? store.resolveExpiredInputRecommendations(now)
-      : selection.taskIds.size === 0
+      : selectedInputTaskIds.size === 0
         ? []
-        : store.resolveExpiredInputRecommendations(now, selection.taskIds);
+        : store.resolveExpiredInputRecommendations(now, selectedInputTaskIds);
     // Liveness and auto-resolution can durably queue new Leader work. Process
     // only Tasks that were not part of phase one, except when a same-pass due
     // completion made an initially busy Leader idle. Result order remains
@@ -440,8 +469,11 @@ function selectedPendingWakeups(
   selection: SchedulerReconcileSelection
 ): Map<string, PendingWakeup> {
   const wakeups = selection.full
-    ? store.listPendingWakeups()
+    ? store.listPendingWakeups().filter((wakeup) => (
+        !selection.blockedTaskIds?.has(wakeup.taskId)
+      ))
     : [...selection.taskIds].flatMap((taskId) => {
+        if (selection.blockedTaskIds?.has(taskId)) return [];
         const wakeup = store.getPendingWakeup(taskId);
         return wakeup === null ? [] : [wakeup];
       });
@@ -457,7 +489,8 @@ function exactTaskSelection(taskIds: ReadonlySet<string>): SchedulerReconcileSel
     taskIds,
     allRoleTaskIds: new Set(),
     rolesByTask: new Map(),
-    operator: false
+    operator: false,
+    blockedTaskIds: new Set()
   };
 }
 
@@ -497,6 +530,26 @@ function queueSelectedCompletedTaskRuntimeCleanups(
   now: Date
 ): void {
   if (store.enqueueRuntimeCleanup === undefined) return;
+  if (selection.full && store.listRuntimeSessionCandidates !== undefined) {
+    for (const candidate of store.listRuntimeSessionCandidates({
+      cleanupRequiredOnly: true
+    })) {
+      if (
+        candidate.owner.scope !== "task"
+        || !candidate.cleanupRequired
+        || selection.blockedTaskIds?.has(candidate.owner.taskId)
+      ) {
+        continue;
+      }
+      const { taskId, roleName } = candidate.owner;
+      if (store.getTask(taskId)?.status !== "completed") continue;
+      if (store.getActiveAgentRun(taskId, roleName) !== null) continue;
+      const target = runtimeLifecycleTarget(candidate.owner);
+      if (hasRuntimeCleanupObligation(store.getWorkMailbox(target))) continue;
+      store.enqueueRuntimeCleanup(candidate.owner, now);
+    }
+    return;
+  }
   for (const task of selectedSchedulerTasks(store, selection)) {
     if (task.status !== "completed") continue;
     for (const role of selectedSchedulerRoles(store, task.id, selection)) {
@@ -533,9 +586,10 @@ async function processSelectedRoleRuntimeCleanups(
   lifecycleHost: RuntimeLifecycleHost | undefined,
   scope: ReconcileScope,
   now: Date,
-  outcomes: RuntimeCleanupOutcome[]
+  outcomes: RuntimeCleanupOutcome[],
+  blockedTaskIds: ReadonlySet<string> = new Set()
 ): Promise<ReadonlySet<string>> {
-  const targets = selectedRuntimeLifecycleTargets(store, scope);
+  const targets = selectedRuntimeLifecycleTargets(store, scope, blockedTaskIds);
   const failedRoles = new Set<string>();
   for (const target of targets) {
     const mailbox = store.getWorkMailbox(target);
@@ -647,7 +701,8 @@ async function reconcileDormantRuntimeOwners(
   delivery: TmuxDeliveryPort,
   lifecycleHost: RuntimeLifecycleHost | undefined,
   scope: ReconcileScope,
-  now: Date
+  now: Date,
+  blockedTaskIds: ReadonlySet<string> = new Set()
 ): Promise<void> {
   if (
     scope.kind !== "full"
@@ -657,7 +712,10 @@ async function reconcileDormantRuntimeOwners(
   ) {
     return;
   }
-  const candidates = store.listDormantRuntimeOwners();
+  const candidates = store.listDormantRuntimeOwners().filter((candidate) => (
+    candidate.owner.scope !== "task"
+    || !blockedTaskIds.has(candidate.owner.taskId)
+  ));
   if (candidates.length === 0) return;
   const owners = candidates.map((candidate) => candidate.owner);
   let inspections: readonly Readonly<{
@@ -736,14 +794,14 @@ function resolveDueRuntimeTurnCompletions(
   now: Date
 ): void {
   if (typeof store.resolveDueRuntimeTurnCompletions !== "function") return;
-  const selectedTaskIds = selection.full ? undefined : selection.taskIds;
+  const selectedTaskIds = selectedTaskIdsForBoundedPass(store, selection);
   if (selectedTaskIds?.size === 0) return;
-  const candidates = store.listPendingRuntimeTurnCompletions().filter(
-    (completion) => (
-      selectedTaskIds === undefined
-      || selectedTaskIds.has(completion.taskId)
-    )
-  );
+  const candidateTaskIds = selectedTaskIds === undefined
+    ? undefined
+    : [...selectedTaskIds].sort((left, right) => (
+        left.localeCompare(right, undefined, { numeric: true })
+      ));
+  const candidates = store.listPendingRuntimeTurnCompletions(candidateTaskIds);
   const finalized = new Set(
     store.resolveDueRuntimeTurnCompletions(now, selectedTaskIds)
   );
@@ -774,27 +832,55 @@ function resolveDueProviderRetries(
   now: Date
 ): void {
   if (typeof store.resolveDueProviderRetries !== "function") return;
-  const selectedTaskIds = selection.full ? undefined : selection.taskIds;
+  const selectedTaskIds = selectedTaskIdsForBoundedPass(store, selection);
   if (selectedTaskIds?.size === 0) return;
   store.resolveDueProviderRetries(now, selectedTaskIds);
 }
 
+function selectedTaskIdsForBoundedPass(
+  store: SchedulerStorePort,
+  selection: ReconcileSelection
+): ReadonlySet<string> | undefined {
+  if (!selection.full) {
+    if ((selection.blockedTaskIds?.size ?? 0) === 0) return selection.taskIds;
+    return new Set([...selection.taskIds].filter((taskId) => (
+      !selection.blockedTaskIds!.has(taskId)
+    )));
+  }
+  if ((selection.blockedTaskIds?.size ?? 0) === 0) return undefined;
+  return new Set(selectedActiveSchedulerTasks(store, selection).map((task) => task.id));
+}
+
+function selectedReadyWorkMailboxes(
+  store: Pick<SchedulerStorePort, "listReadyWorkMailboxes" | "listWorkMailboxes">
+): readonly WorkMailbox[] {
+  return store.listReadyWorkMailboxes?.() ?? store.listWorkMailboxes();
+}
+
 function selectedRuntimeLifecycleTargets(
   store: SchedulerStorePort,
-  scope: ReconcileScope
+  scope: ReconcileScope,
+  blockedTaskIds: ReadonlySet<string> = new Set()
 ): RuntimeLifecycleTarget[] {
   if (scope.kind === "full") {
-    return store.listWorkMailboxes().flatMap((mailbox) => (
-      mailbox.target.kind === "role-runtime"
-      || mailbox.target.kind === "global-role-runtime"
+    return selectedReadyWorkMailboxes(store).flatMap<RuntimeLifecycleTarget>((mailbox) => {
+      if (mailbox.target.kind === "role-runtime") {
+        return blockedTaskIds.has(mailbox.target.taskId)
+          ? []
+          : [mailbox.target];
+      }
+      return mailbox.target.kind === "global-role-runtime"
         ? [mailbox.target]
-        : []
-    ));
+        : [];
+    });
   }
   const targets = new Map<string, RuntimeLifecycleTarget>();
   for (const key of scope.keys) {
     const parsed = parseMailboxKey(key);
     if (parsed.kind === "task") {
+      if (blockedTaskIds.has(parsed.taskId)) continue;
+      const task = store.getTask(parsed.taskId);
+      if (task?.status !== "active" && task?.status !== "completed") continue;
       for (const role of store.listRoles(parsed.taskId)) {
         const target = {
           kind: "role-runtime",
@@ -804,6 +890,7 @@ function selectedRuntimeLifecycleTargets(
         targets.set(runtimeTargetIdentity(target), target);
       }
     } else if (parsed.kind === "role") {
+      if (blockedTaskIds.has(parsed.taskId)) continue;
       const target = {
         kind: "role-runtime",
         taskId: parsed.taskId,
@@ -876,7 +963,7 @@ function selectionWithoutFailedCleanupRoles(
 ): ReconcileSelection {
   if (failedRoles.size === 0) return selection;
   const taskIds = selection.full
-    ? new Set(store.listTasks().map((task) => task.id))
+    ? new Set(selectedActiveSchedulerTasks(store, selection).map((task) => task.id))
     : new Set(selection.taskIds);
   const rolesByTask = new Map<string, ReadonlySet<string>>();
   for (const taskId of taskIds) {
@@ -892,7 +979,8 @@ function selectionWithoutFailedCleanupRoles(
     taskIds,
     allRoleTaskIds: new Set(),
     rolesByTask,
-    operator: selection.operator
+    operator: selection.operator,
+    blockedTaskIds: selection.blockedTaskIds
   };
 }
 
@@ -905,7 +993,7 @@ function selectionWithoutFailedLeaderCleanupTasks(
     return selection;
   }
   const taskIds = selection.full
-    ? new Set(store.listTasks().map((task) => task.id))
+    ? new Set(selectedActiveSchedulerTasks(store, selection).map((task) => task.id))
     : new Set(selection.taskIds);
   for (const taskId of taskIds) {
     if (failedRoles.has(roleIdentity(taskId, "leader"))) taskIds.delete(taskId);
@@ -915,7 +1003,8 @@ function selectionWithoutFailedLeaderCleanupTasks(
     taskIds,
     allRoleTaskIds: new Set(),
     rolesByTask: new Map(),
-    operator: selection.operator
+    operator: selection.operator,
+    blockedTaskIds: selection.blockedTaskIds
   };
 }
 
@@ -929,10 +1018,15 @@ function claimSelectedTaskMailboxes(
   now: Date
 ): ClaimedTaskMailbox[] {
   const targets = selection.full
-    ? store.listWorkMailboxes().flatMap((mailbox) => (
-        mailbox.target.kind === "task" ? [mailbox.target] : []
+    ? selectedReadyWorkMailboxes(store).flatMap((mailbox) => (
+        mailbox.target.kind === "task"
+        && !selection.blockedTaskIds?.has(mailbox.target.taskId)
+          ? [mailbox.target]
+          : []
       ))
-    : [...selection.allRoleTaskIds].map((taskId) => ({ kind: "task", taskId } as const));
+    : [...selection.allRoleTaskIds]
+      .filter((taskId) => !selection.blockedTaskIds?.has(taskId))
+      .map((taskId) => ({ kind: "task", taskId } as const));
   const claims: ClaimedTaskMailbox[] = [];
   for (const target of targets) {
     const mailbox = store.getWorkMailbox(target);
@@ -957,7 +1051,8 @@ export function compileReconcileSelection(scope: ReconcileScope): ReconcileSelec
       taskIds: new Set(),
       allRoleTaskIds: new Set(),
       rolesByTask: new Map(),
-      operator: true
+      operator: true,
+      blockedTaskIds: new Set()
     };
   }
   const taskIds = new Set<string>();
@@ -983,7 +1078,8 @@ export function compileReconcileSelection(scope: ReconcileScope): ReconcileSelec
     taskIds,
     allRoleTaskIds,
     rolesByTask: mutableRoles,
-    operator
+    operator,
+    blockedTaskIds: new Set()
   };
 }
 
@@ -995,35 +1091,35 @@ async function prepareActiveWorkspaces(
   onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"]
 ): Promise<Readonly<{ failed: Set<string>; ready: Set<string> }>> {
   if (workspace === undefined) return { failed: new Set(), ready: new Set() };
-  const taskIds = selection.full
-    ? new Set(store.listTasks()
-      .filter((task) => task.status === "active")
-      .map((task) => task.id))
-    : new Set(selection.allRoleTaskIds);
+  const tasks = selection.full
+    ? selectedActiveSchedulerTasks(store, selection)
+    : [...selection.allRoleTaskIds].flatMap((taskId) => {
+        if (selection.blockedTaskIds?.has(taskId)) return [];
+        const task = store.getTask(taskId);
+        return task?.status === "active" ? [task] : [];
+      });
   const failed = new Set<string>();
   const ready = new Set<string>();
-  for (const taskId of taskIds) {
-    const task = store.getTask(taskId);
-    if (task?.status === "active") {
-      // A Project under maintenance is fenced: defer this Task's preparation
-      // for the pass. The deferral is per-Project, never a Controller stop,
-      // and a deferred Task is not marked failed.
-      if (maintenanceFence !== undefined) {
-        const fencedProjects = task.projectBindings
-          .map(({ projectId }) => projectId)
-          .filter((projectId) => maintenanceFence(projectId));
-        if (fencedProjects.length > 0) {
-          onMaintenanceFenceDefer?.({ taskId, projectIds: fencedProjects });
-          continue;
-        }
+  for (const task of tasks) {
+    const taskId = task.id;
+    // A Project under maintenance is fenced: defer this Task's preparation
+    // for the pass. The deferral is per-Project, never a Controller stop,
+    // and a deferred Task is not marked failed.
+    if (maintenanceFence !== undefined) {
+      const fencedProjects = task.projectBindings
+        .map(({ projectId }) => projectId)
+        .filter((projectId) => maintenanceFence(projectId));
+      if (fencedProjects.length > 0) {
+        onMaintenanceFenceDefer?.({ taskId, projectIds: fencedProjects });
+        continue;
       }
-      try {
-        const result = await workspace.prepareTaskWorkspace(taskId);
-        if (result.status === "failed") failed.add(taskId);
-        else ready.add(taskId);
-      } catch {
-        failed.add(taskId);
-      }
+    }
+    try {
+      const result = await workspace.prepareTaskWorkspace(taskId);
+      if (result.status === "failed") failed.add(taskId);
+      else ready.add(taskId);
+    } catch {
+      failed.add(taskId);
     }
   }
   return { failed, ready };
@@ -1073,10 +1169,80 @@ function mailboxPart(value: string, key: string): string {
   }
 }
 
+function partitionDirtyScope(keys: readonly MailboxKey[]): DirtyScopePartition {
+  const taskScopes = new Map<string, {
+    taskKey: MailboxKey | undefined;
+    roleKeys: Map<string, MailboxKey>;
+  }>();
+  const globalKeys = new Set<MailboxKey>();
+  for (const key of keys) {
+    const parsed = parseMailboxKey(key);
+    if (parsed.kind === "operator" || parsed.kind === "global-role") {
+      globalKeys.add(key);
+      continue;
+    }
+    const current = taskScopes.get(parsed.taskId) ?? {
+      taskKey: undefined,
+      roleKeys: new Map<string, MailboxKey>()
+    };
+    if (parsed.kind === "task") {
+      current.taskKey = key;
+      current.roleKeys.clear();
+    } else if (current.taskKey === undefined) {
+      current.roleKeys.set(parsed.roleName, key);
+    }
+    taskScopes.set(parsed.taskId, current);
+  }
+  return {
+    taskScopes: [...taskScopes].map(([taskId, scope]) => ({
+      taskId,
+      keys: scope.taskKey === undefined
+        ? [...scope.roleKeys.values()]
+        : [scope.taskKey]
+    })),
+    globalKeys: [...globalKeys]
+  };
+}
+
+function emptyControllerSchedulerResult(): ControllerSchedulerResult {
+  return {
+    activeRunDeliveries: [],
+    failedRunRefs: [],
+    wakeups: [],
+    inputNotifications: [],
+    autoResolvedInputs: []
+  };
+}
+
+function runtimeTaskFailureIds(
+  result: RuntimeEventDrainResult | undefined
+): ReadonlySet<string> {
+  if (result === undefined) return new Set();
+  return new Set(result.failed.flatMap((failure) => (
+    failure.scope === "task"
+      && typeof failure.taskId === "string"
+      && failure.taskId.length > 0
+      ? [failure.taskId]
+      : []
+  )));
+}
+
+function mergeControllerSchedulerResults(
+  results: readonly ControllerSchedulerResult[]
+): ControllerSchedulerResult {
+  return {
+    activeRunDeliveries: results.flatMap((result) => result.activeRunDeliveries),
+    failedRunRefs: results.flatMap((result) => result.failedRunRefs),
+    wakeups: results.flatMap((result) => result.wakeups),
+    inputNotifications: results.flatMap((result) => result.inputNotifications),
+    autoResolvedInputs: results.flatMap((result) => result.autoResolvedInputs)
+  };
+}
+
 /**
- * Single-owner periodic runtime for FileTaskStore-backed scheduling. Concurrent
- * pump requests coalesce into one follow-up pass; scheduler effects never
- * overlap. There are deliberately no filesystem watchers or derived indexes.
+ * Single-owner periodic runtime for FileTaskStore-backed scheduling. Full pump
+ * requests remain exclusive, while dirty work is serialized per Task and may
+ * progress concurrently across different Tasks up to the configured bound.
  */
 export class FileTaskController {
   #intervalMs: number;
@@ -1088,6 +1254,7 @@ export class FileTaskController {
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
   readonly #taskOrchestrationRetryLimit: number;
+  readonly #taskConcurrency: number;
   readonly #stallWindowMs: number;
   readonly #runtimeEventProcessor: RuntimeEventProcessorPort | AsyncRuntimeEventProcessorPort | undefined;
   readonly #runtimeObserver: AgentRuntimeObserverPort | undefined;
@@ -1101,6 +1268,12 @@ export class FileTaskController {
     terminalFailure?: RoleRunDeliveryFailureIdentity;
   }>>();
   readonly #deliveryRetryTimers = new Map<MailboxKey, NodeJS.Timeout>();
+  readonly #taskPassRetryAttempts = new Map<string, Readonly<{
+    identity: string;
+    attempts: number;
+  }>>();
+  readonly #taskPassRetryTimers = new Map<string, NodeJS.Timeout>();
+  #dirtyTaskQueue: KeyedWorkQueue<string> | undefined;
   #passRetryTimer: NodeJS.Timeout | undefined;
   #passRetryAttempt = 0;
   #timer: NodeJS.Timeout | undefined;
@@ -1167,6 +1340,12 @@ export class FileTaskController {
       options.taskOrchestrationRetryLimit,
       DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT,
       "Controller Task orchestration retry limit"
+    );
+    this.#taskConcurrency = boundedPositiveInteger(
+      options.taskConcurrency,
+      DEFAULT_TASK_CONCURRENCY,
+      MAX_TASK_CONCURRENCY,
+      "Controller Task concurrency"
     );
     this.#stallWindowMs = positiveInteger(
       options.stallWindowMs,
@@ -1314,6 +1493,8 @@ export class FileTaskController {
     for (const timer of this.#deliveryRetryTimers.values()) clearTimeout(timer);
     this.#deliveryRetryTimers.clear();
     this.#deliveryRetryAttempts.clear();
+    this.#clearAllTaskPassRetries();
+    void this.#dirtyTaskQueue?.abortPending();
     if (this.#passRetryTimer !== undefined) {
       clearTimeout(this.#passRetryTimer);
       this.#passRetryTimer = undefined;
@@ -1374,6 +1555,8 @@ export class FileTaskController {
     if (scope.kind === "full") {
       this.#pendingFull = true;
       this.#pendingKeys.clear();
+      this.#clearAllTaskPassRetries();
+      void this.#dirtyTaskQueue?.abortPending();
     } else if (!this.#pendingFull) {
       for (const key of scope.keys) this.#pendingKeys.add(key);
     }
@@ -1394,13 +1577,7 @@ export class FileTaskController {
   }
 
   async #runCoalesced(): Promise<ControllerSchedulerResult> {
-    let result: ControllerSchedulerResult = {
-      activeRunDeliveries: [],
-      failedRunRefs: [],
-      wakeups: [],
-      inputNotifications: [],
-      autoResolvedInputs: []
-    };
+    let result = emptyControllerSchedulerResult();
     let pendingRuntimeDrain = false;
     try {
       while (this.#pendingFull || this.#pendingKeys.size > 0 || pendingRuntimeDrain) {
@@ -1408,6 +1585,8 @@ export class FileTaskController {
           ? { kind: "full" }
           : { kind: "dirty", keys: [...this.#pendingKeys] };
         const runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [];
+        const runtimeFailedTaskIds = new Set<string>();
+        let failedTaskScopes: readonly DirtyTaskReconcileScope[] = [];
         pendingRuntimeDrain = false;
         this.#pendingFull = false;
         this.#pendingKeys.clear();
@@ -1433,24 +1612,41 @@ export class FileTaskController {
             }
           }
           const firstRuntimeDrain = await this.#drainRuntimeEvents();
+          for (const taskId of runtimeTaskFailureIds(firstRuntimeDrain)) {
+            runtimeFailedTaskIds.add(taskId);
+          }
           // DurableJob reconciliation runs before the scheduler pass so a
           // terminal job's Leader wakeup is enqueued in the same pass that
           // processes Leader wakeups.
           this.#jobSupervisor?.reconcile(this.#now());
-          result = await runControllerSchedulerPass(
-            this.store,
-            this.delivery,
-            this.#now(),
-            this.#workspacePreparer,
-            scope,
-            false,
-            runtimeCleanupOutcomes,
-            this.#lifecycleHost,
-            this.#stallWindowMs,
-            this.#maintenanceFence,
-            this.#onMaintenanceFenceDefer
-          );
+          if (scope.kind === "full") {
+            result = await runControllerSchedulerPass(
+              this.store,
+              this.delivery,
+              this.#now(),
+              this.#workspacePreparer,
+              scope,
+              false,
+              runtimeCleanupOutcomes,
+              this.#lifecycleHost,
+              this.#stallWindowMs,
+              this.#maintenanceFence,
+              this.#onMaintenanceFenceDefer,
+              runtimeFailedTaskIds
+            );
+          } else {
+            const dirtyPass = await this.#runDirtySchedulerPass(
+              scope,
+              runtimeCleanupOutcomes,
+              runtimeFailedTaskIds
+            );
+            result = dirtyPass.result;
+            failedTaskScopes = dirtyPass.failedTaskScopes;
+          }
           const secondRuntimeDrain = await this.#drainRuntimeEvents();
+          for (const taskId of runtimeTaskFailureIds(secondRuntimeDrain)) {
+            runtimeFailedTaskIds.add(taskId);
+          }
           pendingRuntimeDrain = (
             (secondRuntimeDrain?.remainingEventCount ?? 0) > 0
             && (
@@ -1477,9 +1673,41 @@ export class FileTaskController {
             }
           }
           this.#clearPassRetry();
+          if (scope.kind === "full") this.#clearAllTaskPassRetries();
           this.#scheduleRuntimeCleanupRetries(runtimeCleanupOutcomes);
           this.#scheduleDeliveryRetries(result);
-          this.#scheduleTaskMailboxRetries(scope);
+          const failedTaskIds = new Set(
+            [
+              ...failedTaskScopes.map((failedScope) => failedScope.taskId),
+              ...runtimeFailedTaskIds
+            ]
+          );
+          this.#scheduleTaskMailboxRetries(
+            scope.kind === "dirty" && failedTaskIds.size > 0
+              ? {
+                  kind: "dirty",
+                  keys: scope.keys.filter((key) => {
+                    const target = parseMailboxKey(key);
+                    return (
+                      target.kind === "operator"
+                      || target.kind === "global-role"
+                      || !failedTaskIds.has(target.taskId)
+                    );
+                  })
+                }
+              : scope
+          );
+          for (const failedScope of failedTaskScopes) {
+            this.#clearDeliveryRetry(
+              `task:${encodeURIComponent(failedScope.taskId)}`
+            );
+            this.#scheduleTaskPassRetry(failedScope);
+          }
+          for (const taskId of runtimeFailedTaskIds) {
+            const key = `task:${encodeURIComponent(taskId)}` as const;
+            this.#clearDeliveryRetry(key);
+            this.#scheduleTaskPassRetry({ taskId, keys: [key] });
+          }
           if (
             scope.kind === "full"
             || scope.keys.some((key) => key !== "operator")
@@ -1509,6 +1737,126 @@ export class FileTaskController {
     } finally {
       this.#scheduleNextInputDeadline();
     }
+  }
+
+  async #runDirtySchedulerPass(
+    scope: Extract<ReconcileScope, { kind: "dirty" }>,
+    runtimeCleanupOutcomes: RuntimeCleanupOutcome[],
+    blockedTaskIds: ReadonlySet<string> = new Set()
+  ): Promise<DirtySchedulerPassResult> {
+    const partition = partitionDirtyScope(scope.keys);
+    const taskScopes = partition.taskScopes.filter((taskScope) => (
+      !blockedTaskIds.has(taskScope.taskId)
+    ));
+    const orderedResults: ControllerSchedulerResult[] = [];
+    if (partition.globalKeys.length > 0) {
+      orderedResults.push(await runControllerSchedulerPass(
+        this.store,
+        this.delivery,
+        this.#now(),
+        this.#workspacePreparer,
+        { kind: "dirty", keys: partition.globalKeys },
+        false,
+        runtimeCleanupOutcomes,
+        this.#lifecycleHost,
+        this.#stallWindowMs,
+        this.#maintenanceFence,
+        this.#onMaintenanceFenceDefer,
+        blockedTaskIds
+      ));
+    }
+    if (
+      taskScopes.length === 0
+      || this.#stopped
+      || this.#pendingFull
+    ) {
+      return {
+        result: mergeControllerSchedulerResults(orderedResults),
+        failedTaskScopes: []
+      };
+    }
+
+    const queue = new KeyedWorkQueue<string>();
+    this.#dirtyTaskQueue = queue;
+    const scopesByTask = new Map(
+      taskScopes.map((taskScope, index) => [
+        taskScope.taskId,
+        { taskScope, index }
+      ])
+    );
+    const taskResults: Array<ControllerSchedulerResult | undefined> =
+      Array(taskScopes.length);
+    const taskCleanupOutcomes: RuntimeCleanupOutcome[][] =
+      Array.from({ length: taskScopes.length }, () => []);
+    const failedTaskScopes: Array<DirtyTaskReconcileScope | undefined> =
+      Array(taskScopes.length);
+    const consume = async (): Promise<void> => {
+      while (true) {
+        const item = await queue.take();
+        if (item === undefined) return;
+        const selected = scopesByTask.get(item.key);
+        if (selected === undefined) {
+          item.done();
+          throw new Error(`Dirty Task queue returned an unknown Task: ${item.key}.`);
+        }
+        try {
+          if (this.#stopped || this.#pendingFull) continue;
+          try {
+            taskResults[selected.index] = await runControllerSchedulerPass(
+              this.store,
+              this.delivery,
+              this.#now(),
+              this.#workspacePreparer,
+              { kind: "dirty", keys: selected.taskScope.keys },
+              false,
+              taskCleanupOutcomes[selected.index]!,
+              this.#lifecycleHost,
+              this.#stallWindowMs,
+              this.#maintenanceFence,
+              this.#onMaintenanceFenceDefer,
+              blockedTaskIds
+            );
+            this.#clearTaskPassRetry(selected.taskScope.taskId);
+          } catch (error) {
+            failedTaskScopes[selected.index] = selected.taskScope;
+            this.#onError(error);
+          }
+        } finally {
+          item.done();
+        }
+      }
+    };
+    const consumers = Array.from(
+      {
+        length: Math.min(this.#taskConcurrency, taskScopes.length)
+      },
+      () => consume()
+    );
+    for (const taskScope of taskScopes) queue.signal(taskScope.taskId);
+    const stopped = queue.shutdown();
+    if (this.#stopped || this.#pendingFull) void queue.abortPending();
+    try {
+      await Promise.all(consumers);
+      await stopped;
+    } catch (error) {
+      await queue.abortPending();
+      await Promise.allSettled(consumers);
+      throw error;
+    } finally {
+      if (this.#dirtyTaskQueue === queue) this.#dirtyTaskQueue = undefined;
+    }
+    for (const outcomes of taskCleanupOutcomes) {
+      runtimeCleanupOutcomes.push(...outcomes);
+    }
+    orderedResults.push(...taskResults.filter(
+      (taskResult): taskResult is ControllerSchedulerResult => taskResult !== undefined
+    ));
+    return {
+      result: mergeControllerSchedulerResults(orderedResults),
+      failedTaskScopes: failedTaskScopes.filter(
+        (failedScope): failedScope is DirtyTaskReconcileScope => failedScope !== undefined
+      )
+    };
   }
 
   async #runOperatorPass(): Promise<void> {
@@ -1561,9 +1909,20 @@ export class FileTaskController {
     this.#runtimeSelectedEvents += metrics.selectedEventCount;
     this.#runtimeProgressEventsCoalesced += metrics.progressEventsCoalesced;
     this.#runtimeStateTransactions += metrics.stateTransactions;
-    if (result.failed.length > 0) {
+    const taskFailures = result.failed.filter((failure) => (
+      failure.scope === "task"
+      && typeof failure.taskId === "string"
+      && failure.taskId.length > 0
+    ));
+    const invalidFailures = result.failed.filter((failure) => !(
+      failure.scope === "task"
+      && typeof failure.taskId === "string"
+      && failure.taskId.length > 0
+    ));
+    for (const failure of taskFailures) this.#onError(failure.error);
+    if (invalidFailures.length > 0) {
       throw new RuntimeEventApplyError(
-        result.failed.map((failure) => failure.error),
+        invalidFailures.map((failure) => failure.error),
         "One or more native Turn events could not be applied."
       );
     }
@@ -1593,6 +1952,65 @@ export class FileTaskController {
     if (this.#passRetryTimer !== undefined) clearTimeout(this.#passRetryTimer);
     this.#passRetryTimer = undefined;
     this.#passRetryAttempt = 0;
+  }
+
+  #scheduleTaskPassRetry(scope: DirtyTaskReconcileScope): void {
+    if (this.#stopped || this.#pendingFull) return;
+    if (this.store.getTask(scope.taskId)?.status !== "active") {
+      this.#clearTaskPassRetry(scope.taskId);
+      return;
+    }
+    const identity = JSON.stringify([...scope.keys].sort((left, right) => (
+      left.localeCompare(right, undefined, { numeric: true })
+    )));
+    let previous = this.#taskPassRetryAttempts.get(scope.taskId);
+    if (previous !== undefined && previous.identity !== identity) {
+      this.#clearTaskPassRetry(scope.taskId);
+      previous = undefined;
+    }
+    if (this.#taskPassRetryTimers.has(scope.taskId)) return;
+    const attempts = previous?.attempts ?? 0;
+    if (attempts >= this.#taskOrchestrationRetryLimit) {
+      this.#clearTaskPassRetry(scope.taskId);
+      return;
+    }
+    this.#taskPassRetryAttempts.set(scope.taskId, {
+      identity,
+      attempts: attempts + 1
+    });
+    const delayMs = Math.min(
+      2_000,
+      this.#deliveryRetryMs * (2 ** Math.min(attempts, 3))
+    );
+    const timer = setTimeout(() => {
+      this.#taskPassRetryTimers.delete(scope.taskId);
+      if (this.#stopped || this.#pendingFull) return;
+      try {
+        if (this.store.getTask(scope.taskId)?.status !== "active") {
+          this.#clearTaskPassRetry(scope.taskId);
+          return;
+        }
+        void this.#requestPass({ kind: "dirty", keys: scope.keys }).catch(this.#onError);
+      } catch (error) {
+        this.#clearTaskPassRetry(scope.taskId);
+        this.#onError(error);
+      }
+    }, delayMs);
+    timer.unref();
+    this.#taskPassRetryTimers.set(scope.taskId, timer);
+  }
+
+  #clearTaskPassRetry(taskId: string): void {
+    const timer = this.#taskPassRetryTimers.get(taskId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.#taskPassRetryTimers.delete(taskId);
+    this.#taskPassRetryAttempts.delete(taskId);
+  }
+
+  #clearAllTaskPassRetries(): void {
+    for (const timer of this.#taskPassRetryTimers.values()) clearTimeout(timer);
+    this.#taskPassRetryTimers.clear();
+    this.#taskPassRetryAttempts.clear();
   }
 
   #scheduleNextInputDeadline(): void {
@@ -1743,7 +2161,7 @@ export class FileTaskController {
   #scheduleTaskMailboxRetries(scope: ReconcileScope): void {
     const selection = compileReconcileSelection(scope);
     const targets = selection.full
-      ? this.store.listWorkMailboxes().flatMap((mailbox) => (
+      ? selectedReadyWorkMailboxes(this.store).flatMap((mailbox) => (
           mailbox.target.kind === "task" ? [mailbox.target] : []
         ))
       : [...selection.allRoleTaskIds].map((taskId) => (
@@ -2120,6 +2538,19 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
   const resolved = value ?? fallback;
   if (!Number.isSafeInteger(resolved) || resolved <= 0) {
     throw new TypeError(`${label} must be a positive integer`);
+  }
+  return resolved;
+}
+
+function boundedPositiveInteger(
+  value: number | undefined,
+  fallback: number,
+  maximum: number,
+  label: string
+): number {
+  const resolved = positiveInteger(value, fallback, label);
+  if (resolved > maximum) {
+    throw new TypeError(`${label} must be at most ${maximum}`);
   }
   return resolved;
 }

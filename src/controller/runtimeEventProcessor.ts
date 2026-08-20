@@ -76,10 +76,18 @@ export type RuntimeTurnEventObserver = Readonly<{
   ): unknown;
 }>;
 
-export type RuntimeEventDrainFailure = Readonly<{
-  eventId?: string;
-  error: unknown;
-}>;
+export type RuntimeEventDrainFailure =
+  | Readonly<{
+      eventId: string;
+      scope: "task";
+      taskId: string;
+      error: unknown;
+    }>
+  | Readonly<{
+      eventId?: string;
+      scope: "global" | "unknown";
+      error: unknown;
+    }>;
 
 export type RuntimeEventDrainResult = Readonly<{
   acknowledgedEventIds: readonly string[];
@@ -151,6 +159,7 @@ const DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN = 64;
 /** Folds immutable Hook facts in one bounded transaction before acknowledging them. */
 export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
   private readonly drivers: AgentDriverRegistry;
+  private drainLaneCursor = 0;
 
   constructor(
     private readonly inbox: RuntimeEventInboxPort,
@@ -175,39 +184,67 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       this.options.maxEventsPerDrain,
       DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN
     );
-    const selected = selectDrainBatch(coalesced, maximum);
+    const selection = selectDrainBatch(coalesced, maximum, this.drainLaneCursor);
+    this.drainLaneCursor = selection.nextLaneCursor;
+    const selected = selection.candidates;
+    const failedTaskIds = new Set<string>();
     let stateTransactions = 0;
     if (selected.length > 0 && this.observer.withRuntimeEventTransaction !== undefined) {
-      try {
-        stateTransactions += 1;
-        const folded = this.observer.withRuntimeEventTransaction(() => (
-          selected.map((candidate) => this.foldOne(candidate, now))
-        ));
-        for (const result of folded) {
-          this.finalizeOne(result, acknowledgedEventIds, deferred, failed);
-        }
-      } catch {
-        // A failed aggregate transaction commits nothing. Retry each candidate
-        // independently so one bad event cannot strand unrelated facts.
-        for (const candidate of selected) {
-          try {
-            stateTransactions += 1;
-            const folded = this.observer.withRuntimeEventTransaction(() => (
-              this.foldOne(candidate, now)
-            ));
-            this.finalizeOne(folded, acknowledgedEventIds, deferred, failed);
-          } catch (candidateError) {
-            failed.push({ eventId: candidate.event.id, error: candidateError });
+      let offset = 0;
+      while (offset < selected.length) {
+        const wave = selectTaskOrderedWave(selected, offset, failedTaskIds);
+        offset = wave.nextOffset;
+        if (wave.candidates.length === 0) continue;
+        try {
+          stateTransactions += 1;
+          const folded = this.observer.withRuntimeEventTransaction(() => (
+            wave.candidates.map((candidate) => this.foldOne(candidate, now))
+          ));
+          for (const result of folded) {
+            const failure = this.finalizeOne(result, acknowledgedEventIds, deferred);
+            if (failure !== undefined) {
+              recordDrainFailure(failure, failed, failedTaskIds);
+            }
+          }
+        } catch {
+          // A failed aggregate transaction commits nothing. Retry each candidate
+          // independently so one bad event cannot strand unrelated Tasks.
+          for (const candidate of wave.candidates) {
+            if (isTaskCandidateBlocked(candidate.event, failedTaskIds)) continue;
+            try {
+              stateTransactions += 1;
+              const folded = this.observer.withRuntimeEventTransaction(() => (
+                this.foldOne(candidate, now)
+              ));
+              const failure = this.finalizeOne(folded, acknowledgedEventIds, deferred);
+              if (failure !== undefined) {
+                recordDrainFailure(failure, failed, failedTaskIds);
+              }
+            } catch (candidateError) {
+              recordDrainFailure(
+                candidateDrainFailure(candidate.event, candidateError),
+                failed,
+                failedTaskIds
+              );
+            }
           }
         }
       }
     } else {
       for (const candidate of selected) {
+        if (isTaskCandidateBlocked(candidate.event, failedTaskIds)) continue;
         try {
           const folded = this.foldOne(candidate, now);
-          this.finalizeOne(folded, acknowledgedEventIds, deferred, failed);
+          const failure = this.finalizeOne(folded, acknowledgedEventIds, deferred);
+          if (failure !== undefined) {
+            recordDrainFailure(failure, failed, failedTaskIds);
+          }
         } catch (error) {
-          failed.push({ eventId: candidate.event.id, error });
+          recordDrainFailure(
+            candidateDrainFailure(candidate.event, error),
+            failed,
+            failedTaskIds
+          );
         }
       }
     }
@@ -282,9 +319,8 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
   private finalizeOne(
     folded: FoldedRuntimeEvent,
     acknowledged: string[],
-    deferred: RuntimeLifecycleEvent[],
-    failed: RuntimeEventDrainFailure[]
-  ): void {
+    deferred: RuntimeLifecycleEvent[]
+  ): RuntimeEventDrainFailure | undefined {
     const { candidate, outcome } = folded;
     try {
       if (outcome === "deferred") {
@@ -293,7 +329,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
           candidate.representedEventIds.filter((id) => id !== candidate.event.id),
           acknowledged
         );
-        return;
+        return undefined;
       }
       if (folded.notifyTaskRuntime) {
         const event = candidate.event;
@@ -327,8 +363,9 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         }
       }
       this.acknowledge(candidate.representedEventIds, acknowledged);
+      return undefined;
     } catch (error) {
-      failed.push({ eventId: candidate.event.id, error });
+      return candidateDrainFailure(candidate.event, error);
     }
   }
 
@@ -509,14 +546,68 @@ export function coalesceRuntimeProgress(
   return result;
 }
 
+type DrainBatchSelection = Readonly<{
+  candidates: readonly CoalescedRuntimeEvent[];
+  nextLaneCursor: number;
+}>;
+
 function selectDrainBatch(
   events: readonly CoalescedRuntimeEvent[],
-  maximum: number
-): CoalescedRuntimeEvent[] {
-  // A batch is always an arrival-order prefix. Drain-time coalescing bounds
-  // worker folds without allowing a later semantic fact to
-  // overtake an earlier progress fence from another Run.
-  return events.slice(0, maximum);
+  maximum: number,
+  laneCursor = 0
+): DrainBatchSelection {
+  // Select one candidate per Task per round. A poison prefix from one Task
+  // therefore cannot consume the whole bounded batch before a later Task gets
+  // a chance to fold. Each lane itself remains in arrival order, preserving
+  // the same-Task semantic fence; only cross-Task order is interleaved.
+  const lanes = new Map<string, CoalescedRuntimeEvent[]>();
+  for (const candidate of events) {
+    const key = drainLaneKey(candidate.event);
+    const lane = lanes.get(key);
+    if (lane === undefined) lanes.set(key, [candidate]);
+    else lane.push(candidate);
+  }
+  const laneStates = [...lanes.values()].map((candidates) => ({
+    candidates,
+    offset: 0
+  }));
+  if (laneStates.length === 0) {
+    return { candidates: [], nextLaneCursor: 0 };
+  }
+  const startLane = positiveModulo(laneCursor, laneStates.length);
+  const selected: CoalescedRuntimeEvent[] = [];
+  let lastLane = startLane;
+  while (selected.length < maximum) {
+    let progressed = false;
+    for (let laneOffset = 0; laneOffset < laneStates.length; laneOffset += 1) {
+      const laneIndex = (startLane + laneOffset) % laneStates.length;
+      const lane = laneStates[laneIndex]!;
+      const candidate = lane.candidates[lane.offset];
+      if (candidate === undefined) continue;
+      lane.offset += 1;
+      selected.push(candidate);
+      lastLane = laneIndex;
+      progressed = true;
+      if (selected.length >= maximum) break;
+    }
+    // Every non-empty lane advances its offset when selected. Keep this
+    // guard explicit so malformed/empty input cannot create a zero-progress
+    // drain loop.
+    if (!progressed) break;
+  }
+  return {
+    candidates: selected,
+    nextLaneCursor: (lastLane + 1) % laneStates.length
+  };
+}
+
+function positiveModulo(value: number, modulus: number): number {
+  return ((value % modulus) + modulus) % modulus;
+}
+
+function drainLaneKey(event: RuntimeLifecycleEvent): string {
+  const taskId = candidateTaskId(event);
+  return taskId === undefined ? "global" : `task:${taskId}`;
 }
 
 function progressStreamKey(event: RuntimeObservationInboxEvent): string {
@@ -549,7 +640,7 @@ function emptyDrainFailure(error: unknown): RuntimeEventDrainResult {
   return {
     acknowledgedEventIds: [],
     deferred: [],
-    failed: [{ error }],
+    failed: [{ scope: "unknown", error }],
     remainingEventCount: 0,
     metrics: {
       listedEventCount: 0,
@@ -576,6 +667,83 @@ function isObsoleteRuntimeTurnObservation(value: unknown): boolean {
   return typeof value === "object"
     && value !== null
     && (value as { disposition?: unknown }).disposition === "obsolete";
+}
+
+function candidateDrainFailure(
+  event: RuntimeLifecycleEvent,
+  error: unknown
+): RuntimeEventDrainFailure {
+  const eventId = nonEmptyString(event.id);
+  if (event.scope === "task") {
+    const taskId = nonEmptyString(event.taskId);
+    if (eventId === undefined || taskId === undefined) {
+      // A Task failure must carry a durable inbox fence. If an injected port
+      // violates that parsed-event contract, do not incorrectly isolate it.
+      return {
+        ...(eventId === undefined ? {} : { eventId }),
+        scope: "unknown",
+        error
+      };
+    }
+    return { eventId, scope: "task", taskId, error };
+  }
+  return {
+    ...(eventId === undefined ? {} : { eventId }),
+    scope: "global",
+    error
+  };
+}
+
+function selectTaskOrderedWave(
+  candidates: readonly CoalescedRuntimeEvent[],
+  offset: number,
+  failedTaskIds: ReadonlySet<string>
+): Readonly<{
+  candidates: readonly CoalescedRuntimeEvent[];
+  nextOffset: number;
+}> {
+  const selected: CoalescedRuntimeEvent[] = [];
+  const selectedTaskIds = new Set<string>();
+  let nextOffset = offset;
+  while (nextOffset < candidates.length) {
+    const candidate = candidates[nextOffset]!;
+    const taskId = candidateTaskId(candidate.event);
+    if (taskId !== undefined && failedTaskIds.has(taskId)) {
+      nextOffset += 1;
+      continue;
+    }
+    if (taskId !== undefined && selectedTaskIds.has(taskId)) break;
+    selected.push(candidate);
+    if (taskId !== undefined) selectedTaskIds.add(taskId);
+    nextOffset += 1;
+  }
+  return { candidates: selected, nextOffset };
+}
+
+function recordDrainFailure(
+  failure: RuntimeEventDrainFailure,
+  failed: RuntimeEventDrainFailure[],
+  failedTaskIds: Set<string>
+): void {
+  failed.push(failure);
+  if (failure.scope === "task") failedTaskIds.add(failure.taskId);
+}
+
+function isTaskCandidateBlocked(
+  event: RuntimeLifecycleEvent,
+  failedTaskIds: ReadonlySet<string>
+): boolean {
+  const taskId = candidateTaskId(event);
+  return taskId !== undefined && failedTaskIds.has(taskId);
+}
+
+function candidateTaskId(event: RuntimeLifecycleEvent): string | undefined {
+  if (event.scope !== "task" || nonEmptyString(event.id) === undefined) return undefined;
+  return nonEmptyString(event.taskId);
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 // -- async variant (worker backend) ------------------------------------------
@@ -653,6 +821,7 @@ export function createAsyncRuntimeObserver(invoke: AsyncObserverInvoker): AsyncR
  */
 export class AsyncRuntimeEventProcessor {
   private readonly drivers: AgentDriverRegistry;
+  private drainLaneCursor = 0;
 
   constructor(
     private readonly inbox: RuntimeEventInboxPort,
@@ -677,9 +846,13 @@ export class AsyncRuntimeEventProcessor {
       this.options.maxEventsPerDrain,
       DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN
     );
-    const selected = selectDrainBatch(coalesced, maximum);
+    const selection = selectDrainBatch(coalesced, maximum, this.drainLaneCursor);
+    this.drainLaneCursor = selection.nextLaneCursor;
+    const selected = selection.candidates;
+    const failedTaskIds = new Set<string>();
     for (const candidate of selected) {
       const event = candidate.event;
+      if (isTaskCandidateBlocked(event, failedTaskIds)) continue;
       try {
         let outcome: "applied" | "deferred" | "obsolete" = "applied";
         if (event.type === "native-turn-completed") {
@@ -702,7 +875,11 @@ export class AsyncRuntimeEventProcessor {
         }
         this.acknowledge(candidate.representedEventIds, acknowledgedEventIds);
       } catch (error) {
-        failed.push({ eventId: event.id, error });
+        recordDrainFailure(
+          candidateDrainFailure(event, error),
+          failed,
+          failedTaskIds
+        );
       }
     }
     const acknowledged = new Set(acknowledgedEventIds);

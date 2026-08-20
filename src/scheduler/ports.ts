@@ -31,6 +31,12 @@ import {
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
 import type { TaskRuntimeLaunchPolicy } from "../runtime/taskRuntimeIsolation.js";
+import type {
+  RuntimeSessionCandidate,
+  RuntimeSessionCandidateQuery
+} from "../runtime/runtimeSessionCandidate.js";
+
+export type { RuntimeSessionCandidate } from "../runtime/runtimeSessionCandidate.js";
 
 export type SchedulerTask = Readonly<Pick<
   Task,
@@ -176,6 +182,8 @@ export type SchedulerReconcileSelection = Readonly<{
   allRoleTaskIds: ReadonlySet<string>;
   rolesByTask: ReadonlyMap<string, ReadonlySet<string>>;
   operator: boolean;
+  /** Tasks whose scheduler phases are fenced for this bounded pass. */
+  blockedTaskIds?: ReadonlySet<string>;
 }>;
 
 export type LeaderDispatchPersistence = Readonly<{
@@ -262,6 +270,12 @@ export type RunProgressFacts = Readonly<{
 export interface SchedulerStorePort {
   getPresentationContext(): Readonly<{ timeZone?: unknown }>;
   listTasks(): readonly SchedulerTask[];
+  /**
+   * Indexed active-Task selection for full Controller reconciliation. Stores
+   * that do not expose the projection retain their existing selection path;
+   * production layout-7 storage provides it directly from `tasks_catalog`.
+   */
+  listActiveTaskIds?(): readonly string[];
   getTask(taskId: string): SchedulerTask | null;
   /** Durable Task-owned main workspace used to fence every active launch. */
   getTaskWorkspace(taskId: string): ManagedWorkspace | null;
@@ -269,8 +283,8 @@ export interface SchedulerStorePort {
   getRole(taskId: string, roleName: string): SchedulerRole | null;
   getActiveAgentRun(taskId: string, roleName: string): SchedulerAgentRun | null;
   hasOpenInputRequest(taskId: string): boolean;
-  listOpenInputRequests(): readonly InputRequest[];
-  listPendingRuntimeTurnCompletions(): readonly PendingTurnCompletion[];
+  listOpenInputRequests(taskIds?: readonly string[]): readonly InputRequest[];
+  listPendingRuntimeTurnCompletions(taskIds?: readonly string[]): readonly PendingTurnCompletion[];
   getInputRequest(taskId: string, inputRequestId: string): InputRequest | null;
   getOperatorDeliveryTarget(): SchedulerOperatorDeliveryTarget | null;
   resolveExpiredInputRecommendations(
@@ -286,7 +300,7 @@ export interface SchedulerStorePort {
    * retry is due; the Controller arms its deadline timer from this projection.
    * Optional so adapters without the feature keep the old behavior.
    */
-  listPendingProviderRetries?(): ReadonlyArray<PendingProviderRetry>;
+  listPendingProviderRetries?(taskIds?: readonly string[]): ReadonlyArray<PendingProviderRetry>;
   /**
    * Issue 04: reopens each due retry on its original Native Session, or
    * terminalizes a Run whose Session is proven dead. Returns the reopened Run
@@ -345,6 +359,12 @@ export interface SchedulerStorePort {
 
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   listWorkMailboxes(): readonly WorkMailbox[];
+  /**
+   * Mailboxes with a pending or processing batch, selected from the durable
+   * ready-work projection. Production Controller full passes use this method
+   * so empty historical mailboxes never enter reconciliation.
+   */
+  listReadyWorkMailboxes?(): readonly WorkMailbox[];
   claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult;
   completeWorkMailbox(target: MailboxTarget, batchId: string): boolean;
   releaseWorkMailbox(target: MailboxTarget, batchId: string): boolean;
@@ -376,6 +396,13 @@ export interface SchedulerStorePort {
   ): boolean;
   /** Non-stopped native sessions with no active Task Run or lifecycle work. */
   listDormantRuntimeOwners?(): readonly DormantRuntimeOwnerCandidate[];
+  /**
+   * Current non-stopped Role Sessions from a storage-owned hot projection.
+   * Historical RoleSessionSets must never be scanned to answer this query.
+   */
+  listRuntimeSessionCandidates?(
+    query?: RuntimeSessionCandidateQuery
+  ): readonly RuntimeSessionCandidate[];
   /**
    * Persists a confirmed absent dormant owner only while its exact session
    * fact is still current and no launch, cleanup, or Task Run has appeared.
@@ -442,10 +469,47 @@ export function selectedSchedulerTasks(
   store: Pick<SchedulerStorePort, "listTasks" | "getTask">,
   selection?: SchedulerReconcileSelection
 ): SchedulerTask[] {
-  if (selection === undefined || selection.full) return [...store.listTasks()];
+  if (selection === undefined || selection.full) {
+    return [...store.listTasks()].filter((task) => (
+      !selection?.blockedTaskIds?.has(task.id)
+    ));
+  }
   return [...selection.taskIds].flatMap((taskId) => {
+    if (selection.blockedTaskIds?.has(taskId)) return [];
     const task = store.getTask(taskId);
     return task === null ? [] : [task];
+  });
+}
+
+/**
+ * Resolves only active Tasks for Controller execution phases. Full passes use
+ * the durable active index, so terminal history never enters Role, delivery,
+ * workspace, or liveness projections. Dirty passes keep their exact-key
+ * semantics and simply discard a Task that is no longer active.
+ */
+export function selectedActiveSchedulerTasks(
+  store: Pick<SchedulerStorePort, "listTasks" | "listActiveTaskIds" | "getTask">,
+  selection?: SchedulerReconcileSelection
+): SchedulerTask[] {
+  if (selection === undefined || selection.full) {
+    const indexedTaskIds = store.listActiveTaskIds?.();
+    if (indexedTaskIds === undefined) {
+      return store.listTasks().filter((task) => (
+        task.status === "active"
+        && !selection?.blockedTaskIds?.has(task.id)
+      ));
+    }
+    return [...indexedTaskIds].flatMap((taskId) => {
+      if (selection?.blockedTaskIds?.has(taskId)) return [];
+      const task = store.getTask(taskId);
+      return task?.status === "active" ? [task] : [];
+    });
+  }
+  const taskIds = selection.taskIds;
+  return [...taskIds].flatMap((taskId) => {
+    if (selection.blockedTaskIds?.has(taskId)) return [];
+    const task = store.getTask(taskId);
+    return task?.status === "active" ? [task] : [];
   });
 }
 
@@ -455,6 +519,7 @@ export function selectedSchedulerRoles(
   taskId: string,
   selection?: SchedulerReconcileSelection
 ): SchedulerRole[] {
+  if (selection?.blockedTaskIds?.has(taskId)) return [];
   if (
     selection === undefined
     || selection.full

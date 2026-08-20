@@ -9,6 +9,8 @@ import {
 import { basename, join, resolve } from "node:path";
 
 import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
+import type { Task } from "../task/task.js";
+import type { TaskRole } from "../role/role.js";
 import {
   inspectStorageSchema,
   type StorageSchemaState
@@ -766,39 +768,93 @@ function loadHomeState(
   }
   try {
     const store = (options.openCompatibleStore ?? openCompatibleFileTaskStore)(home);
-    const roles: RuntimeRoleFact[] = store.listGlobalRoles().map((role) => {
-      const session = activeLiveRoleAgentSession(store.getGlobalRoleSessionSet(role.name));
-      const binding = role.agentBindings[role.activeAgentId];
-      const agentId = session?.effective.agentId ?? role.activeAgentId;
-      const adapterId = session?.effective.adapterId ?? binding?.adapterId;
-      return {
-        ownerKind: "global-role",
-        roleName: role.name,
-        agentId,
-        ...(adapterId === undefined ? {} : { adapterId }),
-        ...(session === null ? {} : { nativeSessionId: session.nativeSessionId }),
-        ...(session?.launchId === undefined ? {} : { launchId: session.launchId })
-      };
-    });
-    for (const task of store.listTasks()) {
-      for (const role of store.listRoles(task.id)) {
-        const session = activeLiveRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
+    const roles: RuntimeRoleFact[] = [...store.listGlobalRoles()]
+      .sort((left, right) => numericCompare(left.name, right.name))
+      .map((role) => {
+        const session = activeLiveRoleAgentSession(store.getGlobalRoleSessionSet(role.name));
         const binding = role.agentBindings[role.activeAgentId];
-        const run = store.getActiveAgentRun(task.id, role.name);
         const agentId = session?.effective.agentId ?? role.activeAgentId;
         const adapterId = session?.effective.adapterId ?? binding?.adapterId;
-        roles.push({
-          ownerKind: "task-role",
-          taskId: task.id,
-          taskTitle: task.title,
-          taskStatus: task.status,
+        return {
+          ownerKind: "global-role",
           roleName: role.name,
           agentId,
           ...(adapterId === undefined ? {} : { adapterId }),
           ...(session === null ? {} : { nativeSessionId: session.nativeSessionId }),
-          ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
-          ...(run === null ? {} : { runId: run.id })
-        });
+          ...(session?.launchId === undefined ? {} : { launchId: session.launchId })
+        };
+      });
+    const appendTaskRole = (task: Task, role: TaskRole): void => {
+      const session = activeLiveRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
+      const binding = role.agentBindings[role.activeAgentId];
+      const run = store.getActiveAgentRun(task.id, role.name);
+      const agentId = session?.effective.agentId ?? role.activeAgentId;
+      const adapterId = session?.effective.adapterId ?? binding?.adapterId;
+      roles.push({
+        ownerKind: "task-role",
+        taskId: task.id,
+        taskTitle: task.title,
+        taskStatus: task.status,
+        roleName: role.name,
+        agentId,
+        ...(adapterId === undefined ? {} : { adapterId }),
+        ...(session === null ? {} : { nativeSessionId: session.nativeSessionId }),
+        ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
+        ...(run === null ? {} : { runId: run.id })
+      });
+    };
+
+    // Layout-7 SQLite owns bounded active-Task and current-Session indexes.
+    // Use those indexes only as selectors, then point-read the authoritative
+    // Task/Role/Session/Run records so an index row cannot bypass ownership
+    // fences. The legacy File store intentionally retains its complete
+    // listTasks fallback because it has no equivalent active selector.
+    const hotStore = store as typeof store & Readonly<{
+      listActiveTaskIds?: () => readonly string[];
+    }>;
+    const indexedTaskIds = hotStore.listActiveTaskIds === undefined
+      ? undefined
+      : [...new Set(hotStore.listActiveTaskIds())].sort(numericCompare);
+    if (indexedTaskIds === undefined) {
+      for (const task of store.listTasks()) {
+        for (const role of [...store.listRoles(task.id)].sort((left, right) => (
+          numericCompare(left.name, right.name)
+        ))) {
+          appendTaskRole(task, role);
+        }
+      }
+    } else {
+      const sessionCandidates = typeof store.listRuntimeSessionCandidates === "function"
+        ? store.listRuntimeSessionCandidates({ scope: "task" })
+        : [];
+      const candidateRoles = new Map<string, Set<string>>();
+      for (const candidate of sessionCandidates) {
+        if (candidate.owner.scope !== "task") continue;
+        const roleNames = candidateRoles.get(candidate.owner.taskId) ?? new Set<string>();
+        roleNames.add(candidate.owner.roleName);
+        candidateRoles.set(candidate.owner.taskId, roleNames);
+      }
+      const activeTaskSet = new Set(indexedTaskIds);
+      const taskIds = [...new Set([
+        ...indexedTaskIds,
+        ...candidateRoles.keys()
+      ])].sort(numericCompare);
+      for (const taskId of taskIds) {
+        const task = store.getTask(taskId);
+        if (task === null) continue;
+        const rolesForTask = activeTaskSet.has(taskId) && task.status === "active"
+          ? store.listRoles(taskId)
+          : [...(candidateRoles.get(taskId) ?? [])]
+            .sort(numericCompare)
+            .flatMap((roleName) => {
+              const role = store.getRole(taskId, roleName);
+              return role === null ? [] : [role];
+            });
+        for (const role of [...rolesForTask].sort((left, right) => (
+          numericCompare(left.name, right.name)
+        ))) {
+          appendTaskRole(task, role);
+        }
       }
     }
     return { storageStatus: schema.status, roles };
@@ -806,6 +862,10 @@ function loadHomeState(
     warnings.push(`Cannot load runtime ownership for ${home}: ${message(error)}`);
     return { storageStatus: "invalid", roles: [] };
   }
+}
+
+function numericCompare(left: string, right: string): number {
+  return left.localeCompare(right, undefined, { numeric: true });
 }
 
 function inspectHomePanes(
