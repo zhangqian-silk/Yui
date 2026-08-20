@@ -4479,7 +4479,7 @@ test("Task-final recovery head mismatch rolls back exact Leader terminalization"
   assert.equal(stored.listAgentRuns(fx.task.id).filter(({ purpose }) => purpose === "review").length, 0);
 });
 
-test("late drift after exact Leader terminalization fails the resumed final Review and wakes one Leader", async (t) => {
+test("late drift after exact Leader terminalization leaves a bounded Leader recovery path", async (t) => {
   const fx = await pendingExactTaskReviewFixture(
     t,
     "Retain a durable owner after late final Review drift"
@@ -4510,6 +4510,10 @@ test("late drift after exact Leader terminalization fails the resumed final Revi
     fx,
     "Terminalize the exact Leader before the late Review drift."
   );
+  // The CLI may leave the durable wake queued or the Controller may already
+  // have consumed it into the successor Leader Run. Drain and stop that
+  // asynchronous owner before taking one coherent persistence snapshot.
+  await stopFileTaskController(fx.home);
   const stored = new FileTaskStore(fx.home);
   const round = stored.getReviewRound(fx.task.id, fx.pending.id);
   const terminalLeader = stored.getAgentRun(fx.task.id, leaderRun.id);
@@ -4518,25 +4522,48 @@ test("late drift after exact Leader terminalization fails the resumed final Revi
     taskId: fx.task.id,
     roleName: "leader"
   });
+  const activeLeader = stored.getActiveAgentRun(fx.task.id, "leader");
+  const successorLeaders = stored.listAgentRuns(fx.task.id).filter((run) => (
+    run.roleName === "leader" && run.id !== leaderRun.id
+  ));
   const observed = {
     taskStatus: stored.getTask(fx.task.id).status,
     leaderStatus: terminalLeader.status,
-    activeLeaderRunId: stored.getActiveAgentRun(fx.task.id, "leader")?.id ?? null,
     roundStatus: round.status,
     reviewerRunId: round.reviewerRunId,
     reviewRunCount: stored.listAgentRuns(fx.task.id)
-      .filter(({ purpose }) => purpose === "review").length,
-    leaderWakeReasons: leaderMailbox?.pending?.reasons ?? []
+      .filter(({ purpose }) => purpose === "review").length
   };
   assert.deepEqual(observed, {
     taskStatus: "active",
     leaderStatus: "yielded",
-    activeLeaderRunId: null,
     roundStatus: "failed",
     reviewerRunId: undefined,
-    reviewRunCount: 0,
-    leaderWakeReasons: ["review-failed"]
+    reviewRunCount: 0
   }, `reachable stranded lifecycle state: ${JSON.stringify(observed)}`);
+  const queuedReviewFailure = leaderMailbox?.pending?.reasons.includes("review-failed") === true;
+  assert.equal(
+    activeLeader !== null || queuedReviewFailure,
+    true,
+    "the failed Review must retain a durable queued or active Leader recovery path"
+  );
+  assert.ok(successorLeaders.length <= 1, "Review recovery must not duplicate Leader Runs");
+  if (activeLeader === null) {
+    assert.equal(queuedReviewFailure, true);
+  } else {
+    assert.equal(successorLeaders.length, 1);
+    assert.equal(activeLeader.id, successorLeaders[0].id);
+    assert.equal(activeLeader.status, "active");
+    assert.equal(activeLeader.purpose, "execution");
+  }
+  if (queuedReviewFailure) {
+    assert.deepEqual(leaderMailbox.pending?.refs, [{
+      type: "work-item",
+      taskId: fx.task.id,
+      id: fx.pending.workItemId
+    }]);
+    assert.equal(leaderMailbox.pending?.requestCount, 1);
+  }
   assert.equal(completed.status, 0, completed.stderr || completed.stdout);
   assert.match(completed.stdout, /Review could not start/);
   assert.match(round.summary, /no longer the current Task candidate/i);
@@ -4545,12 +4572,6 @@ test("late drift after exact Leader terminalization fails the resumed final Revi
   assert.notEqual(round.workspace, undefined);
   assert.deepEqual(stored.getReviewRoundWorkspace(fx.task.id, round.id), round.workspace);
   assert.equal(stored.listReviewRounds(fx.task.id).length, 1);
-  assert.deepEqual(leaderMailbox.pending?.refs, [{
-    type: "work-item",
-    taskId: fx.task.id,
-    id: fx.pending.workItemId
-  }]);
-  assert.equal(leaderMailbox.pending?.requestCount, 1);
 });
 
 test("pending Task-final recovery safely reuses a retained diagnostic branch", async (t) => {
