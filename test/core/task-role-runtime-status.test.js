@@ -26,6 +26,12 @@ import {
   TmuxManager
 } from "../../dist/tmux/tmuxManager.js";
 import { CommandExecutionError } from "../../dist/tmux/commandExecutor.js";
+import { createTaskEvent } from "../../dist/event/taskEvent.js";
+import {
+  createRuntimeObservation,
+  runtimeObservationTaskEventPayload
+} from "../../dist/runtime/runtimeObservation.js";
+import { formatAgentRunReceiptId } from "../../dist/task/taskRecordReference.js";
 
 const NOW = new Date("2026-07-21T12:00:00.000Z");
 
@@ -127,6 +133,36 @@ function recordResetSession(store, taskId, roleName) {
   );
 }
 
+function saveRuntimeObservation(store, run, input) {
+  const observation = createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: input.eventId,
+    kind: input.kind,
+    authority: "provider-structured",
+    receivedAt: input.receivedAt,
+    fence: {
+      taskId: run.taskId,
+      roleName: run.roleName,
+      runId: run.id,
+      agentId: run.effective.agentId,
+      driverId: "openai/codex",
+      launchId: "launch-worker",
+      sessionGenerationId: "launch-worker",
+      nativeSessionId: "thread-worker",
+      nativeTurnId: input.nativeTurnId ?? run.id,
+      receiptId: formatAgentRunReceiptId(run.taskId, run.id)
+    },
+    payload: input.payload ?? {}
+  });
+  store.saveEvent(run.taskId, createTaskEvent(
+    store.nextEventId(run.taskId),
+    run.taskId,
+    "runtime.observation",
+    runtimeObservationTaskEventPayload(observation),
+    new Date(input.receivedAt)
+  ));
+}
+
 test("Task Role list uses one tmux snapshot and returns structured runtime summaries", (t) => {
   const { root, store, options, paneReads } = fixture(t);
   execute(["create", "Runtime status"], store, options);
@@ -148,10 +184,24 @@ test("Task Role list uses one tmux snapshot and returns structured runtime summa
     agentId: "codex",
     adapterId: "codex",
     nativeSessionId: "thread-worker",
+    launchId: "launch-worker",
     policy: "fixed",
     status: "running"
   }, NOW);
   store.saveTaskRoleSessionSet(sessions);
+  saveRuntimeObservation(store, activeRun, {
+    eventId: "runtime-accepted",
+    kind: "turn.accepted",
+    receivedAt: "2026-07-21T12:00:01.000Z",
+    nativeTurnId: "provider-turn-worker"
+  });
+  saveRuntimeObservation(store, activeRun, {
+    eventId: "runtime-tool-started",
+    kind: "operation.started",
+    receivedAt: "2026-07-21T12:00:02.000Z",
+    nativeTurnId: "provider-turn-worker",
+    payload: { operation: "tool", operationId: "tool-1" }
+  });
 
   const before = readFileSync(join(root, "state.json"), "utf8");
   const result = execute(["role", "list", task.id], store, options);
@@ -163,6 +213,7 @@ test("Task Role list uses one tmux snapshot and returns structured runtime summa
   assert.equal(result.data.roles.length, 2);
   const worker = result.data.roles.find((role) => role.roleName === "worker");
   assert.equal(worker.health, "running");
+  assert.equal(worker.runtime.status, "tool-active");
   assert.equal(worker.activeRun.workItemId, work.id);
   assert.equal(worker.activeWork.id, work.id);
   assert.equal(worker.nativeSession.nativeSessionId, "thread-worker");
@@ -175,7 +226,74 @@ test("Task Role list uses one tmux snapshot and returns structured runtime summa
   });
   const status = execute(["role", "status", task.id, "worker"], store, options);
   assert.match(status.output, /thread-worker/);
+  assert.match(status.output, /Agent runtime\s+openai\/codex: tool-active/);
   assert.equal(readFileSync(join(root, "state.json"), "utf8"), before);
+});
+
+test("Task Role status distinguishes a live host from recent Agent activity", (t) => {
+  const { store, options } = fixture(t);
+  execute(["create", "Runtime activity"], store, options);
+  const task = store.listTasks()[0];
+  execute(["role", "add", task.id, "worker"], store, options);
+  execute(["work", "create", task.id, "Implement"], store, options);
+  execute(["activate", task.id], store, options);
+  const run = dispatchTestRun(store, task.id, "worker", store.listWorkItems(task.id)[0].id);
+  store.saveAgentRun({ ...run, pushedAt: NOW.toISOString(), deliveredAt: NOW.toISOString() });
+
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: "worker" },
+    "codex",
+    NOW
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "codex",
+    adapterId: "codex",
+    nativeSessionId: "thread-worker",
+    launchId: "launch-worker",
+    policy: "fixed",
+    status: "running"
+  }, NOW);
+  store.saveTaskRoleSessionSet(sessions);
+  saveRuntimeObservation(store, run, {
+    eventId: "runtime-accepted-quiet",
+    kind: "turn.accepted",
+    receivedAt: NOW.toISOString()
+  });
+
+  const quiet = execute(["role", "status", task.id, "worker"], store, {
+    ...options,
+    now: () => new Date(NOW.getTime() + 6 * 60_000)
+  }).data.role;
+  assert.equal(quiet.runtime.status, "active-quiet");
+  assert.equal(quiet.runtime.attention, "quiet");
+  assert.equal(quiet.health, "needs-attention");
+  assert.match(quiet.healthReason, /not reported recent structured runtime activity/);
+
+  saveRuntimeObservation(store, run, {
+    eventId: "runtime-token-baseline",
+    kind: "activity.observed",
+    receivedAt: new Date(NOW.getTime() + 5 * 60_000).toISOString(),
+    payload: {
+      activity: "model",
+      usage: { inputTokens: 900, outputTokens: 90 }
+    }
+  });
+  saveRuntimeObservation(store, run, {
+    eventId: "runtime-token-advanced",
+    kind: "activity.observed",
+    receivedAt: new Date(NOW.getTime() + 5 * 60_000 + 30_000).toISOString(),
+    payload: {
+      activity: "model",
+      usage: { inputTokens: 1_000, outputTokens: 100 }
+    }
+  });
+  const active = execute(["role", "status", task.id, "worker"], store, {
+    ...options,
+    now: () => new Date(NOW.getTime() + 6 * 60_000)
+  }).data.role;
+  assert.equal(active.runtime.status, "model-active");
+  assert.equal(active.runtime.attention, "healthy");
+  assert.equal(active.health, "running");
 });
 
 test("Task Role status explains persisted and live state without capturing output", (t) => {

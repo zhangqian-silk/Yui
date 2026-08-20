@@ -383,7 +383,7 @@ function latestStallKind(events: readonly TaskEvent[], runId: string): string {
   const event = [...events]
     .filter((candidate) => candidate.type === "run.stalled" && candidate.payload.runId === runId)
     .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
-  return event?.payload.kind ?? "execution-stalled";
+  return event?.payload.kind ?? "workflow-not-progressing";
 }
 
 function renderWorkItemReviews(

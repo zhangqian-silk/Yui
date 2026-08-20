@@ -45,7 +45,6 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const MOCK_EXECUTABLE = join(HERE, "mockClaudeAgent.mjs");
 const START = new Date("2026-08-09T00:00:00.000Z");
 const PUSHED = new Date("2026-08-09T00:00:01.000Z");
-const FOLDED = new Date("2026-08-09T00:00:02.000Z");
 const SUCCESSOR = new Date("2026-08-09T00:00:03.000Z");
 const WAITING_WORKER_START = new Date("2026-08-09T00:30:00.000Z");
 const WAIT_TIMEOUT_MS = 4_000;
@@ -436,14 +435,18 @@ export async function createMockAgentSession(
     activeRun: () => store.getActiveAgentRun(task.id, role.name),
     currentWorkItem: () => store.getWorkItem(task.id, item.id),
     inboxEvents: () => inbox.list(),
-    drainEvents: () => processor.drain(FOLDED),
+    // Hook ingress timestamps come from the real child process clock. Drain
+    // against the current clock rather than the fixture's durable-history
+    // timestamps so valid observations are not classified as future events.
+    drainEvents: () => processor.drain(new Date()),
     waitForEvent: (event) => waitFor(
       () => inbox.list().find((candidate) => (
-        event === "session-start"
-          ? candidate.type === "native-session-lifecycle"
+        candidate.type === "runtime-observation"
+        && (event === "session-start"
+          ? candidate.observation.kind === "session.ready"
           : event === "prompt-accepted"
-            ? candidate.type === "native-prompt-accepted"
-            : candidate.type === "claude-stop-failure"
+            ? candidate.observation.kind === "turn.accepted"
+            : candidate.observation.kind === "turn.failed")
       )),
       `runtime event ${event}`
     ),

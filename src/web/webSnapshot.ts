@@ -128,7 +128,7 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
         runId: run.id,
         roleName: run.roleName,
         progressAt: latestStallProgress(events, run.id),
-        kind: latestStallField(events, run.id, "kind") ?? "execution-stalled",
+        kind: latestStallField(events, run.id, "kind") ?? "workflow-not-progressing",
         classification: latestStallField(events, run.id, "classification") ?? "truly-stalled"
       }));
     const activeRuns = new Map(runs

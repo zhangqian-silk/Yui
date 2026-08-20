@@ -24,8 +24,8 @@ import { SqliteTelemetryStore } from "../telemetry/sqliteTelemetryStore.js";
  * `yui telemetry status|prune|compact|read` — operational surface for the
  * Issue 09 telemetry sidecar. Telemetry lives in the Home's authoritative
  * `yui.db`; these commands never touch the authoritative semantic records
- * except `compact`, which removes only `runtime.provider-turn-progress`
- * events from a staged copy.
+ * except `compact`, which migrates only the historical pre-Driver progress
+ * event family from a staged copy.
  */
 
 export type TelemetryCommandOptions = Readonly<{

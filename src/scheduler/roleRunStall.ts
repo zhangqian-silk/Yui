@@ -18,24 +18,18 @@ import type { RoleLiveStatusSnapshot } from "./roleRunLiveness.js";
  * is simply slow keeps its structured checkpoint fresh and never crosses it.
  */
 export const DEFAULT_STALL_WINDOW_MS = 30 * 60_000;
-/** Cheap execution-stall candidate filter; the real threshold remains 30m. */
-export const DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS = 10 * 60_000;
-/** Resource activity may postpone attention only within this semantic gap. */
-export const DEFAULT_RESOURCE_ONLY_SEMANTIC_GAP_MS = 90 * 60_000;
-
+/** Cheap workflow-stall candidate filter; the real threshold remains 30m. */
+export const DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS = 10 * 60_000;
 export const RUN_PROGRESS_EVENT = "run.progress";
 export const RUN_STALLED_EVENT = "run.stalled";
 export const RUN_RECOVERED_EVENT = "run.recovered";
-/** Durable one-shot advisory resource evidence; never a progress fact. */
-export const RUN_RESOURCE_SUPPRESSED_EVENT = "run.resource-suppressed";
 /** Structured, non-Message recovery evidence written by an explicit Leader. */
 export const RUN_RECOVERY_REQUESTED_EVENT = "run.recovery-requested";
 export const RUN_RECOVERY_APPLIED_EVENT = "run.recovery-applied";
 
-/** Event types that count as Run activity for the durable progress clock. */
+/** Workflow-semantic events that count for the durable progress clock. */
 const ACTIVITY_EVENT_TYPES = new Set([
   RUN_PROGRESS_EVENT,
-  "runtime.provider-turn-progress",
   "message.sent",
   "input.answered",
   "input.auto-answered",
@@ -74,7 +68,7 @@ export function clearMatchingLeaderStallAttention(
   return true;
 }
 
-export type RoleRunStallKind = "delivery-stalled" | "execution-stalled";
+export type RoleRunStallKind = "delivery-stalled" | "workflow-not-progressing";
 export type RoleRunStallClassification =
   | "working"
   | "waiting-user"
@@ -105,10 +99,9 @@ export type RoleRunHealthProjection = Readonly<{
 }>;
 
 /**
- * One pure projection used by every Role. Resource activity can suppress a
- * false positive only together with a live host and matching native Session
- * or launch generation;
- * it never changes the durable progress clock or authorizes recovery.
+ * One pure projection used by every Role. Resource activity is retained only
+ * as exact-generation diagnostic evidence; it never changes the durable
+ * progress clock, suppresses workflow attention, or authorizes recovery.
  */
 export function projectRoleRunHealth(input: Readonly<{
   progressAt: string;
@@ -144,7 +137,7 @@ export function projectRoleRunHealth(input: Readonly<{
   const candidate = Number.isFinite(candidateAge)
     && (input.deliveredAt === undefined
       ? candidateAge >= windowMs
-      : candidateAge >= DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS);
+      : candidateAge >= DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS);
   const providerAcceptance = input.providerAcceptance
     ?? (input.deliveredAt === undefined ? "ambiguous" : "accepted");
   const hostLiveness = input.hostLiveness;
@@ -174,14 +167,13 @@ export function projectRoleRunHealth(input: Readonly<{
   // evidence is still actionable in that case.  Only an explicit stopped or
   // broken Session blocks the projection; identity mismatches are fenced by
   // reconcileStalledRoleRuns below before this projection is routed.
-  const executionStall = candidate
+  const workflowStall = candidate
     && evaluation.stalled
     && hostLiveness === "present"
     && nativeSession !== "stopped"
     && nativeSession !== "broken"
-    && providerAcceptance !== "ambiguous"
-    && !resourceActivity;
-  const stalled = executionStall
+    && providerAcceptance !== "ambiguous";
+  const stalled = workflowStall
     && !waitingUser
     && !waitingOnWorkers;
   const classification: RoleRunStallClassification = waitingUser
@@ -245,9 +237,9 @@ export function evaluateRoleRunStall(input: Readonly<{
 
 /**
  * Latest durable progress timestamp for an active Run. Provider acceptance
- * (deliveredAt), explicit structured checkpoints, and semantic Run-scoped
- * activity all count as progress; bookkeeping-only Run/Session timestamps are
- * intentionally excluded. CPU/memory are never inputs here.
+ * (deliveredAt), explicit workflow checkpoints, and semantic domain activity
+ * count as progress. Provider operations, tokens, CPU/memory and bookkeeping
+ * timestamps are intentionally excluded.
  */
 export function latestDurableProgressAt(input: Readonly<{
   deliveredAt?: string;
@@ -282,16 +274,8 @@ export function latestRunProgressAt(
 ): string | undefined {
   let latest: string | undefined;
   for (const event of events) {
-    if (
-      event.type !== RUN_PROGRESS_EVENT
-      && event.type !== "runtime.provider-turn-progress"
-    ) continue;
+    if (event.type !== RUN_PROGRESS_EVENT) continue;
     if (event.payload.runId !== runId) continue;
-    if (
-      event.type === "runtime.provider-turn-progress"
-      && (typeof event.payload.progressAt !== "string"
-        || !Number.isFinite(Date.parse(event.payload.progressAt)))
-    ) continue;
     const progressAt = typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -497,13 +481,7 @@ export function latestRunActivityAt(
       || event.type === RUN_STALLED_EVENT
       || event.type === RUN_RECOVERED_EVENT
     ) continue;
-    if (
-      event.type === "runtime.provider-turn-progress"
-      && (typeof event.payload.progressAt !== "string"
-        || !Number.isFinite(Date.parse(event.payload.progressAt)))
-    ) continue;
-    const activityAt = (event.type === RUN_PROGRESS_EVENT
-      || event.type === "runtime.provider-turn-progress")
+    const activityAt = event.type === RUN_PROGRESS_EVENT
       && typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -577,12 +555,10 @@ export function foldRunProgressFacts(
       byRun.set(runId, facts);
     }
     const type = event.type;
-    const isProgress = type === RUN_PROGRESS_EVENT
-      || type === "runtime.provider-turn-progress";
+    const isProgress = type === RUN_PROGRESS_EVENT;
     if (isProgress) {
       const validProgress = typeof event.payload.progressAt === "string"
         && Number.isFinite(Date.parse(event.payload.progressAt));
-      if (type === "runtime.provider-turn-progress" && !validProgress) continue;
       const progressAt = validProgress
         ? (event.payload.progressAt as string)
         : event.createdAt;
@@ -590,9 +566,7 @@ export function foldRunProgressFacts(
         || Date.parse(progressAt) > Date.parse(facts.latestCheckpointAt)) {
         facts.latestCheckpointAt = progressAt;
       }
-      // Both progress event types are activity events; the stall/recovered
-      // exclusion in latestRunActivityAt is structural here because a progress
-      // event can never be either type.
+      // Workflow checkpoints are also semantic activity.
       if (facts.latestActivityAt === undefined
         || Date.parse(progressAt) > Date.parse(facts.latestActivityAt)) {
         facts.latestActivityAt = progressAt;
@@ -667,7 +641,7 @@ export type RoleRunStallResult = Readonly<{
 /**
  * Low-frequency health pass for active Task Role Runs. An unaccepted Run is
  * watched as delivery-stalled after the reasonable delivery window; an
- * accepted Run enters the execution-stall candidate scan after ten minutes,
+ * accepted Run enters the workflow-stall candidate scan after ten minutes,
  * while the actual no-progress threshold remains thirty minutes.
  * Leader Runs are only persisted when classification reaches truly-stalled —
  * healthy downstream work, open user input, and recent own progress remain
@@ -681,8 +655,7 @@ export async function reconcileStalledRoleRuns(
   selection?: SchedulerReconcileSelection,
   windowMs = DEFAULT_STALL_WINDOW_MS,
   liveStatuses?: RoleLiveStatusSnapshot,
-  resourceEvidence?: RoleRunResourceEvidenceSnapshot,
-  resourceSuppressionKeys?: Set<string>
+  resourceEvidence?: RoleRunResourceEvidenceSnapshot
 ): Promise<RoleRunStallResult[]> {
   // Dirty mailbox passes are intentionally not a second scheduler. Full
   // reconcile owns the all-active-Run scan; dirty passes may still route the
@@ -886,7 +859,7 @@ export async function reconcileStalledRoleRuns(
       candidate.role.name,
       candidate.run.id
     );
-    const resourceCanSuppress = live === "present"
+    const resourceIsCurrent = live === "present"
       && sessionMatchesRun
       && sessionUsable
       && expectedResourceIdentity !== undefined
@@ -896,19 +869,7 @@ export async function reconcileStalledRoleRuns(
         progressAt
       )
       && resourceEvidenceIsFresh(resourceSnapshot, now, windowMs);
-    const resource = resourceCanSuppress
-      ? await consumeResourceEvidence(
-          store,
-          resourceEvidence,
-          candidate.task.id,
-          candidate.role.name,
-          candidate.run.id,
-          progressAt,
-          expectedResourceIdentity!,
-          resourceSuppressionKeys,
-          now
-        )
-      : undefined;
+    const resource = resourceIsCurrent ? resourceSnapshot : undefined;
     const health = projectRoleRunHealth({
       progressAt,
       createdAt: candidate.run.createdAt,
@@ -927,8 +888,7 @@ export async function reconcileStalledRoleRuns(
     });
     // Delivery-stalled Runs retain the existing delivery clock and immediate
     // provider-uncertainty path. Accepted execution Runs use the shared
-    // projection, including its exact Session/host and advisory resource
-    // conditions.
+    // projection. Exact Session/host resource evidence remains diagnostic.
     const resourceActivity = health.resourceActivity;
     const stalled = candidate.run.deliveredAt === undefined
       ? evaluation.stalled && live === "present"
@@ -938,9 +898,8 @@ export async function reconcileStalledRoleRuns(
       live,
       progressAt,
       idleMs: evaluation.idleMs,
-      // Resource activity is advisory: with a live, matching native Session it
-      // keeps a long inference/remote-IO Run in the working projection, but it
-      // never advances progress or creates a recovered event by itself.
+      // Resource activity is advisory and never advances workflow progress or
+      // suppresses a workflow-not-progressing episode.
       stalled,
       resourceActivity,
       evidence: [
@@ -975,7 +934,7 @@ export async function reconcileStalledRoleRuns(
     }
     const kind: RoleRunStallKind = candidate.run.deliveredAt === undefined
       ? "delivery-stalled"
-      : "execution-stalled";
+      : "workflow-not-progressing";
     const classification = candidate.role.name === "leader"
       ? classifyLeaderStall(store, candidate.task.id, observed, now, windowMs)
       : "truly-stalled";
@@ -1057,10 +1016,10 @@ function isStallCandidate(
   const ageMs = now.getTime() - Date.parse(startAt);
   if (!Number.isFinite(ageMs)) return false;
   // Undelivered Runs are watched for a delivery stall on the same reasonable
-  // window, but they never enter execution-stall candidate filtering.
+  // window, but they never enter workflow-stall candidate filtering.
   return run.deliveredAt === undefined
     ? ageMs >= windowMs
-    : ageMs >= DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS;
+    : ageMs >= DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS;
 }
 
 type ObservedRun = Readonly<{
@@ -1148,7 +1107,6 @@ function classifyLeaderStall(
 
 const LEADER_ACTION_PROGRESS_TYPES = new Set([
   RUN_PROGRESS_EVENT,
-  "runtime.provider-turn-progress",
   "input.answered",
   "input.auto-answered",
   "input.cancelled",
@@ -1190,8 +1148,7 @@ function latestLeaderActionProgressAt(
       || createdMs < startedMs
       || createdMs > now.getTime()
     ) continue;
-    const value = (event.type === RUN_PROGRESS_EVENT
-      || event.type === "runtime.provider-turn-progress")
+    const value = event.type === RUN_PROGRESS_EVENT
       && typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -1355,73 +1312,6 @@ function hasResourceIdentityText(value: string | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-/** Persist the first advisory sample and keep it bounded by the semantic gap. */
-async function consumeResourceEvidence(
-  store: SchedulerStorePort,
-  snapshot: RoleRunResourceEvidenceSnapshot | undefined,
-  taskId: string,
-  roleName: string,
-  runId: string,
-  progressAt: string,
-  expectedIdentity: Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    agentId: string;
-    adapterId: string;
-    nativeSessionId?: string;
-    launchId?: string;
-  }>,
-  suppressionKeys: Set<string> | undefined,
-  now: Date
-): Promise<RoleRunResourceEvidence | undefined> {
-  const resource = resourceForRun(snapshot, taskId, roleName, runId);
-  if (resource === undefined) return undefined;
-  if (!resourceEvidenceMatchesCurrentRun(resource, expectedIdentity, progressAt)) {
-    return resource;
-  }
-  if (resource.active !== true || resource.changed !== true) return resource;
-  const key = `${taskId}\0${roleName}\0${runId}\0${progressAt}`;
-  if (store.recordRoleRunResourceSuppression !== undefined) {
-    const persisted = store.recordRoleRunResourceSuppression({
-      taskId,
-      roleName,
-      runId,
-      agentId: expectedIdentity.agentId,
-      adapterId: expectedIdentity.adapterId,
-      ...(expectedIdentity.nativeSessionId === undefined
-        ? {}
-        : { nativeSessionId: expectedIdentity.nativeSessionId }),
-      ...(expectedIdentity.launchId === undefined
-        ? {}
-        : { launchId: expectedIdentity.launchId }),
-      progressAt,
-      observedAt: resource.observedAt,
-      now
-    });
-    if (persisted === "recorded" || persisted === "already-recorded") {
-      return resourceFallsWithinSemanticGap(progressAt, now)
-        ? resource
-        : { ...resource, active: false, changed: false };
-    }
-    // A concurrent Run/session change invalidates this sample. Do not let the
-    // stale changed bit suppress the current Run's attention episode.
-    return { ...resource, active: false, changed: false };
-  }
-  if (suppressionKeys === undefined || !suppressionKeys.has(key)) {
-    suppressionKeys?.add(key);
-    return resource;
-  }
-  return { ...resource, active: false, changed: false };
-}
-
-function resourceFallsWithinSemanticGap(progressAt: string, now: Date): boolean {
-  const progressMs = Date.parse(progressAt);
-  return Number.isFinite(progressMs)
-    && progressMs <= now.getTime()
-    && now.getTime() - progressMs < DEFAULT_RESOURCE_ONLY_SEMANTIC_GAP_MS;
-}
-
 function resourceEvidenceIsFresh(
   evidence: RoleRunResourceEvidence | undefined,
   now: Date,
@@ -1432,5 +1322,5 @@ function resourceEvidenceIsFresh(
   if (!Number.isFinite(observedAt)) return false;
   // A sample from an earlier scheduler window is not a current health signal.
   return observedAt <= now.getTime()
-    && now.getTime() - observedAt < Math.max(windowMs, DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS);
+    && now.getTime() - observedAt < Math.max(windowMs, DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS);
 }

@@ -74,8 +74,8 @@ test("frozen baseline passes: consistency and production registry coverage", () 
 test("the production registry registers every adjacent post-baseline step", () => {
   const registry = createProductionRegistry();
   assert.equal(BASELINE_AGGREGATE_SCHEMA_VERSION, 16);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
-  assert.equal(registry.size, 25);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 19);
+  assert.equal(registry.size, 26);
   const agentRunOptionalFieldsStep = registry.lookup("record", "agentRun", 6);
   assert.notEqual(agentRunOptionalFieldsStep, undefined);
   assert.equal(agentRunOptionalFieldsStep.toVersion, 7);
@@ -88,6 +88,9 @@ test("the production registry registers every adjacent post-baseline step", () =
   const homeIdentityStep = registry.lookup("aggregate", undefined, 17);
   assert.notEqual(homeIdentityStep, undefined);
   assert.equal(homeIdentityStep.toVersion, 18);
+  const runtimeObservationStep = registry.lookup("aggregate", undefined, 18);
+  assert.notEqual(runtimeObservationStep, undefined);
+  assert.equal(runtimeObservationStep.toVersion, 19);
   const projectOwnershipStep = registry.lookup("record", "project", 2);
   assert.notEqual(projectOwnershipStep, undefined);
   assert.equal(projectOwnershipStep.toVersion, 3);
@@ -429,6 +432,8 @@ test("integrationAttempt v2 to v3 migration runs on a real snapshot", () => {
     migrated = planned.step.transform(migrated);
   }
 
+  assert.equal(migrated.schemaManifest.aggregateSchemaVersion, 19);
+  assert.equal(migrated.state.schemaVersion, 19);
   assert.equal(migrated.schemaManifest.recordVersions.integrationAttempt, 4);
   const attempt = migrated.state.tasks["task-1"].integrationAttempts["integration-1"];
   assert.equal(attempt.schemaVersion, 4);

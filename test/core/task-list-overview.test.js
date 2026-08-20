@@ -179,7 +179,7 @@ test("task overview makes missing summary and structured blockers actionable", (
     {
       runId: run.id,
       progressAt: NOW.toISOString(),
-      kind: "execution-stalled",
+      kind: "workflow-not-progressing",
       classification: "truly-stalled",
       evidenceKey: "fixture-stall"
     },
@@ -234,7 +234,7 @@ test("task overview keeps worker stalls as Leader wakeups rather than Leader att
       runId: run.id,
       roleName: "worker",
       progressAt: NOW.toISOString(),
-      kind: "execution-stalled",
+      kind: "workflow-not-progressing",
       classification: "truly-stalled",
       evidenceKey: "worker-stall"
     },

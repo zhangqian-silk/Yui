@@ -214,7 +214,7 @@ function buildLargeFixture(home, now) {
           ? {
               runId,
               roleName,
-              kind: "execution-stalled",
+              kind: "workflow-not-progressing",
               classification: "truly-stalled",
               progressAt: at.toISOString(),
               idleMs: "60000",
@@ -247,7 +247,7 @@ function buildLargeFixture(home, now) {
           {
             runId: id,
             roleName,
-            kind: "execution-stalled",
+            kind: "workflow-not-progressing",
             classification: "truly-stalled",
             progressAt: finalAttentionAt.toISOString(),
             idleMs: "60000",

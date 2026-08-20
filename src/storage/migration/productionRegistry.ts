@@ -11,6 +11,8 @@ const FINAL_REVIEW_AGGREGATE_FROM_VERSION = 16;
 const FINAL_REVIEW_AGGREGATE_TO_VERSION = 17;
 const HOME_IDENTITY_AGGREGATE_FROM_VERSION = 17;
 const HOME_IDENTITY_AGGREGATE_TO_VERSION = 18;
+const RUNTIME_OBSERVATION_AGGREGATE_FROM_VERSION = 18;
+const RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION = 19;
 const SQLITE_LAYOUT_FROM_VERSION = 6;
 const SQLITE_LAYOUT_TO_VERSION = 7;
 const PROJECT_FROM_VERSION = 2;
@@ -90,6 +92,14 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       toVersion: HOME_IDENTITY_AGGREGATE_TO_VERSION,
       preconditions: requireAggregateV17Snapshot,
       transform: migrateAggregateV17ToV18,
+      declaredEffects: []
+    })
+    .registerOfflineMigration({
+      axis: "aggregate",
+      fromVersion: RUNTIME_OBSERVATION_AGGREGATE_FROM_VERSION,
+      toVersion: RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION,
+      preconditions: requireAggregateV18Snapshot,
+      transform: migrateAggregateV18ToV19,
       declaredEffects: []
     })
     .registerOfflineMigration(projectOwnershipStep())
@@ -1557,6 +1567,43 @@ function requireAggregateV17Snapshot(snapshot: HomeSnapshot): void {
     && snapshot.state.schemaVersion !== HOME_IDENTITY_AGGREGATE_FROM_VERSION) {
     throw new Error(
       "Aggregate 17->18 migration requires state.json schemaVersion 17 to match schema.json."
+    );
+  }
+}
+
+/**
+ * Runtime state is now projected exclusively from canonical
+ * `runtime.observation` events. Offline upgrade inventory proves there are no
+ * active Runs or live Sessions, so the historical lifecycle vocabulary needs
+ * no dual-read adapter after this version-only boundary.
+ */
+function migrateAggregateV18ToV19(snapshot: HomeSnapshot): HomeSnapshot {
+  requireAggregateV18Snapshot(snapshot);
+  return {
+    schemaManifest: {
+      ...snapshot.schemaManifest,
+      aggregateSchemaVersion: RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION
+    },
+    state: snapshot.state === null
+      ? null
+      : {
+          ...snapshot.state,
+          schemaVersion: RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION
+        }
+  };
+}
+
+function requireAggregateV18Snapshot(snapshot: HomeSnapshot): void {
+  if (snapshot.schemaManifest.aggregateSchemaVersion
+    !== RUNTIME_OBSERVATION_AGGREGATE_FROM_VERSION) {
+    throw new Error(
+      "Aggregate 18->19 migration requires schema.json aggregateSchemaVersion 18."
+    );
+  }
+  if (snapshot.state !== null
+    && snapshot.state.schemaVersion !== RUNTIME_OBSERVATION_AGGREGATE_FROM_VERSION) {
+    throw new Error(
+      "Aggregate 18->19 migration requires state.json schemaVersion 18 to match schema.json."
     );
   }
 }

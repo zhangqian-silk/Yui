@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import type { TaskEvent } from "../event/taskEvent.js";
 import {
   DEFAULT_RUN_CAP,
   DEFAULT_TERMINAL_KEEP,
@@ -206,36 +205,6 @@ export class SqliteTelemetryStore implements TelemetryStore {
 
   revision(): number {
     return this.#applied;
-  }
-
-  latestProgressEvents(taskId: string): TaskEvent[] {
-    const db = this.#ensureDb();
-    if (db === null) return [];
-    const rows = db.prepare(
-      `SELECT task_id, role_name, run_id, generation, progress_id, sequence, payload, received_at FROM (
-         SELECT *, ROW_NUMBER() OVER (
-           PARTITION BY run_id
-           ORDER BY COALESCE(sequence, -1) DESC, received_at DESC, progress_id ASC
-         ) AS rn FROM telemetry WHERE task_id = ?
-       ) WHERE rn = 1`
-    ).all(taskId) as TelemetryRow[];
-    return rows.map((row) => {
-      const entry = rowToEntry(row);
-      const payload: Record<string, string> = { ...entry.payload };
-      payload.runId = entry.runId;
-      payload.progressId = entry.progressId;
-      // The semantic progress event carries progressAt = observation time;
-      // mirror that so liveness folds see the same timestamp.
-      payload.progressAt = entry.receivedAt;
-      return {
-        schemaVersion: 2 as const,
-        id: `telemetry-progress-${entry.runId}-${entry.progressId}`,
-        taskId: entry.taskId,
-        type: "runtime.provider-turn-progress",
-        payload,
-        createdAt: entry.receivedAt
-      };
-    });
   }
 
   // -- retention -----------------------------------------------------------------

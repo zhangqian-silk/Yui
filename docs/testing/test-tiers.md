@@ -171,8 +171,9 @@ re-thrown.
 
 The Provider and Release manifests live under `test/privileged/`, which is
 structurally outside the default `test/*.test.js test/core/*.test.js` selection.
-They intentionally remain empty until a real scenario is implemented. Empty
-means **not run**, not passed. A non-empty manifest is dispatched only through
+The Provider manifest contains bounded real Claude and Codex runtime-observer
+scenarios; the Release manifest remains empty, which means **not run**, not
+passed. A non-empty manifest is dispatched only through
 `test/privileged/privileged-tier.test.js` and
 `test/helpers/privilegedTest.js`; there is no direct privileged test-file path.
 The wrapper performs this order:

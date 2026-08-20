@@ -1,15 +1,11 @@
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import type { DurableJob } from "../job/durableJob.js";
 import type { MailboxEntityRef } from "../coordination/workMailbox.js";
-import type { TelemetryMode } from "../telemetry/telemetryConfig.js";
-import { routeProviderProgress } from "../telemetry/telemetryRouter.js";
 import {
-  NullTelemetrySink,
   type SchedulerTelemetry,
-  type TelemetryProgressEntry,
-  type TelemetryReader,
-  type TelemetrySink
+  type TelemetryProgressEntry
 } from "../telemetry/telemetryStore.js";
 
 import {
@@ -71,16 +67,8 @@ import {
   type CanonicalIdentityFence,
   type CanonicalRunExpectation
 } from "../lifecycle/canonicalLifecycleEvent.js";
-import {
-  mapNativeLifecycleSignal,
-  type NativeLifecycleSignal
-} from "../lifecycle/providerLifecycleMapping.js";
 import type {
   ProviderLifecycleObservation,
-  TaskClaudeStopFailureEvent,
-  TaskProviderPromptAccepted,
-  TaskProviderSessionLifecycle,
-  TaskProviderTurnProgress
 } from "./runtimeEventProcessor.js";
 import type {
   DormantRuntimeOwnerCandidate,
@@ -90,7 +78,6 @@ import type {
   RoleRunDeliveryFailurePersistence,
   RoleRunDeliveryPersistence,
   RoleRunProgressPersistence,
-  RoleRunResourceSuppressionPersistence,
   RoleRunStallPersistence,
   SchedulerRunProgress,
   SchedulerRole,
@@ -115,7 +102,6 @@ import {
   clearMatchingLeaderStallAttention,
   RUN_PROGRESS_EVENT,
   RUN_RECOVERED_EVENT,
-  RUN_RESOURCE_SUPPRESSED_EVENT,
   RUN_STALLED_EVENT
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -151,6 +137,18 @@ import {
   type RuntimeRoleOwner
 } from "../runtime/lifecycleReservation.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
+import {
+  builtinAgentDriverRegistry
+} from "../runtime/builtinAgentDrivers.js";
+import type { AgentDriverRegistry } from "../runtime/agentDriver.js";
+import {
+  RUNTIME_OBSERVATION_TASK_EVENT,
+  createRuntimeObservation,
+  runtimeObservationFenceMatches,
+  runtimeObservationFromTaskEvent,
+  runtimeObservationTaskEventPayload,
+  type RuntimeObservation
+} from "../runtime/runtimeObservation.js";
 
 /**
  * One durable revision's read-only facts for one Task. A scheduler pass reads
@@ -181,21 +179,261 @@ type TaskReadProjection = Readonly<{
   messages: ReturnType<TaskStore["listMessages"]>;
 }>;
 
-const NULL_TELEMETRY_SINK = new NullTelemetrySink();
+export type TaskRuntimeTurnFailed = Readonly<{
+  eventId: string;
+  eventType: string;
+  taskId: string;
+  roleName: string;
+  agentId: string;
+  adapterId: string;
+  launchId: string;
+  nativeSessionId: string;
+  runId: string;
+  error: string;
+  errorDetails?: string;
+  lastAssistantMessage?: string;
+}>;
 
 /** Maps the authoritative FileTaskStore records to the scheduler's narrow port. */
 export class FileSchedulerStoreAdapter implements SchedulerStorePort {
-  /**
-   * @param telemetry Optional sidecar wiring (Issue 09). Absent or `legacy`
-   * keeps master behavior (semantic progress events only); `dual` also
-   * upserts progress to the sidecar; `bounded` routes progress to the
-   * sidecar only and feeds the scheduler projection synthesized latest
-   * progress from the reader.
-   */
+  /** Diagnostic telemetry is optional and never participates in runtime truth. */
   constructor(
     readonly store: TaskStore,
-    private readonly telemetry: SchedulerTelemetry | null = null
+    private readonly telemetry: SchedulerTelemetry | null = null,
+    private readonly drivers: AgentDriverRegistry = builtinAgentDriverRegistry()
   ) {}
+
+  /**
+   * Sole provider-independent ingress for structured runtime state. Driver
+   * mapping has already happened before this boundary; this method validates
+   * the exact durable Run/session fence, applies the small workflow-relevant
+   * transitions, and retains the canonical observation for status projection.
+   */
+  observeRuntimeObservation(
+    raw: RuntimeObservation,
+    now = new Date()
+  ): ProviderLifecycleObservation {
+    const input = createRuntimeObservation(raw);
+    const taskId = input.fence.taskId;
+    if (taskId === undefined) return "obsolete";
+    if (Date.parse(input.receivedAt) > now.getTime()) {
+      return this.recordObsoleteCanonicalObservation(input, "received-at-in-future", now);
+    }
+    const adapterId = this.adapterForRuntimeObservation(input);
+    if (adapterId === null) {
+      return this.recordObsoleteCanonicalObservation(input, "driver-or-run-mismatch", now);
+    }
+    let outcome: ProviderLifecycleObservation;
+    switch (input.kind) {
+      case "session.started":
+      case "session.ready":
+        outcome = this.observeRuntimeSession(input, adapterId, now);
+        break;
+      case "turn.accepted":
+        outcome = this.observeRuntimePromptAccepted(input, adapterId, now);
+        break;
+      case "turn.completed": {
+        const completed = {
+          taskId,
+          roleName: input.fence.roleName,
+          agentId: input.fence.agentId,
+          adapterId,
+          launchId: input.fence.launchId,
+          nativeSessionId: input.fence.nativeSessionId!,
+          turnId: input.fence.nativeTurnId!,
+          runId: input.fence.runId,
+          summary: input.payload.summary ?? "Agent turn completed without a workflow outcome."
+        };
+        const classification = this.classifyRuntimeTurnCompleted(completed);
+        if (classification !== "apply") return classification;
+        const result = this.observeRuntimeTurnCompleted(completed, now);
+        outcome = result.disposition === "obsolete" ? "obsolete" : "applied";
+        break;
+      }
+      case "turn.failed": {
+        const failureEvidence = input.payload.failure!;
+        const failure = {
+          eventId: input.eventId,
+          eventType: input.kind,
+          taskId,
+          roleName: input.fence.roleName,
+          agentId: input.fence.agentId,
+          adapterId,
+          launchId: input.fence.launchId,
+          nativeSessionId: input.fence.nativeSessionId!,
+          runId: input.fence.runId!,
+          error: failureEvidence.code,
+          ...(failureEvidence.details === undefined
+            ? {}
+            : { errorDetails: failureEvidence.details }),
+          ...(failureEvidence.lastOutput === undefined
+            ? {}
+            : { lastAssistantMessage: failureEvidence.lastOutput })
+        };
+        if (this.classifyRuntimeTurnFailed(failure) !== "apply") return "obsolete";
+        outcome = this.observeRuntimeTurnFailed(failure, now).disposition === "applied"
+          ? "applied"
+          : "obsolete";
+        break;
+      }
+      case "operation.started":
+      case "operation.completed":
+      case "operation.failed":
+      case "turn.waiting":
+      case "turn.cancelled":
+      case "activity.observed":
+      case "observer.health":
+        outcome = this.validateCanonicalRunObservation(input, now);
+        break;
+      case "session.ended":
+      case "session.failed":
+        outcome = this.validateCanonicalSessionObservation(input, now);
+        break;
+      case "host.observed":
+        outcome = "obsolete";
+        break;
+      default:
+        outcome = "obsolete";
+    }
+    if (outcome === "applied") this.persistRuntimeObservation(input, now);
+    return outcome;
+  }
+
+  private adapterForRuntimeObservation(
+    input: RuntimeObservation
+  ): string | null {
+    const taskId = input.fence.taskId;
+    const runId = input.fence.runId;
+    if (taskId === undefined || runId === undefined) return null;
+    const run = this.store.getAgentRun(taskId, runId);
+    if (run === null
+      || run.roleName !== input.fence.roleName
+      || run.effective.agentId !== input.fence.agentId) return null;
+    try {
+      return this.drivers.requireByAdapterId(run.effective.adapterId).id === input.fence.driverId
+        ? run.effective.adapterId
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private validateCanonicalRunObservation(
+    input: RuntimeObservation,
+    now: Date
+  ): ProviderLifecycleObservation {
+    return this.store.transaction((store) => {
+      if (store.listEvents(input.fence.taskId!).some((event) => (
+        event.type === RUNTIME_OBSERVATION_TASK_EVENT
+        && event.payload.eventId === input.eventId
+      ))) return "applied";
+      const run = store.getAgentRun(input.fence.taskId!, input.fence.runId!);
+      const active = store.getActiveAgentRun(input.fence.taskId!, input.fence.roleName);
+      const sessions = store.getTaskRoleSessionSet(input.fence.taskId!, input.fence.roleName);
+      const session = sessions?.sessions[input.fence.agentId];
+      const requiresActive = input.kind !== "turn.cancelled";
+      const valid = run !== null
+        && (!requiresActive || (run.status === "active" && active?.id === run.id))
+        && run.roleName === input.fence.roleName
+        && run.effective.agentId === input.fence.agentId
+        && this.drivers.requireByAdapterId(run.effective.adapterId).id === input.fence.driverId
+        && session?.launchId === input.fence.launchId
+        && session.nativeSessionId === input.fence.nativeSessionId
+        && input.fence.sessionGenerationId === input.fence.launchId
+        && input.fence.receiptId === formatAgentRunReceiptId(input.fence.taskId!, run.id)
+        && (run.deliveredAt !== undefined || input.kind === "turn.cancelled");
+      if (!valid) {
+        recordCanonicalObservationObsolete(store, input, "runtime-fence-not-current", now);
+        return "obsolete";
+      }
+      return "applied";
+    });
+  }
+
+  private validateCanonicalSessionObservation(
+    input: RuntimeObservation,
+    now: Date
+  ): ProviderLifecycleObservation {
+    return this.store.transaction((store) => {
+      const run = store.getAgentRun(input.fence.taskId!, input.fence.runId!);
+      const sessions = store.getTaskRoleSessionSet(input.fence.taskId!, input.fence.roleName);
+      const session = sessions?.sessions[input.fence.agentId];
+      if (run === null
+        || run.roleName !== input.fence.roleName
+        || run.effective.agentId !== input.fence.agentId
+        || this.drivers.requireByAdapterId(run.effective.adapterId).id !== input.fence.driverId
+        || input.fence.receiptId !== formatAgentRunReceiptId(input.fence.taskId!, run.id)
+        || session?.launchId !== input.fence.launchId
+        || session.nativeSessionId !== input.fence.nativeSessionId
+        || input.fence.sessionGenerationId !== input.fence.launchId) {
+        recordCanonicalObservationObsolete(store, input, "runtime-session-not-current", now);
+        return "obsolete";
+      }
+      const status: AgentSessionStatus = input.kind === "session.failed" ? "broken" : "stopped";
+      store.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
+        sessions!,
+        input.fence.agentId,
+        status,
+        now
+      ));
+      return "applied";
+    });
+  }
+
+  private persistRuntimeObservation(input: RuntimeObservation, now: Date): void {
+    this.store.transaction((store) => {
+      const taskId = input.fence.taskId!;
+      const events = store.listEvents(taskId);
+      if (events.some((event) => (
+        event.type === RUNTIME_OBSERVATION_TASK_EVENT
+        && event.payload.eventId === input.eventId
+      ))) return;
+      if (usageSnapshotIsSuperseded(events, input)) return;
+      const confirmedActivity = confirmedUsageActivityObservation(events, input);
+      const removable = [
+        ...compactedRuntimeObservationIds(events, input),
+        ...(confirmedActivity === null
+          ? []
+          : compactedRuntimeObservationIds(events, confirmedActivity))
+      ];
+      if (removable.length > 0) store.removeEvents(taskId, removable);
+      store.saveEvent(taskId, createTaskEvent(
+        store.nextEventId(taskId),
+        taskId,
+        RUNTIME_OBSERVATION_TASK_EVENT,
+        runtimeObservationTaskEventPayload(input),
+        now
+      ));
+      if (confirmedActivity !== null) {
+        store.saveEvent(taskId, createTaskEvent(
+          store.nextEventId(taskId),
+          taskId,
+          RUNTIME_OBSERVATION_TASK_EVENT,
+          runtimeObservationTaskEventPayload(confirmedActivity),
+          now
+        ));
+      }
+    });
+    if (this.telemetry !== null && input.fence.runId !== undefined) {
+      try {
+        this.telemetry.sink.observe(runtimeObservationTelemetryEntry(input));
+      } catch {
+        // Runtime telemetry is diagnostic; the compact durable state snapshot
+        // above remains authoritative when a sidecar is unavailable.
+      }
+    }
+  }
+
+  private recordObsoleteCanonicalObservation(
+    input: RuntimeObservation,
+    reason: string,
+    now: Date
+  ): "obsolete" {
+    const taskId = input.fence.taskId;
+    if (taskId === undefined || this.store.getTask(taskId) === null) return "obsolete";
+    this.store.transaction((store) => recordCanonicalObservationObsolete(store, input, reason, now));
+    return "obsolete";
+  }
 
   /**
    * Revision-scoped read projection. Keyed by the store's durable revision;
@@ -204,7 +442,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    */
   #readProjection: {
     revision: number;
-    telemetryRevision: number;
     tasks: Map<string, TaskReadProjection>;
   } | null = null;
 
@@ -212,26 +449,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     const revision = typeof this.store.getStateRevision === "function"
       ? this.store.getStateRevision()
       : Number.NaN;
-    const telemetryRevision = this.telemetry?.mode === "bounded"
-      ? this.telemetry.reader.revision()
-      : 0;
     if (
       this.#readProjection === null
       || this.#readProjection.revision !== revision
-      || this.#readProjection.telemetryRevision !== telemetryRevision
     ) {
-      this.#readProjection = { revision, telemetryRevision, tasks: new Map() };
+      this.#readProjection = { revision, tasks: new Map() };
     }
     const tasks = this.#readProjection.tasks;
     let task = tasks.get(taskId);
     if (task === undefined) {
-      const semanticEvents = this.store.listEvents(taskId);
-      // In bounded mode progress lives only in the sidecar; merge the latest
-      // observation per Run so liveness/stall folds keep working. In legacy
-      // and dual modes semantic history already carries progress.
-      const events = this.telemetry?.mode === "bounded"
-        ? [...semanticEvents, ...this.telemetry.reader.latestProgressEvents(taskId)]
-        : semanticEvents;
+      const events = this.store.listEvents(taskId);
       task = {
         events,
         runFacts: foldRunProgressFacts(events),
@@ -548,53 +775,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  recordRoleRunResourceSuppression(
-    input: RoleRunResourceSuppressionPersistence
-  ): "recorded" | "already-recorded" | "state-changed" {
-    return this.store.transaction((store) => {
-      const task = store.getTask(input.taskId);
-      const run = store.getActiveAgentRun(input.taskId, input.roleName);
-      if (
-        task === null
-        || task.status !== "active"
-        || run === null
-        || run.id !== input.runId
-        || run.status !== "active"
-      ) return "state-changed";
-      const session = store.getRoleSession(input.taskId, input.roleName);
-      if (
-        session === null
-        || session.agentId !== input.agentId
-        || session.adapterId !== input.adapterId
-        || session.status === "stopped"
-        || session.status === "broken"
-        || session.nativeSessionId !== input.nativeSessionId
-        || session.launchId !== input.launchId
-      ) return "state-changed";
-      const existing = store.listEvents(task.id).some((event) => (
-        event.type === RUN_RESOURCE_SUPPRESSED_EVENT
-        && event.payload.runId === run.id
-        && event.payload.roleName === input.roleName
-        && event.payload.progressAt === input.progressAt
-      ));
-      if (existing) return "already-recorded";
-      store.saveEvent(task.id, createTaskEvent(
-        store.nextEventId(task.id),
-        task.id,
-        RUN_RESOURCE_SUPPRESSED_EVENT,
-        {
-          runId: run.id,
-          roleName: input.roleName,
-          progressAt: input.progressAt,
-          observedAt: input.observedAt,
-          kind: "advisory-resource"
-        },
-        input.now
-      ));
-      return "recorded";
-    });
-  }
-
   hasInFlightTurn(taskId: string, roleName: string): boolean {
     const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
     return sessions !== null && sessions.inFlight !== null;
@@ -607,20 +787,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     launchId?: string;
     nativeSessionId?: string;
   }>): boolean {
-    // A provider-ready fact for this exact generation is proven by a folded
-    // runtime.provider-session-lifecycle event with preInputReady true and a
-    // matching agent/launch/nativeSession fence. This reads durable folded truth
+    // A session.ready observation for this exact generation is the durable
+    // pre-input fence. This reads folded Driver truth
     // only — no liveness, screen, or pane/PID inference. Served from the
     // revision projection: a stale miss only repeats an idempotent first push.
-    return this.listEvents(input.taskId).some((event) => (
-      event.type === "runtime.provider-session-lifecycle"
-      && event.payload.roleName === input.roleName
-      && event.payload.agentId === input.agentId
-      && event.payload.preInputReady === "true"
-      && (input.launchId === undefined || event.payload.launchId === input.launchId)
-      && (input.nativeSessionId === undefined
-        || event.payload.nativeSessionId === input.nativeSessionId)
-    ));
+    return this.listEvents(input.taskId).some((event) => {
+      const observation = runtimeObservationFromTaskEvent(event);
+      return observation?.kind === "session.ready"
+        && observation.fence.roleName === input.roleName
+        && observation.fence.agentId === input.agentId
+        && (input.launchId === undefined || observation.fence.launchId === input.launchId)
+        && (input.nativeSessionId === undefined
+          || observation.fence.nativeSessionId === input.nativeSessionId);
+    });
   }
 
   peekNextAgentRunId(taskId: string): string {
@@ -1519,7 +1698,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (hasRuntimeCleanupObligation(mailbox)) {
         throw new Error("Runtime cleanup is still pending.");
       }
-      // A synchronous provider lifecycle Hook may bind a fresh native Session
+      // A synchronous Driver Hook may bind a fresh native Session
       // and complete the reservation while the host start call is still
       // unwinding. Preserve that exact hook-won generation instead of treating
       // the already-settled reservation as a launch failure.
@@ -1737,7 +1916,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }
     // Provider completion is not a transport acknowledgement. Retain the
     // immutable Hook until the exact pane receipt independently reconciles
-    // run.pushed; never infer transport from provider progress/terminal facts.
+    // run.pushed; never infer transport from Driver activity/terminal facts.
     return sessions.inFlight.pushedAt === undefined ? "deferred" : "apply";
   }
 
@@ -1888,35 +2067,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         observedAt: now,
         dueAt: new Date(now.getTime() + 2_000)
       });
-      const wasStalled = isRoleRunStalled(store.listEvents(task.id), fence.runId);
-      store.saveEvent(task.id, createTaskEvent(
-        store.nextEventId(task.id),
-        task.id,
-        RUN_PROGRESS_EVENT,
-        {
-          runId: fence.runId,
-          roleName: role.name,
-          kind: "native-turn",
-          turnId: input.turnId,
-          note: boundedRuntimeNote(input.summary)
-        },
-        now
-      ));
-      if (wasStalled) {
-        store.saveEvent(task.id, createTaskEvent(
-          store.nextEventId(task.id),
-          task.id,
-          RUN_RECOVERED_EVENT,
-          {
-            runId: fence.runId,
-            roleName: role.name,
-            progressAt: now.toISOString(),
-            kind: "native-turn"
-          },
-          now
-        ));
-      }
-      clearMatchingLeaderStallAttention(store, task.id, fence.runId);
+      // Runtime completion is not workflow progress. The exact Run remains
+      // open for the short outcome grace period so a concurrently committed
+      // yui yield/block/complete action can win; otherwise the contract fails.
       sessions = recordObservedTaskRoleCompletion(sessions, completion);
       const active = store.getActiveAgentRun(task.id, role.name);
       if (active === null || active.id !== fence.runId || active.status !== "active") {
@@ -2098,35 +2251,40 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return { session };
       }
 
-      if (role.name !== "leader" || active.workItemId !== undefined) {
-        const summary = `Role turn completed without yui task run yield. Last assistant message: ${input.summary}`;
-        const result = terminalizeExactTaskRun(store, {
-          taskId: task.id,
-          roleName: role.name,
-          agentId: active.effective.agentId,
-          runId: active.id,
-          receiptId: formatAgentRunReceiptId(task.id, active.id),
-          nativeSessionId: input.nativeSessionId,
-          ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-          outcome: { status: "failed", summary }
-        }, now);
-        if (result.disposition !== "applied" || result.run === null) {
-          throw new Error(
-            `Role Run changed during native Turn completion: ${active.id}/${result.reason}.`
+      const summary = `Agent turn completed without a Yui workflow outcome. Last assistant message: ${input.summary}`;
+      const result = terminalizeExactTaskRun(store, {
+        taskId: task.id,
+        roleName: role.name,
+        agentId: active.effective.agentId,
+        runId: active.id,
+        receiptId: formatAgentRunReceiptId(task.id, active.id),
+        nativeSessionId: input.nativeSessionId,
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        outcome: { status: "failed", summary }
+      }, now);
+      if (result.disposition !== "applied" || result.run === null) {
+        throw new Error(
+          `Role Run changed during native Turn completion: ${active.id}/${result.reason}.`
+        );
+      }
+      const terminal = result.run;
+      const leaderWorkflowRun = role.name === "leader" && active.workItemId === undefined;
+      if (active.purpose === "execution" && active.workItemId !== undefined) {
+        const item = store.getWorkItem(task.id, active.workItemId);
+        if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
+          store.saveWorkItem(
+            task.id,
+            updateWorkItemStatus(item, "failed", now, summary)
           );
         }
-        const terminal = result.run;
-        if (active.purpose === "execution" && active.workItemId !== undefined) {
-          const item = store.getWorkItem(task.id, active.workItemId);
-          if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
-            store.saveWorkItem(
-              task.id,
-              updateWorkItemStatus(item, "failed", now, summary)
-            );
-          }
-        }
-        store.saveRole(task.id, updateRoleStatus(role, "idle", now));
-        clearMatchingLeaderStallAttention(store, task.id, terminal.id);
+      }
+      store.saveRole(task.id, updateRoleStatus(
+        role,
+        leaderWorkflowRun ? "failed" : "idle",
+        now
+      ));
+      clearMatchingLeaderStallAttention(store, task.id, terminal.id);
+      if (!leaderWorkflowRun) {
         enqueueWork(
           store,
           { kind: "role", taskId: task.id, roleName: "leader" },
@@ -2140,97 +2298,40 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
                   type: "work-item" as const,
                   taskId: task.id,
                   id: terminal.workItemId
-                }])
+            }])
           ]
         );
-        return { session, finalizedRunId: terminal.id };
-      }
-
-      const leaderTarget = { kind: "role", taskId: task.id, roleName: role.name } as const;
-      const leaderMailbox = store.getWorkMailbox(leaderTarget);
-      const recoveryTurn = leaderMailbox?.processing?.executionRef?.type === "run"
-        && leaderMailbox.processing.executionRef.taskId === task.id
-        && leaderMailbox.processing.executionRef.id === active.id
-        && leaderMailbox.processing.batch.reasons.includes("leader-turn-unclosed");
-      const quiescent = leaderMailbox?.pending === null
-        && !store.listRoles(task.id).some((candidate) => (
-          candidate.name !== "leader"
-          && store.getActiveAgentRun(task.id, candidate.name) !== null
-        ))
-        && !store.listWorkItems(task.id).some((item) => item.status === "running")
-        && !store.listInputRequests(task.id).some((request) => request.status === "open");
-      const result = terminalizeExactTaskRun(store, {
-        taskId: task.id,
-        roleName: role.name,
-        agentId: active.effective.agentId,
-        runId: active.id,
-        receiptId: formatAgentRunReceiptId(task.id, active.id),
-        nativeSessionId: input.nativeSessionId,
-        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-        outcome: { status: "yielded", summary: input.summary }
-      }, now);
-      if (result.disposition !== "applied" || result.run === null) {
-        throw new Error(
-          `Leader Run changed during native Turn completion: ${active.id}/${result.reason}.`
-        );
-      }
-      const terminal = result.run;
-      if (input.origin === "recovery") {
-        store.saveEvent(task.id, createTaskEvent(
-          store.nextEventId(task.id),
+      } else {
+        store.saveLeaderFailure(recordLeaderFailure(
           task.id,
-          RUN_RECOVERED_EVENT,
-          { runId: terminal.id, roleName: role.name, summary: input.summary },
-          now
+          input.nativeSessionId,
+          summary,
+          now,
+          store.getLeaderFailure(task.id)
         ));
-      }
-      clearMatchingLeaderStallAttention(store, task.id, terminal.id);
-      if (quiescent) {
-        if (recoveryTurn) {
-          const message = "Leader ended a recovery Turn without completing, blocking, or continuing the Task.";
-          store.saveLeaderFailure(recordLeaderFailure(
-            task.id,
-            input.nativeSessionId,
-            message,
-            now,
-            store.getLeaderFailure(task.id)
-          ));
-          store.saveOperatorNotification(createLeaderRecoveryNotification(
-            task.id,
-            message,
-            now,
-            store.getOperatorNotification(task.id)
-          ));
-          store.saveRole(task.id, updateRoleStatus(role, "failed", now));
-          enqueueWork(
-            store,
-            { kind: "operator" },
-            "leader-recovery-failed",
-            now,
-            [
-              { type: "task", id: task.id },
-              { type: "run", taskId: task.id, id: terminal.id }
-            ]
-          );
-        } else {
-          enqueueWork(
-            store,
-            leaderTarget,
-            "leader-turn-unclosed",
-            now,
-            [
-              { type: "task", id: task.id },
-              { type: "run", taskId: task.id, id: terminal.id }
-            ]
-          );
-        }
+        store.saveOperatorNotification(createLeaderRecoveryNotification(
+          task.id,
+          summary,
+          now,
+          store.getOperatorNotification(task.id)
+        ));
+        enqueueWork(
+          store,
+          { kind: "operator" },
+          "leader-run-failed",
+          now,
+          [
+            { type: "task", id: task.id },
+            { type: "run", taskId: task.id, id: terminal.id }
+          ]
+        );
       }
       return { session, finalizedRunId: terminal.id };
     });
   }
 
-  classifyClaudeStopFailureEvent(
-    input: TaskClaudeStopFailureEvent
+  classifyRuntimeTurnFailed(
+    input: TaskRuntimeTurnFailed
   ): "apply" | "obsolete" {
     const task = this.store.getTask(input.taskId);
     if (task?.status !== "active") return "obsolete";
@@ -2244,8 +2345,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       || active?.id !== run.id
       || run.roleName !== input.roleName
       || run.effective.agentId !== input.agentId
-      || run.effective.adapterId !== "claude"
-      || input.adapterId !== "claude"
+      || run.effective.adapterId !== input.adapterId
     ) return "obsolete";
     const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
     const session = sessions?.sessions[input.agentId];
@@ -2260,8 +2360,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return "apply";
   }
 
-  observeClaudeStopFailureEvent(
-    input: TaskClaudeStopFailureEvent,
+  observeRuntimeTurnFailed(
+    input: TaskRuntimeTurnFailed,
     now = new Date()
   ): Readonly<{ disposition: "applied" | "obsolete"; runId: string }> {
     return this.store.transaction((store) => {
@@ -2270,7 +2370,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         recordObsoleteRuntimeEvent(store, input, "run-missing", now);
         return { disposition: "obsolete", runId: input.runId };
       }
-      const summary = claudeStopFailureSummary(input);
+      const summary = runtimeTurnFailureSummary(input);
       // Issue 04: a classified transient Provider failure keeps the exact Run
       // and Native Session and is retried in place instead of terminalizing.
       const retryDecision = this.providerRetryDecision(store, input, summary, now);
@@ -2334,7 +2434,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       store.saveEvent(input.taskId, createTaskEvent(
         store.nextEventId(input.taskId),
         input.taskId,
-        "runtime.claude-stop-failure",
+        "runtime.turn-failed",
         {
           eventId: input.eventId,
           runId: input.runId,
@@ -2386,7 +2486,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    */
   private providerRetryDecision(
     store: TaskStore,
-    input: TaskClaudeStopFailureEvent,
+    input: TaskRuntimeTurnFailed,
     summary: string,
     now: Date
   ): Readonly<{ disposition: "applied"; runId: string }> | null {
@@ -2490,7 +2590,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    */
   private applyProviderPolicyBlock(
     store: TaskStore,
-    input: TaskClaudeStopFailureEvent,
+    input: TaskRuntimeTurnFailed,
     summary: string,
     now: Date
   ): Readonly<{ disposition: "applied"; runId: string }> | null {
@@ -2523,7 +2623,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   private recordProviderRetryClassified(
     store: TaskStore,
-    input: TaskClaudeStopFailureEvent,
+    input: TaskRuntimeTurnFailed,
     errorClass: string,
     extra: Readonly<Record<string, string | undefined>>,
     now: Date
@@ -2646,82 +2746,72 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   /**
-   * Folds a provider SessionStart lifecycle fact
-   * through the canonical contract. Session-started/ready never advance Run
-   * acceptance; this only records generation facts and binds a discovered native
-   * id under the exact launch fence. Idempotent replays are no-ops.
+   * Applies already-normalized Session observations. Driver-specific startup
+   * names and source variants have terminated before this boundary.
    */
-  observeProviderSessionLifecycle(
-    input: TaskProviderSessionLifecycle,
-    now = new Date()
+  private observeRuntimeSession(
+    input: RuntimeObservation,
+    adapterId: string,
+    now: Date
   ): ProviderLifecycleObservation {
     return this.store.transaction((store) => {
-      const decision = this.foldProviderSignal(store, {
-        kind: "native-session-start",
-        ...(input.sessionSource === undefined ? {} : { sessionSource: input.sessionSource }),
-        fence: providerFence(input)
-      }, input.runId);
+      const event = createCanonicalLifecycleEvent({
+        phase: input.kind === "session.ready" ? "provider-ready" : "provider-session-started",
+        source: "provider-native",
+        evidence: "provider-native-durable",
+        ...(input.kind === "session.ready"
+          ? {
+              preInputReady: true,
+              readinessVariant: `${input.fence.driverId}:session.ready`
+            }
+          : {}),
+        fence: runtimeObservationLifecycleFence(input, adapterId)
+      });
+      const decision = this.foldRuntimeLifecycleEvent(store, event, input);
       switch (decision.kind) {
         case "obsolete":
-          recordCanonicalObsolete(store, input, "native-session-lifecycle", decision.reason, now);
+          recordCanonicalObservationObsolete(store, input, decision.reason, now);
           return "obsolete";
         case "deferred":
           return "deferred";
         case "idempotent":
           return "applied";
-        case "apply":
-          if (
-            decision.outcome.outcome === "mark-ready"
-            && input.adapterId === "claude"
-            && input.sessionSource === "startup"
-            && store.getTaskRoleSessionSet(input.taskId, input.roleName)
-              ?.sessions[input.agentId] === undefined
-          ) {
-            // Claude emits startup readiness after native process creation but
-            // before the Controller projects its preallocated Session. Keep
-            // the immutable fact queued until that exact Session is durable.
-            return "deferred";
+        case "apply": {
+          if (decision.outcome.outcome === "mark-ready"
+            && store.getTaskRoleSessionSet(input.fence.taskId!, input.fence.roleName)
+              ?.sessions[input.fence.agentId] === undefined) {
+            return preallocatedRuntimeReadyAwaitingProjection(store, input, this.drivers)
+              ? "applied"
+              : "deferred";
           }
           if (decision.outcome.outcome === "bind-native-session") {
-            const role = store.getRole(input.taskId, input.roleName);
-            const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-            const run = input.runId === undefined
-              ? null
-              : store.getAgentRun(input.taskId, input.runId);
+            const taskId = input.fence.taskId!;
+            const role = store.getRole(taskId, input.fence.roleName);
+            const sessions = store.getTaskRoleSessionSet(taskId, input.fence.roleName);
+            const run = store.getAgentRun(taskId, input.fence.runId!);
             if (role === null || sessions === null || run === null) {
-              recordCanonicalObsolete(
-                store,
-                input,
-                "native-session-lifecycle",
-                "bind-state-missing",
-                now
-              );
+              recordCanonicalObservationObsolete(store, input, "bind-state-missing", now);
               return "obsolete";
             }
             const bound = recordRoleAgentSession(sessions, {
-              agentId: input.agentId,
-              adapterId: input.adapterId,
+              agentId: input.fence.agentId,
+              adapterId,
               nativeSessionId: decision.outcome.nativeSessionId,
-              launchId: input.launchId,
+              launchId: input.fence.launchId,
               policy: "fixed",
               status: "running",
               effective: run.effective
             }, now);
             store.saveTaskRoleSessionSet(bound);
-            // Codex 0.145 emits SessionStart from inside run_turn(input), so a
-            // runtime-discovered bind is durable evidence that this Run's
-            // initial transport input already crossed the provider boundary.
-            // Preserve that truth before clearing the launch reservation: a
-            // restarted Controller must not allocate a second generation or
-            // push the same first input again. UserPromptSubmit remains the
-            // sole acceptance/delivered transition.
-            if (input.adapterId === "codex" && run.pushedAt === undefined) {
+            const driver = this.drivers.require(input.fence.driverId);
+            if (driver.capabilities.observation.sessionBootstrap === "discovered"
+              && run.pushedAt === undefined) {
               const pushed = markAgentRunPushed(run, now);
               store.saveAgentRun(pushed);
               markTaskRoleRunPushedInFlight(store, role, pushed, now);
-              store.saveEvent(input.taskId, createTaskEvent(
-                store.nextEventId(input.taskId),
-                input.taskId,
+              store.saveEvent(taskId, createTaskEvent(
+                store.nextEventId(taskId),
+                taskId,
                 "run.pushed",
                 runLaunchEventPayload(pushed),
                 now
@@ -2729,75 +2819,55 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             }
             completeRuntimeHookReservation(
               store,
-              { scope: "task", taskId: input.taskId, roleName: input.roleName },
-              input.launchId
+              { scope: "task", taskId, roleName: input.fence.roleName },
+              input.fence.launchId
             );
           }
-          // Session-started/ready/bind facts are recorded provider-neutrally as
-          // an auditable event. The
-          // payload carries the generation fence + preInputReady so the fresh
-          // push gate can read the exact provider-ready fact for this generation.
-          store.saveEvent(input.taskId, createTaskEvent(
-            store.nextEventId(input.taskId),
-            input.taskId,
-            "runtime.provider-session-lifecycle",
-            {
-              eventId: input.eventId,
-              roleName: input.roleName,
-              agentId: input.agentId,
-              adapterId: input.adapterId,
-              launchId: input.launchId,
-              nativeSessionId: input.nativeSessionId,
-              outcome: decision.outcome.outcome,
-              preInputReady: (decision.outcome.outcome === "mark-ready"
-                && decision.outcome.preInputReady) ? "true" : "false",
-              ...(input.runId === undefined ? {} : { runId: input.runId })
-            },
-            now
-          ));
           return "applied";
+        }
       }
     });
   }
 
-  /**
-   * Folds a provider UserPromptSubmit acceptance fact. This is the ONLY path
-   * that may advance a Run to accepted/delivered, and only after an exact
-   * transport receipt has independently committed run.pushed.
-   */
-  observeProviderPromptAccepted(
-    input: TaskProviderPromptAccepted,
-    now = new Date()
+  /** Provider acceptance is canonical before storage and remains receipt-fenced. */
+  private observeRuntimePromptAccepted(
+    input: RuntimeObservation,
+    adapterId: string,
+    now: Date
   ): ProviderLifecycleObservation {
     return this.store.transaction((store) => {
-      const decision = this.foldProviderSignal(store, {
-        kind: "native-prompt-submit",
-        fence: providerFence(input)
-      }, input.runId);
+      const event = createCanonicalLifecycleEvent({
+        phase: "provider-accepted",
+        source: "provider-native",
+        evidence: "provider-native-durable",
+        fence: runtimeObservationLifecycleFence(input, adapterId)
+      });
+      const decision = this.foldRuntimeLifecycleEvent(store, event, input);
       if (decision.kind === "obsolete") {
-        recordCanonicalObsolete(store, input, "native-prompt-accepted", decision.reason, now);
+        recordCanonicalObservationObsolete(store, input, decision.reason, now);
         return "obsolete";
       }
       if (decision.kind === "deferred") return "deferred";
       if (decision.kind === "idempotent") return "applied";
-      // decision.kind === "apply" && outcome advance-accepted
-      const active = store.getActiveAgentRun(input.taskId, input.roleName);
-      if (active === null || active.id !== input.runId || active.status !== "active") {
-        recordCanonicalObsolete(store, input, "native-prompt-accepted", "run-not-active", now);
+      const active = store.getActiveAgentRun(input.fence.taskId!, input.fence.roleName);
+      if (active === null
+        || active.id !== input.fence.runId
+        || active.status !== "active") {
+        recordCanonicalObservationObsolete(store, input, "run-not-active", now);
         return "obsolete";
       }
-      const role = store.getRole(input.taskId, input.roleName);
+      const role = store.getRole(input.fence.taskId!, input.fence.roleName);
       if (role === null) {
-        recordCanonicalObsolete(store, input, "native-prompt-accepted", "role-missing", now);
+        recordCanonicalObservationObsolete(store, input, "role-missing", now);
         return "obsolete";
       }
       if (active.deliveredAt === undefined) {
         const delivered = markAgentRunDelivered(active, now);
         store.saveAgentRun(delivered);
         markTaskRoleRunDeliveredInFlight(store, role, delivered, now);
-        store.saveEvent(input.taskId, createTaskEvent(
-          store.nextEventId(input.taskId),
-          input.taskId,
+        store.saveEvent(input.fence.taskId!, createTaskEvent(
+          store.nextEventId(input.fence.taskId!),
+          input.fence.taskId!,
           "run.delivered",
           runLaunchEventPayload(delivered),
           now
@@ -2807,100 +2877,29 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  /**
-   * Folds provider-native in-turn progress through the canonical lifecycle
-   * contract. Progress is an advisory semantic fence only: it never advances
-   * Run delivery/acceptance and never reads pane text or process counters.
-   */
-  observeProviderTurnProgress(
-    input: TaskProviderTurnProgress,
-    now = new Date()
-  ): ProviderLifecycleObservation {
-    return this.store.transaction((store) => {
-      const receivedAtMs = Date.parse(input.receivedAt);
-      if (!Number.isFinite(receivedAtMs) || receivedAtMs > now.getTime()) {
-        recordCanonicalObsolete(store, input, "native-turn-progress", "received-at-invalid", now);
-        return "obsolete";
-      }
-      const decision = this.foldProviderSignal(store, {
-        kind: "native-turn-progress",
-        ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
-        fence: providerFence(input)
-      }, input.runId);
-      switch (decision.kind) {
-        case "obsolete":
-          recordCanonicalObsolete(store, input, "native-turn-progress", decision.reason, now);
-          return "obsolete";
-        case "deferred":
-          return "deferred";
-        case "idempotent":
-          return "applied";
-        case "apply":
-          if (decision.outcome.outcome !== "advance-progress") return "obsolete";
-          return routeProviderProgress({
-            mode: this.telemetry?.mode ?? "legacy",
-            entry: toTelemetryEntry(input),
-            semanticExists: this.telemetry?.mode === "bounded"
-              ? false
-              : store.listEvents(input.taskId).some((event) => (
-                event.type === "runtime.provider-turn-progress"
-                && event.payload.eventId === input.eventId
-              )),
-            writeSemantic: () => {
-              store.saveEvent(input.taskId, createTaskEvent(
-                store.nextEventId(input.taskId),
-                input.taskId,
-                "runtime.provider-turn-progress",
-                {
-                  eventId: input.eventId,
-                  roleName: input.roleName,
-                  agentId: input.agentId,
-                  adapterId: input.adapterId,
-                  launchId: input.launchId,
-                  nativeSessionId: input.nativeSessionId,
-                  runId: input.runId,
-                  progressId: input.progressId,
-                  progressAt: input.receivedAt,
-                  ...(input.sequence === undefined ? {} : { sequence: String(input.sequence) })
-                },
-                now
-              ));
-            },
-            sink: this.telemetry?.sink ?? NULL_TELEMETRY_SINK
-          });
-      }
-    });
-  }
-
-  /**
-   * Shared projection + canonical fold for provider-native lifecycle signals.
-   * Reads current durable Run/session state into a CanonicalRunExpectation,
-   * maps the neutral signal through the per-adapter registry, and folds. The
-   * fold owns every ordering/identity/evidence decision; this method only reads
-   * durable truth and never branches on the provider name.
-   */
-  private foldProviderSignal(
+  private foldRuntimeLifecycleEvent(
     store: TaskStore,
-    signal: NativeLifecycleSignal,
-    runId: string | undefined
+    event: ReturnType<typeof createCanonicalLifecycleEvent>,
+    observation: RuntimeObservation
   ): Readonly<
     | { kind: "apply"; outcome: ReturnType<typeof foldCanonicalLifecycleEvent> }
     | { kind: "idempotent"; reason: string }
     | { kind: "deferred"; reason: string }
     | { kind: "obsolete"; reason: string }
   > {
-    let event;
-    try {
-      event = mapNativeLifecycleSignal(signal);
-    } catch (error) {
-      return { kind: "obsolete", reason: error instanceof Error ? error.message : "map-failed" };
-    }
-    const expectation = this.projectRunExpectation(store, signal.fence, runId);
+    const expectation = this.projectRunExpectation(
+      store,
+      event.fence,
+      observation.fence.runId
+    );
     if (expectation === null) {
-      if (preallocatedClaudeStartupAwaitingProjection(store, signal, runId)) {
-        return { kind: "deferred", reason: "preallocated-session-not-yet-projected" };
-      }
-      return { kind: "obsolete", reason: "run-or-role-missing" };
+      return preallocatedRuntimeReadyAwaitingProjection(
+        store,
+        observation,
+        this.drivers
+      )
+        ? { kind: "apply", outcome: { outcome: "mark-ready", preInputReady: true } }
+        : { kind: "obsolete", reason: "run-or-role-missing" };
     }
     const outcome = foldCanonicalLifecycleEvent(event, expectation);
     switch (outcome.outcome) {
@@ -2960,18 +2959,23 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       receiptId: inFlight.receiptId,
       ...(boundNativeSessionId === undefined ? {} : { nativeSessionId: boundNativeSessionId })
     };
-    const lifecycleEvents = store.listEvents(fence.taskId).filter((event) => (
-      event.type === "runtime.provider-session-lifecycle"
-      && event.payload.roleName === fence.roleName
-      && event.payload.agentId === run.effective.agentId
-      && event.payload.adapterId === run.effective.adapterId
-      && event.payload.launchId === launchId
-      && event.payload.nativeSessionId === (boundNativeSessionId ?? fence.nativeSessionId)
-    ));
+    const driverId = this.drivers.requireByAdapterId(run.effective.adapterId).id;
+    const lifecycleEvents = store.listEvents(fence.taskId).flatMap((event) => {
+      const observation = runtimeObservationFromTaskEvent(event);
+      return observation !== null
+        && (observation.kind === "session.started" || observation.kind === "session.ready")
+        && observation.fence.roleName === fence.roleName
+        && observation.fence.agentId === run.effective.agentId
+        && observation.fence.driverId === driverId
+        && observation.fence.launchId === launchId
+        && observation.fence.nativeSessionId === (boundNativeSessionId ?? fence.nativeSessionId)
+        ? [observation]
+        : [];
+    });
     return {
       fence: expectedFence,
       sessionStarted: lifecycleEvents.length > 0,
-      ready: lifecycleEvents.some((event) => event.payload.preInputReady === "true"),
+      ready: lifecycleEvents.some((event) => event.kind === "session.ready"),
       pushed: run.pushedAt !== undefined,
       accepted: run.deliveredAt !== undefined,
       terminal: run.status !== "active",
@@ -3122,9 +3126,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 }
 
-function claudeStopFailureSummary(input: TaskClaudeStopFailureEvent): string {
+function runtimeTurnFailureSummary(input: TaskRuntimeTurnFailed): string {
   return [
-    "Claude StopFailure.",
+    "Agent runtime turn failed.",
     `error: ${input.error}`,
     ...(input.errorDetails === undefined
       ? []
@@ -3135,46 +3139,42 @@ function claudeStopFailureSummary(input: TaskClaudeStopFailureEvent): string {
   ].join("\n");
 }
 
-function providerFence(
-  input: Readonly<{
-    taskId: string;
-    roleName: string;
-    agentId: string;
-    adapterId: "codex" | "claude";
-    launchId: string;
-    nativeSessionId: string;
-    runId?: string;
-    receiptId?: string;
-  }>
+function runtimeObservationLifecycleFence(
+  input: RuntimeObservation,
+  adapterId: string
 ): CanonicalIdentityFence {
   return {
-    taskId: input.taskId,
-    roleName: input.roleName,
-    agentId: input.agentId,
-    adapterId: input.adapterId,
-    launchId: input.launchId,
-    nativeSessionId: input.nativeSessionId,
-    ...(input.runId === undefined ? {} : { runId: input.runId }),
-    ...(input.receiptId === undefined ? {} : { receiptId: input.receiptId })
+    taskId: input.fence.taskId!,
+    roleName: input.fence.roleName,
+    agentId: input.fence.agentId,
+    adapterId,
+    launchId: input.fence.launchId,
+    ...(input.fence.runId === undefined ? {} : { runId: input.fence.runId }),
+    ...(input.fence.nativeSessionId === undefined
+      ? {}
+      : { nativeSessionId: input.fence.nativeSessionId }),
+    ...(input.fence.receiptId === undefined ? {} : { receiptId: input.fence.receiptId })
   };
 }
 
-function recordCanonicalObsolete(
+function recordCanonicalObservationObsolete(
   store: TaskStore,
-  input: Readonly<{
-    eventId: string;
-    taskId: string;
-    roleName: string;
-    agentId: string;
-    launchId: string;
-    nativeSessionId: string;
-    runId?: string;
-  }>,
-  eventType: string,
+  input: RuntimeObservation,
   reason: string,
   now: Date
 ): void {
-  recordObsoleteRuntimeEvent(store, { ...input, eventType }, reason, now);
+  const taskId = input.fence.taskId;
+  if (taskId === undefined) return;
+  recordObsoleteRuntimeEvent(store, {
+    eventId: input.eventId,
+    eventType: input.kind,
+    taskId,
+    roleName: input.fence.roleName,
+    agentId: input.fence.agentId,
+    ...(input.fence.runId === undefined ? {} : { runId: input.fence.runId }),
+    launchId: input.fence.launchId,
+    nativeSessionId: input.fence.nativeSessionId ?? input.fence.sessionGenerationId
+  }, reason, now);
 }
 
 function recordObsoleteRuntimeEvent(
@@ -3270,11 +3270,6 @@ function sessionPreview(value: string): string {
     : truncated;
 }
 
-function boundedRuntimeNote(value: string): string {
-  const normalized = value.trim().replaceAll(/\s+/gu, " ");
-  return normalized.length <= 280 ? normalized : `${normalized.slice(0, 279)}…`;
-}
-
 function requireRuntimeLaunchReservation(
   store: TaskStore,
   owner: RuntimeRoleOwner,
@@ -3299,62 +3294,51 @@ function runtimeHookMatchesReservation(
     && isRuntimeLaunchReservation(processing, launchId);
 }
 
-/**
- * Claude may publish SessionStart(startup) synchronously from host.start(),
- * before the Controller can atomically project the returned Session and bind
- * the Run. Preserve that exact immutable fact only while the matching launch
- * reservation is still the durable owner of the active Run. Everything else
- * remains obsolete/fail-closed.
- */
-function preallocatedClaudeStartupAwaitingProjection(
+function preallocatedRuntimeReadyAwaitingProjection(
   store: TaskStore,
-  signal: NativeLifecycleSignal,
-  runId: string | undefined
+  observation: RuntimeObservation,
+  drivers: AgentDriverRegistry
 ): boolean {
-  if (
-    signal.kind !== "native-session-start"
-    || signal.sessionSource !== "startup"
-    || signal.fence.adapterId !== "claude"
+  const taskId = observation.fence.taskId;
+  const runId = observation.fence.runId;
+  const nativeSessionId = observation.fence.nativeSessionId;
+  const driver = drivers.find(observation.fence.driverId);
+  if (observation.kind !== "session.ready"
+    || driver?.capabilities.observation.sessionBootstrap !== "preallocated"
+    || taskId === undefined
     || runId === undefined
-    || signal.fence.runId !== runId
-    || signal.fence.launchId === undefined
-    || signal.fence.nativeSessionId === undefined
-  ) return false;
+    || nativeSessionId === undefined) return false;
 
-  const task = store.getTask(signal.fence.taskId);
-  const role = store.getRole(signal.fence.taskId, signal.fence.roleName);
-  const run = store.getActiveAgentRun(signal.fence.taskId, signal.fence.roleName);
-  const sessions = store.getTaskRoleSessionSet(signal.fence.taskId, signal.fence.roleName);
-  if (
-    task === null
-    || task.status !== "active"
-    || role === null
-    || role.activeAgentId !== signal.fence.agentId
-    || run === null
-    || run.id !== runId
+  const task = store.getTask(taskId);
+  const role = store.getRole(taskId, observation.fence.roleName);
+  const run = store.getActiveAgentRun(taskId, observation.fence.roleName);
+  const sessions = store.getTaskRoleSessionSet(taskId, observation.fence.roleName);
+  if (task?.status !== "active"
+    || role?.activeAgentId !== observation.fence.agentId
+    || run?.id !== runId
     || run.status !== "active"
-    || run.effective.agentId !== signal.fence.agentId
-    || run.effective.adapterId !== "claude"
+    || run.effective.agentId !== observation.fence.agentId
+    || run.effective.adapterId !== driver.adapterId
+    || observation.fence.receiptId !== formatAgentRunReceiptId(taskId, runId)
     || (sessions?.inFlight !== null && sessions?.inFlight !== undefined)
-    || sessions?.sessions[signal.fence.agentId] !== undefined
-  ) return false;
+    || sessions?.sessions[observation.fence.agentId] !== undefined) return false;
 
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
     scope: "task",
-    taskId: signal.fence.taskId,
-    roleName: signal.fence.roleName
+    taskId,
+    roleName: observation.fence.roleName
   }));
   const executionRef = mailbox?.processing?.executionRef;
-  return isRuntimeLaunchReservation(mailbox?.processing, signal.fence.launchId)
+  return isRuntimeLaunchReservation(mailbox?.processing, observation.fence.launchId)
     && !hasRuntimeCleanupObligation(mailbox)
     && executionRef?.type === "run"
-    && executionRef.taskId === signal.fence.taskId
+    && executionRef.taskId === taskId
     && executionRef.id === runId
-    && signal.fence.nativeSessionId === nativeSessionIdForLaunch(
+    && nativeSessionId === nativeSessionIdForLaunch(
       store.rootDirectory(),
-      signal.fence.launchId,
-      signal.fence.agentId,
-      "claude"
+      observation.fence.launchId,
+      observation.fence.agentId,
+      driver.adapterId
     );
 }
 
@@ -4071,31 +4055,161 @@ function runLaunchEventPayload(run: AgentRun): Record<string, string> {
   };
 }
 
-/**
- * Maps a provider progress observation to the telemetry sidecar entry. The
- * payload mirrors the semantic event payload so sidecar rows and legacy
- * events carry identical evidence.
- */
-function toTelemetryEntry(input: TaskProviderTurnProgress): TelemetryProgressEntry {
+function runtimeObservationTelemetryEntry(
+  input: RuntimeObservation
+): TelemetryProgressEntry {
   return {
-    taskId: input.taskId,
-    roleName: input.roleName,
-    runId: input.runId,
-    generation: input.launchId !== "" ? input.launchId : input.nativeSessionId,
-    progressId: input.progressId,
+    taskId: input.fence.taskId!,
+    roleName: input.fence.roleName,
+    runId: input.fence.runId!,
+    generation: input.fence.sessionGenerationId,
+    progressId: [
+      input.kind,
+      input.payload.operationId ?? input.payload.activity ?? "state"
+    ].join(":"),
     ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
     payload: {
       eventId: input.eventId,
-      roleName: input.roleName,
-      agentId: input.agentId,
-      adapterId: input.adapterId,
-      launchId: input.launchId,
-      nativeSessionId: input.nativeSessionId,
-      runId: input.runId,
-      progressId: input.progressId,
-      progressAt: input.receivedAt,
-      ...(input.sequence === undefined ? {} : { sequence: String(input.sequence) })
+      kind: input.kind,
+      authority: input.authority,
+      driverId: input.fence.driverId,
+      launchId: input.fence.launchId,
+      nativeSessionId: input.fence.nativeSessionId ?? "",
+      nativeTurnId: input.fence.nativeTurnId ?? "",
+      ...(input.payload.operation === undefined
+        ? {}
+        : { operation: input.payload.operation }),
+      ...(input.payload.activity === undefined
+        ? {}
+        : { activity: input.payload.activity }),
+      ...(input.payload.usage === undefined
+        ? {}
+        : { usage: JSON.stringify(input.payload.usage) })
     },
     receivedAt: input.receivedAt
   };
+}
+
+/**
+ * Runtime observations are a current-state snapshot, not an append-only
+ * semantic history. Retain active operations, one latest usage baseline, and
+ * one latest confirmed activity boundary so a token stream remains
+ * O(active operations) per Run without losing the delta that was already
+ * proven before an unchanged later snapshot arrived.
+ */
+function compactedRuntimeObservationIds(
+  events: readonly TaskEvent[],
+  incoming: RuntimeObservation
+): string[] {
+  const existing = events.flatMap((event) => {
+    const observation = runtimeObservationFromTaskEvent(event);
+    return observation !== null
+      && runtimeObservationFenceMatches(observation.fence, incoming.fence)
+      ? [{ event, observation }]
+      : [];
+  });
+  const remove = ({ observation }: typeof existing[number]): boolean => {
+    if (incoming.kind === "activity.observed") {
+      return observation.kind === "activity.observed"
+        && (observation.payload.usage === undefined)
+          === (incoming.payload.usage === undefined);
+    }
+    if (incoming.kind === "operation.started") {
+      return (observation.kind === "operation.started"
+          && observation.payload.operationId === incoming.payload.operationId)
+        || observation.kind === "operation.completed"
+        || observation.kind === "operation.failed";
+    }
+    if (incoming.kind === "operation.completed" || incoming.kind === "operation.failed") {
+      return (observation.kind.startsWith("operation.")
+          && observation.payload.operationId === incoming.payload.operationId)
+        || observation.kind === "operation.completed"
+        || observation.kind === "operation.failed";
+    }
+    if (incoming.kind === "turn.waiting") return observation.kind === "turn.waiting";
+    if (incoming.kind === "observer.health") {
+      return observation.kind === "observer.health"
+        && observation.payload.sourceId === incoming.payload.sourceId;
+    }
+    if (["turn.completed", "turn.failed", "turn.cancelled"].includes(incoming.kind)) {
+      return observation.kind.startsWith("operation.")
+        || observation.kind === "turn.waiting"
+        || observation.kind === "turn.completed"
+        || observation.kind === "turn.failed"
+        || observation.kind === "turn.cancelled";
+    }
+    if (incoming.kind === "turn.accepted") return observation.kind === "turn.accepted";
+    if (incoming.kind.startsWith("session.")) return observation.kind.startsWith("session.");
+    return false;
+  };
+  return existing.filter(remove).map(({ event }) => event.id);
+}
+
+function confirmedUsageActivityObservation(
+  events: readonly TaskEvent[],
+  incoming: RuntimeObservation
+): RuntimeObservation | null {
+  const usage = incoming.payload.usage;
+  if (incoming.kind !== "activity.observed" || usage === undefined) return null;
+  const previous = events
+    .map(runtimeObservationFromTaskEvent)
+    .filter((observation): observation is RuntimeObservation => (
+      observation !== null
+      && observation.kind === "activity.observed"
+      && observation.payload.usage !== undefined
+      && runtimeObservationFenceMatches(observation.fence, incoming.fence)
+    ))
+    .sort(compareCanonicalObservationOrder)
+    .at(-1)?.payload.usage;
+  if (previous === undefined
+    || usage.inputTokens + usage.outputTokens
+      <= previous.inputTokens + previous.outputTokens) return null;
+  const digest = createHash("sha256")
+    .update(`confirmed-runtime-activity\0${incoming.eventId}`)
+    .digest("hex");
+  return createRuntimeObservation({
+    schemaVersion: 1,
+    eventId: `runtime-activity-${digest}`,
+    kind: "activity.observed",
+    authority: "controller",
+    receivedAt: incoming.receivedAt,
+    ...(incoming.observedAt === undefined ? {} : { observedAt: incoming.observedAt }),
+    ...(incoming.sequence === undefined ? {} : { sequence: incoming.sequence }),
+    ...(incoming.ordinal === undefined ? {} : { ordinal: incoming.ordinal }),
+    fence: incoming.fence,
+    payload: { activity: incoming.payload.activity ?? "model" }
+  });
+}
+
+function usageSnapshotIsSuperseded(
+  events: readonly TaskEvent[],
+  incoming: RuntimeObservation
+): boolean {
+  if (incoming.kind !== "activity.observed" || incoming.payload.usage === undefined) {
+    return false;
+  }
+  return events
+    .map(runtimeObservationFromTaskEvent)
+    .some((observation) => observation !== null
+      && observation.kind === "activity.observed"
+      && observation.payload.usage !== undefined
+      && runtimeObservationFenceMatches(observation.fence, incoming.fence)
+      && observationIsStrictlyNewer(observation, incoming));
+}
+
+function observationIsStrictlyNewer(
+  left: RuntimeObservation,
+  right: RuntimeObservation
+): boolean {
+  return compareCanonicalObservationOrder(left, right) > 0;
+}
+
+function compareCanonicalObservationOrder(
+  left: RuntimeObservation,
+  right: RuntimeObservation
+): number {
+  return left.receivedAt.localeCompare(right.receivedAt)
+    || (left.sequence ?? -1) - (right.sequence ?? -1)
+    || (left.ordinal ?? -1) - (right.ordinal ?? -1)
+    || left.eventId.localeCompare(right.eventId);
 }

@@ -12,7 +12,7 @@ export function createStartupReadyClaudeAgent(
   const cliEntry = join(process.cwd(), "dist", "cli.js");
   writeFileSync(command, `#!${process.execPath}
 const { spawnSync } = require("node:child_process");
-const started = spawnSync(process.execPath, [${JSON.stringify(cliEntry)}, "internal", "claude-hook"], {
+const started = spawnSync(process.execPath, [${JSON.stringify(cliEntry)}, "internal", "runtime-hook"], {
   encoding: "utf8",
   env: process.env,
   input: JSON.stringify({

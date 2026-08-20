@@ -408,9 +408,9 @@ test("Task retirement closes exact work and makes late provider facts obsolete",
   assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
   assert.equal(store.getWorkItem(task.id, item.id).status, "retired");
   assert.equal(store.getWorkItem(task.id, item.id).disposition, undefined);
-  assert.equal(new FileSchedulerStoreAdapter(store).classifyClaudeStopFailureEvent({
+  assert.equal(new FileSchedulerStoreAdapter(store).classifyRuntimeTurnFailed({
     eventId: "late-after-retirement",
-    type: "claude-stop-failure",
+    eventType: "turn.failed",
     taskId: task.id,
     roleName: run.roleName,
     agentId: "claude-primary",

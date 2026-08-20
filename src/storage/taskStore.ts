@@ -530,8 +530,8 @@ export type TaskStore = {
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
   /**
-   * Remove events by id. Used by telemetry compaction to fold legacy
-   * `runtime.provider-turn-progress` rows into the sidecar while keeping
+   * Remove events by id. Used by the historical telemetry migration to fold
+   * pre-Driver progress rows into the sidecar while keeping
    * every semantic event. Returns the number of events actually removed.
    */
   removeEvents(taskId: string, eventIds: readonly string[]): number;

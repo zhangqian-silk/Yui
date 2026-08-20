@@ -69,7 +69,7 @@ async function startIsolatedController(home, t) {
 }
 
 test("parent update stops a running Controller on an old aggregate Home through its internal path", async (t) => {
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 19);
   const fixture = tempHome();
   t.after(() => rmSync(fixture.base, { recursive: true, force: true }));
   await startIsolatedController(fixture.home, t);

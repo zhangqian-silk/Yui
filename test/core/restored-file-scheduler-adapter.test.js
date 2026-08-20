@@ -125,7 +125,7 @@ function seedLeaderStall(store, task, run, now) {
       {
         runId: run.id,
         roleName: run.roleName,
-        kind: "execution-stalled",
+        kind: "workflow-not-progressing",
         classification: "truly-stalled",
         progressAt,
         idleMs: "1800000",
@@ -560,7 +560,7 @@ test("stale Leader stall persistence cannot outrun newer durable progress", (t) 
     agentId: run.effective.agentId,
     adapterId: run.effective.adapterId,
     session: observedSession,
-    kind: "execution-stalled",
+    kind: "workflow-not-progressing",
     classification: "truly-stalled",
     progressAt: deliveredAt,
     idleMs: 30 * 60_000,
@@ -596,7 +596,7 @@ test("stale stall persistence cannot cross a Session terminal transition", (t) =
     agentId: run.effective.agentId,
     adapterId: run.effective.adapterId,
     session: observedSession,
-    kind: "execution-stalled",
+    kind: "workflow-not-progressing",
     classification: "truly-stalled",
     progressAt: deliveredAt,
     idleMs: 30 * 60_000,
@@ -613,7 +613,7 @@ test("stale stall persistence cannot cross a Session terminal transition", (t) =
   );
 });
 
-test("advisory resource suppression survives restart but expires at the semantic progress bound", async (t) => {
+test("workflow attention survives restart while advisory resource evidence continues", async (t) => {
   const { home, store, task, role, now, adapter } = fixture(t);
   const createdAt = new Date(now.getTime() - 60 * 60_000);
   const run = createAgentRun(
@@ -691,17 +691,12 @@ test("advisory resource suppression survives restart but expires at the semantic
     true,
     [],
     undefined,
-    30 * 60_000,
-    new Set()
+    30 * 60_000
   );
   assert.deepEqual(first.failedRunRefs, []);
   assert.equal(
-    store.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
-    1
-  );
-  assert.equal(
     store.listEvents(task.id).filter((event) => event.type === "run.stalled").length,
-    0
+    1
   );
 
   const restartedStore = new FileTaskStore(home);
@@ -715,17 +710,12 @@ test("advisory resource suppression survives restart but expires at the semantic
     true,
     [],
     undefined,
-    30 * 60_000,
-    new Set()
+    30 * 60_000
   );
   assert.deepEqual(second.failedRunRefs, []);
   assert.equal(
-    restartedStore.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
-    1
-  );
-  assert.equal(
     restartedStore.listEvents(task.id).filter((event) => event.type === "run.stalled").length,
-    0
+    1
   );
 
   const expired = new Date(now.getTime() + 31 * 60_000);
@@ -739,14 +729,9 @@ test("advisory resource suppression survives restart but expires at the semantic
     true,
     [],
     undefined,
-    30 * 60_000,
-    new Set()
+    30 * 60_000
   );
   assert.deepEqual(third.failedRunRefs, []);
-  assert.equal(
-    restartedStore.listEvents(task.id).filter((event) => event.type === "run.resource-suppressed").length,
-    1
-  );
   assert.equal(
     restartedStore.listEvents(task.id).filter((event) => event.type === "run.stalled").length,
     1
@@ -862,7 +847,7 @@ test("adapter delivery progress ignores a newer Work Item timestamp before accep
   assert.equal(result[0].kind, "delivery-stalled");
 });
 
-test("native and Controller recovery clear only the matching Leader stall attention", (t) => {
+test("runtime completion preserves workflow attention until a terminal Controller outcome", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
@@ -893,7 +878,7 @@ test("native and Controller recovery clear only the matching Leader stall attent
     summary: "native progress"
   }, now);
   assert.equal(observed.pendingRunId, run.id);
-  assert.equal(store.getOperatorNotification(task.id), null);
+  assert.equal(store.getOperatorNotification(task.id).runId, run.id);
 
   const duplicate = adapter.observeRuntimeTurnCompleted({
     taskId: task.id,
@@ -906,7 +891,7 @@ test("native and Controller recovery clear only the matching Leader stall attent
     summary: "native progress"
   }, now);
   assert.equal(duplicate.duplicate, true);
-  assert.equal(store.getOperatorNotification(task.id), null);
+  assert.equal(store.getOperatorNotification(task.id).runId, run.id);
 
   const controllerFixture = fixture(t);
   const controllerStore = controllerFixture.store;
@@ -1513,7 +1498,7 @@ test("a stale Leader preparation failure cannot overwrite a newer active Run", (
   assert.deepEqual(store.getPendingWakeup(task.id), wakeup);
 });
 
-test("runtime Turn completion waits for the two-second grace deadline before closing a Leader Run", (t) => {
+test("runtime Turn completion waits for the two-second grace deadline before failing an unclosed Leader Run", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   const run = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "continue", now);
   assert.equal(adapter.saveLeaderDispatch({
@@ -1554,11 +1539,13 @@ test("runtime Turn completion waits for the two-second grace deadline before clo
     [`${task.id}/${run.id}`]
   );
   assert.equal(store.getActiveAgentRun(task.id, role.name), null);
-  assert.equal(store.getAgentRun(task.id, run.id).status, "yielded");
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
   assert.equal(store.getRoleSession(task.id, role.name).status, "ready");
   assert.equal(store.getTaskRoleSessionSet(task.id, role.name).inFlight, null);
   assert.equal(store.getTask(task.id).status, "active");
-  assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["leader-turn-unclosed"]);
+  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.equal(store.getRole(task.id, role.name).status, "failed");
+  assert.equal(store.getOperatorNotification(task.id).type, "leader-recovery-failed");
 });
 
 test("an unrelated Hook cannot prove that a prepared Leader Run was delivered", (t) => {
@@ -1888,7 +1875,7 @@ test("Operator notification delivery requires a structured ready Session", (t) =
   });
 });
 
-test("a Hook classified for Run A cannot close Run B after an intervening dispatch", (t) => {
+test("an unclosed Run A contract failure prevents an intervening Leader dispatch", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   const first = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "new", "A", now);
   assert.equal(adapter.saveLeaderDispatch({
@@ -1922,6 +1909,7 @@ test("a Hook classified for Run A cannot close Run B after an intervening dispat
     ...event,
     expectedRunId: first.id
   }, now);
+  assert.equal(store.getAgentRun(task.id, first.id).status, "failed");
   const second = createAgentRun(adapter, adapter.peekNextAgentRunId(task.id), task.id, role.name, "resume", "B", now);
   assert.equal(adapter.saveLeaderDispatch({
     task,
@@ -1930,22 +1918,8 @@ test("a Hook classified for Run A cannot close Run B after an intervening dispat
     session: store.getRoleSession(task.id, role.name),
     wakeup: store.getPendingWakeup(task.id),
     now
-  }), "claimed");
-  adapter.saveRoleRunDelivery({
-    task,
-    role: adapter.getRole(task.id, role.name),
-    run: second,
-    session: store.getRoleSession(task.id, role.name),
-    now
-  });
-
-  adapter.observeRuntimeTurnCompleted(event, new Date(now.getTime() + 1_000));
-
-  assert.equal(store.getActiveAgentRun(task.id, role.name).id, second.id);
-  assert.equal(
-    store.getTaskRoleSessionSet(task.id, role.name).pendingTurnCompletion,
-    null
-  );
+  }), "state-changed");
+  assert.equal(store.getActiveAgentRun(task.id, role.name), null);
 });
 
 test("a Hook for an older Run is acknowledged without closing the fresh Run", (t) => {
@@ -2113,7 +2087,7 @@ test("native completion failure for a Leader WorkItem clears only matching stall
   assert.equal(store.getOperatorNotification(task.id).runId, "agent-run-2");
 });
 
-test("a quiescent result-driven Leader Turn is recovered instead of inferring Task completion", (t) => {
+test("a quiescent result-driven Leader Turn fails its missing workflow outcome", (t) => {
   const { store, task, role, now, adapter } = fixture(t);
   store.transaction((tx) => {
     tx.clearPendingWakeup(task.id);
@@ -2155,7 +2129,10 @@ test("a quiescent result-driven Leader Turn is recovered instead of inferring Ta
   adapter.resolveDueRuntimeTurnCompletions(new Date(now.getTime() + 2_000));
 
   assert.equal(store.getTask(task.id).status, "active");
-  assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["leader-turn-unclosed"]);
+  assert.equal(store.getPendingWakeup(task.id), null);
+  assert.equal(store.getAgentRun(task.id, run.id).status, "failed");
+  assert.equal(store.getRole(task.id, role.name).status, "failed");
+  assert.equal(store.getOperatorNotification(task.id).type, "leader-recovery-failed");
   assert.equal(
     store.listEvents(task.id).some((event) => event.type === "task.completed"),
     false
@@ -2208,7 +2185,7 @@ test("a repeated unclosed Leader recovery escalates and notifies Operator once",
   assert.equal(store.getOperatorNotification(task.id).type, "leader-recovery-failed");
   assert.deepEqual(
     store.getWorkMailbox({ kind: "operator" }).pending.reasons,
-    ["leader-recovery-failed"]
+    ["leader-run-failed"]
   );
 
   const deliveries = [];

@@ -20,6 +20,7 @@ import type { TelemetryAggregate, TelemetryProgressEntry, TelemetryStore } from 
  * throws and leaves the original history unchanged.
  */
 
+/** Historical pre-Driver event type accepted only by the offline migration. */
 export const PROGRESS_EVENT_TYPE = "runtime.provider-turn-progress";
 
 export type CompactionGenerationPlan = Readonly<{

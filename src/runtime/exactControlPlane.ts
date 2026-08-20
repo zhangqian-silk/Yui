@@ -427,7 +427,10 @@ export type ExactTaskRuntimeStatePort = Pick<
 
 export type ExactTaskRuntimeStateOptions = Readonly<{
   /** Narrow startup allowance before a deterministic preallocated Session is projected. */
-  preallocatedNativeSessionReservation?: Readonly<{ yuiHome: string }>;
+  preallocatedDriverSessionReservation?: Readonly<{
+    yuiHome: string;
+    adapterId: string;
+  }>;
 }>;
 
 /** Fences a descriptor to the one currently active durable Task runtime. */
@@ -473,10 +476,10 @@ export function assertExactTaskRuntimeState(
   const sessionLaunch = runtime.launchId !== undefined
     && session?.launchId === runtime.launchId;
   const executionRef = lifecycleMailbox?.processing?.executionRef;
-  const preallocated = options.preallocatedNativeSessionReservation;
+  const preallocated = options.preallocatedDriverSessionReservation;
   const exactPreallocatedReservation =
     preallocated !== undefined
-    && runtime.adapterId === "claude"
+    && runtime.adapterId === preallocated.adapterId
     && runtime.runId !== undefined
     && runtime.launchId !== undefined
     && runtime.nativeSessionId !== undefined

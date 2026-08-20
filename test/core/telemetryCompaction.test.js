@@ -73,7 +73,7 @@ function buildFixtureHome() {
       createdAt: now.toISOString()
     });
     store.saveEvent(taskId, semanticEvent(store, taskId, "run.dispatched", { runId: `${taskId}-run-1` }, now));
-    store.saveEvent(taskId, semanticEvent(store, taskId, "runtime.provider-session-lifecycle", { runId: `${taskId}-run-1`, preInputReady: "true" }, now));
+    store.saveEvent(taskId, semanticEvent(store, taskId, "runtime.role-session-reset", { runId: `${taskId}-run-1` }, now));
   }
   // task-1: one Run with 250 progress events (over the 200 window).
   for (let i = 1; i <= 250; i++) {

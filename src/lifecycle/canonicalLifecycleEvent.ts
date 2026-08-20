@@ -1,14 +1,10 @@
-import type { AgentAdapterId } from "../agent/adapterCatalog.js";
-
 /**
  * The smallest stable, provider-neutral Yui lifecycle vocabulary.
  *
  * Each phase is a durable semantic fact about a managed Agent generation or the
- * Run whose prompt it carries. Provider adapters translate their own native
- * signals into these phases (see providerLifecycleMapping.ts); the scheduler and
- * the durable fold then reason about phases, sources, and evidence — never about
- * provider names. This is the seam decision-19 requires: canonical semantics in
- * the middle, adapter-specific mapping only at the edges.
+ * Run whose prompt it carries. Agent Drivers translate native signals into
+ * these phases; the scheduler and durable fold reason about phases, sources,
+ * and evidence — never about provider names.
  */
 export type CanonicalLifecyclePhase =
   /** A host window/process was created by Yui for a Role generation. */
@@ -66,7 +62,7 @@ export type CanonicalIdentityFence = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
-  adapterId: AgentAdapterId;
+  adapterId: string;
   runId?: string;
   nativeSessionId?: string;
   launchId?: string;

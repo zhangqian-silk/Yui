@@ -70,6 +70,7 @@ import type {
   RuntimeEventProcessorPort
 } from "./runtimeEventProcessor.js";
 import type { EphemeralDomainIdentity } from "./domainIdentity.js";
+import type { AgentRuntimeObserverPort } from "./agentRuntimeObserver.js";
 import type { DurableJobControlPort } from "./jobControl.js";
 import {
   parseDurableJobAcknowledgeParams,
@@ -80,6 +81,7 @@ import {
 
 const DEFAULT_RECONCILIATION_INTERVAL_MS = reconciliationIntervalMilliseconds();
 const DEFAULT_SIGNAL_WINDOW_MS = 100;
+const DEFAULT_RUNTIME_OBSERVER_INTERVAL_MS = 1_000;
 const DEFAULT_DELIVERY_RETRY_MS = 250;
 const DEFAULT_DELIVERY_RETRY_LIMIT = 60;
 const DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT = 2;
@@ -118,6 +120,8 @@ export type ControllerRuntimeOptions = Readonly<{
   onError?: (error: unknown) => void;
   workspacePreparer?: Pick<TaskWorkspacePreparer, "prepareTaskWorkspace">;
   runtimeEventProcessor?: RuntimeEventProcessorPort | AsyncRuntimeEventProcessorPort;
+  runtimeObserver?: AgentRuntimeObserverPort;
+  runtimeObserverIntervalMs?: number;
   lifecycleHost?: RuntimeLifecycleHost;
   configuration?: ControllerConfigurationPort;
   domainIdentity?: EphemeralDomainIdentity;
@@ -241,7 +245,6 @@ export async function runControllerSchedulerPass(
   runtimeCleanupOutcomes: RuntimeCleanupOutcome[] = [],
   lifecycleHost?: RuntimeLifecycleHost,
   stallWindowMs = DEFAULT_STALL_WINDOW_MS,
-  resourceSuppressionKeys: Set<string> = new Set(),
   maintenanceFence?: (projectId: string) => boolean,
   onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"]
 ): Promise<ControllerSchedulerResult> {
@@ -365,8 +368,7 @@ export async function runControllerSchedulerPass(
       roleSelection,
       stallWindowMs,
       liveStatuses,
-      resourceEvidence,
-      resourceSuppressionKeys
+      resourceEvidence
     );
     await controlEventLoopTurn();
     await reconcileDormantRuntimeOwners(
@@ -1087,9 +1089,9 @@ export class FileTaskController {
   readonly #deliveryRetryLimit: number;
   readonly #taskOrchestrationRetryLimit: number;
   readonly #stallWindowMs: number;
-  /** Narrow-port fallback; FileSchedulerStoreAdapter durably records these keys. */
-  readonly #resourceSuppressionKeys = new Set<string>();
   readonly #runtimeEventProcessor: RuntimeEventProcessorPort | AsyncRuntimeEventProcessorPort | undefined;
+  readonly #runtimeObserver: AgentRuntimeObserverPort | undefined;
+  readonly #runtimeObserverIntervalMs: number;
   readonly #lifecycleHost:
     | RuntimeLifecycleHost
     | undefined;
@@ -1103,6 +1105,7 @@ export class FileTaskController {
   #passRetryAttempt = 0;
   #timer: NodeJS.Timeout | undefined;
   #deadlineTimer: NodeJS.Timeout | undefined;
+  #runtimeObserverTimer: NodeJS.Timeout | undefined;
   readonly #signalScheduler: MailboxScheduler<MailboxKey>;
   readonly #operatorSignalScheduler: MailboxScheduler<MailboxKey>;
   readonly #configuration: ControllerConfigurationPort | undefined;
@@ -1124,6 +1127,7 @@ export class FileTaskController {
   readonly #jobSupervisor: ControllerRuntimeOptions["jobSupervisor"];
   #current: Promise<ControllerSchedulerResult> | undefined;
   #operatorCurrent: Promise<void> | undefined;
+  #runtimeObserverCurrent: Promise<void> | undefined;
   #pendingFull = false;
   readonly #pendingKeys = new Set<MailboxKey>();
   #operatorStartupRetryArmed = false;
@@ -1170,6 +1174,12 @@ export class FileTaskController {
       "Controller Run stall window"
     );
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
+    this.#runtimeObserver = options.runtimeObserver;
+    this.#runtimeObserverIntervalMs = positiveInteger(
+      options.runtimeObserverIntervalMs,
+      DEFAULT_RUNTIME_OBSERVER_INTERVAL_MS,
+      "Controller runtime observer interval"
+    );
     this.#lifecycleHost = options.lifecycleHost;
     this.#configuration = options.configuration;
     this.#resourceReaper = options.resourceReaper;
@@ -1267,6 +1277,7 @@ export class FileTaskController {
     if (this.#timer !== undefined) return;
     if (this.#stopped) throw new Error("Controller runtime is stopped.");
     this.#requestBackgroundPump();
+    this.#requestRuntimeObservation();
     // Arm the Operator lane once for work that was already pending when the
     // Controller started. Subsequent main-lane passes signal it only when a
     // new Operator batch is durably queued; an unchanged pending batch must
@@ -1276,6 +1287,12 @@ export class FileTaskController {
       this.#requestBackgroundPump();
     }, this.#intervalMs);
     this.#timer.unref();
+    if (this.#runtimeObserver !== undefined) {
+      this.#runtimeObserverTimer = setInterval(() => {
+        this.#requestRuntimeObservation();
+      }, this.#runtimeObserverIntervalMs);
+      this.#runtimeObserverTimer.unref();
+    }
   }
 
   stop(): void {
@@ -1290,6 +1307,10 @@ export class FileTaskController {
       clearInterval(this.#timer);
       this.#timer = undefined;
     }
+    if (this.#runtimeObserverTimer !== undefined) {
+      clearInterval(this.#runtimeObserverTimer);
+      this.#runtimeObserverTimer = undefined;
+    }
     for (const timer of this.#deliveryRetryTimers.values()) clearTimeout(timer);
     this.#deliveryRetryTimers.clear();
     this.#deliveryRetryAttempts.clear();
@@ -1303,7 +1324,8 @@ export class FileTaskController {
     this.stop();
     await Promise.allSettled([
       this.#current ?? Promise.resolve(),
-      this.#operatorCurrent ?? Promise.resolve()
+      this.#operatorCurrent ?? Promise.resolve(),
+      this.#runtimeObserverCurrent ?? Promise.resolve()
     ]);
   }
 
@@ -1322,6 +1344,18 @@ export class FileTaskController {
 
   pump(): Promise<ControllerSchedulerResult> {
     return this.#requestPass({ kind: "full" });
+  }
+
+  #requestRuntimeObservation(): void {
+    if (this.#stopped || this.#runtimeObserver === undefined
+      || this.#runtimeObserverCurrent !== undefined) return;
+    const running = this.#runtimeObserver.sample(this.#now()).then((keys) => {
+      if (this.#stopped) return;
+      for (const key of keys) this.signal(key);
+    }).catch(this.#onError).finally(() => {
+      if (this.#runtimeObserverCurrent === running) this.#runtimeObserverCurrent = undefined;
+    });
+    this.#runtimeObserverCurrent = running;
   }
 
   armOperatorStartupRetry(): void {
@@ -1413,7 +1447,6 @@ export class FileTaskController {
             runtimeCleanupOutcomes,
             this.#lifecycleHost,
             this.#stallWindowMs,
-            this.#resourceSuppressionKeys,
             this.#maintenanceFence,
             this.#onMaintenanceFenceDefer
           );

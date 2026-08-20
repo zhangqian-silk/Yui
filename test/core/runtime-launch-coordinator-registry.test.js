@@ -8,8 +8,19 @@ import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { FileTaskController } from "../../dist/controller/controller.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { RuntimeLaunchCoordinator } from "../../dist/controller/runtimeLaunchCoordinator.js";
-import { runClaudeLifecycleHookCommand } from "../../dist/controller/claudeLifecycleHook.js";
-import { runCodexLifecycleHookCommand } from "../../dist/controller/codexLifecycleHook.js";
+import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
+const runClaudeLifecycleHookCommand = (payload, environment, call) => (
+  runRuntimeObservationHookCommand(payload, {
+    ...environment,
+    YUI_DRIVER_ID: "anthropic/claude-code"
+  }, call, NOW)
+);
+const runCodexLifecycleHookCommand = (payload, environment, call) => (
+  runRuntimeObservationHookCommand(payload, {
+    ...environment,
+    YUI_DRIVER_ID: "openai/codex"
+  }, call, NOW)
+);
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { FileRuntimeEventProcessor } from "../../dist/controller/runtimeEventProcessor.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";

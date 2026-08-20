@@ -24,16 +24,35 @@ test("default npm test structurally selects only root and core deterministic tes
   assert.doesNotMatch(packageJson.scripts.test, /test\/privileged/);
 });
 
-test("Provider and Release manifests are nested, explicit, and truthfully empty", () => {
-  for (const tier of ["provider-e2e", "release-e2e"]) {
-    const plan = resolveTierTestPlan(tier, repoRoot);
-    assert.deepEqual(plan.files, []);
-    assert.deepEqual(plan.labels, []);
-  }
+test("Provider scenarios are explicit and Release remains truthfully empty", () => {
+  const providerPlan = resolveTierTestPlan("provider-e2e", repoRoot);
+  assert.deepEqual(providerPlan.files, [
+    join(repoRoot, "test/privileged/privileged-tier.test.js")
+  ]);
+  assert.deepEqual(providerPlan.labels, [
+    "real Claude managed runtime observer",
+    "real Codex managed runtime observer"
+  ]);
+  assert.equal(
+    providerPlan.environment.YUI_TEST_PRIVILEGED_MANIFEST,
+    join(repoRoot, "test/privileged/provider-e2e/manifest.json")
+  );
   assert.deepEqual(
     JSON.parse(readFileSync(join(repoRoot, "test/privileged/provider-e2e/manifest.json"), "utf8")),
-    []
+    [
+      {
+        name: "real Claude managed runtime observer",
+        module: "claude-runtime-observer.mjs"
+      },
+      {
+        name: "real Codex managed runtime observer",
+        module: "codex-runtime-observer.mjs"
+      }
+    ]
   );
+  const releasePlan = resolveTierTestPlan("release-e2e", repoRoot);
+  assert.deepEqual(releasePlan.files, []);
+  assert.deepEqual(releasePlan.labels, []);
   assert.deepEqual(
     JSON.parse(readFileSync(join(repoRoot, "test/privileged/release-e2e/manifest.json"), "utf8")),
     []

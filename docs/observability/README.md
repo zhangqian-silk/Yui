@@ -8,6 +8,19 @@ All observability features are **read-only**: they never wake a Leader, write
 Task state, or change business behavior. Collection failures degrade to
 `unsupported`/`unavailable` without affecting the control plane.
 
+## Agent runtime status
+
+`yui task role status <task> <role>` projects the provider-independent Agent
+Driver observations documented in [Agent Runtime Drivers](../agent-runtime-drivers.md).
+It reports the Driver, current Session/Turn/operation state, recent activity,
+waiting reason, and normalized usage. Host presence remains a separate tmux
+field: a live pane is not proof that the Agent is actively working.
+
+Five minutes without structured activity changes runtime attention to `quiet`
+(or `active-operation-quiet` when an operation is still open). This is a
+diagnostic health signal only. Workflow-stall attention uses durable Yui
+progress and is not postponed by tokens, tools, CPU, RSS, or Turn completion.
+
 ## Feature flag
 
 The new `controller status` identity fields are gated by `YUI_STATUS_IDENTITY`:

@@ -84,7 +84,7 @@ test("Agent adapters expose the stable Codex and Claude catalog", () => {
   assert.equal(claude.capabilities.preInputReadiness.status, "supported");
   assert.equal(
     claude.capabilities.preInputReadiness.nativeEvent,
-    "SessionStart(source=startup)"
+    "Agent Driver session.ready"
   );
   assert.throws(() => resolveAgentAdapter("unknown"), /unsupported/i);
 });

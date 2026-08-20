@@ -51,10 +51,10 @@ function readEffective(agentId, adapterId, workspace) {
     context: {}
   };
 }
-test("storage schema initializes layout v7 with aggregate v18 and rejects non-current versions", () => {
+test("storage schema initializes layout v7 with the current aggregate and rejects non-current versions", () => {
   const home = temporaryHome();
   assert.equal(CURRENT_STORAGE_LAYOUT_VERSION, 7);
-  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 18);
+  assert.equal(CURRENT_AGGREGATE_SCHEMA_VERSION, 19);
   assert.equal(inspectStorageSchema(home).status, "uninitialized");
 
   ensureStorageSchema(home, new Date("2026-07-19T00:00:00.000Z"));
@@ -232,7 +232,7 @@ test("FileTaskStore commits the authoritative workflow graph in one aggregate wr
   });
 
   const onDisk = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-  assert.equal(onDisk.schemaVersion, 18);
+  assert.equal(onDisk.schemaVersion, CURRENT_AGGREGATE_SCHEMA_VERSION);
   assert.equal(onDisk.tasks[task.id].schemaVersion, CURRENT_STORED_TASK_SCHEMA_VERSION);
   assert.equal(onDisk.revision, 1);
   assert.deepEqual(store.getConfiguredAgent("codex"), agent);

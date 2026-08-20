@@ -11,7 +11,7 @@ import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
 import {
   currentRoleRunProgressAt,
-  DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS
+  DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS
 } from "./roleRunStall.js";
 
 export const EXITED_ROLE_RUN_SUMMARY = "The role's tmux session exited before the run yielded.";
@@ -237,5 +237,5 @@ function isResourceCandidate(
   }
   const deliveredAt = Date.parse(run.deliveredAt);
   return Number.isFinite(deliveredAt)
-    && now.getTime() - deliveredAt >= DEFAULT_EXECUTION_STALL_CANDIDATE_AGE_MS;
+    && now.getTime() - deliveredAt >= DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS;
 }

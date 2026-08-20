@@ -64,6 +64,11 @@ import {
   type TaskRuntimeIsolationDescriptor
 } from "../runtime/taskRuntimeIsolation.js";
 import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
+import {
+  builtinAgentDriverRegistry,
+  builtinDriverIdForAdapter
+} from "../runtime/builtinAgentDrivers.js";
+import { managedRuntimeAdmission } from "../runtime/agentDriver.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -468,16 +473,32 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           trustWorkspace: true
         })
       : undefined;
-    if (codexConfig?.notify.status === "configured") {
+    if (
+      codexConfig?.notify.status === "configured"
+      && (owner.scope !== "task" || input.runId === undefined)
+    ) {
       throw new Error(
         "Codex notify is already configured by "
-        + `${codexConfig.notify.source}; Yui requires exclusive ownership of the structured `
-        + "notify callback and refuses to replace or be replaced by native configuration."
+        + `${codexConfig.notify.source}; this interactive Yui Session requires exclusive `
+        + "ownership of the structured notify callback and refuses to replace or be replaced "
+        + "by native configuration."
       );
     }
     const managedRun = owner.scope === "task" && input.runId !== undefined
       ? this.store.getAgentRun(owner.taskId, input.runId)
       : null;
+    const driver = builtinAgentDriverRegistry().require(
+      builtinDriverIdForAdapter(configured.adapterId)
+    );
+    if (owner.scope === "task" && input.runId !== undefined) {
+      const admission = managedRuntimeAdmission(driver.capabilities);
+      if (!admission.admitted) {
+        throw new Error(
+          `Agent Driver ${driver.id} cannot host managed Runs; missing capabilities: `
+          + admission.missing.join(", ")
+        );
+      }
+    }
     const roleConfig = binding.config.adapterId === "claude"
       && owner.scope === "task"
       && input.runId !== undefined
@@ -536,7 +557,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     let command = configured.command;
     let session: SchedulerRoleSession | null;
     if (binding.adapterId === "codex") {
-      args = addCodexSessionNotify(args, launchMode, this.#cliPath);
+      // Global/interactive Codex sessions still use notify for presentation.
+      // Managed Runs use the structured Driver Hook as their sole lifecycle
+      // authority, avoiding two terminal channels for the same Turn.
+      if (owner.scope !== "task" || input.runId === undefined) {
+        args = addCodexSessionNotify(args, launchMode, this.#cliPath);
+      }
       // A fresh Codex TUI has no provider event before its first prompt. Carry
       // the exact Run input as the provider's positional launch prompt so it is
       // submitted only after Codex completes startup; never race terminal bytes
@@ -653,6 +679,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         YUI_ROLE: role.name,
         YUI_AGENT_ID: configured.id,
         YUI_ADAPTER_ID: configured.adapterId,
+        YUI_DRIVER_ID: driver.id,
         YUI_WORKSPACE: effectiveWorkspace,
         ...(jobCallerKey === undefined ? {} : { YUI_JOB_CALLER_KEY: jobCallerKey }),
         ...(runtimeDescriptor === undefined
@@ -850,21 +877,26 @@ function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): stri
   const command = {
     type: "command",
     command: canonicalPath(process.execPath),
-    args: [canonicalPath(cliPath), "internal", "claude-hook"]
+    args: [canonicalPath(cliPath), "internal", "runtime-hook"]
   };
   writeTextFileAtomically(
     join(root, "hooks", "hooks.json"),
     `${JSON.stringify({
       hooks: {
-        // SessionStart proves the session exists (and, for source=startup,
-        // pre-input readiness); UserPromptSubmit is the exact provider-accepted
-        // fence; PostToolUse is a provider-native in-turn progress fact and
-        // StopFailure is the terminal failure fact. All route to the same
-        // Yui-owned entrypoint, which parses by hook_event_name.
+        // All native names terminate at the Driver edge; core sees only
+        // canonical RuntimeObservation values.
         SessionStart: [{ hooks: [command] }],
         UserPromptSubmit: [{ hooks: [command] }],
+        PreToolUse: [{ hooks: [command] }],
+        PermissionRequest: [{ hooks: [command] }],
+        MessageDisplay: [{ hooks: [command] }],
         PostToolUse: [{ hooks: [command] }],
-        StopFailure: [{ hooks: [command] }]
+        PostToolUseFailure: [{ hooks: [command] }],
+        SubagentStart: [{ hooks: [command] }],
+        SubagentStop: [{ hooks: [command] }],
+        Stop: [{ hooks: [command] }],
+        StopFailure: [{ hooks: [command] }],
+        SessionEnd: [{ hooks: [command] }]
       }
     }, null, 2)}\n`
   );
@@ -972,10 +1004,19 @@ function codexLifecycleHooksConfig(cliPath: string): string {
     shellQuote(canonicalPath(process.execPath)),
     shellQuote(canonicalPath(cliPath)),
     "internal",
-    "codex-hook"
+    "runtime-hook"
   ].join(" ");
   const handler = `{hooks=[{type="command",command=${JSON.stringify(command)}}]}`;
-  return `hooks={SessionStart=[${handler}],UserPromptSubmit=[${handler}]}`;
+  return `hooks={`
+    + `SessionStart=[${handler}],`
+    + `UserPromptSubmit=[${handler}],`
+    + `PreToolUse=[${handler}],`
+    + `PermissionRequest=[${handler}],`
+    + `PostToolUse=[${handler}],`
+    + `SubagentStart=[${handler}],`
+    + `SubagentStop=[${handler}],`
+    + `Stop=[${handler}]`
+    + `}`;
 }
 
 function addCodexLifecycleHooks(

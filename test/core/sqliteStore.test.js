@@ -53,7 +53,7 @@ function makeEvent(store, taskId, overrides = {}) {
     schemaVersion: 2,
     id: store.nextEventId(taskId),
     taskId,
-    type: "runtime.provider-turn-progress",
+    type: "run.progress",
     payload: {},
     createdAt: now,
     ...overrides
@@ -246,7 +246,7 @@ test("CRUD: event save/list (terminal, retained)", () => {
   const events = store.listEvents(task.id);
   assert.equal(events.length, 1);
   assert.equal(events[0].id, e1.id);
-  assert.equal(events[0].type, "runtime.provider-turn-progress");
+  assert.equal(events[0].type, "run.progress");
   store.close();
 });
 

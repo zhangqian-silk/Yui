@@ -243,7 +243,7 @@ test("the declarative catalog exposes exactly the lean public command surface", 
   assert.equal(internal.hidden, true);
   assert.deepEqual(
     internal.children.map((child) => child.name),
-    ["session-notify", "claude-hook", "codex-hook", "managed-claude-run"]
+    ["session-notify", "runtime-hook", "managed-claude-run"]
   );
   const completion = ROOT_COMMAND.children.find((child) => child.name === "completion");
   assert.ok(completion);
@@ -416,12 +416,9 @@ test("the canonical execution commands are callable while the redundant yield al
   const internal = routeInvocation(["internal", "session-notify", "{}"]);
   assert.equal(internal.kind, "execute");
   assert.deepEqual(internal.node.path, ["yui", "internal", "session-notify"]);
-  const claudeHook = routeInvocation(["internal", "claude-hook"]);
-  assert.equal(claudeHook.kind, "execute");
-  assert.deepEqual(claudeHook.node.path, ["yui", "internal", "claude-hook"]);
-  const codexHook = routeInvocation(["internal", "codex-hook"]);
-  assert.equal(codexHook.kind, "execute");
-  assert.deepEqual(codexHook.node.path, ["yui", "internal", "codex-hook"]);
+  const runtimeHook = routeInvocation(["internal", "runtime-hook"]);
+  assert.equal(runtimeHook.kind, "execute");
+  assert.deepEqual(runtimeHook.node.path, ["yui", "internal", "runtime-hook"]);
 
   const completion = routeInvocation([
     "completion", "candidates", "--shell", "zsh", "--index", "1", "--", "task"

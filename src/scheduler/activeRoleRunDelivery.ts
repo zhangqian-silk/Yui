@@ -20,10 +20,7 @@ import {
   effectiveLaunchSnapshotsCompatibleForTaskMain
 } from "../executor/effectiveLaunch.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
-import {
-  isPreInputReadinessSupported
-} from "../lifecycle/canonicalLifecycleEvent.js";
-import { preInputReadinessCapability } from "../lifecycle/providerLifecycleMapping.js";
+import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
@@ -248,7 +245,8 @@ export async function processActiveRoleRunDeliveries(
         // supported adapter whose readiness cannot be confirmed.
         if (
           ready.prepared.sessionStarted
-          && isPreInputReadinessSupported(preInputReadinessCapability(run.effective.adapterId))
+          && builtinAgentDriverRegistry().requireByAdapterId(run.effective.adapterId)
+            .capabilities.observation.preInputReadiness === "exact"
           && !providerReadyForPush(store, {
             taskId: task.id,
             roleName: role.name,

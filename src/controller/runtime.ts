@@ -76,6 +76,7 @@ import {
 } from "./jobSupervisor.js";
 import { createDurableJobControl } from "./jobControl.js";
 import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
+import { AgentRuntimeObserver } from "./agentRuntimeObserver.js";
 import {
   AsyncRuntimeEventProcessor,
   FileRuntimeEventProcessor,
@@ -562,6 +563,8 @@ export async function startFileTaskControllerRuntime(
               }
             }
           )),
+      runtimeObserver: options.runtimeObserver
+        ?? new AgentRuntimeObserver(store, runtimeEventInbox),
       domainIdentity,
       ...(options.configuration !== undefined
         ? { configuration: options.configuration }
