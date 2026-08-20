@@ -47,11 +47,21 @@ import type { Decision } from "../decision/decision.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from "../executor/agentExecutor.js";
+import {
+  validatePendingTurnCompletion,
+  type PendingTurnCompletion
+} from "../executor/turnCompletion.js";
 import type { TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { PendingProviderRetry } from "../run/providerRetry.js";
 import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
+import {
+  compareRuntimeSessionCandidates,
+  projectRuntimeSessionCandidate,
+  type RuntimeSessionCandidate,
+  type RuntimeSessionCandidateQuery
+} from "../runtime/runtimeSessionCandidate.js";
 import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { ReviewRound } from "../review/reviewRound.js";
@@ -811,6 +821,12 @@ export class SqliteTaskStore implements TaskStore {
           `INSERT INTO global_role_session_sets (name, payload, updated_at) VALUES (?, ?, ?)
            ON CONFLICT(name) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
         ).run(role.name, this.#json(sessions), this.#now());
+        this.#saveRuntimeSessionCandidate(sessions);
+      } else {
+        this.#db.prepare(
+          "DELETE FROM global_role_session_sets WHERE name = ?"
+        ).run(role.name);
+        this.#deleteRuntimeSessionCandidate({ scope: "global", roleName: role.name });
       }
     });
   }
@@ -833,7 +849,11 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   removeGlobalRole(name: string): boolean {
-    return this.#mutate(() => this.#db.prepare("DELETE FROM global_roles WHERE name = ?").run(name).changes > 0);
+    return this.#mutate(() => {
+      this.#deleteRuntimeSessionCandidate({ scope: "global", roleName: name });
+      this.#db.prepare("DELETE FROM global_role_session_sets WHERE name = ?").run(name);
+      return this.#db.prepare("DELETE FROM global_roles WHERE name = ?").run(name).changes > 0;
+    });
   }
 
   getGlobalRoleSessionSet(name: string): GlobalRoleSessionSet | null {
@@ -851,6 +871,7 @@ export class SqliteTaskStore implements TaskStore {
         `INSERT INTO global_role_session_sets (name, payload, updated_at) VALUES (?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(sessions.owner.roleName, this.#json(sessions), this.#now());
+      this.#saveRuntimeSessionCandidate(sessions);
     });
   }
 
@@ -1151,8 +1172,15 @@ export class SqliteTaskStore implements TaskStore {
     );
   }
 
-  listAllDurableJobs(): DurableJob[] {
-    return this.#listPayload<DurableJob>("durable_jobs", "1 = 1", []);
+  listActiveDurableJobs(): DurableJob[] {
+    return this.#sortById(
+      this.#listPayload<DurableJob>(
+        "durable_jobs",
+        "status IN ('queued', 'running')",
+        []
+      ),
+      (job) => `${job.taskId}/${job.id}`
+    );
   }
 
   hasActiveDurableJobs(): boolean {
@@ -1280,11 +1308,24 @@ export class SqliteTaskStore implements TaskStore {
         `INSERT INTO role_session_sets (task_id, role_name, payload, updated_at) VALUES (?, ?, ?, ?)
          ON CONFLICT(task_id, role_name) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(sessions.owner.taskId, sessions.owner.roleName, this.#json(sessions), this.#now());
+      this.#saveRuntimeSessionCandidate(sessions);
+      this.#savePendingRuntimeTurnCompletion(sessions);
     });
   }
 
   removeTaskRole(taskId: string, name: string): boolean {
     return this.#mutate(() => {
+      this.#deleteRuntimeSessionCandidate({
+        scope: "task",
+        taskId,
+        roleName: name
+      });
+      this.#db.prepare(
+        "DELETE FROM role_session_sets WHERE task_id = ? AND role_name = ?"
+      ).run(taskId, name);
+      this.#db.prepare(
+        "DELETE FROM pending_runtime_turn_completions WHERE task_id = ? AND role_name = ?"
+      ).run(taskId, name);
       const result = this.#db.prepare("DELETE FROM task_roles WHERE task_id = ? AND role_name = ?").run(taskId, name);
       return result.changes > 0;
     });
@@ -1368,6 +1409,207 @@ export class SqliteTaskStore implements TaskStore {
     );
   }
 
+  listRuntimeSessionCandidates(query: RuntimeSessionCandidateQuery = {}): RuntimeSessionCandidate[] {
+    const taskIds = query.taskIds === undefined
+      ? undefined
+      : [...new Set(query.taskIds)].sort(numericCompare);
+    if (taskIds?.length === 0 || (taskIds !== undefined && query.scope === "global")) {
+      return [];
+    }
+    const predicates: string[] = [];
+    const parameters: string[] = [];
+    if (query.cleanupRequiredOnly) predicates.push("cleanup_required = 1");
+    if (taskIds !== undefined) {
+      predicates.push("scope = 'task'");
+      predicates.push(`task_id IN (${taskIds.map(() => "?").join(", ")})`);
+      parameters.push(...taskIds);
+    } else if (query.scope !== undefined) {
+      predicates.push("scope = ?");
+      parameters.push(query.scope);
+    }
+    const where = predicates.length === 0
+      ? ""
+      : ` WHERE ${predicates.join(" AND ")}`;
+    const rows = this.#db.prepare(
+      `SELECT scope, task_id, role_name, agent_id, adapter_id,
+              native_session_id, launch_id, status, session_updated_at,
+              cleanup_required
+       FROM runtime_session_candidates${where}`
+    ).all(...parameters) as Array<{
+      scope: "task" | "global";
+      task_id: string;
+      role_name: string;
+      agent_id: string;
+      adapter_id: string;
+      native_session_id: string;
+      launch_id: string | null;
+      status: RuntimeSessionCandidate["status"];
+      session_updated_at: string;
+      cleanup_required: 0 | 1;
+    }>;
+    const candidates = rows.map((row): RuntimeSessionCandidate => ({
+      owner: row.scope === "task"
+        ? { scope: "task", taskId: row.task_id, roleName: row.role_name }
+        : { scope: "global", roleName: row.role_name },
+      agentId: row.agent_id,
+      adapterId: row.adapter_id,
+      nativeSessionId: row.native_session_id,
+      ...(row.launch_id === null ? {} : { launchId: row.launch_id }),
+      status: row.status,
+      sessionUpdatedAt: row.session_updated_at,
+      cleanupRequired: row.cleanup_required === 1
+    })).sort(compareRuntimeSessionCandidates);
+    for (const candidate of candidates) {
+      if (!this.#runtimeSessionCandidateMatchesSource(candidate)) {
+        throw new StorageRecordError(
+          `Runtime Session projection is inconsistent: ${
+            candidate.owner.scope === "task"
+              ? `${candidate.owner.taskId}/${candidate.owner.roleName}`
+              : `global/${candidate.owner.roleName}`
+          }.`
+        );
+      }
+    }
+    return candidates;
+  }
+
+  /**
+   * Compare the hot projection with the authoritative current Session without
+   * parsing or validating the RoleSessionSet aggregate.  In particular, the
+   * historical `history` field must never enter this cleanup discovery path:
+   * JSON1 reads only the active Agent object selected by `activeAgentId`.
+   */
+  #runtimeSessionCandidateMatchesSource(candidate: RuntimeSessionCandidate): boolean {
+    const source = candidate.owner.scope === "task"
+      ? {
+          table: "role_session_sets",
+          where: "task_id = ? AND role_name = ?",
+          parameters: [candidate.owner.taskId, candidate.owner.roleName]
+        }
+      : {
+          table: "global_role_session_sets",
+          where: "name = ?",
+          parameters: [candidate.owner.roleName]
+        };
+    type SourceRow = {
+      owner_scope: string | null;
+      owner_task_id: string | null;
+      owner_role_name: string | null;
+      active_agent_id: string | null;
+      agent_id: string | null;
+      adapter_id: string | null;
+      native_session_id: string | null;
+      launch_id: string | null;
+      status: RuntimeSessionCandidate["status"] | null;
+      session_updated_at: string | null;
+      cleanup_required: 0 | 1 | null;
+    };
+    let row: SourceRow | undefined;
+    try {
+      row = this.#db.prepare(
+        `WITH source AS (
+           SELECT payload,
+                  json_extract(payload, '$.activeAgentId') AS active_agent_id
+           FROM ${source.table}
+           WHERE ${source.where}
+         ), active AS (
+           SELECT payload,
+                  active_agent_id,
+                  json_extract(
+                    payload,
+                    '$.sessions.' || json_quote(active_agent_id)
+                  ) AS active_session
+           FROM source
+         )
+         SELECT
+           json_extract(payload, '$.owner.scope') AS owner_scope,
+           json_extract(payload, '$.owner.taskId') AS owner_task_id,
+           json_extract(payload, '$.owner.roleName') AS owner_role_name,
+           active_agent_id,
+           json_extract(active_session, '$.agentId') AS agent_id,
+           json_extract(active_session, '$.adapterId') AS adapter_id,
+           json_extract(active_session, '$.nativeSessionId') AS native_session_id,
+           json_extract(active_session, '$.launchId') AS launch_id,
+           json_extract(active_session, '$.status') AS status,
+           json_extract(active_session, '$.updatedAt') AS session_updated_at,
+           CASE
+             WHEN json_extract(active_session, '$.status') NOT IN ('stopped','broken')
+               AND (
+                 json_extract(active_session, '$.status') = 'running'
+                 OR json_type(active_session, '$.launchId') = 'text'
+               )
+             THEN 1 ELSE 0
+           END AS cleanup_required
+         FROM active`
+      ).get(...source.parameters) as SourceRow | undefined;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new StorageRecordError(
+        `Runtime Session projection source is invalid for ${
+          candidate.owner.scope === "task"
+            ? `${candidate.owner.taskId}/${candidate.owner.roleName}`
+            : `global/${candidate.owner.roleName}`
+        }: ${detail}`
+      );
+    }
+    if (row === undefined) return false;
+    return row.owner_scope === candidate.owner.scope
+      && row.owner_task_id === (
+        candidate.owner.scope === "task" ? candidate.owner.taskId : null
+      )
+      && row.owner_role_name === candidate.owner.roleName
+      && row.active_agent_id === candidate.agentId
+      && row.agent_id === candidate.agentId
+      && row.adapter_id === candidate.adapterId
+      && row.native_session_id === candidate.nativeSessionId
+      && (row.launch_id ?? undefined) === candidate.launchId
+      && row.status === candidate.status
+      && row.session_updated_at === candidate.sessionUpdatedAt
+      && row.cleanup_required === (candidate.cleanupRequired ? 1 : 0);
+  }
+
+  listPendingRuntimeTurnCompletions(taskIds?: readonly string[]): PendingTurnCompletion[] {
+    const selectedTaskIds = taskIds === undefined
+      ? undefined
+      : [...new Set(taskIds)].sort(numericCompare);
+    if (selectedTaskIds?.length === 0) return [];
+    const where = selectedTaskIds === undefined
+      ? ""
+      : ` WHERE task_id IN (${selectedTaskIds.map(() => "?").join(", ")})`;
+    const rows = this.#db.prepare(
+      `SELECT task_id, role_name, schema_version, agent_id, native_session_id,
+              turn_id, run_id, summary, observed_at, due_at
+       FROM pending_runtime_turn_completions${where}`
+    ).all(...(selectedTaskIds ?? [])) as Array<{
+      task_id: string;
+      role_name: string;
+      schema_version: number;
+      agent_id: string;
+      native_session_id: string;
+      turn_id: string;
+      run_id: string;
+      summary: string;
+      observed_at: string;
+      due_at: string;
+    }>;
+    return rows.map((row) => validatePendingTurnCompletion({
+      schemaVersion: row.schema_version,
+      taskId: row.task_id,
+      roleName: row.role_name,
+      agentId: row.agent_id,
+      nativeSessionId: row.native_session_id,
+      turnId: row.turn_id,
+      runId: row.run_id,
+      summary: row.summary,
+      observedAt: row.observed_at,
+      dueAt: row.due_at
+    })).sort((left, right) => (
+      numericCompare(left.taskId, right.taskId)
+      || numericCompare(left.roleName, right.roleName)
+      || numericCompare(left.runId, right.runId)
+    ));
+  }
+
   saveRoleSessionSet(sessions: TaskRoleSessionSet): void {
     const taskId = sessions.owner.taskId;
     this.#requireTask(taskId);
@@ -1376,6 +1618,8 @@ export class SqliteTaskStore implements TaskStore {
         `INSERT INTO role_session_sets (task_id, role_name, payload, updated_at) VALUES (?, ?, ?, ?)
          ON CONFLICT(task_id, role_name) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(taskId, sessions.owner.roleName, this.#json(sessions), this.#now());
+      this.#saveRuntimeSessionCandidate(sessions);
+      this.#savePendingRuntimeTurnCompletion(sessions);
     });
   }
 
@@ -1388,6 +1632,97 @@ export class SqliteTaskStore implements TaskStore {
     if (set === null) return null;
     const session = set.sessions[set.activeAgentId];
     return session === undefined ? null : session;
+  }
+
+  #saveRuntimeSessionCandidate(
+    sessions: TaskRoleSessionSet | GlobalRoleSessionSet
+  ): void {
+    const candidate = projectRuntimeSessionCandidate(sessions);
+    if (candidate === null) {
+      this.#deleteRuntimeSessionCandidate(sessions.owner);
+      return;
+    }
+    const taskId = candidate.owner.scope === "task" ? candidate.owner.taskId : "";
+    this.#db.prepare(
+      `INSERT INTO runtime_session_candidates (
+         scope, task_id, role_name, agent_id, adapter_id, native_session_id,
+         launch_id, status, session_updated_at, cleanup_required
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(scope, task_id, role_name) DO UPDATE SET
+         agent_id = excluded.agent_id,
+         adapter_id = excluded.adapter_id,
+         native_session_id = excluded.native_session_id,
+         launch_id = excluded.launch_id,
+         status = excluded.status,
+         session_updated_at = excluded.session_updated_at,
+         cleanup_required = excluded.cleanup_required`
+    ).run(
+      candidate.owner.scope,
+      taskId,
+      candidate.owner.roleName,
+      candidate.agentId,
+      candidate.adapterId,
+      candidate.nativeSessionId,
+      candidate.launchId ?? null,
+      candidate.status,
+      candidate.sessionUpdatedAt,
+      candidate.cleanupRequired ? 1 : 0
+    );
+  }
+
+  #deleteRuntimeSessionCandidate(owner: RuntimeOwner): void {
+    this.#db.prepare(
+      `DELETE FROM runtime_session_candidates
+       WHERE scope = ? AND task_id = ? AND role_name = ?`
+    ).run(
+      owner.scope,
+      owner.scope === "task" ? owner.taskId : "",
+      owner.roleName
+    );
+  }
+
+  /** Maintain the independent pending-Turn projection in the same write txn. */
+  #savePendingRuntimeTurnCompletion(sessions: TaskRoleSessionSet): void {
+    const owner = sessions.owner;
+    const pending = sessions.pendingTurnCompletion;
+    if (pending === null) {
+      this.#db.prepare(
+        "DELETE FROM pending_runtime_turn_completions WHERE task_id = ? AND role_name = ?"
+      ).run(owner.taskId, owner.roleName);
+      return;
+    }
+    const normalized = validatePendingTurnCompletion(pending);
+    if (normalized.taskId !== owner.taskId || normalized.roleName !== owner.roleName) {
+      throw new StorageRecordError(
+        `Pending Turn completion owner does not match Role session: ${owner.taskId}/${owner.roleName}.`
+      );
+    }
+    this.#db.prepare(
+      `INSERT INTO pending_runtime_turn_completions (
+         task_id, role_name, schema_version, agent_id, native_session_id,
+         turn_id, run_id, summary, observed_at, due_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(task_id, role_name) DO UPDATE SET
+         schema_version = excluded.schema_version,
+         agent_id = excluded.agent_id,
+         native_session_id = excluded.native_session_id,
+         turn_id = excluded.turn_id,
+         run_id = excluded.run_id,
+         summary = excluded.summary,
+         observed_at = excluded.observed_at,
+         due_at = excluded.due_at`
+    ).run(
+      normalized.taskId,
+      normalized.roleName,
+      normalized.schemaVersion,
+      normalized.agentId,
+      normalized.nativeSessionId,
+      normalized.turnId,
+      normalized.runId,
+      normalized.summary,
+      normalized.observedAt,
+      normalized.dueAt
+    );
   }
 
   // -- work items -------------------------------------------------------------
@@ -1683,17 +2018,34 @@ export class SqliteTaskStore implements TaskStore {
    * replaces the adapter's per-Task in-memory sweep, so Controller deadline
    * arming no longer materializes every Task and Run in JavaScript.
    */
-  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
+  listPendingProviderRetries(taskIds?: readonly string[]): ReadonlyArray<PendingProviderRetry> {
+    const selectedTaskIds = taskIds === undefined
+      ? undefined
+      : [...new Set(taskIds)].sort(numericCompare);
+    if (selectedTaskIds?.length === 0) return [];
+    const taskPredicate = selectedTaskIds === undefined
+      ? ""
+      : ` AND tc.task_id IN (${selectedTaskIds.map(() => "?").join(", ")})`;
     const rows = this.#db.prepare(
-      `SELECT ar.task_id AS taskId, ar.run_id AS runId, ar.role_name AS roleName,
+      `SELECT DISTINCT ar.task_id AS taskId, ar.run_id AS runId, ar.role_name AS roleName,
               json_extract(ar.payload, '$.providerRetry.nextAttemptAt') AS nextAttemptAt
-       FROM agent_runs ar
-       JOIN tasks_catalog tc ON tc.task_id = ar.task_id
-       WHERE ar.status = 'active'
-         AND tc.is_active = 1
-         AND json_extract(ar.payload, '$.providerRetry.nextAttemptAt') IS NOT NULL`
-    ).all() as Array<{ taskId: string; runId: string; roleName: string; nextAttemptAt: string }>;
-    return rows;
+       FROM tasks_catalog tc INDEXED BY idx_tasks_active
+       JOIN active_runs ap ON ap.task_id = tc.task_id
+       JOIN agent_runs ar ON ar.task_id = ap.task_id AND ar.run_id = ap.run_id
+       WHERE tc.is_active = 1
+         AND ar.status = 'active'
+         AND json_extract(ar.payload, '$.providerRetry.nextAttemptAt') IS NOT NULL${taskPredicate}`
+    ).all(...(selectedTaskIds ?? [])) as Array<{
+      taskId: string;
+      runId: string;
+      roleName: string;
+      nextAttemptAt: string;
+    }>;
+    return rows.sort((left, right) => (
+      numericCompare(left.taskId, right.taskId)
+      || numericCompare(left.roleName, right.roleName)
+      || numericCompare(left.runId, right.runId)
+    ));
   }
 
   // -- review rounds ----------------------------------------------------------
@@ -1766,12 +2118,92 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
-  #getActiveRun(taskId: string, pointer: string): AgentRun | null {
+  #readActiveRunPointer(taskId: string, pointer: string): {
+    runId: string;
+    run: AgentRun | null;
+  } | null {
     const row = this.#db.prepare(
       "SELECT run_id FROM active_runs WHERE task_id = ? AND pointer = ?"
     ).get(taskId, pointer) as { run_id: string } | undefined;
     if (row === undefined) return null;
-    return this.getAgentRun(taskId, row.run_id);
+    return {
+      runId: row.run_id,
+      run: this.getAgentRun(taskId, row.run_id)
+    };
+  }
+
+  #assertActiveRunForWrite(
+    run: AgentRun,
+    lane?: Readonly<{ executionGroupId: string; executionLaneId: string }>
+  ): void {
+    if (run.status !== "active") {
+      throw new StorageRecordError(`Active Agent run must have active status: ${run.id}`);
+    }
+    const hasGroup = run.executionGroupId !== undefined;
+    const hasLane = run.executionLaneId !== undefined;
+    if (hasGroup !== hasLane) {
+      throw new StorageRecordError(`Agent Run execution lineage is incomplete: ${run.id}.`);
+    }
+    if (lane !== undefined
+      && (run.executionGroupId !== lane.executionGroupId
+        || run.executionLaneId !== lane.executionLaneId)) {
+      throw new StorageRecordError(
+        `Active Agent run execution lineage does not match its Lane: ${run.id}`
+      );
+    }
+  }
+
+  #getActiveRoleRun(taskId: string, roleName: string): AgentRun | null {
+    const pointer = this.#readActiveRunPointer(taskId, roleName);
+    if (pointer === null) return null;
+    const task = this.getTask(taskId);
+    if (task === null) {
+      throw new StorageRecordError(`Active Agent run Task is missing: ${taskId}/${roleName}`);
+    }
+    if (pointer.run === null) {
+      // Retired Tasks are an explicit historical isolation boundary. Their
+      // retained pointer rows may intentionally reference a missing Run.
+      if (task.status === "retired") return null;
+      throw new StorageRecordError(`Active Agent run pointer is dangling: ${taskId}/${roleName}`);
+    }
+    const run = pointer.run;
+    if (task.status === "retired") return run;
+    if (run.id !== pointer.runId
+      || run.taskId !== taskId
+      || run.roleName !== roleName
+      || run.status !== "active"
+      || (run.executionGroupId === undefined) !== (run.executionLaneId === undefined)) {
+      throw new StorageRecordError(`Active Agent run pointer is invalid: ${taskId}/${roleName}`);
+    }
+    return run;
+  }
+
+  #getActiveLaneRun(
+    taskId: string,
+    executionGroupId: string,
+    executionLaneId: string
+  ): AgentRun | null {
+    const pointerKey = executionLaneActiveRunKey(executionGroupId, executionLaneId);
+    const pointer = this.#readActiveRunPointer(taskId, pointerKey);
+    if (pointer === null) return null;
+    const task = this.getTask(taskId);
+    if (task === null) {
+      throw new StorageRecordError(`Active Agent run Task is missing: ${taskId}/${pointerKey}`);
+    }
+    if (pointer.run === null) {
+      if (task.status === "retired") return null;
+      throw new StorageRecordError(`Active Agent run pointer is dangling: ${taskId}/${pointerKey}`);
+    }
+    const run = pointer.run;
+    if (task.status === "retired") return run;
+    if (run.id !== pointer.runId
+      || run.taskId !== taskId
+      || run.status !== "active"
+      || run.executionGroupId !== executionGroupId
+      || run.executionLaneId !== executionLaneId) {
+      throw new StorageRecordError(`Active Agent run pointer is invalid: ${taskId}/${pointerKey}`);
+    }
+    return run;
   }
 
   #clearActiveRun(taskId: string, pointer: string): void {
@@ -1781,50 +2213,109 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
-    return this.#getActiveRun(taskId, roleName);
+    return this.#getActiveRoleRun(taskId, roleName);
   }
 
   saveActiveAgentRun(run: AgentRun): void {
-    if (run.executionGroupId !== undefined && run.executionLaneId !== undefined) {
+    if (run.executionGroupId !== undefined || run.executionLaneId !== undefined) {
       this.saveActiveExecutionLaneRun(run);
       return;
     }
-    this.#saveActiveRun(run.taskId, run.roleName, run.id);
+    this.transaction((store) => {
+      this.#assertActiveRunForWrite(run);
+      const current = store.getActiveAgentRun(run.taskId, run.roleName);
+      if (current !== null && current.id !== run.id) {
+        throw new StorageRecordError(`Role already has an active Agent run: ${run.taskId}/${run.roleName}`);
+      }
+      const sessions = store.getTaskRoleSessionSet(run.taskId, run.roleName);
+      if (sessions !== null && sessions.inFlight !== null && sessions.inFlight.runId !== run.id) {
+        throw new StorageRecordError(
+          `Role still has an in-flight Turn: ${run.taskId}/${run.roleName}/${sessions.inFlight.runId}`
+        );
+      }
+      // Keep the Run row and its active pointer in the same transaction. The
+      // adapter may have already written the row; this upsert remains
+      // intentionally idempotent for that backend-neutral path.
+      store.saveAgentRun(run);
+      this.#saveActiveRun(run.taskId, run.roleName, run.id);
+    });
   }
 
   clearActiveAgentRun(taskId: string, roleName: string): void {
     // Older Controller paths only know the Role key.  When that key points
     // at a lane-backed Run, remove the matching lane pointer too; preserve
     // every other lane for the same Role in a multi-lane group.
-    const rolePointer = this.#getActiveRun(taskId, roleName);
-    this.#clearActiveRun(taskId, roleName);
-    if (rolePointer === null) return;
-    const laneRows = this.#db.prepare(
-      "SELECT task_id, pointer FROM active_runs WHERE task_id = ?"
-    ).all(taskId) as Array<{ task_id: string; pointer: string }>;
-    for (const row of laneRows) {
-      if (executionLaneActiveRunKeyParts(row.pointer) !== null) {
-        const laneRun = this.#getActiveRun(taskId, row.pointer);
-        if (laneRun !== null && laneRun.id === rolePointer.id) {
+    this.transaction(() => {
+      const rolePointer = this.#readActiveRunPointer(taskId, roleName);
+      this.#clearActiveRun(taskId, roleName);
+      if (rolePointer === null) return;
+      const laneRows = this.#db.prepare(
+        "SELECT pointer, run_id FROM active_runs WHERE task_id = ?"
+      ).all(taskId) as Array<{ pointer: string; run_id: string }>;
+      for (const row of laneRows) {
+        if (executionLaneActiveRunKeyParts(row.pointer) !== null
+          && row.run_id === rolePointer.runId) {
           this.#clearActiveRun(taskId, row.pointer);
         }
       }
-    }
+    });
   }
 
   getActiveExecutionLaneRun(taskId: string, executionGroupId: string, executionLaneId: string): AgentRun | null {
-    return this.#getActiveRun(taskId, executionLaneActiveRunKey(executionGroupId, executionLaneId));
+    return this.#getActiveLaneRun(taskId, executionGroupId, executionLaneId);
   }
 
   saveActiveExecutionLaneRun(run: AgentRun): void {
     if (run.executionGroupId === undefined || run.executionLaneId === undefined) {
       throw new StorageRecordError(`Active execution-lane run requires group and lane ids: ${run.id}`);
     }
-    this.#saveActiveRun(run.taskId, executionLaneActiveRunKey(run.executionGroupId, run.executionLaneId), run.id);
+    this.transaction((store) => {
+      const key = executionLaneActiveRunKey(run.executionGroupId!, run.executionLaneId!);
+      this.#assertActiveRunForWrite(run, {
+        executionGroupId: run.executionGroupId!,
+        executionLaneId: run.executionLaneId!
+      });
+      const current = store.getActiveExecutionLaneRun(
+        run.taskId,
+        run.executionGroupId!,
+        run.executionLaneId!
+      );
+      if (current !== null && current.id !== run.id) {
+        throw new StorageRecordError(`Execution Lane already has an active Agent run: ${run.taskId}/${key}`);
+      }
+      const sessions = store.getTaskRoleSessionSet(run.taskId, run.roleName);
+      if (sessions !== null && sessions.inFlight !== null && sessions.inFlight.runId !== run.id) {
+        throw new StorageRecordError(
+          `Role still has an in-flight Turn: ${run.taskId}/${run.roleName}/${sessions.inFlight.runId}`
+        );
+      }
+      const rolePointer = this.#readActiveRunPointer(run.taskId, run.roleName);
+      store.saveAgentRun(run);
+      this.#saveActiveRun(run.taskId, key, run.id);
+      // Keep the legacy role pointer for the single-lane delivery path, but
+      // never replace it when another Lane already owns that Role.
+      if (rolePointer === null) {
+        this.#saveActiveRun(run.taskId, run.roleName, run.id);
+      }
+    });
   }
 
   clearActiveExecutionLaneRun(taskId: string, executionGroupId: string, executionLaneId: string): void {
-    this.#clearActiveRun(taskId, executionLaneActiveRunKey(executionGroupId, executionLaneId));
+    this.transaction(() => {
+      const key = executionLaneActiveRunKey(executionGroupId, executionLaneId);
+      const lanePointer = this.#readActiveRunPointer(taskId, key);
+      this.#clearActiveRun(taskId, key);
+      if (lanePointer === null) return;
+      const roleRows = this.#db.prepare(
+        "SELECT pointer, run_id FROM active_runs WHERE task_id = ?"
+      ).all(taskId) as Array<{ pointer: string; run_id: string }>;
+      for (const row of roleRows) {
+        if (executionLaneActiveRunKeyParts(row.pointer) === null
+          && row.run_id === lanePointer.runId) {
+          this.#clearActiveRun(taskId, row.pointer);
+        }
+      }
+    });
   }
 
   // -- messages ----------------------------------------------------------------
@@ -1873,6 +2364,24 @@ export class SqliteTaskStore implements TaskStore {
     return this.#sortById(
       this.#listPayload<InputRequest>("input_requests", "task_id = ?", [taskId]),
       (request) => request.id
+    );
+  }
+
+  listOpenInputRequests(taskIds?: readonly string[]): InputRequest[] {
+    const selectedTaskIds = taskIds === undefined
+      ? undefined
+      : [...new Set(taskIds)].sort(numericCompare);
+    if (selectedTaskIds?.length === 0) return [];
+    const where = selectedTaskIds === undefined
+      ? "status = 'open'"
+      : `status = 'open' AND task_id IN (${selectedTaskIds.map(() => "?").join(", ")})`;
+    return this.#sortById(
+      this.#listPayload<InputRequest>(
+        "input_requests",
+        where,
+        selectedTaskIds ?? []
+      ),
+      (request) => `${request.taskId}/${request.id}`
     );
   }
 
@@ -2037,6 +2546,16 @@ export class SqliteTaskStore implements TaskStore {
     return rows.map((row) => this.#rowToMailbox(row));
   }
 
+  listReadyWorkMailboxes(): WorkMailbox[] {
+    const rows = this.#db.prepare(
+      `SELECT target_kind, task_id, role_name, next_sequence, processing, pending
+       FROM mailboxes
+       WHERE processing IS NOT NULL OR pending IS NOT NULL
+       ORDER BY target_key`
+    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string | null }>;
+    return rows.map((row) => this.#rowToMailbox(row));
+  }
+
   saveWorkMailbox(mailbox: WorkMailbox): void {
     const cols = this.#mailboxCols(mailbox.target);
     this.#mutate(() => {
@@ -2160,7 +2679,7 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   listPendingWakeups(): PendingWakeup[] {
-    return this.listWorkMailboxes()
+    return this.listReadyWorkMailboxes()
       .flatMap((mailbox) => {
         const wakeup = pendingWakeupProjection(mailbox);
         return wakeup === null ? [] : [wakeup];

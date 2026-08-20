@@ -527,6 +527,7 @@ export async function startFileTaskControllerRuntime(
       intervalMs: options.intervalMs
         ?? reconciliationIntervalMilliseconds(store.getConfig().reconciliationIntervalSeconds),
       signalWindowMs: options.signalWindowMs,
+      taskConcurrency: options.taskConcurrency,
       deliveryRetryMs: options.deliveryRetryMs,
       deliveryRetryLimit: options.deliveryRetryLimit,
       now: options.now,

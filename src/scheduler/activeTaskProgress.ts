@@ -1,5 +1,5 @@
 import {
-  selectedSchedulerTasks,
+  selectedActiveSchedulerTasks,
   isSchedulerTaskWorkspaceReady,
   type SchedulerReconcileSelection,
   type SchedulerStorePort
@@ -31,8 +31,7 @@ export function repairOrphanedActiveTasks(
   selection?: SchedulerReconcileSelection
 ): readonly string[] {
   const repaired: string[] = [];
-  for (const task of selectedSchedulerTasks(store, selection)) {
-    if (task.status !== "active") continue;
+  for (const task of selectedActiveSchedulerTasks(store, selection)) {
     const roles = store.listRoles(task.id);
     const activeRuns = roles.flatMap((role) => {
       const run = store.getActiveAgentRun(task.id, role.name);

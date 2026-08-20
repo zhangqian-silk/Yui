@@ -48,11 +48,21 @@ import {
   type RoleAgentSession,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
+import {
+  validatePendingTurnCompletion,
+  type PendingTurnCompletion
+} from "../executor/turnCompletion.js";
 import { validateTaskMessage, type TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import { validateAgentRun, type AgentRun } from "../run/agentRun.js";
 import type { PendingProviderRetry } from "../run/providerRetry.js";
 import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
+import {
+  compareRuntimeSessionCandidates,
+  projectRuntimeSessionCandidate,
+  type RuntimeSessionCandidate,
+  type RuntimeSessionCandidateQuery
+} from "../runtime/runtimeSessionCandidate.js";
 import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
 import { FileSessionOwnerRegistry } from "../runtime/sessionOwnerRegistry.js";
 import {
@@ -406,6 +416,8 @@ export type TaskStore = {
   nextTaskId(): string;
   saveTask(task: Task): void;
   listTasks(): Task[];
+  /** Active Task ids only; production SQLite uses its bounded catalog index. */
+  listActiveTaskIds(): string[];
   /** Current durable state revision; advances once per committed mutation. */
   getStateRevision(): number;
   getTask(id: string): Task | null;
@@ -436,7 +448,8 @@ export type TaskStore = {
   listDurableJobs(taskId: string): DurableJob[];
   getDurableJob(taskId: string, jobId: string): DurableJob | null;
   findDurableJobByIdempotencyKey(taskId: string, key: string): DurableJob | null;
-  listAllDurableJobs(): DurableJob[];
+  /** Jobs that still require Controller supervision, across all Tasks. */
+  listActiveDurableJobs(): DurableJob[];
   hasActiveDurableJobs(): boolean;
   saveRole(taskId: string, role: TaskRole): void;
   listRoles(taskId: string): TaskRole[];
@@ -456,6 +469,10 @@ export type TaskStore = {
   getRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
   getTaskRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
   listRoleSessionSets(taskId: string): TaskRoleSessionSet[];
+  /** Current non-stopped Role Sessions; production SQLite reads a bounded hot projection. */
+  listRuntimeSessionCandidates(query?: RuntimeSessionCandidateQuery): RuntimeSessionCandidate[];
+  /** Pending native Turn completions from the independent bounded hot projection. */
+  listPendingRuntimeTurnCompletions(taskIds?: readonly string[]): PendingTurnCompletion[];
   saveRoleSessionSet(sessions: TaskRoleSessionSet): void;
   saveTaskRoleSessionSet(sessions: TaskRoleSessionSet): void;
   getRoleSession(taskId: string, roleName: string): RoleAgentSession | null;
@@ -487,7 +504,7 @@ export type TaskStore = {
    * store answers this with one indexed query; the legacy File store fails
    * closed because in-place retry is a db-only control-plane capability.
    */
-  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry>;
+  listPendingProviderRetries(taskIds?: readonly string[]): ReadonlyArray<PendingProviderRetry>;
   nextReviewRoundId(taskId: string): string;
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
@@ -517,6 +534,8 @@ export type TaskStore = {
   saveInputRequest(taskId: string, request: InputRequest): void;
   getInputRequest(taskId: string, requestId: string): InputRequest | null;
   listInputRequests(taskId: string): InputRequest[];
+  /** Open requests only; production SQLite uses the bounded partial index. */
+  listOpenInputRequests(taskIds?: readonly string[]): InputRequest[];
   listAllInputRequests(): InputRequest[];
   nextDecisionId(taskId: string): string;
   saveDecision(taskId: string, decision: Decision): void;
@@ -559,6 +578,8 @@ export type TaskStore = {
   pruneGateArtifacts(projectId: string, options: GateArtifactPruneOptions): GateArtifactPruneResult;
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   listWorkMailboxes(): WorkMailbox[];
+  /** Mailboxes with processing or pending work, in mailbox target-key order. */
+  listReadyWorkMailboxes(): WorkMailbox[];
   saveWorkMailbox(mailbox: WorkMailbox): void;
   removeWorkMailbox(target: MailboxTarget): boolean;
   /** @deprecated Transitional projection over the Leader Role WorkMailbox. It cannot expose processing batches or refs. */
@@ -890,6 +911,13 @@ export class FileTaskStore implements TaskStore {
       .map((aggregate) => clone(aggregate.task))
       .sort((left, right) => numericCompare(left.id, right.id));
   }
+  listActiveTaskIds(): string[] {
+    // The file rollback backend has no catalog index, so it filters the loaded
+    // aggregate. Layout-7 Controller hot paths use SQLite's bounded selector.
+    return this.listTasks()
+      .filter((task) => task.status === "active")
+      .map((task) => task.id);
+  }
   getStateRevision(): number { return this.#state().revision; }
   getTask(id: string): Task | null { return optional(this.#state().tasks[id]?.task); }
   readNextActionFacts(taskId: string): NextActionFacts | null {
@@ -1137,12 +1165,23 @@ export class FileTaskStore implements TaskStore {
       .find((job) => job.idempotencyKey === key);
     return optional(found);
   }
-  listAllDurableJobs(): DurableJob[] {
+  listActiveDurableJobs(): DurableJob[] {
+    // The file rollback backend has no secondary indexes, so it filters its
+    // already-loaded aggregate here. Layout-7 Controller hot paths use the
+    // SQLite implementation below, whose status index avoids this history
+    // scan; the return contract and ordering stay identical across backends.
     const all: DurableJob[] = [];
     for (const aggregate of Object.values(this.#state().tasks)) {
-      all.push(...Object.values(aggregate.durableJobs));
+      for (const job of Object.values(aggregate.durableJobs)) {
+        if (job.status === "queued" || job.status === "running") all.push(job);
+      }
     }
-    return all.map((job) => clone(job));
+    return all
+      .map((job) => clone(job))
+      .sort((left, right) => numericCompare(
+        `${left.taskId}/${left.id}`,
+        `${right.taskId}/${right.id}`
+      ));
   }
   hasActiveDurableJobs(): boolean {
     for (const aggregate of Object.values(this.#state().tasks)) {
@@ -1317,6 +1356,61 @@ export class FileTaskStore implements TaskStore {
   listRoleSessionSets(taskId: string): TaskRoleSessionSet[] {
     return values(this.#requireTask(taskId).roleSessionSets, (set) => set.owner.roleName);
   }
+  listRuntimeSessionCandidates(query: RuntimeSessionCandidateQuery = {}): RuntimeSessionCandidate[] {
+    const state = this.#state();
+    const selectedTaskIds = query.taskIds === undefined
+      ? undefined
+      : [...new Set(query.taskIds)].sort(numericCompare);
+    const taskAggregates = query.scope === "global"
+      ? []
+      : selectedTaskIds === undefined
+        ? Object.values(state.tasks)
+        : selectedTaskIds.flatMap((taskId) => {
+            const aggregate = state.tasks[taskId];
+            return aggregate === undefined ? [] : [aggregate];
+          });
+    const candidates = [
+      ...taskAggregates.flatMap((task) => (
+        Object.values(task.roleSessionSets).flatMap((sessions) => {
+          const candidate = projectRuntimeSessionCandidate(sessions);
+          return candidate === null ? [] : [candidate];
+        })
+      )),
+      ...(query.scope === "task" || selectedTaskIds !== undefined
+        ? []
+        : Object.values(state.globalRoleSessionSets).flatMap((sessions) => {
+            const candidate = projectRuntimeSessionCandidate(sessions);
+            return candidate === null ? [] : [candidate];
+          }))
+    ];
+    return candidates
+      .filter((candidate) => !query.cleanupRequiredOnly || candidate.cleanupRequired)
+      .sort(compareRuntimeSessionCandidates);
+  }
+  listPendingRuntimeTurnCompletions(taskIds?: readonly string[]): PendingTurnCompletion[] {
+    const selectedTaskIds = taskIds === undefined
+      ? undefined
+      : [...new Set(taskIds)].sort(numericCompare);
+    if (selectedTaskIds?.length === 0) return [];
+    const taskAggregates = selectedTaskIds === undefined
+      ? Object.values(this.#state().tasks)
+      : selectedTaskIds.flatMap((taskId) => {
+          const aggregate = this.#state().tasks[taskId];
+          return aggregate === undefined ? [] : [aggregate];
+        });
+    return taskAggregates.flatMap((aggregate) => (
+      Object.values(aggregate.roleSessionSets).flatMap((sessions) => {
+        const pending = sessions.pendingTurnCompletion;
+        return pending === null || pending === undefined
+          ? []
+          : [validatePendingTurnCompletion(pending)];
+      })
+    )).sort((left, right) => (
+      numericCompare(left.taskId, right.taskId)
+      || numericCompare(left.roleName, right.roleName)
+      || numericCompare(left.runId, right.runId)
+    ));
+  }
   saveRoleSessionSet(sessions: TaskRoleSessionSet): void {
     const stored = taskSessions(sessions);
     const taskId = stored.owner.taskId;
@@ -1429,11 +1523,17 @@ export class FileTaskStore implements TaskStore {
   }
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
-  listPendingProviderRetries(): ReadonlyArray<PendingProviderRetry> {
+  listPendingProviderRetries(taskIds?: readonly string[]): ReadonlyArray<PendingProviderRetry> {
     // The legacy File store can answer the empty case without a scan fallback.
     // If durable retry state exists, the db-only capability must fail closed
     // instead of silently losing the Controller's wake deadline.
-    for (const task of this.listTasks()) {
+    const tasks = taskIds === undefined
+      ? this.listTasks()
+      : [...new Set(taskIds)].sort(numericCompare).flatMap((taskId) => {
+          const task = this.getTask(taskId);
+          return task === null ? [] : [task];
+        });
+    for (const task of tasks) {
       if (task.status !== "active") continue;
       for (const run of this.listAgentRuns(task.id)) {
         if (run.status === "active" && run.providerRetry?.nextAttemptAt !== undefined) {
@@ -1738,6 +1838,23 @@ export class FileTaskStore implements TaskStore {
   listInputRequests(taskId: string): InputRequest[] {
     return values(this.#requireTask(taskId).inputRequests, "id");
   }
+  listOpenInputRequests(taskIds?: readonly string[]): InputRequest[] {
+    const state = this.#state();
+    const selected = taskIds === undefined
+      ? Object.values(state.tasks)
+      : [...new Set(taskIds)].sort(numericCompare).flatMap((taskId) => {
+          const aggregate = state.tasks[taskId];
+          return aggregate === undefined ? [] : [aggregate];
+        });
+    return selected
+      .flatMap((aggregate) => Object.values(aggregate.inputRequests))
+      .filter((request) => request.status === "open")
+      .map(clone)
+      .sort((left, right) => (
+        numericCompare(left.taskId, right.taskId)
+        || numericCompare(left.id, right.id)
+      ));
+  }
   listAllInputRequests(): InputRequest[] {
     return Object.values(this.#state().tasks)
       .flatMap((aggregate) => Object.values(aggregate.inputRequests).map(clone))
@@ -2038,6 +2155,15 @@ export class FileTaskStore implements TaskStore {
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([, mailbox]) => clone(mailbox));
   }
+  listReadyWorkMailboxes(): WorkMailbox[] {
+    // The file rollback backend has no secondary indexes. It filters the
+    // in-memory aggregate while preserving the indexed SQLite contract's
+    // target-key order; production layout 7 uses the bounded SQLite query.
+    return Object.entries(this.#state().mailboxes)
+      .filter(([, mailbox]) => mailbox.processing !== null || mailbox.pending !== null)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, mailbox]) => clone(mailbox));
+  }
   saveWorkMailbox(value: WorkMailbox): void {
     let mailbox: WorkMailbox;
     try {
@@ -2061,7 +2187,7 @@ export class FileTaskStore implements TaskStore {
     return pendingWakeupProjection(this.getWorkMailbox({ kind: "role", taskId, roleName: "leader" }));
   }
   listPendingWakeups(): PendingWakeup[] {
-    return this.listWorkMailboxes()
+    return this.listReadyWorkMailboxes()
       .flatMap((mailbox) => {
         const wakeup = pendingWakeupProjection(mailbox);
         return wakeup === null ? [] : [wakeup];

@@ -3,13 +3,12 @@
  *
  * The supervisor is pure logic over injected ports. It is invoked from the
  * Controller scheduler pass and on Controller startup. Each pass reconciles
- * every job toward its correct state:
+ * only jobs that can still change under supervision:
  *
  *  queued  -> write spec, spawn detached runner, transition to running
  *  running -> harvest exit.json / liveness via pid+startIdentity /
  *             evidence ladder (exit.json -> checkpoint -> unknown) /
  *             stale heartbeat SIGTERM then SIGKILL escalation
- *  terminal + !wakeupNotified -> set flag + enqueue Leader wakeup
  *  cancelRequestedAt -> write cancel fence + SIGTERM
  */
 import { spawn } from "node:child_process";
@@ -106,7 +105,12 @@ export type DurableJobReadyMarker = Readonly<{
 }>;
 
 export type JobSupervisorStorePort = Readonly<{
-  listAllDurableJobs(): readonly DurableJob[];
+  /**
+   * Current-contract terminal transitions atomically persist
+   * `wakeupNotified` and enqueue the Leader wakeup. Terminal history therefore
+   * never needs a recovery scan; only queued/running jobs belong here.
+   */
+  listActiveDurableJobs(): readonly DurableJob[];
   transitionDurableJob(
     taskId: string,
     jobId: string,
@@ -177,7 +181,7 @@ export class DurableJobSupervisor {
   }
 
   reconcile(now: Date): void {
-    const jobs = this.#store.listAllDurableJobs();
+    const jobs = this.#store.listActiveDurableJobs();
     for (const job of jobs) {
       try {
         this.#reconcileJob(job, now);
@@ -197,9 +201,6 @@ export class DurableJobSupervisor {
     if (job.status === "running") {
       this.#superviseRunning(job, now);
       return;
-    }
-    if (isDurableJobTerminal(job.status) && job.wakeupNotified !== true) {
-      this.#notifyWakeup(job, now);
     }
   }
 
@@ -568,22 +569,6 @@ export class DurableJobSupervisor {
     });
   }
 
-  /**
-   * Recovery fallback for terminal jobs that reached their terminal state
-   * before the atomic wakeup composition existed (or whose wakeup was lost).
-   * The normal path (#harvestExit / #handleDeadProcess) already composes
-   * complete + wakeupNotified + enqueue in one transaction; this pass only
-   * fires for jobs that somehow slipped through without wakeupNotified.
-   */
-  #notifyWakeup(job: DurableJob, now: Date): void {
-    this.#store.transitionDurableJob(
-      job.taskId,
-      job.id,
-      (current) => markDurableJobWakeupNotified(current, now),
-      now,
-      { reason: "job-finished", refs: wakeupRefs(job) }
-    );
-  }
 }
 
 function wakeupRefs(job: DurableJob): readonly MailboxEntityRef[] {
