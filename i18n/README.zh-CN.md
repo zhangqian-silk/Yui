@@ -52,7 +52,8 @@ Leader 和 Operator，再说明全局 Worker 配置会复制到新建的 Task Ro
 支持的思考强度。随后 setup 会确认位于 Yui home 外部的 Project workspace，
 并询问 shell completion。选择器同时提供原生 CLI 默认值和自定义值入口。
 再次运行不会删除已有 Task/Role，也不会改变当前安装的 Project workspace，
-可用于安全地调整配置。
+可用于安全地调整配置。setup 成功返回前会确保当前 Home 的后台 Controller
+已经启动。
 
 模型与思考强度属于 Agent binding 设置，因此 Operator、Leader 和全局
 Worker 即使使用同一个 Agent CLI，也可以采用不同配置。Profile 中的
@@ -476,6 +477,11 @@ yui controller restart
 ```
 
 `controller restart` 会用当前安装的 Yui 版本替换 Controller 进程及其调度循环、socket 服务，不会停止或重启已受管的 tmux/Agent 会话。
+
+成功的 `setup`、`upgrade` 和 `update` 都会确保当前 Home 有一个运行中的
+Controller；如果之前没有运行，会在完成后启动。只读命令和
+`upgrade --dry-run` 不会启动 Controller。`update` 只有在新二进制健康检查通过后，
+才会替换或启动 Controller。
 
 恢复 reconciliation 默认每 120 秒执行一次。普通持久状态变化只会将 Task、Role 或 Operator key 放入队列并立即返回；固定 100ms 窗口内到达的 key 会合并触发一次不重叠的定向处理。Operator 呈现使用独立 lane，不会被 Task 的 Git/worktree 操作阻塞；周期 Git/worktree 处理只覆盖仍有持久 Task mailbox 工作的 Task，活动 Role 的存活检查合并为一次 tmux inventory。Codex turn-complete Hook 直接写入存储，不启动或等待 Controller，并给合法的 yield、输入请求或完成动作保留 2 秒竞争窗口；到期后才关闭被 Agent 遗忘的活动 Role Run。持久 WorkMailbox 会冻结当前 processing 批次，期间的新事件合并到下一 pending 批次；失败会释放当前批次供恢复。推荐输入与 pending Turn 共用最近 deadline 选择器，不依赖恢复扫描间隔；显式 `task reconcile` 仍会立即请求恢复扫描。保留的闭环为：
 

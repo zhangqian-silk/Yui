@@ -302,6 +302,10 @@ export async function main(): Promise<void> {
       new NodeCommandExecutor(),
       setupIo
     );
+    // A successful setup leaves the Home ready for normal Yui work. Start the
+    // detached per-Home Controller even when setup began with no Controller;
+    // read-only commands and failed setup still remain non-starting paths.
+    await ensureFileTaskController(home, { environment: process.env });
     const refresh = await refreshRunningFileTaskControllerEnvironment(
       home,
       openCompatibleFileTaskStore(home),
@@ -354,6 +358,16 @@ export async function main(): Promise<void> {
         ? { controllerLifecycle: "externally-quiesced" }
         : {}
     );
+    // Public execute upgrades leave the Home operational even when no
+    // Controller existed before the command. Dry-run and the staged updater's
+    // externally-quiesced preflight must remain read-only/lifecycle-neutral.
+    if (
+      args.length === 1
+      && result.exitCode === 0
+      && process.env.YUI_UPDATE_EXTERNALLY_QUIESCED !== "1"
+    ) {
+      await ensureFileTaskController(home, { environment: process.env });
+    }
     process.exitCode = result.exitCode;
     emit(result.output, false, result.data);
     return;

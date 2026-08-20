@@ -279,6 +279,8 @@ export type UpdatePhase =
   | "post-verify";
 
 type UpdateControllerLifecycle = Readonly<{
+  /** Whether the update owns a Controller handoff and must leave one running. */
+  ensureRunning: boolean;
   wasRunning: boolean;
   stopped: boolean;
   identity?: ControllerIdentity;
@@ -511,11 +513,14 @@ function activateAndVerify(
     return restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
   }
 
-  if (lifecycle?.wasRunning === true) {
+  if (lifecycle?.ensureRunning === true) {
     try {
       ports.startController!(home);
     } catch (error) {
       const unknownActive = isUnknownActiveControllerFailure(error);
+      const startFailureAction = lifecycle.wasRunning
+        ? "The Home was not migrated. Keep writes quiesced and restore the previously running Controller identity before retrying."
+        : "The Home was not migrated. Keep writes quiesced and start the replacement Controller after verifying the activated binary.";
       const failure: UpdateResult = {
         outcome: "aborted",
         phase: "post-verify",
@@ -525,7 +530,7 @@ function activateAndVerify(
         action: unknownActive
           ? unknownActiveControllerAction(home, storageBackupPath)
           : storageBackupPath === undefined
-            ? "The Home was not migrated. Keep writes quiesced and restore the previously running Controller identity before retrying."
+            ? startFailureAction
             : postSwitchRecoveryAction(home, storageBackupPath),
         recoverable: false,
         version: staged.version,
@@ -570,7 +575,9 @@ function captureControllerLifecycle(
     ports.startController,
     ports.restoreController
   ].some((port) => port !== undefined);
-  if (!supplied) return { lifecycle: { wasRunning: false, stopped: false } };
+  if (!supplied) {
+    return { lifecycle: { ensureRunning: false, wasRunning: false, stopped: false } };
+  }
   if (
     ports.controllerStatus === undefined
     || ports.stopController === undefined
@@ -612,7 +619,9 @@ function captureControllerLifecycle(
       version
     };
   }
-  if (!status.running) return { lifecycle: { wasRunning: false, stopped: false } };
+  if (!status.running) {
+    return { lifecycle: { ensureRunning: true, wasRunning: false, stopped: false } };
+  }
   if (!isPositivePid(status.pid)) {
     return {
       outcome: "aborted",
@@ -669,6 +678,7 @@ function captureControllerLifecycle(
   }
   return {
     lifecycle: {
+      ensureRunning: true,
       wasRunning: true,
       stopped: true,
       identity: status.identity

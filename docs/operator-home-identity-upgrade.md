@@ -16,14 +16,9 @@ the Home in a consistent, usable state.
    yui update
    ```
 
-   If a Controller is running, replace it with the new binary:
-
-   ```sh
-   yui controller stop
-   yui controller start
-   ```
-
-   The new CLI refuses to run against an older storage schema until the Home is
+   `yui update` replaces an already-running Controller only after the new
+   binary passes its health checks, and starts one when the Home was idle. The
+   new CLI refuses to run against an older storage schema until the Home is
    migrated; the next step performs that migration.
 
 ## 2. Migrate the storage schema
