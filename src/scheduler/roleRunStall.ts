@@ -611,20 +611,43 @@ export function isRoleRunStalled(
   events: readonly TaskEvent[],
   runId: string
 ): boolean {
-  const stalledAt = latestRunEventTime(events, RUN_STALLED_EVENT, runId);
-  if (stalledAt === undefined) return false;
-  const stalled = [...events]
-    .filter((event) => event.type === RUN_STALLED_EVENT && event.payload.runId === runId)
-    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
-  const stalledProgressAt = typeof stalled?.payload.progressAt === "string"
+  let stalled: TaskEvent | undefined;
+  let recoveredAt: string | undefined;
+  let progressAt: string | undefined;
+  for (const event of events) {
+    if (event.payload.runId !== runId) continue;
+    if (event.type === RUN_STALLED_EVENT) {
+      if (stalled === undefined
+        || Date.parse(event.createdAt) > Date.parse(stalled.createdAt)) {
+        stalled = event;
+      }
+      continue;
+    }
+    if (event.type === RUN_RECOVERED_EVENT) {
+      if (recoveredAt === undefined
+        || Date.parse(event.createdAt) > Date.parse(recoveredAt)) {
+        recoveredAt = event.createdAt;
+      }
+      continue;
+    }
+    if (event.type !== RUN_PROGRESS_EVENT) continue;
+    const candidate = typeof event.payload.progressAt === "string"
+      && Number.isFinite(Date.parse(event.payload.progressAt))
+      ? event.payload.progressAt
+      : event.createdAt;
+    if (progressAt === undefined || Date.parse(candidate) > Date.parse(progressAt)) {
+      progressAt = candidate;
+    }
+  }
+  if (stalled === undefined) return false;
+  const stalledAt = stalled.createdAt;
+  const stalledProgressAt = typeof stalled.payload.progressAt === "string"
     && Number.isFinite(Date.parse(stalled.payload.progressAt))
     ? stalled.payload.progressAt
     : stalledAt;
-  const recoveredAt = latestRunEventTime(events, RUN_RECOVERED_EVENT, runId);
   if (recoveredAt !== undefined && Date.parse(recoveredAt) > Date.parse(stalledAt)) {
     return false;
   }
-  const progressAt = latestRunProgressAt(events, runId);
   return progressAt === undefined || Date.parse(progressAt) <= Date.parse(stalledProgressAt);
 }
 
