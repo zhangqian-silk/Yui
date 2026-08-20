@@ -146,10 +146,21 @@ test("runtime observation uses its own bounded cadence", async () => {
       }
     }
   });
+  let deadline;
+  const boundedWait = new Promise((_, reject) => {
+    deadline = setTimeout(
+      () => reject(new Error("runtime observer did not reach its second sample within 1 second")),
+      1_000
+    );
+  });
   controller.start();
-  await second;
-  controller.stop();
-  await controller.shutdownAndDrain();
+  try {
+    await Promise.race([second, boundedWait]);
+  } finally {
+    clearTimeout(deadline);
+    controller.stop();
+    await controller.shutdownAndDrain();
+  }
   assert.ok(samples >= 2);
 });
 

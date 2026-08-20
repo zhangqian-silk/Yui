@@ -12,8 +12,6 @@ import {
 import { join, resolve } from "node:path";
 import test from "node:test";
 
-import { GATE_STEPS } from "../helpers/gateHermetic.js";
-
 const root = resolve(import.meta.dirname, "../..");
 
 function readJson(path) {
@@ -25,6 +23,8 @@ test("the source package keeps one TypeScript build and declares its Web runtime
   const tsconfig = readJson(join(root, "tsconfig.json"));
 
   assert.equal(sourcePackage.scripts.build, "tsc -p tsconfig.json");
+  assert.equal(sourcePackage.scripts["pretest:core"], "npm run build");
+  assert.equal(sourcePackage.scripts["test:core"], "node scripts/run-core-tests.mjs");
   assert.equal(sourcePackage.scripts.pretest, "npm run build");
   assert.equal(
     sourcePackage.scripts.test,
@@ -185,13 +185,11 @@ test("CI package smoke consumes npm JSON paths relative to the package root", (t
     /runtime package is missing dist\/cli\.js/u
   );
 
-  // The package smoke moved from inline ci.yml steps into the hermetic gate
-  // runner (scripts/gate-hermetic.mjs); pin the command where it now lives.
+  // Keep package validation visible and cheap in the direct CI workflow.
   const workflow = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
-  assert.match(workflow, /node scripts\/gate-hermetic\.mjs/u);
-  const smoke = GATE_STEPS.find((step) => step.name === "package-smoke").command;
-  assert.match(smoke, /check-runtime-package-structure\.mjs package-smoke\.json/u);
-  assert.doesNotMatch(smoke, /package\/dist\/cli\.js/u);
+  assert.match(workflow, /check-runtime-package-structure\.mjs package-smoke\.json/u);
+  assert.match(workflow, /node \.release-stage\/dist\/cli\.js help/u);
+  assert.doesNotMatch(workflow, /package\/dist\/cli\.js/u);
 });
 
 test("Leader and Operator keep native subagent creation inside the Leader conversation", () => {
@@ -388,30 +386,30 @@ test("release reuses the gated exact commit and smokes the same package on Node 
   );
   assert.doesNotMatch(workflow, /native-prebuild|prebuilds\/|smoke-native|build:native/u);
 
-  // The release never re-runs the deterministic suite: the exact tagged commit
-  // already passed the ci.yml PR/master gate, and this workflow asserts that
-  // link instead of repeating build evidence.
+  // The release never re-runs the broad diagnostic suite: the exact tagged
+  // commit already passed the bounded ci.yml core gate.
   assert.doesNotMatch(workflow, /npm test/u);
   assert.doesNotMatch(workflow, /npm run lint/u);
   assert.match(workflow, /merge-base --is-ancestor/u);
 
-  // Ancestry only proves branch membership. The release also downloads the
-  // per-SHA gate-record artifact persisted by ci.yml for this exact commit and
-  // verifies sha + result, so a skipped, cancelled, or bypassed gate blocks the
-  // release (P2-2 regression contract).
+  // Ancestry only proves branch membership. The release also requires a
+  // successful ci.yml run for this exact master SHA, so a skipped, cancelled,
+  // or bypassed gate blocks the release.
   assert.match(workflow, /actions: read/u);
-  assert.match(workflow, /gh run list[^\n]*--commit/u);
-  assert.match(workflow, /gh run download/u);
-  assert.match(workflow, /verify-gate-record\.mjs[^\n]*--expected-sha/u);
+  assert.match(
+    workflow,
+    /gh run list[^\n]*--workflow=ci\.yml[^\n]*--commit[^\n]*--branch master[^\n]*--status success/u
+  );
+  assert.doesNotMatch(workflow, /gh run download|gate-record|verify-gate-record/u);
 
   // gh is not auto-authenticated by github.token in Actions: the step that
-  // queries and downloads the gate record must export GH_TOKEN explicitly or
-  // every tag release stops before the build (review-round-2 P1 contract).
-  const gateRecordStep = workflow.match(
-    /- name: Verify the exact commit's Deterministic CI gate record[\s\S]*?(?=\n      - name:|\n  \S|\s*$)/u
+  // queries the exact-SHA CI result must export GH_TOKEN explicitly or every
+  // tag release stops before the build.
+  const coreCiStep = workflow.match(
+    /- name: Verify exact commit passed Core CI[\s\S]*?(?=\n      - name:|\n  \S|\s*$)/u
   )?.[0];
-  assert.ok(gateRecordStep, "publish.yml must keep the exact-commit gate-record verification step");
-  assert.match(gateRecordStep, /GH_TOKEN: \$\{\{ github\.token \}\}/u);
+  assert.ok(coreCiStep, "publish.yml must keep the exact-commit Core CI verification step");
+  assert.match(coreCiStep, /GH_TOKEN: \$\{\{ github\.token \}\}/u);
 
   // One tarball, provenance-pinned: its SHA-256 is recorded with the exact
   // commit and re-verified by every consumer (smoke matrix and publish).

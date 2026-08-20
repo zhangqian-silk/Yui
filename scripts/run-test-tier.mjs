@@ -6,9 +6,10 @@
 //   node scripts/run-test-tier.mjs list
 //
 // This selects and runs the tests classified into one tier. It does NOT
-// reclassify historical tests: the default `npm test` remains the full
-// deterministic regression suite (Unit + Isolated Integration + local Mock
-// Agent Session, no real model). Deterministic files and nested privileged
+// reclassify historical tests: `npm test` remains the broad on-demand
+// deterministic diagnostic suite (Unit + Isolated Integration + local Mock
+// Agent Session, no real model). CI uses a separate explicit core subset.
+// Deterministic files and nested privileged
 // scenario manifests are resolved by test/helpers/testTierManifest.js.
 //
 // The runner is the fail-closed gate for the privileged tiers: Provider E2E and
@@ -56,7 +57,7 @@ function printTierTable() {
   }
   process.stdout.write(`\nNote: ${MOCK_TRANSPORT_DISCLAIMER}\n`);
   process.stdout.write(
-    "Default `npm test` runs the full deterministic suite (no model). "
+    "`npm test` runs the full on-demand deterministic diagnostic suite (no model). "
     + "These entrypoints select explicitly-classified tiers.\n"
   );
 }

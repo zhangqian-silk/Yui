@@ -1,9 +1,9 @@
 name: Publish npm package
 
 # Release evidence contract (see docs/testing/verification-levels.md):
-# release never re-runs the deterministic suite. The exact tagged commit already
-# passed the PR/master gate in ci.yml; this workflow only adds evidence the gate
-# cannot substitute: tag/version identity, the packaged artifact's structure and
+# release never re-runs the broader diagnostic suite. The exact tagged commit
+# already passed the bounded core gate in ci.yml; this workflow only adds
+# release-specific evidence: tag/version identity, the artifact's structure and
 # executable bit, a fresh install across the supported Node matrix, and npm
 # provenance. The build job assembles one tarball from the exact tagged commit;
 # smoke and publish consume that same artifact, verified by SHA-256.
@@ -32,8 +32,8 @@ jobs:
         shell: bash
         run: |
           # A release tag must point at a master commit. Ancestry alone does
-          # not prove the Deterministic CI gate passed for this exact SHA;
-          # the next step verifies the persisted per-SHA gate record.
+          # not prove the bounded Core CI passed for this exact SHA;
+          # the next step checks the GitHub Actions result.
           git fetch origin master
           if ! git merge-base --is-ancestor HEAD origin/master; then
             echo "Tag ${GITHUB_REF_NAME} points at $(git rev-parse HEAD), which is not on master." >&2
@@ -42,27 +42,23 @@ jobs:
           fi
           echo "Releasing master-gated commit $(git rev-parse HEAD)"
 
-      - name: Verify the exact commit's Deterministic CI gate record
+      - name: Verify exact commit passed Core CI
         shell: bash
         env:
           # gh is not auto-authenticated by github.token in Actions; without
           # this export every tag release stops at `gh run list` below.
           GH_TOKEN: ${{ github.token }}
         run: |
-          # ci.yml persists a per-SHA gate-record artifact for every gate run.
-          # Download the successful master run for this exact commit and verify
-          # the record binds this SHA to a pass result, before building anything.
-          # A skipped, cancelled, or bypassed gate leaves no successful run and
-          # fails the release here.
+          # A skipped, cancelled, or bypassed core gate leaves no successful
+          # ci.yml run for this exact master SHA and fails the release here.
           head_sha="$(git rev-parse HEAD)"
           run_id="$(gh run list --workflow=ci.yml --commit "$head_sha" --branch master --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
           if [ -z "$run_id" ]; then
-            echo "No successful Deterministic CI run found for $head_sha on master." >&2
+            echo "No successful Core CI run found for $head_sha on master." >&2
             echo "Releases reuse the exact commit that passed the PR/master gate." >&2
             exit 1
           fi
-          gh run download "$run_id" --name gate-record --dir gate-evidence
-          node scripts/verify-gate-record.mjs gate-evidence/gate-record.json --expected-sha "$head_sha"
+          echo "Core CI run $run_id passed for $head_sha"
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4

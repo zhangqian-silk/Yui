@@ -70,12 +70,17 @@ Provider E2E tier can record provider-native acceptance; the evidence recorder
 enforces this — a Mock or Unit tier that tries to claim a model call or provider
 acceptance throws.
 
-## The default suite never launches a real model
+## The full diagnostic suite never launches a real model
 
 `npm test` (and `make test` / `make check`) runs the full **deterministic**
 suite — Unit, Isolated Integration, and local Mock Agent Session tests under
 `test/` and `test/core/`. It never launches a real model and never touches the
 global `yui` binary, a shared `YUI_HOME`, or an existing production Session.
+
+This is an on-demand diagnostic suite, not the default CI gate. CI uses the
+small explicit no-Session subset in `scripts/run-core-tests.mjs`; the five tiers
+continue to describe resource use and supported targeted execution, not which
+files must run on every commit.
 
 To keep that guarantee even when the suite is launched *from inside* a managed
 Yui Session, `npm test` runs with

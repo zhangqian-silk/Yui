@@ -19,11 +19,14 @@ executable tier contract, and
 [`docs/testing/verification-levels.md`](../../../docs/testing/verification-levels.md)
 for how evidence is split across local development, the PR gate, and release:
 
-- Local changes get the smallest targeted check set for their risk; ordinary
-  fixes do not repeat the full deterministic suite — the `ci.yml` PR gate owns
-  that, once per exact commit.
+- Local changes get the smallest targeted check set for their risk. The
+  `ci.yml` PR gate is only a bounded core tripwire, so change-specific coverage
+  remains the responsibility of local validation.
+- The full deterministic `npm test` suite is an on-demand diagnostic for
+  unusually cross-cutting changes or regression investigation. It is not a
+  routine handoff requirement or merge gate.
 - The release reuses the PR/master-gated exact commit and runs only
-  release-unique package/install smoke; never re-run the deterministic suite
+  release-unique package/install smoke; never re-run the diagnostic suite
   or lint as part of a release.
 
 - Use Unit tests for pure logic and storage behavior.

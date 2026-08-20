@@ -1,97 +1,75 @@
 # Verification levels
 
-Yui separates verification evidence into three levels. Each level adds
-evidence the others cannot substitute; running the same suite again at a
-different level is not higher confidence, it is duplication.
+Yui is primarily a single-user local product. Its verification policy optimizes
+for a fast feedback loop around the few failures that would make the product
+unusable. It deliberately does not try to prove the whole repository on every
+commit: users can install an earlier version, and a focused fix can be released
+quickly when a non-core regression escapes.
 
-| Level | Where | What it proves | Runs |
-| --- | --- | --- | --- |
-| **L1 — change-related targeted evidence** | local development | the changed behavior, under the smallest relevant check | on every change, sized to its risk |
-| **L2 — PR global gate** | `ci.yml` on the PR / master exact commit | the whole tree builds, lints, passes the full deterministic suite, and packages, in a hermetic environment | once per exact commit, owned by CI |
-| **L3 — release package smoke** | `publish.yml` on the tag | the exact published artifact is installable and runnable across supported Node versions | once per release, on the L2-passing commit |
+| Level | Where | What it proves |
+| --- | --- | --- |
+| **L1 — targeted evidence** | local development | the behavior changed by this patch works under the smallest relevant test |
+| **L2 — core tripwire** | `ci.yml` on PRs and `master` | Yui builds, its core storage/workflow/Agent Driver paths work, and the runtime package has the expected shape |
+| **L3 — release smoke** | `publish.yml` on a tag | the exact artifact installs and starts on supported Node versions |
 
-## L1: risk-based local verification
+## L1: the change owns its specific risk
 
-For ordinary changes, run the smallest check set that can catch the changed
-behavior. Do not repeat the full deterministic suite locally for a local fix —
-that is L2's job, and CI owns the completion gate.
+Run the smallest tests that exercise the changed behavior. A change outside the
+L2 core list must still have targeted local evidence; absence from CI does not
+mean the behavior is unimportant.
 
 | Change touches | Minimal local evidence |
 | --- | --- |
-| pure logic, storage, or parsing in `src/` | the affected Unit test files (or the `unit` tier) |
-| Controller / tmux / Session / lifecycle seams | the affected Isolated Integration or Mock Agent Session tests |
-| packaging scripts, `skills/`, workflows, `package.json` | `npm run pack:dry-run` + `check-runtime-package-structure.mjs`, plus `test/core/core-package.test.js` |
-| docs or Skill prose only | `npm run lint` and the tests that pin that prose |
-| anything that changes `dist/` assembly or the bin entry | the package smoke above plus `node scripts/smoke-runtime-package.mjs` against a local install |
+| pure logic, storage, parsing | affected Unit files |
+| Controller, tmux, Session, lifecycle | affected Isolated Integration or Mock Agent Session files |
+| package scripts, Skills, workflows | package smoke plus `test/core/core-package.test.js` |
+| real Provider protocol | only the explicitly authorized Provider E2E scenario |
 
-When a change spans several rows, run the union of their targeted checks. The
-tier runner (`npm run test:tier -- <tier>`, see
-[test-tiers.md](./test-tiers.md)) always establishes a fresh build boundary,
-so a tier run is safe targeted evidence. Privileged tiers (Provider E2E,
-Release E2E) stay opt-in and are never routine local verification.
+`npm test` remains the broad deterministic diagnostic suite. Use it when a
+change is unusually cross-cutting or while investigating a regression; it is
+not routine completion evidence and is not a merge gate.
 
-## L2: the PR gate owns the full suite
+## L2: a bounded core tripwire
 
-`ci.yml` runs exactly once on the exact PR commit through the hermetic gate
-runner (`scripts/gate-hermetic.mjs`): install, build, lint, the full
-deterministic suite (Unit + Isolated Integration + Mock Agent Session, no real
-model), and package structure smoke including the `dist/cli.js` `0755`
-assertion. The runner is the L2 executable form — the same command gates a
-local checkout, a CI checkout, and any exact SHA:
+`ci.yml` uses the disposable GitHub runner directly and has a three-minute hard
+timeout. Its normal path should finish well below that limit:
 
-- **Hermetic environment.** Every run isolates `HOME`, the XDG config/cache/
-  data tree, the global git identity (`GIT_CONFIG_GLOBAL`), `TMPDIR`, and the
-  npm cache under a fresh root, and replaces `PATH` with the resolved
-  node/npm/git/tmux directories followed by the standard system directories.
-  The gate cannot silently depend on a developer's `~/.gitconfig`, a global
-  npm cache, or a machine-specific `PATH` (a missing `tsc` or a fixture
-  reading host config fails the gate instead of corrupting it).
-- **Per-SHA gate record.** Each run writes `gate-record.json`: the exact
-  commit SHA, the per-step pass/fail results with durations, and the
-  environment the steps ran in. CI uploads it as the `gate-record` artifact —
-  the durable, per-commit pass/fail evidence. A later PR or release consumes
-  the record for that exact SHA instead of re-running the gate; repeating the
-  same suite on the same SHA is not higher confidence.
-- **Load-aware scheduling.** Ordinary deterministic files retain Node's
-  parallel execution. The process-lifecycle E2E runs as the separate
-  `test-process-lifecycle` step with file concurrency fixed at one, so its
-  bounded process-exit assertions measure Yui behavior rather than contention
-  with the rest of the suite. The assertion timeout is not relaxed or retried.
-- **Strict current baseline.** Every failing step fails the gate. The runner
-  does not execute an older commit or classify a failure as pre-existing;
-  master remains green and every candidate satisfies the current contract.
+1. `npm ci`, using the Actions npm cache;
+2. `npm run test:core`, which builds TypeScript once and runs the explicit,
+   serial file list in `scripts/run-core-tests.mjs`;
+3. one runtime-package structure and CLI-start smoke.
 
-Agents and humans do not re-run the suite to "approve" a change — the gate
-record is the completion evidence. A flaky failure is fixed at its source; CI
-must not depend on a human reading logs and clicking re-run.
+The selected tests cover the core command framework, Task workflow and
+scheduler, durable storage/schema delivery, runtime events, Agent Driver
+registration, Codex/Claude observation adapters, and the runtime-status
+projection. They do not start tmux Sessions, real Agent CLIs, or real models.
 
-## L3: release reuses the gated exact commit
+The list is intentionally explicit rather than a directory glob. New tests do
+not silently increase CI time. Expanding it requires a product-level reason:
+the failure must be both central to basic use and cheap, deterministic, and
+local to detect. `npm run lint` is not repeated because `npm run build` already
+runs TypeScript checking.
 
-A release tag must point at a master commit, so the exact commit being
-released already passed L2 (branch protection requires the gate on master).
-`publish.yml` asserts that link with `git merge-base --is-ancestor` and then
-runs only what L2 cannot substitute:
+Stale runs for the same PR are cancelled. There are no retries, historical
+baseline comparisons, or fresh-clone-within-runner. The GitHub job result is
+the gate evidence. A failure is fixed or the change is corrected; a hang is
+bounded by the job timeout.
 
-- tag/version identity (`verify:release-tag.mjs`) and npm provenance;
-- one assembly from the exact commit, with package structure and tarball
-  `0755` assertions;
-- a SHA-256 manifest binding the tarball to the commit, re-verified by every
-  consumer of the artifact;
-- a fresh install and `.bin/yui` execution smoke on Node 20, 22, and 24.
+## L3: release-only evidence
 
-The release never re-runs the deterministic suite or lint. No remote artifact
-service or release state machine is involved: GitHub Actions artifacts, the
-commit SHA, and the npm pack manifest are the only evidence stores.
+A release tag must point to `master`, and `publish.yml` confirms that the exact
+SHA has a successful `ci.yml` run. It does not repeat the diagnostic suite and
+adds only evidence unique to publishing:
 
-## Release regression contracts
+- tag/version identity and npm provenance;
+- one assembled tarball whose checksum is shared by all release jobs;
+- package contents and executable-bit checks;
+- a fresh install and `.bin/yui` start on Node 20, 22, and 24.
 
-Two regressions must fail before a bad artifact publishes:
+## Accepted residual risk
 
-- **Skill manifest / package structure (PR #109):** the runtime package ships
-  exactly the four generic Skills; the count and names are asserted in
-  `publish.yml` and pinned by `test/core/core-package.test.js`.
-- **Executable CLI (PR #110):** `dist/cli.js` ships as `0755` in the tarball,
-  stays executable after a fresh npm install (npm applies the process umask on
-  extraction, so the installed mode may be `0700` — the contract is a surviving
-  execute bit), and runs through `.bin/yui`. All three are asserted — the pack
-  manifest alone is not proof.
+The core tripwire will not catch every regression, platform scheduling issue,
+or Provider CLI change. This is intentional. Process-lifecycle, large storage,
+full deterministic, Provider, and release-isolation suites remain available as
+focused diagnostics. They are run when the affected code or an observed failure
+justifies their cost, not on every commit.
