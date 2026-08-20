@@ -73,6 +73,8 @@ export const DEFAULT_GRACEFUL_GRACE_MS = 3_000;
 export const DEFAULT_FORCED_GRACE_MS = 2_000;
 export const DEFAULT_TERMINATION_POLL_MS = 100;
 
+type TrackedFencedChildren = Map<string, Map<number, string>>;
+
 /**
  * Stops one Role owner with physical exit proof.
  *
@@ -110,6 +112,17 @@ export async function terminateSessionOwners(
   const now = ports.now();
   ports.emit({ stage: "stop-requested", owner, at: now });
 
+  // A launch-fence scan is a point-in-time observation, not a durable owner
+  // inventory: /proc entries can disappear between the directory and
+  // environment reads. Retain every exact child identity observed during the
+  // stop so one later scan miss cannot be mistaken for physical zero.
+  const trackedChildren: TrackedFencedChildren = new Map(
+    records.map((record) => [record.launchId, new Map<number, string>()])
+  );
+  for (const record of records) {
+    refreshTrackedFencedChildren(record, ports, trackedChildren);
+  }
+
   let gracefulOk = true;
   try {
     gracefulOk = await ports.gracefulStop(owner);
@@ -141,7 +154,7 @@ export async function terminateSessionOwners(
   }
 
   // Bounded graceful grace: poll the exact owned trees for exit.
-  if (await waitForTreesAbsent(records, ports, gracefulGraceMs, pollMs)) {
+  if (await waitForTreesAbsent(records, ports, trackedChildren, gracefulGraceMs, pollMs)) {
     ports.emit({ stage: "stop-confirmed", owner, at: ports.now() });
     return {
       outcome: "stop-confirmed",
@@ -156,25 +169,25 @@ export async function terminateSessionOwners(
   // safety requires pairing the PID with its start identity.
   ports.emit({ stage: "forced-stop", owner, at: ports.now() });
   for (const record of records) {
-    escalateRecord(record, ports, "SIGTERM");
+    escalateRecord(record, ports, trackedChildren, "SIGTERM");
   }
-  await waitForTreesAbsent(records, ports, forcedGraceMs, pollMs);
+  await waitForTreesAbsent(records, ports, trackedChildren, forcedGraceMs, pollMs);
   for (const record of records) {
-    escalateRecord(record, ports, "SIGKILL");
+    escalateRecord(record, ports, trackedChildren, "SIGKILL");
   }
-  await waitForTreesAbsent(records, ports, forcedGraceMs, pollMs);
+  await waitForTreesAbsent(records, ports, trackedChildren, forcedGraceMs, pollMs);
 
   const remaining: Array<{ record: SessionOwnerIdentity; detail: string }> = [];
   const confirmed: SessionOwnerIdentity[] = [];
   let verificationGap: string | undefined;
   for (const record of records) {
-    const verdict = treeVerdict(record, ports);
+    const verdict = treeVerdict(record, ports, trackedChildren);
     if (verdict.kind === "absent") {
       confirmed.push(record);
       continue;
     }
     if (verdict.kind === "gap") {
-      verificationGap = `/proc unreadable for pid ${record.providerRoot.pid}`;
+      verificationGap = `/proc unreadable for launch ${record.launchId}`;
       remaining.push({ record, detail: verificationGap });
       continue;
     }
@@ -236,18 +249,63 @@ function rootVerdict(
  */
 function treeVerdict(
   record: SessionOwnerIdentity,
-  ports: SessionTerminationPorts
+  ports: SessionTerminationPorts,
+  trackedChildren: TrackedFencedChildren
 ): { kind: "absent" } | { kind: "live" } | { kind: "gap" } {
+  const scanGap = refreshTrackedFencedChildren(record, ports, trackedChildren);
   const root = rootVerdict(record, ports);
-  if (root.kind === "live") return { kind: "live" };
-  // The root is gone or unreadable: a surviving child carrying the exact
-  // launch fence keeps the tree live. Children without the fence are
-  // unattributed and never block confirmation on their own.
-  const fencedChildren = ports
-    .listLaunchFencedProcesses(record.launchId)
-    .filter((pid) => pid !== record.providerRoot.pid);
-  if (fencedChildren.length > 0) return { kind: "live" };
-  return root;
+  const children = trackedChildrenVerdict(record, ports, trackedChildren);
+  if (root.kind === "live" || children.kind === "live") return { kind: "live" };
+  if (root.kind === "gap" || children.kind === "gap" || scanGap) return { kind: "gap" };
+  return { kind: "absent" };
+}
+
+function refreshTrackedFencedChildren(
+  record: SessionOwnerIdentity,
+  ports: SessionTerminationPorts,
+  trackedChildren: TrackedFencedChildren
+): boolean {
+  const tracked = trackedChildren.get(record.launchId);
+  if (tracked === undefined) return true;
+  let verificationGap = false;
+  for (const pid of ports.listLaunchFencedProcesses(record.launchId)) {
+    if (pid === record.providerRoot.pid) continue;
+    const identity = ports.processIdentity(pid);
+    if (identity === undefined) {
+      if (ports.procEntryExists(pid)) verificationGap = true;
+      continue;
+    }
+    if (identity.state === "Z") continue;
+    tracked.set(pid, identity.startIdentity);
+  }
+  return verificationGap;
+}
+
+function trackedChildrenVerdict(
+  record: SessionOwnerIdentity,
+  ports: SessionTerminationPorts,
+  trackedChildren: TrackedFencedChildren
+): { kind: "absent" } | { kind: "live" } | { kind: "gap" } {
+  const tracked = trackedChildren.get(record.launchId);
+  if (tracked === undefined) return { kind: "gap" };
+  let verificationGap = false;
+  for (const [pid, startIdentity] of tracked) {
+    const current = ports.processIdentity(pid);
+    if (current === undefined) {
+      if (ports.procEntryExists(pid)) {
+        verificationGap = true;
+      } else {
+        tracked.delete(pid);
+      }
+      continue;
+    }
+    if (current.state === "Z" || current.startIdentity !== startIdentity) {
+      tracked.delete(pid);
+      continue;
+    }
+    return { kind: "live" };
+  }
+  return verificationGap ? { kind: "gap" } : { kind: "absent" };
 }
 
 /**
@@ -259,6 +317,7 @@ function treeVerdict(
 function escalateRecord(
   record: SessionOwnerIdentity,
   ports: SessionTerminationPorts,
+  trackedChildren: TrackedFencedChildren,
   signal: "SIGTERM" | "SIGKILL"
 ): void {
   const root = rootVerdict(record, ports);
@@ -280,8 +339,18 @@ function escalateRecord(
     return;
   }
   if (root.kind !== "absent") return;
-  for (const pid of ports.listLaunchFencedProcesses(record.launchId)) {
-    if (pid === record.providerRoot.pid) continue;
+  refreshTrackedFencedChildren(record, ports, trackedChildren);
+  const tracked = trackedChildren.get(record.launchId);
+  if (tracked === undefined) return;
+  for (const [pid, startIdentity] of tracked) {
+    const current = ports.processIdentity(pid);
+    if (
+      current === undefined
+      || current.state === "Z"
+      || current.startIdentity !== startIdentity
+    ) {
+      continue;
+    }
     try {
       ports.signalProcess(pid, signal);
     } catch {
@@ -293,12 +362,17 @@ function escalateRecord(
 async function waitForTreesAbsent(
   records: readonly SessionOwnerIdentity[],
   ports: SessionTerminationPorts,
+  trackedChildren: TrackedFencedChildren,
   timeoutMs: number,
   pollMs: number
 ): Promise<boolean> {
   const start = Date.now();
   for (;;) {
-    if (records.every((record) => treeVerdict(record, ports).kind === "absent")) {
+    if (
+      records.every(
+        (record) => treeVerdict(record, ports, trackedChildren).kind === "absent"
+      )
+    ) {
       return true;
     }
     if (Date.now() - start >= timeoutMs) return false;
