@@ -70,7 +70,11 @@ import {
   type ReviewFinding
 } from "../review/reviewFinding.js";
 import type { Project } from "../repository/project.js";
-import { generateHomeIdentity, type HomeIdentity } from "../repository/homeIdentity.js";
+import {
+  generateHomeIdentity,
+  validateHomeIdentity,
+  type HomeIdentity
+} from "../repository/homeIdentity.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
@@ -157,6 +161,34 @@ export type SqliteTransactionOptions = Readonly<{
   /** Opaque command payload recorded alongside the outbox row. */
   outboxCommand?: unknown;
 }>;
+
+/** Read the immutable Home identity without opening a writable Store connection. */
+export function readSqliteHomeIdentity(
+  rootDir: string,
+  databaseFilename = "yui.db"
+): HomeIdentity {
+  const database = new Database(join(rootDir, databaseFilename), {
+    readonly: true,
+    fileMustExist: true
+  });
+  try {
+    const row = database.prepare(
+      "SELECT home_identity FROM home_meta WHERE id = 1"
+    ).get() as { home_identity?: unknown } | undefined;
+    if (typeof row?.home_identity !== "string") {
+      throw new StorageRecordError("SQLite Home identity is missing.");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.home_identity) as unknown;
+    } catch {
+      throw new StorageRecordError("SQLite Home identity is invalid JSON.");
+    }
+    return validateHomeIdentity(parsed as HomeIdentity);
+  } finally {
+    database.close();
+  }
+}
 
 /** A single telemetry progress row (§4.4). */
 export type TelemetryProgress = Readonly<{

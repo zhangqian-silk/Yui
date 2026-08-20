@@ -1,7 +1,12 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { callController, readControllerDiscovery } from "../core/controllerClient.js";
+import {
+  callController,
+  readControllerDiscovery,
+  stopOrphanedFileTaskController,
+  stopPreviousFileTaskController
+} from "../core/controllerClient.js";
 import {
   FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
   type JsonValue
@@ -356,8 +361,23 @@ export async function restartFileTaskController(
     "shutdownTimeoutMs"
   );
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
-  const current = await readOptionalControllerStatus(home, call);
-  const previousPid = controllerPid(current);
+  let current: JsonValue | null = null;
+  let previousPid: number | undefined;
+  try {
+    current = await readOptionalControllerStatus(home, call);
+    previousPid = controllerPid(current);
+  } catch (error) {
+    if (options.call !== undefined || !isInvalidDiscovery(error)) throw error;
+    // Protocol v3 is the immediately previous released Controller. Keep its
+    // parser and transport confined to this explicit replacement operation;
+    // no ordinary request can fall back to it.
+    const previous = await stopPreviousFileTaskController(home, shutdownTimeoutMs);
+    previousPid = previous.pid;
+  }
+  if (!controllerRunning(current) && options.call === undefined) {
+    const orphan = await stopOrphanedFileTaskController(home, shutdownTimeoutMs);
+    if (orphan !== undefined) previousPid = orphan.pid;
+  }
   if (controllerRunning(current)) {
     await callFileTaskController(home, "controller.stop", {}, options);
     const deadline = Date.now() + shutdownTimeoutMs;
@@ -754,6 +774,11 @@ function isDefinitelyNotRunning(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) return false;
   const code = (error as { code?: unknown }).code;
   return code === "CONTROLLER_NOT_RUNNING";
+}
+
+function isInvalidDiscovery(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return (error as { code?: unknown }).code === "CONTROLLER_DISCOVERY_INVALID";
 }
 
 async function readOptionalControllerStatus(

@@ -19,6 +19,10 @@ import {
   type JsonValue
 } from "./protocol.js";
 import { controllerSocketPath } from "./controllerEndpoint.js";
+import { readHomeFilesystemId } from "./homeFilesystemIdentity.js";
+import { findLiveControllerProcessForHome } from "./controllerProcessIdentity.js";
+import { validateHomeId } from "../repository/homeIdentity.js";
+import { readCompatibleHomeIdentity } from "../storage/compatibleTaskStore.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
 import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
@@ -114,7 +118,14 @@ async function startControllerServerLocked(
   options: ControllerServerOptions = {}
 ): Promise<RunningControllerServer> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
-  const socketPath = controllerSocketPath(home);
+  const homeId = validateHomeId(readCompatibleHomeIdentity(home).homeId);
+  const homeFilesystemId = readHomeFilesystemId(home);
+  await assertExistingDiscoveryReplaceable(discoveryPath);
+  if (findLiveControllerProcessForHome(homeFilesystemId) !== undefined) {
+    throw controllerAlreadyRunning();
+  }
+  const controllerInstanceId = randomBytes(16).toString("hex");
+  const socketPath = controllerSocketPath(homeId);
   const runtimeDirectory = dirname(discoveryPath);
   const socketDirectory = dirname(socketPath);
   await mkdir(runtimeDirectory, { recursive: true, mode: 0o700 });
@@ -158,6 +169,9 @@ async function startControllerServerLocked(
       telemetry,
       handover,
       home,
+      homeId,
+      homeFilesystemId,
+      controllerInstanceId,
       () => primaryIdentity
     );
   });
@@ -182,6 +196,11 @@ async function startControllerServerLocked(
     await chmod(socketPath, 0o600);
     const processStartIdentity = await readLinuxProcessStartIdentity(process.pid);
     const discovery: ControllerDiscovery = Object.freeze({
+      schemaVersion: 1,
+      protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+      homeId,
+      homeFilesystemId,
+      controllerInstanceId,
       pid: process.pid,
       processStartIdentity,
       socketPath,
@@ -216,7 +235,7 @@ async function startControllerServerLocked(
         eventLoopDelay.stop();
         await beforeDiscoveryRemoval?.();
         await closeNetServer(netServer);
-        await removeOwnedDiscovery(discoveryPath, token);
+        await removeOwnedDiscovery(discoveryPath, token, controllerInstanceId);
         if (options.domainIdentity !== undefined) {
           // Keep the exact target fence while detached Role panes survive a
           // Controller stop/restart. The owning test teardown or an expired
@@ -250,6 +269,58 @@ async function startControllerServerLocked(
   }
 }
 
+/**
+ * Fence an older Controller whose socket name was derived by another protocol.
+ * A dead or PID-reused owner is stale and may be replaced; an unverifiable
+ * live owner fails closed so an endpoint migration can never create dual
+ * writers for one durable Home.
+ */
+async function assertExistingDiscoveryReplaceable(discoveryPath: string): Promise<void> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(discoveryPath, "utf8")) as unknown;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw unsafeExistingDiscovery(discoveryPath, error);
+  }
+  if (
+    typeof value !== "object"
+    || value === null
+    || Array.isArray(value)
+    || !("pid" in value)
+    || !Number.isSafeInteger(value.pid)
+    || (value.pid as number) < 1
+  ) {
+    throw unsafeExistingDiscovery(discoveryPath);
+  }
+  const pid = value.pid as number;
+  if (!isProcessAlive(pid)) return;
+  if (
+    !("processStartIdentity" in value)
+    || typeof value.processStartIdentity !== "string"
+    || !/^[0-9]{1,32}$/u.test(value.processStartIdentity)
+  ) {
+    throw unsafeExistingDiscovery(discoveryPath);
+  }
+  let currentIdentity: string;
+  try {
+    currentIdentity = await readLinuxProcessStartIdentity(pid);
+  } catch (error) {
+    if (!isProcessAlive(pid)) return;
+    throw unsafeExistingDiscovery(discoveryPath, error);
+  }
+  if (currentIdentity === value.processStartIdentity) {
+    throw controllerAlreadyRunning();
+  }
+}
+
+function unsafeExistingDiscovery(discoveryPath: string, cause?: unknown): Error {
+  return new Error(
+    `Cannot safely replace existing Controller discovery: ${discoveryPath}.`,
+    cause === undefined ? undefined : { cause }
+  );
+}
+
 async function writeDiscoveryAtomically(
   discoveryPath: string,
   discovery: ControllerDiscovery
@@ -277,6 +348,9 @@ function receiveRequest(
   telemetry: ControllerStatusTelemetry,
   handover: ControllerHandoverState,
   home: string,
+  homeId: string,
+  homeFilesystemId: string,
+  controllerInstanceId: string,
   getPrimaryIdentity: () => RuntimeIdentityReceipt | null
 ): void {
   let buffer = Buffer.alloc(0);
@@ -317,6 +391,9 @@ function receiveRequest(
       telemetry,
       handover,
       home,
+      homeId,
+      homeFilesystemId,
+      controllerInstanceId,
       getPrimaryIdentity
     );
   });
@@ -336,6 +413,9 @@ async function routeRequest(
   telemetry: ControllerStatusTelemetry,
   handover: ControllerHandoverState,
   home: string,
+  homeId: string,
+  homeFilesystemId: string,
+  controllerInstanceId: string,
   getPrimaryIdentity: () => RuntimeIdentityReceipt | null
 ): Promise<void> {
   let request;
@@ -359,6 +439,34 @@ async function routeRequest(
         request.id,
         "UNAUTHORIZED",
         "Controller authentication failed."
+      )
+    );
+    return;
+  }
+
+  if (request.protocolVersion !== FILE_TASK_CONTROLLER_PROTOCOL_VERSION) {
+    sendResponse(
+      socket,
+      controllerFailure(
+        request.id,
+        "CONTROLLER_PROTOCOL_MISMATCH",
+        "Controller protocol version does not match the running Controller."
+      )
+    );
+    return;
+  }
+
+  if (
+    request.homeId !== homeId
+    || request.homeFilesystemId !== homeFilesystemId
+    || request.controllerInstanceId !== controllerInstanceId
+  ) {
+    sendResponse(
+      socket,
+      controllerFailure(
+        request.id,
+        "CONTROLLER_IDENTITY_MISMATCH",
+        "Controller request identity does not match the running Controller."
       )
     );
     return;
@@ -441,6 +549,9 @@ async function routeRequest(
         cliRealpath: controllerCliRealpath(),
         controllerRealpath: realpathSync(fileURLToPath(import.meta.url)),
         controllerProtocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        homeId,
+        homeFilesystemId,
+        controllerInstanceId,
         storageBackend: resolveTaskStoreBackendForHome(home, process.env),
         workerEnabled: resolveStoreWorkerEnabledForHome(home, process.env),
         mode: "primary",
@@ -476,6 +587,9 @@ async function routeRequest(
         uptimeMs: Math.round(process.uptime() * 1000),
         rssBytes: process.memoryUsage().rss,
         protocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+        homeId,
+        homeFilesystemId,
+        controllerInstanceId,
         version: YUI_VERSION,
         storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,
         aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion,
@@ -946,7 +1060,11 @@ function closeNetServer(server: Server): Promise<void> {
   });
 }
 
-async function removeOwnedDiscovery(path: string, token: string): Promise<void> {
+async function removeOwnedDiscovery(
+  path: string,
+  token: string,
+  controllerInstanceId: string
+): Promise<void> {
   try {
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
     if (
@@ -954,6 +1072,8 @@ async function removeOwnedDiscovery(path: string, token: string): Promise<void> 
       && value !== null
       && "token" in value
       && value.token === token
+      && "controllerInstanceId" in value
+      && value.controllerInstanceId === controllerInstanceId
     ) {
       await rm(path, { force: true });
     }

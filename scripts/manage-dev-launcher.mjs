@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   lstatSync,
@@ -12,10 +12,11 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -30,7 +31,7 @@ const registrySchemaVersion = 3;
 const recoverySchemaVersion = 1;
 const controllerDiscoveryName = "controller.json";
 const controllerProbeTimeoutMs = 500;
-const linuxUnixSocketPathBudget = 100;
+const controllerProtocolVersion = 4;
 
 export function installDevLauncher(options = {}) {
   const projectRoot = resolve(options.projectRoot ?? process.cwd());
@@ -293,9 +294,15 @@ export async function resetDevHome(options = {}) {
   try {
     if (!pathExists(homePath)) return { homePath, backupPath: null, moved: false };
     const discoveryPath = join(homePath, "runtime", controllerDiscoveryName);
-    const socketPath = controllerSocketPath(homePath);
     if (pathExists(discoveryPath)) {
-      const discovery = readControllerDiscoveryForReset(homePath, discoveryPath);
+      const homeId = await readHomeIdForReset(homePath).catch((error) => {
+        throw cannotVerifyController(discoveryPath, error);
+      });
+      const discovery = readControllerDiscoveryForReset(
+        homePath,
+        homeId,
+        discoveryPath
+      );
       const probe = await probeController(discovery);
       if (probe.status === "running") {
         if (probe.pid !== discovery.pid) {
@@ -318,8 +325,14 @@ export async function resetDevHome(options = {}) {
       if (currentProcessStartIdentity === discovery.processStartIdentity) {
         throw cannotVerifyController(discoveryPath);
       }
-    } else if (pathExists(socketPath)) {
-      throw cannotVerifyController(discoveryPath);
+    } else {
+      // A Controller using the current protocol cannot exist without a
+      // durable Home identity. If identity is readable, retain the previous
+      // fail-closed orphan-socket check for its exact endpoint.
+      const homeId = await readHomeIdForReset(homePath).catch(() => null);
+      if (homeId !== null && pathExists(controllerSocketPath(homeId))) {
+        throw cannotVerifyController(discoveryPath);
+      }
     }
 
     const timestamp = (options.now ?? new Date()).toISOString().replaceAll(/[-:.]/g, "");
@@ -551,7 +564,7 @@ function releaseRegistryLock(lockPath, token) {
   if (owner?.token === token) rmSync(lockPath, { force: true });
 }
 
-function readControllerDiscoveryForReset(homePath, discoveryPath) {
+function readControllerDiscoveryForReset(homePath, homeId, discoveryPath) {
   try {
     const metadata = lstatSync(discoveryPath);
     if (
@@ -562,10 +575,17 @@ function readControllerDiscoveryForReset(homePath, discoveryPath) {
       throw new Error("invalid metadata");
     }
     const discovery = JSON.parse(readFileSync(discoveryPath, "utf8"));
-    const expectedSocketPath = controllerSocketPath(homePath);
+    const expectedSocketPath = controllerSocketPath(homeId);
+    const expectedHomeFilesystemId = readHomeFilesystemId(homePath);
     if (
       typeof discovery !== "object" || discovery === null
-      || Reflect.ownKeys(discovery).length !== 4
+      || Reflect.ownKeys(discovery).length !== 9
+      || discovery.schemaVersion !== 1
+      || discovery.protocolVersion !== controllerProtocolVersion
+      || discovery.homeId !== homeId
+      || discovery.homeFilesystemId !== expectedHomeFilesystemId
+      || typeof discovery.controllerInstanceId !== "string"
+      || !/^[a-f0-9]{32}$/u.test(discovery.controllerInstanceId)
       || !Object.hasOwn(discovery, "pid")
       || !Object.hasOwn(discovery, "processStartIdentity")
       || !Object.hasOwn(discovery, "socketPath")
@@ -585,18 +605,47 @@ function readControllerDiscoveryForReset(homePath, discoveryPath) {
   }
 }
 
-function controllerSocketPath(homePath) {
+async function readHomeIdForReset(homePath) {
+  const databasePath = join(homePath, "yui.db");
+  const manifest = JSON.parse(readFileSync(join(homePath, "schema.json"), "utf8"));
+  let homeId;
+  if (
+    Number.isSafeInteger(manifest?.storageVersion)
+    && manifest.storageVersion >= 7
+    && pathExists(databasePath)
+  ) {
+    const { default: Database } = await import("better-sqlite3");
+    const database = new Database(databasePath, { readonly: true, fileMustExist: true });
+    try {
+      const row = database.prepare(
+        "SELECT home_identity FROM home_meta WHERE id = 1"
+      ).get();
+      homeId = JSON.parse(row?.home_identity ?? "null")?.homeId;
+    } finally {
+      database.close();
+    }
+  } else {
+    homeId = JSON.parse(readFileSync(join(homePath, "state.json"), "utf8"))
+      ?.homeIdentity?.homeId;
+  }
+  if (typeof homeId !== "string" || !/^home-[a-f0-9]{16}$/u.test(homeId)) {
+    throw new Error("Development Home identity is invalid.");
+  }
+  return homeId;
+}
+
+function controllerSocketPath(homeId) {
+  if (typeof homeId !== "string" || !/^home-[a-f0-9]{16}$/u.test(homeId)) {
+    throw new Error("Development Home identity is invalid.");
+  }
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const identity = createHash("sha256")
-    .update(resolve(homePath))
-    .digest("hex")
-    .slice(0, 24);
-  const socketName = `${identity}.sock`;
-  const isolatedPath = join(tmpdir(), `yui-${uid}`, socketName);
-  return process.platform === "linux"
-    && Buffer.byteLength(isolatedPath) >= linuxUnixSocketPathBudget
-    ? join("/tmp", `yui-${uid}`, socketName)
-    : isolatedPath;
+  return join("/tmp", `yui-${uid}`, `${homeId}.sock`);
+}
+
+function readHomeFilesystemId(homePath) {
+  const metadata = statSync(homePath, { bigint: true });
+  if (!metadata.isDirectory()) throw new Error("Development Home is not a directory.");
+  return `${metadata.dev}:${metadata.ino}`;
 }
 
 function cannotVerifyController(discoveryPath, cause) {
@@ -635,6 +684,10 @@ function probeController(discovery) {
     const request = `${JSON.stringify({
       id: requestId,
       token: discovery.token,
+      protocolVersion: controllerProtocolVersion,
+      homeId: discovery.homeId,
+      homeFilesystemId: discovery.homeFilesystemId,
+      controllerInstanceId: discovery.controllerInstanceId,
       method: "controller.status",
       params: {}
     })}\n`;
@@ -678,20 +731,27 @@ function probeController(discovery) {
           || response.id !== requestId
           || response.ok !== true
           || typeof result !== "object" || result === null
-          || resultKeys.length < 2
-          || resultKeys.length > 9
+          || resultKeys.length < 11
+          || resultKeys.length > 12
           || resultKeys.some((key) => ![
             "pid",
             "running",
             "uptimeMs",
             "rssBytes",
             "protocolVersion",
+            "homeId",
+            "homeFilesystemId",
+            "controllerInstanceId",
             "version",
             "storageLayoutVersion",
             "aggregateSchemaVersion",
             "runtime"
           ].includes(key))
           || result.running !== true
+          || result.protocolVersion !== controllerProtocolVersion
+          || result.homeId !== discovery.homeId
+          || result.homeFilesystemId !== discovery.homeFilesystemId
+          || result.controllerInstanceId !== discovery.controllerInstanceId
           || !Number.isSafeInteger(result.pid) || result.pid <= 0
           || (
             Object.hasOwn(result, "protocolVersion")

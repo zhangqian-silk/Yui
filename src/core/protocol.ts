@@ -1,7 +1,10 @@
+import { validateHomeId } from "../repository/homeIdentity.js";
+import { validateHomeFilesystemId } from "./homeFilesystemIdentity.js";
+
 export const MAX_CONTROLLER_MESSAGE_BYTES = 1_048_576;
 export const CONTROLLER_DISCOVERY_PATH = "runtime/controller.json";
 /** Bump when a running Controller cannot safely share one YUI_HOME with this CLI. */
-export const FILE_TASK_CONTROLLER_PROTOCOL_VERSION = 3;
+export const FILE_TASK_CONTROLLER_PROTOCOL_VERSION = 4;
 
 export type JsonValue =
   | null
@@ -14,6 +17,10 @@ export type JsonValue =
 export type ControllerRequest = Readonly<{
   id: string;
   token: string;
+  protocolVersion: number;
+  homeId: string;
+  homeFilesystemId: string;
+  controllerInstanceId: string;
   method: string;
   params: JsonValue;
 }>;
@@ -38,6 +45,11 @@ export type ControllerFailureResponse = Readonly<{
 export type ControllerResponse = ControllerSuccessResponse | ControllerFailureResponse;
 
 export type ControllerDiscovery = Readonly<{
+  schemaVersion: 1;
+  protocolVersion: number;
+  homeId: string;
+  homeFilesystemId: string;
+  controllerInstanceId: string;
   pid: number;
   processStartIdentity: string;
   socketPath: string;
@@ -64,13 +76,28 @@ export function parseControllerRequest(line: string): ControllerRequest {
   }
   try {
     const value: unknown = JSON.parse(line);
-    if (!isRecord(value) || !hasExactKeys(value, ["id", "token", "method", "params"])) {
+    if (!isRecord(value) || !hasExactKeys(value, [
+      "id",
+      "token",
+      "protocolVersion",
+      "homeId",
+      "homeFilesystemId",
+      "controllerInstanceId",
+      "method",
+      "params"
+    ])) {
       throw new Error("shape");
     }
     if (
       !isIdentifier(value.id)
       || typeof value.token !== "string"
       || !/^[a-f0-9]{64}$/u.test(value.token)
+      || !Number.isSafeInteger(value.protocolVersion)
+      || (value.protocolVersion as number) < 1
+      || !isHomeId(value.homeId)
+      || !isHomeFilesystemId(value.homeFilesystemId)
+      || typeof value.controllerInstanceId !== "string"
+      || !/^[a-f0-9]{32}$/u.test(value.controllerInstanceId)
       || typeof value.method !== "string"
       || value.method.length > 128
       || !/^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)*$/u.test(value.method)
@@ -81,6 +108,10 @@ export function parseControllerRequest(line: string): ControllerRequest {
     return Object.freeze({
       id: value.id,
       token: value.token,
+      protocolVersion: value.protocolVersion as number,
+      homeId: value.homeId,
+      homeFilesystemId: value.homeFilesystemId,
+      controllerInstanceId: value.controllerInstanceId,
       method: value.method,
       params: value.params
     });
@@ -157,16 +188,33 @@ export function controllerFailure(
 
 export function parseControllerDiscovery(
   value: unknown,
-  expectedSocketPath: string
+  expected: Readonly<{ homeFilesystemId: string; socketPath: string }>
 ): ControllerDiscovery {
   if (
     !isRecord(value)
-    || !hasExactKeys(value, ["pid", "processStartIdentity", "socketPath", "token"])
+    || !hasExactKeys(value, [
+      "schemaVersion",
+      "protocolVersion",
+      "homeId",
+      "homeFilesystemId",
+      "controllerInstanceId",
+      "pid",
+      "processStartIdentity",
+      "socketPath",
+      "token"
+    ])
+    || value.schemaVersion !== 1
+    || value.protocolVersion !== FILE_TASK_CONTROLLER_PROTOCOL_VERSION
+    || !isHomeId(value.homeId)
+    || value.homeFilesystemId !== expected.homeFilesystemId
+    || !isHomeFilesystemId(value.homeFilesystemId)
+    || typeof value.controllerInstanceId !== "string"
+    || !/^[a-f0-9]{32}$/u.test(value.controllerInstanceId)
     || !Number.isSafeInteger(value.pid)
     || (value.pid as number) < 1
     || typeof value.processStartIdentity !== "string"
     || !/^[0-9]{1,32}$/u.test(value.processStartIdentity)
-    || value.socketPath !== expectedSocketPath
+    || value.socketPath !== expected.socketPath
     || typeof value.token !== "string"
     || !/^[a-f0-9]{64}$/u.test(value.token)
   ) {
@@ -176,6 +224,11 @@ export function parseControllerDiscovery(
     );
   }
   return Object.freeze({
+    schemaVersion: 1,
+    protocolVersion: value.protocolVersion,
+    homeId: value.homeId,
+    homeFilesystemId: value.homeFilesystemId,
+    controllerInstanceId: value.controllerInstanceId,
     pid: value.pid as number,
     processStartIdentity: value.processStartIdentity,
     socketPath: value.socketPath,
@@ -207,6 +260,25 @@ function invalidResponse(): ControllerProtocolError {
 function isIdentifier(value: unknown): value is string {
   return typeof value === "string"
     && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value);
+}
+
+function isHomeId(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    validateHomeId(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isHomeFilesystemId(value: unknown): value is string {
+  try {
+    validateHomeFilesystemId(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

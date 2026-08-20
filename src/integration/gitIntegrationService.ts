@@ -142,7 +142,10 @@ export class GitIntegrationService {
     readonly git: GitWorkspacePort = new NodeGitWorkspace(),
     readonly now: () => Date = () => new Date(),
     environment: NodeJS.ProcessEnv = process.env,
-    runtimeIsolation: TaskRuntimeIsolationPort = defaultIntegrationRuntimeIsolation(home),
+    runtimeIsolation: TaskRuntimeIsolationPort = defaultIntegrationRuntimeIsolation(
+      home,
+      store.getHomeIdentity().homeId
+    ),
     readonly jobPort?: IntegrationJobPort
   ) {
     this.home = resolve(home);
@@ -1200,14 +1203,17 @@ function isNodeCode(error: unknown, code: string): boolean {
     && (error as { code?: unknown }).code === code;
 }
 
-function defaultIntegrationRuntimeIsolation(home: string): TaskRuntimeIsolationPort {
+function defaultIntegrationRuntimeIsolation(
+  home: string,
+  homeId: string
+): TaskRuntimeIsolationPort {
   const controlHome = resolve(home);
   return new FileTaskRuntimeIsolation({
     runtimeRoot: integrationRuntimeRoot(),
     pathLayout: "compact",
     controlPlane: {
       yuiHome: controlHome,
-      controllerSocketPath: controllerSocketPath(controlHome),
+      controllerSocketPath: controllerSocketPath(homeId),
       tmuxNamespace: yuiTmuxServerName(controlHome),
       globalInstallPaths: [process.execPath]
     }

@@ -16,8 +16,12 @@ import {
   StorageRecordError,
   validateCurrentStorageStateSnapshot
 } from "./taskStore.js";
-import { SqliteTaskStore } from "./sqliteStore.js";
+import { readSqliteHomeIdentity, SqliteTaskStore } from "./sqliteStore.js";
 import { COMMITTED_DATABASE_FILENAME } from "./upgrade/sqliteStateMigration.js";
+import {
+  validateHomeIdentity,
+  type HomeIdentity
+} from "../repository/homeIdentity.js";
 import {
   ensureStorageSchema,
   inspectStorageSchema,
@@ -130,6 +134,46 @@ export function openCompatibleFileTaskStore(
       );
     case "unsupported":
       throw new StorageCompatibilityError(describeUnsupported(classification.classification));
+  }
+}
+
+/**
+ * Read the one authoritative durable Home identity without creating runtime
+ * state. SQLite is opened read-only; file-backed Homes read only the immutable
+ * identity field, so an aggregate that requires offline migration can still
+ * authenticate its already-running Controller before the migration stops it.
+ */
+export function readCompatibleHomeIdentity(
+  home: string,
+  options: OpenCompatibleFileTaskStoreOptions = {}
+): HomeIdentity {
+  const schema = inspectStorageSchema(home);
+  if (
+    !options.forceStateSource
+    && (schema.status === "current" || schema.status === "unsupported")
+    && schema.currentLayoutVersion >= 7
+    && existsSync(join(home, COMMITTED_DATABASE_FILENAME))
+  ) {
+    return readSqliteHomeIdentity(home, COMMITTED_DATABASE_FILENAME);
+  }
+  if (!existsSync(join(home, STORAGE_STATE_FILE))) {
+    throw new StorageRecordError("Durable Home identity is missing.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8")) as unknown;
+  } catch {
+    throw new StorageRecordError("Durable Home identity state is invalid JSON.");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new StorageRecordError("Durable Home identity state is invalid.");
+  }
+  try {
+    return validateHomeIdentity(
+      (parsed as { homeIdentity?: unknown }).homeIdentity as HomeIdentity
+    );
+  } catch {
+    throw new StorageRecordError("Durable Home identity is invalid.");
   }
 }
 

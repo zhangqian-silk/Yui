@@ -1,46 +1,30 @@
-import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { join } from "node:path";
 
-const LINUX_UNIX_SOCKET_PATH_BUDGET = 100;
+import { validateHomeId } from "../repository/homeIdentity.js";
 
-export function controllerSocketPath(home: string): string {
+export function controllerSocketPath(homeId: string): string {
+  const identity = validateHomeId(homeId);
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const socketName = `${controllerSocketIdentity(home)}.sock`;
-  const isolatedPath = join(tmpdir(), `yui-${uid}`, socketName);
-  if (
-    process.platform !== "linux"
-    || Buffer.byteLength(isolatedPath) < LINUX_UNIX_SOCKET_PATH_BUDGET
-  ) {
-    return isolatedPath;
-  }
-
-  // Linux limits Unix-socket paths to a small fixed budget. Managed Task
-  // runtimes intentionally use isolated TMPDIR roots, which may themselves
-  // be nested deeply enough to exhaust that budget. Keep the Home/uid/name
-  // fence while using the compact system temporary root only for this
-  // exceptional path; clients follow the Home-owned discovery record.
-  return join("/tmp", `yui-${uid}`, socketName);
+  const socketName = `${identity}.sock`;
+  // Linux Unix-socket paths have a small fixed budget. A stable per-uid system
+  // root is both short and independent of each caller's isolated TMPDIR.
+  const root = process.platform === "linux" ? "/tmp" : tmpdir();
+  return join(root, `yui-${uid}`, socketName);
 }
 
 /**
- * A protected Home discovery record owns the Controller endpoint. Clients may
- * run with an isolated TMPDIR, so validate the published Home/uid identity
- * without recomputing the Controller process's temporary root.
+ * A protected Home discovery record owns the Controller endpoint. Linux uses
+ * one fixed root, so every caller validates the exact Home/uid endpoint
+ * independently of its own TMPDIR.
  */
 export function isControllerSocketPathForHome(
-  home: string,
+  homeId: string,
   candidate: string
 ): boolean {
-  if (!isAbsolute(candidate) || resolve(candidate) !== candidate) return false;
-  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  return basename(dirname(candidate)) === `yui-${uid}`
-    && basename(candidate) === `${controllerSocketIdentity(home)}.sock`;
-}
-
-function controllerSocketIdentity(home: string): string {
-  return createHash("sha256")
-    .update(resolve(home))
-    .digest("hex")
-    .slice(0, 24);
+  try {
+    return candidate === controllerSocketPath(validateHomeId(homeId));
+  } catch {
+    return false;
+  }
 }

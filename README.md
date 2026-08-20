@@ -735,7 +735,7 @@ process cleanup explicitly, and revalidates process, tmux pane, and socket
 identity immediately before acting. Partial failures are reported without
 hiding the resources that remain. Use `--all` to include discovered Yui homes.
 
-`controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It does not stop or restart managed tmux/Agent sessions.
+`controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It can recover a lost discovery record only when the old process still matches the current UID, Controller entrypoint, physical Home, PID, and process-start identity. It does not stop or restart managed tmux/Agent sessions.
 
 Successful `setup`, `upgrade`, and `update` commands ensure that the current
 Home has a running Controller, starting one when the Home was previously idle.
@@ -927,9 +927,13 @@ make install-local
 
 `make install-local` writes a self-contained launcher at `output/dev/bin/yui`
 and never touches the user-level `yui` command. The launcher resolves its own
-checkout and defaults `YUI_HOME` to this checkout's `output/dev/home`, so every
-instance identity that Yui derives from `YUI_HOME`—Controller socket, tmux
-server, and state—stays separate from any other checkout or the global install.
+checkout and defaults `YUI_HOME` to this checkout's `output/dev/home`. The
+Controller socket is derived from that Home's durable `homeId` at the fixed
+Linux path `/tmp/yui-<uid>/<homeId>.sock`; discovery also binds the physical
+Home directory, so caller `TMPDIR`, path aliases, and copied runtime records
+cannot redirect control requests. The tmux server namespace and state remain
+scoped to the selected Home, so the checkout stays separate from other
+checkouts and the global install.
 It is idempotent, so re-run it after pulling new code (then run
 `./output/dev/bin/yui controller restart` if a Controller is already running).
 Call the launcher by its absolute path for a stable per-checkout entry point;

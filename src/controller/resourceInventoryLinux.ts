@@ -30,6 +30,7 @@ import {
   CONTROLLER_DISCOVERY_PATH
 } from "../core/protocol.js";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
+import { readHomeFilesystemId } from "../core/homeFilesystemIdentity.js";
 import {
   buildControllerResourceInventory,
   type ControllerDiscoveryFact,
@@ -98,8 +99,10 @@ export async function scanControllerResourceInventory(
   const observedAt = (options.now ?? (() => new Date()))();
   const warnings: string[] = [];
   const activeSockets = readActiveUnixSocketPaths(warnings);
-  const processes = (await listLinuxProcesses(warnings))
-    .filter(({ pid }) => pid !== process.pid);
+  const processes = normalizePhysicalHomeAliases(
+    (await listLinuxProcesses(warnings)).filter(({ pid }) => pid !== process.pid),
+    currentHome
+  );
   const homes = new Set<string>([currentHome]);
   if (options.scope === "all") {
     for (const process of processes) {
@@ -186,7 +189,9 @@ export async function scanControllerResourceInventory(
         )
       );
     const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
-    const expectedControllerSocketPath = controllerSocketPath(home);
+    const expectedControllerSocketPath = state.homeId === undefined
+      ? undefined
+      : controllerSocketPath(state.homeId);
     if (
       discovery.status === "valid"
       && !validDiscoveryProcess
@@ -195,7 +200,8 @@ export async function scanControllerResourceInventory(
       artifacts.push(fileArtifact(discoveryPath, "controller-discovery", false));
     }
     if (
-      existsSync(expectedControllerSocketPath)
+      expectedControllerSocketPath !== undefined
+      && existsSync(expectedControllerSocketPath)
       && !activeSockets.has(expectedControllerSocketPath)
       && !validDiscoveryProcess
     ) {
@@ -204,6 +210,7 @@ export async function scanControllerResourceInventory(
 
     homeFacts.push({
       yuiHome: home,
+      ...(state.homeId === undefined ? {} : { homeId: state.homeId }),
       exists: existsSync(home),
       storageStatus: state.storageStatus,
       discovery,
@@ -329,6 +336,9 @@ async function listLinuxProcesses(warnings: string[]): Promise<RuntimeProcessFac
           const args = splitNullDelimited(readFileSync(`/proc/${pid}/cmdline`));
           const command = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
           const yuiHome = readYuiHome(pid);
+          const homeFilesystemId = yuiHome === undefined
+            ? undefined
+            : optionalHomeFilesystemId(yuiHome);
           const io = readProcessIo(pid);
           result.push({
             pid,
@@ -336,6 +346,7 @@ async function listLinuxProcesses(warnings: string[]): Promise<RuntimeProcessFac
             uid: processUid,
             startIdentity: parsed.startIdentity,
             ...(yuiHome === undefined ? {} : { yuiHome }),
+            ...(homeFilesystemId === undefined ? {} : { homeFilesystemId }),
             kind: classifyRuntimeProcess(args, command),
             command,
             args,
@@ -352,6 +363,52 @@ async function listLinuxProcesses(warnings: string[]): Promise<RuntimeProcessFac
     }
   );
   return result;
+}
+
+/**
+ * Process environments retain their launch-time path spelling. Collapse
+ * symlink and bind-mount aliases by physical directory identity so inventory,
+ * update reconciliation, and cleanup all attribute them to one Home.
+ */
+function normalizePhysicalHomeAliases(
+  processes: readonly RuntimeProcessFact[],
+  currentHome: string
+): RuntimeProcessFact[] {
+  const currentFilesystemId = optionalHomeFilesystemId(currentHome);
+  const representatives = new Map<string, string>();
+  if (currentFilesystemId !== undefined) {
+    representatives.set(currentFilesystemId, currentHome);
+  }
+  for (const processFact of processes) {
+    const filesystemId = processFact.homeFilesystemId;
+    const yuiHome = processFact.yuiHome;
+    if (
+      filesystemId === undefined
+      || yuiHome === undefined
+      || filesystemId === currentFilesystemId
+    ) continue;
+    const existing = representatives.get(filesystemId);
+    if (existing === undefined || yuiHome.localeCompare(existing) < 0) {
+      representatives.set(filesystemId, yuiHome);
+    }
+  }
+  return processes.map((processFact) => {
+    const filesystemId = processFact.homeFilesystemId;
+    const representative = filesystemId === undefined
+      ? undefined
+      : representatives.get(filesystemId);
+    return representative === undefined || representative === processFact.yuiHome
+      ? processFact
+      : { ...processFact, yuiHome: representative };
+  });
+}
+
+function optionalHomeFilesystemId(home: string): string | undefined {
+  try {
+    return readHomeFilesystemId(home);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Cooperatively visits synchronous inventory entries in bounded turns. */
@@ -548,6 +605,10 @@ async function inspectDiscovery(
     const discovery = await readControllerDiscovery(home);
     return {
       status: "valid",
+      protocolVersion: discovery.protocolVersion,
+      homeId: discovery.homeId,
+      homeFilesystemId: discovery.homeFilesystemId,
+      controllerInstanceId: discovery.controllerInstanceId,
       pid: discovery.pid,
       processStartIdentity: discovery.processStartIdentity,
       socketPath: discovery.socketPath,
@@ -752,6 +813,7 @@ function loadHomeState(
   options: Pick<ControllerInventoryScanOptions, "inspectStorage" | "openCompatibleStore">
 ): Readonly<{
   storageStatus: RuntimeHomeFact["storageStatus"];
+  homeId?: string;
   roles: RuntimeRoleFact[];
 }> {
   const schema = (options.inspectStorage ?? inspectStorageSchema)(home);
@@ -857,7 +919,11 @@ function loadHomeState(
         }
       }
     }
-    return { storageStatus: schema.status, roles };
+    return {
+      storageStatus: schema.status,
+      homeId: store.getHomeIdentity().homeId,
+      roles
+    };
   } catch (error) {
     warnings.push(`Cannot load runtime ownership for ${home}: ${message(error)}`);
     return { storageStatus: "invalid", roles: [] };

@@ -1,7 +1,9 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -9,7 +11,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { validateConfiguredAgent, type ConfiguredAgent } from "../agent/agent.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
@@ -2419,11 +2421,59 @@ export class StorageConflictError extends Error { constructor(message: string) {
 export class StorageCancelledError extends Error { constructor(message: string) { super(message); this.name = "StorageCancelledError"; } }
 
 export function resolveYuiHome(env: NodeJS.ProcessEnv): string {
-  return env.YUI_HOME === undefined || env.YUI_HOME.length === 0
+  const requested = env.YUI_HOME === undefined || env.YUI_HOME.length === 0
     ? join(homedir(), ".yui")
     : resolve(env.YUI_HOME);
+  return canonicalizeYuiHome(requested);
 }
 export function ensureYuiHome(rootDir: string): void { mkdirSync(rootDir, { recursive: true, mode: 0o700 }); }
+
+/**
+ * YUI_HOME is a runtime identity, not only a storage path. Resolve every
+ * existing symlink component before Controller/tmux namespaces or exact
+ * descriptors derive identity from it. A Home may not exist before `setup`,
+ * so retain proven-missing trailing components below the longest existing
+ * physical ancestor. Existing-but-unresolvable paths fail closed.
+ */
+function canonicalizeYuiHome(value: string): string {
+  const absolute = resolve(value);
+  let current = absolute;
+  const trailing: string[] = [];
+  for (;;) {
+    try {
+      const physical = realpathSync(current);
+      return trailing.length === 0 ? physical : join(physical, ...trailing);
+    } catch (realpathError) {
+      if (!isErrno(realpathError, "ENOENT")) {
+        throw unstableYuiHome(absolute, realpathError);
+      }
+      try {
+        lstatSync(current);
+      } catch (lstatError) {
+        if (!isErrno(lstatError, "ENOENT")) {
+          throw unstableYuiHome(absolute, lstatError);
+        }
+        const parent = dirname(current);
+        if (parent === current) return absolute;
+        trailing.unshift(basename(current));
+        current = parent;
+        continue;
+      }
+      throw unstableYuiHome(absolute, realpathError);
+    }
+  }
+}
+
+function unstableYuiHome(path: string, cause: unknown): Error {
+  return new Error(
+    `YUI_HOME cannot be resolved to a stable physical path: ${path}.`,
+    { cause }
+  );
+}
+
+function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
+}
 
 function emptyState(): StorageState {
   return {
