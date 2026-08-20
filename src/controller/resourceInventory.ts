@@ -51,6 +51,8 @@ export type RuntimeProcessFact = Readonly<{
   uid: number;
   startIdentity: string;
   yuiHome?: string;
+  /** Internal physical-Home key used to collapse path aliases during a scan. */
+  homeFilesystemId?: string;
   kind: RuntimeProcessKind;
   command: string;
   args: readonly string[];
@@ -61,7 +63,10 @@ export type RuntimeProcessFact = Readonly<{
   ageMs: number;
 }>;
 
-export type RuntimeProcessInfo = Readonly<Omit<RuntimeProcessFact, "args" | "kind" | "yuiHome">>;
+export type RuntimeProcessInfo = Readonly<Omit<
+  RuntimeProcessFact,
+  "args" | "kind" | "yuiHome" | "homeFilesystemId"
+>>;
 
 export type RuntimePaneFact = Readonly<{
   taskId: string;

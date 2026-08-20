@@ -97,7 +97,10 @@ replacement/restore of the original identity, not a new independent Home.
 The explicit `yui controller restart` operation recognizes only the immediately
 previous released Controller discovery shape (protocol v3), authenticates its
 PID/start identity and physical Home, stops that exact owner, and then starts
-the current Controller. Ordinary requests never fall back to the old protocol.
+the current Controller. If discovery was lost, explicit restart can recover
+only an exact same-UID Controller process whose entrypoint, physical Home, PID,
+and process-start identity all match. Ordinary requests never fall back to the
+old protocol and never signal an unproven process.
 
 The archive step is idempotent: re-running it is a no-op for already-archived
 refs.

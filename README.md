@@ -735,7 +735,7 @@ process cleanup explicitly, and revalidates process, tmux pane, and socket
 identity immediately before acting. Partial failures are reported without
 hiding the resources that remain. Use `--all` to include discovered Yui homes.
 
-`controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It does not stop or restart managed tmux/Agent sessions.
+`controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It can recover a lost discovery record only when the old process still matches the current UID, Controller entrypoint, physical Home, PID, and process-start identity. It does not stop or restart managed tmux/Agent sessions.
 
 Successful `setup`, `upgrade`, and `update` commands ensure that the current
 Home has a running Controller, starting one when the Home was previously idle.

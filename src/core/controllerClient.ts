@@ -16,7 +16,10 @@ import {
 } from "./protocol.js";
 import { isControllerSocketPathForHome } from "./controllerEndpoint.js";
 import { readHomeFilesystemId } from "./homeFilesystemIdentity.js";
-import { inspectLiveControllerProcess } from "./controllerProcessIdentity.js";
+import {
+  findLiveControllerProcessForHome,
+  inspectLiveControllerProcess
+} from "./controllerProcessIdentity.js";
 
 export class ControllerClientError extends Error {
   constructor(readonly code: string, message: string) {
@@ -164,6 +167,54 @@ export async function stopPreviousFileTaskController(
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   return Object.freeze({ pid: discovery.pid });
+}
+
+/**
+ * Explicit restart recovery for an exact Controller whose discovery record
+ * was lost. The signal is fenced by same UID, controller entrypoint, physical
+ * Home identity, PID, and process-start identity; an unprovable process is
+ * never touched.
+ */
+export async function stopOrphanedFileTaskController(
+  home: string,
+  timeoutMs: number
+): Promise<Readonly<{ pid: number }> | undefined> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new TypeError("Controller timeout must be a positive integer.");
+  }
+  const homeFilesystemId = readHomeFilesystemId(home);
+  const candidate = findLiveControllerProcessForHome(homeFilesystemId);
+  if (candidate === undefined) return undefined;
+  if (
+    inspectLiveControllerProcess(
+      candidate.pid,
+      homeFilesystemId,
+      candidate.processStartIdentity
+    ) === undefined
+  ) return undefined;
+  try {
+    process.kill(candidate.pid, "SIGTERM");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ESRCH") return undefined;
+    throw error;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (
+    inspectLiveControllerProcess(
+      candidate.pid,
+      homeFilesystemId,
+      candidate.processStartIdentity
+    ) !== undefined
+  ) {
+    if (Date.now() >= deadline) {
+      throw new ControllerClientError(
+        "CONTROLLER_TIMEOUT",
+        `Orphaned Controller did not stop within ${timeoutMs} ms.`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return Object.freeze({ pid: candidate.pid });
 }
 
 async function readPreviousControllerDiscovery(

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   callController,
   readControllerDiscovery,
+  stopOrphanedFileTaskController,
   stopPreviousFileTaskController
 } from "../core/controllerClient.js";
 import {
@@ -372,6 +373,10 @@ export async function restartFileTaskController(
     // no ordinary request can fall back to it.
     const previous = await stopPreviousFileTaskController(home, shutdownTimeoutMs);
     previousPid = previous.pid;
+  }
+  if (!controllerRunning(current) && options.call === undefined) {
+    const orphan = await stopOrphanedFileTaskController(home, shutdownTimeoutMs);
+    if (orphan !== undefined) previousPid = orphan.pid;
   }
   if (controllerRunning(current)) {
     await callFileTaskController(home, "controller.stop", {}, options);
