@@ -888,14 +888,18 @@ The reusable, user-driven acceptance plan is documented in
 
 ```sh
 npm ci
-npm run build
-npm test
-npm run lint
+npm run test:core
 ```
 
-`npm test` (and `make test` / `make check`) runs the full **deterministic** test
-suite: it never launches a real model and never touches the global `yui`
-binary, a shared `YUI_HOME`, or a running production Session. It stays
+`npm run test:core` builds once and runs the same small, explicit core matrix as
+CI. During development, add the smallest affected test files for the behavior
+being changed.
+
+`npm test` (and `make test` / `make check`) remains the full **deterministic**
+diagnostic suite. Run it on demand for unusually cross-cutting changes or
+regression investigation; it is not a routine merge requirement. It never
+launches a real model or touches the global `yui` binary, a shared `YUI_HOME`,
+or a running production Session. It stays
 deterministic even when launched from inside a managed Yui Session, because it
 preloads `test/helpers/scrubSessionEnv.js` to strip every Yui-owned managed
 runtime value from the test process, including shared `YUI_HOME`, exact Leader

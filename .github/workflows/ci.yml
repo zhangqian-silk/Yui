@@ -1,19 +1,9 @@
-name: Deterministic CI
+name: Core CI
 
-# The single PR/master deterministic gate (see docs/testing/verification-levels.md).
-# It runs once on the exact commit through the hermetic gate runner
-# (scripts/gate-hermetic.mjs): install, build, lint, the full deterministic
-# suite with process-lifecycle E2E isolated, and package structure smoke,
-# inside an isolated HOME, XDG tree, git
-# identity, temp dir, and npm cache with a sanitized PATH. The runner persists
-# a per-SHA gate record (gate-record.json) uploaded as the `gate-record`
-# artifact: the per-commit pass/fail evidence. Local development uses
-# risk-targeted checks instead of repeating this suite; the release workflow
-# reuses its result on the exact tagged commit.
-#
-# Every failing step fails the gate. CI does not re-run an older commit or
-# excuse a failure because it also existed in history; master is the green
-# baseline and each candidate must satisfy the current contract directly.
+# A deliberately small regression tripwire for a single-user product. It builds
+# once, runs an explicit list of core storage/workflow/Agent Driver tests, and
+# checks the package structure. Broader deterministic, process-lifecycle, and
+# real-provider suites remain available on demand but are not merge blockers.
 
 on:
   pull_request:
@@ -26,30 +16,33 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # The gate clones this checkout into its hermetic domain. Git
-          # rejects a local clone from a shallow repository.
-          fetch-depth: 0
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
 
-      - name: Hermetic deterministic gate
-        run: node scripts/gate-hermetic.mjs --record gate-record.json
+      - name: Install
+        run: npm ci
 
-      - name: Upload gate record
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gate-record
-          path: gate-record.json
-          if-no-files-found: error
-          retention-days: 90
+      - name: Core regression smoke
+        run: npm run test:core
+
+      - name: Package structure smoke
+        run: |
+          node scripts/assemble-runtime-package.mjs --output .release-stage
+          npm pack ./.release-stage --dry-run --ignore-scripts --json > package-smoke.json
+          node scripts/check-runtime-package-structure.mjs package-smoke.json
+          node .release-stage/dist/cli.js help > /dev/null

@@ -203,7 +203,8 @@ authority.
 
 The privileged **Release E2E** tier (install/update/upgrade under an isolated
 npm prefix) is separate: it is opt-in (`YUI_ALLOW_RELEASE_E2E=1`), passes the
-mandatory isolation preflight, and is never part of the default suite. See
+mandatory isolation preflight, and is never part of core CI or the deterministic
+diagnostic suite. See
 [docs/testing/test-tiers.md](testing/test-tiers.md).
 
 ## Adapter security hardening
