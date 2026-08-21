@@ -116,16 +116,16 @@ yui task activate <task-id>
 
 ```sh
 yui config show
-yui config set --time-zone Europe/London
+yui config set time-zone Europe/London
 ```
 
 WorkItem 审查只有一条可选的全局规则，并直接复用已有 Global Role 的
 Agent、model、权限、prompt 和 Skills：
 
 ```sh
-yui config review set --role reviewer --trigger always
-yui config review show
-yui config review clear
+yui config set review --role reviewer --trigger always
+yui config show
+yui config clear review
 ```
 
 对带 Project 的软件交付，可使用 `--trigger final`：WorkItem 验收与
@@ -133,7 +133,7 @@ Integration 保持独立，在 Task 完成前只对所有已集成 Project 的�
 一次 Task 级 ReviewRound：
 
 ```sh
-yui config review set --role reviewer --trigger final
+yui config set review --role reviewer --trigger final
 ```
 
 每个进入 Leader 验收阶段的结果，都会成为原 WorkItem 上一个明确的候选。

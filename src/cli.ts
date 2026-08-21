@@ -781,19 +781,19 @@ export async function main(): Promise<void> {
   }
   if (resolved[0] === "config") {
     const configArgs = resolved.slice(1);
-    const output = runConfigCommand(configArgs, store);
+    const result = runConfigCommand(configArgs, store);
     if (
       configArgs[0] === "set"
-      && configArgs[1] === "--reconciliation-interval-seconds"
+      && configArgs[1] === "reconciliation-interval-seconds"
     ) {
       const refresh = await refreshRunningFileTaskControllerConfiguration(
         home,
         { environment: process.env }
       );
-      emit(withControllerRefreshWarning(output, refresh, "Controller configuration"));
+      emit(withControllerRefreshWarning(result.output, refresh, "Controller configuration"));
       return;
     }
-    emit(output);
+    emit(result.output, false, result.data);
     return;
   }
   if (resolved[0] === "project") {

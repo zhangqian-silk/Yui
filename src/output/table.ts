@@ -6,6 +6,24 @@ export type TableColumn = {
   maxWidth: number;
 };
 
+/**
+ * The shared renderer for every command whose output is row/column data
+ * (lists, overviews, settings such as `config show`). The consistent rules:
+ *
+ * - Column width: each column declares `minWidth`/`maxWidth`; widths start at
+ *   the widest cell and shrink largest-spare-first until the table fits.
+ * - Alignment: cells are left-aligned and padded by visible width, so CJK and
+ *   other wide characters align correctly.
+ * - Empty values: rendered as empty cells (trimmed at line end); the
+ *   narrow-terminal record fallback skips empty detail values.
+ * - Terminal width: callers pass `defaultTableWidth()` (46–140 columns) unless
+ *   a command has a narrower natural bound.
+ * - JSON mode: commands that have structured data pass it as `emit`'s `data`
+ *   argument; the table text is the human view of the same values.
+ *
+ * Do not use this for long-form prose, diagnostic detail, or interactive
+ * prompts — those keep their own non-tabular formats.
+ */
 export function renderTable(
   title: string,
   columns: readonly TableColumn[],
