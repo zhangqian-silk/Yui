@@ -54,6 +54,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .filter-dot.completed{background:var(--success);box-shadow:0 0 6px var(--success)}
 .filter-dot.yielded{background:var(--success);box-shadow:0 0 6px var(--success)}
 .filter-dot.failed{background:var(--danger);box-shadow:0 0 6px var(--danger)}
+.filter-dot.retired{background:var(--faint)}
 .filter-dot.archived{background:var(--muted)}
 .filter-chip[data-status=active].is-active{color:var(--active);background:var(--active-soft);border-color:color-mix(in srgb,var(--active) 45%,transparent)}
 .filter-chip[data-status=active].is-active .filter-count{color:var(--active)}
