@@ -350,7 +350,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         },
         {
           kind: "native-subagent",
-          reason: "Use one native implementer subagent when one bounded implementation pass benefits from parallel attention.",
+          reason: "Use native implementer subagents when bounded work benefits from specialist attention or parallel fan-out inside the Leader Session.",
           refs
         }
       ],

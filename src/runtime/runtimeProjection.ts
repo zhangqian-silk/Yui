@@ -1,8 +1,8 @@
 import type { AgentRuntimeOperation, AgentRuntimeWaitReason } from "./agentDriver.js";
 import {
   createRuntimeObservation,
-  runtimeObservationFenceMatches,
   runtimeObservationFromTaskEvent,
+  runtimeObservationRunFenceMatches,
   type RuntimeObservation,
   type RuntimeObservationFence,
   type RuntimeUsageSnapshot
@@ -96,7 +96,7 @@ export function projectRuntimeTaskEvents(
   const observations = events
     .map(runtimeObservationFromTaskEvent)
     .filter((event): event is RuntimeObservation => (
-      event !== null && runtimeObservationFenceMatches(fence, event.fence)
+      event !== null && runtimeObservationRunFenceMatches(fence, event.fence)
     ))
     .sort((left, right) => (
       left.receivedAt.localeCompare(right.receivedAt)
@@ -112,7 +112,7 @@ export function projectRuntimeObservation(
   raw: RuntimeObservation
 ): RuntimeProjection {
   const event = createRuntimeObservation(raw);
-  if (!runtimeObservationFenceMatches(current.fence, event.fence)) {
+  if (!runtimeObservationRunFenceMatches(current.fence, event.fence)) {
     throw new Error("Runtime observation fence does not match the projection.");
   }
   const at = event.receivedAt;
@@ -162,7 +162,10 @@ export function projectRuntimeObservation(
         turn: "completed",
         waitingReason: undefined,
         waitId: undefined,
-        operations: Object.freeze({}),
+        // Tool operations belong to the completed native Turn. Provider-owned
+        // background subagents may legitimately outlive it and wake later
+        // native Turns inside the same durable Yui Run.
+        operations: activeSubagentOperations(current.operations),
         stateSince: at
       }), "provider", at);
     case "turn.failed":
@@ -364,6 +367,14 @@ function dominantOperation(
   if (kinds.includes("tool")) return "tool";
   if (kinds.includes("model")) return "model";
   return null;
+}
+
+function activeSubagentOperations(
+  operations: RuntimeProjection["operations"]
+): RuntimeProjection["operations"] {
+  return Object.freeze(Object.fromEntries(
+    Object.entries(operations).filter(([, operation]) => operation.kind === "subagent")
+  ));
 }
 
 function terminalTurn(

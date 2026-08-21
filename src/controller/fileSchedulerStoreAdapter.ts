@@ -150,9 +150,11 @@ import {
   createRuntimeObservation,
   runtimeObservationFenceMatches,
   runtimeObservationFromTaskEvent,
+  runtimeObservationRunFenceMatches,
   runtimeObservationTaskEventPayload,
   type RuntimeObservation
 } from "../runtime/runtimeObservation.js";
+import { projectRuntimeTaskEvents } from "../runtime/runtimeProjection.js";
 
 /**
  * One durable revision's read-only facts for one Task. A scheduler pass reads
@@ -250,6 +252,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         };
         const classification = this.classifyRuntimeTurnCompleted(completed);
         if (classification !== "apply") return classification;
+        if (this.runtimeTurnHasActiveNativeSubagents(input)) {
+          // This is an intermediate provider Turn boundary, not the end of the
+          // durable Yui Run. The provider will deliver child completion
+          // notifications as later native Turns in the same Run generation.
+          outcome = this.validateCanonicalRunObservation(input, now);
+          break;
+        }
         const result = this.observeRuntimeTurnCompleted(completed, now);
         outcome = result.disposition === "obsolete" ? "obsolete" : "applied";
         break;
@@ -352,6 +361,18 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       return "applied";
     });
+  }
+
+  private runtimeTurnHasActiveNativeSubagents(input: RuntimeObservation): boolean {
+    const taskId = input.fence.taskId!;
+    const run = this.store.getAgentRun(taskId, input.fence.runId!);
+    if (run === null) return false;
+    const projection = projectRuntimeTaskEvents(
+      input.fence,
+      run.createdAt,
+      this.store.listEvents(taskId)
+    );
+    return Object.values(projection.operations).some(({ kind }) => kind === "subagent");
   }
 
   private validateCanonicalSessionObservation(
@@ -1846,7 +1867,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   /**
-   * Fast hook path: durably records the native Turn boundary and a two-second
+   * Fast hook path: validates the native Turn boundary before it is either
+   * retained as an intermediate child wait or given a two-second workflow
    * closure deadline. It never performs tmux, workspace, or Controller I/O.
    */
   classifyRuntimeTurnCompleted(input: Readonly<{
@@ -4125,8 +4147,13 @@ function compactedRuntimeObservationIds(
 ): string[] {
   const existing = events.flatMap((event) => {
     const observation = runtimeObservationFromTaskEvent(event);
+    const matches = incoming.kind.startsWith("operation.")
+      ? observation !== null
+        && runtimeObservationRunFenceMatches(observation.fence, incoming.fence)
+      : observation !== null
+        && runtimeObservationFenceMatches(observation.fence, incoming.fence);
     return observation !== null
-      && runtimeObservationFenceMatches(observation.fence, incoming.fence)
+      && matches
       ? [{ event, observation }]
       : [];
   });
@@ -4154,7 +4181,8 @@ function compactedRuntimeObservationIds(
         && observation.payload.sourceId === incoming.payload.sourceId;
     }
     if (["turn.completed", "turn.failed", "turn.cancelled"].includes(incoming.kind)) {
-      return observation.kind.startsWith("operation.")
+      return (observation.kind.startsWith("operation.")
+          && observation.payload.operation !== "subagent")
         || observation.kind === "turn.waiting"
         || observation.kind === "turn.completed"
         || observation.kind === "turn.failed"

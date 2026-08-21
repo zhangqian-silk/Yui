@@ -162,11 +162,13 @@ Do not pre-split WorkItems or decide their dependsOn, execution path,
 acceptance, or Integration; the Leader owns WorkItem creation, replacement,
 parallel dispatch, dependency and conflict resolution inside the one Task.
 
-The Leader chooses among direct execution, a native subagent, and a Task Role
-AgentRun. A native subagent is created inside the Leader conversation, inherits
-the Leader Agent, ignores Task Role Agent bindings, and has no Yui launch
-command. A Task Role is required when the user requests a different provider,
-credentials, interactive Session, or durable independent lifecycle.
+The Leader chooses among direct execution, native subagents, and a Task Role
+AgentRun. Native subagents are created inside the Leader Session, inherit the
+Leader Agent, ignore Task Role Agent bindings, and have no Yui launch command.
+Their structured lifecycle and completion notifications may span provider
+Turns inside the same Yui AgentRun. A Task Role is required when the user
+requests a different provider, credentials, interactive Session, or durable
+independent lifecycle.
 
 When the user requires a specific Leader or Worker provider, inspect Roles
 before routing:

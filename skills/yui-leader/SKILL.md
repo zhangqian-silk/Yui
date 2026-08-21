@@ -38,20 +38,23 @@ Choose the executor in this order:
 
 1. **Leader directly** when the work is small and the current Leader context,
    authority, and tools are sufficient.
-2. **At most one native implementer subagent** when one bounded implementation
-   pass benefits from parallel attention or a specialist available inside the
-   current Agent. Give it one explicit Profile, one writable workspace, and one
-   result contract.
-3. **Task Role AgentRun** only when the work genuinely needs independent
-   parallel ownership, different credentials or authority, a provider/model
-   capability unavailable to the current Agent, or an independently managed
-   Session and durable Run lifecycle.
+2. **Native subagents** when bounded implementation or research benefits from
+   specialist attention or parallel fan-out inside the current Agent Session.
+   Give each child an explicit Profile, workspace access, and result contract.
+3. **Task Role AgentRun** when the work genuinely needs independent durable
+   ownership, different credentials or authority, a provider/model capability
+   unavailable to the current Agent, or an independently managed Session and
+   Run lifecycle.
 
 Do not dispatch a Task Role merely to obtain a fresh context, run a command,
 perform a routine small edit, or add an intermediate review. Direct and native
 execution add no Worker Role, Worker Yui Session, or Worker AgentRun. The exact
-Leader Run fence stays active until a native child hands back its result; the
+Leader Run fence stays active while native child work is outstanding; the
 WorkItem and its workspace remain the durable delivery boundary.
+
+Provider-native foreground and background child lifecycle stays owned by the
+current Agent Session. Structured child completion notifications may resume the
+Leader in later provider Turns while the same Yui AgentRun remains active.
 
 A Project-backed code result still uses one WorkItem-owned Develop workspace
 and a clean committed Candidate. The fast path compresses orchestration, not
@@ -84,11 +87,11 @@ WorkItem while its delivery scope remains open. If an immutable final-review
 boundary makes that impossible, create only the smallest repair WorkItem and
 retain the original Candidate, Review, and Integration evidence.
 
-Native and managed waits use different fences. For a native child, wait once on
-the native completion event inside the current Leader turn. Keep the exact
-Leader Run active; the child result returns control directly to this Leader.
-Do not poll, send a waiting Message, rewrite a checkpoint, or yield before that
-handoff.
+Native and managed waits use different fences. For native children, let the
+provider deliver structured completion notifications and continue the parent
+Agent. The exact Leader Run stays active across intermediate provider Turn
+boundaries while native children remain active. Do not poll, send a waiting
+Message, rewrite a checkpoint, or yield merely to preserve that native wait.
 
 For a managed Task Role or Reviewer Run, persist a necessary changed checkpoint,
 yield the active Leader Run, and stop the turn. Its durable mailbox result or an
@@ -344,12 +347,12 @@ hint only if this Agent's native child API supports that override; otherwise
 inherit the actual runtime setting. Never claim a model that cannot be
 confirmed.
 
-Create and communicate with the child through the native Agent tools. Yui does
-not create, address, resume, or terminate that child. The child returns its
-result through the native child-result mechanism and must not mutate Yui
-lifecycle state. Wait on the native completion event in this Leader turn and
-keep the current Leader Run active until that one result arrives; do not yield
-the Run as though Yui could wake it for a native child.
+Create and communicate with children through the native Agent tools. Yui does
+not create, address, resume, or terminate those children; it observes their
+structured lifecycle so the parent AgentRun can span the provider Turns needed
+to receive their results. Children must not mutate Yui lifecycle state. Let the
+provider's native completion mechanism return results to the Leader, then
+synthesize them before deciding the next Yui workflow outcome.
 
 Review the returned work and run proportionate checks. Record each round in the
 WorkItem summary; preserve earlier round facts when updating it:
@@ -617,9 +620,10 @@ evidence; truthfully surface the blocker through the supported provider failure
 boundary. Do not add a fallback protocol.
 
 Yield before waiting only for managed Task Role or Reviewer results whose
-durable mailbox can wake the Task. Do not yield while a native child result is
-outstanding; its native completion event returns to this same Leader turn and
-requires the exact Leader Run fence to remain active.
+durable mailbox can wake the Task. Do not yield merely because native child
+results are outstanding: the provider owns their completion notifications, and
+Yui keeps this AgentRun active across intermediate provider Turns. After native
+work drains, continue to Task completion, InputRequest, or final yield.
 
 Complete only after required WorkItems are accepted, Role work is terminal,
 latest isolated results are integrated or deliberately abandoned, and user
