@@ -88,6 +88,159 @@ export function anchorSection(id, head, body) {
   return section;
 }
 
+// --- Task-first execution status -------------------------------------------
+// The projection is the current read-model vocabulary: one derived status,
+// owner, next action, and the attention/blocker facts behind it.
+const EXEC_STATUS_TONE = {
+  "needs-leader-action": "is-accent",
+  "waiting-on-agents": "is-active",
+  "waiting-user": "is-warning",
+  "recovering": "is-warning",
+  "attention": "is-danger",
+  "progressing-with-attention": "is-warning",
+  "blocked": "is-danger",
+  "working": "is-active",
+  "completed": "is-muted",
+  "retired": "is-muted",
+  "archived": "is-muted"
+};
+
+export function executionBand(projection, t, locale) {
+  if (!projection) return null;
+  const tone = EXEC_STATUS_TONE[projection.status] || "";
+  const band = node("div", "exec-band " + tone);
+
+  const head = node("div", "exec-band-head");
+  head.append(pill(t, "exec.status", projection.status));
+  head.append(node("span", "exec-band-owner",
+    t("exec.owner." + projection.owner) + " · " + t("exec.action." + projection.action)));
+  if (projection.activeExecutorCount > 0) {
+    head.append(node("span", "exec-band-executors",
+      projection.activeExecutorCount + " " + t("exec.executors")));
+  }
+  if (projection.monitoring === "stopped") {
+    head.append(node("span", "exec-band-stopped", t("exec.monitoring.stopped")));
+  }
+  if (projection.failClosed) {
+    head.append(node("span", "exec-band-failclosed", t("exec.failClosed")));
+  }
+  band.append(head);
+
+  if (projection.summary) {
+    band.append(node("p", "exec-band-summary", projection.summary));
+  }
+
+  if (projection.attention && projection.attention.length) {
+    const list = node("div", "exec-signal-list");
+    projection.attention.forEach(function (item) {
+      const row = node("div", "exec-signal is-attention");
+      row.append(node("span", "exec-signal-kind", t("exec.attention." + item.kind)));
+      row.append(node("span", "exec-signal-text", item.summary));
+      list.append(row);
+    });
+    band.append(list);
+  }
+
+  if (projection.blockers && projection.blockers.length) {
+    const list = node("div", "exec-signal-list");
+    projection.blockers.forEach(function (blocker) {
+      const row = node("div", "exec-signal is-blocker");
+      row.append(node("span", "exec-signal-kind",
+        t("exec.blocker." + blocker.kind) + " · " + t("exec.owner." + blocker.owner)));
+      row.append(node("span", "exec-signal-text", blocker.summary));
+      list.append(row);
+    });
+    band.append(list);
+  }
+
+  return band;
+}
+
+// --- Unified execution Group (Lanes + resolution) ---------------------------
+export function executionGroupCard(summary, t, locale) {
+  const card = node("article", "record-card exec-group");
+  const head = node("div", "record-head");
+  const titleRow = node("div", "record-title-row");
+  titleRow.append(node("strong", "record-title", summary.groupId));
+  head.append(titleRow);
+  const pills = node("div", "record-pills");
+  pills.append(pill(t, "exec.purpose", summary.purpose));
+  const strategy = summary.strategy.mode === "fixed"
+    ? t("exec.strategy.fixed").replace("{count}", String(summary.strategy.count))
+    : t("exec.strategy.adaptive").replace("{max}", String(summary.strategy.max));
+  pills.append(chip(strategy));
+  if (summary.failedLaneCount > 0) {
+    pills.append(chip(summary.failedLaneCount + " " + t("exec.lanesFailed"), "is-danger"));
+  }
+  head.append(pills);
+  card.append(head);
+
+  const lanes = node("div", "lane-list");
+  summary.laneSummaries.forEach(function (lane) {
+    const row = node("div", "lane-row");
+    row.append(statusDot(lane.status));
+    row.append(node("span", "lane-role", lane.roleName));
+    row.append(node("span", "lane-status", t("lane." + lane.status)));
+    if (lane.summary) {
+      row.append(node("span", "lane-summary", lane.summary));
+    }
+    if (lane.decision) {
+      row.append(chip(t("resolution." + lane.decision), "is-active"));
+    }
+    lanes.append(row);
+  });
+  card.append(lanes);
+
+  if (summary.resolution) {
+    const res = node("div", "exec-resolution");
+    res.append(node("span", "exec-resolution-decision",
+      t("resolution." + summary.resolution.decision)));
+    res.append(node("span", "exec-resolution-summary", summary.resolution.summary));
+    res.append(node("time", "", formatDateTime(summary.resolution.decidedAt, locale)));
+    card.append(res);
+  }
+  return card;
+}
+
+// --- WorkItem Candidates -----------------------------------------------------
+export function candidateList(candidates, t, locale) {
+  if (!candidates || !candidates.length) return null;
+  const block = node("div", "record-block");
+  block.append(node("small", "", t("detail.candidates")));
+  const list = node("div", "candidate-list");
+  candidates.slice().sort(function (a, b) { return b.sequence - a.sequence; })
+    .forEach(function (candidate) {
+      const row = node("div", "candidate-row");
+      row.append(node("span", "candidate-seq", "#" + candidate.sequence));
+      row.append(node("span", "candidate-summary", candidate.summary));
+      const source = candidate.source.type === "direct"
+        ? t("candidate.source.direct")
+        : t("candidate.source.run") + " " + candidate.source.runId;
+      row.append(node("span", "candidate-source", source));
+      row.append(node("time", "", formatDateTime(candidate.createdAt, locale)));
+      list.append(row);
+    });
+  block.append(list);
+  return block;
+}
+
+// --- Execution findings (checks / review findings) ---------------------------
+export function findingsBlock(label, findings, t) {
+  if (!findings || !findings.length) return null;
+  const block = node("div", "record-block");
+  block.append(node("small", "", label));
+  const list = node("div", "finding-list");
+  findings.forEach(function (finding) {
+    const row = node("div", "finding-row is-" + finding.severity);
+    row.append(chip(t("finding.severity." + finding.severity), "is-" + finding.severity));
+    row.append(node("span", "finding-summary", finding.summary));
+    row.append(chip(t("finding.status." + finding.status)));
+    list.append(row);
+  });
+  block.append(list);
+  return block;
+}
+
 // --- Progressive disclosure --------------------------------------------------
 // Re-render is cheap and happens whenever the underlying data changes, so all
 // disclosure state (collapsed blocks, visible pages) is deliberately
@@ -242,6 +395,10 @@ export function inputCard(input, _options, t, locale, actions) {
     const blocked = input.blockedRefs.map(function (ref) { return ref.type + "·" + ref.id; }).join("  ");
     top.append(node("span", "input-blocked", blocked));
   }
+  if (input.requester) {
+    top.append(node("span", "input-requester",
+      t("detail.requester") + " · " + input.requester.roleName + " / " + input.requester.runId));
+  }
   card.append(top);
   card.append(answerActions(input, actions, t));
   return card;
@@ -286,6 +443,9 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
   if (item.assignee) meta.append(node("span", "meta-name", item.assignee));
   meta.append(node("span", "mono", item.id));
   meta.append(node("time", "", formatDateTime(item.updatedAt, locale)));
+  if (item.endedAt) {
+    meta.append(node("span", "", t("detail.endedAt") + " · " + formatDateTime(item.endedAt, locale)));
+  }
   body.append(meta);
 
   if (item.objective && item.objective !== item.title) {
@@ -307,6 +467,28 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
   }
   if (chipCols.childNodes.length) body.append(chipCols);
 
+  // Current execution iteration: the unified Group with its Lanes and the
+  // Leader's resolution when the iteration is settled.
+  if (item.currentExecution) {
+    body.append(executionGroupCard(item.currentExecution, t, locale));
+  }
+
+  // Review candidates submitted for this WorkItem, newest first.
+  const candidates = candidateList(item.candidates, t, locale);
+  if (candidates) body.append(candidates);
+
+  // Explicit Leader retirement disposition.
+  if (item.disposition) {
+    const disposition = node("div", "record-block disposition-block");
+    disposition.append(node("small", "", t("detail.disposition")));
+    const text = item.disposition.summary
+      + (item.disposition.replacementWorkItemId
+        ? " · " + t("detail.replacementWorkItem") + " " + item.disposition.replacementWorkItemId
+        : "");
+    disposition.append(node("p", "muted", text));
+    body.append(disposition);
+  }
+
   if (item.outcome) {
     body.append(richText(t("detail.outcome"), item.outcome, t, { extraClass: "outcome-callout", muted: true }));
   }
@@ -323,7 +505,8 @@ export function runCard(run, t, locale) {
   idRow.append(node("span", "role", run.roleName));
   idRow.append(node("span", "", run.id));
   if (run.workItemId) idRow.append(node("span", "", t("detail.workItem") + " · " + run.workItemId));
-  idRow.append(node("time", "", formatDateTime(run.updatedAt, locale)));
+  if (run.purpose) idRow.append(chip(t("run.purpose." + run.purpose)));
+  idRow.append(node("time", "", formatDateTime(run.endedAt || run.updatedAt, locale)));
   card.append(idRow);
 
   card.append(richText(t("detail.instruction"), run.input, t, { className: "execute-io", threshold: 320 }));
@@ -334,6 +517,10 @@ export function runCard(run, t, locale) {
   const foot = node("div", "execute-foot");
   const tags = node("div", "execute-tags");
   tags.append(chip(t("mode." + run.mode)));
+  if (run.executionGroupId) {
+    tags.append(chip(t("detail.lineage") + " · " + run.executionGroupId
+      + (run.executionLaneId ? "/" + run.executionLaneId : "")));
+  }
   const deliveryKey = run.deliveredAt
     ? "delivery.delivered"
     : run.pushedAt
@@ -354,6 +541,26 @@ export function runCard(run, t, locale) {
     card.append(eff);
   }
 
+  // Leader Run disposition: the machine-derived outcome of a terminal Leader
+  // Run, plus any structured wait reference.
+  if (run.disposition) {
+    const disposition = node("div", "record-meta");
+    disposition.append(node("span", "", t("run.disposition") + " · " + t("run.disposition." + run.disposition)));
+    if (run.waitReason) {
+      disposition.append(node("span", "", t("run.waitReason") + " · " + run.waitReason.kind
+        + (run.waitReason.ref ? " (" + run.waitReason.ref + ")" : "")));
+    }
+    card.append(disposition);
+  }
+
+  // Idempotent yield receipt on a yielded Run.
+  if (run.yieldReceipt) {
+    const receipt = node("div", "record-meta");
+    receipt.append(node("span", "mono", t("run.yieldReceipt") + " · " + run.yieldReceipt.receiptId));
+    receipt.append(node("time", "", formatDateTime(run.yieldReceipt.committedAt, locale)));
+    card.append(receipt);
+  }
+
   return card;
 }
 
@@ -363,7 +570,10 @@ export function reviewCard(round, t, locale) {
   const titleRow = node("div", "record-title-row");
   titleRow.append(node("strong", "record-title", round.id));
   head.append(titleRow);
-  head.append(pill(t, "review", round.status));
+  const headPills = node("div", "record-pills");
+  if (round.scope) headPills.append(pill(t, "review.scope", round.scope));
+  headPills.append(pill(t, "review", round.status));
+  head.append(headPills);
   card.append(head);
   const meta = node("div", "record-meta");
   meta.append(node("span", "meta-name", round.reviewerRoleName));
@@ -376,13 +586,20 @@ export function reviewCard(round, t, locale) {
   if (round.evidenceCommit) {
     meta.append(node("span", "", t("detail.evidence") + " · " + round.evidenceCommit));
   }
+  if (round.workspaceDisposition) {
+    meta.append(node("span", "", t("detail.workspaceDisposition") + " · "
+      + t("disposition." + round.workspaceDisposition.kind)));
+  }
   card.append(meta);
   if (round.checks && round.checks.length) {
     card.append(richText(t("detail.checks"), round.checks.map(function (check) {
       return check.name + "=" + check.outcome;
     }).join(", "), t));
   }
+  const findings = findingsBlock(t("detail.findings"), round.findings, t);
+  if (findings) card.append(findings);
   if (round.summary) card.append(richText(null, round.summary, t));
+  if (round.report) card.append(richText(t("detail.report"), round.report, t, { muted: true }));
   return card;
 }
 
@@ -562,14 +779,18 @@ export function attentionRow(item, t, locale, onSelect) {
   return row;
 }
 
-export function overviewRow(task, t, locale, onSelect) {
+export function overviewRow(task, label, variant, t, locale, onSelect) {
   const hasInputs = task.openInputCount > 0;
-  const row = node("button", "overview-row" + (hasInputs ? " has-inputs" : ""));
+  const row = node("button", "overview-row"
+    + (hasInputs || variant === "has-inputs" ? " has-inputs" : ""));
   row.type = "button";
   row.append(statusDot(task.status));
   const main = node("span", "overview-row-title", task.title);
   main.title = task.title;
   row.append(main);
+  if (label) {
+    row.append(node("span", "overview-row-label", label));
+  }
   row.append(node("span", "overview-row-time", relativeTime(task.updatedAt, locale, t)));
   row.addEventListener("click", function () { onSelect(task.id); });
   return row;
@@ -587,6 +808,14 @@ export function taskCard(task, hasAttention, state, t, locale, onSelect) {
   main.append(node("strong", "task-title", task.title));
   main.append(node("span", "task-meta", relativeTime(task.updatedAt, locale, t)));
   button.append(main);
+
+  // Derived Task-first execution status for active tasks (blocked, waiting on
+  // agents, recovering, etc.) — a richer signal than the raw lifecycle status.
+  if (task.executionStatus && task.status === "active") {
+    const exec = node("span", "task-exec is-" + task.executionStatus,
+      t("exec.status." + task.executionStatus));
+    button.append(exec);
+  }
 
   // One signal only: an open input (needs the user) outranks a running count.
   if (hasAttention) {

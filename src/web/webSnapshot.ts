@@ -8,6 +8,8 @@ import {
   buildTaskExecutionProjection,
   type TaskExecutionProjection
 } from "../scheduler/taskExecutionProjection.js";
+import { summarizeExecutionGroup } from "../execution/executionGroup.js";
+import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
@@ -24,6 +26,13 @@ export type WebDashboardStore = Pick<TaskStore,
   | "listDecisions"
   | "listMilestones"
   | "listProjects"
+  | "listChangeSets"
+  | "listIntegrationAttempts"
+  | "getWorkMailbox"
+  | "getPendingWakeup"
+  | "getLeaderFailure"
+  | "getOperatorNotification"
+  | "getRoleSession"
 > & Readonly<{
   listEvents?: (taskId: string) => readonly TaskEvent[];
 }>;
@@ -38,6 +47,8 @@ type DashboardTask = Task & Readonly<{
   openInputCount: number;
   needsAttentionCount: number;
   execution: TaskExecutionProjection | null;
+  /** Derived Task-first execution status, copied from the projection for the sidebar. */
+  executionStatus: TaskExecutionProjection["status"] | null;
   projectNames?: readonly string[];
 }>;
 
@@ -95,7 +106,8 @@ export function buildWebDashboardSnapshot(
         roleCount: reader.listRoles(task.id).length,
         openInputCount: taskOpenInputs,
         needsAttentionCount,
-        execution
+        execution,
+        executionStatus: execution?.status ?? null
       };
     }).sort(compareDashboardTasks);
 
@@ -154,7 +166,13 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
       execution: buildTaskExecutionProjection(reader, taskId),
       brief: reader.getTaskBrief(taskId),
       roles,
-      workItems: reader.listWorkItems(taskId),
+      workItems: reader.listWorkItems(taskId).map((item) => {
+        const group = currentWorkItemExecutionGroup(item);
+        return {
+          ...item,
+          ...(group === undefined ? {} : { currentExecution: summarizeExecutionGroup(group) })
+        };
+      }),
       runs,
       runtimeHealth: { needsAttentionRuns },
       reviewRounds: reader.listReviewRounds(taskId),

@@ -8,6 +8,7 @@ import {
   attentionRow,
   conclusionMeta,
   emptyRow,
+  executionBand,
   historyEventRow,
   inputCard,
   messageCard,
@@ -134,7 +135,7 @@ function overviewBlock(head, tasks, t, locale, onSelect) {
   block.append(sectionHead(head, { count: tasks.length }));
   const list = node("div", "overview-list");
   tasks.forEach(function (task) {
-    list.append(overviewRow(task, t, locale, onSelect));
+    list.append(overviewRow(task, null, null, t, locale, onSelect));
   });
   block.append(list);
   return block;
@@ -174,23 +175,30 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   }
   wrap.append(inbox);
 
-  const stalledTasks = (state.tasks || []).filter(function (task) {
-    return (task.needsAttentionCount || 0) > 0;
+  // Tasks whose Task-first projection says they need attention: blocked,
+  // recovering, or in an attention state. This replaces the raw stalled-run
+  // count with the derived execution status.
+  const attentionTasks = (state.tasks || []).filter(function (task) {
+    const status = task.executionStatus;
+    return status === "blocked"
+      || status === "attention"
+      || status === "recovering"
+      || status === "progressing-with-attention";
   });
-  if (stalledTasks.length) {
-    const stalledBlock = node("section", "overview-block");
-    stalledBlock.append(node("h3", "", t("overview.attention") + " · " + stalledTasks.length));
+  if (attentionTasks.length) {
+    const attentionBlock = node("section", "overview-block");
+    attentionBlock.append(node("h3", "", t("overview.attention") + " · " + attentionTasks.length));
     const list = node("div", "overview-list");
-    stalledTasks.forEach(function (task) {
+    attentionTasks.forEach(function (task) {
       list.append(overviewRow(
         task,
-        task.needsAttentionCount + " " + t("stats.stalledRuns"),
+        t("exec.status." + task.executionStatus),
         "has-inputs",
         onSelect
       ));
     });
-    stalledBlock.append(list);
-    wrap.append(stalledBlock);
+    attentionBlock.append(list);
+    wrap.append(attentionBlock);
   }
 
   // Active work and the freshest updates sit side by side on wide screens, so
@@ -273,6 +281,11 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   if (task.cwd) meta.append(pathMetaItem(t("detail.workspace"), task.cwd));
   headBlock.append(meta);
   summaryBody.append(headBlock);
+
+  // Task-first execution status: the derived status, owner, next action, and
+  // the attention/blocker facts behind it.
+  const band = executionBand(data.execution, t, locale);
+  if (band) summaryBody.append(band);
 
   if (task.completionSummary) {
     const conclusion = node("div", "conclusion");
