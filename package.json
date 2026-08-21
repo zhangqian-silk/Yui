@@ -23,9 +23,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "pretest:core": "npm run build",
-    "test:core": "node --test test/core/",
+    "test:core": "node --test test/core/*.test.js",
     "pretest": "npm run build",
-    "test": "node --test test/core/",
+    "test": "node --test test/core/*.test.js",
     "lint": "tsc -p tsconfig.json --noEmit",
     "seed:web": "npm run build && node scripts/seed-web-dashboard.mjs",
     "verify:release-tag": "node scripts/verify-release-tag.mjs",
