@@ -690,14 +690,17 @@ function hashPayloadTable(db: Database.Database, sql: string): FamilyChecksum {
 }
 
 /** Reconstruct a WorkMailbox from the normalised mailboxes table columns. */
-export function rowToMailbox(row: {
+type WorkMailboxRow = Readonly<{
   target_kind: string;
   task_id: string | null;
   role_name: string | null;
   next_sequence: number;
   processing: string | null;
   pending: string | null;
-}): Record<string, unknown> {
+  input_delivery?: string | null;
+}>;
+
+export function rowToMailbox(row: WorkMailboxRow): Record<string, unknown> {
   let target: Record<string, unknown>;
   switch (row.target_kind) {
     case "operator":
@@ -718,13 +721,32 @@ export function rowToMailbox(row: {
     default:
       target = { kind: row.target_kind };
   }
-  return {
-    schemaVersion: 1,
+  const common = {
     target,
     nextSequence: row.next_sequence,
     processing: row.processing === null ? null : JSON.parse(row.processing) as unknown,
     pending: row.pending === null ? null : JSON.parse(row.pending) as unknown
   };
+  return Object.hasOwn(row, "input_delivery")
+    ? {
+        schemaVersion: 2,
+        ...common,
+        inputDelivery: row.input_delivery === null
+          ? null
+          : JSON.parse(row.input_delivery!) as unknown
+      }
+    : { schemaVersion: 1, ...common };
+}
+
+function readWorkMailboxRows(db: Database.Database): WorkMailboxRow[] {
+  const hasInputDelivery = (db.prepare("PRAGMA table_info(mailboxes)").all() as Array<{
+    name: string;
+  }>).some(({ name }) => name === "input_delivery");
+  return db.prepare(
+    `SELECT target_kind, task_id, role_name, next_sequence, processing, pending${
+      hasInputDelivery ? ", input_delivery" : ""
+    } FROM mailboxes ORDER BY target_key`
+  ).all() as WorkMailboxRow[];
 }
 
 /**
@@ -805,16 +827,7 @@ export function computeDbFamilyChecksums(
     checksums.releaseWorkflow = hashPayloadTable(db, "SELECT payload FROM release_workflows");
 
     // Mailboxes are reconstructed from typed columns (no payload column).
-    const mailboxRows = db.prepare(
-      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending FROM mailboxes ORDER BY target_key"
-    ).all() as Array<{
-      target_kind: string;
-      task_id: string | null;
-      role_name: string | null;
-      next_sequence: number;
-      processing: string | null;
-      pending: string | null;
-    }>;
+    const mailboxRows = readWorkMailboxRows(db);
     checksums.workMailbox = hashRecords(mailboxRows.map(rowToMailbox));
 
     return checksums;
@@ -1063,16 +1076,7 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
     }
 
     // Work mailboxes: reconstructed from typed columns (no payload column).
-    const mailboxRows = db.prepare(
-      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending FROM mailboxes ORDER BY target_key"
-    ).all() as Array<{
-      target_kind: string;
-      task_id: string | null;
-      role_name: string | null;
-      next_sequence: number;
-      processing: string | null;
-      pending: string | null;
-    }>;
+    const mailboxRows = readWorkMailboxRows(db);
     const mailboxes = state.mailboxes as Record<string, unknown>;
     for (const row of mailboxRows) {
       const mailbox = rowToMailbox(row);
