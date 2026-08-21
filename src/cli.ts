@@ -784,7 +784,7 @@ export async function main(): Promise<void> {
     const output = runConfigCommand(configArgs, store);
     if (
       configArgs[0] === "set"
-      && configArgs[1] === "--reconciliation-interval-seconds"
+      && configArgs[1] === "reconciliation-interval-seconds"
     ) {
       const refresh = await refreshRunningFileTaskControllerConfiguration(
         home,
