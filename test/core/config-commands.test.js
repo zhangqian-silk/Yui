@@ -63,62 +63,87 @@ function runCli(home, args) {
   }
 }
 
-test("config show reports the unified effective configuration", (t) => {
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Matches one rendered table row: two-space indent, label, padding, value. */
+function tableRow(label, value) {
+  return new RegExp(`^  ${escapeRegExp(label)}[ ]+${escapeRegExp(value)}$`, "m");
+}
+
+function assertTableFrame(output) {
+  assert.match(output, /^Yui configuration$/m);
+  assert.match(output, /^  Setting[ ]+Value$/m);
+  assert.match(output, /^  ─+[ ]+─+$/m);
+}
+
+test("config show reports the unified effective configuration as a table", (t) => {
   const home = isolatedHome(t);
   const shown = runCli(home, ["config", "show"]);
   assert.equal(shown.status, 0);
-  assert.match(shown.stdout, /Time zone: Asia\/Shanghai/);
-  assert.match(shown.stdout, /Reconciliation interval: 120 seconds/);
-  assert.match(shown.stdout, /Leader next-action mode: display/);
-  assert.match(shown.stdout, /Resources GC mode: report/);
-  assert.match(shown.stdout, /Resources GC auto-quarantine: off/);
-  assert.match(shown.stdout, /Review: disabled/);
+  assertTableFrame(shown.stdout);
+  for (const [label, value] of [
+    ["Time zone", "Asia/Shanghai"],
+    ["Reconciliation interval", "120 seconds"],
+    ["Leader next-action mode", "display"],
+    ["Resources GC mode", "report"],
+    ["Resources GC auto-quarantine", "off"],
+    ["Review", "disabled"]
+  ]) {
+    assert.match(shown.stdout, tableRow(label, value), `missing row: ${label}`);
+  }
 });
 
 const scalarKeys = [
   {
     key: "time-zone",
+    showLabel: "Time zone",
     value: "Europe/London",
     setMessage: "Time zone set to Europe/London",
-    showLine: "Time zone: Europe/London",
+    showValue: "Europe/London",
     clearMessage: "Time zone reset to Asia/Shanghai",
-    defaultLine: "Time zone: Asia/Shanghai",
+    defaultValue: "Asia/Shanghai",
     invalid: { value: "Not/AZone", error: /timeZone must be a valid IANA timezone/ }
   },
   {
     key: "reconciliation-interval-seconds",
+    showLabel: "Reconciliation interval",
     value: "60",
     setMessage: "Reconciliation interval set to 60 seconds",
-    showLine: "Reconciliation interval: 60 seconds",
+    showValue: "60 seconds",
     clearMessage: "Reconciliation interval reset to 120 seconds",
-    defaultLine: "Reconciliation interval: 120 seconds",
+    defaultValue: "120 seconds",
     invalid: { value: "4", error: /must be an integer from 5 to 300/ }
   },
   {
     key: "leader-next-action",
+    showLabel: "Leader next-action mode",
     value: "enforce",
     setMessage: "Leader next-action mode set to enforce",
-    showLine: "Leader next-action mode: enforce",
+    showValue: "enforce",
     clearMessage: "Leader next-action mode reset to display",
-    defaultLine: "Leader next-action mode: display",
+    defaultValue: "display",
     invalid: { value: "bogus", error: /must be display, warn, or enforce/ }
   },
   {
     key: "resources-gc-mode",
+    showLabel: "Resources GC mode",
     value: "quarantine",
     setMessage: "Resources GC mode set to quarantine",
-    showLine: "Resources GC mode: quarantine",
+    showValue: "quarantine",
     clearMessage: "Resources GC mode reset to report",
-    defaultLine: "Resources GC mode: report",
+    defaultValue: "report",
     invalid: { value: "bogus", error: /must be 'report' or 'quarantine'/ }
   },
   {
     key: "resources-gc-auto-quarantine",
+    showLabel: "Resources GC auto-quarantine",
     value: "true",
     setMessage: "Resources GC auto-quarantine set to on",
-    showLine: "Resources GC auto-quarantine: on",
+    showValue: "on",
     clearMessage: "Resources GC auto-quarantine reset to off",
-    defaultLine: "Resources GC auto-quarantine: off",
+    defaultValue: "off",
     invalid: { value: "bogus", error: /must be a boolean/ }
   }
 ];
@@ -129,7 +154,7 @@ for (const key of scalarKeys) {
     const set = runCli(home, ["config", "set", key.key, key.value]);
     assert.equal(set.status, 0, set.stderr);
     assert.ok(set.stdout.includes(key.setMessage));
-    assert.ok(runCli(home, ["config", "show"]).stdout.includes(key.showLine));
+    assert.match(runCli(home, ["config", "show"]).stdout, tableRow(key.showLabel, key.showValue));
 
     const invalid = runCli(home, ["config", "set", key.key, key.invalid.value]);
     assert.equal(invalid.status, 2);
@@ -139,7 +164,7 @@ for (const key of scalarKeys) {
     const cleared = runCli(home, ["config", "clear", key.key]);
     assert.equal(cleared.status, 0, cleared.stderr);
     assert.ok(cleared.stdout.includes(key.clearMessage));
-    assert.ok(runCli(home, ["config", "show"]).stdout.includes(key.defaultLine));
+    assert.match(runCli(home, ["config", "show"]).stdout, tableRow(key.showLabel, key.defaultValue));
   });
 }
 
@@ -150,7 +175,10 @@ test("config set review manages the global review rule through the unified keys"
   const set = runCli(home, ["config", "set", "review", "--role", "reviewer", "--trigger", "always"]);
   assert.equal(set.status, 0, set.stderr);
   assert.match(set.stdout, /Review set to reviewer \(always; finding ledger: shadow\)/);
-  assert.match(runCli(home, ["config", "show"]).stdout, /Review: reviewer \(always; finding ledger: shadow\)/);
+  assert.match(
+    runCli(home, ["config", "show"]).stdout,
+    tableRow("Review", "reviewer (always; finding ledger: shadow)")
+  );
 
   const upgraded = runCli(home, [
     "config", "set", "review",
@@ -158,12 +186,15 @@ test("config set review manages the global review rule through the unified keys"
   ]);
   assert.equal(upgraded.status, 0, upgraded.stderr);
   assert.match(upgraded.stdout, /Review set to reviewer \(final; finding ledger: enforce\)/);
-  assert.match(runCli(home, ["config", "show"]).stdout, /Review: reviewer \(final; finding ledger: enforce\)/);
+  assert.match(
+    runCli(home, ["config", "show"]).stdout,
+    tableRow("Review", "reviewer (final; finding ledger: enforce)")
+  );
 
   const cleared = runCli(home, ["config", "clear", "review"]);
   assert.equal(cleared.status, 0, cleared.stderr);
   assert.match(cleared.stdout, /Review disabled/);
-  assert.match(runCli(home, ["config", "show"]).stdout, /Review: disabled/);
+  assert.match(runCli(home, ["config", "show"]).stdout, tableRow("Review", "disabled"));
 });
 
 test("config set review rejects unknown Roles and malformed options", (t) => {
@@ -266,6 +297,46 @@ test("config show honors the stored leaderNextActionMode and review fields", (t)
 
   const shown = runCli(home, ["config", "show"]);
   assert.equal(shown.status, 0, shown.stderr);
-  assert.match(shown.stdout, /Leader next-action mode: enforce/);
-  assert.match(shown.stdout, /Review: reviewer \(always; finding ledger: shadow\)/);
+  assertTableFrame(shown.stdout);
+  assert.match(shown.stdout, tableRow("Leader next-action mode", "enforce"));
+  assert.match(shown.stdout, tableRow("Review", "reviewer (always; finding ledger: shadow)"));
+});
+
+test("config show --json emits the effective configuration as structured data", (t) => {
+  const home = isolatedHome(t);
+  const result = runCli(home, ["config", "show", "--json"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    ok: true,
+    data: {
+      timeZone: "Asia/Shanghai",
+      reconciliationIntervalSeconds: 120,
+      leaderNextActionMode: "display",
+      resourcesGcMode: "report",
+      resourcesGcAutoQuarantine: false,
+      review: null
+    }
+  });
+});
+
+test("config show --json reflects stored leaderNextActionMode and review fields", (t) => {
+  const home = isolatedHome(t);
+  const store = new SqliteTaskStore(home);
+  store.saveConfig({
+    ...store.getConfig(),
+    leaderNextActionMode: "warn",
+    review: { roleName: "reviewer", trigger: "final", findingLedger: "enforce" }
+  });
+  store.close();
+
+  const result = runCli(home, ["config", "show", "--json"]);
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.data.leaderNextActionMode, "warn");
+  assert.deepEqual(payload.data.review, {
+    roleName: "reviewer",
+    trigger: "final",
+    findingLedger: "enforce"
+  });
 });

@@ -11,6 +11,7 @@ import {
   type LeaderNextActionMode
 } from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 import {
   REVIEW_FINDING_LEDGER_MODES,
@@ -18,6 +19,16 @@ import {
   type ReviewFindingLedgerMode,
   type ReviewTrigger
 } from "../review/reviewConfig.js";
+
+/**
+ * `output` is the rendered text shown to humans. `data` carries the same
+ * effective values as structured JSON for `--json` consumers; it is present
+ * only for `config show`, since set/clear are single-line confirmations.
+ */
+export type ConfigCommandResult = Readonly<{
+  output: string;
+  data?: unknown;
+}>;
 
 type ConfigCommandStore = Readonly<{
   transaction<T>(execute: (store: ConfigCommandStore) => T): T;
@@ -58,25 +69,63 @@ const REVIEW_SET_USAGE = "Config set usage: yui config set review --role <global
 
 type ConfigKeyHandler = Readonly<{
   key: ConfigKey;
-  showLine(config: YuiConfig): string;
+  showLabel: string;
+  showValue(config: YuiConfig): string;
   set(args: string[], store: ConfigCommandStore): string;
   clear(store: ConfigCommandStore): string;
 }>;
 
-export function runConfigCommand(args: string[], store: ConfigCommandStore): string {
+export function runConfigCommand(args: string[], store: ConfigCommandStore): ConfigCommandResult {
   const [command, ...rest] = args;
   if (command === "show") {
     if (rest.length !== 0) throw usageError("Config show usage: yui config show.");
     const config = store.getConfig();
     reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
-    return [...CONFIG_KEY_HANDLERS.map((handler) => handler.showLine(config)), ""].join("\n");
+    return { output: renderConfigShow(config), data: effectiveConfigData(config) };
   }
-  if (command === "set") return runConfigSet(rest, store);
-  if (command === "clear") return runConfigClear(rest, store);
+  if (command === "set") return { output: runConfigSet(rest, store) };
+  if (command === "clear") return { output: runConfigClear(rest, store) };
   throw usageError(
     command === undefined ? "Config command is required." : `Unknown command: config ${command}`,
     CONFIG_USAGE
   );
+}
+
+/**
+ * `config show` is row/column data, so it renders through the shared
+ * `renderTable` like every other list command. The column contract follows
+ * the shared rules: left-aligned cells, widths fitted between min/max,
+ * terminal width from `defaultTableWidth()`, and empty values as empty cells.
+ */
+function renderConfigShow(config: YuiConfig): string {
+  return renderTable(
+    "Yui configuration",
+    [
+      { header: "Setting", minWidth: 20, maxWidth: 32 },
+      { header: "Value", minWidth: 10, maxWidth: 60 }
+    ],
+    CONFIG_KEY_HANDLERS.map((handler) => [handler.showLabel, handler.showValue(config)]),
+    defaultTableWidth()
+  );
+}
+
+/** Effective values under the same field names as the stored YuiConfig. */
+function effectiveConfigData(config: YuiConfig): Record<string, unknown> {
+  return {
+    timeZone: resolveTimeZone(config.timeZone),
+    reconciliationIntervalSeconds: config.reconciliationIntervalSeconds
+      ?? DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+    leaderNextActionMode: resolveLeaderNextActionMode(config.leaderNextActionMode),
+    resourcesGcMode: resolveResourcesGcMode(config.resourcesGcMode),
+    resourcesGcAutoQuarantine: resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine),
+    review: config.review === undefined
+      ? null
+      : {
+          roleName: config.review.roleName,
+          trigger: config.review.trigger,
+          findingLedger: config.review.findingLedger ?? "shadow"
+        }
+  };
 }
 
 function runConfigSet(args: string[], store: ConfigCommandStore): string {
@@ -132,7 +181,8 @@ function parseBooleanConfigValue(value: string): boolean | string {
 const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
   {
     key: "time-zone",
-    showLine: (config) => `Time zone: ${resolveTimeZone(config.timeZone)}`,
+    showLabel: "Time zone",
+    showValue: (config) => resolveTimeZone(config.timeZone),
     set(args, store) {
       if (args.length !== 1) throw usageError(TIME_ZONE_SET_USAGE);
       const timeZone = validatedConfigValue(() => resolveTimeZone(args[0]), TIME_ZONE_SET_USAGE);
@@ -149,7 +199,9 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
   },
   {
     key: "reconciliation-interval-seconds",
-    showLine: (config) => `Reconciliation interval: ${config.reconciliationIntervalSeconds ?? DEFAULT_RECONCILIATION_INTERVAL_SECONDS} seconds`,
+    showLabel: "Reconciliation interval",
+    showValue: (config) =>
+      `${config.reconciliationIntervalSeconds ?? DEFAULT_RECONCILIATION_INTERVAL_SECONDS} seconds`,
     set(args, store) {
       if (args.length !== 1) throw usageError(RECONCILIATION_SET_USAGE);
       const reconciliationIntervalSeconds = parseReconciliationIntervalSeconds(args[0]);
@@ -170,7 +222,8 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
   },
   {
     key: "leader-next-action",
-    showLine: (config) => `Leader next-action mode: ${resolveLeaderNextActionMode(config.leaderNextActionMode)}`,
+    showLabel: "Leader next-action mode",
+    showValue: (config) => resolveLeaderNextActionMode(config.leaderNextActionMode),
     set(args, store) {
       if (args.length !== 1) throw usageError(LEADER_NEXT_ACTION_SET_USAGE);
       let mode: LeaderNextActionMode;
@@ -195,7 +248,8 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
   },
   {
     key: "resources-gc-mode",
-    showLine: (config) => `Resources GC mode: ${resolveResourcesGcMode(config.resourcesGcMode)}`,
+    showLabel: "Resources GC mode",
+    showValue: (config) => resolveResourcesGcMode(config.resourcesGcMode),
     set(args, store) {
       if (args.length !== 1) throw usageError(RESOURCES_GC_MODE_SET_USAGE);
       const resourcesGcMode = validatedConfigValue(
@@ -215,7 +269,9 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
   },
   {
     key: "resources-gc-auto-quarantine",
-    showLine: (config) => `Resources GC auto-quarantine: ${resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine) ? "on" : "off"}`,
+    showLabel: "Resources GC auto-quarantine",
+    showValue: (config) =>
+      (resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine) ? "on" : "off"),
     set(args, store) {
       if (args.length !== 1) throw usageError(RESOURCES_GC_AUTO_QUARANTINE_SET_USAGE);
       const resourcesGcAutoQuarantine = validatedConfigValue(
@@ -235,9 +291,10 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
   },
   {
     key: "review",
-    showLine: (config) => (config.review === undefined
-      ? "Review: disabled"
-      : `Review: ${config.review.roleName} (${config.review.trigger}; finding ledger: ${config.review.findingLedger ?? "shadow"})`),
+    showLabel: "Review",
+    showValue: (config) => (config.review === undefined
+      ? "disabled"
+      : `${config.review.roleName} (${config.review.trigger}; finding ledger: ${config.review.findingLedger ?? "shadow"})`),
     set(args, store) {
       if (args.length !== 4 && args.length !== 6) throw usageError(REVIEW_SET_USAGE);
       const options = new Map<string, string>();
