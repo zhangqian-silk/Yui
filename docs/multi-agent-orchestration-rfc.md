@@ -64,9 +64,9 @@ Leader 负责语义规划、动态修订和最终决议；Controller 负责确�
 
 | 基线声称 | 核对结果 |
 |---|---|
-| `WorkItem.dependsOn` 可作为 Task DAG 唯一权威来源 | **存在**（`workItem.ts:117`，schemaVersion 9），存储层强制无环（`taskStore.ts` `assertAcyclicWorkItems`）；ready = 全部依赖 `completed` 的二元谓词（`nextAction.ts:739`）。**无拓扑/分层调度、无独立 WorkItem 自动并行派发**——DAG 引擎是 T1 的新增工作，不是既有能力 |
+| `WorkItem.dependsOn` 可作为 Task DAG 唯一权威来源 | **存在**（`workItem.ts:117`，schemaVersion 9），存储层强制无环（`taskStore.ts` `assertAcyclicWorkItems`）；ready = 全部依赖 `completed` 的二元谓词（`nextAction.ts:743-745`）。**无拓扑/分层调度、无独立 WorkItem 自动并行派发**——DAG 引擎是 T1 的新增工作，不是既有能力 |
 | ExecutionGroup/Lane 表达单路/并行、固定/自适应、隔离工作区、结构化结果 | **全部存在**（`executionGroup.ts`）：strategy `fixed`/`adaptive`、Lane 禁共享可写根（强制）、`ExecutionLaneResult` 结构化结果（summary/report/checks/findings/evidence）、`ExecutionResolution` 以 `selectedLaneIds` 汇合。**无 stage/round 字段** |
-| EffectiveLaunchSnapshot 冻结最终启动配置 | **存在**（`effectiveLaunch.ts:63`，schemaVersion 2）：冻结 agent/adapter/model/effort/permission/profileAccess/writeProjectIds/workspace/context(RoleProfile)/sourceDesiredRevision 等；Dispatch 后不可变，运行中进程不被热变更 |
+| EffectiveLaunchSnapshot 冻结最终启动配置 | **存在**（`effectiveLaunch.ts:33`，schemaVersion 2）：冻结 agent/adapter/model/effort/permission/profileAccess/writeProjectIds/workspace/context(RoleProfile)/sourceDesiredRevision 等；Dispatch 后不可变，运行中进程不被热变更 |
 | Candidate / ReviewRound / Task-final Review / Integration 主链 | **存在**：Candidate 单槽（仅最新为 current，只能从 running 提交）；ReviewRound 与 Candidate 1:1、冻结 reviewBaseCommit、独占隔离工作区；Task-final 按集成头变化自动排队；IntegrationAttempt 以 CAS 推进目标头，冲突产出报告且 ResolutionDecision 为 Leader 独占 |
 | AgentRun 审计记录 | **存在**（`agentRun.ts`，schemaVersion 7）。注意两级重试语义：瞬时 Provider 错误的**传输级重试在同 Run+Session 内原地进行**（`providerRetry.ts`，指数退避、跨重启持久）；WorkItem 级重试派发**新 Group**；Lane 重启使用**新 Run id** |
 | 运行健康监控 | **存在 Role/Run 级**（`roleRunStall.ts`）：30 分钟无持久进展窗口 + 语义事件进展钟（非文本输出），分类 working/waiting-user/waiting-on-workers/truly-stalled，恢复归 Leader、绝不自动终止——与 I-10 一致。**Lane 级健康是 T7 的扩展** |
@@ -207,9 +207,9 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 2. **放大风险证据**：Google 的 agent 系统规模化研究表明集中协调适合可并行任务，顺序任务与独立 Agent 可能放大错误——多 Agent 不是默认提质开关。
 3. **预算统一**：借鉴 CATS，在并行探索与顺序深化之间统一分配预算。预算维度 = token、工具调用、墙钟时间、最大 Lane 数、最大轮次。成本核算应有量化模型（Task-25 记录的 WikiLoop 参考式：Cost=0.6·token+0.2·搜索+0.2·阅读；Yui 的口径由 T6/T10 定义）。
 4. **充分先于省费**：Task-25 核实的 WikiLoop sufficiency-before-efficiency 门控提供直接反例——不门控时成本最低但过早停止率 24.2%。因此「省上下文/省 token」的激励必须挂在证据集齐之后，否则上下文受限的 Leader 会理性地接受薄证据。这与 I-11 共同构成成本规则的两面：多 Agent 非默认，但一旦开启探索，不得以成本为由在证据不足时提前终止。
-4. **路由规则**：根据任务特征决定增加并行 Lane 还是继续顺序深化；自适应扩展必须依据分歧、证据和预算，不依据乐观情绪。
-5. **终止经济**：支持 quorum、deadline、straggler 与达到充分度后的提前终止；新增 Lane 的边际价值必须可观测（§10）。
-6. **优先级**：验收与证据充分 > 成本优化。成本指标用于事后复盘与路由改进，不用于在证据不足时提前终止验证。
+5. **路由规则**：根据任务特征决定增加并行 Lane 还是继续顺序深化；自适应扩展必须依据分歧、证据和预算，不依据乐观情绪。
+6. **终止经济**：支持 quorum、deadline、straggler 与达到充分度后的提前终止；新增 Lane 的边际价值必须可观测（§10）。
+7. **优先级**：验收与证据充分 > 成本优化。成本指标用于事后复盘与路由改进，不用于在证据不足时提前终止验证。
 
 ## 8. 上下文与知识边界
 
