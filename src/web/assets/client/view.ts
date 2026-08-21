@@ -8,6 +8,7 @@ import {
   attentionRow,
   conclusionMeta,
   emptyRow,
+  executionBand,
   historyEventRow,
   inputCard,
   messageCard,
@@ -27,7 +28,7 @@ import {
   workItemCard
 } from "/assets/js/components.js";
 
-const statuses = ["all", "active", "draft", "completed", "archived"];
+const statuses = ["all", "active", "draft", "completed", "retired", "archived"];
 
 export function renderFilters(container, state, t, onFilter) {
   const counts = state.counts || {};
@@ -49,7 +50,7 @@ export function renderFilters(container, state, t, onFilter) {
         dot.classList.add(status);
         btn.append(dot);
       }
-      btn.append(document.createTextNode(translatedStatus(t, "status", status)));
+      btn.append(node("span", "filter-label", translatedStatus(t, "status", status)));
       const badge = node("span", "filter-count");
       btn.append(badge);
       btn.addEventListener("click", function () { onFilter(status); });
@@ -61,6 +62,8 @@ export function renderFilters(container, state, t, onFilter) {
     const btn = row.querySelector('.filter-chip[data-status="' + status + '"]');
     if (!btn) return;
     btn.classList.toggle("is-active", state.filter === status);
+    const label = btn.querySelector(".filter-label");
+    if (label) label.textContent = translatedStatus(t, "status", status);
     const count = status === "all" ? counts.total : counts[status];
     const badge = btn.querySelector(".filter-count");
     if (badge) {
@@ -78,6 +81,7 @@ function taskGroupOf(task, attentionIds) {
   if (attentionIds.has(task.id)) return "attention";
   if (task.status === "active") return "active";
   if (task.status === "draft") return "draft";
+  if (task.status === "retired") return "retired";
   if (task.status === "archived") return "archived";
   return "finished";
 }
@@ -96,7 +100,7 @@ export function renderTasks(container, state, t, locale, onSelect) {
   clear(container);
   const query = state.query.trim().toLocaleLowerCase(locale);
   const attentionIds = new Set((state.attention || []).map(function (item) { return item.taskId; }));
-  const groups = { attention: [], active: [], draft: [], finished: [], archived: [] };
+  const groups = { attention: [], active: [], draft: [], finished: [], retired: [], archived: [] };
   (state.tasks || []).forEach(function (task) {
     if (state.filter !== "all" && task.status !== state.filter) return;
     if (!taskMatchesQuery(task, query, locale)) return;
@@ -108,6 +112,7 @@ export function renderTasks(container, state, t, locale, onSelect) {
     ["active", t("group.active")],
     ["draft", t("group.draft")],
     ["finished", t("group.finished")],
+    ["retired", t("group.retired")],
     ["archived", t("group.archived")]
   ];
   const firstGroup = order.find(function (entry) { return groups[entry[0]].length > 0; });
@@ -134,7 +139,7 @@ function overviewBlock(head, tasks, t, locale, onSelect) {
   block.append(sectionHead(head, { count: tasks.length }));
   const list = node("div", "overview-list");
   tasks.forEach(function (task) {
-    list.append(overviewRow(task, t, locale, onSelect));
+    list.append(overviewRow(task, null, null, t, locale, onSelect));
   });
   block.append(list);
   return block;
@@ -174,23 +179,30 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   }
   wrap.append(inbox);
 
-  const stalledTasks = (state.tasks || []).filter(function (task) {
-    return (task.needsAttentionCount || 0) > 0;
+  // Tasks whose Task-first projection says they need attention: blocked,
+  // recovering, or in an attention state. This replaces the raw stalled-run
+  // count with the derived execution status.
+  const attentionTasks = (state.tasks || []).filter(function (task) {
+    const status = task.executionStatus;
+    return status === "blocked"
+      || status === "attention"
+      || status === "recovering"
+      || status === "progressing-with-attention";
   });
-  if (stalledTasks.length) {
-    const stalledBlock = node("section", "overview-block");
-    stalledBlock.append(node("h3", "", t("overview.attention") + " · " + stalledTasks.length));
+  if (attentionTasks.length) {
+    const attentionBlock = node("section", "overview-block");
+    attentionBlock.append(node("h3", "", t("overview.attention") + " · " + attentionTasks.length));
     const list = node("div", "overview-list");
-    stalledTasks.forEach(function (task) {
+    attentionTasks.forEach(function (task) {
       list.append(overviewRow(
         task,
-        task.needsAttentionCount + " " + t("stats.stalledRuns"),
+        t("exec.status." + task.executionStatus),
         "has-inputs",
         onSelect
       ));
     });
-    stalledBlock.append(list);
-    wrap.append(stalledBlock);
+    attentionBlock.append(list);
+    wrap.append(attentionBlock);
   }
 
   // Active work and the freshest updates sit side by side on wide screens, so
@@ -273,6 +285,11 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   if (task.cwd) meta.append(pathMetaItem(t("detail.workspace"), task.cwd));
   headBlock.append(meta);
   summaryBody.append(headBlock);
+
+  // Task-first execution status: the derived status, owner, next action, and
+  // the attention/blocker facts behind it.
+  const band = executionBand(data.execution, t, locale);
+  if (band) summaryBody.append(band);
 
   if (task.completionSummary) {
     const conclusion = node("div", "conclusion");
