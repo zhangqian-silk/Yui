@@ -13,6 +13,8 @@ const HOME_IDENTITY_AGGREGATE_FROM_VERSION = 17;
 const HOME_IDENTITY_AGGREGATE_TO_VERSION = 18;
 const RUNTIME_OBSERVATION_AGGREGATE_FROM_VERSION = 18;
 const RUNTIME_OBSERVATION_AGGREGATE_TO_VERSION = 19;
+const MULTI_AGENT_RUNTIME_AGGREGATE_FROM_VERSION = 19;
+const MULTI_AGENT_RUNTIME_AGGREGATE_TO_VERSION = 20;
 const SQLITE_LAYOUT_FROM_VERSION = 6;
 const SQLITE_LAYOUT_TO_VERSION = 7;
 const PROJECT_FROM_VERSION = 2;
@@ -62,6 +64,10 @@ const CAPABILITY_GRANT_FROM_VERSION = 0;
 const CAPABILITY_GRANT_TO_VERSION = 1;
 const RELEASE_WORKFLOW_FROM_VERSION = 0;
 const RELEASE_WORKFLOW_TO_VERSION = 1;
+const WORK_MAILBOX_FROM_VERSION = 1;
+const WORK_MAILBOX_TO_VERSION = 2;
+const TASK_ROLE_SESSION_SET_FROM_VERSION = 4;
+const TASK_ROLE_SESSION_SET_TO_VERSION = 5;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -92,6 +98,14 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       toVersion: HOME_IDENTITY_AGGREGATE_TO_VERSION,
       preconditions: requireAggregateV17Snapshot,
       transform: migrateAggregateV17ToV18,
+      declaredEffects: []
+    })
+    .registerOfflineMigration({
+      axis: "aggregate",
+      fromVersion: MULTI_AGENT_RUNTIME_AGGREGATE_FROM_VERSION,
+      toVersion: MULTI_AGENT_RUNTIME_AGGREGATE_TO_VERSION,
+      preconditions: requireAggregateV19Snapshot,
+      transform: migrateAggregateV19ToV20,
       declaredEffects: []
     })
     .registerOfflineMigration({
@@ -163,7 +177,9 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerCompatible(storedTaskJobCallerKeyHashesStep())
     .registerCompatible(durableJobIntroductionStep())
     .registerOfflineMigration(capabilityGrantIntroductionStep())
-    .registerOfflineMigration(releaseWorkflowIntroductionStep());
+    .registerOfflineMigration(releaseWorkflowIntroductionStep())
+    .registerOfflineMigration(workMailboxV2Step())
+    .registerOfflineMigration(taskRoleSessionSetV5Step());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
@@ -1656,6 +1672,509 @@ function requireAggregateV18Snapshot(snapshot: HomeSnapshot): void {
       "Aggregate 18->19 migration requires state.json schemaVersion 18 to match schema.json."
     );
   }
+}
+
+function requireAggregateV19Snapshot(snapshot: HomeSnapshot): void {
+  if (snapshot.schemaManifest.aggregateSchemaVersion
+    !== MULTI_AGENT_RUNTIME_AGGREGATE_FROM_VERSION) {
+    throw new Error("Aggregate 19->20 migration requires schema.json aggregateSchemaVersion 19.");
+  }
+  if (snapshot.state !== null
+    && snapshot.state.schemaVersion !== MULTI_AGENT_RUNTIME_AGGREGATE_FROM_VERSION) {
+    throw new Error(
+      "Aggregate 19->20 migration requires state.json schemaVersion 19 to match schema.json."
+    );
+  }
+}
+
+function migrateAggregateV19ToV20(snapshot: HomeSnapshot): HomeSnapshot {
+  requireAggregateV19Snapshot(snapshot);
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    aggregateSchemaVersion: MULTI_AGENT_RUNTIME_AGGREGATE_TO_VERSION
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const events = asObject(aggregate.events, `Task events ${taskId}`);
+    const nextEvents: Record<string, unknown> = {};
+    for (const [eventId, rawEvent] of Object.entries(events)) {
+      const event = asObject(rawEvent, `Task event ${taskId}/${eventId}`);
+      nextEvents[eventId] = event.type === "runtime.observation"
+        ? migrateRuntimeObservationEventV1ToV2(event, taskId, eventId)
+        : { ...event };
+    }
+    nextTasks[taskId] = { ...aggregate, events: nextEvents };
+  }
+  return {
+    schemaManifest,
+    state: {
+      ...snapshot.state,
+      schemaVersion: MULTI_AGENT_RUNTIME_AGGREGATE_TO_VERSION,
+      tasks: nextTasks
+    }
+  };
+}
+
+function migrateRuntimeObservationEventV1ToV2(
+  event: Record<string, unknown>,
+  taskId: string,
+  eventId: string
+): Record<string, unknown> {
+  const payload = asObject(event.payload, `Runtime observation event payload ${taskId}/${eventId}`);
+  if (typeof payload.observation !== "string") {
+    throw new Error(`Runtime observation event has no canonical observation: ${taskId}/${eventId}.`);
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(payload.observation);
+  } catch {
+    throw new Error(`Runtime observation event JSON is invalid: ${taskId}/${eventId}.`);
+  }
+  const observation = asObject(raw, `Runtime observation ${taskId}/${eventId}`);
+  if (observation.schemaVersion !== 1) {
+    throw new Error(`Runtime observation ${taskId}/${eventId} must use schemaVersion 1.`);
+  }
+  const fence = asObject(observation.fence, `Runtime observation fence ${taskId}/${eventId}`);
+  const kind = String(observation.kind);
+  const semanticKey = migratedRuntimeObservationSemanticKey(observation, fence);
+  const nextObservation = {
+    ...observation,
+    schemaVersion: 2,
+    semanticKey,
+    fence: {
+      ...fence,
+      ...(fence.nativeSessionId === undefined
+        ? {}
+        : { conversationId: String(fence.nativeSessionId) }),
+      activationId: String(fence.launchId)
+    }
+  };
+  return {
+    ...event,
+    payload: {
+      ...payload,
+      semanticKey,
+      kind,
+      observation: JSON.stringify(nextObservation)
+    }
+  };
+}
+
+function migratedRuntimeObservationSemanticKey(
+  observation: Record<string, unknown>,
+  fence: Record<string, unknown>
+): string {
+  const kind = String(observation.kind);
+  if (Number.isSafeInteger(observation.sequence)) {
+    return `provider-sequence:${String(fence.driverId)}:${String(fence.nativeSessionId ?? fence.launchId)}:${String(observation.sequence)}:${kind}`;
+  }
+  const terminal = [
+    "session.ended",
+    "session.failed",
+    "turn.completed",
+    "turn.failed",
+    "turn.cancelled"
+  ].includes(kind);
+  if (terminal) {
+    const payload = asObject(observation.payload, "Runtime observation payload");
+    const failure = payload.failure === undefined
+      ? undefined
+      : asObject(payload.failure, "Runtime observation failure");
+    return [
+      "terminal",
+      String(fence.driverId),
+      String(fence.nativeSessionId ?? fence.launchId),
+      String(fence.launchId),
+      String(fence.nativeTurnId ?? "none"),
+      kind,
+      String(payload.outcome ?? failure?.code ?? "terminal")
+    ].join(":");
+  }
+  return `provider-event:${String(observation.eventId)}`;
+}
+
+function workMailboxV2Step(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "workMailbox",
+    fromVersion: WORK_MAILBOX_FROM_VERSION,
+    toVersion: WORK_MAILBOX_TO_VERSION,
+    preconditions: requireWorkMailboxV1Family,
+    transform: migrateWorkMailboxV1ToV2,
+    declaredEffects: []
+  };
+}
+
+function requireWorkMailboxV1Family(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.workMailbox !== WORK_MAILBOX_FROM_VERSION) {
+    throw new Error(`Record workMailbox migration requires manifest version ${WORK_MAILBOX_FROM_VERSION}.`);
+  }
+  if (snapshot.state === null) return;
+  const mailboxes = asObject(snapshot.state.mailboxes, "state mailboxes");
+  for (const [key, rawMailbox] of Object.entries(mailboxes)) {
+    const mailbox = asObject(rawMailbox, `WorkMailbox ${key}`);
+    if (mailbox.schemaVersion !== WORK_MAILBOX_FROM_VERSION) {
+      throw new Error(`WorkMailbox ${key} must use schemaVersion ${WORK_MAILBOX_FROM_VERSION}.`);
+    }
+    if (mailbox.pending !== null) asObject(mailbox.pending, `WorkMailbox ${key} pending`);
+    if (mailbox.processing !== null) asObject(mailbox.processing, `WorkMailbox ${key} processing`);
+  }
+}
+
+function migrateWorkMailboxV1ToV2(snapshot: HomeSnapshot): HomeSnapshot {
+  requireWorkMailboxV1Family(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...versions, workMailbox: WORK_MAILBOX_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const mailboxes = asObject(snapshot.state.mailboxes, "state mailboxes");
+  const nextMailboxes: Record<string, unknown> = {};
+  for (const [key, rawMailbox] of Object.entries(mailboxes)) {
+    const mailbox = asObject(rawMailbox, `WorkMailbox ${key}`);
+    const pending = mailbox.pending === null
+      ? null
+      : migrateMailboxBatchV1(mailbox.pending, key, "pending");
+    const migratedProcessing = mailbox.processing === null
+      ? null
+      : migrateMailboxProcessingV1(mailbox.processing, key);
+    const continuationDelivery = migratedProcessing === null
+      ? null
+      : migrateMailboxContinuationDeliveryV1(
+          snapshot,
+          mailbox,
+          migratedProcessing,
+          key
+        );
+    nextMailboxes[key] = {
+      ...mailbox,
+      schemaVersion: WORK_MAILBOX_TO_VERSION,
+      processing: continuationDelivery === null ? migratedProcessing : null,
+      pending: {
+        normal: pending,
+        userCorrection: null,
+        cursors: { normal: 0, userCorrection: 0 },
+        recentDedupeKeys: []
+      },
+      inputDelivery: continuationDelivery
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, mailboxes: nextMailboxes }
+  };
+}
+
+/**
+ * v1 used `processing` for both internal/initial dispatch ownership and later
+ * model input.  A crashed later input may already have reached the provider;
+ * migrate it to an explicit delivery-unknown fence instead of making it
+ * eligible for a blind resend.  Other processing batches retain their old
+ * controller ownership semantics.
+ */
+function migrateMailboxContinuationDeliveryV1(
+  snapshot: HomeSnapshot,
+  mailbox: Record<string, unknown>,
+  processing: Record<string, unknown>,
+  mailboxKey: string
+): Record<string, unknown> | null {
+  const batchId = String(processing.batchId ?? "");
+  if (!batchId.startsWith("agent-input:")) return null;
+  const target = asObject(mailbox.target, `WorkMailbox ${mailboxKey} target`);
+  if (target.kind !== "role") {
+    throw new Error(`WorkMailbox ${mailboxKey} continuation input requires a Role target.`);
+  }
+  const executionRef = asObject(
+    processing.executionRef,
+    `WorkMailbox ${mailboxKey} continuation executionRef`
+  );
+  if (executionRef.type !== "run") {
+    throw new Error(`WorkMailbox ${mailboxKey} continuation input requires a Run reference.`);
+  }
+  const taskId = String(target.taskId);
+  const roleName = String(target.roleName);
+  const tasks = asObject(snapshot.state!.tasks, "state tasks");
+  const aggregate = asObject(tasks[taskId], `Task aggregate ${taskId}`);
+  const sets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+  const set = asObject(sets[roleName], `Task Role session set ${taskId}/${roleName}`);
+  const sessions = asObject(set.sessions, `Task Role sessions ${taskId}/${roleName}`);
+  const active = asObject(
+    sessions[String(set.activeAgentId)],
+    `Task Role active Session ${taskId}/${roleName}`
+  );
+  const activationId = String(active.launchId ?? asObject(
+    set.inFlight,
+    `Task Role in-flight Run ${taskId}/${roleName}`
+  ).receiptId);
+  return {
+    attemptId: batchId,
+    lane: "normal",
+    mode: "followup",
+    batch: processing.batch,
+    owner: processing.owner,
+    status: "delivery-unknown",
+    startedAt: processing.startedAt,
+    pushedAt: processing.startedAt,
+    unknownReason: "migrated-unconfirmed-provider-acceptance",
+    executionRef,
+    providerFence: {
+      conversationId: String(active.nativeSessionId),
+      activationId
+    }
+  };
+}
+
+function migrateMailboxProcessingV1(
+  value: unknown,
+  mailboxKey: string
+): Record<string, unknown> {
+  const processing = asObject(value, `WorkMailbox ${mailboxKey} processing`);
+  return {
+    ...processing,
+    lane: "normal",
+    batch: migrateMailboxBatchV1(processing.batch, mailboxKey, "processing")
+  };
+}
+
+function migrateMailboxBatchV1(
+  value: unknown,
+  mailboxKey: string,
+  location: string
+): Record<string, unknown> {
+  const batch = asObject(value, `WorkMailbox ${mailboxKey} ${location} batch`);
+  const from = batch.fromSequence;
+  const to = batch.toSequence;
+  if (!Number.isInteger(from) || !Number.isInteger(to)) {
+    throw new Error(`WorkMailbox ${mailboxKey} ${location} sequence range is invalid.`);
+  }
+  return {
+    ...batch,
+    sources: ["migration-v1"],
+    dedupeKeys: [`mailbox-v1:${mailboxKey}:${String(from)}-${String(to)}`],
+    deliveryModes: ["followup"]
+  };
+}
+
+function taskRoleSessionSetV5Step(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "taskRoleSessionSet",
+    fromVersion: TASK_ROLE_SESSION_SET_FROM_VERSION,
+    toVersion: TASK_ROLE_SESSION_SET_TO_VERSION,
+    preconditions: requireTaskRoleSessionSetV4Family,
+    transform: migrateTaskRoleSessionSetV4ToV5,
+    declaredEffects: []
+  };
+}
+
+function requireTaskRoleSessionSetV4Family(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.taskRoleSessionSet !== TASK_ROLE_SESSION_SET_FROM_VERSION) {
+    throw new Error(
+      `Record taskRoleSessionSet migration requires manifest version ${TASK_ROLE_SESSION_SET_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const sets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+    for (const [roleName, rawSet] of Object.entries(sets)) {
+      const set = asObject(rawSet, `Task Role session set ${taskId}/${roleName}`);
+      if (set.schemaVersion !== TASK_ROLE_SESSION_SET_FROM_VERSION) {
+        throw new Error(
+          `Task Role session set ${taskId}/${roleName} must use schemaVersion ${TASK_ROLE_SESSION_SET_FROM_VERSION}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateTaskRoleSessionSetV4ToV5(snapshot: HomeSnapshot): HomeSnapshot {
+  requireTaskRoleSessionSetV4Family(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...versions,
+      taskRoleSessionSet: TASK_ROLE_SESSION_SET_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const rawSets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+    const nextSets: Record<string, unknown> = {};
+    let events = { ...asObject(aggregate.events, `Task events ${taskId}`) };
+    const highWater = { ...asObject(aggregate.idHighWaterMarks, `Task id high-water marks ${taskId}`) };
+    let eventHighWater = Number(highWater.event ?? 0);
+    if (!Number.isSafeInteger(eventHighWater) || eventHighWater < 0) {
+      throw new Error(`Task event high-water mark is invalid: ${taskId}.`);
+    }
+    for (const [roleName, rawSet] of Object.entries(rawSets)) {
+      const set = asObject(rawSet, `Task Role session set ${taskId}/${roleName}`);
+      const sessions = asObject(set.sessions, `Task Role sessions ${taskId}/${roleName}`);
+      const inFlight = set.inFlight === null
+        ? null
+        : asObject(set.inFlight, `Task Role in-flight Run ${taskId}/${roleName}`);
+      const pending = set.pendingTurnCompletion === null
+        ? null
+        : asObject(set.pendingTurnCompletion, `Task Role Turn completion ${taskId}/${roleName}`);
+      const activeAgentId = String(set.activeAgentId ?? "");
+      const activeSession = sessions[activeAgentId] === undefined
+        ? null
+        : asObject(sessions[activeAgentId], `Task Role active Session ${taskId}/${roleName}`);
+      if (inFlight !== null && activeSession === null) {
+        throw new Error(`Task Role in-flight Run has no active Session: ${taskId}/${roleName}.`);
+      }
+      const nextSessions = { ...sessions };
+      if (pending !== null) {
+        if (activeSession === null
+          || pending.agentId !== activeAgentId
+          || pending.runId !== inFlight?.runId
+          || pending.nativeSessionId !== activeSession.nativeSessionId) {
+          throw new Error(`Task Role Turn completion identity is inconsistent: ${taskId}/${roleName}.`);
+        }
+        const recent = Array.isArray(activeSession.recentCompletedTurnIds)
+          ? activeSession.recentCompletedTurnIds.map(String)
+          : [];
+        const turnId = String(pending.turnId);
+        nextSessions[activeAgentId] = {
+          ...activeSession,
+          recentCompletedTurnIds: recent.includes(turnId) ? recent : [...recent, turnId],
+          updatedAt: String(pending.observedAt)
+        };
+        eventHighWater += 1;
+        const eventId = `event-${eventHighWater}`;
+        const driverId = migratedDriverId(String(activeSession.adapterId));
+        const launchId = String(activeSession.launchId ?? inFlight?.receiptId ?? `legacy-${eventId}`);
+        const observation = {
+          schemaVersion: 2,
+          eventId: `migrated-turn-completed:${taskId}:${roleName}:${turnId}`,
+          semanticKey: [
+            "terminal",
+            driverId,
+            activeAgentId,
+            String(activeSession.nativeSessionId),
+            launchId,
+            "none",
+            "none",
+            turnId,
+            "turn.completed",
+            "terminal",
+            "none",
+            "turn-terminal"
+          ].join(":"),
+          kind: "turn.completed",
+          authority: "controller",
+          receivedAt: String(pending.observedAt),
+          observedAt: String(pending.observedAt),
+          fence: {
+            taskId,
+            roleName,
+            runId: String(pending.runId),
+            agentId: activeAgentId,
+            driverId,
+            launchId,
+            sessionGenerationId: launchId,
+            conversationId: String(activeSession.nativeSessionId),
+            activationId: launchId,
+            nativeSessionId: String(activeSession.nativeSessionId),
+            nativeTurnId: turnId
+          },
+          payload: { summary: String(pending.summary) }
+        };
+        events[eventId] = {
+          schemaVersion: 2,
+          id: eventId,
+          taskId,
+          type: "runtime.observation",
+          payload: {
+            eventId: observation.eventId,
+            roleName,
+            agentId: activeAgentId,
+            driverId,
+            launchId,
+            taskId,
+            runId: String(pending.runId),
+            nativeSessionId: String(activeSession.nativeSessionId),
+            kind: "turn.completed",
+            receivedAt: String(pending.observedAt),
+            observation: JSON.stringify(observation)
+          },
+          createdAt: String(pending.observedAt)
+        };
+      }
+      const providerBinding = inFlight === null || activeSession === null
+        ? null
+        : migratedProviderBinding(activeSession, inFlight);
+      const { pendingTurnCompletion: _removed, ...withoutPending } = set;
+      void _removed;
+      nextSets[roleName] = {
+        ...withoutPending,
+        schemaVersion: TASK_ROLE_SESSION_SET_TO_VERSION,
+        sessions: nextSessions,
+        providerBinding
+      };
+    }
+    highWater.event = eventHighWater;
+    nextTasks[taskId] = {
+      ...aggregate,
+      roleSessionSets: nextSets,
+      events,
+      idHighWaterMarks: highWater
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+function migratedProviderBinding(
+  session: Record<string, unknown>,
+  inFlight: Record<string, unknown>
+): Record<string, unknown> {
+  const conversationId = String(session.nativeSessionId);
+  const activationId = String(session.launchId ?? inFlight.receiptId);
+  const startedAt = String(inFlight.preparedAt);
+  const live = session.status !== "stopped" && session.status !== "broken";
+  return {
+    schemaVersion: 1,
+    providerNamespace: migratedDriverId(String(session.adapterId)),
+    accountScope: String(session.agentId),
+    runId: String(inFlight.runId),
+    currentConversationEpoch: 1,
+    conversations: [{
+      conversationId,
+      epoch: 1,
+      status: "current",
+      recoverability: "unknown",
+      createdAt: String(session.createdAt ?? startedAt)
+    }],
+    activations: [{
+      activationId,
+      conversationId,
+      generation: 1,
+      status: live ? "active" : session.status === "broken" ? "failed" : "ended",
+      writerLease: live,
+      startedAt,
+      ...(live ? {} : { endedAt: String(session.updatedAt) })
+    }]
+  };
+}
+
+function migratedDriverId(adapterId: string): string {
+  if (adapterId === "claude") return "anthropic/claude-code";
+  if (adapterId === "codex") return "openai/codex";
+  return adapterId.includes("/") ? adapterId : `legacy/${adapterId}`;
 }
 
 /**

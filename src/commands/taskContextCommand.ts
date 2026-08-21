@@ -39,6 +39,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       throw new Error(`Task execution projection disappeared: ${task.id}.`);
     }
     const roleSessionSets = reader.listRoleSessionSets(task.id);
+    const coordinationMailboxes = [
+      reader.getWorkMailbox({ kind: "task", taskId: task.id }),
+      ...roles.map((role) => reader.getWorkMailbox({
+        kind: "role" as const,
+        taskId: task.id,
+        roleName: role.name
+      }))
+    ].filter((mailbox): mailbox is NonNullable<typeof mailbox> => mailbox !== null);
     const agentRuns = chronological(reader.listAgentRuns(task.id));
     const reviewRounds = chronological(reader.listReviewRounds(task.id));
     const changeSets = chronological(reader.listChangeSets(task.id));
@@ -58,6 +66,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       roles,
       managedWorkspaces: reader.listManagedWorkspaces(task.id),
       roleSessionSets,
+      coordinationMailboxes,
       roleSessionRecoveries: roles.map((role) => (
         inspectTaskRoleSessionRecovery(task.id, role.name, reader)
       )),
@@ -83,6 +92,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     roles,
     managedWorkspaces,
     roleSessionSets,
+    coordinationMailboxes,
     roleSessionRecoveries,
     workItems,
     agentRuns,
@@ -246,6 +256,11 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
           ];
         })),
     "",
+    `Coordination mailboxes (${coordinationMailboxes.length}):`,
+    ...(coordinationMailboxes.length === 0
+      ? ["  None."]
+      : coordinationMailboxes.flatMap(renderCoordinationMailbox)),
+    "",
     `Current and recent work items (${displayedWorkItems.length}${workItems.length > displayedWorkItems.length ? ` of ${workItems.length}` : ""}):`,
     ...(displayedWorkItems.length === 0
       ? ["  None."]
@@ -377,6 +392,23 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     output: `${lines.join("\n")}\n`,
     data
   };
+}
+
+function renderCoordinationMailbox(
+  mailbox: ReturnType<TaskStore["getWorkMailbox"]> & object
+): string[] {
+  const target = mailbox.target.kind === "role"
+    ? `role/${mailbox.target.roleName}`
+    : mailbox.target.kind;
+  const pending = [mailbox.pending.userCorrection, mailbox.pending.normal]
+    .filter((batch): batch is NonNullable<typeof batch> => batch !== null);
+  return [
+    `  ${target}: cursor normal=${mailbox.pending.cursors.normal}, correction=${mailbox.pending.cursors.userCorrection}; next=${mailbox.nextSequence}`,
+    `    Delivery: ${mailbox.inputDelivery?.status ?? "none"}; processing: ${mailbox.processing?.batchId ?? "none"}; pending batches: ${pending.length}`,
+    ...pending.map((batch) => (
+      `    Pending ${batch.fromSequence}-${batch.toSequence}: ${batch.reasons.join(", ")} · refs ${batch.refs.map((ref) => `${ref.type}:${ref.id}`).join(", ") || "none"}`
+    ))
+  ];
 }
 
 function latestStallKind(events: readonly TaskEvent[], runId: string): string {

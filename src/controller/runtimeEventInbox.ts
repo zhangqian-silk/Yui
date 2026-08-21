@@ -321,9 +321,16 @@ export class FileRuntimeEventInbox {
     const invalidDirectory = join(this.home, INVALID_RUNTIME_EVENT_DIRECTORY);
     ensureInboxDirectory(invalidDirectory);
     const source = join(this.directory, name);
-    const target = join(invalidDirectory, `${name}.${randomUUID()}`);
+    // One semantic ingress identity owns one quarantine slot. Repeated poison
+    // entries replace neither the first diagnostic nor create an event storm.
+    const target = join(invalidDirectory, name);
     try {
-      renameSync(source, target);
+      try {
+        linkSync(source, target);
+      } catch (error) {
+        if (!isNodeError(error, "EEXIST")) throw error;
+      }
+      unlinkSync(source);
       fsyncDirectory(this.directory);
       fsyncDirectory(invalidDirectory);
     } catch (error) {
@@ -355,9 +362,11 @@ function runtimeEventId(
   if (type === "runtime-observation") {
     const observation = (input as Readonly<{ observation: RuntimeObservation }>).observation;
     return `turn-${createHash("sha256").update(JSON.stringify([
-      1,
+      2,
       type,
-      observation
+      observation.fence.taskId ?? null,
+      observation.fence.roleName,
+      observation.semanticKey
     ])).digest("hex")}`;
   }
   if (type === "durable-job-terminal") {

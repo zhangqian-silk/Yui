@@ -19,8 +19,12 @@ export type RoleLiveStatus = "present" | "absent";
 export type RoleLiveStatusSnapshot = ReadonlyMap<string, RoleLiveStatus>;
 
 /**
- * Lightweight liveness only: an active AgentRun whose tmux role is absent is
- * failed, then the Leader is durably queued. No TTL, cooldown, or schedules.
+ * Lightweight liveness only. Host absence may fail a Run only before any
+ * prompt bytes were pushed. After push, acceptance may be unknown even when
+ * deliveredAt is absent; pane/process loss is therefore runtime-health
+ * evidence, not an application-level outcome. The Run stays active so native
+ * child work or another observer can still contribute facts, while the stall
+ * path raises bounded attention independently.
  */
 export async function reconcileExitedRoleRuns(
   store: SchedulerStorePort,
@@ -62,16 +66,9 @@ export async function reconcileExitedRoleRuns(
     })
   ));
   if (candidates.length === 0) return failed;
-  const candidateTaskIds = [...new Set(candidates.map(({ task }) => task.id))]
-    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
-  const completing = new Set(
-    store.listPendingRuntimeTurnCompletions(candidateTaskIds).map((completion) => (
-      `${completion.taskId}\0${completion.roleName}\0${completion.runId}`
-    ))
-  );
-  const eligible = candidates.filter(({ task, role, run }) => (
+  const eligible = candidates.filter(({ task, run }) => (
     !excludedRunRefs.has(formatTaskRecordReference(task.id, run.id, "agentRun"))
-    && !completing.has(`${task.id}\0${role.name}\0${run.id}`)
+    && run.pushedAt === undefined
   ));
   // Full reconciliation builds one complete provider inventory for every
   // active Run, including delivery-uncertain and completion-pending Runs.

@@ -12,6 +12,7 @@ import type {
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "./ports.js";
+import { mailboxHasWork, nextPendingBatch } from "../coordination/workMailbox.js";
 
 type OperatorNotificationOutcome = Readonly<{
   taskId: string;
@@ -39,8 +40,8 @@ export async function processOperatorInputNotifications(
   if (selection !== undefined && !selection.full && !selection.operator) return [];
   const targetMailbox = { kind: "operator" } as const;
   const mailbox = store.getWorkMailbox(targetMailbox);
-  if (mailbox === null || (mailbox.pending === null && mailbox.processing === null)) return [];
-  const pending = mailbox.pending;
+  if (mailbox === null || !mailboxHasWork(mailbox)) return [];
+  const pending = nextPendingBatch(mailbox);
   const claim = store.claimWorkMailbox({
     target: targetMailbox,
     batchId: pending === null

@@ -7,6 +7,7 @@ import type {
 } from "./agentDriver.js";
 import {
   createRuntimeObservation,
+  runtimeObservationSemanticKey,
   type RuntimeObservation,
   type RuntimeObservationFence,
   type RuntimeUsageSnapshot
@@ -24,23 +25,34 @@ export type AgentDriverObservationInput = AgentDriverNativeHook & Readonly<{
 export function mapAgentDriverHook(
   input: AgentDriverObservationInput
 ): RuntimeObservation {
+  return mapAgentDriverHooks(input)[0]!;
+}
+
+export function mapAgentDriverHooks(
+  input: AgentDriverObservationInput
+): readonly RuntimeObservation[] {
   requireMatchingDriver(input);
-  const mapped = input.driver.runtime.mapHook({
+  const raw = input.driver.runtime.mapHook({
     hookEventName: input.hookEventName,
     payload: input.payload,
     ...(input.occurrenceId === undefined ? {} : { occurrenceId: input.occurrenceId })
   });
-  const source = mapped.kind === "turn.accepted"
+  const mapped = Array.isArray(raw) ? raw : [raw];
+  if (mapped.length === 0) throw new Error("Agent Driver Hook must map at least one observation.");
+  const source = mapped.some((entry) => entry.kind === "turn.accepted")
     ? input.driver.runtime.observer?.source({
         hookEventName: input.hookEventName,
         payload: input.payload,
         ...(input.occurrenceId === undefined ? {} : { occurrenceId: input.occurrenceId })
       }) ?? null
     : null;
-  return observation(input, source === null ? mapped : {
-    ...mapped,
-    payload: Object.freeze({ ...mapped.payload, observerSource: source })
-  });
+  return Object.freeze(mapped.map((entry, index) => observation(
+    { ...input, ordinal: (input.ordinal ?? 0) + index },
+    source === null || entry.kind !== "turn.accepted" ? entry : {
+      ...entry,
+      payload: Object.freeze({ ...entry.payload, observerSource: source })
+    }
+  )));
 }
 
 export function mapAgentDriverUsage(
@@ -58,16 +70,25 @@ function observation(
   input: AgentDriverObservationInput,
   mapped: AgentDriverMappedHook
 ): RuntimeObservation {
+  const eventId = hookEventId(input, mapped);
+  const fence = { ...input.fence, ...mapped.fence };
   return createRuntimeObservation({
-    schemaVersion: 1,
-    eventId: hookEventId(input, mapped),
+    schemaVersion: 2,
+    eventId,
+    semanticKey: runtimeObservationSemanticKey({
+      eventId,
+      kind: mapped.kind,
+      fence,
+      ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
+      payload: mapped.payload
+    }),
     kind: mapped.kind,
     authority: "provider-structured",
     receivedAt: input.receivedAt,
     ...(input.observedAt === undefined ? {} : { observedAt: input.observedAt }),
     ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
     ...(input.ordinal === undefined ? {} : { ordinal: input.ordinal }),
-    fence: input.fence,
+    fence,
     payload: mapped.payload
   });
 }

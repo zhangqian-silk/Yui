@@ -96,7 +96,6 @@ export function copySqlitePassthroughState(
     target.transaction(() => {
       mergeGlobalSequences(source, target);
       copyTableRows(source, target, "outbox");
-      copyMailboxSignals(source, target);
       copyTableRows(source, target, "work_item_candidates");
       copyTableRows(source, target, "review_findings");
       copyTableRows(source, target, "telemetry");
@@ -126,52 +125,6 @@ function mergeGlobalSequences(source: Database.Database, target: Database.Databa
        high_water = MAX(global_sequences.high_water, excluded.high_water)`
   );
   for (const row of rows) merge.run(row.name, row.high_water);
-}
-
-function copyMailboxSignals(source: Database.Database, target: Database.Database): void {
-  if (!sqliteTableExists(source, "mailbox_signals")) return;
-  const rows = source.prepare(
-    `SELECT m.target_key, s.sequence, s.reason, s.ref_type, s.ref_task_id,
-            s.ref_id, s.occurred_at, s.request_id
-       FROM mailbox_signals s
-       JOIN mailboxes m ON m.mailbox_id = s.mailbox_id
-      ORDER BY m.target_key, s.sequence`
-  ).iterate() as IterableIterator<Readonly<{
-    target_key: string;
-    sequence: number;
-    reason: string;
-    ref_type: string | null;
-    ref_task_id: string | null;
-    ref_id: string | null;
-    occurred_at: string;
-    request_id: string;
-  }>>;
-  const findMailbox = target.prepare(
-    "SELECT mailbox_id FROM mailboxes WHERE target_key = ?"
-  );
-  const insert = target.prepare(
-    `INSERT INTO mailbox_signals
-       (mailbox_id, sequence, reason, ref_type, ref_task_id, ref_id, occurred_at, request_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  for (const row of rows) {
-    const mailbox = findMailbox.get(row.target_key) as { mailbox_id: number } | undefined;
-    if (mailbox === undefined) {
-      throw new Error(
-        `SQLite migration cannot preserve signals for missing mailbox ${row.target_key}.`
-      );
-    }
-    insert.run(
-      mailbox.mailbox_id,
-      row.sequence,
-      row.reason,
-      row.ref_type,
-      row.ref_task_id,
-      row.ref_id,
-      row.occurred_at,
-      row.request_id
-    );
-  }
 }
 
 function copyTableRows(

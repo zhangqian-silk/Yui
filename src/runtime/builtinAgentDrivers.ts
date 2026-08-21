@@ -31,6 +31,24 @@ const STRUCTURED_CLI_CAPABILITIES: AgentDriverCapabilities = Object.freeze({
     interrupt: true,
     stop: true
   }),
+  conversation: Object.freeze({
+    persistentIdentity: "exact" as const,
+    crossProcessResume: true,
+    readback: "partial" as const
+  }),
+  input: Object.freeze({
+    startTurn: true,
+    steer: "unavailable" as const,
+    inject: "unavailable" as const,
+    acceptance: "exact" as const,
+    idempotency: "unavailable" as const
+  }),
+  descendants: Object.freeze({
+    lineage: "partial" as const,
+    detachedQuery: "partial" as const,
+    resultRouting: "partial" as const
+  }),
+  bounded: Object.freeze({ structuredTerminal: true }),
   observation: Object.freeze({
     sessionIdentity: "exact",
     sessionBootstrap: "discovered",
@@ -74,7 +92,11 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
         ...(hookEventName === "SessionStart" && payload.source === "startup"
           ? { startupSession: "preallocated" as const }
           : {}),
-        terminal: isTerminalHook(hookEventName)
+        terminal: isTerminalHook(hookEventName),
+        ...(hookEventName !== "SubagentStop" ? {} : {
+          continuationId: subagentId(payload),
+          continuationGeneration: continuationGeneration(payload)
+        })
       }),
       observer: Object.freeze({
         source: (input: AgentDriverNativeHook) => transcriptObserverSource(
@@ -90,7 +112,27 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
     label: "Codex",
     protocolVersion: 1,
     adapterId: "codex",
-    capabilities: STRUCTURED_CLI_CAPABILITIES,
+    capabilities: Object.freeze({
+      ...STRUCTURED_CLI_CAPABILITIES,
+      surfaces: Object.freeze(["interactive-cli", "managed-protocol"] as const),
+      conversation: Object.freeze({
+        persistentIdentity: "exact" as const,
+        crossProcessResume: true,
+        readback: "exact" as const
+      }),
+      input: Object.freeze({
+        startTurn: true,
+        steer: "fenced" as const,
+        inject: "fenced" as const,
+        acceptance: "exact" as const,
+        idempotency: "unavailable" as const
+      }),
+      descendants: Object.freeze({
+        lineage: "partial" as const,
+        detachedQuery: "partial" as const,
+        resultRouting: "partial" as const
+      })
+    }),
     runtime: Object.freeze({
       nativeSessionId: ({ payload }: AgentDriverNativeHook) => (
         optionalIdentityFrom(payload, ["session_id"])
@@ -101,11 +143,15 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
       mapHook: ({ hookEventName, payload, occurrenceId }: AgentDriverNativeHook) => (
         mapCodexHook(hookEventName, payload, occurrenceId)
       ),
-      classifyHook: ({ hookEventName }: AgentDriverNativeHook) => Object.freeze({
+      classifyHook: ({ hookEventName, payload }: AgentDriverNativeHook) => Object.freeze({
         ...(hookEventName === "SessionStart"
           ? { startupSession: "discovered" as const }
           : {}),
-        terminal: isTerminalHook(hookEventName)
+        terminal: isTerminalHook(hookEventName),
+        ...(hookEventName !== "SubagentStop" ? {} : {
+          continuationId: subagentId(payload),
+          continuationGeneration: continuationGeneration(payload)
+        })
       }),
       observer: Object.freeze({
         source: (input: AgentDriverNativeHook) => transcriptObserverSource(
@@ -130,12 +176,16 @@ function mapClaudeHook(
   name: string,
   payload: Readonly<Record<string, unknown>>,
   occurrenceId?: string
-): MappedHook {
+): MappedHook | readonly MappedHook[] {
   switch (name) {
     case "SessionStart":
-      return payload.source === "startup"
-        ? mapped("session.ready")
-        : mapped("session.started");
+      return [
+        payload.source === "startup"
+          ? mapped("session.ready")
+          : mapped("session.started"),
+        mapped("conversation.observed", { recoverability: "recoverable" }),
+        mapped("activation.started")
+      ];
     case "UserPromptSubmit":
       return mapped("turn.accepted");
     case "PreToolUse":
@@ -162,15 +212,51 @@ function mapClaudeHook(
       });
     }
     case "SubagentStart":
-      return operation("operation.started", "subagent", subagentId(payload));
+      return [
+        operation("operation.started", "subagent", subagentId(payload)),
+        continuationObservation("continuation.started", payload, {
+          execution: "active",
+          outcome: "pending",
+          attachment: "attached",
+          observationQuality: "exact",
+          mayWriteWorkspace: true
+        })
+      ];
     case "SubagentStop":
-      return operation("operation.completed", "subagent", subagentId(payload));
+      return [
+        operation("operation.completed", "subagent", subagentId(payload)),
+        ...(optionalSummary(payload).summary === undefined ? [] : [
+          continuationObservation("continuation.reported", payload, {
+            execution: "quiescent",
+            outcome: "succeeded",
+            attachment: "attached",
+            observationQuality: "exact",
+            mayWriteWorkspace: false,
+            reportId: reportId(payload),
+            ...optionalSummary(payload)
+          })
+        ]),
+        continuationObservation("continuation.settled", payload, {
+          execution: "quiescent",
+          outcome: continuationOutcome(payload),
+          attachment: "attached",
+          observationQuality: "exact",
+          mayWriteWorkspace: false,
+          ...optionalSummary(payload)
+        })
+      ];
     case "Stop":
-      return mapped("turn.completed", optionalSummary(payload));
+      return [
+        mapped("turn.completed", optionalSummary(payload)),
+        mapped("native-work.snapshot", {
+          snapshotComplete: payload.background_tasks_complete === true,
+          observationQuality: payload.background_tasks_complete === true ? "exact" : "partial"
+        })
+      ];
     case "StopFailure":
       return mapped("turn.failed", claudeFailure(payload));
     case "SessionEnd":
-      return mapped("session.ended");
+      return [mapped("session.ended"), mapped("activation.ended")];
     default:
       throw new Error(`Claude Code Driver does not support Hook event: ${name}.`);
   }
@@ -180,10 +266,14 @@ function mapCodexHook(
   name: string,
   payload: Readonly<Record<string, unknown>>,
   occurrenceId?: string
-): MappedHook {
+): MappedHook | readonly MappedHook[] {
   switch (name) {
     case "SessionStart":
-      return mapped("session.started");
+      return [
+        mapped("session.started"),
+        mapped("conversation.observed", { recoverability: "recoverable" }),
+        mapped("activation.started")
+      ];
     case "UserPromptSubmit":
       return mapped("turn.accepted");
     case "PreToolUse":
@@ -199,13 +289,33 @@ function mapCodexHook(
           ?? requireOccurrence(occurrenceId)
       });
     case "SubagentStart":
-      return operation("operation.started", "subagent", subagentId(payload));
+      return [
+        operation("operation.started", "subagent", subagentId(payload)),
+        continuationObservation("continuation.started", payload, {
+          execution: "active",
+          outcome: "pending",
+          attachment: "attached",
+          observationQuality: "partial",
+          mayWriteWorkspace: true
+        })
+      ];
     case "SubagentStop":
-      return operation("operation.completed", "subagent", subagentId(payload));
+      return [
+        operation("operation.completed", "subagent", subagentId(payload)),
+        continuationObservation("continuation.reported", payload, {
+          execution: "unknown",
+          outcome: "unknown",
+          attachment: "attached",
+          observationQuality: "partial",
+          mayWriteWorkspace: true,
+          reportId: reportId(payload),
+          ...optionalSummary(payload)
+        })
+      ];
     case "Stop":
       return mapped("turn.completed", optionalSummary(payload));
     case "SessionEnd":
-      return mapped("session.ended");
+      return [mapped("session.ended"), mapped("activation.ended")];
     default:
       throw new Error(`Codex Driver does not support Hook event: ${name}.`);
   }
@@ -213,9 +323,58 @@ function mapCodexHook(
 
 function mapped(
   kind: RuntimeObservationKind,
-  payload: RuntimeObservationPayload = {}
+  payload: RuntimeObservationPayload = {},
+  fence?: AgentDriverMappedHook["fence"]
 ): MappedHook {
-  return Object.freeze({ kind, payload: Object.freeze({ ...payload }) });
+  return Object.freeze({
+    kind,
+    payload: Object.freeze({ ...payload }),
+    ...(fence === undefined ? {} : { fence: Object.freeze({ ...fence }) })
+  });
+}
+
+function continuationObservation(
+  kind: "continuation.started" | "continuation.reported" | "continuation.settled",
+  native: Readonly<Record<string, unknown>>,
+  payload: RuntimeObservationPayload
+): MappedHook {
+  const continuationId = subagentId(native);
+  const generation = continuationGeneration(native);
+  return mapped(kind, payload, {
+    continuationId,
+    continuationGeneration: generation,
+    ...(optionalIdentityFrom(native, ["parent_agent_id", "parent_subagent_id"]) === undefined
+      ? {}
+      : {
+          parentContinuationId: optionalIdentityFrom(
+            native,
+            ["parent_agent_id", "parent_subagent_id"]
+          )
+        })
+  });
+}
+
+function continuationGeneration(native: Readonly<Record<string, unknown>>): number {
+  return typeof native.generation === "number"
+    && Number.isSafeInteger(native.generation) && native.generation >= 1
+    ? native.generation
+    : 1;
+}
+
+function reportId(payload: Readonly<Record<string, unknown>>): string {
+  return optionalIdentityFrom(payload, ["report_id", "message_id", "agent_id", "subagent_id"])
+    ?? subagentId(payload);
+}
+
+function continuationOutcome(
+  payload: Readonly<Record<string, unknown>>
+): "succeeded" | "failed" | "cancelled" | "unknown" {
+  if (payload.cancelled === true || payload.status === "cancelled") return "cancelled";
+  if (payload.error !== undefined || payload.status === "failed") return "failed";
+  if (payload.status === undefined || payload.status === "completed" || payload.status === "succeeded") {
+    return "succeeded";
+  }
+  return "unknown";
 }
 
 function operation(
@@ -284,7 +443,10 @@ function claudeFailure(
     failure: {
       code,
       ...(details === undefined ? {} : { details }),
-      ...(lastOutput === undefined ? {} : { lastOutput })
+      ...(lastOutput === undefined ? {} : { lastOutput }),
+      ...(payload.run_terminal === true || payload.unrecoverable === true
+        ? { runTerminal: true }
+        : {})
     },
     summary: [
       "Agent turn failed.",

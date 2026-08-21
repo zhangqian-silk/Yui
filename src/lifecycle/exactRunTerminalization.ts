@@ -401,7 +401,7 @@ export function terminalizeExactTaskRun(
         roleTarget,
         { type: "run", taskId: run.taskId, id: run.id }
       );
-      if (mailboxSettlement === "absent" && isReview) {
+      if (mailboxSettlement === "absent" && isReview && run.deliveredAt === undefined) {
         return obsolete(run, "review-mailbox-missing");
       }
     }
@@ -761,13 +761,6 @@ function matchesSessionFence(
   if (input.nativeSessionId !== undefined) {
     if (session?.nativeSessionId !== input.nativeSessionId) return false;
   }
-  const pending = sessions.pendingTurnCompletion;
-  if (pending !== null && (
-    pending.agentId !== input.agentId
-    || pending.runId !== input.runId
-    || (input.nativeSessionId !== undefined
-      && pending.nativeSessionId !== input.nativeSessionId)
-  )) return false;
   const inFlight = sessions.inFlight;
   return inFlight === null || (
     inFlight.agentId === input.agentId
