@@ -8,7 +8,7 @@ import {
   normalizeAgentDriverHookClassification
 } from "../runtime/agentDriver.js";
 import {
-  mapAgentDriverHook
+  mapAgentDriverHooks
 } from "../runtime/agentDriverObservation.js";
 import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
 import type { RuntimeObservation } from "../runtime/runtimeObservation.js";
@@ -113,6 +113,10 @@ export function parseRuntimeObservationHook(
         ? {}
         : { startupSession: classification.startupSession }),
       terminal: classification.terminal,
+      ...(classification.continuationId === undefined ? {} : {
+        continuationId: classification.continuationId,
+        continuationGeneration: classification.continuationGeneration ?? 1
+      }),
       ...(nativeTurnId === undefined ? {} : { nativeTurnId })
     }
   );
@@ -133,13 +137,15 @@ export function parseRuntimeObservationHook(
       driverId,
       launchId: fence.launchId,
       sessionGenerationId: fence.launchId,
+      conversationId: fence.nativeSessionId,
+      activationId: fence.launchId,
       nativeSessionId: fence.nativeSessionId,
       nativeTurnId: nativeTurnId ?? fence.runId,
       receiptId: fence.receiptId ?? formatAgentRunReceiptId(fence.taskId, fence.runId)
     },
     payload
   } as const;
-  const observations = [mapAgentDriverHook({ ...driverInput, ordinal: 0 })];
+  const observations = mapAgentDriverHooks({ ...driverInput, ordinal: 0 });
   return {
     home: requireIdentity(environment.YUI_HOME, "YUI_HOME"),
     taskId: fence.taskId,

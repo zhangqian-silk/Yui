@@ -1,7 +1,8 @@
-import type {
-  MailboxTarget,
-  ProcessingBatch,
-  WorkMailbox
+import {
+  mailboxHasWork,
+  type MailboxTarget,
+  type ProcessingBatch,
+  type WorkMailbox
 } from "../coordination/workMailbox.js";
 
 export const RUNTIME_LIFECYCLE_OWNER = "runtime-lifecycle";
@@ -64,7 +65,8 @@ export function hasRuntimeLaunchReservation(
 export function hasRuntimeCleanupObligation(
   mailbox: WorkMailbox | null
 ): boolean {
-  return mailbox?.pending?.reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON) === true
+  const pending = mailbox?.pending.normal;
+  return pending?.reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON) === true
     || (
       !isRuntimeLaunchReservation(mailbox?.processing)
       && mailbox?.processing?.batch.reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON) === true
@@ -74,6 +76,5 @@ export function hasRuntimeCleanupObligation(
 export function hasRuntimeLifecycleWork(
   mailbox: WorkMailbox | null
 ): boolean {
-  return mailbox !== null
-    && (mailbox.processing !== null || mailbox.pending !== null);
+  return mailbox !== null && mailboxHasWork(mailbox);
 }

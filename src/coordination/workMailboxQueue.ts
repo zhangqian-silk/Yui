@@ -1,10 +1,13 @@
 import {
   completeProcessing,
+  consumePendingBatch,
   createWorkMailbox,
   enqueueSignal,
+  mailboxBatches,
   mailboxEntityRefKey,
   type MailboxEntityRef,
   type MailboxTarget,
+  type WorkSignal,
   type WorkMailbox
 } from "./workMailbox.js";
 
@@ -19,13 +22,15 @@ export function enqueueWork(
   target: MailboxTarget,
   reason: string,
   occurredAt: Date | string,
-  refs: readonly MailboxEntityRef[] = []
+  refs: readonly MailboxEntityRef[] = [],
+  metadata: Omit<WorkSignal, "reason" | "refs" | "occurredAt"> = {}
 ): WorkMailbox {
   const mailbox = store.getWorkMailbox(target) ?? createWorkMailbox(target);
   const queued = enqueueSignal(mailbox, {
     reason,
     refs,
-    occurredAt: timestamp(occurredAt)
+    occurredAt: timestamp(occurredAt),
+    ...metadata
   });
   store.saveWorkMailbox(queued);
   return queued;
@@ -99,19 +104,23 @@ export function settleExactWorkExecution(
   if (completeWorkExecution(store, target, executionRef)) return "processing";
   const mailbox = store.getWorkMailbox(target);
   if (mailbox === null) return "absent";
-  const pending = mailbox.pending;
-  if (pending === null) return "absent";
-  const matches = pending.refs.some(
+  const matching = mailboxBatches(mailbox).filter((batch) => batch.refs.some(
     (ref) => mailboxEntityRefKey(ref) === mailboxEntityRefKey(executionRef)
-  );
-  if (!matches) return "absent";
-  if (pending.requestCount !== 1) {
+  ));
+  if (matching.length === 0) return "absent";
+  if (matching.length !== 1 || matching[0]!.requestCount !== 1) {
     throw new Error(
       `Cannot settle a merged pending mailbox batch for ${targetLabel(target)}: `
       + `${executionRef.type}/${executionRef.id}.`
     );
   }
-  store.saveWorkMailbox({ ...mailbox, pending: null });
+  const pending = matching[0]!;
+  const pendingKey = mailbox.pending.normal === pending ? "normal" : "userCorrection";
+  if (mailbox.pending[pendingKey] !== pending) return "absent";
+  store.saveWorkMailbox(consumePendingBatch(
+    mailbox,
+    pendingKey === "normal" ? "normal" : "user-correction"
+  ));
   return "pending";
 }
 

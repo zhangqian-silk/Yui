@@ -344,7 +344,7 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "send",
         summary: "Send a Task message.",
-        usage: "yui task message send <id> (<body>|--body-file <path|->)",
+        usage: "yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none] [--delivery-mode followup|steer]",
         options: ["--body-file"],
         fileOptions: ["--body-file"]
       },

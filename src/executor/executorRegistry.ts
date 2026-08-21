@@ -18,11 +18,13 @@ import type {
 } from "../tmux/tmuxManager.js";
 import {
   createPromptEnvelope,
+  createRuntimeBinding,
   createSessionLaunchRequest,
   type ActivePromptPushPort,
   type RuntimeBinding,
   type RuntimeLaunchPreStart,
   type RuntimeLaunchPreparationPort,
+  type ProviderInputRoutingPort,
   type SessionHostPort
 } from "../runtime/index.js";
 import type { EffectiveLaunchSnapshot } from "./effectiveLaunch.js";
@@ -31,6 +33,7 @@ import type {
   TaskRuntimeIsolationDescriptor,
   TaskRuntimeLaunchPolicy
 } from "../runtime/taskRuntimeIsolation.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
 export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
@@ -122,6 +125,7 @@ export type ExecutorRuntimePorts = Readonly<{
   sessionHost: SessionHostPort;
   promptPush: ActivePromptPushPort;
   launchCoordinator?: RuntimeLaunchPreparationPort;
+  providerInputRouting?: ProviderInputRoutingPort;
   /** One advisory resource sample produced alongside the full Role inventory. */
   roleResourceInventory?: (
     panes: readonly TmuxRolePaneState[],
@@ -160,6 +164,10 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     private readonly readiness: AgentReadinessResolver = agentProcessReadinessProbe,
     private readonly runtimePorts?: ExecutorRuntimePorts
   ) {}
+
+  canRouteProviderInput(adapterId: string): boolean {
+    return adapterId === "codex" && this.runtimePorts?.providerInputRouting !== undefined;
+  }
 
   async prepareRoleSession(input: Readonly<{
     taskId: string;
@@ -348,7 +356,10 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         envelope: createPromptEnvelope({
           id: input.receiptId,
           source: {
-            kind: "agent-run",
+            kind: input.receiptId === formatAgentRunReceiptId(
+              input.delivery.prepared.taskId,
+              runId
+            ) ? "agent-run" : "run-input",
             taskId: input.delivery.prepared.taskId,
             localId: runId
           },
@@ -372,6 +383,72 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       this.#prepared.delete(input.delivery.prepared.deliveryId);
     }
     return outcome;
+  }
+
+  async routeProviderInput(input: Readonly<{
+    delivery: ReadyRoleDelivery;
+    attemptId: string;
+    mode: "steer-if-safe" | "inject";
+    text: string;
+    fence: Readonly<{
+      conversationId: string;
+      activationId: string;
+      nativeTurnId?: string;
+    }>;
+  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unsafe" | "unavailable"> {
+    const prepared = this.requirePrepared(input.delivery.prepared);
+    if (prepared.binding === undefined || this.runtimePorts?.providerInputRouting === undefined) {
+      return "unavailable";
+    }
+    try {
+      return await this.runtimePorts.providerInputRouting.route({
+        binding: prepared.binding,
+        attemptId: input.attemptId,
+        mode: input.mode,
+        text: input.text,
+        fence: input.fence
+      });
+    } finally {
+      // A routed mutation is fenced by its durable inputDelivery, not by this
+      // process-local preparation. Never let a later Turn reuse a cached
+      // Activation binding after this attempt (including an unknown result).
+      this.#prepared.delete(input.delivery.prepared.deliveryId);
+    }
+  }
+
+  async reconcileProviderInput(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    launchId: string;
+    nativeSessionId: string;
+    attemptId: string;
+    mode: "followup" | "steer-if-safe" | "inject";
+    fence: Readonly<{
+      conversationId: string;
+      activationId: string;
+      nativeTurnId?: string;
+    }>;
+  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unavailable"> {
+    if (this.runtimePorts?.providerInputRouting === undefined) {
+      return "unavailable";
+    }
+    return this.runtimePorts.providerInputRouting.reconcile({
+      binding: createRuntimeBinding({
+        id: `metadata:${input.taskId}:${input.roleName}:${input.launchId}`,
+        launchId: input.launchId,
+        owner: { scope: "task", taskId: input.taskId, roleName: input.roleName },
+        agentId: input.agentId,
+        adapterId: input.adapterId,
+        hostRef: "metadata-only",
+        hostCreated: false,
+        nativeSessionId: input.nativeSessionId
+      }),
+      attemptId: input.attemptId,
+      mode: input.mode,
+      fence: input.fence
+    });
   }
 
   async notifyOperatorInputOnce(input: Readonly<{

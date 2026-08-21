@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 13;
+export const SQLITE_SCHEMA_VERSION = 14;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -186,21 +186,6 @@ CREATE TABLE IF NOT EXISTS mailboxes (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mailboxes_target_key
   ON mailboxes(target_key);
-
--- Signals are the durable append log; (mailbox, sequence) is the exactly-once key.
-CREATE TABLE IF NOT EXISTS mailbox_signals (
-  mailbox_id   INTEGER NOT NULL,
-  sequence     INTEGER NOT NULL,
-  reason       TEXT NOT NULL,
-  ref_type     TEXT,
-  ref_task_id  TEXT,
-  ref_id       TEXT,
-  occurred_at  TEXT NOT NULL,
-  request_id   TEXT NOT NULL,
-  PRIMARY KEY (mailbox_id, sequence),
-  FOREIGN KEY (mailbox_id) REFERENCES mailboxes(mailbox_id)
-);
-CREATE INDEX IF NOT EXISTS idx_mailbox_signals_request ON mailbox_signals(request_id);
 
 -- Task-partitioned tables (§4.3). Every task-local read constrains task_id. ----
 
@@ -789,6 +774,105 @@ FROM role_session_sets AS source
 WHERE json_type(source.payload, '$.pendingTurnCompletion') = 'object';
 `;
 
+/** Migration 14: WorkMailbox v2 lanes and the single durable model-input delivery. */
+const MIGRATION_14_SQL = `
+ALTER TABLE mailboxes ADD COLUMN input_delivery TEXT;
+
+UPDATE mailboxes
+SET processing = CASE
+  WHEN processing IS NULL THEN NULL
+  ELSE json_set(
+    processing,
+    '$.lane', 'normal',
+    '$.batch.sources', json_array('migration-v1'),
+    '$.batch.dedupeKeys', json_array(
+      'mailbox-v1:' || target_key || ':'
+      || json_extract(processing, '$.batch.fromSequence') || '-'
+      || json_extract(processing, '$.batch.toSequence')
+    ),
+    '$.batch.deliveryModes', json_array('followup')
+  )
+END;
+
+UPDATE mailboxes
+SET input_delivery = json_object(
+  'attemptId', json_extract(processing, '$.batchId'),
+  'lane', 'normal',
+  'mode', 'followup',
+  'batch', json(json_extract(processing, '$.batch')),
+  'owner', json_extract(processing, '$.owner'),
+  'status', 'delivery-unknown',
+  'startedAt', json_extract(processing, '$.startedAt'),
+  'pushedAt', json_extract(processing, '$.startedAt'),
+  'unknownReason', 'migrated-unconfirmed-provider-acceptance',
+  'executionRef', json(json_extract(processing, '$.executionRef')),
+  'providerFence', json_object(
+    'conversationId', (
+      SELECT json_extract(
+        json_extract(role_session_sets.payload, '$.sessions'),
+        '$.' || json_quote(json_extract(role_session_sets.payload, '$.activeAgentId'))
+          || '.nativeSessionId'
+      )
+      FROM role_session_sets
+      WHERE role_session_sets.task_id = mailboxes.task_id
+        AND role_session_sets.role_name = mailboxes.role_name
+    ),
+    'activationId', COALESCE((
+      SELECT json_extract(
+        json_extract(role_session_sets.payload, '$.sessions'),
+        '$.' || json_quote(json_extract(role_session_sets.payload, '$.activeAgentId'))
+          || '.launchId'
+      )
+      FROM role_session_sets
+      WHERE role_session_sets.task_id = mailboxes.task_id
+        AND role_session_sets.role_name = mailboxes.role_name
+    ), (
+      SELECT json_extract(role_session_sets.payload, '$.inFlight.receiptId')
+      FROM role_session_sets
+      WHERE role_session_sets.task_id = mailboxes.task_id
+        AND role_session_sets.role_name = mailboxes.role_name
+    ))
+  )
+)
+WHERE target_kind = 'role'
+  AND json_extract(processing, '$.batchId') LIKE 'agent-input:%';
+
+UPDATE mailboxes
+SET processing = NULL
+WHERE input_delivery IS NOT NULL;
+
+UPDATE mailboxes
+SET pending = json_object(
+  'normal', CASE
+    WHEN pending IS NULL THEN json('null')
+    ELSE json(json_set(
+      pending,
+      '$.sources', json_array('migration-v1'),
+      '$.dedupeKeys', json_array(
+        'mailbox-v1:' || target_key || ':'
+        || json_extract(pending, '$.fromSequence') || '-'
+        || json_extract(pending, '$.toSequence')
+      ),
+      '$.deliveryModes', json_array('followup')
+    ))
+  END,
+  'userCorrection', json('null'),
+  'cursors', json_object('normal', 0, 'userCorrection', 0),
+  'recentDedupeKeys', json_array()
+);
+
+DROP INDEX idx_mailboxes_ready;
+CREATE INDEX idx_mailboxes_ready
+  ON mailboxes(target_key)
+  WHERE processing IS NOT NULL
+     OR input_delivery IS NOT NULL
+     OR json_type(pending, '$.normal') <> 'null'
+     OR json_type(pending, '$.userCorrection') <> 'null';
+
+DROP TABLE pending_runtime_turn_completions;
+DROP TABLE IF EXISTS mailbox_signals;
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -809,15 +893,15 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 10, axis: "layout", sql: MIGRATION_10_SQL },
   { version: 11, axis: "layout", sql: MIGRATION_11_SQL },
   { version: 12, axis: "layout", sql: MIGRATION_12_SQL },
-  { version: 13, axis: "layout", sql: MIGRATION_13_SQL }
+  { version: 13, axis: "layout", sql: MIGRATION_13_SQL },
+  { version: 14, axis: "record", recordKind: "workMailbox", sql: MIGRATION_14_SQL }
 ];
 
 /** Current hot-path indexes whose absence would invalidate a current Home. */
 const REQUIRED_SCHEMA_INDEXES = [
   "idx_mailboxes_ready",
   "idx_runtime_session_cleanup_required",
-  "idx_input_requests_open_hot",
-  "idx_pending_runtime_turn_completions_due"
+  "idx_input_requests_open_hot"
 ] as const;
 
 function checksum(sql: string): string {
@@ -1120,7 +1204,6 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "job_caller_key_hashes",
   "outbox",
   "mailboxes",
-  "mailbox_signals",
   "task_records",
   "task_roles",
   "role_session_sets",
@@ -1144,7 +1227,6 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "release_workflows",
   "session_owners",
   "runtime_session_candidates",
-  "pending_runtime_turn_completions",
   "resource_registry",
   "gate_artifacts",
   "gate_artifact_logs"

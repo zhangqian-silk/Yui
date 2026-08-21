@@ -5,6 +5,7 @@ import {
   hasRuntimeLifecycleWork,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
+import { blockingProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
@@ -200,6 +201,7 @@ export class TaskWorkspaceCoordinator {
       if (task.status !== "completed" && task.status !== "retired") {
         throw new Error(`Task must be completed or retired before archive cleanup: ${task.id}.`);
       }
+      this.#assertNoProviderContinuationWriters(task.id);
       const managedWorkspaces = [...this.store.listManagedWorkspaces(task.id)]
         .sort((left, right) => managedWorkspaceKey(left.owner)
           .localeCompare(managedWorkspaceKey(right.owner)));
@@ -392,6 +394,19 @@ export class TaskWorkspaceCoordinator {
         `Task changed during archive cleanup: ${expected.id}.`
       );
     }
+    this.#assertNoProviderContinuationWriters(expected.id);
+  }
+
+  #assertNoProviderContinuationWriters(taskId: string): void {
+    const blockers = blockingProviderContinuations(this.store.listEvents(taskId));
+    if (blockers.length > 0) {
+      throw new WorkspaceCleanupBlockedError(
+        "active-run",
+        `task:${taskId}`,
+        true,
+        `Task has Provider continuations that may still write its Workspace: ${taskId}.`
+      );
+    }
   }
 
   #assertWorkItemRuntimeQuiescent(item: WorkItem): void {
@@ -461,10 +476,6 @@ export class TaskWorkspaceCoordinator {
       }
       const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
       if (sessions?.inFlight !== null && sessions?.inFlight !== undefined) {
-        throw new Error(`Role has unsettled Run state: ${taskId}/${roleName}.`);
-      }
-      if (sessions?.pendingTurnCompletion !== null
-        && sessions?.pendingTurnCompletion !== undefined) {
         throw new Error(`Role has unsettled Run state: ${taskId}/${roleName}.`);
       }
       if (this.store.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(

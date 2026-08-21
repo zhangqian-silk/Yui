@@ -8,6 +8,7 @@ import {
   type RuntimeUsageSnapshot
 } from "./runtimeObservation.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import type { WorkMailbox } from "../coordination/workMailbox.js";
 
 export type RuntimeDisplayStatus =
   | "starting"
@@ -29,6 +30,22 @@ export type RuntimeProjection = Readonly<{
   host: "unknown" | "alive" | "exited";
   session: "unknown" | "started" | "ready" | "active" | "waiting" | "ended" | "failed";
   turn: "none" | "accepted" | "waiting" | "completed" | "failed" | "cancelled";
+  conversation: "unknown" | "recoverable" | "unrecoverable";
+  activation: "none" | "active" | "ended" | "failed";
+  continuations: Readonly<Record<string, Readonly<{
+    execution: "active" | "quiescent" | "unknown";
+    outcome: "pending" | "succeeded" | "failed" | "cancelled" | "unknown";
+    attachment: "attached" | "detached";
+    observation: "exact" | "partial" | "unavailable";
+    mayWriteWorkspace: boolean;
+    identityConflict: boolean;
+    resultRef?: string;
+  }>>>;
+  inputDelivery: "none" | "dispatching" | "delivery-unknown";
+  runActivity: "starting" | "running" | "waiting" | "parked";
+  health: "healthy" | "reconciling" | "unobservable";
+  waitingOn: readonly string[];
+  attention: readonly string[];
   waitingReason?: AgentRuntimeWaitReason;
   waitId?: string;
   operations: Readonly<Record<string, Readonly<{
@@ -76,6 +93,14 @@ export function createRuntimeProjection(
     host: "unknown",
     session: "unknown",
     turn: "none",
+    conversation: "unknown",
+    activation: "none",
+    continuations: Object.freeze({}),
+    inputDelivery: "none",
+    runActivity: "starting",
+    health: "reconciling",
+    waitingOn: Object.freeze([]),
+    attention: Object.freeze([]),
     operations: Object.freeze({}),
     activity: Object.freeze({ kind: "none" }),
     observer: Object.freeze({ status: "unknown" }),
@@ -123,24 +148,36 @@ export function projectRuntimeObservation(
         stateSince: at
       });
     case "session.started":
-      return next(current, { session: "started", stateSince: at });
+      return next(current, {
+        session: "started",
+        conversation: "recoverable",
+        activation: "active",
+        stateSince: at
+      });
     case "session.ready":
       return next(current, { session: "ready", stateSince: at });
     case "session.ended":
       return next(current, {
         session: "ended",
+        activation: "ended",
         turn: terminalTurn(current.turn),
-        operations: Object.freeze({}),
+        // A parent provider Session ending is independent from native child
+        // operations already observed under the Run. Keep those children
+        // visible until their own terminal facts arrive; host/session loss is
+        // health evidence, not proof that child work or the Yui Run ended.
+        operations: activeSubagentOperations(current.operations),
         stateSince: at
       });
     case "session.failed":
       return next(current, {
         session: "failed",
+        activation: "failed",
         turn: current.turn === "none" ? "failed" : terminalTurn(current.turn, "failed"),
-        operations: Object.freeze({}),
+        operations: activeSubagentOperations(current.operations),
         stateSince: at
       });
     case "turn.accepted":
+    case "input.accepted":
       return withActivity(next(current, {
         session: "active",
         turn: "accepted",
@@ -190,7 +227,9 @@ export function projectRuntimeObservation(
       const operationId = event.payload.operationId!;
       const operation = event.payload.operation!;
       return withActivity(next(current, {
-        session: "active",
+        session: current.session === "ended" || current.session === "failed"
+          ? current.session
+          : "active",
         turn: current.turn === "waiting" ? "accepted" : current.turn,
         waitingReason: undefined,
         waitId: undefined,
@@ -206,7 +245,9 @@ export function projectRuntimeObservation(
       const operations = { ...current.operations };
       delete operations[event.payload.operationId!];
       return withActivity(next(current, {
-        session: "active",
+        session: current.session === "ended" || current.session === "failed"
+          ? current.session
+          : "active",
         turn: current.turn === "waiting" ? "accepted" : current.turn,
         waitingReason: undefined,
         waitId: undefined,
@@ -237,6 +278,84 @@ export function projectRuntimeObservation(
             : { detail: event.payload.observerDetail })
         })
       });
+    case "conversation.observed":
+      return next(current, {
+        conversation: event.payload.recoverability === "unrecoverable"
+          ? "unrecoverable"
+          : event.payload.recoverability === "recoverable" ? "recoverable" : "unknown"
+      });
+    case "activation.started":
+      return next(current, { activation: "active", stateSince: at });
+    case "activation.ended":
+      return next(current, { activation: "ended", stateSince: at });
+    case "activation.failed":
+      return next(current, { activation: "failed", stateSince: at });
+    case "continuation.started":
+    case "continuation.reported":
+    case "continuation.settled": {
+      const id = [
+        event.fence.activationId,
+        event.fence.continuationId,
+        event.fence.continuationGeneration
+      ].join("/");
+      const existing = current.continuations[id];
+      if (event.kind === "continuation.reported") {
+        // A report is an attachment, not lifecycle evidence. When it races
+        // ahead of continuation.started, retain a conservative writer-owned
+        // stub until structured start/settlement metadata arrives.
+        const reported = existing ?? Object.freeze({
+          execution: "unknown" as const,
+          outcome: "pending" as const,
+          attachment: event.payload.attachment ?? "detached",
+          observation: "unavailable" as const,
+          mayWriteWorkspace: true,
+          identityConflict: false
+        });
+        return next(current, {
+          continuations: Object.freeze({
+            ...current.continuations,
+            [id]: Object.freeze({
+              ...reported,
+              ...(event.payload.resultRef === undefined
+                ? {}
+                : { resultRef: event.payload.resultRef })
+            })
+          }),
+          stateSince: at
+        });
+      }
+      const settled = existing?.execution === "quiescent" && existing.observation === "exact";
+      const conflicts = settled && (
+        event.payload.execution !== "quiescent"
+        || event.payload.outcome !== existing.outcome
+      );
+      return next(current, {
+        continuations: Object.freeze({
+          ...current.continuations,
+          [id]: Object.freeze(conflicts
+            ? { ...existing, identityConflict: true }
+            : {
+                execution: event.payload.execution!,
+                outcome: event.payload.outcome!,
+                attachment: event.payload.attachment!,
+                observation: event.payload.observationQuality!,
+                mayWriteWorkspace: event.payload.observationQuality === "exact"
+                  ? event.payload.mayWriteWorkspace!
+                  : (existing?.mayWriteWorkspace ?? false)
+                    || event.payload.mayWriteWorkspace!,
+                identityConflict: existing?.identityConflict ?? false,
+                ...(event.payload.resultRef === undefined
+                  ? existing?.resultRef === undefined ? {} : { resultRef: existing.resultRef }
+                  : { resultRef: event.payload.resultRef })
+              })
+        }),
+        stateSince: at
+      });
+    }
+    case "input.delivery-unknown":
+      return next(current, { inputDelivery: "delivery-unknown", stateSince: at });
+    case "native-work.snapshot":
+      return next(current, {});
     default:
       return current;
   }
@@ -267,10 +386,28 @@ export function completeRuntimeWorkflow(
   });
 }
 
+export function projectRuntimeMailbox(
+  current: RuntimeProjection,
+  mailbox: WorkMailbox | null
+): RuntimeProjection {
+  if (mailbox?.inputDelivery === undefined || mailbox.inputDelivery === null) {
+    return next(current, { inputDelivery: "none" });
+  }
+  return next(current, {
+    inputDelivery: mailbox.inputDelivery.status === "delivery-unknown"
+      ? "delivery-unknown"
+      : "dispatching"
+  });
+}
+
 export function runtimeDisplayStatus(current: RuntimeProjection): RuntimeDisplayStatus {
   if (current.session === "failed") return "broken";
-  if (current.host === "exited" || current.session === "ended") return "stopped";
   const operation = dominantOperation(current.operations);
+  // Provider-owned child work can outlive the parent Session. Surface the
+  // child as active while retaining host/session health orthogonally in the
+  // projection instead of collapsing both facts into "stopped".
+  if (operation === "subagent") return "subagent-active";
+  if (current.host === "exited" || current.session === "ended") return "stopped";
   if (operation !== null) return `${operation}-active`;
   if (current.turn === "waiting") return `waiting-${current.waitingReason ?? "external"}`;
   if (current.session === "ready" || current.turn === "completed"
@@ -339,7 +476,53 @@ function next(
     delete copy.waitingReason;
   }
   if (patch.waitId === undefined && Object.hasOwn(patch, "waitId")) delete copy.waitId;
-  return Object.freeze(copy);
+  const continuations = Object.entries(copy.continuations);
+  const waitingNative = continuations.filter(([, continuation]) => (
+    continuation.execution === "active" || continuation.execution === "unknown"
+  ));
+  const activeNativeOperations = Object.entries(copy.operations).filter(([, operation]) => (
+    operation.kind === "subagent"
+  ));
+  const waitingOn = [
+    ...waitingNative.map(([id]) => `native:${id}`),
+    ...activeNativeOperations.map(([id]) => `native-operation:${id}`)
+  ];
+  const attention = [
+    ...(copy.inputDelivery === "delivery-unknown" ? ["delivery-unknown"] : []),
+    ...continuations.flatMap(([id, continuation]) => (
+      continuation.identityConflict ? [`identity-conflict:${id}`]
+        : continuation.observation === "unavailable" ? [`continuation-unresolved:${id}`]
+        : []
+    )),
+    ...(copy.conversation === "unrecoverable" ? ["leader-decision-needed"] : []),
+    ...(copy.host === "exited" || copy.session === "ended" || copy.session === "failed"
+      ? ["runtime-unobservable"]
+      : [])
+  ];
+  const health: RuntimeProjection["health"] = copy.observer.status === "unavailable"
+      || waitingNative.some(([, continuation]) => continuation.observation === "unavailable")
+      || copy.host === "exited"
+      || copy.session === "ended"
+      || copy.session === "failed"
+    ? "unobservable"
+    : copy.inputDelivery === "dispatching"
+      || (copy.activation !== "active" && waitingNative.length > 0)
+      ? "reconciling"
+      : "healthy";
+  const runActivity: RuntimeProjection["runActivity"] = copy.inputDelivery === "dispatching"
+      || copy.turn === "accepted"
+      || copy.session === "active"
+    ? "running"
+    : waitingNative.length > 0 || activeNativeOperations.length > 0 ? "waiting"
+    : copy.session === "unknown" || copy.session === "started" ? "starting"
+    : "parked";
+  return Object.freeze({
+    ...copy,
+    waitingOn: Object.freeze(waitingOn),
+    attention: Object.freeze([...new Set(attention)]),
+    health,
+    runActivity
+  });
 }
 
 function usageAdvanced(

@@ -51,10 +51,12 @@ import { isProjectMaintenanceFenced } from "../repository/projectMaintenanceLock
 import { KeyedWorkQueue } from "../coordination/keyedWorkQueue.js";
 import { MailboxScheduler } from "../coordination/mailboxScheduler.js";
 import { nearestDeadlineBatch } from "../coordination/deadlineScheduler.js";
-import type {
-  MailboxTarget,
-  ProcessingBatch,
-  WorkMailbox
+import {
+  mailboxHasWork,
+  nextPendingBatch,
+  type MailboxTarget,
+  type ProcessingBatch,
+  type WorkMailbox
 } from "../coordination/workMailbox.js";
 import {
   hasRuntimeCleanupObligation,
@@ -170,6 +172,10 @@ export type ControllerRuntimeOptions = Readonly<{
    * runners, harvests terminal evidence, and enqueues Leader wakeups.
    */
   jobSupervisor?: Readonly<{ reconcile(now: Date): void }>;
+  /** Metadata-only reconciliation of already-known detached provider work. */
+  continuationReconciler?: Readonly<{
+    reconcile(now: Date): Promise<readonly string[]>;
+  }>;
   /** Serves the socket `job.*` methods; absent methods report METHOD_NOT_FOUND. */
   jobControl?: DurableJobControlPort;
 }>;
@@ -271,7 +277,8 @@ export async function runControllerSchedulerPass(
   stallWindowMs = DEFAULT_STALL_WINDOW_MS,
   maintenanceFence?: (projectId: string) => boolean,
   onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"],
-  blockedTaskIds: ReadonlySet<string> = new Set()
+  blockedTaskIds: ReadonlySet<string> = new Set(),
+  inputDeliveryRecoveryCutoff?: Date
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
@@ -331,7 +338,7 @@ export async function runControllerSchedulerPass(
     // exact same input in this same pass.
     resolveDueProviderRetries(store, roleSelection, now);
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
-      store, delivery, now, roleSelection
+      store, delivery, now, roleSelection, inputDeliveryRecoveryCutoff
     );
     await controlEventLoopTurn();
     const unsettledRunRefs = new Set(activeRunDeliveries.flatMap((result) => (
@@ -339,7 +346,6 @@ export async function runControllerSchedulerPass(
         ? [formatTaskRecordReference(result.taskId, result.runId, "agentRun")]
         : []
     )));
-    resolveDueRuntimeTurnCompletions(store, delivery, selection, now);
     // Every successful Task has completed the targeted phases owned by its
     // mailbox at this boundary. Settle that exact claim before advisory
     // cross-Task reconciliation so an unrelated failure cannot retain and
@@ -787,39 +793,6 @@ function runtimeOwnerIdentity(owner: RuntimeRoleOwner): string {
     : `global\0${owner.roleName}`;
 }
 
-function resolveDueRuntimeTurnCompletions(
-  store: SchedulerStorePort,
-  delivery: TmuxDeliveryPort,
-  selection: ReconcileSelection,
-  now: Date
-): void {
-  if (typeof store.resolveDueRuntimeTurnCompletions !== "function") return;
-  const selectedTaskIds = selectedTaskIdsForBoundedPass(store, selection);
-  if (selectedTaskIds?.size === 0) return;
-  const candidateTaskIds = selectedTaskIds === undefined
-    ? undefined
-    : [...selectedTaskIds].sort((left, right) => (
-        left.localeCompare(right, undefined, { numeric: true })
-      ));
-  const candidates = store.listPendingRuntimeTurnCompletions(candidateTaskIds);
-  const finalized = new Set(
-    store.resolveDueRuntimeTurnCompletions(now, selectedTaskIds)
-  );
-  if (finalized.size === 0) return;
-  for (const completion of candidates) {
-    if (!finalized.has(formatTaskRecordReference(
-      completion.taskId,
-      completion.runId,
-      "agentRun"
-    ))) continue;
-    delivery.forgetPrepared?.({
-      taskId: completion.taskId,
-      roleName: completion.roleName,
-      runId: completion.runId
-    });
-  }
-}
-
 /**
  * Issue 04: reopens due in-place Provider retries on their original Native
  * Sessions before the active-run delivery pass, so the existing delivery
@@ -941,7 +914,7 @@ function runtimeLifecycleBatchIdentity(
   mailbox: NonNullable<ReturnType<SchedulerStorePort["getWorkMailbox"]>>
 ): string {
   if (mailbox.processing !== null) return mailbox.processing.batchId;
-  const pending = mailbox.pending;
+  const pending = nextPendingBatch(mailbox);
   return pending === null
     ? runtimeTargetIdentity(target)
     : `${runtimeTargetIdentity(target)}:${pending.fromSequence}-${pending.toSequence}`;
@@ -1030,9 +1003,10 @@ function claimSelectedTaskMailboxes(
   const claims: ClaimedTaskMailbox[] = [];
   for (const target of targets) {
     const mailbox = store.getWorkMailbox(target);
-    if (mailbox === null || (mailbox.processing === null && mailbox.pending === null)) continue;
+    if (mailbox === null || !mailboxHasWork(mailbox)) continue;
+    const pending = nextPendingBatch(mailbox);
     const batchId = mailbox.processing?.batchId
-      ?? `task:${encodeURIComponent(target.taskId)}:${mailbox.pending!.fromSequence}-${mailbox.pending!.toSequence}`;
+      ?? `task:${encodeURIComponent(target.taskId)}:${pending!.fromSequence}-${pending!.toSequence}`;
     const claim = store.claimWorkMailbox({
       target,
       batchId,
@@ -1245,6 +1219,7 @@ function mergeControllerSchedulerResults(
  * progress concurrently across different Tasks up to the configured bound.
  */
 export class FileTaskController {
+  readonly #startedAt: Date;
   #intervalMs: number;
   readonly #now: () => Date;
   readonly #onError: (error: unknown) => void;
@@ -1298,6 +1273,7 @@ export class FileTaskController {
     | ControllerRuntimeOptions["onMaintenanceFenceDefer"]
     | undefined;
   readonly #jobSupervisor: ControllerRuntimeOptions["jobSupervisor"];
+  readonly #continuationReconciler: ControllerRuntimeOptions["continuationReconciler"];
   #current: Promise<ControllerSchedulerResult> | undefined;
   #operatorCurrent: Promise<void> | undefined;
   #runtimeObserverCurrent: Promise<void> | undefined;
@@ -1324,6 +1300,7 @@ export class FileTaskController {
       "Controller reconciliation interval"
     );
     this.#now = options.now ?? (() => new Date());
+    this.#startedAt = this.#now();
     this.#onError = options.onError ?? (() => {});
     this.#workspacePreparer = options.workspacePreparer;
     this.#deliveryRetryMs = positiveInteger(
@@ -1367,6 +1344,7 @@ export class FileTaskController {
     this.#maintenanceFence = options.maintenanceFence;
     this.#onMaintenanceFenceDefer = options.onMaintenanceFenceDefer;
     this.#jobSupervisor = options.jobSupervisor;
+    this.#continuationReconciler = options.continuationReconciler;
     this.#signalScheduler = new MailboxScheduler(
       async (keys) => { await this.#requestPass({ kind: "dirty", keys }); },
       {
@@ -1543,7 +1521,7 @@ export class FileTaskController {
     if (this.#stopped) return;
     const mailbox = this.store.getWorkMailbox({ kind: "operator" });
     const shouldArm = mailbox !== null
-      && (mailbox.pending !== null || mailbox.processing !== null);
+      && mailboxHasWork(mailbox);
     if (shouldArm) this.#clearDeliveryRetry("operator");
     this.#operatorStartupRetryArmed = shouldArm;
   }
@@ -1615,6 +1593,12 @@ export class FileTaskController {
           for (const taskId of runtimeTaskFailureIds(firstRuntimeDrain)) {
             runtimeFailedTaskIds.add(taskId);
           }
+          // Detached reconciliation is deliberately confined to the low-rate
+          // full pass. It queries only identities already present in Task
+          // facts and cannot start a model Turn or scan unknown children.
+          if (scope.kind === "full" && this.#continuationReconciler !== undefined) {
+            await this.#continuationReconciler.reconcile(this.#now());
+          }
           // DurableJob reconciliation runs before the scheduler pass so a
           // terminal job's Leader wakeup is enqueued in the same pass that
           // processes Leader wakeups.
@@ -1632,7 +1616,8 @@ export class FileTaskController {
               this.#stallWindowMs,
               this.#maintenanceFence,
               this.#onMaintenanceFenceDefer,
-              runtimeFailedTaskIds
+              runtimeFailedTaskIds,
+              this.#startedAt
             );
           } else {
             const dirtyPass = await this.#runDirtySchedulerPass(
@@ -1762,7 +1747,8 @@ export class FileTaskController {
         this.#stallWindowMs,
         this.#maintenanceFence,
         this.#onMaintenanceFenceDefer,
-        blockedTaskIds
+        blockedTaskIds,
+        this.#startedAt
       ));
     }
     if (
@@ -1814,7 +1800,8 @@ export class FileTaskController {
               this.#stallWindowMs,
               this.#maintenanceFence,
               this.#onMaintenanceFenceDefer,
-              blockedTaskIds
+              blockedTaskIds,
+              this.#startedAt
             );
             this.#clearTaskPassRetry(selected.taskScope.taskId);
           } catch (error) {
@@ -1871,7 +1858,7 @@ export class FileTaskController {
       const mailbox = this.store.getWorkMailbox({ kind: "operator" });
       if (
         mailbox === null
-        || (mailbox.pending === null && mailbox.processing === null)
+        || !mailboxHasWork(mailbox)
       ) {
         this.#operatorStartupRetryArmed = false;
       }
@@ -2027,13 +2014,6 @@ export class FileTaskController {
             at: Date.parse(request.policy.timeoutAt)
           }]
         : []),
-      ...(typeof this.store.listPendingRuntimeTurnCompletions === "function"
-        ? this.store.listPendingRuntimeTurnCompletions()
-        : []).map((completion) => ({
-        key: `role:${encodeURIComponent(completion.taskId)}/${encodeURIComponent(completion.roleName)}` as MailboxKey,
-        at: Date.parse(completion.dueAt)
-      }))
-      ,
       // Issue 04 durable in-place retry timer: arm the Controller wake at the
       // earliest `nextAttemptAt` so a due retry re-pushes on its original
       // Session. The projection is durable, so a restart resumes the lineage.
@@ -2079,8 +2059,7 @@ export class FileTaskController {
       }
       else if (delivery.reason === "writer-attached") writerBlocked.add(key);
       else if (delivery.reason === "not-ready"
-        || delivery.reason === "runtime-unavailable"
-        || delivery.reason === "delivery-uncertain") {
+        || delivery.reason === "runtime-unavailable") {
         retry.set(key, {
           identity: delivery.runId,
           ...(delivery.terminalFailure === undefined
@@ -2099,7 +2078,6 @@ export class FileTaskController {
       }
       else if (
         wakeup.reason === "not-ready"
-        || wakeup.reason === "delivery-uncertain"
       ) {
         retry.set(key, { identity: wakeup.runId ?? key });
       }
@@ -2172,7 +2150,8 @@ export class FileTaskController {
       const mailbox = this.store.getWorkMailbox(target);
       // A newly queued pending batch must not reset the retry identity/bound
       // while this Controller still owns an older processing batch.
-      const batch = mailbox?.processing?.batch ?? mailbox?.pending;
+      const batch = mailbox?.processing?.batch
+        ?? (mailbox === null || mailbox === undefined ? null : nextPendingBatch(mailbox));
       if (batch === undefined || batch === null) {
         this.#clearDeliveryRetry(key);
         continue;
@@ -2282,7 +2261,7 @@ export class FileTaskController {
     const mailbox = this.store.getWorkMailbox({ kind: "operator" });
     if (
       mailbox === null
-      || (mailbox.pending === null && mailbox.processing === null)
+      || !mailboxHasWork(mailbox)
     ) {
       this.#operatorStartupRetryArmed = false;
       this.#clearDeliveryRetry("operator");
@@ -2558,7 +2537,8 @@ function boundedPositiveInteger(
 function operatorMailboxBatchIdentity(
   mailbox: ReturnType<SchedulerStorePort["getWorkMailbox"]>
 ): string | null {
-  const batch = mailbox?.pending ?? mailbox?.processing?.batch;
+  const batch = mailbox?.processing?.batch
+    ?? (mailbox === null || mailbox === undefined ? null : nextPendingBatch(mailbox));
   if (batch === null || batch === undefined) return null;
   return [
     batch.fromSequence,

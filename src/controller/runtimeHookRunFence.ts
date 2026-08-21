@@ -37,6 +37,8 @@ export type RuntimeHookRunFenceOptions = Readonly<{
   terminal?: boolean;
   /** Stable provider Turn identity used to recover its durable accepted Run. */
   nativeTurnId?: string;
+  continuationId?: string;
+  continuationGeneration?: number;
 }>;
 
 /**
@@ -101,7 +103,19 @@ export function resolveRuntimeHookRunFence(
   }
   const inFlight = sessions?.inFlight;
   const session = sessions?.sessions[agentId];
-  const acceptedBinding = options.nativeTurnId === undefined
+  const roleMailbox = store.getWorkMailbox({ kind: "role", taskId, roleName });
+  const roleInputDelivery = roleMailbox?.inputDelivery;
+  const roleExecution = roleMailbox?.processing?.executionRef;
+  const activationReceiptId = roleInputDelivery?.executionRef?.type === "run"
+    && roleInputDelivery.executionRef.taskId === taskId
+    && roleInputDelivery.executionRef.id === inFlight?.runId
+    ? roleInputDelivery.attemptId
+    : roleExecution?.type === "run"
+    && roleExecution.taskId === taskId
+    && roleExecution.id === inFlight?.runId
+    ? roleMailbox!.processing!.batchId
+    : inFlight?.receiptId;
+  const acceptedTurn = options.nativeTurnId === undefined
     ? null
     : acceptedTurnBinding(store.listEvents(taskId), {
         taskId,
@@ -110,6 +124,19 @@ export function resolveRuntimeHookRunFence(
         nativeSessionId,
         nativeTurnId: options.nativeTurnId
       });
+  const acceptedBinding = acceptedTurn ?? (
+    options.continuationId === undefined ? null : knownContinuationBinding(
+      store.listEvents(taskId),
+      {
+        taskId,
+        roleName,
+        agentId,
+        nativeSessionId,
+        continuationId: options.continuationId,
+        continuationGeneration: options.continuationGeneration ?? 1
+      }
+    )
+  );
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
     scope: "task",
     taskId,
@@ -236,14 +263,14 @@ export function resolveRuntimeHookRunFence(
   if (run.effective.workspace.root !== workspace) {
     throw new Error("Runtime observation Hook workspace does not match the durable Run snapshot.");
   }
-  if (session !== undefined) {
+  if (session !== undefined && acceptedBinding === null) {
     if (session.adapterId !== adapterId
-      || (acceptedBinding === null && session.launchId !== effectiveLaunchId)
+      || session.launchId !== effectiveLaunchId
       || session.nativeSessionId !== nativeSessionId
       || session.effective.workspace.root !== workspace) {
       throw new Error("Runtime observation Hook Session does not match its durable generation.");
     }
-  } else {
+  } else if (session === undefined && acceptedBinding === null) {
     if (!discoveredStartup && !preallocatedStartup) {
       throw new Error("Runtime observation Hook launch is not durably reserved.");
     }
@@ -255,11 +282,49 @@ export function resolveRuntimeHookRunFence(
     launchId: effectiveLaunchId,
     runId,
     ...(acceptedBinding?.fence.receiptId === undefined
-      ? inFlight?.receiptId === undefined ? {} : { receiptId: inFlight.receiptId }
+      ? activationReceiptId === undefined ? {} : { receiptId: activationReceiptId }
       : { receiptId: acceptedBinding.fence.receiptId }),
     nativeSessionId,
     workspace
   };
+}
+
+function knownContinuationBinding(
+  events: readonly TaskEvent[],
+  expected: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    nativeSessionId: string;
+    continuationId: string;
+    continuationGeneration: number;
+  }>
+): RuntimeObservation | null {
+  const matches = events
+    .map(runtimeObservationFromTaskEvent)
+    .filter((observation): observation is RuntimeObservation => observation !== null
+      && observation.kind.startsWith("continuation.")
+      && observation.fence.taskId === expected.taskId
+      && observation.fence.roleName === expected.roleName
+      && observation.fence.agentId === expected.agentId
+      && observation.fence.nativeSessionId === expected.nativeSessionId
+      && observation.fence.continuationId === expected.continuationId
+      && observation.fence.continuationGeneration === expected.continuationGeneration
+      && observation.fence.runId !== undefined)
+    .sort((left, right) => (
+      left.receivedAt.localeCompare(right.receivedAt)
+      || (left.sequence ?? -1) - (right.sequence ?? -1)
+      || (left.ordinal ?? -1) - (right.ordinal ?? -1)
+      || left.eventId.localeCompare(right.eventId)
+    ));
+  const binding = matches.at(-1) ?? null;
+  if (binding === null) return null;
+  if (matches.some((candidate) => candidate.fence.runId !== binding.fence.runId
+    || candidate.fence.launchId !== binding.fence.launchId
+    || candidate.fence.receiptId !== binding.fence.receiptId)) {
+    throw new Error("Runtime observation Hook continuation has conflicting durable Run bindings.");
+  }
+  return binding;
 }
 
 function acceptedTurnBinding(
