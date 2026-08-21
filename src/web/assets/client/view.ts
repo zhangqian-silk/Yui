@@ -50,7 +50,7 @@ export function renderFilters(container, state, t, onFilter) {
         dot.classList.add(status);
         btn.append(dot);
       }
-      btn.append(document.createTextNode(translatedStatus(t, "status", status)));
+      btn.append(node("span", "filter-label", translatedStatus(t, "status", status)));
       const badge = node("span", "filter-count");
       btn.append(badge);
       btn.addEventListener("click", function () { onFilter(status); });
@@ -62,6 +62,8 @@ export function renderFilters(container, state, t, onFilter) {
     const btn = row.querySelector('.filter-chip[data-status="' + status + '"]');
     if (!btn) return;
     btn.classList.toggle("is-active", state.filter === status);
+    const label = btn.querySelector(".filter-label");
+    if (label) label.textContent = translatedStatus(t, "status", status);
     const count = status === "all" ? counts.total : counts[status];
     const badge = btn.querySelector(".filter-count");
     if (badge) {
