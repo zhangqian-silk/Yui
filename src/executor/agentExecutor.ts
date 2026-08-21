@@ -18,6 +18,7 @@ import {
   validateProviderRuntimeBinding,
   type ProviderRuntimeBinding
 } from "../runtime/providerRuntimeIdentity.js";
+import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 
 export type AgentSessionStatus = "reserved" | "ready" | "running" | "stopped" | "broken";
 
@@ -820,7 +821,7 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       if (session === undefined) {
         throw new Error("Provider Runtime Binding has no active Role Agent session.");
       }
-      if (providerBinding.providerNamespace !== session.adapterId) {
+      if (providerBinding.providerNamespace !== builtinDriverIdForAdapter(session.adapterId)) {
         throw new Error("Provider Runtime Binding namespace does not match the Agent adapter.");
       }
     }
