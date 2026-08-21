@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -11,6 +11,7 @@ import {
   createProductionRegistry
 } from "../../dist/storage/migration/index.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
+import { moveSqliteFileSet } from "../../dist/storage/upgrade/sqliteFileSet.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
@@ -63,6 +64,25 @@ test("the SQLite Task path persists one normal Task and Message", (t) => {
   assert.equal(reopened.getTask(task.id)?.status, "active");
   assert.deepEqual(reopened.listMessages(task.id), [message]);
   reopened.close();
+});
+
+test("a SQLite switch backs up the database and its live WAL file set", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-sqlite-switch-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const source = join(home, "yui.db");
+  const backup = join(home, "yui.db.backup");
+  writeFileSync(source, "database");
+  writeFileSync(`${source}-wal`, "wal");
+  writeFileSync(`${source}-shm`, "shm");
+
+  moveSqliteFileSet(source, backup);
+
+  assert.equal(existsSync(source), false);
+  assert.equal(existsSync(`${source}-wal`), false);
+  assert.equal(existsSync(`${source}-shm`), false);
+  assert.equal(readFileSync(backup, "utf8"), "database");
+  assert.equal(readFileSync(`${backup}-wal`, "utf8"), "wal");
+  assert.equal(readFileSync(`${backup}-shm`, "utf8"), "shm");
 });
 
 test("the production migration graph advances the normal aggregate path", () => {

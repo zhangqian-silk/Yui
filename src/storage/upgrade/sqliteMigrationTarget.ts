@@ -68,6 +68,7 @@ import {
 } from "./sqliteStateMigration.js";
 import { latestStateBackupPath } from "./pseudoLayoutRepair.js";
 import { migrationReceiptPath, writeMigrationReceipt } from "./migrationReceipt.js";
+import { moveSqliteFileSet, removeSqliteFileSet } from "./sqliteFileSet.js";
 
 export type SqliteMigrationTargetOptions = Readonly<{
   /** The authoritative source Home (never written until the atomic switch). */
@@ -212,7 +213,7 @@ export function createSqliteMigrationTarget(
           if (existsSync(backupPath)) {
             throw new Error(`Refusing to overwrite an existing database backup: ${backupPath}.`);
           }
-          renameSync(committedDbPath, backupPath);
+          moveSqliteFileSet(committedDbPath, backupPath);
         }
         renameSync(stagedDbPath, committedDbPath);
         // The staged connection may leave empty WAL/SHM sidecars behind
@@ -223,7 +224,7 @@ export function createSqliteMigrationTarget(
         // Pre-promotion failure: restore the original database if we moved it.
         if (backupPath !== undefined && existsSync(backupPath)) {
           try {
-            renameSync(backupPath, committedDbPath);
+            moveSqliteFileSet(backupPath, committedDbPath);
           } catch {
             throw new AmbiguousSwitchError({
               homePath: home,
@@ -269,9 +270,10 @@ export function createSqliteMigrationTarget(
         // is ambiguous and must be recovered manually.
         try {
           if (backupPath !== undefined && existsSync(backupPath)) {
-            renameSync(backupPath, committedDbPath);
+            removeSqliteFileSet(committedDbPath);
+            moveSqliteFileSet(backupPath, committedDbPath);
           } else {
-            rmSync(committedDbPath, { force: true });
+            removeSqliteFileSet(committedDbPath);
           }
         } catch {
           throw new AmbiguousSwitchError({
