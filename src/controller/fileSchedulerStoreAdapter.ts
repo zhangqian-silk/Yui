@@ -2553,7 +2553,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     summary: string,
     now: Date
   ): Readonly<{ disposition: "applied"; runId: string }> | null {
-    const config = providerRetryConfig();
+    const config = providerRetryConfig(this.store.getConfig());
     if (config.mode === "off") return null;
     const classification = classifyProviderError({
       adapterId: input.adapterId,
@@ -2746,7 +2746,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       (entry) => Date.parse(entry.nextAttemptAt) <= now.getTime()
     );
     const reopened: string[] = [];
-    const config = providerRetryConfig();
+    const config = providerRetryConfig(this.store.getConfig());
     for (const entry of due) {
       this.store.transaction((store) => {
         const run = store.getAgentRun(entry.taskId, entry.runId);

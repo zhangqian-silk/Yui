@@ -1,3 +1,6 @@
+import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
+import { PROVIDER_RETRY_MAX_WINDOW_MS } from "../run/providerRetry.js";
+
 export const DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 120;
 export const MIN_RECONCILIATION_INTERVAL_SECONDS = 5;
 export const MAX_RECONCILIATION_INTERVAL_SECONDS = 300;
@@ -87,4 +90,74 @@ export function leaderNextActionMode(
     return resolveLeaderNextActionMode(override);
   }
   return resolveLeaderNextActionMode(configured);
+}
+
+// ── Issue 01: Provider retry ──────────────────────────────────────────────
+
+export const PROVIDER_RETRY_MODES = ["off", "shadow", "enforce"] as const;
+export type ProviderRetryMode = (typeof PROVIDER_RETRY_MODES)[number];
+export const DEFAULT_PROVIDER_RETRY_MODE: ProviderRetryMode = "enforce";
+
+export function resolveProviderRetryMode(value?: unknown): ProviderRetryMode {
+  if (value === undefined || value === null) return DEFAULT_PROVIDER_RETRY_MODE;
+  if (typeof value !== "string") {
+    throw new TypeError("providerRetryMode must be off, shadow, or enforce.");
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized.length === 0) return DEFAULT_PROVIDER_RETRY_MODE;
+  if (!(PROVIDER_RETRY_MODES as readonly string[]).includes(normalized)) {
+    throw new TypeError("providerRetryMode must be off, shadow, or enforce.");
+  }
+  return normalized as ProviderRetryMode;
+}
+
+/**
+ * Resolves the adapter list. `["all"]` or undefined means every supported
+ * adapter; an empty array disables in-place retry.
+ */
+export function resolveProviderRetryAdapters(value?: unknown): string[] {
+  if (value === undefined || value === null) {
+    return [...supportedAgentAdapterIds()];
+  }
+  if (!Array.isArray(value)) {
+    throw new TypeError("providerRetryAdapters must be an array of adapter ids.");
+  }
+  const supported = new Set<string>(supportedAgentAdapterIds());
+  const adapters: string[] = [];
+  for (const raw of value) {
+    if (typeof raw !== "string") {
+      throw new TypeError("providerRetryAdapters entries must be strings.");
+    }
+    const token = raw.trim().toLowerCase();
+    if (token === "all") {
+      for (const adapter of supportedAgentAdapterIds()) {
+        if (!adapters.includes(adapter)) adapters.push(adapter);
+      }
+      continue;
+    }
+    if (!/^[a-z0-9][a-z0-9._-]*$/u.test(token)) {
+      throw new TypeError(`Invalid Provider retry adapter: ${token}.`);
+    }
+    if (!supported.has(token)) {
+      throw new TypeError(`Unknown Provider retry adapter: ${token}.`);
+    }
+    if (!adapters.includes(token)) adapters.push(token);
+  }
+  return adapters;
+}
+
+export function resolveProviderRetryMaxWindowMs(value?: unknown): number {
+  if (value === undefined || value === null) return PROVIDER_RETRY_MAX_WINDOW_MS;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError("providerRetryMaxWindowMs must be a positive integer.");
+  }
+  return value;
+}
+
+export function resolveYieldReceiptReplay(value?: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== "boolean") {
+    throw new TypeError("yieldReceiptReplay must be a boolean.");
+  }
+  return value;
 }

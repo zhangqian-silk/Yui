@@ -20,6 +20,15 @@ import {
   resolveLeaderNextActionMode,
   type LeaderNextActionMode
 } from "../config/yuiConfig.js";
+import {
+  DEFAULT_PROVIDER_RETRY_MODE,
+  PROVIDER_RETRY_MODES,
+  resolveProviderRetryAdapters,
+  resolveProviderRetryMaxWindowMs,
+  resolveProviderRetryMode,
+  resolveYieldReceiptReplay,
+  type ProviderRetryMode
+} from "../config/yuiConfig.js";
 
 type ConfigCommandStore = Readonly<{
   transaction<T>(execute: (store: ConfigCommandStore) => T): T;
@@ -32,7 +41,11 @@ const CONFIG_SET_USAGE = "Config set usage: yui config set "
   + "<--time-zone <IANA timezone> | "
   + "--reconciliation-interval-seconds <seconds> | "
   + "--resources-gc-mode <report|quarantine> | "
-  + "--resources-gc-auto-quarantine <true|false>>.";
+  + "--resources-gc-auto-quarantine <true|false> | "
+  + "--provider-retry-mode <off|shadow|enforce> | "
+  + "--provider-retry-adapters <all|claude,codex|off> | "
+  + "--provider-retry-max-window-ms <milliseconds> | "
+  + "--yield-receipt-replay <true|false>>.";
 
 export function runConfigCommand(args: string[], store: ConfigCommandStore): string {
   const [command, ...rest] = args;
@@ -50,6 +63,10 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
       `Leader next-action mode: ${resolveLeaderNextActionMode(config.leaderNextActionMode)}`,
       `Resources GC mode: ${resolveResourcesGcMode(config.resourcesGcMode)}`,
       `Resources GC auto-quarantine: ${resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine) ? "on" : "off"}`,
+      `Provider retry mode: ${resolveProviderRetryMode(config.providerRetryMode)}`,
+      `Provider retry adapters: ${resolveProviderRetryAdapters(config.providerRetryAdapters).join(", ") || "none"}`,
+      `Provider retry max window: ${resolveProviderRetryMaxWindowMs(config.providerRetryMaxWindowMs)} ms`,
+      `Yield receipt replay: ${resolveYieldReceiptReplay(config.yieldReceiptReplay) ? "on" : "off"}`,
       ""
     ].join("\n");
   }
@@ -87,6 +104,43 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
         tx.saveConfig({ ...tx.getConfig(), resourcesGcAutoQuarantine });
       });
       return `Resources GC auto-quarantine set to ${resourcesGcAutoQuarantine ? "on" : "off"}\n`;
+    }
+    if (rest[0] === "--provider-retry-mode") {
+      const providerRetryMode = validatedConfigValue(
+        () => resolveProviderRetryMode(rest[1])
+      );
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), providerRetryMode });
+      });
+      return `Provider retry mode set to ${providerRetryMode}\n`;
+    }
+    if (rest[0] === "--provider-retry-adapters") {
+      const raw = rest[1].trim().toLowerCase();
+      const providerRetryAdapters = raw === "off" || raw === "" || raw === "0"
+        ? []
+        : validatedConfigValue(() => resolveProviderRetryAdapters(raw.split(",")));
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), providerRetryAdapters });
+      });
+      return `Provider retry adapters set to ${providerRetryAdapters.join(", ") || "none"}\n`;
+    }
+    if (rest[0] === "--provider-retry-max-window-ms") {
+      const providerRetryMaxWindowMs = validatedConfigValue(
+        () => resolveProviderRetryMaxWindowMs(Number(rest[1]))
+      );
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), providerRetryMaxWindowMs });
+      });
+      return `Provider retry max window set to ${providerRetryMaxWindowMs} ms\n`;
+    }
+    if (rest[0] === "--yield-receipt-replay") {
+      const yieldReceiptReplay = validatedConfigValue(
+        () => resolveYieldReceiptReplay(rest[1] === "true" ? true : rest[1] === "false" ? false : rest[1])
+      );
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), yieldReceiptReplay });
+      });
+      return `Yield receipt replay set to ${yieldReceiptReplay ? "on" : "off"}\n`;
     }
     throw configSetUsageError();
   }
