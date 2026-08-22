@@ -21,7 +21,17 @@ import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { validateAgentLaunchConfiguration } from "../../dist/executor/agentConfigurationCatalog.js";
 import { runExecutionAudit } from "../../dist/observability/executionAudit.js";
-import { createAgentRun, failAgentRun } from "../../dist/run/agentRun.js";
+import { createAgentRun, failAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
+import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import {
+  createRoleSessionSet,
+  recordRoleAgentSession,
+  updateRoleAgentSessionStatus
+} from "../../dist/executor/agentExecutor.js";
+import {
+  inspectTaskRoleRuntimeStatuses,
+  renderTaskRoleRuntimeStatus
+} from "../../dist/commands/taskRoleRuntimeStatus.js";
 import {
   createSessionLaunchRequest,
   RuntimeLaunchFailure,
@@ -484,6 +494,103 @@ test("execution audit projects structured launch failure phase and kind", (t) =>
   assert.equal(report.runs.data.launchFailures.total, 1);
   assert.equal(report.runs.data.launchFailures.byPhase["native-session-discovery"], 1);
   assert.equal(report.runs.data.launchFailures.byKind.timeout, 1);
+});
+
+// Issue 09: a Session that stops after its Run yielded is a post-completion
+// Session stop, not a Run failure. The audit keeps the two axes separate.
+const issue09Effective = {
+  schemaVersion: 2,
+  sourceDesiredRevision: 1,
+  agentId: "agent",
+  adapterId: "codex",
+  profileAccess: "write",
+  search: false,
+  permission: { strategy: "default" },
+  writeProjectIds: [],
+  workspace: { root: "/tmp/yui-issue09", entries: [] },
+  context: {}
+};
+
+function issue09Setup(now) {
+  const home = mkdtempSync(join(tmpdir(), "yui-core-smoke-issue09-"));
+  const store = new SqliteTaskStore(home);
+  const task = activateTask(createTask(store.nextTaskId(), "Issue 09", now), now);
+  store.saveTask(task);
+  const role = createRole(
+    task.id,
+    "leader",
+    [createRoleAgentBinding({ id: "agent", adapterId: "codex" })],
+    "agent",
+    "/tmp/yui-issue09",
+    now
+  );
+  store.saveRole(task.id, role);
+  return { home, store, task, role };
+}
+
+function issue09Session(store, task, status, at) {
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: "leader" },
+    "agent",
+    at
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "agent",
+    adapterId: "codex",
+    nativeSessionId: "sess-1",
+    status: "running",
+    policy: "fixed",
+    effective: issue09Effective
+  }, at);
+  sessions = updateRoleAgentSessionStatus(sessions, "agent", status, at);
+  store.saveTaskRoleSessionSet(sessions);
+}
+
+test("execution audit separates post-completion Session stops from Run failures", (t) => {
+  const now = new Date("2026-08-22T00:00:00.000Z");
+  const { home, store, task } = issue09Setup(now);
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  // R1 yields durably; the Session stops 6s later.
+  let run = createAgentRun("agent-run-1", task.id, "leader", "new", "wake", now, {
+    effective: issue09Effective
+  });
+  run = yieldAgentRun(run, "delivered", now);
+  store.saveAgentRun(run);
+  issue09Session(store, task, "stopped", new Date(now.getTime() + 6_000));
+  const report = runExecutionAudit(home, { taskId: task.id }, {
+    openStore: () => store,
+    directorySize: () => null
+  });
+  assert.equal(report.runs.status, "ok");
+  assert.equal(report.runs.data.yielded, 1);
+  assert.equal(report.runs.data.failed, 0);
+  assert.equal(report.sessions.data.terminalByRunRelation.postRunYielded, 1);
+  assert.equal(report.sessions.data.terminalByRunRelation.runFailed, 0);
+  assert.equal(report.sessions.data.terminalByRunRelation.activeRun, 0);
+  // The Run stays yielded even though the Session later stopped.
+  assert.equal(store.getAgentRun(task.id, "agent-run-1").status, "yielded");
+});
+
+test("role status shows the last Run outcome beside the Session lifecycle", (t) => {
+  const now = new Date("2026-08-22T00:00:00.000Z");
+  const { home, store, task, role } = issue09Setup(now);
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  let run = createAgentRun("agent-run-1", task.id, "leader", "new", "wake", now, {
+    effective: issue09Effective
+  });
+  run = yieldAgentRun(run, "delivered", now);
+  store.saveAgentRun(run);
+  const brokenAt = new Date(now.getTime() + 6_000);
+  issue09Session(store, task, "broken", brokenAt);
+  const [status] = inspectTaskRoleRuntimeStatuses(task.id, [role], store, [], brokenAt);
+  assert.equal(status.lastRun?.id, "agent-run-1");
+  assert.equal(status.lastRun?.status, "yielded");
+  // A broken Session after the Run yielded is attention, not a Run failure.
+  assert.equal(status.health, "needs-attention");
+  assert.match(status.healthReason, /last run agent-run-1 yielded/u);
+  const rendered = renderTaskRoleRuntimeStatus(status);
+  assert.match(rendered, /Last run\s+agent-run-1 \(yielded/u);
+  assert.match(rendered, /Native session\s+sess-1 \(broken/u);
 });
 
 test("the Codex App Server adapter keeps attachment and Run boundaries separate", async () => {
