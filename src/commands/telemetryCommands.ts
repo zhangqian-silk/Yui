@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { usageError } from "../errors/cliError.js";
 import { STORAGE_SCHEMA_FILE } from "../storage/storageSchema.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { TaskStore, YuiConfig } from "../storage/taskStore.js";
 import { openTaskStore, SqliteTaskStore } from "../storage/sqliteStore.js";
 import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
 import {
@@ -35,6 +35,11 @@ export type TelemetryCommandOptions = Readonly<{
   store?: TaskStore;
 }>;
 
+/** Read the durable config, falling back to defaults when no store is available. */
+function storeConfig(options: TelemetryCommandOptions): YuiConfig {
+  return options.store?.getConfig() ?? { schemaVersion: 1 as const };
+}
+
 export async function runTelemetryCommand(
   args: string[],
   options: TelemetryCommandOptions
@@ -59,12 +64,12 @@ export async function runTelemetryCommand(
 
 function telemetryStatus(args: string[], options: TelemetryCommandOptions): string {
   const flags = parseFlags(args, new Set([]));
-  const env = options.environment ?? process.env;
-  const mode = resolveTelemetryMode(env);
+  
+  const mode = resolveTelemetryMode(storeConfig(options).telemetryMode);
   const telemetry = new SqliteTelemetryStore(options.home, {
     mode,
-    terminalKeep: resolveTerminalKeep(env),
-    runCap: resolveRunCap(env)
+    terminalKeep: resolveTerminalKeep(storeConfig(options).telemetryTerminalKeep),
+    runCap: resolveRunCap(storeConfig(options).telemetryRunCap)
   });
   try {
     const health = telemetry.health();
@@ -84,8 +89,8 @@ function telemetryStatus(args: string[], options: TelemetryCommandOptions): stri
       coalesced: health.coalesced,
       lastError: health.lastError,
       totalRows: health.rows,
-      terminalKeep: resolveTerminalKeep(env),
-      runCap: resolveRunCap(env),
+      terminalKeep: resolveTerminalKeep(storeConfig(options).telemetryTerminalKeep),
+      runCap: resolveRunCap(storeConfig(options).telemetryRunCap),
       tasks: perTask
     };
     if (options.json || flags.has("json")) return JSON.stringify(report, null, 2);
@@ -116,11 +121,11 @@ function telemetryPrune(args: string[], options: TelemetryCommandOptions): strin
   const taskId = stringOption(args, "--task");
   const keep = integerOption(args, "--keep", DEFAULT_TERMINAL_KEEP);
   const dryRun = flags.has("dry-run");
-  const env = options.environment ?? process.env;
-  const cap = resolveRunCap(env);
+  
+  const cap = resolveRunCap(storeConfig(options).telemetryRunCap);
   const store = requireStore(options);
   const telemetry = new SqliteTelemetryStore(options.home, {
-    mode: resolveTelemetryMode(env),
+    mode: resolveTelemetryMode(storeConfig(options).telemetryMode),
     terminalKeep: keep,
     runCap: cap
   });
@@ -296,11 +301,11 @@ function telemetryRead(args: string[], options: TelemetryCommandOptions): string
   const runId = stringOption(args, "--run");
   const limit = integerOption(args, "--limit", 100);
   const offset = integerOption(args, "--offset", 0);
-  const env = options.environment ?? process.env;
+  
   const telemetry = new SqliteTelemetryStore(options.home, {
-    mode: resolveTelemetryMode(env),
-    terminalKeep: resolveTerminalKeep(env),
-    runCap: resolveRunCap(env)
+    mode: resolveTelemetryMode(storeConfig(options).telemetryMode),
+    terminalKeep: resolveTerminalKeep(storeConfig(options).telemetryTerminalKeep),
+    runCap: resolveRunCap(storeConfig(options).telemetryRunCap)
   });
   try {
     if (flags.has("aggregate")) {

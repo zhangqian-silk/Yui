@@ -120,7 +120,8 @@ export function createEphemeralResourceReaper(
   return () => reapExpiredEphemeralResources({
     scan,
     clean: (resource) => cleanControllerResource(resource, {
-      environment: options.environment
+      environment: options.environment,
+      tmuxBin: options.tmuxBin
     }),
     onExpiredDomain: options.onExpiredDomain
   });

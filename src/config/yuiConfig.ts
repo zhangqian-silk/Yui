@@ -1,5 +1,12 @@
 import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
 import { PROVIDER_RETRY_MAX_WINDOW_MS } from "../run/providerRetry.js";
+import {
+  DEFAULT_RUN_CAP,
+  DEFAULT_TELEMETRY_MODE,
+  DEFAULT_TERMINAL_KEEP,
+  MAX_RUN_CAP,
+  type TelemetryMode
+} from "../telemetry/telemetryConfig.js";
 
 export const DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 120;
 export const MIN_RECONCILIATION_INTERVAL_SECONDS = 5;
@@ -76,22 +83,6 @@ export function resolveLeaderNextActionMode(value?: unknown): LeaderNextActionMo
   return normalized as LeaderNextActionMode;
 }
 
-/**
- * Resolve the effective mode. An explicit environment override
- * (`YUI_LEADER_NEXT_ACTION_MODE`) wins over the durable config value so a
- * single CLI invocation can be tightened or loosened without a config write.
- */
-export function leaderNextActionMode(
-  configured: unknown,
-  env: NodeJS.ProcessEnv = process.env
-): LeaderNextActionMode {
-  const override = env.YUI_LEADER_NEXT_ACTION_MODE;
-  if (override !== undefined && override.trim().length > 0) {
-    return resolveLeaderNextActionMode(override);
-  }
-  return resolveLeaderNextActionMode(configured);
-}
-
 // ── Issue 01: Provider retry ──────────────────────────────────────────────
 
 export const PROVIDER_RETRY_MODES = ["off", "shadow", "enforce"] as const;
@@ -158,6 +149,64 @@ export function resolveYieldReceiptReplay(value?: unknown): boolean {
   if (value === undefined || value === null) return true;
   if (typeof value !== "boolean") {
     throw new TypeError("yieldReceiptReplay must be a boolean.");
+  }
+  return value;
+}
+
+// ── Executable paths ──────────────────────────────────────────────────────
+
+export function resolveTmuxBin(value?: unknown): string {
+  if (value === undefined || value === null) return "tmux";
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new TypeError("tmuxBin must be a non-empty string.");
+  }
+  return value.trim();
+}
+
+export function resolveGitBin(value?: unknown): string {
+  if (value === undefined || value === null) return "git";
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new TypeError("gitBin must be a non-empty string.");
+  }
+  return value.trim();
+}
+
+// ── Telemetry ─────────────────────────────────────────────────────────────
+
+const TELEMETRY_MODES: readonly TelemetryMode[] = ["legacy", "dual", "bounded"];
+
+export function resolveTelemetryMode(value?: unknown): TelemetryMode {
+  if (value === undefined || value === null) return DEFAULT_TELEMETRY_MODE;
+  if (typeof value !== "string") {
+    throw new TypeError("telemetryMode must be legacy, dual, or bounded.");
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized.length === 0) return DEFAULT_TELEMETRY_MODE;
+  if (!TELEMETRY_MODES.includes(normalized as TelemetryMode)) {
+    throw new TypeError(
+      `telemetryMode must be one of ${TELEMETRY_MODES.join(", ")}; got ${JSON.stringify(normalized)}.`
+    );
+  }
+  return normalized as TelemetryMode;
+}
+
+export function resolveTelemetryTerminalKeep(value?: unknown): number {
+  if (value === undefined || value === null) return DEFAULT_TERMINAL_KEEP;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError("telemetryTerminalKeep must be a positive integer.");
+  }
+  return value;
+}
+
+export function resolveTelemetryRunCap(value?: unknown): number {
+  if (value === undefined || value === null) return DEFAULT_RUN_CAP;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError("telemetryRunCap must be a positive integer.");
+  }
+  if (value > MAX_RUN_CAP) {
+    throw new TypeError(
+      `telemetryRunCap must not exceed ${MAX_RUN_CAP.toLocaleString("en-US")} (retention cannot be disabled).`
+    );
   }
   return value;
 }

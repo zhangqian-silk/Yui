@@ -278,6 +278,23 @@ export type YuiConfig = Readonly<{
    * Defaults to true; safe by construction (same request → same receipt).
    */
   yieldReceiptReplay?: boolean;
+  /**
+   * Path to the tmux binary. Defaults to `tmux` on PATH.
+   */
+  tmuxBin?: string;
+  /**
+   * Path to the git binary. Defaults to `git` on PATH.
+   */
+  gitBin?: string;
+  /**
+   * Telemetry mode. `legacy` (default) keeps the master-only behavior;
+   * `dual` and `bounded` activate the diagnostic sidecar.
+   */
+  telemetryMode?: "legacy" | "dual" | "bounded";
+  /** Terminal Run/generation progress rows retained after prune. */
+  telemetryTerminalKeep?: number;
+  /** Hard cap of progress rows per Run while it is still active. */
+  telemetryRunCap?: number;
   completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
 }>;
 export type ConfiguredAgentPatch = Readonly<Partial<

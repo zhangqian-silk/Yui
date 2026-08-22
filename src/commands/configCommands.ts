@@ -29,6 +29,13 @@ import {
   resolveYieldReceiptReplay,
   type ProviderRetryMode
 } from "../config/yuiConfig.js";
+import {
+  resolveGitBin,
+  resolveTelemetryMode,
+  resolveTelemetryRunCap,
+  resolveTelemetryTerminalKeep,
+  resolveTmuxBin
+} from "../config/yuiConfig.js";
 
 type ConfigCommandStore = Readonly<{
   transaction<T>(execute: (store: ConfigCommandStore) => T): T;
@@ -45,7 +52,12 @@ const CONFIG_SET_USAGE = "Config set usage: yui config set "
   + "--provider-retry-mode <off|shadow|enforce> | "
   + "--provider-retry-adapters <all|claude,codex|off> | "
   + "--provider-retry-max-window-ms <milliseconds> | "
-  + "--yield-receipt-replay <true|false>>.";
+  + "--yield-receipt-replay <true|false> | "
+  + "--tmux-bin <path> | "
+  + "--git-bin <path> | "
+  + "--telemetry-mode <legacy|dual|bounded> | "
+  + "--telemetry-terminal-keep <n> | "
+  + "--telemetry-run-cap <n>>.";
 
 export function runConfigCommand(args: string[], store: ConfigCommandStore): string {
   const [command, ...rest] = args;
@@ -67,6 +79,11 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
       `Provider retry adapters: ${resolveProviderRetryAdapters(config.providerRetryAdapters).join(", ") || "none"}`,
       `Provider retry max window: ${resolveProviderRetryMaxWindowMs(config.providerRetryMaxWindowMs)} ms`,
       `Yield receipt replay: ${resolveYieldReceiptReplay(config.yieldReceiptReplay) ? "on" : "off"}`,
+      `Tmux bin: ${resolveTmuxBin(config.tmuxBin)}`,
+      `Git bin: ${resolveGitBin(config.gitBin)}`,
+      `Telemetry mode: ${resolveTelemetryMode(config.telemetryMode)}`,
+      `Telemetry terminal keep: ${resolveTelemetryTerminalKeep(config.telemetryTerminalKeep)}`,
+      `Telemetry run cap: ${resolveTelemetryRunCap(config.telemetryRunCap)}`,
       ""
     ].join("\n");
   }
@@ -141,6 +158,45 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
         tx.saveConfig({ ...tx.getConfig(), yieldReceiptReplay });
       });
       return `Yield receipt replay set to ${yieldReceiptReplay ? "on" : "off"}\n`;
+    }
+    if (rest[0] === "--tmux-bin") {
+      const tmuxBin = validatedConfigValue(() => resolveTmuxBin(rest[1]));
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), tmuxBin });
+      });
+      return `Tmux bin set to ${tmuxBin}\n`;
+    }
+    if (rest[0] === "--git-bin") {
+      const gitBin = validatedConfigValue(() => resolveGitBin(rest[1]));
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), gitBin });
+      });
+      return `Git bin set to ${gitBin}\n`;
+    }
+    if (rest[0] === "--telemetry-mode") {
+      const telemetryMode = validatedConfigValue(() => resolveTelemetryMode(rest[1]));
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), telemetryMode });
+      });
+      return `Telemetry mode set to ${telemetryMode}\n`;
+    }
+    if (rest[0] === "--telemetry-terminal-keep") {
+      const telemetryTerminalKeep = validatedConfigValue(
+        () => resolveTelemetryTerminalKeep(Number(rest[1]))
+      );
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), telemetryTerminalKeep });
+      });
+      return `Telemetry terminal keep set to ${telemetryTerminalKeep}\n`;
+    }
+    if (rest[0] === "--telemetry-run-cap") {
+      const telemetryRunCap = validatedConfigValue(
+        () => resolveTelemetryRunCap(Number(rest[1]))
+      );
+      store.transaction((tx) => {
+        tx.saveConfig({ ...tx.getConfig(), telemetryRunCap });
+      });
+      return `Telemetry run cap set to ${telemetryRunCap}\n`;
     }
     throw configSetUsageError();
   }

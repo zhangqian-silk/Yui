@@ -36,6 +36,8 @@ export type ControllerCleanupPorts = Readonly<{
 
 export type ControllerResourceCleanupOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
+  /** Path to the tmux binary, from the durable Yui config. */
+  tmuxBin?: string;
   termGraceMs?: number;
   killGraceMs?: number;
   pollMs?: number;
@@ -51,7 +53,7 @@ export async function cleanControllerResource(
   }
   assertEphemeralDomainFence(resource);
   const environment = options.environment ?? process.env;
-  const ports = options.ports ?? linuxCleanupPorts(environment);
+  const ports = options.ports ?? linuxCleanupPorts(environment, options.tmuxBin ?? "tmux");
   const cleanup = async (): Promise<void> => {
     if (resource.artifact !== undefined) {
       cleanArtifact(resource, ports, environment);
@@ -237,7 +239,7 @@ async function waitForProcesses(
   }
 }
 
-function linuxCleanupPorts(environment: NodeJS.ProcessEnv): ControllerCleanupPorts {
+function linuxCleanupPorts(environment: NodeJS.ProcessEnv, tmuxBin: string): ControllerCleanupPorts {
   return {
     processStartIdentity: readProcessStartIdentity,
     signal: (pid, signal) => process.kill(pid, signal),
@@ -254,7 +256,7 @@ function linuxCleanupPorts(environment: NodeJS.ProcessEnv): ControllerCleanupPor
     socketActive: unixSocketIsActive,
     removeArtifact: (path) => unlinkSync(path),
     inspectTmuxServerPanes: async (resource) => {
-      const manager = tmuxManagerForResource(resource, environment);
+      const manager = tmuxManagerForResource(resource, environment, tmuxBin);
       return manager.inspectRolePaneInventory().map((pane) => (
         `${pane.taskId}/${pane.roleName}`
       ));
@@ -264,7 +266,7 @@ function linuxCleanupPorts(environment: NodeJS.ProcessEnv): ControllerCleanupPor
       if (target === undefined) {
         throw new Error(`Role pane identity is unavailable: ${resource.id}.`);
       }
-      const manager = tmuxManagerForResource(resource, environment);
+      const manager = tmuxManagerForResource(resource, environment, tmuxBin);
       const pane = manager.inspectRolePaneInventory().find((candidate) => (
         candidate.target === target
       ));
@@ -295,7 +297,8 @@ function linuxCleanupPorts(environment: NodeJS.ProcessEnv): ControllerCleanupPor
 
 function tmuxManagerForResource(
   resource: RuntimeResource,
-  environment: NodeJS.ProcessEnv
+  environment: NodeJS.ProcessEnv,
+  tmuxBin: string
 ): TmuxManager {
   const home = resource.yuiHome;
   if (home === undefined) {
@@ -304,7 +307,7 @@ function tmuxManagerForResource(
   const executor = new NodeCommandExecutor();
   const commandEnvironment = tmuxSocketEnvironment(environment);
   return new TmuxManager(
-    environment.YUI_TMUX_BIN ?? "tmux",
+    tmuxBin,
     {
       run: (command, args, options) => executor.run(command, args, {
         ...options,
