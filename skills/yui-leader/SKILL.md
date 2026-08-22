@@ -96,6 +96,19 @@ children through adapter metadata, and routes a later result reference through
 the durable inbox. Do not poll, send a waiting Message, rewrite a checkpoint,
 or yield merely to preserve that native wait.
 
+Native child results have an explicit durability boundary. A native subagent is
+best-effort by default: its result returns through the parent Conversation, and
+if the parent Session is lost before Yui externalizes the result, rerun the
+child — Yui does not claim it was durably received. When Yui persists a
+continuation report with result content, the child becomes durable-result:
+`yui task continuation list <task>` shows its mode, content digest, and the
+Task event holding the full result. After a parent crash, read durable-result
+children by their event reference instead of rerunning them; rerun only
+best-effort children whose result was never externalized. Critical,
+non-repeatable, or independently verifiable work must use a Yui
+WorkItem/ExecutionGroup, not a native subagent, because only a managed Lane
+owns an independent Run, receipt, and workspace.
+
 For a managed Task Role or Reviewer Run, persist a necessary changed checkpoint,
 yield the active Leader Run, and stop the turn. Its durable mailbox result or an
 attention event wakes a later Leader Run. An unchanged healthy managed wait is

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { MailboxEntityRef, WorkSignal } from "../coordination/workMailbox.js";
 import {
   createProviderContinuation,
@@ -67,12 +69,14 @@ export function foldContinuationObservation(
     throw new Error("Continuation observation identity does not match the existing projection.");
   }
   if (observation.kind === "continuation.reported") {
+    const resultReceipt = durableResultReceipt(payload.summary);
     const next = recordProviderReport(base, {
       reportId: payload.reportId!,
       ...(payload.resultRef === undefined ? {} : { resultRef: payload.resultRef }),
       ...(payload.providerDeliveryRef === undefined
         ? {}
         : { providerDeliveryRef: payload.providerDeliveryRef }),
+      ...resultReceipt,
       observedAt: observation.observedAt ?? observation.receivedAt
     }, observation.sequence);
     return {
@@ -98,6 +102,23 @@ export function foldContinuationObservation(
       : existing === null ? "created" : "updated",
     continuation: next
   };
+}
+
+/**
+ * The durable-result receipt for a native child report. Yui only claims
+ * "durable-result" durability when it has actually persisted result content;
+ * the sha256 digest makes replays idempotent and lets recovery verify the
+ * result by digest. A report without persisted content stays best-effort.
+ */
+function durableResultReceipt(summary: string | undefined): Readonly<{
+  resultDigest?: string;
+  resultSize?: number;
+}> {
+  if (summary === undefined || summary.trim().length === 0) return {};
+  return Object.freeze({
+    resultDigest: createHash("sha256").update(summary).digest("hex"),
+    resultSize: summary.length
+  });
 }
 
 /**

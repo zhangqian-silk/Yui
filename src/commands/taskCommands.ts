@@ -134,7 +134,11 @@ import {
   runtimeLifecycleTarget,
   type RuntimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
-import { blockingProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
+import {
+  blockingProviderContinuations,
+  projectProviderContinuations
+} from "../runtime/runtimeContinuationProjection.js";
+import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import {
   activateTask,
   addTaskProjectBinding,
@@ -569,6 +573,7 @@ export function runTaskCommand(
     case "decision": return taskDecisionCommand(rest, store, options);
     case "milestone": return taskMilestoneCommand(rest, store, options);
     case "event": return taskEventCommand(rest, store);
+    case "continuation": return taskContinuationCommand(rest, store);
     case "enter": return enterTaskRoleAlias(rest, store, options);
     default:
       throw usageError(command === undefined
@@ -7581,6 +7586,122 @@ function taskEventCommand(
   throw usageError(command === undefined
     ? "Task event command is required."
     : `Unknown command: task event ${command}`);
+}
+
+/**
+ * Issue 13: native child durability visibility. A native Provider subagent is
+ * best-effort until Yui persists its result content; once a continuation
+ * report carries a result digest receipt the child is durable-result and its
+ * full content stays readable through the referenced Task event.
+ */
+function taskContinuationCommand(
+  args: string[],
+  store: TaskWorkflowStore
+): TaskCommandExecution {
+  const [command, ...rest] = args;
+  if (command !== "list") {
+    throw usageError(command === undefined
+      ? "Task continuation command is required."
+      : `Unknown command: task continuation ${command}`);
+  }
+  const usage = "Task continuation list usage: yui task continuation list <task> [--json].";
+  const asJson = rest.includes("--json");
+  const positionals = rest.filter((arg) => arg !== "--json");
+  exactPositionals(positionals, 1, usage);
+  const task = requireTask(store, positionals[0]);
+  const events = store.listEvents(task.id);
+  const continuations = projectProviderContinuations(events);
+  const reportEvents = continuationReportEvents(events);
+  const rows = continuations.map((continuation) => {
+    const identity = continuation.identity;
+    const report = [...continuation.reports].reverse()[0];
+    const reportEvent = report === undefined
+      ? undefined
+      : reportEvents.find((entry) => (
+        entry.continuationId === identity.continuationId
+        && entry.continuationGeneration === identity.generation
+        && entry.reportId === report.reportId
+      ));
+    return Object.freeze({
+      continuationId: identity.continuationId,
+      generation: identity.generation,
+      driver: identity.providerNamespace,
+      runId: continuation.runId,
+      execution: continuation.execution,
+      outcome: continuation.outcome,
+      attachment: continuation.attachment,
+      durability: continuation.durability,
+      ...(report?.resultDigest === undefined
+        ? {}
+        : { resultDigest: report.resultDigest }),
+      ...(report?.resultSize === undefined
+        ? {}
+        : { resultSize: report.resultSize }),
+      ...(reportEvent === undefined ? {} : { resultEvent: reportEvent.event.id }),
+      ...(continuation.settledAt === undefined ? {} : { settledAt: continuation.settledAt })
+    });
+  });
+  if (asJson) {
+    return output(`${JSON.stringify({ taskId: task.id, continuations: rows }, null, 2)}\n`,
+      { taskId: task.id, continuations: rows });
+  }
+  if (rows.length === 0) {
+    return output(`No native child continuations found for ${task.id}.\n`,
+      { taskId: task.id, continuations: rows });
+  }
+  const timeZone = store.getConfig().timeZone;
+  return output(`${renderTable(
+    `Native child continuations: ${task.id}`,
+    [
+      { header: "Child", minWidth: 8, maxWidth: 24 },
+      { header: "Driver", minWidth: 8, maxWidth: 24 },
+      { header: "Execution", minWidth: 8, maxWidth: 12 },
+      { header: "Outcome", minWidth: 8, maxWidth: 12 },
+      { header: "Durability", minWidth: 10, maxWidth: 16 },
+      { header: "Result", minWidth: 8, maxWidth: 24 },
+      { header: "Settled", minWidth: 10, maxWidth: 28 }
+    ],
+    rows.map((row) => [
+      row.continuationId,
+      row.driver,
+      row.execution,
+      row.outcome,
+      row.durability,
+      row.resultEvent ?? (row.resultDigest === undefined ? "-" : `digest:${row.resultDigest.slice(0, 12)}`),
+      ...(row.settledAt === undefined ? ["-"] : [presentTime(row.settledAt, timeZone)])
+    ]),
+    defaultTableWidth()
+  )}\n`, { taskId: task.id, continuations: rows });
+}
+
+function continuationReportEvents(
+  events: readonly TaskEvent[]
+): readonly Readonly<{
+  event: TaskEvent;
+  continuationId: string;
+  continuationGeneration: number;
+  reportId: string;
+}>[] {
+  const result: {
+    event: TaskEvent;
+    continuationId: string;
+    continuationGeneration: number;
+    reportId: string;
+  }[] = [];
+  for (const event of events) {
+    const observation = runtimeObservationFromTaskEvent(event);
+    if (observation !== null && observation.kind === "continuation.reported") {
+      const continuationId = observation.fence.continuationId;
+      const continuationGeneration = observation.fence.continuationGeneration;
+      const reportId = observation.payload?.reportId;
+      if (continuationId !== undefined
+        && continuationGeneration !== undefined
+        && reportId !== undefined) {
+        result.push({ event, continuationId, continuationGeneration, reportId });
+      }
+    }
+  }
+  return result;
 }
 
 /**

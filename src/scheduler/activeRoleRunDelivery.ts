@@ -26,6 +26,8 @@ import { RuntimeLaunchFailure } from "../runtime/launchDiagnostics.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { mailboxHasWork, nextPendingBatch } from "../coordination/workMailbox.js";
+import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
+import { projectProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import {
   hasRuntimeLifecycleWork,
   RuntimeLifecycleBusyError,
@@ -668,7 +670,8 @@ async function processActiveRunContinuation(
       role,
       run,
       inputDelivery.attemptId,
-      inputDelivery.batch
+      inputDelivery.batch,
+      boundedContinuationSummaries(store, task.id, inputDelivery.batch.refs)
     );
     if (mode !== "followup") {
       const routed = await delivery.routeProviderInput!({
@@ -833,7 +836,8 @@ function continuationInput(
     reasons: readonly string[];
     refs: readonly import("../coordination/workMailbox.js").MailboxEntityRef[];
     sources: readonly string[];
-  }>
+  }>,
+  resultSummaries: readonly string[]
 ): string {
   const references = batch.refs.map((ref) => (
     "taskId" in ref
@@ -847,8 +851,72 @@ function continuationInput(
     "Do not create a new Yui Run merely because this is a new Provider Turn.",
     `Reasons: ${batch.reasons.join(", ")}.`,
     ...(batch.sources.length === 0 ? [] : [`Sources: ${batch.sources.join(", ")}.`]),
-    ...(references.length === 0 ? [] : [`References: ${references.join(", ")}.`])
+    ...(references.length === 0 ? [] : [`References: ${references.join(", ")}.`]),
+    ...(resultSummaries.length === 0
+      ? []
+      : [
+          "Native child results (bounded excerpts; read the referenced event for the full content):",
+          ...resultSummaries
+        ])
   ].join("\n"), run.id, taskRoleSessionTitle(task, role.name));
+}
+
+/**
+ * Issue 13: the parent prompt only ever sees a bounded excerpt of a native
+ * child result plus its durable event reference. The full content stays in
+ * the Task event log and is read on demand through `yui task event show`.
+ * This prevents an unbounded provider result from being re-injected into the
+ * parent Session on every continuation wake.
+ */
+const MAX_RESULT_SUMMARY_CHARS = 512;
+const MAX_RESULT_SUMMARY_LINES = 8;
+
+function boundedContinuationSummaries(
+  store: SchedulerStorePort,
+  taskId: string,
+  refs: readonly import("../coordination/workMailbox.js").MailboxEntityRef[]
+): readonly string[] {
+  if (store.listEvents === undefined) return [];
+  const events = store.listEvents(taskId);
+  const continuations = projectProviderContinuations(events);
+  const byKey = new Map(continuations.map((entry) => [
+    `${entry.identity.continuationId}\u0000${entry.identity.generation}`,
+    entry
+  ]));
+  const summaries: string[] = [];
+  for (const ref of refs) {
+    if (!("taskId" in ref) || ref.type !== "event") continue;
+    const event = events.find((entry) => entry.id === ref.id);
+    if (event === undefined) continue;
+    const observation = runtimeObservationFromTaskEvent(event);
+    if (observation === null || observation.kind !== "continuation.reported") continue;
+    const summary = observation.payload?.summary;
+    if (summary === undefined || summary.trim().length === 0) continue;
+    const continuation = byKey.get(
+      `${observation.fence.continuationId}\u0000${observation.fence.continuationGeneration}`
+    );
+    const digest = continuation?.reports
+      .find((report) => report.reportId === observation.payload?.reportId)
+      ?.resultDigest;
+    summaries.push([
+      `- child ${observation.fence.continuationId}`,
+      ...(continuation?.durability === "durable-result"
+        ? ["  (durable-result; full content: "
+          + `yui task event show ${taskId} ${ref.id}`
+          + (digest === undefined ? "" : `; digest ${digest.slice(0, 12)}`)
+          + ")"]
+        : ["  (best-effort; rerun if the parent Session was lost)"]),
+      `  ${boundedExcerpt(summary)}`
+    ].join("\n"));
+  }
+  return summaries;
+}
+
+function boundedExcerpt(text: string): string {
+  const lines = text.split("\n").slice(0, MAX_RESULT_SUMMARY_LINES);
+  const joined = lines.join("\n");
+  if (joined.length <= MAX_RESULT_SUMMARY_CHARS && text.length === joined.length) return joined;
+  return `${joined.slice(0, MAX_RESULT_SUMMARY_CHARS)}… [truncated]`;
 }
 
 function roleRunDeliveryFailure(
