@@ -229,6 +229,40 @@ export function renderExecutionAudit(
     lines.push("", ...sectionError("events", report));
   }
 
+  if (report.providerRetries.status === "ok" && report.providerRetries.data !== undefined) {
+    const retries = report.providerRetries.data;
+    if (retries.total > 0) {
+      lines.push(
+        "",
+        `Provider retries: ${retries.total} run(s) retried in place · ${retries.terminal} terminal`
+      );
+      lines.push(
+        renderTable(
+          "Provider retry lineages",
+          [
+            { header: "Task", minWidth: 8, maxWidth: 14 },
+            { header: "Run", minWidth: 14, maxWidth: 24 },
+            { header: "Role", minWidth: 8, maxWidth: 12 },
+            { header: "Attempts", minWidth: 8, maxWidth: 10 },
+            { header: "Error class", minWidth: 14, maxWidth: 24 },
+            { header: "Decision", minWidth: 14, maxWidth: 26 }
+          ],
+          retries.entries.map((entry) => [
+            entry.taskId,
+            entry.runId,
+            entry.roleName,
+            String(entry.attempts),
+            entry.errorClass,
+            entry.decision
+          ]),
+          width
+        )
+      );
+    }
+  } else {
+    lines.push("", ...sectionError("providerRetries", report));
+  }
+
   if (report.workItems.status === "ok" && report.workItems.data !== undefined) {
     const items = report.workItems.data;
     lines.push(

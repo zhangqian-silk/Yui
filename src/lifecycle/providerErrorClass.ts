@@ -97,8 +97,11 @@ const INVALID_REQUEST_PATTERNS: readonly Pattern[] = [
 
 const TRANSIENT_PROVIDER_PATTERNS: readonly Pattern[] = [
   { pattern: /\b50[024]\b/u, label: "http-5xx" },
-  { pattern: /server[_-]?error/iu, label: "server-error" },
+  { pattern: /server[\s_-]?error/iu, label: "server-error" },
   { pattern: /internal server error/iu, label: "internal-server-error" },
+  // HTTP/2 RST_STREAM / gRPC status carried by Claude Code and Codex streams
+  // (Task-27: "stream error: stream ID …; INTERNAL_ERROR; received from peer").
+  { pattern: /\binternal[\s_-]?error\b/iu, label: "internal-error" },
   { pattern: /connection lost/iu, label: "connection-lost" },
   { pattern: /connection reset/iu, label: "connection-reset" },
   { pattern: /econnreset/iu, label: "econnreset" },
@@ -120,6 +123,9 @@ const TRANSPORT_UNCERTAIN_PATTERNS: readonly Pattern[] = [
   { pattern: /etimedout/iu, label: "etimedout" },
   { pattern: /response lost/iu, label: "response-lost" },
   { pattern: /lost response/iu, label: "lost-response" },
+  // A stream-level failure means the response may have been cut mid-turn;
+  // the retry path consults durable completion facts before any resend.
+  { pattern: /stream error/iu, label: "stream-error" },
   { pattern: /stream interrupted/iu, label: "stream-interrupted" },
   { pattern: /interrupted function/iu, label: "interrupted-function" },
   { pattern: /controller timeout/iu, label: "controller-timeout" },

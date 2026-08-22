@@ -56,6 +56,7 @@ import {
 } from "../lifecycle/providerErrorClass.js";
 import {
   type PendingProviderRetry,
+  providerRetryBudgetExhausted,
   providerRetryIsDue,
   scheduleProviderRetry
 } from "../run/providerRetry.js";
@@ -2076,6 +2077,30 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         );
         store.saveTaskRoleSessionSet(sessions);
         completeRuntimeHookReservation(store, owner, input.launchId);
+        // The in-flight fence was cleared by an in-place provider retry
+        // decision. If the active Run is still in its retry window and this
+        // completion belongs to it, the recovered CLI finished the original
+        // turn: terminalize the exact Run through the normal completion path
+        // instead of re-pushing the prompt on the next retry deadline.
+        const activeRun = store.getActiveAgentRun(task.id, role.name);
+        if (
+          activeRun !== null
+          && activeRun.providerRetry !== undefined
+          && input.runId === activeRun.id
+        ) {
+          this.recordRuntimeTurnCompleted({
+            taskId: task.id,
+            roleName: role.name,
+            agentId: input.agentId,
+            adapterId: input.adapterId,
+            nativeSessionId: input.nativeSessionId,
+            ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+            turnId: input.turnId,
+            expectedRunId: activeRun.id,
+            summary: input.summary,
+            origin: "native"
+          }, now);
+        }
         return { session: sessions.sessions[input.agentId]!, duplicate: false };
       }
 
@@ -2557,27 +2582,38 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       return null;
     }
 
-    // transport-uncertain: the Provider may have accepted the turn. If a
-    // native completion is already durable, the completion path owns the
-    // yield; do not resend.
-    if (classification.errorClass === "transport-uncertain") {
-      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-      const pending = sessions?.pendingTurnCompletion;
-      if (pending !== null
-        && pending !== undefined
-        && pending.runId === input.runId
-        && pending.agentId === input.agentId) {
-        this.recordProviderRetryClassified(store, input, classification.errorClass, {
-          wouldRetry: "false",
-          shadow: "false",
-          note: "native-turn-completion-durable"
-        }, now);
-        return { disposition: "applied", runId: input.runId };
-      }
-    }
-
     const run = store.getAgentRun(input.taskId, input.runId);
     if (run === null || run.status !== "active") return null;
+    // At-most-once delivery: if a native completion is already durable for
+    // this Run, the completion path owns the yield; never resend. This applies
+    // to every retryable class, not only transport-uncertain, because a
+    // transient stream failure may have been observed after the turn finished.
+    const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+    const pending = sessions?.pendingTurnCompletion;
+    if (pending !== null
+      && pending !== undefined
+      && pending.runId === input.runId
+      && pending.agentId === input.agentId) {
+      this.recordProviderRetryClassified(store, input, classification.errorClass, {
+        wouldRetry: "false",
+        shadow: "false",
+        note: "native-turn-completion-durable"
+      }, now);
+      return { disposition: "applied", runId: input.runId };
+    }
+    // A retry lineage that has used its total budget terminalizes with one
+    // structured failure instead of looping. The Run falls through to the
+    // normal terminalization path below.
+    if (run.providerRetry !== undefined
+      && providerRetryBudgetExhausted(run.providerRetry, now, config.maxWindowMs)) {
+      this.recordProviderRetryClassified(store, input, classification.errorClass, {
+        wouldRetry: "false",
+        shadow: "false",
+        note: "retry-budget-exhausted",
+        attempt: String(run.providerRetry.attempt)
+      }, now);
+      return null;
+    }
     const retry = scheduleProviderRetry(run.providerRetry, {
       errorClass: classification.errorClass,
       launchId: input.launchId,
@@ -2588,8 +2624,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
     // Clear the in-flight fence so the original Session can be re-bound and
     // re-pushed by the delivery path; the Session itself stays alive.
-    const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-    if (sessions !== null) {
+    if (sessions !== null && sessions.inFlight !== null) {
       store.saveTaskRoleSessionSet(clearTaskRoleRun(sessions, {
         agentId: input.agentId,
         runId: input.runId,
@@ -2711,6 +2746,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       (entry) => Date.parse(entry.nextAttemptAt) <= now.getTime()
     );
     const reopened: string[] = [];
+    const config = providerRetryConfig();
     for (const entry of due) {
       this.store.transaction((store) => {
         const run = store.getAgentRun(entry.taskId, entry.runId);
@@ -2723,6 +2759,56 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
         const sessions = store.getTaskRoleSessionSet(entry.taskId, entry.roleName);
         const session = sessions?.sessions[run.effective.agentId];
+        // At-most-once delivery: a durable completion for this Run owns the
+        // yield; never re-push.
+        const pending = sessions?.pendingTurnCompletion;
+        if (pending !== null
+          && pending !== undefined
+          && pending.runId === run.id
+          && pending.agentId === run.effective.agentId) {
+          return;
+        }
+        // Budget exhausted: one structured terminal failure, never a loop.
+        if (providerRetryBudgetExhausted(run.providerRetry, now, config.maxWindowMs)) {
+          const summary = `Provider retry budget exhausted after ${run.providerRetry.attempt} attempt(s) `
+            + `(run ${run.id}, error class ${run.providerRetry.errorClass}, `
+            + `last error: ${run.providerRetry.lastErrorSummary}). `
+            + `The original Session requires an explicit Leader recovery decision.`;
+          const result = terminalizeExactTaskRun(store, {
+            taskId: entry.taskId,
+            roleName: entry.roleName,
+            agentId: run.effective.agentId,
+            runId: run.id,
+            receiptId: formatAgentRunReceiptId(entry.taskId, run.id),
+            ...(run.providerRetry.nativeSessionId === undefined
+              ? {}
+              : { nativeSessionId: run.providerRetry.nativeSessionId }),
+            ...(run.providerRetry.launchId === undefined
+              ? {}
+              : { launchId: run.providerRetry.launchId }),
+            outcome: { status: "failed", summary }
+          }, now);
+          if (result.disposition !== "applied") return;
+          store.saveEvent(entry.taskId, createTaskEvent(
+            store.nextEventId(entry.taskId),
+            entry.taskId,
+            "runtime.provider-retry-budget-exhausted",
+            {
+              runId: run.id,
+              attempt: String(run.providerRetry.attempt),
+              errorClass: run.providerRetry.errorClass
+            },
+            now
+          ));
+          enqueueWork(
+            store,
+            { kind: "role", taskId: entry.taskId, roleName: "leader" },
+            "role-run-failed",
+            now,
+            [{ type: "run", taskId: entry.taskId, id: run.id }]
+          );
+          return;
+        }
         const identityMatches = session !== undefined
           && session.adapterId === run.effective.adapterId
           && (run.providerRetry.nativeSessionId === undefined
@@ -2732,10 +2818,47 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         const sessionAlive = identityMatches
           && session.status !== "stopped"
           && session.status !== "broken";
-        if (!sessionAlive) {
-          // Session-dead: stop in-place retry and raise a precise, actionable
-          // replacement blocker for the Leader.
+        if (sessionAlive) {
+          // The CLI process is still alive. Enter a grace period: let the
+          // Provider reconnect and finish the turn itself instead of sending
+          // a duplicate prompt. Reschedule with the next backoff; a late
+          // completion is attributed to this Run by observeRuntimeTurnCompleted.
+          const retry = scheduleProviderRetry(run.providerRetry, {
+            errorClass: run.providerRetry.errorClass,
+            ...(run.providerRetry.launchId === undefined
+              ? {}
+              : { launchId: run.providerRetry.launchId }),
+            ...(run.providerRetry.nativeSessionId === undefined
+              ? {}
+              : { nativeSessionId: run.providerRetry.nativeSessionId }),
+            lastErrorSummary: run.providerRetry.lastErrorSummary
+          }, now);
+          store.saveAgentRun(withProviderRetry(run, retry));
+          store.saveEvent(entry.taskId, createTaskEvent(
+            store.nextEventId(entry.taskId),
+            entry.taskId,
+            "runtime.provider-retry-waiting",
+            {
+              runId: run.id,
+              attempt: String(retry.attempt),
+              ...(retry.nextAttemptAt === undefined
+                ? {}
+                : { nextAttemptAt: retry.nextAttemptAt })
+            },
+            now
+          ));
+          return;
+        }
+        // The process is gone. If the adapter supports resume and the
+        // projection carries a native Session id, relaunch with resume: the
+        // conversation identity stays the same, only the launch generation
+        // changes. Otherwise terminalize with a precise replacement blocker.
+        const canResume = run.providerRetry.nativeSessionId !== undefined
+          && this.drivers.requireByAdapterId(run.effective.adapterId)
+            .capabilities.control.resume;
+        if (!canResume) {
           const summary = `Provider retry stopped: the original Session is gone `
+            + `and the adapter cannot resume it `
             + `(run ${run.id}, attempt ${run.providerRetry.attempt}, `
             + `last error: ${run.providerRetry.lastErrorSummary}). `
             + `A replacement Session requires an explicit Leader recovery decision.`;
@@ -2770,10 +2893,23 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           );
           return;
         }
-        // Reopen the Run on its original Session: reset transport markers,
-        // switch to resume, and mark the projection in-flight. The delivery
-        // pass re-pushes the exact same input in this same pass.
+        // Resume relaunch: reopen the Run in resume mode on the same native
+        // Session. The delivery pass relaunches the process with resume and
+        // re-pushes the exact same input; only the launch generation changes.
         store.saveAgentRun(reopenRunForProviderRetry(run, now));
+        store.saveEvent(entry.taskId, createTaskEvent(
+          store.nextEventId(entry.taskId),
+          entry.taskId,
+          "runtime.provider-retry-resume",
+          {
+            runId: run.id,
+            attempt: String(run.providerRetry.attempt),
+            ...(run.providerRetry.nativeSessionId === undefined
+              ? {}
+              : { nativeSessionId: run.providerRetry.nativeSessionId })
+          },
+          now
+        ));
         // The retry decision settled the original delivery claim; re-queue the
         // Role mailbox so the delivery pass can claim and re-push the Run.
         enqueueWork(

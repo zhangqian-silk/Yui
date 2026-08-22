@@ -33,11 +33,18 @@ export type AgentRunProviderRetry = Readonly<{
 
 export const PROVIDER_RETRY_BASE_DELAY_MS = 1_000;
 export const PROVIDER_RETRY_MAX_DELAY_MS = 60_000;
+/**
+ * Default total budget for one in-place retry lineage. The window starts at
+ * the first classified failure and bounds the total wall-clock time the Run
+ * may stay in `provider-retrying`; once it elapses the Run terminalizes with
+ * one structured failure instead of looping.
+ */
+export const PROVIDER_RETRY_MAX_WINDOW_MS = 600_000;
 
 /**
- * Bounded exponential backoff. The delay is uncapped in attempt count (Issue
- * 04 retries transient failures indefinitely with backoff) but capped in
- * interval so a hot loop can never occupy the control plane.
+ * Bounded exponential backoff. The delay is capped in interval so a hot loop
+ * can never occupy the control plane; the total retry lineage is bounded by
+ * {@link PROVIDER_RETRY_MAX_WINDOW_MS} (see {@link providerRetryBudgetExhausted}).
  */
 export function nextProviderRetryDelayMs(attempt: number): number {
   if (!Number.isSafeInteger(attempt) || attempt < 1) {
@@ -48,6 +55,22 @@ export function nextProviderRetryDelayMs(attempt: number): number {
     PROVIDER_RETRY_MAX_DELAY_MS,
     PROVIDER_RETRY_BASE_DELAY_MS * (2 ** exponent)
   );
+}
+
+/**
+ * True when the retry lineage has used its total wall-clock budget. The
+ * budget is measured from the first classified failure, so repeated failures
+ * never extend it.
+ */
+export function providerRetryBudgetExhausted(
+  value: AgentRunProviderRetry,
+  now: Date,
+  maxWindowMs: number = PROVIDER_RETRY_MAX_WINDOW_MS
+): boolean {
+  if (!Number.isSafeInteger(maxWindowMs) || maxWindowMs <= 0) {
+    throw new Error(`Provider retry max window must be a positive integer: ${String(maxWindowMs)}.`);
+  }
+  return Date.parse(value.firstFailureAt) + maxWindowMs <= now.getTime();
 }
 
 export function validateAgentRunProviderRetry(
