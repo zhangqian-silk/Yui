@@ -249,6 +249,14 @@ export function parseCodexError(
   if (/\[codex:(unrecognized_model|invalid_model|model_not_found)\]/iu.test(text)) {
     return { code: "invalid-request", raw: error };
   }
+  // Model not supported / invalid model (non-retryable)
+  if (/model.*not supported|invalid.*model|model.*not found/iu.test(text)) {
+    return { code: "invalid-request", raw: error };
+  }
+  // Stream disconnected (retryable transport)
+  if (/stream disconnected/iu.test(text)) {
+    return { code: "stream-error", raw: error };
+  }
 
   // ── Stream / transport ────────────────────────────────────────────
   if (/stream error:.*INTERNAL_ERROR/iu.test(text)) {
