@@ -79,6 +79,13 @@ export type TaskRoleRuntimeStatus = Readonly<{
   openInputRequestCount: number;
   role: TaskRole;
   activeRun: AgentRun | null;
+  /**
+   * Issue 09: the most recently updated Run for this Role, regardless of
+   * status. Lets the status display both axes — the last Run outcome and the
+   * current/last Session lifecycle — so a Session that stops after a Run
+   * yielded is never read back as a Run failure.
+   */
+  lastRun: AgentRun | null;
   activeWork: WorkItem | null;
   nativeSession: RoleAgentSession | null;
   runtimeCleanupPending: boolean;
@@ -133,6 +140,11 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
   const activeRun = status.activeRun === null
     ? "-"
     : `${status.activeRun.id} (${activeRunDeliveryLabel(status.activeRun)})`;
+  const lastRun = status.activeRun !== null || status.lastRun === null
+    ? undefined
+    : `${status.lastRun.id} (${status.lastRun.status}${
+      status.lastRun.endedAt === undefined ? "" : ` at ${status.lastRun.endedAt}`
+    })`;
   const activeWork = status.activeWork === null
     ? "-"
     : `${status.activeWork.id} (${status.activeWork.status}) ${status.activeWork.title}`;
@@ -194,6 +206,7 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     `  Role state       ${status.role.status}`,
     `  Active work      ${activeWork}`,
     `  Active run       ${activeRun}`,
+    ...(lastRun === undefined ? [] : [`  Last run         ${lastRun}`]),
     `  Run attention    ${status.stall.active
       ? `needs-attention (${status.stall.kind ?? "workflow-not-progressing"}; no workflow progress since ${status.stall.progressAt ?? "unknown"})`
       : "none"}`,
@@ -212,6 +225,13 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
 export function taskRoleActiveWorkLabel(status: TaskRoleRuntimeStatus): string {
   if (status.activeWork !== null) return `${status.activeWork.id}: ${status.activeWork.title}`;
   return status.activeRun === null ? "-" : status.activeRun.id;
+}
+
+/** Issue 09: compact last-Run outcome label for the Role list table. */
+export function taskRoleLastRunLabel(status: TaskRoleRuntimeStatus): string {
+  if (status.activeRun !== null) return `${status.activeRun.id} ${status.activeRun.status}`;
+  if (status.lastRun === null) return "-";
+  return `${status.lastRun.id} ${status.lastRun.status}`;
 }
 
 export function taskRoleNativeSessionLabel(status: TaskRoleRuntimeStatus): string {
@@ -260,6 +280,13 @@ function inspectTaskRoleRuntimeStatus(
   now: Date
 ): TaskRoleRuntimeStatus {
   const activeRun = store.getActiveAgentRun(taskId, role.name);
+  // Issue 09: the last Run outcome is a separate axis from the Session
+  // lifecycle. A Session that stops after its Run yielded must not retroactively
+  // turn that Run into a failure; the status display keeps both visible.
+  const lastRun = store.listAgentRuns(taskId)
+    .filter((candidate) => candidate.roleName === role.name)
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0]
+    ?? null;
   const activeWork = activeRun?.workItemId === undefined
     ? null
     : store.getWorkItem(taskId, activeRun.workItemId);
@@ -314,6 +341,7 @@ function inspectTaskRoleRuntimeStatus(
   const health = calculateHealth(
     role,
     activeRun,
+    lastRun,
     nativeSession,
     recovery.runtimeCleanupPending,
     tmux,
@@ -342,6 +370,7 @@ function inspectTaskRoleRuntimeStatus(
     openInputRequestCount,
     role,
     activeRun,
+    lastRun,
     activeWork,
     nativeSession,
     tmux,
@@ -366,6 +395,7 @@ function latestStallKind(
 function calculateHealth(
   role: TaskRole,
   activeRun: AgentRun | null,
+  lastRun: AgentRun | null,
   nativeSession: RoleAgentSession | null,
   runtimeCleanupPending: boolean,
   tmux: TaskRoleTmuxStatus,
@@ -383,7 +413,18 @@ function calculateHealth(
     return { health: "failed", healthReason: `persisted Role state is ${role.status}` };
   }
   if (nativeSession?.status === "broken") {
-    return { health: "failed", healthReason: "the active native session is broken" };
+    // Issue 09: a broken Session only fails a live Run. When the last Run
+    // already yielded, the Session death is a lifecycle event, not a Run
+    // failure — surface it as attention with the persisted Run outcome.
+    if (activeRun !== null) {
+      return { health: "failed", healthReason: "the active native session is broken" };
+    }
+    return {
+      health: "needs-attention",
+      healthReason: lastRun === null
+        ? "the native session is broken"
+        : `the native session is broken; last run ${lastRun.id} ${lastRun.status}`
+    };
   }
   const awaitingProviderAcceptance = activeRun?.pushedAt !== undefined
     && activeRun.deliveredAt === undefined;

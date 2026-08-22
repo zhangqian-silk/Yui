@@ -92,6 +92,24 @@ export type SessionsAudit = Readonly<{
   resets: number;
   lifecycleEvents: number;
   stopFailures: number;
+  /**
+   * Issue 09: terminal Sessions (stopped/broken) split by their relationship
+   * to the last Run they carried, so a Session that stops after its Run
+   * yielded is never merged into the Run failure rate.
+   *
+   * - `postRunYielded`: the Session ended after its last Run yielded — a
+   *   post-completion Session stop, not a Run failure.
+   * - `runFailed`: the Session ended tied to a failed Run's recovery.
+   * - `activeRun`: the Session died while a Run was still active (no terminal
+   *   receipt) — a Session failure that impacted a Run.
+   * - `noRun`: the Session ended without carrying any Run.
+   */
+  terminalByRunRelation: Readonly<{
+    postRunYielded: number;
+    runFailed: number;
+    activeRun: number;
+    noRun: number;
+  }>;
 }>;
 
 export type ReviewsAudit = Readonly<{
@@ -324,6 +342,55 @@ function addLaunchFailureCounts(
   counts.total += 1;
 }
 
+/**
+ * Issue 09: classify a terminal Session (stopped/broken) by its relationship
+ * to the last Run it carried. Runs and Sessions are separate axes: a Session
+ * that stops after its Run yielded is a post-completion stop, not a Run
+ * failure. Correlation is by Role + Agent + Adapter (the durable identity a
+ * Run and its Session share) and the Session's terminal update timestamp.
+ */
+function classifyTerminalSessionRunRelation(
+  runs: readonly AgentRun[],
+  roleName: string,
+  session: Readonly<{
+    agentId: string;
+    adapterId: string;
+    updatedAt: string;
+  }>,
+  counts: {
+    postRunYielded: number;
+    runFailed: number;
+    activeRun: number;
+    noRun: number;
+  }
+): void {
+  const terminalAt = Date.parse(session.updatedAt);
+  const carried = runs
+    .filter((run) => (
+      run.roleName === roleName
+      && run.effective.agentId === session.agentId
+      && run.effective.adapterId === session.adapterId
+      && Date.parse(run.createdAt) <= terminalAt
+    ))
+    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
+  const lastRun = carried[0];
+  if (lastRun === undefined) {
+    counts.noRun += 1;
+    return;
+  }
+  if (lastRun.status === "yielded"
+    && lastRun.endedAt !== undefined
+    && Date.parse(lastRun.endedAt) <= terminalAt) {
+    counts.postRunYielded += 1;
+    return;
+  }
+  if (lastRun.status === "failed") {
+    counts.runFailed += 1;
+    return;
+  }
+  counts.activeRun += 1;
+}
+
 function ok<T>(data: T): AuditSection<T> {
   return { status: "ok", data };
 }
@@ -524,7 +591,14 @@ export function runExecutionAudit(
       let resets = 0;
       let lifecycleEvents = 0;
       let stopFailures = 0;
+      const terminalByRunRelation = {
+        postRunYielded: 0,
+        runFailed: 0,
+        activeRun: 0,
+        noRun: 0
+      };
       for (const taskId of taskIds) {
+        const runs = store.listAgentRuns(taskId);
         for (const set of store.listRoleSessionSets(taskId)) {
           const history = Array.isArray(set.history) ? set.history : [];
           for (const session of [...history, ...Object.values(set.sessions)]) {
@@ -532,6 +606,14 @@ export function runExecutionAudit(
             if (session.status === "broken") broken += 1;
             else if (session.status === "stopped") stopped += 1;
             else other += 1;
+            if (session.status === "broken" || session.status === "stopped") {
+              classifyTerminalSessionRunRelation(
+                runs,
+                set.owner.roleName,
+                session,
+                terminalByRunRelation
+              );
+            }
           }
         }
         for (const event of store.listEvents(taskId)) {
@@ -549,7 +631,8 @@ export function runExecutionAudit(
         other,
         resets,
         lifecycleEvents,
-        stopFailures
+        stopFailures,
+        terminalByRunRelation
       });
     } catch (error) {
       return failed<SessionsAudit>(error);

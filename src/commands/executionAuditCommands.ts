@@ -205,7 +205,11 @@ export function renderExecutionAudit(
     lines.push(
       "",
       `Sessions: ${sessions.generations} generations · ${sessions.broken} broken · ${sessions.stopped} stopped · ${sessions.other} other`,
-      `Resets: ${sessions.resets} · lifecycle events ${sessions.lifecycleEvents} · stop failures ${sessions.stopFailures}`
+      `Resets: ${sessions.resets} · lifecycle events ${sessions.lifecycleEvents} · stop failures ${sessions.stopFailures}`,
+      `Terminal by Run relation: ${sessions.terminalByRunRelation.postRunYielded} post-run-yielded`
+        + ` · ${sessions.terminalByRunRelation.runFailed} run-failed`
+        + ` · ${sessions.terminalByRunRelation.activeRun} active-run`
+        + ` · ${sessions.terminalByRunRelation.noRun} no-run`
     );
   } else {
     lines.push("", ...sectionError("sessions", report));

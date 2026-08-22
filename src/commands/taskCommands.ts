@@ -229,6 +229,7 @@ import {
   inspectTaskRoleRuntimeStatuses,
   renderTaskRoleRuntimeStatus,
   taskRoleActiveWorkLabel,
+  taskRoleLastRunLabel,
   taskRoleNativeSessionLabel,
   taskRoleOpenInputLabel,
   taskRoleTmuxLabel
@@ -1911,6 +1912,7 @@ function listTaskRoles(
       { header: "Health", minWidth: 6, maxWidth: 15 },
       { header: "Open input", minWidth: 5, maxWidth: 10 },
       { header: "Active work", minWidth: 10, maxWidth: 34 },
+      { header: "Last run", minWidth: 10, maxWidth: 28 },
       { header: "Native session", minWidth: 10, maxWidth: 28 },
       { header: "tmux", minWidth: 6, maxWidth: 22 }
     ],
@@ -1920,6 +1922,7 @@ function listTaskRoles(
       status.health,
       taskRoleOpenInputLabel(status),
       taskRoleActiveWorkLabel(status),
+      taskRoleLastRunLabel(status),
       taskRoleNativeSessionLabel(status),
       taskRoleTmuxLabel(status)
     ]),
