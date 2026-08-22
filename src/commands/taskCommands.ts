@@ -1708,9 +1708,23 @@ function taskMessageCommand(
     return `Sent message ${result.message.id} to ${result.task.id}\n`;
   }
   if (command === "list") {
-    exactPositionals(rest, 1, "Task message list usage: yui task message list <id>.");
-    const task = requireTask(store, rest[0]);
-    const messages = store.listMessages(task.id);
+    const messageListUsage = "Task message list usage: yui task message list <id> [--after <timestamp>] [--limit <n>].";
+    const parsed = parseTail(rest, new Set(["--after", "--limit"]), messageListUsage);
+    exactPositionals(parsed.positionals, 1, messageListUsage);
+    const task = requireTask(store, parsed.positionals[0]);
+    let messages = store.listMessages(task.id);
+    const after = optionalNonEmptyOption(parsed.options, "--after");
+    if (after !== undefined) {
+      const afterMs = Date.parse(after);
+      if (!Number.isFinite(afterMs)) throw usageError("--after must be a valid timestamp.", messageListUsage);
+      messages = messages.filter((m) => Date.parse(m.createdAt) > afterMs);
+    }
+    const limit = optionalNonEmptyOption(parsed.options, "--limit");
+    if (limit !== undefined) {
+      const n = Number(limit);
+      if (!Number.isSafeInteger(n) || n <= 0) throw usageError("--limit must be a positive integer.", messageListUsage);
+      messages = messages.slice(-n);
+    }
     if (messages.length === 0) return "No messages found.\n";
     const timeZone = store.getConfig().timeZone;
     return `${renderTable(
@@ -7184,9 +7198,23 @@ function taskEventCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "list") {
-    exactPositionals(rest, 1, "Task event list usage: yui task event list <task>.");
-    const task = requireTask(store, rest[0]);
-    const events = store.listEvents(task.id);
+    const eventListUsage = "Task event list usage: yui task event list <task> [--after <timestamp>] [--limit <n>].";
+    const parsed = parseTail(rest, new Set(["--after", "--limit"]), eventListUsage);
+    exactPositionals(parsed.positionals, 1, eventListUsage);
+    const task = requireTask(store, parsed.positionals[0]);
+    let events = store.listEvents(task.id);
+    const after = optionalNonEmptyOption(parsed.options, "--after");
+    if (after !== undefined) {
+      const afterMs = Date.parse(after);
+      if (!Number.isFinite(afterMs)) throw usageError("--after must be a valid timestamp.", eventListUsage);
+      events = events.filter((e) => Date.parse(e.createdAt) > afterMs);
+    }
+    const limit = optionalNonEmptyOption(parsed.options, "--limit");
+    if (limit !== undefined) {
+      const n = Number(limit);
+      if (!Number.isSafeInteger(n) || n <= 0) throw usageError("--limit must be a positive integer.", eventListUsage);
+      events = events.slice(-n);
+    }
     if (events.length === 0) {
       return output(`No events found for ${task.id}.\n`, { taskId: task.id, events: [] });
     }

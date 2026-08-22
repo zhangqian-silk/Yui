@@ -191,7 +191,7 @@ export async function processLeaderWakeups(
           if (rollover !== null) {
             existingSession = null;
             effectiveSession = null;
-            contextBudgetAdvisory = `Previous Session generation ${rollover.retiredNativeSessionId ?? "unknown"} was retired at the hard context budget (peak ${budget.peakTokens} >= ${budget.budget.hardTokens} tokens). This wake starts a fresh generation; durable Task records and the snapshot below preserve all state.`;
+            contextBudgetAdvisory = `Previous Session generation ${rollover.retiredNativeSessionId ?? "unknown"} was retired at the hard context budget (peak ${budget.peakTokens} >= ${budget.budget.hardTokens} tokens). This wake starts a fresh generation; durable Task records preserve all state.`;
           }
         } else if (budget.state === "soft") {
           contextBudgetAdvisory = `Session context budget advisory: observed per-request input peak ${budget.peakTokens} tokens crossed the soft threshold (${budget.budget.softTokens}). Durable Yui records are the checkpoint; a fresh generation starts automatically at the hard threshold (${budget.budget.hardTokens}).`;
@@ -199,13 +199,13 @@ export async function processLeaderWakeups(
       }
       const mode = hasNativeSession(existingSession) && compatibleSession ? "resume" : "new";
       const runId = store.peekNextAgentRunId(task.id);
-      const contextSnapshot = resolveLeaderContextSnapshot(store, task.id, mode);
+      const wakeNotification = resolveLeaderWakeNotification(store, task.id, mode);
       const input = markYuiRunInput(leaderWakeupInput(
         task.id,
         runId,
         wakeup.reasons,
         task.projectBindings,
-        contextSnapshot,
+        wakeNotification,
         contextBudgetAdvisory
       ), runId, taskRoleSessionTitle(task, role.name));
       run = createAgentRun(
@@ -574,31 +574,32 @@ function hasNativeSession(
 }
 
 /**
- * Issue 04: builds the bounded context snapshot for a Leader wake. Resume
- * generations receive only records created after the previous Leader Run so
- * repeated small wakes do not re-embed the full history; fresh generations
- * (including hard-budget rollovers) receive the recent-record fallback.
- * Returns undefined when the store lacks the projection, so the wake falls
- * back to the full `yui task context` instruction.
+ * Issue 04 (long-term design): builds the bounded wake notification for a
+ * Leader wake. Resume generations receive only the delta after the previous
+ * Leader Run so repeated small wakes do not re-embed history; fresh
+ * generations (including hard-budget rollovers) receive a minimal orientation
+ * (goal + next action) plus a recent-activity fallback. Returns undefined
+ * when the store lacks the projection, so the wake falls back to the full
+ * `yui task context` instruction.
  */
-function resolveLeaderContextSnapshot(
+function resolveLeaderWakeNotification(
   store: SchedulerStorePort,
   taskId: string,
   mode: "new" | "resume"
 ): string | undefined {
-  if (typeof store.getTaskContextSnapshot !== "function") return undefined;
+  if (typeof store.getTaskWakeNotification !== "function") return undefined;
   const afterCreatedAt = mode === "resume"
     && typeof store.listAgentRuns === "function"
     ? store.listAgentRuns(taskId)
       .filter((run) => run.roleName === "leader")
       .at(-1)?.createdAt
     : undefined;
-  const snapshot = store.getTaskContextSnapshot({
+  const notification = store.getTaskWakeNotification({
     taskId,
     mode,
     ...(afterCreatedAt === undefined ? {} : { afterCreatedAt })
   });
-  return snapshot.text;
+  return notification.text;
 }
 
 function leaderWakeupInput(
@@ -606,7 +607,7 @@ function leaderWakeupInput(
   runId: string,
   reasons: readonly string[],
   projectBindings: readonly Readonly<{ projectId: string; directory: string }>[],
-  contextSnapshot: string | undefined,
+  wakeNotification: string | undefined,
   contextBudgetAdvisory: string | undefined
 ): string {
   const lines: string[] = [
@@ -615,12 +616,11 @@ function leaderWakeupInput(
     `For every Leader decision, milestone, or Work Item lifecycle command that is meaningful progress, carry this exact current-turn assertion on that command: YUI_LEADER_ACTION_RUN_ID=${runId} YUI_LEADER_ACTION_RECEIPT_ID=${formatAgentRunReceiptId(taskId, runId)}. The native Session environment may retain an older YUI_RUN_ID/launch; never copy those values, and never reuse this assertion after the turn changes.`,
     `Yui wakeup reasons: ${reasons.join(", ")}.`,
     ...(contextBudgetAdvisory === undefined ? [] : [contextBudgetAdvisory]),
-    ...(contextSnapshot === undefined
+    ...(wakeNotification === undefined
       ? [`Read the authoritative context with yui task context ${taskId}.`]
       : [
-          "Bounded Task context snapshot (Issue 04):",
-          contextSnapshot,
-          `This snapshot is a bounded projection of durable Yui records. Read full records on demand with yui task event list ${taskId}, yui task message list ${taskId}, yui task work list ${taskId}, or the full projection with yui task context ${taskId}.`
+          "Wake notification (Issue 04):",
+          wakeNotification
         ]),
     "Keep the context layers separate: Yui Core owns durable identity, lifecycle, access, workspace, and exact-yield safety; the generic role Skill owns portable collaboration behavior; Project Policy/Knowledge owns project-specific build, test, migration, release, and review rules; the Task Contract owns this Task's objective, scope, acceptance, and evidence.",
     "For role-run-stalled or runtime-health attention, diagnose from the exact Run/Event/Session and related WorkItem/Review/Integration records. Preserve the current fence and write a Task Message only for a new root cause, impact, recovery action, acceptance decision, or user-relevant conclusion; an unchanged healthy wait is zero Message.",

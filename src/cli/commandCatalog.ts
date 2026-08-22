@@ -348,7 +348,7 @@ const taskChildren: readonly NodeInput[] = [
         options: ["--body-file"],
         fileOptions: ["--body-file"]
       },
-      { name: "list", summary: "List Task messages.", usage: "yui task message list <id>" }
+      { name: "list", summary: "List Task messages.", usage: "yui task message list <id> [--after <timestamp>] [--limit <n>]", options: ["--after", "--limit"] }
     ]
   },
   {
@@ -838,7 +838,7 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Inspect the durable Task event history.",
     sections: [{ id: "manage", title: "Commands", entries: ["list", "show"] }],
     children: [
-      { name: "list", summary: "List Task events.", usage: "yui task event list <task>" },
+      { name: "list", summary: "List Task events.", usage: "yui task event list <task> [--after <timestamp>] [--limit <n>]", options: ["--after", "--limit"] },
       { name: "show", summary: "Show one Task event.", usage: "yui task event show <task> <event>" }
     ]
   },

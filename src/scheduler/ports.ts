@@ -477,12 +477,13 @@ export interface SchedulerStorePort {
   listDecisions(taskId: string): readonly Decision[];
   listMilestones(taskId: string): readonly Milestone[];
   /**
-   * Issue 04: bounded, deterministic context projection for a Leader wake.
+   * Issue 04: bounded wake notification for a Leader wake — delta since the
+   * last consumption point plus a minimal orientation for fresh generations.
    * Optional so adapters without the feature keep the full-context prompt.
    */
-  getTaskContextSnapshot?(
-    request: import("../context/contextSnapshot.js").ContextSnapshotRequest
-  ): import("../context/contextSnapshot.js").ContextSnapshot;
+  getTaskWakeNotification?(
+    request: import("../context/wakeNotification.js").WakeNotificationRequest
+  ): import("../context/wakeNotification.js").WakeNotification;
   /**
    * Issue 04: retire a native Session generation that crossed the hard
    * context budget so the next wake starts a fresh generation. Returns null

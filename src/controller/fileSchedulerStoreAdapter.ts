@@ -37,10 +37,10 @@ import {
 } from "../executor/turnCompletion.js";
 import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
 import {
-  buildTaskContextSnapshot,
-  type ContextSnapshot,
-  type ContextSnapshotRequest
-} from "../context/contextSnapshot.js";
+  buildTaskWakeNotification,
+  type WakeNotification,
+  type WakeNotificationRequest
+} from "../context/wakeNotification.js";
 import {
   rolloverTaskRoleSessionForContextBudget,
   type ContextBudgetRolloverResult
@@ -825,8 +825,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   getTaskBrief(taskId: string) { return this.store.getTaskBrief(taskId); }
   listDecisions(taskId: string) { return this.store.listDecisions(taskId); }
   listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
-  getTaskContextSnapshot(request: ContextSnapshotRequest): ContextSnapshot {
-    return this.store.transaction((reader) => buildTaskContextSnapshot(reader, request));
+  getTaskWakeNotification(request: WakeNotificationRequest): WakeNotification {
+    return this.store.transaction((reader) => buildTaskWakeNotification(reader, request));
   }
   rolloverTaskRoleSessionForContextBudget(input: Readonly<{
     taskId: string;
