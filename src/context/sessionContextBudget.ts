@@ -100,8 +100,11 @@ function usageTotal(usage: unknown): number | null {
   const record = usage as Record<string, unknown>;
   const inputTokens = integer(record.inputTokens);
   if (inputTokens === null) return null;
-  const cachedInputTokens = integer(record.cachedInputTokens) ?? 0;
-  return inputTokens + cachedInputTokens;
+  // RuntimeUsageSnapshot.inputTokens is the normalized processed input total.
+  // cachedInputTokens is an informational breakdown of that total, matching
+  // runtimeProjection and the Driver documentation; adding it again would
+  // fabricate context pressure and trigger premature Session rollover.
+  return inputTokens;
 }
 
 function integer(value: unknown): number | null {

@@ -1213,7 +1213,7 @@ export const ROOT_COMMAND = buildNode({
             {
               id: "manage",
               title: "Commands",
-              entries: ["add", "update", "retire", "list", "show", "propose", "proposals", "accept", "reject"]
+              entries: ["add", "retire", "list", "show", "propose", "proposals", "accept", "reject"]
             }
           ],
           children: [
@@ -1222,12 +1222,6 @@ export const ROOT_COMMAND = buildNode({
               summary: "Add Project knowledge (Operator authority).",
               usage: "yui project knowledge add <project> <title> --body <text>",
               options: ["--body"]
-            },
-            {
-              name: "update",
-              summary: "Update active Project knowledge (Operator authority).",
-              usage: "yui project knowledge update <project> <knowledge> [--title <text>] [--body <text>]",
-              options: ["--title", "--body"]
             },
             {
               name: "retire",

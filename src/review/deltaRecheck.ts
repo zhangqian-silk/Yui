@@ -64,13 +64,14 @@ export type DeltaRecheckAssessment = Readonly<
  * Reviewer's explicit disposition.
  */
 export async function assessDeltaRecheck(input: Readonly<{
-  repositoryPath: string;
+  /** Exact repository for every Project in the frozen Task candidate. */
+  repositoryPaths: Readonly<Record<string, string>>;
   previousRound: ReviewRound;
   candidate: TaskReviewCandidate;
   git: DeltaRecheckGitPort;
   config: ReviewConfig;
 }>): Promise<DeltaRecheckAssessment> {
-  const { repositoryPath, previousRound, candidate, git, config } = input;
+  const { repositoryPaths, previousRound, candidate, git, config } = input;
   if (previousRound.status !== "completed"
     || (previousRound.scope ?? "work-item") !== "task") {
     return {
@@ -93,6 +94,13 @@ export async function assessDeltaRecheck(input: Readonly<{
   let deletedLines = 0;
   let anyChange = false;
   for (const project of candidate.projects) {
+    const repositoryPath = repositoryPaths[project.projectId];
+    if (repositoryPath === undefined) {
+      return {
+        kind: "ineligible",
+        reason: `Delta recheck repository is unavailable for Project ${project.projectId}.`
+      };
+    }
     const previousHead = previousByProject.get(project.projectId);
     if (previousHead === undefined) {
       return {
@@ -267,16 +275,21 @@ function digestDiff(diffByProject: Readonly<Record<string, string>>): string {
  * the dispatch context; only path-like entries drive the deterministic gate.
  */
 function extractEvidencePaths(round: ReviewRound): string[] {
-  return [...new Set(extractEvidenceFromReportJson(round.report ?? ""))]
+  return previousEvidenceReferences(round)
     .filter((entry) => isPathLike(entry));
 }
 
-/** All evidence references from the previous Round's JSON report. */
+/** All path-like evidence references from Markdown or JSON Review reports. */
 function previousEvidenceReferences(round: ReviewRound): string[] {
-  return extractEvidenceFromReportJson(round.report ?? "");
+  const report = round.report ?? "";
+  return [...new Set([
+    ...extractDeclaredEvidence(report),
+    ...extractEvidenceReferences(report)
+  ])];
 }
 
-function extractEvidenceFromReportJson(report: string): string[] {
+/** Preserve the free-form evidence array that older JSON reports exposed. */
+function extractDeclaredEvidence(report: string): string[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(report) as unknown;
@@ -286,9 +299,23 @@ function extractEvidenceFromReportJson(report: string): string[] {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
   const evidence = (parsed as Record<string, unknown>).evidence;
   if (!Array.isArray(evidence)) return [];
-  return evidence
-    .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => entry.trim());
+  return evidence.flatMap((entry) => (
+    typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []
+  ));
+}
+
+/**
+ * Reviewer reports intentionally accept clear Markdown or JSON without a
+ * fixed schema. Extract conservative repo-relative path tokens from the full
+ * preserved report so evidence overlap cannot be bypassed by presentation
+ * format, nested JSON, Markdown links, backticks, or line-qualified paths.
+ */
+function extractEvidenceReferences(report: string): string[] {
+  const references = report.match(
+    /(?:\.{0,2}\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}/gu
+  ) ?? [];
+  return [...new Set(references.map((entry) => entry.replace(/^\.\//u, "")))]
+    .filter((entry) => isPathLike(entry));
 }
 
 function isPathLike(value: string): boolean {
@@ -302,8 +329,8 @@ function isPathLike(value: string): boolean {
 }
 
 function pathEvidenceMatches(evidencePath: string, changedFile: string): boolean {
-  const normalizedEvidence = evidencePath.replace(/^\.\//u, "");
-  const normalizedFile = changedFile.replace(/^\.\//u, "");
+  const normalizedEvidence = evidencePath.replace(/^\.\//u, "").replace(/\/+$/u, "");
+  const normalizedFile = changedFile.replace(/^\.\//u, "").replace(/\/+$/u, "");
   if (normalizedEvidence === normalizedFile) return true;
   // A directory-level evidence reference covers every file under it.
   return normalizedFile.startsWith(`${normalizedEvidence}/`);

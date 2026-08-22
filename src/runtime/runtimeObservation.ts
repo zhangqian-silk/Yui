@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   AgentRuntimeObserverSource,
   AgentRuntimeOperation,
@@ -560,7 +562,11 @@ export function runtimeObservationSemanticKey(input: Readonly<{
     ].join(":");
   }
   if (input.kind === "continuation.reported") {
-    return ["continuation-report", ...continuationIdentity, input.payload?.reportId ?? "missing"]
+    const summary = input.payload?.summary?.trim();
+    const resultIdentity = summary === undefined || summary.length === 0
+      ? input.payload?.reportId ?? "missing"
+      : `sha256:${createHash("sha256").update(summary).digest("hex")}`;
+    return ["continuation-report", ...continuationIdentity, resultIdentity]
       .join(":");
   }
   if (input.kind === "continuation.started") {

@@ -129,11 +129,23 @@ export function projectCompletionReadiness(
     });
   }
 
-  // Issue 07: a completed delta-recheck that did not accept the head keeps the
-  // completion gate closed.  `requires-full-review` escalates to a full Review;
-  // `finding` stays a blocker for the Leader to repair.
-  for (const round of facts.reviewRounds) {
-    if (!deltaRecheckBlocksAcceptance(round)) continue;
+  // Issue 07: only the latest completed Task-final Review can define whether
+  // the current review lineage is accepted. Historical delta findings and
+  // escalations remain audit evidence, but a later completed full Review (or
+  // accepted delta) supersedes them instead of blocking completion forever.
+  const latestCompletedTaskReview = facts.reviewRounds
+    .filter((round) => (
+      (round.scope ?? "work-item") === "task" && round.status === "completed"
+    ))
+    .slice()
+    .sort((left, right) => (
+      left.createdAt.localeCompare(right.createdAt)
+      || left.id.localeCompare(right.id, undefined, { numeric: true })
+    ))
+    .at(-1);
+  if (latestCompletedTaskReview !== undefined
+    && deltaRecheckBlocksAcceptance(latestCompletedTaskReview)) {
+    const round = latestCompletedTaskReview;
     const disposition = round.deltaRecheck!.disposition!;
     blockers.push({
       code: "delta-recheck-not-accepted",

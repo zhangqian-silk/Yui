@@ -726,7 +726,11 @@ function matchesRecoverySessionFence(
   const session = sessions.sessions[input.agentId];
   if (session === undefined) return false;
   if (session.agentId !== input.agentId || session.adapterId !== input.adapterId) return false;
-  if (session.status === "stopped" || session.status === "broken") return false;
+  // A dead Session is precisely when replace-session/terminate recovery is
+  // needed. Preserve its exact identity as the CAS fence; only same-Session
+  // retry is invalid once the native process is stopped or broken.
+  if ((session.status === "stopped" || session.status === "broken")
+    && input.action === "retry") return false;
 
   const sessionNativeSessionId = session.nativeSessionId;
   if (sessionNativeSessionId === undefined) {

@@ -790,23 +790,12 @@ function projectKnowledge(
     };
   }
   if (command === "update") {
-    const usage = "Project knowledge update usage: yui project knowledge update <project> <knowledge> [--title <text>] [--body <text>].";
-    const parsed = parseKnowledgeUpdateArguments(rest, usage);
-    assertKnowledgeOperator(options, "update");
-    const updated = store.transaction((tx) => {
-      const project = requireProject(tx, parsed.project);
-      const next = updateProjectKnowledge(project, parsed.id, {
-        ...(parsed.title === undefined ? {} : { title: parsed.title }),
-        ...(parsed.body === undefined ? {} : { body: parsed.body })
-      }, (options.now ?? (() => new Date()))());
-      tx.saveProject(next);
-      return next;
-    });
-    return {
-      output: `Updated project knowledge ${parsed.id} in ${updated.id}\n`,
-      projectId: updated.id,
-      knowledgeId: parsed.id
-    };
+    throw usageError(
+      "Direct Project Knowledge update is not supported because it would erase version history. "
+      + "Propose the replacement with `yui project knowledge propose <project> ... --task <task>` "
+      + "and let the Operator apply it with `yui project knowledge accept <project> <proposal> "
+      + "--update <knowledge>`; use --supersedes when replacing Knowledge without proposal history."
+    );
   }
   if (command === "retire") {
     if (rest.length !== 2) {
@@ -1241,6 +1230,19 @@ function acceptKnowledgeProposal(
       if (target.status !== "active") {
         throw usageError(`Knowledge is not active: ${target.id}.`);
       }
+      const previousProposal = target.provenance?.proposalId === undefined
+        ? null
+        : findKnowledgeProposal(next, target.provenance.proposalId);
+      if (previousProposal === null
+        || previousProposal.status !== "accepted"
+        || previousProposal.knowledgeId !== target.id
+        || previousProposal.title !== target.title
+        || previousProposal.body !== target.body) {
+        throw usageError(
+          `Knowledge ${target.id} has no complete proposal-backed version history. `
+          + "Create the replacement proposal with --supersedes instead of --update."
+        );
+      }
       knowledgeId = target.id;
       next = updateProjectKnowledge(next, knowledgeId, {
         title: proposal.title,
@@ -1496,42 +1498,6 @@ function parseProjectUpdateArguments(
     ...(remote === undefined ? {} : { remote }),
     ...(stable === undefined ? {} : { stable }),
     ...(development === undefined ? {} : { development })
-  };
-}
-
-function parseKnowledgeUpdateArguments(
-  args: readonly string[],
-  usage: string
-): Readonly<{ project: string; id: string; title?: string; body?: string }> {
-  const positionals: string[] = [];
-  let title: string | undefined;
-  let body: string | undefined;
-  for (let index = 0; index < args.length; index += 1) {
-    const value = args[index]!;
-    if (value === "--title" || value === "--body") {
-      const next = args[index + 1];
-      if (next === undefined || next.startsWith("--")) throw usageError(`${value} is required. ${usage}`);
-      if (value === "--title") {
-        if (title !== undefined) throw usageError(`--title may only be provided once. ${usage}`);
-        title = requireText(next, value);
-      } else {
-        if (body !== undefined) throw usageError(`--body may only be provided once. ${usage}`);
-        body = requireText(next, value);
-      }
-      index += 1;
-      continue;
-    }
-    if (value.startsWith("--")) throw usageError(`Unknown option: ${value}. ${usage}`);
-    positionals.push(value);
-  }
-  if (positionals.length !== 2 || (title === undefined && body === undefined)) {
-    throw usageError(usage);
-  }
-  return {
-    project: positionals[0]!,
-    id: positionals[1]!,
-    ...(title === undefined ? {} : { title }),
-    ...(body === undefined ? {} : { body })
   };
 }
 

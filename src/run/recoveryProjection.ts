@@ -214,8 +214,11 @@ export function projectRunRecovery(facts: RunRecoveryFacts): RunRecoveryProjecti
     : ["rejected", "ambiguous"] as const;
 
   const blocked = recoveryBlocker(facts, session, canonicalProgressAt);
+  const supportedActions = session?.status === "stopped" || session?.status === "broken"
+    ? RUN_RECOVERY_ACTIONS.filter((action) => action !== "retry")
+    : RUN_RECOVERY_ACTIONS;
   const actions = blocked === null
-    ? RUN_RECOVERY_ACTIONS.map((action) => buildActionPlan(facts, action, session!, canonicalProgressAt!))
+    ? supportedActions.map((action) => buildActionPlan(facts, action, session!, canonicalProgressAt!))
     : [];
 
   const judgmentRequired = blocked === null && actions.some((plan) =>
@@ -282,8 +285,6 @@ function recoveryBlocker(
   if (run.status !== "active") return "run-terminal";
   if (canonicalProgressAt === null) return "progress-unavailable";
   if (session === null) return "session-missing";
-  if (session.status === "stopped") return "session-stopped";
-  if (session.status === "broken") return "session-broken";
   return null;
 }
 
