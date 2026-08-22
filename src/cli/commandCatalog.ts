@@ -340,13 +340,12 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "list",
         summary: "List legacy Task refs and their live owners.",
-        usage: "yui task history list [--task <task>]"
+        usage: "yui task history list [task]"
       },
       {
         name: "archive",
         summary: "Archive legacy Task refs without a live owner.",
-        usage: "yui task history archive [<task>] [--force]",
-        options: ["--force"]
+        usage: "yui task history archive [task]"
       }
     ]
   },
@@ -365,10 +364,19 @@ const taskChildren: readonly NodeInput[] = [
         name: "send",
         summary: "Send a Task message.",
         usage: "yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none] [--delivery-mode followup|steer]",
-        options: ["--body-file"],
+        options: ["--body-file", "--wake-policy", "--delivery-mode"],
+        optionValues: {
+          "--wake-policy": ["leader", "none"],
+          "--delivery-mode": ["followup", "steer"]
+        },
         fileOptions: ["--body-file"]
       },
-      { name: "list", summary: "List Task messages.", usage: "yui task message list <id>" }
+      {
+        name: "list",
+        summary: "List Task messages.",
+        usage: "yui task message list <id> [--after <timestamp>] [--limit <n>]",
+        options: ["--after", "--limit"]
+      }
     ]
   },
   {
@@ -659,8 +667,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "recover",
         summary: "Record one exact Leader-controlled Run recovery decision.",
-        usage: "yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> --expected-progress-at <timestamp> --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
-        options: ["--action", "--expected-progress-at", "--provider-acceptance", "--reason", "--role", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
+        usage: "yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> (--expected-progress-at <timestamp>|--progress-at <timestamp>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
+        options: ["--action", "--expected-progress-at", "--progress-at", "--provider-acceptance", "--reason", "--role", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
       },
       {
         name: "yield",
@@ -858,7 +866,12 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Inspect the durable Task event history.",
     sections: [{ id: "manage", title: "Commands", entries: ["list", "show"] }],
     children: [
-      { name: "list", summary: "List Task events.", usage: "yui task event list <task>" },
+      {
+        name: "list",
+        summary: "List Task events.",
+        usage: "yui task event list <task> [--after <timestamp>] [--limit <n>]",
+        options: ["--after", "--limit"]
+      },
       { name: "show", summary: "Show one Task event.", usage: "yui task event show <task> <event>" }
     ]
   },
