@@ -255,6 +255,12 @@ export type YuiConfig = Readonly<{
    * Homes without it default to `display`, so no config migration is needed.
    */
   leaderNextActionMode?: "display" | "warn" | "enforce";
+  /**
+   * Issue 04 (context token budget): per-Session-generation input peak
+   * thresholds. Optional additive field; Homes without it use the defaults,
+   * so no config migration is needed.
+   */
+  contextBudget?: import("../config/yuiConfig.js").ContextBudgetConfig;
   completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
 }>;
 export type ConfiguredAgentPatch = Readonly<Partial<

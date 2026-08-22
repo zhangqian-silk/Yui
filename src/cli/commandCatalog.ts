@@ -1008,7 +1008,7 @@ export const ROOT_COMMAND = buildNode({
     {
       name: "config",
       summary: "Inspect or update Yui configuration.",
-      sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "review", "leader-next-action"] }],
+      sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "review", "leader-next-action", "context-budget"] }],
       children: [
         { name: "show", summary: "Show effective Yui configuration." },
         {
@@ -1052,6 +1052,21 @@ export const ROOT_COMMAND = buildNode({
               usage: "yui config leader-next-action set <display|warn|enforce>"
             },
             { name: "clear", summary: "Reset to the default display mode." }
+          ]
+        },
+        {
+          name: "context-budget",
+          summary: "Configure the per-Session context token budget (Issue 04).",
+          sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
+          children: [
+            { name: "show", summary: "Show the context token budget thresholds." },
+            {
+              name: "set",
+              summary: "Set the soft/hard per-request input peak thresholds (tokens).",
+              usage: "yui config context-budget set [--soft-tokens <n>] [--hard-tokens <n>]",
+              options: ["--soft-tokens", "--hard-tokens"]
+            },
+            { name: "clear", summary: "Reset to the default thresholds." }
           ]
         }
       ]

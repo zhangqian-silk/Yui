@@ -36,6 +36,19 @@ import {
   hasRecentTurnId
 } from "../executor/turnCompletion.js";
 import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
+import {
+  buildTaskContextSnapshot,
+  type ContextSnapshot,
+  type ContextSnapshotRequest
+} from "../context/contextSnapshot.js";
+import {
+  rolloverTaskRoleSessionForContextBudget,
+  type ContextBudgetRolloverResult
+} from "../lifecycle/contextBudgetRollover.js";
+import {
+  resolveContextBudget,
+  type ResolvedContextBudget
+} from "../config/yuiConfig.js";
 import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import {
@@ -812,6 +825,27 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   getTaskBrief(taskId: string) { return this.store.getTaskBrief(taskId); }
   listDecisions(taskId: string) { return this.store.listDecisions(taskId); }
   listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
+  getTaskContextSnapshot(request: ContextSnapshotRequest): ContextSnapshot {
+    return this.store.transaction((reader) => buildTaskContextSnapshot(reader, request));
+  }
+  rolloverTaskRoleSessionForContextBudget(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    peakTokens: number;
+    hardTokens: number;
+    now: Date;
+  }>): ContextBudgetRolloverResult | null {
+    return this.store.transaction((reader) => rolloverTaskRoleSessionForContextBudget(
+      reader,
+      input.taskId,
+      input.roleName,
+      { peakTokens: input.peakTokens, hardTokens: input.hardTokens },
+      input.now
+    ));
+  }
+  getContextBudget(): ResolvedContextBudget {
+    return resolveContextBudget(this.store.getConfig().contextBudget);
+  }
 
   listRoles(taskId: string): SchedulerRole[] {
     return this.store.listRoles(taskId).map((role) => mapRole(this.store, role));

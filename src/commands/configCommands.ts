@@ -20,6 +20,12 @@ import {
   resolveLeaderNextActionMode,
   type LeaderNextActionMode
 } from "../config/yuiConfig.js";
+import {
+  DEFAULT_CONTEXT_HARD_TOKENS,
+  DEFAULT_CONTEXT_SOFT_TOKENS,
+  resolveContextBudget,
+  type ContextBudgetConfig
+} from "../config/yuiConfig.js";
 
 type ConfigCommandStore = Readonly<{
   transaction<T>(execute: (store: ConfigCommandStore) => T): T;
@@ -38,6 +44,7 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
   const [command, ...rest] = args;
   if (command === "review") return runReviewConfigCommand(rest, store);
   if (command === "leader-next-action") return runLeaderNextActionConfigCommand(rest, store);
+  if (command === "context-budget") return runContextBudgetConfigCommand(rest, store);
   if (command === "show") {
     if (rest.length !== 0) throw usageError("Config show usage: yui config show.");
     const config = store.getConfig();
@@ -48,6 +55,7 @@ export function runConfigCommand(args: string[], store: ConfigCommandStore): str
       `Time zone: ${resolveTimeZone(config.timeZone)}`,
       `Reconciliation interval: ${reconciliationIntervalSeconds} seconds`,
       `Leader next-action mode: ${resolveLeaderNextActionMode(config.leaderNextActionMode)}`,
+      `Context budget: soft ${resolveContextBudget(config.contextBudget).softTokens} / hard ${resolveContextBudget(config.contextBudget).hardTokens} tokens`,
       `Resources GC mode: ${resolveResourcesGcMode(config.resourcesGcMode)}`,
       `Resources GC auto-quarantine: ${resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine) ? "on" : "off"}`,
       ""
@@ -137,6 +145,70 @@ function runLeaderNextActionConfigCommand(
   throw usageError(command === undefined
     ? "Config leader-next-action command is required."
     : `Unknown command: config leader-next-action ${command}`);
+}
+
+function runContextBudgetConfigCommand(
+  args: string[],
+  store: ConfigCommandStore
+): string {
+  const [command, ...rest] = args;
+  if (command === "show") {
+    if (rest.length !== 0) {
+      throw usageError("Config context-budget show usage: yui config context-budget show.");
+    }
+    const budget = resolveContextBudget(store.getConfig().contextBudget);
+    return `Context budget: soft ${budget.softTokens} / hard ${budget.hardTokens} tokens\n`;
+  }
+  if (command === "set") {
+    const usage = "Config context-budget set usage: "
+      + "yui config context-budget set [--soft-tokens <n>] [--hard-tokens <n>].";
+    if (rest.length !== 2 && rest.length !== 4) throw usageError(usage);
+    const options = new Map<string, string>();
+    for (let index = 0; index < rest.length; index += 2) {
+      const name = rest[index];
+      const value = rest[index + 1];
+      if (!["--soft-tokens", "--hard-tokens"].includes(name)
+        || value === undefined
+        || options.has(name)) {
+        throw usageError(usage);
+      }
+      options.set(name, value);
+    }
+    const current = resolveContextBudget(store.getConfig().contextBudget);
+    const next: ContextBudgetConfig = {
+      ...(options.get("--soft-tokens") === undefined
+        ? {}
+        : { softTokens: parseBudgetToken(options.get("--soft-tokens")!, "--soft-tokens") }),
+      ...(options.get("--hard-tokens") === undefined
+        ? {}
+        : { hardTokens: parseBudgetToken(options.get("--hard-tokens")!, "--hard-tokens") })
+    };
+    const resolved = resolveContextBudget({ ...current, ...next });
+    store.transaction((tx) => {
+      tx.saveConfig({ ...tx.getConfig(), contextBudget: resolved });
+    });
+    return `Context budget set to soft ${resolved.softTokens} / hard ${resolved.hardTokens} tokens\n`;
+  }
+  if (command === "clear") {
+    if (rest.length !== 0) {
+      throw usageError("Config context-budget clear usage: yui config context-budget clear.");
+    }
+    store.transaction((tx) => {
+      const { contextBudget: _cleared, ...config } = tx.getConfig();
+      tx.saveConfig(config);
+    });
+    return `Context budget reset to soft ${DEFAULT_CONTEXT_SOFT_TOKENS} / hard ${DEFAULT_CONTEXT_HARD_TOKENS} tokens\n`;
+  }
+  throw usageError(command === undefined
+    ? "Config context-budget command is required."
+    : `Unknown command: config context-budget ${command}`);
+}
+
+function parseBudgetToken(value: string, label: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw usageError(`${label} must be a positive integer.`);
+  }
+  return Number(value);
 }
 
 function runReviewConfigCommand(args: string[], store: ConfigCommandStore): string {
