@@ -194,6 +194,10 @@ export type LeaderDispatchPersistence = Readonly<{
   run: SchedulerAgentRun;
   session: SchedulerRoleSession | null;
   wakeup: PendingWakeup;
+  /** The TaskWake record id this dispatch will persist (peeked before dispatch). */
+  wakeId?: string;
+  /** The delta window's exclusive lower bound for this wake. */
+  wakeFromCursor?: string;
   now: Date;
 }>;
 
@@ -477,13 +481,15 @@ export interface SchedulerStorePort {
   listDecisions(taskId: string): readonly Decision[];
   listMilestones(taskId: string): readonly Milestone[];
   /**
-   * Issue 04: bounded wake notification for a Leader wake — delta since the
-   * last consumption point plus a minimal orientation for fresh generations.
-   * Optional so adapters without the feature keep the full-context prompt.
+   * Issue 04 (long-term): the minimal wake envelope for a Leader wake —
+   * aggregated reason tags, the delta window, and read pointers. The Agent
+   * reads delta content on demand with `yui task wake show`. Returns null
+   * when no wake is pending. Optional so adapters without the feature keep
+   * the full-context prompt.
    */
-  getTaskWakeNotification?(
-    request: import("../context/wakeNotification.js").WakeNotificationRequest
-  ): import("../context/wakeNotification.js").WakeNotification;
+  getTaskWakeEnvelope?(
+    taskId: string
+  ): import("../context/wakeNotification.js").WakeEnvelope | null;
   /**
    * Issue 04: retire a native Session generation that crossed the hard
    * context budget so the next wake starts a fresh generation. Returns null

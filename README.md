@@ -250,6 +250,20 @@ operation and requires the checkout to be on that branch; detached or mismatched
 
 Use `task context` as the first detailed read of an existing Task. It combines the Task, Brief, active Decisions, recent Milestones, Roles, current and recent WorkItems with their Runs, recent Messages, open and resolved InputRequests, and recent Events. Terminal output keeps histories and long text compact; `yui --json task context <task-id>` returns the complete records in the top-level `data` field.
 
+Leader wakeups stay deliberately small: the wake envelope carries only the
+aggregated wake reasons, a delta window, and read pointers. The durable wake
+ledger is the on-demand read for what changed:
+
+```sh
+yui task wake list <task-id>
+yui task wake show <task-id> <wake-id>
+```
+
+`wake list` shows the dispatch history with status, reasons, and consuming
+Run; `wake show` renders one wake's delta window — the Events, Messages, and
+Runs recorded between its cursors. A human or Agent can still force a wake
+with `yui task wake <task-id> --force --reason "<text>"`.
+
 Human-facing timestamps default to Beijing time (`Asia/Shanghai`) while durable
 records and `--json` data remain UTC/RFC 3339. Inspect or change the IANA
 timezone with:

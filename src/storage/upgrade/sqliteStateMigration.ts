@@ -53,6 +53,7 @@ import type { CapabilityGrant } from "../../grant/capabilityGrant.js";
 import type { ReleaseWorkflow } from "../../release/releaseWorkflow.js";
 import type { LeaderFailure } from "../../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../../scheduler/operatorNotification.js";
+import type { TaskWake } from "../../scheduler/taskWake.js";
 import type { Task } from "../../task/task.js";
 import type { WorkItem } from "../../workItem/workItem.js";
 import type { ManagedWorkspace } from "../../worktree/managedWorkspace.js";
@@ -254,6 +255,7 @@ interface StoredTaskShape {
   decisions: Record<string, Record<string, unknown>>;
   milestones: Record<string, Record<string, unknown>>;
   events: Record<string, Record<string, unknown>>;
+  wakes: Record<string, Record<string, unknown>>;
   leaderFailure: Record<string, unknown> | null;
   operatorNotification: Record<string, unknown> | null;
   idHighWaterMarks: Record<string, number>;
@@ -286,6 +288,7 @@ function asStoredTask(value: unknown): StoredTaskShape {
     decisions: asObjectMap(record.decisions),
     milestones: asObjectMap(record.milestones),
     events: asObjectMap(record.events),
+    wakes: asObjectMap(record.wakes),
     leaderFailure: asNullableObject(record.leaderFailure),
     operatorNotification: asNullableObject(record.operatorNotification),
     idHighWaterMarks: asObject(record.idHighWaterMarks) as Record<string, number>,
@@ -454,6 +457,9 @@ export function populateSqliteFromState(
         for (const event of Object.values(stored.events)) {
           store.saveEvent(taskId, event as unknown as TaskEvent);
         }
+        for (const wake of Object.values(stored.wakes)) {
+          store.saveTaskWake(taskId, wake as unknown as TaskWake);
+        }
         if (stored.leaderFailure !== null) {
           store.saveLeaderFailure(stored.leaderFailure as unknown as LeaderFailure);
         }
@@ -603,6 +609,7 @@ export function computeStateFamilyChecksums(
   const decisions: unknown[] = [];
   const milestones: unknown[] = [];
   const events: unknown[] = [];
+  const wakes: unknown[] = [];
   const leaderFailures: unknown[] = [];
   const operatorNotifications: unknown[] = [];
   const capabilityGrants: unknown[] = [];
@@ -641,6 +648,7 @@ export function computeStateFamilyChecksums(
     decisions.push(...Object.values(stored.decisions));
     milestones.push(...Object.values(stored.milestones));
     events.push(...Object.values(stored.events));
+    wakes.push(...Object.values(stored.wakes));
     if (stored.leaderFailure !== null) leaderFailures.push(stored.leaderFailure);
     if (stored.operatorNotification !== null) operatorNotifications.push(stored.operatorNotification);
     capabilityGrants.push(...Object.values(stored.capabilityGrants));
@@ -666,6 +674,7 @@ export function computeStateFamilyChecksums(
   checksums.decision = hashRecords(decisions);
   checksums.milestone = hashRecords(milestones);
   checksums.event = hashRecords(events);
+  checksums.taskWake = hashRecords(wakes);
   checksums.leaderFailure = hashRecords(leaderFailures);
   checksums.operatorNotification = hashRecords(operatorNotifications);
   checksums.capabilityGrant = hashRecords(capabilityGrants);
@@ -815,6 +824,7 @@ export function computeDbFamilyChecksums(
     checksums.decision = hashPayloadTable(db, "SELECT payload FROM decisions");
     checksums.milestone = hashPayloadTable(db, "SELECT payload FROM milestones");
     checksums.event = hashPayloadTable(db, "SELECT payload FROM events");
+    checksums.taskWake = hashPayloadTable(db, "SELECT payload FROM task_wakes");
     checksums.leaderFailure = hashPayloadTable(
       db,
       "SELECT payload FROM task_projections WHERE kind = 'leader-failure' AND payload IS NOT NULL"
@@ -972,6 +982,7 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
         decisions: {},
         milestones: {},
         events: {},
+        wakes: {},
         leaderFailure: null,
         operatorNotification: null,
         idHighWaterMarks: {},
@@ -1020,6 +1031,7 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
     loadTaskPayloadMap(db, "decisions", tasks, "decisions", (record) => record.id as string);
     loadTaskPayloadMap(db, "milestones", tasks, "milestones", (record) => record.id as string);
     loadTaskPayloadMap(db, "events", tasks, "events", (record) => record.id as string);
+    loadTaskPayloadMap(db, "task_wakes", tasks, "wakes", (record) => record.id as string);
     loadTaskPayloadMap(
       db,
       "capability_grants",

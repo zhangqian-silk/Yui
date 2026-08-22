@@ -51,6 +51,7 @@ import {
 } from "../taskStore.js";
 import { CURRENT_LEADER_FAILURE_SCHEMA_VERSION } from "../../scheduler/leaderFailure.js";
 import { CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION } from "../../scheduler/operatorNotification.js";
+import { CURRENT_TASK_WAKE_SCHEMA_VERSION } from "../../scheduler/taskWake.js";
 import { CURRENT_DURABLE_JOB_SCHEMA_VERSION } from "../../job/durableJob.js";
 import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js";
 
@@ -90,6 +91,7 @@ const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object
   decision: "state.json#/tasks/*/decisions",
   milestone: "state.json#/tasks/*/milestones",
   event: "state.json#/tasks/*/events",
+  taskWake: "state.json#/tasks/*/wakes",
   capabilityGrant: "state.json#/tasks/*/capabilityGrants",
   releaseWorkflow: "state.json#/tasks/*/releaseWorkflows",
   leaderFailure: "state.json#/tasks/*/leaderFailure",
@@ -174,6 +176,7 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
       decision: descriptor(CURRENT_DECISION_SCHEMA_VERSION, "state.json#/tasks/*/decisions"),
       milestone: descriptor(CURRENT_MILESTONE_SCHEMA_VERSION, "state.json#/tasks/*/milestones"),
       event: descriptor(CURRENT_EVENT_SCHEMA_VERSION, "state.json#/tasks/*/events"),
+      taskWake: descriptor(CURRENT_TASK_WAKE_SCHEMA_VERSION, "state.json#/tasks/*/wakes"),
       capabilityGrant: descriptor(
         CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION,
         "state.json#/tasks/*/capabilityGrants"

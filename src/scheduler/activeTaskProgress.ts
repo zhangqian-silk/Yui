@@ -5,6 +5,7 @@ import {
   type SchedulerStorePort
 } from "./ports.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
+import { wakeReason } from "./wakeReason.js";
 import { projectTaskExecution } from "./taskExecutionProjection.js";
 import {
   collectTaskActionability,
@@ -74,11 +75,11 @@ export function repairOrphanedActiveTasks(
     if (leaderMailbox?.processing !== null && leaderMailbox?.processing !== undefined) {
       const recovered = store.releaseLeaderWakeupAndEnqueue === undefined
         ? store.releaseWorkMailbox(leaderTarget, leaderMailbox.processing.batchId)
-          && (queueLeaderWakeup(store, task.id, "task-orphaned", now), true)
+          && (queueLeaderWakeup(store, task.id, wakeReason("task-orphaned"), now), true)
         : store.releaseLeaderWakeupAndEnqueue(
             task.id,
             leaderMailbox.processing.batchId,
-            "task-orphaned",
+            wakeReason("task-orphaned"),
             now
           );
       if (recovered) {
@@ -87,7 +88,7 @@ export function repairOrphanedActiveTasks(
       continue;
     }
 
-    queueLeaderWakeup(store, task.id, "task-orphaned", now);
+    queueLeaderWakeup(store, task.id, wakeReason("task-orphaned"), now);
     repaired.push(task.id);
   }
   return repaired;

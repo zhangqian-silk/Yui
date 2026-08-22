@@ -60,6 +60,10 @@ const STORED_TASK_DURABLE_JOBS_FROM_VERSION = 14;
 const STORED_TASK_DURABLE_JOBS_TO_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION = 16;
+const STORED_TASK_WAKES_FROM_VERSION = 16;
+const STORED_TASK_WAKES_TO_VERSION = 17;
+const TASK_WAKE_FROM_VERSION = 0;
+const TASK_WAKE_TO_VERSION = 1;
 const CAPABILITY_GRANT_FROM_VERSION = 0;
 const CAPABILITY_GRANT_TO_VERSION = 1;
 const RELEASE_WORKFLOW_FROM_VERSION = 0;
@@ -175,6 +179,8 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(integrationQueueIntroductionStep())
     .registerCompatible(storedTaskDurableJobsStep())
     .registerCompatible(storedTaskJobCallerKeyHashesStep())
+    .registerCompatible(storedTaskWakesStep())
+    .registerCompatible(taskWakeIntroductionStep())
     .registerCompatible(durableJobIntroductionStep())
     .registerOfflineMigration(capabilityGrantIntroductionStep())
     .registerOfflineMigration(releaseWorkflowIntroductionStep())
@@ -1122,6 +1128,161 @@ function normalizeStoredTaskV15ToV16(snapshot: HomeSnapshot): HomeSnapshot {
   return {
     schemaManifest,
     state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * StoredTask v17 introduces the durable TaskWake ledger (Issue 04 long-term
+ * design). Every aggregate gains an empty `wakes` map and a zero high-water
+ * mark; existing wake history starts empty and the cursor falls back to the
+ * last Leader Run creation time until the first wake is dispatched.
+ */
+function storedTaskWakesStep(): CompatibleStep<HomeSnapshot> {
+  return {
+    kind: "compatible",
+    axis: "record",
+    recordKind: "storedTask",
+    fromVersion: STORED_TASK_WAKES_FROM_VERSION,
+    toVersion: STORED_TASK_WAKES_TO_VERSION,
+    defaults: [
+      "wakes defaults to an empty map on every Task aggregate"
+    ],
+    validateSource: (snapshot) => requireStoredTaskV16Shape(snapshot),
+    normalize: (snapshot) => normalizeStoredTaskV16ToV17(snapshot)
+  };
+}
+
+const STORED_TASK_V16_FIELDS = [
+  "schemaVersion",
+  "task",
+  "idHighWaterMarks",
+  "brief",
+  "changeSets",
+  "integrationAttempts",
+  "integrationQueue",
+  "durableJobs",
+  "jobCallerKeyHashes",
+  "capabilityGrants",
+  "releaseWorkflows",
+  "roles",
+  "managedWorkspaces",
+  "roleSessionSets",
+  "workItems",
+  "agentRuns",
+  "reviewRounds",
+  "activeRuns",
+  "messages",
+  "inputRequests",
+  "decisions",
+  "milestones",
+  "events",
+  "leaderFailure",
+  "operatorNotification"
+] as const;
+
+function requireStoredTaskV16Shape(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.storedTask !== STORED_TASK_WAKES_FROM_VERSION) {
+    throw new Error(
+      `Record storedTask compatible step requires manifest version ${STORED_TASK_WAKES_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.schemaVersion !== STORED_TASK_WAKES_FROM_VERSION) {
+      throw new Error(
+        `Task aggregate ${taskId} must use schemaVersion ${STORED_TASK_WAKES_FROM_VERSION}.`
+      );
+    }
+    const allowed = new Set<string>(STORED_TASK_V16_FIELDS);
+    const unknown = Object.keys(task).find((key) => !allowed.has(key));
+    if (unknown !== undefined) {
+      throw new Error(
+        `Task aggregate ${taskId} has an unknown v16 field: ${unknown}.`
+      );
+    }
+  }
+}
+
+function normalizeStoredTaskV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {
+  requireStoredTaskV16Shape(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      storedTask: STORED_TASK_WAKES_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const marks = asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`);
+    nextTasks[taskId] = {
+      ...task,
+      schemaVersion: STORED_TASK_WAKES_TO_VERSION,
+      idHighWaterMarks: { ...marks, taskWake: TASK_WAKE_FROM_VERSION },
+      wakes: {}
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * The taskWake record family is introduced alongside StoredTask v17. The
+ * compatible step supplies the empty map and high-water mark; this step only
+ * advances the manifest record version so the planner can resolve the 0->1
+ * boundary.
+ */
+function taskWakeIntroductionStep(): CompatibleStep<HomeSnapshot> {
+  return {
+    kind: "compatible",
+    axis: "record",
+    recordKind: "taskWake",
+    fromVersion: TASK_WAKE_FROM_VERSION,
+    toVersion: TASK_WAKE_TO_VERSION,
+    introduction: true,
+    defaults: [
+      "taskWake family starts at version 1 with an empty ledger"
+    ],
+    validateSource: (snapshot) => {
+      const manifestVersions = asObject(
+        snapshot.schemaManifest.recordVersions,
+        "schema manifest recordVersions"
+      );
+      const namedVersion = manifestVersions.taskWake;
+      if (namedVersion !== undefined && namedVersion !== TASK_WAKE_FROM_VERSION) {
+        throw new Error(
+          `Record taskWake introduction requires an absent manifest version or ${TASK_WAKE_FROM_VERSION}.`
+        );
+      }
+    },
+    normalize: (snapshot) => ({
+      schemaManifest: {
+        ...snapshot.schemaManifest,
+        recordVersions: {
+          ...asObject(
+            snapshot.schemaManifest.recordVersions,
+            "schema manifest recordVersions"
+          ),
+          taskWake: TASK_WAKE_TO_VERSION
+        }
+      },
+      state: snapshot.state
+    })
   };
 }
 

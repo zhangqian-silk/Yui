@@ -843,6 +843,15 @@ const taskChildren: readonly NodeInput[] = [
     ]
   },
   {
+    name: "wake",
+    summary: "Inspect the durable Leader wake ledger and its delta content.",
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "show"] }],
+    children: [
+      { name: "list", summary: "List recorded Leader wakes.", usage: "yui task wake list <task>" },
+      { name: "show", summary: "Show one wake and its delta content.", usage: "yui task wake show <task> <wake>" }
+    ]
+  },
+  {
     name: "overlap",
     summary: "Show read-only cross-Task overlap diagnostics.",
     usage: "yui task overlap [--project <project>] [--base <sha>] [--task <task> ...]",
@@ -1219,7 +1228,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
-        { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
+        { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "wake"] }
       ],
       children: taskChildren
     },

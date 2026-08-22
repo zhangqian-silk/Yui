@@ -199,13 +199,11 @@ export async function processLeaderWakeups(
       }
       const mode = hasNativeSession(existingSession) && compatibleSession ? "resume" : "new";
       const runId = store.peekNextAgentRunId(task.id);
-      const wakeNotification = resolveLeaderWakeNotification(store, task.id, mode);
+      const wakeEnvelope = resolveLeaderWakeEnvelope(store, task.id);
       const input = markYuiRunInput(leaderWakeupInput(
         task.id,
         runId,
-        wakeup.reasons,
-        task.projectBindings,
-        wakeNotification,
+        wakeEnvelope,
         contextBudgetAdvisory
       ), runId, taskRoleSessionTitle(task, role.name));
       run = createAgentRun(
@@ -232,6 +230,10 @@ export async function processLeaderWakeups(
         // durable, retryable recovery obligation before any provider call.
         session: reopenIdentityDrift ? null : existingSession,
         wakeup,
+        ...(wakeEnvelope === null ? {} : {
+          wakeId: wakeEnvelope.wakeId,
+          wakeFromCursor: wakeEnvelope.fromCursor
+        }),
         now
       });
       if (claim !== "claimed") {
@@ -574,63 +576,38 @@ function hasNativeSession(
 }
 
 /**
- * Issue 04 (long-term design): builds the bounded wake notification for a
- * Leader wake. Resume generations receive only the delta after the previous
- * Leader Run so repeated small wakes do not re-embed history; fresh
- * generations (including hard-budget rollovers) receive a minimal orientation
- * (goal + next action) plus a recent-activity fallback. Returns undefined
- * when the store lacks the projection, so the wake falls back to the full
- * `yui task context` instruction.
+ * Issue 04 (long-term design): resolves the minimal wake envelope for a
+ * Leader wake. The envelope carries only the aggregated reason tags, the
+ * delta window, and read pointers; the Agent reads delta content on demand
+ * with `yui task wake show`. Returns null when the adapter lacks the
+ * projection, so the wake falls back to the full `yui task context`
+ * instruction.
  */
-function resolveLeaderWakeNotification(
+function resolveLeaderWakeEnvelope(
   store: SchedulerStorePort,
-  taskId: string,
-  mode: "new" | "resume"
-): string | undefined {
-  if (typeof store.getTaskWakeNotification !== "function") return undefined;
-  const afterCreatedAt = mode === "resume"
-    && typeof store.listAgentRuns === "function"
-    ? store.listAgentRuns(taskId)
-      .filter((run) => run.roleName === "leader")
-      .at(-1)?.createdAt
-    : undefined;
-  const notification = store.getTaskWakeNotification({
-    taskId,
-    mode,
-    ...(afterCreatedAt === undefined ? {} : { afterCreatedAt })
-  });
-  return notification.text;
+  taskId: string
+): import("../context/wakeNotification.js").WakeEnvelope | null {
+  if (typeof store.getTaskWakeEnvelope !== "function") return null;
+  return store.getTaskWakeEnvelope(taskId);
 }
 
 function leaderWakeupInput(
   taskId: string,
   runId: string,
-  reasons: readonly string[],
-  projectBindings: readonly Readonly<{ projectId: string; directory: string }>[],
-  wakeNotification: string | undefined,
+  wakeEnvelope: import("../context/wakeNotification.js").WakeEnvelope | null,
   contextBudgetAdvisory: string | undefined
 ): string {
   const lines: string[] = [
     "Follow the injected yui-leader Skill for this Yui wakeup.",
     `Current Leader Run: ${runId}.`,
     `For every Leader decision, milestone, or Work Item lifecycle command that is meaningful progress, carry this exact current-turn assertion on that command: YUI_LEADER_ACTION_RUN_ID=${runId} YUI_LEADER_ACTION_RECEIPT_ID=${formatAgentRunReceiptId(taskId, runId)}. The native Session environment may retain an older YUI_RUN_ID/launch; never copy those values, and never reuse this assertion after the turn changes.`,
-    `Yui wakeup reasons: ${reasons.join(", ")}.`,
     ...(contextBudgetAdvisory === undefined ? [] : [contextBudgetAdvisory]),
-    ...(wakeNotification === undefined
+    ...(wakeEnvelope === null
       ? [`Read the authoritative context with yui task context ${taskId}.`]
       : [
-          "Wake notification (Issue 04):",
-          wakeNotification
+          "Wake envelope (Issue 04):",
+          wakeEnvelope.text
         ]),
-    "Keep the context layers separate: Yui Core owns durable identity, lifecycle, access, workspace, and exact-yield safety; the generic role Skill owns portable collaboration behavior; Project Policy/Knowledge owns project-specific build, test, migration, release, and review rules; the Task Contract owns this Task's objective, scope, acceptance, and evidence.",
-    "For role-run-stalled or runtime-health attention, diagnose from the exact Run/Event/Session and related WorkItem/Review/Integration records. Preserve the current fence and write a Task Message only for a new root cause, impact, recovery action, acceptance decision, or user-relevant conclusion; an unchanged healthy wait is zero Message.",
-    projectBindings.length === 0
-      ? "This Task has no bound Project Policy; do not invent repository-specific rules."
-      : `Project Policy references: ${projectBindings.map((binding) => `${binding.directory} (${binding.projectId})`).join(", ")}. Read each with yui project show <project>, then yui project knowledge list <project> and yui project knowledge show <project> <knowledge>.`,
-    "Use narrower Task message, WorkItem, decision, milestone, and input commands only when a specific record needs closer inspection.",
-    `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary-file - and a quoted heredoc containing the final outcome and evidence.`,
-    "Provider-native subagents remain inside this Leader AgentRun. Yui observes their structured lifecycle and keeps the Run active across intermediate provider Turn boundaries while children remain active; let the provider deliver completion notifications and continue synthesis without polling or yielding merely for that native wait.",
-    `A Provider Turn ending does not end this Yui Run. Leave the Run active when later native-subagent results, managed Role results, reviewer results, or user corrections still belong to the same objective; Yui will aggregate those durable events and resume this Session with another Turn. Use yui task run yield ${runId} --summary-file - only for a deliberate Yui-level handoff that should close this Run rather than for ordinary waiting. If used, the yield command must be the final tool action: after it succeeds, stop immediately.`
   ];
   return lines.join("\n");
 }

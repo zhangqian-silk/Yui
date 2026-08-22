@@ -191,8 +191,17 @@ character budget: choose the smallest useful abstraction for the recipient.
 
 ## Recover and persist Task context
 
-A launch or wake message is a pointer, not the full context. Start with the
-complete Task projection, then follow its Project Policy references:
+A launch or wake message is a pointer, not the full context. A wake carries a
+minimal envelope: the wake id, the aggregated reason tags, and the delta
+window. It never embeds context content. Read the delta on demand:
+
+```sh
+yui task wake show <task-id> <wake-id>
+```
+
+For a fresh generation (no native history), or when the envelope indicates a
+major change, start with the complete Task projection, then follow its Project
+Policy references:
 
 ```sh
 yui task context <task-id>
@@ -200,10 +209,18 @@ yui project show <project>
 yui project knowledge list <project>
 ```
 
-Inspect `task work`, `task role`, `task integration`, `task input`, and other
-narrower records only when the projection identifies a specific record that
-needs closer evidence. Use exact IDs returned by Yui. Never edit `state.json`,
-managed refs, worktrees, Sessions, or provider IDs directly.
+The `wake show` delta lists the exact events, messages, and Runs that arrived
+in the window. Inspect `task work`, `task role`, `task integration`, `task
+input`, and other narrower records only when the projection or delta
+identifies a specific record that needs closer evidence. Use exact IDs
+returned by Yui. Never edit `state.json`, managed refs, worktrees, Sessions,
+or provider IDs directly.
+
+For a `role-run-stalled` or runtime-health wake, diagnose from the exact
+Run/Event/Session and related WorkItem/Review/Integration records. Preserve
+the current fence and write a Task Message only for a new root cause, impact,
+recovery action, acceptance decision, or user-relevant conclusion; an
+unchanged healthy wait is zero Message.
 
 Maintain durable context throughout a long-running Task:
 
