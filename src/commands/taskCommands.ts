@@ -71,6 +71,11 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
+import {
+  projectRunRecovery,
+  readRunRecoveryFacts,
+  type RunRecoveryProjection
+} from "../run/recoveryProjection.js";
 import { matchYieldReceipt } from "../run/yieldReceipt.js";
 import { providerRetryConfig, type ProviderRetryConfig } from "../run/providerRetryConfig.js";
 import {
@@ -4309,6 +4314,7 @@ function taskRunCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "list") return output(listRuns(rest, store, options));
+  if (command === "show") return showRun(rest, store, options);
   if (command === "retry") return retryRun(rest, store, options);
   if (command === "settle") return settleStaleFinalReviewRun(rest, store, options);
   if (command === "recover") return output(recoverRun(rest, store, options));
@@ -5510,13 +5516,14 @@ function recoverRun(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task run recover usage: yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> --expected-progress-at <timestamp> --provider-acceptance <accepted|rejected|ambiguous> --reason <text> [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>].";
+  const usage = "Task run recover usage: yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> (--expected-progress-at <timestamp>|--from-next-action <fingerprint>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text> [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>].";
   const parsed = parseTail(
     args,
     new Set([
       "--action",
       "--expected-progress-at",
       "--progress-at",
+      "--from-next-action",
       "--provider-acceptance",
       "--reason",
       "--role",
@@ -5529,6 +5536,15 @@ function recoverRun(
   );
   exactPositionals(parsed.positionals, 1, usage);
   const now = clock(options);
+  const fingerprint = parsed.options.get("--from-next-action");
+  const explicitFence = parsed.options.get("--expected-progress-at")
+    ?? parsed.options.get("--progress-at");
+  if (fingerprint !== undefined && explicitFence !== undefined) {
+    throw usageError(
+      "--from-next-action and --expected-progress-at/--progress-at are mutually exclusive.",
+      usage
+    );
+  }
   const input = store.transaction((tx) => {
     const active = requireRun(tx, parsed.positionals[0], options);
     const task = requireTask(tx, active.taskId);
@@ -5543,19 +5559,54 @@ function recoverRun(
     const role = requireRole(tx, task.id, roleName);
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
     const session = sessions?.sessions[sessions.activeAgentId];
-    const action = parseRecoveryAction(parsed.options.get("--action"), usage);
-    const expectedProgressAt = parsed.options.get("--expected-progress-at")
-      ?? parsed.options.get("--progress-at");
-    if (expectedProgressAt === undefined) throw usageError("--expected-progress-at is required.", usage);
+    // Issue 08: a fingerprint copied from `task run show` resolves the
+    // canonical fence server-side. The projection is recomputed here, so a
+    // fingerprint from stale observations matches nothing and fails closed.
+    let plan: RunRecoveryProjection["actions"][number] | null = null;
+    if (fingerprint !== undefined) {
+      const facts = readRunRecoveryFacts(tx, task.id, active.id);
+      if (facts === null) throw usageError(`Agent Run not found: ${task.id}/${active.id}.`, usage);
+      const projection = projectRunRecovery(facts);
+      plan = projection.actions.find((entry) => entry.fingerprint === fingerprint) ?? null;
+      if (plan === null) {
+        throw usageError(runRecoveryStaleDiagnosis(
+          task.id,
+          active.id,
+          projection.canonicalProgressAt ?? null,
+          "recovery action fingerprint is stale or unknown"
+        ), usage);
+      }
+    }
+    const action = parseRecoveryAction(
+      parsed.options.get("--action") ?? plan?.action,
+      usage
+    );
+    if (plan !== null && plan.action !== action) {
+      throw usageError(
+        `--action ${action} does not match recovery fingerprint action ${plan.action}.`,
+        usage
+      );
+    }
+    const expectedProgressAt = explicitFence ?? plan?.expectedProgressAt;
+    if (expectedProgressAt === undefined) {
+      throw usageError("--expected-progress-at is required.", usage);
+    }
     const providerAcceptance = parseProviderAcceptance(
       parsed.options.get("--provider-acceptance"),
       usage
     );
-    const agentId = parsed.options.get("--agent-id") ?? active.effective.agentId;
-    const adapterId = parsed.options.get("--adapter-id") ?? active.effective.adapterId;
+    const agentId = parsed.options.get("--agent-id")
+      ?? plan?.agentId
+      ?? active.effective.agentId;
+    const adapterId = parsed.options.get("--adapter-id")
+      ?? plan?.adapterId
+      ?? active.effective.adapterId;
     const nativeSessionId = parsed.options.get("--native-session-id")
+      ?? plan?.nativeSessionId
       ?? session?.nativeSessionId;
-    const launchId = parsed.options.get("--launch-id") ?? session?.launchId;
+    const launchId = parsed.options.get("--launch-id")
+      ?? plan?.launchId
+      ?? session?.launchId;
     return {
       taskId: task.id,
       roleName: role.name,
@@ -5574,7 +5625,12 @@ function recoverRun(
   const result = recoverExactAgentRun(store, input);
   if (result.disposition !== "applied") {
     throw usageError(
-      `Exact Run recovery ${result.disposition}: ${result.reason ?? "state changed"}.`,
+      runRecoveryStaleDiagnosis(
+        input.taskId,
+        input.runId,
+        result.progressAt ?? null,
+        `exact Run recovery ${result.disposition}: ${result.reason ?? "state changed"}`
+      ),
       usage
     );
   }
@@ -5587,6 +5643,106 @@ function recoverRun(
     ? " Leader follow-up is required; no provider input or Session action was performed."
     : "";
   return `Recorded exact ${result.action} recovery for ${result.run?.id ?? "unknown Run"}.${followup}\n`;
+}
+
+/**
+ * Issue 08: every recovery rejection carries the current canonical fence and
+ * points at the single read-only command that projects it. The caller's
+ * side-effecting action is never retried automatically.
+ */
+function runRecoveryStaleDiagnosis(
+  taskId: string,
+  runId: string,
+  canonicalProgressAt: string | null,
+  detail: string
+): string {
+  const fence = canonicalProgressAt === null
+    ? "no durable progress timestamp is available for this Run"
+    : `the canonical durable fence is now ${canonicalProgressAt}`;
+  return `${detail}; ${fence}. Re-read the recovery plan: yui task run show ${taskId}/${runId}.`;
+}
+
+/**
+ * Issue 08: read-only Run detail with the canonical recovery fence, Provider
+ * evidence, and every exact recovery action. Never mutates state and never
+ * selects an action or Provider acceptance for the Leader.
+ */
+function showRun(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task run show usage: yui task run show <task>/<run> [--json].";
+  const asJson = args.includes("--json");
+  const positionals = args.filter((arg) => arg !== "--json");
+  exactPositionals(positionals, 1, usage);
+  const data = store.transaction((tx) => {
+    const run = requireRun(tx, positionals[0], options);
+    const facts = readRunRecoveryFacts(tx, run.taskId, run.id);
+    if (facts === null) throw usageError(`Agent Run not found: ${run.taskId}/${run.id}.`, usage);
+    return { run, recovery: projectRunRecovery(facts) };
+  });
+  if (asJson) {
+    return { kind: "output" as const, output: `${JSON.stringify(data, null, 2)}\n`, data };
+  }
+  return { kind: "output" as const, output: renderRunShow(data.run, data.recovery), data };
+}
+
+function renderRunShow(run: AgentRun, recovery: RunRecoveryProjection): string {
+  const lines = [
+    `Run: ${run.id}`,
+    `Task: ${run.taskId}`,
+    `Role: ${run.roleName}`,
+    `Purpose: ${run.purpose}`,
+    `Mode: ${run.mode}`,
+    `Status: ${run.status}`,
+    `Effective: ${run.effective.agentId}/${run.effective.adapterId} r${run.effective.sourceDesiredRevision}`,
+    `Created: ${run.createdAt}`,
+    ...(run.pushedAt === undefined ? [] : [`Pushed: ${run.pushedAt}`]),
+    ...(run.deliveredAt === undefined
+      ? []
+      : [`Provider accepted (durable): ${run.deliveredAt}`]),
+    ...(run.summary === undefined || run.summary.trim().length === 0
+      ? []
+      : [`Summary: ${run.summary}`])
+  ];
+  if (recovery.canonicalProgressAt !== null) {
+    lines.push(
+      `Canonical recovery fence (Yui durable CAS): ${recovery.canonicalProgressAt}`,
+      ...(recovery.canonicalProgressEvidence === undefined
+        ? []
+        : [`Fence evidence: ${recovery.canonicalProgressEvidence}`])
+    );
+  }
+  if (recovery.provider.observedAt !== null) {
+    lines.push(
+      `Provider observation (evidence only, not a fence): `
+      + `${recovery.provider.observationKind} at ${recovery.provider.observedAt}`
+    );
+  }
+  if (recovery.session !== null) {
+    const session = recovery.session;
+    lines.push(
+      `Session: ${session.status}`
+      + `${session.nativeSessionId === undefined ? "" : ` ${session.nativeSessionId}`}`
+      + `${session.launchId === undefined ? "" : ` launch ${session.launchId}`}`
+    );
+  }
+  if (recovery.recoverable) {
+    lines.push(
+      `Provider acceptance options: ${recovery.providerAcceptance.options.join(", ")}`,
+      "Recovery actions (copy one; the fence is already canonical):"
+    );
+    for (const plan of recovery.actions) {
+      lines.push(`  [${plan.action}] ${plan.reason}`, `    ${plan.command}`);
+    }
+    if (recovery.judgmentRequired !== undefined) {
+      lines.push(`Judgment: ${recovery.judgmentRequired}`);
+    }
+  } else {
+    lines.push(`Not recoverable: ${recovery.reason ?? "unknown"}`);
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 /**
