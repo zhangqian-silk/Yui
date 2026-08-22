@@ -49,8 +49,9 @@ Choose the executor in this order:
 Do not dispatch a Task Role merely to obtain a fresh context, run a command,
 perform a routine small edit, or add an intermediate review. Direct and native
 execution add no Worker Role, Worker Yui Session, or Worker AgentRun. The exact
-Leader Run fence stays active while native child work is outstanding; the
-WorkItem and its workspace remain the durable delivery boundary.
+Leader Run remains active until an explicit Yui yield, completion, or exact
+failure; native child lifecycle never decides that Run outcome. The WorkItem
+and its workspace remain the durable delivery boundary.
 
 Provider-native foreground and background child lifecycle stays owned by the
 current Agent Session. Structured child completion notifications may resume the
@@ -88,10 +89,12 @@ boundary makes that impossible, create only the smallest repair WorkItem and
 retain the original Candidate, Review, and Integration evidence.
 
 Native and managed waits use different fences. For native children, let the
-provider deliver structured completion notifications and continue the parent
-Agent. The exact Leader Run stays active across intermediate provider Turn
-boundaries while native children remain active. Do not poll, send a waiting
-Message, rewrite a checkpoint, or yield merely to preserve that native wait.
+provider deliver structured completion notifications while the parent
+Conversation is live. A parent Turn or Activation may end first; Yui preserves
+the active Run and known continuation identities, reconciles only known
+children through adapter metadata, and routes a later result reference through
+the durable inbox. Do not poll, send a waiting Message, rewrite a checkpoint,
+or yield merely to preserve that native wait.
 
 For a managed Task Role or Reviewer Run, persist a necessary changed checkpoint,
 yield the active Leader Run, and stop the turn. Its durable mailbox result or an
@@ -350,9 +353,11 @@ confirmed.
 Create and communicate with children through the native Agent tools. Yui does
 not create, address, resume, or terminate those children; it observes their
 structured lifecycle so the parent AgentRun can span the provider Turns needed
-to receive their results. Children must not mutate Yui lifecycle state. Let the
-provider's native completion mechanism return results to the Leader, then
-synthesize them before deciding the next Yui workflow outcome.
+to receive their results, including a later provider Activation. Children must
+not mutate Yui lifecycle state. If the provider cannot automatically return a
+detached result to the parent, the adapter records a bounded Provider result
+reference and the inbox wakes the Leader. Synthesize that fact before deciding
+the next Yui workflow outcome.
 
 Review the returned work and run proportionate checks. Record each round in the
 WorkItem summary; preserve earlier round facts when updating it:

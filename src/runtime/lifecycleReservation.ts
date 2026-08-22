@@ -1,12 +1,28 @@
-import type {
-  MailboxTarget,
-  ProcessingBatch,
-  WorkMailbox
+import {
+  mailboxHasWork,
+  type MailboxTarget,
+  type ProcessingBatch,
+  type WorkMailbox
 } from "../coordination/workMailbox.js";
 
 export const RUNTIME_LIFECYCLE_OWNER = "runtime-lifecycle";
 export const RUNTIME_LAUNCH_RESERVED_REASON = "runtime-launch-reserved";
 export const RUNTIME_CLEANUP_REQUIRED_REASON = "runtime-cleanup-required";
+
+/**
+ * A Role runtime lifecycle lane already holds an in-flight operation (a
+ * launch reservation or a cleanup obligation). This is scheduler
+ * backpressure: the equivalent wake/Run must be retried after the lane
+ * settles. It is never grounds to terminalize a Run, because the contention
+ * happens before (or outside) any semantic Run launch.
+ */
+export class RuntimeLifecycleBusyError extends Error {
+  readonly name = "RuntimeLifecycleBusyError";
+
+  constructor(message: string) {
+    super(message);
+  }
+}
 
 export type RuntimeRoleOwner =
   | Readonly<{
@@ -64,7 +80,8 @@ export function hasRuntimeLaunchReservation(
 export function hasRuntimeCleanupObligation(
   mailbox: WorkMailbox | null
 ): boolean {
-  return mailbox?.pending?.reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON) === true
+  const pending = mailbox?.pending.normal;
+  return pending?.reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON) === true
     || (
       !isRuntimeLaunchReservation(mailbox?.processing)
       && mailbox?.processing?.batch.reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON) === true
@@ -74,6 +91,5 @@ export function hasRuntimeCleanupObligation(
 export function hasRuntimeLifecycleWork(
   mailbox: WorkMailbox | null
 ): boolean {
-  return mailbox !== null
-    && (mailbox.processing !== null || mailbox.pending !== null);
+  return mailbox !== null && mailboxHasWork(mailbox);
 }

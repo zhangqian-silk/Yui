@@ -72,7 +72,7 @@ import {
   type AgentRun
 } from "../run/agentRun.js";
 import { matchYieldReceipt } from "../run/yieldReceipt.js";
-import { providerRetryConfig } from "../run/providerRetryConfig.js";
+import { providerRetryConfig, type ProviderRetryConfig } from "../run/providerRetryConfig.js";
 import {
   createReviewRound,
   createTaskReviewRound,
@@ -89,14 +89,11 @@ import {
   type ReviewRequestSource
 } from "../review/reviewRound.js";
 import {
-  blockingOpenFindings,
   buildTaskFinalReviewFindingContext,
-  completionGateBlocked,
   dispositionReviewFinding,
   planRepairGroups,
   reconcileReviewFindings,
   reconcileReviewFindingsAfterReview,
-  reviewFindingLedgerWriteFailed,
   type ReviewFindingDispositionCommand
 } from "../review/reviewFindingLedger.js";
 import {
@@ -113,12 +110,18 @@ import {
   requireCompleteWorkExecution,
   settleExactWorkExecution
 } from "../coordination/workMailboxQueue.js";
-import type { MailboxEntityRef, MailboxTarget } from "../coordination/workMailbox.js";
+import {
+  mailboxHasWork as workMailboxHasWork,
+  nextPendingBatch,
+  type MailboxEntityRef,
+  type MailboxTarget
+} from "../coordination/workMailbox.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
   runtimeLifecycleTarget,
   type RuntimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
+import { blockingProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import {
   activateTask,
   addTaskProjectBinding,
@@ -138,6 +141,10 @@ import {
   formatAgentRunReceiptId,
   resolveTaskRecordReference
 } from "../task/taskRecordReference.js";
+import {
+  projectCompletionReadiness,
+  type CompletionBlocker
+} from "../task/completionReadiness.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
 import { resolveProject, type Project } from "../repository/project.js";
@@ -422,6 +429,11 @@ export function parseTaskCompletionRequest(
  * path invokes this same preflight and then repeats its checks while holding
  * the store write fence, so remote reconciliation can never get ahead of the
  * local lifecycle/readiness gate.
+ *
+ * Issue 06: the blocker enumeration is the pure `projectCompletionReadiness`
+ * projection, shared with `task next-action` so the Leader sees every
+ * terminalization precondition before attempting completion.  All blockers
+ * are reported in one error instead of one per attempt.
  */
 export function preflightTaskCompletion(
   taskId: string,
@@ -444,76 +456,27 @@ export function preflightTaskCompletion(
     (round.scope ?? "work-item") === "task"
     && (round.status === "pending" || round.status === "running")
   ));
-  assertNoOpenInputRequests(store, task.id, "completing the Task");
-  const incompleteWork = store.listWorkItems(task.id).find((item) => (
-    item.status !== "completed"
-    && item.status !== "retired"
-  ));
-  if (incompleteWork !== undefined) {
-    throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
-  }
-  const activeJob = store.listDurableJobs(task.id).find((job) => (
-    job.status === "queued"
-    || job.status === "running"
-    || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
-  ));
-  if (activeJob !== undefined) {
-    throw usageError(
-      `Task ${task.id} has an active DurableJob: ${activeJob.id}/${activeJob.status}.`
-    );
-  }
-  if (task.requireIntegration) {
-    if (store.listWorkItems(task.id).length === 0) {
-      throw usageError(`Task ${task.id} requires at least one WorkItem before completion.`);
-    }
-    if (store.listChangeSets(task.id).length === 0) {
-      throw usageError(`Task ${task.id} requires at least one ChangeSet before completion.`);
-    }
-    if (!store.listIntegrationAttempts(task.id).some(({ status }) => status === "committed")) {
-      throw usageError(`Task ${task.id} requires a committed Integration Attempt before completion.`);
-    }
-  }
-  const unresolvedIntegration = store.listIntegrationAttempts(task.id).find((integration) => (
-    integration.status === "running"
-    || integration.status === "blocked"
-    || integration.status === "validating"
-  ));
-  if (unresolvedIntegration !== undefined) {
-    throw usageError(
-      `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
-    );
-  }
-  const unsettledQueueEntry = store.listIntegrationQueueEntries(task.id).find((entry) => (
-    entry.status !== "committed" && entry.status !== "superseded"
-  ));
-  if (unsettledQueueEntry !== undefined) {
-    throw usageError(
-      `Task ${task.id} has an unsettled integration queue entry: `
-      + `${unsettledQueueEntry.id}/${unsettledQueueEntry.status}.`
-    );
-  }
-  const isolatedWorkspace = store.listManagedWorkspaces(task.id)
-    .find(({ owner }) => owner.type === "work-item");
-  if (isolatedWorkspace?.owner.type === "work-item") {
-    throw usageError(
-      `Task ${task.id} has an isolated WorkItem workspace: `
-      + `${isolatedWorkspace.owner.workItemId}. Capture, integrate or abandon it, then clean it up.`
-    );
+  // Issue 06: one shared readiness projection enumerates every blocker.
+  const readinessFacts = store.readCompletionReadinessFacts(task.id);
+  if (readinessFacts === null) throw taskNotFound(task.id);
+  // The finding ledger gate is intentionally deferred: the transactional
+  // completion path runs it after `prepareFinalTaskReview`, which may create
+  // the Task-final Review that resolves `fixed-pending-review` findings.
+  const readiness = projectCompletionReadiness(readinessFacts, { findingsGate: false });
+  // An active Task-final Review is not a preflight failure: the transactional
+  // path resumes a pending Round (or reports the running one) via
+  // `prepareFinalTaskReview`, and the CLI skips remote reconciliation while
+  // `activeTaskReview` is true.  The blocker stays in the shared projection
+  // so other surfaces (next-action, future readers) see the full rule set.
+  const blockers = readiness.blockers.filter((blocker) => blocker.code !== "active-task-review");
+  if (blockers.length > 0) {
+    throw usageError(formatCompletionBlockers(task.id, blockers));
   }
 
   const roles = store.listRoles(task.id);
   const activeRuns = roles
     .map((role) => ({ role, run: store.getActiveAgentRun(task.id, role.name) }))
     .filter((entry): entry is { role: Role; run: AgentRun } => entry.run !== null);
-  const workerRun = activeRuns.find(({ role }) => role.name !== LEADER_ROLE);
-  if (workerRun !== undefined) {
-    throw usageError(`Task ${task.id} has an active run for Role ${workerRun.role.name}.`);
-  }
-  const unsettledWork = store.listWorkItems(task.id)
-    .find((item) => item.status === "pending" || item.status === "running");
-  if (unsettledWork !== undefined) {
-    throw usageError(`Task ${task.id} has unsettled work: ${unsettledWork.id}.`);
-  }
 
   const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
   if (leaderEntry !== undefined) {
@@ -535,6 +498,18 @@ export function preflightTaskCompletion(
     activeTaskReview,
     ...(taskFinalReviewContract === undefined ? {} : { taskFinalReviewContract })
   };
+}
+
+/**
+ * Issue 06: format every completion blocker into one fail-closed error so the
+ * Leader sees the full remaining work instead of one blocker per attempt.
+ */
+function formatCompletionBlockers(taskId: string, blockers: readonly CompletionBlocker[]): string {
+  const lines = blockers.map((blocker) =>
+    `  ${blocker.code} (${blocker.ref.kind} ${blocker.ref.id}): ${blocker.reason}`
+    + ` — fix: ${blocker.fix}`
+  );
+  return `Task ${taskId} cannot complete: ${blockers.length} blocker(s) remain.\n${lines.join("\n")}`;
 }
 
 export function runTaskCommand(
@@ -1087,15 +1062,10 @@ function completeTaskCommand(
     const activeRuns = roles
       .map((role) => ({ role, run: tx.getActiveAgentRun(task.id, role.name) }))
       .filter((entry): entry is { role: Role; run: AgentRun } => entry.run !== null);
-    const workerRun = activeRuns.find(({ role }) => role.name !== LEADER_ROLE);
-    if (workerRun !== undefined) {
-      throw usageError(`Task ${task.id} has an active run for Role ${workerRun.role.name}.`);
-    }
-    const unsettledWork = tx.listWorkItems(task.id)
-      .find((item) => item.status === "pending" || item.status === "running");
-    if (unsettledWork !== undefined) {
-      throw usageError(`Task ${task.id} has unsettled work: ${unsettledWork.id}.`);
-    }
+    // The preflight (above, same transaction) already projected the full
+    // readiness via projectCompletionReadiness.  The leader-Run check is
+    // actor-dependent and stays here; every other blocker is re-validated by
+    // the post-Review readiness fence below.
 
     let terminalizedLeaderRun = false;
     const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
@@ -1152,25 +1122,17 @@ function completeTaskCommand(
       } as const;
     }
 
-    // Issue 06: under `review.findingLedger=enforce`, Task completion fails
-    // closed on undispositioned open P1/P2 findings. Run this after final-review
-    // preparation so `fixed-pending-review` findings can still request the one
-    // re-review for a changed frozen head; once no Review is needed, the gate
-    // blocks final completion.
-    if (completionGateBlocked(tx, task.id)) {
-      const blocking = blockingOpenFindings(tx, task.id);
-      if (reviewFindingLedgerWriteFailed(tx, task.id)) {
-        throw usageError(
-          `Task ${task.id} cannot complete: the Review finding ledger was unavailable `
-          + "while reconciling a semantic Review. Recover the ledger and reconcile the Round "
-          + "before completing the Task."
-        );
-      }
-      throw usageError(
-        `Task ${task.id} has ${blocking.length} undispositioned open P1/P2 finding(s): `
-        + `${blocking.map(({ id }) => id).join(", ")}. `
-        + "Disposition each finding (yui task review finding dispose) before completing the Task."
-      );
+    // Issue 06: re-validate the full completion readiness inside the
+    // transaction (the CAS fence) after final-review preparation.  This is the
+    // same pure projection `task next-action` displays, now with the finding
+    // ledger gate enabled: `fixed-pending-review` findings that the prepared
+    // Review would resolve are no longer blocked, but once no Review is needed
+    // every remaining blocker fails closed with the fresh list.
+    const readinessFacts = tx.readCompletionReadinessFacts(task.id);
+    if (readinessFacts === null) throw taskNotFound(task.id);
+    const readiness = projectCompletionReadiness(readinessFacts);
+    if (!readiness.ready) {
+      throw usageError(formatCompletionBlockers(task.id, readiness.blockers));
     }
 
     const completed = completeTask(task, now, { by: actor, summary });
@@ -1314,6 +1276,13 @@ function archiveTaskCommand(
     if (activeArchiveJob !== undefined) {
       throw usageError(
         `Task ${task.id} has an active DurableJob: ${activeArchiveJob.id}/${activeArchiveJob.status}.`
+      );
+    }
+    const continuationBlockers = blockingProviderContinuations(tx.listEvents(task.id));
+    if (continuationBlockers.length > 0) {
+      throw usageError(
+        `Task ${task.id} still owns unsettled Provider continuation(s); `
+        + "reconcile or cancel them before archiving."
       );
     }
     if (task.cwd !== undefined || tx.listManagedWorkspaces(task.id).length > 0) {
@@ -1594,8 +1563,12 @@ function taskMessageCommand(
 ): string {
   const [command, ...rest] = args;
   if (command === "send") {
-    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none].";
-    const parsed = parseTail(rest, new Set(["--body-file", "--wake-policy"]), usage);
+    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none] [--delivery-mode followup|steer].";
+    const parsed = parseTail(
+      rest,
+      new Set(["--body-file", "--wake-policy", "--delivery-mode"]),
+      usage
+    );
     if (parsed.positionals.length < 1 || parsed.positionals.length > 2) throw usageError(usage);
     const body = readCommandText(
       parsed.positionals[1],
@@ -1611,6 +1584,13 @@ function taskMessageCommand(
       wakePolicy = wakePolicyRaw;
     } else {
       throw usageError(`--wake-policy must be 'leader' or 'none': ${wakePolicyRaw}.`);
+    }
+    const deliveryModeRaw = parsed.options.get("--delivery-mode") ?? "followup";
+    if (deliveryModeRaw !== "followup" && deliveryModeRaw !== "steer") {
+      throw usageError(`--delivery-mode must be 'followup' or 'steer': ${deliveryModeRaw}.`);
+    }
+    if (deliveryModeRaw === "steer" && wakePolicy === "none") {
+      throw usageError("--delivery-mode steer cannot be combined with --wake-policy none.");
     }
     const now = clock(options);
     const result = store.transaction((tx) => {
@@ -1640,7 +1620,20 @@ function taskMessageCommand(
           leaderMailbox(task.id),
           actor === "operator" ? "operator-input" : "user-message",
           now,
-          [messageRef(task.id, message.id)]
+          [messageRef(task.id, message.id)],
+          deliveryModeRaw === "steer"
+            ? {
+                source: actor,
+                dedupeKey: `user-correction:${task.id}:${message.id}`,
+                deliveryMode: "steer-if-safe",
+                lane: "user-correction"
+              }
+            : {
+                source: actor,
+                dedupeKey: `message:${task.id}:${message.id}`,
+                deliveryMode: "followup",
+                lane: "normal"
+              }
         );
       }
       return { task, message, actor };
@@ -3946,8 +3939,7 @@ function assertTaskReviewRequestLane(
     roleName: reviewerRoleName
   }));
   const hasMailboxWork = (mailbox: ReturnType<TaskWorkflowStore["getWorkMailbox"]>): boolean => (
-    mailbox?.processing !== null && mailbox?.processing !== undefined
-    || mailbox?.pending !== null && mailbox?.pending !== undefined
+    mailbox !== null && workMailboxHasWork(mailbox)
   );
   const activePointer = store.getActiveAgentRun(taskId, reviewerRoleName);
   const activeRuns = store.listAgentRuns(taskId).filter((entry) => (
@@ -3979,16 +3971,16 @@ function assertTaskReviewRequestLane(
     );
   }
   const exactRun = runRef(taskId, reviewerRunId!);
+  const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
   const processingMatches = reviewerMailbox?.processing !== null
     && reviewerMailbox?.processing !== undefined
-    && reviewerMailbox.pending === null
+    && reviewerPending === null
     && reviewerMailbox.processing.executionRef !== undefined
     && isDeepStrictEqual(reviewerMailbox.processing.executionRef, exactRun);
-  const pendingMatches = reviewerMailbox?.pending !== null
-    && reviewerMailbox?.pending !== undefined
-    && reviewerMailbox.processing === null
-    && reviewerMailbox.pending.requestCount === 1
-    && reviewerMailbox.pending.refs.some((ref) => isDeepStrictEqual(ref, exactRun));
+  const pendingMatches = reviewerPending !== null
+    && reviewerMailbox?.processing === null
+    && reviewerPending.requestCount === 1
+    && reviewerPending.refs.some((ref) => isDeepStrictEqual(ref, exactRun));
   if (hasMailboxWork(reviewerMailbox) && !processingMatches && !pendingMatches) {
     throw usageError(`Reviewer mailbox has unrelated active work: ${reviewerRoleName}.`);
   }
@@ -4109,8 +4101,7 @@ function retryFailedTaskReviewRound(
       roleName: reviewer.name
     }));
     const hasMailboxWork = (mailbox: ReturnType<typeof tx.getWorkMailbox>): boolean => (
-      mailbox?.processing !== null && mailbox?.processing !== undefined
-      || mailbox?.pending !== null && mailbox?.pending !== undefined
+      mailbox !== null && workMailboxHasWork(mailbox)
     );
     const activeReviewerRuns = tx.listAgentRuns(task.id).filter((entry) => (
       entry.roleName === reviewer.name && entry.status === "active"
@@ -4312,18 +4303,19 @@ function settleStaleFinalReviewRun(
 
     const reviewerTarget = roleMailbox(task.id, round.reviewerRoleName);
     const reviewerMailbox = tx.getWorkMailbox(reviewerTarget);
+    const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
     const exactRunRef = runRef(task.id, run.id);
     if (reviewerMailbox?.processing !== null && reviewerMailbox?.processing !== undefined) {
       const processing = reviewerMailbox.processing;
       if (
         processing.executionRef === undefined
         || !isDeepStrictEqual(processing.executionRef, exactRunRef)
-        || reviewerMailbox.pending !== null
+        || reviewerPending !== null
       ) {
         throw usageError(`Reviewer mailbox has unrelated processing work: ${round.reviewerRoleName}.`);
       }
-    } else if (reviewerMailbox?.pending !== null && reviewerMailbox?.pending !== undefined) {
-      const pending = reviewerMailbox.pending;
+    } else if (reviewerPending !== null) {
+      const pending = reviewerPending;
       if (
         pending.requestCount !== 1
         || !pending.refs.some((ref) => isDeepStrictEqual(ref, exactRunRef))
@@ -4339,7 +4331,7 @@ function settleStaleFinalReviewRun(
     if (runtimeMailbox?.processing !== null && runtimeMailbox?.processing !== undefined) {
       throw usageError(`Reviewer runtime lifecycle is pending: ${round.reviewerRoleName}.`);
     }
-    if (runtimeMailbox?.pending !== null && runtimeMailbox?.pending !== undefined) {
+    if (runtimeMailbox !== null && workMailboxHasWork(runtimeMailbox)) {
       throw usageError(`Reviewer runtime lifecycle has pending work: ${round.reviewerRoleName}.`);
     }
 
@@ -5156,6 +5148,7 @@ function retryFailedReviewRun(
 
     const reviewerMailboxTarget = roleMailbox(task.id, round.reviewerRoleName);
     const reviewerMailbox = tx.getWorkMailbox(reviewerMailboxTarget);
+    const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
     const runtimeMailbox = tx.getWorkMailbox(runtimeLifecycleTarget({
       scope: "task",
       taskId: task.id,
@@ -5163,8 +5156,7 @@ function retryFailedReviewRun(
     }));
 
     const hasMailboxWork = (mailbox: ReturnType<typeof tx.getWorkMailbox>): boolean => (
-      mailbox?.processing !== null && mailbox?.processing !== undefined
-      || mailbox?.pending !== null && mailbox?.pending !== undefined
+      mailbox !== null && workMailboxHasWork(mailbox)
     );
 
     const reviewer = requireRole(tx, task.id, round.reviewerRoleName);
@@ -5201,11 +5193,11 @@ function retryFailedReviewRun(
           reviewerMailbox.processing.executionRef,
           runRef(task.id, reviewerRunId)
         )
-        && reviewerMailbox.pending === null;
+        && reviewerPending === null;
       const pendingMatches = reviewerRunId !== undefined
         && reviewerMailbox?.processing === null
-        && reviewerMailbox.pending?.requestCount === 1
-        && reviewerMailbox.pending.refs.some((ref) => (
+        && reviewerPending?.requestCount === 1
+        && reviewerPending.refs.some((ref) => (
           isDeepStrictEqual(ref, runRef(task.id, reviewerRunId))
         ));
       if (activePointer !== null
@@ -5236,7 +5228,7 @@ function retryFailedReviewRun(
     if (runtimeMailbox?.processing !== null && runtimeMailbox?.processing !== undefined) {
       throw usageError(`Reviewer runtime lifecycle is pending: ${reviewer.name}.`);
     }
-    if (runtimeMailbox?.pending !== null && runtimeMailbox?.pending !== undefined) {
+    if (runtimeMailbox !== null && workMailboxHasWork(runtimeMailbox)) {
       throw usageError(`Reviewer runtime lifecycle has pending work: ${reviewer.name}.`);
     }
 
@@ -5255,17 +5247,17 @@ function retryFailedReviewRun(
       if (
         reviewerMailbox.processing.executionRef === undefined
         || !isDeepStrictEqual(reviewerMailbox.processing.executionRef, exactOldRunRef)
-        || reviewerMailbox.pending !== null
+        || reviewerPending !== null
       ) {
         throw usageError(`Reviewer mailbox is busy: ${reviewer.name}.`);
       }
       settleExactWorkExecution(tx, reviewerMailboxTarget, exactOldRunRef);
-    } else if (reviewerMailbox?.pending !== null && reviewerMailbox?.pending !== undefined) {
-      const exact = reviewerMailbox.pending.refs.some((ref) => (
+    } else if (reviewerPending !== null) {
+      const exact = reviewerPending.refs.some((ref) => (
         isDeepStrictEqual(ref, exactOldRunRef)
       ));
       if (!exact) throw usageError(`Reviewer mailbox has unrelated pending work: ${reviewer.name}.`);
-      if (reviewerMailbox.pending.requestCount !== 1) {
+      if (reviewerPending.requestCount !== 1) {
         throw usageError(`Reviewer mailbox has merged pending work: ${reviewer.name}.`);
       }
       settleExactWorkExecution(tx, reviewerMailboxTarget, exactOldRunRef);
@@ -5447,10 +5439,10 @@ function buildYieldOutcome(
 function replayYieldReceipt(
   run: AgentRun,
   inputSummary: string,
-  options: TaskCommandOptions
+  options: TaskCommandOptions,
+  retryConfig: ProviderRetryConfig
 ): TaskCommandExecution | null {
-  const config = providerRetryConfig(options.environment ?? process.env);
-  if (!config.yieldReceiptReplay) return null;
+  if (!retryConfig.yieldReceiptReplay) return null;
   if (run.yieldReceipt === undefined) return null;
   const outcome = buildYieldOutcome(run, inputSummary, options);
   const match = matchYieldReceipt(run.yieldReceipt, {
@@ -5527,7 +5519,12 @@ function yieldRun(
   // transaction; the receipt is immutable once committed.
   const existing = requireRun(store, parsed.positionals[0], options);
   if (existing.status !== "active") {
-    const replayed = replayYieldReceipt(existing, inputSummary, options);
+    const replayed = replayYieldReceipt(
+      existing,
+      inputSummary,
+      options,
+      providerRetryConfig(store.getConfig())
+    );
     if (replayed !== null) return replayed;
     throw usageError(`Run ${existing.id} is already terminal: ${existing.status}.`);
   }

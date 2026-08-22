@@ -11,6 +11,7 @@ import {
 } from "./ports.js";
 import type { OperatorNotification } from "./operatorNotification.js";
 import type { RoleLiveStatusSnapshot } from "./roleRunLiveness.js";
+import { nextPendingBatch } from "../coordination/workMailbox.js";
 
 /**
  * Default window of no durable progress before a live-but-idle Run becomes a
@@ -1126,7 +1127,7 @@ function classifyLeaderStall(
     entry.candidate.task.id === taskId && entry.candidate.role.name === "leader"
   ));
   const mailbox = store.getWorkMailbox({ kind: "role", taskId, roleName: "leader" });
-  const pending = mailbox?.pending;
+  const pending = mailbox === null || mailbox === undefined ? null : nextPendingBatch(mailbox);
   const processing = mailbox?.processing;
   const processingCurrent = processing?.executionRef?.type === "run"
     && processing.executionRef.taskId === taskId
@@ -1266,7 +1267,8 @@ function leaderStallEvidence(
   const active = downstream.filter((entry) => entry.candidate.run !== null).length;
   const healthy = downstream.filter((entry) => entry.live === "present" && !entry.stalled).length;
   const stalled = downstream.filter((entry) => entry.live === "present" && entry.stalled).length;
-  const pending = store.getWorkMailbox({ kind: "role", taskId, roleName: "leader" })?.pending;
+  const leaderMailbox = store.getWorkMailbox({ kind: "role", taskId, roleName: "leader" });
+  const pending = leaderMailbox === null ? null : nextPendingBatch(leaderMailbox);
   const pendingAge = pending === undefined || pending === null
     ? "none"
     : Number.isFinite(Date.parse(pending.lastQueuedAt))

@@ -39,7 +39,9 @@ function describeOption(option: string): string {
     "--project": "Select a Project.",
     "--role": "Select a Task role.",
     "--summary": "Set summary text.",
-    "--task": "Select a Task."
+    "--task": "Select a Task.",
+    "--trigger": "Set the review trigger (always, leader, final).",
+    "--finding-ledger": "Set the review finding ledger mode (shadow, enforce)."
   };
   return descriptions[option] ?? `Set ${option.slice(2).replaceAll("-", " ")}.`;
 }

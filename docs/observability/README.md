@@ -137,9 +137,10 @@ Sections:
   by-role and by-purpose distribution, fault class counts, and structured
   launch-failure phase/kind counts parsed from launch diagnostics.
 - **wakes** — leader runs with wake reasons, orphan wakes, orphan yield-only.
-  `suppressedWakes` is `unsupported`: quiescence suppression (Issue 05) is
-  silent by design and writes no durable counter, so the audit cannot report
-  a count without guessing.
+  `suppressedWakes` counts durable `wake.suppressed` task events: Leader wakes
+  coalesced by scheduler single-flight because the Role runtime lifecycle lane
+  was busy (Issue 05). The wake stays durable and is retried after the lane
+  settles, so a suppression is scheduler backpressure, never a failed Run.
 - **sessions** — generations, broken/stopped, resets, lifecycle events, stop
   failures.
 - **reviews** — total/completed/failed, infra vs semantic-negative.

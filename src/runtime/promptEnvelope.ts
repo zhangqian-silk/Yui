@@ -6,7 +6,7 @@ import {
 } from "../task/taskRecordReference.js";
 
 export type PromptSource = Readonly<{
-  kind: "agent-run" | "input-request";
+  kind: "agent-run" | "run-input" | "input-request";
   taskId: string;
   localId: string;
 }>;
@@ -24,13 +24,15 @@ export function createPromptEnvelope(input: Readonly<{
   text: string;
   createdAt: Date;
 }>): PromptEnvelope {
-  if (input.source.kind !== "agent-run" && input.source.kind !== "input-request") {
+  if (input.source.kind !== "agent-run"
+    && input.source.kind !== "run-input"
+    && input.source.kind !== "input-request") {
     throw new Error("Prompt source kind is invalid.");
   }
   const source = validateTaskRecordReference({
     taskId: input.source.taskId,
     localId: input.source.localId
-  }, input.source.kind === "agent-run" ? "agentRun" : "inputRequest");
+  }, input.source.kind === "input-request" ? "inputRequest" : "agentRun");
   const id = requireQualifiedReceiptId(
     input.id,
     input.source.kind,
@@ -57,7 +59,16 @@ function requireQualifiedReceiptId(
 ): string {
   const expected = kind === "agent-run"
     ? formatAgentRunReceiptId(taskId, localId)
-    : formatInputRequestReceiptId(taskId, localId);
+    : kind === "input-request"
+      ? formatInputRequestReceiptId(taskId, localId)
+      : `agent-input:${taskId}/${localId}/`;
+  if (kind === "run-input") {
+    if (!value.startsWith(expected)
+      || !/^(normal|user-correction):[1-9]\d*-[1-9]\d*$/.test(value.slice(expected.length))) {
+      throw new Error("Prompt envelope id does not match its source.");
+    }
+    return value;
+  }
   if (value !== expected) throw new Error("Prompt envelope id does not match its source.");
   return expected;
 }

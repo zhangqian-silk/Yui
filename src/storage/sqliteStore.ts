@@ -12,10 +12,9 @@
  *                                    the write transaction; conflict ->
  *                                    StorageConflictError (transactionWithRevisionCas).
  *   - Atomic durable write ........ WAL + synchronous=FULL; COMMIT == fsync.
- *   - Mailbox per-target ordering . mailboxes.next_sequence + mailbox_signals
- *                                    (mailbox_id, sequence) primary key.
+ *   - Mailbox per-target ordering . WorkMailbox v2 sequence/cursors in one row.
  *   - Exactly-once terminal state . conditional updates + UNIQUE(request_id)
- *                                    on outbox / mailbox_signals.
+ *                                    on the durable outbox.
  *   - Crash recovery .............. WAL rollback of uncommitted transactions;
  *                                    outbox replay of committed-but-unacked effects.
  *   - Record family versioning .... full record (incl. schemaVersion) in payload.
@@ -41,16 +40,17 @@ import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
 import type { ConfiguredAgent } from "../agent/agent.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
-import type { MailboxEntityRef, MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
-import { mailboxTargetKey } from "../coordination/workMailbox.js";
+import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
+import {
+  consumePendingBatch,
+  mailboxTargetKey,
+  pendingLane,
+  validateWorkMailbox
+} from "../coordination/workMailbox.js";
 import type { Decision } from "../decision/decision.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from "../executor/agentExecutor.js";
-import {
-  validatePendingTurnCompletion,
-  type PendingTurnCompletion
-} from "../executor/turnCompletion.js";
 import type { TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { AgentRun } from "../run/agentRun.js";
@@ -69,6 +69,7 @@ import {
   validateReviewFinding,
   type ReviewFinding
 } from "../review/reviewFinding.js";
+import { reviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
 import type { Project } from "../repository/project.js";
 import {
   generateHomeIdentity,
@@ -94,6 +95,7 @@ import type { OperatorNotification } from "../scheduler/operatorNotification.js"
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { Task } from "../task/task.js";
 import type { NextActionFacts } from "../task/nextAction.js";
+import type { CompletionReadinessFacts } from "../task/completionReadiness.js";
 import { TASK_RECORD_ID_PREFIXES, type TaskRecordKind } from "../task/taskRecordReference.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import { managedWorkspaceKey, type ManagedWorkspace, type ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
@@ -218,17 +220,18 @@ function isUniqueConstraint(error: unknown): boolean {
 
 /** Project a leader-role work mailbox's pending batch to a PendingWakeup (mirrors taskStore.ts). */
 function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | null {
+  const pending = mailbox === null ? null : pendingLane(mailbox, "normal");
   if (mailbox === null || mailbox.target.kind !== "role" || mailbox.target.roleName !== "leader"
-    || mailbox.pending === null) {
+    || pending === null) {
     return null;
   }
   return {
     schemaVersion: CURRENT_PENDING_WAKEUP_SCHEMA_VERSION,
     taskId: mailbox.target.taskId,
-    reasons: [...mailbox.pending.reasons],
-    requestCount: mailbox.pending.requestCount,
-    firstRequestedAt: mailbox.pending.firstQueuedAt,
-    lastRequestedAt: mailbox.pending.lastQueuedAt
+    reasons: [...pending.reasons],
+    requestCount: pending.requestCount,
+    firstRequestedAt: pending.firstQueuedAt,
+    lastRequestedAt: pending.lastQueuedAt
   };
 }
 
@@ -961,7 +964,8 @@ export class SqliteTaskStore implements TaskStore {
       task: {
         id: task.id,
         status: task.status,
-        projectBindings: task.projectBindings
+        projectBindings: task.projectBindings,
+        requireIntegration: task.requireIntegration
       },
       workItems: this.#sortById(
         this.#listPayload<WorkItem>("work_items", "task_id = ?", [taskId]),
@@ -990,6 +994,39 @@ export class SqliteTaskStore implements TaskStore {
       ),
       activeRuns: runs.filter((run) => run.status === "active"),
       leaderRuns: runs.filter((run) => run.roleName === "leader")
+    };
+  }
+
+  readCompletionReadinessFacts(taskId: string): CompletionReadinessFacts | null {
+    const base = this.readNextActionFacts(taskId);
+    if (base === null) return null;
+    return {
+      ...base,
+      managedWorkspaces: this.#sortById(
+        this.#listPayload<ManagedWorkspace>("managed_workspaces", "task_id = ?", [taskId]),
+        (workspace) => managedWorkspaceKey(workspace.owner)
+      ),
+      durableJobs: this.#sortById(
+        this.#listPayload<DurableJob>("durable_jobs", "task_id = ?", [taskId]),
+        (job) => job.id
+      ),
+      integrationQueueEntries: this.#sortById(
+        this.#listPayload<IntegrationQueueEntry>(
+          "integration_queue",
+          "task_id = ?",
+          [taskId]
+        ),
+        (entry) => entry.id
+      ),
+      reviewFindings: this.#sortById(
+        this.#listPayload<ReviewFinding>("review_findings", "task_id = ?", [taskId]),
+        (finding) => finding.id
+      ),
+      reviewFindingLedgerMode: reviewFindingLedgerMode(this.getConfig()),
+      events: this.#sortById(
+        this.#listPayload<TaskEvent>("events", "task_id = ?", [taskId]),
+        (event) => event.id
+      )
     };
   }
 
@@ -1341,7 +1378,6 @@ export class SqliteTaskStore implements TaskStore {
          ON CONFLICT(task_id, role_name) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(sessions.owner.taskId, sessions.owner.roleName, this.#json(sessions), this.#now());
       this.#saveRuntimeSessionCandidate(sessions);
-      this.#savePendingRuntimeTurnCompletion(sessions);
     });
   }
 
@@ -1600,47 +1636,6 @@ export class SqliteTaskStore implements TaskStore {
       && row.cleanup_required === (candidate.cleanupRequired ? 1 : 0);
   }
 
-  listPendingRuntimeTurnCompletions(taskIds?: readonly string[]): PendingTurnCompletion[] {
-    const selectedTaskIds = taskIds === undefined
-      ? undefined
-      : [...new Set(taskIds)].sort(numericCompare);
-    if (selectedTaskIds?.length === 0) return [];
-    const where = selectedTaskIds === undefined
-      ? ""
-      : ` WHERE task_id IN (${selectedTaskIds.map(() => "?").join(", ")})`;
-    const rows = this.#db.prepare(
-      `SELECT task_id, role_name, schema_version, agent_id, native_session_id,
-              turn_id, run_id, summary, observed_at, due_at
-       FROM pending_runtime_turn_completions${where}`
-    ).all(...(selectedTaskIds ?? [])) as Array<{
-      task_id: string;
-      role_name: string;
-      schema_version: number;
-      agent_id: string;
-      native_session_id: string;
-      turn_id: string;
-      run_id: string;
-      summary: string;
-      observed_at: string;
-      due_at: string;
-    }>;
-    return rows.map((row) => validatePendingTurnCompletion({
-      schemaVersion: row.schema_version,
-      taskId: row.task_id,
-      roleName: row.role_name,
-      agentId: row.agent_id,
-      nativeSessionId: row.native_session_id,
-      turnId: row.turn_id,
-      runId: row.run_id,
-      summary: row.summary,
-      observedAt: row.observed_at,
-      dueAt: row.due_at
-    })).sort((left, right) => (
-      numericCompare(left.taskId, right.taskId)
-      || numericCompare(left.roleName, right.roleName)
-      || numericCompare(left.runId, right.runId)
-    ));
-  }
 
   saveRoleSessionSet(sessions: TaskRoleSessionSet): void {
     const taskId = sessions.owner.taskId;
@@ -1651,7 +1646,6 @@ export class SqliteTaskStore implements TaskStore {
          ON CONFLICT(task_id, role_name) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(taskId, sessions.owner.roleName, this.#json(sessions), this.#now());
       this.#saveRuntimeSessionCandidate(sessions);
-      this.#savePendingRuntimeTurnCompletion(sessions);
     });
   }
 
@@ -1710,50 +1704,6 @@ export class SqliteTaskStore implements TaskStore {
       owner.scope,
       owner.scope === "task" ? owner.taskId : "",
       owner.roleName
-    );
-  }
-
-  /** Maintain the independent pending-Turn projection in the same write txn. */
-  #savePendingRuntimeTurnCompletion(sessions: TaskRoleSessionSet): void {
-    const owner = sessions.owner;
-    const pending = sessions.pendingTurnCompletion;
-    if (pending === null) {
-      this.#db.prepare(
-        "DELETE FROM pending_runtime_turn_completions WHERE task_id = ? AND role_name = ?"
-      ).run(owner.taskId, owner.roleName);
-      return;
-    }
-    const normalized = validatePendingTurnCompletion(pending);
-    if (normalized.taskId !== owner.taskId || normalized.roleName !== owner.roleName) {
-      throw new StorageRecordError(
-        `Pending Turn completion owner does not match Role session: ${owner.taskId}/${owner.roleName}.`
-      );
-    }
-    this.#db.prepare(
-      `INSERT INTO pending_runtime_turn_completions (
-         task_id, role_name, schema_version, agent_id, native_session_id,
-         turn_id, run_id, summary, observed_at, due_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(task_id, role_name) DO UPDATE SET
-         schema_version = excluded.schema_version,
-         agent_id = excluded.agent_id,
-         native_session_id = excluded.native_session_id,
-         turn_id = excluded.turn_id,
-         run_id = excluded.run_id,
-         summary = excluded.summary,
-         observed_at = excluded.observed_at,
-         due_at = excluded.due_at`
-    ).run(
-      normalized.taskId,
-      normalized.roleName,
-      normalized.schemaVersion,
-      normalized.agentId,
-      normalized.nativeSessionId,
-      normalized.turnId,
-      normalized.runId,
-      normalized.summary,
-      normalized.observedAt,
-      normalized.dueAt
     );
   }
 
@@ -2541,15 +2491,16 @@ export class SqliteTaskStore implements TaskStore {
     };
   }
 
-  #rowToMailbox(row: { target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string | null }): WorkMailbox {
+  #rowToMailbox(row: { target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; input_delivery: string | null }): WorkMailbox {
     const target = this.#targetFromCols(row.target_kind, row.task_id, row.role_name);
-    return {
-      schemaVersion: 1,
+    return validateWorkMailbox({
+      schemaVersion: CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
       target,
       nextSequence: row.next_sequence,
       processing: row.processing === null ? null : this.#parse(row.processing),
-      pending: row.pending === null ? null : this.#parse(row.pending)
-    };
+      pending: this.#parse(row.pending),
+      inputDelivery: row.input_delivery === null ? null : this.#parse(row.input_delivery)
+    });
   }
 
   #targetFromCols(kind: string, taskId: string | null, roleName: string | null): MailboxTarget {
@@ -2566,25 +2517,28 @@ export class SqliteTaskStore implements TaskStore {
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null {
     const cols = this.#mailboxCols(target);
     const row = this.#db.prepare(
-      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending FROM mailboxes WHERE target_key = ?"
-    ).get(cols.targetKey) as { target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string | null } | undefined;
+      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending, input_delivery FROM mailboxes WHERE target_key = ?"
+    ).get(cols.targetKey) as { target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; input_delivery: string | null } | undefined;
     return row === undefined ? null : this.#rowToMailbox(row);
   }
 
   listWorkMailboxes(): WorkMailbox[] {
     const rows = this.#db.prepare(
-      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending FROM mailboxes ORDER BY target_key"
-    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string | null }>;
+      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending, input_delivery FROM mailboxes ORDER BY target_key"
+    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; input_delivery: string | null }>;
     return rows.map((row) => this.#rowToMailbox(row));
   }
 
   listReadyWorkMailboxes(): WorkMailbox[] {
     const rows = this.#db.prepare(
-      `SELECT target_kind, task_id, role_name, next_sequence, processing, pending
+      `SELECT target_kind, task_id, role_name, next_sequence, processing, pending, input_delivery
        FROM mailboxes
-       WHERE processing IS NOT NULL OR pending IS NOT NULL
+       WHERE processing IS NOT NULL
+          OR input_delivery IS NOT NULL
+          OR json_type(pending, '$.normal') <> 'null'
+          OR json_type(pending, '$.userCorrection') <> 'null'
        ORDER BY target_key`
-    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string | null }>;
+    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; input_delivery: string | null }>;
     return rows.map((row) => this.#rowToMailbox(row));
   }
 
@@ -2592,15 +2546,17 @@ export class SqliteTaskStore implements TaskStore {
     const cols = this.#mailboxCols(mailbox.target);
     this.#mutate(() => {
       this.#db.prepare(
-        `INSERT INTO mailboxes (target_kind, task_id, role_name, target_key, next_sequence, processing, pending)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO mailboxes (target_kind, task_id, role_name, target_key, next_sequence, processing, pending, input_delivery)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(target_key) DO UPDATE SET next_sequence = excluded.next_sequence,
-           processing = excluded.processing, pending = excluded.pending`
+           processing = excluded.processing, pending = excluded.pending,
+           input_delivery = excluded.input_delivery`
       ).run(
         cols.targetKind, cols.taskId, cols.roleName, cols.targetKey,
         mailbox.nextSequence,
         mailbox.processing === null ? null : this.#json(mailbox.processing),
-        mailbox.pending === null ? null : this.#json(mailbox.pending)
+        this.#json(mailbox.pending),
+        mailbox.inputDelivery === null ? null : this.#json(mailbox.inputDelivery)
       );
     });
   }
@@ -2619,40 +2575,6 @@ export class SqliteTaskStore implements TaskStore {
    * single writer connection serializes enqueues, so sequences stay gapless per
    * mailbox. `(mailbox_id, sequence)` is the exactly-once key.
    */
-  enqueueMailboxSignal(target: MailboxTarget, input: { reason: string; ref?: MailboxEntityRef; requestId: string }): number {
-    return this.#mutate(() => {
-      const cols = this.#mailboxCols(target);
-      let mailboxId: number;
-      let sequence: number;
-      const existing = this.#db.prepare(
-        "SELECT mailbox_id, next_sequence FROM mailboxes WHERE target_key = ?"
-      ).get(cols.targetKey) as { mailbox_id: number; next_sequence: number } | undefined;
-      if (existing === undefined) {
-        const result = this.#db.prepare(
-          `INSERT INTO mailboxes (target_kind, task_id, role_name, target_key, next_sequence, processing, pending)
-           VALUES (?, ?, ?, ?, 1, NULL, NULL)`
-        ).run(cols.targetKind, cols.taskId, cols.roleName, cols.targetKey);
-        mailboxId = Number(result.lastInsertRowid);
-        sequence = 1;
-      } else {
-        mailboxId = existing.mailbox_id;
-        sequence = existing.next_sequence;
-      }
-      this.#db.prepare(
-        `INSERT INTO mailbox_signals (mailbox_id, sequence, reason, ref_type, ref_task_id, ref_id, occurred_at, request_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        mailboxId, sequence, input.reason,
-        input.ref?.type ?? null,
-        input.ref && "taskId" in input.ref ? input.ref.taskId : null,
-        input.ref?.id ?? null,
-        this.#now(), input.requestId
-      );
-      this.#db.prepare("UPDATE mailboxes SET next_sequence = ? WHERE mailbox_id = ?").run(sequence + 1, mailboxId);
-      return sequence;
-    });
-  }
-
   // -- scheduler projections -----------------------------------------------------
 
   #getProjection<T>(taskId: string, kind: "leader-failure" | "operator-notification"): T | null {
@@ -2723,33 +2645,47 @@ export class SqliteTaskStore implements TaskStore {
     const target: MailboxTarget = { kind: "role", taskId: value.taskId, roleName: "leader" };
     this.transaction((store) => {
       const existing = store.getWorkMailbox(target);
-      if (existing !== null && existing.pending !== null
-        && value.requestCount <= existing.pending.requestCount) {
+      const existingPending = existing === null ? null : pendingLane(existing, "normal");
+      if (existingPending !== null
+        && value.requestCount <= existingPending.requestCount) {
         throw new StorageRecordError(`Pending wakeup is stale: ${value.taskId}`);
       }
-      const fromSequence = existing?.pending?.fromSequence ?? existing?.nextSequence ?? 1;
+      const fromSequence = existingPending?.fromSequence ?? existing?.nextSequence ?? 1;
       const toSequence = fromSequence + value.requestCount - 1;
       store.saveWorkMailbox({
         schemaVersion: CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
         target,
         nextSequence: Math.max(existing?.nextSequence ?? 1, toSequence + 1),
         processing: existing?.processing ?? null,
+        inputDelivery: existing?.inputDelivery ?? null,
         pending: {
-          ...existing?.pending,
-          fromSequence,
-          toSequence,
-          reasons: [...value.reasons],
-          refs: existing?.pending?.refs ?? [],
-          requestCount: value.requestCount,
-          firstQueuedAt: value.firstRequestedAt,
-          lastQueuedAt: value.lastRequestedAt
+          normal: {
+            fromSequence,
+            toSequence,
+            reasons: [...value.reasons],
+            refs: existingPending?.refs ?? [],
+            requestCount: value.requestCount,
+            firstQueuedAt: value.firstRequestedAt,
+            lastQueuedAt: value.lastRequestedAt,
+            sources: existingPending?.sources ?? ["pending-wakeup-projection"],
+            dedupeKeys: existingPending?.dedupeKeys ?? [
+              `pending-wakeup:${value.taskId}:${fromSequence}-${toSequence}`
+            ],
+            deliveryModes: existingPending?.deliveryModes ?? ["followup"]
+          },
+          userCorrection: existing?.pending.userCorrection ?? null,
+          cursors: existing?.pending.cursors ?? { normal: 0, userCorrection: 0 },
+          recentDedupeKeys: existing?.pending.recentDedupeKeys ?? []
         }
       });
     });
   }
 
   clearPendingWakeup(taskId: string): void {
-    this.removeWorkMailbox({ kind: "role", taskId, roleName: "leader" });
+    const target = { kind: "role" as const, taskId, roleName: "leader" };
+    const mailbox = this.getWorkMailbox(target);
+    if (mailbox === null || mailbox.pending.normal === null) return;
+    this.saveWorkMailbox(consumePendingBatch(mailbox, "normal"));
   }
 
   // -- telemetry (§4.4) -----------------------------------------------------------

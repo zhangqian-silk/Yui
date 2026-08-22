@@ -578,7 +578,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         );
         // End option parsing before the opaque prompt so a wakeup beginning
         // with '-' can never be reinterpreted as a Codex CLI flag.
-        args.push("--", managedRun.input);
+        if (managedRun.pushedAt === undefined) args.push("--", managedRun.input);
       }
       session = launchMode === "resume"
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
@@ -720,7 +720,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       },
       launch: scopedLaunch,
       session,
-      ...((binding.adapterId === "codex" || managedClaudeRun) && input.runId !== undefined
+      ...((binding.adapterId === "codex" && managedRun?.pushedAt === undefined
+          || managedClaudeRun) && input.runId !== undefined
         ? { initialPromptRunId: input.runId }
         : {})
     };

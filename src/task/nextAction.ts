@@ -80,7 +80,7 @@ export type NextAction = Readonly<{
 }>;
 
 export type NextActionFacts = Readonly<{
-  task: Readonly<Pick<Task, "id" | "status" | "projectBindings">>;
+  task: Readonly<Pick<Task, "id" | "status" | "projectBindings" | "requireIntegration">>;
   workItems: readonly WorkItem[];
   changeSets: readonly ChangeSet[];
   integrations: readonly IntegrationAttempt[];

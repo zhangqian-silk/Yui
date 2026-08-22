@@ -105,8 +105,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         if (existingState === undefined && freshSession && state.usage === undefined) {
           const zero = Object.freeze({ inputTokens: 0, outputTokens: 0 });
           this.inbox.enqueueObservation(createRuntimeObservation({
-            schemaVersion: 1,
+            schemaVersion: 2,
             eventId: observationId("baseline", fence, source.sourceId, "zero"),
+            semanticKey: observationId("baseline", fence, source.sourceId, "zero"),
             kind: "activity.observed",
             authority: "controller",
             receivedAt: at,
@@ -121,8 +122,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         const health = JSON.stringify([sample.status, sample.detail ?? null]);
         if (state.health !== health) {
           this.inbox.enqueueObservation(createRuntimeObservation({
-            schemaVersion: 1,
+            schemaVersion: 2,
             eventId: observationId("health", fence, source.sourceId, health),
+            semanticKey: observationId("health", fence, source.sourceId, health),
             kind: "observer.health",
             authority: "diagnostic",
             receivedAt: at,
@@ -145,8 +147,14 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         if (usageChanged || (activityChanged && state.cursor !== undefined)) {
           const usage = sample.usage;
           this.inbox.enqueueObservation(createRuntimeObservation({
-            schemaVersion: 1,
+            schemaVersion: 2,
             eventId: observationId(
+              "activity",
+              fence,
+              source.sourceId,
+              JSON.stringify([usage ?? null, sample.activityId ?? null])
+            ),
+            semanticKey: observationId(
               "activity",
               fence,
               source.sourceId,

@@ -43,7 +43,6 @@ const ENVIRONMENT_REFRESH_TIMEOUT_MS = 500;
 const CONFIGURATION_REFRESH_TIMEOUT_MS = 500;
 const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
   ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
-  "YUI_TMUX_BIN",
   // Issue 01: YUI_STORE_BACKEND/YUI_STORE_WORKER are reserved for tests and
   // explicit recovery commands. A Controller spawned by such a command must
   // inherit the forced backend; otherwise a layout-7 test Home silently opens

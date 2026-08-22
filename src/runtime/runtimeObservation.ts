@@ -5,6 +5,7 @@ import type {
 } from "./agentDriver.js";
 import { requireDriverId } from "./agentDriver.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import type { ProviderErrorCode } from "./providerErrorCodes.js";
 
 export const RUNTIME_OBSERVATION_TASK_EVENT = "runtime.observation";
 
@@ -14,6 +15,10 @@ export type RuntimeObservationKind =
   | "session.ready"
   | "session.ended"
   | "session.failed"
+  | "conversation.observed"
+  | "activation.started"
+  | "activation.ended"
+  | "activation.failed"
   | "turn.accepted"
   | "turn.waiting"
   | "turn.completed"
@@ -22,6 +27,12 @@ export type RuntimeObservationKind =
   | "operation.started"
   | "operation.completed"
   | "operation.failed"
+  | "native-work.snapshot"
+  | "continuation.started"
+  | "continuation.reported"
+  | "continuation.settled"
+  | "input.accepted"
+  | "input.delivery-unknown"
   | "activity.observed"
   | "observer.health";
 
@@ -42,6 +53,11 @@ export type RuntimeObservationFence = Readonly<{
   driverId: string;
   launchId: string;
   sessionGenerationId: string;
+  conversationId?: string;
+  activationId?: string;
+  continuationId?: string;
+  continuationGeneration?: number;
+  parentContinuationId?: string;
   nativeSessionId?: string;
   nativeTurnId?: string;
   receiptId?: string;
@@ -55,9 +71,13 @@ export type RuntimeUsageSnapshot = Readonly<{
 }>;
 
 export type RuntimeTurnFailure = Readonly<{
+  /** Structured Provider-neutral error code, when the driver could extract one. */
+  errorCode?: ProviderErrorCode;
   code: string;
   details?: string;
   lastOutput?: string;
+  /** Exact Provider evidence that this error irrecoverably covers the Yui Run. */
+  runTerminal?: boolean;
 }>;
 
 export type RuntimeObservationPayload = Readonly<{
@@ -75,11 +95,22 @@ export type RuntimeObservationPayload = Readonly<{
   observerDetail?: string;
   failure?: RuntimeTurnFailure;
   summary?: string;
+  execution?: "active" | "quiescent" | "unknown";
+  outcome?: "pending" | "succeeded" | "failed" | "cancelled" | "unknown";
+  attachment?: "attached" | "detached";
+  observationQuality?: "exact" | "partial" | "unavailable";
+  mayWriteWorkspace?: boolean;
+  resultRef?: string;
+  reportId?: string;
+  providerDeliveryRef?: string;
+  snapshotComplete?: boolean;
+  recoverability?: "unknown" | "recoverable" | "unrecoverable";
 }>;
 
 export type RuntimeObservation = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   eventId: string;
+  semanticKey: string;
   kind: RuntimeObservationKind;
   authority: RuntimeObservationAuthority;
   receivedAt: string;
@@ -97,6 +128,10 @@ const KINDS: readonly RuntimeObservationKind[] = [
   "session.ready",
   "session.ended",
   "session.failed",
+  "conversation.observed",
+  "activation.started",
+  "activation.ended",
+  "activation.failed",
   "turn.accepted",
   "turn.waiting",
   "turn.completed",
@@ -105,6 +140,12 @@ const KINDS: readonly RuntimeObservationKind[] = [
   "operation.started",
   "operation.completed",
   "operation.failed",
+  "native-work.snapshot",
+  "continuation.started",
+  "continuation.reported",
+  "continuation.settled",
+  "input.accepted",
+  "input.delivery-unknown",
   "activity.observed",
   "observer.health"
 ];
@@ -131,6 +172,12 @@ const RUN_SCOPED: ReadonlySet<RuntimeObservationKind> = new Set([
   "observer.health"
 ]);
 
+const CONTINUATION_SCOPED: ReadonlySet<RuntimeObservationKind> = new Set([
+  "continuation.started",
+  "continuation.reported",
+  "continuation.settled"
+]);
+
 const PROVIDER_STATE: ReadonlySet<RuntimeObservationKind> = new Set([
   "session.started",
   "session.ready",
@@ -147,7 +194,7 @@ const PROVIDER_STATE: ReadonlySet<RuntimeObservationKind> = new Set([
 ]);
 
 export function createRuntimeObservation(input: RuntimeObservation): RuntimeObservation {
-  if (input.schemaVersion !== 1) throw new Error("Runtime observation schemaVersion must be 1.");
+  if (input.schemaVersion !== 2) throw new Error("Runtime observation schemaVersion must be 2.");
   if (!KINDS.includes(input.kind)) throw new Error("Runtime observation kind is invalid.");
   if (!AUTHORITIES.includes(input.authority)) throw new Error("Runtime observation authority is invalid.");
   if (input.kind === "host.observed" && input.authority !== "host" && input.authority !== "controller") {
@@ -168,6 +215,22 @@ export function createRuntimeObservation(input: RuntimeObservation): RuntimeObse
   if (RUN_SCOPED.has(input.kind) && fence.nativeTurnId === undefined) {
     throw new Error(`${input.kind} requires nativeTurnId.`);
   }
+  if ((input.kind.startsWith("activation.") || CONTINUATION_SCOPED.has(input.kind)
+      || input.kind === "native-work.snapshot")
+    && fence.activationId === undefined) {
+    throw new Error(`${input.kind} requires activationId.`);
+  }
+  if ((input.kind === "conversation.observed" || input.kind.startsWith("activation.")
+      || CONTINUATION_SCOPED.has(input.kind) || input.kind === "native-work.snapshot")
+    && fence.conversationId === undefined) {
+    throw new Error(`${input.kind} requires conversationId.`);
+  }
+  if (CONTINUATION_SCOPED.has(input.kind) && fence.continuationId === undefined) {
+    throw new Error(`${input.kind} requires continuationId.`);
+  }
+  if (CONTINUATION_SCOPED.has(input.kind) && fence.continuationGeneration === undefined) {
+    throw new Error(`${input.kind} requires continuationGeneration.`);
+  }
   const payload = normalizePayload(input.kind, input.payload);
   const sequence = input.sequence;
   if (sequence !== undefined && (!Number.isSafeInteger(sequence) || sequence < 0)) {
@@ -178,8 +241,9 @@ export function createRuntimeObservation(input: RuntimeObservation): RuntimeObse
     throw new Error("Runtime observation ordinal must be a non-negative safe integer.");
   }
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
     eventId: requireIdentity(input.eventId, "Runtime observation event id"),
+    semanticKey: requireIdentity(input.semanticKey, "Runtime observation semantic key"),
     kind: input.kind,
     authority: input.authority,
     receivedAt: requireTimestamp(input.receivedAt, "Runtime observation receivedAt"),
@@ -205,6 +269,11 @@ export function runtimeObservationFenceMatches(
     "driverId",
     "launchId",
     "sessionGenerationId",
+    "conversationId",
+    "activationId",
+    "continuationId",
+    "continuationGeneration",
+    "parentContinuationId",
     "nativeSessionId",
     "nativeTurnId",
     "receiptId"
@@ -217,7 +286,9 @@ export function runtimeObservationFenceMatches(
 /**
  * Matches observations that belong to one durable Run/session generation.
  * A provider may advance its native Turn while background subagents from an
- * earlier Turn are still active, so nativeTurnId is intentionally excluded.
+ * earlier Turn are still active and later mailbox activations use their own
+ * exactly-once receipt, so nativeTurnId and receiptId are intentionally
+ * excluded. Exact acceptance still validates both fields before persistence.
  */
 export function runtimeObservationRunFenceMatches(
   expected: RuntimeObservationFence,
@@ -231,8 +302,7 @@ export function runtimeObservationRunFenceMatches(
     "driverId",
     "launchId",
     "sessionGenerationId",
-    "nativeSessionId",
-    "receiptId"
+    "nativeSessionId"
   ] as const) {
     if (expected[field] !== actual[field]) return false;
   }
@@ -246,6 +316,7 @@ export function runtimeObservationTaskEventPayload(
   const observation = createRuntimeObservation(input);
   return Object.freeze({
     eventId: observation.eventId,
+    semanticKey: observation.semanticKey,
     roleName: observation.fence.roleName,
     agentId: observation.fence.agentId,
     driverId: observation.fence.driverId,
@@ -290,7 +361,33 @@ function normalizeFence(input: RuntimeObservationFence): RuntimeObservationFence
       : { nativeTurnId: requireIdentity(input.nativeTurnId, "Native Turn id") }),
     ...(input.receiptId === undefined
       ? {}
-      : { receiptId: requireIdentity(input.receiptId, "Receipt id") })
+      : { receiptId: requireIdentity(input.receiptId, "Receipt id") }),
+    ...(input.conversationId === undefined
+      ? {}
+      : { conversationId: requireIdentity(input.conversationId, "Provider Conversation id") }),
+    ...(input.activationId === undefined
+      ? {}
+      : { activationId: requireIdentity(input.activationId, "Provider Activation id") }),
+    ...(input.continuationId === undefined
+      ? {}
+      : { continuationId: requireIdentity(input.continuationId, "Provider Continuation id") }),
+    ...(input.continuationGeneration === undefined
+      ? {}
+      : {
+          continuationGeneration: requireNonNegativeInteger(
+            input.continuationGeneration,
+            1,
+            "Provider Continuation generation"
+          )
+        }),
+    ...(input.parentContinuationId === undefined
+      ? {}
+      : {
+          parentContinuationId: requireIdentity(
+            input.parentContinuationId,
+            "Parent Provider Continuation id"
+          )
+        })
   });
 }
 
@@ -335,6 +432,42 @@ function normalizePayload(
   if (kind === "turn.failed" && input.failure === undefined) {
     throw new Error("turn.failed requires normalized failure evidence.");
   }
+  if (kind === "conversation.observed"
+    && !["unknown", "recoverable", "unrecoverable"].includes(input.recoverability ?? "")) {
+    throw new Error("conversation.observed requires recoverability.");
+  }
+  if (kind === "native-work.snapshot") {
+    if (typeof input.snapshotComplete !== "boolean"
+      || !["exact", "partial", "unavailable"].includes(input.observationQuality ?? "")) {
+      throw new Error("native-work.snapshot requires completeness and observation quality.");
+    }
+    if (input.snapshotComplete && input.observationQuality !== "exact") {
+      throw new Error("A complete native-work.snapshot requires exact observation quality.");
+    }
+  }
+  if (kind.startsWith("continuation.")) {
+    if (!["active", "quiescent", "unknown"].includes(input.execution ?? "")) {
+      throw new Error(`${kind} requires continuation execution.`);
+    }
+    if (!["pending", "succeeded", "failed", "cancelled", "unknown"].includes(
+      input.outcome ?? ""
+    )) {
+      throw new Error(`${kind} requires continuation outcome.`);
+    }
+    if (input.attachment !== "attached" && input.attachment !== "detached") {
+      throw new Error(`${kind} requires continuation attachment.`);
+    }
+    if (!["exact", "partial", "unavailable"].includes(input.observationQuality ?? "")) {
+      throw new Error(`${kind} requires continuation observation quality.`);
+    }
+    if (typeof input.mayWriteWorkspace !== "boolean") {
+      throw new Error(`${kind} requires mayWriteWorkspace.`);
+    }
+    if (kind === "continuation.reported") requireIdentity(input.reportId, "Provider report id");
+    if (kind === "continuation.settled" && input.observationQuality !== "exact") {
+      throw new Error("continuation.settled requires exact observation quality.");
+    }
+  }
   const failure = input.failure === undefined
     ? undefined
     : normalizeFailure(input.failure);
@@ -360,8 +493,101 @@ function normalizePayload(
       ? {}
       : { observerDetail: requireText(input.observerDetail, "Runtime observer detail") }),
     ...(failure === undefined ? {} : { failure }),
-    ...(input.summary === undefined ? {} : { summary: requireText(input.summary, "Runtime summary") })
+    ...(input.summary === undefined ? {} : { summary: requireText(input.summary, "Runtime summary") }),
+    ...(input.execution === undefined ? {} : { execution: input.execution }),
+    ...(input.outcome === undefined ? {} : { outcome: input.outcome }),
+    ...(input.attachment === undefined ? {} : { attachment: input.attachment }),
+    ...(input.observationQuality === undefined
+      ? {}
+      : { observationQuality: input.observationQuality }),
+    ...(input.mayWriteWorkspace === undefined
+      ? {}
+      : { mayWriteWorkspace: input.mayWriteWorkspace }),
+    ...(input.resultRef === undefined
+      ? {}
+      : { resultRef: requireIdentity(input.resultRef, "Provider result ref") }),
+    ...(input.reportId === undefined
+      ? {}
+      : { reportId: requireIdentity(input.reportId, "Provider report id") }),
+    ...(input.providerDeliveryRef === undefined
+      ? {}
+      : {
+          providerDeliveryRef: requireIdentity(
+            input.providerDeliveryRef,
+            "Provider delivery ref"
+          )
+        }),
+    ...(input.snapshotComplete === undefined
+      ? {}
+      : { snapshotComplete: input.snapshotComplete }),
+    ...(input.recoverability === undefined
+      ? {}
+      : { recoverability: input.recoverability })
   });
+}
+
+export function runtimeObservationSemanticKey(input: Readonly<{
+  eventId: string;
+  kind: RuntimeObservationKind;
+  fence: RuntimeObservationFence;
+  sequence?: number;
+  payload?: RuntimeObservationPayload;
+}>): string {
+  const fence = input.fence;
+  const continuationIdentity = [
+    fence.driverId,
+    fence.agentId,
+    fence.conversationId ?? fence.nativeSessionId ?? fence.launchId,
+    fence.activationId ?? fence.launchId,
+    fence.continuationId ?? "none",
+    fence.continuationGeneration ?? "none"
+  ];
+  // Terminal boundaries are semantic facts. Providers may replay them with a
+  // fresh transport sequence after reconnect, so terminal identity must win
+  // over occurrence ordering or one SessionEnd storm becomes many facts.
+  if (["session.ended", "session.failed", "activation.ended", "activation.failed",
+    "turn.completed", "turn.failed", "turn.cancelled", "continuation.settled"].includes(input.kind)) {
+    return [
+      "terminal",
+      ...continuationIdentity,
+      fence.continuationId ?? fence.nativeTurnId ?? "none",
+      input.kind,
+      input.payload?.outcome ?? input.payload?.failure?.code ?? "terminal",
+      input.kind === "continuation.settled" ? input.payload?.resultRef ?? "none" : "none",
+      input.kind === "turn.failed" && input.payload?.failure?.runTerminal === true
+        ? "run-terminal"
+        : "turn-terminal"
+    ].join(":");
+  }
+  if (input.kind === "continuation.reported") {
+    return ["continuation-report", ...continuationIdentity, input.payload?.reportId ?? "missing"]
+      .join(":");
+  }
+  if (input.kind === "continuation.started") {
+    return [
+      "continuation-state",
+      ...continuationIdentity,
+      input.payload?.execution ?? "unknown",
+      input.payload?.attachment ?? "unknown",
+      input.payload?.observationQuality ?? "unknown",
+      input.payload?.mayWriteWorkspace === true ? "writer" : "read-only",
+      input.payload?.outcome ?? "unknown",
+      input.payload?.resultRef ?? "none"
+    ].join(":");
+  }
+  if (input.sequence !== undefined) {
+    return [
+      "provider-sequence",
+      fence.driverId,
+      fence.conversationId ?? fence.nativeSessionId ?? fence.launchId,
+      fence.activationId ?? fence.launchId,
+      fence.continuationId ?? fence.nativeTurnId ?? "none",
+      fence.continuationGeneration ?? "none",
+      input.sequence,
+      input.kind
+    ].join(":");
+  }
+  return `provider-event:${requireIdentity(input.eventId, "Runtime observation event id")}`;
 }
 
 function normalizeObserverSource(input: AgentRuntimeObserverSource): AgentRuntimeObserverSource {
@@ -384,14 +610,23 @@ function normalizeFailure(input: RuntimeTurnFailure): RuntimeTurnFailure {
     throw new Error("Runtime failure evidence must be an object.");
   }
   return Object.freeze({
+    ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
     code: requireText(input.code, "Runtime failure code"),
     ...(input.details === undefined
       ? {}
       : { details: requireText(input.details, "Runtime failure details") }),
     ...(input.lastOutput === undefined
       ? {}
-      : { lastOutput: requireText(input.lastOutput, "Runtime failure last output") })
+      : { lastOutput: requireText(input.lastOutput, "Runtime failure last output") }),
+    ...(input.runTerminal === undefined
+      ? {}
+      : { runTerminal: requireBoolean(input.runTerminal, "Runtime failure runTerminal") })
   });
+}
+
+function requireBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${label} must be boolean.`);
+  return value;
 }
 
 function validateUsage(input: RuntimeUsageSnapshot): void {
@@ -409,6 +644,11 @@ function requireTimestamp(value: string, label: string): string {
   const timestamp = requireText(value, label);
   if (!Number.isFinite(Date.parse(timestamp))) throw new Error(`${label} is invalid.`);
   return timestamp;
+}
+
+function requireNonNegativeInteger(value: number, minimum: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${label} is invalid.`);
+  return value;
 }
 
 function requireIdentity(value: unknown, label: string): string {

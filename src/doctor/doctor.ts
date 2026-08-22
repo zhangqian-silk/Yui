@@ -42,6 +42,7 @@ import {
 import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
 import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
 import { classifyHome } from "../storage/upgrade/homeClassification.js";
+import { resolveGitBin, resolveTmuxBin } from "../config/yuiConfig.js";
 import {
   readMigrationReceipt,
   type PersistentMigrationReceipt
@@ -311,9 +312,10 @@ function inspectDoctor(
     compatibility
   );
   const domain = checkEphemeralDomain(home);
+  const durableConfig = readDurableConfigSafely(home, compatibility.storageOptions);
   const toolChecks = [
-    checkExecutable("git", env.YUI_GIT_BIN ?? "git", ["--version"], executor),
-    checkExecutable("tmux", env.YUI_TMUX_BIN ?? "tmux", ["-V"], executor)
+    checkExecutable("git", durableConfig.gitBin, ["--version"], executor),
+    checkExecutable("tmux", durableConfig.tmuxBin, ["-V"], executor)
   ];
   const agentChecks = storage.agents.flatMap((agent) => checkAgent(agent, executor, env));
   const review = inspectReview({ ...storage.review, home }, agentChecks, env);
@@ -1284,4 +1286,24 @@ function systemCode(error: unknown): string | undefined {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Read the durable config for executable paths. Falls back to defaults when
+ * the Home store cannot be opened (the doctor must still run on broken Homes).
+ */
+function readDurableConfigSafely(
+  home: string,
+  storageOptions: Readonly<{ registry?: OpenCompatibleFileTaskStoreOptions["registry"]; latest?: OpenCompatibleFileTaskStoreOptions["latest"] }> | undefined
+): { tmuxBin: string; gitBin: string } {
+  try {
+    const store = openCompatibleFileTaskStore(home, storageOptions ?? {});
+    const config = store.getConfig();
+    return {
+      tmuxBin: resolveTmuxBin(config.tmuxBin),
+      gitBin: resolveGitBin(config.gitBin)
+    };
+  } catch {
+    return { tmuxBin: "tmux", gitBin: "git" };
+  }
 }

@@ -25,6 +25,7 @@ import {
 } from "../runtime/runtimeObservation.js";
 import {
   evaluateRuntimeAttention,
+  projectRuntimeMailbox,
   projectRuntimeObservation,
   projectRuntimeTaskEvents,
   runtimeDisplayStatus,
@@ -287,7 +288,14 @@ function inspectTaskRoleRuntimeStatus(
     ? { managed: false, path: role.workspace }
     : { ...managedWorkspace, managed: true };
   const events = store.listEvents(taskId);
-  const runtime = projectTaskRoleRuntime(activeRun, nativeSession, tmux, events, now);
+  const runtime = projectTaskRoleRuntime(
+    activeRun,
+    nativeSession,
+    tmux,
+    events,
+    store.getWorkMailbox({ kind: "role", taskId, roleName: role.name }),
+    now
+  );
   const stalled = activeRun !== null && isRoleRunStalled(events, activeRun.id);
   const stallProgressAt = activeRun === null
     ? undefined
@@ -381,7 +389,10 @@ function calculateHealth(
     };
   }
   if (tmux.state === "exited") {
-    return { health: "failed", healthReason: "the tmux pane has exited" };
+    return {
+      health: "needs-attention",
+      healthReason: "the tmux pane exited; Provider Conversation/continuation state is unobservable"
+    };
   }
   if (activeRun !== null) {
     if (role.status !== "running") {
@@ -416,10 +427,16 @@ function calculateHealth(
             : "the Agent Driver has not reported recent structured runtime activity"
         };
       }
-      if (runtime.status === "broken" || runtime.status === "stopped") {
+      if (runtime.status === "broken") {
         return {
           health: "failed",
           healthReason: `the Agent Driver runtime is ${runtime.status}`
+        };
+      }
+      if (runtime.status === "stopped") {
+        return {
+          health: "needs-attention",
+          healthReason: "the Provider Activation ended while the Yui Run remains active"
         };
       }
       if (runtime.status.startsWith("waiting-")) {
@@ -481,6 +498,7 @@ function projectTaskRoleRuntime(
   session: RoleAgentSession | null,
   tmux: TaskRoleTmuxStatus,
   events: ReturnType<TaskStore["listEvents"]>,
+  mailbox: ReturnType<TaskStore["getWorkMailbox"]>,
   now: Date
 ): TaskRoleRuntimeStatus["runtime"] {
   if (run === null || session?.launchId === undefined) return null;
@@ -515,9 +533,11 @@ function projectTaskRoleRuntime(
     receiptId: formatAgentRunReceiptId(run.taskId, run.id)
   };
   let projection = projectRuntimeTaskEvents(fence, run.createdAt, events);
+  projection = projectRuntimeMailbox(projection, mailbox);
   projection = projectRuntimeObservation(projection, createRuntimeObservation({
-    schemaVersion: 1,
+    schemaVersion: 2,
     eventId: `runtime-host-${run.id}`,
+    semanticKey: `runtime-host-${run.id}`,
     kind: "host.observed",
     authority: "host",
     receivedAt: run.updatedAt,

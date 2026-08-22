@@ -13,10 +13,12 @@ import type { PendingProviderRetry } from "../run/providerRetry.js";
 import type {
   MailboxEntityRef,
   MailboxTarget,
+  MailboxLane,
+  DeliveryMode,
+  InputDelivery,
   ProcessingBatch,
   WorkMailbox
 } from "../coordination/workMailbox.js";
-import type { PendingTurnCompletion } from "../executor/turnCompletion.js";
 import type {
   RuntimeLifecycleTarget,
   RuntimeRoleOwner
@@ -209,6 +211,25 @@ export type SchedulerMailboxClaimResult =
   | Readonly<{ status: "claimed" | "processing"; processing: ProcessingBatch }>
   | Readonly<{ status: "empty" }>;
 
+export type SchedulerInputDeliveryClaimInput = Readonly<{
+  target: Extract<MailboxTarget, { kind: "role" | "operator" }>;
+  attemptId: string;
+  lane: MailboxLane;
+  mode: DeliveryMode;
+  owner: string;
+  now: Date;
+  executionRef: MailboxEntityRef;
+  providerFence: Readonly<{
+    conversationId: string;
+    activationId: string;
+    nativeTurnId?: string;
+  }>;
+}>;
+
+export type SchedulerInputDeliveryClaimResult =
+  | Readonly<{ status: "claimed" | "delivery"; delivery: InputDelivery }>
+  | Readonly<{ status: "empty" }>;
+
 export type RoleRunDeliveryPersistence = Readonly<{
   task: SchedulerTask;
   role: SchedulerRole;
@@ -284,17 +305,12 @@ export interface SchedulerStorePort {
   getActiveAgentRun(taskId: string, roleName: string): SchedulerAgentRun | null;
   hasOpenInputRequest(taskId: string): boolean;
   listOpenInputRequests(taskIds?: readonly string[]): readonly InputRequest[];
-  listPendingRuntimeTurnCompletions(taskIds?: readonly string[]): readonly PendingTurnCompletion[];
   getInputRequest(taskId: string, inputRequestId: string): InputRequest | null;
   getOperatorDeliveryTarget(): SchedulerOperatorDeliveryTarget | null;
   resolveExpiredInputRecommendations(
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly AutoResolvedInput[];
-  resolveDueRuntimeTurnCompletions(
-    now: Date,
-    taskIds?: ReadonlySet<string>
-  ): readonly string[];
   /**
    * Issue 04 durable in-place retry timer. Lists active Runs whose Provider
    * retry is due; the Controller arms its deadline timer from this projection.
@@ -355,6 +371,19 @@ export interface SchedulerStorePort {
     nativeSessionId?: string;
   }>): boolean;
   hasInFlightTurn(taskId: string, roleName: string): boolean;
+  /** Exact currently-active Provider Turn fence, or null when no safe steer boundary exists. */
+  getActiveProviderTurnFence?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+    launchId: string;
+    nativeSessionId: string;
+  }>): Readonly<{
+    conversationId: string;
+    activationId: string;
+    nativeTurnId: string;
+  }> | null;
   peekNextAgentRunId(taskId: string): string;
 
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
@@ -366,6 +395,17 @@ export interface SchedulerStorePort {
    */
   listReadyWorkMailboxes?(): readonly WorkMailbox[];
   claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult;
+  claimInputDelivery(input: SchedulerInputDeliveryClaimInput): SchedulerInputDeliveryClaimResult;
+  markInputDeliveryPushed(target: MailboxTarget, attemptId: string, now: Date): boolean;
+  completeInputDelivery(target: MailboxTarget, attemptId: string, now: Date): boolean;
+  releaseInputDelivery(target: MailboxTarget, attemptId: string): boolean;
+  resolveInputDeliveryNotAccepted(target: MailboxTarget, attemptId: string): boolean;
+  markInputDeliveryUnknown(
+    target: MailboxTarget,
+    attemptId: string,
+    reason: string,
+    now: Date
+  ): boolean;
   completeWorkMailbox(target: MailboxTarget, batchId: string): boolean;
   releaseWorkMailbox(target: MailboxTarget, batchId: string): boolean;
   /**
@@ -430,6 +470,12 @@ export interface SchedulerStorePort {
   ): boolean;
   savePendingWakeup(wakeup: PendingWakeup): void;
   clearPendingWakeup(taskId: string): void;
+  /**
+   * Records that a Leader wake was suppressed by scheduler single-flight
+   * (the Role runtime lifecycle lane was busy). The wake stays durable and
+   * is retried after the lane settles.
+   */
+  recordWakeSuppression?(taskId: string, reason: string, now: Date): void;
 
   getLeaderFailure(taskId: string): LeaderFailure | null;
   getOperatorNotification(taskId: string): OperatorNotification | null;
@@ -573,6 +619,7 @@ export type ReadyRoleDelivery = Readonly<{
  * readiness, and performs receipt-backed literal delivery.
  */
 export interface TmuxDeliveryPort {
+  canRouteProviderInput?(adapterId: string): boolean;
   prepareRoleSession(input: Readonly<{
     taskId: string;
     roleName: string;
@@ -593,6 +640,32 @@ export interface TmuxDeliveryPort {
     receiptId: string;
     text: string;
   }>): Promise<"sent" | "already-sent" | "busy" | "unavailable">;
+  routeProviderInput?(input: Readonly<{
+    delivery: ReadyRoleDelivery;
+    attemptId: string;
+    mode: "steer-if-safe" | "inject";
+    text: string;
+    fence: Readonly<{
+      conversationId: string;
+      activationId: string;
+      nativeTurnId?: string;
+    }>;
+  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unsafe" | "unavailable">;
+  reconcileProviderInput?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    launchId: string;
+    nativeSessionId: string;
+    attemptId: string;
+    mode: "followup" | "steer-if-safe" | "inject";
+    fence: Readonly<{
+      conversationId: string;
+      activationId: string;
+      nativeTurnId?: string;
+    }>;
+  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unavailable">;
   /**
    * Drops transient prepared bindings after authoritative terminal/absence
    * state. Omitting runId clears every prepared generation for the Role.

@@ -8,6 +8,7 @@ import {
 } from "../executor/effectiveLaunch.js";
 import {
   hasRuntimeLifecycleWork,
+  RuntimeLifecycleBusyError,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
@@ -79,6 +80,21 @@ export async function processLeaderWakeups(
     if (typeof store.hasInFlightTurn === "function"
       && store.hasInFlightTurn(task.id, role.name)) {
       results.push({ taskId: task.id, status: "skipped", reason: "busy" });
+      continue;
+    }
+
+    // Single-flight: a Role runtime lifecycle lane that already holds a
+    // launch reservation or cleanup obligation must not be entered by a
+    // second wake. The wake stays durable (pendingWakeup is not consumed) and
+    // is retried after the lane settles; the suppression is recorded for the
+    // audit instead of manufacturing a failed Run.
+    if (hasRuntimeLifecycleWork(store.getWorkMailbox(runtimeLifecycleTarget({
+      scope: "task",
+      taskId: task.id,
+      roleName: role.name
+    })))) {
+      store.recordWakeSuppression?.(task.id, "lifecycle-busy", now);
+      results.push({ taskId: task.id, status: "skipped", reason: "recovery-blocked" });
       continue;
     }
 
@@ -351,6 +367,26 @@ export async function processLeaderWakeups(
       const detail = error instanceof Error ? error.message : String(error);
       const message = `Leader dispatch failed: ${detail}`;
       if (claimed && run !== null) {
+        // Scheduler single-flight backpressure: the Role runtime lifecycle
+        // lane was busy when the launch was reserved. The claimed Run stays
+        // active-unpushed; the active-Run delivery path retries it after the
+        // lane settles. This is contention before any semantic launch, not a
+        // Run failure and not grounds for a Leader failure record.
+        if (error instanceof RuntimeLifecycleBusyError) {
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id
+          });
+          results.push({
+            taskId: task.id,
+            runId: run.id,
+            status: "skipped",
+            reason: "not-ready",
+            error: message
+          });
+          continue;
+        }
         // A finite managed provider from the preceding Run may still be
         // exiting after its durable yield. Keep this newly-claimed Run as the
         // sole owner of the Role mailbox; active-Run delivery will retry it
@@ -543,7 +579,7 @@ function leaderWakeupInput(
     "Use narrower Task message, WorkItem, decision, milestone, and input commands only when a specific record needs closer inspection.",
     `When the requested outcome is finished and there are no active Worker Runs or unresolved inputs, complete the Task with yui task complete ${taskId} --summary-file - and a quoted heredoc containing the final outcome and evidence.`,
     "Provider-native subagents remain inside this Leader AgentRun. Yui observes their structured lifecycle and keeps the Run active across intermediate provider Turn boundaries while children remain active; let the provider deliver completion notifications and continue synthesis without polling or yielding merely for that native wait.",
-    `Before ending this turn, if the Task was not completed, no InputRequest terminalized this Run, and no provider-native child work remains active, release the active fence with yui task run yield ${runId} --summary-file - and a quoted heredoc containing the current result or waiting state. For managed Task Role or Reviewer results, checkpoint and yield before waiting so their durable mailbox can wake a later Leader Run. The yield command must be the final tool action: after it succeeds, stop immediately and do not inspect, poll, accept, or perform further work in the same native turn.`
+    `A Provider Turn ending does not end this Yui Run. Leave the Run active when later native-subagent results, managed Role results, reviewer results, or user corrections still belong to the same objective; Yui will aggregate those durable events and resume this Session with another Turn. Use yui task run yield ${runId} --summary-file - only for a deliberate Yui-level handoff that should close this Run rather than for ordinary waiting. If used, the yield command must be the final tool action: after it succeeds, stop immediately.`
   ];
   return lines.join("\n");
 }

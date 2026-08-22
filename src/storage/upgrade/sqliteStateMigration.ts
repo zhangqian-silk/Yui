@@ -96,7 +96,6 @@ export function copySqlitePassthroughState(
     target.transaction(() => {
       mergeGlobalSequences(source, target);
       copyTableRows(source, target, "outbox");
-      copyMailboxSignals(source, target);
       copyTableRows(source, target, "work_item_candidates");
       copyTableRows(source, target, "review_findings");
       copyTableRows(source, target, "telemetry");
@@ -126,52 +125,6 @@ function mergeGlobalSequences(source: Database.Database, target: Database.Databa
        high_water = MAX(global_sequences.high_water, excluded.high_water)`
   );
   for (const row of rows) merge.run(row.name, row.high_water);
-}
-
-function copyMailboxSignals(source: Database.Database, target: Database.Database): void {
-  if (!sqliteTableExists(source, "mailbox_signals")) return;
-  const rows = source.prepare(
-    `SELECT m.target_key, s.sequence, s.reason, s.ref_type, s.ref_task_id,
-            s.ref_id, s.occurred_at, s.request_id
-       FROM mailbox_signals s
-       JOIN mailboxes m ON m.mailbox_id = s.mailbox_id
-      ORDER BY m.target_key, s.sequence`
-  ).iterate() as IterableIterator<Readonly<{
-    target_key: string;
-    sequence: number;
-    reason: string;
-    ref_type: string | null;
-    ref_task_id: string | null;
-    ref_id: string | null;
-    occurred_at: string;
-    request_id: string;
-  }>>;
-  const findMailbox = target.prepare(
-    "SELECT mailbox_id FROM mailboxes WHERE target_key = ?"
-  );
-  const insert = target.prepare(
-    `INSERT INTO mailbox_signals
-       (mailbox_id, sequence, reason, ref_type, ref_task_id, ref_id, occurred_at, request_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  for (const row of rows) {
-    const mailbox = findMailbox.get(row.target_key) as { mailbox_id: number } | undefined;
-    if (mailbox === undefined) {
-      throw new Error(
-        `SQLite migration cannot preserve signals for missing mailbox ${row.target_key}.`
-      );
-    }
-    insert.run(
-      mailbox.mailbox_id,
-      row.sequence,
-      row.reason,
-      row.ref_type,
-      row.ref_task_id,
-      row.ref_id,
-      row.occurred_at,
-      row.request_id
-    );
-  }
 }
 
 function copyTableRows(
@@ -737,14 +690,17 @@ function hashPayloadTable(db: Database.Database, sql: string): FamilyChecksum {
 }
 
 /** Reconstruct a WorkMailbox from the normalised mailboxes table columns. */
-export function rowToMailbox(row: {
+type WorkMailboxRow = Readonly<{
   target_kind: string;
   task_id: string | null;
   role_name: string | null;
   next_sequence: number;
   processing: string | null;
   pending: string | null;
-}): Record<string, unknown> {
+  input_delivery?: string | null;
+}>;
+
+export function rowToMailbox(row: WorkMailboxRow): Record<string, unknown> {
   let target: Record<string, unknown>;
   switch (row.target_kind) {
     case "operator":
@@ -765,13 +721,32 @@ export function rowToMailbox(row: {
     default:
       target = { kind: row.target_kind };
   }
-  return {
-    schemaVersion: 1,
+  const common = {
     target,
     nextSequence: row.next_sequence,
     processing: row.processing === null ? null : JSON.parse(row.processing) as unknown,
     pending: row.pending === null ? null : JSON.parse(row.pending) as unknown
   };
+  return Object.hasOwn(row, "input_delivery")
+    ? {
+        schemaVersion: 2,
+        ...common,
+        inputDelivery: row.input_delivery === null
+          ? null
+          : JSON.parse(row.input_delivery!) as unknown
+      }
+    : { schemaVersion: 1, ...common };
+}
+
+function readWorkMailboxRows(db: Database.Database): WorkMailboxRow[] {
+  const hasInputDelivery = (db.prepare("PRAGMA table_info(mailboxes)").all() as Array<{
+    name: string;
+  }>).some(({ name }) => name === "input_delivery");
+  return db.prepare(
+    `SELECT target_kind, task_id, role_name, next_sequence, processing, pending${
+      hasInputDelivery ? ", input_delivery" : ""
+    } FROM mailboxes ORDER BY target_key`
+  ).all() as WorkMailboxRow[];
 }
 
 /**
@@ -852,16 +827,7 @@ export function computeDbFamilyChecksums(
     checksums.releaseWorkflow = hashPayloadTable(db, "SELECT payload FROM release_workflows");
 
     // Mailboxes are reconstructed from typed columns (no payload column).
-    const mailboxRows = db.prepare(
-      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending FROM mailboxes ORDER BY target_key"
-    ).all() as Array<{
-      target_kind: string;
-      task_id: string | null;
-      role_name: string | null;
-      next_sequence: number;
-      processing: string | null;
-      pending: string | null;
-    }>;
+    const mailboxRows = readWorkMailboxRows(db);
     checksums.workMailbox = hashRecords(mailboxRows.map(rowToMailbox));
 
     return checksums;
@@ -1110,16 +1076,7 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
     }
 
     // Work mailboxes: reconstructed from typed columns (no payload column).
-    const mailboxRows = db.prepare(
-      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending FROM mailboxes ORDER BY target_key"
-    ).all() as Array<{
-      target_kind: string;
-      task_id: string | null;
-      role_name: string | null;
-      next_sequence: number;
-      processing: string | null;
-      pending: string | null;
-    }>;
+    const mailboxRows = readWorkMailboxRows(db);
     const mailboxes = state.mailboxes as Record<string, unknown>;
     for (const row of mailboxRows) {
       const mailbox = rowToMailbox(row);

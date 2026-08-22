@@ -1,4 +1,4 @@
-import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
+import { reconciliationIntervalMilliseconds, resolveTmuxBin } from "../config/yuiConfig.js";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -63,6 +63,9 @@ import {
   type ActivePromptPushPort,
   type AgentEnvironmentRefreshPort,
   type RuntimeLaunchPreparationPort,
+  ProviderContinuationReconciliationService,
+  type ProviderContinuationMetadataPort,
+  type ProviderInputRoutingPort,
   type TaskRuntimeIsolationPort,
   type TaskRuntimeLifecycleCleanupPort,
   type SessionHostPort
@@ -120,6 +123,10 @@ export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readon
   workspacePreparer?: TaskWorkspacePreparer;
   runtimeIsolation?: TaskRuntimeIsolationPort & Partial<TaskRuntimeLifecycleCleanupPort>;
   catalogs?: AgentConfigurationCatalogService;
+  /** Optional Adapter metadata query; never grants model/launch authority. */
+  continuationMetadata?: ProviderContinuationMetadataPort;
+  /** Must share the same Provider SessionHost/Activation ownership. */
+  providerInputRouting?: ProviderInputRoutingPort;
 }>;
 
 export type RunningFileTaskControllerRuntime = RunningFileTaskController & Readonly<{
@@ -216,7 +223,7 @@ export async function startFileTaskControllerRuntime(
   const schedulerStore = options.schedulerStore
     ?? new FileSchedulerStoreAdapter(
       store,
-      openSchedulerTelemetry(home, options.environment ?? process.env)
+      openSchedulerTelemetry(home, store.getConfig())
     );
   const domainIdentity = options.domainIdentity
     ?? ephemeralDomainFromEnvironment(options.environment ?? process.env);
@@ -224,7 +231,7 @@ export async function startFileTaskControllerRuntime(
     environment: options.environment
   });
   const tmux = options.tmux ?? new TmuxManager(
-    options.environment?.YUI_TMUX_BIN ?? process.env.YUI_TMUX_BIN ?? "tmux",
+    resolveTmuxBin(store.getConfig().tmuxBin),
     new NodeCommandExecutor(),
     {
       yuiHome: home,
@@ -424,6 +431,7 @@ export async function startFileTaskControllerRuntime(
         currentHome: home,
         scope: "current",
         panes,
+        tmuxBin: resolveTmuxBin(store.getConfig().tmuxBin),
         ...(options.environment === undefined
           ? {}
           : { environment: options.environment })
@@ -436,6 +444,9 @@ export async function startFileTaskControllerRuntime(
       sessionHost,
       promptPush,
       launchCoordinator,
+      ...(options.providerInputRouting === undefined
+        ? {}
+        : { providerInputRouting: options.providerInputRouting }),
       roleResourceInventory: async (panes, inputs) => {
         const inventory = await scanInventory(panes);
         return inventory.resources.flatMap((resource) => {
@@ -513,6 +524,7 @@ export async function startFileTaskControllerRuntime(
           // explicit `controller cleanup --all` inventory operation.
           scope: "current",
           environment: options.environment,
+          tmuxBin: resolveTmuxBin(store.getConfig().tmuxBin),
           // When the worker backend is active, the reaper's scan runs in the
           // inventory worker too (same cadence, same inventory shape).
           ...(inventoryClient === undefined
@@ -587,6 +599,13 @@ export async function startFileTaskControllerRuntime(
     onError: options.onError
   });
   const jobControl = createDurableJobControl(store);
+  const continuationReconciler = options.continuationMetadata === undefined
+    ? undefined
+    : new ProviderContinuationReconciliationService(
+        store,
+        schedulerStore,
+        options.continuationMetadata
+      );
   const running = await startFileTaskController(
     home,
     schedulerStore,
@@ -604,6 +623,7 @@ export async function startFileTaskControllerRuntime(
       lifecycleHost,
       jobSupervisor,
       jobControl,
+      ...(continuationReconciler === undefined ? {} : { continuationReconciler }),
       ...(resourceReaper === undefined ? {} : { resourceReaper }),
       resourceAutoGc,
       onExpiredEphemeralDomain: (domain) => {
