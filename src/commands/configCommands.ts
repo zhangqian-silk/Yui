@@ -1,14 +1,26 @@
 import { usageError } from "../errors/cliError.js";
 import {
   DEFAULT_LEADER_NEXT_ACTION_MODE,
+  DEFAULT_PROVIDER_RETRY_MODE,
   DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
   DEFAULT_RESOURCES_GC_MODE,
   LEADER_NEXT_ACTION_MODES,
+  PROVIDER_RETRY_MODES,
   reconciliationIntervalMilliseconds,
+  resolveGitBin,
   resolveLeaderNextActionMode,
+  resolveProviderRetryAdapters,
+  resolveProviderRetryMaxWindowMs,
+  resolveProviderRetryMode,
   resolveResourcesGcAutoQuarantine,
   resolveResourcesGcMode,
-  type LeaderNextActionMode
+  resolveTelemetryMode,
+  resolveTelemetryRunCap,
+  resolveTelemetryTerminalKeep,
+  resolveTmuxBin,
+  resolveYieldReceiptReplay,
+  type LeaderNextActionMode,
+  type ProviderRetryMode
 } from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
@@ -51,6 +63,15 @@ export const CONFIG_KEYS = [
   "leader-next-action",
   "resources-gc-mode",
   "resources-gc-auto-quarantine",
+  "provider-retry-mode",
+  "provider-retry-adapters",
+  "provider-retry-max-window-ms",
+  "yield-receipt-replay",
+  "tmux-bin",
+  "git-bin",
+  "telemetry-mode",
+  "telemetry-terminal-keep",
+  "telemetry-run-cap",
   "review"
 ] as const;
 
@@ -290,7 +311,200 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
     }
   },
   {
+    key: "provider-retry-mode",
+    showLabel: "Provider retry mode",
+    showValue: (config) => resolveProviderRetryMode(config.providerRetryMode),
+    set(args, store) {
+      if (args.length !== 1) throw usageError(`Config set usage: yui config set provider-retry-mode <${PROVIDER_RETRY_MODES.join("|")}>.`);
+      const mode = validatedConfigValue(
+        () => resolveProviderRetryMode(args[0]),
+        `Config set usage: yui config set provider-retry-mode <${PROVIDER_RETRY_MODES.join("|")}>.`
+      );
+      saveConfigKey(store, (config) => ({ ...config, providerRetryMode: mode }));
+      return `Provider retry mode set to ${mode}\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { providerRetryMode: _removed, ...rest } = config;
+        return rest;
+      });
+      return `Provider retry mode reset to ${DEFAULT_PROVIDER_RETRY_MODE}\n`;
+    }
+  },
+  {
+    key: "provider-retry-adapters",
+    showLabel: "Provider retry adapters",
+    showValue: (config) => resolveProviderRetryAdapters(config.providerRetryAdapters).join(", ") || "none",
+    set(args, store) {
+      if (args.length !== 1) throw usageError("Config set usage: yui config set provider-retry-adapters <all|claude,codex|off>.");
+      const raw = args[0].trim().toLowerCase();
+      const adapters = raw === "off" || raw === "" || raw === "0"
+        ? []
+        : validatedConfigValue(
+          () => resolveProviderRetryAdapters(raw.split(",")),
+          "Config set usage: yui config set provider-retry-adapters <all|claude,codex|off>."
+        );
+      saveConfigKey(store, (config) => ({ ...config, providerRetryAdapters: adapters }));
+      return `Provider retry adapters set to ${adapters.join(", ") || "none"}\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { providerRetryAdapters: _removed, ...rest } = config;
+        return rest;
+      });
+      return "Provider retry adapters reset to all supported\n";
+    }
+  },
+  {
+    key: "provider-retry-max-window-ms",
+    showLabel: "Provider retry max window",
+    showValue: (config) => `${resolveProviderRetryMaxWindowMs(config.providerRetryMaxWindowMs)} ms`,
+    set(args, store) {
+      if (args.length !== 1) throw usageError("Config set usage: yui config set provider-retry-max-window-ms <milliseconds>.");
+      const maxWindowMs = validatedConfigValue(
+        () => resolveProviderRetryMaxWindowMs(Number(args[0])),
+        "Config set usage: yui config set provider-retry-max-window-ms <milliseconds>."
+      );
+      saveConfigKey(store, (config) => ({ ...config, providerRetryMaxWindowMs: maxWindowMs }));
+      return `Provider retry max window set to ${maxWindowMs} ms\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { providerRetryMaxWindowMs: _removed, ...rest } = config;
+        return rest;
+      });
+      return "Provider retry max window reset to default\n";
+    }
+  },
+  {
+    key: "yield-receipt-replay",
+    showLabel: "Yield receipt replay",
+    showValue: (config) => (resolveYieldReceiptReplay(config.yieldReceiptReplay) ? "on" : "off"),
+    set(args, store) {
+      if (args.length !== 1) throw usageError("Config set usage: yui config set yield-receipt-replay <true|false>.");
+      const yieldReceiptReplay = validatedConfigValue(
+        () => resolveYieldReceiptReplay(parseBooleanConfigValue(args[0])),
+        "Config set usage: yui config set yield-receipt-replay <true|false>."
+      );
+      saveConfigKey(store, (config) => ({ ...config, yieldReceiptReplay }));
+      return `Yield receipt replay set to ${yieldReceiptReplay ? "on" : "off"}\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { yieldReceiptReplay: _removed, ...rest } = config;
+        return rest;
+      });
+      return "Yield receipt replay reset to on\n";
+    }
+  },
+  {
+    key: "tmux-bin",
+    showLabel: "Tmux bin",
+    showValue: (config) => resolveTmuxBin(config.tmuxBin),
+    set(args, store) {
+      if (args.length !== 1) throw usageError("Config set usage: yui config set tmux-bin <path>.");
+      const tmuxBin = validatedConfigValue(
+        () => resolveTmuxBin(args[0]),
+        "Config set usage: yui config set tmux-bin <path>."
+      );
+      saveConfigKey(store, (config) => ({ ...config, tmuxBin }));
+      return `Tmux bin set to ${tmuxBin}\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { tmuxBin: _removed, ...rest } = config;
+        return rest;
+      });
+      return "Tmux bin reset to tmux\n";
+    }
+  },
+  {
+    key: "git-bin",
+    showLabel: "Git bin",
+    showValue: (config) => resolveGitBin(config.gitBin),
+    set(args, store) {
+      if (args.length !== 1) throw usageError("Config set usage: yui config set git-bin <path>.");
+      const gitBin = validatedConfigValue(
+        () => resolveGitBin(args[0]),
+        "Config set usage: yui config set git-bin <path>."
+      );
+      saveConfigKey(store, (config) => ({ ...config, gitBin }));
+      return `Git bin set to ${gitBin}\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { gitBin: _removed, ...rest } = config;
+        return rest;
+      });
+      return "Git bin reset to git\n";
+    }
+  },
+  {
+    key: "telemetry-mode",
+    showLabel: "Telemetry mode",
+    showValue: (config) => resolveTelemetryMode(config.telemetryMode),
+    set(args, store) {
+      if (args.length !== 1) throw usageError("Config set usage: yui config set telemetry-mode <legacy|dual|bounded>.");
+      const telemetryMode = validatedConfigValue(
+        () => resolveTelemetryMode(args[0]),
+        "Config set usage: yui config set telemetry-mode <legacy|dual|bounded>."
+      );
+      saveConfigKey(store, (config) => ({ ...config, telemetryMode }));
+      return `Telemetry mode set to ${telemetryMode}\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { telemetryMode: _removed, ...rest } = config;
+        return rest;
+      });
+      return "Telemetry mode reset to legacy\n";
+    }
+  },
+  {
+    key: "telemetry-terminal-keep",
+    showLabel: "Telemetry terminal keep",
+    showValue: (config) => String(resolveTelemetryTerminalKeep(config.telemetryTerminalKeep)),
+    set(args, store) {
+      if (args.length !== 1) throw usageError("Config set usage: yui config set telemetry-terminal-keep <n>.");
+      const telemetryTerminalKeep = validatedConfigValue(
+        () => resolveTelemetryTerminalKeep(Number(args[0])),
+        "Config set usage: yui config set telemetry-terminal-keep <n>."
+      );
+      saveConfigKey(store, (config) => ({ ...config, telemetryTerminalKeep }));
+      return `Telemetry terminal keep set to ${telemetryTerminalKeep}\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { telemetryTerminalKeep: _removed, ...rest } = config;
+        return rest;
+      });
+      return "Telemetry terminal keep reset to default\n";
+    }
+  },
+  {
+    key: "telemetry-run-cap",
+    showLabel: "Telemetry run cap",
+    showValue: (config) => String(resolveTelemetryRunCap(config.telemetryRunCap)),
+    set(args, store) {
+      if (args.length !== 1) throw usageError("Config set usage: yui config set telemetry-run-cap <n>.");
+      const telemetryRunCap = validatedConfigValue(
+        () => resolveTelemetryRunCap(Number(args[0])),
+        "Config set usage: yui config set telemetry-run-cap <n>."
+      );
+      saveConfigKey(store, (config) => ({ ...config, telemetryRunCap }));
+      return `Telemetry run cap set to ${telemetryRunCap}\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { telemetryRunCap: _removed, ...rest } = config;
+        return rest;
+      });
+      return "Telemetry run cap reset to default\n";
+    }
+  },
+  {
     key: "review",
+
     showLabel: "Review",
     showValue: (config) => (config.review === undefined
       ? "disabled"

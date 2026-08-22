@@ -859,7 +859,7 @@ async function setupTmux(
   executor: CommandExecutor,
   question: SetupQuestion
 ): Promise<string[]> {
-  const command = env.YUI_TMUX_BIN ?? "tmux";
+  const command = "tmux";
   if (hasExecutable(command, ["-V"], executor)) return ["Tmux already installed."];
 
   const plan = detectTmuxInstallPlan(env, executor);

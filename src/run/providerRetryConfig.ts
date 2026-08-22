@@ -1,17 +1,27 @@
-import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
+import {
+  resolveProviderRetryAdapters,
+  resolveProviderRetryMaxWindowMs,
+  resolveProviderRetryMode,
+  resolveYieldReceiptReplay,
+  type ProviderRetryMode
+} from "../config/yuiConfig.js";
+import type { YuiConfig } from "../storage/taskStore.js";
 
 /**
  * Issue 04 feature flags.
  *
- * The retry-in-place path is per-Provider-adapter and defaults to off so a
- * deployment keeps the existing terminalize-immediately behavior until it
- * explicitly opts in. Yield receipt replay is safe by construction (same
- * request → same receipt; different digest → fail closed) and defaults on,
- * matching the Issue 04 rollout order: shadow classification, receipt replay,
- * then per-adapter in-place retry.
+ * The retry-in-place path is per-Provider-adapter and defaults to on for every
+ * supported adapter. Task-27 proved that a transient stream/INTERNAL_ERROR
+ * otherwise terminalizes the original Run and Native Session and forces a
+ * full replay under a new Run. The in-place path is bounded by a finite retry
+ * budget and by at-most-once delivery checks, so defaulting it on cannot loop
+ * forever or double-send a prompt once a durable completion exists. Yield
+ * receipt replay is safe by construction (same request → same receipt;
+ * different digest → fail closed) and defaults on.
+ *
+ * All settings live in the durable Yui config (`yui config show/set`), not in
+ * environment variables, so a Home's retry policy is visible and auditable.
  */
-
-export type ProviderRetryMode = "off" | "shadow" | "enforce";
 
 export type ProviderRetryConfig = Readonly<{
   mode: ProviderRetryMode;
@@ -19,66 +29,24 @@ export type ProviderRetryConfig = Readonly<{
   adapters: readonly string[];
   /** Idempotent yield receipt replay on resend. */
   yieldReceiptReplay: boolean;
+  /** Total retry budget per Run lineage, in milliseconds. */
+  maxWindowMs: number;
 }>;
 
-function parseAdapters(value: string | undefined): string[] {
-  if (value === undefined) return [];
-  const supported = supportedAgentAdapterIds();
-  const supportedSet = new Set<string>(supported);
-  const adapters: string[] = [];
-  for (const raw of value.split(",")) {
-    const token = raw.trim().toLowerCase();
-    if (token === "") continue;
-    if (token === "all") {
-      for (const adapter of supported) {
-        if (!adapters.includes(adapter)) adapters.push(adapter);
-      }
-      continue;
-    }
-    if (!/^[a-z0-9][a-z0-9._-]*$/u.test(token)) {
-      throw new Error(`Invalid Provider retry adapter: ${token}.`);
-    }
-    if (!supportedSet.has(token)) {
-      throw new Error(`Unknown Provider retry adapter: ${token}.`);
-    }
-    if (!adapters.includes(token)) {
-      adapters.push(token);
-    }
-  }
-  return adapters;
-}
-
 /**
- * Resolves the Issue 04 flags from the process environment.
- *
- * - `YUI_PROVIDER_RETRY_IN_PLACE` — comma-separated adapter ids (`claude`,
- *   `codex`, `all`). Unset/empty disables the feature entirely.
- * - `YUI_PROVIDER_RETRY_MODE` — `shadow` (default when adapters are listed)
- *   records classification and "would retry" facts without changing behavior;
- *   `enforce` keeps the Run active and retries in place.
- * - `YUI_YIELD_RECEIPT_REPLAY` — `0` disables receipt replay; default `1`.
+ * Resolves the retry flags from the durable Yui config. Homes without the
+ * fields get the safe defaults: enforce mode, all supported adapters, receipt
+ * replay on, 10-minute budget.
  */
-export function providerRetryConfig(
-  environment: NodeJS.ProcessEnv = process.env
-): ProviderRetryConfig {
-  const adapters = parseAdapters(environment.YUI_PROVIDER_RETRY_IN_PLACE);
-  const modeValue = environment.YUI_PROVIDER_RETRY_MODE?.trim().toLowerCase();
-  let mode: ProviderRetryMode;
-  if (adapters.length === 0) {
-    mode = "off";
-  } else if (modeValue === "enforce") {
-    mode = "enforce";
-  } else if (modeValue === undefined || modeValue === "" || modeValue === "shadow") {
-    mode = "shadow";
-  } else {
-    throw new Error(`Unknown Provider retry mode: ${modeValue}.`);
-  }
-  const replayValue = environment.YUI_YIELD_RECEIPT_REPLAY?.trim();
-  const yieldReceiptReplay = replayValue === undefined || replayValue === "" || replayValue === "1";
-  if (!["0", "1"].includes(replayValue ?? "1")) {
-    throw new Error(`YUI_YIELD_RECEIPT_REPLAY must be 0 or 1: ${replayValue}.`);
-  }
-  return { mode, adapters, yieldReceiptReplay };
+export function providerRetryConfig(config: YuiConfig): ProviderRetryConfig {
+  const mode = resolveProviderRetryMode(config.providerRetryMode);
+  const adapters = resolveProviderRetryAdapters(config.providerRetryAdapters);
+  return {
+    mode: adapters.length === 0 ? "off" : mode,
+    adapters,
+    yieldReceiptReplay: resolveYieldReceiptReplay(config.yieldReceiptReplay),
+    maxWindowMs: resolveProviderRetryMaxWindowMs(config.providerRetryMaxWindowMs)
+  };
 }
 
 /** Whether the adapter has in-place retry enabled in the given mode. */

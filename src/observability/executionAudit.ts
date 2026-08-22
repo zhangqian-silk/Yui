@@ -106,6 +106,30 @@ export type EventsAudit = Readonly<{
   progressShare: number;
 }>;
 
+export type ProviderRetryAuditEntry = Readonly<{
+  taskId: string;
+  runId: string;
+  roleName: string;
+  /** Highest retry attempt recorded on this lineage. */
+  attempts: number;
+  /** Last classified Provider error code. */
+  errorClass: string;
+  firstFailureAt: string;
+  lastFailureAt: string;
+  /** Last scheduled backoff deadline, when recorded. */
+  lastBackoffAt?: string;
+  /** Last recorded decision (retrying, waiting, resume, session-dead, …). */
+  decision: string;
+}>;
+
+export type ProviderRetriesAudit = Readonly<{
+  /** Runs that entered in-place Provider retry at least once. */
+  total: number;
+  /** Runs whose retry lineage ended in a terminal decision. */
+  terminal: number;
+  entries: readonly ProviderRetryAuditEntry[];
+}>;
+
 export type StorageAudit = Readonly<{
   stateJsonBytes: number | Unsupported;
   databaseBytes: number | Unsupported;
@@ -136,6 +160,7 @@ export type ExecutionAuditReport = Readonly<{
   reviews: AuditSection<ReviewsAudit>;
   integrations: AuditSection<IntegrationsAudit>;
   events: AuditSection<EventsAudit>;
+  providerRetries: AuditSection<ProviderRetriesAudit>;
   workItems: AuditSection<Readonly<{
     total: number;
     completed: number;
@@ -212,6 +237,19 @@ function roleBucket(roleName: string): keyof RunsAudit["byRole"] {
   return "other";
 }
 
+/** Maps a provider-retry lifecycle event to its last recorded decision. */
+function providerRetryDecision(event: { type: string; payload: Readonly<Record<string, string>> }): string {
+  if (event.type === "runtime.provider-retry-waiting") return "waiting";
+  if (event.type === "runtime.provider-retry-resume") return "resume";
+  if (event.type === "runtime.provider-retry-session-dead") return "session-dead";
+  if (event.type === "runtime.provider-retry-budget-exhausted") return "budget-exhausted";
+  if (event.payload.note === "native-turn-completion-durable") return "suppressed:completion-durable";
+  if (event.payload.note === "retry-budget-exhausted") return "budget-exhausted";
+  if (event.payload.wouldRetry === "true") return "retrying";
+  if (event.payload.shadow === "true") return "shadow";
+  return "not-retried";
+}
+
 function durationMs(run: AgentRun): number {
   if (run.endedAt === undefined) return 0;
   return Math.max(0, Date.parse(run.endedAt) - Date.parse(run.createdAt));
@@ -261,6 +299,7 @@ export function runExecutionAudit(
       reviews: section,
       integrations: section,
       events: section,
+      providerRetries: section,
       workItems: section,
       storage: section,
       topLongRunning: section
@@ -561,6 +600,54 @@ export function runExecutionAudit(
     }
   })();
 
+  const providerRetries = ((): AuditSection<ProviderRetriesAudit> => {
+    try {
+      const entries = new Map<string, ProviderRetryAuditEntry & { terminal: boolean }>();
+      for (const taskId of taskIds) {
+        for (const event of store.listEvents(taskId)) {
+          if (!inWindow(event.createdAt, options)) continue;
+          if (!event.type.startsWith("runtime.provider-retry-")) continue;
+          const runId = event.payload.runId;
+          if (typeof runId !== "string") continue;
+          const key = `${taskId}/${runId}`;
+          const previous = entries.get(key);
+          const attempt = Number(event.payload.attempt ?? "0");
+          const decision = providerRetryDecision(event);
+          const terminal = decision === "session-dead" || decision === "budget-exhausted";
+          const next = {
+            taskId,
+            runId,
+            roleName: typeof event.payload.roleName === "string"
+              ? event.payload.roleName
+              : previous?.roleName ?? "",
+            attempts: Number.isFinite(attempt) ? Math.max(previous?.attempts ?? 0, attempt) : (previous?.attempts ?? 0),
+            errorClass: typeof event.payload.errorClass === "string"
+              ? event.payload.errorClass
+              : previous?.errorClass ?? "",
+            firstFailureAt: previous?.firstFailureAt ?? event.createdAt,
+            lastFailureAt: event.createdAt,
+            ...(typeof event.payload.nextAttemptAt === "string"
+              ? { lastBackoffAt: event.payload.nextAttemptAt }
+              : previous?.lastBackoffAt !== undefined
+                ? { lastBackoffAt: previous.lastBackoffAt }
+                : {}),
+            decision,
+            terminal: (previous?.terminal ?? false) || terminal
+          };
+          entries.set(key, next);
+        }
+      }
+      const list = [...entries.values()];
+      return ok({
+        total: list.length,
+        terminal: list.filter((entry) => entry.terminal).length,
+        entries: list.map(({ terminal: _terminal, ...entry }) => entry)
+      });
+    } catch (error) {
+      return failed<ProviderRetriesAudit>(error);
+    }
+  })();
+
   const workItems = ((): AuditSection<{ total: number; completed: number; retired: number }> => {
     try {
       let total = 0;
@@ -653,6 +740,7 @@ export function runExecutionAudit(
     reviews,
     integrations,
     events,
+    providerRetries,
     workItems,
     storage,
     topLongRunning

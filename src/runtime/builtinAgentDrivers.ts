@@ -14,6 +14,7 @@ import {
   codexTranscriptObserver,
   transcriptObserverSource
 } from "./builtinTranscriptObserver.js";
+import { parseClaudeError } from "./providerErrorCodes.js";
 
 export const CODEX_DRIVER_ID = "openai/codex";
 export const CLAUDE_CODE_DRIVER_ID = "anthropic/claude-code";
@@ -439,8 +440,10 @@ function claudeFailure(
   const code = firstIdentity(payload, ["error"], "Claude StopFailure error");
   const details = optionalText(payload.error_details);
   const lastOutput = optionalText(payload.last_assistant_message);
+  const parsed = parseClaudeError(code, details);
   return {
     failure: {
+      ...(parsed.code !== "unknown" ? { errorCode: parsed.code } : {}),
       code,
       ...(details === undefined ? {} : { details }),
       ...(lastOutput === undefined ? {} : { lastOutput }),

@@ -72,7 +72,7 @@ import {
   type AgentRun
 } from "../run/agentRun.js";
 import { matchYieldReceipt } from "../run/yieldReceipt.js";
-import { providerRetryConfig } from "../run/providerRetryConfig.js";
+import { providerRetryConfig, type ProviderRetryConfig } from "../run/providerRetryConfig.js";
 import {
   createReviewRound,
   createTaskReviewRound,
@@ -5497,10 +5497,10 @@ function buildYieldOutcome(
 function replayYieldReceipt(
   run: AgentRun,
   inputSummary: string,
-  options: TaskCommandOptions
+  options: TaskCommandOptions,
+  retryConfig: ProviderRetryConfig
 ): TaskCommandExecution | null {
-  const config = providerRetryConfig(options.environment ?? process.env);
-  if (!config.yieldReceiptReplay) return null;
+  if (!retryConfig.yieldReceiptReplay) return null;
   if (run.yieldReceipt === undefined) return null;
   const outcome = buildYieldOutcome(run, inputSummary, options);
   const match = matchYieldReceipt(run.yieldReceipt, {
@@ -5577,7 +5577,12 @@ function yieldRun(
   // transaction; the receipt is immutable once committed.
   const existing = requireRun(store, parsed.positionals[0], options);
   if (existing.status !== "active") {
-    const replayed = replayYieldReceipt(existing, inputSummary, options);
+    const replayed = replayYieldReceipt(
+      existing,
+      inputSummary,
+      options,
+      providerRetryConfig(store.getConfig())
+    );
     if (replayed !== null) return replayed;
     throw usageError(`Run ${existing.id} is already terminal: ${existing.status}.`);
   }

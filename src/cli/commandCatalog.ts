@@ -113,6 +113,15 @@ const CONFIG_KEY_VALUES: readonly CommandValue[] = [
   { name: "leader-next-action", summary: "Leader next-action mode: display, warn, or enforce (default: display)." },
   { name: "resources-gc-mode", summary: "Resource GC mode: report or quarantine (default: report)." },
   { name: "resources-gc-auto-quarantine", summary: "Auto-quarantine terminal Task resources: true or false (default: false)." },
+  { name: "provider-retry-mode", summary: "Provider retry mode: off, shadow, or enforce (default: enforce)." },
+  { name: "provider-retry-adapters", summary: "Adapters with in-place retry: all, comma-separated adapter ids, or off (default: all)." },
+  { name: "provider-retry-max-window-ms", summary: "Total retry budget per Run lineage in milliseconds (default: 600000)." },
+  { name: "yield-receipt-replay", summary: "Replay committed yield receipts on resend: true or false (default: true)." },
+  { name: "tmux-bin", summary: "Path to the tmux binary (default: tmux)." },
+  { name: "git-bin", summary: "Path to the git binary (default: git)." },
+  { name: "telemetry-mode", summary: "Telemetry mode: legacy, dual, or bounded (default: legacy)." },
+  { name: "telemetry-terminal-keep", summary: "Telemetry terminal retention count (default: 200)." },
+  { name: "telemetry-run-cap", summary: "Telemetry per-run row cap (default: 50000)." },
   { name: "review", summary: "Global WorkItem review rule; set with --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>] (default: disabled)." }
 ];
 

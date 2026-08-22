@@ -447,7 +447,6 @@ const CONTROLLER_OPERATIONAL_ENV = [
   "TZ",
   "LANG",
   "TERM",
-  "YUI_TMUX_BIN"
 ] as const;
 
 function spawnDetachedController(

@@ -255,6 +255,46 @@ export type YuiConfig = Readonly<{
    * Homes without it default to `display`, so no config migration is needed.
    */
   leaderNextActionMode?: "display" | "warn" | "enforce";
+  /**
+   * Issue 01 in-place Provider retry mode. `enforce` (default) keeps the
+   * original AgentRun and native Session on retryable Provider failures;
+   * `shadow` only records classification; `off` disables the feature.
+   * Optional additive field; Homes without it default to `enforce`.
+   */
+  providerRetryMode?: "off" | "shadow" | "enforce";
+  /**
+   * Adapters with in-place retry enabled. `["all"]` means every supported
+   * adapter; an empty array disables the feature. Defaults to all supported.
+   */
+  providerRetryAdapters?: string[];
+  /**
+   * Total retry budget per Run lineage in milliseconds. Defaults to
+   * {@link PROVIDER_RETRY_MAX_WINDOW_MS}; once the window elapses the Run
+   * terminalizes with one structured failure.
+   */
+  providerRetryMaxWindowMs?: number;
+  /**
+   * Whether an already-committed yield receipt may be replayed on resend.
+   * Defaults to true; safe by construction (same request → same receipt).
+   */
+  yieldReceiptReplay?: boolean;
+  /**
+   * Path to the tmux binary. Defaults to `tmux` on PATH.
+   */
+  tmuxBin?: string;
+  /**
+   * Path to the git binary. Defaults to `git` on PATH.
+   */
+  gitBin?: string;
+  /**
+   * Telemetry mode. `legacy` (default) keeps the master-only behavior;
+   * `dual` and `bounded` activate the diagnostic sidecar.
+   */
+  telemetryMode?: "legacy" | "dual" | "bounded";
+  /** Terminal Run/generation progress rows retained after prune. */
+  telemetryTerminalKeep?: number;
+  /** Hard cap of progress rows per Run while it is still active. */
+  telemetryRunCap?: number;
   completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
 }>;
 export type ConfiguredAgentPatch = Readonly<Partial<

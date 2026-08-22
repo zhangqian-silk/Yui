@@ -43,6 +43,8 @@ export type ResourceInventoryScanRequest = Readonly<{
   currentHome: string;
   scope: ControllerInventoryScope;
   environment?: Readonly<Record<string, string | undefined>>;
+  /** Path to the tmux binary, from the durable Yui config. */
+  tmuxBin?: string;
   /** Reuse the caller's one full pane inventory when already available. */
   panes?: readonly RuntimePaneFact[];
 }>;
