@@ -93,6 +93,7 @@ import type { GlobalRole, TaskRole } from "../role/role.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
+import { validateTaskWake, type TaskWake } from "../scheduler/taskWake.js";
 import type { Task } from "../task/task.js";
 import type { NextActionFacts } from "../task/nextAction.js";
 import type { CompletionReadinessFacts } from "../task/completionReadiness.js";
@@ -2602,6 +2603,61 @@ export class SqliteTaskStore implements TaskStore {
       }
       return removed;
     });
+  }
+
+  nextTaskWakeId(taskId: string): string { return this.#nextTaskRecordId(taskId, "taskWake"); }
+  peekNextTaskWakeId(taskId: string): string { return this.#peekTaskRecordId(taskId, "taskWake"); }
+
+  saveTaskWake(taskId: string, wake: TaskWake): void {
+    if (wake.taskId !== taskId) {
+      throw new StorageRecordError(`Task wake belongs to another Task: ${wake.taskId}`);
+    }
+    validateTaskWake(wake);
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const seq = this.#idSequence(wake.id, "taskWake");
+      this.#db.prepare(
+        `INSERT INTO task_wakes
+          (task_id, wake_id, seq, status, run_id, from_cursor, to_cursor, reasons, payload, created_at, consumed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       + ` ON CONFLICT(task_id, wake_id) DO UPDATE SET
+           status = excluded.status,
+           run_id = excluded.run_id,
+           reasons = excluded.reasons,
+           payload = excluded.payload,
+           consumed_at = excluded.consumed_at`
+      ).run(
+        taskId,
+        wake.id,
+        wake.seq,
+        wake.status,
+        wake.runId ?? null,
+        wake.fromCursor,
+        wake.toCursor,
+        this.#json([...wake.reasons]),
+        this.#json(wake),
+        wake.createdAt,
+        wake.consumedAt ?? null
+      );
+      this.#observeHighWater(taskId, "taskWake", seq);
+    });
+  }
+
+  getTaskWake(taskId: string, wakeId: string): TaskWake | null {
+    const row = this.#db.prepare(
+      "SELECT payload FROM task_wakes WHERE task_id = ? AND wake_id = ?"
+    ).get(taskId, wakeId) as { payload: string } | undefined;
+    if (row === undefined) return null;
+    const wake = this.#parse<TaskWake>(row.payload);
+    validateTaskWake(wake);
+    return wake;
+  }
+
+  listTaskWakes(taskId: string): TaskWake[] {
+    return this.#sortById(
+      this.#listPayload<TaskWake>("task_wakes", "task_id = ?", [taskId]),
+      (wake) => wake.id
+    );
   }
 
   // -- high-water maintenance ---------------------------------------------------

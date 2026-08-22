@@ -1,5 +1,6 @@
 import type { SchedulerAgentRun, SchedulerStorePort, SchedulerTask } from "./ports.js";
 import { mergePendingWakeup, type PendingWakeup } from "./pendingWakeup.js";
+import { wakeReason } from "./wakeReason.js";
 
 export function queueLeaderWakeup(
   store: Pick<SchedulerStorePort, "getPendingWakeup" | "savePendingWakeup">
@@ -24,5 +25,5 @@ export function queueLeaderWakeupAfterYield(
 ): PendingWakeup | null {
   if (run.taskId !== task.id) throw new Error(`AgentRun belongs to another Task: ${run.taskId}.`);
   if (task.status !== "active" || run.roleName === "leader") return null;
-  return queueLeaderWakeup(store, task.id, "role-result", now);
+  return queueLeaderWakeup(store, task.id, wakeReason("role-result"), now);
 }

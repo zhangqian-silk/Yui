@@ -4,6 +4,13 @@ export {
   type PromptSource
 } from "./promptEnvelope.js";
 export {
+  codexTranscriptUsage,
+  codexTranscriptUsageReport,
+  claudeTranscriptUsage,
+  claudeTranscriptUsageReport,
+  type TranscriptUsageReport
+} from "./builtinTranscriptUsage.js";
+export {
   createRuntimeBinding,
   type RuntimeBinding
 } from "./runtimeBinding.js";

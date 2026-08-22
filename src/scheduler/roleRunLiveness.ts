@@ -9,6 +9,7 @@ import {
 } from "./ports.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import { queueLeaderWakeup } from "./wakeupQueue.js";
+import { wakeReason } from "./wakeReason.js";
 import {
   currentRoleRunProgressAt,
   DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS
@@ -152,7 +153,7 @@ export async function reconcileExitedRoleRuns(
         queueLeaderWakeup(
           store,
           task.id,
-          role.name === "leader" ? "leader-run-failed" : "role-run-failed",
+          wakeReason(role.name === "leader" ? "leader-run-failed" : "role-run-failed"),
           now
         );
       }

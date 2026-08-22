@@ -1,5 +1,7 @@
 import { usageError } from "../errors/cliError.js";
 import {
+  DEFAULT_CONTEXT_HARD_TOKENS,
+  DEFAULT_CONTEXT_SOFT_TOKENS,
   DEFAULT_LEADER_NEXT_ACTION_MODE,
   DEFAULT_PROVIDER_RETRY_MODE,
   DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
@@ -7,6 +9,7 @@ import {
   LEADER_NEXT_ACTION_MODES,
   PROVIDER_RETRY_MODES,
   reconciliationIntervalMilliseconds,
+  resolveContextBudget,
   resolveGitBin,
   resolveLeaderNextActionMode,
   resolveProviderRetryAdapters,
@@ -19,6 +22,7 @@ import {
   resolveTelemetryTerminalKeep,
   resolveTmuxBin,
   resolveYieldReceiptReplay,
+  type ContextBudgetConfig,
   type LeaderNextActionMode,
   type ProviderRetryMode
 } from "../config/yuiConfig.js";
@@ -61,6 +65,7 @@ export const CONFIG_KEYS = [
   "time-zone",
   "reconciliation-interval-seconds",
   "leader-next-action",
+  "context-budget",
   "resources-gc-mode",
   "resources-gc-auto-quarantine",
   "provider-retry-mode",
@@ -86,6 +91,7 @@ const RECONCILIATION_SET_USAGE = "Config set usage: yui config set reconciliatio
 const RESOURCES_GC_MODE_SET_USAGE = "Config set usage: yui config set resources-gc-mode <report|quarantine>.";
 const RESOURCES_GC_AUTO_QUARANTINE_SET_USAGE = "Config set usage: yui config set resources-gc-auto-quarantine <true|false>.";
 const LEADER_NEXT_ACTION_SET_USAGE = `Config set usage: yui config set leader-next-action <${LEADER_NEXT_ACTION_MODES.join("|")}>.`;
+const CONTEXT_BUDGET_SET_USAGE = "Config set usage: yui config set context-budget [--soft-tokens <n>] [--hard-tokens <n>].";
 const REVIEW_SET_USAGE = "Config set usage: yui config set review --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>].";
 
 type ConfigKeyHandler = Readonly<{
@@ -190,6 +196,13 @@ function validatedConfigValue<T>(validate: () => T, usage: string): T {
   }
 }
 
+function parseBudgetToken(value: string, label: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw usageError(`${label} must be a positive integer.`);
+  }
+  return Number(value);
+}
+
 function parseReconciliationIntervalSeconds(value: string): number {
   if (!/^\d+$/.test(value)) return Number.NaN;
   return Number(value);
@@ -265,6 +278,47 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         return rest;
       });
       return `Leader next-action mode reset to ${DEFAULT_LEADER_NEXT_ACTION_MODE}\n`;
+    }
+  },
+  {
+    key: "context-budget",
+    showLabel: "Context budget",
+    showValue: (config) => {
+      const budget = resolveContextBudget(config.contextBudget);
+      return `soft ${budget.softTokens} / hard ${budget.hardTokens} tokens`;
+    },
+    set(args, store) {
+      if (args.length !== 2 && args.length !== 4) throw usageError(CONTEXT_BUDGET_SET_USAGE);
+      const options = new Map<string, string>();
+      for (let index = 0; index < args.length; index += 2) {
+        const name = args[index];
+        const value = args[index + 1];
+        if (!["--soft-tokens", "--hard-tokens"].includes(name)
+          || value === undefined
+          || options.has(name)) {
+          throw usageError(CONTEXT_BUDGET_SET_USAGE);
+        }
+        options.set(name, value);
+      }
+      const current = resolveContextBudget(store.getConfig().contextBudget);
+      const next: ContextBudgetConfig = {
+        ...(options.get("--soft-tokens") === undefined
+          ? {}
+          : { softTokens: parseBudgetToken(options.get("--soft-tokens")!, "--soft-tokens") }),
+        ...(options.get("--hard-tokens") === undefined
+          ? {}
+          : { hardTokens: parseBudgetToken(options.get("--hard-tokens")!, "--hard-tokens") })
+      };
+      const resolved = resolveContextBudget({ ...current, ...next });
+      saveConfigKey(store, (config) => ({ ...config, contextBudget: resolved }));
+      return `Context budget set to soft ${resolved.softTokens} / hard ${resolved.hardTokens} tokens\n`;
+    },
+    clear(store) {
+      saveConfigKey(store, (config) => {
+        const { contextBudget: _removed, ...rest } = config;
+        return rest;
+      });
+      return `Context budget reset to soft ${DEFAULT_CONTEXT_SOFT_TOKENS} / hard ${DEFAULT_CONTEXT_HARD_TOKENS} tokens\n`;
     }
   },
   {

@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 15;
+export const SQLITE_SCHEMA_VERSION = 16;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -910,6 +910,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_references_external_root
   ON publication_references(external_key) WHERE supersedes IS NULL;
 `;
 
+const MIGRATION_16_SQL = `
+-- Durable Leader wake ledger (Issue 04 long-term design). A wake is a
+-- notification envelope, not a context dump: the record holds the aggregated
+-- reason tags and the delta window; the Agent reads delta content on demand.
+CREATE TABLE IF NOT EXISTS task_wakes (
+  task_id     TEXT NOT NULL,
+  wake_id     TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  status      TEXT NOT NULL CHECK (status IN ('dispatched','consumed')),
+  run_id      TEXT,
+  from_cursor TEXT NOT NULL,
+  to_cursor   TEXT NOT NULL,
+  reasons     TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  consumed_at TEXT,
+  PRIMARY KEY (task_id, wake_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_wakes_seq ON task_wakes(task_id, seq);
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -933,6 +954,8 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 13, axis: "layout", sql: MIGRATION_13_SQL },
   { version: 14, axis: "record", recordKind: "workMailbox", sql: MIGRATION_14_SQL },
   { version: 15, axis: "record", recordKind: "publicationReference", sql: MIGRATION_15_SQL }
+  ,
+  { version: 16, axis: "record", recordKind: "taskWake", sql: MIGRATION_16_SQL }
 ];
 
 /** Current hot-path indexes whose absence would invalidate a current Home. */

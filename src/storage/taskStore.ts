@@ -131,6 +131,11 @@ import {
   type OperatorNotification
 } from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
+import {
+  CURRENT_TASK_WAKE_SCHEMA_VERSION,
+  validateTaskWake,
+  type TaskWake
+} from "../scheduler/taskWake.js";
 import { validateTask, type Task } from "../task/task.js";
 import type { NextActionFacts } from "../task/nextAction.js";
 import type { CompletionReadinessFacts } from "../task/completionReadiness.js";
@@ -263,6 +268,12 @@ export type YuiConfig = Readonly<{
    * Homes without it default to `display`, so no config migration is needed.
    */
   leaderNextActionMode?: "display" | "warn" | "enforce";
+  /**
+   * Issue 04 (context token budget): per-Session-generation input peak
+   * thresholds. Optional additive field; Homes without it use the defaults,
+   * so no config migration is needed.
+   */
+  contextBudget?: import("../config/yuiConfig.js").ContextBudgetConfig;
   /**
    * Issue 01 in-place Provider retry mode. `enforce` (default) keeps the
    * original AgentRun and native Session on retryable Provider failures;
@@ -397,6 +408,7 @@ type StoredTask = {
   decisions: Record<string, Decision>;
   milestones: Record<string, Milestone>;
   events: Record<string, TaskEvent>;
+  wakes: Record<string, TaskWake>;
   capabilityGrants: Record<string, CapabilityGrant>;
   releaseWorkflows: Record<string, ReleaseWorkflow>;
   publicationReferences: Record<string, PublicationReference>;
@@ -605,6 +617,11 @@ export type TaskStore = {
   nextEventId(taskId: string): string;
   saveEvent(taskId: string, event: TaskEvent): void;
   listEvents(taskId: string): TaskEvent[];
+  nextTaskWakeId(taskId: string): string;
+  peekNextTaskWakeId(taskId: string): string;
+  saveTaskWake(taskId: string, wake: TaskWake): void;
+  getTaskWake(taskId: string, wakeId: string): TaskWake | null;
+  listTaskWakes(taskId: string): TaskWake[];
   /**
    * Remove events by id. Used by the historical telemetry migration to fold
    * pre-Driver progress rows into the sidecar while keeping
@@ -1998,6 +2015,29 @@ export class FileTaskStore implements TaskStore {
   }
   listEvents(taskId: string): TaskEvent[] { return values(this.#requireTask(taskId).events, "id"); }
 
+  nextTaskWakeId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "taskWake");
+  }
+  peekNextTaskWakeId(taskId: string): string {
+    return this.#peekTaskRecordId(taskId, "taskWake");
+  }
+  saveTaskWake(taskId: string, wake: TaskWake): void {
+    if (wake.taskId !== taskId) {
+      throw new StorageRecordError(`Task wake belongs to another Task: ${wake.taskId}`);
+    }
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      observeTaskRecordId(aggregate, "taskWake", wake.id);
+      aggregate.wakes[wake.id] = wake;
+    });
+  }
+  getTaskWake(taskId: string, wakeId: string): TaskWake | null {
+    return this.#state().tasks[taskId]?.wakes[wakeId] ?? null;
+  }
+  listTaskWakes(taskId: string): TaskWake[] {
+    return values(this.#requireTask(taskId).wakes, "id");
+  }
+
   removeEvents(taskId: string, eventIds: readonly string[]): number {
     if (eventIds.length === 0) return 0;
     let removed = 0;
@@ -2658,6 +2698,7 @@ function emptyStoredTask(task: Task): StoredTask {
     decisions: {},
     milestones: {},
     events: {},
+    wakes: {},
     capabilityGrants: {},
     releaseWorkflows: {},
     publicationReferences: {},
@@ -2681,6 +2722,7 @@ function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
     decision: 0,
     milestone: 0,
     event: 0,
+    taskWake: 0,
     capabilityGrant: 0,
     releaseWorkflow: 0,
     publicationReference: 0
@@ -2908,6 +2950,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "decisions",
     "milestones",
     "events",
+    "wakes",
     "capabilityGrants",
     "releaseWorkflows",
     "publicationReferences",
@@ -3140,6 +3183,20 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     }
     return event;
   }, "events");
+  parseMap(aggregate.wakes, (record, key) => {
+    const wake = identified<TaskWake>(
+      record,
+      CURRENT_TASK_WAKE_SCHEMA_VERSION,
+      "id",
+      key,
+      "Task wake"
+    );
+    if (wake.taskId !== taskId) {
+      throw new StorageRecordError(`Task wake belongs to another Task: ${wake.taskId}`);
+    }
+    validateTaskWake(wake);
+    return wake;
+  }, "wakes");
   parseMap(aggregate.capabilityGrants, (record, key) => {
     const grant = storedCapabilityGrant(record);
     if (grant.id !== key) {
@@ -3203,6 +3260,7 @@ function validateTaskIdHighWaterCoverage(
     decision: aggregate.decisions,
     milestone: aggregate.milestones,
     event: aggregate.events,
+    taskWake: aggregate.wakes,
     capabilityGrant: aggregate.capabilityGrants,
     releaseWorkflow: aggregate.releaseWorkflows,
     publicationReference: aggregate.publicationReferences

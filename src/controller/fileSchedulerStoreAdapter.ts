@@ -36,6 +36,19 @@ import {
   hasRecentTurnId
 } from "../executor/turnCompletion.js";
 import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
+import {
+  buildTaskWakeEnvelope,
+  type WakeEnvelope
+} from "../context/wakeNotification.js";
+import { createTaskWake, fallbackWakeCursor, latestTaskWake } from "../scheduler/taskWake.js";
+import {
+  rolloverTaskRoleSessionForContextBudget,
+  type ContextBudgetRolloverResult
+} from "../lifecycle/contextBudgetRollover.js";
+import {
+  resolveContextBudget,
+  type ResolvedContextBudget
+} from "../config/yuiConfig.js";
 import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import {
@@ -100,6 +113,7 @@ import {
 } from "../scheduler/operatorNotification.js";
 import { pendingWakeupsMatch } from "../scheduler/pendingWakeup.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import { wakeReason } from "../scheduler/wakeReason.js";
 import {
   foldRunProgressFacts,
   latestRunDurableProgressAt,
@@ -820,6 +834,45 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   getTaskBrief(taskId: string) { return this.store.getTaskBrief(taskId); }
   listDecisions(taskId: string) { return this.store.listDecisions(taskId); }
   listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
+  getTaskWakeEnvelope(taskId: string): WakeEnvelope | null {
+    return this.store.transaction((reader) => {
+      const pending = reader.getPendingWakeup(taskId);
+      if (pending === null) return null;
+      const task = reader.getTask(taskId);
+      if (task === null) return null;
+      const latest = latestTaskWake(reader.listTaskWakes(taskId));
+      const fromCursor = latest?.toCursor ?? fallbackWakeCursor({
+        taskCreatedAt: task.createdAt,
+        leaderRunCreatedAt: reader.listAgentRuns(taskId)
+          .filter((run) => run.roleName === "leader")
+          .at(-1)?.createdAt
+      });
+      return buildTaskWakeEnvelope(reader, {
+        taskId,
+        wakeId: reader.peekNextTaskWakeId(taskId),
+        reasons: pending.reasons,
+        fromCursor
+      });
+    });
+  }
+  rolloverTaskRoleSessionForContextBudget(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    peakTokens: number;
+    hardTokens: number;
+    now: Date;
+  }>): ContextBudgetRolloverResult | null {
+    return this.store.transaction((reader) => rolloverTaskRoleSessionForContextBudget(
+      reader,
+      input.taskId,
+      input.roleName,
+      { peakTokens: input.peakTokens, hardTokens: input.hardTokens },
+      input.now
+    ));
+  }
+  getContextBudget(): ResolvedContextBudget {
+    return resolveContextBudget(this.store.getConfig().contextBudget);
+  }
 
   listRoles(taskId: string): SchedulerRole[] {
     return this.store.listRoles(taskId).map((role) => mapRole(this.store, role));
@@ -888,7 +941,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           { requestId: request.id, choiceKey },
           now
         ));
-        queueLeaderWakeup(store, task.id, `input-timeout:${request.id}`, now);
+        queueLeaderWakeup(store, task.id, wakeReason("input-timeout", request.id), now);
         resolved.push({ inputRequestId: request.id, taskId: task.id, choiceKey });
       }
       return resolved;
@@ -1030,7 +1083,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           { type: "task", id: task.id }
         ]);
       } else {
-        queueLeaderWakeup(store, task.id, "role-run-stalled", input.now);
+        queueLeaderWakeup(store, task.id, wakeReason("role-run-stalled"), input.now);
       }
       return "raised";
     });
@@ -1652,6 +1705,24 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         runLaunchEventPayload(input.run),
         input.now
       ));
+      if (input.wakeId !== undefined && input.wakeFromCursor !== undefined) {
+        if (store.peekNextTaskWakeId(input.task.id) !== input.wakeId) {
+          return "state-changed";
+        }
+        const allocatedWakeId = store.nextTaskWakeId(input.task.id);
+        if (allocatedWakeId !== input.wakeId) {
+          throw new Error(`Leader TaskWake allocation changed unexpectedly: ${input.task.id}.`);
+        }
+        store.saveTaskWake(input.task.id, createTaskWake({
+          id: allocatedWakeId,
+          taskId: input.task.id,
+          reasons: input.wakeup.reasons,
+          fromCursor: input.wakeFromCursor,
+          toCursor: input.now.toISOString(),
+          runId: input.run.id,
+          now: input.now
+        }));
+      }
       if (input.session !== null && input.session.nativeSessionId !== undefined) {
         saveTaskSession(store, role, {
           ...input.session,
@@ -2035,7 +2106,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           currentRun.effective.agentId,
           input.now
         );
-        queueLeaderWakeup(store, task.id, "review-failed", input.now);
+        queueLeaderWakeup(store, task.id, wakeReason("review-failed"), input.now);
         return "failed";
       }
       const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
@@ -2107,7 +2178,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       queueLeaderWakeup(
         store,
         task.id,
-        role.name === "leader" ? "leader-run-failed" : "role-run-failed",
+        wakeReason(role.name === "leader" ? "leader-run-failed" : "role-run-failed"),
         input.now
       );
       return "failed";

@@ -16,6 +16,8 @@ export const TASK_RECORD_ID_PREFIXES = {
   event: "event",
   capabilityGrant: "capability-grant",
   releaseWorkflow: "release-workflow",
+  taskWake: "wake"
+  ,
   publicationReference: "publication"
 } as const;
 

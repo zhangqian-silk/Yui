@@ -234,6 +234,7 @@ import {
 } from "./taskActor.js";
 import { createTaskTerminalNotification } from "../scheduler/operatorNotification.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import { renderWakeReason, wakeReason } from "../scheduler/wakeReason.js";
 import {
   collectTaskActionability,
   computeActionabilityDigest,
@@ -538,7 +539,7 @@ export function runTaskCommand(
     case "retire": return retireTaskCommand(rest, store, options);
     case "reconcile": return output(reconcileTaskCommand(rest, store, options));
     case "message": return output(taskMessageCommand(rest, store, options));
-    case "wake": return output(taskWakeCommand(rest, store, options));
+    case "wake": return taskWakeDispatch(rest, store, options);
     case "project": return taskProjectCommand(rest, store, options);
     case "input": return runTaskInputCommand(rest, store, options);
     case "grant": return runGrantCommand(rest, store, options);
@@ -1238,8 +1239,9 @@ function reopenTaskCommand(
       const active = reopenTask(task, now);
       tx.saveTask(active);
       tx.clearOperatorNotification(task.id);
-      enqueueWork(tx, leaderMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
-      enqueueWork(tx, taskMailbox(task.id), "task-reopened", now, [taskRef(task.id)]);
+      const reopenedReason = wakeReason("task-reopened");
+      enqueueWork(tx, leaderMailbox(task.id), reopenedReason, now, [taskRef(task.id)]);
+      enqueueWork(tx, taskMailbox(task.id), reopenedReason, now, [taskRef(task.id)]);
       recordTaskEvent(tx, task.id, "task.reopened", { status: active.status }, now);
       return { task: active, changed: true } as const;
     });
@@ -1663,9 +1665,23 @@ function taskMessageCommand(
     return `Sent message ${result.message.id} to ${result.task.id}\n`;
   }
   if (command === "list") {
-    exactPositionals(rest, 1, "Task message list usage: yui task message list <id>.");
-    const task = requireTask(store, rest[0]);
-    const messages = store.listMessages(task.id);
+    const messageListUsage = "Task message list usage: yui task message list <id> [--after <timestamp>] [--limit <n>].";
+    const parsed = parseTail(rest, new Set(["--after", "--limit"]), messageListUsage);
+    exactPositionals(parsed.positionals, 1, messageListUsage);
+    const task = requireTask(store, parsed.positionals[0]);
+    let messages = store.listMessages(task.id);
+    const after = optionalNonEmptyOption(parsed.options, "--after");
+    if (after !== undefined) {
+      const afterMs = Date.parse(after);
+      if (!Number.isFinite(afterMs)) throw usageError("--after must be a valid timestamp.", messageListUsage);
+      messages = messages.filter((m) => Date.parse(m.createdAt) > afterMs);
+    }
+    const limit = optionalNonEmptyOption(parsed.options, "--limit");
+    if (limit !== undefined) {
+      const n = Number(limit);
+      if (!Number.isSafeInteger(n) || n <= 0) throw usageError("--limit must be a positive integer.", messageListUsage);
+      messages = messages.slice(-n);
+    }
     if (messages.length === 0) return "No messages found.\n";
     const timeZone = store.getConfig().timeZone;
     return `${renderTable(
@@ -1695,7 +1711,7 @@ function taskMessageCommand(
  * enqueues exactly one Leader wakeup with an auditable reason. The reason is
  * truncated to keep the event payload compact.
  */
-function taskWakeCommand(
+function taskWakeForceCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
@@ -1710,13 +1726,13 @@ function taskWakeCommand(
   const now = clock(options);
   const task = requireTask(store, parsed.positionals[0]);
   assertTaskOpen(task);
-  const wakeReason = `force-wake:${truncateEventNote(reason)}`;
+  const wakeReasonTag = wakeReason("force-wake", truncateEventNote(reason));
   store.transaction((tx) => {
-    queueLeaderWakeup(tx, task.id, wakeReason, now);
-    recordTaskEvent(tx, task.id, "task.wake-forced", { reason: wakeReason }, now);
+    queueLeaderWakeup(tx, task.id, wakeReasonTag, now);
+    recordTaskEvent(tx, task.id, "task.wake-forced", { reason: wakeReasonTag }, now);
   });
   notifyMailbox(options.runtime, leaderMailbox(task.id), task.id);
-  return `Woke ${task.id} (${wakeReason})\n`;
+  return `Woke ${task.id} (${wakeReasonTag})\n`;
 }
 
 function taskRoleCommand(
@@ -7144,9 +7160,23 @@ function taskEventCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "list") {
-    exactPositionals(rest, 1, "Task event list usage: yui task event list <task>.");
-    const task = requireTask(store, rest[0]);
-    const events = store.listEvents(task.id);
+    const eventListUsage = "Task event list usage: yui task event list <task> [--after <timestamp>] [--limit <n>].";
+    const parsed = parseTail(rest, new Set(["--after", "--limit"]), eventListUsage);
+    exactPositionals(parsed.positionals, 1, eventListUsage);
+    const task = requireTask(store, parsed.positionals[0]);
+    let events = store.listEvents(task.id);
+    const after = optionalNonEmptyOption(parsed.options, "--after");
+    if (after !== undefined) {
+      const afterMs = Date.parse(after);
+      if (!Number.isFinite(afterMs)) throw usageError("--after must be a valid timestamp.", eventListUsage);
+      events = events.filter((e) => Date.parse(e.createdAt) > afterMs);
+    }
+    const limit = optionalNonEmptyOption(parsed.options, "--limit");
+    if (limit !== undefined) {
+      const n = Number(limit);
+      if (!Number.isSafeInteger(n) || n <= 0) throw usageError("--limit must be a positive integer.", eventListUsage);
+      events = events.slice(-n);
+    }
     if (events.length === 0) {
       return output(`No events found for ${task.id}.\n`, { taskId: task.id, events: [] });
     }
@@ -7183,6 +7213,110 @@ function taskEventCommand(
   throw usageError(command === undefined
     ? "Task event command is required."
     : `Unknown command: task event ${command}`);
+}
+
+/**
+ * Issue 04 (long-term): the durable wake ledger. `wake list` shows the
+ * dispatch history; `wake show` returns the structured delta content for one
+ * wake — the on-demand read the Agent uses instead of a context dump in the
+ * wake envelope.
+ */
+function taskWakeDispatch(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const [subcommand] = args;
+  if (subcommand === "list" || subcommand === "show") {
+    return taskWakeInspectionCommand(args, store);
+  }
+  return output(taskWakeForceCommand(args, store, options));
+}
+
+/**
+ * Issue 04 (long-term): the durable wake ledger. `wake list` shows the
+ * dispatch history; `wake show` returns the structured delta content for one
+ * wake — the on-demand read the Agent uses instead of a context dump in the
+ * wake envelope.
+ */
+function taskWakeInspectionCommand(
+  args: string[],
+  store: TaskWorkflowStore
+): TaskCommandExecution {
+  const [command, ...rest] = args;
+  if (command === "list") {
+    const usage = "Task wake list usage: yui task wake list <task>.";
+    exactPositionals(rest, 1, usage);
+    const task = requireTask(store, rest[0]);
+    const wakes = store.listTaskWakes(task.id);
+    if (wakes.length === 0) {
+      return output(`No wakes recorded for ${task.id}.\n`, { taskId: task.id, wakes: [] });
+    }
+    const timeZone = store.getConfig().timeZone;
+    return output(`${renderTable(
+      `Wakes: ${task.id}`,
+      [
+        { header: "Wake", minWidth: 8, maxWidth: 18 },
+        { header: "Status", minWidth: 8, maxWidth: 12 },
+        { header: "Reasons", minWidth: 10, maxWidth: 40 },
+        { header: "Run", minWidth: 10, maxWidth: 20 },
+        { header: "Dispatched", minWidth: 10, maxWidth: 28 }
+      ],
+      wakes.map((wake) => [
+        wake.id,
+        wake.status,
+        wake.reasons.map(renderWakeReason).join(", "),
+        wake.runId ?? "-",
+        presentTime(wake.createdAt, timeZone)
+      ]),
+      defaultTableWidth()
+    )}\n`, { taskId: task.id, wakes });
+  }
+  if (command === "show") {
+    const usage = "Task wake show usage: yui task wake show <task> <wake>.";
+    exactPositionals(rest, 2, usage);
+    const task = requireTask(store, rest[0]);
+    const wake = store.getTaskWake(task.id, rest[1]);
+    if (wake === null) throw dataError(`Wake not found: ${rest[1]}.`);
+    const timeZone = store.getConfig().timeZone;
+    const fromMs = Date.parse(wake.fromCursor);
+    const toMs = Date.parse(wake.toCursor);
+    const inWindow = (createdAt: string) => {
+      const ms = Date.parse(createdAt);
+      return ms > fromMs && ms <= toMs;
+    };
+    const events = store.listEvents(task.id).filter((e) => inWindow(e.createdAt));
+    const messages = store.listMessages(task.id).filter((m) => inWindow(m.createdAt));
+    const runs = store.listAgentRuns(task.id).filter((r) => inWindow(r.createdAt));
+    const lines: string[] = [
+      `Wake: ${wake.id}`,
+      `Task: ${task.id}`,
+      `Status: ${wake.status}`,
+      `Reasons: ${wake.reasons.map(renderWakeReason).join(", ")}`,
+      `Delta window: ${wake.fromCursor} → ${wake.toCursor}`,
+      ...(wake.runId === undefined ? [] : [`Run: ${wake.runId}`]),
+      `Dispatched: ${presentTime(wake.createdAt, timeZone)}`,
+      ...(wake.consumedAt === undefined
+        ? []
+        : [`Consumed: ${presentTime(wake.consumedAt, timeZone)}`]),
+      `Events (${events.length}):`,
+      ...events.map((e) => `  ${e.id} ${e.type} ${presentTime(e.createdAt, timeZone)}`),
+      `Messages (${messages.length}):`,
+      ...messages.map((m) => `  ${m.id} [${taskMessageAuthorLabel(m.author)}] ${presentTime(m.createdAt, timeZone)}`),
+      `Runs (${runs.length}):`,
+      ...runs.map((r) => `  ${r.id} [${r.status}/${r.purpose}] ${r.roleName} ${presentTime(r.createdAt, timeZone)}`)
+    ];
+    return output(lines.join("\n").concat("\n"), {
+      taskId: task.id,
+      wake,
+      events,
+      messages,
+      runs
+    });
+  }
+  throw usageError(command === undefined
+    ? "Task wake command is required."
+    : `Unknown command: task wake ${command}`);
 }
 
 type ParsedMultiTail = Readonly<{

@@ -60,6 +60,10 @@ const STORED_TASK_DURABLE_JOBS_FROM_VERSION = 14;
 const STORED_TASK_DURABLE_JOBS_TO_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION = 16;
+const STORED_TASK_WAKES_FROM_VERSION = 16;
+const STORED_TASK_WAKES_TO_VERSION = 17;
+const TASK_WAKE_FROM_VERSION = 0;
+const TASK_WAKE_TO_VERSION = 1;
 const STORED_TASK_PUBLICATION_REFERENCES_FROM_VERSION = 16;
 const STORED_TASK_PUBLICATION_REFERENCES_TO_VERSION = 17;
 const CAPABILITY_GRANT_FROM_VERSION = 0;
@@ -179,7 +183,8 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(integrationQueueIntroductionStep())
     .registerCompatible(storedTaskDurableJobsStep())
     .registerCompatible(storedTaskJobCallerKeyHashesStep())
-    .registerCompatible(storedTaskPublicationReferencesStep())
+    .registerCompatible(storedTaskWakesAndPublicationReferencesStep())
+    .registerCompatible(taskWakeIntroductionStep())
     .registerCompatible(durableJobIntroductionStep())
     .registerOfflineMigration(capabilityGrantIntroductionStep())
     .registerOfflineMigration(releaseWorkflowIntroductionStep())
@@ -1132,18 +1137,21 @@ function normalizeStoredTaskV15ToV16(snapshot: HomeSnapshot): HomeSnapshot {
 }
 
 /**
- * Issue 11: the StoredTask aggregate gains the `publicationReferences` map.
- * Every v16 Task defaults to an empty map and a zero high-water mark. The
- * adjacent publicationReference introduction owns the record family version.
+ * StoredTask v17 introduces both the durable TaskWake ledger (Issue 04
+ * long-term design) and the publicationReferences map (Issue 11). Every
+ * aggregate gains empty `wakes` and `publicationReferences` maps and zero
+ * high-water marks.
  */
-function storedTaskPublicationReferencesStep(): CompatibleStep<HomeSnapshot> {
+function storedTaskWakesAndPublicationReferencesStep(): CompatibleStep<HomeSnapshot> {
   return {
     kind: "compatible",
     axis: "record",
     recordKind: "storedTask",
-    fromVersion: STORED_TASK_PUBLICATION_REFERENCES_FROM_VERSION,
-    toVersion: STORED_TASK_PUBLICATION_REFERENCES_TO_VERSION,
+    fromVersion: STORED_TASK_WAKES_FROM_VERSION,
+    toVersion: STORED_TASK_WAKES_TO_VERSION,
     defaults: [
+      "wakes defaults to an empty map on every Task aggregate"
+      ,
       "publicationReferences defaults to an empty map on every Task aggregate"
     ],
     validateSource: (snapshot) => requireStoredTaskV16Shape(snapshot),
@@ -1187,18 +1195,18 @@ function requireStoredTaskV16Shape(snapshot: HomeSnapshot): void {
     snapshot.schemaManifest.recordVersions,
     "schema manifest recordVersions"
   );
-  if (manifestVersions.storedTask !== STORED_TASK_PUBLICATION_REFERENCES_FROM_VERSION) {
+  if (manifestVersions.storedTask !== STORED_TASK_WAKES_FROM_VERSION) {
     throw new Error(
-      `Record storedTask compatible step requires manifest version ${STORED_TASK_PUBLICATION_REFERENCES_FROM_VERSION}.`
+      `Record storedTask compatible step requires manifest version ${STORED_TASK_WAKES_FROM_VERSION}.`
     );
   }
   if (snapshot.state === null) return;
   const tasks = asObject(snapshot.state.tasks, "state tasks");
   for (const [taskId, rawTask] of Object.entries(tasks)) {
     const task = asObject(rawTask, `Task aggregate ${taskId}`);
-    if (task.schemaVersion !== STORED_TASK_PUBLICATION_REFERENCES_FROM_VERSION) {
+    if (task.schemaVersion !== STORED_TASK_WAKES_FROM_VERSION) {
       throw new Error(
-        `Task aggregate ${taskId} must use schemaVersion ${STORED_TASK_PUBLICATION_REFERENCES_FROM_VERSION}.`
+        `Task aggregate ${taskId} must use schemaVersion ${STORED_TASK_WAKES_FROM_VERSION}.`
       );
     }
     const allowed = new Set<string>(STORED_TASK_V16_FIELDS);
@@ -1230,7 +1238,7 @@ function normalizeStoredTaskV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {
     ...snapshot.schemaManifest,
     recordVersions: {
       ...manifestVersions,
-      storedTask: STORED_TASK_PUBLICATION_REFERENCES_TO_VERSION
+      storedTask: STORED_TASK_WAKES_TO_VERSION
     }
   };
   if (snapshot.state === null) return { schemaManifest, state: null };
@@ -1243,19 +1251,67 @@ function normalizeStoredTaskV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {
       : asObject(task.publicationReferences, `Task aggregate ${taskId} publicationReferences`);
     const marks = asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`);
     const existingMark = marks.publicationReference;
+    const existingWakeMark = marks.taskWake;
     nextTasks[taskId] = {
       ...task,
-      schemaVersion: STORED_TASK_PUBLICATION_REFERENCES_TO_VERSION,
+      schemaVersion: STORED_TASK_WAKES_TO_VERSION,
       idHighWaterMarks: {
         ...marks,
-        publicationReference: typeof existingMark === "number" ? existingMark : 0
+        publicationReference: typeof existingMark === "number" ? existingMark : 0,
+        taskWake: typeof existingWakeMark === "number" ? existingWakeMark : TASK_WAKE_FROM_VERSION
       },
-      publicationReferences: existingReferences
+      publicationReferences: existingReferences,
+      wakes: {}
     };
   }
   return {
     schemaManifest,
     state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * The taskWake record family is introduced alongside StoredTask v17. The
+ * compatible step supplies the empty map and high-water mark; this step only
+ * advances the manifest record version so the planner can resolve the 0->1
+ * boundary.
+ */
+function taskWakeIntroductionStep(): CompatibleStep<HomeSnapshot> {
+  return {
+    kind: "compatible",
+    axis: "record",
+    recordKind: "taskWake",
+    fromVersion: TASK_WAKE_FROM_VERSION,
+    toVersion: TASK_WAKE_TO_VERSION,
+    introduction: true,
+    defaults: [
+      "taskWake family starts at version 1 with an empty ledger"
+    ],
+    validateSource: (snapshot) => {
+      const manifestVersions = asObject(
+        snapshot.schemaManifest.recordVersions,
+        "schema manifest recordVersions"
+      );
+      const namedVersion = manifestVersions.taskWake;
+      if (namedVersion !== undefined && namedVersion !== TASK_WAKE_FROM_VERSION) {
+        throw new Error(
+          `Record taskWake introduction requires an absent manifest version or ${TASK_WAKE_FROM_VERSION}.`
+        );
+      }
+    },
+    normalize: (snapshot) => ({
+      schemaManifest: {
+        ...snapshot.schemaManifest,
+        recordVersions: {
+          ...asObject(
+            snapshot.schemaManifest.recordVersions,
+            "schema manifest recordVersions"
+          ),
+          taskWake: TASK_WAKE_TO_VERSION
+        }
+      },
+      state: snapshot.state
+    })
   };
 }
 

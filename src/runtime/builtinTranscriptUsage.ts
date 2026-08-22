@@ -1,7 +1,49 @@
 import type { RuntimeUsageSnapshot } from "./runtimeObservation.js";
 
+/**
+ * Issue 04 (context token budget): per-transcript usage report that keeps
+ * uncached input, cache read, cache creation, output, and the largest single
+ * request peak as separate dimensions. Cache-read accumulation is processed
+ * volume, not unique context size; callers must never infer auto-compaction
+ * from these totals.
+ */
+export type TranscriptUsageReport = Readonly<{
+  /** Provider requests (assistant messages / token-count snapshots) observed. */
+  requests: number;
+  /** Input tokens served outside the provider cache. */
+  uncachedInputTokens: number;
+  /** Input tokens served from the provider cache. */
+  cacheReadTokens: number;
+  /** Input tokens written into the provider cache. */
+  cacheCreatedTokens: number;
+  outputTokens: number;
+  /** Largest single-request processed input (uncached + cache read + created). */
+  peakRequestTokens: number;
+}>;
+
 export function codexTranscriptUsage(transcript: string): RuntimeUsageSnapshot | null {
-  let latest: RuntimeUsageSnapshot | null = null;
+  const report = codexTranscriptUsageReport(transcript);
+  if (report === null) return null;
+  return Object.freeze({
+    inputTokens: report.uncachedInputTokens + report.cacheReadTokens + report.cacheCreatedTokens,
+    outputTokens: report.outputTokens,
+    ...(report.cacheReadTokens + report.cacheCreatedTokens === 0
+      ? {}
+      : { cachedInputTokens: report.cacheReadTokens + report.cacheCreatedTokens })
+  });
+}
+
+export function codexTranscriptUsageReport(transcript: string): TranscriptUsageReport | null {
+  // Codex token_count events are cumulative session snapshots. Per-request
+  // input is the delta between consecutive snapshots; the first snapshot is
+  // treated as one full request.
+  let latestInput = 0;
+  let latestCached = 0;
+  let latestOutput = 0;
+  let previous = 0;
+  let peak = 0;
+  let requests = 0;
+  let seen = false;
   for (const line of transcript.split("\n")) {
     const entry = parseLine(line);
     if (entry?.type !== "event_msg") continue;
@@ -12,32 +54,59 @@ export function codexTranscriptUsage(transcript: string): RuntimeUsageSnapshot |
     const inputTokens = integer(usage?.input_tokens);
     const outputTokens = integer(usage?.output_tokens);
     if (inputTokens === null || outputTokens === null) continue;
-    const cachedInputTokens = integer(usage?.cached_input_tokens);
-    const reasoningTokens = integer(usage?.reasoning_output_tokens);
-    latest = Object.freeze({
-      inputTokens,
-      outputTokens,
-      ...(cachedInputTokens === null ? {} : { cachedInputTokens }),
-      ...(reasoningTokens === null ? {} : { reasoningTokens })
-    });
+    const cachedInputTokens = integer(usage?.cached_input_tokens) ?? 0;
+    requests += 1;
+    seen = true;
+    const total = inputTokens + cachedInputTokens;
+    const delta = Math.max(0, total - previous);
+    if (delta > peak) peak = delta;
+    previous = total;
+    latestInput = inputTokens;
+    latestCached = cachedInputTokens;
+    latestOutput = outputTokens;
   }
-  return latest;
+  if (!seen) return null;
+  return Object.freeze({
+    requests,
+    uncachedInputTokens: Math.max(0, latestInput - latestCached),
+    cacheReadTokens: latestCached,
+    cacheCreatedTokens: 0,
+    outputTokens: latestOutput,
+    peakRequestTokens: peak
+  });
 }
 
 export function claudeTranscriptUsage(transcript: string): RuntimeUsageSnapshot | null {
-  const messages = new Map<string, RuntimeUsageSnapshot>();
+  const report = claudeTranscriptUsageReport(transcript);
+  if (report === null) return null;
+  return Object.freeze({
+    inputTokens: report.uncachedInputTokens + report.cacheReadTokens + report.cacheCreatedTokens,
+    outputTokens: report.outputTokens,
+    ...(report.cacheReadTokens + report.cacheCreatedTokens === 0
+      ? {}
+      : { cachedInputTokens: report.cacheReadTokens + report.cacheCreatedTokens })
+  });
+}
+
+export function claudeTranscriptUsageReport(transcript: string): TranscriptUsageReport | null {
+  // Each Claude assistant message carries its own per-request usage, so the
+  // report is a direct aggregation; the peak is the largest single message.
+  const messages = new Map<string, Readonly<{
+    directInput: number;
+    cacheRead: number;
+    cacheCreated: number;
+    output: number;
+  }>>();
   for (const line of transcript.split("\n")) {
     const entry = parseLine(line);
     if (entry?.type !== "assistant") continue;
     const message = object(entry.message);
     const usage = object(message?.usage);
     const directInput = integer(usage?.input_tokens);
-    const outputTokens = integer(usage?.output_tokens);
-    if (directInput === null || outputTokens === null) continue;
+    const output = integer(usage?.output_tokens);
+    if (directInput === null || output === null) continue;
     const cacheRead = integer(usage?.cache_read_input_tokens) ?? 0;
     const cacheCreated = integer(usage?.cache_creation_input_tokens) ?? 0;
-    const details = object(usage?.output_tokens_details);
-    const reasoningTokens = integer(details?.thinking_tokens);
     const key = typeof message?.id === "string" && message.id.length > 0
       ? `message:${message.id}`
       : typeof entry.uuid === "string" && entry.uuid.length > 0
@@ -46,31 +115,29 @@ export function claudeTranscriptUsage(transcript: string): RuntimeUsageSnapshot 
     // A streaming transcript can repeat cumulative snapshots. Without a
     // stable provider or entry identity, summing them would fabricate growth.
     if (key === null) continue;
-    messages.set(key, Object.freeze({
-      // Normalize inputTokens as the complete input total. cachedInputTokens is
-      // a breakdown and must not be added to it again by the projection.
-      inputTokens: directInput + cacheRead + cacheCreated,
-      outputTokens,
-      cachedInputTokens: cacheRead + cacheCreated,
-      ...(reasoningTokens === null ? {} : { reasoningTokens })
-    }));
+    messages.set(key, { directInput, cacheRead, cacheCreated, output });
   }
   if (messages.size === 0) return null;
-  let inputTokens = 0;
+  let uncachedInputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheCreatedTokens = 0;
   let outputTokens = 0;
-  let cachedInputTokens = 0;
-  let reasoningTokens = 0;
+  let peak = 0;
   for (const usage of messages.values()) {
-    inputTokens += usage.inputTokens;
-    outputTokens += usage.outputTokens;
-    cachedInputTokens += usage.cachedInputTokens ?? 0;
-    reasoningTokens += usage.reasoningTokens ?? 0;
+    uncachedInputTokens += usage.directInput;
+    cacheReadTokens += usage.cacheRead;
+    cacheCreatedTokens += usage.cacheCreated;
+    outputTokens += usage.output;
+    const total = usage.directInput + usage.cacheRead + usage.cacheCreated;
+    if (total > peak) peak = total;
   }
   return Object.freeze({
-    inputTokens,
+    requests: messages.size,
+    uncachedInputTokens,
+    cacheReadTokens,
+    cacheCreatedTokens,
     outputTokens,
-    cachedInputTokens,
-    ...(reasoningTokens === 0 ? {} : { reasoningTokens })
+    peakRequestTokens: peak
   });
 }
 

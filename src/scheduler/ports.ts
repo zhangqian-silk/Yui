@@ -194,6 +194,10 @@ export type LeaderDispatchPersistence = Readonly<{
   run: SchedulerAgentRun;
   session: SchedulerRoleSession | null;
   wakeup: PendingWakeup;
+  /** The TaskWake record id this dispatch will persist (peeked before dispatch). */
+  wakeId?: string;
+  /** The delta window's exclusive lower bound for this wake. */
+  wakeFromCursor?: string;
   now: Date;
 }>;
 
@@ -482,6 +486,33 @@ export interface SchedulerStorePort {
   getTaskBrief(taskId: string): TaskBrief | null;
   listDecisions(taskId: string): readonly Decision[];
   listMilestones(taskId: string): readonly Milestone[];
+  /**
+   * Issue 04 (long-term): the minimal wake envelope for a Leader wake —
+   * aggregated reason tags, the delta window, and read pointers. The Agent
+   * reads delta content on demand with `yui task wake show`. Returns null
+   * when no wake is pending. Optional so adapters without the feature keep
+   * the full-context prompt.
+   */
+  getTaskWakeEnvelope?(
+    taskId: string
+  ): import("../context/wakeNotification.js").WakeEnvelope | null;
+  /**
+   * Issue 04: retire a native Session generation that crossed the hard
+   * context budget so the next wake starts a fresh generation. Returns null
+   * when no live generation exists. Optional so adapters without the feature
+   * keep resuming the existing Session.
+   */
+  rolloverTaskRoleSessionForContextBudget?(
+    input: Readonly<{
+      taskId: string;
+      roleName: string;
+      peakTokens: number;
+      hardTokens: number;
+      now: Date;
+    }>
+  ): import("../lifecycle/contextBudgetRollover.js").ContextBudgetRolloverResult | null;
+  /** Issue 04: resolved per-Session-generation context budget thresholds. */
+  getContextBudget?(): import("../config/yuiConfig.js").ResolvedContextBudget;
   /** Persist the AgentRun, active-run pointer, running Role and active fixed session. */
   saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult;
   /** Persist a fixed session discovered while preparing an undelivered Run. */

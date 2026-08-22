@@ -33,6 +33,7 @@ import {
   RUN_RECOVERY_APPLIED_EVENT,
   RUN_RECOVERY_REQUESTED_EVENT
 } from "../scheduler/roleRunStall.js";
+import { markTaskWakeConsumed } from "../scheduler/taskWake.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   workItemExecutionGroupById,
@@ -469,6 +470,13 @@ export function terminalizeExactTaskRun(
     }
   }
   store.saveAgentRun(terminal);
+  if (terminal.roleName === "leader") {
+    const wake = store.listTaskWakes(input.taskId)
+      .find((candidate) => candidate.runId === terminal.id && candidate.status === "dispatched");
+    if (wake !== undefined) {
+      store.saveTaskWake(input.taskId, markTaskWakeConsumed(wake, now));
+    }
+  }
   if (terminal.executionGroupId !== undefined && terminal.executionLaneId !== undefined) {
     store.clearActiveExecutionLaneRun(
       input.taskId,

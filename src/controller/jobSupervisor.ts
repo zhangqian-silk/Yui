@@ -43,6 +43,7 @@ import {
   type DurableJobStepResult
 } from "../job/durableJob.js";
 import { readLinuxProcessStartIdentity } from "./domainIdentity.js";
+import { wakeReason } from "../scheduler/wakeReason.js";
 
 const DEFAULT_STEP_TIMEOUT_MS = 30 * 60_000;
 const HEARTBEAT_STALE_MS = 2 * 60_000;
@@ -270,7 +271,7 @@ export class DurableJobSupervisor {
           now
         ),
         now,
-        { reason: "job-finished", refs: wakeupRefs(job) }
+        { reason: wakeReason("job-finished"), refs: wakeupRefs(job) }
       );
       this.#deliverTerminalEvent(terminal);
       return;
@@ -503,7 +504,7 @@ export class DurableJobSupervisor {
         now
       ),
       now,
-      { reason: "job-finished", refs: wakeupRefs(job) }
+      { reason: wakeReason("job-finished"), refs: wakeupRefs(job) }
     );
     this.#deliverTerminalEvent(terminal);
     this.#sigkillAt.delete(this.#sigkillKey(job));
@@ -526,7 +527,7 @@ export class DurableJobSupervisor {
           now
         ),
         now,
-        { reason: "job-finished", refs: wakeupRefs(job) }
+        { reason: wakeReason("job-finished"), refs: wakeupRefs(job) }
       );
       this.#deliverTerminalEvent(terminal);
     } else {
@@ -544,7 +545,7 @@ export class DurableJobSupervisor {
           now
         ),
         now,
-        { reason: "job-finished", refs: wakeupRefs(job) }
+        { reason: wakeReason("job-finished"), refs: wakeupRefs(job) }
       );
       this.#deliverTerminalEvent(terminal);
     }
