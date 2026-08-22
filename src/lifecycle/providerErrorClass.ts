@@ -30,6 +30,10 @@
  *                            observable in shadow metrics.
  */
 
+import type { ProviderErrorCode } from "../runtime/providerErrorCodes.js";
+import { PROVIDER_ERROR_CODE_CLASS } from "../runtime/providerErrorCodes.js";
+
+
 export type ProviderErrorClass =
   | "transient-provider"
   | "transport-uncertain"
@@ -50,8 +54,6 @@ export function isRetryableProviderErrorClass(
   return RETRYABLE_PROVIDER_ERROR_CLASSES.includes(errorClass);
 }
 
-import type { ProviderErrorCode } from "../runtime/providerErrorCodes.js";
-import { PROVIDER_ERROR_CODE_CLASS } from "../runtime/providerErrorCodes.js";
 
 export type ProviderErrorClassificationInput = Readonly<{
   adapterId: string;

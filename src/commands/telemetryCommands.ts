@@ -64,7 +64,7 @@ export async function runTelemetryCommand(
 
 function telemetryStatus(args: string[], options: TelemetryCommandOptions): string {
   const flags = parseFlags(args, new Set([]));
-  
+
   const mode = resolveTelemetryMode(storeConfig(options).telemetryMode);
   const telemetry = new SqliteTelemetryStore(options.home, {
     mode,
@@ -121,7 +121,7 @@ function telemetryPrune(args: string[], options: TelemetryCommandOptions): strin
   const taskId = stringOption(args, "--task");
   const keep = integerOption(args, "--keep", DEFAULT_TERMINAL_KEEP);
   const dryRun = flags.has("dry-run");
-  
+
   const cap = resolveRunCap(storeConfig(options).telemetryRunCap);
   const store = requireStore(options);
   const telemetry = new SqliteTelemetryStore(options.home, {
@@ -301,7 +301,7 @@ function telemetryRead(args: string[], options: TelemetryCommandOptions): string
   const runId = stringOption(args, "--run");
   const limit = integerOption(args, "--limit", 100);
   const offset = integerOption(args, "--offset", 0);
-  
+
   const telemetry = new SqliteTelemetryStore(options.home, {
     mode: resolveTelemetryMode(storeConfig(options).telemetryMode),
     terminalKeep: resolveTerminalKeep(storeConfig(options).telemetryTerminalKeep),
