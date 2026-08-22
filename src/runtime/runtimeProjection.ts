@@ -9,6 +9,10 @@ import {
 } from "./runtimeObservation.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { WorkMailbox } from "../coordination/workMailbox.js";
+import {
+  DEFAULT_RUNTIME_HEALTH_POLICY,
+  type RuntimeHealthPolicy
+} from "./runtimeHealthPolicy.js";
 
 export type RuntimeDisplayStatus =
   | "starting"
@@ -71,16 +75,40 @@ export type RuntimeProjection = Readonly<{
   }>;
 }>;
 
-export type RuntimeAttention = Readonly<{
-  runtime:
-    | "healthy"
-    | "waiting"
-    | "unobservable"
-    | "quiet"
-    | "active-operation-quiet"
-    | "stopped"
-    | "broken";
-  workflow: "progressing" | "not-progressing" | "completed";
+/**
+ * Layered runtime health state shared by the CLI status projection, the Web
+ * snapshot, and the scheduler. Short silence is a hint, not a failure: only
+ * deterministic dead/broken evidence or the durable semantic stall window
+ * (surfaced separately by the scheduler as `stalled-candidate`) authorizes
+ * recovery.
+ */
+export type RuntimeHealthLayer =
+  | "model-active"
+  | "tool-active"
+  | "subagent-active"
+  | "active-quiet"
+  | "quiet"
+  | "diagnostic-needed"
+  | "waiting-user"
+  | "waiting-permission"
+  | "waiting-external"
+  | "stopped"
+  | "broken"
+  | "ready"
+  | "starting"
+  | "awaiting-provider-acceptance"
+  | "runtime-unobservable";
+
+export type RuntimeHealthClassification = Readonly<{
+  layer: RuntimeHealthLayer;
+  reason: string;
+  lastRuntimeActivityAt?: string;
+  lastSemanticProgressAt: string;
+  activeOperations: readonly string[];
+  host: "unknown" | "alive" | "exited";
+  observerStatus: "unknown" | "healthy" | "degraded" | "unavailable";
+  runtimeIdleMs: number;
+  semanticIdleMs: number;
 }>;
 
 export function createRuntimeProjection(
@@ -420,37 +448,129 @@ export function runtimeDisplayStatus(current: RuntimeProjection): RuntimeDisplay
   return "starting";
 }
 
-export function evaluateRuntimeAttention(
-  current: RuntimeProjection,
-  now: Date,
-  policy: Readonly<{ runtimeSilenceMs: number; semanticSilenceMs: number }>
-): RuntimeAttention {
-  const display = runtimeDisplayStatus(current);
+/**
+ * Classify one RuntimeProjection into the layered health state shared by CLI,
+ * Web, and scheduler. The semantic progress timestamp is the same durable
+ * fence the scheduler stall pass consumes (deliveredAt plus Work/Review/
+ * Integration checkpoints), so token/tool/CPU activity can never masquerade
+ * as business progress.
+ *
+ * Layers below the durable stall window are advisory: `quiet` and
+ * `diagnostic-needed` never authorize a reset. The 30-minute semantic stall is
+ * persisted by the scheduler and surfaced as `stalled-candidate` by the
+ * caller; this function deliberately stops at `diagnostic-needed` so the
+ * Leader's waiting-user/waiting-on-workers classification stays authoritative.
+ */
+export function classifyRuntimeHealth(input: Readonly<{
+  projection: RuntimeProjection;
+  semanticProgressAt: string;
+  now: Date;
+  policy?: RuntimeHealthPolicy;
+}>): RuntimeHealthClassification {
+  const policy = input.policy ?? DEFAULT_RUNTIME_HEALTH_POLICY;
+  const current = input.projection;
+  const semanticMs = Date.parse(input.semanticProgressAt);
+  if (!Number.isFinite(semanticMs)) {
+    throw new Error("Runtime health semantic progress timestamp is invalid.");
+  }
   const runtimeIdleMs = current.lastRuntimeActivityAt === undefined
     ? Number.POSITIVE_INFINITY
-    : now.getTime() - Date.parse(current.lastRuntimeActivityAt);
-  const semanticIdleMs = now.getTime() - Date.parse(current.workflow.lastSemanticProgressAt);
-  const runtime: RuntimeAttention["runtime"] = display === "broken"
-    ? "broken"
-    : display === "stopped"
-      ? "stopped"
-      : display === "runtime-unobservable"
-        ? "unobservable"
-        : display.startsWith("waiting-")
-          ? "waiting"
-          : runtimeIdleMs <= policy.runtimeSilenceMs
-            ? "healthy"
-            : Object.keys(current.operations).length > 0
-              ? "active-operation-quiet"
-              : "quiet";
+    : input.now.getTime() - Date.parse(current.lastRuntimeActivityAt);
+  const semanticIdleMs = input.now.getTime() - semanticMs;
+  const activeOperations = Object.entries(current.operations)
+    .map(([id, operation]) => `${operation.kind}:${id}`);
+  const base = {
+    lastSemanticProgressAt: input.semanticProgressAt,
+    activeOperations,
+    host: current.host,
+    observerStatus: current.observer.status,
+    runtimeIdleMs,
+    semanticIdleMs,
+    ...(current.lastRuntimeActivityAt === undefined
+      ? {}
+      : { lastRuntimeActivityAt: current.lastRuntimeActivityAt })
+  };
+  const operation = dominantOperation(current.operations);
+  const layer = classifyLayer(current, operation, runtimeIdleMs, semanticIdleMs, policy);
   return Object.freeze({
-    runtime,
-    workflow: current.workflow.completed
-      ? "completed"
-      : semanticIdleMs > policy.semanticSilenceMs
-        ? "not-progressing"
-        : "progressing"
+    layer,
+    reason: runtimeHealthReason(layer, current),
+    ...base
   });
+}
+
+function classifyLayer(
+  current: RuntimeProjection,
+  operation: AgentRuntimeOperation | null,
+  runtimeIdleMs: number,
+  semanticIdleMs: number,
+  policy: RuntimeHealthPolicy
+): RuntimeHealthLayer {
+  // Deterministic terminal evidence is immediate: no waiting for any window.
+  if (current.session === "failed") return "broken";
+  if (current.host === "exited" || current.session === "ended") return "stopped";
+  // Recent structured runtime activity is the strongest liveness signal.
+  if (operation === "subagent") return "subagent-active";
+  if (operation === "tool") return "tool-active";
+  if (operation === "model") return "model-active";
+  // An incomplete observer signal warrants a read-only diagnostic, but a
+  // dominant operation above is still trusted as the most recent fact.
+  if (current.observer.status === "degraded" || current.observer.status === "unavailable") {
+    return "diagnostic-needed";
+  }
+  if (current.turn === "waiting") {
+    return `waiting-${current.waitingReason ?? "external"}` as RuntimeHealthLayer;
+  }
+  // No durable semantic progress past the diagnostic window: read-only look.
+  if (semanticIdleMs >= policy.diagnosticAfterMs) return "diagnostic-needed";
+  // A live turn with no recent structured activity is quiet, not dead.
+  if (runtimeIdleMs >= policy.quietAfterMs) return "quiet";
+  if (current.turn === "accepted" || current.session === "active") return "active-quiet";
+  if (current.session === "ready"
+    || current.turn === "completed"
+    || current.turn === "failed"
+    || current.turn === "cancelled") return "ready";
+  if (current.session === "started") return "awaiting-provider-acceptance";
+  if (current.host === "alive") return "runtime-unobservable";
+  return "starting";
+}
+
+function runtimeHealthReason(
+  layer: RuntimeHealthLayer,
+  current: RuntimeProjection
+): string {
+  switch (layer) {
+    case "broken":
+      return "the Agent Driver runtime is broken";
+    case "stopped":
+      return "the Provider Activation ended while the Yui Run remains active";
+    case "subagent-active":
+    case "tool-active":
+    case "model-active":
+      return `the Agent Driver reports ${layer.replaceAll("-", " ")}`;
+    case "diagnostic-needed":
+      if (current.observer.status === "degraded" || current.observer.status === "unavailable") {
+        return `the runtime observer is ${current.observer.status}; read-only diagnostic recommended`;
+      }
+      return "no durable semantic progress in the diagnostic window; read-only diagnostic recommended";
+    case "quiet":
+      return "the Agent turn is active but has reported no structured runtime activity recently";
+    case "active-quiet":
+      return "the Agent Driver reports active quiet";
+    case "waiting-user":
+    case "waiting-permission":
+    case "waiting-external":
+      return `the Agent Driver is ${layer.replaceAll("-", " ")}`;
+    case "ready":
+      return "the Agent turn ended while the workflow Run is still active";
+    case "awaiting-provider-acceptance":
+      return "the pushed active Run is awaiting provider acceptance";
+    case "runtime-unobservable":
+      return "the host is present but the Agent Driver exposes no current runtime state";
+    case "starting":
+    default:
+      return "the Agent Driver runtime is starting";
+  }
 }
 
 function withActivity(

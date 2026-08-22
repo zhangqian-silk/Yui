@@ -24,14 +24,15 @@ import {
   type RuntimeUsageSnapshot
 } from "../runtime/runtimeObservation.js";
 import {
-  evaluateRuntimeAttention,
+  classifyRuntimeHealth,
   projectRuntimeMailbox,
   projectRuntimeObservation,
   projectRuntimeTaskEvents,
   runtimeDisplayStatus,
-  type RuntimeAttention,
+  type RuntimeHealthLayer,
   type RuntimeDisplayStatus
 } from "../runtime/runtimeProjection.js";
+import { latestRunDurableProgressAt } from "../scheduler/roleRunStall.js";
 import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
@@ -87,8 +88,10 @@ export type TaskRoleRuntimeStatus = Readonly<{
   runtime: Readonly<{
     driverId: string;
     status: RuntimeDisplayStatus;
-    attention: RuntimeAttention["runtime"];
+    healthLayer: RuntimeHealthLayer;
+    healthReason: string;
     lastActivityAt?: string;
+    lastSemanticProgressAt: string;
     activeOperations: readonly string[];
     waitingReason?: "user" | "permission" | "external";
     usage?: RuntimeUsageSnapshot;
@@ -158,10 +161,12 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
     ? "not observable"
     : [
         `${status.runtime.driverId}: ${status.runtime.status}`,
-        `attention=${status.runtime.attention}`,
+        `health=${status.runtime.healthLayer}`,
+        `health reason=${status.runtime.healthReason}`,
         status.runtime.lastActivityAt === undefined
           ? undefined
           : `last activity=${status.runtime.lastActivityAt}`,
+        `last semantic progress=${status.runtime.lastSemanticProgressAt}`,
         status.runtime.activeOperations.length === 0
           ? undefined
           : `operations=${status.runtime.activeOperations.join(",")}`,
@@ -294,6 +299,9 @@ function inspectTaskRoleRuntimeStatus(
     tmux,
     events,
     store.getWorkMailbox({ kind: "role", taskId, roleName: role.name }),
+    store,
+    taskId,
+    role.name,
     now
   );
   const stalled = activeRun !== null && isRoleRunStalled(events, activeRun.id);
@@ -411,52 +419,36 @@ function calculateHealth(
       };
     }
     if (activeRun.deliveredAt !== undefined) {
-      if (runtime === null
-        || runtime.status === "runtime-unobservable"
-        || runtime.attention === "unobservable") {
+      if (runtime === null) {
         return {
           health: "needs-attention",
-          healthReason: "the host is present but the Agent Driver exposes no current runtime state"
+          healthReason: "the delivered Run has no authoritative Agent Driver state"
         };
       }
-      if (runtime.attention === "quiet" || runtime.attention === "active-operation-quiet") {
-        return {
-          health: "needs-attention",
-          healthReason: runtime.attention === "active-operation-quiet"
-            ? "the Agent Driver reports an open operation but no recent structured runtime activity"
-            : "the Agent Driver has not reported recent structured runtime activity"
-        };
-      }
-      if (runtime.status === "broken") {
-        return {
-          health: "failed",
-          healthReason: `the Agent Driver runtime is ${runtime.status}`
-        };
-      }
-      if (runtime.status === "stopped") {
-        return {
-          health: "needs-attention",
-          healthReason: "the Provider Activation ended while the Yui Run remains active"
-        };
-      }
-      if (runtime.status.startsWith("waiting-")) {
-        return {
-          health: runtime.status === "waiting-user" ? "blocked-input" : "waiting",
-          healthReason: `the Agent Driver is ${runtime.status.replaceAll("-", " ")}`
-        };
-      }
-      if (runtime.status === "ready") {
-        return {
-          health: "needs-attention",
-          healthReason: "the Agent turn ended while the workflow Run is still active"
-        };
-      }
-      if (["model-active", "tool-active", "subagent-active", "active-quiet"]
-        .includes(runtime.status)) {
-        return {
-          health: "running",
-          healthReason: `the Agent Driver reports ${runtime.status.replaceAll("-", " ")}`
-        };
+      switch (runtime.healthLayer) {
+        case "broken":
+          return { health: "failed", healthReason: runtime.healthReason };
+        case "stopped":
+        case "diagnostic-needed":
+        case "ready":
+        case "awaiting-provider-acceptance":
+        case "runtime-unobservable":
+        case "starting":
+          return { health: "needs-attention", healthReason: runtime.healthReason };
+        case "waiting-user":
+          return { health: "blocked-input", healthReason: runtime.healthReason };
+        case "waiting-permission":
+        case "waiting-external":
+          return { health: "waiting", healthReason: runtime.healthReason };
+        case "quiet":
+        case "active-quiet":
+        case "model-active":
+        case "tool-active":
+        case "subagent-active":
+        default:
+          // Short silence is a hint, not a failure. Only deterministic
+          // dead/broken evidence or the durable stall window escalates.
+          return { health: "running", healthReason: runtime.healthReason };
       }
     }
   }
@@ -499,6 +491,9 @@ function projectTaskRoleRuntime(
   tmux: TaskRoleTmuxStatus,
   events: ReturnType<TaskStore["listEvents"]>,
   mailbox: ReturnType<TaskStore["getWorkMailbox"]>,
+  store: TaskStore,
+  taskId: string,
+  roleName: string,
   now: Date
 ): TaskRoleRuntimeStatus["runtime"] {
   if (run === null || session?.launchId === undefined) return null;
@@ -544,23 +539,27 @@ function projectTaskRoleRuntime(
     fence,
     payload: { alive: tmux.state === "running" }
   }));
-  const attention = evaluateRuntimeAttention(projection, now, {
-    runtimeSilenceMs: 5 * 60_000,
-    // Workflow attention has its own durable scheduler policy. This value is
-    // deliberately not consumed here; keeping it separate prevents token/tool
-    // activity from extending the workflow deadline.
-    semanticSilenceMs: 30 * 60_000
+  // The semantic progress fence is the same durable fold the scheduler stall
+  // pass consumes, so CLI/Web/scheduler share one progress clock.
+  const semanticProgress = run.deliveredAt === undefined
+    ? { progressAt: run.createdAt }
+    : latestRunDurableProgressAt(store, taskId, roleName, run.id)
+      ?? { progressAt: run.deliveredAt };
+  const classification = classifyRuntimeHealth({
+    projection,
+    semanticProgressAt: semanticProgress.progressAt,
+    now
   });
   return {
     driverId,
     status: runtimeDisplayStatus(projection),
-    attention: attention.runtime,
-    ...(projection.lastRuntimeActivityAt === undefined
+    healthLayer: classification.layer,
+    healthReason: classification.reason,
+    lastSemanticProgressAt: classification.lastSemanticProgressAt,
+    ...(classification.lastRuntimeActivityAt === undefined
       ? {}
-      : { lastActivityAt: projection.lastRuntimeActivityAt }),
-    activeOperations: Object.entries(projection.operations).map(([id, operation]) => (
-      `${operation.kind}:${id}`
-    )),
+      : { lastActivityAt: classification.lastRuntimeActivityAt }),
+    activeOperations: classification.activeOperations,
     ...(projection.waitingReason === undefined
       ? {}
       : { waitingReason: projection.waitingReason }),

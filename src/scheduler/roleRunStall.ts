@@ -12,15 +12,19 @@ import {
 import type { OperatorNotification } from "./operatorNotification.js";
 import type { RoleLiveStatusSnapshot } from "./roleRunLiveness.js";
 import { nextPendingBatch } from "../coordination/workMailbox.js";
+import {
+  RUNTIME_DIAGNOSTIC_AFTER_MS,
+  SEMANTIC_STALL_WINDOW_MS
+} from "../runtime/runtimeHealthPolicy.js";
 
 /**
  * Default window of no durable progress before a live-but-idle Run becomes a
  * traceable needs-attention signal. It is deliberately long: a healthy Run that
  * is simply slow keeps its structured checkpoint fresh and never crosses it.
  */
-export const DEFAULT_STALL_WINDOW_MS = 30 * 60_000;
+export const DEFAULT_STALL_WINDOW_MS = SEMANTIC_STALL_WINDOW_MS;
 /** Cheap workflow-stall candidate filter; the real threshold remains 30m. */
-export const DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS = 10 * 60_000;
+export const DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS = RUNTIME_DIAGNOSTIC_AFTER_MS;
 export const RUN_PROGRESS_EVENT = "run.progress";
 export const RUN_STALLED_EVENT = "run.stalled";
 export const RUN_RECOVERED_EVENT = "run.recovered";
