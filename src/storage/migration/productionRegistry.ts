@@ -1172,6 +1172,11 @@ const STORED_TASK_V16_FIELDS = [
   "integrationQueue",
   "durableJobs",
   "jobCallerKeyHashes",
+  // The SQLite reverse reader reconstructs every physical family map even
+  // when the older manifest has not introduced that family yet. A v16
+  // aggregate may therefore contain an empty wakes map; preserve that exact
+  // repair shape, but reject records because taskWake has no v16 version.
+  "wakes",
   // May already be present after the publicationReference introduction runs
   // first; the 16->17 normalizer preserves the empty introduced map.
   "publicationReferences",
@@ -1217,6 +1222,12 @@ function requireStoredTaskV16Shape(snapshot: HomeSnapshot): void {
     if (unknown !== undefined) {
       throw new Error(`Task aggregate ${taskId} has an unknown v16 field: ${unknown}.`);
     }
+    if (task.wakes !== undefined) {
+      const wakes = asObject(task.wakes, `Task aggregate ${taskId} wakes`);
+      if (Object.keys(wakes).length > 0) {
+        throw new Error(`Task aggregate ${taskId} already has Task wakes before v17.`);
+      }
+    }
     if (task.publicationReferences !== undefined) {
       const references = asObject(
         task.publicationReferences,
@@ -1252,6 +1263,9 @@ function normalizeStoredTaskV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {
     const existingReferences = task.publicationReferences === undefined
       ? {}
       : asObject(task.publicationReferences, `Task aggregate ${taskId} publicationReferences`);
+    const existingWakes = task.wakes === undefined
+      ? {}
+      : asObject(task.wakes, `Task aggregate ${taskId} wakes`);
     const marks = asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`);
     const existingMark = marks.publicationReference;
     const existingWakeMark = marks.taskWake;
@@ -1264,7 +1278,7 @@ function normalizeStoredTaskV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {
         taskWake: typeof existingWakeMark === "number" ? existingWakeMark : TASK_WAKE_FROM_VERSION
       },
       publicationReferences: existingReferences,
-      wakes: {}
+      wakes: existingWakes
     };
   }
   return {
