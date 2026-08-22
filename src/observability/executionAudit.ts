@@ -97,6 +97,15 @@ export type IntegrationsAudit = Readonly<{
   faultClasses: FaultClassCounts;
 }>;
 
+export type PublicationsAudit = Readonly<{
+  total: number;
+  merged: number;
+  verified: number;
+  open: number;
+  closed: number;
+  superseded: number;
+}>;
+
 export type EventsAudit = Readonly<{
   total: number;
   progressEvents: number;
@@ -159,6 +168,7 @@ export type ExecutionAuditReport = Readonly<{
   sessions: AuditSection<SessionsAudit>;
   reviews: AuditSection<ReviewsAudit>;
   integrations: AuditSection<IntegrationsAudit>;
+  publications: AuditSection<PublicationsAudit>;
   events: AuditSection<EventsAudit>;
   providerRetries: AuditSection<ProviderRetriesAudit>;
   workItems: AuditSection<Readonly<{
@@ -298,6 +308,7 @@ export function runExecutionAudit(
       sessions: section,
       reviews: section,
       integrations: section,
+      publications: section,
       events: section,
       providerRetries: section,
       workItems: section,
@@ -569,6 +580,37 @@ export function runExecutionAudit(
     }
   })();
 
+  const publications = ((): AuditSection<PublicationsAudit> => {
+    try {
+      let total = 0;
+      let merged = 0;
+      let verified = 0;
+      let open = 0;
+      let closed = 0;
+      let superseded = 0;
+      for (const taskId of taskIds) {
+        const references = store.listPublicationReferences(taskId);
+        const supersededIds = new Set(
+          references
+            .map((reference) => reference.supersedes)
+            .filter((id): id is string => id !== undefined)
+        );
+        for (const reference of references) {
+          if (!inWindow(reference.createdAt, options)) continue;
+          total += 1;
+          if (reference.state === "merged") merged += 1;
+          if (reference.state === "open") open += 1;
+          if (reference.state === "closed") closed += 1;
+          if (reference.verification === "verified") verified += 1;
+          if (supersededIds.has(reference.id)) superseded += 1;
+        }
+      }
+      return ok({ total, merged, verified, open, closed, superseded });
+    } catch (error) {
+      return failed<PublicationsAudit>(error);
+    }
+  })();
+
   const events = ((): AuditSection<EventsAudit> => {
     try {
       let total = 0;
@@ -739,6 +781,7 @@ export function runExecutionAudit(
     sessions,
     reviews,
     integrations,
+    publications,
     events,
     providerRetries,
     workItems,

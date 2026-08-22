@@ -220,6 +220,16 @@ export function renderExecutionAudit(
     lines.push("", ...sectionError("integrations", report));
   }
 
+  if (report.publications.status === "ok" && report.publications.data !== undefined) {
+    const publications = report.publications.data;
+    lines.push(
+      "",
+      `Publication references: ${publications.total} total · ${publications.merged} merged · ${publications.verified} verified · ${publications.open} open · ${publications.closed} closed · ${publications.superseded} superseded`
+    );
+  } else {
+    lines.push("", ...sectionError("publications", report));
+  }
+
   if (report.events.status === "ok" && report.events.data !== undefined) {
     const events = report.events.data;
     lines.push(
