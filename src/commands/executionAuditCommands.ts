@@ -153,6 +153,20 @@ export function renderExecutionAudit(
         )
       );
     }
+    if (runs.launchFailures.total > 0) {
+      const phaseRows = Object.entries(runs.launchFailures.byPhase)
+        .filter(([, count]) => count > 0)
+        .sort((left, right) => right[1] - left[1]);
+      const kindRows = Object.entries(runs.launchFailures.byKind)
+        .filter(([, count]) => count > 0)
+        .sort((left, right) => right[1] - left[1]);
+      lines.push(
+        "",
+        `Launch failures: ${runs.launchFailures.total}`,
+        `By phase: ${phaseRows.map(([name, count]) => `${name}=${count}`).join(" · ")}`,
+        `By kind: ${kindRows.map(([name, count]) => `${name}=${count}`).join(" · ")}`
+      );
+    }
   } else {
     lines.push("", ...sectionError("runs", report));
   }

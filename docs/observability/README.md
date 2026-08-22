@@ -134,7 +134,8 @@ Sections:
 
 - **tasks** — total/archived/active counts.
 - **runs** — total/active/yielded/failed, failure rate, cumulative duration,
-  by-role and by-purpose distribution, fault class counts.
+  by-role and by-purpose distribution, fault class counts, and structured
+  launch-failure phase/kind counts parsed from launch diagnostics.
 - **wakes** — leader runs with wake reasons, orphan wakes, orphan yield-only.
   `suppressedWakes` is `unsupported`: quiescence suppression (Issue 05) is
   silent by design and writes no durable counter, so the audit cannot report

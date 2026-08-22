@@ -1,19 +1,27 @@
 import { CommandExecutionError } from "../tmux/commandExecutor.js";
 
-export type RuntimeLaunchPhase =
-  | "validation"
-  | "host-start"
-  | "host-started"
-  | "host-stop"
-  | "delivery";
+export const RUNTIME_LAUNCH_PHASES = [
+  "validation",
+  "host-start",
+  "host-started",
+  "native-session-discovery",
+  "host-stop",
+  "delivery"
+] as const;
 
-export type RuntimeLaunchKind =
-  | "config"
-  | "auth"
-  | "executable"
-  | "tmux"
-  | "provider"
-  | "unknown";
+export type RuntimeLaunchPhase = (typeof RUNTIME_LAUNCH_PHASES)[number];
+
+export const RUNTIME_LAUNCH_KINDS = [
+  "config",
+  "auth",
+  "executable",
+  "tmux",
+  "timeout",
+  "provider",
+  "unknown"
+] as const;
+
+export type RuntimeLaunchKind = (typeof RUNTIME_LAUNCH_KINDS)[number];
 
 export type RuntimeLaunchPaneDiagnostic = Readonly<{
   target: string;
@@ -34,6 +42,7 @@ export type RuntimeLaunchDiagnostic = Readonly<{
   stderrTail?: string;
   pane?: RuntimeLaunchPaneDiagnostic;
   hint?: string;
+  detail?: string;
 }>;
 
 export type RuntimeLaunchDiagnosticContext = Readonly<{
@@ -49,10 +58,12 @@ export type RuntimeLaunchDiagnosticContext = Readonly<{
 
 const MAX_ARGUMENT_CHARS = 1_000;
 const MAX_STDERR_CHARS = 4_000;
+const MAX_DETAIL_CHARS = 1_000;
 
 const SECRET_VALUE_PATTERN =
   /(api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|passwd|cookie|authorization)(\s*[=:]\s*)([^\s,;]+)/gi;
-const OPENAI_KEY_PATTERN = /sk-[A-Za-z0-9_-]{6,}/gu;
+// Word boundary keeps "task-5-…" workspace paths from being mistaken for keys.
+const OPENAI_KEY_PATTERN = /\bsk-[A-Za-z0-9_-]{6,}/gu;
 
 /** A bounded, single-line, secret-redacted launch failure for Run summaries. */
 export class RuntimeLaunchFailure extends Error {
@@ -76,6 +87,10 @@ export function toRuntimeLaunchFailure(
   );
   const kind = classifyLaunchFailure(phase, error, stderrTail);
   const exitStatus = context.exitStatus ?? commandError?.exitStatus;
+  const detail = tail(
+    redactLaunchText(error instanceof Error ? error.message : String(error)),
+    MAX_DETAIL_CHARS
+  );
   return new RuntimeLaunchFailure({
     phase,
     kind,
@@ -90,6 +105,7 @@ export function toRuntimeLaunchFailure(
     ...(context.signal === undefined ? {} : { signal: context.signal }),
     ...(stderrTail.length === 0 ? {} : { stderrTail }),
     ...(context.pane === undefined ? {} : { pane: context.pane }),
+    ...(detail.length === 0 ? {} : { detail }),
     ...(launchHint(kind, context.agentId) === undefined
       ? {}
       : { hint: launchHint(kind, context.agentId) })
@@ -112,6 +128,9 @@ export function formatRuntimeLaunchDiagnostic(
     fields.push(`stderrTail=${JSON.stringify(tail(diagnostic.stderrTail, MAX_STDERR_CHARS))}`);
   }
   if (diagnostic.pane !== undefined) fields.push(`pane=${JSON.stringify(diagnostic.pane)}`);
+  if (diagnostic.detail !== undefined) {
+    fields.push(`detail=${JSON.stringify(tail(diagnostic.detail, MAX_DETAIL_CHARS))}`);
+  }
   if (diagnostic.hint !== undefined) fields.push(`hint=${JSON.stringify(diagnostic.hint)}`);
   return `Role Run could not start: ${fields.join(" ")}`;
 }
@@ -140,6 +159,7 @@ function classifyLaunchFailure(
   if (isConfigFailure(stderrTail)) return "config";
   if (isAuthFailure(stderrTail)) return "auth";
   if (phase === "host-start") return "tmux";
+  if (phase === "native-session-discovery") return "timeout";
   if (phase === "validation" || phase === "delivery") return "config";
   return "provider";
 }
@@ -167,6 +187,8 @@ function launchHint(
       return "Verify Provider authentication and the Agent environment.";
     case "executable":
       return "Verify the Provider command is installed and on PATH.";
+    case "timeout":
+      return "Verify Provider lifecycle hooks and Controller connectivity.";
     default:
       return undefined;
   }

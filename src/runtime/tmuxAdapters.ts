@@ -27,6 +27,7 @@ import {
   toRuntimeLaunchFailure,
   type RuntimeLaunchDiagnosticContext
 } from "./launchDiagnostics.js";
+import { builtinAgentDriverRegistry } from "./builtinAgentDrivers.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
@@ -207,7 +208,20 @@ export type TmuxSessionHostOptions = Readonly<{
       exitStatus?: number;
     }>;
   }>) => void;
+  /** Validates resolved launch configuration after planning, before process start. */
+  validateLaunch?: (request: SessionLaunchRequest) => Promise<void>;
+  /**
+   * Awaits the durable native-session fact for a runtime-discovered Provider
+   * launch. The host bounds the wait and stops the fresh Provider on timeout.
+   */
+  waitForNativeSession?: (
+    request: SessionLaunchRequest,
+    signal: AbortSignal
+  ) => Promise<string>;
+  nativeSessionDiscoveryTimeoutMs?: number;
 }>;
+
+const DEFAULT_NATIVE_SESSION_DISCOVERY_TIMEOUT_MS = 30_000;
 
 /**
  * Runtime lifecycle adapter for the current tmux host. The returned hostRef is
@@ -217,6 +231,9 @@ export class TmuxSessionHost implements SessionHostPort {
   readonly #globalHostId: string;
   readonly #createBindingId: () => string;
   readonly #onHostCreated: TmuxSessionHostOptions["onHostCreated"];
+  readonly #validateLaunch: TmuxSessionHostOptions["validateLaunch"];
+  readonly #waitForNativeSession: TmuxSessionHostOptions["waitForNativeSession"];
+  readonly #nativeSessionDiscoveryTimeoutMs: number;
   readonly #launchTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -230,6 +247,13 @@ export class TmuxSessionHost implements SessionHostPort {
     );
     this.#createBindingId = options.createBindingId ?? randomUUID;
     this.#onHostCreated = options.onHostCreated;
+    this.#validateLaunch = options.validateLaunch;
+    this.#waitForNativeSession = options.waitForNativeSession;
+    this.#nativeSessionDiscoveryTimeoutMs = positiveInteger(
+      options.nativeSessionDiscoveryTimeoutMs
+        ?? DEFAULT_NATIVE_SESSION_DISCOVERY_TIMEOUT_MS,
+      "Native session discovery timeout"
+    );
   }
 
   async start(
@@ -432,6 +456,13 @@ export class TmuxSessionHost implements SessionHostPort {
       beforeHostStart
     );
     const launchContext = diagnosticContext(request, planned);
+    if (this.#validateLaunch !== undefined) {
+      try {
+        await this.#validateLaunch(request);
+      } catch (error) {
+        throw toRuntimeLaunchFailure(error, "validation", launchContext);
+      }
+    }
     // Process creation is last: every local invariant has already passed.
     let hostCreated: boolean;
     try {
@@ -457,7 +488,7 @@ export class TmuxSessionHost implements SessionHostPort {
         callerKey: planned.launch.env.YUI_JOB_CALLER_KEY
       });
     }
-    const binding = createRuntimeBinding({
+    let binding = createRuntimeBinding({
       id: bindingId,
       launchId: request.launchId,
       owner: request.owner,
@@ -498,9 +529,152 @@ export class TmuxSessionHost implements SessionHostPort {
           launchContext
         );
       }
+      if (requiresNativeSessionDiscovery(request, planned, this.#waitForNativeSession)) {
+        const discoveredNativeSessionId = await this.waitForNativeSessionDiscovery(
+          request,
+          hostId,
+          launchContext,
+          pane
+        );
+        binding = createRuntimeBinding({
+          ...binding,
+          nativeSessionId: discoveredNativeSessionId
+        });
+      }
+      this.#onHostCreated?.({ binding, pane });
     }
     return binding;
   }
+
+  async waitForNativeSessionDiscovery(
+    request: SessionLaunchRequest,
+    hostId: string,
+    context: RuntimeLaunchDiagnosticContext,
+    pane: Readonly<{
+      pid?: number;
+      target: string;
+      dead: boolean;
+      currentCommand: string;
+      exitStatus?: number;
+    }>
+  ): Promise<string> {
+    if (this.#waitForNativeSession === undefined) {
+      throw new Error("Native session discovery is not configured.");
+    }
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    const discovery = this.#waitForNativeSession(request, controller.signal);
+    // The losing branch of the race rejects when the controller aborts; keep
+    // that rejection handled so a settled launch does not surface it later.
+    discovery.catch(() => undefined);
+    try {
+      return await Promise.race([
+        discovery,
+        this.waitForPaneDeath(request, hostId, context, controller.signal),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(
+              `Native session discovery timed out after ${
+                this.#nativeSessionDiscoveryTimeoutMs
+              }ms.`
+            ));
+          }, this.#nativeSessionDiscoveryTimeoutMs);
+        })
+      ]);
+    } catch (error) {
+      try {
+        await stopExactRole(this.tmux, hostId, request.owner.roleName);
+      } catch {
+        // The launch failure below is authoritative; durable owner cleanup
+        // remains responsible for a Provider that rejected immediate stop.
+      }
+      throw toRuntimeLaunchFailure(error, "native-session-discovery", {
+        ...context,
+        pane
+      });
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+    }
+  }
+
+  /**
+   * Polls the managed pane while native session discovery is pending. A
+   * Provider that exits during the wait (bad configuration, auth failure,
+   * immediate crash) must surface its own exit evidence instead of being
+   * misreported as a discovery timeout.
+   */
+  private async waitForPaneDeath(
+    request: SessionLaunchRequest,
+    hostId: string,
+    context: RuntimeLaunchDiagnosticContext,
+    signal: AbortSignal
+  ): Promise<never> {
+    while (!signal.aborted) {
+      await abortableDelay(PANE_LIVENESS_POLL_MS, signal);
+      let pane;
+      try {
+        pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
+      } catch {
+        // A tmux inspection hiccup must not fabricate a Provider death; the
+        // bounded discovery timeout remains the backstop.
+        continue;
+      }
+      if (pane !== undefined && pane.dead) {
+        await deadHostLaunchFailure(
+          this.tmux,
+          hostId,
+          request.owner.roleName,
+          pane,
+          context
+        );
+      }
+    }
+    throw new Error("Native session discovery was aborted.");
+  }
+}
+
+function requiresNativeSessionDiscovery(
+  request: SessionLaunchRequest,
+  planned: RuntimePlannedSession,
+  wait: TmuxSessionHostOptions["waitForNativeSession"]
+): boolean {
+  return request.mode === "new"
+    && request.owner.scope === "task"
+    && request.runId !== undefined
+    && planned.initialPromptRunId === request.runId
+    && wait !== undefined
+    && builtinAgentDriverRegistry()
+      .requireByAdapterId(request.adapterId)
+      .capabilities.observation.sessionBootstrap === "discovered";
+}
+
+function positiveInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer.`);
+  }
+  return value;
+}
+
+const PANE_LIVENESS_POLL_MS = 100;
+
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("Native session discovery was aborted."));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Native session discovery was aborted."));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function planManagedLaunch(
