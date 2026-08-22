@@ -176,7 +176,7 @@ test("TmuxSessionHost runs launch validation before creating the provider proces
   );
 });
 
-test("TmuxSessionHost bounds Codex native session discovery and stops the host on timeout", async () => {
+test("TmuxSessionHost backstops an unresponsive agent and stops the host", async () => {
   let killed = false;
   const planner = {
     plan: () => ({
@@ -190,10 +190,11 @@ test("TmuxSessionHost bounds Codex native session discovery and stops the host o
     ensureRoleWindow: () => true,
     probeRoleStatus: () => "running",
     inspectRolePane: () => ({ target: "tmux:0", dead: false, currentCommand: "codex" }),
+    captureRolePane: () => "",
     killRole: () => { killed = true; }
   };
   const host = new TmuxSessionHost(planner, tmux, {
-    nativeSessionDiscoveryTimeoutMs: 25,
+    inactivityTimeoutMs: 25,
     waitForNativeSession: () => new Promise(() => undefined)
   });
   await assert.rejects(
@@ -211,6 +212,7 @@ test("TmuxSessionHost bounds Codex native session discovery and stops the host o
       assert.ok(error instanceof RuntimeLaunchFailure);
       assert.equal(error.diagnostic.phase, "native-session-discovery");
       assert.equal(error.diagnostic.kind, "timeout");
+      assert.match(error.diagnostic.detail, /no signal/);
       assert.equal(killed, true);
       return true;
     }

@@ -174,6 +174,21 @@ function isAuthFailure(stderrTail: string): boolean {
     .test(stderrTail);
 }
 
+/**
+ * Conservative detection of fatal error signatures in agent output during
+ * launch. These are errors the agent cannot recover from without
+ * intervention (missing executable, invalid configuration, authentication
+ * failure). Transient errors (network retries, temporary blips) are not
+ * matched. Failure-kind classification uses the broader patterns in
+ * classifyLaunchFailure once a fatal output is confirmed.
+ */
+export function hasFatalLaunchOutput(output: string): boolean {
+  return /command not found|no such file or directory/i.test(output)
+    || /unknown model|invalid effort|unknown option|invalid value|unexpected argument/i.test(output)
+    || /401\s+unauthorized|403\s+forbidden|authentication failed|not logged in|sign in with/i
+      .test(output);
+}
+
 function launchHint(
   kind: RuntimeLaunchKind,
   agentId: string | undefined

@@ -25,6 +25,7 @@ import {
 } from "./ports.js";
 import {
   toRuntimeLaunchFailure,
+  hasFatalLaunchOutput,
   type RuntimeLaunchDiagnosticContext
 } from "./launchDiagnostics.js";
 import { builtinAgentDriverRegistry } from "./builtinAgentDrivers.js";
@@ -212,16 +213,22 @@ export type TmuxSessionHostOptions = Readonly<{
   validateLaunch?: (request: SessionLaunchRequest) => Promise<void>;
   /**
    * Awaits the durable native-session fact for a runtime-discovered Provider
-   * launch. The host bounds the wait and stops the fresh Provider on timeout.
+   * launch. The host monitors agent-emitted signals (pane death, fatal output,
+   * inactivity) and stops the fresh Provider when a negative signal arrives.
    */
   waitForNativeSession?: (
     request: SessionLaunchRequest,
     signal: AbortSignal
   ) => Promise<string>;
-  nativeSessionDiscoveryTimeoutMs?: number;
+  /**
+   * Backstop for a completely unresponsive agent: if the agent produces no
+   * signal (no hook, no pane output change, no exit) for this long, the launch
+   * fails. A slow-but-active agent never triggers this. Defaults to 5 minutes.
+   */
+  inactivityTimeoutMs?: number;
 }>;
 
-const DEFAULT_NATIVE_SESSION_DISCOVERY_TIMEOUT_MS = 30_000;
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 300_000;
 
 /**
  * Runtime lifecycle adapter for the current tmux host. The returned hostRef is
@@ -233,7 +240,7 @@ export class TmuxSessionHost implements SessionHostPort {
   readonly #onHostCreated: TmuxSessionHostOptions["onHostCreated"];
   readonly #validateLaunch: TmuxSessionHostOptions["validateLaunch"];
   readonly #waitForNativeSession: TmuxSessionHostOptions["waitForNativeSession"];
-  readonly #nativeSessionDiscoveryTimeoutMs: number;
+  readonly #inactivityTimeoutMs: number;
   readonly #launchTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -249,10 +256,9 @@ export class TmuxSessionHost implements SessionHostPort {
     this.#onHostCreated = options.onHostCreated;
     this.#validateLaunch = options.validateLaunch;
     this.#waitForNativeSession = options.waitForNativeSession;
-    this.#nativeSessionDiscoveryTimeoutMs = positiveInteger(
-      options.nativeSessionDiscoveryTimeoutMs
-        ?? DEFAULT_NATIVE_SESSION_DISCOVERY_TIMEOUT_MS,
-      "Native session discovery timeout"
+    this.#inactivityTimeoutMs = positiveInteger(
+      options.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS,
+      "Launch inactivity timeout"
     );
   }
 
@@ -562,7 +568,6 @@ export class TmuxSessionHost implements SessionHostPort {
       throw new Error("Native session discovery is not configured.");
     }
     const controller = new AbortController();
-    let timer: NodeJS.Timeout | undefined;
     const discovery = this.#waitForNativeSession(request, controller.signal);
     // The losing branch of the race rejects when the controller aborts; keep
     // that rejection handled so a settled launch does not surface it later.
@@ -570,17 +575,7 @@ export class TmuxSessionHost implements SessionHostPort {
     try {
       return await Promise.race([
         discovery,
-        this.waitForPaneDeath(request, hostId, context, controller.signal),
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => {
-            controller.abort();
-            reject(new Error(
-              `Native session discovery timed out after ${
-                this.#nativeSessionDiscoveryTimeoutMs
-              }ms.`
-            ));
-          }, this.#nativeSessionDiscoveryTimeoutMs);
-        })
+        this.monitorPaneSignals(request, hostId, context, controller.signal)
       ]);
     } catch (error) {
       try {
@@ -594,31 +589,39 @@ export class TmuxSessionHost implements SessionHostPort {
         pane
       });
     } finally {
-      clearTimeout(timer);
       controller.abort();
     }
   }
 
   /**
-   * Polls the managed pane while native session discovery is pending. A
-   * Provider that exits during the wait (bad configuration, auth failure,
-   * immediate crash) must surface its own exit evidence instead of being
-   * misreported as a discovery timeout.
+   * Monitors the managed pane for agent-emitted signals while native session
+   * discovery is pending. The agent's own behavior drives the outcome:
+   *
+   * - Pane death → failure with exit status and stderr (the agent exited).
+   * - Fatal output (auth, config, executable errors) → failure with the
+   *   agent's own error text.
+   * - No signal at all (no hook, no output change, no exit) for the
+   *   inactivity window → backstop failure.
+   *
+   * There is no fixed wall-clock timeout: a slow-but-active agent is never
+   * killed merely for taking too long to start.
    */
-  private async waitForPaneDeath(
+  private async monitorPaneSignals(
     request: SessionLaunchRequest,
     hostId: string,
     context: RuntimeLaunchDiagnosticContext,
     signal: AbortSignal
   ): Promise<never> {
+    let lastContent = "";
+    let lastActivityAt = Date.now();
     while (!signal.aborted) {
-      await abortableDelay(PANE_LIVENESS_POLL_MS, signal);
+      await abortableDelay(PANE_SIGNAL_POLL_MS, signal);
       let pane;
       try {
         pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
       } catch {
         // A tmux inspection hiccup must not fabricate a Provider death; the
-        // bounded discovery timeout remains the backstop.
+        // inactivity backstop remains the safety net.
         continue;
       }
       if (pane !== undefined && pane.dead) {
@@ -628,6 +631,35 @@ export class TmuxSessionHost implements SessionHostPort {
           request.owner.roleName,
           pane,
           context
+        );
+      }
+      let content = "";
+      try {
+        content = this.tmux.captureRolePane?.(hostId, request.owner.roleName, 80) ?? "";
+      } catch {
+        // Capture is best-effort; pane death and hooks remain authoritative.
+      }
+      if (content !== lastContent) {
+        lastContent = content;
+        lastActivityAt = Date.now();
+        if (hasFatalLaunchOutput(content)) {
+          throw toRuntimeLaunchFailure(
+            new Error(
+              "Agent emitted a fatal error before native session discovery completed."
+            ),
+            "native-session-discovery",
+            {
+              ...context,
+              ...(pane !== undefined ? { pane } : {}),
+              stderrTail: content
+            }
+          );
+        }
+      }
+      if (Date.now() - lastActivityAt >= this.#inactivityTimeoutMs) {
+        throw new Error(
+          `Agent produced no signal for ${this.#inactivityTimeoutMs}ms. `
+          + "The process is alive but emitted no lifecycle hook, output, or exit."
         );
       }
     }
@@ -657,7 +689,7 @@ function positiveInteger(value: number, label: string): number {
   return value;
 }
 
-const PANE_LIVENESS_POLL_MS = 100;
+const PANE_SIGNAL_POLL_MS = 1_000;
 
 function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {

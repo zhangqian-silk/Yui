@@ -307,10 +307,10 @@ export async function startFileTaskControllerRuntime(
       }
       throw new Error("Native session discovery was aborted.");
     },
-    nativeSessionDiscoveryTimeoutMs: positiveIntegerOption(
-      options.environment?.YUI_NATIVE_SESSION_DISCOVERY_TIMEOUT_MS
-        ?? process.env.YUI_NATIVE_SESSION_DISCOVERY_TIMEOUT_MS,
-      30_000
+    inactivityTimeoutMs: positiveIntegerOption(
+      options.environment?.YUI_LAUNCH_INACTIVITY_TIMEOUT_MS
+        ?? process.env.YUI_LAUNCH_INACTIVITY_TIMEOUT_MS,
+      300_000
     ),
     onHostCreated: ({ binding, pane }) => {
       sessionOwners.recordHostOwner({
