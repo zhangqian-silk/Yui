@@ -340,6 +340,24 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
         node("p", "record-copy", (run.kind || "workflow-not-progressing") + " · " + (run.classification || "truly-stalled")),
         node("small", "", t("detail.lastProgress") + " · " + formatDateTime(run.progressAt, locale))
       );
+      // Issue 08: the same canonical recovery projection as the CLI. The
+      // durable fence and the Provider observation stay clearly separated;
+      // the exact recovery actions live in "yui task run show".
+      if (run.recovery) {
+        if (run.recovery.canonicalProgressAt) {
+          card.append(node("small", "",
+            t("detail.recoveryFence") + " · " + formatDateTime(run.recovery.canonicalProgressAt, locale)));
+        }
+        if (run.recovery.provider && run.recovery.provider.observedAt) {
+          card.append(node("small", "",
+            t("detail.recoveryProviderObserved") + " · " + run.recovery.provider.observationKind
+            + " " + formatDateTime(run.recovery.provider.observedAt, locale)));
+        }
+        if (run.recovery.recoverable) {
+          card.append(node("small", "record-copy",
+            "yui task run show " + task.id + "/" + run.runId));
+        }
+      }
       runtimeHealthBody.append(card);
     });
     scaffold.append(anchorSection(

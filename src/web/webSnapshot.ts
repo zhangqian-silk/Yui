@@ -10,12 +10,18 @@ import {
 } from "../scheduler/taskExecutionProjection.js";
 import { summarizeExecutionGroup } from "../execution/executionGroup.js";
 import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
+import {
+  projectRunRecovery,
+  readRunRecoveryFacts
+} from "../run/recoveryProjection.js";
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
   | "listTasks"
   | "getTask"
   | "getTaskBrief"
+  | "getAgentRun"
+  | "getWorkItem"
   | "listRoles"
   | "getTaskRoleSessionSet"
   | "listWorkItems"
@@ -136,13 +142,18 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
     const events = reader.listEvents?.(taskId) ?? [];
     const needsAttentionRuns = runs
       .filter((run) => run.status === "active" && isRoleRunStalled(events, run.id))
-      .map((run) => ({
-        runId: run.id,
-        roleName: run.roleName,
-        progressAt: latestStallProgress(events, run.id),
-        kind: latestStallField(events, run.id, "kind") ?? "workflow-not-progressing",
-        classification: latestStallField(events, run.id, "classification") ?? "truly-stalled"
-      }));
+      .map((run) => {
+        const facts = readRunRecoveryFacts(reader, taskId, run.id);
+        return {
+          runId: run.id,
+          roleName: run.roleName,
+          progressAt: latestStallProgress(events, run.id),
+          kind: latestStallField(events, run.id, "kind") ?? "workflow-not-progressing",
+          classification: latestStallField(events, run.id, "classification") ?? "truly-stalled",
+          // Issue 08: the same canonical recovery projection the CLI exposes.
+          ...(facts === null ? {} : { recovery: projectRunRecovery(facts) })
+        };
+      });
     const activeRuns = new Map(runs
       .filter((run) => run.status === "active")
       .map((run) => [run.roleName, run]));

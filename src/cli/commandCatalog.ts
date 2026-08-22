@@ -687,9 +687,14 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "retry", "settle", "recover", "yield", "checkpoint"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "recover", "yield", "checkpoint"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
+      {
+        name: "show",
+        summary: "Show one Run with its canonical recovery fence and exact recovery actions.",
+        usage: "yui task run show <task>/<run> [--json]"
+      },
       {
         name: "retry",
         summary: "Retry a failed execution Run or request a fresh Round for an exact failed final Review Run.",
@@ -703,8 +708,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "recover",
         summary: "Record one exact Leader-controlled Run recovery decision.",
-        usage: "yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> (--expected-progress-at <timestamp>|--progress-at <timestamp>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
-        options: ["--action", "--expected-progress-at", "--progress-at", "--provider-acceptance", "--reason", "--role", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
+        usage: "yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> (--expected-progress-at <timestamp>|--from-next-action <fingerprint>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
+        options: ["--action", "--expected-progress-at", "--progress-at", "--from-next-action", "--provider-acceptance", "--reason", "--role", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
       },
       {
         name: "yield",
