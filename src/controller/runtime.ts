@@ -29,9 +29,14 @@ import {
 import {
   effectiveLaunchSnapshotsCompatible,
   effectiveLaunchSnapshotsCompatibleForTaskMain,
+  effectiveLaunchConfig,
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
+import {
+  AgentConfigurationCatalogService,
+  validateAgentLaunchConfiguration
+} from "../executor/agentConfigurationCatalog.js";
 import {
   isTaskOwnedWorkspace,
   managedWorkspaceIdentity,
@@ -117,6 +122,7 @@ export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readon
   environment?: NodeJS.ProcessEnv;
   workspacePreparer?: TaskWorkspacePreparer;
   runtimeIsolation?: TaskRuntimeIsolationPort & Partial<TaskRuntimeLifecycleCleanupPort>;
+  catalogs?: AgentConfigurationCatalogService;
   /** Optional Adapter metadata query; never grants model/launch authority. */
   continuationMetadata?: ProviderContinuationMetadataPort;
   /** Must share the same Provider SessionHost/Activation ownership. */
@@ -249,7 +255,70 @@ export async function startFileTaskControllerRuntime(
     tmux,
     onWarning: options.onError
   });
+  // The runtime inbox is also the low-latency discovery source during a
+  // scheduler-owned launch. Waiting only for the post-pass durable projection
+  // would deadlock behind the same pass that is currently starting the host.
+  const runtimeEventInbox = new FileRuntimeEventInbox(home);
+  const catalogs = options.catalogs
+    ?? new AgentConfigurationCatalogService(home, {
+      environment: options.environment ?? process.env
+    });
   const sessionHost = options.sessionHost ?? new TmuxSessionHost(planner, tmux, {
+    validateLaunch: async (request) => {
+      const agent = store.getConfiguredAgent(request.agentId);
+      if (agent === null) return;
+      const resolved = await catalogs.resolve({
+        agent,
+        cwd: request.workspace,
+        config: effectiveLaunchConfig(request.effective)
+      });
+      validateAgentLaunchConfiguration(
+        resolved.catalog,
+        effectiveLaunchConfig(request.effective)
+      );
+    },
+    waitForNativeSession: async (request, signal) => {
+      const owner = request.owner;
+      if (owner.scope !== "task") {
+        throw new Error("Native session discovery requires a Task runtime owner.");
+      }
+      while (!signal.aborted) {
+        const session = schedulerStore.getRoleSession(
+          owner.taskId,
+          owner.roleName,
+          request.agentId
+        );
+        if (
+          session !== null
+          && session.launchId === request.launchId
+          && typeof session.nativeSessionId === "string"
+          && session.nativeSessionId.trim().length > 0
+        ) {
+          return session.nativeSessionId;
+        }
+        for (const event of runtimeEventInbox.list()) {
+          if (
+            event.type === "runtime-observation"
+            && event.observation.kind === "session.started"
+            && event.observation.fence.taskId === owner.taskId
+            && event.observation.fence.roleName === owner.roleName
+            && event.observation.fence.agentId === request.agentId
+            && event.observation.fence.launchId === request.launchId
+            && typeof event.observation.fence.nativeSessionId === "string"
+            && event.observation.fence.nativeSessionId.trim().length > 0
+          ) {
+            return event.observation.fence.nativeSessionId;
+          }
+        }
+        await abortableDelay(50, signal);
+      }
+      throw new Error("Native session discovery was aborted.");
+    },
+    inactivityTimeoutMs: positiveIntegerOption(
+      options.environment?.YUI_LAUNCH_INACTIVITY_TIMEOUT_MS
+        ?? process.env.YUI_LAUNCH_INACTIVITY_TIMEOUT_MS,
+      300_000
+    ),
     onHostCreated: ({ binding, pane }) => {
       sessionOwners.recordHostOwner({
         owner: binding.owner,
@@ -488,12 +557,11 @@ export async function startFileTaskControllerRuntime(
     launchCoordinator,
     planner
   );
-  // f7/rr5: Share one inbox between the supervisor's terminal channel and
-  // the runtime event processor. When a Job reaches a terminal state, the
-  // supervisor enqueues a durable-job-terminal event; the processor drains
-  // it on the next pass, waking the Controller immediately instead of
-  // waiting for the poll interval.
-  const runtimeEventInbox = new FileRuntimeEventInbox(home);
+  // f7/rr5: This same inbox feeds the supervisor's terminal channel and the
+  // runtime event processor. When a Job reaches a terminal state, the
+  // supervisor enqueues a durable-job-terminal event; the processor drains it
+  // on the next pass, waking the Controller immediately instead of waiting for
+  // the poll interval.
   const jobSupervisor = new DurableJobSupervisor({
     store: schedulerStore,
     process: createLinuxProcessPort(),
@@ -1237,6 +1305,33 @@ function requiredParam(value: JsonValue | undefined): string {
     throw applicationError("INVALID_PARAMS", "Runtime session params are invalid.");
   }
   return value;
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Native session discovery was aborted."));
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function positiveIntegerOption(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim().length === 0) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid native session discovery timeout: ${value}`);
+  }
+  return parsed;
 }
 
 function applicationError(

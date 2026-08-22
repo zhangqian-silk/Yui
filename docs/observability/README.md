@@ -134,7 +134,8 @@ Sections:
 
 - **tasks** — total/archived/active counts.
 - **runs** — total/active/yielded/failed, failure rate, cumulative duration,
-  by-role and by-purpose distribution, fault class counts.
+  by-role and by-purpose distribution, fault class counts, and structured
+  launch-failure phase/kind counts parsed from launch diagnostics.
 - **wakes** — leader runs with wake reasons, orphan wakes, orphan yield-only.
   `suppressedWakes` counts durable `wake.suppressed` task events: Leader wakes
   coalesced by scheduler single-flight because the Role runtime lifecycle lane

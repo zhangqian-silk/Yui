@@ -15,6 +15,7 @@ import type {
 } from "./sessionLaunchRequest.js";
 import {
   RuntimeHostContentionError,
+  RuntimeLaunchError,
   type ActivePromptPushPort,
   type ActivePromptPushRequest,
   type PromptPushResult,
@@ -22,6 +23,12 @@ import {
   type SessionHostPort,
   type SessionInspection
 } from "./ports.js";
+import {
+  toRuntimeLaunchFailure,
+  hasFatalLaunchOutput,
+  type RuntimeLaunchDiagnosticContext
+} from "./launchDiagnostics.js";
+import { builtinAgentDriverRegistry } from "./builtinAgentDrivers.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
@@ -127,6 +134,7 @@ export interface RuntimeTmuxHostPort {
     target: string;
     dead: boolean;
     currentCommand: string;
+    exitStatus?: number;
   }>;
   inspectRolePaneAsync?(
     hostId: string,
@@ -136,7 +144,10 @@ export interface RuntimeTmuxHostPort {
     target: string;
     dead: boolean;
     currentCommand: string;
+    exitStatus?: number;
   }>>;
+  /** Captures a fresh dead Provider pane for launch diagnostics. */
+  captureRolePane?(hostId: string, roleName: string, lines?: number): string;
 }
 
 export type RuntimeTmuxPaneState = Readonly<{
@@ -195,9 +206,29 @@ export type TmuxSessionHostOptions = Readonly<{
       target: string;
       dead: boolean;
       currentCommand: string;
+      exitStatus?: number;
     }>;
   }>) => void;
+  /** Validates resolved launch configuration after planning, before process start. */
+  validateLaunch?: (request: SessionLaunchRequest) => Promise<void>;
+  /**
+   * Awaits the durable native-session fact for a runtime-discovered Provider
+   * launch. The host monitors agent-emitted signals (pane death, fatal output,
+   * inactivity) and stops the fresh Provider when a negative signal arrives.
+   */
+  waitForNativeSession?: (
+    request: SessionLaunchRequest,
+    signal: AbortSignal
+  ) => Promise<string>;
+  /**
+   * Backstop for a completely unresponsive agent: if the agent produces no
+   * signal (no hook, no pane output change, no exit) for this long, the launch
+   * fails. A slow-but-active agent never triggers this. Defaults to 5 minutes.
+   */
+  inactivityTimeoutMs?: number;
 }>;
+
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 300_000;
 
 /**
  * Runtime lifecycle adapter for the current tmux host. The returned hostRef is
@@ -207,6 +238,9 @@ export class TmuxSessionHost implements SessionHostPort {
   readonly #globalHostId: string;
   readonly #createBindingId: () => string;
   readonly #onHostCreated: TmuxSessionHostOptions["onHostCreated"];
+  readonly #validateLaunch: TmuxSessionHostOptions["validateLaunch"];
+  readonly #waitForNativeSession: TmuxSessionHostOptions["waitForNativeSession"];
+  readonly #inactivityTimeoutMs: number;
   readonly #launchTails = new Map<string, Promise<void>>();
 
   constructor(
@@ -220,6 +254,12 @@ export class TmuxSessionHost implements SessionHostPort {
     );
     this.#createBindingId = options.createBindingId ?? randomUUID;
     this.#onHostCreated = options.onHostCreated;
+    this.#validateLaunch = options.validateLaunch;
+    this.#waitForNativeSession = options.waitForNativeSession;
+    this.#inactivityTimeoutMs = positiveInteger(
+      options.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS,
+      "Launch inactivity timeout"
+    );
   }
 
   async start(
@@ -416,6 +456,268 @@ export class TmuxSessionHost implements SessionHostPort {
           : {})
       });
     }
+    const { planned, nativeSessionId } = planManagedLaunch(
+      this.planner,
+      request,
+      beforeHostStart
+    );
+    const launchContext = diagnosticContext(request, planned);
+    if (this.#validateLaunch !== undefined) {
+      try {
+        await this.#validateLaunch(request);
+      } catch (error) {
+        throw toRuntimeLaunchFailure(error, "validation", launchContext);
+      }
+    }
+    // Process creation is last: every local invariant has already passed.
+    let hostCreated: boolean;
+    try {
+      hostCreated = await ensureRoleWindow(
+        this.tmux,
+        hostId,
+        planned.role,
+        planned.launch
+      );
+    } catch (error) {
+      throw toRuntimeLaunchFailure(error, "host-start", launchContext);
+    }
+    if (
+      hostCreated
+      && request.owner.scope === "task"
+      && planned.launch.env.YUI_JOB_CALLER_KEY !== undefined
+      && this.planner.commitTaskCallerKey !== undefined
+    ) {
+      this.planner.commitTaskCallerKey({
+        taskId: request.owner.taskId,
+        roleName: request.owner.roleName,
+        agentId: request.agentId,
+        callerKey: planned.launch.env.YUI_JOB_CALLER_KEY
+      });
+    }
+    let binding = createRuntimeBinding({
+      id: bindingId,
+      launchId: request.launchId,
+      owner: request.owner,
+      agentId: request.agentId,
+      adapterId: request.adapterId,
+      hostRef: encodeHostRef({
+        scope: request.owner.scope,
+        hostId,
+        roleName: request.owner.roleName
+      }),
+      hostCreated,
+      ...(hostCreated && planned.initialPromptRunId !== undefined
+        ? { initialPromptRunId: planned.initialPromptRunId }
+        : {}),
+      ...(nativeSessionId === undefined ? {} : { nativeSessionId })
+    });
+    if (hostCreated) {
+      let pane;
+      try {
+        pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
+      } catch (error) {
+        throw toRuntimeLaunchFailure(error, "host-started", launchContext);
+      }
+      if (pane === undefined) {
+        throw toRuntimeLaunchFailure(
+          new Error("Managed host pane could not be inspected after creation."),
+          "host-started",
+          launchContext
+        );
+      }
+      this.#onHostCreated?.({ binding, pane });
+      if (pane.dead) {
+        await deadHostLaunchFailure(
+          this.tmux,
+          hostId,
+          request.owner.roleName,
+          pane,
+          launchContext
+        );
+      }
+      if (requiresNativeSessionDiscovery(request, planned, this.#waitForNativeSession)) {
+        const discoveredNativeSessionId = await this.waitForNativeSessionDiscovery(
+          request,
+          hostId,
+          launchContext,
+          pane
+        );
+        binding = createRuntimeBinding({
+          ...binding,
+          nativeSessionId: discoveredNativeSessionId
+        });
+      }
+      this.#onHostCreated?.({ binding, pane });
+    }
+    return binding;
+  }
+
+  async waitForNativeSessionDiscovery(
+    request: SessionLaunchRequest,
+    hostId: string,
+    context: RuntimeLaunchDiagnosticContext,
+    pane: Readonly<{
+      pid?: number;
+      target: string;
+      dead: boolean;
+      currentCommand: string;
+      exitStatus?: number;
+    }>
+  ): Promise<string> {
+    if (this.#waitForNativeSession === undefined) {
+      throw new Error("Native session discovery is not configured.");
+    }
+    const controller = new AbortController();
+    const discovery = this.#waitForNativeSession(request, controller.signal);
+    // The losing branch of the race rejects when the controller aborts; keep
+    // that rejection handled so a settled launch does not surface it later.
+    discovery.catch(() => undefined);
+    try {
+      return await Promise.race([
+        discovery,
+        this.monitorPaneSignals(request, hostId, context, controller.signal)
+      ]);
+    } catch (error) {
+      try {
+        await stopExactRole(this.tmux, hostId, request.owner.roleName);
+      } catch {
+        // The launch failure below is authoritative; durable owner cleanup
+        // remains responsible for a Provider that rejected immediate stop.
+      }
+      throw toRuntimeLaunchFailure(error, "native-session-discovery", {
+        ...context,
+        pane
+      });
+    } finally {
+      controller.abort();
+    }
+  }
+
+  /**
+   * Monitors the managed pane for agent-emitted signals while native session
+   * discovery is pending. The agent's own behavior drives the outcome:
+   *
+   * - Pane death → failure with exit status and stderr (the agent exited).
+   * - Fatal output (auth, config, executable errors) → failure with the
+   *   agent's own error text.
+   * - No signal at all (no hook, no output change, no exit) for the
+   *   inactivity window → backstop failure.
+   *
+   * There is no fixed wall-clock timeout: a slow-but-active agent is never
+   * killed merely for taking too long to start.
+   */
+  private async monitorPaneSignals(
+    request: SessionLaunchRequest,
+    hostId: string,
+    context: RuntimeLaunchDiagnosticContext,
+    signal: AbortSignal
+  ): Promise<never> {
+    let lastContent = "";
+    let lastActivityAt = Date.now();
+    while (!signal.aborted) {
+      await abortableDelay(PANE_SIGNAL_POLL_MS, signal);
+      let pane;
+      try {
+        pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
+      } catch {
+        // A tmux inspection hiccup must not fabricate a Provider death; the
+        // inactivity backstop remains the safety net.
+        continue;
+      }
+      if (pane !== undefined && pane.dead) {
+        await deadHostLaunchFailure(
+          this.tmux,
+          hostId,
+          request.owner.roleName,
+          pane,
+          context
+        );
+      }
+      let content = "";
+      try {
+        content = this.tmux.captureRolePane?.(hostId, request.owner.roleName, 80) ?? "";
+      } catch {
+        // Capture is best-effort; pane death and hooks remain authoritative.
+      }
+      if (content !== lastContent) {
+        lastContent = content;
+        lastActivityAt = Date.now();
+        if (hasFatalLaunchOutput(content)) {
+          throw toRuntimeLaunchFailure(
+            new Error(
+              "Agent emitted a fatal error before native session discovery completed."
+            ),
+            "native-session-discovery",
+            {
+              ...context,
+              ...(pane !== undefined ? { pane } : {}),
+              stderrTail: content
+            }
+          );
+        }
+      }
+      if (Date.now() - lastActivityAt >= this.#inactivityTimeoutMs) {
+        throw new Error(
+          `Agent produced no signal for ${this.#inactivityTimeoutMs}ms. `
+          + "The process is alive but emitted no lifecycle hook, output, or exit."
+        );
+      }
+    }
+    throw new Error("Native session discovery was aborted.");
+  }
+}
+
+function requiresNativeSessionDiscovery(
+  request: SessionLaunchRequest,
+  planned: RuntimePlannedSession,
+  wait: TmuxSessionHostOptions["waitForNativeSession"]
+): boolean {
+  return request.mode === "new"
+    && request.owner.scope === "task"
+    && request.runId !== undefined
+    && planned.initialPromptRunId === request.runId
+    && wait !== undefined
+    && builtinAgentDriverRegistry()
+      .requireByAdapterId(request.adapterId)
+      .capabilities.observation.sessionBootstrap === "discovered";
+}
+
+function positiveInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer.`);
+  }
+  return value;
+}
+
+const PANE_SIGNAL_POLL_MS = 1_000;
+
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("Native session discovery was aborted."));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Native session discovery was aborted."));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function planManagedLaunch(
+  planner: RuntimeRoleLaunchPlannerPort,
+  request: SessionLaunchRequest,
+  beforeHostStart: RuntimeLaunchPreStart | undefined
+): Readonly<{
+  planned: RuntimePlannedSession;
+  nativeSessionId: string | undefined;
+}> {
+  try {
     const input = {
       roleName: request.owner.roleName,
       agentId: request.agentId,
@@ -433,8 +735,8 @@ export class TmuxSessionHost implements SessionHostPort {
       ...(request.mode === "resume" ? { nativeSessionId: request.nativeSessionId } : {})
     };
     const planned = request.owner.scope === "task"
-      ? this.planner.plan({ taskId: request.owner.taskId, ...input })
-      : this.planner.planGlobalRole(input);
+      ? planner.plan({ taskId: request.owner.taskId, ...input })
+      : planner.planGlobalRole(input);
     if (planned.role.name !== request.owner.roleName) {
       throw new Error("Planned Role does not match the runtime owner.");
     }
@@ -463,51 +765,62 @@ export class TmuxSessionHost implements SessionHostPort {
         ? {}
         : { initialPromptRunId: planned.initialPromptRunId })
     });
-    // Process creation is last: every local invariant has already passed.
-    const hostCreated = await ensureRoleWindow(
-      this.tmux,
-      hostId,
-      planned.role,
-      planned.launch
-    );
+    return { planned, nativeSessionId };
+  } catch (error) {
     if (
-      hostCreated
-      && request.owner.scope === "task"
-      && planned.launch.env.YUI_JOB_CALLER_KEY !== undefined
-      && this.planner.commitTaskCallerKey !== undefined
+      error instanceof RuntimeLaunchError
+      || error instanceof RuntimeHostContentionError
     ) {
-      this.planner.commitTaskCallerKey({
-        taskId: request.owner.taskId,
-        roleName: request.owner.roleName,
-        agentId: request.agentId,
-        callerKey: planned.launch.env.YUI_JOB_CALLER_KEY
-      });
+      throw error;
     }
-    const binding = createRuntimeBinding({
-      id: bindingId,
-      launchId: request.launchId,
-      owner: request.owner,
+    throw toRuntimeLaunchFailure(error, "validation", {
       agentId: request.agentId,
-      adapterId: request.adapterId,
-      hostRef: encodeHostRef({
-        scope: request.owner.scope,
-        hostId,
-        roleName: request.owner.roleName
-      }),
-      hostCreated,
-      ...(hostCreated && planned.initialPromptRunId !== undefined
-        ? { initialPromptRunId: planned.initialPromptRunId }
-        : {}),
-      ...(nativeSessionId === undefined ? {} : { nativeSessionId })
+      cwd: request.workspace
     });
-    if (hostCreated && this.#onHostCreated !== undefined) {
-      const pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
-      if (pane !== undefined) {
-        this.#onHostCreated({ binding, pane });
-      }
-    }
-    return binding;
   }
+}
+
+function diagnosticContext(
+  request: SessionLaunchRequest,
+  planned: RuntimePlannedSession
+): RuntimeLaunchDiagnosticContext {
+  return {
+    command: planned.launch.command,
+    argv: [planned.launch.command, ...planned.launch.args],
+    cwd: planned.role.cwd ?? planned.role.workspace,
+    agentId: request.agentId
+  };
+}
+
+async function deadHostLaunchFailure(
+  tmux: RuntimeTmuxHostPort,
+  hostId: string,
+  roleName: string,
+  pane: Readonly<{
+    pid?: number;
+    target: string;
+    dead: boolean;
+    currentCommand: string;
+    exitStatus?: number;
+  }>,
+  context: RuntimeLaunchDiagnosticContext
+): Promise<never> {
+  let stderrTail: string | undefined;
+  try {
+    stderrTail = tmux.captureRolePane?.(hostId, roleName, 80);
+  } catch {
+    // The pane state is the required evidence; capture is best-effort.
+  }
+  throw toRuntimeLaunchFailure(
+    new Error("Provider exited immediately after managed host start."),
+    "host-started",
+    {
+      ...context,
+      pane,
+      ...(pane.exitStatus === undefined ? {} : { exitStatus: pane.exitStatus }),
+      ...(stderrTail === undefined || stderrTail.length === 0 ? {} : { stderrTail })
+    }
+  );
 }
 
 /** Non-blocking receipt-backed tmux push; it never interprets provider output. */
@@ -573,17 +886,11 @@ async function inspectRolePane(
   target: string;
   dead: boolean;
   currentCommand: string;
-}> | undefined> {
-  try {
-    return tmux.inspectRolePaneAsync === undefined
-      ? tmux.inspectRolePane?.(hostId, roleName)
-      : await tmux.inspectRolePaneAsync(hostId, roleName);
-  } catch {
-    // The pane may have exited between creation and inspection; the owner
-    // recorder treats a missing pane as a verification gap, not a launch
-    // failure.
-    return undefined;
-  }
+  exitStatus?: number;
+ }> | undefined> {
+  return tmux.inspectRolePaneAsync === undefined
+    ? tmux.inspectRolePane?.(hostId, roleName)
+    : await tmux.inspectRolePaneAsync(hostId, roleName);
 }
 
 async function killRole(

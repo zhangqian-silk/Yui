@@ -40,6 +40,7 @@ export type TmuxPaneState = Readonly<{
   dead: boolean;
   pid?: number;
   currentCommand: string;
+  exitStatus?: number;
   cursorX?: number;
   cursorY?: number;
   historySize?: number;
@@ -52,6 +53,7 @@ export type TmuxRolePaneState = Readonly<{
   dead: boolean;
   pid?: number;
   currentCommand: string;
+  exitStatus?: number;
 }>;
 
 export type TmuxRoleHistory = Readonly<{
@@ -195,6 +197,8 @@ export class TmuxManager {
         ";",
         "set-option", "-g", "history-limit", String(this.#historyLimit),
         ";",
+        "set-option", "-g", "remain-on-exit", "on",
+        ";",
         "new-session", "-d",
         "-x", String(this.#initialColumns),
         "-y", String(this.#initialRows),
@@ -206,6 +210,7 @@ export class TmuxManager {
       ]);
     } else {
       this.configureServerHistory();
+      this.run(["set-option", "-g", "remain-on-exit", "on"]);
       this.run([
         "new-window",
         "-t", this.sessionName(taskId),
@@ -243,6 +248,8 @@ export class TmuxManager {
         ";",
         "set-option", "-g", "history-limit", String(this.#historyLimit),
         ";",
+        "set-option", "-g", "remain-on-exit", "on",
+        ";",
         "new-session", "-d",
         "-x", String(this.#initialColumns),
         "-y", String(this.#initialRows),
@@ -254,6 +261,7 @@ export class TmuxManager {
       ]);
     } else {
       await this.configureServerHistoryAsync();
+      await this.runAsync(["set-option", "-g", "remain-on-exit", "on"]);
       await this.runAsync([
         "new-window",
         "-t", this.sessionName(taskId),
@@ -473,6 +481,10 @@ export class TmuxManager {
     ]);
   }
 
+  captureRolePane(taskId: string, roleName: string, lines = 80): string {
+    return this.captureRole(taskId, roleName, lines);
+  }
+
   dispatchRole(
     taskId: string,
     role: TmuxRole,
@@ -524,24 +536,33 @@ export class TmuxManager {
     const target = this.target(taskId, roleName);
     const output = this.run([
       "display-message", "-p", "-t", target,
-      "#{pane_dead}|#{pane_pid}|#{pane_current_command}"
+      [
+        "#{pane_dead}",
+        "#{pane_pid}",
+        "#{pane_current_command}",
+        "#{pane_dead_status}"
+      ].join("|")
     ]).trim();
     const separator = output.indexOf("|");
     const secondSeparator = separator < 0 ? -1 : output.indexOf("|", separator + 1);
-    if (separator < 0 || secondSeparator < 0) {
+    const lastSeparator = secondSeparator < 0 ? -1 : output.lastIndexOf("|");
+    if (separator < 0 || secondSeparator < 0 || lastSeparator <= secondSeparator) {
       throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
     }
     const dead = output.slice(0, separator);
     const pidText = output.slice(separator + 1, secondSeparator);
-    const currentCommand = output.slice(secondSeparator + 1);
+    const currentCommand = output.slice(secondSeparator + 1, lastSeparator);
+    const exitStatusText = output.slice(lastSeparator + 1);
     const pid = Number(pidText);
+    const exitStatus = nonNegativeNumber(exitStatusText);
     return {
       taskId,
       roleName,
       target,
       dead: dead === "1",
       ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
-      currentCommand
+      currentCommand,
+      ...(dead === "1" && exitStatus !== undefined ? { exitStatus } : {})
     };
   }
 
@@ -570,23 +591,36 @@ export class TmuxManager {
         "#{cursor_y}",
         "#{history_size}",
         "#{pane_current_command}",
+        "#{pane_dead_status}",
         receiptFormat
       ].join("|")
     ]);
-    const state = output.trimEnd().split("|");
-    if (state.length !== 8 || state[0] !== PANE_STATE_MARKER) {
+    const normalizedOutput = output.trimEnd();
+    const fieldSeparators = [...normalizedOutput.matchAll(/\|/g)].map((match) => match.index);
+    const lastSeparator = fieldSeparators.at(-1);
+    const exitSeparator = fieldSeparators.at(-2);
+    if (
+      fieldSeparators.length < 8
+      || lastSeparator === undefined
+      || exitSeparator === undefined
+      || !normalizedOutput.startsWith(PANE_STATE_MARKER)
+    ) {
       throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
     }
-    const [
-      ,
-      deadText,
-      pidText,
-      cursorXText,
-      cursorYText,
-      historySizeText,
-      currentCommand,
-      receiptText
-    ] = state;
+    const [markerEnd, deadEnd, pidEnd, cursorXEnd, cursorYEnd, historyEnd] =
+      fieldSeparators;
+    const receiptSeparator = lastSeparator;
+    const deadText = normalizedOutput.slice(markerEnd! + 1, deadEnd!);
+    const pidText = normalizedOutput.slice(deadEnd! + 1, pidEnd!);
+    const cursorXText = normalizedOutput.slice(pidEnd! + 1, cursorXEnd!);
+    const cursorYText = normalizedOutput.slice(cursorXEnd! + 1, cursorYEnd!);
+    const historySizeText = normalizedOutput.slice(cursorYEnd! + 1, historyEnd!);
+    const currentCommand = normalizedOutput.slice(historyEnd! + 1, exitSeparator);
+    const exitStatusText = normalizedOutput.slice(exitSeparator + 1, receiptSeparator);
+    const receiptText = normalizedOutput.slice(receiptSeparator + 1);
+    if (!normalizedOutput.slice(0, markerEnd!).startsWith(PANE_STATE_MARKER)) {
+      throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
+    }
     if (
       (deadText !== "0" && deadText !== "1")
       || currentCommand === undefined
@@ -599,6 +633,7 @@ export class TmuxManager {
     const cursorX = nonNegativeNumber(cursorXText);
     const cursorY = nonNegativeNumber(cursorYText);
     const historySize = nonNegativeNumber(historySizeText);
+    const exitStatus = nonNegativeNumber(exitStatusText);
     if (cursorX === undefined || cursorY === undefined || historySize === undefined) {
       throw runtimeError(`Tmux returned an invalid pane state for ${roleName}.`);
     }
@@ -610,6 +645,7 @@ export class TmuxManager {
         dead: deadText === "1",
         ...(pid === undefined ? {} : { pid }),
         currentCommand,
+        ...(deadText === "1" && exitStatus !== undefined ? { exitStatus } : {}),
         cursorX,
         cursorY,
         historySize
@@ -1015,13 +1051,15 @@ export class TmuxManager {
     target: string;
     dead: boolean;
     currentCommand: string;
+    exitStatus?: number;
   }> {
     const pane = this.inspectPane(taskId, roleName);
     return {
       ...(pane.pid === undefined ? {} : { pid: pane.pid }),
       target: pane.target,
       dead: pane.dead,
-      currentCommand: pane.currentCommand
+      currentCommand: pane.currentCommand,
+      ...(pane.exitStatus === undefined ? {} : { exitStatus: pane.exitStatus })
     };
   }
 
@@ -1033,13 +1071,15 @@ export class TmuxManager {
     target: string;
     dead: boolean;
     currentCommand: string;
+    exitStatus?: number;
   }>> {
     const pane = await this.inspectPaneAsync(taskId, roleName);
     return {
       ...(pane.pid === undefined ? {} : { pid: pane.pid }),
       target: pane.target,
       dead: pane.dead,
-      currentCommand: pane.currentCommand
+      currentCommand: pane.currentCommand,
+      ...(pane.exitStatus === undefined ? {} : { exitStatus: pane.exitStatus })
     };
   }
 
