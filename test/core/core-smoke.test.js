@@ -15,7 +15,9 @@ import { moveSqliteFileSet } from "../../dist/storage/upgrade/sqliteFileSet.js";
 import { createProject } from "../../dist/repository/project.js";
 import { createPublicationReference } from "../../dist/task/publicationReference.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
+import { createDecision } from "../../dist/decision/decision.js";
 import { createTaskMessage } from "../../dist/message/message.js";
+import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { validateAgentLaunchConfiguration } from "../../dist/executor/agentConfigurationCatalog.js";
 import { runExecutionAudit } from "../../dist/observability/executionAudit.js";
@@ -160,6 +162,101 @@ test("the SQLite publication path records an external MR reference", (t) => {
   reopened.close();
 });
 
+test("the Knowledge promotion flow proposes, accepts, deduplicates, and gates Agents", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-core-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const now = new Date("2026-08-22T00:00:00.000Z");
+  const store = new SqliteTaskStore(home);
+  const project = createProject(
+    "project-1",
+    "app",
+    home,
+    { stable: "master", development: "master" },
+    now
+  );
+  const task = activateTask(createTask(store.nextTaskId(), "Promotion smoke", now, {
+    projectBindings: [{ projectId: project.id, directory: "app", baseRef: "master" }]
+  }), now);
+  store.saveProject(project);
+  store.saveTask(task);
+  store.saveDecision(task.id, createDecision(
+    store.nextDecisionId(task.id),
+    task.id,
+    "D-01 freeze",
+    "The two-layer orchestration RFC is frozen.",
+    now
+  ));
+
+  const leaderEnv = {
+    YUI_SESSION_SCOPE: "task",
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: "leader"
+  };
+
+  // A Leader may propose a candidate for its own Task but cannot write the
+  // authoritative Knowledge list directly.
+  const proposed = await runProjectCommand(
+    ["knowledge", "propose", "project-1", "--title", "Two-layer orchestration",
+     "--body", "The Leader owns protocol convergence.", "--task", task.id,
+     "--decision", "decision-1"],
+    store,
+    { environment: leaderEnv, now: () => now }
+  );
+  assert.match(proposed.output, /Proposed knowledge proposal-1/);
+  await assert.rejects(
+    () => runProjectCommand(
+      ["knowledge", "add", "project-1", "Sneaky", "--body", "bypass"],
+      store,
+      { environment: leaderEnv, now: () => now }
+    ),
+    /Operator authority/
+  );
+
+  // The Operator accepts; the Knowledge entry carries source provenance.
+  const accepted = await runProjectCommand(
+    ["knowledge", "accept", "project-1", "proposal-1"],
+    store,
+    { now: () => now }
+  );
+  assert.match(accepted.output, /Accepted knowledge proposal proposal-1 as knowledge-1/);
+  const withKnowledge = store.getProject("project-1");
+  const knowledge = withKnowledge.knowledge.find(({ id }) => id === "knowledge-1");
+  assert.equal(knowledge?.title, "Two-layer orchestration");
+  assert.equal(knowledge?.provenance?.taskId, task.id);
+  assert.equal(knowledge?.provenance?.decisionId, "decision-1");
+  assert.equal(knowledge?.provenance?.proposalId, "proposal-1");
+  assert.ok(knowledge?.provenance?.evidenceDigest);
+
+  // Resubmitting the same candidate is deduplicated to the existing entry.
+  const duplicate = await runProjectCommand(
+    ["knowledge", "propose", "project-1", "--title", "Two-layer orchestration",
+     "--body", "The Leader owns protocol convergence.", "--task", task.id,
+     "--decision", "decision-1"],
+    store,
+    { now: () => now }
+  );
+  assert.match(duplicate.output, /Already accepted as knowledge knowledge-1/);
+  assert.equal(store.getProject("project-1").knowledge.length, 1);
+
+  // A conflicting candidate (same title, different body) fails closed on
+  // accept instead of silently overwriting the existing entry.
+  await runProjectCommand(
+    ["knowledge", "propose", "project-1", "--title", "Two-layer orchestration",
+     "--body", "A conflicting conclusion.", "--task", task.id],
+    store,
+    { now: () => now }
+  );
+  await assert.rejects(
+    () => runProjectCommand(
+      ["knowledge", "accept", "project-1", "proposal-2"],
+      store,
+      { now: () => now }
+    ),
+    /same title but a different conclusion/
+  );
+  store.close();
+});
+
 test("the production migration graph advances the normal aggregate path", () => {
   const registry = createProductionRegistry();
   assert.doesNotThrow(() => assertRegistryCoversBaselineToCurrent(registry));
@@ -184,6 +281,40 @@ test("the production migration graph advances the normal aggregate path", () => 
   const current = currentStep.transform(currentSource);
   assert.equal(current.schemaManifest.aggregateSchemaVersion, 20);
   assert.equal(current.state.schemaVersion, 20);
+
+  // Issue 12: the Project v3->v4 compatible normalizer adds the
+  // knowledgeProposals workflow list without rewriting any other field.
+  const projectStep = registry.lookupDeclaration("record", "project", 3);
+  assert.notEqual(projectStep, undefined);
+  const v3Project = {
+    schemaVersion: 3,
+    id: "project-1",
+    name: "app",
+    aliases: [],
+    path: "/tmp/app",
+    ownership: "external",
+    stableBranch: "master",
+    developmentBranch: "master",
+    knowledge: [],
+    createdAt: "2026-08-22T00:00:00.000Z",
+    updatedAt: "2026-08-22T00:00:00.000Z"
+  };
+  const projectSnapshot = {
+    schemaManifest: {
+      schemaVersion: 1,
+      storageVersion: 7,
+      aggregateSchemaVersion: 20,
+      recordVersions: { project: 3 },
+      updatedAt: "2026-08-22T00:00:00.000Z"
+    },
+    state: { schemaVersion: 20, projects: { "project-1": v3Project } }
+  };
+  projectStep.validateSource(projectSnapshot);
+  const normalizedProject = projectStep.normalize(projectSnapshot);
+  assert.equal(normalizedProject.state.projects["project-1"].schemaVersion, 4);
+  assert.deepEqual(normalizedProject.state.projects["project-1"].knowledgeProposals, []);
+  assert.deepEqual(normalizedProject.state.projects["project-1"].knowledge, []);
+  assert.equal(normalizedProject.schemaManifest.recordVersions.project, 4);
 });
 
 test("the built-in Agent Drivers are available through the shared registry", () => {

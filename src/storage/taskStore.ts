@@ -195,7 +195,7 @@ export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 3 as const;
  * below, but are not independent record-axis families.
  */
 export const CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION = 2 as const;
-export const CURRENT_PROJECT_SCHEMA_VERSION = 3 as const;
+export const CURRENT_PROJECT_SCHEMA_VERSION = 4 as const;
 export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;

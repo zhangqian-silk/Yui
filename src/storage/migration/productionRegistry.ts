@@ -19,6 +19,8 @@ const SQLITE_LAYOUT_FROM_VERSION = 6;
 const SQLITE_LAYOUT_TO_VERSION = 7;
 const PROJECT_FROM_VERSION = 2;
 const PROJECT_TO_VERSION = 3;
+const PROJECT_KNOWLEDGE_PROPOSALS_FROM_VERSION = 3;
+const PROJECT_KNOWLEDGE_PROPOSALS_TO_VERSION = 4;
 const TASK_FROM_VERSION = 3;
 const TASK_TO_VERSION = 4;
 const WORK_ITEM_FROM_VERSION = 6;
@@ -125,6 +127,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       declaredEffects: []
     })
     .registerOfflineMigration(projectOwnershipStep())
+    .registerCompatible(projectKnowledgeProposalsStep())
     .registerOfflineMigration(taskWorkspaceIdentityStep())
     .registerOfflineMigration(recordFamilyStep(
       "workItem",
@@ -2521,6 +2524,104 @@ function migrateProjectV2ToV3(snapshot: HomeSnapshot): HomeSnapshot {
       ...project,
       schemaVersion: PROJECT_TO_VERSION,
       ownership: "external"
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, projects: nextProjects }
+  };
+}
+
+/**
+ * Project v4 adds the `knowledgeProposals` workflow list (Leader-proposed
+ * Knowledge candidates awaiting an Operator decision). Every v3 Project
+ * defaults to an empty list; the compatible normalizer adds it in place
+ * without rewriting any other field.
+ */
+function projectKnowledgeProposalsStep(): CompatibleStep<HomeSnapshot> {
+  return {
+    kind: "compatible",
+    axis: "record",
+    recordKind: "project",
+    fromVersion: PROJECT_KNOWLEDGE_PROPOSALS_FROM_VERSION,
+    toVersion: PROJECT_KNOWLEDGE_PROPOSALS_TO_VERSION,
+    defaults: [
+      "knowledgeProposals defaults to an empty list on every Project"
+    ],
+    validateSource: (snapshot) => requireProjectV3Shape(snapshot),
+    normalize: (snapshot) => normalizeProjectV3ToV4(snapshot)
+  };
+}
+
+function requireProjectV3Shape(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.project !== PROJECT_KNOWLEDGE_PROPOSALS_FROM_VERSION) {
+    throw new Error(
+      `Record project compatible step requires manifest version ${PROJECT_KNOWLEDGE_PROPOSALS_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const projects = snapshot.state.projects;
+  if (projects === undefined) return;
+  const map = asObject(projects, "project map");
+  const allowed = new Set<string>(PROJECT_V3_FIELDS);
+  for (const [projectId, rawProject] of Object.entries(map)) {
+    const project = asObject(rawProject, `Project ${projectId}`);
+    if (project.schemaVersion !== PROJECT_KNOWLEDGE_PROPOSALS_FROM_VERSION) {
+      throw new Error(
+        `Project ${projectId} must use schemaVersion ${PROJECT_KNOWLEDGE_PROPOSALS_FROM_VERSION}.`
+      );
+    }
+    const unknown = Object.keys(project).find((key) => !allowed.has(key));
+    if (unknown !== undefined) {
+      throw new Error(
+        `Project ${projectId} has an unknown v3 field: ${unknown}.`
+      );
+    }
+  }
+}
+
+const PROJECT_V3_FIELDS = [
+  "schemaVersion",
+  "id",
+  "name",
+  "aliases",
+  "path",
+  "ownership",
+  "remoteUrl",
+  "stableBranch",
+  "developmentBranch",
+  "knowledge",
+  "createdAt",
+  "updatedAt"
+] as const;
+
+function normalizeProjectV3ToV4(snapshot: HomeSnapshot): HomeSnapshot {
+  requireProjectV3Shape(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...manifestVersions, project: PROJECT_KNOWLEDGE_PROPOSALS_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const projects = snapshot.state.projects;
+  if (projects === undefined) {
+    return { schemaManifest, state: { ...snapshot.state } };
+  }
+  const map = asObject(projects, "project map");
+  const nextProjects: Record<string, unknown> = {};
+  for (const [projectId, rawProject] of Object.entries(map)) {
+    const project = asObject(rawProject, `Project ${projectId}`);
+    nextProjects[projectId] = {
+      ...project,
+      schemaVersion: PROJECT_KNOWLEDGE_PROPOSALS_TO_VERSION,
+      knowledgeProposals: []
     };
   }
   return {

@@ -8,17 +8,31 @@ import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorksp
 import { acquireProjectMaintenanceLock } from "../repository/projectMaintenanceLock.js";
 import {
   addProjectKnowledge,
+  addKnowledgeProposal,
+  decideKnowledgeProposal,
   createProject,
+  findKnowledgeProposal,
+  findKnowledgeProposalByFingerprint,
+  knowledgeEvidenceDigest,
+  knowledgeProposalFingerprint,
   managedProjectPath,
+  planKnowledgeAcceptance,
   retireProjectKnowledge,
   resolveProject,
   updateProjectKnowledge,
   updateProjectMetadata,
   validateProject,
   validateProjectName,
+  type KnowledgeProposal,
+  type KnowledgeProposalSource,
+  type ProjectKnowledgeProvenance,
   type Project,
   type ProjectOwnership
 } from "../repository/project.js";
+import { projectActor } from "./taskActor.js";
+import type { Decision } from "../decision/decision.js";
+import type { Milestone } from "../milestone/milestone.js";
+import type { Task } from "../task/task.js";
 
 export type ProjectCommandStore = Readonly<{
   transaction<T>(execute: (store: ProjectCommandStore) => T): T;
@@ -29,6 +43,10 @@ export type ProjectCommandStore = Readonly<{
   getConfig(): Readonly<{ defaultWorkspace?: string }>;
   /** The persistent Home root; managed Project repositories live below it. */
   rootDirectory(): string;
+  /** Task evidence for Knowledge promotion proposals. */
+  getTask?(id: string): Task | null;
+  getDecision?(taskId: string, decisionId: string): Decision | null;
+  getMilestone?(taskId: string, milestoneId: string): Milestone | null;
 }>;
 
 export type ProjectCommandOptions = Readonly<{
@@ -38,6 +56,7 @@ export type ProjectCommandOptions = Readonly<{
       | "resolveRemoteBaseline" | "copyRefs"
   >;
   now?: () => Date;
+  environment?: NodeJS.ProcessEnv;
 }>;
 
 export type ProjectCommandExecution = Readonly<{ output: string; data?: unknown }>;
@@ -664,7 +683,8 @@ function showProject(args: readonly string[], store: ProjectCommandStore): strin
     ...(project.remoteUrl === undefined ? [] : [`Remote: ${project.remoteUrl}`]),
     `Stable: ${project.stableBranch}`,
     `Development: ${project.developmentBranch}`,
-    `Knowledge: ${project.knowledge.filter(({ status }) => status === "active").length} active`
+    `Knowledge: ${project.knowledge.filter(({ status }) => status === "active").length} active`,
+    `Knowledge proposals: ${project.knowledgeProposals.filter(({ status }) => status === "pending").length} pending`
   ].join("\n").concat("\n");
 }
 
@@ -683,6 +703,7 @@ function projectKnowledge(
     const usage = "Project knowledge add usage: yui project knowledge add <project> <title> --body <text>.";
     const parsed = parseSingleOption(rest, "--body", usage);
     if (parsed.positionals.length !== 2) throw usageError(usage);
+    assertKnowledgeOperator(options, "add");
     const added = store.transaction((tx) => {
       const project = requireProject(tx, parsed.positionals[0]!);
       const id = nextKnowledgeId(project);
@@ -746,6 +767,21 @@ function projectKnowledge(
         `Project: ${project.id}`,
         `Title: ${entry.title}`,
         `Status: ${entry.status}`,
+        ...(entry.provenance === undefined ? [] : [
+          `Source: ${entry.provenance.taskId}`
+            + `${entry.provenance.decisionId === undefined ? "" : `/${entry.provenance.decisionId}`}`
+            + `${entry.provenance.milestoneId === undefined ? "" : `/${entry.provenance.milestoneId}`}`
+            + `${entry.provenance.commitSha === undefined ? "" : `@${entry.provenance.commitSha}`}`,
+          ...(entry.provenance.evidenceDigest === undefined
+            ? []
+            : [`Evidence digest: ${entry.provenance.evidenceDigest}`]),
+          ...(entry.provenance.proposalId === undefined
+            ? []
+            : [`Proposal: ${entry.provenance.proposalId}`]),
+          ...(entry.provenance.promotedBy === undefined
+            ? []
+            : [`Promoted by: ${entry.provenance.promotedBy} at ${entry.provenance.promotedAt ?? "?"}`])
+        ]),
         "",
         entry.body
       ].join("\n").concat("\n"),
@@ -756,6 +792,7 @@ function projectKnowledge(
   if (command === "update") {
     const usage = "Project knowledge update usage: yui project knowledge update <project> <knowledge> [--title <text>] [--body <text>].";
     const parsed = parseKnowledgeUpdateArguments(rest, usage);
+    assertKnowledgeOperator(options, "update");
     const updated = store.transaction((tx) => {
       const project = requireProject(tx, parsed.project);
       const next = updateProjectKnowledge(project, parsed.id, {
@@ -775,6 +812,7 @@ function projectKnowledge(
     if (rest.length !== 2) {
       throw usageError("Project knowledge retire usage: yui project knowledge retire <project> <knowledge>.");
     }
+    assertKnowledgeOperator(options, "retire");
     const updated = store.transaction((tx) => {
       const project = requireProject(tx, rest[0]!);
       const next = retireProjectKnowledge(
@@ -790,6 +828,22 @@ function projectKnowledge(
       projectId: updated.id,
       knowledgeId: rest[1]!
     };
+  }
+  if (command === "propose") {
+    return proposeKnowledge(rest, store, options);
+  }
+  if (command === "proposals") {
+    const [sub, ...subRest] = rest;
+    if (sub === "list") return listKnowledgeProposals(subRest, store);
+    if (sub === "show") return showKnowledgeProposal(subRest, store);
+    throw usageError("Project knowledge proposals usage: yui project knowledge proposals list <project>"
+      + " [--status pending|accepted|rejected] [--all] | yui project knowledge proposals show <project> <proposal>.");
+  }
+  if (command === "accept") {
+    return acceptKnowledgeProposal(rest, store, options);
+  }
+  if (command === "reject") {
+    return rejectKnowledgeProposal(rest, store, options);
   }
   throw usageError(command === undefined
     ? "Project knowledge command is required."
@@ -809,6 +863,530 @@ function nextKnowledgeId(project: Project): string {
     if (!used.has(id)) return id;
   }
 }
+
+function nextProposalId(project: Project): string {
+  const used = new Set(project.knowledgeProposals.map(({ id }) => id));
+  for (let index = 1; ; index += 1) {
+    const id = `proposal-${index}`;
+    if (!used.has(id)) return id;
+  }
+}
+
+/**
+ * Project Knowledge is an Operator authority. A managed Task Session (Leader,
+ * Reviewer, Worker) must use `propose` and let an Operator accept; it can
+ * never write the authoritative list directly.
+ */
+function assertKnowledgeOperator(options: ProjectCommandOptions, action: string): void {
+  const actor = projectActor(options.environment);
+  if (actor === "agent") {
+    throw usageError(
+      `Project Knowledge is an Operator authority; a managed Task Session cannot ${action} it.`
+      + " Propose a candidate with `yui project knowledge propose` instead."
+    );
+  }
+}
+
+type KnowledgeProposalOptions = Readonly<{
+  project: string;
+  title: string;
+  body: string;
+  task: string;
+  decision?: string;
+  milestone?: string;
+  commit?: string;
+  scope?: string;
+  expiresWhen?: string;
+  supersedes?: string;
+}>;
+
+const PROPOSE_OPTIONS = [
+  "--title", "--body", "--task", "--decision", "--milestone",
+  "--commit", "--scope", "--expires-when", "--supersedes"
+] as const;
+
+function parseKnowledgeProposalOptions(
+  args: readonly string[],
+  usage: string
+): KnowledgeProposalOptions {
+  const values: Record<string, string> = {};
+  const positionals: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (PROPOSE_OPTIONS.includes(value as typeof PROPOSE_OPTIONS[number])) {
+      if (values[value] !== undefined) {
+        throw usageError(`${value} may only be provided once. ${usage}`);
+      }
+      const next = args[index + 1];
+      if (next === undefined || next.startsWith("--")) {
+        throw usageError(`${value} is required. ${usage}`);
+      }
+      values[value] = requireText(next, value);
+      index += 1;
+    } else if (value.startsWith("--")) {
+      throw usageError(`Unknown option: ${value}. ${usage}`);
+    } else {
+      positionals.push(value);
+    }
+  }
+  if (positionals.length !== 1) throw usageError(usage);
+  if (values["--title"] === undefined || values["--body"] === undefined || values["--task"] === undefined) {
+    throw usageError(usage);
+  }
+  return {
+    project: positionals[0]!,
+    title: values["--title"]!,
+    body: values["--body"]!,
+    task: values["--task"]!,
+    ...(values["--decision"] === undefined ? {} : { decision: values["--decision"] }),
+    ...(values["--milestone"] === undefined ? {} : { milestone: values["--milestone"] }),
+    ...(values["--commit"] === undefined ? {} : { commit: values["--commit"] }),
+    ...(values["--scope"] === undefined ? {} : { scope: values["--scope"] }),
+    ...(values["--expires-when"] === undefined ? {} : { expiresWhen: values["--expires-when"] }),
+    ...(values["--supersedes"] === undefined ? {} : { supersedes: values["--supersedes"] })
+  };
+}
+
+/**
+ * Leader-proposed promotion candidate. The proposal is workflow state, not
+ * Knowledge: it never appears in `project knowledge list/show` until an
+ * Operator accepts it. A managed Task Session may propose only for its own
+ * Task. The same candidate (source identity + title + body) is deduplicated to
+ * the existing pending proposal instead of creating a second copy.
+ */
+function proposeKnowledge(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): ProjectKnowledgeCommandResult {
+  const usage = "Project knowledge propose usage: yui project knowledge propose <project>"
+    + " --title <text> --body <text> --task <task> [--decision <id>] [--milestone <id>]"
+    + " [--commit <sha>] [--scope <text>] [--expires-when <text>] [--supersedes <knowledge-id>].";
+  const parsed = parseKnowledgeProposalOptions(args, usage);
+  const actor = projectActor(options.environment);
+  if (actor === "agent" && options.environment?.YUI_TASK_ID !== parsed.task) {
+    throw usageError("A managed Task Session may propose Knowledge only for its own Task.");
+  }
+  if (actor === "agent"
+    && options.environment?.YUI_ROLE !== "leader"
+    && options.environment?.YUI_ROLE !== "reviewer") {
+    throw usageError("Only a Leader or Reviewer Session may propose Knowledge promotion.");
+  }
+  const proposedBy = actor === "agent"
+    ? (options.environment?.YUI_ROLE === "reviewer" ? "reviewer" as const : "leader" as const)
+    : actor;
+  const now = (options.now ?? (() => new Date()))();
+  const result = store.transaction((tx) => {
+    const project = requireProject(tx, parsed.project);
+    const source = requireProposalEvidence(tx, parsed);
+    const fingerprint = knowledgeProposalFingerprint({
+      projectId: project.id,
+      source,
+      title: parsed.title,
+      body: parsed.body
+    });
+    const pending = findKnowledgeProposalByFingerprint(project, fingerprint, "pending");
+    if (pending !== null) {
+      return {
+        projectId: project.id,
+        proposalId: pending.id,
+        deduped: true,
+        alreadyAccepted: false
+      };
+    }
+    const accepted = findKnowledgeProposalByFingerprint(project, fingerprint, "accepted");
+    if (accepted !== null) {
+      return {
+        projectId: project.id,
+        proposalId: accepted.id,
+        knowledgeId: accepted.knowledgeId,
+        deduped: true,
+        alreadyAccepted: true
+      };
+    }
+    const proposal: KnowledgeProposal = {
+      schemaVersion: 1,
+      id: nextProposalId(project),
+      projectId: project.id,
+      title: parsed.title,
+      body: parsed.body,
+      status: "pending",
+      source,
+      ...(parsed.scope === undefined ? {} : { scope: parsed.scope }),
+      ...(parsed.expiresWhen === undefined ? {} : { expiresWhen: parsed.expiresWhen }),
+      ...(parsed.supersedes === undefined ? {} : { supersedesKnowledgeId: parsed.supersedes }),
+      fingerprint,
+      ...(source.evidenceDigest === undefined ? {} : { evidenceDigest: source.evidenceDigest }),
+      proposedBy,
+      proposedAt: now.toISOString(),
+      updatedAt: now.toISOString()
+    };
+    tx.saveProject(addKnowledgeProposal(project, proposal));
+    return {
+      projectId: project.id,
+      proposalId: proposal.id,
+      deduped: false,
+      alreadyAccepted: false
+    };
+  });
+  const lines = [
+    result.deduped
+      ? `Knowledge proposal ${result.proposalId} already exists for ${result.projectId}`
+      : `Proposed knowledge ${result.proposalId} for ${result.projectId}`,
+    result.alreadyAccepted
+      ? `Already accepted as knowledge ${result.knowledgeId ?? "?"}`
+      : "Awaiting Operator decision: yui project knowledge proposals list "
+        + `${result.projectId} / yui project knowledge accept ${result.projectId} ${result.proposalId}`
+  ];
+  return {
+    output: `${lines.join("\n")}\n`,
+    projectId: result.projectId,
+    proposalId: result.proposalId,
+    ...(result.knowledgeId === undefined ? {} : { knowledgeId: result.knowledgeId })
+  };
+}
+
+type ProposalEvidence = KnowledgeProposalSource & Readonly<{ evidenceDigest?: string }>;
+
+/**
+ * Verify the cited Task/Decision/Milestone exist and capture the evidence
+ * digest at proposal time, so a later Agent can verify the source record.
+ */
+function requireProposalEvidence(
+  store: ProjectCommandStore,
+  parsed: KnowledgeProposalOptions
+): ProposalEvidence {
+  if (store.getTask === undefined) {
+    throw usageError("Knowledge promotion requires Task evidence, which this store does not provide.");
+  }
+  const task = store.getTask(parsed.task);
+  if (task === null) throw usageError(`Task not found: ${parsed.task}.`);
+  const source: KnowledgeProposalSource = {
+    taskId: task.id,
+    ...(parsed.decision === undefined ? {} : { decisionId: parsed.decision }),
+    ...(parsed.milestone === undefined ? {} : { milestoneId: parsed.milestone }),
+    ...(parsed.commit === undefined ? {} : { commitSha: parsed.commit })
+  };
+  let evidence: string;
+  if (parsed.decision !== undefined) {
+    if (store.getDecision === undefined) {
+      throw usageError("Knowledge promotion requires Decision evidence, which this store does not provide.");
+    }
+    const decision = store.getDecision(task.id, parsed.decision);
+    if (decision === null) {
+      throw usageError(`Decision not found: ${parsed.decision} in Task ${task.id}.`);
+    }
+    evidence = `${decision.title}\n${decision.rationale}`;
+  } else if (parsed.milestone !== undefined) {
+    if (store.getMilestone === undefined) {
+      throw usageError("Knowledge promotion requires Milestone evidence, which this store does not provide.");
+    }
+    const milestone = store.getMilestone(task.id, parsed.milestone);
+    if (milestone === null) {
+      throw usageError(`Milestone not found: ${parsed.milestone} in Task ${task.id}.`);
+    }
+    evidence = `${milestone.title}\n${milestone.summary}`;
+  } else {
+    evidence = task.completionSummary ?? task.title;
+  }
+  return { ...source, evidenceDigest: knowledgeEvidenceDigest(evidence) };
+}
+
+function listKnowledgeProposals(
+  args: readonly string[],
+  store: ProjectCommandStore
+): ProjectKnowledgeCommandResult {
+  const usage = "Project knowledge proposals list usage: yui project knowledge proposals list <project>"
+    + " [--status pending|accepted|rejected] [--all].";
+  const positionals: string[] = [];
+  let status: "pending" | "accepted" | "rejected" | undefined = "pending";
+  let sawAll = false;
+  let sawStatus = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (value === "--all") {
+      if (sawStatus) throw usageError(`--all and --status are mutually exclusive. ${usage}`);
+      sawAll = true;
+      status = undefined;
+    } else if (value === "--status") {
+      if (sawAll) throw usageError(`--all and --status are mutually exclusive. ${usage}`);
+      sawStatus = true;
+      const next = args[index + 1];
+      if (next === undefined || next.startsWith("--")) throw usageError(usage);
+      if (next !== "pending" && next !== "accepted" && next !== "rejected") throw usageError(usage);
+      status = next;
+      index += 1;
+    } else if (value.startsWith("--")) {
+      throw usageError(`Unknown option: ${value}. ${usage}`);
+    } else {
+      positionals.push(value);
+    }
+  }
+  if (positionals.length !== 1) throw usageError(usage);
+  const project = requireProject(store, positionals[0]!);
+  const entries = project.knowledgeProposals
+    .filter((entry) => status === undefined || entry.status === status)
+    .slice()
+    .sort((a, b) => a.id.localeCompare(b.id));
+  if (entries.length === 0) {
+    return {
+      output: "No knowledge proposals found.\n",
+      projectId: project.id,
+      proposals: []
+    };
+  }
+  return {
+    output: `${renderTable(
+      `Knowledge proposals: ${project.name}`,
+      [
+        { header: "Proposal", minWidth: 9, maxWidth: 24 },
+        { header: "Title", minWidth: 8, maxWidth: 48 },
+        { header: "Status", minWidth: 7, maxWidth: 10 },
+        { header: "Source", minWidth: 8, maxWidth: 32 },
+        { header: "Knowledge", minWidth: 9, maxWidth: 24 }
+      ],
+      entries.map((entry) => [
+        entry.id,
+        entry.title,
+        entry.status,
+        `${entry.source.taskId}`
+          + `${entry.source.decisionId === undefined ? "" : `/${entry.source.decisionId}`}`
+          + `${entry.source.milestoneId === undefined ? "" : `/${entry.source.milestoneId}`}`,
+        entry.knowledgeId ?? "-"
+      ]),
+      defaultTableWidth()
+    )}\n`,
+    projectId: project.id,
+    proposals: entries
+  };
+}
+
+function showKnowledgeProposal(
+  args: readonly string[],
+  store: ProjectCommandStore
+): ProjectKnowledgeCommandResult {
+  const usage = "Project knowledge proposals show usage: yui project knowledge proposals show <project> <proposal>.";
+  if (args.length !== 2) throw usageError(usage);
+  const project = requireProject(store, args[0]!);
+  const proposal = findKnowledgeProposal(project, args[1]!);
+  if (proposal === null) {
+    throw usageError(`Knowledge proposal not found: ${args[1]!}.`);
+  }
+  const lines = [
+    `Proposal: ${proposal.id}`,
+    `Project: ${project.id}`,
+    `Title: ${proposal.title}`,
+    `Status: ${proposal.status}`,
+    `Source: ${proposal.source.taskId}`
+      + `${proposal.source.decisionId === undefined ? "" : `/${proposal.source.decisionId}`}`
+      + `${proposal.source.milestoneId === undefined ? "" : `/${proposal.source.milestoneId}`}`
+      + `${proposal.source.commitSha === undefined ? "" : `@${proposal.source.commitSha}`}`,
+    `Proposed by: ${proposal.proposedBy} at ${proposal.proposedAt}`,
+    ...(proposal.scope === undefined ? [] : [`Scope: ${proposal.scope}`]),
+    ...(proposal.expiresWhen === undefined ? [] : [`Expires when: ${proposal.expiresWhen}`]),
+    ...(proposal.supersedesKnowledgeId === undefined
+      ? []
+      : [`Supersedes: ${proposal.supersedesKnowledgeId}`]),
+    ...(proposal.evidenceDigest === undefined ? [] : [`Evidence digest: ${proposal.evidenceDigest}`]),
+    ...(proposal.decidedBy === undefined ? [] : [`Decided by: ${proposal.decidedBy} at ${proposal.decidedAt ?? "?"}`]),
+    ...(proposal.decisionReason === undefined ? [] : [`Decision reason: ${proposal.decisionReason}`]),
+    ...(proposal.knowledgeId === undefined ? [] : [`Knowledge: ${proposal.knowledgeId}`]),
+    "",
+    proposal.body
+  ];
+  return {
+    output: `${lines.join("\n")}\n`,
+    projectId: project.id,
+    proposalId: proposal.id,
+    proposals: [proposal]
+  };
+}
+
+/**
+ * Operator acceptance. The pure {@link planKnowledgeAcceptance} policy decides
+ * create/update/duplicate/conflict; a conflict fails closed so a candidate can
+ * never silently overwrite an existing conclusion. The accepted Knowledge
+ * entry carries the source provenance and fingerprint, and the proposal record
+ * retains the decision for history.
+ */
+function acceptKnowledgeProposal(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): ProjectKnowledgeCommandResult {
+  const usage = "Project knowledge accept usage: yui project knowledge accept <project> <proposal>"
+    + " [--update <knowledge-id>].";
+  const parsed = parseAcceptArguments(args, usage);
+  assertKnowledgeOperator(options, "accept");
+  const actor = projectActor(options.environment);
+  const decidedBy = actor === "operator" ? "operator" as const : "user" as const;
+  const now = (options.now ?? (() => new Date()))();
+  const accepted = store.transaction((tx) => {
+    const project = requireProject(tx, parsed.project);
+    const proposal = findKnowledgeProposal(project, parsed.proposal);
+    if (proposal === null) {
+      throw usageError(`Knowledge proposal not found: ${parsed.proposal}.`);
+    }
+    if (proposal.status !== "pending") {
+      throw usageError(`Knowledge proposal is already ${proposal.status}: ${proposal.id}.`);
+    }
+    let next = project;
+    let knowledgeId: string;
+    let duplicate = false;
+    if (parsed.update !== undefined) {
+      const target = next.knowledge.find((entry) => entry.id === parsed.update);
+      if (target === undefined) {
+        throw usageError(`Knowledge not found: ${parsed.update}.`);
+      }
+      if (target.status !== "active") {
+        throw usageError(`Knowledge is not active: ${target.id}.`);
+      }
+      knowledgeId = target.id;
+      next = updateProjectKnowledge(next, knowledgeId, {
+        title: proposal.title,
+        body: proposal.body
+      }, now);
+      next = withKnowledgeProvenance(next, knowledgeId, {
+        ...provenanceFromProposal(proposal),
+        proposalId: proposal.id,
+        promotedBy: decidedBy,
+        promotedAt: now.toISOString()
+      }, now);
+    } else {
+      const plan = planKnowledgeAcceptance(next, proposal);
+      if (plan.kind === "duplicate") {
+        knowledgeId = plan.knowledgeId;
+        duplicate = true;
+      } else {
+        if (plan.kind === "create" && plan.supersedesKnowledgeId !== undefined) {
+          next = retireProjectKnowledge(next, plan.supersedesKnowledgeId, now);
+        }
+        knowledgeId = nextKnowledgeId(next);
+        next = addProjectKnowledge(
+          next,
+          knowledgeId,
+          proposal.title,
+          proposal.body,
+          now,
+          {
+            ...provenanceFromProposal(proposal),
+            proposalId: proposal.id,
+            promotedBy: decidedBy,
+            promotedAt: now.toISOString()
+          }
+        );
+      }
+    }
+    next = decideKnowledgeProposal(next, proposal.id, {
+      by: decidedBy,
+      knowledgeId
+    }, now);
+    tx.saveProject(next);
+    return { projectId: next.id, proposalId: proposal.id, knowledgeId, duplicate };
+  });
+  return {
+    output: `${accepted.duplicate
+      ? `Knowledge proposal ${accepted.proposalId} was already promoted as ${accepted.knowledgeId}`
+      : `Accepted knowledge proposal ${accepted.proposalId} as ${accepted.knowledgeId}`} in ${accepted.projectId}\n`,
+    projectId: accepted.projectId,
+    proposalId: accepted.proposalId,
+    knowledgeId: accepted.knowledgeId
+  };
+}
+
+function rejectKnowledgeProposal(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): ProjectKnowledgeCommandResult {
+  const usage = "Project knowledge reject usage: yui project knowledge reject <project> <proposal>"
+    + " --reason <text>.";
+  const parsed = parseSingleOption(args, "--reason", usage);
+  if (parsed.positionals.length !== 2) throw usageError(usage);
+  assertKnowledgeOperator(options, "reject");
+  const actor = projectActor(options.environment);
+  const decidedBy = actor === "operator" ? "operator" as const : "user" as const;
+  const rejected = store.transaction((tx) => {
+    const project = requireProject(tx, parsed.positionals[0]!);
+    const proposal = findKnowledgeProposal(project, parsed.positionals[1]!);
+    if (proposal === null) {
+      throw usageError(`Knowledge proposal not found: ${parsed.positionals[1]!}.`);
+    }
+    if (proposal.status !== "pending") {
+      throw usageError(`Knowledge proposal is already ${proposal.status}: ${proposal.id}.`);
+    }
+    const next = decideKnowledgeProposal(project, proposal.id, {
+      by: decidedBy,
+      reason: parsed.value
+    }, (options.now ?? (() => new Date()))());
+    tx.saveProject(next);
+    return { projectId: next.id, proposalId: proposal.id };
+  });
+  return {
+    output: `Rejected knowledge proposal ${rejected.proposalId} in ${rejected.projectId}\n`,
+    projectId: rejected.projectId,
+    proposalId: rejected.proposalId
+  };
+}
+
+function provenanceFromProposal(proposal: KnowledgeProposal): ProjectKnowledgeProvenance {
+  return {
+    taskId: proposal.source.taskId,
+    ...(proposal.source.decisionId === undefined ? {} : { decisionId: proposal.source.decisionId }),
+    ...(proposal.source.milestoneId === undefined ? {} : { milestoneId: proposal.source.milestoneId }),
+    ...(proposal.source.commitSha === undefined ? {} : { commitSha: proposal.source.commitSha }),
+    ...(proposal.evidenceDigest === undefined ? {} : { evidenceDigest: proposal.evidenceDigest }),
+    fingerprint: proposal.fingerprint
+  };
+}
+
+/** Replace a Knowledge entry's provenance (used by accept --update). */
+function withKnowledgeProvenance(
+  project: Project,
+  knowledgeId: string,
+  provenance: ProjectKnowledgeProvenance,
+  now: Date
+): Project {
+  const timestamp = now.toISOString();
+  const knowledge = project.knowledge.map((entry) => (
+    entry.id === knowledgeId
+      ? { ...entry, provenance, updatedAt: timestamp }
+      : entry
+  ));
+  return validateProject({ ...project, knowledge, updatedAt: timestamp });
+}
+
+function parseAcceptArguments(
+  args: readonly string[],
+  usage: string
+): Readonly<{ project: string; proposal: string; update?: string }> {
+  const positionals: string[] = [];
+  let update: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (value === "--update") {
+      if (update !== undefined) throw usageError(`--update may only be provided once. ${usage}`);
+      const next = args[index + 1];
+      if (next === undefined || next.startsWith("--")) throw usageError(`--update is required. ${usage}`);
+      update = requireText(next, "--update");
+      index += 1;
+    } else if (value.startsWith("--")) {
+      throw usageError(`Unknown option: ${value}. ${usage}`);
+    } else {
+      positionals.push(value);
+    }
+  }
+  if (positionals.length !== 2) throw usageError(usage);
+  return { project: positionals[0]!, proposal: positionals[1]!, ...(update === undefined ? {} : { update }) };
+}
+
+type ProjectKnowledgeCommandResult = Readonly<{
+  output: string;
+  projectId: string;
+  proposalId?: string;
+  knowledgeId?: string;
+  proposals?: readonly KnowledgeProposal[];
+}>;
 
 function parseAddArguments(
   args: readonly string[],

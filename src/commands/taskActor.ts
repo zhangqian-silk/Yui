@@ -54,6 +54,33 @@ export function taskActor(
 }
 
 /**
+ * Resolve the caller identity for Project-scoped authority. Project Knowledge
+ * is an Operator-level authority: a managed Task Session (Leader/Reviewer/
+ * Worker) may propose candidates but must not write the authoritative
+ * Knowledge list directly. A managed global Session must be the Operator; a
+ * plain terminal is the human Operator.
+ */
+export type ProjectActor = "user" | "operator" | "agent";
+
+export function projectActor(environment: NodeJS.ProcessEnv | undefined): ProjectActor {
+  const env = environment ?? {};
+  if (env.YUI_SESSION_SCOPE === "task") return "agent";
+  if (env.YUI_SESSION_SCOPE === "global") {
+    if (env.YUI_ROLE === "operator") return "operator";
+    throw usageError("A managed global Session may manage Project Knowledge only as Operator.");
+  }
+  if (
+    env.YUI_ROLE !== undefined
+    || env.YUI_AGENT_ID !== undefined
+    || env.YUI_RUN_ID !== undefined
+    || env.YUI_NATIVE_SESSION_ID !== undefined
+  ) {
+    throw usageError("Managed Agent identity is incomplete; refusing to infer user authority.");
+  }
+  return "user";
+}
+
+/**
  * rr8: Resolve the caller identity for a `job.start`/`job.cancel` request from
  * the managed Session environment. The Controller binds the declared job owner
  * to this identity — a Reviewer is rejected outright, a Worker can only touch

@@ -237,8 +237,11 @@ Maintain durable context throughout a long-running Task:
   work. Supersede it explicitly when the choice changes.
 - Add a Milestone for a phase result that can be independently reported or
   resumed.
-- Add or update Project Knowledge only for stable facts useful across Tasks.
-  Do not use it as a Task log, transcript, or scratchpad.
+- Propose Project Knowledge promotion for stable conclusions useful across
+  Tasks. Project Knowledge is an Operator authority: a Leader proposes a
+  candidate (with its source Task/Decision/Milestone evidence) and an Operator
+  reviews and accepts it; the Leader cannot write the authoritative Knowledge
+  list directly. Do not use Knowledge as a Task log, transcript, or scratchpad.
 - Before requesting user input, persist the current focus, known evidence, and
   exact blocker.
 
@@ -253,10 +256,16 @@ yui task decision record <task-id> \
   --title "<material choice>" --rationale "<reason and consequences>"
 yui task milestone add <task-id> \
   --title "<phase>" --summary "<delivered result and evidence>"
-yui project knowledge add <project> "<stable fact>" --body "<reusable knowledge>"
+yui project knowledge propose <project> \
+  --title "<stable conclusion>" --body "<self-contained project-level knowledge>" \
+  --task <task-id> [--decision <id>] [--milestone <id>]
 ```
 
-Update an existing Knowledge record instead of creating duplicates.
+Resubmitting the same candidate is deduplicated to the existing proposal. A
+proposal that conflicts with an existing Knowledge entry is never silently
+overwritten: the Operator chooses an explicit update, supersede, or reject.
+Pending proposals appear in `yui task next-action <task-id>` as a non-blocking
+advisory; they do not block Task completion.
 
 ## Choose the execution path
 

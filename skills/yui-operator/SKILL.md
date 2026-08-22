@@ -139,15 +139,25 @@ yui project discover [name]
 yui project show <project>
 yui project knowledge list <project>
 yui project knowledge show <project> <knowledge-id>
+yui project knowledge proposals list <project>
+yui project knowledge proposals show <project> <proposal-id>
+yui project knowledge accept <project> <proposal-id>
+yui project knowledge reject <project> <proposal-id> --reason "<text>"
 yui task create "<title>" \
   --project <project-a> --project <project-b> \
   --base <project-a>=<ref> --base <project-b>=<ref>
 yui task activate <task-id>
 ```
 
-Keep catalog metadata current with `project update`. Update current Knowledge
-and retire obsolete Knowledge without deleting its history. If discovery finds
-an existing stable checkout, bind it with `project add`. If only a remote is
+Keep catalog metadata current with `project update`. Project Knowledge is an
+Operator authority: a Leader proposes promotion candidates (with source
+Task/Decision/Milestone evidence) and the Operator reviews and accepts or
+rejects them. Acceptance writes the Knowledge entry with its provenance; a
+candidate that duplicates an existing entry is deduplicated, and one that
+conflicts with an existing title fails closed so the Operator must choose an
+explicit `--update`, supersede, or reject. Update current Knowledge and retire
+obsolete Knowledge without deleting its history. If discovery finds an
+existing stable checkout, bind it with `project add`. If only a remote is
 known, explain the clone destination and impact, obtain confirmation, then run
 `project clone`; do not send the user mechanical clone steps.
 
