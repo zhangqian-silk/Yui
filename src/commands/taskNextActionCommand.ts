@@ -47,13 +47,28 @@ export function runTaskNextActionCommand(
     if (facts === null) throw taskNotFound(taskId);
     const action = projectNextAction(facts);
     const repairWave = repairWaveFor(action, facts);
+    // Issue 12: surface pending Knowledge promotion proposals for the Task's
+    // bound Projects as a non-blocking advisory. The proposals are workflow
+    // state, not completion blockers: an Operator reviews them separately.
+    const knowledgeProposals = facts.task.projectBindings.flatMap((binding) => {
+      const project = reader.getProject(binding.projectId);
+      if (project === null) return [];
+      return project.knowledgeProposals
+        .filter((proposal) => proposal.status === "pending")
+        .map((proposal) => ({
+          projectId: binding.projectId,
+          proposalId: proposal.id,
+          title: proposal.title,
+          sourceTaskId: proposal.source.taskId
+        }));
+    });
     let completionReadiness: CompletionReadiness | null = null;
     if (action.kind === "complete-task") {
       const readinessFacts = reader.readCompletionReadinessFacts(taskId);
       if (readinessFacts === null) throw taskNotFound(taskId);
       completionReadiness = projectCompletionReadiness(readinessFacts);
     }
-    return { action, repairWave, completionReadiness };
+    return { action, repairWave, completionReadiness, knowledgeProposals };
   });
   if (asJson) {
     return {
@@ -64,7 +79,12 @@ export function runTaskNextActionCommand(
   }
   return {
     kind: "output" as const,
-    output: renderNextAction(data.action, data.repairWave, data.completionReadiness),
+    output: renderNextAction(
+      data.action,
+      data.repairWave,
+      data.completionReadiness,
+      data.knowledgeProposals
+    ),
     data
   };
 }
@@ -86,7 +106,13 @@ function repairWaveFor(
 function renderNextAction(
   action: NextAction,
   repairWave: RepairWave | null,
-  completionReadiness: CompletionReadiness | null
+  completionReadiness: CompletionReadiness | null,
+  knowledgeProposals: readonly {
+    projectId: string;
+    proposalId: string;
+    title: string;
+    sourceTaskId: string;
+  }[]
 ): string {
   const lines = [
     `Task: ${action.taskId}`,
@@ -145,6 +171,14 @@ function renderNextAction(
         `  ${group.id}: findings ${group.findingIds.join(", ")}`
         + ` — paths ${group.paths.length === 0 ? "none" : group.paths.join(", ")}`
         + ` — ${group.reason}`)
+    );
+  }
+  if (knowledgeProposals.length > 0) {
+    lines.push(
+      `Knowledge proposals (non-blocking): ${knowledgeProposals.length} pending`,
+      ...knowledgeProposals.map((proposal) =>
+        `  ${proposal.projectId}/${proposal.proposalId}: ${proposal.title}`
+        + ` — review: yui project knowledge proposals list ${proposal.projectId}`)
     );
   }
   return `${lines.join("\n")}\n`;

@@ -1196,23 +1196,29 @@ export const ROOT_COMMAND = buildNode({
         {
           name: "knowledge",
           summary: "Manage durable Project knowledge stored by Yui.",
-          sections: [{ id: "manage", title: "Commands", entries: ["add", "update", "retire", "list", "show"] }],
+          sections: [
+            {
+              id: "manage",
+              title: "Commands",
+              entries: ["add", "update", "retire", "list", "show", "propose", "proposals", "accept", "reject"]
+            }
+          ],
           children: [
             {
               name: "add",
-              summary: "Add Project knowledge.",
+              summary: "Add Project knowledge (Operator authority).",
               usage: "yui project knowledge add <project> <title> --body <text>",
               options: ["--body"]
             },
             {
               name: "update",
-              summary: "Update active Project knowledge.",
+              summary: "Update active Project knowledge (Operator authority).",
               usage: "yui project knowledge update <project> <knowledge> [--title <text>] [--body <text>]",
               options: ["--title", "--body"]
             },
             {
               name: "retire",
-              summary: "Retire Project knowledge without deleting its record.",
+              summary: "Retire Project knowledge without deleting its record (Operator authority).",
               usage: "yui project knowledge retire <project> <knowledge>"
             },
             {
@@ -1225,6 +1231,44 @@ export const ROOT_COMMAND = buildNode({
               name: "show",
               summary: "Read one Project knowledge entry.",
               usage: "yui project knowledge show <project> <knowledge>"
+            },
+            {
+              name: "propose",
+              summary: "Propose a Task conclusion for promotion into Project knowledge.",
+              usage: "yui project knowledge propose <project> --title <text> --body <text> --task <task>"
+                + " [--decision <id>] [--milestone <id>] [--commit <sha>] [--scope <text>]"
+                + " [--expires-when <text>] [--supersedes <knowledge-id>]",
+              options: ["--title", "--body", "--task", "--decision", "--milestone", "--commit", "--scope", "--expires-when", "--supersedes"]
+            },
+            {
+              name: "proposals",
+              summary: "List or show Knowledge promotion proposals.",
+              sections: [{ id: "manage", title: "Commands", entries: ["list", "show"] }],
+              children: [
+                {
+                  name: "list",
+                  summary: "List Knowledge promotion proposals (pending by default).",
+                  usage: "yui project knowledge proposals list <project> [--status pending|accepted|rejected] [--all]",
+                  options: ["--status", "--all"]
+                },
+                {
+                  name: "show",
+                  summary: "Show one Knowledge promotion proposal.",
+                  usage: "yui project knowledge proposals show <project> <proposal>"
+                }
+              ]
+            },
+            {
+              name: "accept",
+              summary: "Accept a Knowledge promotion proposal (Operator authority).",
+              usage: "yui project knowledge accept <project> <proposal> [--update <knowledge-id>]",
+              options: ["--update"]
+            },
+            {
+              name: "reject",
+              summary: "Reject a Knowledge promotion proposal (Operator authority).",
+              usage: "yui project knowledge reject <project> <proposal> --reason <text>",
+              options: ["--reason"]
             }
           ]
         }

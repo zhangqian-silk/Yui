@@ -806,7 +806,7 @@ export async function main(): Promise<void> {
     return;
   }
   if (resolved[0] === "project") {
-    const result = await runProjectCommand(resolved.slice(1), store);
+    const result = await runProjectCommand(resolved.slice(1), store, { environment: process.env });
     emit(result.output, false, result.data);
     return;
   }
