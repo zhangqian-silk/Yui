@@ -142,6 +142,7 @@ yui project knowledge show <project> <knowledge-id>
 yui project knowledge proposals list <project>
 yui project knowledge proposals show <project> <proposal-id>
 yui project knowledge accept <project> <proposal-id>
+yui project knowledge accept <project> <proposal-id> --update <knowledge-id>
 yui project knowledge reject <project> <proposal-id> --reason "<text>"
 yui task create "<title>" \
   --project <project-a> --project <project-b> \
@@ -155,8 +156,11 @@ Task/Decision/Milestone evidence) and the Operator reviews and accepts or
 rejects them. Acceptance writes the Knowledge entry with its provenance; a
 candidate that duplicates an existing entry is deduplicated, and one that
 conflicts with an existing title fails closed so the Operator must choose an
-explicit `--update`, supersede, or reject. Update current Knowledge and retire
-obsolete Knowledge without deleting its history. If discovery finds an
+explicit proposal-backed `accept --update`, supersede, or reject. Direct
+Knowledge mutation is not supported because it would erase version history;
+`--update` is allowed only when the current version is already traceable to an
+accepted proposal. Otherwise submit the replacement with `--supersedes` so the
+old Knowledge entry remains retired and readable. If discovery finds an
 existing stable checkout, bind it with `project add`. If only a remote is
 known, explain the clone destination and impact, obtain confirmation, then run
 `project clone`; do not send the user mechanical clone steps.

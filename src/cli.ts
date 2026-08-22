@@ -2211,13 +2211,16 @@ async function deltaRecheckPreflightForTaskCommand(
       "Delta-recheck requires a previous completed Task-final Review that accepted a head."
     );
   }
-  const projectId = actualTaskReviewCandidate.projects[0]!.projectId;
-  const project = store.getProject(projectId);
-  if (project === null) {
-    throw usageError(`Delta-recheck Project not found: ${projectId}.`);
+  const repositoryPaths: Record<string, string> = {};
+  for (const candidateProject of actualTaskReviewCandidate.projects) {
+    const project = store.getProject(candidateProject.projectId);
+    if (project === null) {
+      throw usageError(`Delta-recheck Project not found: ${candidateProject.projectId}.`);
+    }
+    repositoryPaths[candidateProject.projectId] = project.path;
   }
   const assessment = await assessDeltaRecheck({
-    repositoryPath: project.path,
+    repositoryPaths,
     previousRound: previous,
     candidate: actualTaskReviewCandidate,
     git: new NodeGitWorkspace(),

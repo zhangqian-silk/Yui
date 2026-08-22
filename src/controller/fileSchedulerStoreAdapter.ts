@@ -2940,6 +2940,24 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         now,
         [{ type: "run", taskId: input.taskId, id: input.runId }]
       );
+    } else {
+      const message = `Leader Run ${input.runId} is blocked by Provider policy: ${summary}`;
+      store.saveOperatorNotification(createLeaderRecoveryNotification(
+        input.taskId,
+        message,
+        now,
+        store.getOperatorNotification(input.taskId)
+      ));
+      enqueueWork(
+        store,
+        { kind: "operator" },
+        "leader-provider-policy-blocked",
+        now,
+        [
+          { type: "task", id: input.taskId },
+          { type: "run", taskId: input.taskId, id: input.runId }
+        ]
+      );
     }
     return { disposition: "applied", runId: input.runId };
   }
