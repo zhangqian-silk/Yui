@@ -348,8 +348,15 @@ export function reviewFindingLedgerWriteFailed(
   store: ReviewFindingStorePort,
   taskId: string
 ): boolean {
+  return reviewFindingLedgerWriteFailedFromEvents(store.listEvents(taskId));
+}
+
+/** Pure event-fold variant of {@link reviewFindingLedgerWriteFailed}. */
+export function reviewFindingLedgerWriteFailedFromEvents(
+  events: readonly TaskEvent[]
+): boolean {
   const latestByRound = new Map<string, TaskEvent>();
-  for (const event of store.listEvents(taskId)) {
+  for (const event of events) {
     if (event.type !== REVIEW_FINDINGS_RECONCILE_FAILED_EVENT
       && event.type !== "review.findings-reconciled") {
       continue;

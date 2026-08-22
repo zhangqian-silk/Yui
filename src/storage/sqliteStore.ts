@@ -69,6 +69,7 @@ import {
   validateReviewFinding,
   type ReviewFinding
 } from "../review/reviewFinding.js";
+import { reviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
 import type { Project } from "../repository/project.js";
 import {
   generateHomeIdentity,
@@ -94,6 +95,7 @@ import type { OperatorNotification } from "../scheduler/operatorNotification.js"
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { Task } from "../task/task.js";
 import type { NextActionFacts } from "../task/nextAction.js";
+import type { CompletionReadinessFacts } from "../task/completionReadiness.js";
 import { TASK_RECORD_ID_PREFIXES, type TaskRecordKind } from "../task/taskRecordReference.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import { managedWorkspaceKey, type ManagedWorkspace, type ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
@@ -962,7 +964,8 @@ export class SqliteTaskStore implements TaskStore {
       task: {
         id: task.id,
         status: task.status,
-        projectBindings: task.projectBindings
+        projectBindings: task.projectBindings,
+        requireIntegration: task.requireIntegration
       },
       workItems: this.#sortById(
         this.#listPayload<WorkItem>("work_items", "task_id = ?", [taskId]),
@@ -991,6 +994,39 @@ export class SqliteTaskStore implements TaskStore {
       ),
       activeRuns: runs.filter((run) => run.status === "active"),
       leaderRuns: runs.filter((run) => run.roleName === "leader")
+    };
+  }
+
+  readCompletionReadinessFacts(taskId: string): CompletionReadinessFacts | null {
+    const base = this.readNextActionFacts(taskId);
+    if (base === null) return null;
+    return {
+      ...base,
+      managedWorkspaces: this.#sortById(
+        this.#listPayload<ManagedWorkspace>("managed_workspaces", "task_id = ?", [taskId]),
+        (workspace) => managedWorkspaceKey(workspace.owner)
+      ),
+      durableJobs: this.#sortById(
+        this.#listPayload<DurableJob>("durable_jobs", "task_id = ?", [taskId]),
+        (job) => job.id
+      ),
+      integrationQueueEntries: this.#sortById(
+        this.#listPayload<IntegrationQueueEntry>(
+          "integration_queue",
+          "task_id = ?",
+          [taskId]
+        ),
+        (entry) => entry.id
+      ),
+      reviewFindings: this.#sortById(
+        this.#listPayload<ReviewFinding>("review_findings", "task_id = ?", [taskId]),
+        (finding) => finding.id
+      ),
+      reviewFindingLedgerMode: reviewFindingLedgerMode(this.getConfig()),
+      events: this.#sortById(
+        this.#listPayload<TaskEvent>("events", "task_id = ?", [taskId]),
+        (event) => event.id
+      )
     };
   }
 
