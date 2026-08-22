@@ -149,6 +149,7 @@ import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
   RUNTIME_LAUNCH_RESERVED_REASON,
   RUNTIME_LIFECYCLE_OWNER,
+  RuntimeLifecycleBusyError,
   hasRuntimeCleanupObligation,
   hasRuntimeLifecycleWork,
   isRuntimeLaunchReservation,
@@ -1199,6 +1200,30 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     ));
   }
 
+  /**
+   * Records that a Leader wake was suppressed by scheduler single-flight
+   * (the Role runtime lifecycle lane was busy). The wake stays durable and
+   * is retried after the lane settles; this event is the audit trail that
+   * separates scheduler backpressure from real Run failures.
+   */
+  recordWakeSuppression(
+    taskId: string,
+    reason: string,
+    now: Date
+  ): void {
+    this.store.transaction((store) => {
+      const task = store.getTask(taskId);
+      if (task === null) return;
+      store.saveEvent(taskId, createTaskEvent(
+        store.nextEventId(taskId),
+        taskId,
+        "wake.suppressed",
+        { reason },
+        now
+      ));
+    });
+  }
+
   listActiveDurableJobs(): readonly DurableJob[] {
     return this.store.listActiveDurableJobs();
   }
@@ -2131,7 +2156,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         existing !== null
         && (existing.processing !== null || existing.pending !== null)
       ) {
-        throw new Error("Runtime lifecycle work is already pending.");
+        throw new RuntimeLifecycleBusyError(
+          "Runtime lifecycle work is already pending."
+        );
       }
       enqueueWork(
         store,

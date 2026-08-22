@@ -61,7 +61,7 @@ export type WakesAudit = Readonly<{
   orphanWakes: number;
   orphanYieldOnly: number;
   byReason: Readonly<Record<string, number>>;
-  /** Suppressed-wake counters belong to the scheduler Issue; absent → unsupported. */
+  /** Wakes suppressed by scheduler single-flight (lifecycle lane busy). */
   suppressedWakes: AuditSection<number>;
 }>;
 
@@ -359,6 +359,7 @@ export function runExecutionAudit(
       let withWakeReasons = 0;
       let orphanWakes = 0;
       let orphanYieldOnly = 0;
+      let suppressedWakes = 0;
       const byReason = new Map<string, number>();
       for (const taskId of taskIds) {
         for (const run of store.listAgentRuns(taskId)) {
@@ -378,6 +379,11 @@ export function runExecutionAudit(
             if (run.status === "yielded") orphanYieldOnly += 1;
           }
         }
+        for (const event of store.listEvents(taskId)) {
+          if (event.type !== "wake.suppressed") continue;
+          if (!inWindow(event.createdAt, options)) continue;
+          suppressedWakes += 1;
+        }
       }
       return ok({
         leaderRuns,
@@ -387,9 +393,10 @@ export function runExecutionAudit(
         byReason: Object.fromEntries(
           [...byReason.entries()].sort((left, right) => right[1] - left[1])
         ),
-        // The quiescence/suppression counter is owned by the scheduler Issue;
-        // this build has no producer, so report unsupported rather than 0.
-        suppressedWakes: { status: "unsupported" }
+        // Scheduler single-flight suppression: wakes that were coalesced
+        // because the Role runtime lifecycle lane was busy. These are
+        // scheduler outcomes, never failed Runs.
+        suppressedWakes: { status: "ok", data: suppressedWakes }
       });
     } catch (error) {
       return failed<WakesAudit>(error);
