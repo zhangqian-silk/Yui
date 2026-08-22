@@ -127,6 +127,18 @@ export interface GitWorkspacePort {
     fromCommit: string;
     toCommit: string;
   }>): Promise<string[]>;
+  /** Issue 07: exact unified diff text between two commits. */
+  diffTextBetween(input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>): Promise<string>;
+  /** Issue 07: per-file added/deleted line totals between two commits. */
+  diffNumstatBetween(input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>): Promise<{ addedLines: number; deletedLines: number }>;
   headRef(repositoryPath: string): Promise<string>;
   isClean(repositoryPath: string): Promise<boolean>;
   mergeWorktree(input: Readonly<{
@@ -310,6 +322,53 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       input.fromCommit, input.toCommit
     ]);
     return output.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  }
+
+  /** Issue 07: exact unified diff text between two commits. */
+  async diffTextBetween(input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>): Promise<string> {
+    return git([
+      "-C", input.repositoryPath,
+      "diff", "--no-color", "--no-ext-diff",
+      input.fromCommit, input.toCommit
+    ]);
+  }
+
+  /** Issue 07: sums `git diff --numstat` added/deleted lines. */
+  async diffNumstatBetween(input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>): Promise<{ addedLines: number; deletedLines: number }> {
+    const output = await git([
+      "-C", input.repositoryPath,
+      "diff", "--numstat",
+      input.fromCommit, input.toCommit
+    ]);
+    let addedLines = 0;
+    let deletedLines = 0;
+    for (const line of output.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      const [added, deleted] = trimmed.split("\t");
+      // Binary files report "-" for both counts; they change the tree and
+      // must not be treated as zero-line edits.
+      if (added === "-" || deleted === "-") {
+        throw new Error("Delta recheck cannot assess a binary diff.");
+      }
+      const addedCount = Number(added);
+      const deletedCount = Number(deleted);
+      if (!Number.isInteger(addedCount) || !Number.isInteger(deletedCount)
+        || addedCount < 0 || deletedCount < 0) {
+        throw new Error("Git returned invalid numstat output.");
+      }
+      addedLines += addedCount;
+      deletedLines += deletedCount;
+    }
+    return { addedLines, deletedLines };
   }
 
   /**

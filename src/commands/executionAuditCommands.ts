@@ -216,7 +216,15 @@ export function renderExecutionAudit(
     lines.push(
       "",
       `Review rounds: ${reviews.total} total · ${reviews.completed} completed · ${reviews.failed} failed`,
-      `Execution failures: ${reviews.infraFailed} · semantic negatives: ${reviews.semanticNegative}`
+      `Execution failures: ${reviews.infraFailed} · semantic negatives: ${reviews.semanticNegative}`,
+      ...(reviews.deltaRechecks.total === 0
+        ? []
+        : [
+            `Delta-rechecks: ${reviews.deltaRechecks.total} total · `
+              + `${reviews.deltaRechecks.equivalentAndAccepted} accepted · `
+              + `${reviews.deltaRechecks.finding} finding · `
+              + `${reviews.deltaRechecks.requiresFullReview} escalated to full Review`
+          ])
     );
   } else {
     lines.push("", ...sectionError("reviews", report));

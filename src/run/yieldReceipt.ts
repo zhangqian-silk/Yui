@@ -33,6 +33,8 @@ export type YieldOutcomeDigestInput = Readonly<{
     evidence?: readonly string[];
     evidenceCommit?: string;
     gitSnapshot?: unknown;
+    deltaDisposition?: string;
+    deltaReasoning?: string;
   }>;
 }>;
 

@@ -101,6 +101,13 @@ export type ReviewsAudit = Readonly<{
   infraFailed: number;
   semanticNegative: number;
   faultClasses: FaultClassCounts;
+  /** Issue 07: delta-recheck rounds and their terminal dispositions. */
+  deltaRechecks: Readonly<{
+    total: number;
+    equivalentAndAccepted: number;
+    finding: number;
+    requiresFullReview: number;
+  }>;
 }>;
 
 export type IntegrationsAudit = Readonly<{
@@ -556,6 +563,10 @@ export function runExecutionAudit(
       let failedCount = 0;
       let infraFailed = 0;
       let semanticNegative = 0;
+      let deltaTotal = 0;
+      let deltaAccepted = 0;
+      let deltaFinding = 0;
+      let deltaEscalated = 0;
       const classes = [];
       for (const taskId of taskIds) {
         for (const round of store.listReviewRounds(taskId)) {
@@ -563,6 +574,12 @@ export function runExecutionAudit(
           total += 1;
           if (round.status === "completed") completed += 1;
           else if (round.status === "failed") failedCount += 1;
+          if (round.deltaRecheck !== undefined) {
+            deltaTotal += 1;
+            if (round.deltaRecheck.disposition === "equivalent-and-accepted") deltaAccepted += 1;
+            else if (round.deltaRecheck.disposition === "finding") deltaFinding += 1;
+            else if (round.deltaRecheck.disposition === "requires-full-review") deltaEscalated += 1;
+          }
           const classification = classifyReviewRound(round);
           if (classification.faultClass === "review-infra") infraFailed += 1;
           else if (classification.faultClass === "review-semantic-negative") {
@@ -577,7 +594,13 @@ export function runExecutionAudit(
         failed: failedCount,
         infraFailed,
         semanticNegative,
-        faultClasses: countFaultClasses(classes)
+        faultClasses: countFaultClasses(classes),
+        deltaRechecks: {
+          total: deltaTotal,
+          equivalentAndAccepted: deltaAccepted,
+          finding: deltaFinding,
+          requiresFullReview: deltaEscalated
+        }
       });
     } catch (error) {
       return failed<ReviewsAudit>(error);

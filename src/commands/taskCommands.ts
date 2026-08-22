@@ -76,7 +76,9 @@ import { providerRetryConfig, type ProviderRetryConfig } from "../run/providerRe
 import {
   createReviewRound,
   createTaskReviewRound,
+  createTaskDeltaReviewRound,
   attachReviewExecutionGroup,
+  deltaRecheckBlocksAcceptance,
   finishReviewRound,
   parseReviewYieldReport,
   recordReviewWorkspaceDisposition,
@@ -88,6 +90,11 @@ import {
   type TaskReviewCandidate,
   type ReviewRequestSource
 } from "../review/reviewRound.js";
+import {
+  buildDeltaRecheckDispatchContext,
+  verifyDeltaRecheckDiff,
+  type DeltaRecheckPreflight
+} from "../review/deltaRecheck.js";
 import {
   buildTaskFinalReviewFindingContext,
   dispositionReviewFinding,
@@ -393,6 +400,10 @@ export type TaskCommandOptions = Readonly<{
   taskFinalReviewContract?: TaskFinalReviewContract;
   /** Physical Task-main heads verified by the CLI immediately before mutation. */
   actualTaskReviewCandidate?: TaskReviewCandidate;
+  /** Issue 07: CLI-verified delta-recheck assessment for `task review request --delta-recheck`. */
+  deltaRecheckPreflight?: DeltaRecheckPreflight;
+  /** Issue 07: per-Project diff text for a delta-recheck dispatch, digest-verified. */
+  deltaRecheckDiff?: Readonly<Record<string, string>>;
 }>;
 
 export type TaskCompletionPreflight = Readonly<{
@@ -3764,17 +3775,20 @@ function requestTaskReviewRound(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task review request usage: yui task review request <task> --role <global-role> [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...].";
+  const usage = "Task review request usage: yui task review request <task> --role <global-role> "
+    + "[--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--delta-recheck].";
   const parsed = parseMultiValueTail(
     args,
     new Set(["--role", "--strategy"]),
     new Set(["--lane-role"]),
-    usage
+    usage,
+    new Set(["--delta-recheck"])
   );
   exactPositionals(parsed.positionals, 1, usage);
   const reviewerRoleName = requiredOption(parsed.options, "--role");
   const requestedStrategy = parseExecutionStrategy(parsed.options.get("--strategy"), usage);
   const requestedLaneRoles = parsed.multiOptions.get("--lane-role") ?? [];
+  const deltaRecheckRequested = parsed.options.has("--delta-recheck");
   const now = clock(options);
   const round = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
@@ -3786,6 +3800,19 @@ function requestTaskReviewRound(
       throw usageError(`Task ${task.id} has no bound Projects for a Task-final Review.`);
     }
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
+    if (deltaRecheckRequested) {
+      const reviewConfig = tx.getReviewConfig();
+      if (reviewConfig === null || reviewConfig.deltaRecheck !== "enabled") {
+        throw usageError(
+          "Delta-recheck is not enabled for this Project's review policy. "
+          + "Set `yui config set review --role <role> --trigger final --delta-recheck enabled` "
+          + "or request a full Review."
+        );
+      }
+      if (taskFinalContract !== undefined) {
+        throw usageError("Delta-recheck is not supported with a Task-final review contract.");
+      }
+    }
     if (tx.getGlobalRole(reviewerRoleName) === null) {
       throw usageError(`Global Role not found: ${reviewerRoleName}.`);
     }
@@ -3806,7 +3833,8 @@ function requestTaskReviewRound(
       ))
       && isSameTaskReviewCandidate(entry.taskCandidate, provenance.candidate)
     )).at(-1);
-    if (exact !== undefined) {
+    if (exact !== undefined
+      && (deltaRecheckRequested || !deltaRecheckBlocksAcceptance(exact))) {
       if (exact.status === "failed") {
         throw usageError(
           `Explicit Task-final ReviewRound ${exact.id} is failed for this exact candidate; resolve it before requesting again.`
@@ -3910,17 +3938,43 @@ function requestTaskReviewRound(
       }
       assertTaskReviewRequestLane(tx, task.id, laneRole.name);
     }
-    let created = createTaskReviewRound(
-      tx.nextReviewRoundId(task.id),
-      task.id,
-      anchor.item.id,
-      anchor.candidate.id,
-      reviewerRoleName,
-      "leader",
-      provenance.candidate,
-      now,
-      taskFinalContract
-    );
+    let deltaRecord: DeltaRecheckPreflight["record"] | undefined;
+    if (deltaRecheckRequested) {
+      if (requestedLaneRoles.length > 0 || requestedStrategy !== undefined) {
+        throw usageError("Delta-recheck supports only the default single Reviewer Lane.");
+      }
+      deltaRecord = validateDeltaRecheckRequest(
+        tx,
+        task.id,
+        reviewerRoleName,
+        provenance.candidate,
+        options.deltaRecheckPreflight
+      );
+    }
+    let created = deltaRecord === undefined
+      ? createTaskReviewRound(
+          tx.nextReviewRoundId(task.id),
+          task.id,
+          anchor.item.id,
+          anchor.candidate.id,
+          reviewerRoleName,
+          "leader",
+          provenance.candidate,
+          now,
+          taskFinalContract
+        )
+      : createTaskDeltaReviewRound(
+          tx.nextReviewRoundId(task.id),
+          task.id,
+          anchor.item.id,
+          anchor.candidate.id,
+          reviewerRoleName,
+          "leader",
+          provenance.candidate,
+          deltaRecord,
+          now,
+          taskFinalContract
+        );
     let group = createExecutionGroup(
       `execution-group-${created.id}`,
       task.id,
@@ -3937,22 +3991,101 @@ function requestTaskReviewRound(
       executionGroup: group
     };
     tx.saveReviewRound(task.id, created);
+    // Issue 07: when a full Review is created after a non-accepting delta
+    // disposition, record the escalation lineage on the delta Round.
+    if (exact !== undefined
+      && deltaRecheckBlocksAcceptance(exact)
+      && created.deltaRecheck === undefined
+      && exact.deltaRecheck !== undefined
+      && exact.deltaRecheck.escalatedToReviewRoundId === undefined) {
+      tx.saveReviewRound(task.id, {
+        ...exact,
+        deltaRecheck: {
+          ...exact.deltaRecheck,
+          escalatedToReviewRoundId: created.id
+        }
+      });
+    }
     recordTaskEvent(tx, task.id, "review.task-final-requested", {
       reviewRoundId: created.id,
       workItemId: created.workItemId,
       candidateId: created.candidateId,
       reviewerRoleName: created.reviewerRoleName,
       requestedBy: created.requestedBy,
-      taskCandidate: JSON.stringify(created.taskCandidate)
+      taskCandidate: JSON.stringify(created.taskCandidate),
+      ...(created.deltaRecheck === undefined
+        ? {}
+        : {
+            deltaRecheck: "true",
+            previousReviewRoundId: created.deltaRecheck.previousReviewRoundId,
+            diffDigest: created.deltaRecheck.diffDigest
+          })
     }, now);
     return created;
   });
   return output(
     round.status === "pending"
-      ? `Task-final Review requested as ${round.id}\n`
+      ? round.deltaRecheck === undefined
+        ? `Task-final Review requested as ${round.id}\n`
+        : `Task-final delta-recheck requested as ${round.id} (rechecks ${round.deltaRecheck.previousReviewRoundId})\n`
       : `Task-final Review is already ${round.status}: ${round.id}\n`,
     { reviewRound: round }
   );
+}
+
+/**
+ * Issue 07: re-validates the CLI-computed delta preflight inside the store
+ * transaction.  The previous Round must be a completed acceptance (a full
+ * Review or an equivalent-and-accepted delta) so a delta never extends a
+ * non-accepting disposition.
+ */
+function validateDeltaRecheckRequest(
+  store: TaskWorkflowStore,
+  taskId: string,
+  reviewerRoleName: string,
+  candidate: TaskReviewCandidate,
+  preflight: DeltaRecheckPreflight | undefined
+): DeltaRecheckPreflight["record"] {
+  if (preflight === undefined) {
+    throw usageError(
+      "Delta-recheck assessment is missing; the CLI preflight did not run. "
+      + "Request a full Review or retry with a current CLI."
+    );
+  }
+  const previous = store.getReviewRound(taskId, preflight.record.previousReviewRoundId);
+  if (previous === null
+    || (previous.scope ?? "work-item") !== "task"
+    || previous.status !== "completed") {
+    throw usageError(
+      `Delta-recheck previous ReviewRound is not a completed Task-final Review: `
+      + `${preflight.record.previousReviewRoundId}.`
+    );
+  }
+  if (previous.reviewerRoleName !== reviewerRoleName) {
+    throw usageError(
+      `Delta-recheck Reviewer Role must match the previous acceptance: `
+      + `${previous.reviewerRoleName}.`
+    );
+  }
+  if (previous.reviewBaseCommit !== preflight.record.previousBaseCommit) {
+    throw usageError(
+      "Delta-recheck previous base commit does not match the recorded acceptance."
+    );
+  }
+  // A delta may only extend an acceptance, never a finding or an escalation.
+  if (previous.deltaRecheck !== undefined
+    && previous.deltaRecheck.disposition !== "equivalent-and-accepted") {
+    throw usageError(
+      `Delta-recheck cannot extend ${previous.id}: its disposition is `
+      + `${previous.deltaRecheck.disposition}. Resolve it with a full Review first.`
+    );
+  }
+  if (candidate.projects[0]!.commit === preflight.record.previousBaseCommit) {
+    throw usageError(
+      "Delta-recheck candidate head is unchanged; the previous acceptance already covers it."
+    );
+  }
+  return preflight.record;
 }
 
 function assertTaskReviewRequestLane(
@@ -4958,7 +5091,43 @@ function prepareFinalTaskReview(
     // review evidence. Do not create duplicate rounds on repeated completion
     // attempts. A failed round remains a blocker until the Leader changes the
     // candidate or otherwise resolves the failed evidence explicitly.
-    return latest.status === "completed" ? null : latest;
+    // Issue 07: a completed delta-recheck that did not accept the head is not
+    // final evidence.  A `requires-full-review` disposition escalates to a new
+    // full Review; a `finding` disposition stays a blocker for the Leader.
+    if (latest.status === "completed"
+      && latest.deltaRecheck !== undefined
+      && latest.deltaRecheck.disposition === "requires-full-review") {
+      // Fall through to queue a full Review for the same candidate.
+      const anchor = taskFinalContract === undefined
+        ? latestTaskReviewAnchor(store, task)
+        : latestTaskReviewContractAnchor(store, task, taskFinalContract);
+      const escalated = queueTaskReviewRound(
+        store,
+        task,
+        anchor.item,
+        anchor.candidate.id,
+        config,
+        taskCandidate,
+        options,
+        now,
+        establishedRound?.requestedBy ?? "policy",
+        taskFinalContract
+      );
+      // Record the escalation lineage on the delta Round so the full Review
+      // is traceable from the non-accepting delta disposition.
+      if (latest.deltaRecheck.escalatedToReviewRoundId === undefined) {
+        store.saveReviewRound(task.id, {
+          ...latest,
+          deltaRecheck: {
+            ...latest.deltaRecheck,
+            escalatedToReviewRoundId: escalated.id
+          }
+        });
+      }
+      return escalated;
+    } else {
+      return latest.status === "completed" ? null : latest;
+    }
   }
 
   const anchor = taskFinalContract === undefined
@@ -5455,7 +5624,13 @@ function buildYieldOutcome(
       ...(options.executionLaneGitSnapshot === undefined
         || options.executionLaneGitSnapshot === null
         ? {}
-        : { gitSnapshot: options.executionLaneGitSnapshot })
+        : { gitSnapshot: options.executionLaneGitSnapshot }),
+      ...(yieldedReport.deltaDisposition === undefined
+        ? {}
+        : { deltaDisposition: yieldedReport.deltaDisposition }),
+      ...(yieldedReport.deltaReasoning === undefined
+        ? {}
+        : { deltaReasoning: yieldedReport.deltaReasoning })
     }
   };
 }
@@ -5681,7 +5856,15 @@ function yieldRun(
           reviewBaseCommit: round.reviewBaseCommit,
           evidenceCommit: round.evidenceCommit ?? "none",
           checks: round.checks?.map(({ name, outcome }) => `${name}:${outcome}`)
-            .join(",") || "none"
+            .join(",") || "none",
+          ...(round.deltaRecheck === undefined
+            ? {}
+            : {
+                reviewMode: "delta-recheck",
+                deltaDisposition: round.deltaRecheck.disposition ?? "requires-full-review",
+                previousReviewRoundId: round.deltaRecheck.previousReviewRoundId,
+                diffDigest: round.deltaRecheck.diffDigest
+              })
         }, now);
       }
     }
@@ -6196,6 +6379,35 @@ export function dispatchPreparedReviewRound(
     const findingContext = taskScope
       ? buildTaskFinalReviewFindingContext(tx, taskId, round.taskCandidate!).context
       : "";
+    let deltaContext = "";
+    if (taskScope && round.deltaRecheck !== undefined) {
+      const previousRound = tx.getReviewRound(taskId, round.deltaRecheck.previousReviewRoundId);
+      if (previousRound === null || previousRound.status !== "completed") {
+        throw new TaskFinalReviewDispatchDriftError(
+          `Delta-recheck previous ReviewRound is unavailable: ${round.deltaRecheck.previousReviewRoundId}.`
+        );
+      }
+      const diffByProject = options.deltaRecheckDiff;
+      if (diffByProject === undefined) {
+        throw new TaskFinalReviewDispatchDriftError(
+          `Delta-recheck diff is missing for ${round.id}; the CLI preflight did not run.`
+        );
+      }
+      try {
+        verifyDeltaRecheckDiff(round.deltaRecheck, diffByProject);
+      } catch (error) {
+        throw new TaskFinalReviewDispatchDriftError(
+          `Delta-recheck diff verification failed for ${round.id}: `
+          + `${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      deltaContext = buildDeltaRecheckDispatchContext({
+        round,
+        previousRound,
+        diffByProject,
+        ledgerContext: findingContext
+      });
+    }
     const scopeLabel = taskScope ? "Task-final" : "WorkItem";
     const projectPolicyPointers = task.projectBindings
       .map(({ projectId }) => (
@@ -6214,10 +6426,10 @@ export function dispatchPreparedReviewRound(
       `Review workspace source: exact workspace attached to this Reviewer Lane`,
       `Candidate summary: ${candidate.summary}`,
       `Acceptance criteria: ${item.acceptance.length === 0 ? "none" : item.acceptance.join("; ")}`,
-      ...(taskScope ? [findingContext] : []),
+      ...(taskScope ? [deltaContext !== "" ? deltaContext : findingContext] : []),
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
       "Keep Yui Core lifecycle safety, generic Reviewer behavior, Project Policy/Knowledge, and the Task Contract separate. Follow Project Policy pointers from the dispatch context for project-specific checks.",
-      ...(round.scope === "task"
+      ...(round.scope === "task" && round.deltaRecheck === undefined
         ? ["This is the one final Task Review: inspect every bound Project at the frozen integrated heads, and report only reachable, material, actionable P1/P2 findings or bounded verification gaps."]
         : []),
       "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this ReviewRound-owned workspace.",

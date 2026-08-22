@@ -30,8 +30,12 @@ import { resolveTimeZone } from "../output/timePresentation.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 import {
+  DEFAULT_DELTA_RECHECK_MAX_CHANGED_FILES,
+  DEFAULT_DELTA_RECHECK_MAX_CHANGED_LINES,
   REVIEW_FINDING_LEDGER_MODES,
+  REVIEW_DELTA_RECHECK_MODES,
   REVIEW_TRIGGERS,
+  type ReviewDeltaRecheckMode,
   type ReviewFindingLedgerMode,
   type ReviewTrigger
 } from "../review/reviewConfig.js";
@@ -92,7 +96,9 @@ const RESOURCES_GC_MODE_SET_USAGE = "Config set usage: yui config set resources-
 const RESOURCES_GC_AUTO_QUARANTINE_SET_USAGE = "Config set usage: yui config set resources-gc-auto-quarantine <true|false>.";
 const LEADER_NEXT_ACTION_SET_USAGE = `Config set usage: yui config set leader-next-action <${LEADER_NEXT_ACTION_MODES.join("|")}>.`;
 const CONTEXT_BUDGET_SET_USAGE = "Config set usage: yui config set context-budget [--soft-tokens <n>] [--hard-tokens <n>].";
-const REVIEW_SET_USAGE = "Config set usage: yui config set review --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>].";
+const REVIEW_SET_USAGE = "Config set usage: yui config set review --role <global-role> --trigger <always|leader|final> "
+  + "[--finding-ledger <shadow|enforce>] [--delta-recheck <enabled|disabled>] "
+  + "[--delta-recheck-max-lines <n>] [--delta-recheck-max-files <n>].";
 
 type ConfigKeyHandler = Readonly<{
   key: ConfigKey;
@@ -150,7 +156,12 @@ function effectiveConfigData(config: YuiConfig): Record<string, unknown> {
       : {
           roleName: config.review.roleName,
           trigger: config.review.trigger,
-          findingLedger: config.review.findingLedger ?? "shadow"
+          findingLedger: config.review.findingLedger ?? "shadow",
+          deltaRecheck: config.review.deltaRecheck ?? "disabled",
+          deltaRecheckMaxChangedLines: config.review.deltaRecheckMaxChangedLines
+            ?? DEFAULT_DELTA_RECHECK_MAX_CHANGED_LINES,
+          deltaRecheckMaxChangedFiles: config.review.deltaRecheckMaxChangedFiles
+            ?? DEFAULT_DELTA_RECHECK_MAX_CHANGED_FILES
         }
   };
 }
@@ -210,6 +221,14 @@ function parseReconciliationIntervalSeconds(value: string): number {
 
 function parseBooleanConfigValue(value: string): boolean | string {
   return value === "true" ? true : value === "false" ? false : value;
+}
+
+function parsePositiveIntegerOption(value: string | undefined, usage: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^\d+$/.test(value) || Number(value) < 1) {
+    throw usageError(usage);
+  }
+  return Number(value);
 }
 
 const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
@@ -562,14 +581,16 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
     showLabel: "Review",
     showValue: (config) => (config.review === undefined
       ? "disabled"
-      : `${config.review.roleName} (${config.review.trigger}; finding ledger: ${config.review.findingLedger ?? "shadow"})`),
+      : `${config.review.roleName} (${config.review.trigger}; finding ledger: ${config.review.findingLedger ?? "shadow"}`
+        + `${config.review.deltaRecheck === "enabled" ? "; delta recheck: enabled" : ""})`),
     set(args, store) {
-      if (args.length !== 4 && args.length !== 6) throw usageError(REVIEW_SET_USAGE);
+      if (args.length < 4 || args.length % 2 !== 0) throw usageError(REVIEW_SET_USAGE);
       const options = new Map<string, string>();
       for (let index = 0; index < args.length; index += 2) {
         const name = args[index];
         const value = args[index + 1];
-        if (!["--role", "--trigger", "--finding-ledger"].includes(name)
+        if (!["--role", "--trigger", "--finding-ledger", "--delta-recheck",
+          "--delta-recheck-max-lines", "--delta-recheck-max-files"].includes(name)
           || value === undefined
           || options.has(name)) {
           throw usageError(REVIEW_SET_USAGE);
@@ -595,15 +616,39 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         }
         findingLedger = rawLedgerMode as ReviewFindingLedgerMode;
       }
+      const rawDeltaRecheck = options.get("--delta-recheck")?.trim();
+      let deltaRecheck: ReviewDeltaRecheckMode | undefined;
+      if (rawDeltaRecheck !== undefined) {
+        if (!REVIEW_DELTA_RECHECK_MODES.includes(rawDeltaRecheck as ReviewDeltaRecheckMode)) {
+          throw usageError(REVIEW_SET_USAGE);
+        }
+        deltaRecheck = rawDeltaRecheck as ReviewDeltaRecheckMode;
+      }
+      const deltaRecheckMaxChangedLines = parsePositiveIntegerOption(
+        options.get("--delta-recheck-max-lines"),
+        REVIEW_SET_USAGE
+      );
+      const deltaRecheckMaxChangedFiles = parsePositiveIntegerOption(
+        options.get("--delta-recheck-max-files"),
+        REVIEW_SET_USAGE
+      );
       saveConfigKey(store, (config) => ({
         ...config,
         review: {
           roleName,
           trigger,
-          ...(findingLedger === undefined ? {} : { findingLedger })
+          ...(findingLedger === undefined ? {} : { findingLedger }),
+          ...(deltaRecheck === undefined ? {} : { deltaRecheck }),
+          ...(deltaRecheckMaxChangedLines === undefined
+            ? {}
+            : { deltaRecheckMaxChangedLines }),
+          ...(deltaRecheckMaxChangedFiles === undefined
+            ? {}
+            : { deltaRecheckMaxChangedFiles })
         }
       }));
-      return `Review set to ${roleName} (${trigger}; finding ledger: ${findingLedger ?? "shadow"})\n`;
+      return `Review set to ${roleName} (${trigger}; finding ledger: ${findingLedger ?? "shadow"}; `
+        + `delta recheck: ${deltaRecheck ?? "disabled"})\n`;
     },
     clear(store) {
       saveConfigKey(store, (config) => {

@@ -186,6 +186,9 @@ import {
   type TaskFinalReviewContract
 } from "./review/taskFinalReviewContract.js";
 import type { TaskReviewCandidate } from "./review/reviewRound.js";
+import { assessDeltaRecheck, type DeltaRecheckPreflight } from "./review/deltaRecheck.js";
+import { deltaRecheckEnabled } from "./review/reviewConfig.js";
+import { NodeGitWorkspace } from "./repository/gitWorkspace.js";
 import {
   currentWorkItemExecutionGroup,
   workItemExecutionGroupById
@@ -1301,6 +1304,11 @@ export async function main(): Promise<void> {
         process.env,
         taskFinalReviewContract
       );
+      const deltaRecheckPreflight = await deltaRecheckPreflightForTaskCommand(
+        resolved.slice(1),
+        store,
+        actualTaskReviewCandidate
+      );
       const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
         resolved,
         store,
@@ -1338,6 +1346,9 @@ export async function main(): Promise<void> {
           ...(actualTaskReviewCandidate === undefined
             ? {}
             : { actualTaskReviewCandidate }),
+          ...(deltaRecheckPreflight === undefined
+            ? {}
+            : { deltaRecheckPreflight }),
           ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
           ...(laneSnapshotPreflight === undefined ? {} : { executionLaneGitSnapshot: laneSnapshotPreflight }),
           ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
@@ -1412,7 +1423,11 @@ export async function main(): Promise<void> {
                 ...(freshTaskCandidate === undefined
                   ? {}
                   : { actualTaskReviewCandidate: freshTaskCandidate }),
-                ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces })
+                ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
+                ...(storedRound?.deltaRecheck === undefined
+                  || deltaRecheckPreflight === undefined
+                  ? {}
+                  : { deltaRecheckDiff: deltaRecheckPreflight.diffByProject })
               }
             );
             reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
@@ -2147,6 +2162,73 @@ async function snapshotActualTaskReviewCandidate(
       + `${error instanceof Error ? error.message : String(error)}`
     );
   }
+}
+
+/**
+ * Issue 07: computes the delta-recheck assessment for `task review request
+ * --delta-recheck`.  Runs only for that exact command; every other command
+ * returns undefined.  The assessment's deterministic gates (contiguous base,
+ * attempt thresholds, evidence-file overlap) fail closed here; the Reviewer
+ * still owns the semantic equivalence decision.
+ */
+async function deltaRecheckPreflightForTaskCommand(
+  args: readonly string[],
+  store: TaskStore,
+  actualTaskReviewCandidate: TaskReviewCandidate | undefined
+): Promise<DeltaRecheckPreflight | undefined> {
+  if (args[0] !== "task" || args[1] !== "review" || args[2] !== "request") {
+    return undefined;
+  }
+  if (!args.includes("--delta-recheck")) return undefined;
+  const taskId = args[3];
+  if (taskId === undefined) return undefined;
+  const task = store.getTask(taskId);
+  if (task === null || task.status !== "active") return undefined;
+  const config = store.getReviewConfig();
+  if (!deltaRecheckEnabled(config)) {
+    throw usageError(
+      "Delta-recheck is not enabled for this Project's review policy. "
+      + "Set `yui config set review --role <role> --trigger final --delta-recheck enabled` "
+      + "or request a full Review."
+    );
+  }
+  const reviewConfig = config!;
+  if (actualTaskReviewCandidate === undefined) return undefined;
+  // The previous Round is the latest completed Task-final Round that accepted
+  // a head (a full Review or an equivalent-and-accepted delta).  A
+  // non-accepted delta cannot be the base for a new delta.
+  const previous = [...store.listReviewRounds(task.id)]
+    .filter((round) => (
+      (round.scope ?? "work-item") === "task"
+      && round.status === "completed"
+      && (round.deltaRecheck === undefined
+        || round.deltaRecheck.disposition === "equivalent-and-accepted")
+    ))
+    .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))
+    .at(-1);
+  if (previous === undefined) {
+    throw usageError(
+      "Delta-recheck requires a previous completed Task-final Review that accepted a head."
+    );
+  }
+  const projectId = actualTaskReviewCandidate.projects[0]!.projectId;
+  const project = store.getProject(projectId);
+  if (project === null) {
+    throw usageError(`Delta-recheck Project not found: ${projectId}.`);
+  }
+  const assessment = await assessDeltaRecheck({
+    repositoryPath: project.path,
+    previousRound: previous,
+    candidate: actualTaskReviewCandidate,
+    git: new NodeGitWorkspace(),
+    config: reviewConfig
+  });
+  if (assessment.kind === "ineligible") {
+    throw usageError(
+      `Delta-recheck is not allowed: ${assessment.reason} Request a full Review instead.`
+    );
+  }
+  return assessment.preflight;
 }
 
 async function reviewWorkspaceResultForTaskCommand(

@@ -453,7 +453,21 @@ function renderWorkItemReviews(
       ? [
           `      Frozen integrated Task heads: ${latest.taskCandidate?.projects
             .map(({ projectId, commit }) => `${projectId}@${commit}`).join(", ") ?? "unavailable"}`,
-          `      Task-final contract: ${latest.taskFinalReviewContract?.digest ?? "global policy"}`
+          `      Task-final contract: ${latest.taskFinalReviewContract?.digest ?? "global policy"}`,
+          ...(latest.deltaRecheck === undefined
+            ? [`      Review mode: full`]
+            : [
+                `      Review mode: delta-recheck (rechecks ${latest.deltaRecheck.previousReviewRoundId}@${latest.deltaRecheck.previousBaseCommit.slice(0, 12)})`,
+                `      Delta: ${latest.deltaRecheck.changedFiles.length} file(s), +${latest.deltaRecheck.addedLines}/-${latest.deltaRecheck.deletedLines}, digest ${latest.deltaRecheck.diffDigest.slice(0, 12)}`,
+                ...(latest.deltaRecheck.disposition === undefined
+                  ? []
+                  : [
+                      `      Delta disposition: ${latest.deltaRecheck.disposition}`,
+                      ...(latest.deltaRecheck.escalatedToReviewRoundId === undefined
+                        ? []
+                        : [`      Escalated to: ${latest.deltaRecheck.escalatedToReviewRoundId}`])
+                    ])
+              ])
         ]
       : []),
     `      Review workspace: ${latest.workspace === undefined
