@@ -8,6 +8,7 @@ import {
 } from "../executor/effectiveLaunch.js";
 import {
   hasRuntimeLifecycleWork,
+  RuntimeLifecycleBusyError,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
@@ -80,6 +81,21 @@ export async function processLeaderWakeups(
     if (typeof store.hasInFlightTurn === "function"
       && store.hasInFlightTurn(task.id, role.name)) {
       results.push({ taskId: task.id, status: "skipped", reason: "busy" });
+      continue;
+    }
+
+    // Single-flight: a Role runtime lifecycle lane that already holds a
+    // launch reservation or cleanup obligation must not be entered by a
+    // second wake. The wake stays durable (pendingWakeup is not consumed) and
+    // is retried after the lane settles; the suppression is recorded for the
+    // audit instead of manufacturing a failed Run.
+    if (hasRuntimeLifecycleWork(store.getWorkMailbox(runtimeLifecycleTarget({
+      scope: "task",
+      taskId: task.id,
+      roleName: role.name
+    })))) {
+      store.recordWakeSuppression?.(task.id, "lifecycle-busy", now);
+      results.push({ taskId: task.id, status: "skipped", reason: "recovery-blocked" });
       continue;
     }
 
@@ -403,6 +419,26 @@ export async function processLeaderWakeups(
       const detail = error instanceof Error ? error.message : String(error);
       const message = `Leader dispatch failed: ${detail}`;
       if (claimed && run !== null) {
+        // Scheduler single-flight backpressure: the Role runtime lifecycle
+        // lane was busy when the launch was reserved. The claimed Run stays
+        // active-unpushed; the active-Run delivery path retries it after the
+        // lane settles. This is contention before any semantic launch, not a
+        // Run failure and not grounds for a Leader failure record.
+        if (error instanceof RuntimeLifecycleBusyError) {
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id
+          });
+          results.push({
+            taskId: task.id,
+            runId: run.id,
+            status: "skipped",
+            reason: "not-ready",
+            error: message
+          });
+          continue;
+        }
         // A finite managed provider from the preceding Run may still be
         // exiting after its durable yield. Keep this newly-claimed Run as the
         // sole owner of the Role mailbox; active-Run delivery will retry it

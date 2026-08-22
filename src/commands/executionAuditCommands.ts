@@ -163,7 +163,9 @@ export function renderExecutionAudit(
       "",
       `Leader wakes: ${wakes.leaderRuns} runs · ${wakes.withWakeReasons} with reasons · ${wakes.orphanWakes} orphan wakes (${wakes.orphanYieldOnly} yield-only)`
     );
-    if (wakes.suppressedWakes.status === "unsupported") {
+    if (wakes.suppressedWakes.status === "ok") {
+      lines.push(`Suppressed wakes: ${wakes.suppressedWakes.data ?? 0} (scheduler single-flight, not failed Runs)`);
+    } else if (wakes.suppressedWakes.status === "unsupported") {
       lines.push("Suppressed wakes: unsupported (no quiescence producer in this build)");
     }
     const reasonRows = Object.entries(wakes.byReason).slice(0, 8);
@@ -227,6 +229,40 @@ export function renderExecutionAudit(
     );
   } else {
     lines.push("", ...sectionError("events", report));
+  }
+
+  if (report.providerRetries.status === "ok" && report.providerRetries.data !== undefined) {
+    const retries = report.providerRetries.data;
+    if (retries.total > 0) {
+      lines.push(
+        "",
+        `Provider retries: ${retries.total} run(s) retried in place · ${retries.terminal} terminal`
+      );
+      lines.push(
+        renderTable(
+          "Provider retry lineages",
+          [
+            { header: "Task", minWidth: 8, maxWidth: 14 },
+            { header: "Run", minWidth: 14, maxWidth: 24 },
+            { header: "Role", minWidth: 8, maxWidth: 12 },
+            { header: "Attempts", minWidth: 8, maxWidth: 10 },
+            { header: "Error class", minWidth: 14, maxWidth: 24 },
+            { header: "Decision", minWidth: 14, maxWidth: 26 }
+          ],
+          retries.entries.map((entry) => [
+            entry.taskId,
+            entry.runId,
+            entry.roleName,
+            String(entry.attempts),
+            entry.errorClass,
+            entry.decision
+          ]),
+          width
+        )
+      );
+    }
+  } else {
+    lines.push("", ...sectionError("providerRetries", report));
   }
 
   if (report.workItems.status === "ok" && report.workItems.data !== undefined) {

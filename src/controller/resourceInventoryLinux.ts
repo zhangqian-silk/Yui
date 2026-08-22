@@ -55,6 +55,8 @@ export type ControllerInventoryScanOptions = Readonly<{
   currentHome: string;
   scope: ControllerInventoryScope;
   environment?: NodeJS.ProcessEnv;
+  /** Path to the tmux binary, from the durable Yui config. */
+  tmuxBin?: string;
   now?: () => Date;
   /** Reuse the caller's one full pane inventory when already available. */
   panes?: readonly RuntimePaneFact[];
@@ -139,7 +141,7 @@ export async function scanControllerResourceInventory(
     const panes = options.panes !== undefined
       ? options.panes
       : tmuxArtifact?.active === true
-        ? inspectHomePanes(home, environment, warnings)
+        ? inspectHomePanes(home, environment, options.tmuxBin ?? "tmux", warnings)
         : [];
     const discovery = await inspectDiscovery(home, matchingProcesses, activeSockets);
     if (
@@ -937,12 +939,13 @@ function numericCompare(left: string, right: string): number {
 function inspectHomePanes(
   home: string,
   environment: NodeJS.ProcessEnv,
+  tmuxBin: string,
   warnings: string[]
 ) {
   try {
     const executor = new NodeCommandExecutor();
     const commandEnvironment = tmuxSocketEnvironment(environment);
-    return new TmuxManager(environment.YUI_TMUX_BIN ?? "tmux", {
+    return new TmuxManager(tmuxBin, {
       run: (command, args, options) => executor.run(command, args, {
         ...options,
         environment: {

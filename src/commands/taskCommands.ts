@@ -72,7 +72,7 @@ import {
   type AgentRun
 } from "../run/agentRun.js";
 import { matchYieldReceipt } from "../run/yieldReceipt.js";
-import { providerRetryConfig } from "../run/providerRetryConfig.js";
+import { providerRetryConfig, type ProviderRetryConfig } from "../run/providerRetryConfig.js";
 import {
   createReviewRound,
   createTaskReviewRound,
@@ -89,14 +89,11 @@ import {
   type ReviewRequestSource
 } from "../review/reviewRound.js";
 import {
-  blockingOpenFindings,
   buildTaskFinalReviewFindingContext,
-  completionGateBlocked,
   dispositionReviewFinding,
   planRepairGroups,
   reconcileReviewFindings,
   reconcileReviewFindingsAfterReview,
-  reviewFindingLedgerWriteFailed,
   type ReviewFindingDispositionCommand
 } from "../review/reviewFindingLedger.js";
 import {
@@ -144,6 +141,10 @@ import {
   formatAgentRunReceiptId,
   resolveTaskRecordReference
 } from "../task/taskRecordReference.js";
+import {
+  projectCompletionReadiness,
+  type CompletionBlocker
+} from "../task/completionReadiness.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
 import { resolveProject, type Project } from "../repository/project.js";
@@ -429,6 +430,11 @@ export function parseTaskCompletionRequest(
  * path invokes this same preflight and then repeats its checks while holding
  * the store write fence, so remote reconciliation can never get ahead of the
  * local lifecycle/readiness gate.
+ *
+ * Issue 06: the blocker enumeration is the pure `projectCompletionReadiness`
+ * projection, shared with `task next-action` so the Leader sees every
+ * terminalization precondition before attempting completion.  All blockers
+ * are reported in one error instead of one per attempt.
  */
 export function preflightTaskCompletion(
   taskId: string,
@@ -451,83 +457,27 @@ export function preflightTaskCompletion(
     (round.scope ?? "work-item") === "task"
     && (round.status === "pending" || round.status === "running")
   ));
-  assertNoOpenInputRequests(store, task.id, "completing the Task");
-  const incompleteWork = store.listWorkItems(task.id).find((item) => (
-    item.status !== "completed"
-    && item.status !== "retired"
-  ));
-  if (incompleteWork !== undefined) {
-    throw usageError(`Task ${task.id} has unaccepted work: ${incompleteWork.id}/${incompleteWork.status}.`);
-  }
-  const activeJob = store.listDurableJobs(task.id).find((job) => (
-    job.status === "queued"
-    || job.status === "running"
-    || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
-  ));
-  if (activeJob !== undefined) {
-    throw usageError(
-      `Task ${task.id} has an active DurableJob: ${activeJob.id}/${activeJob.status}.`
-    );
-  }
-  if (task.requireIntegration) {
-    if (store.listWorkItems(task.id).length === 0) {
-      throw usageError(`Task ${task.id} requires at least one WorkItem before completion.`);
-    }
-    if (store.listChangeSets(task.id).length === 0) {
-      throw usageError(`Task ${task.id} requires at least one ChangeSet before completion.`);
-    }
-    if (!store.listIntegrationAttempts(task.id).some(({ status }) => status === "committed")) {
-      throw usageError(`Task ${task.id} requires a committed Integration Attempt before completion.`);
-    }
-  }
-  const unresolvedIntegration = store.listIntegrationAttempts(task.id).find((integration) => (
-    integration.status === "running"
-    || integration.status === "blocked"
-    || integration.status === "validating"
-  ));
-  if (unresolvedIntegration !== undefined) {
-    throw usageError(
-      `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
-    );
-  }
-  const unsettledQueueEntry = store.listIntegrationQueueEntries(task.id).find((entry) => (
-    entry.status !== "committed" && entry.status !== "superseded"
-  ));
-  if (unsettledQueueEntry !== undefined) {
-    throw usageError(
-      `Task ${task.id} has an unsettled integration queue entry: `
-      + `${unsettledQueueEntry.id}/${unsettledQueueEntry.status}.`
-    );
-  }
-  const continuationBlockers = blockingProviderContinuations(store.listEvents(task.id));
-  if (continuationBlockers.length > 0) {
-    throw usageError(
-      `Task ${task.id} has ${continuationBlockers.length} Provider continuation(s) `
-      + "that may still write the Workspace or have an identity conflict."
-    );
-  }
-  const isolatedWorkspace = store.listManagedWorkspaces(task.id)
-    .find(({ owner }) => owner.type === "work-item");
-  if (isolatedWorkspace?.owner.type === "work-item") {
-    throw usageError(
-      `Task ${task.id} has an isolated WorkItem workspace: `
-      + `${isolatedWorkspace.owner.workItemId}. Capture, integrate or abandon it, then clean it up.`
-    );
+  // Issue 06: one shared readiness projection enumerates every blocker.
+  const readinessFacts = store.readCompletionReadinessFacts(task.id);
+  if (readinessFacts === null) throw taskNotFound(task.id);
+  // The finding ledger gate is intentionally deferred: the transactional
+  // completion path runs it after `prepareFinalTaskReview`, which may create
+  // the Task-final Review that resolves `fixed-pending-review` findings.
+  const readiness = projectCompletionReadiness(readinessFacts, { findingsGate: false });
+  // An active Task-final Review is not a preflight failure: the transactional
+  // path resumes a pending Round (or reports the running one) via
+  // `prepareFinalTaskReview`, and the CLI skips remote reconciliation while
+  // `activeTaskReview` is true.  The blocker stays in the shared projection
+  // so other surfaces (next-action, future readers) see the full rule set.
+  const blockers = readiness.blockers.filter((blocker) => blocker.code !== "active-task-review");
+  if (blockers.length > 0) {
+    throw usageError(formatCompletionBlockers(task.id, blockers));
   }
 
   const roles = store.listRoles(task.id);
   const activeRuns = roles
     .map((role) => ({ role, run: store.getActiveAgentRun(task.id, role.name) }))
     .filter((entry): entry is { role: Role; run: AgentRun } => entry.run !== null);
-  const workerRun = activeRuns.find(({ role }) => role.name !== LEADER_ROLE);
-  if (workerRun !== undefined) {
-    throw usageError(`Task ${task.id} has an active run for Role ${workerRun.role.name}.`);
-  }
-  const unsettledWork = store.listWorkItems(task.id)
-    .find((item) => item.status === "pending" || item.status === "running");
-  if (unsettledWork !== undefined) {
-    throw usageError(`Task ${task.id} has unsettled work: ${unsettledWork.id}.`);
-  }
 
   const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
   if (leaderEntry !== undefined) {
@@ -549,6 +499,18 @@ export function preflightTaskCompletion(
     activeTaskReview,
     ...(taskFinalReviewContract === undefined ? {} : { taskFinalReviewContract })
   };
+}
+
+/**
+ * Issue 06: format every completion blocker into one fail-closed error so the
+ * Leader sees the full remaining work instead of one blocker per attempt.
+ */
+function formatCompletionBlockers(taskId: string, blockers: readonly CompletionBlocker[]): string {
+  const lines = blockers.map((blocker) =>
+    `  ${blocker.code} (${blocker.ref.kind} ${blocker.ref.id}): ${blocker.reason}`
+    + ` — fix: ${blocker.fix}`
+  );
+  return `Task ${taskId} cannot complete: ${blockers.length} blocker(s) remain.\n${lines.join("\n")}`;
 }
 
 export function runTaskCommand(
@@ -1101,22 +1063,10 @@ function completeTaskCommand(
     const activeRuns = roles
       .map((role) => ({ role, run: tx.getActiveAgentRun(task.id, role.name) }))
       .filter((entry): entry is { role: Role; run: AgentRun } => entry.run !== null);
-    const workerRun = activeRuns.find(({ role }) => role.name !== LEADER_ROLE);
-    if (workerRun !== undefined) {
-      throw usageError(`Task ${task.id} has an active run for Role ${workerRun.role.name}.`);
-    }
-    const unsettledWork = tx.listWorkItems(task.id)
-      .find((item) => item.status === "pending" || item.status === "running");
-    if (unsettledWork !== undefined) {
-      throw usageError(`Task ${task.id} has unsettled work: ${unsettledWork.id}.`);
-    }
-    const continuationBlockers = blockingProviderContinuations(tx.listEvents(task.id));
-    if (continuationBlockers.length > 0) {
-      throw usageError(
-        `Task ${task.id} has ${continuationBlockers.length} Provider continuation(s) `
-        + "that may still write the Workspace or have an identity conflict."
-      );
-    }
+    // The preflight (above, same transaction) already projected the full
+    // readiness via projectCompletionReadiness.  The leader-Run check is
+    // actor-dependent and stays here; every other blocker is re-validated by
+    // the post-Review readiness fence below.
 
     let terminalizedLeaderRun = false;
     const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
@@ -1173,25 +1123,17 @@ function completeTaskCommand(
       } as const;
     }
 
-    // Issue 06: under `review.findingLedger=enforce`, Task completion fails
-    // closed on undispositioned open P1/P2 findings. Run this after final-review
-    // preparation so `fixed-pending-review` findings can still request the one
-    // re-review for a changed frozen head; once no Review is needed, the gate
-    // blocks final completion.
-    if (completionGateBlocked(tx, task.id)) {
-      const blocking = blockingOpenFindings(tx, task.id);
-      if (reviewFindingLedgerWriteFailed(tx, task.id)) {
-        throw usageError(
-          `Task ${task.id} cannot complete: the Review finding ledger was unavailable `
-          + "while reconciling a semantic Review. Recover the ledger and reconcile the Round "
-          + "before completing the Task."
-        );
-      }
-      throw usageError(
-        `Task ${task.id} has ${blocking.length} undispositioned open P1/P2 finding(s): `
-        + `${blocking.map(({ id }) => id).join(", ")}. `
-        + "Disposition each finding (yui task review finding dispose) before completing the Task."
-      );
+    // Issue 06: re-validate the full completion readiness inside the
+    // transaction (the CAS fence) after final-review preparation.  This is the
+    // same pure projection `task next-action` displays, now with the finding
+    // ledger gate enabled: `fixed-pending-review` findings that the prepared
+    // Review would resolve are no longer blocked, but once no Review is needed
+    // every remaining blocker fails closed with the fresh list.
+    const readinessFacts = tx.readCompletionReadinessFacts(task.id);
+    if (readinessFacts === null) throw taskNotFound(task.id);
+    const readiness = projectCompletionReadiness(readinessFacts);
+    if (!readiness.ready) {
+      throw usageError(formatCompletionBlockers(task.id, readiness.blockers));
     }
 
     const completed = completeTask(task, now, { by: actor, summary });
@@ -5513,10 +5455,10 @@ function buildYieldOutcome(
 function replayYieldReceipt(
   run: AgentRun,
   inputSummary: string,
-  options: TaskCommandOptions
+  options: TaskCommandOptions,
+  retryConfig: ProviderRetryConfig
 ): TaskCommandExecution | null {
-  const config = providerRetryConfig(options.environment ?? process.env);
-  if (!config.yieldReceiptReplay) return null;
+  if (!retryConfig.yieldReceiptReplay) return null;
   if (run.yieldReceipt === undefined) return null;
   const outcome = buildYieldOutcome(run, inputSummary, options);
   const match = matchYieldReceipt(run.yieldReceipt, {
@@ -5593,7 +5535,12 @@ function yieldRun(
   // transaction; the receipt is immutable once committed.
   const existing = requireRun(store, parsed.positionals[0], options);
   if (existing.status !== "active") {
-    const replayed = replayYieldReceipt(existing, inputSummary, options);
+    const replayed = replayYieldReceipt(
+      existing,
+      inputSummary,
+      options,
+      providerRetryConfig(store.getConfig())
+    );
     if (replayed !== null) return replayed;
     throw usageError(`Run ${existing.id} is already terminal: ${existing.status}.`);
   }

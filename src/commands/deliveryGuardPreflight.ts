@@ -1,4 +1,4 @@
-import { leaderNextActionMode } from "../config/yuiConfig.js";
+import { resolveLeaderNextActionMode } from "../config/yuiConfig.js";
 import { usageError } from "../errors/cliError.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
@@ -37,9 +37,8 @@ export function runDeliveryGuardPreflight(
   intent: DeliveryGuardIntent,
   options: DeliveryGuardPreflightOptions = {}
 ): DeliveryGuardPreflight {
-  const mode = leaderNextActionMode(
-    store.getConfig().leaderNextActionMode,
-    options.environment
+  const mode = resolveLeaderNextActionMode(
+    store.getConfig().leaderNextActionMode
   );
   if (mode === "display") return { warnings: [] };
   const facts = store.readNextActionFacts(taskId);

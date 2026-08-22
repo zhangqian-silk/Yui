@@ -25,6 +25,11 @@ import { RuntimeLaunchError } from "../runtime/ports.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { mailboxHasWork, nextPendingBatch } from "../coordination/workMailbox.js";
+import {
+  hasRuntimeLifecycleWork,
+  RuntimeLifecycleBusyError,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
@@ -80,6 +85,25 @@ export async function processActiveRoleRunDeliveries(
           runId: run.id,
           status: "skipped",
           reason: "workspace-not-ready"
+        });
+        continue;
+      }
+
+      // Single-flight: a Role runtime lifecycle lane that already holds a
+      // launch reservation or cleanup obligation must not be entered by a
+      // second delivery. The Run stays active-unpushed and is retried after
+      // the lane settles; the contention is never terminalized as a failure.
+      if (hasRuntimeLifecycleWork(store.getWorkMailbox(runtimeLifecycleTarget({
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      })))) {
+        results.push({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          status: "skipped",
+          reason: "runtime-unavailable"
         });
         continue;
       }
@@ -318,6 +342,27 @@ export async function processActiveRoleRunDeliveries(
         results.push({ taskId: task.id, roleName: role.name, runId: run.id, status });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        // Scheduler single-flight backpressure: the Role runtime lifecycle
+        // lane was busy when the launch was reserved. The Run stays
+        // active-unpushed and its mailbox claim is retained; the next pass
+        // retries after the lane settles. This is contention before any
+        // semantic launch, never a Run failure.
+        if (error instanceof RuntimeLifecycleBusyError) {
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id
+          });
+          results.push({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            status: "skipped",
+            reason: "runtime-unavailable",
+            error: message
+          });
+          continue;
+        }
         if (error instanceof RuntimeLaunchError) {
           const terminalFailure = roleRunDeliveryFailure(
             run,

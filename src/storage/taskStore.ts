@@ -76,6 +76,7 @@ import {
   type ReviewRound
 } from "../review/reviewRound.js";
 import type { ReviewFinding } from "../review/reviewFinding.js";
+import { reviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
 import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
 import {
   assertProjectCatalog,
@@ -132,6 +133,7 @@ import {
 } from "../scheduler/taskWake.js";
 import { validateTask, type Task } from "../task/task.js";
 import type { NextActionFacts } from "../task/nextAction.js";
+import type { CompletionReadinessFacts } from "../task/completionReadiness.js";
 import {
   formatAgentRunReceiptId,
   TASK_RECORD_ID_PREFIXES,
@@ -266,6 +268,46 @@ export type YuiConfig = Readonly<{
    * so no config migration is needed.
    */
   contextBudget?: import("../config/yuiConfig.js").ContextBudgetConfig;
+  /**
+   * Issue 01 in-place Provider retry mode. `enforce` (default) keeps the
+   * original AgentRun and native Session on retryable Provider failures;
+   * `shadow` only records classification; `off` disables the feature.
+   * Optional additive field; Homes without it default to `enforce`.
+   */
+  providerRetryMode?: "off" | "shadow" | "enforce";
+  /**
+   * Adapters with in-place retry enabled. `["all"]` means every supported
+   * adapter; an empty array disables the feature. Defaults to all supported.
+   */
+  providerRetryAdapters?: string[];
+  /**
+   * Total retry budget per Run lineage in milliseconds. Defaults to
+   * {@link PROVIDER_RETRY_MAX_WINDOW_MS}; once the window elapses the Run
+   * terminalizes with one structured failure.
+   */
+  providerRetryMaxWindowMs?: number;
+  /**
+   * Whether an already-committed yield receipt may be replayed on resend.
+   * Defaults to true; safe by construction (same request → same receipt).
+   */
+  yieldReceiptReplay?: boolean;
+  /**
+   * Path to the tmux binary. Defaults to `tmux` on PATH.
+   */
+  tmuxBin?: string;
+  /**
+   * Path to the git binary. Defaults to `git` on PATH.
+   */
+  gitBin?: string;
+  /**
+   * Telemetry mode. `legacy` (default) keeps the master-only behavior;
+   * `dual` and `bounded` activate the diagnostic sidecar.
+   */
+  telemetryMode?: "legacy" | "dual" | "bounded";
+  /** Terminal Run/generation progress rows retained after prune. */
+  telemetryTerminalKeep?: number;
+  /** Hard cap of progress rows per Run while it is still active. */
+  telemetryRunCap?: number;
   completionInstallations?: Partial<Record<CompletionShell, CompletionInstallation>>;
 }>;
 export type ConfiguredAgentPatch = Readonly<Partial<
@@ -441,6 +483,13 @@ export type TaskStore = {
    * active/leader Runs). Returns null when the Task does not exist.
    */
   readNextActionFacts(taskId: string): NextActionFacts | null;
+  /**
+   * Issue 06 (Task terminalization readiness): load the full record set the
+   * completion readiness projection consumes, including managed workspaces,
+   * DurableJobs, integration queue entries, Review findings, and the event
+   * fold. Returns null when the Task does not exist.
+   */
+  readCompletionReadinessFacts(taskId: string): CompletionReadinessFacts | null;
   getReviewConfig(): ReviewConfig | null;
   getTaskBrief(taskId: string): TaskBrief | null;
   saveTaskBrief(taskId: string, brief: TaskBrief): void;
@@ -946,7 +995,8 @@ export class FileTaskStore implements TaskStore {
       task: {
         id: aggregate.task.id,
         status: aggregate.task.status,
-        projectBindings: aggregate.task.projectBindings
+        projectBindings: aggregate.task.projectBindings,
+        requireIntegration: aggregate.task.requireIntegration
       },
       workItems: values(aggregate.workItems, "id"),
       changeSets: values(aggregate.changeSets, "id"),
@@ -957,6 +1007,32 @@ export class FileTaskStore implements TaskStore {
         .filter((request) => request.status === "open"),
       activeRuns: agentRuns.filter((run) => run.status === "active"),
       leaderRuns: agentRuns.filter((run) => run.roleName === "leader")
+    };
+  }
+  readCompletionReadinessFacts(taskId: string): CompletionReadinessFacts | null {
+    const base = this.readNextActionFacts(taskId);
+    if (base === null) return null;
+    const aggregate = this.#state().tasks[taskId]!;
+    const ledgerMode = reviewFindingLedgerMode(this.#state().config);
+    // The file-rollback backend does not persist the finding ledger.  Under
+    // `enforce` the completion gate must fail closed with the same bounded
+    // diagnosis as `listReviewFindings` instead of silently treating
+    // "unsupported" as "no open findings".
+    if (ledgerMode === "enforce") {
+      throw new StorageRecordError(
+        `Review findings require the SQLite backend (yui.db); migrate this Home with \`yui update\` before using the finding ledger on Task ${taskId}.`
+      );
+    }
+    return {
+      ...base,
+      managedWorkspaces: values(aggregate.managedWorkspaces, (workspace) => managedWorkspaceKey(workspace.owner)),
+      durableJobs: values(aggregate.durableJobs, "id"),
+      integrationQueueEntries: values(aggregate.integrationQueue, "id"),
+      // The SQLite backend supplies real findings; the file backend never
+      // reaches this point under `enforce` (throw above).
+      reviewFindings: [],
+      reviewFindingLedgerMode: ledgerMode,
+      events: values(aggregate.events, "id")
     };
   }
   getReviewConfig(): ReviewConfig | null {

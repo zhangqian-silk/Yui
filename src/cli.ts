@@ -28,6 +28,7 @@ import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
 import { runUpgradeCommand } from "./cli/upgradeCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
+import { resolveTmuxBin } from "./config/yuiConfig.js";
 import { renderAgentConfigurationCatalog } from "./output/agentConfigurationPresentation.js";
 import type { ConfiguredAgent } from "./agent/agent.js";
 import { nativeAgentEnvironmentNames } from "./agent/launchEnvironment.js";
@@ -423,7 +424,7 @@ export async function main(): Promise<void> {
     const options = parseSessionReconcileOptions(args.slice(2));
     const store = openCompatibleFileTaskStore(home);
     const tmux = new TmuxManager(
-      process.env.YUI_TMUX_BIN ?? "tmux",
+      resolveTmuxBin(store.getConfig().tmuxBin),
       new NodeCommandExecutor(),
       { yuiHome: home }
     );
@@ -646,7 +647,7 @@ export async function main(): Promise<void> {
 
   const executor = new NodeCommandExecutor();
   const tmux = new TmuxManager(
-    process.env.YUI_TMUX_BIN ?? "tmux",
+    resolveTmuxBin(store.getConfig().tmuxBin),
     executor,
     {
       yuiHome: home,
@@ -656,7 +657,7 @@ export async function main(): Promise<void> {
   );
   const schedulerStore = new FileSchedulerStoreAdapter(
     store,
-    openSchedulerTelemetry(home, process.env)
+    openSchedulerTelemetry(home, store.getConfig())
   );
   const planner = new FileRoleLaunchPlanner(home, store, { environment: process.env });
   const workspacePreparer = new FileTaskWorkspacePreparer(home, store);
@@ -682,7 +683,7 @@ export async function main(): Promise<void> {
     const options = parseWebCommandOptions(resolved.slice(1));
     const terminal = new TmuxWebTerminalService({
       yuiHome: home,
-      tmuxBin: process.env.YUI_TMUX_BIN ?? "tmux",
+      tmuxBin: resolveTmuxBin(store.getConfig().tmuxBin),
       tmux,
       prepareGlobalRole: (roleName) => runtime.prepareGlobalRoleEnter(roleName),
       environment: process.env,
@@ -781,19 +782,19 @@ export async function main(): Promise<void> {
   }
   if (resolved[0] === "config") {
     const configArgs = resolved.slice(1);
-    const output = runConfigCommand(configArgs, store);
+    const result = runConfigCommand(configArgs, store);
     if (
       configArgs[0] === "set"
-      && configArgs[1] === "--reconciliation-interval-seconds"
+      && configArgs[1] === "reconciliation-interval-seconds"
     ) {
       const refresh = await refreshRunningFileTaskControllerConfiguration(
         home,
         { environment: process.env }
       );
-      emit(withControllerRefreshWarning(output, refresh, "Controller configuration"));
+      emit(withControllerRefreshWarning(result.output, refresh, "Controller configuration"));
       return;
     }
-    emit(output);
+    emit(result.output, false, result.data);
     return;
   }
   if (resolved[0] === "project") {

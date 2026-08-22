@@ -6,6 +6,10 @@ import {
   type NextActionFacts
 } from "../task/nextAction.js";
 import {
+  projectCompletionReadiness,
+  type CompletionReadiness
+} from "../task/completionReadiness.js";
+import {
   extractReviewFindings,
   planRepairWave,
   type RepairWave
@@ -18,6 +22,10 @@ import {
  * the judgment that remains owned by the Leader.
  * The command never mutates state; when the action is `route-review-findings`
  * it also prints the minimal repair wave for the failing Review.
+ *
+ * Issue 06: when the recommended action is `complete-task`, the output also
+ * carries the full `completionReadiness` blocker list so the Leader sees every
+ * terminalization precondition before attempting `yui task complete`.
  */
 export function runTaskNextActionCommand(
   args: string[],
@@ -31,11 +39,21 @@ export function runTaskNextActionCommand(
   }
   const taskId = positionals[0].trim();
   const data = store.transaction((reader) => {
+    // Issue 06: the lightweight facts drive the action on every call; the
+    // heavier readiness facts (full event fold, workspaces, jobs, ledger) are
+    // loaded only when the action is `complete-task`, keeping the per-turn
+    // read path cheap during execution.
     const facts = reader.readNextActionFacts(taskId);
     if (facts === null) throw taskNotFound(taskId);
     const action = projectNextAction(facts);
     const repairWave = repairWaveFor(action, facts);
-    return { action, repairWave };
+    let completionReadiness: CompletionReadiness | null = null;
+    if (action.kind === "complete-task") {
+      const readinessFacts = reader.readCompletionReadinessFacts(taskId);
+      if (readinessFacts === null) throw taskNotFound(taskId);
+      completionReadiness = projectCompletionReadiness(readinessFacts);
+    }
+    return { action, repairWave, completionReadiness };
   });
   if (asJson) {
     return {
@@ -46,7 +64,7 @@ export function runTaskNextActionCommand(
   }
   return {
     kind: "output" as const,
-    output: renderNextAction(data.action, data.repairWave),
+    output: renderNextAction(data.action, data.repairWave, data.completionReadiness),
     data
   };
 }
@@ -65,7 +83,11 @@ function repairWaveFor(
   return planRepairWave(round.id, findings);
 }
 
-function renderNextAction(action: NextAction, repairWave: RepairWave | null): string {
+function renderNextAction(
+  action: NextAction,
+  repairWave: RepairWave | null,
+  completionReadiness: CompletionReadiness | null
+): string {
   const lines = [
     `Task: ${action.taskId}`,
     `Next action: ${action.kind}`,
@@ -104,6 +126,18 @@ function renderNextAction(action: NextAction, repairWave: RepairWave | null): st
           ...action.conflicts.map((conflict) => `  ${conflict.kind}: ${conflict.id}`)
         ])
   ];
+  if (completionReadiness !== null) {
+    if (completionReadiness.ready) {
+      lines.push("Completion readiness: ready (no blockers)");
+    } else {
+      lines.push(
+        `Completion readiness: ${completionReadiness.blockers.length} blocker(s)`,
+        ...completionReadiness.blockers.map((blocker) =>
+          `  ${blocker.code} (${blocker.ref.kind} ${blocker.ref.id}): ${blocker.reason}`
+          + ` — fix: ${blocker.fix}`)
+      );
+    }
+  }
   if (repairWave !== null) {
     lines.push(
       `Repair wave (${repairWave.openFindingCount} open finding(s), ${repairWave.groups.length} group(s)):`,

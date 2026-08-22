@@ -5,6 +5,7 @@ import type {
 } from "./agentDriver.js";
 import { requireDriverId } from "./agentDriver.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import type { ProviderErrorCode } from "./providerErrorCodes.js";
 
 export const RUNTIME_OBSERVATION_TASK_EVENT = "runtime.observation";
 
@@ -70,6 +71,8 @@ export type RuntimeUsageSnapshot = Readonly<{
 }>;
 
 export type RuntimeTurnFailure = Readonly<{
+  /** Structured Provider-neutral error code, when the driver could extract one. */
+  errorCode?: ProviderErrorCode;
   code: string;
   details?: string;
   lastOutput?: string;
@@ -607,6 +610,7 @@ function normalizeFailure(input: RuntimeTurnFailure): RuntimeTurnFailure {
     throw new Error("Runtime failure evidence must be an object.");
   }
   return Object.freeze({
+    ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
     code: requireText(input.code, "Runtime failure code"),
     ...(input.details === undefined
       ? {}

@@ -474,6 +474,12 @@ export interface SchedulerStorePort {
   ): boolean;
   savePendingWakeup(wakeup: PendingWakeup): void;
   clearPendingWakeup(taskId: string): void;
+  /**
+   * Records that a Leader wake was suppressed by scheduler single-flight
+   * (the Role runtime lifecycle lane was busy). The wake stays durable and
+   * is retried after the lane settles.
+   */
+  recordWakeSuppression?(taskId: string, reason: string, now: Date): void;
 
   getLeaderFailure(taskId: string): LeaderFailure | null;
   getOperatorNotification(taskId: string): OperatorNotification | null;

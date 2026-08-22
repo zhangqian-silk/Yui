@@ -29,10 +29,18 @@ import {
 
 const root = resolve(import.meta.dirname, "../..");
 
+// Strip managed Task runtime descriptors so the packaged CLI is exercised
+// directly instead of being refused by the exact control-plane guard.
+const bareEnv = {
+  PATH: process.env.PATH ?? "",
+  HOME: process.env.HOME ?? ""
+};
+
 test("the packaged CLI starts and exposes the core workflow", () => {
   const help = execFileSync(process.execPath, [join(root, "dist", "cli.js"), "help"], {
     cwd: root,
-    encoding: "utf8"
+    encoding: "utf8",
+    env: bareEnv
   });
   assert.match(help, /Yui/u);
   const commands = listPublicCommandPaths();

@@ -270,16 +270,16 @@ timezone with:
 
 ```sh
 yui config show
-yui config set --time-zone Europe/London
+yui config set time-zone Europe/London
 ```
 
 WorkItem review is one global, optional rule that reuses an existing Global
 Role's Agent, model, permissions, prompt, and Skills:
 
 ```sh
-yui config review set --role reviewer --trigger always
-yui config review show
-yui config review clear
+yui config set review --role reviewer --trigger always
+yui config show
+yui config clear review
 ```
 
 For Project-backed software delivery, use `--trigger final` to keep WorkItem
@@ -287,7 +287,7 @@ acceptance and Integration independent and run one fresh ReviewRound over the
 complete frozen integrated Task candidate before completion:
 
 ```sh
-yui config review set --role reviewer --trigger final
+yui config set review --role reviewer --trigger final
 ```
 
 Every result entering Leader acceptance is one explicit candidate on its

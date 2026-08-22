@@ -1,11 +1,15 @@
 /**
  * Issue 04 — Provider error classification.
  *
- * Provider failures arrive as opaque free text (Claude StopFailure
- * `error`/`errorDetails`, Codex turn-completion summaries). The retry-in-place
- * coordinator needs a stable, provider-neutral error class before it can decide
- * whether the original Session may be retried. This module is the single
- * classifier: it is pure, table-driven, and deliberately conservative.
+ * Provider failures arrive at the driver boundary as opaque free text (Claude
+ * StopFailure `error`/`errorDetails`, Codex turn-completion summaries). Each
+ * driver parses its own Provider's format into a structured
+ * {@link ProviderErrorCode} at the driver boundary. This module maps those
+ * codes to provider-neutral error classes by lookup, falling back to text
+ * matching only when the driver could not produce a structured code.
+ *
+ * The retry-in-place coordinator needs a stable, provider-neutral error class
+ * before it can decide whether the original Session may be retried.
  *
  * Classes (Issue 04 §2):
  * - `transient-provider`   — 500/502/504, connection reset, backend capacity;
@@ -25,6 +29,10 @@
  *                            terminalize-immediately behavior) while remaining
  *                            observable in shadow metrics.
  */
+
+import type { ProviderErrorCode } from "../runtime/providerErrorCodes.js";
+import { PROVIDER_ERROR_CODE_CLASS } from "../runtime/providerErrorCodes.js";
+
 
 export type ProviderErrorClass =
   | "transient-provider"
@@ -46,8 +54,11 @@ export function isRetryableProviderErrorClass(
   return RETRYABLE_PROVIDER_ERROR_CLASSES.includes(errorClass);
 }
 
+
 export type ProviderErrorClassificationInput = Readonly<{
   adapterId: string;
+  /** Structured error code from the driver, when available. */
+  errorCode?: ProviderErrorCode;
   /** Raw provider error text (e.g. Claude StopFailure `error`). */
   error?: string;
   /** Raw provider error detail text (e.g. Claude StopFailure `errorDetails`). */
@@ -97,8 +108,11 @@ const INVALID_REQUEST_PATTERNS: readonly Pattern[] = [
 
 const TRANSIENT_PROVIDER_PATTERNS: readonly Pattern[] = [
   { pattern: /\b50[024]\b/u, label: "http-5xx" },
-  { pattern: /server[_-]?error/iu, label: "server-error" },
+  { pattern: /server[\s_-]?error/iu, label: "server-error" },
   { pattern: /internal server error/iu, label: "internal-server-error" },
+  // HTTP/2 RST_STREAM / gRPC status carried by Claude Code and Codex streams
+  // (Task-27: "stream error: stream ID …; INTERNAL_ERROR; received from peer").
+  { pattern: /\binternal[\s_-]?error\b/iu, label: "internal-error" },
   { pattern: /connection lost/iu, label: "connection-lost" },
   { pattern: /connection reset/iu, label: "connection-reset" },
   { pattern: /econnreset/iu, label: "econnreset" },
@@ -120,6 +134,9 @@ const TRANSPORT_UNCERTAIN_PATTERNS: readonly Pattern[] = [
   { pattern: /etimedout/iu, label: "etimedout" },
   { pattern: /response lost/iu, label: "response-lost" },
   { pattern: /lost response/iu, label: "lost-response" },
+  // A stream-level failure means the response may have been cut mid-turn;
+  // the retry path consults durable completion facts before any resend.
+  { pattern: /stream error/iu, label: "stream-error" },
   { pattern: /stream interrupted/iu, label: "stream-interrupted" },
   { pattern: /interrupted function/iu, label: "interrupted-function" },
   { pattern: /controller timeout/iu, label: "controller-timeout" },
@@ -141,26 +158,38 @@ const CLASS_TABLE: readonly Readonly<{
 
 export type ProviderErrorClassification = Readonly<{
   errorClass: ProviderErrorClass;
-  /** The pattern label that matched, or `none` for `unclassified`. */
+  /** The structured code or pattern label that matched, or `none` for `unclassified`. */
   matched: string;
+  /** How the classification was derived. */
+  basis: "structured" | "text";
 }>;
 
 /**
- * Classifies one provider failure. Every available text field is concatenated
- * so a class can be recognized regardless of which field carried it. Unknown
- * text is `unclassified`, which keeps the old fail-immediately behavior.
+ * Classifies one provider failure. When the driver produced a structured
+ * {@link ProviderErrorCode}, the class is looked up directly. Otherwise the
+ * raw text fields are matched against the fallback pattern tables. Every
+ * available text field is concatenated so a class can be recognized
+ * regardless of which field carried it.
  */
 export function classifyProviderError(
   input: ProviderErrorClassificationInput
 ): ProviderErrorClassification {
+  // Structured path: the driver already parsed the Provider's error format.
+  if (input.errorCode !== undefined) {
+    const errorClass = PROVIDER_ERROR_CODE_CLASS[input.errorCode];
+    if (errorClass !== undefined) {
+      return { errorClass, matched: input.errorCode, basis: "structured" };
+    }
+  }
+  // Text fallback: for drivers that cannot yet produce a structured code.
   const text = [input.error, input.errorDetails, input.summary]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .join("\n");
-  if (text.length === 0) return { errorClass: "unclassified", matched: "none" };
+  if (text.length === 0) return { errorClass: "unclassified", matched: "none", basis: "text" };
   for (const { errorClass, patterns } of CLASS_TABLE) {
     for (const { pattern, label } of patterns) {
-      if (pattern.test(text)) return { errorClass, matched: label };
+      if (pattern.test(text)) return { errorClass, matched: label, basis: "text" };
     }
   }
-  return { errorClass: "unclassified", matched: "none" };
+  return { errorClass: "unclassified", matched: "none", basis: "text" };
 }

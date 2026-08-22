@@ -25,7 +25,8 @@ export type UpdateControllerReconciliationResult = Readonly<{
  */
 export async function reconcileControllerResourcesForUpdate(
   home: string,
-  environment: NodeJS.ProcessEnv = process.env
+  environment: NodeJS.ProcessEnv = process.env,
+  tmuxBin?: string
 ): Promise<UpdateControllerReconciliationResult> {
   const resolvedHome = resolve(home);
   const releaseLock = await acquireHomeLifecycleLock(resolvedHome, {
@@ -37,7 +38,8 @@ export async function reconcileControllerResourcesForUpdate(
       const snapshot = await scanControllerResourceInventory({
         currentHome: resolvedHome,
         scope: "current",
-        environment
+        environment,
+        ...(tmuxBin === undefined ? {} : { tmuxBin })
       });
       assertCertainSnapshot(snapshot, resolvedHome);
 
@@ -83,7 +85,7 @@ export async function reconcileControllerResourcesForUpdate(
 
       for (const candidate of candidates) {
         try {
-          await cleanControllerResource(candidate, { environment });
+          await cleanControllerResource(candidate, { environment, ...(tmuxBin === undefined ? {} : { tmuxBin }) });
           cleaned.add(candidate.id);
         } catch (error) {
           // A concurrent exact cleanup that already reached the desired state

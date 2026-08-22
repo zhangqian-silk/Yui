@@ -154,6 +154,7 @@ const READ_ONLY_STORE_METHODS: ReadonlySet<string> = new Set([
   "listTasks",
   "getTask",
   "readNextActionFacts",
+  "readCompletionReadinessFacts",
   "listActiveTaskIds",
   "getTaskBrief",
   "listChangeSets",
