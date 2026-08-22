@@ -52,6 +52,8 @@ const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
   // rr13/test: Forward the liveness seam so an integration test's Controller
   // subprocess does not reap a saved active Leader Run without a real tmux role.
   "YUI_TEST_ROLE_LIVENESS_PRESENT",
+  // Issue 02: agent-signal-driven launch monitoring is Controller-owned.
+  "YUI_LAUNCH_INACTIVITY_TIMEOUT_MS",
   ...EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES
 ] as const;
 

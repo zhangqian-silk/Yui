@@ -153,6 +153,20 @@ export function renderExecutionAudit(
         )
       );
     }
+    if (runs.launchFailures.total > 0) {
+      const phaseRows = Object.entries(runs.launchFailures.byPhase)
+        .filter(([, count]) => count > 0)
+        .sort((left, right) => right[1] - left[1]);
+      const kindRows = Object.entries(runs.launchFailures.byKind)
+        .filter(([, count]) => count > 0)
+        .sort((left, right) => right[1] - left[1]);
+      lines.push(
+        "",
+        `Launch failures: ${runs.launchFailures.total}`,
+        `By phase: ${phaseRows.map(([name, count]) => `${name}=${count}`).join(" · ")}`,
+        `By kind: ${kindRows.map(([name, count]) => `${name}=${count}`).join(" · ")}`
+      );
+    }
   } else {
     lines.push("", ...sectionError("runs", report));
   }
@@ -218,6 +232,16 @@ export function renderExecutionAudit(
     );
   } else {
     lines.push("", ...sectionError("integrations", report));
+  }
+
+  if (report.publications.status === "ok" && report.publications.data !== undefined) {
+    const publications = report.publications.data;
+    lines.push(
+      "",
+      `Publication references: ${publications.total} total · ${publications.merged} merged · ${publications.verified} verified · ${publications.open} open · ${publications.closed} closed · ${publications.superseded} superseded`
+    );
+  } else {
+    lines.push("", ...sectionError("publications", report));
   }
 
   if (report.events.status === "ok" && report.events.data !== undefined) {

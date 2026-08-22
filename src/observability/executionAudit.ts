@@ -26,6 +26,12 @@ import {
   countFaultClasses,
   type FaultClassCounts
 } from "./faultClassification.js";
+import {
+  RUNTIME_LAUNCH_KINDS,
+  RUNTIME_LAUNCH_PHASES,
+  type RuntimeLaunchKind,
+  type RuntimeLaunchPhase
+} from "../runtime/launchDiagnostics.js";
 import { UNSUPPORTED, type OptionalFact, type Unsupported } from "./runtimeIdentity.js";
 
 export type ExecutionAuditOptions = Readonly<{
@@ -53,7 +59,20 @@ export type RunsAudit = Readonly<{
   byRole: Readonly<{ leader: number; reviewer: number; implementer: number; other: number }>;
   byPurpose: Readonly<{ execution: number; review: number }>;
   faultClasses: FaultClassCounts;
+  launchFailures: LaunchFailureCounts;
 }>;
+
+export type LaunchFailureCounts = Readonly<{
+  total: number;
+  byPhase: Readonly<Record<RuntimeLaunchPhase, number>>;
+  byKind: Readonly<Record<RuntimeLaunchKind, number>>;
+}>;
+
+type MutableLaunchFailureCounts = {
+  total: number;
+  byPhase: Record<RuntimeLaunchPhase, number>;
+  byKind: Record<RuntimeLaunchKind, number>;
+};
 
 export type WakesAudit = Readonly<{
   leaderRuns: number;
@@ -95,6 +114,15 @@ export type IntegrationsAudit = Readonly<{
   /** Attempts reusing an exact (candidateCommit, checkCommands) signature. */
   gateReuse: number;
   faultClasses: FaultClassCounts;
+}>;
+
+export type PublicationsAudit = Readonly<{
+  total: number;
+  merged: number;
+  verified: number;
+  open: number;
+  closed: number;
+  superseded: number;
 }>;
 
 export type EventsAudit = Readonly<{
@@ -159,6 +187,7 @@ export type ExecutionAuditReport = Readonly<{
   sessions: AuditSection<SessionsAudit>;
   reviews: AuditSection<ReviewsAudit>;
   integrations: AuditSection<IntegrationsAudit>;
+  publications: AuditSection<PublicationsAudit>;
   events: AuditSection<EventsAudit>;
   providerRetries: AuditSection<ProviderRetriesAudit>;
   workItems: AuditSection<Readonly<{
@@ -255,6 +284,39 @@ function durationMs(run: AgentRun): number {
   return Math.max(0, Date.parse(run.endedAt) - Date.parse(run.createdAt));
 }
 
+function emptyLaunchFailureCounts(): MutableLaunchFailureCounts {
+  const counts: MutableLaunchFailureCounts = {
+    total: 0,
+    byPhase: Object.fromEntries(
+      RUNTIME_LAUNCH_PHASES.map((phase) => [phase, 0])
+    ) as Record<RuntimeLaunchPhase, number>,
+    byKind: Object.fromEntries(
+      RUNTIME_LAUNCH_KINDS.map((kind) => [kind, 0])
+    ) as Record<RuntimeLaunchKind, number>
+  };
+  return counts;
+}
+
+function addLaunchFailureCounts(
+  counts: MutableLaunchFailureCounts,
+  summary: string | undefined
+): void {
+  if (summary === undefined) return;
+  const phase = /failurePhase=([a-z-]+)/u.exec(summary)?.[1];
+  const kind = /failureKind=([a-z-]+)/u.exec(summary)?.[1];
+  if (
+    phase === undefined
+    || kind === undefined
+    || !RUNTIME_LAUNCH_PHASES.includes(phase as RuntimeLaunchPhase)
+    || !RUNTIME_LAUNCH_KINDS.includes(kind as RuntimeLaunchKind)
+  ) {
+    return;
+  }
+  counts.byPhase[phase as RuntimeLaunchPhase] += 1;
+  counts.byKind[kind as RuntimeLaunchKind] += 1;
+  counts.total += 1;
+}
+
 function ok<T>(data: T): AuditSection<T> {
   return { status: "ok", data };
 }
@@ -298,6 +360,7 @@ export function runExecutionAudit(
       sessions: section,
       reviews: section,
       integrations: section,
+      publications: section,
       events: section,
       providerRetries: section,
       workItems: section,
@@ -350,6 +413,7 @@ export function runExecutionAudit(
       const byRole = { leader: 0, reviewer: 0, implementer: 0, other: 0 };
       const byPurpose = { execution: 0, review: 0 };
       const failures = [];
+      const launchFailures: MutableLaunchFailureCounts = emptyLaunchFailureCounts();
       for (const taskId of taskIds) {
         for (const run of store.listAgentRuns(taskId)) {
           if (!inWindow(run.createdAt, options)) continue;
@@ -371,6 +435,7 @@ export function runExecutionAudit(
             failedCount += 1;
             failedDurationMs += duration;
             cumulativeDurationMs += duration;
+            addLaunchFailureCounts(launchFailures, run.summary);
             failures.push(classifyAgentRunFailure(run));
           }
         }
@@ -385,7 +450,8 @@ export function runExecutionAudit(
         failedDurationMs,
         byRole,
         byPurpose,
-        faultClasses: countFaultClasses(failures)
+        faultClasses: countFaultClasses(failures),
+        launchFailures
       });
     } catch (error) {
       return failed<RunsAudit>(error);
@@ -569,6 +635,37 @@ export function runExecutionAudit(
     }
   })();
 
+  const publications = ((): AuditSection<PublicationsAudit> => {
+    try {
+      let total = 0;
+      let merged = 0;
+      let verified = 0;
+      let open = 0;
+      let closed = 0;
+      let superseded = 0;
+      for (const taskId of taskIds) {
+        const references = store.listPublicationReferences(taskId);
+        const supersededIds = new Set(
+          references
+            .map((reference) => reference.supersedes)
+            .filter((id): id is string => id !== undefined)
+        );
+        for (const reference of references) {
+          if (!inWindow(reference.createdAt, options)) continue;
+          total += 1;
+          if (reference.state === "merged") merged += 1;
+          if (reference.state === "open") open += 1;
+          if (reference.state === "closed") closed += 1;
+          if (reference.verification === "verified") verified += 1;
+          if (supersededIds.has(reference.id)) superseded += 1;
+        }
+      }
+      return ok({ total, merged, verified, open, closed, superseded });
+    } catch (error) {
+      return failed<PublicationsAudit>(error);
+    }
+  })();
+
   const events = ((): AuditSection<EventsAudit> => {
     try {
       let total = 0;
@@ -739,6 +836,7 @@ export function runExecutionAudit(
     sessions,
     reviews,
     integrations,
+    publications,
     events,
     providerRetries,
     workItems,

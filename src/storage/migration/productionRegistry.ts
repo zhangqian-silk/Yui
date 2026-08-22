@@ -64,6 +64,8 @@ const STORED_TASK_WAKES_FROM_VERSION = 16;
 const STORED_TASK_WAKES_TO_VERSION = 17;
 const TASK_WAKE_FROM_VERSION = 0;
 const TASK_WAKE_TO_VERSION = 1;
+const STORED_TASK_PUBLICATION_REFERENCES_FROM_VERSION = 16;
+const STORED_TASK_PUBLICATION_REFERENCES_TO_VERSION = 17;
 const CAPABILITY_GRANT_FROM_VERSION = 0;
 const CAPABILITY_GRANT_TO_VERSION = 1;
 const RELEASE_WORKFLOW_FROM_VERSION = 0;
@@ -72,6 +74,8 @@ const WORK_MAILBOX_FROM_VERSION = 1;
 const WORK_MAILBOX_TO_VERSION = 2;
 const TASK_ROLE_SESSION_SET_FROM_VERSION = 4;
 const TASK_ROLE_SESSION_SET_TO_VERSION = 5;
+const PUBLICATION_REFERENCE_FROM_VERSION = 0;
+const PUBLICATION_REFERENCE_TO_VERSION = 1;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -179,13 +183,14 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(integrationQueueIntroductionStep())
     .registerCompatible(storedTaskDurableJobsStep())
     .registerCompatible(storedTaskJobCallerKeyHashesStep())
-    .registerCompatible(storedTaskWakesStep())
+    .registerCompatible(storedTaskWakesAndPublicationReferencesStep())
     .registerCompatible(taskWakeIntroductionStep())
     .registerCompatible(durableJobIntroductionStep())
     .registerOfflineMigration(capabilityGrantIntroductionStep())
     .registerOfflineMigration(releaseWorkflowIntroductionStep())
     .registerOfflineMigration(workMailboxV2Step())
-    .registerOfflineMigration(taskRoleSessionSetV5Step());
+    .registerOfflineMigration(taskRoleSessionSetV5Step())
+    .registerOfflineMigration(publicationReferenceIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
@@ -1132,12 +1137,12 @@ function normalizeStoredTaskV15ToV16(snapshot: HomeSnapshot): HomeSnapshot {
 }
 
 /**
- * StoredTask v17 introduces the durable TaskWake ledger (Issue 04 long-term
- * design). Every aggregate gains an empty `wakes` map and a zero high-water
- * mark; existing wake history starts empty and the cursor falls back to the
- * last Leader Run creation time until the first wake is dispatched.
+ * StoredTask v17 introduces both the durable TaskWake ledger (Issue 04
+ * long-term design) and the publicationReferences map (Issue 11). Every
+ * aggregate gains empty `wakes` and `publicationReferences` maps and zero
+ * high-water marks.
  */
-function storedTaskWakesStep(): CompatibleStep<HomeSnapshot> {
+function storedTaskWakesAndPublicationReferencesStep(): CompatibleStep<HomeSnapshot> {
   return {
     kind: "compatible",
     axis: "record",
@@ -1146,6 +1151,8 @@ function storedTaskWakesStep(): CompatibleStep<HomeSnapshot> {
     toVersion: STORED_TASK_WAKES_TO_VERSION,
     defaults: [
       "wakes defaults to an empty map on every Task aggregate"
+      ,
+      "publicationReferences defaults to an empty map on every Task aggregate"
     ],
     validateSource: (snapshot) => requireStoredTaskV16Shape(snapshot),
     normalize: (snapshot) => normalizeStoredTaskV16ToV17(snapshot)
@@ -1162,6 +1169,9 @@ const STORED_TASK_V16_FIELDS = [
   "integrationQueue",
   "durableJobs",
   "jobCallerKeyHashes",
+  // May already be present after the publicationReference introduction runs
+  // first; the 16->17 normalizer preserves the empty introduced map.
+  "publicationReferences",
   "capabilityGrants",
   "releaseWorkflows",
   "roles",
@@ -1202,9 +1212,18 @@ function requireStoredTaskV16Shape(snapshot: HomeSnapshot): void {
     const allowed = new Set<string>(STORED_TASK_V16_FIELDS);
     const unknown = Object.keys(task).find((key) => !allowed.has(key));
     if (unknown !== undefined) {
-      throw new Error(
-        `Task aggregate ${taskId} has an unknown v16 field: ${unknown}.`
+      throw new Error(`Task aggregate ${taskId} has an unknown v16 field: ${unknown}.`);
+    }
+    if (task.publicationReferences !== undefined) {
+      const references = asObject(
+        task.publicationReferences,
+        `Task aggregate ${taskId} publicationReferences`
       );
+      if (Object.keys(references).length > 0) {
+        throw new Error(
+          `Task aggregate ${taskId} already has publication references before v17.`
+        );
+      }
     }
   }
 }
@@ -1227,11 +1246,21 @@ function normalizeStoredTaskV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {
   const nextTasks: Record<string, unknown> = {};
   for (const [taskId, rawTask] of Object.entries(tasks)) {
     const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const existingReferences = task.publicationReferences === undefined
+      ? {}
+      : asObject(task.publicationReferences, `Task aggregate ${taskId} publicationReferences`);
     const marks = asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`);
+    const existingMark = marks.publicationReference;
+    const existingWakeMark = marks.taskWake;
     nextTasks[taskId] = {
       ...task,
       schemaVersion: STORED_TASK_WAKES_TO_VERSION,
-      idHighWaterMarks: { ...marks, taskWake: TASK_WAKE_FROM_VERSION },
+      idHighWaterMarks: {
+        ...marks,
+        publicationReference: typeof existingMark === "number" ? existingMark : 0,
+        taskWake: typeof existingWakeMark === "number" ? existingWakeMark : TASK_WAKE_FROM_VERSION
+      },
+      publicationReferences: existingReferences,
       wakes: {}
     };
   }
@@ -1522,6 +1551,95 @@ function introduceReleaseWorkflowFamily(snapshot: HomeSnapshot): HomeSnapshot {
       ...task,
       idHighWaterMarks: { ...marks, releaseWorkflow: RELEASE_WORKFLOW_FROM_VERSION },
       releaseWorkflows: {}
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * Issue 11: introduce the task-scoped PublicationReference family. A
+ * pre-introduction Home names no publicationReference manifest version and its
+ * Task aggregates carry no `publicationReferences` map; this explicit 0->1
+ * step adds the empty family to every Task (plus the matching high-water mark).
+ */
+function publicationReferenceIntroductionStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "publicationReference",
+    fromVersion: PUBLICATION_REFERENCE_FROM_VERSION,
+    toVersion: PUBLICATION_REFERENCE_TO_VERSION,
+    introduction: true,
+    preconditions: requirePublicationReferenceIntroduction,
+    transform: introducePublicationReferenceFamily,
+    declaredEffects: []
+  };
+}
+
+function requirePublicationReferenceIntroduction(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const namedVersion = manifestVersions.publicationReference;
+  if (namedVersion !== undefined && namedVersion !== PUBLICATION_REFERENCE_FROM_VERSION) {
+    throw new Error(
+      `Record publicationReference introduction requires an absent manifest version or ${PUBLICATION_REFERENCE_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.publicationReferences !== undefined) {
+      const references = asObject(
+        task.publicationReferences,
+        `publicationReference map ${taskId}`
+      );
+      if (Object.keys(references).length > 0) {
+        throw new Error(
+          `Publication reference introduction found existing records: ${taskId}.`
+        );
+      }
+    }
+    const marks = task.idHighWaterMarks;
+    if (marks !== undefined) {
+      const highWaterMarks = asObject(marks, `Task id high-water marks ${taskId}`);
+      const mark = highWaterMarks.publicationReference;
+      if (mark !== undefined && mark !== PUBLICATION_REFERENCE_FROM_VERSION) {
+        throw new Error(
+          `Publication reference introduction found a high-water mark: ${taskId}.`
+        );
+      }
+    }
+  }
+}
+
+function introducePublicationReferenceFamily(snapshot: HomeSnapshot): HomeSnapshot {
+  requirePublicationReferenceIntroduction(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      publicationReference: PUBLICATION_REFERENCE_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const marks = asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`);
+    nextTasks[taskId] = {
+      ...task,
+      idHighWaterMarks: { ...marks, publicationReference: PUBLICATION_REFERENCE_FROM_VERSION },
+      publicationReferences: {}
     };
   }
   return {

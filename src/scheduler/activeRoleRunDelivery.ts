@@ -22,6 +22,7 @@ import {
   effectiveLaunchSnapshotsCompatibleForTaskMain
 } from "../executor/effectiveLaunch.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
+import { RuntimeLaunchFailure } from "../runtime/launchDiagnostics.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { mailboxHasWork, nextPendingBatch } from "../coordination/workMailbox.js";
@@ -362,6 +363,38 @@ export async function processActiveRoleRunDeliveries(
             error: message
           });
           continue;
+        }
+        if (error instanceof RuntimeLaunchFailure) {
+          if (!deliveryAttempted) {
+            delivery.forgetPrepared?.({
+              taskId: task.id,
+              roleName: role.name,
+              runId: run.id,
+              ...(prepared?.launchId === undefined
+                ? {}
+                : { launchId: prepared.launchId })
+            });
+            const persisted = store.saveExitedRoleRun({
+              task,
+              role,
+              run,
+              session: existingSession,
+              summary: error.message,
+              now
+            });
+            results.push({
+              taskId: task.id,
+              roleName: role.name,
+              runId: run.id,
+              status: "failed",
+              reason: "launch-failed",
+              error: persisted === "state-changed"
+                ? "Run state changed during launch failure."
+                : message,
+              terminalized: persisted === "failed"
+            });
+            continue;
+          }
         }
         if (error instanceof RuntimeLaunchError) {
           const terminalFailure = roleRunDeliveryFailure(

@@ -112,6 +112,7 @@ import {
   StorageRecordError,
   FileTaskStore,
   storedCapabilityGrant,
+  storedPublicationReference,
   storedReleaseWorkflow,
   isValidCapabilityGrantTransition,
   isValidReleaseWorkflowTransition,
@@ -121,8 +122,10 @@ import {
   type YuiConfig,
   validateYuiConfig
 } from "./taskStore.js";
+import { publicationExternalKey } from "../task/publicationReference.js";
 import type { CapabilityGrant } from "../grant/capabilityGrant.js";
 import type { ReleaseWorkflow } from "../release/releaseWorkflow.js";
+import type { PublicationReference } from "../task/publicationReference.js";
 import {
   gateArtifactKey,
   validateGateArtifact,
@@ -209,6 +212,37 @@ const DEFAULT_CONFIG: YuiConfig = { schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION
 
 function numericCompare(left: string, right: string): number {
   return left.localeCompare(right, undefined, { numeric: true });
+}
+
+function latestSqlitePublicationReference(
+  references: readonly PublicationReference[]
+): PublicationReference {
+  const byId = new Map(references.map((reference) => [reference.id, reference]));
+  const superseded = new Set(
+    references
+      .map((reference) => reference.supersedes)
+      .filter((id): id is string => id !== undefined)
+  );
+  const roots = references.filter((reference) => !superseded.has(reference.id));
+  const latest = roots.length === 1
+    ? roots[0]!
+    : [...references].sort((left, right) => numericCompare(right.id, left.id))[0]!;
+  let current = latest;
+  const seen = new Set<string>();
+  while (current.supersedes !== undefined) {
+    if (seen.has(current.id)) {
+      throw new StorageRecordError(`Publication supersession cycle at ${current.id}.`);
+    }
+    seen.add(current.id);
+    const previous = byId.get(current.supersedes);
+    if (previous === undefined) {
+      throw new StorageRecordError(
+        `Publication supersession target not found: ${current.id}/${current.supersedes}.`
+      );
+    }
+    current = previous;
+  }
+  return latest;
 }
 
 /** True when the better-sqlite3 error is a UNIQUE/PRIMARY KEY constraint failure. */
@@ -1810,6 +1844,113 @@ export class SqliteTaskStore implements TaskStore {
 
   getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null {
     return this.#getPayload<ReleaseWorkflow>("release_workflows", "task_id = ? AND workflow_id = ?", [taskId, workflowId]);
+  }
+
+  // -- publication references -------------------------------------------------
+
+  nextPublicationReferenceId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "publicationReference");
+  }
+
+  savePublicationReference(taskId: string, reference: PublicationReference): void {
+    const stored = storedPublicationReference(reference);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Publication reference belongs to another Task: ${stored.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const key = publicationExternalKey(stored);
+      const existing = this.#getPayload<PublicationReference>(
+        "publication_references",
+        "task_id = ? AND publication_id = ?",
+        [taskId, stored.id]
+      );
+      if (existing !== null && !isDeepStrictEqual(existing, stored)) {
+        throw new StorageRecordError(
+          `Publication reference cannot be overwritten: ${taskId}/${stored.id}`
+        );
+      }
+      if (existing === null) {
+        const sameExternal = this.#listPayload<PublicationReference>(
+          "publication_references",
+          "external_key = ?",
+          [key]
+        );
+        const otherTask = sameExternal.find((candidate) => candidate.taskId !== taskId);
+        if (otherTask !== undefined) {
+          throw new StorageRecordError(
+            `Publication external identity already belongs to Task ${otherTask.taskId}: ${key}.`
+          );
+        }
+        if (sameExternal.length > 0) {
+          const latest = latestSqlitePublicationReference(sameExternal);
+          if (stored.supersedes !== latest.id) {
+            throw new StorageRecordError(
+              `Publication external identity conflicts with ${latest.id}; `
+              + `explicitly supersede that record: ${key}.`
+            );
+          }
+        } else if (stored.supersedes !== undefined) {
+          throw new StorageRecordError(
+            `Publication supersedes target has a different external identity: ${stored.supersedes}.`
+          );
+        }
+      }
+      this.#db.prepare(
+        `INSERT INTO publication_references
+           (task_id, publication_id, project_id, provider, repository, external_kind,
+            external_id, external_key, state, verification, external_url, local_commit,
+            remote_commit, supersedes, payload, merged_at, created_at,
+            title, source_branch, target_branch)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(task_id, publication_id) DO UPDATE SET payload = excluded.payload`
+      ).run(
+        taskId,
+        stored.id,
+        stored.projectId,
+        stored.provider,
+        stored.repository,
+        stored.externalKind,
+        stored.externalId,
+        key,
+        stored.state,
+        stored.verification,
+        stored.externalUrl ?? null,
+        stored.localCommit ?? null,
+        stored.remoteCommit ?? null,
+        stored.supersedes ?? null,
+        this.#json(stored),
+        stored.mergedAt ?? null,
+        this.#now(),
+        stored.title ?? null,
+        stored.sourceBranch ?? null,
+        stored.targetBranch ?? null
+      );
+    });
+  }
+
+  listPublicationReferences(taskId: string): PublicationReference[] {
+    return this.#sortById(
+      this.#listPayload<PublicationReference>("publication_references", "task_id = ?", [taskId]),
+      (reference) => reference.id
+    );
+  }
+
+  getPublicationReference(taskId: string, referenceId: string): PublicationReference | null {
+    return this.#getPayload<PublicationReference>(
+      "publication_references",
+      "task_id = ? AND publication_id = ?",
+      [taskId, referenceId]
+    );
+  }
+
+  findPublicationReferenceByExternalKey(externalKey: string): PublicationReference | null {
+    const matches = this.#listPayload<PublicationReference>(
+      "publication_references",
+      "external_key = ?",
+      [externalKey]
+    );
+    return matches.length === 0 ? null : latestSqlitePublicationReference(matches);
   }
 
   // -- gate artifacts (Issue 08) ----------------------------------------------

@@ -25,6 +25,11 @@ import {
   type ReleaseWorkflow
 } from "../release/releaseWorkflow.js";
 import {
+  publicationExternalKey,
+  validatePublicationReference,
+  type PublicationReference
+} from "../task/publicationReference.js";
+import {
   reconciliationIntervalMilliseconds,
   resolveLeaderNextActionMode,
   resolveResourcesGcAutoQuarantine,
@@ -210,6 +215,7 @@ export const CURRENT_EVENT_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION = 1 as const;
 export const CURRENT_WORK_MAILBOX_SCHEMA_VERSION = 2 as const;
+export const CURRENT_PUBLICATION_REFERENCE_SCHEMA_VERSION = 1 as const;
 export const CURRENT_ROLE_AGENT_SESSION_SCHEMA_VERSION = 3 as const;
 export const CURRENT_PENDING_WAKEUP_SCHEMA_VERSION = 1 as const;
 const STORAGE_LOCK_DIRECTORY = ".state.lock";
@@ -405,6 +411,7 @@ type StoredTask = {
   wakes: Record<string, TaskWake>;
   capabilityGrants: Record<string, CapabilityGrant>;
   releaseWorkflows: Record<string, ReleaseWorkflow>;
+  publicationReferences: Record<string, PublicationReference>;
   leaderFailure: LeaderFailure | null;
   operatorNotification: OperatorNotification | null;
 };
@@ -629,6 +636,11 @@ export type TaskStore = {
   saveReleaseWorkflow(taskId: string, workflow: ReleaseWorkflow): void;
   listReleaseWorkflows(taskId: string): ReleaseWorkflow[];
   getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null;
+  nextPublicationReferenceId(taskId: string): string;
+  savePublicationReference(taskId: string, reference: PublicationReference): void;
+  listPublicationReferences(taskId: string): PublicationReference[];
+  getPublicationReference(taskId: string, referenceId: string): PublicationReference | null;
+  findPublicationReferenceByExternalKey(externalKey: string): PublicationReference | null;
   // -- Gate artifacts (Issue 08) ---------------------------------------------
   saveGateArtifact(artifact: GateArtifact, logs: ReadonlyMap<string, Buffer>): void;
   touchGateArtifact(artifact: GateArtifact): void;
@@ -2098,6 +2110,69 @@ export class FileTaskStore implements TaskStore {
     return this.#requireTask(taskId).releaseWorkflows[workflowId] ?? null;
   }
 
+  nextPublicationReferenceId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "publicationReference");
+  }
+  savePublicationReference(taskId: string, reference: PublicationReference): void {
+    const stored = storedPublicationReference(reference);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Publication reference belongs to another Task: ${stored.taskId}`);
+    }
+    this.#mutate((state) => {
+      const aggregate = requireTaskFromState(state, taskId);
+      const existing = aggregate.publicationReferences[stored.id];
+      if (existing !== undefined) {
+        if (!isDeepStrictEqual(existing, stored)) {
+          throw new StorageRecordError(
+            `Publication reference cannot be overwritten: ${taskId}/${stored.id}`
+          );
+        }
+      } else {
+        const key = publicationExternalKey(stored);
+        const sameExternal: PublicationReference[] = [];
+        for (const [otherTaskId, otherAggregate] of Object.entries(state.tasks)) {
+          for (const candidate of Object.values(otherAggregate.publicationReferences)) {
+            if (publicationExternalKey(candidate) === key) {
+              if (otherTaskId !== taskId) {
+                throw new StorageRecordError(
+                  `Publication external identity already belongs to Task ${otherTaskId}: ${key}.`
+                );
+              }
+              sameExternal.push(candidate);
+            }
+          }
+        }
+        if (sameExternal.length > 0) {
+          const latest = latestPublicationReference(sameExternal);
+          if (stored.supersedes !== latest.id) {
+            throw new StorageRecordError(
+              `Publication external identity conflicts with ${latest.id}; `
+              + `explicitly supersede that record: ${key}.`
+            );
+          }
+        } else if (stored.supersedes !== undefined) {
+          throw new StorageRecordError(
+            `Publication supersedes target has a different external identity: ${stored.supersedes}.`
+          );
+        }
+        observeTaskRecordId(aggregate, "publicationReference", stored.id);
+      }
+      aggregate.publicationReferences[stored.id] = stored;
+    });
+  }
+  listPublicationReferences(taskId: string): PublicationReference[] {
+    return values(this.#requireTask(taskId).publicationReferences, "id");
+  }
+  getPublicationReference(taskId: string, referenceId: string): PublicationReference | null {
+    return this.#requireTask(taskId).publicationReferences[referenceId] ?? null;
+  }
+  findPublicationReferenceByExternalKey(externalKey: string): PublicationReference | null {
+    const matches = Object.values(this.#state().tasks)
+      .flatMap((aggregate) => Object.values(aggregate.publicationReferences))
+      .filter((reference) => publicationExternalKey(reference) === externalKey);
+    return matches.length === 0 ? null : latestPublicationReference(matches);
+  }
+
   // -- Gate artifacts (Issue 08) ---------------------------------------------
   // FileTaskStore delegates to the file-backed artifact namespace under
   // `<home>/artifacts/gates/`.  This is the transitional path for Homes that
@@ -2626,6 +2701,7 @@ function emptyStoredTask(task: Task): StoredTask {
     wakes: {},
     capabilityGrants: {},
     releaseWorkflows: {},
+    publicationReferences: {},
     leaderFailure: null,
     operatorNotification: null
   };
@@ -2648,7 +2724,8 @@ function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
     event: 0,
     taskWake: 0,
     capabilityGrant: 0,
-    releaseWorkflow: 0
+    releaseWorkflow: 0,
+    publicationReference: 0
   };
 }
 
@@ -2876,6 +2953,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "wakes",
     "capabilityGrants",
     "releaseWorkflows",
+    "publicationReferences",
     "leaderFailure",
     "operatorNotification"
   ], `Task aggregate ${taskId}`);
@@ -3139,6 +3217,16 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     }
     return workflow;
   }, "releaseWorkflows");
+  parseMap(aggregate.publicationReferences, (record, key) => {
+    const reference = storedPublicationReference(record);
+    if (reference.id !== key) {
+      throw new StorageRecordError(`Publication reference identity is inconsistent: ${key}.`);
+    }
+    if (reference.taskId !== taskId) {
+      throw new StorageRecordError(`Publication reference belongs to another Task: ${reference.taskId}`);
+    }
+    return reference;
+  }, "publicationReferences");
   for (const [key, label] of [["leaderFailure", "Leader failure"], ["operatorNotification", "Operator notification"]] as const) {
     const record = aggregate[key];
     if (record !== null) {
@@ -3174,7 +3262,8 @@ function validateTaskIdHighWaterCoverage(
     event: aggregate.events,
     taskWake: aggregate.wakes,
     capabilityGrant: aggregate.capabilityGrants,
-    releaseWorkflow: aggregate.releaseWorkflows
+    releaseWorkflow: aggregate.releaseWorkflows,
+    publicationReference: aggregate.publicationReferences
   };
   for (const kind of Object.keys(TASK_RECORD_ID_PREFIXES) as TaskRecordKind[]) {
     const pattern = new RegExp(`^${TASK_RECORD_ID_PREFIXES[kind]}-(\\d+)$`);
@@ -3659,6 +3748,108 @@ export function storedReleaseWorkflow(value: unknown): ReleaseWorkflow {
   }
 }
 
+export function storedPublicationReference(value: unknown): PublicationReference {
+  const reference = versioned<PublicationReference>(
+    value,
+    CURRENT_PUBLICATION_REFERENCE_SCHEMA_VERSION,
+    "Publication reference"
+  );
+  const fields = [
+    "schemaVersion", "id", "taskId", "projectId", "provider", "repository",
+    "externalKind", "externalId", "state", "verification", "recordedBy",
+    "source", "createdAt"
+  ];
+  if (reference.externalUrl !== undefined) fields.push("externalUrl");
+  if (reference.title !== undefined) fields.push("title");
+  if (reference.sourceBranch !== undefined) fields.push("sourceBranch");
+  if (reference.targetBranch !== undefined) fields.push("targetBranch");
+  if (reference.localCommit !== undefined) fields.push("localCommit");
+  if (reference.remoteCommit !== undefined) fields.push("remoteCommit");
+  if (reference.evidence !== undefined) fields.push("evidence");
+  if (reference.supersedes !== undefined) fields.push("supersedes");
+  if (reference.mergedAt !== undefined) fields.push("mergedAt");
+  exact(reference as unknown as Record<string, unknown>, fields, "Publication reference");
+  requireRecordIdentity(reference.id, "Publication reference id");
+  requireRecordIdentity(reference.taskId, "Publication reference Task id");
+  validateTaskRecordReference(
+    { taskId: reference.taskId, localId: reference.id },
+    "publicationReference"
+  );
+  requireRecordIdentity(reference.projectId, "Publication reference Project id");
+  requireNormalizedText(reference.provider, "Publication reference provider");
+  requireNormalizedText(reference.repository, "Publication reference repository");
+  requireNormalizedText(reference.externalKind, "Publication reference external kind");
+  requireNormalizedText(reference.externalId, "Publication reference external id");
+  if (reference.externalUrl !== undefined) {
+    requireNormalizedText(reference.externalUrl, "Publication reference external URL");
+  }
+  if (reference.title !== undefined) {
+    requireNormalizedText(reference.title, "Publication reference title");
+  }
+  if (reference.sourceBranch !== undefined) {
+    requireNormalizedText(reference.sourceBranch, "Publication reference source branch");
+  }
+  if (reference.targetBranch !== undefined) {
+    requireNormalizedText(reference.targetBranch, "Publication reference target branch");
+  }
+  if (reference.localCommit !== undefined) {
+    requireNormalizedText(reference.localCommit, "Publication reference local commit");
+  }
+  if (reference.remoteCommit !== undefined) {
+    requireNormalizedText(reference.remoteCommit, "Publication reference remote commit");
+  }
+  requireNormalizedText(reference.state, "Publication reference state");
+  requireNormalizedText(reference.verification, "Publication reference verification");
+  if (reference.evidence !== undefined) {
+    requireNormalizedText(reference.evidence, "Publication reference evidence");
+  }
+  if (reference.supersedes !== undefined) {
+    requireNormalizedText(reference.supersedes, "Publication reference supersedes id");
+  }
+  requireNormalizedText(reference.recordedBy, "Publication reference recordedBy");
+  requireNormalizedText(reference.source, "Publication reference source");
+  if (reference.mergedAt !== undefined) {
+    requireTimestamp(reference.mergedAt, "Publication reference mergedAt");
+  }
+  requireTimestamp(reference.createdAt, "Publication reference createdAt");
+  try {
+    return validatePublicationReference(reference);
+  } catch (error) {
+    throw new StorageRecordError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function latestPublicationReference(
+  references: readonly PublicationReference[]
+): PublicationReference {
+  const byId = new Map(references.map((reference) => [reference.id, reference]));
+  const superseded = new Set(
+    references
+      .map((reference) => reference.supersedes)
+      .filter((id): id is string => id !== undefined)
+  );
+  const roots = references.filter((reference) => !superseded.has(reference.id));
+  const latest = roots.length === 1 ? roots[0]! : [...byId.values()].sort((left, right) => (
+    right.id.localeCompare(left.id, undefined, { numeric: true })
+  ))[0]!;
+  let current = latest;
+  const seen = new Set<string>();
+  while (current.supersedes !== undefined) {
+    if (seen.has(current.id)) {
+      throw new StorageRecordError(`Publication supersession cycle at ${current.id}.`);
+    }
+    seen.add(current.id);
+    const previous = byId.get(current.supersedes);
+    if (previous === undefined) {
+      throw new StorageRecordError(
+        `Publication supersession target not found: ${current.id}/${current.supersedes}.`
+      );
+    }
+    current = previous;
+  }
+  return latest;
+}
+
 function storedReleaseWorkflowSource(source: ReleaseWorkflow["source"]): void {
   const value = object(source, "Release workflow source");
   const sourceFields = ["repository", "commit"];
@@ -4139,8 +4330,45 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
       }
     }
   }
+  for (const reference of Object.values(aggregate.publicationReferences)) {
+    if (!boundProjects.has(reference.projectId)) {
+      throw new StorageRecordError(
+        `Publication reference Project does not match Task: ${reference.id}.`
+      );
+    }
+    if (reference.supersedes !== undefined) {
+      const target = aggregate.publicationReferences[reference.supersedes];
+      if (target === undefined) {
+        throw new StorageRecordError(
+          `Publication reference supersedes target not found: ${reference.id}/${reference.supersedes}.`
+        );
+      }
+      if (publicationExternalKey(target) !== publicationExternalKey(reference)) {
+        throw new StorageRecordError(
+          `Publication reference supersedes a different external identity: ${reference.id}/${reference.supersedes}.`
+        );
+      }
+    }
+  }
+  assertPublicationExternalIdentityUniqueness(state);
   for (const workspace of Object.values(aggregate.managedWorkspaces)) {
     assertManagedWorkspaceReferences(aggregate, workspace, "Managed workspace");
+  }
+}
+
+function assertPublicationExternalIdentityUniqueness(state: StorageState): void {
+  const owners = new Map<string, string>();
+  for (const aggregate of Object.values(state.tasks)) {
+    for (const reference of Object.values(aggregate.publicationReferences)) {
+      const key = publicationExternalKey(reference);
+      const owner = owners.get(key);
+      if (owner !== undefined && owner !== aggregate.task.id) {
+        throw new StorageRecordError(
+          `Publication external identity belongs to multiple Tasks: ${key}.`
+        );
+      }
+      owners.set(key, aggregate.task.id);
+    }
   }
 }
 

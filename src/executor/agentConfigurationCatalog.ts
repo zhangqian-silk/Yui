@@ -270,6 +270,39 @@ export function modelChoice(
     : catalog.models.find((model) => model.value === value);
 }
 
+/**
+ * Validates the launch-time model/effort against a live or cached capability
+ * catalog. A fallback catalog intentionally carries no model list, so an
+ * unavailable Provider probe does not block a supported launch.
+ */
+export function validateAgentLaunchConfiguration(
+  catalog: AgentConfigurationCatalog,
+  config: Pick<RoleAgentConfig, "model" | "effort">
+): void {
+  if (catalog.models.length === 0) return;
+  const model = modelChoice(catalog, config.model);
+  if (model === undefined) {
+    throw new Error(
+      `Unsupported ${catalog.adapterId} launch configuration: field=model actual=${
+        JSON.stringify(config.model ?? "")
+      } supported=${JSON.stringify(catalog.models.map(({ value }) => value))}.`
+    );
+  }
+  if (
+    config.effort !== undefined
+    && model.efforts.length > 0
+    && !model.efforts.some((effort) => effort.value === config.effort)
+  ) {
+    throw new Error(
+      `Unsupported ${catalog.adapterId} launch configuration: field=effort actual=${
+        JSON.stringify(config.effort)
+      } model=${JSON.stringify(model.value)} supported=${
+        JSON.stringify(model.efforts.map(({ value }) => value))
+      }.`
+    );
+  }
+}
+
 function field(
   key: string,
   choices: readonly AgentConfigurationChoice[],

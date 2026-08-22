@@ -105,6 +105,7 @@ import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
 import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
+import { runPublicationCommand } from "./taskPublicationCommands.js";
 import {
   enqueueWork,
   requireCompleteWorkExecution,
@@ -407,8 +408,13 @@ export function parseTaskCompletionRequest(
   args: string[],
   summaryOverride?: string
 ): Readonly<{ taskId: string; summary: string }> {
-  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
-  const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
+  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote].";
+  const parsed = parseTail(
+    args,
+    new Set(["--summary", "--summary-file"]),
+    usage,
+    new Set(["--refresh-remote"])
+  );
   exactPositionals(parsed.positionals, 1, usage);
   const inlineSummary = parsed.options.get("--summary");
   const summaryFile = parsed.options.get("--summary-file");
@@ -538,6 +544,7 @@ export function runTaskCommand(
     case "input": return runTaskInputCommand(rest, store, options);
     case "grant": return runGrantCommand(rest, store, options);
     case "workflow": return runWorkflowCommand(rest, store, options);
+    case "publication": return runPublicationCommand(rest, store, options);
     case "role": return taskRoleCommand(rest, store, options);
     case "work": return taskWorkCommand(rest, store, options);
     case "review": return taskReviewCommand(rest, store, options);
@@ -950,6 +957,10 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const work = store.listWorkItems(task.id);
   const changeSets = store.listChangeSets(task.id);
   const integrations = store.listIntegrationAttempts(task.id);
+  const publications = store.listPublicationReferences(task.id);
+  const verifiedMergedPublications = publications.filter((reference) => (
+    reference.state === "merged" && reference.verification === "verified"
+  )).length;
   const counts = {
     messages: messages.length,
     decisions: decisions.length,
@@ -959,6 +970,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     agentRuns: store.listAgentRuns(task.id).length,
     changeSets: changeSets.length,
     integrations: integrations.length,
+    publications: publications.length,
     openInputs
   };
   const timeZone = store.getConfig().timeZone;
@@ -996,6 +1008,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Agent Runs: ${counts.agentRuns}`,
     `ChangeSets: ${counts.changeSets}`,
     `Integration Attempts: ${counts.integrations}`,
+    `Publication references: ${counts.publications} (${verifiedMergedPublications} verified merged)`,
     `Open inputs: ${counts.openInputs}`,
     `Created: ${presentTime(task.createdAt, timeZone)}`,
     `Updated: ${presentTime(task.updatedAt, timeZone)}`

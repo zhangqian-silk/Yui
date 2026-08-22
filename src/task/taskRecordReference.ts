@@ -17,6 +17,8 @@ export const TASK_RECORD_ID_PREFIXES = {
   capabilityGrant: "capability-grant",
   releaseWorkflow: "release-workflow",
   taskWake: "wake"
+  ,
+  publicationReference: "publication"
 } as const;
 
 export type TaskRecordKind = keyof typeof TASK_RECORD_ID_PREFIXES;

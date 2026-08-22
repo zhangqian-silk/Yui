@@ -51,6 +51,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     const reviewRounds = chronological(reader.listReviewRounds(task.id));
     const changeSets = chronological(reader.listChangeSets(task.id));
     const integrations = chronological(reader.listIntegrationAttempts(task.id));
+    const publications = chronological(reader.listPublicationReferences(task.id));
     const nextActionFacts = reader.readNextActionFacts(task.id);
     if (nextActionFacts === null) {
       throw new Error(`Task next-action facts disappeared: ${task.id}.`);
@@ -75,6 +76,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       reviewRounds,
       changeSets,
       integrations,
+      publications,
       messages: reader.listMessages(task.id),
       openInputRequests: inputRequests.filter((request) => request.status === "open"),
       resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
@@ -99,6 +101,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     reviewRounds,
     changeSets,
     integrations,
+    publications,
     messages,
     openInputRequests,
     resolvedInputRequests,
@@ -353,6 +356,26 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             integration.targetRef
           }; ${integration.changeSetIds.join(", ")}`
         ))),
+    "",
+    `Publication references (${publications.length}):`,
+    ...(publications.length === 0
+      ? ["  None."]
+      : publications.slice(-RECENT_RECORD_LIMIT).map((reference) => [
+          `  ${reference.id}: ${reference.provider}/${reference.repository}/${reference.externalId}`,
+          ...(reference.title === undefined ? [] : [`    Title: ${reference.title}`]),
+          ...(reference.sourceBranch === undefined && reference.targetBranch === undefined
+            ? []
+            : [`    Branches: ${reference.sourceBranch ?? "unknown"} -> ${reference.targetBranch ?? "unknown"}`]),
+          `    ${reference.state}/${reference.verification}; ${
+            reference.localCommit ?? "unknown"
+          } -> ${reference.remoteCommit ?? "unknown"}`,
+          ...(reference.mergedAt === undefined
+            ? []
+            : [`    Merged: ${formatTimestamp(reference.mergedAt, timeZone)}`]),
+          ...(reference.supersedes === undefined
+            ? []
+            : [`    Supersedes: ${reference.supersedes}`])
+        ]).flat()),
     "",
     ...recentSection(
       "messages",
