@@ -51,6 +51,7 @@ import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   NodeGitWorkspace,
   worktreeIdentity,
+  type GitRemoteBaseline,
   type GitWorkspacePort,
   type GitWorkspaceRemoval,
   type GitWorkspaceState
@@ -69,6 +70,11 @@ import {
   type TaskWorkspaceIdentity
 } from "./taskWorkspaceIdentity.js";
 import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
+import {
+  captureTaskBaseProvenance,
+  recordTaskBaseProvenanceEvents,
+  type TaskBaseProvenance
+} from "./taskBaseFreshness.js";
 
 const MAIN_WORKTREE = "main";
 const LEADER_ROLE = "leader";
@@ -85,6 +91,7 @@ type TaskWorkspaceBaseline = Readonly<{
   recordedBaseRef: string;
   expectedCommit?: string;
   pinTask?: boolean;
+  remoteBaseline?: GitRemoteBaseline;
 }>;
 
 export type TaskWorkspacePreparation = Readonly<{
@@ -342,7 +349,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     );
 
     const root = this.#taskWorkspaceRoot(task.id);
-    const prepared: Array<Readonly<{ project: Project; entry: WorkspaceProjectEntry }>> = [];
+    const prepared: Array<Readonly<{
+      project: Project;
+      entry: WorkspaceProjectEntry;
+      provenance: TaskBaseProvenance;
+    }>> = [];
     const defaultProjects = remoteDefaultProjects(this.store, task.id);
     const baselines = new Map<string, TaskWorkspaceBaseline>();
     try {
@@ -382,7 +393,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             baseRef: remote.commit,
             recordedBaseRef: remote.commit,
             expectedCommit: remote.commit,
-            pinTask: true
+            pinTask: true,
+            remoteBaseline: remote
           });
           continue;
         }
@@ -414,6 +426,14 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             `Task Project workspace did not start at the fetched remote baseline: ${project.id}.`
           );
         }
+        const provenance = await captureTaskBaseProvenance({
+          git: this.git,
+          project,
+          binding,
+          baseRef: previous?.baseRef ?? baseline.recordedBaseRef,
+          baseCommit: physical.baseCommit,
+          ...(baseline.remoteBaseline === undefined ? {} : { remoteBaseline: baseline.remoteBaseline })
+        });
         prepared.push({
           project,
           entry: {
@@ -424,7 +444,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             branch: physical.branch,
             baseRef: previous?.baseRef ?? baseline.recordedBaseRef,
             baseCommit: physical.baseCommit
-          }
+          },
+          provenance
         });
       }
       await ensureWorkspaceView(root, prepared.map(({ entry }) => entry));
@@ -504,6 +525,14 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           tx.saveTask(persistedTask);
         }
         tx.saveManagedWorkspace(preserveWorkspaceCreatedAt(workspace, current));
+        if (current === null) {
+          recordTaskBaseProvenanceEvents(
+            tx,
+            task.id,
+            prepared.map(({ provenance }) => provenance),
+            timestamp
+          );
+        }
         for (const role of tx.listRoles(task.id)) {
           // The Role field is only a cwd/snapshot hint.  Preserve the hint for
           // an active WorkItem assignment; the durable owner is the WorkItem,

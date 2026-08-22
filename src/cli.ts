@@ -104,6 +104,11 @@ import {
   runReleaseList
 } from "./commands/releaseCommands.js";
 import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
+import { runTaskBaseStatusCommand } from "./commands/taskBaseCommands.js";
+import {
+  assertTaskBaseFreshnessForCompletion,
+  inspectTaskBaseFreshness
+} from "./repository/taskBaseFreshness.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
 import {
   assertFileTaskControllerStorageCompatible,
@@ -1218,9 +1223,15 @@ export async function main(): Promise<void> {
       }
     }
     let completionSummary: string | undefined;
+    if (resolved[1] === "base" && resolved[2] === "status") {
+      const result = await runTaskBaseStatusCommand(resolved.slice(3), store);
+      emit(result.output, false, result.data);
+      return;
+    }
     if (resolved[1] === "complete" && resolved[2] !== undefined) {
       const completionRequest = parseTaskCompletionRequest(resolved.slice(2));
       completionSummary = completionRequest.summary;
+      const refreshRemote = resolved.includes("--refresh-remote");
       const completion = preflightTaskCompletion(resolved[2], store, {
         environment: process.env,
         ...(taskFinalReviewContract === undefined
@@ -1228,12 +1239,22 @@ export async function main(): Promise<void> {
           : { taskFinalReviewContract })
       });
       if (!completion.completed && !completion.activeTaskReview) {
-        await reconcileTaskRemoteBaselines(
-          resolved[2],
-          store,
-          home,
-          { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env, store }) }
-        );
+        const freshness = await inspectTaskBaseFreshness(resolved[2], store, {
+          refresh: refreshRemote
+        });
+        for (const warning of assertTaskBaseFreshnessForCompletion(freshness)) {
+          process.stderr.write(`Warning: ${warning}\n`);
+        }
+        // Keep completion offline by default. An explicit refresh is the only
+        // path that may fetch and reconcile a moved remote baseline.
+        if (refreshRemote) {
+          await reconcileTaskRemoteBaselines(
+            resolved[2],
+            store,
+            home,
+            { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env, store }) }
+          );
+        }
       }
     }
     let candidateMaterialization: Awaited<ReturnType<typeof candidateMaterializationForTaskCommand>>;

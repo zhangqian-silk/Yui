@@ -33,6 +33,14 @@ export type GitRemoteHead = Readonly<{
   commit: string;
 }>;
 
+/** A local remote-tracking branch that matches a configured Project remote. */
+export type GitRemoteTrackingRef = Readonly<{
+  remoteName: string;
+  remoteUrl: string;
+  ref: string;
+  commit: string;
+}>;
+
 type FetchedGitRemoteHead = GitRemoteHead & Readonly<{
   fetchedRef: string;
 }>;
@@ -101,6 +109,24 @@ export interface GitWorkspacePort {
     ancestor: string,
     descendant: string
   ): Promise<boolean>;
+  /** Resolve the local remote-tracking branch for a configured remote URL. */
+  inspectRemoteTracking(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    branch: string;
+  }>): Promise<GitRemoteTrackingRef | null>;
+  /** The common ancestor of two commits. */
+  mergeBase(input: Readonly<{
+    repositoryPath: string;
+    leftCommit: string;
+    rightCommit: string;
+  }>): Promise<string>;
+  /** Every path changed between two commits. */
+  changedFilesBetween(input: Readonly<{
+    repositoryPath: string;
+    fromCommit: string;
+    toCommit: string;
+  }>): Promise<string[]>;
   headRef(repositoryPath: string): Promise<string>;
   isClean(repositoryPath: string): Promise<boolean>;
   mergeWorktree(input: Readonly<{
@@ -833,6 +859,65 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       "merge-base", "--is-ancestor",
       safeRef(ancestor),
       safeRef(descendant)
+    ]);
+  }
+
+  async inspectRemoteTracking(input: Readonly<{
+    repositoryPath: string;
+    remoteUrl: string;
+    branch: string;
+  }>): Promise<GitRemoteTrackingRef | null> {
+    const root = (await this.inspect(input.repositoryPath)).root;
+    const wantedUrl = requireText(input.remoteUrl, "Project remote URL");
+    let output: string;
+    try {
+      output = await git([
+        "-C", root,
+        "config", "--get-regexp", "--null",
+        "^remote\\..*\\.url$"
+      ]);
+    } catch {
+      return null;
+    }
+    const records = output.split("\0").filter((record) => record.length > 0);
+    const matches: Array<Readonly<{ remoteName: string; url: string }>> = [];
+    for (const record of records) {
+      const separator = record.indexOf("\n");
+      if (separator < 0) continue;
+      const key = record.slice(0, separator).trim();
+      const url = record.slice(separator + 1).trim();
+      const prefix = "remote.";
+      const suffix = ".url";
+      if (!key.startsWith(prefix) || !key.endsWith(suffix) || url !== wantedUrl) continue;
+      matches.push({ remoteName: key.slice(prefix.length, -suffix.length), url });
+    }
+    if (matches.length !== 1) return null;
+    const remoteName = requireText(matches[0]!.remoteName, "Git remote name");
+    const branch = await safeFetchBranch(input.branch);
+    const ref = `refs/remotes/${remoteName}/${branch}`;
+    if (!await gitSucceeds(["check-ref-format", ref])) {
+      throw new Error("Git remote tracking ref is invalid.");
+    }
+    if (!await this.refExists(root, ref)) return null;
+    return {
+      remoteName,
+      remoteUrl: matches[0]!.url,
+      ref,
+      commit: (await this.inspect(root, ref)).baseCommit
+    };
+  }
+
+  async mergeBase(input: Readonly<{
+    repositoryPath: string;
+    leftCommit: string;
+    rightCommit: string;
+  }>): Promise<string> {
+    const root = (await this.inspect(input.repositoryPath)).root;
+    return gitLine([
+      "-C", root,
+      "merge-base",
+      safeRef(input.leftCommit),
+      safeRef(input.rightCommit)
     ]);
   }
 

@@ -288,9 +288,22 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "complete",
     summary: "Complete an active Task and stop automatic wakeups.",
-    usage: "yui task complete <id> (--summary <text>|--summary-file <path|->)",
-    options: ["--summary", "--summary-file"],
+    usage: "yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote]",
+    options: ["--summary", "--summary-file", "--refresh-remote"],
     fileOptions: ["--summary-file"]
+  },
+  {
+    name: "base",
+    summary: "Inspect Task Project baseline freshness.",
+    sections: [{ id: "manage", title: "Commands", entries: ["status"] }],
+    children: [
+      {
+        name: "status",
+        summary: "Classify Task Project bases against local or refreshed remote refs.",
+        usage: "yui task base status <task> [--refresh]",
+        options: ["--refresh"]
+      }
+    ]
   },
   { name: "reopen", summary: "Reopen a completed Task.", usage: "yui task reopen <id>" },
   {
@@ -1197,7 +1210,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],

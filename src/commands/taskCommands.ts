@@ -406,8 +406,13 @@ export function parseTaskCompletionRequest(
   args: string[],
   summaryOverride?: string
 ): Readonly<{ taskId: string; summary: string }> {
-  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->).";
-  const parsed = parseTail(args, new Set(["--summary", "--summary-file"]), usage);
+  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote].";
+  const parsed = parseTail(
+    args,
+    new Set(["--summary", "--summary-file"]),
+    usage,
+    new Set(["--refresh-remote"])
+  );
   exactPositionals(parsed.positionals, 1, usage);
   const inlineSummary = parsed.options.get("--summary");
   const summaryFile = parsed.options.get("--summary-file");
