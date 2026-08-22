@@ -54,6 +54,7 @@ import {
   classifyProviderError,
   isRetryableProviderErrorClass
 } from "../lifecycle/providerErrorClass.js";
+import type { ProviderErrorCode } from "../runtime/providerErrorCodes.js";
 import {
   type PendingProviderRetry,
   providerRetryBudgetExhausted,
@@ -196,6 +197,8 @@ export type TaskRuntimeTurnFailed = Readonly<{
   launchId: string;
   nativeSessionId: string;
   runId: string;
+  /** Structured Provider error code, when the driver could extract one. */
+  errorCode?: ProviderErrorCode;
   error: string;
   errorDetails?: string;
   lastAssistantMessage?: string;
@@ -276,6 +279,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           launchId: input.fence.launchId,
           nativeSessionId: input.fence.nativeSessionId!,
           runId: input.fence.runId!,
+          ...(failureEvidence.errorCode === undefined
+            ? {}
+            : { errorCode: failureEvidence.errorCode }),
           error: failureEvidence.code,
           ...(failureEvidence.details === undefined
             ? {}
@@ -2557,6 +2563,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (config.mode === "off") return null;
     const classification = classifyProviderError({
       adapterId: input.adapterId,
+      ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
       error: input.error,
       errorDetails: input.errorDetails,
       summary: input.lastAssistantMessage
@@ -2572,6 +2579,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (adapterEnabled) {
     this.recordProviderRetryClassified(store, input, classification.errorClass, {
           wouldRetry: String(retryable),
+          basis: classification.basis,
           shadow: String(shadow)
         }, now);
       }
@@ -2597,6 +2605,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       this.recordProviderRetryClassified(store, input, classification.errorClass, {
         wouldRetry: "false",
         shadow: "false",
+        basis: classification.basis,
         note: "native-turn-completion-durable"
       }, now);
       return { disposition: "applied", runId: input.runId };
@@ -2609,6 +2618,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       this.recordProviderRetryClassified(store, input, classification.errorClass, {
         wouldRetry: "false",
         shadow: "false",
+        basis: classification.basis,
         note: "retry-budget-exhausted",
         attempt: String(run.providerRetry.attempt)
       }, now);
@@ -2649,6 +2659,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     this.recordProviderRetryClassified(store, input, classification.errorClass, {
       wouldRetry: "true",
       shadow: "false",
+      basis: classification.basis,
       attempt: String(retry.attempt),
       nextAttemptAt: retry.nextAttemptAt
     }, now);
