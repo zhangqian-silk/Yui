@@ -123,7 +123,7 @@ const CONFIG_KEY_VALUES: readonly CommandValue[] = [
   { name: "telemetry-mode", summary: "Telemetry mode: legacy, dual, or bounded (default: legacy)." },
   { name: "telemetry-terminal-keep", summary: "Telemetry terminal retention count (default: 200)." },
   { name: "telemetry-run-cap", summary: "Telemetry per-run row cap (default: 50000)." },
-  { name: "review", summary: "Global WorkItem review rule; set with --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>] (default: disabled)." }
+  { name: "review", summary: "Global WorkItem review rule; set with --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>] [--delta-recheck <enabled|disabled>] (default: disabled)." }
 ];
 
 const agentChildren: readonly NodeInput[] = [
@@ -731,8 +731,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "request",
         summary: "Request one Task-local final ReviewRound from a Global Role.",
-        usage: "yui task review request <task> --role <global-role> [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...]",
-        options: ["--role", "--strategy", "--lane-role"]
+        usage: "yui task review request <task> --role <global-role> [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--delta-recheck]",
+        options: ["--role", "--strategy", "--lane-role", "--delta-recheck"]
       },
       {
         name: "group",
@@ -1095,10 +1095,11 @@ export const ROOT_COMMAND = buildNode({
           usage: "yui config set <key> <value...>",
           sections: [{ id: "keys", title: "Configuration keys", entries: [...CONFIG_KEYS] }],
           values: CONFIG_KEY_VALUES,
-          options: ["--role", "--trigger", "--finding-ledger"],
+          options: ["--role", "--trigger", "--finding-ledger", "--delta-recheck", "--delta-recheck-max-lines", "--delta-recheck-max-files"],
           optionValues: {
             "--trigger": ["always", "leader", "final"],
-            "--finding-ledger": ["shadow", "enforce"]
+            "--finding-ledger": ["shadow", "enforce"],
+            "--delta-recheck": ["enabled", "disabled"]
           }
         },
         {

@@ -12,6 +12,7 @@ import { createTaskEvent } from "../event/taskEvent.js";
 import {
   finishReviewRound,
   updateReviewExecutionGroup,
+  type DeltaRecheckDisposition,
   type ReviewCheck,
   type ReviewRound
 } from "../review/reviewRound.js";
@@ -190,6 +191,8 @@ export function terminalizeExactRunReviewRound(
       evidence?: readonly string[];
       evidenceCommit?: string;
       gitSnapshot?: ExecutionLaneGitSnapshot;
+      deltaDisposition?: DeltaRecheckDisposition;
+      deltaReasoning?: string;
     }>;
   }>,
   now: Date
@@ -284,6 +287,8 @@ export type ExactRunTerminalizationInput = Readonly<{
     evidence?: readonly string[];
     evidenceCommit?: string;
     gitSnapshot?: ExecutionLaneGitSnapshot;
+    deltaDisposition?: DeltaRecheckDisposition;
+    deltaReasoning?: string;
   }>;
 }>;
 
@@ -436,7 +441,9 @@ export function terminalizeExactTaskRun(
                   ...(input.reviewResult.findings === undefined ? {} : { findings: input.reviewResult.findings }),
                   ...(input.reviewResult.evidence === undefined ? {} : { evidence: input.reviewResult.evidence }),
                   ...(input.reviewResult.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit }),
-                  ...(input.reviewResult.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot })
+                  ...(input.reviewResult.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot }),
+                  ...(input.reviewResult.deltaDisposition === undefined ? {} : { deltaDisposition: input.reviewResult.deltaDisposition }),
+                  ...(input.reviewResult.deltaReasoning === undefined ? {} : { deltaReasoning: input.reviewResult.deltaReasoning })
                 }
               })
         }, now)

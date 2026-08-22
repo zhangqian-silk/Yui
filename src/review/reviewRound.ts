@@ -24,6 +24,42 @@ export type ReviewRequestSource = "policy" | "leader";
 export type ReviewWorkspaceDisposition = "preserved" | "removed";
 export type ReviewScope = "work-item" | "task";
 
+/**
+ * Issue 07: the only dispositions a delta-recheck Reviewer may return.
+ * `equivalent-and-accepted` accepts the new frozen head; `finding` records
+ * blocking findings; `requires-full-review` escalates to a full Review.
+ */
+export type DeltaRecheckDisposition =
+  | "equivalent-and-accepted"
+  | "finding"
+  | "requires-full-review";
+
+/**
+ * Issue 07: lineage of a delta-recheck Task-final ReviewRound.  The record
+ * binds the round to the previous completed Round and the exact diff it
+ * rechecked, so an acceptance can never be silently copied to a different
+ * tree.  `disposition` is absent while the Round is active and is recorded
+ * exactly once at terminalization.
+ */
+export type DeltaRecheckRecord = Readonly<{
+  schemaVersion: 1;
+  /** The completed Task-final ReviewRound whose acceptance this recheck extends. */
+  previousReviewRoundId: string;
+  /** Frozen head accepted by the previous Round. */
+  previousBaseCommit: string;
+  /** sha256 of the exact unified diff text between the two frozen heads. */
+  diffDigest: string;
+  changedFiles: readonly string[];
+  addedLines: number;
+  deletedLines: number;
+  /** Present only once the delta Round completed. */
+  disposition?: DeltaRecheckDisposition;
+  /** Reviewer's equivalence/escalation reasoning; present once terminal. */
+  reasoning?: string;
+  /** Full ReviewRound created after a `requires-full-review` escalation. */
+  escalatedToReviewRoundId?: string;
+}>;
+
 /** Immutable heads reviewed by a Task-scoped final ReviewRound. */
 export type TaskReviewCandidate = Readonly<{
   schemaVersion: 1;
@@ -46,6 +82,10 @@ export type ReviewYieldReport = Readonly<{
   findings?: readonly ExecutionFinding[];
   evidence?: readonly string[];
   evidenceCommit?: string;
+  /** Issue 07: delta-recheck disposition; absent for full Reviews. */
+  deltaDisposition?: DeltaRecheckDisposition;
+  /** Issue 07: delta-recheck equivalence/escalation reasoning. */
+  deltaReasoning?: string;
 }>;
 
 export type ReviewRound = {
@@ -64,6 +104,8 @@ export type ReviewRound = {
   taskCandidate?: TaskReviewCandidate;
   /** Exact Task/control capability that established this Task-final gate. */
   taskFinalReviewContract?: TaskFinalReviewContract;
+  /** Present only when this Round is an Issue 07 delta-recheck. */
+  deltaRecheck?: DeltaRecheckRecord;
   /** Optional reviewer panel Group; each lane still owns this Round. */
   executionGroup?: ExecutionGroup;
   workspace?: ManagedWorkspace;
@@ -140,6 +182,48 @@ export function createTaskReviewRound(
   });
 }
 
+/**
+ * Issue 07: creates a delta-recheck Task-final Round.  The Round still targets
+ * the new frozen head and still requires a fresh Reviewer disposition; the
+ * delta record only binds the recheck to the previous acceptance and the exact
+ * diff so the Reviewer can prove equivalence instead of reloading every
+ * first-round evidence.
+ */
+export function createTaskDeltaReviewRound(
+  id: string,
+  taskId: string,
+  workItemId: string,
+  candidateId: string,
+  reviewerRoleName: string,
+  requestedBy: ReviewRequestSource,
+  taskCandidate: TaskReviewCandidate,
+  deltaRecheck: DeltaRecheckRecord,
+  now: Date,
+  taskFinalReviewContract?: TaskFinalReviewContract,
+  executionGroup?: ExecutionGroup
+): ReviewRound {
+  const candidate = validateTaskReviewCandidate(taskCandidate);
+  return validateReviewRound({
+    schemaVersion: 4,
+    id: requireIdentity(id, "ReviewRound id"),
+    taskId: requireIdentity(taskId, "Task id"),
+    workItemId: requireIdentity(workItemId, "Work Item id"),
+    candidateId: requireIdentity(candidateId, "Candidate id"),
+    reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
+    reviewBaseCommit: candidate.projects[0]!.commit,
+    scope: "task",
+    taskCandidate: candidate,
+    ...(taskFinalReviewContract === undefined
+      ? {}
+      : { taskFinalReviewContract }),
+    deltaRecheck: validateDeltaRecheckRecord(deltaRecheck),
+    requestedBy: validateReviewRequestSource(requestedBy),
+    status: "pending",
+    ...(executionGroup === undefined ? {} : { executionGroup }),
+    createdAt: now.toISOString()
+  });
+}
+
 export function attachReviewRoundWorkspace(
   round: ReviewRound,
   workspace: ManagedWorkspace
@@ -185,13 +269,17 @@ export function finishReviewRound(
     report?: string;
     checks?: readonly ReviewCheck[];
     evidenceCommit?: string;
+    /** Issue 07: delta-recheck disposition extracted from the Reviewer report. */
+    deltaDisposition?: DeltaRecheckDisposition;
+    /** Issue 07: Reviewer's delta-recheck equivalence/escalation reasoning. */
+    deltaReasoning?: string;
   }> = {}
 ): ReviewRound {
   validateReviewRound(round);
   if (round.status !== "pending" && round.status !== "running") {
     throw new Error(`ReviewRound is already terminal: ${round.id}.`);
   }
-  return validateReviewRound({
+  const terminal = validateReviewRound({
     ...round,
     status,
     summary: requireText(summary, "Review summary"),
@@ -201,6 +289,29 @@ export function finishReviewRound(
       ? {}
       : { evidenceCommit: requireCommit(result.evidenceCommit, "Review evidence commit") }),
     endedAt: now.toISOString()
+  });
+  if (round.deltaRecheck === undefined) {
+    if (result.deltaDisposition !== undefined || result.deltaReasoning !== undefined) {
+      throw new Error(`Only a delta-recheck ReviewRound can carry a delta disposition: ${round.id}.`);
+    }
+    return terminal;
+  }
+  if (status !== "completed") {
+    // A failed delta Round is an infra attempt; it records no disposition and
+    // the candidate stays unaccepted.
+    return terminal;
+  }
+  // Fail closed: a completed delta Round without an explicit, valid
+  // disposition escalates to a full Review.  Uncertainty never accepts.
+  const disposition = result.deltaDisposition ?? "requires-full-review";
+  const reasoning = result.deltaReasoning ?? result.report ?? summary;
+  return validateReviewRound({
+    ...terminal,
+    deltaRecheck: validateDeltaRecheckRecord({
+      ...round.deltaRecheck,
+      disposition,
+      reasoning: requireText(reasoning, "Delta recheck reasoning")
+    })
   });
 }
 
@@ -234,6 +345,22 @@ export function retryTaskReviewRound(round: ReviewRound): ReviewRound {
     ...(round.taskFinalReviewContract === undefined
       ? {}
       : { taskFinalReviewContract: round.taskFinalReviewContract }),
+    ...(round.deltaRecheck === undefined
+      ? {}
+      // A retried delta Round is still the same semantic recheck: the
+      // disposition is terminal evidence and must not be carried into the
+      // fresh attempt, so only the immutable lineage is preserved.
+      : {
+          deltaRecheck: validateDeltaRecheckRecord({
+            schemaVersion: 1,
+            previousReviewRoundId: round.deltaRecheck.previousReviewRoundId,
+            previousBaseCommit: round.deltaRecheck.previousBaseCommit,
+            diffDigest: round.deltaRecheck.diffDigest,
+            changedFiles: round.deltaRecheck.changedFiles,
+            addedLines: round.deltaRecheck.addedLines,
+            deletedLines: round.deltaRecheck.deletedLines
+          })
+        }),
     // Keep the historical attempt Group and Lane addressable from AgentRun
     // history while resetting the Lane for another dispatch attempt.
     ...(retryExecutionGroup === undefined ? {} : { executionGroup: retryExecutionGroup }),
@@ -277,12 +404,18 @@ export function parseReviewYieldReport(value: string): ReviewYieldReport {
   const checks = extractChecks(record.checks);
   const findings = extractFindings(record.findings);
   const evidence = extractEvidence(record.evidence);
+  const deltaDisposition = extractDeltaDisposition(record.deltaDisposition);
   return {
     summary,
     report,
     checks,
     ...(findings.length === 0 ? {} : { findings }),
     ...(evidence.length === 0 ? {} : { evidence }),
+    ...(deltaDisposition === undefined ? {} : { deltaDisposition }),
+    ...(typeof record.deltaReasoning !== "string"
+      || record.deltaReasoning.trim().length === 0
+      ? {}
+      : { deltaReasoning: requireText(record.deltaReasoning, "Delta recheck reasoning") }),
     ...(typeof record.evidenceCommit !== "string"
       ? {}
       : {
@@ -292,6 +425,15 @@ export function parseReviewYieldReport(value: string): ReviewYieldReport {
           )
         })
   };
+}
+
+function extractDeltaDisposition(value: unknown): DeltaRecheckDisposition | undefined {
+  if (value !== "equivalent-and-accepted"
+    && value !== "finding"
+    && value !== "requires-full-review") {
+    return undefined;
+  }
+  return value;
 }
 
 function extractFindings(value: unknown): readonly ExecutionFinding[] {
@@ -437,6 +579,12 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
   if (!["pending", "running", "completed", "failed"].includes(round.status)) {
     throw new Error(`ReviewRound status is invalid: ${String(round.status)}.`);
   }
+  if (round.deltaRecheck !== undefined) {
+    if (scope !== "task") {
+      throw new Error(`Only a Task-final ReviewRound can be a delta-recheck: ${round.id}.`);
+    }
+    validateDeltaRecheckRecord(round.deltaRecheck);
+  }
   if (round.reviewerRunId !== undefined) {
     validateTaskRecordReference({
       taskId: round.taskId,
@@ -480,7 +628,81 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     }
     requireTimestamp(round.workspaceDisposition.recordedAt, "Review workspace disposition time");
   }
+  if (round.deltaRecheck?.disposition !== undefined) {
+    if (!terminal) {
+      throw new Error("An active delta-recheck ReviewRound cannot have a disposition.");
+    }
+    if (round.deltaRecheck.reasoning === undefined
+      || round.deltaRecheck.reasoning.trim().length === 0) {
+      throw new Error("A terminal delta-recheck ReviewRound requires reasoning.");
+    }
+    if (round.deltaRecheck.escalatedToReviewRoundId !== undefined
+      && round.deltaRecheck.disposition !== "requires-full-review") {
+      throw new Error("Only a requires-full-review delta-recheck can record an escalation.");
+    }
+  }
   return round;
+}
+
+/** Validates a delta-recheck record's immutable identity and terminal fields. */
+export function validateDeltaRecheckRecord(
+  record: DeltaRecheckRecord
+): DeltaRecheckRecord {
+  if (record.schemaVersion !== 1) {
+    throw new Error("Delta recheck record must use schemaVersion 1.");
+  }
+  requireIdentity(record.previousReviewRoundId, "Delta recheck previous ReviewRound id");
+  requireCommit(record.previousBaseCommit, "Delta recheck previous base commit");
+  if (!/^[a-f0-9]{64}$/u.test(record.diffDigest)) {
+    throw new Error("Delta recheck diff digest is invalid.");
+  }
+  if (!Array.isArray(record.changedFiles)
+    || record.changedFiles.some((file) => typeof file !== "string" || file.trim().length === 0)) {
+    throw new Error("Delta recheck changed files are invalid.");
+  }
+  if (!Number.isInteger(record.addedLines) || record.addedLines < 0
+    || !Number.isInteger(record.deletedLines) || record.deletedLines < 0) {
+    throw new Error("Delta recheck line counts are invalid.");
+  }
+  if (record.disposition !== undefined
+    && record.disposition !== "equivalent-and-accepted"
+    && record.disposition !== "finding"
+    && record.disposition !== "requires-full-review") {
+    throw new Error(`Delta recheck disposition is invalid: ${String(record.disposition)}.`);
+  }
+  if (record.reasoning !== undefined) {
+    requireText(record.reasoning, "Delta recheck reasoning");
+  }
+  if (record.escalatedToReviewRoundId !== undefined) {
+    requireIdentity(record.escalatedToReviewRoundId, "Delta recheck escalation ReviewRound id");
+  }
+  return record;
+}
+
+/** True when this Round is an Issue 07 delta-recheck. */
+export function isDeltaRecheckRound(round: ReviewRound): boolean {
+  return round.deltaRecheck !== undefined;
+}
+
+/** True only when a delta Round explicitly accepted the new head. */
+export function deltaRecheckAccepted(round: ReviewRound): boolean {
+  return round.deltaRecheck?.disposition === "equivalent-and-accepted";
+}
+
+/** True when a delta Round escalated to a full Review. */
+export function deltaRecheckEscalated(round: ReviewRound): boolean {
+  return round.deltaRecheck?.disposition === "requires-full-review";
+}
+
+/**
+ * True when a completed delta Round does NOT accept the new head.  A `finding`
+ * or `requires-full-review` disposition must keep the completion gate closed.
+ */
+export function deltaRecheckBlocksAcceptance(round: ReviewRound): boolean {
+  return round.deltaRecheck !== undefined
+    && round.status === "completed"
+    && round.deltaRecheck.disposition !== undefined
+    && round.deltaRecheck.disposition !== "equivalent-and-accepted";
 }
 
 function validateReviewExecutionGroup(group: ExecutionGroup, round: ReviewRound): ExecutionGroup {

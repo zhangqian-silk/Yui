@@ -174,7 +174,7 @@ test("config set review manages the global review rule through the unified keys"
 
   const set = runCli(home, ["config", "set", "review", "--role", "reviewer", "--trigger", "always"]);
   assert.equal(set.status, 0, set.stderr);
-  assert.match(set.stdout, /Review set to reviewer \(always; finding ledger: shadow\)/);
+  assert.match(set.stdout, /Review set to reviewer \(always; finding ledger: shadow; delta recheck: disabled\)/);
   assert.match(
     runCli(home, ["config", "show"]).stdout,
     tableRow("Review", "reviewer (always; finding ledger: shadow)")
@@ -185,7 +185,7 @@ test("config set review manages the global review rule through the unified keys"
     "--role", "reviewer", "--trigger", "final", "--finding-ledger", "enforce"
   ]);
   assert.equal(upgraded.status, 0, upgraded.stderr);
-  assert.match(upgraded.stdout, /Review set to reviewer \(final; finding ledger: enforce\)/);
+  assert.match(upgraded.stdout, /Review set to reviewer \(final; finding ledger: enforce; delta recheck: disabled\)/);
   assert.match(
     runCli(home, ["config", "show"]).stdout,
     tableRow("Review", "reviewer (final; finding ledger: enforce)")
@@ -337,6 +337,9 @@ test("config show --json reflects stored leaderNextActionMode and review fields"
   assert.deepEqual(payload.data.review, {
     roleName: "reviewer",
     trigger: "final",
-    findingLedger: "enforce"
+    findingLedger: "enforce",
+    deltaRecheck: "disabled",
+    deltaRecheckMaxChangedLines: 200,
+    deltaRecheckMaxChangedFiles: 5
   });
 });

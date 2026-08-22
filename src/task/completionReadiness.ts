@@ -2,6 +2,7 @@ import type { DurableJob } from "../job/durableJob.js";
 import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import { isReviewFindingBlocking, type ReviewFinding } from "../review/reviewFinding.js";
+import { deltaRecheckBlocksAcceptance } from "../review/reviewRound.js";
 import type { ReviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
 import {
   REVIEW_FINDINGS_RECONCILE_FAILED_EVENT,
@@ -43,7 +44,8 @@ export type CompletionBlockerCode =
   | "execution-lane-workspace-undisposed"
   | "active-run"
   | "open-review-finding"
-  | "finding-ledger-unavailable";
+  | "finding-ledger-unavailable"
+  | "delta-recheck-not-accepted";
 
 export type CompletionBlocker = Readonly<{
   /** Stable machine-readable code; callers may key on it. */
@@ -124,6 +126,22 @@ export function projectCompletionReadiness(
       fix: round.status === "pending"
         ? `yui task review retry ${task.id}/${round.id}`
         : `wait for Reviewer Run on ${round.id} to finish`
+    });
+  }
+
+  // Issue 07: a completed delta-recheck that did not accept the head keeps the
+  // completion gate closed.  `requires-full-review` escalates to a full Review;
+  // `finding` stays a blocker for the Leader to repair.
+  for (const round of facts.reviewRounds) {
+    if (!deltaRecheckBlocksAcceptance(round)) continue;
+    const disposition = round.deltaRecheck!.disposition!;
+    blockers.push({
+      code: "delta-recheck-not-accepted",
+      ref: ref("review-round", round.id),
+      reason: `Delta-recheck ${round.id} disposition is ${disposition}; the head is not accepted.`,
+      fix: disposition === "requires-full-review"
+        ? `yui task review request ${task.id} --role <global-role>`
+        : `repair the finding and request a new Task-final Review`
     });
   }
 
