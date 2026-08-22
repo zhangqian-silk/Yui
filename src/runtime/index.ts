@@ -99,6 +99,18 @@ export {
   FileSessionOwnerRegistry
 } from "./sessionOwnerRegistry.js";
 export {
+  formatRuntimeLaunchDiagnostic,
+  redactLaunchArgument,
+  redactLaunchText,
+  RuntimeLaunchFailure,
+  toRuntimeLaunchFailure,
+  type RuntimeLaunchDiagnostic,
+  type RuntimeLaunchDiagnosticContext,
+  type RuntimeLaunchKind,
+  type RuntimeLaunchPaneDiagnostic,
+  type RuntimeLaunchPhase
+} from "./launchDiagnostics.js";
+export {
   DEFAULT_FORCED_GRACE_MS,
   DEFAULT_GRACEFUL_GRACE_MS,
   terminateSessionOwners,

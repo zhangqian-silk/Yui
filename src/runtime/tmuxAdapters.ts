@@ -15,6 +15,7 @@ import type {
 } from "./sessionLaunchRequest.js";
 import {
   RuntimeHostContentionError,
+  RuntimeLaunchError,
   type ActivePromptPushPort,
   type ActivePromptPushRequest,
   type PromptPushResult,
@@ -22,6 +23,10 @@ import {
   type SessionHostPort,
   type SessionInspection
 } from "./ports.js";
+import {
+  toRuntimeLaunchFailure,
+  type RuntimeLaunchDiagnosticContext
+} from "./launchDiagnostics.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
@@ -127,6 +132,7 @@ export interface RuntimeTmuxHostPort {
     target: string;
     dead: boolean;
     currentCommand: string;
+    exitStatus?: number;
   }>;
   inspectRolePaneAsync?(
     hostId: string,
@@ -136,7 +142,10 @@ export interface RuntimeTmuxHostPort {
     target: string;
     dead: boolean;
     currentCommand: string;
+    exitStatus?: number;
   }>>;
+  /** Captures a fresh dead Provider pane for launch diagnostics. */
+  captureRolePane?(hostId: string, roleName: string, lines?: number): string;
 }
 
 export type RuntimeTmuxPaneState = Readonly<{
@@ -195,6 +204,7 @@ export type TmuxSessionHostOptions = Readonly<{
       target: string;
       dead: boolean;
       currentCommand: string;
+      exitStatus?: number;
     }>;
   }>) => void;
 }>;
@@ -416,60 +426,24 @@ export class TmuxSessionHost implements SessionHostPort {
           : {})
       });
     }
-    const input = {
-      roleName: request.owner.roleName,
-      agentId: request.agentId,
-      adapterId: request.adapterId,
-      effective: request.effective,
-      launchId: request.launchId,
-      mode: request.mode,
-      ...(request.runId === undefined ? {} : { runId: request.runId }),
-      ...(request.runtimeIsolation === undefined
-        ? {}
-        : { runtimeIsolation: request.runtimeIsolation }),
-      ...(request.environment === undefined
-        ? {}
-        : { environment: request.environment }),
-      ...(request.mode === "resume" ? { nativeSessionId: request.nativeSessionId } : {})
-    };
-    const planned = request.owner.scope === "task"
-      ? this.planner.plan({ taskId: request.owner.taskId, ...input })
-      : this.planner.planGlobalRole(input);
-    if (planned.role.name !== request.owner.roleName) {
-      throw new Error("Planned Role does not match the runtime owner.");
-    }
-    if (planned.role.workspace !== request.workspace) {
-      throw new Error("Planned Role workspace does not match the runtime request.");
-    }
-    const plannedNativeSessionId = planned.session?.nativeSessionId;
-    if (
-      request.mode === "resume"
-      && plannedNativeSessionId !== undefined
-      && plannedNativeSessionId !== request.nativeSessionId
-    ) {
-      throw new Error("Planned native session does not match the resume request.");
-    }
-    const nativeSessionId = plannedNativeSessionId
-      ?? (request.mode === "resume" ? request.nativeSessionId : undefined);
-    beforeHostStart?.({
-      owner: request.owner,
-      launchId: request.launchId,
-      ...(request.runId === undefined ? {} : { runId: request.runId }),
-      agentId: request.agentId,
-      adapterId: request.adapterId,
-      effective: request.effective,
-      ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
-      ...(planned.initialPromptRunId === undefined
-        ? {}
-        : { initialPromptRunId: planned.initialPromptRunId })
-    });
-    // Process creation is last: every local invariant has already passed.
-    const hostCreated = await ensureRoleWindow(
-      this.tmux,
-      hostId,
-      planned.role,
-      planned.launch
+    const { planned, nativeSessionId } = planManagedLaunch(
+      this.planner,
+      request,
+      beforeHostStart
     );
+    const launchContext = diagnosticContext(request, planned);
+    // Process creation is last: every local invariant has already passed.
+    let hostCreated: boolean;
+    try {
+      hostCreated = await ensureRoleWindow(
+        this.tmux,
+        hostId,
+        planned.role,
+        planned.launch
+      );
+    } catch (error) {
+      throw toRuntimeLaunchFailure(error, "host-start", launchContext);
+    }
     if (
       hostCreated
       && request.owner.scope === "task"
@@ -500,14 +474,147 @@ export class TmuxSessionHost implements SessionHostPort {
         : {}),
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
-    if (hostCreated && this.#onHostCreated !== undefined) {
-      const pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
-      if (pane !== undefined) {
-        this.#onHostCreated({ binding, pane });
+    if (hostCreated) {
+      let pane;
+      try {
+        pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
+      } catch (error) {
+        throw toRuntimeLaunchFailure(error, "host-started", launchContext);
+      }
+      if (pane === undefined) {
+        throw toRuntimeLaunchFailure(
+          new Error("Managed host pane could not be inspected after creation."),
+          "host-started",
+          launchContext
+        );
+      }
+      this.#onHostCreated?.({ binding, pane });
+      if (pane.dead) {
+        await deadHostLaunchFailure(
+          this.tmux,
+          hostId,
+          request.owner.roleName,
+          pane,
+          launchContext
+        );
       }
     }
     return binding;
   }
+}
+
+function planManagedLaunch(
+  planner: RuntimeRoleLaunchPlannerPort,
+  request: SessionLaunchRequest,
+  beforeHostStart: RuntimeLaunchPreStart | undefined
+): Readonly<{
+  planned: RuntimePlannedSession;
+  nativeSessionId: string | undefined;
+}> {
+  try {
+    const input = {
+      roleName: request.owner.roleName,
+      agentId: request.agentId,
+      adapterId: request.adapterId,
+      effective: request.effective,
+      launchId: request.launchId,
+      mode: request.mode,
+      ...(request.runId === undefined ? {} : { runId: request.runId }),
+      ...(request.runtimeIsolation === undefined
+        ? {}
+        : { runtimeIsolation: request.runtimeIsolation }),
+      ...(request.environment === undefined
+        ? {}
+        : { environment: request.environment }),
+      ...(request.mode === "resume" ? { nativeSessionId: request.nativeSessionId } : {})
+    };
+    const planned = request.owner.scope === "task"
+      ? planner.plan({ taskId: request.owner.taskId, ...input })
+      : planner.planGlobalRole(input);
+    if (planned.role.name !== request.owner.roleName) {
+      throw new Error("Planned Role does not match the runtime owner.");
+    }
+    if (planned.role.workspace !== request.workspace) {
+      throw new Error("Planned Role workspace does not match the runtime request.");
+    }
+    const plannedNativeSessionId = planned.session?.nativeSessionId;
+    if (
+      request.mode === "resume"
+      && plannedNativeSessionId !== undefined
+      && plannedNativeSessionId !== request.nativeSessionId
+    ) {
+      throw new Error("Planned native session does not match the resume request.");
+    }
+    const nativeSessionId = plannedNativeSessionId
+      ?? (request.mode === "resume" ? request.nativeSessionId : undefined);
+    beforeHostStart?.({
+      owner: request.owner,
+      launchId: request.launchId,
+      ...(request.runId === undefined ? {} : { runId: request.runId }),
+      agentId: request.agentId,
+      adapterId: request.adapterId,
+      effective: request.effective,
+      ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
+      ...(planned.initialPromptRunId === undefined
+        ? {}
+        : { initialPromptRunId: planned.initialPromptRunId })
+    });
+    return { planned, nativeSessionId };
+  } catch (error) {
+    if (
+      error instanceof RuntimeLaunchError
+      || error instanceof RuntimeHostContentionError
+    ) {
+      throw error;
+    }
+    throw toRuntimeLaunchFailure(error, "validation", {
+      agentId: request.agentId,
+      cwd: request.workspace
+    });
+  }
+}
+
+function diagnosticContext(
+  request: SessionLaunchRequest,
+  planned: RuntimePlannedSession
+): RuntimeLaunchDiagnosticContext {
+  return {
+    command: planned.launch.command,
+    argv: [planned.launch.command, ...planned.launch.args],
+    cwd: planned.role.cwd ?? planned.role.workspace,
+    agentId: request.agentId
+  };
+}
+
+async function deadHostLaunchFailure(
+  tmux: RuntimeTmuxHostPort,
+  hostId: string,
+  roleName: string,
+  pane: Readonly<{
+    pid?: number;
+    target: string;
+    dead: boolean;
+    currentCommand: string;
+    exitStatus?: number;
+  }>,
+  context: RuntimeLaunchDiagnosticContext
+): Promise<never> {
+  let stderrTail: string | undefined;
+  try {
+    stderrTail = tmux.captureRolePane?.(hostId, roleName, 80);
+  } catch {
+    // The pane state is the required evidence; capture is best-effort.
+  }
+  throw toRuntimeLaunchFailure(
+    new Error("Provider exited immediately after managed host start."),
+    "host-started",
+    {
+      ...context,
+      pane,
+      ...(pane.exitStatus === undefined ? {} : { exitStatus: pane.exitStatus }),
+      ...(stderrTail === undefined || stderrTail.length === 0 ? {} : { stderrTail })
+    }
+  );
 }
 
 /** Non-blocking receipt-backed tmux push; it never interprets provider output. */
@@ -573,17 +680,11 @@ async function inspectRolePane(
   target: string;
   dead: boolean;
   currentCommand: string;
-}> | undefined> {
-  try {
-    return tmux.inspectRolePaneAsync === undefined
-      ? tmux.inspectRolePane?.(hostId, roleName)
-      : await tmux.inspectRolePaneAsync(hostId, roleName);
-  } catch {
-    // The pane may have exited between creation and inspection; the owner
-    // recorder treats a missing pane as a verification gap, not a launch
-    // failure.
-    return undefined;
-  }
+  exitStatus?: number;
+ }> | undefined> {
+  return tmux.inspectRolePaneAsync === undefined
+    ? tmux.inspectRolePane?.(hostId, roleName)
+    : await tmux.inspectRolePaneAsync(hostId, roleName);
 }
 
 async function killRole(

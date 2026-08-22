@@ -788,7 +788,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   }
 }
 
-function nativeAgentWorkspace(
+export function nativeAgentWorkspace(
   workspace: EffectiveLaunchSnapshot["workspace"]
 ): string {
   return workspace.entries.length === 1
@@ -796,7 +796,7 @@ function nativeAgentWorkspace(
     : workspace.root;
 }
 
-function nativeAdditionalDirectories(
+export function nativeAdditionalDirectories(
   workspace: EffectiveLaunchSnapshot["workspace"],
   agentWorkspace: string
 ): string[] {
@@ -804,7 +804,7 @@ function nativeAdditionalDirectories(
     .filter((path) => path !== agentWorkspace);
 }
 
-function withNativeProjectDirectories<T extends RoleAgentConfig>(
+export function withNativeProjectDirectories<T extends RoleAgentConfig>(
   config: T,
   projectDirectories: readonly string[]
 ): T {

@@ -16,6 +16,11 @@ import {
   type CapabilitySnapshot
 } from "../executor/agentAdapter.js";
 import { inspectCodexLaunchConfig } from "../executor/codexConfigConflict.js";
+import {
+  nativeAdditionalDirectories,
+  nativeAgentWorkspace,
+  withNativeProjectDirectories
+} from "../executor/fileRoleLaunchPlanner.js";
 import { resolveEffectiveLaunch } from "../executor/effectiveLaunch.js";
 import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { usageError } from "../errors/cliError.js";
@@ -1050,9 +1055,11 @@ function checkReviewerLaunch(
     const definition = configuredAgentToDefinition(agent);
     const launchEnvironment = resolveDoctorAgentEnvironment(definition, environment);
     const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
-    const agentWorkspace = effective.workspace.entries.length === 1
-      ? effective.workspace.entries[0]!.path
-      : effective.workspace.root;
+    const agentWorkspace = nativeAgentWorkspace(effective.workspace);
+    const launchConfig = withNativeProjectDirectories(
+      binding.config,
+      nativeAdditionalDirectories(effective.workspace, agentWorkspace)
+    );
     const codexConfig = adapter.id === "codex"
       ? inspectCodexLaunchConfig({
           environment: launchEnvironment,
@@ -1075,7 +1082,7 @@ function checkReviewerLaunch(
       : undefined;
     const compiled = adapter.compileNew({
       agent: definition,
-      config: binding.config,
+      config: launchConfig,
       workspace: agentWorkspace,
       sessionTitle: "reviewer",
       ...(reviewerContext === undefined
@@ -1090,7 +1097,7 @@ function checkReviewerLaunch(
     return {
       name: "reviewer launch",
       status: "ok",
-      detail: `adapter=${adapter.id} strategy=${compiled.sessionStrategy} command=${agent.command}`
+      detail: `adapter=${adapter.id} strategy=${compiled.sessionStrategy} command=${agent.command} addDirs=${launchConfig.additionalDirectories?.length ?? 0}`
     };
   } catch (error) {
     return {
