@@ -288,9 +288,22 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "complete",
     summary: "Complete an active Task and stop automatic wakeups.",
-    usage: "yui task complete <id> (--summary <text>|--summary-file <path|->)",
-    options: ["--summary", "--summary-file"],
+    usage: "yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote]",
+    options: ["--summary", "--summary-file", "--refresh-remote"],
     fileOptions: ["--summary-file"]
+  },
+  {
+    name: "base",
+    summary: "Inspect Task Project baseline freshness.",
+    sections: [{ id: "manage", title: "Commands", entries: ["status"] }],
+    children: [
+      {
+        name: "status",
+        summary: "Classify Task Project bases against local or refreshed remote refs.",
+        usage: "yui task base status <task> [--refresh]",
+        options: ["--refresh"]
+      }
+    ]
   },
   { name: "reopen", summary: "Reopen a completed Task.", usage: "yui task reopen <id>" },
   {
@@ -473,6 +486,29 @@ const taskChildren: readonly NodeInput[] = [
         name: "status",
         summary: "Show a release workflow and its step states.",
         usage: "yui task workflow status <task> <workflow-id>"
+      }
+    ]
+  },
+  {
+    name: "publication",
+    summary: "Record external PR/MR publication evidence for a Task.",
+    sections: [{ id: "manage", title: "Commands", entries: ["add", "list", "show"] }],
+    children: [
+      {
+        name: "add",
+        summary: "Record an external PR/MR and its publication state.",
+        usage: "yui task publication add <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--supersede <publication-id>] [--merged-at <iso-timestamp>]",
+        options: ["--project", "--provider", "--repository", "--kind", "--id", "--url", "--title", "--source-branch", "--target-branch", "--local-commit", "--remote-commit", "--state", "--reported", "--verified", "--evidence", "--supersede", "--merged-at"]
+      },
+      {
+        name: "list",
+        summary: "List external publication evidence for a Task.",
+        usage: "yui task publication list <task>"
+      },
+      {
+        name: "show",
+        summary: "Show one external publication reference.",
+        usage: "yui task publication show (<task>/<publication-id> | <task> <publication-id>)"
       }
     ]
   },
@@ -1197,8 +1233,8 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event"] }
       ],
       children: taskChildren

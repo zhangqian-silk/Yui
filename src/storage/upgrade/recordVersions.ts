@@ -38,6 +38,7 @@ import {
   CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION,
   CURRENT_MESSAGE_SCHEMA_VERSION,
   CURRENT_MILESTONE_SCHEMA_VERSION,
+  CURRENT_PUBLICATION_REFERENCE_SCHEMA_VERSION,
   CURRENT_PROJECT_SCHEMA_VERSION,
   CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION,
   CURRENT_REVIEW_ROUND_SCHEMA_VERSION,
@@ -92,6 +93,7 @@ const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object
   event: "state.json#/tasks/*/events",
   capabilityGrant: "state.json#/tasks/*/capabilityGrants",
   releaseWorkflow: "state.json#/tasks/*/releaseWorkflows",
+  publicationReference: "state.json#/tasks/*/publicationReferences",
   leaderFailure: "state.json#/tasks/*/leaderFailure",
   operatorNotification: "state.json#/tasks/*/operatorNotification",
   workMailbox: "state.json#/mailboxes"
@@ -181,6 +183,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
       releaseWorkflow: descriptor(
         CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION,
         "state.json#/tasks/*/releaseWorkflows"
+      ),
+      publicationReference: descriptor(
+        CURRENT_PUBLICATION_REFERENCE_SCHEMA_VERSION,
+        "state.json#/tasks/*/publicationReferences"
       ),
       leaderFailure: descriptor(
         CURRENT_LEADER_FAILURE_SCHEMA_VERSION,

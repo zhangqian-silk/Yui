@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 14;
+export const SQLITE_SCHEMA_VERSION = 15;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -873,6 +873,43 @@ DROP TABLE pending_runtime_turn_completions;
 DROP TABLE IF EXISTS mailbox_signals;
 `;
 
+/**
+ * Migration 15: Issue 11 external publication evidence. Records are immutable;
+ * a corrected MR/PR state appends a superseding record with the same
+ * external_key, so only the unsuperseded root is globally unique.
+ */
+const MIGRATION_15_SQL = `
+CREATE TABLE IF NOT EXISTS publication_references (
+  task_id         TEXT NOT NULL,
+  publication_id  TEXT NOT NULL,
+  project_id      TEXT NOT NULL,
+  provider        TEXT NOT NULL,
+  repository      TEXT NOT NULL,
+  external_kind   TEXT NOT NULL,
+  external_id     TEXT NOT NULL,
+  external_key    TEXT NOT NULL,
+  state           TEXT NOT NULL,
+  verification    TEXT NOT NULL,
+  external_url    TEXT,
+  title           TEXT,
+  source_branch   TEXT,
+  target_branch   TEXT,
+  local_commit    TEXT,
+  remote_commit   TEXT,
+  supersedes      TEXT,
+  payload         TEXT NOT NULL,
+  merged_at       TEXT,
+  created_at      TEXT NOT NULL,
+  PRIMARY KEY (task_id, publication_id)
+);
+CREATE INDEX IF NOT EXISTS idx_publication_references_task
+  ON publication_references(task_id);
+CREATE INDEX IF NOT EXISTS idx_publication_references_external
+  ON publication_references(external_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_references_external_root
+  ON publication_references(external_key) WHERE supersedes IS NULL;
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -894,7 +931,8 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 11, axis: "layout", sql: MIGRATION_11_SQL },
   { version: 12, axis: "layout", sql: MIGRATION_12_SQL },
   { version: 13, axis: "layout", sql: MIGRATION_13_SQL },
-  { version: 14, axis: "record", recordKind: "workMailbox", sql: MIGRATION_14_SQL }
+  { version: 14, axis: "record", recordKind: "workMailbox", sql: MIGRATION_14_SQL },
+  { version: 15, axis: "record", recordKind: "publicationReference", sql: MIGRATION_15_SQL }
 ];
 
 /** Current hot-path indexes whose absence would invalidate a current Home. */
@@ -1225,6 +1263,7 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "telemetry_aggregate",
   "capability_grants",
   "release_workflows",
+  "publication_references",
   "session_owners",
   "runtime_session_candidates",
   "resource_registry",

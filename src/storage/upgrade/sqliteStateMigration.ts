@@ -51,6 +51,7 @@ import type { IntegrationQueueEntry } from "../../integration/integrationQueueEn
 import type { GlobalRole, TaskRole } from "../../role/role.js";
 import type { CapabilityGrant } from "../../grant/capabilityGrant.js";
 import type { ReleaseWorkflow } from "../../release/releaseWorkflow.js";
+import type { PublicationReference } from "../../task/publicationReference.js";
 import type { LeaderFailure } from "../../scheduler/leaderFailure.js";
 import type { OperatorNotification } from "../../scheduler/operatorNotification.js";
 import type { Task } from "../../task/task.js";
@@ -259,6 +260,7 @@ interface StoredTaskShape {
   idHighWaterMarks: Record<string, number>;
   capabilityGrants: Record<string, Record<string, unknown>>;
   releaseWorkflows: Record<string, Record<string, unknown>>;
+  publicationReferences: Record<string, Record<string, unknown>>;
 }
 
 function asStoredTask(value: unknown): StoredTaskShape {
@@ -290,7 +292,8 @@ function asStoredTask(value: unknown): StoredTaskShape {
     operatorNotification: asNullableObject(record.operatorNotification),
     idHighWaterMarks: asObject(record.idHighWaterMarks) as Record<string, number>,
     capabilityGrants: asObjectMap(record.capabilityGrants),
-    releaseWorkflows: asObjectMap(record.releaseWorkflows)
+    releaseWorkflows: asObjectMap(record.releaseWorkflows),
+    publicationReferences: asObjectMap(record.publicationReferences)
   };
 }
 
@@ -473,6 +476,9 @@ export function populateSqliteFromState(
         for (const workflow of Object.values(stored.releaseWorkflows)) {
           store.saveReleaseWorkflow(taskId, workflow as unknown as ReleaseWorkflow);
         }
+        for (const reference of Object.values(stored.publicationReferences)) {
+          store.savePublicationReference(taskId, reference as unknown as PublicationReference);
+        }
       }
 
       // Work mailboxes.
@@ -607,6 +613,7 @@ export function computeStateFamilyChecksums(
   const operatorNotifications: unknown[] = [];
   const capabilityGrants: unknown[] = [];
   const releaseWorkflows: unknown[] = [];
+  const publicationReferences: unknown[] = [];
 
   for (const stored of Object.values(tasks)) {
     taskRecords.push(stored.task);
@@ -645,6 +652,7 @@ export function computeStateFamilyChecksums(
     if (stored.operatorNotification !== null) operatorNotifications.push(stored.operatorNotification);
     capabilityGrants.push(...Object.values(stored.capabilityGrants));
     releaseWorkflows.push(...Object.values(stored.releaseWorkflows));
+    publicationReferences.push(...Object.values(stored.publicationReferences));
   }
 
   checksums.task = hashRecords(taskRecords);
@@ -670,6 +678,7 @@ export function computeStateFamilyChecksums(
   checksums.operatorNotification = hashRecords(operatorNotifications);
   checksums.capabilityGrant = hashRecords(capabilityGrants);
   checksums.releaseWorkflow = hashRecords(releaseWorkflows);
+  checksums.publicationReference = hashRecords(publicationReferences);
 
   checksums.workMailbox = hashRecords(Object.values(asObjectMap(state.mailboxes)));
 
@@ -825,6 +834,10 @@ export function computeDbFamilyChecksums(
     );
     checksums.capabilityGrant = hashPayloadTable(db, "SELECT payload FROM capability_grants");
     checksums.releaseWorkflow = hashPayloadTable(db, "SELECT payload FROM release_workflows");
+    checksums.publicationReference = hashPayloadTable(
+      db,
+      "SELECT payload FROM publication_references"
+    );
 
     // Mailboxes are reconstructed from typed columns (no payload column).
     const mailboxRows = readWorkMailboxRows(db);
@@ -976,7 +989,8 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
         operatorNotification: null,
         idHighWaterMarks: {},
         capabilityGrants: {},
-        releaseWorkflows: {}
+        releaseWorkflows: {},
+        publicationReferences: {}
       };
     }
 
@@ -1032,6 +1046,13 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
       "release_workflows",
       tasks,
       "releaseWorkflows",
+      (record) => record.id as string
+    );
+    loadTaskPayloadMap(
+      db,
+      "publication_references",
+      tasks,
+      "publicationReferences",
       (record) => record.id as string
     );
 

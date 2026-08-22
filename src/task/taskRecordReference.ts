@@ -15,7 +15,8 @@ export const TASK_RECORD_ID_PREFIXES = {
   milestone: "milestone",
   event: "event",
   capabilityGrant: "capability-grant",
-  releaseWorkflow: "release-workflow"
+  releaseWorkflow: "release-workflow",
+  publicationReference: "publication"
 } as const;
 
 export type TaskRecordKind = keyof typeof TASK_RECORD_ID_PREFIXES;

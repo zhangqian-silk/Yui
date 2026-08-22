@@ -12,6 +12,8 @@ import {
 } from "../../dist/storage/migration/index.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { moveSqliteFileSet } from "../../dist/storage/upgrade/sqliteFileSet.js";
+import { createProject } from "../../dist/repository/project.js";
+import { createPublicationReference } from "../../dist/task/publicationReference.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
@@ -91,6 +93,63 @@ test("a SQLite switch backs up the database and its live WAL file set", (t) => {
   assert.equal(readFileSync(backup, "utf8"), "database");
   assert.equal(readFileSync(`${backup}-wal`, "utf8"), "wal");
   assert.equal(readFileSync(`${backup}-shm`, "utf8"), "shm");
+});
+
+test("the SQLite publication path records an external MR reference", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-core-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const now = new Date("2026-08-22T00:00:00.000Z");
+  const store = new SqliteTaskStore(home);
+  const project = createProject(
+    "project-1",
+    "app",
+    home,
+    { stable: "master", development: "master" },
+    now
+  );
+  const task = activateTask(createTask(store.nextTaskId(), "Publication smoke", now, {
+    projectBindings: [{ projectId: project.id, directory: "app", baseRef: "master" }]
+  }), now);
+  store.saveProject(project);
+  store.saveTask(task);
+  const reference = createPublicationReference(
+    store.nextPublicationReferenceId(task.id),
+    task.id,
+    {
+      projectId: project.id,
+      provider: "gitlab",
+      repository: "team/app",
+      externalKind: "merge-request",
+      externalId: "179",
+      externalUrl: "https://example.invalid/team/app/-/merge_requests/179",
+      title: "Ship publication trace",
+      sourceBranch: "feature/publication-trace",
+      targetBranch: "master",
+      localCommit: "0123456789abcdef0123456789abcdef01234567",
+      remoteCommit: "fedcba9876543210fedcba9876543210fedcba98",
+      state: "merged",
+      verification: "verified",
+      mergedAt: "2026-08-22T01:02:03.000Z"
+    },
+    now
+  );
+  store.savePublicationReference(task.id, reference);
+  store.close();
+
+  const reopened = new SqliteTaskStore(home);
+  const loaded = reopened.getPublicationReference(task.id, reference.id);
+  assert.equal(loaded?.title, "Ship publication trace");
+  assert.equal(loaded?.sourceBranch, "feature/publication-trace");
+  assert.equal(loaded?.targetBranch, "master");
+  assert.equal(loaded?.mergedAt, "2026-08-22T01:02:03.000Z");
+  assert.equal(loaded?.state, "merged");
+  assert.equal(loaded?.verification, "verified");
+  assert.equal(
+    reopened.findPublicationReferenceByExternalKey("gitlab/team/app/179")?.id,
+    reference.id
+  );
+  assert.deepEqual(reopened.listPublicationReferences(task.id), [reference]);
+  reopened.close();
 });
 
 test("the production migration graph advances the normal aggregate path", () => {

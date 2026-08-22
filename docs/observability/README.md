@@ -144,6 +144,8 @@ Sections:
   failures.
 - **reviews** — total/completed/failed, infra vs semantic-negative.
 - **integrations** — total/committed/failed, environment failures, gate reuse.
+- **publications** — total/merged/verified/open/closed/superseded external
+  PR/MR references.
 - **events** — total, progress vs semantic, obsolete, message count.
 - **workItems** — total/completed/retired.
 - **storage** — state.json/runtime/deployments byte sizes.

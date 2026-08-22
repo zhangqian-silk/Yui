@@ -343,6 +343,20 @@ yui task create "Update authentication" \
 yui task project add <task-id> shared-sdk --base main
 ```
 
+Project-backed Tasks record the local baseline, redacted remote identity, and
+the remote-tracking commit observed when their main workspace is created.
+Inspect delivery freshness with:
+
+```sh
+yui task base status <task-id>
+yui task base status <task-id> --refresh
+```
+
+The default check is offline and uses local remote-tracking refs. `--refresh`
+is the explicit authorization to query the configured remote; Yui never
+fetches, rebases, merges, or force-pushes as a hidden side effect of Task
+completion.
+
 Implementation WorkItems declare the Projects they may modify. Their workspace
 keeps the same relative layout, creates isolated worktrees only for that write
 scope, and exposes the other Task Projects as context from Task main. Yui puts
@@ -610,6 +624,7 @@ When the requested outcome is finished, complete the Task to stop automatic Lead
 
 ```sh
 yui task complete <task-id> --summary "CSV export shipped and verified"
+yui task complete <task-id> --summary-file delivery.txt --refresh-remote
 yui task reopen <task-id>
 ```
 
