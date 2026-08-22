@@ -2,6 +2,7 @@ export type ContinuationExecution = "active" | "quiescent" | "unknown";
 export type ContinuationOutcome = "pending" | "succeeded" | "failed" | "cancelled" | "unknown";
 export type ContinuationAttachment = "attached" | "detached";
 export type ContinuationObservationQuality = "exact" | "partial" | "unavailable";
+export type ContinuationDurability = "best-effort" | "durable-result";
 
 export type ProviderContinuationIdentity = Readonly<{
   providerNamespace: string;
@@ -16,6 +17,14 @@ export type ProviderReport = Readonly<{
   reportId: string;
   resultRef?: string;
   providerDeliveryRef?: string;
+  /**
+   * sha256 hex digest of the result content Yui persisted for this report.
+   * Its presence is the durable-result receipt: the continuation only claims
+   * "durable-result" durability when at least one report carries a digest.
+   */
+  resultDigest?: string;
+  /** Character length of the full persisted result content. */
+  resultSize?: number;
   observedAt: string;
 }>;
 
@@ -31,6 +40,11 @@ export type ProviderContinuation = Readonly<{
   attachment: ContinuationAttachment;
   observation: ContinuationObservationQuality;
   mayWriteWorkspace: boolean;
+  /**
+   * "best-effort" until Yui persists result content for a report;
+   * "durable-result" once a report carries a resultDigest receipt.
+   */
+  durability: ContinuationDurability;
   reports: readonly ProviderReport[];
   resultRef?: string;
   settledAt?: string;
@@ -78,6 +92,7 @@ export function createProviderContinuation(input: Readonly<{
     attachment: input.attachment,
     observation: input.observation,
     mayWriteWorkspace: input.mayWriteWorkspace,
+    durability: "best-effort",
     reports: [],
     ...(input.providerSequence === undefined ? {} : { lastProviderSequence: input.providerSequence }),
     identityConflict: false,
@@ -96,9 +111,17 @@ export function recordProviderReport(
   if (providerSequenceRegresses(current, providerSequence)) return current;
   const normalized = validateProviderReport(report);
   if (current.reports.some((entry) => entry.reportId === normalized.reportId)) return current;
+  // Idempotent durable-result receipt: a replay carrying the same content
+  // digest must not create a second report even when the Provider assigns a
+  // fresh report id.
+  if (normalized.resultDigest !== undefined
+    && current.reports.some((entry) => entry.resultDigest === normalized.resultDigest)) {
+    return current;
+  }
   return validateProviderContinuation({
     ...current,
     reports: [...current.reports, normalized],
+    ...(normalized.resultDigest === undefined ? {} : { durability: "durable-result" as const }),
     ...(providerSequence === undefined ? {} : { lastProviderSequence: providerSequence }),
     updatedAt: normalized.observedAt
   });
@@ -232,9 +255,20 @@ export function validateProviderContinuation(value: ProviderContinuation): Provi
   if (typeof value.mayWriteWorkspace !== "boolean" || typeof value.identityConflict !== "boolean") {
     throw new Error("Provider Continuation flags are invalid.");
   }
+  if (value.durability !== "best-effort" && value.durability !== "durable-result") {
+    throw new Error("Provider Continuation durability is invalid.");
+  }
   const reports = value.reports.map(validateProviderReport);
   if (new Set(reports.map((entry) => entry.reportId)).size !== reports.length) {
     throw new Error("Provider Continuation reports contain duplicate identity.");
+  }
+  if (value.durability === "durable-result"
+    && !reports.some((entry) => entry.resultDigest !== undefined)) {
+    throw new Error("Durable-result Provider Continuation requires a result digest receipt.");
+  }
+  if (value.durability === "best-effort"
+    && reports.some((entry) => entry.resultDigest !== undefined)) {
+    throw new Error("Best-effort Provider Continuation must not carry a result digest receipt.");
   }
   timestamp(value.createdAt, "Provider Continuation createdAt");
   timestamp(value.updatedAt, "Provider Continuation updatedAt");
@@ -272,8 +306,28 @@ function validateProviderReport(value: ProviderReport): ProviderReport {
     ...(value.providerDeliveryRef === undefined
       ? {}
       : { providerDeliveryRef: text(value.providerDeliveryRef, "Provider delivery ref") }),
+    ...(value.resultDigest === undefined
+      ? {}
+      : { resultDigest: digest(value.resultDigest) }),
+    ...(value.resultSize === undefined
+      ? {}
+      : { resultSize: reportSize(value.resultSize) }),
     observedAt: timestamp(value.observedAt, "Provider report observedAt")
   };
+}
+
+function digest(value: string): string {
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    throw new Error("Provider report result digest must be a sha256 hex string.");
+  }
+  return value;
+}
+
+function reportSize(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error("Provider report result size is invalid.");
+  }
+  return value;
 }
 
 function providerSequenceRegresses(

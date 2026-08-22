@@ -158,6 +158,7 @@ function sameContinuationState(
     && left.attachment === right.attachment
     && left.observation === right.observation
     && left.mayWriteWorkspace === right.mayWriteWorkspace
+    && left.durability === right.durability
     && left.resultRef === right.resultRef
     && left.lastProviderSequence === right.lastProviderSequence
     && left.identityConflict === right.identityConflict;

@@ -917,6 +917,19 @@ const taskChildren: readonly NodeInput[] = [
     ]
   },
   {
+    name: "continuation",
+    summary: "Inspect native Provider child continuations and their durability mode.",
+    sections: [{ id: "manage", title: "Commands", entries: ["list"] }],
+    children: [
+      {
+        name: "list",
+        summary: "List native child continuations for a Task.",
+        usage: "yui task continuation list <task> [--json]",
+        options: ["--json"]
+      }
+    ]
+  },
+  {
     name: "wake",
     summary: "Inspect the durable Leader wake ledger and its delta content.",
     sections: [{ id: "manage", title: "Commands", entries: ["list", "show"] }],
@@ -1308,7 +1321,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
-        { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "wake"] }
+        { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "continuation", "wake"] }
       ],
       children: taskChildren
     },

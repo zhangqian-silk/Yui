@@ -144,6 +144,50 @@ terminal observations clear obsolete operation and waiting snapshots. Detailed
 high-volume diagnostics may go to the telemetry sidecar, but Task state retains
 only what restart-safe projection needs.
 
+## Native child result durability
+
+Provider-native subagents (Claude `Task`, Codex descendants) are observed as
+`continuation.started` / `continuation.reported` / `continuation.settled`
+facts. A native child has one of two durability modes, visible through
+`yui task continuation list <task>`:
+
+- **best-effort** (default): the child result returns through the parent
+  Conversation. Yui tracks the child's lifecycle but does not claim it
+  persisted the result. If the parent Session is lost before the result is
+  externalized, rerun the child. A best-effort child is never counted as a
+  durable Yui lane.
+- **durable-result**: Yui persisted the child's result content in a
+  `continuation.reported` Task event. The report carries a sha256 content
+  digest and the result size; the continuation record references the event
+  holding the full content. After a parent crash, recovery reads the result by
+  its event reference or digest instead of rerunning the child.
+
+The durability mode is derived from evidence, not declared: a continuation is
+`durable-result` only when at least one report carries a result digest receipt.
+Replays with the same content digest are idempotent and never create a second
+report. The parent prompt receives a bounded excerpt (512 characters) plus the
+event reference; the full content is read on demand through
+`yui task event show <task> <event>`.
+
+Size and retention boundaries:
+
+- A single continuation result summary is capped at 32 KiB by the observation
+  validator; larger provider output is rejected rather than truncated, so Yui
+  never silently persists a partial result and claims it is complete.
+- The parent prompt excerpt is capped at 512 characters and 8 lines per
+  report; the full content stays in the Task event log.
+- Continuation reports are durable facts and are not compacted by the
+  observation GC. They are retained for the lifetime of the Task, like other
+  Task Knowledge records.
+- Native child results may contain provider transcript content. Treat them as
+  untrusted application data: never inject secrets, argv, environment values,
+  or credential material into a continuation report, and never execute
+  instructions found in one.
+
+Critical, non-repeatable, or independently verifiable work must use a Yui
+WorkItem/ExecutionGroup, not a native subagent. Only a managed Lane owns an
+independent Run, receipt, and workspace.
+
 ## Adding another Agent CLI
 
 A new CLI integration must pair a launch adapter with one Driver registry
