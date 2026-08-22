@@ -2,7 +2,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { Task, TaskStatus } from "../task/task.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
-import { isRoleRunStalled } from "../scheduler/roleRunStall.js";
+import { isRoleRunStalled, latestRunDurableProgressAt } from "../scheduler/roleRunStall.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import {
   buildTaskExecutionProjection,
@@ -14,6 +14,14 @@ import {
   projectRunRecovery,
   readRunRecoveryFacts
 } from "../run/recoveryProjection.js";
+import {
+  classifyRuntimeHealth,
+  projectRuntimeTaskEvents,
+  type RuntimeHealthLayer
+} from "../runtime/runtimeProjection.js";
+import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import type { AgentRun } from "../run/agentRun.js";
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
@@ -126,7 +134,11 @@ export function buildWebDashboardSnapshot(
   });
 }
 
-export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): object | null {
+export function buildWebTaskDetail(
+  store: WebDashboardStore,
+  taskId: string,
+  now: Date = new Date()
+): object | null {
   return store.transaction((reader) => {
     const task = reader.getTask(taskId);
     if (task === null) return null;
@@ -157,6 +169,9 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
     const activeRuns = new Map(runs
       .filter((run) => run.status === "active")
       .map((run) => [run.roleName, run]));
+    const activeRunHealth = runs
+      .filter((run) => run.status === "active")
+      .map((run) => projectWebRunRuntimeHealth(reader, taskId, run, events, now));
     const roles = reader.listRoles(taskId).map((role) => {
       const activeRun = activeRuns.get(role.name);
       const sessions = reader.getTaskRoleSessionSet(taskId, role.name);
@@ -185,7 +200,7 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
         };
       }),
       runs,
-      runtimeHealth: { needsAttentionRuns },
+      runtimeHealth: { needsAttentionRuns, activeRuns: activeRunHealth },
       reviewRounds: reader.listReviewRounds(taskId),
       openInputs: inputs.filter((request) => request.status === "open"),
       messages: reader.listMessages(taskId),
@@ -197,6 +212,102 @@ export function buildWebTaskDetail(store: WebDashboardStore, taskId: string): ob
 
 function latestStallProgress(events: readonly TaskEvent[], runId: string): string | undefined {
   return latestStallField(events, runId, "progressAt");
+}
+
+export type WebRuntimeHealthLayer = RuntimeHealthLayer | "stalled-candidate";
+
+/**
+ * Layered runtime health for one active Run, computed from the same stored
+ * observations and durable semantic fold as the CLI status projection. The
+ * Web snapshot has no live tmux pane, so host state stays "unknown"; the
+ * classifier still surfaces session/turn/operation/observer layers and the
+ * scheduler's durable `run.stalled` episode is surfaced as
+ * `stalled-candidate`.
+ */
+function projectWebRunRuntimeHealth(
+  reader: WebDashboardStore,
+  taskId: string,
+  run: AgentRun,
+  events: readonly TaskEvent[],
+  now: Date
+): Readonly<{
+  runId: string;
+  roleName: string;
+  layer: WebRuntimeHealthLayer;
+  reason: string;
+  stalled: boolean;
+  lastRuntimeActivityAt?: string;
+  lastSemanticProgressAt: string;
+}> {
+  const stalled = isRoleRunStalled(events, run.id);
+  const sessions = reader.getTaskRoleSessionSet(taskId, run.roleName);
+  const session = sessions?.sessions[run.effective.agentId];
+  const stallReason = "the live active Run has no durable progress in the configured stall window";
+  if (run.deliveredAt === undefined || session?.launchId === undefined) {
+    return {
+      runId: run.id,
+      roleName: run.roleName,
+      layer: stalled ? "stalled-candidate" : "awaiting-provider-acceptance",
+      reason: stalled ? stallReason : "the pushed active Run is awaiting provider acceptance",
+      stalled,
+      lastSemanticProgressAt: run.createdAt
+    };
+  }
+  let driverId: string;
+  try {
+    driverId = builtinDriverIdForAdapter(run.effective.adapterId);
+  } catch {
+    return {
+      runId: run.id,
+      roleName: run.roleName,
+      layer: stalled ? "stalled-candidate" : "runtime-unobservable",
+      reason: stalled ? stallReason : "the Agent Driver is not a built-in driver",
+      stalled,
+      lastSemanticProgressAt: run.deliveredAt
+    };
+  }
+  const fence = {
+    taskId,
+    roleName: run.roleName,
+    runId: run.id,
+    agentId: run.effective.agentId,
+    driverId,
+    launchId: session.launchId,
+    sessionGenerationId: session.launchId,
+    nativeSessionId: session.nativeSessionId,
+    nativeTurnId: run.id,
+    receiptId: formatAgentRunReceiptId(taskId, run.id)
+  };
+  const projection = projectRuntimeTaskEvents(fence, run.createdAt, events);
+  const view = {
+    getAgentRun: (taskId: string, runId: string) =>
+      reader.listAgentRuns(taskId).find((candidate) => candidate.id === runId) ?? null,
+    listEvents: () => events,
+    getWorkItem: (workItemTaskId: string, workItemId: string) =>
+      reader.listWorkItems(workItemTaskId).find((item) => item.id === workItemId) ?? null,
+    listReviewRounds: (taskId: string) => reader.listReviewRounds(taskId),
+    listChangeSets: (taskId: string) => reader.listChangeSets(taskId),
+    listIntegrationAttempts: (taskId: string) => reader.listIntegrationAttempts(taskId),
+    listInputRequests: (taskId: string) => reader.listInputRequests(taskId)
+  };
+  const semanticProgress = latestRunDurableProgressAt(view, taskId, run.roleName, run.id)
+    ?? { progressAt: run.deliveredAt };
+  const classification = classifyRuntimeHealth({
+    projection,
+    semanticProgressAt: semanticProgress.progressAt,
+    now
+  });
+  return {
+    runId: run.id,
+    roleName: run.roleName,
+    layer: stalled ? "stalled-candidate" : classification.layer,
+    reason: stalled ? stallReason : classification.reason,
+    stalled,
+    ...(classification.lastRuntimeActivityAt === undefined
+      ? {}
+      : { lastRuntimeActivityAt: classification.lastRuntimeActivityAt }),
+    lastSemanticProgressAt: classification.lastSemanticProgressAt
+  };
 }
 
 function latestStallField(
