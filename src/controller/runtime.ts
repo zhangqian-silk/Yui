@@ -58,6 +58,9 @@ import {
   type ActivePromptPushPort,
   type AgentEnvironmentRefreshPort,
   type RuntimeLaunchPreparationPort,
+  ProviderContinuationReconciliationService,
+  type ProviderContinuationMetadataPort,
+  type ProviderInputRoutingPort,
   type TaskRuntimeIsolationPort,
   type TaskRuntimeLifecycleCleanupPort,
   type SessionHostPort
@@ -114,6 +117,10 @@ export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readon
   environment?: NodeJS.ProcessEnv;
   workspacePreparer?: TaskWorkspacePreparer;
   runtimeIsolation?: TaskRuntimeIsolationPort & Partial<TaskRuntimeLifecycleCleanupPort>;
+  /** Optional Adapter metadata query; never grants model/launch authority. */
+  continuationMetadata?: ProviderContinuationMetadataPort;
+  /** Must share the same Provider SessionHost/Activation ownership. */
+  providerInputRouting?: ProviderInputRoutingPort;
 }>;
 
 export type RunningFileTaskControllerRuntime = RunningFileTaskController & Readonly<{
@@ -368,6 +375,9 @@ export async function startFileTaskControllerRuntime(
       sessionHost,
       promptPush,
       launchCoordinator,
+      ...(options.providerInputRouting === undefined
+        ? {}
+        : { providerInputRouting: options.providerInputRouting }),
       roleResourceInventory: async (panes, inputs) => {
         const inventory = await scanInventory(panes);
         return inventory.resources.flatMap((resource) => {
@@ -521,6 +531,13 @@ export async function startFileTaskControllerRuntime(
     onError: options.onError
   });
   const jobControl = createDurableJobControl(store);
+  const continuationReconciler = options.continuationMetadata === undefined
+    ? undefined
+    : new ProviderContinuationReconciliationService(
+        store,
+        schedulerStore,
+        options.continuationMetadata
+      );
   const running = await startFileTaskController(
     home,
     schedulerStore,
@@ -538,6 +555,7 @@ export async function startFileTaskControllerRuntime(
       lifecycleHost,
       jobSupervisor,
       jobControl,
+      ...(continuationReconciler === undefined ? {} : { continuationReconciler }),
       ...(resourceReaper === undefined ? {} : { resourceReaper }),
       resourceAutoGc,
       onExpiredEphemeralDomain: (domain) => {

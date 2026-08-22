@@ -32,7 +32,11 @@ import {
 } from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
 import {
+  mailboxBatches,
+  consumePendingBatch,
+  mailboxHasWork,
   mailboxTargetKey,
+  pendingLane,
   validateWorkMailbox,
   type MailboxEntityRef,
   type MailboxTarget,
@@ -50,10 +54,6 @@ import {
   type RoleAgentSession,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
-import {
-  validatePendingTurnCompletion,
-  type PendingTurnCompletion
-} from "../executor/turnCompletion.js";
 import { validateTaskMessage, type TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import { validateAgentRun, type AgentRun } from "../run/agentRun.js";
@@ -202,7 +202,7 @@ export const CURRENT_MILESTONE_SCHEMA_VERSION = 1 as const;
 export const CURRENT_EVENT_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION = 1 as const;
-export const CURRENT_WORK_MAILBOX_SCHEMA_VERSION = 1 as const;
+export const CURRENT_WORK_MAILBOX_SCHEMA_VERSION = 2 as const;
 export const CURRENT_ROLE_AGENT_SESSION_SCHEMA_VERSION = 3 as const;
 export const CURRENT_PENDING_WAKEUP_SCHEMA_VERSION = 1 as const;
 const STORAGE_LOCK_DIRECTORY = ".state.lock";
@@ -351,7 +351,7 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 16 as const;
  * Keep these named at the storage boundary so the upgrade record-axis map can
  * assert it is classifying the same bytes the store reads and writes.
  */
-export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
+export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 5 as const;
 /**
  * v7 combines optional Issue 04 retry/receipt fields and Issue 05 Leader
  * actionability fields. All are optional, so the v6→v7 migration is a
@@ -514,7 +514,6 @@ export type TaskStore = {
   /** Current non-stopped Role Sessions; production SQLite reads a bounded hot projection. */
   listRuntimeSessionCandidates(query?: RuntimeSessionCandidateQuery): RuntimeSessionCandidate[];
   /** Pending native Turn completions from the independent bounded hot projection. */
-  listPendingRuntimeTurnCompletions(taskIds?: readonly string[]): PendingTurnCompletion[];
   saveRoleSessionSet(sessions: TaskRoleSessionSet): void;
   saveTaskRoleSessionSet(sessions: TaskRoleSessionSet): void;
   getRoleSession(taskId: string, roleName: string): RoleAgentSession | null;
@@ -1429,30 +1428,6 @@ export class FileTaskStore implements TaskStore {
       .filter((candidate) => !query.cleanupRequiredOnly || candidate.cleanupRequired)
       .sort(compareRuntimeSessionCandidates);
   }
-  listPendingRuntimeTurnCompletions(taskIds?: readonly string[]): PendingTurnCompletion[] {
-    const selectedTaskIds = taskIds === undefined
-      ? undefined
-      : [...new Set(taskIds)].sort(numericCompare);
-    if (selectedTaskIds?.length === 0) return [];
-    const taskAggregates = selectedTaskIds === undefined
-      ? Object.values(this.#state().tasks)
-      : selectedTaskIds.flatMap((taskId) => {
-          const aggregate = this.#state().tasks[taskId];
-          return aggregate === undefined ? [] : [aggregate];
-        });
-    return taskAggregates.flatMap((aggregate) => (
-      Object.values(aggregate.roleSessionSets).flatMap((sessions) => {
-        const pending = sessions.pendingTurnCompletion;
-        return pending === null || pending === undefined
-          ? []
-          : [validatePendingTurnCompletion(pending)];
-      })
-    )).sort((left, right) => (
-      numericCompare(left.taskId, right.taskId)
-      || numericCompare(left.roleName, right.roleName)
-      || numericCompare(left.runId, right.runId)
-    ));
-  }
   saveRoleSessionSet(sessions: TaskRoleSessionSet): void {
     const stored = taskSessions(sessions);
     const taskId = stored.owner.taskId;
@@ -2202,7 +2177,7 @@ export class FileTaskStore implements TaskStore {
     // in-memory aggregate while preserving the indexed SQLite contract's
     // target-key order; production layout 7 uses the bounded SQLite query.
     return Object.entries(this.#state().mailboxes)
-      .filter(([, mailbox]) => mailbox.processing !== null || mailbox.pending !== null)
+      .filter(([, mailbox]) => mailboxHasWork(mailbox))
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([, mailbox]) => clone(mailbox));
   }
@@ -2247,32 +2222,46 @@ export class FileTaskStore implements TaskStore {
     const target: MailboxTarget = { kind: "role", taskId: wakeup.taskId, roleName: "leader" };
     this.transaction(() => {
       const existing = this.getWorkMailbox(target);
-      if (existing !== null && existing.pending !== null
-        && wakeup.requestCount <= existing.pending.requestCount) {
+      const existingPending = existing === null ? null : pendingLane(existing, "normal");
+      if (existingPending !== null
+        && wakeup.requestCount <= existingPending.requestCount) {
         throw new StorageRecordError(`Pending wakeup is stale: ${wakeup.taskId}`);
       }
-      const fromSequence = existing?.pending?.fromSequence ?? existing?.nextSequence ?? 1;
+      const fromSequence = existingPending?.fromSequence ?? existing?.nextSequence ?? 1;
       const toSequence = fromSequence + wakeup.requestCount - 1;
       this.saveWorkMailbox({
         schemaVersion: CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
         target,
         nextSequence: Math.max(existing?.nextSequence ?? 1, toSequence + 1),
         processing: existing?.processing ?? null,
+        inputDelivery: existing?.inputDelivery ?? null,
         pending: {
-          ...existing?.pending,
-          fromSequence,
-          toSequence,
-          reasons: [...wakeup.reasons],
-          refs: existing?.pending?.refs ?? [],
-          requestCount: wakeup.requestCount,
-          firstQueuedAt: wakeup.firstRequestedAt,
-          lastQueuedAt: wakeup.lastRequestedAt
+          normal: {
+            fromSequence,
+            toSequence,
+            reasons: [...wakeup.reasons],
+            refs: existingPending?.refs ?? [],
+            requestCount: wakeup.requestCount,
+            firstQueuedAt: wakeup.firstRequestedAt,
+            lastQueuedAt: wakeup.lastRequestedAt,
+            sources: existingPending?.sources ?? ["pending-wakeup-projection"],
+            dedupeKeys: existingPending?.dedupeKeys ?? [
+              `pending-wakeup:${wakeup.taskId}:${fromSequence}-${toSequence}`
+            ],
+            deliveryModes: existingPending?.deliveryModes ?? ["followup"]
+          },
+          userCorrection: existing?.pending.userCorrection ?? null,
+          cursors: existing?.pending.cursors ?? { normal: 0, userCorrection: 0 },
+          recentDedupeKeys: existing?.pending.recentDedupeKeys ?? []
         }
       });
     });
   }
   clearPendingWakeup(taskId: string): void {
-    this.removeWorkMailbox({ kind: "role", taskId, roleName: "leader" });
+    const target = { kind: "role" as const, taskId, roleName: "leader" };
+    const mailbox = this.getWorkMailbox(target);
+    if (mailbox === null || mailbox.pending.normal === null) return;
+    this.saveWorkMailbox(consumePendingBatch(mailbox, "normal"));
   }
   getLeaderFailure(taskId: string): LeaderFailure | null { return optional(this.#state().tasks[taskId]?.leaderFailure ?? undefined); }
   saveLeaderFailure(value: LeaderFailure): void { this.#saveSingleton(value.taskId, "leaderFailure", value, "Leader failure"); }
@@ -3819,17 +3808,18 @@ function values<T>(records: Record<string, T>, identity: keyof T | ((value: T) =
 }
 function numericCompare(left: string, right: string): number { return left.localeCompare(right, undefined, { numeric: true }); }
 export function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | null {
+  const pending = mailbox === null ? null : pendingLane(mailbox, "normal");
   if (mailbox === null || mailbox.target.kind !== "role" || mailbox.target.roleName !== "leader"
-    || mailbox.pending === null) {
+    || pending === null) {
     return null;
   }
   return {
     schemaVersion: CURRENT_PENDING_WAKEUP_SCHEMA_VERSION,
     taskId: mailbox.target.taskId,
-    reasons: [...mailbox.pending.reasons],
-    requestCount: mailbox.pending.requestCount,
-    firstRequestedAt: mailbox.pending.firstQueuedAt,
-    lastRequestedAt: mailbox.pending.lastQueuedAt
+    reasons: [...pending.reasons],
+    requestCount: pending.requestCount,
+    firstRequestedAt: pending.firstQueuedAt,
+    lastRequestedAt: pending.lastQueuedAt
   };
 }
 function validateMailboxReferences(state: StorageState, mailbox: WorkMailbox): void {
@@ -3850,10 +3840,9 @@ function validateMailboxReferences(state: StorageState, mailbox: WorkMailbox): v
   }
   const refs: MailboxEntityRef[] = [];
   if (mailbox.processing !== null) {
-    refs.push(...mailbox.processing.batch.refs);
     if (mailbox.processing.executionRef !== undefined) refs.push(mailbox.processing.executionRef);
   }
-  if (mailbox.pending !== null) refs.push(...mailbox.pending.refs);
+  for (const batch of mailboxBatches(mailbox)) refs.push(...batch.refs);
   for (const ref of refs) {
     if (!mailboxReferenceExists(state, ref)) {
       const identity = "taskId" in ref ? `${ref.taskId}/${ref.id}` : ref.id;
@@ -3939,15 +3928,6 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
       if (run === undefined || run.roleName !== roleName
         || sessions.inFlight.receiptId !== formatAgentRunReceiptId(taskId, run.id)) {
         throw new StorageRecordError(`Task Role in-flight Run is invalid: ${taskId}/${roleName}.`);
-      }
-    }
-    if (sessions.pendingTurnCompletion !== null) {
-      const completion = sessions.pendingTurnCompletion;
-      const run = aggregate.agentRuns[completion.runId];
-      if (completion.taskId !== taskId || run === undefined || run.roleName !== roleName) {
-        throw new StorageRecordError(
-          `Task Role pending completion Run is invalid: ${taskId}/${roleName}.`
-        );
       }
     }
   }
@@ -4301,6 +4281,7 @@ function mailboxReferenceExists(state: StorageState, ref: MailboxEntityRef): boo
       case "work-item": return aggregate.workItems[ref.id] !== undefined;
       case "input": return aggregate.inputRequests[ref.id] !== undefined;
       case "message": return aggregate.messages[ref.id] !== undefined;
+      case "event": return aggregate.events[ref.id] !== undefined;
     }
   }
   switch (ref.type) {

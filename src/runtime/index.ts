@@ -34,6 +34,7 @@ export {
   type ActivePromptPushPort,
   type ActivePromptPushRequest,
   type PromptPushResult,
+  type ProviderInputRoutingPort,
   RuntimeHostContentionError,
   RuntimeLaunchError,
   type RuntimeLaunchRetryReason,
@@ -108,6 +109,25 @@ export {
   type SessionTerminationResult,
   type SessionTerminationStage
 } from "./sessionTerminationGuard.js";
+export {
+  ProviderContinuationReconciliationService,
+  type ProviderContinuationObservationSink
+} from "./providerContinuationReconciliationService.js";
+export type {
+  ProviderContinuationMetadataPort,
+  ProviderContinuationQueryResult,
+  ProviderReconcileResult,
+  ProviderReconcileSchedule
+} from "./providerRuntimeReconciler.js";
+export {
+  codexNotificationBoundary,
+  CodexAppServerRequestError,
+  CodexAppServerRuntime,
+  type CodexAppServerTransport,
+  type CodexThreadSnapshot,
+  type CodexTurnAcceptance,
+  type JsonRpcObject
+} from "./codexAppServerRuntime.js";
 export {
   reconcileSessionOwners,
   type DurableSessionFact,

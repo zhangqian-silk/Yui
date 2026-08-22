@@ -163,7 +163,9 @@ export function renderExecutionAudit(
       "",
       `Leader wakes: ${wakes.leaderRuns} runs · ${wakes.withWakeReasons} with reasons · ${wakes.orphanWakes} orphan wakes (${wakes.orphanYieldOnly} yield-only)`
     );
-    if (wakes.suppressedWakes.status === "unsupported") {
+    if (wakes.suppressedWakes.status === "ok") {
+      lines.push(`Suppressed wakes: ${wakes.suppressedWakes.data ?? 0} (scheduler single-flight, not failed Runs)`);
+    } else if (wakes.suppressedWakes.status === "unsupported") {
       lines.push("Suppressed wakes: unsupported (no quiescence producer in this build)");
     }
     const reasonRows = Object.entries(wakes.byReason).slice(0, 8);

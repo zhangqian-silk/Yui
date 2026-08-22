@@ -145,3 +145,28 @@ export type ActivePromptPushRequest = Readonly<{
 export interface ActivePromptPushPort {
   tryPush(request: ActivePromptPushRequest): Promise<PromptPushResult>;
 }
+
+export interface ProviderInputRoutingPort {
+  route(input: Readonly<{
+    binding: RuntimeBinding;
+    attemptId: string;
+    mode: "steer-if-safe" | "inject";
+    text: string;
+    fence: Readonly<{
+      conversationId: string;
+      activationId: string;
+      nativeTurnId?: string;
+    }>;
+  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unsafe" | "unavailable">;
+  /** Metadata-only receipt/readback reconciliation; it must never start a model Turn. */
+  reconcile(input: Readonly<{
+    binding: RuntimeBinding;
+    attemptId: string;
+    mode: "followup" | "steer-if-safe" | "inject";
+    fence: Readonly<{
+      conversationId: string;
+      activationId: string;
+      nativeTurnId?: string;
+    }>;
+  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unavailable">;
+}

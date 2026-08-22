@@ -256,16 +256,16 @@ timezone with:
 
 ```sh
 yui config show
-yui config set --time-zone Europe/London
+yui config set time-zone Europe/London
 ```
 
 WorkItem review is one global, optional rule that reuses an existing Global
 Role's Agent, model, permissions, prompt, and Skills:
 
 ```sh
-yui config review set --role reviewer --trigger always
-yui config review show
-yui config review clear
+yui config set review --role reviewer --trigger always
+yui config show
+yui config clear review
 ```
 
 For Project-backed software delivery, use `--trigger final` to keep WorkItem
@@ -273,7 +273,7 @@ acceptance and Integration independent and run one fresh ReviewRound over the
 complete frozen integrated Task candidate before completion:
 
 ```sh
-yui config review set --role reviewer --trigger final
+yui config set review --role reviewer --trigger final
 ```
 
 Every result entering Leader acceptance is one explicit candidate on its
@@ -798,9 +798,16 @@ The dashboard opens on an overview cockpit: four operational metrics (active
 tasks, open inputs waiting on you, completed tasks, and the total), a
 cross-task attention inbox that surfaces every open InputRequest with its
 question and urgency so you can answer without drilling in, and the list of
-currently active tasks. Selecting a task opens an anchored detail view
-(Summary, Focus, Work items, Runs, Roles, History, Messages) with a sticky
-tab bar that tracks the visible section.
+currently active tasks. Each task row carries a derived execution status
+(progressing, needs attention, blocked, recovering) so stalled or failed
+work is visible before you open a task. Selecting a task opens an anchored
+detail view (Summary, Focus, Work items, Runs, Roles, History, Messages)
+with a sticky tab bar that tracks the visible section. The Summary tab leads
+with an execution band that consolidates the Task's owner, current action,
+attention list, blockers, and fail-closed indicators; Work items surface
+their current ExecutionGroup with per-lane status, Candidates, and
+retirement disposition; Runs show purpose, execution lineage, yield receipt,
+and Leader disposition.
 
 The control room supports English and Simplified Chinese, selecting an initial locale from the browser and remembering manual changes. The theme selector switches between the dark Control Room, the light Paper Ledger, and the dark-blue Atlas themes. Both choices are stored only in browser `localStorage`; they do not modify `YUI_HOME`.
 

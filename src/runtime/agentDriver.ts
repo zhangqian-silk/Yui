@@ -17,6 +17,7 @@ export type AgentRuntimeDeliveryMode =
   | "ordered-best-effort"
   | "best-effort"
   | "host-only";
+export type AgentRuntimeEvidenceQuality = "exact" | "partial" | "unavailable";
 
 export type AgentDriverCapabilities = Readonly<{
   surfaces: readonly AgentDriverSurface[];
@@ -26,6 +27,26 @@ export type AgentDriverCapabilities = Readonly<{
     sendTurn: boolean;
     interrupt: boolean;
     stop: boolean;
+  }>;
+  conversation: Readonly<{
+    persistentIdentity: AgentRuntimeEvidenceQuality;
+    crossProcessResume: boolean;
+    readback: AgentRuntimeEvidenceQuality;
+  }>;
+  input: Readonly<{
+    startTurn: boolean;
+    steer: "fenced" | "unavailable";
+    inject: "fenced" | "unavailable";
+    acceptance: "exact" | "unavailable";
+    idempotency: "exact" | "unavailable";
+  }>;
+  descendants: Readonly<{
+    lineage: AgentRuntimeEvidenceQuality;
+    detachedQuery: AgentRuntimeEvidenceQuality;
+    resultRouting: AgentRuntimeEvidenceQuality;
+  }>;
+  bounded: Readonly<{
+    structuredTerminal: boolean;
   }>;
   observation: Readonly<{
     sessionIdentity: "exact" | "unavailable";
@@ -80,6 +101,11 @@ export type AgentRuntimeObserverSample = Readonly<{
 export type AgentDriverMappedHook = Readonly<{
   kind: RuntimeObservationKind;
   payload: RuntimeObservationPayload;
+  fence?: Readonly<{
+    continuationId?: string;
+    continuationGeneration?: number;
+    parentContinuationId?: string;
+  }>;
 }>;
 
 export type AgentDriverHookClassification = Readonly<{
@@ -87,6 +113,9 @@ export type AgentDriverHookClassification = Readonly<{
   startupSession?: "preallocated" | "discovered";
   /** Terminal Hooks remain admissible after the exact Run has yielded. */
   terminal?: boolean;
+  /** Existing native child identity that can recover its original Run fence. */
+  continuationId?: string;
+  continuationGeneration?: number;
 }>;
 
 /**
@@ -101,7 +130,7 @@ export type AgentDriver = AgentDriverDescriptor & Readonly<{
     nativeSessionId(input: AgentDriverNativeHook): string | undefined;
     /** Resolve the provider's stable Turn identity without leaking its field names into core. */
     nativeTurnId(input: AgentDriverNativeHook): string | undefined;
-    mapHook(input: AgentDriverNativeHook): AgentDriverMappedHook;
+    mapHook(input: AgentDriverNativeHook): AgentDriverMappedHook | readonly AgentDriverMappedHook[];
     classifyHook(input: AgentDriverNativeHook): AgentDriverHookClassification;
     /** Optional independent observation source, sampled outside the Hook path. */
     observer?: Readonly<{
@@ -133,6 +162,23 @@ const DELIVERY_MODES: readonly AgentRuntimeDeliveryMode[] = [
   "best-effort",
   "host-only"
 ];
+
+function requireCapabilityObject(
+  value: unknown,
+  label: string
+): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Agent Driver ${label} capabilities must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function evidenceQuality(value: unknown, label: string): AgentRuntimeEvidenceQuality {
+  if (value !== "exact" && value !== "partial" && value !== "unavailable") {
+    throw new Error(`${label} capability is invalid.`);
+  }
+  return value;
+}
 
 export function validateAgentDriverCapabilities(
   input: AgentDriverCapabilities
@@ -178,6 +224,28 @@ export function validateAgentDriverCapabilities(
   if (!DELIVERY_MODES.includes(observation.delivery)) {
     throw new Error("Agent Driver delivery capability is invalid.");
   }
+  const conversation = requireCapabilityObject(input.conversation, "conversation");
+  evidenceQuality(conversation.persistentIdentity, "Provider Conversation identity");
+  evidenceQuality(conversation.readback, "Provider Conversation readback");
+  if (typeof conversation.crossProcessResume !== "boolean") {
+    throw new Error("Agent Driver Conversation resume capability must be boolean.");
+  }
+  const inputRouting = requireCapabilityObject(input.input, "input");
+  if (typeof inputRouting.startTurn !== "boolean"
+    || !["fenced", "unavailable"].includes(String(inputRouting.steer))
+    || !["fenced", "unavailable"].includes(String(inputRouting.inject))
+    || !["exact", "unavailable"].includes(String(inputRouting.acceptance))
+    || !["exact", "unavailable"].includes(String(inputRouting.idempotency))) {
+    throw new Error("Agent Driver input routing capabilities are invalid.");
+  }
+  const descendants = requireCapabilityObject(input.descendants, "descendants");
+  evidenceQuality(descendants.lineage, "Provider descendant lineage");
+  evidenceQuality(descendants.detachedQuery, "Provider detached descendant query");
+  evidenceQuality(descendants.resultRouting, "Provider descendant result routing");
+  const bounded = requireCapabilityObject(input.bounded, "bounded");
+  if (typeof bounded.structuredTerminal !== "boolean") {
+    throw new Error("Agent Driver bounded terminal capability must be boolean.");
+  }
   return Object.freeze({
     surfaces: Object.freeze(surfaces),
     control: Object.freeze({
@@ -187,6 +255,24 @@ export function validateAgentDriverCapabilities(
       interrupt: control.interrupt,
       stop: control.stop
     }),
+    conversation: Object.freeze({
+      persistentIdentity: conversation.persistentIdentity as AgentRuntimeEvidenceQuality,
+      crossProcessResume: conversation.crossProcessResume as boolean,
+      readback: conversation.readback as AgentRuntimeEvidenceQuality
+    }),
+    input: Object.freeze({
+      startTurn: inputRouting.startTurn as boolean,
+      steer: inputRouting.steer as "fenced" | "unavailable",
+      inject: inputRouting.inject as "fenced" | "unavailable",
+      acceptance: inputRouting.acceptance as "exact" | "unavailable",
+      idempotency: inputRouting.idempotency as "exact" | "unavailable"
+    }),
+    descendants: Object.freeze({
+      lineage: descendants.lineage as AgentRuntimeEvidenceQuality,
+      detachedQuery: descendants.detachedQuery as AgentRuntimeEvidenceQuality,
+      resultRouting: descendants.resultRouting as AgentRuntimeEvidenceQuality
+    }),
+    bounded: Object.freeze({ structuredTerminal: bounded.structuredTerminal as boolean }),
     observation: Object.freeze({
       sessionIdentity: observation.sessionIdentity,
       sessionBootstrap: observation.sessionBootstrap,
@@ -215,13 +301,27 @@ export function managedRuntimeAdmission(
   const actual = validateAgentDriverCapabilities(capabilities);
   const missing: string[] = [];
   if (!actual.control.start) missing.push("start");
-  if (!actual.control.resume) missing.push("resume");
-  if (!actual.control.sendTurn) missing.push("send-turn");
+  if (!actual.control.resume || !actual.conversation.crossProcessResume) missing.push("resume");
+  if (!actual.control.sendTurn || !actual.input.startTurn) missing.push("send-turn");
   if (!actual.control.interrupt) missing.push("interrupt");
   if (!actual.control.stop) missing.push("stop");
-  if (actual.observation.sessionIdentity !== "exact") missing.push("exact-session-identity");
-  if (actual.observation.promptAcceptance !== "exact") missing.push("exact-prompt-acceptance");
+  if (actual.observation.sessionIdentity !== "exact"
+    || actual.conversation.persistentIdentity !== "exact") missing.push("exact-session-identity");
+  if (actual.observation.promptAcceptance !== "exact"
+    || actual.input.acceptance !== "exact") missing.push("exact-prompt-acceptance");
   if (actual.observation.turnLifecycle !== "exact") missing.push("exact-turn-lifecycle");
+  return missing.length === 0
+    ? Object.freeze({ admitted: true })
+    : Object.freeze({ admitted: false, missing: Object.freeze(missing) });
+}
+
+export function boundedRuntimeAdmission(
+  capabilities: AgentDriverCapabilities
+): ManagedRuntimeAdmission {
+  const actual = validateAgentDriverCapabilities(capabilities);
+  const missing: string[] = [];
+  if (!actual.control.start) missing.push("start");
+  if (!actual.bounded.structuredTerminal) missing.push("structured-terminal");
   return missing.length === 0
     ? Object.freeze({ admitted: true })
     : Object.freeze({ admitted: false, missing: Object.freeze(missing) });
@@ -319,7 +419,8 @@ export function requireDriverId(value: string): string {
 export function normalizeAgentDriverHookClassification(
   input: AgentDriverHookClassification
 ): Required<Pick<AgentDriverHookClassification, "terminal">>
-  & Pick<AgentDriverHookClassification, "startupSession"> {
+  & Pick<AgentDriverHookClassification,
+    "startupSession" | "continuationId" | "continuationGeneration"> {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new Error("Agent Driver Hook classification must be an object.");
   }
@@ -331,8 +432,21 @@ export function normalizeAgentDriverHookClassification(
   if (input.terminal !== undefined && typeof input.terminal !== "boolean") {
     throw new Error("Agent Driver Hook terminal classification is invalid.");
   }
+  if (input.continuationId !== undefined) {
+    requireText(input.continuationId, "Agent Driver Hook continuation id");
+    if (!Number.isSafeInteger(input.continuationGeneration)
+      || input.continuationGeneration! < 1) {
+      throw new Error("Agent Driver Hook continuation generation is invalid.");
+    }
+  } else if (input.continuationGeneration !== undefined) {
+    throw new Error("Agent Driver Hook continuation generation requires an id.");
+  }
   return Object.freeze({
     ...(input.startupSession === undefined ? {} : { startupSession: input.startupSession }),
+    ...(input.continuationId === undefined ? {} : {
+      continuationId: input.continuationId,
+      continuationGeneration: input.continuationGeneration
+    }),
     terminal: input.terminal ?? false
   });
 }

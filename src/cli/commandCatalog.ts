@@ -1,4 +1,5 @@
 import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
+import { CONFIG_KEYS } from "../commands/configCommands.js";
 
 export type CommandNodeKind = "group" | "leaf" | "hybrid";
 export type CompletionProviderId = "role-agent";
@@ -105,6 +106,24 @@ function freezeRecord<T extends string | number>(
     Object.entries(record ?? {}).map(([key, values]) => [key, Object.freeze([...(values as readonly string[])])])
   )) as Readonly<Record<T, readonly string[]>>;
 }
+
+const CONFIG_KEY_VALUES: readonly CommandValue[] = [
+  { name: "time-zone", summary: "IANA timezone for human-facing timestamps (default: Asia/Shanghai)." },
+  { name: "reconciliation-interval-seconds", summary: "Recovery reconciliation interval, 5-300 seconds (default: 120)." },
+  { name: "leader-next-action", summary: "Leader next-action mode: display, warn, or enforce (default: display)." },
+  { name: "resources-gc-mode", summary: "Resource GC mode: report or quarantine (default: report)." },
+  { name: "resources-gc-auto-quarantine", summary: "Auto-quarantine terminal Task resources: true or false (default: false)." },
+  { name: "provider-retry-mode", summary: "Provider retry mode: off, shadow, or enforce (default: enforce)." },
+  { name: "provider-retry-adapters", summary: "Adapters with in-place retry: all, comma-separated adapter ids, or off (default: all)." },
+  { name: "provider-retry-max-window-ms", summary: "Total retry budget per Run lineage in milliseconds (default: 600000)." },
+  { name: "yield-receipt-replay", summary: "Replay committed yield receipts on resend: true or false (default: true)." },
+  { name: "tmux-bin", summary: "Path to the tmux binary (default: tmux)." },
+  { name: "git-bin", summary: "Path to the git binary (default: git)." },
+  { name: "telemetry-mode", summary: "Telemetry mode: legacy, dual, or bounded (default: legacy)." },
+  { name: "telemetry-terminal-keep", summary: "Telemetry terminal retention count (default: 200)." },
+  { name: "telemetry-run-cap", summary: "Telemetry per-run row cap (default: 50000)." },
+  { name: "review", summary: "Global WorkItem review rule; set with --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>] (default: disabled)." }
+];
 
 const agentChildren: readonly NodeInput[] = [
   {
@@ -344,7 +363,7 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "send",
         summary: "Send a Task message.",
-        usage: "yui task message send <id> (<body>|--body-file <path|->)",
+        usage: "yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none] [--delivery-mode followup|steer]",
         options: ["--body-file"],
         fileOptions: ["--body-file"]
       },
@@ -1008,51 +1027,27 @@ export const ROOT_COMMAND = buildNode({
     {
       name: "config",
       summary: "Inspect or update Yui configuration.",
-      sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "review", "leader-next-action"] }],
+      sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
       children: [
         { name: "show", summary: "Show effective Yui configuration." },
         {
           name: "set",
-          summary: "Update Yui configuration.",
-          usage: "yui config set <--time-zone <IANA timezone> | --reconciliation-interval-seconds <5-300> | --resources-gc-mode <report|quarantine> | --resources-gc-auto-quarantine <true|false>>",
-          options: ["--time-zone", "--reconciliation-interval-seconds", "--resources-gc-mode", "--resources-gc-auto-quarantine"],
+          summary: "Set one Yui configuration key.",
+          usage: "yui config set <key> <value...>",
+          sections: [{ id: "keys", title: "Configuration keys", entries: [...CONFIG_KEYS] }],
+          values: CONFIG_KEY_VALUES,
+          options: ["--role", "--trigger", "--finding-ledger"],
           optionValues: {
-            "--resources-gc-mode": ["report", "quarantine"],
-            "--resources-gc-auto-quarantine": ["true", "false"]
+            "--trigger": ["always", "leader", "final"],
+            "--finding-ledger": ["shadow", "enforce"]
           }
         },
         {
-          name: "review",
-          summary: "Configure WorkItem review.",
-          sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
-          children: [
-            { name: "show", summary: "Show the global review rule." },
-          {
-            name: "set",
-            summary: "Enable review with a Global Role.",
-            usage: "yui config review set --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>]",
-            options: ["--role", "--trigger", "--finding-ledger"],
-            optionValues: {
-              "--trigger": ["always", "leader", "final"],
-              "--finding-ledger": ["shadow", "enforce"]
-            }
-          },
-            { name: "clear", summary: "Disable global review." }
-          ]
-        },
-        {
-          name: "leader-next-action",
-          summary: "Configure the Leader next-action/duplicate-guard mode.",
-          sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
-          children: [
-            { name: "show", summary: "Show the Leader next-action mode." },
-            {
-              name: "set",
-              summary: "Set the Leader next-action mode (display|warn|enforce).",
-              usage: "yui config leader-next-action set <display|warn|enforce>"
-            },
-            { name: "clear", summary: "Reset to the default display mode." }
-          ]
+          name: "clear",
+          summary: "Reset one Yui configuration key to its default.",
+          usage: "yui config clear <key>",
+          sections: [{ id: "keys", title: "Configuration keys", entries: [...CONFIG_KEYS] }],
+          values: CONFIG_KEY_VALUES
         }
       ]
     },

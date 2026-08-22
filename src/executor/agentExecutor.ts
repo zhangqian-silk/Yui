@@ -14,6 +14,11 @@ import {
   type EffectiveLaunchSnapshot
 } from "./effectiveLaunch.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import {
+  validateProviderRuntimeBinding,
+  type ProviderRuntimeBinding
+} from "../runtime/providerRuntimeIdentity.js";
+import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 
 export type AgentSessionStatus = "reserved" | "ready" | "running" | "stopped" | "broken";
 
@@ -74,11 +79,11 @@ export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & 
 };
 
 export type TaskRoleSessionSet = RoleSessionSetBase<TaskRoleSessionOwner> & {
-  schemaVersion: 4;
+  schemaVersion: 5;
   /** Immutable terminal native Sessions superseded by a fresh effective launch. */
   history?: readonly RoleAgentSession[];
   inFlight: TaskRoleInFlight | null;
-  pendingTurnCompletion: PendingTurnCompletion | null;
+  providerBinding: ProviderRuntimeBinding | null;
 };
 export type RoleSessionSet = GlobalRoleSessionSet | TaskRoleSessionSet;
 
@@ -131,9 +136,9 @@ export function createRoleSessionSet(
     ? { ...base, schemaVersion: 3 } as GlobalRoleSessionSet
     : {
         ...base,
-        schemaVersion: 4,
+        schemaVersion: 5,
         inFlight: null,
-        pendingTurnCompletion: null
+        providerBinding: null
       } as TaskRoleSessionSet;
 }
 
@@ -308,10 +313,7 @@ export function retireTaskRoleSessionsForWorkspace(
   now: Date
 ): TaskRoleSessionSet {
   validateRoleSessionSet(set);
-  if (
-    set.inFlight !== null
-    || set.pendingTurnCompletion !== null
-  ) {
+  if (set.inFlight !== null) {
     throw new Error("Cannot retire a Task Role session with unsettled Run state.");
   }
   const live = Object.values(set.sessions).find(
@@ -344,7 +346,7 @@ export function retireConfirmedAbsentInactiveTaskRolePlaceholders(
   now: Date
 ): TaskRoleSessionSet {
   validateRoleSessionSet(set);
-  if (set.inFlight !== null || set.pendingTurnCompletion !== null) {
+  if (set.inFlight !== null) {
     throw new Error("Cannot retire a Task Role placeholder with unsettled Run state.");
   }
   const timestamp = now.toISOString();
@@ -463,9 +465,6 @@ export function bindTaskRoleRun(
   if (normalized.agentId !== set.activeAgentId) {
     throw new Error("Task Role Run Agent does not match the active Agent.");
   }
-  if (set.pendingTurnCompletion !== null) {
-    throw new Error("Task Role session set has an unsettled Turn completion.");
-  }
   if (set.inFlight !== null) {
     if (sameRunFence(set.inFlight, normalized)) return set;
     throw new Error("Task Role session set already has an in-flight Run.");
@@ -477,6 +476,47 @@ export function bindTaskRoleRun(
     updatedAt: timestamp
   };
   return validateRoleSessionSet(updated);
+}
+
+export function bindTaskRoleProviderRuntime(
+  set: TaskRoleSessionSet,
+  binding: ProviderRuntimeBinding,
+  updatedAt: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  const normalized = validateProviderRuntimeBinding(binding);
+  if (set.inFlight === null || set.inFlight.runId !== normalized.runId) {
+    throw new Error("Provider Runtime Binding does not match the in-flight Run.");
+  }
+  if (set.providerBinding !== null) {
+    if (JSON.stringify(set.providerBinding) === JSON.stringify(normalized)) return set;
+    throw new Error("Task Role already has a Provider Runtime Binding.");
+  }
+  return validateRoleSessionSet({
+    ...set,
+    providerBinding: normalized,
+    updatedAt: requireDate(updatedAt, "Provider Runtime Binding timestamp")
+  });
+}
+
+export function updateTaskRoleProviderRuntime(
+  set: TaskRoleSessionSet,
+  binding: ProviderRuntimeBinding,
+  updatedAt: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  const normalized = validateProviderRuntimeBinding(binding);
+  if (set.providerBinding === null
+    || normalized.runId !== set.providerBinding.runId
+    || normalized.providerNamespace !== set.providerBinding.providerNamespace
+    || normalized.accountScope !== set.providerBinding.accountScope) {
+    throw new Error("Provider Runtime Binding identity cannot change in place.");
+  }
+  return validateRoleSessionSet({
+    ...set,
+    providerBinding: normalized,
+    updatedAt: requireDate(updatedAt, "Provider Runtime Binding timestamp")
+  });
 }
 
 export function markTaskRoleRunPushed(
@@ -525,39 +565,69 @@ export function markTaskRoleRunDelivered(
   return validateRoleSessionSet(updated);
 }
 
+/**
+ * Records a provider Turn boundary without changing the durable Yui Run.
+ *
+ * A native session may finish one foreground Turn while provider-owned
+ * subagents, mailbox work, or later user corrections still belong to the same
+ * application-level Run.  Only an explicit Yui workflow outcome may clear the
+ * Run fence; this transition merely makes the native session available for a
+ * subsequent input and remembers the provider Turn idempotently.
+ */
+export function recordTaskRoleTurnBoundary(
+  set: TaskRoleSessionSet,
+  input: Readonly<{
+    agentId: string;
+    nativeSessionId: string;
+    turnId: string;
+  }>,
+  completedAt: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  assertTaskRoleSessionSet(set);
+  const agentId = requireSafeIdentity(input.agentId, "Agent id");
+  const nativeSessionId = requireText(input.nativeSessionId, "Native session id");
+  const turnId = requireSafeIdentity(input.turnId, "Turn id");
+  const session = set.sessions[agentId];
+  if (session === undefined || session.nativeSessionId !== nativeSessionId) {
+    throw new Error("Completed Turn has no matching Role Agent native session.");
+  }
+  if (session.recentCompletedTurnIds.includes(turnId)) return set;
+  if (set.inFlight !== null && set.inFlight.agentId !== agentId) {
+    throw new Error("Completed Turn Agent does not match the in-flight Run.");
+  }
+  const timestamp = requireDate(completedAt, "Turn completedAt");
+  const status = session.status === "stopped" || session.status === "broken"
+    ? session.status
+    : "ready";
+  return validateRoleSessionSet({
+    ...set,
+    sessions: {
+      ...set.sessions,
+      [agentId]: {
+        ...session,
+        status,
+        recentCompletedTurnIds: rememberRecentTurnId(
+          session.recentCompletedTurnIds,
+          turnId
+        ),
+        updatedAt: timestamp
+      }
+    },
+    updatedAt: timestamp
+  });
+}
+
 export function recordObservedTaskRoleCompletion(
   set: TaskRoleSessionSet,
   completion: PendingTurnCompletion
 ): TaskRoleSessionSet {
-  validateRoleSessionSet(set);
-  assertTaskRoleSessionSet(set);
   const observed = validatePendingTurnCompletion(completion);
-  assertCompletionOwner(set, observed);
-  const session = set.sessions[observed.agentId];
-  if (session !== undefined && session.nativeSessionId !== observed.nativeSessionId) {
-    throw new Error("Observed Turn native session does not match the Role Agent session.");
-  }
-  if (session?.recentCompletedTurnIds.includes(observed.turnId) === true) return set;
-  if (set.pendingTurnCompletion !== null) {
-    if (samePendingTurnCompletion(set.pendingTurnCompletion, observed)) return set;
-    throw new Error("Task Role session set already has a pending Turn completion.");
-  }
-  const inFlight = set.inFlight;
-  if (inFlight === null) {
-    throw new Error("Observed Turn has no matching in-flight Run.");
-  }
-  if (inFlight.agentId !== observed.agentId || inFlight.runId !== observed.runId) {
-    throw new Error("Observed Turn Run does not match the in-flight Run.");
-  }
-  if (inFlight.pushedAt === undefined) {
-    throw new Error("Observed Turn Run must be pushed before completion is recorded.");
-  }
-  const updated: TaskRoleSessionSet = {
-    ...set,
-    pendingTurnCompletion: observed,
-    updatedAt: observed.observedAt
-  };
-  return validateRoleSessionSet(updated);
+  return recordTaskRoleTurnBoundary(set, {
+    agentId: observed.agentId,
+    nativeSessionId: observed.nativeSessionId,
+    turnId: observed.turnId
+  }, new Date(observed.observedAt));
 }
 
 export function clearTaskRoleRun(
@@ -572,26 +642,10 @@ export function clearTaskRoleRun(
   if (Date.parse(timestamp) < Date.parse(inFlight.preparedAt)) {
     throw new Error("Task Role Run clearedAt must not be earlier than preparedAt.");
   }
-  const pending = set.pendingTurnCompletion;
-  const session = set.sessions[inFlight.agentId];
-  const sessions = pending !== null && session !== undefined
-    ? {
-        ...set.sessions,
-        [inFlight.agentId]: {
-          ...session,
-          recentCompletedTurnIds: rememberRecentTurnId(
-            session.recentCompletedTurnIds,
-            pending.turnId
-          ),
-          updatedAt: timestamp
-        }
-      }
-    : set.sessions;
   const updated: TaskRoleSessionSet = {
     ...set,
-    sessions,
     inFlight: null,
-    pendingTurnCompletion: null,
+    providerBinding: null,
     updatedAt: timestamp
   };
   return validateRoleSessionSet(updated);
@@ -609,16 +663,7 @@ export function terminalizeTaskRoleRunSession(
 ): TaskRoleSessionSet {
   validateRoleSessionSet(set);
   const inFlight = set.inFlight;
-  const pending = set.pendingTurnCompletion;
-  let updated = pending !== null
-    && pending.agentId === fence.agentId
-    && pending.runId === fence.runId
-    ? settleTaskRoleCompletion(set, {
-        agentId: fence.agentId,
-        runId: fence.runId,
-        turnId: pending.turnId
-      }, terminalAt)
-    : inFlight === null
+  let updated = inFlight === null
       ? set
       : clearTaskRoleRun(set, fence, terminalAt);
   const session = updated.sessions[updated.activeAgentId];
@@ -657,7 +702,7 @@ export function resetTaskRoleSession(
     sessions,
     ...(history === undefined ? {} : { history }),
     inFlight: null,
-    pendingTurnCompletion: null,
+    providerBinding: null,
     updatedAt: timestamp
   });
 }
@@ -672,42 +717,27 @@ export function settleTaskRoleCompletion(
   const agentId = requireSafeIdentity(expected.agentId, "Agent id");
   const runId = requireSafeIdentity(expected.runId, "Run id");
   const turnId = requireSafeIdentity(expected.turnId, "Turn id");
-  const pending = set.pendingTurnCompletion;
-  if (pending === null) throw new Error("Task Role session set has no pending Turn completion.");
-  if (
-    pending.agentId !== agentId
-    || pending.runId !== runId
-    || pending.turnId !== turnId
-  ) {
-    throw new Error("Pending Turn completion does not match the expected Turn.");
-  }
   const inFlight = set.inFlight;
   if (inFlight === null || inFlight.agentId !== agentId || inFlight.runId !== runId) {
     throw new Error("Pending Turn completion does not match the in-flight Run.");
   }
   const session = set.sessions[agentId];
-  if (session === undefined || session.nativeSessionId !== pending.nativeSessionId) {
-    throw new Error("Pending Turn completion has no matching Role Agent native session.");
+  if (session === undefined || !session.recentCompletedTurnIds.includes(turnId)) {
+    throw new Error("Turn completion has not been observed for the Role Agent session.");
   }
   const timestamp = requireDate(settledAt, "Turn settledAt");
-  if (Date.parse(timestamp) < Date.parse(pending.observedAt)) {
-    throw new Error("Turn settledAt must not be earlier than observedAt.");
-  }
   const updated: TaskRoleSessionSet = {
     ...set,
     sessions: {
       ...set.sessions,
       [agentId]: {
         ...session,
-        recentCompletedTurnIds: rememberRecentTurnId(
-          session.recentCompletedTurnIds,
-          pending.turnId
-        ),
+        recentCompletedTurnIds: session.recentCompletedTurnIds,
         updatedAt: timestamp
       }
     },
     inFlight: null,
-    pendingTurnCompletion: null,
+    providerBinding: null,
     updatedAt: timestamp
   };
   return validateRoleSessionSet(updated);
@@ -725,7 +755,7 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
     }
     if (
       Object.hasOwn(set, "inFlight")
-      || Object.hasOwn(set, "pendingTurnCompletion")
+      || Object.hasOwn(set, "providerBinding")
     ) {
       throw new Error(
         "Global Role session set must not contain Task Role lifecycle fields."
@@ -742,12 +772,12 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       }
     }
   } else {
-    if (set.schemaVersion !== 4) {
+    if (set.schemaVersion !== 5) {
       throw new Error("Task Role session set schema version is invalid.");
     }
     if (
       !Object.hasOwn(set, "inFlight")
-      || !Object.hasOwn(set, "pendingTurnCompletion")
+      || !Object.hasOwn(set, "providerBinding")
     ) {
       throw new Error("Task Role session set must contain its Turn fence.");
     }
@@ -777,30 +807,22 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
     const inFlight = taskSet.inFlight === null
       ? null
       : validateTaskRoleInFlight(taskSet.inFlight);
-    const pending = taskSet.pendingTurnCompletion === null
+    const providerBinding = taskSet.providerBinding === null
       ? null
-      : validatePendingTurnCompletion(taskSet.pendingTurnCompletion);
-    if (inFlight === null && pending !== null) {
-      throw new Error("Pending Turn completion requires an in-flight Run.");
-    }
+      : validateProviderRuntimeBinding(taskSet.providerBinding);
     if (inFlight !== null && inFlight.agentId !== set.activeAgentId) {
       throw new Error("Task Role in-flight Run Agent must be active.");
     }
-    if (pending !== null) {
-      assertCompletionOwner(taskSet, pending);
-      if (
-        inFlight?.agentId !== pending.agentId
-        || inFlight.runId !== pending.runId
-        || inFlight.pushedAt === undefined
-      ) {
-        throw new Error("Pending Turn completion must match a pushed in-flight Run.");
+    if (providerBinding !== null) {
+      if (inFlight === null || providerBinding.runId !== inFlight.runId) {
+        throw new Error("Provider Runtime Binding must match the in-flight Run.");
       }
-      const session = taskSet.sessions[pending.agentId];
+      const session = taskSet.sessions[inFlight.agentId];
       if (session === undefined) {
-        throw new Error("Pending Turn completion has no Role Agent session.");
+        throw new Error("Provider Runtime Binding has no active Role Agent session.");
       }
-      if (session.nativeSessionId !== pending.nativeSessionId) {
-        throw new Error("Pending Turn native session does not match the Role Agent session.");
+      if (providerBinding.providerNamespace !== builtinDriverIdForAdapter(session.adapterId)) {
+        throw new Error("Provider Runtime Binding namespace does not match the Agent adapter.");
       }
     }
   }

@@ -15,6 +15,8 @@ import {
 } from "./ports.js";
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { markYuiRunInput } from "../run/runIdentity.js";
+import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import {
   effectiveLaunchSnapshotsCompatible,
   effectiveLaunchSnapshotsCompatibleForTaskMain
@@ -22,13 +24,19 @@ import {
 import { RuntimeLaunchError } from "../runtime/ports.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
+import { mailboxHasWork, nextPendingBatch } from "../coordination/workMailbox.js";
+import {
+  hasRuntimeLifecycleWork,
+  RuntimeLifecycleBusyError,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
   roleName: string;
   runId: string;
   status: "delivered" | "already-delivered" | "skipped" | "failed";
-  reason?: "workspace-not-ready" | "launch-failed" | "generation-lost" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "writer-attached" | "delivery-uncertain";
+  reason?: "workspace-not-ready" | "launch-failed" | "generation-lost" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "writer-attached" | "delivery-uncertain" | "delivery-unsupported";
   error?: string;
   terminalFailure?: Omit<RoleRunDeliveryFailurePersistence, "now">;
   terminalized?: boolean;
@@ -43,12 +51,26 @@ export async function processActiveRoleRunDeliveries(
   store: SchedulerStorePort,
   delivery: TmuxDeliveryPort,
   now: Date,
-  selection?: SchedulerReconcileSelection
+  selection?: SchedulerReconcileSelection,
+  inputDeliveryRecoveryCutoff?: Date
 ): Promise<ActiveRoleRunDeliveryResult[]> {
   const results: ActiveRoleRunDeliveryResult[] = [];
   for (const task of selectedActiveSchedulerTasks(store, selection)) {
     for (const role of selectedSchedulerRoles(store, task.id, selection)) {
       const run = store.getActiveAgentRun(task.id, role.name);
+      if (run !== null && run.pushedAt !== undefined) {
+        const continuation = await processActiveRunContinuation(
+          store,
+          delivery,
+          task,
+          role,
+          run,
+          now,
+          inputDeliveryRecoveryCutoff
+        );
+        if (continuation !== null) results.push(continuation);
+        continue;
+      }
       // A crash after a Leader wake is durably claimed but before tmux input
       // is recoverable through the same receipt-backed delivery path. The
       // re-push guard keys on pushedAt (transport), not deliveredAt (provider
@@ -63,6 +85,25 @@ export async function processActiveRoleRunDeliveries(
           runId: run.id,
           status: "skipped",
           reason: "workspace-not-ready"
+        });
+        continue;
+      }
+
+      // Single-flight: a Role runtime lifecycle lane that already holds a
+      // launch reservation or cleanup obligation must not be entered by a
+      // second delivery. The Run stays active-unpushed and is retried after
+      // the lane settles; the contention is never terminalized as a failure.
+      if (hasRuntimeLifecycleWork(store.getWorkMailbox(runtimeLifecycleTarget({
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      })))) {
+        results.push({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          status: "skipped",
+          reason: "runtime-unavailable"
         });
         continue;
       }
@@ -301,6 +342,27 @@ export async function processActiveRoleRunDeliveries(
         results.push({ taskId: task.id, roleName: role.name, runId: run.id, status });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        // Scheduler single-flight backpressure: the Role runtime lifecycle
+        // lane was busy when the launch was reserved. The Run stays
+        // active-unpushed and its mailbox claim is retained; the next pass
+        // retries after the lane settles. This is contention before any
+        // semantic launch, never a Run failure.
+        if (error instanceof RuntimeLifecycleBusyError) {
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id
+          });
+          results.push({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            status: "skipped",
+            reason: "runtime-unavailable",
+            error: message
+          });
+          continue;
+        }
         if (error instanceof RuntimeLaunchError) {
           const terminalFailure = roleRunDeliveryFailure(
             run,
@@ -392,6 +454,368 @@ export async function processActiveRoleRunDeliveries(
     }
   }
   return results;
+}
+
+async function processActiveRunContinuation(
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
+  task: SchedulerTask,
+  role: SchedulerRole,
+  run: SchedulerAgentRun,
+  now: Date,
+  inputDeliveryRecoveryCutoff?: Date
+): Promise<ActiveRoleRunDeliveryResult | null> {
+  const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
+  const mailbox = store.getWorkMailbox(target);
+  if (mailbox === null || !mailboxHasWork(mailbox)) return null;
+  const session = store.getRoleSession(task.id, role.name, run.effective.agentId);
+  if (session === null || session.launchId === undefined || !hasText(session.nativeSessionId)) {
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: "not-ready"
+    };
+  }
+
+  const originalReceipt = formatAgentRunReceiptId(task.id, run.id);
+  if (mailbox.processing !== null && (
+    mailbox.processing.executionRef?.type !== "run"
+    || mailbox.processing.executionRef.taskId !== task.id
+    || mailbox.processing.executionRef.id !== run.id
+    || mailbox.processing.batchId !== originalReceipt
+  )) {
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: "mailbox-busy"
+    };
+  }
+  if (mailbox.inputDelivery !== null) {
+    const existing = mailbox.inputDelivery;
+    if ((existing.status === "delivery-unknown"
+      || (existing.status === "dispatching"
+        && inputDeliveryRecoveryCutoff !== undefined
+        && Date.parse(existing.startedAt) < inputDeliveryRecoveryCutoff.getTime()))) {
+      return reconcileStrandedInputDelivery(
+        store,
+        delivery,
+        task,
+        role,
+        run,
+        session,
+        existing,
+        now
+      );
+    }
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: "delivery-uncertain"
+    };
+  }
+  const pending = nextPendingBatch(mailbox);
+  const lane = mailbox.pending.userCorrection === pending ? "user-correction" : "normal";
+  const requestedBatchId = pending === null
+    ? originalReceipt
+    : `agent-input:${task.id}/${run.id}/${lane}:${pending.fromSequence}-${pending.toSequence}`;
+  if (requestedBatchId === originalReceipt) {
+    // Initial provider acceptance is still outstanding. It owns this claim;
+    // never reinterpret the original Run prompt as a continuation.
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: "delivery-uncertain"
+    };
+  }
+  if (pending === null || session.launchId === undefined) return null;
+  if (session.status === "broken") {
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: "runtime-unavailable"
+    };
+  }
+  const activeTurn = store.getActiveProviderTurnFence?.({
+    taskId: task.id,
+    roleName: role.name,
+    runId: run.id,
+    agentId: run.effective.agentId,
+    launchId: session.launchId,
+    nativeSessionId: session.nativeSessionId!
+  }) ?? null;
+  const mode = lane === "user-correction"
+    ? activeTurn !== null && delivery.canRouteProviderInput?.(run.effective.adapterId) === true
+      ? "steer-if-safe"
+      : "followup"
+    : pending.deliveryModes.includes("followup") ? "followup" : "inject";
+  // Normal facts never enter an active Turn. A user correction may steer only
+  // through the exact Turn fence above; without it, retain the high-priority
+  // lane until the current Turn ends and deliver it as the next followup.
+  if (mode === "followup" && session.status === "running") {
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: "not-ready"
+    };
+  }
+  if (mode === "inject" && (
+    delivery.routeProviderInput === undefined
+    || delivery.canRouteProviderInput?.(run.effective.adapterId) !== true
+  )) {
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: "delivery-unsupported"
+    };
+  }
+  let deliveryAttempted = false;
+  let inputDelivery: import("../coordination/workMailbox.js").InputDelivery | undefined;
+  try {
+    const prepared = await delivery.prepareRoleSession({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: run.effective.agentId,
+      adapterId: run.effective.adapterId,
+      effective: run.effective,
+      workspace: run.effective.workspace.root,
+      ...(run.workspace === undefined ? {} : { managedWorkspace: run.workspace }),
+      mode: "resume",
+      runId: run.id,
+      nativeSessionId: session.nativeSessionId!
+    });
+    const ready = await delivery.waitUntilReady(prepared);
+    const readySession = ready.session ?? session;
+    if (readySession.launchId === undefined || !hasText(readySession.nativeSessionId)) {
+      throw new Error("Continuation delivery has no Provider Activation fence.");
+    }
+    const providerFence = mode === "steer-if-safe"
+      ? activeTurn!
+      : {
+          conversationId: readySession.nativeSessionId!,
+          activationId: readySession.launchId
+        };
+    const claim = store.claimInputDelivery({
+      target,
+      attemptId: requestedBatchId,
+      lane,
+      mode,
+      owner: "controller",
+      now,
+      executionRef: { type: "run", taskId: task.id, id: run.id },
+      providerFence
+    });
+    if (claim.status === "empty") return null;
+    if (claim.delivery.attemptId !== requestedBatchId || claim.status === "delivery") {
+      return {
+        taskId: task.id,
+        roleName: role.name,
+        runId: run.id,
+        status: "skipped",
+        reason: "delivery-uncertain"
+      };
+    }
+    inputDelivery = claim.delivery;
+    deliveryAttempted = true;
+    const text = continuationInput(
+      task,
+      role,
+      run,
+      inputDelivery.attemptId,
+      inputDelivery.batch
+    );
+    if (mode !== "followup") {
+      const routed = await delivery.routeProviderInput!({
+        delivery: ready,
+        attemptId: inputDelivery.attemptId,
+        mode,
+        text,
+        fence: providerFence
+      });
+      if (routed === "accepted") {
+        store.completeInputDelivery(target, inputDelivery.attemptId, now);
+        return { taskId: task.id, roleName: role.name, runId: run.id, status: "delivered" };
+      }
+      if (routed === "unknown") {
+        store.markInputDeliveryUnknown(
+          target,
+          inputDelivery.attemptId,
+          "Provider input acceptance could not be reconciled.",
+          now
+        );
+        return {
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          status: "skipped",
+          reason: "delivery-uncertain"
+        };
+      }
+      store.releaseInputDelivery(target, inputDelivery.attemptId);
+      return {
+        taskId: task.id,
+        roleName: role.name,
+        runId: run.id,
+        status: "skipped",
+        reason: routed === "unavailable" ? "runtime-unavailable" : "not-ready"
+      };
+    }
+    const outcome = await delivery.sendOnce({
+      delivery: ready,
+      receiptId: inputDelivery.attemptId,
+      text
+    });
+    if (outcome === "busy" || outcome === "unavailable") {
+      store.releaseInputDelivery(target, inputDelivery.attemptId);
+      return {
+        taskId: task.id,
+        roleName: role.name,
+        runId: run.id,
+        status: "skipped",
+        reason: outcome === "busy" ? "not-ready" : "runtime-unavailable"
+      };
+    }
+    store.markInputDeliveryPushed(target, inputDelivery.attemptId, now);
+    // Keep the exact claim until the matching provider turn.accepted Hook
+    // folds it. sendOnce is receipt-idempotent, so Controller recovery cannot
+    // inject a second Enter for the same batch.
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: outcome === "sent" ? "delivered" : "already-delivered"
+    };
+  } catch (error) {
+    if (inputDelivery === undefined) {
+      // No durable input intent existed and no provider input method was
+      // called. Session preparation may be retried safely.
+    } else if (!deliveryAttempted) store.releaseInputDelivery(target, inputDelivery.attemptId);
+    else store.markInputDeliveryUnknown(
+      target,
+      inputDelivery.attemptId,
+      error instanceof Error ? error.message : String(error),
+      now
+    );
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: deliveryAttempted ? "delivery-uncertain" : "runtime-unavailable",
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+async function reconcileStrandedInputDelivery(
+  store: SchedulerStorePort,
+  delivery: TmuxDeliveryPort,
+  task: SchedulerTask,
+  role: SchedulerRole,
+  run: SchedulerAgentRun,
+  session: SchedulerRoleSession,
+  input: import("../coordination/workMailbox.js").InputDelivery,
+  now: Date
+): Promise<ActiveRoleRunDeliveryResult> {
+  const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
+  const uncertain = (reason: string): ActiveRoleRunDeliveryResult => {
+    store.markInputDeliveryUnknown(target, input.attemptId, reason, now);
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      runId: run.id,
+      status: "skipped",
+      reason: "delivery-uncertain"
+    };
+  };
+  if (input.providerFence === undefined
+    || delivery.reconcileProviderInput === undefined
+    || delivery.canRouteProviderInput?.(run.effective.adapterId) !== true) {
+    return uncertain("Controller restarted without exact Provider input readback.");
+  }
+  try {
+    // Exact readback is addressed entirely from the durable fence. It must not
+    // resume a Session, create an Activation, or call any model-starting port.
+    const reconciled = await delivery.reconcileProviderInput({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: run.effective.agentId,
+      adapterId: run.effective.adapterId,
+      launchId: session.launchId!,
+      nativeSessionId: session.nativeSessionId!,
+      attemptId: input.attemptId,
+      mode: input.mode,
+      fence: input.providerFence
+    });
+    if (reconciled === "accepted") {
+      store.completeInputDelivery(target, input.attemptId, now);
+      return {
+        taskId: task.id,
+        roleName: role.name,
+        runId: run.id,
+        status: "already-delivered"
+      };
+    }
+    if (reconciled === "not-accepted") {
+      store.resolveInputDeliveryNotAccepted(target, input.attemptId);
+      return {
+        taskId: task.id,
+        roleName: role.name,
+        runId: run.id,
+        status: "skipped",
+        reason: "not-ready"
+      };
+    }
+    return uncertain(
+      reconciled === "unavailable"
+        ? "Provider input readback is unavailable after Controller restart."
+        : "Provider input acceptance remains unknown after metadata readback."
+    );
+  } catch (error) {
+    return uncertain(
+      `Provider input readback failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+function continuationInput(
+  task: SchedulerTask,
+  role: SchedulerRole,
+  run: SchedulerAgentRun,
+  attemptId: string,
+  batch: Readonly<{
+    reasons: readonly string[];
+    refs: readonly import("../coordination/workMailbox.js").MailboxEntityRef[];
+    sources: readonly string[];
+  }>
+): string {
+  const references = batch.refs.map((ref) => (
+    "taskId" in ref
+      ? `${ref.type}:${ref.taskId}/${ref.id}`
+      : `${ref.type}:${ref.id}`
+  ));
+  return markYuiRunInput([
+    `Yui Task Event Batch: ${attemptId}.`,
+    "New durable task events are available for the current Yui Run.",
+    "Read the referenced shared context through the Yui CLI, incorporate it, and decide whether to continue work or wait for more results.",
+    "Do not create a new Yui Run merely because this is a new Provider Turn.",
+    `Reasons: ${batch.reasons.join(", ")}.`,
+    ...(batch.sources.length === 0 ? [] : [`Sources: ${batch.sources.join(", ")}.`]),
+    ...(references.length === 0 ? [] : [`References: ${references.join(", ")}.`])
+  ].join("\n"), run.id, taskRoleSessionTitle(task, role.name));
 }
 
 function roleRunDeliveryFailure(

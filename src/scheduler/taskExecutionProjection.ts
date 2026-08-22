@@ -11,7 +11,7 @@ import { currentWorkItemExecutionGroup, type WorkItem } from "../workItem/workIt
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
-import type { WorkMailbox } from "../coordination/workMailbox.js";
+import { mailboxBatches, type WorkMailbox } from "../coordination/workMailbox.js";
 import {
   summarizeExecutionGroup,
   type ExecutionGroup,
@@ -795,8 +795,7 @@ function isRecoveryPending(
   if (failure !== null || notification?.type === "leader-recovery-failed") return false;
   const reasons = [
     ...(wakeup?.reasons ?? []),
-    ...(mailbox?.pending?.reasons ?? []),
-    ...(mailbox?.processing?.batch.reasons ?? [])
+    ...(mailbox === null ? [] : mailboxBatches(mailbox).flatMap((batch) => batch.reasons))
   ];
   return reasons.some((reason) => /(?:recover|stalled|failed|uncertain|orphan)/iu.test(reason));
 }

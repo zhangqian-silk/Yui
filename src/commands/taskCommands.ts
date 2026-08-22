@@ -113,12 +113,18 @@ import {
   requireCompleteWorkExecution,
   settleExactWorkExecution
 } from "../coordination/workMailboxQueue.js";
-import type { MailboxEntityRef, MailboxTarget } from "../coordination/workMailbox.js";
+import {
+  mailboxHasWork as workMailboxHasWork,
+  nextPendingBatch,
+  type MailboxEntityRef,
+  type MailboxTarget
+} from "../coordination/workMailbox.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
   runtimeLifecycleTarget,
   type RuntimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
+import { blockingProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import {
   activateTask,
   addTaskProjectBinding,
@@ -490,6 +496,13 @@ export function preflightTaskCompletion(
     throw usageError(
       `Task ${task.id} has an unsettled integration queue entry: `
       + `${unsettledQueueEntry.id}/${unsettledQueueEntry.status}.`
+    );
+  }
+  const continuationBlockers = blockingProviderContinuations(store.listEvents(task.id));
+  if (continuationBlockers.length > 0) {
+    throw usageError(
+      `Task ${task.id} has ${continuationBlockers.length} Provider continuation(s) `
+      + "that may still write the Workspace or have an identity conflict."
     );
   }
   const isolatedWorkspace = store.listManagedWorkspaces(task.id)
@@ -1096,6 +1109,13 @@ function completeTaskCommand(
     if (unsettledWork !== undefined) {
       throw usageError(`Task ${task.id} has unsettled work: ${unsettledWork.id}.`);
     }
+    const continuationBlockers = blockingProviderContinuations(tx.listEvents(task.id));
+    if (continuationBlockers.length > 0) {
+      throw usageError(
+        `Task ${task.id} has ${continuationBlockers.length} Provider continuation(s) `
+        + "that may still write the Workspace or have an identity conflict."
+      );
+    }
 
     let terminalizedLeaderRun = false;
     const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
@@ -1314,6 +1334,13 @@ function archiveTaskCommand(
     if (activeArchiveJob !== undefined) {
       throw usageError(
         `Task ${task.id} has an active DurableJob: ${activeArchiveJob.id}/${activeArchiveJob.status}.`
+      );
+    }
+    const continuationBlockers = blockingProviderContinuations(tx.listEvents(task.id));
+    if (continuationBlockers.length > 0) {
+      throw usageError(
+        `Task ${task.id} still owns unsettled Provider continuation(s); `
+        + "reconcile or cancel them before archiving."
       );
     }
     if (task.cwd !== undefined || tx.listManagedWorkspaces(task.id).length > 0) {
@@ -1594,8 +1621,12 @@ function taskMessageCommand(
 ): string {
   const [command, ...rest] = args;
   if (command === "send") {
-    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none].";
-    const parsed = parseTail(rest, new Set(["--body-file", "--wake-policy"]), usage);
+    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none] [--delivery-mode followup|steer].";
+    const parsed = parseTail(
+      rest,
+      new Set(["--body-file", "--wake-policy", "--delivery-mode"]),
+      usage
+    );
     if (parsed.positionals.length < 1 || parsed.positionals.length > 2) throw usageError(usage);
     const body = readCommandText(
       parsed.positionals[1],
@@ -1611,6 +1642,13 @@ function taskMessageCommand(
       wakePolicy = wakePolicyRaw;
     } else {
       throw usageError(`--wake-policy must be 'leader' or 'none': ${wakePolicyRaw}.`);
+    }
+    const deliveryModeRaw = parsed.options.get("--delivery-mode") ?? "followup";
+    if (deliveryModeRaw !== "followup" && deliveryModeRaw !== "steer") {
+      throw usageError(`--delivery-mode must be 'followup' or 'steer': ${deliveryModeRaw}.`);
+    }
+    if (deliveryModeRaw === "steer" && wakePolicy === "none") {
+      throw usageError("--delivery-mode steer cannot be combined with --wake-policy none.");
     }
     const now = clock(options);
     const result = store.transaction((tx) => {
@@ -1640,7 +1678,20 @@ function taskMessageCommand(
           leaderMailbox(task.id),
           actor === "operator" ? "operator-input" : "user-message",
           now,
-          [messageRef(task.id, message.id)]
+          [messageRef(task.id, message.id)],
+          deliveryModeRaw === "steer"
+            ? {
+                source: actor,
+                dedupeKey: `user-correction:${task.id}:${message.id}`,
+                deliveryMode: "steer-if-safe",
+                lane: "user-correction"
+              }
+            : {
+                source: actor,
+                dedupeKey: `message:${task.id}:${message.id}`,
+                deliveryMode: "followup",
+                lane: "normal"
+              }
         );
       }
       return { task, message, actor };
@@ -3946,8 +3997,7 @@ function assertTaskReviewRequestLane(
     roleName: reviewerRoleName
   }));
   const hasMailboxWork = (mailbox: ReturnType<TaskWorkflowStore["getWorkMailbox"]>): boolean => (
-    mailbox?.processing !== null && mailbox?.processing !== undefined
-    || mailbox?.pending !== null && mailbox?.pending !== undefined
+    mailbox !== null && workMailboxHasWork(mailbox)
   );
   const activePointer = store.getActiveAgentRun(taskId, reviewerRoleName);
   const activeRuns = store.listAgentRuns(taskId).filter((entry) => (
@@ -3979,16 +4029,16 @@ function assertTaskReviewRequestLane(
     );
   }
   const exactRun = runRef(taskId, reviewerRunId!);
+  const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
   const processingMatches = reviewerMailbox?.processing !== null
     && reviewerMailbox?.processing !== undefined
-    && reviewerMailbox.pending === null
+    && reviewerPending === null
     && reviewerMailbox.processing.executionRef !== undefined
     && isDeepStrictEqual(reviewerMailbox.processing.executionRef, exactRun);
-  const pendingMatches = reviewerMailbox?.pending !== null
-    && reviewerMailbox?.pending !== undefined
-    && reviewerMailbox.processing === null
-    && reviewerMailbox.pending.requestCount === 1
-    && reviewerMailbox.pending.refs.some((ref) => isDeepStrictEqual(ref, exactRun));
+  const pendingMatches = reviewerPending !== null
+    && reviewerMailbox?.processing === null
+    && reviewerPending.requestCount === 1
+    && reviewerPending.refs.some((ref) => isDeepStrictEqual(ref, exactRun));
   if (hasMailboxWork(reviewerMailbox) && !processingMatches && !pendingMatches) {
     throw usageError(`Reviewer mailbox has unrelated active work: ${reviewerRoleName}.`);
   }
@@ -4109,8 +4159,7 @@ function retryFailedTaskReviewRound(
       roleName: reviewer.name
     }));
     const hasMailboxWork = (mailbox: ReturnType<typeof tx.getWorkMailbox>): boolean => (
-      mailbox?.processing !== null && mailbox?.processing !== undefined
-      || mailbox?.pending !== null && mailbox?.pending !== undefined
+      mailbox !== null && workMailboxHasWork(mailbox)
     );
     const activeReviewerRuns = tx.listAgentRuns(task.id).filter((entry) => (
       entry.roleName === reviewer.name && entry.status === "active"
@@ -4312,18 +4361,19 @@ function settleStaleFinalReviewRun(
 
     const reviewerTarget = roleMailbox(task.id, round.reviewerRoleName);
     const reviewerMailbox = tx.getWorkMailbox(reviewerTarget);
+    const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
     const exactRunRef = runRef(task.id, run.id);
     if (reviewerMailbox?.processing !== null && reviewerMailbox?.processing !== undefined) {
       const processing = reviewerMailbox.processing;
       if (
         processing.executionRef === undefined
         || !isDeepStrictEqual(processing.executionRef, exactRunRef)
-        || reviewerMailbox.pending !== null
+        || reviewerPending !== null
       ) {
         throw usageError(`Reviewer mailbox has unrelated processing work: ${round.reviewerRoleName}.`);
       }
-    } else if (reviewerMailbox?.pending !== null && reviewerMailbox?.pending !== undefined) {
-      const pending = reviewerMailbox.pending;
+    } else if (reviewerPending !== null) {
+      const pending = reviewerPending;
       if (
         pending.requestCount !== 1
         || !pending.refs.some((ref) => isDeepStrictEqual(ref, exactRunRef))
@@ -4339,7 +4389,7 @@ function settleStaleFinalReviewRun(
     if (runtimeMailbox?.processing !== null && runtimeMailbox?.processing !== undefined) {
       throw usageError(`Reviewer runtime lifecycle is pending: ${round.reviewerRoleName}.`);
     }
-    if (runtimeMailbox?.pending !== null && runtimeMailbox?.pending !== undefined) {
+    if (runtimeMailbox !== null && workMailboxHasWork(runtimeMailbox)) {
       throw usageError(`Reviewer runtime lifecycle has pending work: ${round.reviewerRoleName}.`);
     }
 
@@ -5156,6 +5206,7 @@ function retryFailedReviewRun(
 
     const reviewerMailboxTarget = roleMailbox(task.id, round.reviewerRoleName);
     const reviewerMailbox = tx.getWorkMailbox(reviewerMailboxTarget);
+    const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
     const runtimeMailbox = tx.getWorkMailbox(runtimeLifecycleTarget({
       scope: "task",
       taskId: task.id,
@@ -5163,8 +5214,7 @@ function retryFailedReviewRun(
     }));
 
     const hasMailboxWork = (mailbox: ReturnType<typeof tx.getWorkMailbox>): boolean => (
-      mailbox?.processing !== null && mailbox?.processing !== undefined
-      || mailbox?.pending !== null && mailbox?.pending !== undefined
+      mailbox !== null && workMailboxHasWork(mailbox)
     );
 
     const reviewer = requireRole(tx, task.id, round.reviewerRoleName);
@@ -5201,11 +5251,11 @@ function retryFailedReviewRun(
           reviewerMailbox.processing.executionRef,
           runRef(task.id, reviewerRunId)
         )
-        && reviewerMailbox.pending === null;
+        && reviewerPending === null;
       const pendingMatches = reviewerRunId !== undefined
         && reviewerMailbox?.processing === null
-        && reviewerMailbox.pending?.requestCount === 1
-        && reviewerMailbox.pending.refs.some((ref) => (
+        && reviewerPending?.requestCount === 1
+        && reviewerPending.refs.some((ref) => (
           isDeepStrictEqual(ref, runRef(task.id, reviewerRunId))
         ));
       if (activePointer !== null
@@ -5236,7 +5286,7 @@ function retryFailedReviewRun(
     if (runtimeMailbox?.processing !== null && runtimeMailbox?.processing !== undefined) {
       throw usageError(`Reviewer runtime lifecycle is pending: ${reviewer.name}.`);
     }
-    if (runtimeMailbox?.pending !== null && runtimeMailbox?.pending !== undefined) {
+    if (runtimeMailbox !== null && workMailboxHasWork(runtimeMailbox)) {
       throw usageError(`Reviewer runtime lifecycle has pending work: ${reviewer.name}.`);
     }
 
@@ -5255,17 +5305,17 @@ function retryFailedReviewRun(
       if (
         reviewerMailbox.processing.executionRef === undefined
         || !isDeepStrictEqual(reviewerMailbox.processing.executionRef, exactOldRunRef)
-        || reviewerMailbox.pending !== null
+        || reviewerPending !== null
       ) {
         throw usageError(`Reviewer mailbox is busy: ${reviewer.name}.`);
       }
       settleExactWorkExecution(tx, reviewerMailboxTarget, exactOldRunRef);
-    } else if (reviewerMailbox?.pending !== null && reviewerMailbox?.pending !== undefined) {
-      const exact = reviewerMailbox.pending.refs.some((ref) => (
+    } else if (reviewerPending !== null) {
+      const exact = reviewerPending.refs.some((ref) => (
         isDeepStrictEqual(ref, exactOldRunRef)
       ));
       if (!exact) throw usageError(`Reviewer mailbox has unrelated pending work: ${reviewer.name}.`);
-      if (reviewerMailbox.pending.requestCount !== 1) {
+      if (reviewerPending.requestCount !== 1) {
         throw usageError(`Reviewer mailbox has merged pending work: ${reviewer.name}.`);
       }
       settleExactWorkExecution(tx, reviewerMailboxTarget, exactOldRunRef);
