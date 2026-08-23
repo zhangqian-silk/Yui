@@ -103,7 +103,11 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         // identity or the canonical sequence assigned to a source.
         const sequence = sequenceBase + index;
         if (existingState === undefined && freshSession && state.usage === undefined) {
-          const zero = Object.freeze({ inputTokens: 0, outputTokens: 0 });
+          const zero = Object.freeze({
+            semantics: "cumulative-session" as const,
+            inputTokens: 0,
+            outputTokens: 0
+          });
           this.inbox.enqueueObservation(createRuntimeObservation({
             schemaVersion: 2,
             eventId: observationId("baseline", fence, source.sourceId, "zero"),
@@ -352,6 +356,7 @@ function sameUsage(
   right: RuntimeUsageSnapshot
 ): boolean {
   return left !== undefined
+    && left.semantics === right.semantics
     && left.inputTokens === right.inputTokens
     && left.outputTokens === right.outputTokens
     && left.cachedInputTokens === right.cachedInputTokens

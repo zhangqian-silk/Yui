@@ -630,6 +630,34 @@ export function recordObservedTaskRoleCompletion(
   }, new Date(observed.observedAt));
 }
 
+/**
+ * Rebinds the same active Run to a bounded control-input receipt while keeping
+ * its observed native Turn completion unsettled. No new Run fence is created.
+ */
+export function rebindTaskRoleRunControlReceipt(
+  set: TaskRoleSessionSet,
+  input: Readonly<{ agentId: string; runId: string; receiptId: string }>,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  assertTaskRoleSessionSet(set);
+  const inFlight = set.inFlight;
+  if (inFlight === null
+    || inFlight.agentId !== input.agentId
+    || inFlight.runId !== input.runId) {
+    throw new Error("Workflow outcome control request does not match the unsettled Run.");
+  }
+  const timestamp = requireDate(now, "Workflow outcome control receipt timestamp");
+  return validateRoleSessionSet({
+    ...set,
+    inFlight: {
+      ...inFlight,
+      receiptId: requireSafeIdentity(input.receiptId, "Workflow outcome control receipt id")
+    },
+    updatedAt: timestamp
+  });
+}
+
 export function clearTaskRoleRun(
   set: TaskRoleSessionSet,
   fence: TaskRoleRunFence,

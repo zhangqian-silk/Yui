@@ -18,9 +18,39 @@ export type AgentRuntimeDeliveryMode =
   | "best-effort"
   | "host-only";
 export type AgentRuntimeEvidenceQuality = "exact" | "partial" | "unavailable";
+export type AgentHostLifecycle = "persistent";
+export type ProviderProcessLifecycle = "persistent" | "per-turn";
+export type NativeConversationResume = "exact" | "unsupported";
+export type NativeCompactionCapability =
+  | "automatic"
+  | "native-explicit"
+  | "unsupported"
+  | "unknown";
+export type NativeCompactionEvents = "exact" | "unavailable";
+export type ContextUsageSemantics =
+  | "per-request"
+  | "remaining-context"
+  | "cumulative-only"
+  | "unavailable";
+export type DeliveryDeduplication = "exact" | "unsupported";
 
 export type AgentDriverCapabilities = Readonly<{
   surfaces: readonly AgentDriverSurface[];
+  /**
+   * Native-lifecycle facts used by recovery admission. These capabilities are
+   * deliberately independent from transcript usage: cumulative token counters
+   * can never prove that a native Session needs replacement.
+   */
+  lifecycle: Readonly<{
+    host: AgentHostLifecycle;
+    providerProcess: ProviderProcessLifecycle;
+    nativeConversationResume: NativeConversationResume;
+    compaction: NativeCompactionCapability;
+    compactionEvents: NativeCompactionEvents;
+    contextUsage: ContextUsageSemantics;
+    inSessionContinuation: boolean;
+    deliveryDeduplication: DeliveryDeduplication;
+  }>;
   control: Readonly<{
     start: boolean;
     resume: boolean;
@@ -197,6 +227,40 @@ export function validateAgentDriverCapabilities(
       throw new Error(`Agent Driver control capability ${name} must be boolean.`);
     }
   }
+  const lifecycle = input.lifecycle;
+  if (lifecycle === null || typeof lifecycle !== "object" || Array.isArray(lifecycle)) {
+    throw new Error("Agent Driver lifecycle capabilities must be an object.");
+  }
+  if (lifecycle.host !== "persistent") {
+    throw new Error("Managed Agent Host lifecycle must be persistent.");
+  }
+  if (lifecycle.providerProcess !== "persistent" && lifecycle.providerProcess !== "per-turn") {
+    throw new Error("Provider process lifecycle capability is invalid.");
+  }
+  if (lifecycle.nativeConversationResume !== "exact"
+    && lifecycle.nativeConversationResume !== "unsupported") {
+    throw new Error("Native conversation resume capability is invalid.");
+  }
+  if (!["automatic", "native-explicit", "unsupported", "unknown"].includes(
+    lifecycle.compaction
+  )) {
+    throw new Error("Native compaction capability is invalid.");
+  }
+  if (lifecycle.compactionEvents !== "exact" && lifecycle.compactionEvents !== "unavailable") {
+    throw new Error("Native compaction event capability is invalid.");
+  }
+  if (!["per-request", "remaining-context", "cumulative-only", "unavailable"].includes(
+    lifecycle.contextUsage
+  )) {
+    throw new Error("Context usage capability is invalid.");
+  }
+  if (typeof lifecycle.inSessionContinuation !== "boolean") {
+    throw new Error("In-Session continuation capability must be boolean.");
+  }
+  if (lifecycle.deliveryDeduplication !== "exact"
+    && lifecycle.deliveryDeduplication !== "unsupported") {
+    throw new Error("Delivery deduplication capability is invalid.");
+  }
   const observation = input.observation;
   if (observation === null || typeof observation !== "object" || Array.isArray(observation)) {
     throw new Error("Agent Driver observation capabilities must be an object.");
@@ -248,6 +312,16 @@ export function validateAgentDriverCapabilities(
   }
   return Object.freeze({
     surfaces: Object.freeze(surfaces),
+    lifecycle: Object.freeze({
+      host: lifecycle.host,
+      providerProcess: lifecycle.providerProcess,
+      nativeConversationResume: lifecycle.nativeConversationResume,
+      compaction: lifecycle.compaction,
+      compactionEvents: lifecycle.compactionEvents,
+      contextUsage: lifecycle.contextUsage,
+      inSessionContinuation: lifecycle.inSessionContinuation,
+      deliveryDeduplication: lifecycle.deliveryDeduplication
+    }),
     control: Object.freeze({
       start: control.start,
       resume: control.resume,
@@ -309,6 +383,11 @@ export function managedRuntimeAdmission(
     || actual.conversation.persistentIdentity !== "exact") missing.push("exact-session-identity");
   if (actual.observation.promptAcceptance !== "exact"
     || actual.input.acceptance !== "exact") missing.push("exact-prompt-acceptance");
+  if (actual.lifecycle.host !== "persistent") missing.push("persistent-agent-host");
+  if (actual.lifecycle.nativeConversationResume !== "exact") {
+    missing.push("exact-native-conversation-resume");
+  }
+  if (!actual.lifecycle.inSessionContinuation) missing.push("in-session-continuation");
   if (actual.observation.turnLifecycle !== "exact") missing.push("exact-turn-lifecycle");
   return missing.length === 0
     ? Object.freeze({ admitted: true })

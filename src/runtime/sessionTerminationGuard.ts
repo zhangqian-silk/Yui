@@ -111,6 +111,19 @@ export async function terminateSessionOwners(
   );
   const now = ports.now();
   ports.emit({ stage: "stop-requested", owner, at: now });
+  // Persist one exact launch receipt before any graceful stop can kill the
+  // Host. The owner-wide event remains for compatibility and summary display.
+  for (const record of records) {
+    ports.emit({
+      stage: "stop-requested",
+      owner,
+      launchId: record.launchId,
+      ...(record.nativeSessionId === undefined
+        ? {}
+        : { nativeSessionId: record.nativeSessionId }),
+      at: now
+    });
+  }
 
   // A launch-fence scan is a point-in-time observation, not a durable owner
   // inventory: /proc entries can disappear between the directory and

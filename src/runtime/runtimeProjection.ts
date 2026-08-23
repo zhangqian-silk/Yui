@@ -649,10 +649,11 @@ function usageAdvanced(
   previous: RuntimeUsageSnapshot | undefined,
   current: RuntimeUsageSnapshot
 ): boolean {
+  if (current.semantics === "remaining-context") return false;
+  if (current.semantics === "request-context") return usageTotal(current) > 0;
   // A first cumulative snapshot may contain history from a resumed native
-  // Session. It establishes the generation baseline but cannot prove that
-  // tokens were consumed during the current observation window.
-  if (previous === undefined) return false;
+  // Session. It establishes a baseline but cannot prove current progress.
+  if (previous === undefined || previous.semantics !== "cumulative-session") return false;
   return usageTotal(current) > usageTotal(previous);
 }
 

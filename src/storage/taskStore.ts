@@ -48,6 +48,10 @@ import {
   type WorkMailbox
 } from "../coordination/workMailbox.js";
 import type { Decision } from "../decision/decision.js";
+import {
+  validateContextSnapshot,
+  type ContextSnapshot
+} from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import {
   validateInputRequest,
@@ -61,8 +65,15 @@ import {
 } from "../executor/agentExecutor.js";
 import { validateTaskMessage, type TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
-import { validateAgentRun, type AgentRun } from "../run/agentRun.js";
-import type { PendingProviderRetry } from "../run/providerRetry.js";
+import {
+  agentRunDeliveryReceiptId,
+  validateAgentRun,
+  type AgentRun
+} from "../run/agentRun.js";
+import {
+  providerRetryWakeAt,
+  type PendingProviderRetry
+} from "../run/providerRetry.js";
 import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
 import {
   compareRuntimeSessionCandidates,
@@ -201,6 +212,7 @@ export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
 export const CURRENT_TASK_SCHEMA_VERSION = 4 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
+export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 9 as const;
@@ -376,7 +388,7 @@ export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 5 as const;
  * actionability fields. All are optional, so the v6→v7 migration is a
  * version-only rewrite.
  */
-export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 7 as const;
+export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 9 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 
 type StoredTask = {
@@ -400,6 +412,7 @@ type StoredTask = {
    */
   jobCallerKeyHashes: Record<string, string>;
   workItems: Record<string, WorkItem>;
+  contextSnapshots: Record<string, ContextSnapshot>;
   agentRuns: Record<string, AgentRun>;
   reviewRounds: Record<string, ReviewRound>;
   activeRuns: Record<string, ActiveRunPointer>;
@@ -563,6 +576,10 @@ export type TaskStore = {
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
   listWorkItems(taskId: string): WorkItem[];
   saveWorkItem(taskId: string, item: WorkItem): void;
+  nextContextSnapshotId(taskId: string): string;
+  getContextSnapshot(taskId: string, snapshotId: string): ContextSnapshot | null;
+  listContextSnapshots(taskId: string): ContextSnapshot[];
+  saveContextSnapshot(snapshot: ContextSnapshot): void;
   nextAgentRunId(taskId: string): string;
   peekNextAgentRunId(taskId: string): string;
   getAgentRun(taskId: string, runId: string): AgentRun | null;
@@ -1597,6 +1614,49 @@ export class FileTaskStore implements TaskStore {
     });
   }
 
+  nextContextSnapshotId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "contextSnapshot");
+  }
+  getContextSnapshot(taskId: string, id: string): ContextSnapshot | null {
+    return optional(this.#state().tasks[taskId]?.contextSnapshots[id]);
+  }
+  listContextSnapshots(taskId: string): ContextSnapshot[] {
+    return values(this.#requireTask(taskId).contextSnapshots, "id");
+  }
+  saveContextSnapshot(snapshot: ContextSnapshot): void {
+    const stored = identified<ContextSnapshot>(
+      snapshot,
+      CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+      "id",
+      snapshot.id,
+      "Context Snapshot"
+    );
+    validateContextSnapshot(stored);
+    const aggregate = this.#requireTaskForWrite(stored.taskId);
+    const existing = aggregate.contextSnapshots[stored.id];
+    if (existing !== undefined) {
+      if (!isDeepStrictEqual(existing, stored)) {
+        throw new StorageRecordError(`Context Snapshot is immutable: ${stored.id}.`);
+      }
+      return;
+    }
+    const duplicateSequence = Object.values(aggregate.contextSnapshots).find((candidate) => (
+      candidate.scope === stored.scope
+      && candidate.scopeRef === stored.scopeRef
+      && candidate.sequence === stored.sequence
+    ));
+    if (duplicateSequence !== undefined) {
+      throw new StorageRecordError(
+        `Context Snapshot sequence already exists: ${stored.taskId}/${stored.scope}/${stored.sequence}.`
+      );
+    }
+    this.#mutate((state) => {
+      const task = state.tasks[stored.taskId];
+      observeTaskRecordId(task, "contextSnapshot", stored.id);
+      task.contextSnapshots[stored.id] = stored;
+    });
+  }
+
   nextAgentRunId(taskId: string): string {
     return this.#nextTaskRecordId(taskId, "agentRun");
   }
@@ -1618,7 +1678,9 @@ export class FileTaskStore implements TaskStore {
     for (const task of tasks) {
       if (task.status !== "active") continue;
       for (const run of this.listAgentRuns(task.id)) {
-        if (run.status === "active" && run.providerRetry?.nextAttemptAt !== undefined) {
+        if (run.status === "active"
+          && run.providerRetry !== undefined
+          && providerRetryWakeAt(run.providerRetry) !== null) {
           throw new StorageRecordError(
             "Provider retry in place requires the SQLite backend; run `yui update` to migrate this Home."
           );
@@ -2690,6 +2752,7 @@ function emptyStoredTask(task: Task): StoredTask {
     roleSessionSets: {},
     jobCallerKeyHashes: {},
     workItems: {},
+    contextSnapshots: {},
     agentRuns: {},
     reviewRounds: {},
     activeRuns: {},
@@ -2710,6 +2773,7 @@ function emptyStoredTask(task: Task): StoredTask {
 function emptyTaskIdHighWaterMarks(): TaskIdHighWaterMarks {
   return {
     workItem: 0,
+    contextSnapshot: 0,
     agentRun: 0,
     reviewRound: 0,
     reviewFinding: 0,
@@ -2942,6 +3006,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "roleSessionSets",
     "jobCallerKeyHashes",
     "workItems",
+    "contextSnapshots",
     "agentRuns",
     "reviewRounds",
     "activeRuns",
@@ -3082,6 +3147,22 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     validateWorkItem(item);
     return item;
   }, "workItems");
+  parseMap(aggregate.contextSnapshots, (record, key) => {
+    const snapshot = identified<ContextSnapshot>(
+      record,
+      CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+      "id",
+      key,
+      "Context Snapshot"
+    );
+    if (snapshot.taskId !== taskId) {
+      throw new StorageRecordError(
+        `Context Snapshot belongs to another Task: ${snapshot.taskId}.`
+      );
+    }
+    validateContextSnapshot(snapshot);
+    return snapshot;
+  }, "contextSnapshots");
   parseMap(aggregate.agentRuns, (record, key) => {
     const run = identified<AgentRun>(
       record,
@@ -3246,6 +3327,7 @@ function validateTaskIdHighWaterCoverage(
 ): void {
   const records: Readonly<Record<TaskRecordKind, Readonly<Record<string, unknown>>>> = {
     workItem: aggregate.workItems,
+    contextSnapshot: aggregate.contextSnapshots,
     agentRun: aggregate.agentRuns,
     reviewRound: aggregate.reviewRounds,
     // Issue 06 dbonly: review findings are SQLite-native; the file aggregate
@@ -4211,7 +4293,7 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
     if (sessions.inFlight !== null) {
       const run = aggregate.agentRuns[sessions.inFlight.runId];
       if (run === undefined || run.roleName !== roleName
-        || sessions.inFlight.receiptId !== formatAgentRunReceiptId(taskId, run.id)) {
+        || sessions.inFlight.receiptId !== agentRunDeliveryReceiptId(run)) {
         throw new StorageRecordError(`Task Role in-flight Run is invalid: ${taskId}/${roleName}.`);
       }
     }

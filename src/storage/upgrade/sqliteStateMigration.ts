@@ -27,6 +27,7 @@ import Database from "better-sqlite3";
 
 import type { ConfiguredAgent } from "../../agent/agent.js";
 import type { TaskBrief } from "../../brief/taskBrief.js";
+import type { ContextSnapshot } from "../../context/contextSnapshot.js";
 import { mailboxTargetKey } from "../../coordination/workMailbox.js";
 import { managedWorkspaceKey, type ManagedWorkspaceOwner } from "../../worktree/managedWorkspace.js";
 import type { MailboxTarget, WorkMailbox } from "../../coordination/workMailbox.js";
@@ -243,6 +244,7 @@ interface StoredTaskShape {
   managedWorkspaces: Record<string, Record<string, unknown>>;
   roleSessionSets: Record<string, Record<string, unknown>>;
   workItems: Record<string, Record<string, unknown>>;
+  contextSnapshots: Record<string, Record<string, unknown>>;
   agentRuns: Record<string, Record<string, unknown>>;
   reviewRounds: Record<string, Record<string, unknown>>;
   changeSets: Record<string, Record<string, unknown>>;
@@ -274,6 +276,7 @@ function asStoredTask(value: unknown): StoredTaskShape {
     managedWorkspaces: asObjectMap(record.managedWorkspaces),
     roleSessionSets: asObjectMap(record.roleSessionSets),
     workItems: asObjectMap(record.workItems),
+    contextSnapshots: asObjectMap(record.contextSnapshots),
     agentRuns: asObjectMap(record.agentRuns) as Record<string, Record<string, unknown>>,
     reviewRounds: asObjectMap(record.reviewRounds),
     changeSets: asObjectMap(record.changeSets),
@@ -385,6 +388,9 @@ export function populateSqliteFromState(
         }
         for (const item of Object.values(stored.workItems)) {
           store.saveWorkItem(taskId, item as unknown as WorkItem);
+        }
+        for (const snapshot of Object.values(stored.contextSnapshots)) {
+          store.saveContextSnapshot(snapshot as unknown as ContextSnapshot);
         }
         for (const run of Object.values(stored.agentRuns)) {
           store.saveAgentRun(run as unknown as AgentRun);
@@ -602,6 +608,7 @@ export function computeStateFamilyChecksums(
   const workspaces: unknown[] = [];
   const roleSessionSets: unknown[] = [];
   const workItems: unknown[] = [];
+  const contextSnapshots: unknown[] = [];
   const agentRuns: unknown[] = [];
   const reviewRounds: unknown[] = [];
   const changeSets: unknown[] = [];
@@ -629,6 +636,7 @@ export function computeStateFamilyChecksums(
     workspaces.push(...Object.values(stored.managedWorkspaces));
     roleSessionSets.push(...Object.values(stored.roleSessionSets));
     workItems.push(...Object.values(stored.workItems));
+    contextSnapshots.push(...Object.values(stored.contextSnapshots));
     agentRuns.push(...Object.values(stored.agentRuns));
     reviewRounds.push(...Object.values(stored.reviewRounds));
     changeSets.push(...Object.values(stored.changeSets));
@@ -669,6 +677,7 @@ export function computeStateFamilyChecksums(
   checksums.managedWorkspace = hashRecords(workspaces);
   checksums.taskRoleSessionSet = hashRecords(roleSessionSets);
   checksums.workItem = hashRecords(workItems);
+  checksums.contextSnapshot = hashRecords(contextSnapshots);
   checksums.agentRun = hashRecords(agentRuns);
   checksums.reviewRound = hashRecords(reviewRounds);
   checksums.changeSet = hashRecords(changeSets);
@@ -799,6 +808,7 @@ export function computeDbFamilyChecksums(
     checksums.managedWorkspace = hashPayloadTable(db, "SELECT payload FROM managed_workspaces");
     checksums.taskRoleSessionSet = hashPayloadTable(db, "SELECT payload FROM role_session_sets");
     checksums.workItem = hashPayloadTable(db, "SELECT payload FROM work_items");
+    checksums.contextSnapshot = hashPayloadTable(db, "SELECT payload FROM context_snapshots");
     checksums.agentRun = hashPayloadTable(db, "SELECT payload FROM agent_runs");
     checksums.reviewRound = hashPayloadTable(db, "SELECT payload FROM review_rounds");
     checksums.changeSet = hashPayloadTable(db, "SELECT payload FROM change_sets");
@@ -982,6 +992,7 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
         managedWorkspaces: {},
         roleSessionSets: {},
         workItems: {},
+        contextSnapshots: {},
         agentRuns: {},
         reviewRounds: {},
         changeSets: {},
@@ -1022,6 +1033,13 @@ export function readStateFromSqlite(home: string): Record<string, unknown> {
       (record) => (record.owner as Record<string, unknown>).roleName as string
     );
     loadTaskPayloadMap(db, "work_items", tasks, "workItems", (record) => record.id as string);
+    loadTaskPayloadMap(
+      db,
+      "context_snapshots",
+      tasks,
+      "contextSnapshots",
+      (record) => record.id as string
+    );
     loadTaskPayloadMap(db, "agent_runs", tasks, "agentRuns", (record) => record.id as string);
     loadTaskPayloadMap(db, "review_rounds", tasks, "reviewRounds", (record) => record.id as string);
     loadTaskPayloadMap(db, "change_sets", tasks, "changeSets", (record) => record.id as string);

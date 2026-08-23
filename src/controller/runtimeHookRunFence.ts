@@ -17,7 +17,7 @@ import {
   parseExactControlPlaneDescriptor,
   refreshReusedTaskRuntimeDescriptorSource
 } from "../runtime/exactControlPlane.js";
-import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 
 export type RuntimeHookRunFence = Readonly<{
@@ -160,6 +160,9 @@ export function resolveRuntimeHookRunFence(
     && executionRef?.type === "run"
     && executionRef.taskId === taskId
     && executionRef.id === startupRunId;
+  const startupRun = startupRunId === undefined
+    ? null
+    : store.getAgentRun(taskId, startupRunId);
   const preallocatedStartup = options.startupSession === "preallocated"
     && expectedNativeSessionId !== undefined
     && session === undefined
@@ -206,7 +209,8 @@ export function resolveRuntimeHookRunFence(
     && inFlight !== undefined
     && (
       inFlight.runId !== startupRunId
-      || inFlight.receiptId !== formatAgentRunReceiptId(taskId, startupRunId!)
+      || startupRun === null
+      || inFlight.receiptId !== agentRunDeliveryReceiptId(startupRun)
     )
   ) {
     throw new Error("Runtime observation Hook has no matching durable in-flight Run.");

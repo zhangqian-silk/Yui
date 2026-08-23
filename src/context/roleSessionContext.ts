@@ -19,6 +19,9 @@ export type RoleSessionContext = Readonly<{
   developerInstructions: string;
   skills: readonly RoleSkillContext[];
   managedContextFile?: string;
+  sessionManifestPath?: string;
+  sessionManifestDigest?: string;
+  sessionCliPath?: string;
 }>;
 
 export type RoleSessionOwner = Readonly<
@@ -32,6 +35,7 @@ export type RoleSessionContextOptions = Readonly<{
 type RoleSessionKind = "operator" | "global" | "leader" | "worker" | "reviewer";
 
 const BUILTIN_YUI_SKILLS = new Set([
+  "yui-runtime",
   "yui-operator",
   "yui-leader",
   "yui-worker",
@@ -51,6 +55,7 @@ export function compileRoleSessionContext(
   const kind = roleSessionKind(role, owner, options.purpose ?? "execution");
   const builtInSkillId = kind === "global" ? undefined : `yui-${kind}`;
   const skillIds = unique([
+    "yui-runtime",
     ...(builtInSkillId === undefined ? [] : [builtInSkillId]),
     ...(role.skills ?? [])
   ]);
@@ -80,7 +85,7 @@ function renderDeveloperInstructions(
   return [...core, ...profile].join("\n");
 }
 
-function roleSessionKind(
+export function roleSessionKind(
   role: GlobalRole | TaskRole,
   owner: RoleSessionOwner,
   purpose: "execution" | "review"

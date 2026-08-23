@@ -1,9 +1,15 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { createRunAssignment } from "../context/runContextContract.js";
 import {
-  compileDispatchInput,
-  ensureWorkerRunCompletionRequirement
-} from "../context/dispatchContext.js";
+  buildRunContextPack,
+  buildRunContextDelta,
+  contextSnapshotDeltaRefIds,
+  expandRunContextRef,
+  freezeRunContextSnapshot
+} from "../context/runContextPack.js";
+import { contextSnapshotRef } from "../context/contextSnapshot.js";
 import {
   CliError,
   dataError,
@@ -66,8 +72,10 @@ import {
   type Role
 } from "../role/role.js";
 import {
+  agentRunDeliveryReceiptId,
   createAgentRun,
   failAgentRun,
+  withAgentRunContextSnapshot,
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
@@ -112,8 +120,6 @@ import {
   LEADER_FINDING_DISPOSITIONS,
   type ReviewFindingDisposition
 } from "../review/reviewFinding.js";
-import { markYuiRunInput, retagYuiRunInput } from "../run/runIdentity.js";
-import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
 import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
@@ -1120,7 +1126,7 @@ function completeTaskCommand(
         roleName: LEADER_ROLE,
         agentId: leaderEntry.run.effective.agentId,
         runId: leaderEntry.run.id,
-        receiptId: formatAgentRunReceiptId(task.id, leaderEntry.run.id),
+        receiptId: agentRunDeliveryReceiptId(leaderEntry.run),
         outcome: { status: "yielded", summary }
       }, now);
       if (terminal.disposition !== "applied") {
@@ -1425,7 +1431,7 @@ function retireTaskCommand(
         roleName: run.roleName,
         agentId: run.effective.agentId,
         runId: run.id,
-        receiptId: formatAgentRunReceiptId(task.id, run.id),
+        receiptId: agentRunDeliveryReceiptId(run),
         mailboxDisposition: "discard",
         outcome: {
           status: "failed",
@@ -2737,25 +2743,26 @@ function dispatchWork(
             workspace: laneWorkspace
           }, now);
       runningGroup = runningLane;
-      const input = markYuiRunInput(
-        compileDispatchInput({}, task.id, plan.role,
-          `${rawInput}\nExecution Group ${group.id}; Lane ${lane.id}; frozen target ${group.target.fingerprint}.`, {
-            workItem: item,
-            projectPolicy: task.projectBindings.map(({ projectId, directory }) => ({
-              projectId,
-              directory
-            })),
-            ...(laneManagedWorkspace === undefined ? {} : { workspace: laneManagedWorkspace })
-          }),
-        plan.runId,
-        taskRoleSessionTitle(task, plan.role.name)
-      );
+      const assignment = createRunAssignment({
+        runId: plan.runId,
+        roleName: plan.role.name,
+        purpose: "execution",
+        action: item.status === "failed" ? "repair-work-item" : "execute-work-item",
+        subject: {
+          taskId: task.id,
+          workItemId: item.id,
+          executionGroupId: runningGroup.id,
+          executionLaneId: lane.id
+        },
+        directive: `${rawInput}\nFrozen target: ${group.target.fingerprint}.`,
+        deltaRefIds: []
+      });
       createdRuns.push(createAgentRun(
         plan.runId,
         task.id,
         plan.role.name,
         dispatchMode,
-        input,
+        assignment,
         now,
         {
           workItemId: item.id,
@@ -2812,7 +2819,19 @@ function dispatchWork(
       }
     }
     for (let index = 0; index < createdRuns.length; index += 1) {
-      const runWithLineage = createdRuns[index]!;
+      const unboundRun = createdRuns[index]!;
+      const snapshot = freezeRunContextSnapshot(tx, {
+        taskId: task.id,
+        roleName: unboundRun.roleName,
+        purpose: "execution",
+        workItemId: item.id
+      }, now);
+      const runWithLineage = withAgentRunContextSnapshot(
+        unboundRun,
+        contextSnapshotRef(snapshot),
+        contextSnapshotDeltaRefIds(tx, snapshot)
+      );
+      createdRuns[index] = runWithLineage;
       const role = plans[index]!.role;
       tx.saveAgentRun(runWithLineage);
       tx.saveActiveAgentRun(runWithLineage);
@@ -3289,7 +3308,7 @@ function retireWork(
         roleName: run.roleName,
         agentId: run.effective.agentId,
         runId: run.id,
-        receiptId: formatAgentRunReceiptId(task.id, run.id),
+        receiptId: agentRunDeliveryReceiptId(run),
         outcome: {
           status: "failed",
           summary: `Work Item retired: ${summary}`
@@ -4323,6 +4342,7 @@ function taskRunCommand(
   const [command, ...rest] = args;
   if (command === "list") return output(listRuns(rest, store, options));
   if (command === "show") return showRun(rest, store, options);
+  if (command === "context") return runContextCommand(rest, store, options);
   if (command === "retry") return retryRun(rest, store, options);
   if (command === "settle") return settleStaleFinalReviewRun(rest, store, options);
   if (command === "recover") return output(recoverRun(rest, store, options));
@@ -4332,6 +4352,91 @@ function taskRunCommand(
   throw usageError(command === undefined
     ? "Task run command is required."
     : `Unknown command: task run ${command}`);
+}
+
+function runContextCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const [first, ...rest] = args;
+  if (first === "expand") {
+    if (rest.length < 2 || rest.length > 4 || (rest.length > 2
+      && !(rest.length === 4 && rest[2] === "--mode" && rest[3] === "full"))) {
+      throw usageError(
+        "Task run context expand usage: yui task run context expand <task>/<run> <ref-id> [--mode full]."
+      );
+    }
+    const { taskId, runId } = parseRunContextReference(rest[0]!);
+    authorizeRunContext(store, taskId, runId, options.environment);
+    const expanded = store.transaction((tx) => expandRunContextRef(tx, taskId, runId, rest[1]!));
+    return output(`${JSON.stringify(expanded, null, 2)}\n`, { context: expanded });
+  }
+  if (first === "delta") {
+    if (rest.length !== 3 || rest[1] !== "--after") {
+      throw usageError(
+        "Task run context delta usage: yui task run context delta <task>/<run> --after <cursor>."
+      );
+    }
+    const { taskId, runId } = parseRunContextReference(rest[0]!);
+    authorizeRunContext(store, taskId, runId, options.environment);
+    const delta = store.transaction((tx) => (
+      buildRunContextDelta(tx, taskId, runId, rest[2]!)
+    ));
+    return output(`${JSON.stringify(delta, null, 2)}\n`, { contextDelta: delta });
+  }
+  if (first === undefined || rest.length !== 0) {
+    throw usageError("Task run context usage: yui task run context <task>/<run>.");
+  }
+  const { taskId, runId } = parseRunContextReference(first);
+  authorizeRunContext(store, taskId, runId, options.environment);
+  const pack = store.transaction((tx) => buildRunContextPack(tx, taskId, runId));
+  return output(`${JSON.stringify(pack, null, 2)}\n`, { context: pack });
+}
+
+function parseRunContextReference(value: string): { taskId: string; runId: string } {
+  const [taskId, runId, extra] = value.split("/");
+  if (taskId === undefined || taskId.length === 0 || runId === undefined || runId.length === 0
+    || extra !== undefined) {
+    throw usageError(`Run context reference is invalid: ${value}.`);
+  }
+  return { taskId, runId };
+}
+
+function authorizeRunContext(
+  store: TaskWorkflowStore,
+  taskId: string,
+  runId: string,
+  environment: NodeJS.ProcessEnv | undefined
+): void {
+  const managed = environment?.YUI_SESSION_SCOPE !== undefined
+    || environment?.YUI_TASK_ID !== undefined
+    || environment?.YUI_ROLE !== undefined
+    || environment?.YUI_RUN_ID !== undefined;
+  if (!managed) return;
+  const run = store.getAgentRun(taskId, runId);
+  const active = run === null ? null : store.getActiveAgentRun(taskId, run.roleName);
+  if (environment?.YUI_SESSION_SCOPE !== "task"
+    || environment.YUI_TASK_ID !== taskId
+    || run === null
+    || environment.YUI_ROLE !== run.roleName
+    || environment.YUI_AGENT_ID !== run.effective.agentId
+    || environment.YUI_ADAPTER_ID !== run.effective.adapterId
+    || run.status !== "active"
+    || active?.id !== runId) {
+    throw usageError(`Run Context access is not authorized: ${taskId}/${runId}.`);
+  }
+  const callerKey = environment.YUI_JOB_CALLER_KEY;
+  const expectedCallerKeyHash = store.getJobCallerKeyHash(
+    taskId,
+    run.roleName,
+    run.effective.agentId
+  );
+  if (callerKey === undefined
+    || expectedCallerKeyHash === null
+    || createHash("sha256").update(callerKey).digest("hex") !== expectedCallerKeyHash) {
+    throw usageError(`Run Context caller key is not authorized: ${taskId}/${runId}.`);
+  }
 }
 
 function listRuns(
@@ -4654,19 +4759,45 @@ function retryRun(
       : laneRestartedItem.status === "failed"
         ? retryFailedWorkItem(laneRestartedItem, now)
         : laneRestartedItem;
-    const retaggedInput = retagYuiRunInput(
-      previous.input,
+    if (retriedItemWithGroup !== null) {
+      if (laneRestartedItem !== null && laneRestartedItem !== retryItem) {
+        tx.saveWorkItem(task.id, laneRestartedItem);
+      }
+      if (retriedItemWithGroup !== laneRestartedItem) {
+        tx.saveWorkItem(task.id, retriedItemWithGroup);
+      }
+    }
+    const retrySnapshot = freezeRunContextSnapshot(tx, {
+      taskId: task.id,
+      roleName: role.name,
+      purpose: "execution",
+      ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId })
+    }, now);
+    const assignment = createRunAssignment({
       runId,
-      taskRoleSessionTitle(task, role.name)
-    );
+      roleName: role.name,
+      purpose: previous.assignment.purpose,
+      action: previous.workItemId === undefined ? previous.assignment.action : "repair-work-item",
+      subject: {
+        taskId: task.id,
+        ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId }),
+        ...(runningGroup === undefined ? {} : {
+          executionGroupId: runningGroup.id,
+          executionLaneId: retryLane!.id
+        })
+      },
+      ...(previous.assignment.directive === undefined
+        ? {}
+        : { directive: previous.assignment.directive }),
+      contextSnapshotRef: contextSnapshotRef(retrySnapshot),
+      deltaRefIds: contextSnapshotDeltaRefIds(tx, retrySnapshot)
+    });
     const created = createAgentRun(
       runId,
       task.id,
       role.name,
       roleAgentSessionResumeMode(sessions, effective.agentId, effective),
-      previous.workItemId === undefined
-        ? retaggedInput
-        : ensureWorkerRunCompletionRequirement(retaggedInput),
+      assignment,
       now,
       {
         ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId }),
@@ -4678,14 +4809,6 @@ function retryRun(
         effective
       }
     );
-    if (retriedItemWithGroup !== null) {
-      if (laneRestartedItem !== null && laneRestartedItem !== retryItem) {
-        tx.saveWorkItem(task.id, laneRestartedItem);
-      }
-      if (retriedItemWithGroup !== laneRestartedItem) {
-        tx.saveWorkItem(task.id, retriedItemWithGroup);
-      }
-    }
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
     tx.saveRole(task.id, updateRoleStatus(role, "running", now));
@@ -5951,7 +6074,7 @@ function yieldRun(
       roleName: role.name,
       agentId: active.effective.agentId,
       runId: active.id,
-      receiptId: formatAgentRunReceiptId(task.id, active.id),
+      receiptId: agentRunDeliveryReceiptId(active),
       ...(active.purpose !== "review" || options.environment?.YUI_NATIVE_SESSION_ID === undefined
         ? {}
         : { nativeSessionId: options.environment.YUI_NATIVE_SESSION_ID }),
@@ -6655,19 +6778,21 @@ export function dispatchPreparedReviewRound(
               .filter(({ access }) => access === "write")
               .map(({ projectId }) => projectId)
           };
-      const input = markYuiRunInput(
-        compileDispatchInput({}, taskId, laneReviewer,
-          `${rawInput}\nReviewer Lane ${lane.id}; frozen target ${runningGroup.target.fingerprint}.`, {
-            workItem: item,
-            projectPolicy: task.projectBindings.map(({ projectId, directory }) => ({
-              projectId,
-              directory
-            })),
-            workspace: laneManagedWorkspace ?? round.workspace
-          }),
+      const assignment = createRunAssignment({
         runId,
-        taskRoleSessionTitle(task, laneReviewer.name)
-      );
+        roleName: laneReviewer.name,
+        purpose: "review",
+        action: "review-round",
+        subject: {
+          taskId,
+          workItemId: item.id,
+          reviewRoundId: round.id,
+          executionGroupId: runningGroup.id,
+          executionLaneId: lane.id
+        },
+        directive: `${rawInput}\nFrozen target: ${runningGroup.target.fingerprint}.`,
+        deltaRefIds: []
+      });
       runningGroup = updateExecutionLane(runningGroup, lane.id, {
         status: "running",
         runId,
@@ -6680,7 +6805,7 @@ export function dispatchPreparedReviewRound(
         taskId,
         laneReviewer.name,
         roleAgentSessionResumeMode(sessions, effective.agentId, effective),
-        input,
+        assignment,
         now,
         {
           workItemId: item.id,
@@ -6715,7 +6840,20 @@ export function dispatchPreparedReviewRound(
       }
     }
     for (let index = 0; index < createdRuns.length; index += 1) {
-      const created = createdRuns[index]!;
+      const unboundRun = createdRuns[index]!;
+      const snapshot = freezeRunContextSnapshot(tx, {
+        taskId,
+        roleName: unboundRun.roleName,
+        purpose: "review",
+        workItemId: item.id,
+        reviewRoundId: round.id
+      }, now);
+      const created = withAgentRunContextSnapshot(
+        unboundRun,
+        contextSnapshotRef(snapshot),
+        contextSnapshotDeltaRefIds(tx, snapshot)
+      );
+      createdRuns[index] = created;
       const laneReviewer = reviewers[index]!;
       tx.saveAgentRun(created);
       tx.saveActiveAgentRun(created);

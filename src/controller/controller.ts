@@ -2015,13 +2015,14 @@ export class FileTaskController {
           }]
         : []),
       // Issue 04 durable in-place retry timer: arm the Controller wake at the
-      // earliest `nextAttemptAt` so a due retry re-pushes on its original
-      // Session. The projection is durable, so a restart resumes the lineage.
+      // earliest dispatch/deadline wake. Scheduled retries re-push on their
+      // original Session; in-flight retries only wake at the episode deadline.
+      // The projection is durable, so a restart resumes the lineage.
       ...(typeof this.store.listPendingProviderRetries === "function"
         ? this.store.listPendingProviderRetries()
         : []).map((retry) => ({
         key: `role:${encodeURIComponent(retry.taskId)}/${encodeURIComponent(retry.roleName)}` as MailboxKey,
-        at: Date.parse(retry.nextAttemptAt)
+        at: Date.parse(retry.dueAt)
       }))
     ];
     const nearest = nearestDeadlineBatch(deadlines);

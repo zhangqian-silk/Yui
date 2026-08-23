@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 
 import {
   createRuntimeBinding,
@@ -32,6 +34,11 @@ import { builtinAgentDriverRegistry } from "./builtinAgentDrivers.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
+import { launchBrokerForHome, type AgentHostLaunchPayload } from "./launchBroker.js";
+import {
+  AGENT_HOST_CONTROL_PROTOCOL,
+  sendAgentHostLaunchControl
+} from "./agentHost.js";
 
 export type RuntimeTmuxRole = Readonly<{
   name: string;
@@ -44,6 +51,9 @@ export type RuntimeTmuxLaunchPlan = Readonly<{
   command: string;
   args: readonly string[];
   env: Readonly<Record<string, string>>;
+  providerInput?: AgentHostLaunchPayload["providerInput"];
+  childLifecycle?: AgentHostLaunchPayload["childLifecycle"];
+  deferProviderStart?: boolean;
 }>;
 
 export type RuntimePlannedSession = Readonly<{
@@ -119,11 +129,13 @@ export interface RuntimeTmuxHostPort {
     taskId: string;
     roleName: string;
     dead: boolean;
+    deadStatus?: number;
   }>[];
   inspectRolePaneInventoryAsync?(): Promise<readonly Readonly<{
     taskId: string;
     roleName: string;
     dead: boolean;
+    deadStatus?: number;
   }>[]>;
   /** Reads one Role pane's exact process state after host creation. */
   inspectRolePane?(
@@ -428,296 +440,6 @@ export class TmuxSessionHost implements SessionHostPort {
         `A writable human is attached to ${request.owner.taskId}/${request.owner.roleName}.`
       );
     }
-    if (
-      request.owner.scope === "task"
-      && request.adapterId === "claude"
-      && request.runId !== undefined
-      && await probeRoleStatus(this.tmux, hostId, request.owner.roleName) === "running"
-    ) {
-      // Managed Claude is process-per-Run. A live Role window here belongs to
-      // an earlier process (or to recovery of the exact reserved Run); never
-      // plan, persist pre-start state, or inject input into it. The coordinator
-      // decides between same-generation recovery and a retry after natural
-      // exit from the durable reservation identity.
-      return createRuntimeBinding({
-        id: bindingId,
-        launchId: request.launchId,
-        owner: request.owner,
-        agentId: request.agentId,
-        adapterId: request.adapterId,
-        hostRef: encodeHostRef({
-          scope: request.owner.scope,
-          hostId,
-          roleName: request.owner.roleName
-        }),
-        hostCreated: false,
-        ...(request.mode === "resume"
-          ? { nativeSessionId: request.nativeSessionId }
-          : {})
-      });
-    }
-    const { planned, nativeSessionId } = planManagedLaunch(
-      this.planner,
-      request,
-      beforeHostStart
-    );
-    const launchContext = diagnosticContext(request, planned);
-    if (this.#validateLaunch !== undefined) {
-      try {
-        await this.#validateLaunch(request);
-      } catch (error) {
-        throw toRuntimeLaunchFailure(error, "validation", launchContext);
-      }
-    }
-    // Process creation is last: every local invariant has already passed.
-    let hostCreated: boolean;
-    try {
-      hostCreated = await ensureRoleWindow(
-        this.tmux,
-        hostId,
-        planned.role,
-        planned.launch
-      );
-    } catch (error) {
-      throw toRuntimeLaunchFailure(error, "host-start", launchContext);
-    }
-    if (
-      hostCreated
-      && request.owner.scope === "task"
-      && planned.launch.env.YUI_JOB_CALLER_KEY !== undefined
-      && this.planner.commitTaskCallerKey !== undefined
-    ) {
-      this.planner.commitTaskCallerKey({
-        taskId: request.owner.taskId,
-        roleName: request.owner.roleName,
-        agentId: request.agentId,
-        callerKey: planned.launch.env.YUI_JOB_CALLER_KEY
-      });
-    }
-    let binding = createRuntimeBinding({
-      id: bindingId,
-      launchId: request.launchId,
-      owner: request.owner,
-      agentId: request.agentId,
-      adapterId: request.adapterId,
-      hostRef: encodeHostRef({
-        scope: request.owner.scope,
-        hostId,
-        roleName: request.owner.roleName
-      }),
-      hostCreated,
-      ...(hostCreated && planned.initialPromptRunId !== undefined
-        ? { initialPromptRunId: planned.initialPromptRunId }
-        : {}),
-      ...(nativeSessionId === undefined ? {} : { nativeSessionId })
-    });
-    if (hostCreated) {
-      let pane;
-      try {
-        pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
-      } catch (error) {
-        throw toRuntimeLaunchFailure(error, "host-started", launchContext);
-      }
-      if (pane === undefined) {
-        throw toRuntimeLaunchFailure(
-          new Error("Managed host pane could not be inspected after creation."),
-          "host-started",
-          launchContext
-        );
-      }
-      this.#onHostCreated?.({ binding, pane });
-      if (pane.dead) {
-        await deadHostLaunchFailure(
-          this.tmux,
-          hostId,
-          request.owner.roleName,
-          pane,
-          launchContext
-        );
-      }
-      if (requiresNativeSessionDiscovery(request, planned, this.#waitForNativeSession)) {
-        const discoveredNativeSessionId = await this.waitForNativeSessionDiscovery(
-          request,
-          hostId,
-          launchContext,
-          pane
-        );
-        binding = createRuntimeBinding({
-          ...binding,
-          nativeSessionId: discoveredNativeSessionId
-        });
-      }
-      this.#onHostCreated?.({ binding, pane });
-    }
-    return binding;
-  }
-
-  async waitForNativeSessionDiscovery(
-    request: SessionLaunchRequest,
-    hostId: string,
-    context: RuntimeLaunchDiagnosticContext,
-    pane: Readonly<{
-      pid?: number;
-      target: string;
-      dead: boolean;
-      currentCommand: string;
-      exitStatus?: number;
-    }>
-  ): Promise<string> {
-    if (this.#waitForNativeSession === undefined) {
-      throw new Error("Native session discovery is not configured.");
-    }
-    const controller = new AbortController();
-    const discovery = this.#waitForNativeSession(request, controller.signal);
-    // The losing branch of the race rejects when the controller aborts; keep
-    // that rejection handled so a settled launch does not surface it later.
-    discovery.catch(() => undefined);
-    try {
-      return await Promise.race([
-        discovery,
-        this.monitorPaneSignals(request, hostId, context, controller.signal)
-      ]);
-    } catch (error) {
-      try {
-        await stopExactRole(this.tmux, hostId, request.owner.roleName);
-      } catch {
-        // The launch failure below is authoritative; durable owner cleanup
-        // remains responsible for a Provider that rejected immediate stop.
-      }
-      throw toRuntimeLaunchFailure(error, "native-session-discovery", {
-        ...context,
-        pane
-      });
-    } finally {
-      controller.abort();
-    }
-  }
-
-  /**
-   * Monitors the managed pane for agent-emitted signals while native session
-   * discovery is pending. The agent's own behavior drives the outcome:
-   *
-   * - Pane death → failure with exit status and stderr (the agent exited).
-   * - Fatal output (auth, config, executable errors) → failure with the
-   *   agent's own error text.
-   * - No signal at all (no hook, no output change, no exit) for the
-   *   inactivity window → backstop failure.
-   *
-   * There is no fixed wall-clock timeout: a slow-but-active agent is never
-   * killed merely for taking too long to start.
-   */
-  private async monitorPaneSignals(
-    request: SessionLaunchRequest,
-    hostId: string,
-    context: RuntimeLaunchDiagnosticContext,
-    signal: AbortSignal
-  ): Promise<never> {
-    let lastContent = "";
-    let lastActivityAt = Date.now();
-    while (!signal.aborted) {
-      await abortableDelay(PANE_SIGNAL_POLL_MS, signal);
-      let pane;
-      try {
-        pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
-      } catch {
-        // A tmux inspection hiccup must not fabricate a Provider death; the
-        // inactivity backstop remains the safety net.
-        continue;
-      }
-      if (pane !== undefined && pane.dead) {
-        await deadHostLaunchFailure(
-          this.tmux,
-          hostId,
-          request.owner.roleName,
-          pane,
-          context
-        );
-      }
-      let content = "";
-      try {
-        content = this.tmux.captureRolePane?.(hostId, request.owner.roleName, 80) ?? "";
-      } catch {
-        // Capture is best-effort; pane death and hooks remain authoritative.
-      }
-      if (content !== lastContent) {
-        lastContent = content;
-        lastActivityAt = Date.now();
-        if (hasFatalLaunchOutput(content)) {
-          throw toRuntimeLaunchFailure(
-            new Error(
-              "Agent emitted a fatal error before native session discovery completed."
-            ),
-            "native-session-discovery",
-            {
-              ...context,
-              ...(pane !== undefined ? { pane } : {}),
-              stderrTail: content
-            }
-          );
-        }
-      }
-      if (Date.now() - lastActivityAt >= this.#inactivityTimeoutMs) {
-        throw new Error(
-          `Agent produced no signal for ${this.#inactivityTimeoutMs}ms. `
-          + "The process is alive but emitted no lifecycle hook, output, or exit."
-        );
-      }
-    }
-    throw new Error("Native session discovery was aborted.");
-  }
-}
-
-function requiresNativeSessionDiscovery(
-  request: SessionLaunchRequest,
-  planned: RuntimePlannedSession,
-  wait: TmuxSessionHostOptions["waitForNativeSession"]
-): boolean {
-  return request.mode === "new"
-    && request.owner.scope === "task"
-    && request.runId !== undefined
-    && planned.initialPromptRunId === request.runId
-    && wait !== undefined
-    && builtinAgentDriverRegistry()
-      .requireByAdapterId(request.adapterId)
-      .capabilities.observation.sessionBootstrap === "discovered";
-}
-
-function positiveInteger(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`${label} must be a positive integer.`);
-  }
-  return value;
-}
-
-const PANE_SIGNAL_POLL_MS = 1_000;
-
-function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error("Native session discovery was aborted."));
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new Error("Native session discovery was aborted."));
-    };
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, milliseconds);
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-function planManagedLaunch(
-  planner: RuntimeRoleLaunchPlannerPort,
-  request: SessionLaunchRequest,
-  beforeHostStart: RuntimeLaunchPreStart | undefined
-): Readonly<{
-  planned: RuntimePlannedSession;
-  nativeSessionId: string | undefined;
-}> {
-  try {
     const input = {
       roleName: request.owner.roleName,
       agentId: request.agentId,
@@ -735,13 +457,21 @@ function planManagedLaunch(
       ...(request.mode === "resume" ? { nativeSessionId: request.nativeSessionId } : {})
     };
     const planned = request.owner.scope === "task"
-      ? planner.plan({ taskId: request.owner.taskId, ...input })
-      : planner.planGlobalRole(input);
+      ? this.planner.plan({ taskId: request.owner.taskId, ...input })
+      : this.planner.planGlobalRole(input);
     if (planned.role.name !== request.owner.roleName) {
       throw new Error("Planned Role does not match the runtime owner.");
     }
     if (planned.role.workspace !== request.workspace) {
       throw new Error("Planned Role workspace does not match the runtime request.");
+    }
+    const launchContext = diagnosticContext(request, planned);
+    if (this.#validateLaunch !== undefined) {
+      try {
+        await this.#validateLaunch(request);
+      } catch (error) {
+        throw toRuntimeLaunchFailure(error, "validation", launchContext);
+      }
     }
     const plannedNativeSessionId = planned.session?.nativeSessionId;
     if (
@@ -765,20 +495,221 @@ function planManagedLaunch(
         ? {}
         : { initialPromptRunId: planned.initialPromptRunId })
     });
-    return { planned, nativeSessionId };
-  } catch (error) {
-    if (
-      error instanceof RuntimeLaunchError
-      || error instanceof RuntimeHostContentionError
-    ) {
+    const yuiHome = planned.launch.env.YUI_HOME;
+    const childLifecycle = planned.launch.childLifecycle;
+    // Custom/legacy planners do not yet expose the Agent Host contract. Keep
+    // their direct launch behavior for compatibility while all built-in
+    // managed Roles use the persistent Host below.
+    if (yuiHome === undefined || childLifecycle === undefined) {
+      let hostCreated: boolean;
+      try {
+        hostCreated = await ensureRoleWindow(this.tmux, hostId, planned.role, planned.launch);
+      } catch (error) {
+        throw toRuntimeLaunchFailure(error, "host-start", launchContext);
+      }
+      let binding = createRuntimeBinding({
+        id: bindingId,
+        launchId: request.launchId,
+        owner: request.owner,
+        agentId: request.agentId,
+        adapterId: request.adapterId,
+        hostRef: encodeHostRef({
+          scope: request.owner.scope,
+          hostId,
+          roleName: request.owner.roleName
+        }),
+        hostCreated,
+        ...(hostCreated && planned.initialPromptRunId !== undefined
+          ? { initialPromptRunId: planned.initialPromptRunId }
+          : {}),
+        ...(nativeSessionId === undefined ? {} : { nativeSessionId })
+      });
+      if (hostCreated) {
+        const pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
+        if (pane?.dead === true) {
+          await deadHostLaunchFailure(
+            this.tmux,
+            hostId,
+            request.owner.roleName,
+            pane,
+            launchContext
+          );
+        }
+        if (request.mode === "new"
+          && request.owner.scope === "task"
+          && request.runId !== undefined
+          && planned.initialPromptRunId === request.runId
+          && this.#waitForNativeSession !== undefined) {
+          binding = createRuntimeBinding({
+            ...binding,
+            nativeSessionId: await this.waitForNativeSessionDiscovery(
+              request,
+              hostId,
+              launchContext
+            )
+          });
+        }
+        if (pane !== undefined) this.#onHostCreated?.({ binding, pane });
+      }
+      return binding;
+    }
+    const broker = launchBrokerForHome(yuiHome);
+    const reservation = broker.reserve(Object.freeze({
+      schemaVersion: 1,
+      launchId: request.launchId,
+      command: planned.launch.command,
+      args: [...planned.launch.args],
+      environment: { ...planned.launch.env },
+      cwd: planned.role.cwd ?? planned.role.workspace,
+      childLifecycle,
+      startMode: planned.launch.deferProviderStart === true ? "idle" : "provider",
+      ...(planned.launch.providerInput === undefined
+        ? {}
+        : { providerInput: planned.launch.providerInput })
+    }));
+    const hostLaunch = {
+      command: process.execPath,
+      args: [
+        fileURLToPath(new URL("../cli.js", import.meta.url)),
+        "internal",
+        "agent-host",
+        reservation.launchId,
+        reservation.ticket
+      ],
+      env: {
+        YUI_HOME: resolve(yuiHome),
+        YUI_SESSION_SCOPE: request.owner.scope,
+        ...(request.owner.scope === "task" ? { YUI_TASK_ID: request.owner.taskId } : {}),
+        YUI_ROLE: request.owner.roleName,
+        YUI_LAUNCH_ID: request.launchId
+      }
+    };
+    let hostCreated: boolean;
+    let providerChildLaunched = false;
+    let launchPromptAlreadySubmitted = false;
+    try {
+      hostCreated = await ensureRoleWindow(this.tmux, hostId, planned.role, hostLaunch);
+      providerChildLaunched = hostCreated && planned.launch.deferProviderStart !== true;
+      if (!hostCreated) {
+        const controlResult = await sendAgentHostLaunchControl({
+          home: yuiHome,
+          scope: request.owner.scope,
+          ...(request.owner.scope === "task" ? { taskId: request.owner.taskId } : {}),
+          roleName: request.owner.roleName,
+          control: {
+            protocol: AGENT_HOST_CONTROL_PROTOCOL,
+            type: "launch",
+            launchId: reservation.launchId,
+            ticket: reservation.ticket
+          }
+        });
+        if (controlResult !== "accepted") {
+          broker.revoke(request.launchId);
+          launchPromptAlreadySubmitted = controlResult === "active-same-launch";
+          if (childLifecycle === "per-turn" && controlResult === "active-other-launch") {
+            throw new RuntimeHostContentionError(
+              "provider-child-active",
+              `The persistent Agent Host for ${request.owner.roleName} still owns another Provider turn.`
+            );
+          }
+        } else {
+          providerChildLaunched = planned.launch.deferProviderStart !== true;
+        }
+      }
+    } catch (error) {
+      broker.revoke(request.launchId);
       throw error;
     }
-    throw toRuntimeLaunchFailure(error, "validation", {
+    if (
+      providerChildLaunched
+      && request.owner.scope === "task"
+      && planned.launch.env.YUI_JOB_CALLER_KEY !== undefined
+      && this.planner.commitTaskCallerKey !== undefined
+    ) {
+      this.planner.commitTaskCallerKey({
+        taskId: request.owner.taskId,
+        roleName: request.owner.roleName,
+        agentId: request.agentId,
+        callerKey: planned.launch.env.YUI_JOB_CALLER_KEY
+      });
+    }
+    const binding = createRuntimeBinding({
+      id: bindingId,
+      launchId: request.launchId,
+      owner: request.owner,
       agentId: request.agentId,
-      cwd: request.workspace
+      adapterId: request.adapterId,
+      hostRef: encodeHostRef({
+        scope: request.owner.scope,
+        hostId,
+        roleName: request.owner.roleName
+      }),
+      hostCreated,
+      ...(providerChildLaunched && hostCreated && planned.initialPromptRunId !== undefined
+        ? { initialPromptRunId: planned.initialPromptRunId }
+        : {}),
+      ...((launchPromptAlreadySubmitted || (providerChildLaunched && !hostCreated))
+        && planned.initialPromptRunId !== undefined
+        ? { launchPromptUncertainRunId: planned.initialPromptRunId }
+        : {}),
+      ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
+    if (hostCreated && this.#onHostCreated !== undefined) {
+      const pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
+      if (pane !== undefined) this.#onHostCreated({ binding, pane });
+    }
+    return binding;
+  }
+
+  private async waitForNativeSessionDiscovery(
+    request: SessionLaunchRequest,
+    hostId: string,
+    context: RuntimeLaunchDiagnosticContext
+  ): Promise<string> {
+    const controller = new AbortController();
+    const discovery = this.#waitForNativeSession!(request, controller.signal);
+    discovery.catch(() => undefined);
+    let stopped = false;
+    let lastContent = "";
+    let lastActivityAt = Date.now();
+    const monitor = (async (): Promise<never> => {
+      while (!stopped) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(1_000, this.#inactivityTimeoutMs)));
+        const pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
+        if (pane?.dead === true) {
+          await deadHostLaunchFailure(this.tmux, hostId, request.owner.roleName, pane, context);
+        }
+        const content = this.tmux.captureRolePane?.(hostId, request.owner.roleName, 80) ?? "";
+        if (content !== lastContent) {
+          lastContent = content;
+          lastActivityAt = Date.now();
+        }
+        if (Date.now() - lastActivityAt >= this.#inactivityTimeoutMs) {
+          throw new Error(
+            `Agent produced no signal for ${this.#inactivityTimeoutMs}ms. `
+            + "The process is alive but emitted no lifecycle hook, output, or exit."
+          );
+        }
+      }
+      throw new Error("Native session discovery monitor stopped.");
+    })();
+    monitor.catch(() => undefined);
+    try {
+      return await Promise.race([discovery, monitor]);
+    } catch (error) {
+      try {
+        await stopExactRole(this.tmux, hostId, request.owner.roleName);
+      } catch {
+        // Preserve the discovery failure; durable cleanup owns later retries.
+      }
+      throw toRuntimeLaunchFailure(error, "native-session-discovery", context);
+    } finally {
+      stopped = true;
+      controller.abort();
+    }
   }
 }
+
 
 function diagnosticContext(
   request: SessionLaunchRequest,
@@ -862,6 +793,13 @@ async function ensureRoleWindow(
   return tmux.ensureRoleWindowAsync === undefined
     ? tmux.ensureRoleWindow(hostId, role, launch)
     : tmux.ensureRoleWindowAsync(hostId, role, launch);
+}
+
+function positiveInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer.`);
+  }
+  return value;
 }
 
 async function probeRoleStatus(

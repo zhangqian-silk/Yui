@@ -21,7 +21,7 @@ import {
   runtimeLifecycleTarget
 } from "./lifecycleReservation.js";
 import { nativeSessionIdForLaunch } from "./preallocatedNativeSession.js";
-import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
 import { readActiveReleasePointer } from "../release/runtimeRelease.js";
 
@@ -500,10 +500,7 @@ export function assertExactTaskRuntimeState(
   if (runtime.runId !== undefined && (
     sessions?.inFlight?.agentId !== runtime.agentId
     || sessions.inFlight.runId !== runtime.runId
-    || sessions.inFlight.receiptId !== formatAgentRunReceiptId(
-      runtime.taskId,
-      runtime.runId
-    )
+    || sessions.inFlight.receiptId !== agentRunDeliveryReceiptId(run!)
   ) && !preallocatedBeforeInFlightProjection) {
     throw new Error("Exact Task runtime in-flight Run fence is not current.");
   }

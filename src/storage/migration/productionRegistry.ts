@@ -38,6 +38,10 @@ const AGENT_RUN_TO_VERSION = 6;
  */
 const AGENT_RUN_OPTIONAL_FIELDS_FROM_VERSION = 6;
 const AGENT_RUN_OPTIONAL_FIELDS_TO_VERSION = 7;
+const AGENT_RUN_CONTEXT_PROTOCOL_FROM_VERSION = 7;
+const AGENT_RUN_CONTEXT_PROTOCOL_TO_VERSION = 8;
+const AGENT_RUN_RETRY_EPISODE_FROM_VERSION = 8;
+const AGENT_RUN_RETRY_EPISODE_TO_VERSION = 9;
 const MESSAGE_WAKE_POLICY_FROM_VERSION = 2;
 const MESSAGE_WAKE_POLICY_TO_VERSION = 3;
 const REVIEW_ROUND_FROM_VERSION = 2;
@@ -58,6 +62,8 @@ const INTEGRATION_ATTEMPT_GATE_IDENTITY_FROM_VERSION = 3;
 const INTEGRATION_ATTEMPT_GATE_IDENTITY_TO_VERSION = 4;
 const INTEGRATION_QUEUE_FROM_VERSION = 0;
 const INTEGRATION_QUEUE_TO_VERSION = 1;
+const CONTEXT_SNAPSHOT_FROM_VERSION = 0;
+const CONTEXT_SNAPSHOT_TO_VERSION = 1;
 const STORED_TASK_DURABLE_JOBS_FROM_VERSION = 14;
 const STORED_TASK_DURABLE_JOBS_TO_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION = 15;
@@ -154,6 +160,8 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       AGENT_RUN_OPTIONAL_FIELDS_TO_VERSION,
       "agentRuns"
     ))
+    .registerOfflineMigration(agentRunContextProtocolStep())
+    .registerOfflineMigration(agentRunRetryEpisodeStep())
     .registerOfflineMigration(messageWakePolicyStep())
     .registerOfflineMigration(recordFamilyStep(
       "reviewRound",
@@ -184,6 +192,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       "integrationAttempts"
     ))
     .registerOfflineMigration(integrationQueueIntroductionStep())
+    .registerOfflineMigration(contextSnapshotIntroductionStep())
     .registerCompatible(storedTaskDurableJobsStep())
     .registerCompatible(storedTaskJobCallerKeyHashesStep())
     .registerCompatible(storedTaskWakesAndPublicationReferencesStep())
@@ -869,6 +878,80 @@ function introduceIntegrationQueue(snapshot: HomeSnapshot): HomeSnapshot {
       ...task,
       idHighWaterMarks: { ...highWaterMarks, integrationQueue: 0 },
       integrationQueue: {}
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/** Introduce the immutable Task-scoped ContextSnapshot record family. */
+function contextSnapshotIntroductionStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "contextSnapshot",
+    fromVersion: CONTEXT_SNAPSHOT_FROM_VERSION,
+    toVersion: CONTEXT_SNAPSHOT_TO_VERSION,
+    introduction: true,
+    preconditions: requireContextSnapshotIntroduction,
+    transform: introduceContextSnapshots,
+    declaredEffects: []
+  };
+}
+
+function requireContextSnapshotIntroduction(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const namedVersion = manifestVersions.contextSnapshot;
+  if (namedVersion !== undefined && namedVersion !== CONTEXT_SNAPSHOT_FROM_VERSION) {
+    throw new Error(
+      "Record contextSnapshot introduction requires an absent manifest version or 0."
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.contextSnapshots !== undefined) {
+      const records = asObject(task.contextSnapshots, `contextSnapshot map ${taskId}`);
+      if (Object.keys(records).length > 0) {
+        throw new Error(`Context Snapshot introduction found existing records: ${taskId}.`);
+      }
+    }
+    const marks = asObject(task.idHighWaterMarks ?? {}, `Task id high-water marks ${taskId}`);
+    const mark = marks.contextSnapshot;
+    if (mark !== undefined && mark !== CONTEXT_SNAPSHOT_FROM_VERSION) {
+      throw new Error(`Context Snapshot introduction found a high-water mark: ${taskId}.`);
+    }
+  }
+}
+
+function introduceContextSnapshots(snapshot: HomeSnapshot): HomeSnapshot {
+  requireContextSnapshotIntroduction(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      contextSnapshot: CONTEXT_SNAPSHOT_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const marks = asObject(task.idHighWaterMarks ?? {}, `Task id high-water marks ${taskId}`);
+    nextTasks[taskId] = {
+      ...task,
+      idHighWaterMarks: { ...marks, contextSnapshot: 0 },
+      contextSnapshots: {}
     };
   }
   return {
@@ -1691,6 +1774,254 @@ function recordFamilyStep(
     ),
     declaredEffects: []
   };
+}
+
+function agentRunContextProtocolStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "agentRun",
+    fromVersion: AGENT_RUN_CONTEXT_PROTOCOL_FROM_VERSION,
+    toVersion: AGENT_RUN_CONTEXT_PROTOCOL_TO_VERSION,
+    preconditions: (snapshot) => requireRecordFamilyVersion(
+      snapshot,
+      "agentRun",
+      AGENT_RUN_CONTEXT_PROTOCOL_FROM_VERSION,
+      "agentRuns"
+    ),
+    transform: migrateAgentRunsToContextProtocol,
+    declaredEffects: []
+  };
+}
+
+function migrateAgentRunsToContextProtocol(snapshot: HomeSnapshot): HomeSnapshot {
+  requireRecordFamilyVersion(
+    snapshot,
+    "agentRun",
+    AGENT_RUN_CONTEXT_PROTOCOL_FROM_VERSION,
+    "agentRuns"
+  );
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      agentRun: AGENT_RUN_CONTEXT_PROTOCOL_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const records = asObject(task.agentRuns ?? {}, `agentRun map ${taskId}`);
+    const nextRecords: Record<string, unknown> = {};
+    for (const [runId, rawRecord] of Object.entries(records)) {
+      const record = asObject(rawRecord, `agentRun ${taskId}/${runId}`);
+      const {
+        input: rawInput,
+        schemaVersion: _schemaVersion,
+        ...rest
+      } = record;
+      const roleName = requiredMigrationText(record.roleName, "Agent Run roleName");
+      const purpose = record.purpose === "review" ? "review" : "execution";
+      const workItemId = optionalMigrationText(record.workItemId, "Agent Run workItemId");
+      const reviewRoundId = optionalMigrationText(record.reviewRoundId, "Agent Run reviewRoundId");
+      const executionGroupId = optionalMigrationText(
+        record.executionGroupId,
+        "Agent Run executionGroupId"
+      );
+      const executionLaneId = optionalMigrationText(
+        record.executionLaneId,
+        "Agent Run executionLaneId"
+      );
+      const action = purpose === "review"
+        ? "review-round"
+        : roleName === "leader"
+          ? "leader-wake"
+          : workItemId === undefined
+            ? "lead-task"
+            : "execute-work-item";
+      const subject = {
+        taskId,
+        ...(workItemId === undefined ? {} : { workItemId }),
+        ...(reviewRoundId === undefined ? {} : { reviewRoundId }),
+        ...(executionGroupId === undefined ? {} : { executionGroupId }),
+        ...(executionLaneId === undefined ? {} : { executionLaneId })
+      };
+      const assignment = {
+        schemaVersion: 1,
+        runId,
+        roleName,
+        purpose,
+        action,
+        subject,
+        ...(typeof rawInput === "string" && rawInput.trim().length > 0
+          ? { directive: rawInput }
+          : {}),
+        deltaRefIds: []
+      };
+      nextRecords[runId] = {
+        ...rest,
+        schemaVersion: AGENT_RUN_CONTEXT_PROTOCOL_TO_VERSION,
+        assignment,
+        bootstrapEnvelope: {
+          protocol: "yui-run/v1",
+          runId,
+          roleName,
+          purpose,
+          action,
+          subject,
+          deltaRefIds: []
+        }
+      };
+    }
+    nextTasks[taskId] = { ...task, agentRuns: nextRecords };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+function agentRunRetryEpisodeStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "agentRun",
+    fromVersion: AGENT_RUN_RETRY_EPISODE_FROM_VERSION,
+    toVersion: AGENT_RUN_RETRY_EPISODE_TO_VERSION,
+    preconditions: (snapshot) => requireRecordFamilyVersion(
+      snapshot,
+      "agentRun",
+      AGENT_RUN_RETRY_EPISODE_FROM_VERSION,
+      "agentRuns"
+    ),
+    transform: migrateAgentRunsToRetryEpisodes,
+    declaredEffects: []
+  };
+}
+
+function migrateAgentRunsToRetryEpisodes(snapshot: HomeSnapshot): HomeSnapshot {
+  requireRecordFamilyVersion(
+    snapshot,
+    "agentRun",
+    AGENT_RUN_RETRY_EPISODE_FROM_VERSION,
+    "agentRuns"
+  );
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...manifestVersions, agentRun: AGENT_RUN_RETRY_EPISODE_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const records = asObject(task.agentRuns ?? {}, `agentRun map ${taskId}`);
+    const nextRecords: Record<string, unknown> = {};
+    for (const [runId, rawRecord] of Object.entries(records)) {
+      const record = asObject(rawRecord, `agentRun ${taskId}/${runId}`);
+      const legacyRetry = record.providerRetry === undefined
+        ? undefined
+        : asObject(record.providerRetry, `providerRetry ${taskId}/${runId}`);
+      let providerRetry: unknown = undefined;
+      let deliveryReceiptId: string | undefined;
+      if (legacyRetry !== undefined) {
+        const attempt = requiredMigrationPositiveInteger(
+          legacyRetry.attempt,
+          `providerRetry attempt ${taskId}/${runId}`
+        );
+        const firstFailureAt = requiredMigrationTimestamp(
+          legacyRetry.firstFailureAt,
+          `providerRetry firstFailureAt ${taskId}/${runId}`
+        );
+        const lastFailureAt = requiredMigrationTimestamp(
+          legacyRetry.lastFailureAt,
+          `providerRetry lastFailureAt ${taskId}/${runId}`
+        );
+        const nextAttemptAt = optionalMigrationTimestamp(
+          legacyRetry.nextAttemptAt,
+          `providerRetry nextAttemptAt ${taskId}/${runId}`
+        );
+        const policyBlocked = legacyRetry.errorClass === "policy-denied";
+        const deadlineMs = Math.max(
+          Date.parse(firstFailureAt) + 600_000,
+          nextAttemptAt === undefined ? 0 : Date.parse(nextAttemptAt) + 1
+        );
+        deliveryReceiptId = nextAttemptAt !== undefined || policyBlocked
+          ? undefined
+          : `legacy-retry-receipt-${runId}-${attempt}`;
+        providerRetry = {
+          schemaVersion: 2,
+          episodeId: `legacy-retry-${runId}`,
+          failureEventId: `legacy-provider-failure-${runId}-${attempt}`,
+          policyVersion: 1,
+          state: nextAttemptAt !== undefined
+            ? "scheduled"
+            : policyBlocked ? "blocked" : "awaiting-progress",
+          errorClass: legacyRetry.errorClass,
+          consecutiveFailures: attempt,
+          dispatchedRetries: Math.min(3, nextAttemptAt === undefined ? attempt : attempt - 1),
+          maxRetries: 3,
+          firstFailureAt,
+          lastFailureAt,
+          episodeDeadlineAt: new Date(deadlineMs).toISOString(),
+          ...(nextAttemptAt === undefined ? {} : { nextAttemptAt }),
+          ...(deliveryReceiptId === undefined
+            ? {}
+            : { lastRetryReceiptId: deliveryReceiptId }),
+          ...(legacyRetry.launchId === undefined ? {} : { launchId: legacyRetry.launchId }),
+          ...(legacyRetry.nativeSessionId === undefined
+            ? {}
+            : { nativeSessionId: legacyRetry.nativeSessionId }),
+          lastErrorSummary: legacyRetry.lastErrorSummary
+        };
+      }
+      nextRecords[runId] = {
+        ...record,
+        schemaVersion: AGENT_RUN_RETRY_EPISODE_TO_VERSION,
+        ...(deliveryReceiptId === undefined ? {} : { deliveryReceiptId }),
+        ...(providerRetry === undefined ? {} : { providerRetry })
+      };
+    }
+    nextTasks[taskId] = { ...task, agentRuns: nextRecords };
+  }
+  return { schemaManifest, state: { ...snapshot.state, tasks: nextTasks } };
+}
+
+function requiredMigrationPositiveInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new Error(`${label} must be a positive integer.`);
+  }
+  return value as number;
+}
+
+function requiredMigrationTimestamp(value: unknown, label: string): string {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+    throw new Error(`${label} must be a timestamp.`);
+  }
+  return value;
+}
+
+function optionalMigrationTimestamp(value: unknown, label: string): string | undefined {
+  return value === undefined ? undefined : requiredMigrationTimestamp(value, label);
+}
+
+function requiredMigrationText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0 || value.includes("\0")) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return value.trim();
+}
+
+function optionalMigrationText(value: unknown, label: string): string | undefined {
+  return value === undefined ? undefined : requiredMigrationText(value, label);
 }
 
 /**

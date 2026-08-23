@@ -545,6 +545,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     roleName: string;
     status: "present" | "absent";
     resource?: SchedulerRoleResourceEntry["resource"];
+    hostExit?: Readonly<{ deadStatus?: number }>;
   }>[]> {
     if (TEST_ROLE_LIVENESS_PRESENT) {
       return inputs.map((input) => ({
@@ -601,11 +602,19 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     return inputs.map((input) => {
       const key = `${input.taskId}\0${input.roleName}`;
       const resource = resources.get(key);
+      const deadPane = inventory.find((pane) => (
+        pane.taskId === input.taskId && pane.roleName === input.roleName && pane.dead
+      ));
       return {
         taskId: input.taskId,
         roleName: input.roleName,
         status: present.has(key) ? "present" : "absent",
-        ...(resource === undefined ? {} : { resource })
+        ...(resource === undefined ? {} : { resource }),
+        ...(deadPane === undefined
+          ? {}
+          : { hostExit: {
+              ...(deadPane.deadStatus === undefined ? {} : { deadStatus: deadPane.deadStatus })
+            } })
       };
     });
   }

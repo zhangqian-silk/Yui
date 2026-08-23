@@ -1,6 +1,8 @@
 import { createAgentRun } from "../run/agentRun.js";
-import { markYuiRunInput } from "../run/runIdentity.js";
-import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import {
+  createRunAssignment,
+  serializeRunBootstrapEnvelope
+} from "../context/runContextContract.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   effectiveLaunchSnapshotsCompatible,
@@ -13,7 +15,6 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import { createLeaderRecoveryNotification } from "./operatorNotification.js";
-import { evaluateSessionContextBudget } from "../context/sessionContextBudget.js";
 import type {
   PreparedRoleDelivery,
   SchedulerRole,
@@ -167,67 +168,26 @@ export async function processLeaderWakeups(
           `Leader Session is incompatible with desired effective launch: ${task.id}/${role.name}.`
         );
       }
-      // Issue 04: a native Session generation whose observed per-request
-      // input peak crossed the hard context budget is retired before dispatch
-      // so the wake starts a fresh generation instead of waiting for
-      // provider-side auto-compaction. Durable Task records are the checkpoint;
-      // the bounded snapshot below re-establishes working context.
-      let contextBudgetAdvisory: string | undefined;
-      if (
-        hasNativeSession(existingSession)
-        && compatibleSession
-        && existingSession.status !== "stopped"
-        && existingSession.status !== "broken"
-        && typeof store.listEvents === "function"
-        && typeof store.getContextBudget === "function"
-        && typeof store.rolloverTaskRoleSessionForContextBudget === "function"
-      ) {
-        const budget = evaluateSessionContextBudget(
-          store.listEvents(task.id),
-          {
-            taskId: task.id,
-            roleName: role.name,
-            ...(existingSession.nativeSessionId === undefined
-              ? {}
-              : { nativeSessionId: existingSession.nativeSessionId }),
-            ...(existingSession.launchId === undefined
-              ? {}
-              : { launchId: existingSession.launchId })
-          },
-          store.getContextBudget()
-        );
-        if (budget.state === "hard") {
-          const rollover = store.rolloverTaskRoleSessionForContextBudget({
-            taskId: task.id,
-            roleName: role.name,
-            peakTokens: budget.peakTokens,
-            hardTokens: budget.budget.hardTokens,
-            now
-          });
-          if (rollover !== null) {
-            existingSession = null;
-            effectiveSession = null;
-            contextBudgetAdvisory = `Previous Session generation ${rollover.retiredNativeSessionId ?? "unknown"} was retired at the hard context budget (peak ${budget.peakTokens} >= ${budget.budget.hardTokens} tokens). This wake starts a fresh generation; durable Task records preserve all state.`;
-          }
-        } else if (budget.state === "soft") {
-          contextBudgetAdvisory = `Session context budget advisory: observed per-request input peak ${budget.peakTokens} tokens crossed the soft threshold (${budget.budget.softTokens}). Durable Yui records are the checkpoint; a fresh generation starts automatically at the hard threshold (${budget.budget.hardTokens}).`;
-        }
-      }
       const mode = hasNativeSession(existingSession) && compatibleSession ? "resume" : "new";
       const runId = store.peekNextAgentRunId(task.id);
       const wakeEnvelope = resolveLeaderWakeEnvelope(store, task.id);
-      const input = markYuiRunInput(leaderWakeupInput(
-        task.id,
+      const contextSnapshot = store.freezeLeaderContextSnapshot?.(task.id, role.name, now);
+      const assignment = createRunAssignment({
         runId,
-        wakeEnvelope,
-        contextBudgetAdvisory
-      ), runId, taskRoleSessionTitle(task, role.name));
+        roleName: role.name,
+        purpose: "execution",
+        action: "leader-wake",
+        subject: { taskId: task.id },
+        directive: leaderWakeupInput(task.id, runId, wakeup.reasons),
+        ...(contextSnapshot === undefined ? {} : { contextSnapshotRef: contextSnapshot.ref }),
+        deltaRefIds: contextSnapshot?.deltaRefIds ?? []
+      });
       run = createAgentRun(
         runId,
         task.id,
         role.name,
         mode,
-        input,
+        assignment,
         now,
         {
           ...(role.managedWorkspace === undefined
@@ -392,7 +352,7 @@ export async function processLeaderWakeups(
       const outcome = await delivery.sendOnce({
         delivery: ready,
         receiptId: formatAgentRunReceiptId(task.id, run.id),
-        text: input
+        text: serializeRunBootstrapEnvelope(run.bootstrapEnvelope)
       });
       if (outcome === "busy" || outcome === "unavailable") {
         results.push({
@@ -630,20 +590,10 @@ function resolveLeaderWakeEnvelope(
 function leaderWakeupInput(
   taskId: string,
   runId: string,
-  wakeEnvelope: import("../context/wakeNotification.js").WakeEnvelope | null,
-  contextBudgetAdvisory: string | undefined
+  reasons: readonly string[]
 ): string {
-  const lines: string[] = [
-    "Follow the injected yui-leader Skill for this Yui wakeup.",
-    `Current Leader Run: ${runId}.`,
+  return [
     `For every Leader decision, milestone, or Work Item lifecycle command that is meaningful progress, carry this exact current-turn assertion on that command: YUI_LEADER_ACTION_RUN_ID=${runId} YUI_LEADER_ACTION_RECEIPT_ID=${formatAgentRunReceiptId(taskId, runId)}. The native Session environment may retain an older YUI_RUN_ID/launch; never copy those values, and never reuse this assertion after the turn changes.`,
-    ...(contextBudgetAdvisory === undefined ? [] : [contextBudgetAdvisory]),
-    ...(wakeEnvelope === null
-      ? [`Read the authoritative context with yui task context ${taskId}.`]
-      : [
-          "Wake envelope (Issue 04):",
-          wakeEnvelope.text
-        ]),
-  ];
-  return lines.join("\n");
+    `Wake reasons: ${reasons.join(", ")}. Load exact context for ${taskId}/${runId}.`
+  ].join("\n");
 }

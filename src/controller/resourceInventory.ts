@@ -73,6 +73,7 @@ export type RuntimePaneFact = Readonly<{
   roleName: string;
   target: string;
   dead: boolean;
+  deadStatus?: number;
   pid?: number;
   currentCommand: string;
 }>;

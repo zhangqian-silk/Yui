@@ -96,7 +96,8 @@ jobs:
           grep -qx 'package/skills/yui-worker/SKILL.md' package-files.txt
           grep -qx 'package/skills/yui-operator/SKILL.md' package-files.txt
           grep -qx 'package/skills/yui-reviewer/SKILL.md' package-files.txt
-          if [ "$(grep -Ec '^package/skills/' package-files.txt)" -ne 4 ]; then exit 1; fi
+          grep -qx 'package/skills/yui-runtime/SKILL.md' package-files.txt
+          if [ "$(grep -Ec '^package/skills/' package-files.txt)" -ne 5 ]; then exit 1; fi
           if grep -Eq '^package/(binding\.gyp|native/|build/|scripts/|test/)' package-files.txt; then exit 1; fi
           # The executable bit must survive into the actual tarball, not only
           # the npm pack manifest (PR #110 regression contract).

@@ -38,6 +38,7 @@ export type TmuxPaneState = Readonly<{
   roleName: string;
   target: string;
   dead: boolean;
+  deadStatus?: number;
   pid?: number;
   currentCommand: string;
   exitStatus?: number;
@@ -51,6 +52,7 @@ export type TmuxRolePaneState = Readonly<{
   roleName: string;
   target: string;
   dead: boolean;
+  deadStatus?: number;
   pid?: number;
   currentCommand: string;
   exitStatus?: number;
@@ -666,7 +668,7 @@ export class TmuxManager {
     try {
       output = this.run([
         "list-panes", "-s", "-t", this.sessionName(taskId), "-F",
-        `#{window_name}${formatSeparator}#{pane_dead}${formatSeparator}#{pane_pid}${formatSeparator}#{pane_current_command}`
+        `#{window_name}${formatSeparator}#{pane_dead}${formatSeparator}#{pane_dead_status}${formatSeparator}#{pane_pid}${formatSeparator}#{pane_current_command}`
       ]);
     } catch (error) {
       if (isExplicitlyAbsentTmuxSession(error)) return [];
@@ -675,10 +677,11 @@ export class TmuxManager {
     return output.split("\n").flatMap((line): TmuxRolePaneState[] => {
       if (line.length === 0) return [];
       const separator = line.includes(encodedSeparator) ? encodedSeparator : formatSeparator;
-      const [roleName, deadText, pidText, currentCommand, ...extra] = line.split(separator);
+      const [roleName, deadText, deadStatusText, pidText, currentCommand, ...extra] = line.split(separator);
       if (
         roleName === undefined
         || deadText === undefined
+        || deadStatusText === undefined
         || pidText === undefined
         || currentCommand === undefined
         || extra.length > 0
@@ -687,11 +690,13 @@ export class TmuxManager {
         throw runtimeError(`Tmux returned an invalid Task Role pane state for ${taskId}.`);
       }
       const pid = Number(pidText);
+      const deadStatus = Number(deadStatusText);
       return [{
         taskId,
         roleName,
         target: this.target(taskId, roleName),
         dead: deadText === "1",
+        ...(Number.isSafeInteger(deadStatus) && deadStatus >= 0 ? { deadStatus } : {}),
         ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
         currentCommand
       }];
@@ -715,6 +720,7 @@ export class TmuxManager {
           "#{session_name}",
           "#{window_name}",
           "#{pane_dead}",
+          "#{pane_dead_status}",
           "#{pane_pid}",
           "#{pane_current_command}"
         ].join(formatSeparator)
@@ -731,6 +737,7 @@ export class TmuxManager {
         sessionName,
         roleName,
         deadText,
+        deadStatusText,
         pidText,
         currentCommand,
         ...extra
@@ -739,6 +746,7 @@ export class TmuxManager {
         sessionName === undefined
         || roleName === undefined
         || deadText === undefined
+        || deadStatusText === undefined
         || pidText === undefined
         || currentCommand === undefined
         || extra.length > 0
@@ -752,11 +760,13 @@ export class TmuxManager {
         throw runtimeError("Tmux returned an invalid Yui Role pane identity.");
       }
       const pid = Number(pidText);
+      const deadStatus = Number(deadStatusText);
       return [{
         taskId,
         roleName,
         target: this.target(taskId, roleName),
         dead: deadText === "1",
+        ...(Number.isSafeInteger(deadStatus) && deadStatus >= 0 ? { deadStatus } : {}),
         ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
         currentCommand
       }];
@@ -775,6 +785,7 @@ export class TmuxManager {
           "#{session_name}",
           "#{window_name}",
           "#{pane_dead}",
+          "#{pane_dead_status}",
           "#{pane_pid}",
           "#{pane_current_command}"
         ].join(formatSeparator)
@@ -1337,6 +1348,7 @@ function parseRolePaneInventory(
       sessionName,
       roleName,
       deadText,
+      deadStatusText,
       pidText,
       currentCommand,
       ...extra
@@ -1345,6 +1357,7 @@ function parseRolePaneInventory(
       sessionName === undefined
       || roleName === undefined
       || deadText === undefined
+      || deadStatusText === undefined
       || pidText === undefined
       || currentCommand === undefined
       || extra.length > 0
@@ -1358,11 +1371,13 @@ function parseRolePaneInventory(
       throw runtimeError("Tmux returned an invalid Yui Role pane identity.");
     }
     const pid = Number(pidText);
+    const deadStatus = Number(deadStatusText);
     return [{
       taskId,
       roleName,
       target: target(taskId, roleName),
       dead: deadText === "1",
+      ...(Number.isSafeInteger(deadStatus) && deadStatus >= 0 ? { deadStatus } : {}),
       ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
       currentCommand
     }];

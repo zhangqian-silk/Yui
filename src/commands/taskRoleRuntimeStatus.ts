@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import type { RoleAgentSession } from "../executor/agentExecutor.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
-import type { AgentRun } from "../run/agentRun.js";
+import { agentRunDeliveryReceiptId, type AgentRun } from "../run/agentRun.js";
 import type { TaskRole } from "../role/role.js";
 import {
   hasRuntimeCleanupObligation,
@@ -563,10 +563,10 @@ function projectTaskRoleRuntime(
         driverId,
         launchId: session.launchId,
         nativeSessionId: session.nativeSessionId,
-        receiptId: formatAgentRunReceiptId(run.taskId, run.id)
+        receiptId: agentRunDeliveryReceiptId(run)
       }
     ) ?? run.id,
-    receiptId: formatAgentRunReceiptId(run.taskId, run.id)
+    receiptId: agentRunDeliveryReceiptId(run)
   };
   let projection = projectRuntimeTaskEvents(fence, run.createdAt, events);
   projection = projectRuntimeMailbox(projection, mailbox);

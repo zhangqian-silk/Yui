@@ -46,7 +46,7 @@ import {
   type WorkspaceProjectEntry
 } from "../worktree/managedWorkspace.js";
 import type { ExecutionLaneGitSnapshot } from "../execution/executionGroup.js";
-import type { AgentRun } from "../run/agentRun.js";
+import { agentRunDeliveryReceiptId, type AgentRun } from "../run/agentRun.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   NodeGitWorkspace,
@@ -3040,7 +3040,7 @@ function canCorrectActiveWorkItemRoleWorkspaceHint(
     || sessions.inFlight === null
     || sessions.inFlight.agentId !== role.activeAgentId
     || sessions.inFlight.runId !== run.id
-    || sessions.inFlight.receiptId !== formatAgentRunReceiptId(taskId, run.id)
+    || sessions.inFlight.receiptId !== agentRunDeliveryReceiptId(run)
     || session === undefined
     || session.agentId !== role.activeAgentId
     || session.adapterId !== run.effective.adapterId

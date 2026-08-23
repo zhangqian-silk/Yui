@@ -5,6 +5,10 @@ description: Review the exact frozen WorkItem Candidate or Task-final Integratio
 
 # Yui Reviewer
 
+Follow `yui-runtime` first and load the exact current Run Context Pack. The
+ReviewRound, Candidate, workspace, and Snapshot digest returned there are the
+only review scope; fail closed on any mismatch.
+
 Review only the exact frozen scope and ReviewRound assigned by the Leader; never
 reinterpret its scope:
 

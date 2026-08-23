@@ -30,6 +30,9 @@ export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
       "An initial prompt Run id requires a newly-created runtime host."
     );
   }
+  const launchPromptUncertainRunId = input.launchPromptUncertainRunId === undefined
+    ? undefined
+    : requireSafeIdentity(input.launchPromptUncertainRunId, "Uncertain launch prompt Run id");
   return {
     id: requireSafeIdentity(input.id, "Runtime binding id"),
     launchId: requireSafeIdentity(input.launchId, "Launch id"),
@@ -39,6 +42,9 @@ export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
     hostRef: requireText(input.hostRef, "Session host reference"),
     ...(hostCreated === undefined ? {} : { hostCreated }),
     ...(initialPromptRunId === undefined ? {} : { initialPromptRunId }),
+    ...(launchPromptUncertainRunId === undefined
+      ? {}
+      : { launchPromptUncertainRunId }),
     ...(input.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: requireText(input.nativeSessionId, "Native session id") })

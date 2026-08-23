@@ -330,6 +330,16 @@ export interface SchedulerStorePort {
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly string[];
+  /** Persist exact tmux remain-on-exit evidence before rebuilding an Agent Host. */
+  saveRoleHostExitObservation?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    launchId?: string;
+    nativeSessionId?: string;
+    deadStatus?: number;
+    observedAt: Date;
+  }>): void;
   getRoleSession(
     taskId: string,
     roleName: string,
@@ -389,6 +399,15 @@ export interface SchedulerStorePort {
     nativeTurnId: string;
   }> | null;
   peekNextAgentRunId(taskId: string): string;
+  /** Freeze the exact authoritative context before claiming a new Leader Run. */
+  freezeLeaderContextSnapshot?(
+    taskId: string,
+    roleName: string,
+    now: Date
+  ): Readonly<{
+    ref: import("../context/contextSnapshot.js").ContextSnapshotRef;
+    deltaRefIds: readonly string[];
+  }>;
 
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   listWorkMailboxes(): readonly WorkMailbox[];
@@ -744,6 +763,7 @@ export interface TmuxDeliveryPort {
       roleName: string;
       status: "present" | "absent";
       resource?: SchedulerRoleResourceEvidence;
+      hostExit?: Readonly<{ deadStatus?: number }>;
     }>[]>;
   /** Retryable stale lifecycle cleanup for one exact Task Role pane. */
   stopRole?(taskId: string, roleName: string): Promise<boolean>;

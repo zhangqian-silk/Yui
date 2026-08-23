@@ -26,7 +26,7 @@ import type { YuiConfig } from "../storage/taskStore.js";
 export type ProviderRetryConfig = Readonly<{
   mode: ProviderRetryMode;
   /** Adapters with in-place retry enabled (shadow or enforce). */
-  adapters: readonly string[];
+  adapters: readonly string[] | "all-capable";
   /** Idempotent yield receipt replay on resend. */
   yieldReceiptReplay: boolean;
   /** Total retry budget per Run lineage, in milliseconds. */
@@ -56,5 +56,13 @@ export function providerRetryEnabledForAdapter(
   mode: Exclude<ProviderRetryMode, "off">
 ): boolean {
   return config.mode === mode
-    && config.adapters.includes(adapterId);
+    && providerRetryAdapterEnabled(config, adapterId);
+}
+
+/** Default admission is capability-driven, not a hard-coded Provider list. */
+export function providerRetryAdapterEnabled(
+  config: ProviderRetryConfig,
+  adapterId: string
+): boolean {
+  return config.adapters === "all-capable" || config.adapters.includes(adapterId);
 }

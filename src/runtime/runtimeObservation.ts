@@ -66,6 +66,8 @@ export type RuntimeObservationFence = Readonly<{
 }>;
 
 export type RuntimeUsageSnapshot = Readonly<{
+  /** Token-counter meaning; lifecycle code must never infer another meaning. */
+  semantics: "cumulative-session" | "request-context" | "remaining-context";
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens?: number;
@@ -80,6 +82,8 @@ export type RuntimeTurnFailure = Readonly<{
   lastOutput?: string;
   /** Exact Provider evidence that this error irrecoverably covers the Yui Run. */
   runTerminal?: boolean;
+  /** Trusted structured Provider backoff hint; free-form text is never parsed. */
+  retryAfterMs?: number;
 }>;
 
 export type RuntimeObservationPayload = Readonly<{
@@ -420,7 +424,12 @@ function normalizePayload(
     if (!["model", "tool", "subagent", "provider", "resource"].includes(input.activity ?? "")) {
       throw new Error("activity.observed requires an activity kind.");
     }
-    if (input.usage !== undefined) validateUsage(input.usage);
+    if (input.usage !== undefined) {
+      const usage = input.usage as RuntimeUsageSnapshot & { semantics?: RuntimeUsageSnapshot["semantics"] };
+      validateUsage(usage.semantics === undefined
+        ? { ...usage, semantics: "cumulative-session" }
+        : usage);
+    }
   }
   if (kind === "observer.health") {
     requireIdentity(input.sourceId, "Runtime observer source id");
@@ -485,7 +494,12 @@ function normalizePayload(
     ...(input.activityId === undefined
       ? {}
       : { activityId: requireIdentity(input.activityId, "Runtime activity id") }),
-    ...(input.usage === undefined ? {} : { usage: Object.freeze({ ...input.usage }) }),
+    ...(input.usage === undefined
+      ? {}
+      : { usage: Object.freeze({
+          ...input.usage,
+          semantics: input.usage.semantics ?? "cumulative-session"
+        }) }),
     ...(observerSource === undefined ? {} : { observerSource }),
     ...(input.sourceId === undefined
       ? {}
@@ -626,7 +640,10 @@ function normalizeFailure(input: RuntimeTurnFailure): RuntimeTurnFailure {
       : { lastOutput: requireText(input.lastOutput, "Runtime failure last output") }),
     ...(input.runTerminal === undefined
       ? {}
-      : { runTerminal: requireBoolean(input.runTerminal, "Runtime failure runTerminal") })
+      : { runTerminal: requireBoolean(input.runTerminal, "Runtime failure runTerminal") }),
+    ...(input.retryAfterMs === undefined
+      ? {}
+      : { retryAfterMs: requirePositiveMilliseconds(input.retryAfterMs) })
   });
 }
 
@@ -635,9 +652,21 @@ function requireBoolean(value: unknown, label: string): boolean {
   return value;
 }
 
+function requirePositiveMilliseconds(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("Runtime failure retryAfterMs must be a positive safe integer.");
+  }
+  return value;
+}
+
 function validateUsage(input: RuntimeUsageSnapshot): void {
-  for (const [name, value] of Object.entries(input)) {
-    if (!Number.isSafeInteger(value) || value < 0) {
+  if (!["cumulative-session", "request-context", "remaining-context"].includes(
+    input.semantics
+  )) {
+    throw new Error("Runtime usage semantics are invalid.");
+  }
+  for (const [name, value] of Object.entries(input).filter(([name]) => name !== "semantics")) {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
       throw new Error(`Runtime usage ${name} must be a non-negative safe integer.`);
     }
   }

@@ -119,6 +119,8 @@ export type CompileInput<TConfig extends RoleAgentConfig = RoleAgentConfig> = Re
   developerInstructions?: string;
   skills?: readonly Readonly<{ id: string; path: string; content: string }>[];
   managedContextFile?: string;
+  sessionManifestPath?: string;
+  sessionManifestDigest?: string;
   codexDeveloperInstructions?: CodexDeveloperInstructionsInspection;
 }>;
 export type ResumeInput<TConfig extends RoleAgentConfig = RoleAgentConfig> =
@@ -284,7 +286,7 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
       "--config",
       `projects={${JSON.stringify(resolve(input.workspace))}={trust_level="trusted"}}`
     ];
-    const instructions = [
+    const instructions = input.sessionManifestPath === undefined ? [
       input.developerInstructions,
       ...(input.skills === undefined || input.skills.length === 0
         ? []
@@ -292,7 +294,9 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
             "Yui Role Skills are available at the paths below. Before performing work governed by one, read and follow its SKILL.md on demand; do not treat this list as a user message.",
             ...input.skills.map((skill) => `- ${skill.id}: ${skill.path}/SKILL.md`)
         ])
-    ].filter((value): value is string => value !== undefined && value.trim().length > 0);
+    ].filter((value): value is string => value !== undefined && value.trim().length > 0) : [
+      `Yui managed Session. Read and follow the Session Manifest at ${input.sessionManifestPath} (digest ${input.sessionManifestDigest ?? "unknown"}). Load each Skill and Role Profile by its manifest path before acting; Task content is available only through the manifest's exact Context API.`
+    ];
     if (instructions.length === 0) return workspaceTrust;
     const nativeInstructions = input.codexDeveloperInstructions
       ?? inspectCodexDeveloperInstructions({
@@ -399,6 +403,9 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
   }
 
   override launchContextArgs(input: CompileInput<ClaudeAgentConfig>): string[] {
+    if (input.sessionManifestPath !== undefined) {
+      return ["--append-system-prompt-file", input.sessionManifestPath];
+    }
     const sections = [
       input.developerInstructions,
       ...(input.skills ?? []).map((skill) => [
