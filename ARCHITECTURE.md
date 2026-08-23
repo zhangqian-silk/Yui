@@ -201,34 +201,33 @@ context.
 
 ## Runtime ownership
 
-tmux owns Agent process lifetimes and observable output. The Controller owns
-mailbox delivery, wakeups, Role liveness, and reconciliation. Task attachment
-surfaces only attach to an existing pane and cannot create, resume, wake, or
-deliver to a managed runtime. Global interactive entry remains an explicit
-session-lifecycle operation.
+tmux owns the persistent Agent Host lifetime and observable output. The
+Controller owns mailbox delivery, wakeups, Role liveness, recovery decisions,
+and a durable single-writer authority epoch. The Agent Host owns one structured
+Provider child process and mirrors its output to the pane. Managed prompts are
+never terminal bytes: both Controller and human takeover input become fenced
+Provider-native Turn requests.
 
-Task observation is read-only by default. Explicit write access publishes a
-Role-scoped tmux lease before revalidating durable Run state. The managed host
-also checks that lease before planning or process creation, so either the Run
-claim or the writer lease wins and they never share a pane. Writer contention
-is transient backpressure rather than a delivery failure: it does not consume
-bounded delivery retries, and lease release signals only existing durable work.
-Global interactive entry uses the same mechanism at tmux-host scope and
-automatically falls back to read-only when another writer already exists.
+Run, Conversation, Activation, and Turn identities are independent. A
+Conversation can span Runs and Provider processes; one Activation identifies
+one live process; one Turn identifies one pre-recorded input attempt. A live
+Activation is retained when a later Run reuses the Conversation. Process exit
+ends that Activation, and a resumed process receives a new Activation and a
+higher authority epoch.
 
-Managed Task Claude execution is process-per-Run: the exact Run input is a
-stream-json stdin frame submitted at process launch, while native session IDs
-carry conversation continuity across processes. The lifecycle binding records
-the exact Run submitted at launch. A Controller restart may recover only the
-same reserved launch/Run as uncertain until its Provider Hook arrives; a newly
-reserved Run cannot reuse an older live Role pane, so its provisional launch
-is released, the old owner is fenced through the durable cleanup lane, and the
-same Run is retried only after cleanup; pending cleanup prevents a successor
-generation from starting early.
-Terminal key injection is therefore an interactive compatibility mechanism,
-not a managed Claude delivery protocol. Operator and Leader Sessions remain
-fixed Task/global Roles; Task Worker Sessions are selected through Role Agent
-bindings.
+Task observation uses `task role view`. Explicit takeover requires a live
+managed Run, atomically transfers authority to a human holder, synchronizes the
+same fence to the Host, and only then exposes the PTY input gateway. Detach
+releases authority; `task role release` is an idempotent repair path even after
+the Run has ended. Global interactive entry remains a native session-lifecycle
+operation outside this managed Provider contract.
+
+Codex uses a persistent App Server JSON-RPC transport. Claude uses a persistent
+stream-json transport with exact user-message replay acknowledgement. In both
+cases, Yui records Turn intent before writing, accepts only exact Provider
+evidence, and maps an uncertain write to `delivery-unknown` without automatic
+resubmission. Conversation replacement requires exact missing evidence and no
+unsettled input, Turn, Activation, or writer authority.
 
 Role desired revisions and Run/Session effective snapshots keep configuration
 history explicit. Resume compares the complete effective snapshot and

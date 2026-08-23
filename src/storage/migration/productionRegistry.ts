@@ -82,6 +82,8 @@ const WORK_MAILBOX_FROM_VERSION = 1;
 const WORK_MAILBOX_TO_VERSION = 2;
 const TASK_ROLE_SESSION_SET_FROM_VERSION = 4;
 const TASK_ROLE_SESSION_SET_TO_VERSION = 5;
+const STRUCTURED_PROVIDER_SESSION_SET_FROM_VERSION = 5;
+const STRUCTURED_PROVIDER_SESSION_SET_TO_VERSION = 6;
 const PUBLICATION_REFERENCE_FROM_VERSION = 0;
 const PUBLICATION_REFERENCE_TO_VERSION = 1;
 const CONFIG_FROM_VERSION = 1;
@@ -205,6 +207,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(releaseWorkflowIntroductionStep())
     .registerOfflineMigration(workMailboxV2Step())
     .registerOfflineMigration(taskRoleSessionSetV5Step())
+    .registerOfflineMigration(structuredProviderSessionSetV6Step())
     .registerOfflineMigration(publicationReferenceIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
@@ -2668,6 +2671,128 @@ function taskRoleSessionSetV5Step(): MigrationStep<HomeSnapshot> {
     preconditions: requireTaskRoleSessionSetV4Family,
     transform: migrateTaskRoleSessionSetV4ToV5,
     declaredEffects: []
+  };
+}
+
+/**
+ * v6 is a deliberate runtime cutover, not an emulation layer. Existing Task,
+ * Run, Conversation, and Session identities remain as audit evidence, while
+ * every pre-v6 managed process is terminalized locally. A new Agent Host must
+ * establish structured Provider evidence before any further write.
+ */
+function structuredProviderSessionSetV6Step(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "taskRoleSessionSet",
+    fromVersion: STRUCTURED_PROVIDER_SESSION_SET_FROM_VERSION,
+    toVersion: STRUCTURED_PROVIDER_SESSION_SET_TO_VERSION,
+    preconditions: requireTaskRoleSessionSetV5Family,
+    transform: migrateTaskRoleSessionSetV5ToV6,
+    declaredEffects: []
+  };
+}
+
+function requireTaskRoleSessionSetV5Family(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.taskRoleSessionSet !== STRUCTURED_PROVIDER_SESSION_SET_FROM_VERSION) {
+    throw new Error(
+      `Record taskRoleSessionSet migration requires manifest version ${STRUCTURED_PROVIDER_SESSION_SET_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const sets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+    for (const [roleName, rawSet] of Object.entries(sets)) {
+      const set = asObject(rawSet, `Task Role session set ${taskId}/${roleName}`);
+      if (set.schemaVersion !== STRUCTURED_PROVIDER_SESSION_SET_FROM_VERSION) {
+        throw new Error(
+          `Task Role session set ${taskId}/${roleName} must use schemaVersion ${STRUCTURED_PROVIDER_SESSION_SET_FROM_VERSION}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateTaskRoleSessionSetV5ToV6(snapshot: HomeSnapshot): HomeSnapshot {
+  requireTaskRoleSessionSetV5Family(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...versions,
+      taskRoleSessionSet: STRUCTURED_PROVIDER_SESSION_SET_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const rawSets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+    const nextSets: Record<string, unknown> = {};
+    for (const [roleName, rawSet] of Object.entries(rawSets)) {
+      const set = asObject(rawSet, `Task Role session set ${taskId}/${roleName}`);
+      const invalidatedAt = String(set.updatedAt);
+      const sessions = asObject(set.sessions, `Task Role sessions ${taskId}/${roleName}`);
+      const nextSessions = Object.fromEntries(Object.entries(sessions).map(([agentId, rawSession]) => {
+        const session = asObject(rawSession, `Task Role Session ${taskId}/${roleName}/${agentId}`);
+        return [agentId, session.status === "stopped" || session.status === "broken"
+          ? session
+          : { ...session, status: "broken", updatedAt: invalidatedAt }];
+      }));
+      nextSets[roleName] = {
+        ...set,
+        schemaVersion: STRUCTURED_PROVIDER_SESSION_SET_TO_VERSION,
+        sessions: nextSessions,
+        providerBinding: set.providerBinding === null
+          ? null
+          : invalidateLegacyProviderBinding(
+              asObject(set.providerBinding, `Provider Binding ${taskId}/${roleName}`),
+              invalidatedAt
+            )
+      };
+    }
+    nextTasks[taskId] = { ...aggregate, roleSessionSets: nextSets };
+  }
+  return { schemaManifest, state: { ...snapshot.state, tasks: nextTasks } };
+}
+
+function invalidateLegacyProviderBinding(
+  binding: Record<string, unknown>,
+  invalidatedAt: string
+): Record<string, unknown> {
+  if (binding.schemaVersion !== 1) {
+    throw new Error("Pre-v6 Provider Runtime Binding must use schemaVersion 1.");
+  }
+  const activations = Array.isArray(binding.activations) ? binding.activations : [];
+  return {
+    ...binding,
+    schemaVersion: 2,
+    conversations: (Array.isArray(binding.conversations) ? binding.conversations : []).map(
+      (rawConversation) => {
+        const conversation = asObject(rawConversation, "Provider Conversation");
+        return conversation.status === "current"
+          ? { ...conversation, recoverability: "unknown" }
+          : conversation;
+      }
+    ),
+    activations: activations.map((rawActivation) => {
+      const activation = asObject(rawActivation, "Provider Activation");
+      const { writerLease: _removed, ...withoutLease } = activation;
+      void _removed;
+      return activation.status === "active"
+        ? {
+            ...withoutLease,
+            status: "failed",
+            endedAt: invalidatedAt,
+            terminalReason: "legacy-managed-runtime-invalidated"
+          }
+        : withoutLease;
+    }),
+    authority: { epoch: 1, owner: "none", changedAt: invalidatedAt },
+    turn: null
   };
 }
 

@@ -1290,7 +1290,7 @@ export class TmuxManager {
   /**
    * Pin the Role window to the largest attached client. The tmux default
    * `window-size latest` lets a later-attaching smaller client (e.g. the Web
-   * terminal or a second `task enter` from a smaller pane) shrink the shared
+   * terminal or a second Role viewer from a smaller pane) shrink the shared
    * Role window, leaving the primary viewer with a TUI pinned to the top of a
    * large terminal and no scrollback. `largest` keeps the window at the
    * biggest attached client so a compact viewer cannot compress it.

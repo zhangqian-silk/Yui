@@ -24,7 +24,7 @@ export function builtinDriverIdForAdapter(adapterId: string): string {
 }
 
 const STRUCTURED_CLI_CAPABILITIES: AgentDriverCapabilities = Object.freeze({
-  surfaces: Object.freeze(["interactive-cli"] as const),
+  surfaces: Object.freeze(["interactive-cli", "managed-protocol"] as const),
   lifecycle: Object.freeze({
     host: "persistent" as const,
     providerProcess: "persistent" as const,
@@ -85,10 +85,6 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
     adapterId: "claude",
     capabilities: Object.freeze({
       ...STRUCTURED_CLI_CAPABILITIES,
-      lifecycle: Object.freeze({
-        ...STRUCTURED_CLI_CAPABILITIES.lifecycle,
-        providerProcess: "per-turn" as const
-      }),
       observation: Object.freeze({
         ...STRUCTURED_CLI_CAPABILITIES.observation,
         sessionBootstrap: "preallocated" as const,

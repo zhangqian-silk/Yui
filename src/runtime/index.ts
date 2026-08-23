@@ -41,7 +41,6 @@ export {
   type ActivePromptPushPort,
   type ActivePromptPushRequest,
   type PromptPushResult,
-  type ProviderInputRoutingPort,
   RuntimeHostContentionError,
   RuntimeLaunchError,
   type RuntimeLaunchRetryReason,
@@ -62,9 +61,8 @@ export {
   type RuntimeTmuxHostPort,
   type RuntimeTmuxLaunchPlan,
   type RuntimeTmuxPaneState,
-  type RuntimeTmuxPromptPort,
   type RuntimeTmuxRole,
-  TmuxPromptPushAdapter,
+  AgentHostPromptPushAdapter,
   TmuxSessionHost,
   type TmuxSessionHostOptions
 } from "./tmuxAdapters.js";
@@ -140,6 +138,7 @@ export type {
 } from "./providerRuntimeReconciler.js";
 export {
   codexNotificationBoundary,
+  codexAppServerErrorIsMissing,
   CodexAppServerRequestError,
   CodexAppServerRuntime,
   type CodexAppServerTransport,
@@ -147,6 +146,50 @@ export {
   type CodexTurnAcceptance,
   type JsonRpcObject
 } from "./codexAppServerRuntime.js";
+export {
+  createProviderRuntimeBinding,
+  acceptProviderTurn,
+  beginProviderTurn,
+  currentProviderActivation,
+  currentProviderAuthority,
+  currentProviderConversation,
+  endProviderActivation,
+  markProviderTurnDeliveryUnknown,
+  rebindProviderRuntimeRun,
+  rejectProviderTurn,
+  settleProviderTurn,
+  startProviderActivation,
+  supersedeProviderConversation,
+  transferProviderAuthority,
+  updateProviderConversationRecoverability,
+  validateProviderRuntimeBinding,
+  type ProviderActivation,
+  type ProviderActivationStatus,
+  type ProviderAuthority,
+  type ProviderAuthorityOwner,
+  type ProviderConversation,
+  type ProviderConversationRecoverability,
+  type ProviderConversationStatus,
+  type ProviderRuntimeBinding,
+  type ProviderTurn,
+  type ProviderTurnStatus
+} from "./providerRuntimeIdentity.js";
+export {
+  FencedProviderControl,
+  type ProviderControlAdapter,
+  type ProviderConversationProbe,
+  type ProviderTurnAcceptance,
+  type ProviderWriterFence
+} from "./providerControl.js";
+export {
+  sameProviderAuthorityFence,
+  validateProviderAuthorityFence,
+  type ProviderAuthorityFence
+} from "./providerAuthorityFence.js";
+export {
+  decideProviderRecovery,
+  type ProviderRecoveryDecision
+} from "./providerRecoveryDecision.js";
 export {
   reconcileSessionOwners,
   type DurableSessionFact,

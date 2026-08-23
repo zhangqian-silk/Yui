@@ -77,7 +77,6 @@ import { runProfileCommand } from "./commands/profileCommands.js";
 import {
   dispatchPreparedReviewRound,
   failPendingReviewRound,
-  assertTaskRoleWritableAttachAvailable,
   RESUMED_PENDING_FINAL_REVIEW,
   TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
   TaskFinalReviewDispatchDriftError,
@@ -133,7 +132,12 @@ import { runRuntimeObservationHookCommand } from "./controller/runtimeObservatio
 import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
-import { runAgentHost } from "./runtime/agentHost.js";
+import {
+  AGENT_HOST_CONTROL_PROTOCOL,
+  runAgentHost,
+  sendAgentHostAuthorityControl,
+  type AgentHostControlResult
+} from "./runtime/agentHost.js";
 import {
   TaskWorkspaceCoordinator,
   WorkspaceCleanupBlockedError
@@ -1544,35 +1548,91 @@ export async function main(): Promise<void> {
           : { command: result.data, ...reviewData as object });
         return;
       }
-      if (result.output !== undefined) emit(result.output);
-      try {
-        tmux.attachRole(result.taskId, result.roleName, result.access, {
-          ...(result.access === "read-write"
-            ? {
-                revalidateWritableAttach: () => {
-                  assertTaskRoleWritableAttachAvailable(
-                    store,
-                    result.taskId,
-                    result.roleName,
-                    {
-                      isManagedProcessRunning: () => (
-                        tmux.probeRoleStatus(result.taskId, result.roleName) === "running"
-                      )
-                    }
-                  );
-                }
-              }
-            : {})
+      if (jsonOutput) {
+        throw usageError("Task Role view/takeover requires an interactive terminal.");
+      }
+      if (result.kind === "view") {
+        if (result.output !== undefined) emit(result.output);
+        tmux.attachRole(result.taskId, result.roleName, "read-only");
+        return;
+      }
+      const syncAuthority = async (
+        authorityResult: Extract<typeof result, { kind: "authority" }>
+      ): Promise<AgentHostControlResult> => {
+        let control: AgentHostControlResult;
+        try {
+          control = await sendAgentHostAuthorityControl({
+            home,
+            scope: "task",
+            taskId: authorityResult.taskId,
+            roleName: authorityResult.roleName,
+            control: {
+              protocol: AGENT_HOST_CONTROL_PROTOCOL,
+              type: "set-authority",
+              nativeSessionId: authorityResult.nativeSessionId,
+              authority: authorityResult.authority
+            }
+          });
+        } catch (error) {
+          throw runtimeError(
+            `Agent Host authority synchronization failed at epoch ${authorityResult.authority.epoch}: `
+            + `${error instanceof Error ? error.message : String(error)}. `
+            + `Durable authority is ${authorityResult.authority.owner}-owned; retry `
+            + `'yui task role release ${authorityResult.taskId} ${authorityResult.roleName}' `
+            + "to reconcile the Host."
+          );
+        }
+        if (control.outcome !== "accepted"
+          || control.snapshot.nativeSessionId !== authorityResult.nativeSessionId
+          || control.snapshot.authorityEpoch !== authorityResult.authority.epoch
+          || control.snapshot.authorityOwner !== authorityResult.authority.owner
+          || control.snapshot.authorityHolderId !== authorityResult.authority.holderId) {
+          throw runtimeError(
+            `Agent Host did not accept Provider authority epoch ${authorityResult.authority.epoch}: `
+            + (control.snapshot.detail ?? control.outcome)
+            + `. Durable authority is ${authorityResult.authority.owner}-owned; `
+            + "retry 'yui task role release "
+            + `${authorityResult.taskId} ${authorityResult.roleName}' to reconcile the Host.`
+          );
+        }
+        return control;
+      };
+      await syncAuthority(result);
+      emit(result.output);
+      if (result.action === "release") {
+        runtime.notifyMailboxChanged({
+          kind: "role",
+          taskId: result.taskId,
+          roleName: result.roleName
         });
+        return;
+      }
+      process.stdout.write(
+        "Provider input is now routed through the Agent Host PTY gateway. "
+        + "Use tmux detach (Ctrl-b d) to return authority to the Controller.\n"
+      );
+      try {
+        tmux.attachRole(result.taskId, result.roleName, "read-write");
       } finally {
-        if (result.access === "read-write") {
-          // A Run claimed while the writer lease was visible is intentionally
-          // paused. Releasing the lease only signals that existing durable
-          // work may be reconsidered; it never creates or wakes a Run.
+        const currentTask = store.getTask(result.taskId);
+        // Completing or retiring the Task from inside the takeover Turn owns
+        // Provider shutdown and clears the live binding. Do not turn that
+        // successful terminal transition into a failing best-effort release.
+        if (currentTask?.status === "active") {
+          const released = runTaskCommand(
+            ["role", "release", result.taskId, result.roleName],
+            store,
+            { runtime, environment: process.env, yuiHome: home }
+          );
+          if (released.kind !== "authority" || released.action !== "release") {
+            throw runtimeError("Provider authority release returned an invalid result.");
+          }
+          await syncAuthority(released);
+          emit(released.output);
           runtime.notifyMailboxChanged({
             kind: "role",
-            taskId: result.taskId,
-            roleName: result.roleName
+            taskId: released.taskId,
+            roleName: released.roleName
           });
         }
       }

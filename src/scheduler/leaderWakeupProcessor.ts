@@ -109,6 +109,7 @@ export async function processLeaderWakeups(
     let effectiveSession: SchedulerRoleSession | null = existingSession;
     let claimed = false;
     let deliveryAttempted = false;
+    let providerSubmissionBegun = false;
     let run: ReturnType<typeof createAgentRun> | null = null;
     let prepared: PreparedRoleDelivery | undefined;
     let preStartFencePersisted = false;
@@ -256,13 +257,14 @@ export async function processLeaderWakeups(
           preStartFencePersisted = true;
         }
       });
-      // A managed host may already have submitted the exact Run prompt as
-      // part of process launch. Once preparation returns that transport
+      // A managed Host may have submitted the exact Run Turn after its
+      // two-phase launch handshake. Once preparation returns that transport
       // fact, any
       // later readiness or aggregate-write failure is delivery uncertainty,
       // not a launch failure: preserve the Run and its reservation for the
       // matching provider Hook instead of terminalizing it.
-      deliveryAttempted = prepared.inputSubmittedAtLaunch === true;
+      deliveryAttempted = prepared.turnAcceptedDuringLaunch === true
+        || prepared.turnDeliveryUnknownDuringLaunch === true;
       // Persist the exact preparation fence before waiting on provider
       // readiness. A pre-input lifecycle Hook may fire during that wait; it
       // must be able to resolve this Run/Session/launch generation from durable
@@ -290,7 +292,8 @@ export async function processLeaderWakeups(
       }
       const ready = await delivery.waitUntilReady(prepared);
       deliveryAttempted = deliveryAttempted
-        || ready.prepared.inputSubmittedAtLaunch === true;
+        || ready.prepared.turnAcceptedDuringLaunch === true
+        || ready.prepared.turnDeliveryUnknownDuringLaunch === true;
       const latestTask = store.getTask(task.id);
       if (latestTask === null || latestTask.status !== "active") {
         delivery.forgetPrepared?.({
@@ -321,12 +324,54 @@ export async function processLeaderWakeups(
           : { launchId: ready.prepared.launchId }),
         now
       });
-      if (ready.prepared.inputSubmittedAtLaunch === true) {
-        // A fresh Codex command may carry the exact first prompt in its launch
-        // argv. That is transport evidence only: the matching Provider Hook
-        // still owns Run acceptance. Persist the push fence without writing a
-        // second terminal prompt, then leave the reservation for the async
-        // SessionStart/UserPromptSubmit fold.
+      if (ready.prepared.turnRejectedDuringLaunch === true) {
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId })
+        });
+        results.push({
+          taskId: task.id,
+          runId: run.id,
+          status: "skipped",
+          reason: "not-ready"
+        });
+        continue;
+      }
+      if (ready.prepared.turnDeliveryUnknownDuringLaunch === true) {
+        store.saveRoleRunDelivery({
+          task,
+          role,
+          run,
+          session: effectiveSession,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId }),
+          now
+        });
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId })
+        });
+        results.push({
+          taskId: task.id,
+          runId: run.id,
+          status: "skipped",
+          reason: "delivery-uncertain"
+        });
+        continue;
+      }
+      if (ready.prepared.turnAcceptedDuringLaunch === true) {
+        // The Agent Host submitted the exact first Turn through structured
+        // Provider control. Persist the transport fence without a second write;
+        // the matching structured acknowledgement owns Run acceptance.
         store.saveRoleRunDelivery({
           task,
           role,
@@ -348,18 +393,89 @@ export async function processLeaderWakeups(
         results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
         continue;
       }
+      const receiptId = formatAgentRunReceiptId(task.id, run.id);
+      if (effectiveSession === null || effectiveSession.launchId === undefined
+        || !hasNativeSession(effectiveSession)
+        || store.beginRoleRunProviderTurn?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          agentId: run.effective.agentId,
+          launchId: effectiveSession.launchId,
+          nativeSessionId: effectiveSession.nativeSessionId,
+          attemptId: receiptId,
+          now
+        }) !== true) {
+        throw new Error("Provider Turn intent could not be durably fenced before delivery.");
+      }
+      providerSubmissionBegun = true;
       deliveryAttempted = true;
       const outcome = await delivery.sendOnce({
         delivery: ready,
-        receiptId: formatAgentRunReceiptId(task.id, run.id),
+        receiptId,
         text: serializeRunBootstrapEnvelope(run.bootstrapEnvelope)
       });
       if (outcome === "busy" || outcome === "unavailable") {
+        store.resolveRoleRunProviderSubmission?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          attemptId: receiptId,
+          status: "rejected",
+          reason: outcome === "busy"
+            ? "Agent Host was busy before Provider mutation."
+            : "Agent Host was unavailable before Provider mutation.",
+          now
+        });
+        providerSubmissionBegun = false;
         results.push({
           taskId: task.id,
           runId: run.id,
           status: "skipped",
           reason: "not-ready"
+        });
+        continue;
+      }
+      if (outcome === "rejected") {
+        store.resolveRoleRunProviderSubmission?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          attemptId: receiptId,
+          status: "rejected",
+          reason: "Provider returned an exact negative acknowledgement.",
+          now
+        });
+        providerSubmissionBegun = false;
+        results.push({ taskId: task.id, runId: run.id, status: "skipped", reason: "not-ready" });
+        continue;
+      }
+      if (outcome === "delivery-unknown") {
+        store.resolveRoleRunProviderSubmission?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          attemptId: receiptId,
+          status: "delivery-unknown",
+          reason: "Provider Turn delivery is ambiguous; automatic retry is fenced.",
+          now
+        });
+        providerSubmissionBegun = false;
+        store.saveRoleRunDelivery({
+          task,
+          role,
+          run,
+          session: effectiveSession,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId }),
+          now
+        });
+        results.push({
+          taskId: task.id,
+          runId: run.id,
+          status: "skipped",
+          reason: "delivery-uncertain"
         });
         continue;
       }
@@ -378,6 +494,17 @@ export async function processLeaderWakeups(
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       const message = `Leader dispatch failed: ${detail}`;
+      if (providerSubmissionBegun && run !== null) {
+        store.resolveRoleRunProviderSubmission?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          attemptId: formatAgentRunReceiptId(task.id, run.id),
+          status: "delivery-unknown",
+          reason: detail,
+          now
+        });
+      }
       if (claimed && run !== null) {
         // Scheduler single-flight backpressure: the Role runtime lifecycle
         // lane was busy when the launch was reserved. The claimed Run stays
@@ -399,11 +526,9 @@ export async function processLeaderWakeups(
           });
           continue;
         }
-        // A finite managed provider from the preceding Run may still be
-        // exiting after its durable yield. Keep this newly-claimed Run as the
-        // sole owner of the Role mailbox; active-Run delivery will retry it
-        // after the old host disappears. This is runtime backpressure, not a
-        // Leader failure and not grounds for allocating another Run.
+        // A managed Provider lifecycle operation may still be settling. Keep
+        // this newly-claimed Run as the sole mailbox owner; active-Run delivery
+        // retries after the lifecycle lane clears.
         if (error instanceof RuntimeLaunchError && error.retryable) {
           results.push({
             taskId: task.id,

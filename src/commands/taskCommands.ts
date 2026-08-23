@@ -1,5 +1,5 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { createRunAssignment } from "../context/runContextContract.js";
 import {
@@ -29,9 +29,15 @@ import { readCommandText } from "./textInput.js";
 import {
   createRoleSessionSet,
   roleAgentSessionResumeMode,
+  updateTaskRoleProviderRuntime,
   updateRoleAgentSessionStatus,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
+import {
+  currentProviderActivation,
+  transferProviderAuthority
+} from "../runtime/providerRuntimeIdentity.js";
+import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
 import {
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
@@ -362,11 +368,21 @@ function taskFinalReviewContractForMutation(
 export type TaskCommandExecution =
   | Readonly<{ kind: "output"; output: string; data?: unknown }>
   | Readonly<{
-      kind: "enter";
+      kind: "view";
       taskId: string;
       roleName: string;
-      access: "read-only" | "read-write";
+      access: "read-only";
       output?: string;
+    }>
+  | Readonly<{
+      kind: "authority";
+      action: "takeover" | "release";
+      taskId: string;
+      roleName: string;
+      launchId: string;
+      nativeSessionId: string;
+      authority: ProviderAuthorityFence;
+      output: string;
     }>;
 
 /**
@@ -580,7 +596,6 @@ export function runTaskCommand(
     case "milestone": return taskMilestoneCommand(rest, store, options);
     case "event": return taskEventCommand(rest, store);
     case "continuation": return taskContinuationCommand(rest, store);
-    case "enter": return enterTaskRoleAlias(rest, store, options);
     default:
       throw usageError(command === undefined
         ? "Task command is required."
@@ -812,8 +827,8 @@ export function runTaskOutputCommand(
   options: TaskCommandOptions = {}
 ): string {
   const execution = runTaskCommand(args, store, options);
-  if (execution.kind === "enter") {
-    throw runtimeError("Task role enter requires foreground tmux handoff by the CLI.");
+  if (execution.kind !== "output") {
+    throw runtimeError("Task Role foreground runtime control requires the CLI.");
   }
   return execution.output;
 }
@@ -1777,7 +1792,9 @@ function taskRoleCommand(
   if (command === "bind") return output(bindTaskRole(rest, store, options));
   if (command === "unbind") return output(unbindTaskRole(rest, store, options));
   if (command === "reset") return resetTaskRole(rest, store, options);
-  if (command === "enter") return enterTaskRole(rest, store, options);
+  if (command === "view") return viewTaskRole(rest, store);
+  if (command === "takeover") return transferTaskRoleAuthority(rest, store, options, "takeover");
+  if (command === "release") return transferTaskRoleAuthority(rest, store, options, "release");
   throw usageError(command === undefined
     ? "Task role command is required."
     : `Unknown command: task role ${command}`);
@@ -2169,98 +2186,119 @@ function unbindTaskRole(
   return `Unbound Agent ${args[2]} from ${result.taskId}/${result.name}\n`;
 }
 
-function enterTaskRole(
+function viewTaskRole(
   args: string[],
-  store: TaskWorkflowStore,
-  _options: TaskCommandOptions
+  store: TaskWorkflowStore
 ): TaskCommandExecution {
-  const usage = "Task role enter usage: yui task role enter <task> <role> "
-    + "[--read-only | --read-write].";
-  const parsed = parseTail(
-    args,
-    new Set(),
-    usage,
-    new Set(["--read-only", "--read-write"])
-  );
-  exactPositionals(parsed.positionals, 2, usage);
-  if (parsed.options.has("--read-only") && parsed.options.has("--read-write")) {
-    throw usageError("--read-only and --read-write are mutually exclusive.", usage);
-  }
-  const task = requireTask(store, parsed.positionals[0]);
+  const usage = "Task role view usage: yui task role view <task> <role>.";
+  exactPositionals(args, 2, usage);
+  const task = requireTask(store, args[0]);
   if (task.status !== "active") {
-    throw usageError(inactiveTaskMessage(task, "entering a role session"));
+    throw usageError(inactiveTaskMessage(task, "viewing a role session"));
   }
-  const role = requireRole(store, task.id, parsed.positionals[1]);
-  const access = parsed.options.has("--read-write") ? "read-write" : "read-only";
-  if (access === "read-write") {
-    assertTaskRoleWritableAttachAvailable(store, task.id, role.name);
+  const role = requireRole(store, task.id, args[1]);
+  const session = store.getRoleSession(task.id, role.name);
+  if (session === null || session.status === "stopped" || session.status === "broken") {
+    throw usageError(`Task Role has no live Provider view: ${task.id}/${role.name}.`);
   }
   return {
-    kind: "enter",
+    kind: "view",
     taskId: task.id,
     roleName: role.name,
-    access,
-    output: `Attaching to ${role.name} for ${task.id} (${access})\n`
+    access: "read-only",
+    output: `Viewing ${role.name} for ${task.id} (read-only)\n`
   };
 }
 
-/** Re-run after the tmux writer lease exists to close attach/launch races. */
-export function assertTaskRoleWritableAttachAvailable(
-  store: TaskWorkflowStore,
-  taskId: string,
-  roleName: string,
-  options: Readonly<{
-    /** Exact pane probe used after the tmux writer lease is visible. */
-    isManagedProcessRunning?: () => boolean;
-  }> = {}
-): void {
-  const role = requireRole(store, taskId, roleName);
-  if (store.getActiveAgentRun(taskId, roleName) !== null) {
-    throw usageError(
-      `Role has an active managed Run; writable attach is unavailable: ${taskId}/${roleName}.`
-    );
-  }
-  const session = store.getRoleSession(taskId, roleName);
-  if (
-    activeRoleAgentBinding(role).adapterId === "claude"
-    && (
-      (
-        session !== null
-        && session.status !== "stopped"
-        && session.status !== "broken"
-      )
-      || options.isManagedProcessRunning?.() === true
-    )
-  ) {
-    throw usageError(
-      `A managed Claude process is still running; writable attach is unavailable: ${taskId}/${roleName}.`
-    );
-  }
-}
-
-function enterTaskRoleAlias(
+function transferTaskRoleAuthority(
   args: string[],
   store: TaskWorkflowStore,
-  options: TaskCommandOptions
+  options: TaskCommandOptions,
+  action: "takeover" | "release"
 ): TaskCommandExecution {
-  const usage = "Task enter usage: yui task enter <task> [role] "
-    + "[--read-only | --read-write].";
-  const parsed = parseTail(
-    args,
-    new Set(),
-    usage,
-    new Set(["--read-only", "--read-write"])
-  );
-  if (parsed.positionals.length < 1 || parsed.positionals.length > 2
-    || parsed.positionals.some((value) => value.trim().length === 0)) {
-    throw usageError(usage);
+  const usage = `Task role ${action} usage: yui task role ${action} <task> <role>.`;
+  exactPositionals(args, 2, usage);
+  const now = clock(options);
+  try {
+    return store.transaction((tx) => {
+      const task = requireTask(tx, args[0]);
+      if (task.status !== "active") {
+        throw usageError(inactiveTaskMessage(task, `${action} Provider authority`));
+      }
+      const role = requireRole(tx, task.id, args[1]);
+      const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+      const session = sessions?.sessions[role.activeAgentId];
+      const binding = sessions?.providerBinding;
+      if (sessions === null || sessions === undefined || session === undefined
+        || binding === null || binding === undefined
+        || session.launchId === undefined
+        || session.status === "stopped" || session.status === "broken") {
+        throw new Error(`Task Role has no live managed Provider: ${task.id}/${role.name}.`);
+      }
+      const activation = currentProviderActivation(binding);
+      if (activation === null) {
+        throw new Error(`Provider Activation is not live: ${task.id}/${role.name}.`);
+      }
+      if (action === "takeover") {
+        const activeRun = tx.getActiveAgentRun(task.id, role.name);
+        if (sessions.inFlight === null || activeRun?.id !== sessions.inFlight.runId) {
+          throw new Error(`Task Role has no active managed Run for takeover: ${task.id}/${role.name}.`);
+        }
+      }
+      if (action === "takeover"
+        && binding.authority.owner !== "controller"
+        && binding.authority.owner !== "human") {
+        throw new Error(`Provider authority is not Controller-owned: ${task.id}/${role.name}.`);
+      }
+      if (action === "release"
+        && binding.authority.owner !== "human"
+        && binding.authority.owner !== "controller") {
+        throw new Error(`Provider authority is not human-owned: ${task.id}/${role.name}.`);
+      }
+      const desiredOwner = action === "takeover" ? "human" : "controller";
+      const unchanged = binding.authority.owner === desiredOwner;
+      const updatedBinding = unchanged
+        ? binding
+        : transferProviderAuthority(binding, {
+            expectedEpoch: binding.authority.epoch,
+            expectedOwner: binding.authority.owner,
+            owner: desiredOwner,
+            holderId: action === "takeover" ? `human:${randomUUID()}` : activation.activationId,
+            changedAt: now.toISOString()
+          });
+      const authority = updatedBinding.authority;
+      if (authority.owner !== "controller" && authority.owner !== "human") {
+        throw new Error("Provider authority transfer did not produce a writer.");
+      }
+      if (!unchanged) {
+        tx.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(sessions, updatedBinding, now));
+        recordTaskEvent(tx, task.id, "runtime.provider-authority-transferred", {
+          role: role.name,
+          owner: authority.owner,
+          holderId: authority.holderId!,
+          epoch: String(authority.epoch)
+        }, now);
+      }
+      return {
+        kind: "authority" as const,
+        action,
+        taskId: task.id,
+        roleName: role.name,
+        launchId: session.launchId,
+        nativeSessionId: session.nativeSessionId,
+        authority: {
+          epoch: authority.epoch,
+          owner: authority.owner,
+          holderId: authority.holderId!
+        },
+        output: action === "takeover"
+          ? `Human authority ${unchanged ? "replayed" : "acquired"} for ${task.id}/${role.name} at epoch ${authority.epoch}.\n`
+          : `Controller authority ${unchanged ? "replayed" : "restored"} for ${task.id}/${role.name} at epoch ${authority.epoch}.\n`
+      };
+    });
+  } catch (error) {
+    throw usageError(messageOf(error), usage);
   }
-  return enterTaskRole([
-    parsed.positionals[0],
-    parsed.positionals[1] ?? LEADER_ROLE,
-    ...(parsed.options.has("--read-only") ? ["--read-only"] : []),
-    ...(parsed.options.has("--read-write") ? ["--read-write"] : [])
-  ], store, options);
 }
 
 function taskWorkCommand(

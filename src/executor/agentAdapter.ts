@@ -129,6 +129,9 @@ export type CompiledAgentLaunch = Readonly<{
   argv: readonly string[];
   sessionStrategy: "runtime-discovery" | "preallocated";
 }>;
+export type CompiledManagedControlLaunch = CompiledAgentLaunch & Readonly<{
+  transport: "codex-app-server-stdio" | "claude-stream-json";
+}>;
 
 export interface AgentAdapter<TConfig extends RoleAgentConfig = RoleAgentConfig> {
   readonly id: AgentAdapterId;
@@ -143,6 +146,11 @@ export interface AgentAdapter<TConfig extends RoleAgentConfig = RoleAgentConfig>
   validateConfig(input: CompileInput<TConfig>): void;
   compileNew(input: CompileInput<TConfig>): CompiledAgentLaunch;
   compileResume(input: ResumeInput<TConfig>): CompiledAgentLaunch;
+  compileManagedControl(
+    input: CompileInput<TConfig>,
+    mode: "new" | "resume",
+    nativeSessionId?: string
+  ): CompiledManagedControlLaunch;
   canonicalizeConfig(config: TConfig): TConfig;
   reservedArguments(): readonly string[];
   discoverConfiguration(input: AgentConfigurationDiscoveryInput): Promise<AgentConfigurationCatalog>;
@@ -162,6 +170,11 @@ abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdap
   abstract validateStructured(config: TConfig): void;
   abstract structuredArgs(config: TConfig): string[];
   abstract compileResume(input: ResumeInput<TConfig>): CompiledAgentLaunch;
+  abstract compileManagedControl(
+    input: CompileInput<TConfig>,
+    mode: "new" | "resume",
+    nativeSessionId?: string
+  ): CompiledManagedControlLaunch;
   abstract discoverConfiguration(
     input: AgentConfigurationDiscoveryInput
   ): Promise<AgentConfigurationCatalog>;
@@ -321,6 +334,30 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
     const launch = this.compileNew(input);
     return { ...launch, argv: [...launch.argv, "resume", nativeId(input.nativeSessionId)] };
   }
+
+  compileManagedControl(
+    input: CompileInput<CodexAgentConfig>,
+    _mode: "new" | "resume",
+    _nativeSessionId?: string
+  ): CompiledManagedControlLaunch {
+    const launch = this.compileNew(input);
+    const argv = [...launch.argv];
+    if (input.config.model !== undefined) {
+      const modelFlag = argv.findIndex((value, index) => (
+        value === "--model" && argv[index + 1] === input.config.model
+      ));
+      if (modelFlag < 0) throw new Error("Managed Codex launch lost its selected model.");
+      argv.splice(modelFlag, 2);
+      // App Server thread/start reads the model from resolved configuration;
+      // the interactive --model shortcut is not inherited by new threads.
+      argv.push("--config", `model=${tomlString(input.config.model)}`);
+    }
+    return {
+      ...launch,
+      argv: [...argv, "app-server", "--stdio"],
+      transport: "codex-app-server-stdio"
+    };
+  }
 }
 
 class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
@@ -427,6 +464,32 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
   compileResume(input: ResumeInput<ClaudeAgentConfig>): CompiledAgentLaunch {
     const launch = super.compileNew(input);
     return { ...launch, argv: [...launch.argv, "--resume", nativeId(input.nativeSessionId)] };
+  }
+  compileManagedControl(
+    input: CompileInput<ClaudeAgentConfig>,
+    mode: "new" | "resume",
+    nativeSessionId?: string
+  ): CompiledManagedControlLaunch {
+    if (nativeSessionId === undefined) {
+      throw new Error("Managed Claude control requires a preallocated native Session id.");
+    }
+    const sessionId = nativeId(nativeSessionId);
+    const launch = mode === "new"
+      ? super.compileNew(input)
+      : this.compileResume({ ...input, nativeSessionId: sessionId });
+    return {
+      ...launch,
+      argv: [
+        ...launch.argv,
+        ...(mode === "new" ? ["--session-id", sessionId] : []),
+        "-p",
+        "--output-format", "stream-json",
+        "--input-format", "stream-json",
+        "--verbose",
+        "--replay-user-messages"
+      ],
+      transport: "claude-stream-json"
+    };
   }
 }
 

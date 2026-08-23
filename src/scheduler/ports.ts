@@ -385,8 +385,8 @@ export interface SchedulerStorePort {
     nativeSessionId?: string;
   }>): boolean;
   hasInFlightTurn(taskId: string, roleName: string): boolean;
-  /** Exact currently-active Provider Turn fence, or null when no safe steer boundary exists. */
-  getActiveProviderTurnFence?(input: Readonly<{
+  /** Exact durable Provider writer; human/unknown ownership blocks Controller writes. */
+  getProviderAuthorityFence?(input: Readonly<{
     taskId: string;
     roleName: string;
     runId: string;
@@ -396,8 +396,29 @@ export interface SchedulerStorePort {
   }>): Readonly<{
     conversationId: string;
     activationId: string;
-    nativeTurnId: string;
+    epoch: number;
+    owner: "controller" | "human" | "none" | "unknown";
+    holderId?: string;
   }> | null;
+  beginRoleRunProviderTurn?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+    launchId: string;
+    nativeSessionId: string;
+    attemptId: string;
+    now: Date;
+  }>): boolean;
+  resolveRoleRunProviderSubmission?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    attemptId: string;
+    status: "rejected" | "delivery-unknown";
+    reason: string;
+    now: Date;
+  }>): boolean;
   peekNextAgentRunId(taskId: string): string;
   /** Freeze the exact authoritative context before claiming a new Leader Run. */
   freezeLeaderContextSnapshot?(
@@ -421,8 +442,8 @@ export interface SchedulerStorePort {
   claimInputDelivery(input: SchedulerInputDeliveryClaimInput): SchedulerInputDeliveryClaimResult;
   markInputDeliveryPushed(target: MailboxTarget, attemptId: string, now: Date): boolean;
   completeInputDelivery(target: MailboxTarget, attemptId: string, now: Date): boolean;
-  releaseInputDelivery(target: MailboxTarget, attemptId: string): boolean;
-  resolveInputDeliveryNotAccepted(target: MailboxTarget, attemptId: string): boolean;
+  releaseInputDelivery(target: MailboxTarget, attemptId: string, now: Date): boolean;
+  resolveInputDeliveryNotAccepted(target: MailboxTarget, attemptId: string, now: Date): boolean;
   markInputDeliveryUnknown(
     target: MailboxTarget,
     attemptId: string,
@@ -653,8 +674,12 @@ export type PreparedRoleDelivery = Readonly<{
    * that do not expose a pre-readiness Session fact.
    */
   session?: SchedulerRoleSession | null;
-  /** Provider launch argv carried this Run's first prompt atomically. */
-  inputSubmittedAtLaunch?: boolean;
+  /** The launch workflow durably fenced and accepted this Run's first structured Turn. */
+  turnAcceptedDuringLaunch?: boolean;
+  /** Provider launch lost the exact acknowledgement for this Run's first Turn. */
+  turnDeliveryUnknownDuringLaunch?: boolean;
+  /** Provider definitively rejected this Run's first Turn during launch. */
+  turnRejectedDuringLaunch?: boolean;
 }>;
 
 export type ReadyRoleDelivery = Readonly<{
@@ -665,11 +690,10 @@ export type ReadyRoleDelivery = Readonly<{
 
 /**
  * The Scheduler never reads stdin and never writes terminal bytes itself.
- * A tmux-owned implementation launches/resumes the role, establishes terminal
- * readiness, and performs receipt-backed literal delivery.
+ * A tmux-owned Host implementation launches/resumes the role, establishes the
+ * structured Provider control channel, and performs receipt-backed delivery.
  */
 export interface TmuxDeliveryPort {
-  canRouteProviderInput?(adapterId: string): boolean;
   prepareRoleSession(input: Readonly<{
     taskId: string;
     roleName: string;
@@ -689,33 +713,9 @@ export interface TmuxDeliveryPort {
     delivery: ReadyRoleDelivery;
     receiptId: string;
     text: string;
-  }>): Promise<"sent" | "already-sent" | "busy" | "unavailable">;
-  routeProviderInput?(input: Readonly<{
-    delivery: ReadyRoleDelivery;
-    attemptId: string;
-    mode: "steer-if-safe" | "inject";
-    text: string;
-    fence: Readonly<{
-      conversationId: string;
-      activationId: string;
-      nativeTurnId?: string;
-    }>;
-  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unsafe" | "unavailable">;
-  reconcileProviderInput?(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    agentId: string;
-    adapterId: string;
-    launchId: string;
-    nativeSessionId: string;
-    attemptId: string;
-    mode: "followup" | "steer-if-safe" | "inject";
-    fence: Readonly<{
-      conversationId: string;
-      activationId: string;
-      nativeTurnId?: string;
-    }>;
-  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unavailable">;
+  }>): Promise<
+    "sent" | "already-sent" | "busy" | "rejected" | "delivery-unknown" | "unavailable"
+  >;
   /**
    * Drops transient prepared bindings after authoritative terminal/absence
    * state. Omitting runId clears every prepared generation for the Role.

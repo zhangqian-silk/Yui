@@ -376,16 +376,17 @@ export function buildControllerResourceInventory(
         : processTree(processes, pane.pid);
       for (const process of paneProcesses) claimed.add(process.pid);
       const role = findRole(homeFact.roles, pane);
-      const archived = role?.taskStatus === "archived";
+      const terminalIsolation = role?.taskStatus === "retired"
+        || role?.taskStatus === "archived";
       resources.push(processResource({
         kind: "agent-session",
         state: pane.dead ? "dead" : role === undefined ? "orphaned" : "running",
         disposition: role === undefined
           ? pane.dead ? "safe" : "review"
-          : archived ? "safe" : "protected",
+          : terminalIsolation ? "safe" : "protected",
         reasonCode: role === undefined
           ? pane.dead ? "dead-orphan-pane" : "orphan-pane"
-          : archived ? "archived-task-pane" : "owned-role-pane",
+          : terminalIsolation ? `${role.taskStatus}-task-pane` : "owned-role-pane",
         yuiHome,
         owner: role === undefined ? { kind: "none" } : roleOwner(role),
         processes: paneProcesses,
@@ -678,10 +679,13 @@ function artifactResource(
 
 function domainDisposition(
   base: CleanupDisposition,
-  _reason: string | undefined,
+  reason: string | undefined,
   domain: RuntimeDomainFact | undefined,
   target?: string
 ): CleanupDisposition {
+  if (reason === "retired-task-pane" || reason === "archived-task-pane") {
+    return "safe";
+  }
   if (domain === undefined) return base;
   if (domain.disposition === "safe") {
     // Once the exact host identity has expired past grace, every resource
@@ -699,7 +703,7 @@ function domainDisposition(
       // A tmux server with panes is protected until the pane resources have
       // been removed and a later bounded pass can revalidate the empty
       // server. This avoids killing a server while a target race is in flight.
-      if (base === "protected" && _reason === "owned-tmux-server") return "protected";
+      if (base === "protected" && reason === "owned-tmux-server") return "protected";
       // `report-only` is deliberately reserved for an unrecognized process;
       // the YUI_HOME environment alone is not a cleanup ownership proof.
       return base === "report-only" ? "report-only" : "safe";

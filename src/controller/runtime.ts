@@ -65,15 +65,14 @@ import {
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager, yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
+  AgentHostPromptPushAdapter,
   FileTaskRuntimeIsolation,
-  TmuxPromptPushAdapter,
   TmuxSessionHost,
   type ActivePromptPushPort,
   type AgentEnvironmentRefreshPort,
   type RuntimeLaunchPreparationPort,
   ProviderContinuationReconciliationService,
   type ProviderContinuationMetadataPort,
-  type ProviderInputRoutingPort,
   type TaskRuntimeIsolationPort,
   type TaskRuntimeLifecycleCleanupPort,
   type SessionHostPort
@@ -83,7 +82,10 @@ import {
   type ControllerRuntimeOptions,
   type RunningFileTaskController
 } from "./controller.js";
-import { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
+import {
+  AgentHostProviderTurnFenceError,
+  FileSchedulerStoreAdapter
+} from "./fileSchedulerStoreAdapter.js";
 import { openSchedulerTelemetry } from "../telemetry/telemetryWiring.js";
 import {
   createFileArtifactPort,
@@ -124,7 +126,10 @@ import {
 } from "../runtime/processExitObservation.js";
 import { appendGlobalProcessExitObservation } from "../runtime/globalProcessExitStore.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
-import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
+import {
+  createRuntimeObservation,
+  runtimeObservationFromTaskEvent
+} from "../runtime/runtimeObservation.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
@@ -142,8 +147,6 @@ export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readon
   catalogs?: AgentConfigurationCatalogService;
   /** Optional Adapter metadata query; never grants model/launch authority. */
   continuationMetadata?: ProviderContinuationMetadataPort;
-  /** Must share the same Provider SessionHost/Activation ownership. */
-  providerInputRouting?: ProviderInputRoutingPort;
 }>;
 
 export type RunningFileTaskControllerRuntime = RunningFileTaskController & Readonly<{
@@ -350,7 +353,7 @@ export async function startFileTaskControllerRuntime(
     }
   });
   const promptPush = options.promptPush
-    ?? new TmuxPromptPushAdapter(tmux, agentProcessReadinessProbe);
+    ?? new AgentHostPromptPushAdapter(home);
   const runtimeIsolation = options.runtimeIsolation
     ?? new FileTaskRuntimeIsolation({
       // A sibling of the exact control Home keeps provider data/cache/tmp out
@@ -461,9 +464,6 @@ export async function startFileTaskControllerRuntime(
       sessionHost,
       promptPush,
       launchCoordinator,
-      ...(options.providerInputRouting === undefined
-        ? {}
-        : { providerInputRouting: options.providerInputRouting }),
       roleResourceInventory: async (panes, inputs) => {
         const inventory = await scanInventory(panes);
         return inventory.resources.flatMap((resource) => {
@@ -768,6 +768,57 @@ export function createRuntimeLifecycleDispatcher(
     });
   const lifecycleTails = new Map<string, Promise<void>>();
   return async (method, params) => {
+    if (method === "runtime.observation-apply") {
+      return {
+        outcome: schedulerStore.observeRuntimeObservation(
+          createRuntimeObservation(params as never),
+          new Date()
+        )
+      };
+    }
+    if (method === "runtime.provider-turn-begin") {
+      const value = providerTurnControlParams(params);
+      try {
+        schedulerStore.beginAgentHostProviderTurn({
+          taskId: value.taskId,
+          roleName: value.roleName,
+          runId: value.runId,
+          agentId: value.agentId,
+          launchId: value.launchId,
+          nativeSessionId: value.nativeSessionId,
+          attemptId: value.attemptId,
+          authorityEpoch: value.authorityEpoch,
+          authorityOwner: value.authorityOwner,
+          holderId: value.holderId,
+          now: value.now
+        });
+      } catch (error) {
+        if (error instanceof AgentHostProviderTurnFenceError) {
+          throw applicationError("INVALID_PARAMS", error.message);
+        }
+        throw error;
+      }
+      return { recorded: true };
+    }
+    if (method === "runtime.provider-turn-submission-resolve") {
+      const value = providerTurnControlParams(params);
+      const status = (params as Record<string, unknown>).status;
+      const reason = (params as Record<string, unknown>).reason;
+      if ((status !== "rejected" && status !== "delivery-unknown")
+        || typeof reason !== "string" || reason.trim().length === 0) {
+        throw applicationError("INVALID_PARAMS", "Provider Turn resolution is invalid.");
+      }
+      schedulerStore.resolveAgentHostProviderTurnSubmission({
+        taskId: value.taskId,
+        roleName: value.roleName,
+        runId: value.runId,
+        attemptId: value.attemptId,
+        status,
+        reason,
+        now: value.now
+      });
+      return { recorded: true };
+    }
     if (method === "runtime.process-exit-observe") {
       const observation = validateRuntimeProcessExitObservation(params as never);
       const run = observation.taskId === undefined || observation.runId === undefined
@@ -1431,6 +1482,46 @@ function requiredParam(value: JsonValue | undefined): string {
     throw applicationError("INVALID_PARAMS", "Runtime session params are invalid.");
   }
   return value;
+}
+
+function providerTurnControlParams(params: JsonValue): Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  agentId: string;
+  launchId: string;
+  nativeSessionId: string;
+  attemptId: string;
+  authorityEpoch: number;
+  authorityOwner: "controller" | "human";
+  holderId: string;
+  now: Date;
+}> {
+  if (typeof params !== "object" || params === null || Array.isArray(params)) {
+    throw applicationError("INVALID_PARAMS", "Provider Turn control params are invalid.");
+  }
+  const value = params as Readonly<Record<string, JsonValue>>;
+  const authorityEpoch = value.authorityEpoch;
+  const authorityOwner = value.authorityOwner;
+  const observedAt = requiredParam(value.observedAt);
+  if (!Number.isSafeInteger(authorityEpoch) || (authorityEpoch as number) < 1
+    || (authorityOwner !== "controller" && authorityOwner !== "human")
+    || !Number.isFinite(Date.parse(observedAt))) {
+    throw applicationError("INVALID_PARAMS", "Provider Turn control fence is invalid.");
+  }
+  return {
+    taskId: requiredParam(value.taskId),
+    roleName: requiredParam(value.roleName),
+    runId: requiredParam(value.runId),
+    agentId: requiredParam(value.agentId),
+    launchId: requiredParam(value.launchId),
+    nativeSessionId: requiredParam(value.nativeSessionId),
+    attemptId: requiredParam(value.attemptId),
+    authorityEpoch: authorityEpoch as number,
+    authorityOwner,
+    holderId: requiredParam(value.holderId),
+    now: new Date(observedAt)
+  };
 }
 
 function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {

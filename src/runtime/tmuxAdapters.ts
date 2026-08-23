@@ -34,10 +34,17 @@ import { builtinAgentDriverRegistry } from "./builtinAgentDrivers.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
+import {
+  YUI_CONTROL_PLANE_DESCRIPTOR,
+  YUI_TASK_RUNTIME_DESCRIPTOR
+} from "./exactControlPlane.js";
 import { launchBrokerForHome, type AgentHostLaunchPayload } from "./launchBroker.js";
 import {
   AGENT_HOST_CONTROL_PROTOCOL,
-  sendAgentHostLaunchControl
+  sendAgentHostLaunchControl,
+  sendAgentHostTurnControl,
+  waitForAgentHostLaunchAck,
+  type AgentHostSnapshot
 } from "./agentHost.js";
 
 export type RuntimeTmuxRole = Readonly<{
@@ -51,7 +58,7 @@ export type RuntimeTmuxLaunchPlan = Readonly<{
   command: string;
   args: readonly string[];
   env: Readonly<Record<string, string>>;
-  providerInput?: AgentHostLaunchPayload["providerInput"];
+  providerControl?: AgentHostLaunchPayload["providerControl"];
   childLifecycle?: AgentHostLaunchPayload["childLifecycle"];
   deferProviderStart?: boolean;
 }>;
@@ -60,8 +67,8 @@ export type RuntimePlannedSession = Readonly<{
   role: RuntimeTmuxRole;
   launch: RuntimeTmuxLaunchPlan;
   session: Readonly<{ nativeSessionId?: string }> | null;
-  /** Exact Run whose first prompt is submitted by the fresh host process. */
-  initialPromptRunId?: string;
+  /** Exact Run whose first structured Turn is handled by this launch workflow. */
+  initialTurnRunId?: string;
 }>;
 
 /** Narrow structural boundary implemented by FileRoleLaunchPlanner. */
@@ -176,29 +183,6 @@ export type RuntimeTmuxPaneState = Readonly<{
 
 export type RuntimeReadinessProbe = (pane: RuntimeTmuxPaneState) => boolean;
 export type RuntimeReadinessResolver = (adapterId: string) => RuntimeReadinessProbe;
-
-/** The non-blocking delivery subset required from TmuxManager. */
-export interface RuntimeTmuxPromptPort {
-  probeRoleStatus(hostId: string, roleName: string): "running" | "exited";
-  probeRoleStatusAsync?(
-    hostId: string,
-    roleName: string
-  ): Promise<"running" | "exited">;
-  sendRoleInputOnceIfReady(
-    hostId: string,
-    roleName: string,
-    receiptId: string,
-    input: string,
-    readinessProbe: RuntimeReadinessProbe
-  ): "sent" | "already-sent" | "not-ready" | "unavailable";
-  sendRoleInputOnceIfReadyAsync?(
-    hostId: string,
-    roleName: string,
-    receiptId: string,
-    input: string,
-    readinessProbe: RuntimeReadinessProbe
-  ): Promise<"sent" | "already-sent" | "not-ready" | "unavailable">;
-}
 
 export type TmuxSessionHostOptions = Readonly<{
   /** Current global Operator topology uses one synthetic tmux Task session. */
@@ -491,16 +475,18 @@ export class TmuxSessionHost implements SessionHostPort {
       adapterId: request.adapterId,
       effective: request.effective,
       ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
-      ...(planned.initialPromptRunId === undefined
+      ...(planned.initialTurnRunId === undefined
         ? {}
-        : { initialPromptRunId: planned.initialPromptRunId })
+        : { initialTurnRunId: planned.initialTurnRunId })
     });
     const yuiHome = planned.launch.env.YUI_HOME;
     const childLifecycle = planned.launch.childLifecycle;
-    // Custom/legacy planners do not yet expose the Agent Host contract. Keep
-    // their direct launch behavior for compatibility while all built-in
-    // managed Roles use the persistent Host below.
+    // Interactive/global Roles may still be native TUIs. A managed Task Run
+    // has no terminal-write fallback and must expose the Agent Host contract.
     if (yuiHome === undefined || childLifecycle === undefined) {
+      if (request.owner.scope === "task" && request.runId !== undefined) {
+        throw new Error("Managed Task Run is missing its structured Agent Host contract.");
+      }
       let hostCreated: boolean;
       try {
         hostCreated = await ensureRoleWindow(this.tmux, hostId, planned.role, planned.launch);
@@ -519,8 +505,8 @@ export class TmuxSessionHost implements SessionHostPort {
           roleName: request.owner.roleName
         }),
         hostCreated,
-        ...(hostCreated && planned.initialPromptRunId !== undefined
-          ? { initialPromptRunId: planned.initialPromptRunId }
+        ...(hostCreated && planned.initialTurnRunId !== undefined
+          ? { initialTurnRunId: planned.initialTurnRunId }
           : {}),
         ...(nativeSessionId === undefined ? {} : { nativeSessionId })
       });
@@ -538,7 +524,7 @@ export class TmuxSessionHost implements SessionHostPort {
         if (request.mode === "new"
           && request.owner.scope === "task"
           && request.runId !== undefined
-          && planned.initialPromptRunId === request.runId
+          && planned.initialTurnRunId === request.runId
           && this.#waitForNativeSession !== undefined) {
           binding = createRuntimeBinding({
             ...binding,
@@ -554,6 +540,12 @@ export class TmuxSessionHost implements SessionHostPort {
       return binding;
     }
     const broker = launchBrokerForHome(yuiHome);
+    const frozenControlPlane = planned.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR];
+    const frozenTaskRuntime = planned.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
+    if (request.owner.scope === "task" && request.runId !== undefined
+      && (frozenControlPlane === undefined || frozenTaskRuntime === undefined)) {
+      throw new Error("Managed Task Agent Host launch is missing its frozen control descriptors.");
+    }
     const reservation = broker.reserve(Object.freeze({
       schemaVersion: 1,
       launchId: request.launchId,
@@ -563,9 +555,9 @@ export class TmuxSessionHost implements SessionHostPort {
       cwd: planned.role.cwd ?? planned.role.workspace,
       childLifecycle,
       startMode: planned.launch.deferProviderStart === true ? "idle" : "provider",
-      ...(planned.launch.providerInput === undefined
+      ...(planned.launch.providerControl === undefined
         ? {}
-        : { providerInput: planned.launch.providerInput })
+        : { providerControl: planned.launch.providerControl })
     }));
     const hostLaunch = {
       command: process.execPath,
@@ -581,15 +573,50 @@ export class TmuxSessionHost implements SessionHostPort {
         YUI_SESSION_SCOPE: request.owner.scope,
         ...(request.owner.scope === "task" ? { YUI_TASK_ID: request.owner.taskId } : {}),
         YUI_ROLE: request.owner.roleName,
-        YUI_LAUNCH_ID: request.launchId
+        YUI_LAUNCH_ID: request.launchId,
+        ...(planned.launch.env.YUI_AGENT_ID === undefined
+          ? {}
+          : { YUI_AGENT_ID: planned.launch.env.YUI_AGENT_ID }),
+        ...(planned.launch.env.YUI_ADAPTER_ID === undefined
+          ? {}
+          : { YUI_ADAPTER_ID: planned.launch.env.YUI_ADAPTER_ID }),
+        ...(planned.launch.env.YUI_WORKSPACE === undefined
+          ? {}
+          : { YUI_WORKSPACE: planned.launch.env.YUI_WORKSPACE }),
+        ...(frozenControlPlane === undefined
+          ? {}
+          : { [YUI_CONTROL_PLANE_DESCRIPTOR]: frozenControlPlane }),
+        ...(frozenTaskRuntime === undefined
+          ? {}
+          : { [YUI_TASK_RUNTIME_DESCRIPTOR]: frozenTaskRuntime })
       }
     };
     let hostCreated: boolean;
-    let providerChildLaunched = false;
-    let launchPromptAlreadySubmitted = false;
+    let providerAcknowledged = false;
+    let providerDeliveryUnknown = false;
+    let providerRejected = false;
+    let providerDispatchObserved = false;
+    let providerSnapshot: AgentHostSnapshot | undefined;
     try {
       hostCreated = await ensureRoleWindow(this.tmux, hostId, planned.role, hostLaunch);
-      providerChildLaunched = hostCreated && planned.launch.deferProviderStart !== true;
+      if (hostCreated && planned.launch.deferProviderStart !== true) {
+        providerSnapshot = await waitForAgentHostLaunchAck({
+          home: yuiHome,
+          scope: request.owner.scope,
+          ...(request.owner.scope === "task" ? { taskId: request.owner.taskId } : {}),
+          roleName: request.owner.roleName,
+          launchId: reservation.launchId,
+          requireTurnAck: planned.initialTurnRunId !== undefined
+        });
+        providerDeliveryUnknown = providerSnapshot.state === "delivery-unknown";
+        providerRejected = planned.initialTurnRunId !== undefined
+          && providerSnapshot.state === "rejected";
+        providerAcknowledged = !providerDeliveryUnknown && !providerRejected;
+        if (providerSnapshot.state === "rejected" && !providerRejected) {
+          throw new Error("Agent Host rejected a launch without an initial Provider Turn.");
+        }
+        providerDispatchObserved = true;
+      }
       if (!hostCreated) {
         const controlResult = await sendAgentHostLaunchControl({
           home: yuiHome,
@@ -603,25 +630,43 @@ export class TmuxSessionHost implements SessionHostPort {
             ticket: reservation.ticket
           }
         });
-        if (controlResult !== "accepted") {
+        if (controlResult.outcome === "active-other-launch") {
           broker.revoke(request.launchId);
-          launchPromptAlreadySubmitted = controlResult === "active-same-launch";
-          if (childLifecycle === "per-turn" && controlResult === "active-other-launch") {
-            throw new RuntimeHostContentionError(
-              "provider-child-active",
-              `The persistent Agent Host for ${request.owner.roleName} still owns another Provider turn.`
-            );
-          }
-        } else {
-          providerChildLaunched = planned.launch.deferProviderStart !== true;
+          throw new RuntimeHostContentionError(
+            "provider-child-active",
+            `The persistent Agent Host for ${request.owner.roleName} still owns another Provider Turn.`
+          );
         }
+        if (controlResult.outcome === "active-same-launch") {
+          broker.revoke(request.launchId);
+        }
+        const acceptableState = controlResult.snapshot.state === "ready"
+          || (planned.initialTurnRunId === undefined
+            && controlResult.snapshot.state === "idle");
+        const deliveryUnknownState = planned.initialTurnRunId !== undefined
+          && controlResult.snapshot.state === "delivery-unknown";
+        const rejectedState = planned.initialTurnRunId !== undefined
+          && controlResult.snapshot.state === "rejected";
+        if ((!acceptableState && !deliveryUnknownState && !rejectedState)
+          || controlResult.snapshot.launchId !== reservation.launchId) {
+          broker.revoke(request.launchId);
+          throw new Error(
+            `Agent Host did not return an exact Provider acknowledgement for ${reservation.launchId}.`
+          );
+        }
+        providerSnapshot = controlResult.snapshot;
+        providerAcknowledged = acceptableState;
+        providerDeliveryUnknown = deliveryUnknownState;
+        providerRejected = rejectedState;
+        providerDispatchObserved = true;
       }
     } catch (error) {
       broker.revoke(request.launchId);
       throw error;
     }
     if (
-      providerChildLaunched
+      providerDispatchObserved
+      && hostCreated
       && request.owner.scope === "task"
       && planned.launch.env.YUI_JOB_CALLER_KEY !== undefined
       && this.planner.commitTaskCallerKey !== undefined
@@ -645,14 +690,21 @@ export class TmuxSessionHost implements SessionHostPort {
         roleName: request.owner.roleName
       }),
       hostCreated,
-      ...(providerChildLaunched && hostCreated && planned.initialPromptRunId !== undefined
-        ? { initialPromptRunId: planned.initialPromptRunId }
+      ...(providerAcknowledged && planned.initialTurnRunId !== undefined
+        ? { initialTurnRunId: planned.initialTurnRunId }
         : {}),
-      ...((launchPromptAlreadySubmitted || (providerChildLaunched && !hostCreated))
-        && planned.initialPromptRunId !== undefined
-        ? { launchPromptUncertainRunId: planned.initialPromptRunId }
+      ...(providerDeliveryUnknown && planned.initialTurnRunId !== undefined
+        ? { initialTurnDeliveryUnknownRunId: planned.initialTurnRunId }
         : {}),
-      ...(nativeSessionId === undefined ? {} : { nativeSessionId })
+      ...(providerRejected && planned.initialTurnRunId !== undefined
+        ? { initialTurnRejectedRunId: planned.initialTurnRunId }
+        : {}),
+      ...((providerSnapshot?.nativeSessionId ?? nativeSessionId) === undefined
+        ? {}
+        : { nativeSessionId: providerSnapshot?.nativeSessionId ?? nativeSessionId }),
+      ...(planned.launch.providerControl === undefined
+        ? {}
+        : { providerAuthority: planned.launch.providerControl.authority })
     });
     if (hostCreated && this.#onHostCreated !== undefined) {
       const pane = await inspectRolePane(this.tmux, hostId, request.owner.roleName);
@@ -754,33 +806,52 @@ async function deadHostLaunchFailure(
   );
 }
 
-/** Non-blocking receipt-backed tmux push; it never interprets provider output. */
-export class TmuxPromptPushAdapter implements ActivePromptPushPort {
-  constructor(
-    private readonly tmux: RuntimeTmuxPromptPort,
-    private readonly readiness: RuntimeReadinessResolver
-  ) {}
+/** Structured managed-Run input; tmux remains presentation/liveness only. */
+export class AgentHostPromptPushAdapter implements ActivePromptPushPort {
+  constructor(private readonly home: string) {}
 
   async tryPush(request: ActivePromptPushRequest): Promise<PromptPushResult> {
     const ref = requireMatchingHostRef(request.binding);
-    const readinessProbe = this.readiness(request.binding.adapterId);
-    const outcome = this.tmux.sendRoleInputOnceIfReadyAsync === undefined
-      ? this.tmux.sendRoleInputOnceIfReady(
-          ref.hostId,
-          ref.roleName,
-          request.envelope.id,
-          request.envelope.text,
-          readinessProbe
-        )
-      : await this.tmux.sendRoleInputOnceIfReadyAsync(
-          ref.hostId,
-          ref.roleName,
-          request.envelope.id,
-          request.envelope.text,
-          readinessProbe
-        );
-    if (outcome === "unavailable") return "unavailable";
-    return outcome === "not-ready" ? "busy" : "delivered";
+    if (ref.scope !== "task" || request.binding.nativeSessionId === undefined
+      || request.binding.providerAuthority === undefined
+      || request.binding.providerAuthority.owner !== "controller") {
+      return "unavailable";
+    }
+    try {
+      const result = await sendAgentHostTurnControl({
+        home: this.home,
+        scope: "task",
+        taskId: ref.hostId,
+        roleName: ref.roleName,
+        control: {
+          protocol: AGENT_HOST_CONTROL_PROTOCOL,
+          type: "submit-turn",
+          launchId: request.binding.launchId,
+          nativeSessionId: request.binding.nativeSessionId,
+          authority: request.binding.providerAuthority,
+          turn: {
+            attemptId: request.envelope.id,
+            boundedText: request.envelope.text
+          }
+        }
+      });
+      if (result.snapshot.state === "delivery-unknown") return "delivery-unknown";
+      if (result.outcome === "rejected") return "rejected";
+      if (result.snapshot.attemptId !== request.envelope.id) {
+        return result.snapshot.state === "starting" || result.snapshot.state === "settling"
+          ? "busy"
+          : "unavailable";
+      }
+      if (result.snapshot.state === "ready") return "delivered";
+      return result.snapshot.state === "starting" || result.snapshot.state === "settling"
+        ? "busy"
+        : "unavailable";
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return code === "ENOENT" || code === "ECONNREFUSED"
+        ? "unavailable"
+        : "delivery-unknown";
+    }
   }
 }
 

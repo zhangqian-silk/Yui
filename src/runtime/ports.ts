@@ -79,7 +79,7 @@ export type RuntimeLaunchPreflight = Readonly<{
   adapterId: string;
   effective: EffectiveLaunchSnapshot;
   nativeSessionId?: string;
-  initialPromptRunId?: string;
+  initialTurnRunId?: string;
 }>;
 
 export type RuntimeLaunchPreStart = (preflight: RuntimeLaunchPreflight) => void;
@@ -141,7 +141,12 @@ export interface SessionHostPort {
   stopOwner(owner: RuntimeOwner): Promise<boolean>;
 }
 
-export type PromptPushResult = "delivered" | "busy" | "unavailable";
+export type PromptPushResult =
+  | "delivered"
+  | "busy"
+  | "rejected"
+  | "delivery-unknown"
+  | "unavailable";
 
 export type ActivePromptPushRequest = Readonly<{
   binding: RuntimeBinding;
@@ -150,29 +155,4 @@ export type ActivePromptPushRequest = Readonly<{
 
 export interface ActivePromptPushPort {
   tryPush(request: ActivePromptPushRequest): Promise<PromptPushResult>;
-}
-
-export interface ProviderInputRoutingPort {
-  route(input: Readonly<{
-    binding: RuntimeBinding;
-    attemptId: string;
-    mode: "steer-if-safe" | "inject";
-    text: string;
-    fence: Readonly<{
-      conversationId: string;
-      activationId: string;
-      nativeTurnId?: string;
-    }>;
-  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unsafe" | "unavailable">;
-  /** Metadata-only receipt/readback reconciliation; it must never start a model Turn. */
-  reconcile(input: Readonly<{
-    binding: RuntimeBinding;
-    attemptId: string;
-    mode: "followup" | "steer-if-safe" | "inject";
-    fence: Readonly<{
-      conversationId: string;
-      activationId: string;
-      nativeTurnId?: string;
-    }>;
-  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unavailable">;
 }

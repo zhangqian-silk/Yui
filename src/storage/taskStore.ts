@@ -391,7 +391,7 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 17 as const;
  * Keep these named at the storage boundary so the upgrade record-axis map can
  * assert it is classifying the same bytes the store reads and writes.
  */
-export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 5 as const;
+export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 6 as const;
 /**
  * v7 combines optional Issue 04 retry/receipt fields and Issue 05 Leader
  * actionability fields. All are optional, so the v6→v7 migration is a

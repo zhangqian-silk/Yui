@@ -600,7 +600,8 @@ const taskChildren: readonly NodeInput[] = [
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
-      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "reset", "enter"
+      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "reset",
+      "view", "takeover", "release"
     ] }],
     children: [
       {
@@ -635,10 +636,19 @@ const taskChildren: readonly NodeInput[] = [
         options: ["--reason"]
       },
       {
-        name: "enter",
-        summary: "Attach to an existing Task Role session without starting it.",
-        usage: "yui task role enter <task> <role> [--read-only | --read-write]",
-        options: ["--read-only", "--read-write"]
+        name: "view",
+        summary: "Attach read-only to a managed Provider presentation surface.",
+        usage: "yui task role view <task> <role>"
+      },
+      {
+        name: "takeover",
+        summary: "Acquire Provider writer authority and enter the PTY input gateway.",
+        usage: "yui task role takeover <task> <role>"
+      },
+      {
+        name: "release",
+        summary: "Return stranded human Provider authority to the Controller.",
+        usage: "yui task role release <task> <role>"
       }
     ]
   },
@@ -762,7 +772,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "recover", "yield", "checkpoint"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "recover", "yield", "context", "checkpoint"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
       {
@@ -792,6 +802,28 @@ const taskChildren: readonly NodeInput[] = [
         usage: "yui task run yield <task>/<run> (--summary <text>|--summary-file <path|->)",
         options: ["--summary", "--summary-file"],
         fileOptions: ["--summary-file"]
+      },
+      {
+        name: "context",
+        summary: "Load the exact authorized Run context.",
+        usage: "yui task run context <task>/<run> [--json]",
+        executable: true,
+        hidden: true,
+        sections: [{ id: "load", title: "Commands", entries: ["expand", "delta"] }],
+        children: [
+          {
+            name: "expand",
+            summary: "Expand one authorized Run context reference.",
+            usage: "yui task run context expand <task>/<run> <ref-id> [--mode full]",
+            options: ["--mode"]
+          },
+          {
+            name: "delta",
+            summary: "Load authorized Run context changes after a cursor.",
+            usage: "yui task run context delta <task>/<run> --after <cursor>",
+            options: ["--after"]
+          }
+        ]
       },
       {
         name: "checkpoint",
@@ -1027,12 +1059,6 @@ const taskChildren: readonly NodeInput[] = [
       { name: "show", summary: "Show one ChangeSet.", usage: "yui task change-set show <task>/<change-set>" }
     ]
   },
-  {
-    name: "enter",
-    summary: "Attach to an existing Task Role, defaulting to Leader and read-only.",
-    usage: "yui task enter <task> [role] [--read-only | --read-write]",
-    options: ["--read-only", "--read-write"]
-  }
 ];
 
 export const ROOT_COMMAND = buildNode({
@@ -1407,7 +1433,7 @@ export const ROOT_COMMAND = buildNode({
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "continuation", "wake"] }
       ],
       children: taskChildren
@@ -1447,8 +1473,17 @@ export const ROOT_COMMAND = buildNode({
       name: "internal",
       summary: "Internal Yui callbacks.",
       hidden: true,
-      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "runtime-hook"] }],
+      sections: [{
+        id: "callbacks",
+        title: "Callbacks",
+        entries: ["session-notify", "runtime-hook", "agent-host"]
+      }],
       children: [
+        {
+          name: "agent-host",
+          summary: "Run the persistent structured Provider host.",
+          usage: "yui internal agent-host <launch-id> <ticket>"
+        },
         {
           name: "session-notify",
           summary: "Record a structured native session notification.",

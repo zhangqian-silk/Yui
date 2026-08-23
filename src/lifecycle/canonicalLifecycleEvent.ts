@@ -365,8 +365,11 @@ export function foldCanonicalLifecycleEvent(
       // Only an identity-matched durable native event can move accepted/delivered,
       // and only after the independently committed transport receipt. Provider
       // acceptance and transport acknowledgement are deliberately separate
-      // evidence layers: neither may repair or infer the other.
-      if (!expectation.pushed) return { outcome: "fail-closed", reason: "accept-without-push" };
+      // evidence layers: neither may repair or infer the other. A fresh managed
+      // Host can publish native acceptance immediately before its launch call
+      // returns and lets the scheduler persist the transport receipt. Retain
+      // that exact fenced fact for replay instead of misclassifying it as stale.
+      if (!expectation.pushed) return { outcome: "deferred", reason: "accept-before-push" };
       if (expectation.terminal) return { outcome: "obsolete", reason: "accept-after-terminal" };
       if (expectation.accepted) return { outcome: "idempotent", reason: "already-accepted" };
       return { outcome: "advance-accepted" };
