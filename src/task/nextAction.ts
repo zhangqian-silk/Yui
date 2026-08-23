@@ -12,7 +12,11 @@ import {
 } from "../review/taskFinalReviewContract.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { Task } from "./task.js";
-import { currentWorkItemCandidate, type WorkItem } from "../workItem/workItem.js";
+import {
+  currentWorkItemCandidate,
+  governingWorkItemCandidate,
+  type WorkItem
+} from "../workItem/workItem.js";
 
 /**
  * Issue 07 (Leader convergence): a read-only decision-support projection for
@@ -766,8 +770,7 @@ function selectOpenWorkItem(workItems: readonly WorkItem[]): OpenWorkItemSelecti
 
 function taskFinalReviewContract(facts: NextActionFacts): TaskFinalReviewContract | undefined {
   const contract = facts.workItems
-    .flatMap((item) => item.candidates)
-    .map((candidate) => candidate.taskFinalReviewContract)
+    .map((item) => governingWorkItemCandidate(item)?.taskFinalReviewContract)
     .find((contract) => contract !== undefined);
   return contract === undefined ? undefined : validateTaskFinalReviewContract(contract);
 }
@@ -865,7 +868,10 @@ function detectProtocolInconsistency(facts: NextActionFacts): Inconsistency | nu
   const workItemById = new Map(facts.workItems.map((item) => [item.id, item]));
 
   const contractedCandidates = facts.workItems
-    .flatMap((item) => item.candidates.map((candidate) => ({ item, candidate })))
+    .flatMap((item) => {
+      const candidate = governingWorkItemCandidate(item);
+      return candidate === undefined ? [] : [{ item, candidate }];
+    })
     .filter(({ candidate }) => candidate.taskFinalReviewContract !== undefined);
   if (contractedCandidates.length > 1) {
     const first = validateTaskFinalReviewContract(contractedCandidates[0]!.candidate.taskFinalReviewContract!);

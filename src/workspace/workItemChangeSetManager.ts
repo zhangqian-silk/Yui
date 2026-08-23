@@ -13,7 +13,10 @@ import {
 } from "../review/taskFinalReviewContract.js";
 import type { ReviewCheck } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import type { DirectTaskMainSnapshot } from "../workItem/workItem.js";
+import {
+  governingWorkItemCandidate,
+  type DirectTaskMainSnapshot
+} from "../workItem/workItem.js";
 import type {
   ManagedWorkspace,
   WorkspaceProjectEntry
@@ -640,7 +643,7 @@ function latestExactDirectAnchorId(
   if (contract === undefined) return undefined;
   return store.listWorkItems(taskId)
     .filter((item) => {
-      const candidate = item.candidates.at(-1);
+      const candidate = governingWorkItemCandidate(item);
       return candidate?.source.type === "direct"
         && sameTaskFinalReviewContract(candidate.taskFinalReviewContract, contract);
     })

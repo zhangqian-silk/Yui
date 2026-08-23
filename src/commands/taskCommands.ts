@@ -185,6 +185,7 @@ import type { ChangeSet } from "../integration/changeSet.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   currentWorkItemCandidate,
+  governingWorkItemCandidate,
   currentWorkItemExecutionGroup,
   workItemExecutionGroupById,
   createWorkItem,
@@ -319,10 +320,12 @@ function storedTaskFinalReviewContract(
   taskId: string
 ): TaskFinalReviewContract | undefined {
   const contracts = store.listWorkItems(taskId)
-    .flatMap(({ candidates }) => candidates)
-    .flatMap(({ taskFinalReviewContract }) => (
-      taskFinalReviewContract === undefined ? [] : [taskFinalReviewContract]
-    ));
+    .flatMap((item) => {
+      const candidate = governingWorkItemCandidate(item);
+      return candidate?.taskFinalReviewContract === undefined
+        ? []
+        : [candidate.taskFinalReviewContract];
+    });
   const first = contracts[0];
   if (first === undefined) return undefined;
   validateTaskFinalReviewContract(first);
@@ -5460,21 +5463,25 @@ function latestTaskReviewContractAnchor(
   task: Task,
   taskFinalContract: TaskFinalReviewContract
 ): Readonly<{ item: WorkItem; candidate: WorkItemCandidate }> {
-  const item = [...store.listWorkItems(task.id)]
-    .filter(({ candidates }) => candidates.some(({ taskFinalReviewContract: candidateContract }) => (
-      sameTaskFinalReviewContract(candidateContract, taskFinalContract)
-    )))
+  const anchor = store.listWorkItems(task.id)
+    .flatMap((item) => {
+      const candidate = governingWorkItemCandidate(item);
+      return candidate !== undefined && sameTaskFinalReviewContract(
+        candidate.taskFinalReviewContract,
+        taskFinalContract
+      )
+        ? [{ item, candidate }]
+        : [];
+    })
     .sort((left, right) => (
-      left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
+      left.item.updatedAt.localeCompare(right.item.updatedAt)
+      || left.item.id.localeCompare(right.item.id)
     ))
     .at(-1);
-  const candidate = item?.candidates.filter(({ taskFinalReviewContract: candidateContract }) => (
-    sameTaskFinalReviewContract(candidateContract, taskFinalContract)
-  )).at(-1);
-  if (item === undefined || candidate === undefined) {
+  if (anchor === undefined) {
     throw usageError(`Task ${task.id} has no WorkItem Candidate to anchor its final Review.`);
   }
-  return { item, candidate };
+  return anchor;
 }
 
 /**
