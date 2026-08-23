@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { createConnection, createServer, type Server } from "node:net";
 import { createInterface } from "node:readline";
 
-import { callController } from "../core/controllerClient.js";
+import { callController, ControllerClientError } from "../core/controllerClient.js";
 import { readHomeFilesystemId } from "../core/homeFilesystemIdentity.js";
 import {
   publishStructuredProviderAccepted,
@@ -365,7 +365,7 @@ export async function runAgentHost(input: Readonly<{
           requestedAuthority,
           providerControl.initialTurn.attemptId
         );
-        await callController(input.home, "runtime.provider-turn-begin", durableInitialTurn);
+        await beginDurableProviderTurn(input.home, durableInitialTurn);
         activeTurnPayload = next;
         try {
           receipt = await session.submitTurn(providerControl.initialTurn);
@@ -635,12 +635,13 @@ export async function runAgentHost(input: Readonly<{
         attemptId
       );
       try {
-        await callController(input.home, "runtime.provider-turn-begin", durableTurn);
+        await beginDurableProviderTurn(input.home, durableTurn);
       } catch (error) {
         await callController(input.home, "runtime.provider-turn-submission-resolve", {
           ...durableTurn,
           status: "rejected",
-          reason: `Human Turn intent acknowledgement failed before Provider write: ${errorText(error)}`
+          reason: `Human Turn intent acknowledgement failed before Provider write: ${errorText(error)}`,
+          observedAt: new Date().toISOString()
         }).catch(() => {});
         throw error;
       }
@@ -1114,6 +1115,22 @@ function hostTurnControlParams(
     holderId: authority.holderId,
     observedAt: new Date().toISOString()
   });
+}
+
+async function beginDurableProviderTurn(
+  home: string,
+  durableTurn: Readonly<Record<string, string | number>>
+): Promise<void> {
+  try {
+    await callController(home, "runtime.provider-turn-begin", durableTurn);
+  } catch (error) {
+    if (!(error instanceof ControllerClientError) || error.code !== "INTERNAL_ERROR") {
+      throw error;
+    }
+    // The exact attempt is idempotent, so one lost acknowledgement can be
+    // retried without creating a second Provider write.
+    await callController(home, "runtime.provider-turn-begin", durableTurn);
+  }
 }
 
 async function resolveProviderTurnSubmission(

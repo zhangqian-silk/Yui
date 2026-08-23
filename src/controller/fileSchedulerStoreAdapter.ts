@@ -268,6 +268,13 @@ export type TaskRuntimeTurnFailed = Readonly<{
   retryAfterMs?: number;
 }>;
 
+export class AgentHostProviderTurnFenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AgentHostProviderTurnFenceError";
+  }
+}
+
 /** Maps the authoritative FileTaskStore records to the scheduler's narrow port. */
 export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   /** Diagnostic telemetry is optional and never participates in runtime truth. */
@@ -1263,7 +1270,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || binding.authority.owner !== input.authorityOwner
         || binding.authority.epoch !== input.authorityEpoch
         || binding.authority.holderId !== input.holderId) {
-        throw new Error("Agent Host Provider Turn carries a stale durable writer fence.");
+        throw new AgentHostProviderTurnFenceError(
+          "Agent Host Provider Turn carries a stale durable writer fence. Release and reacquire Provider authority before retrying input."
+        );
+      }
+      const exactReplay = binding.turn?.attemptId === input.attemptId
+        && binding.turn.authorityEpoch === input.authorityEpoch
+        && binding.turn.status === "submitting";
+      if (!exactReplay && binding.turn !== null
+        && ["submitting", "accepted", "running", "delivery-unknown"]
+          .includes(binding.turn.status)) {
+        throw new AgentHostProviderTurnFenceError(
+          "Provider Conversation already has an unsettled Turn."
+        );
       }
       store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(
         sessions,

@@ -267,6 +267,12 @@ export function beginProviderTurn(
   input: Readonly<{ attemptId: string; authorityEpoch: number; submittedAt: string }>
 ): ProviderRuntimeBinding {
   const binding = validateProviderRuntimeBinding(raw);
+  const attemptId = identity(input.attemptId, "Provider input attempt id");
+  if (binding.turn?.attemptId === attemptId
+    && binding.turn.authorityEpoch === input.authorityEpoch
+    && binding.turn.status === "submitting") {
+    return binding;
+  }
   if (binding.authority.epoch !== input.authorityEpoch
     || binding.authority.owner === "none"
     || binding.authority.owner === "unknown") {
@@ -279,7 +285,7 @@ export function beginProviderTurn(
   return validateProviderRuntimeBinding({
     ...binding,
     turn: {
-      attemptId: identity(input.attemptId, "Provider input attempt id"),
+      attemptId,
       authorityEpoch: input.authorityEpoch,
       status: "submitting",
       submittedAt,

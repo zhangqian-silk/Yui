@@ -13,6 +13,7 @@ import type {
   AgentHostLaunchPayload,
   AgentHostProviderControl
 } from "./launchBroker.js";
+import { YUI_VERSION } from "../version.js";
 
 const PROVIDER_MESSAGE_MAX_BYTES = 16 * 1024 * 1024;
 const PROVIDER_ACCEPT_TIMEOUT_MS = 30_000;
@@ -286,7 +287,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
   ): Promise<CodexStructuredProviderSession> {
     const channel = new JsonLineChannel(child, mirror);
     await channel.request("initialize", {
-      clientInfo: { name: "yui", title: "Yui", version: "0.7.1" },
+      clientInfo: { name: "yui", title: "Yui", version: YUI_VERSION },
       capabilities: {
         experimentalApi: true,
         requestAttestation: false

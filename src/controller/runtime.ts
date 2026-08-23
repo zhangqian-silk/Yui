@@ -82,7 +82,10 @@ import {
   type ControllerRuntimeOptions,
   type RunningFileTaskController
 } from "./controller.js";
-import { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
+import {
+  AgentHostProviderTurnFenceError,
+  FileSchedulerStoreAdapter
+} from "./fileSchedulerStoreAdapter.js";
 import { openSchedulerTelemetry } from "../telemetry/telemetryWiring.js";
 import {
   createFileArtifactPort,
@@ -775,19 +778,26 @@ export function createRuntimeLifecycleDispatcher(
     }
     if (method === "runtime.provider-turn-begin") {
       const value = providerTurnControlParams(params);
-      schedulerStore.beginAgentHostProviderTurn({
-        taskId: value.taskId,
-        roleName: value.roleName,
-        runId: value.runId,
-        agentId: value.agentId,
-        launchId: value.launchId,
-        nativeSessionId: value.nativeSessionId,
-        attemptId: value.attemptId,
-        authorityEpoch: value.authorityEpoch,
-        authorityOwner: value.authorityOwner,
-        holderId: value.holderId,
-        now: value.now
-      });
+      try {
+        schedulerStore.beginAgentHostProviderTurn({
+          taskId: value.taskId,
+          roleName: value.roleName,
+          runId: value.runId,
+          agentId: value.agentId,
+          launchId: value.launchId,
+          nativeSessionId: value.nativeSessionId,
+          attemptId: value.attemptId,
+          authorityEpoch: value.authorityEpoch,
+          authorityOwner: value.authorityOwner,
+          holderId: value.holderId,
+          now: value.now
+        });
+      } catch (error) {
+        if (error instanceof AgentHostProviderTurnFenceError) {
+          throw applicationError("INVALID_PARAMS", error.message);
+        }
+        throw error;
+      }
       return { recorded: true };
     }
     if (method === "runtime.provider-turn-submission-resolve") {

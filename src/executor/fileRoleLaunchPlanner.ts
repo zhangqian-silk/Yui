@@ -572,6 +572,14 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       ? "new"
       : "resume";
     const managedControl = owner.scope === "task" && input.runId !== undefined;
+    const managedProviderEnvironment: Readonly<Record<string, string>> = managedControl
+      && configured.adapterId === "codex"
+      ? {
+          // Managed Codex Runs are non-interactive. Use the Codex execution
+          // identity for provider requests while clientInfo still identifies Yui.
+          CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "codex_exec"
+        }
+      : {};
     const preallocatedManagedNativeSessionId = managedControl
       && binding.adapterId === "claude"
       && resumeNativeSessionId === undefined
@@ -742,6 +750,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       ...(providerControl === undefined ? {} : { providerControl }),
       env: {
         ...launchEnvironment,
+        ...managedProviderEnvironment,
         YUI_HOME: resolve(this.home),
         YUI_SESSION_SCOPE: owner.scope,
         ...(owner.scope === "task" ? { YUI_TASK_ID: owner.taskId } : {}),
