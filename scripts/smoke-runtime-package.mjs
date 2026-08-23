@@ -85,7 +85,7 @@ try {
   }
   const completion = runCli(
     cli,
-    ["completion", "candidates", "ta", "--"],
+    ["config", "completion", "candidates", "ta", "--"],
     environment
   ).trim().split("\n");
   if (!completion.includes("task")) {
@@ -96,10 +96,14 @@ try {
     cli,
     ["setup"],
     { ...environment, YUI_SETUP_INTERACTIVE: "1" },
-    `\n\n\n\n\n\n\n${join(yuiHome, "workspace")}\n\n`
+    "\n"
   );
-  if (!setup.includes("Yui setup complete.") || !setup.includes("Agents configured: codex")) {
-    throw new Error("Installed CLI setup did not initialize the FileTaskStore runtime.");
+  if (
+    !setup.includes("Yui setup complete.")
+    || !setup.includes("Operator configuration: created.")
+    || !setup.includes("Leader configuration: created.")
+  ) {
+    throw new Error("Installed CLI setup did not create the minimum task-ready runtime.");
   }
 
   const doctor = runCli(cli, ["doctor"], environment);
