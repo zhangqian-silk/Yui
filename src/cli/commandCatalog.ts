@@ -814,8 +814,8 @@ const taskChildren: readonly NodeInput[] = [
           {
             name: "expand",
             summary: "Expand one authorized Run context reference.",
-            usage: "yui task run context expand <task>/<run> <ref-id> [--mode full]",
-            options: ["--mode"]
+            usage: "yui task run context expand <task>/<run> <ref-id> [--store <store>] [--mode full]",
+            options: ["--store", "--mode"]
           },
           {
             name: "delta",

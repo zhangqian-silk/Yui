@@ -4441,15 +4441,22 @@ function runContextCommand(
 ): TaskCommandExecution {
   const [first, ...rest] = args;
   if (first === "expand") {
-    if (rest.length < 2 || rest.length > 4 || (rest.length > 2
-      && !(rest.length === 4 && rest[2] === "--mode" && rest[3] === "full"))) {
-      throw usageError(
-        "Task run context expand usage: yui task run context expand <task>/<run> <ref-id> [--mode full]."
-      );
+    const usage = "Task run context expand usage: yui task run context expand <task>/<run> <ref-id> [--store <store>] [--mode full].";
+    const parsed = parseTail(rest, new Set(["--store", "--mode"]), usage);
+    exactPositionals(parsed.positionals, 2, usage);
+    const mode = parsed.options.get("--mode");
+    if (mode !== undefined && mode !== "full") {
+      throw usageError("Run Context expansion mode must be full.", usage);
     }
-    const { taskId, runId } = parseRunContextReference(rest[0]!);
+    const { taskId, runId } = parseRunContextReference(parsed.positionals[0]!);
     authorizeRunContext(store, taskId, runId, options.environment);
-    const expanded = store.transaction((tx) => expandRunContextRef(tx, taskId, runId, rest[1]!));
+    const expanded = store.transaction((tx) => expandRunContextRef(
+      tx,
+      taskId,
+      runId,
+      parsed.positionals[1]!,
+      optionalNonEmptyOption(parsed.options, "--store")
+    ));
     return output(`${JSON.stringify(expanded, null, 2)}\n`, { context: expanded });
   }
   if (first === "delta") {
