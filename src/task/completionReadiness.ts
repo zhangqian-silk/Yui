@@ -1,4 +1,5 @@
 import type { DurableJob } from "../job/durableJob.js";
+import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import { isReviewFindingBlocking, type ReviewFinding } from "../review/reviewFinding.js";
@@ -8,6 +9,8 @@ import {
   REVIEW_FINDINGS_RECONCILE_FAILED_EVENT,
   reviewFindingLedgerWriteFailedFromEvents
 } from "../review/reviewFindingLedger.js";
+import type { AgentRun } from "../run/agentRun.js";
+import type { ProviderContinuation } from "../runtime/providerContinuation.js";
 import { blockingProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
@@ -72,6 +75,10 @@ export type CompletionReadiness = Readonly<{
  * extra reads on every command.
  */
 export type CompletionReadinessFacts = NextActionFacts & Readonly<{
+  /** Every Run, including terminal owners referenced by historical continuations. */
+  agentRuns: readonly AgentRun[];
+  /** Current Role Session generations used to prove whether a terminal writer is reachable. */
+  roleSessionSets: readonly TaskRoleSessionSet[];
   managedWorkspaces: readonly ManagedWorkspace[];
   durableJobs: readonly DurableJob[];
   integrationQueueEntries: readonly IntegrationQueueEntry[];
@@ -244,6 +251,7 @@ export function projectCompletionReadiness(
 
   // Provider continuations that may still write the Workspace.
   for (const continuation of blockingProviderContinuations(facts.events)) {
+    if (!providerContinuationBlocksCompletion(continuation, facts)) continue;
     const identity = continuation.identity;
     blockers.push({
       code: "blocking-provider-continuation",
@@ -312,6 +320,58 @@ export function projectCompletionReadiness(
   });
 
   return { taskId: task.id, ready: sorted.length === 0, blockers: sorted };
+}
+
+/**
+ * A terminal Run releases only its completion blocker, never its immutable
+ * continuation audit. Missing or inconsistent ownership remains ambiguous and
+ * therefore fail-closed. A live exact native Session can still deliver or
+ * write for a terminal Run, so it retains the blocker until that Session is
+ * stopped, broken, or replaced by another Conversation identity.
+ */
+function providerContinuationBlocksCompletion(
+  continuation: ProviderContinuation,
+  facts: Pick<CompletionReadinessFacts, "agentRuns" | "roleSessionSets">
+): boolean {
+  if (continuation.identityConflict) return true;
+
+  const ownerRun = facts.agentRuns.find(({ id }) => id === continuation.runId);
+  if (ownerRun === undefined
+    || ownerRun.taskId !== continuation.taskId
+    || ownerRun.roleName !== continuation.roleName
+    || ownerRun.effective.agentId !== continuation.identity.accountScope) {
+    return true;
+  }
+  if (ownerRun.status !== "failed" && ownerRun.status !== "yielded") return true;
+
+  const sessions = facts.roleSessionSets.find(({ owner }) => (
+    owner.taskId === continuation.taskId && owner.roleName === continuation.roleName
+  ));
+  const session = sessions?.sessions[continuation.identity.accountScope];
+  if (session !== undefined
+    && session.status !== "stopped"
+    && session.status !== "broken"
+    && session.nativeSessionId === continuation.identity.conversationId) {
+    return true;
+  }
+
+  const binding = sessions?.providerBinding;
+  if (binding === undefined || binding === null
+    || binding.providerNamespace !== continuation.identity.providerNamespace
+    || binding.accountScope !== continuation.identity.accountScope) {
+    return false;
+  }
+  const conversationIsCurrent = binding.conversations.some((conversation) => (
+    conversation.conversationId === continuation.identity.conversationId
+    && conversation.epoch === binding.currentConversationEpoch
+    && conversation.status === "current"
+  ));
+  const activationIsLive = binding.activations.some((activation) => (
+    activation.activationId === continuation.identity.activationId
+    && activation.conversationId === continuation.identity.conversationId
+    && activation.status === "active"
+  ));
+  return conversationIsCurrent && activationIsLive;
 }
 
 function workspaceBlocker(
