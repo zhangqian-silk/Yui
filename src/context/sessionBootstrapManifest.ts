@@ -124,7 +124,7 @@ export function materializeSessionBootstrap(input: Readonly<{
         }
       : {
           loadCommand: `\"${sessionCliPath}\" task run context \"$YUI_TASK_ID/<run-id>\" --json`,
-          expandCommand: `\"${sessionCliPath}\" task run context expand \"$YUI_TASK_ID/<run-id>\" <ref-id> --mode full --json`
+          expandCommand: `\"${sessionCliPath}\" task run context expand \"$YUI_TASK_ID/<run-id>\" <ref-id> --store <store> --mode full --json`
         }
   };
   const manifest = Object.freeze({ ...body, digest: digest(body) });
