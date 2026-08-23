@@ -190,6 +190,7 @@ test("the manifest Run Context API is routable but remains non-public", () => {
   for (const args of [
     ["task", "run", "context", "task-1/agent-run-1", "--json"],
     ["task", "run", "context", "expand", "task-1/agent-run-1", "ref-1", "--mode", "full"],
+    ["task", "run", "context", "expand", "task-1/agent-run-1", "ref-1", "--store", "task", "--mode", "full"],
     ["task", "run", "context", "delta", "task-1/agent-run-1", "--after", "cursor-1"]
   ]) {
     assert.equal(routeInvocation(args).kind, "execute");

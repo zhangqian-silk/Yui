@@ -23,11 +23,16 @@ For every managed Task Run:
    context-load failure if the pack is missing, stale, unauthorized, malformed,
    or mismatched. Never request an inline/full-prompt fallback.
 4. Use pack summaries and pointers first. Expand only an authorized ref when
-   its full value is needed:
+   its full value is needed, selecting it by the pointer's exact `store` and
+   `refId`:
 
    ```sh
-   "$YUI_SESSION_CLI" task run context expand "$YUI_TASK_ID/<run-id>" <ref-id> --mode full --json
+   "$YUI_SESSION_CLI" task run context expand "$YUI_TASK_ID/<run-id>" <ref-id> --store <store> --mode full --json
    ```
+
+   A bare `<ref-id>` remains supported only when it identifies exactly one
+   authorized pointer. If multiple stores use that id, bare expansion fails
+   closed; never guess which store was intended.
 
 5. On a later wake, request only the declared delta after the last pack cursor.
    If no cursor is available, reload the exact pack; do not reconstruct state
