@@ -33,6 +33,7 @@ import {
   type RuntimeDisplayStatus
 } from "../runtime/runtimeProjection.js";
 import { latestRunDurableProgressAt } from "../scheduler/roleRunStall.js";
+import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
@@ -589,7 +590,8 @@ function projectTaskRoleRuntime(
   const classification = classifyRuntimeHealth({
     projection,
     semanticProgressAt: semanticProgress.progressAt,
-    now
+    now,
+    policy: resolveRuntimeHealth(store.getConfig().runtimeHealth)
   });
   return {
     driverId,

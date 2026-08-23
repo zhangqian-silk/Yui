@@ -1,4 +1,7 @@
-import { resolveLeaderNextActionMode } from "../config/yuiConfig.js";
+import {
+  resolveLeaderNextActionMode,
+  resolveLeaderSemanticBudgetTurns
+} from "../config/yuiConfig.js";
 import { usageError } from "../errors/cliError.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
@@ -55,7 +58,10 @@ export function runDeliveryGuardPreflight(
     );
   }
   if (options.budget === true) {
-    const budget = evaluateSemanticBudget(facts);
+    const budget = evaluateSemanticBudget(
+      facts,
+      resolveLeaderSemanticBudgetTurns(store.getConfig().leaderSemanticBudgetTurns)
+    );
     if (budget.exhausted) {
       warnings.push(`Semantic progress budget: ${budget.reason}`);
     }

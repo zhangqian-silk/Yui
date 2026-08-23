@@ -1,5 +1,10 @@
 import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
-import { CONFIG_KEYS } from "../commands/configCommands.js";
+import {
+  CONFIG_DEFINITIONS,
+  CONFIG_DOMAINS,
+  configDefinitionsForDomain,
+  type ConfigDomain
+} from "../config/configCatalog.js";
 
 export type CommandNodeKind = "group" | "leaf" | "hybrid";
 export type CompletionProviderId = "role-agent";
@@ -7,6 +12,7 @@ export type CompletionProviderId = "role-agent";
 export type CommandValue = Readonly<{
   name: string;
   summary: string;
+  takesEffect?: string;
 }>;
 
 export type CommandSection = Readonly<{
@@ -21,6 +27,7 @@ export type CommandNode = Readonly<{
   summary: string;
   kind: CommandNodeKind;
   usage: readonly string[];
+  examples: readonly string[];
   sections: readonly CommandSection[];
   children: readonly CommandNode[];
   hidden: boolean;
@@ -43,6 +50,7 @@ type NodeInput = Readonly<{
   name: string;
   summary: string;
   usage?: string | readonly string[];
+  examples?: string | readonly string[];
   sections?: readonly CommandSection[];
   children?: readonly NodeInput[];
   executable?: boolean;
@@ -69,12 +77,16 @@ function buildNode(input: NodeInput, parentPath: readonly string[] = []): Comman
   const usage = input.usage === undefined
     ? [`${path.join(" ")}${children.length > 0 && !executable ? " <command>" : ""}`]
     : typeof input.usage === "string" ? [input.usage] : [...input.usage];
+  const examples = input.examples === undefined
+    ? usage
+    : typeof input.examples === "string" ? [input.examples] : [...input.examples];
   return Object.freeze({
     name: input.name,
     path: Object.freeze(path),
     summary: input.summary,
     kind: children.length === 0 ? "leaf" : executable ? "hybrid" : "group",
     usage: Object.freeze(usage),
+    examples: Object.freeze(examples),
     sections: Object.freeze((input.sections ?? []).map((section) => Object.freeze({
       ...section,
       entries: Object.freeze([...section.entries])
@@ -107,50 +119,94 @@ function freezeRecord<T extends string | number>(
   )) as Readonly<Record<T, readonly string[]>>;
 }
 
-const CONFIG_KEY_VALUES: readonly CommandValue[] = [
-  { name: "time-zone", summary: "IANA timezone for human-facing timestamps (default: Asia/Shanghai)." },
-  { name: "reconciliation-interval-seconds", summary: "Recovery reconciliation interval, 5-300 seconds (default: 120)." },
-  { name: "leader-next-action", summary: "Leader next-action mode: display, warn, or enforce (default: display)." },
-  { name: "context-budget", summary: "Per-Session context token budget; set with --soft-tokens <n> --hard-tokens <n> (default: soft 100000 / hard 120000)." },
-  { name: "resources-gc-mode", summary: "Resource GC mode: report or quarantine (default: report)." },
-  { name: "resources-gc-auto-quarantine", summary: "Auto-quarantine terminal Task resources: true or false (default: false)." },
-  { name: "provider-retry-mode", summary: "Provider retry mode: off, shadow, or enforce (default: enforce)." },
-  { name: "provider-retry-adapters", summary: "Adapters with in-place retry: all, comma-separated adapter ids, or off (default: all)." },
-  { name: "provider-retry-max-window-ms", summary: "Total retry budget per Run lineage in milliseconds (default: 600000)." },
-  { name: "yield-receipt-replay", summary: "Replay committed yield receipts on resend: true or false (default: true)." },
-  { name: "tmux-bin", summary: "Path to the tmux binary (default: tmux)." },
-  { name: "git-bin", summary: "Path to the git binary (default: git)." },
-  { name: "telemetry-mode", summary: "Telemetry mode: legacy, dual, or bounded (default: legacy)." },
-  { name: "telemetry-terminal-keep", summary: "Telemetry terminal retention count (default: 200)." },
-  { name: "telemetry-run-cap", summary: "Telemetry per-run row cap (default: 50000)." },
-  { name: "review", summary: "Global WorkItem review rule; set with --role <global-role> --trigger <always|leader|final> [--finding-ledger <shadow|enforce>] [--delta-recheck <enabled|disabled>] (default: disabled)." }
-];
+const CONFIG_KEY_VALUES: readonly CommandValue[] = CONFIG_DEFINITIONS.map((definition) => ({
+  name: definition.key,
+  summary: definition.summary,
+  takesEffect: definition.takesEffect
+}));
+
+const CONFIG_DOMAIN_SUMMARIES: Readonly<Record<ConfigDomain, string>> = {
+  system: "Configure Home-wide defaults and human-facing presentation.",
+  runtime: "Configure Controller recovery, concurrency, health, launch, delivery, and Provider retry policy.",
+  workflow: "Configure Leader convergence, context, and optional review policy.",
+  resources: "Configure resource garbage collection and quarantine policy.",
+  tools: "Configure tmux and optional diagnostic telemetry."
+};
+
+function durableConfigDomainNode(domain: ConfigDomain): NodeInput {
+  const definitions = configDefinitionsForDomain(domain);
+  const keys = definitions.map(({ key }) => key);
+  const values = CONFIG_KEY_VALUES.filter(({ name }) => keys.includes(name));
+  const options = domain === "workflow"
+    ? [
+        "--soft-tokens", "--hard-tokens", "--role", "--trigger", "--finding-ledger",
+        "--delta-recheck", "--delta-recheck-max-lines", "--delta-recheck-max-files"
+      ]
+    : domain === "runtime"
+      ? ["--quiet-after-seconds", "--diagnostic-after-seconds", "--stall-after-seconds"]
+      : [];
+  return {
+    name: domain,
+    summary: CONFIG_DOMAIN_SUMMARIES[domain],
+    examples: [
+      `yui config ${domain} show`,
+      `yui config ${domain} set ${keys[0]} <value>`,
+      `yui config ${domain} clear ${keys[0]}`
+    ],
+    sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
+    children: [
+      { name: "show", summary: `Show effective ${domain} configuration.` },
+      {
+        name: "set",
+        summary: `Set one ${domain} configuration key.`,
+        usage: `yui config ${domain} set <key> <value...>`,
+        sections: [{ id: "keys", title: "Configuration keys", entries: keys }],
+        values,
+        options,
+        optionValues: domain === "workflow"
+          ? {
+              "--trigger": ["always", "leader", "final"],
+              "--finding-ledger": ["shadow", "enforce"],
+              "--delta-recheck": ["enabled", "disabled"]
+            }
+          : {}
+      },
+      {
+        name: "clear",
+        summary: `Reset one ${domain} configuration key to its default.`,
+        usage: `yui config ${domain} clear <key>`,
+        sections: [{ id: "keys", title: "Configuration keys", entries: keys }],
+        values
+      }
+    ]
+  };
+}
 
 const agentChildren: readonly NodeInput[] = [
   {
     name: "add",
     summary: "Add a configured native Agent CLI.",
-    usage: "yui agent add <id> [--adapter <adapter>] --command <command> [--arg <arg> ...] [--env TARGET=PROCESS_NAME ...]",
+    usage: "yui config agent add <id> [--adapter <adapter>] --command <command> [--arg <arg> ...] [--env TARGET=PROCESS_NAME ...]",
     options: ["--adapter", "--command", "--arg", "--env"],
     optionValues: { "--adapter": supportedAgentAdapterIds() },
     executableOptions: ["--command"]
   },
   { name: "list", summary: "List configured Agents." },
-  { name: "show", summary: "Show one configured Agent.", usage: "yui agent show <id>" },
+  { name: "show", summary: "Show one configured Agent.", usage: "yui config agent show <id>" },
   {
     name: "capabilities",
     summary: "Probe one Agent CLI for runtime configuration options.",
-    usage: "yui agent capabilities <id>"
+    usage: "yui config agent capabilities <id>"
   },
   {
     name: "update",
     summary: "Update a configured Agent.",
-    usage: "yui agent update <id> [--adapter <adapter>] [--command <command>] [--arg <arg> ... | --clear-args] [--env TARGET=PROCESS_NAME ... | --clear-env]",
+    usage: "yui config agent update <id> [--adapter <adapter>] [--command <command>] [--arg <arg> ... | --clear-args] [--env TARGET=PROCESS_NAME ... | --clear-env]",
     options: ["--adapter", "--command", "--arg", "--clear-args", "--env", "--clear-env"],
     optionValues: { "--adapter": supportedAgentAdapterIds() },
     executableOptions: ["--command"]
   },
-  { name: "remove", summary: "Remove a configured Agent.", usage: "yui agent remove <id>" }
+  { name: "remove", summary: "Remove a configured Agent.", usage: "yui config agent remove <id>" }
 ];
 
 const roleProfileOptions = [
@@ -187,45 +243,51 @@ const roleChildren: readonly NodeInput[] = [
   {
     name: "add",
     summary: "Add a reusable global Role.",
-    usage: "yui role add <name> --agent <id> [Role and Agent settings]",
+    usage: "yui config role add <name> --agent <id> [Role and Agent settings]",
     options: ["--agent", "--workspace", ...roleProfileOptions, ...roleAgentOptions],
     optionValues: roleAgentOptionValues,
     fileOptions: ["--workspace"]
   },
   { name: "list", summary: "List global Roles." },
-  { name: "show", summary: "Show one global Role.", usage: "yui role show <name>" },
-  { name: "context", summary: "Load the exact authorized global Role context.", usage: "yui role context <name>" },
+  { name: "show", summary: "Show one global Role.", usage: "yui config role show <name>" },
   {
     name: "update",
     summary: "Update a global Role.",
-    usage: "yui role update <name> [profile options] [clear options]",
+    usage: "yui config role update <name> [profile options] [clear options]",
     options: ["--agent", "--workspace", ...roleProfileOptions, ...roleAgentOptions,
       ...roleProfileClearOptions, ...roleAgentClearOptions],
     optionValues: roleAgentOptionValues,
     fileOptions: ["--workspace"]
   },
-  { name: "remove", summary: "Remove a global Role.", usage: "yui role remove <name>" },
-  { name: "bind", summary: "Bind and activate an Agent for a global Role.", usage: "yui role bind <role> <agent-id>" },
-  { name: "unbind", summary: "Unbind a dormant Agent from a global Role.", usage: "yui role unbind <role> <agent-id>" },
-  { name: "enter", summary: "Enter a global Role's native session.", usage: "yui role enter <role>" },
+  { name: "remove", summary: "Remove a global Role.", usage: "yui config role remove <name>" },
+  { name: "bind", summary: "Bind and activate an Agent for a global Role.", usage: "yui config role bind <role> <agent-id>" },
+  { name: "unbind", summary: "Unbind a dormant Agent from a global Role.", usage: "yui config role unbind <role> <agent-id>" }
+];
+
+const globalSessionChildren: readonly NodeInput[] = [
+  { name: "enter", summary: "Enter a global Role's native session.", usage: "yui session enter <role>" },
   {
-    name: "session",
-    summary: "Manage native session IDs for a global Role.",
-    sections: [{ id: "manage", title: "Commands", entries: ["record", "replace"] }],
-    children: [
-      {
-        name: "record",
-        summary: "Record the active Agent's native session ID.",
-        usage: "yui role session record <role> --native-id <id>",
-        options: ["--native-id"]
-      },
-      {
-        name: "replace",
-        summary: "Explicitly replace the active Agent's native session ID.",
-        usage: "yui role session replace <role> --native-id <id> --reason <text>",
-        options: ["--native-id", "--reason"]
-      }
-    ]
+    name: "context",
+    summary: "Load the exact authorized global Role context.",
+    usage: "yui session context <role>"
+  },
+  {
+    name: "record",
+    summary: "Record the active Agent's native session ID.",
+    usage: "yui session record <role> --native-id <id>",
+    options: ["--native-id"]
+  },
+  {
+    name: "replace",
+    summary: "Explicitly replace the active Agent's native session ID.",
+    usage: "yui session replace <role> --native-id <id> --reason <text>",
+    options: ["--native-id", "--reason"]
+  },
+  {
+    name: "reconcile",
+    summary: "Reconcile durable Session owners with native sessions.",
+    usage: "yui session reconcile [--report] [--cleanup]",
+    options: ["--report", "--cleanup"]
   }
 ];
 
@@ -233,21 +295,33 @@ const profileChildren: readonly NodeInput[] = [
   {
     name: "add",
     summary: "Add a reusable Agent Profile.",
-    usage: "yui profile add <id> [--access <read|write>] [Profile settings]",
+    usage: "yui config profile add <id> [--access <read|write>] [Profile settings]",
     options: ["--access", ...agentProfileOptions],
     optionValues: { "--access": ["read", "write"] }
   },
   { name: "list", summary: "List Agent Profiles." },
-  { name: "show", summary: "Show one Agent Profile.", usage: "yui profile show <id>" },
+  { name: "show", summary: "Show one Agent Profile.", usage: "yui config profile show <id>" },
   {
     name: "update",
     summary: "Update an Agent Profile.",
-    usage: "yui profile update <id> [--access <read|write>] [Profile settings]",
+    usage: "yui config profile update <id> [--access <read|write>] [Profile settings]",
     options: ["--access", ...agentProfileOptions, ...agentProfileClearOptions],
     optionValues: { "--access": ["read", "write"] }
   },
-  { name: "remove", summary: "Remove a custom Agent Profile.", usage: "yui profile remove <id>" },
+  { name: "remove", summary: "Remove a custom Agent Profile.", usage: "yui config profile remove <id>" },
   { name: "reset", summary: "Reset all built-in Agent Profiles." }
+];
+
+const completionChildren: readonly NodeInput[] = [
+  { name: "bash", summary: "Interactively configure Bash completion." },
+  { name: "zsh", summary: "Interactively configure Zsh completion." },
+  { name: "fish", summary: "Interactively configure Fish completion." },
+  {
+    name: "candidates",
+    summary: "Resolve internal dynamic completion candidates.",
+    usage: "yui config completion candidates <prefix> -- <words...>",
+    hidden: true
+  }
 ];
 
 const taskChildren: readonly NodeInput[] = [
@@ -965,13 +1039,14 @@ export const ROOT_COMMAND = buildNode({
   name: "yui",
   summary: "Coordinate durable, isolated Agent work.",
   usage: "yui [--json] <command>",
+  examples: ["yui setup", "yui operator enter", "yui config show", "yui task list"],
   sections: [
     { id: "general", title: "General", entries: [
-      "help", "version", "update", "upgrade", "setup", "doctor", "completion"
+      "help", "version", "update", "upgrade", "setup", "doctor"
     ] },
     { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
-    { id: "configuration", title: "Configuration", entries: ["config", "agent", "profile", "role"] },
-    { id: "operations", title: "Operations", entries: ["web", "controller", "execution", "job", "jobs", "telemetry", "release"] },
+    { id: "configuration", title: "Configuration", entries: ["config"] },
+    { id: "operations", title: "Operations", entries: ["web", "controller", "session", "execution", "job", "jobs", "telemetry", "release"] },
     { id: "resources", title: "Resources", entries: ["resources"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
@@ -985,35 +1060,17 @@ export const ROOT_COMMAND = buildNode({
       usage: "yui upgrade [--dry-run]",
       options: ["--dry-run"]
     },
-    { name: "setup", summary: "Initialize or update Yui configuration." },
+    {
+      name: "setup",
+      summary: "Initialize the minimum Operator and Leader configuration required to execute Tasks.",
+      examples: "yui setup"
+    },
     { name: "doctor", summary: "Check Yui dependencies and file state." },
     {
       name: "web",
       summary: "Serve the local Task and Agent control room.",
       usage: "yui web [--host <loopback>] [--port <port>]",
       options: ["--host", "--port"]
-    },
-    {
-      name: "completion",
-      summary: "Interactively configure shell completion.",
-      executable: true,
-      acceptsArguments: false,
-      usage: ["yui completion", "yui completion <bash|zsh|fish>"],
-      sections: [
-        { id: "shells", title: "Shells", entries: ["bash", "zsh", "fish"] },
-        { id: "internal", title: "Internal", entries: ["candidates"] }
-      ],
-      children: [
-        { name: "bash", summary: "Interactively configure Bash completion." },
-        { name: "zsh", summary: "Interactively configure Zsh completion." },
-        { name: "fish", summary: "Interactively configure Fish completion." },
-        {
-          name: "candidates",
-          summary: "Resolve internal dynamic completion candidates.",
-          usage: "yui completion candidates <prefix> -- <words...>",
-          hidden: true
-        }
-      ]
     },
     {
       name: "controller",
@@ -1104,29 +1161,78 @@ export const ROOT_COMMAND = buildNode({
     },
     {
       name: "config",
-      summary: "Inspect or update Yui configuration.",
-      sections: [{ id: "manage", title: "Commands", entries: ["show", "set", "clear"] }],
+      summary: "Inspect, understand, and update all persistent Yui configuration.",
+      examples: [
+        "yui config show",
+        "yui config describe runtime",
+        "yui config workflow show",
+        "yui config agent list",
+        "yui config role show operator",
+        "yui config profile list",
+        "yui config completion"
+      ],
+      sections: [
+        { id: "inspect", title: "Inspect", entries: ["show", "describe"] },
+        { id: "domains", title: "Configuration domains", entries: [
+          ...CONFIG_DOMAINS, "agent", "role", "profile", "completion"
+        ] }
+      ],
       children: [
-        { name: "show", summary: "Show effective Yui configuration." },
         {
-          name: "set",
-          summary: "Set one Yui configuration key.",
-          usage: "yui config set <key> <value...>",
-          sections: [{ id: "keys", title: "Configuration keys", entries: [...CONFIG_KEYS] }],
-          values: CONFIG_KEY_VALUES,
-          options: ["--role", "--trigger", "--finding-ledger", "--delta-recheck", "--delta-recheck-max-lines", "--delta-recheck-max-files"],
-          optionValues: {
-            "--trigger": ["always", "leader", "final"],
-            "--finding-ledger": ["shadow", "enforce"],
-            "--delta-recheck": ["enabled", "disabled"]
-          }
+          name: "show",
+          summary: "Show the complete effective Yui configuration.",
+          examples: ["yui config show", "yui --json config show"]
         },
         {
-          name: "clear",
-          summary: "Reset one Yui configuration key to its default.",
-          usage: "yui config clear <key>",
-          sections: [{ id: "keys", title: "Configuration keys", entries: [...CONFIG_KEYS] }],
-          values: CONFIG_KEY_VALUES
+          name: "describe",
+          summary: "Explain configuration effects, defaults, choices, and activation behavior.",
+          usage: `yui config describe [${[...CONFIG_DOMAINS, "agent", "role", "profile", "completion"].join("|")}]`,
+          examples: ["yui config describe", "yui --json config describe role"],
+          argumentValues: { 0: [...CONFIG_DOMAINS, "agent", "role", "profile", "completion"] }
+        },
+        ...CONFIG_DOMAINS.map(durableConfigDomainNode),
+        {
+          name: "agent",
+          summary: "Manage configured native Agent CLIs; launch-setting changes require affected Sessions to be stopped.",
+          examples: ["yui config agent list", "yui config agent capabilities codex"],
+          sections: [
+            { id: "inspect", title: "Inspect", entries: ["list", "show", "capabilities"] },
+            { id: "manage", title: "Manage", entries: ["add", "update", "remove"] }
+          ],
+          children: agentChildren
+        },
+        {
+          name: "profile",
+          summary: "Manage reusable Agent Profiles; updates affect future copies and do not rewrite existing Task Roles.",
+          examples: ["yui config profile list", "yui config profile show implementer"],
+          sections: [
+            { id: "inspect", title: "Inspect", entries: ["list", "show"] },
+            { id: "manage", title: "Manage", entries: ["add", "update", "remove", "reset"] }
+          ],
+          children: profileChildren
+        },
+        {
+          name: "role",
+          summary: "Manage reusable global Roles and desired Agent launch configuration for the next compatible Session.",
+          examples: ["yui config role list", "yui config role show operator"],
+          sections: [
+            { id: "inspect", title: "Inspect", entries: ["list", "show"] },
+            { id: "manage", title: "Manage", entries: ["add", "update", "remove", "bind", "unbind"] }
+          ],
+          children: roleChildren
+        },
+        {
+          name: "completion",
+          summary: "Interactively configure shell completion after confirming generated files and startup-file changes.",
+          executable: true,
+          acceptsArguments: false,
+          usage: ["yui config completion", "yui config completion <bash|zsh|fish>"],
+          examples: ["yui config completion", "yui config completion zsh"],
+          sections: [
+            { id: "shells", title: "Shells", entries: ["bash", "zsh", "fish"] },
+            { id: "internal", title: "Internal", entries: ["candidates"] }
+          ],
+          children: completionChildren
         }
       ]
     },
@@ -1283,32 +1389,18 @@ export const ROOT_COMMAND = buildNode({
       ]
     },
     {
-      name: "agent",
-      summary: "Manage configured native Agent CLIs.",
-      sections: [
-        { id: "inspect", title: "Inspect", entries: ["list", "show", "capabilities"] },
-        { id: "manage", title: "Manage", entries: ["add", "update", "remove"] }
+      name: "session",
+      summary: "Load and enter global Role sessions, and reconcile their durable identities.",
+      examples: [
+        "yui session context operator --json",
+        "yui session enter operator",
+        "yui session reconcile --report"
       ],
-      children: agentChildren
-    },
-    {
-      name: "profile",
-      summary: "Manage reusable Agent Profiles.",
       sections: [
-        { id: "inspect", title: "Inspect", entries: ["list", "show"] },
-        { id: "manage", title: "Manage", entries: ["add", "update", "remove", "reset"] }
+        { id: "global", title: "Global Role sessions", entries: ["context", "enter", "record", "replace"] },
+        { id: "recovery", title: "Recovery", entries: ["reconcile"] }
       ],
-      children: profileChildren
-    },
-    {
-      name: "role",
-      summary: "Manage reusable global Roles and their native sessions.",
-      sections: [
-        { id: "inspect", title: "Inspect", entries: ["list", "show", "context"] },
-        { id: "manage", title: "Manage", entries: ["add", "update", "remove", "bind", "unbind"] },
-        { id: "sessions", title: "Sessions", entries: ["enter", "session"] }
-      ],
-      children: roleChildren
+      children: globalSessionChildren
     },
     {
       name: "task",
@@ -1390,12 +1482,14 @@ export function visibleCommandSections(node: CommandNode): readonly VisibleComma
   const children = new Map(node.children.map((child) => [child.name, child]));
   const values = new Map(node.values.map((value) => [value.name, value]));
   return node.sections.flatMap((section) => {
-    const entries = section.entries.flatMap((entry) => {
-      const child = children.get(entry);
-      if (child !== undefined) return child.hidden ? [] : [child];
-      const value = values.get(entry);
-      return value === undefined ? [] : [value];
-    });
+    const entries: (CommandNode | CommandValue)[] = section.entries.flatMap(
+      (entry): (CommandNode | CommandValue)[] => {
+        const child = children.get(entry);
+        if (child !== undefined) return child.hidden ? [] : [child];
+        const value = values.get(entry);
+        return value === undefined ? [] : [value];
+      }
+    );
     return entries.length === 0 ? [] : [{ id: section.id, title: section.title, entries }];
   });
 }
@@ -1420,12 +1514,49 @@ export function findCommandNode(path: readonly string[]): CommandNode | undefine
 
 export const findCommand = findCommandNode;
 
+export type CommandDescription = Readonly<{
+  path: string;
+  summary: string;
+  usage: readonly string[];
+  examples: readonly string[];
+  options: readonly string[];
+  optionValues: Readonly<Record<string, readonly string[]>>;
+  argumentValues: Readonly<Record<number, readonly string[]>>;
+  values: readonly CommandValue[];
+  children: readonly CommandDescription[];
+}>;
+
+/** Structured help projection consumed by `config describe --json` and Operator. */
+export function describeCommandTree(node: CommandNode): CommandDescription {
+  return {
+    path: node.path.slice(1).join(" "),
+    summary: node.summary,
+    usage: node.usage,
+    examples: node.examples,
+    options: node.options,
+    optionValues: node.optionValues,
+    argumentValues: node.argumentValues,
+    values: node.values,
+    children: visibleChildren(node).map(describeCommandTree)
+  };
+}
+
 export function validateCommandCatalog(root: CommandNode): void {
   const reservedAliases = new Set(["-h", "--help", "-help", "-v", "--version"]);
   const commandPathProviders: CommandNode[] = [];
   const visit = (node: CommandNode): void => {
     if (node.summary.trim().length === 0) throw new Error(`Command summary is required: ${node.path.join(" ")}`);
     if (node.usage.length === 0) throw new Error(`Command usage is required: ${node.path.join(" ")}`);
+    if (node.examples.length === 0 || node.examples.some((example) => example.trim().length === 0)) {
+      throw new Error(`Command examples are required: ${node.path.join(" ")}`);
+    }
+    const canonicalPath = node.path.join(" ");
+    for (const example of node.examples) {
+      const normalized = example.replace(/^yui --json(?=\s|$)/, "yui");
+      if (normalized !== canonicalPath && !normalized.startsWith(`${canonicalPath} `)) {
+        throw new Error(`Command example does not match its path: ${canonicalPath}: ${example}`);
+      }
+    }
     if (node.commandPathArguments) {
       commandPathProviders.push(node);
       const ownsOtherCompletionMetadata = node.kind !== "leaf"
@@ -1502,10 +1633,17 @@ export function validateCommandCatalog(root: CommandNode): void {
     for (const option of node.executableOptions) {
       if (!options.has(option)) throw new Error(`Executable completion references unknown option: ${[...node.path, option].join(" ")}`);
     }
+    if (new Set(node.workspaceMapOptions).size !== node.workspaceMapOptions.length) {
+      throw new Error(`Duplicate workspace-map completion option: ${node.path.join(" ")}`);
+    }
+    for (const option of node.workspaceMapOptions) {
+      if (!options.has(option)) throw new Error(`Workspace-map completion references unknown option: ${[...node.path, option].join(" ")}`);
+    }
     for (const option of options) {
       const owners = Number(Object.hasOwn(node.optionValues, option))
         + Number(node.fileOptions.includes(option))
-        + Number(node.executableOptions.includes(option));
+        + Number(node.executableOptions.includes(option))
+        + Number(node.workspaceMapOptions.includes(option));
       if (owners > 1) throw new Error(`Multiple completion owners for option: ${[...node.path, option].join(" ")}`);
     }
     if (new Set(node.fileArguments).size !== node.fileArguments.length

@@ -296,9 +296,12 @@ Choose before creating the WorkItem:
   credentials, user-owned independent Session, durable lifecycle, or repeated
   dispatches to a Task-bound Worker instance.
 
-Keep review execution separate from implementation. A reviewer uses the single
-built-in write-capable `reviewer` Profile, but Yui grants that capability only
-inside a fresh ReviewRound-owned worktree created from its exact frozen scope:
+Keep review execution separate from implementation. No global Reviewer is
+required: when review is disabled, inspect and decide directly or delegate a
+bounded review to a native subagent or ordinary Worker. When a managed
+ReviewRound is explicitly configured, its reviewer uses the single built-in
+write-capable `reviewer` Profile, but Yui grants that capability only inside a
+fresh ReviewRound-owned worktree created from its exact frozen scope:
 the assigned WorkItem Candidate or the committed Integration heads of a
 Task-final Review. Never reuse the Candidate/Worker workspace or its
 implementation Role Session. Codex and Claude may use their normal configured
@@ -319,7 +322,7 @@ Before the first delegated WorkItem, or after the Profile catalog changes,
 inspect the available Profiles:
 
 ```sh
-yui profile list
+yui config profile list
 ```
 
 Choose the Profile by the work's meaning. `worker`, `implementer`, and
@@ -375,7 +378,7 @@ use `worker`. A Profile is required for this path:
 
 ```sh
 yui task work update <work-id> running
-yui profile show <worker|explorer|implementer|reviewer|profile-id>
+yui config profile show <worker|explorer|implementer|reviewer|profile-id>
 ```
 
 Read the selected Profile and incorporate all applicable portable constraints
@@ -495,6 +498,10 @@ After any Candidate is submitted, inspect its exact policy, Run result,
 ReviewRounds, checks, and workspace through the exact Run Context Pack and its
 authorized expansions.
 
+- No configured review policy: review the Candidate directly, or delegate a
+  bounded evidence-gathering review to a native subagent or ordinary Worker,
+  then make the Leader-owned accept/reject decision. Do not create a Reviewer
+  Role merely to satisfy an old setup convention.
 - `always`: wait for the automatically requested ReviewRound to become
   terminal. Never bypass an active round.
 - `leader`: decide whether the existing evidence is sufficient. Request Agent

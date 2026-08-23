@@ -1,8 +1,8 @@
 import {
   resolveProviderRetryAdapters,
-  resolveProviderRetryMaxWindowMs,
+  resolveProviderRetryDelaysSeconds,
+  resolveProviderRetryMaxWindowSeconds,
   resolveProviderRetryMode,
-  resolveYieldReceiptReplay,
   type ProviderRetryMode
 } from "../config/yuiConfig.js";
 import type { YuiConfig } from "../storage/taskStore.js";
@@ -27,8 +27,8 @@ export type ProviderRetryConfig = Readonly<{
   mode: ProviderRetryMode;
   /** Adapters with in-place retry enabled (shadow or enforce). */
   adapters: readonly string[] | "all-capable";
-  /** Idempotent yield receipt replay on resend. */
-  yieldReceiptReplay: boolean;
+  /** Delay schedule; its length is the continuation-attempt budget. */
+  delaysMs: readonly number[];
   /** Total retry budget per Run lineage, in milliseconds. */
   maxWindowMs: number;
 }>;
@@ -44,8 +44,10 @@ export function providerRetryConfig(config: YuiConfig): ProviderRetryConfig {
   return {
     mode: adapters.length === 0 ? "off" : mode,
     adapters,
-    yieldReceiptReplay: resolveYieldReceiptReplay(config.yieldReceiptReplay),
-    maxWindowMs: resolveProviderRetryMaxWindowMs(config.providerRetryMaxWindowMs)
+    delaysMs: resolveProviderRetryDelaysSeconds(config.providerRetryDelaysSeconds)
+      .map((seconds) => seconds * 1_000),
+    maxWindowMs: resolveProviderRetryMaxWindowSeconds(config.providerRetryMaxWindowSeconds)
+      * 1_000
   };
 }
 

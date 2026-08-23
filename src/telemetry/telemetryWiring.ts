@@ -3,9 +3,9 @@ import { join } from "node:path";
 
 import {
   resolveRunCap,
-  resolveTelemetryMode,
   resolveTerminalKeep
 } from "./telemetryConfig.js";
+import { resolveTelemetryEnabled } from "../config/yuiConfig.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 import { SqliteTelemetryStore } from "./sqliteTelemetryStore.js";
 import type { SchedulerTelemetry } from "./telemetryStore.js";
@@ -27,12 +27,12 @@ export function openSchedulerTelemetry(
   home: string,
   config: YuiConfig
 ): SchedulerTelemetry | null {
-  const mode = resolveTelemetryMode(config.telemetryMode);
-  if (mode === "legacy") return null;
+  if (!resolveTelemetryEnabled(config.telemetryEnabled)) return null;
+  const mode = "on" as const;
   const dbPath = join(home, COMMITTED_DATABASE_FILENAME);
   if (!existsSync(dbPath)) {
     throw new Error(
-      `telemetryMode=${mode} requires SQLite storage, but ${dbPath} does not exist. `
+      `telemetryEnabled=true requires SQLite storage, but ${dbPath} does not exist. `
       + "Migrate this Home to the database backend first (yui upgrade)."
     );
   }
@@ -41,5 +41,5 @@ export function openSchedulerTelemetry(
     terminalKeep: resolveTerminalKeep(config.telemetryTerminalKeep),
     runCap: resolveRunCap(config.telemetryRunCap)
   });
-  return { mode, sink: store, reader: store };
+  return { mode, sink: store, reader: store, retention: store };
 }

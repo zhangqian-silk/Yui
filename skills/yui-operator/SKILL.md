@@ -1,6 +1,6 @@
 ---
 name: yui-operator
-description: Route multi-project user requests into Yui Tasks, preserve durable intent, present progress, answer inputs, and administer lifecycle without taking over Leader decisions.
+description: Route multi-project user requests into Yui Tasks, configure Yui through confirmed conversation, preserve durable intent, present progress, answer inputs, and administer lifecycle without taking over Leader decisions.
 ---
 
 # Yui Operator
@@ -45,6 +45,44 @@ no-change recovery as narrative. Keep the recipient's abstraction level in
 mind and avoid imposing a fixed heading, field, section, or character
 template; one semantic event should have one concise summary unless a later
 role adds a genuinely new decision or impact.
+
+## Configure Yui through conversation
+
+Treat configuration as an Operator-owned conversation, not a list of commands
+the user must discover or run. Start every configuration discussion by reading
+both the complete effective state and Yui's configuration catalog:
+
+```sh
+yui --json config show
+yui --json config describe
+yui --json config describe <system|runtime|workflow|resources|tools|agent|role|profile|completion>
+```
+
+Consume the top-level `data` field. Explain the relevant current values, what
+each setting changes, its accepted values or referenced records, and when the
+change takes effect. Distinguish stored values from effective defaults and say
+when a live Role Session must be stopped and relaunched. Do not infer choices
+from old setup conventions: Review, Worker, Profiles, and completion may
+intentionally be absent after the minimum setup. Leader is part of the minimum
+Task-execution configuration and must be present.
+
+For Agent-dependent Role choices such as model, effort, provider permission,
+search, settings source, or service tier, also read
+`yui --json config agent capabilities <agent-id>`. Treat that live-or-cached
+catalog and its freshness warnings as the choice authority; never invent a
+provider value from memory.
+
+When the user wants a change, narrow the discussion to the affected domains,
+present the exact before/after behavior and material consequences, and obtain
+confirmation before mutating configuration. Then perform only the confirmed
+`yui config ...` commands yourself, read `yui --json config show` back, and
+when the catalog says a Controller restart is required, include that impact in
+the confirmation and run `yui controller restart` after saving. Report the
+verified result. Never make the user execute mechanical CLI steps,
+never parse human tables, never expose secret environment values, and never
+silently create a Reviewer or enable global review. A Leader may review work
+directly or delegate review to an ordinary Worker unless the user explicitly
+configures a review Role and policy.
 
 ## Route across Projects and Tasks
 
@@ -192,11 +230,11 @@ When the user requires a specific Leader or Worker provider, inspect Roles
 before routing:
 
 ```sh
-yui profile list
-yui profile show <profile>
-yui role list
-yui role show leader
-yui role show worker
+yui config profile list
+yui config profile show <profile>
+yui config role list
+yui config role show leader
+yui config role show worker
 yui task role list <task-id>
 yui task work list <task-id>
 yui task integration list <task-id>

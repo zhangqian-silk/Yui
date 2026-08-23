@@ -120,7 +120,7 @@ export function materializeSessionBootstrap(input: Readonly<{
     roleProfileRef: { digest: profileDigest, path: roleProfilePath },
     contextProtocol: input.owner.scope === "global"
       ? {
-          loadCommand: `\"${sessionCliPath}\" role context \"$YUI_ROLE\" --json`
+          loadCommand: `\"${sessionCliPath}\" session context \"$YUI_ROLE\" --json`
         }
       : {
           loadCommand: `\"${sessionCliPath}\" task run context \"$YUI_TASK_ID/<run-id>\" --json`,

@@ -1,4 +1,12 @@
-import { reconciliationIntervalMilliseconds, resolveTmuxBin } from "../config/yuiConfig.js";
+import {
+  reconciliationIntervalMilliseconds,
+  resolveAgentLaunchInactivityTimeoutSeconds,
+  resolveControllerTaskConcurrency,
+  resolveDeliveryTimeoutSeconds,
+  resolveRuntimeHealth,
+  resolveTmuxBin,
+  resolveTmuxHistoryLimit
+} from "../config/yuiConfig.js";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -215,6 +223,7 @@ export async function startFileTaskControllerRuntime(
       ? new SqliteTaskStore(home)
       : openCompatibleFileTaskStore(home));
   const homeId = store.getHomeIdentity().homeId;
+  const durableConfig = store.getConfig();
   // When the worker backend is active, the db-touching observer folds run in
   // the worker (off the main event loop). The client is closed on shutdown.
   const asyncStoreClient = useWorker
@@ -240,10 +249,11 @@ export async function startFileTaskControllerRuntime(
     environment: options.environment
   });
   const tmux = options.tmux ?? new TmuxManager(
-    resolveTmuxBin(store.getConfig().tmuxBin),
+    resolveTmuxBin(durableConfig.tmuxBin),
     new NodeCommandExecutor(),
     {
       yuiHome: home,
+      historyLimit: resolveTmuxHistoryLimit(durableConfig.tmuxHistoryLimit),
       ...(domainIdentity === undefined
         ? {}
         : {
@@ -323,11 +333,9 @@ export async function startFileTaskControllerRuntime(
       }
       throw new Error("Native session discovery was aborted.");
     },
-    inactivityTimeoutMs: positiveIntegerOption(
-      options.environment?.YUI_LAUNCH_INACTIVITY_TIMEOUT_MS
-        ?? process.env.YUI_LAUNCH_INACTIVITY_TIMEOUT_MS,
-      300_000
-    ),
+    inactivityTimeoutMs: resolveAgentLaunchInactivityTimeoutSeconds(
+      durableConfig.agentLaunchInactivityTimeoutSeconds
+    ) * 1_000,
     onHostCreated: ({ binding, pane }) => {
       sessionOwners.recordHostOwner({
         owner: binding.owner,
@@ -624,9 +632,16 @@ export async function startFileTaskControllerRuntime(
       intervalMs: options.intervalMs
         ?? reconciliationIntervalMilliseconds(store.getConfig().reconciliationIntervalSeconds),
       signalWindowMs: options.signalWindowMs,
-      taskConcurrency: options.taskConcurrency,
+      taskConcurrency: options.taskConcurrency
+        ?? resolveControllerTaskConcurrency(durableConfig.controllerTaskConcurrency),
       deliveryRetryMs: options.deliveryRetryMs,
       deliveryRetryLimit: options.deliveryRetryLimit,
+      deliveryTimeoutMs: options.deliveryTimeoutMs
+        ?? resolveDeliveryTimeoutSeconds(durableConfig.deliveryTimeoutSeconds) * 1_000,
+      stallWindowMs: options.stallWindowMs
+        ?? resolveRuntimeHealth(durableConfig.runtimeHealth).stallWindowMs,
+      diagnosticAfterMs: options.diagnosticAfterMs
+        ?? resolveRuntimeHealth(durableConfig.runtimeHealth).diagnosticAfterMs,
       now: options.now,
       onError: options.onError,
       lifecycleHost,
@@ -1420,15 +1435,6 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
     }
     signal.addEventListener("abort", onAbort, { once: true });
   });
-}
-
-function positiveIntegerOption(value: string | undefined, fallback: number): number {
-  if (value === undefined || value.trim().length === 0) return fallback;
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new Error(`Invalid native session discovery timeout: ${value}`);
-  }
-  return parsed;
 }
 
 function applicationError(

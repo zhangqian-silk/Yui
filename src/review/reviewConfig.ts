@@ -19,9 +19,6 @@ export type ReviewDeltaRecheckMode = typeof REVIEW_DELTA_RECHECK_MODES[number];
 export const DEFAULT_DELTA_RECHECK_MAX_CHANGED_LINES = 200;
 export const DEFAULT_DELTA_RECHECK_MAX_CHANGED_FILES = 5;
 
-/** The Reviewer Role seeded in a new Home by `yui setup`. */
-export const DEFAULT_REVIEWER_ROLE = "reviewer";
-
 export type ReviewConfig = Readonly<{
   roleName: string;
   trigger: ReviewTrigger;

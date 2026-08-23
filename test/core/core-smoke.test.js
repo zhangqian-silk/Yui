@@ -48,6 +48,12 @@ import {
   enqueueSignal,
   nextPendingBatch
 } from "../../dist/coordination/workMailbox.js";
+import {
+  prepareProviderRetryDispatch,
+  scheduleProviderRetry,
+  serializeProviderRetryEnvelope
+} from "../../dist/run/providerRetry.js";
+import { SqliteTelemetryStore } from "../../dist/telemetry/sqliteTelemetryStore.js";
 
 const root = resolve(import.meta.dirname, "../..");
 
@@ -325,6 +331,87 @@ test("the production migration graph advances the normal aggregate path", () => 
   assert.deepEqual(normalizedProject.state.projects["project-1"].knowledgeProposals, []);
   assert.deepEqual(normalizedProject.state.projects["project-1"].knowledge, []);
   assert.equal(normalizedProject.schemaManifest.recordVersions.project, 4);
+
+  const configStep = registry.lookup("record", "config", 1);
+  assert.notEqual(configStep, undefined);
+  const configSnapshot = {
+    schemaManifest: {
+      schemaVersion: 1,
+      storageVersion: 7,
+      aggregateSchemaVersion: 20,
+      recordVersions: { config: 1 },
+      updatedAt: "2026-08-22T00:00:00.000Z"
+    },
+    state: {
+      schemaVersion: 20,
+      config: {
+        schemaVersion: 1,
+        providerRetryMaxWindowMs: 12_345,
+        yieldReceiptReplay: false,
+        gitBin: "/custom/git",
+        telemetryMode: "bounded"
+      }
+    }
+  };
+  configStep.preconditions(configSnapshot);
+  const migratedConfig = configStep.transform(configSnapshot);
+  assert.equal(migratedConfig.schemaManifest.recordVersions.config, 2);
+  assert.deepEqual(migratedConfig.state.config, {
+    schemaVersion: 2,
+    providerRetryMaxWindowSeconds: 13,
+    telemetryEnabled: true
+  });
+});
+
+test("Provider retry scheduling consumes the configured delays and total window", () => {
+  const now = new Date("2026-08-22T00:00:00.000Z");
+  const decision = scheduleProviderRetry(undefined, {
+    failureEventId: "event-1",
+    errorClass: "transient-provider",
+    lastErrorSummary: "temporary"
+  }, now, { delaysMs: [1_000, 3_000], maxWindowMs: 10_000 });
+  assert.equal(decision.outcome, "scheduled");
+  assert.equal(decision.retry.nextAttemptAt, "2026-08-22T00:00:01.000Z");
+  assert.equal(decision.retry.episodeDeadlineAt, "2026-08-22T00:00:10.000Z");
+  assert.equal(decision.retry.maxRetries, 2);
+  const dispatching = prepareProviderRetryDispatch(
+    decision.retry,
+    "retry-receipt-1",
+    new Date(decision.retry.nextAttemptAt)
+  );
+  assert.match(serializeProviderRetryEnvelope({
+    taskId: "task-1",
+    runId: "run-1",
+    roleName: "worker",
+    retry: dispatching
+  }), /retry=1\/2/u);
+});
+
+test("diagnostic telemetry enforces the configured per-Run cap during writes", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-core-smoke-telemetry-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const taskStore = new SqliteTaskStore(home);
+  taskStore.close();
+  const telemetry = new SqliteTelemetryStore(home, { mode: "on", runCap: 2 });
+  t.after(() => telemetry.close());
+  for (let sequence = 1; sequence <= 3; sequence += 1) {
+    telemetry.observe({
+      taskId: "task-1",
+      roleName: "worker",
+      runId: "agent-run-1",
+      generation: "launch-1",
+      progressId: `progress-${sequence}`,
+      sequence,
+      payload: { kind: "progress" },
+      receivedAt: new Date(Date.UTC(2026, 7, 22, 0, 0, sequence)).toISOString()
+    });
+  }
+  await telemetry.flush();
+  assert.equal(telemetry.count("task-1", "agent-run-1"), 2);
+  assert.deepEqual(
+    telemetry.list("task-1", "agent-run-1").items.map(({ sequence }) => sequence),
+    [2, 3]
+  );
 });
 
 test("the built-in Agent Drivers are available through the shared registry", () => {

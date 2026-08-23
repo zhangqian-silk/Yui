@@ -197,7 +197,7 @@ function launchHint(
     case "config":
       return agentId === undefined
         ? "Verify the Provider model and effort configuration."
-        : `Verify custom model/effort with yui agent capabilities ${agentId}.`;
+        : `Verify custom model/effort with yui config agent capabilities ${agentId}.`;
     case "auth":
       return "Verify Provider authentication and the Agent environment.";
     case "executable":

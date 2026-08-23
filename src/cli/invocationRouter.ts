@@ -36,7 +36,7 @@ function resolveExecutionPath(args: readonly string[]): Invocation {
     const child = findChild(node, args[index] ?? "");
     const internalExecutable = child !== undefined && (
       (node === ROOT_COMMAND && child.name === "internal")
-      || (node.path.join(" ") === "yui completion" && child.name === "candidates")
+      || (node.path.join(" ") === "yui config completion" && child.name === "candidates")
       || (node.path.join(" ") === "yui task run" && child.name === "checkpoint")
       || (node.path.join(" ") === "yui controller"
         && (child.name === "identity" || child.name === "live-identity"))

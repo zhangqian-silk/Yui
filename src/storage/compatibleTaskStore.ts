@@ -23,6 +23,7 @@ import {
   type HomeIdentity
 } from "../repository/homeIdentity.js";
 import {
+  CURRENT_STORAGE_LAYOUT_VERSION,
   ensureStorageSchema,
   inspectStorageSchema,
   readStorageSchemaManifest,
@@ -51,16 +52,20 @@ export type OpenCompatibleFileTaskStoreOptions = Readonly<{
 }>;
 
 /**
- * Initialize a brand-new Home, or open an existing Home through the same
- * compatibility classification as every ordinary command. Setup is the one
- * ordinary flow that is also responsible for creating the initial manifest.
+ * Initialize a brand-new Home with the current authoritative backend, or open
+ * an existing Home through the same compatibility classification as every
+ * ordinary command. Setup is the one ordinary flow that is also responsible
+ * for creating the initial manifest.
  */
-export function initializeCompatibleFileTaskStore(
+export function initializeCompatibleTaskStore(
   home: string,
   options: OpenCompatibleFileTaskStoreOptions = {}
 ): TaskStore {
   if (inspectStorageSchema(home).status === "uninitialized") {
     ensureStorageSchema(home);
+    if (CURRENT_STORAGE_LAYOUT_VERSION >= 7) {
+      return new SqliteTaskStore(home);
+    }
   }
   return openCompatibleFileTaskStore(home, options);
 }

@@ -41,7 +41,7 @@ For a global Operator or custom GlobalRole Session, load the stable exact view
 before routing or acting:
 
 ```sh
-"$YUI_SESSION_CLI" role context "$YUI_ROLE" --json
+"$YUI_SESSION_CLI" session context "$YUI_ROLE" --json
 ```
 
 Global context grants no Task implementation workspace. Read a Task only after

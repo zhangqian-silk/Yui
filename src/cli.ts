@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 import { renderCommandHelp } from "./cli/helpRenderer.js";
+import { describeCommandTree, findCommandNode } from "./cli/commandCatalog.js";
 import { routeInvocation } from "./cli/invocationRouter.js";
 import { renderCompletion, type CliIdentity } from "./cli/completion.js";
 import { resolveCompletionCandidates } from "./cli/dynamicCompletion.js";
@@ -28,7 +29,7 @@ import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
 import { runUpgradeCommand } from "./cli/upgradeCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
-import { resolveTmuxBin } from "./config/yuiConfig.js";
+import { resolveTmuxBin, resolveTmuxHistoryLimit } from "./config/yuiConfig.js";
 import { renderAgentConfigurationCatalog } from "./output/agentConfigurationPresentation.js";
 import type { ConfiguredAgent } from "./agent/agent.js";
 import { nativeAgentEnvironmentNames } from "./agent/launchEnvironment.js";
@@ -41,6 +42,8 @@ import {
   type GlobalRoleCommandOptions
 } from "./commands/globalRoleCommands.js";
 import { runConfigCommand } from "./commands/configCommands.js";
+import { CONFIG_DOMAINS, type ConfigDomain } from "./config/configCatalog.js";
+import { runConfigOverview } from "./commands/configOverview.js";
 import {
   parseControllerCleanupOptions,
   parseControllerStatusOptions,
@@ -291,8 +294,21 @@ export async function main(): Promise<void> {
       "Release usage: yui release install <source-dir> | list | activate [release-id]."
     );
   }
-  if (args[0] === "completion") {
+  if (args[0] === "config" && args[1] === "completion") {
     await completionCommand(home, invocation.node);
+    return;
+  }
+  if (args[0] === "config" && args[1] === "describe") {
+    const describeNode = findCommandNode(["config", "describe"]);
+    if (describeNode === undefined) throw new Error("Config describe command is missing from the catalog.");
+    const domain = args[2];
+    const domains = describeNode.argumentValues[0] ?? [];
+    if (args.length > 3 || (domain !== undefined && !domains.includes(domain))) {
+      throw usageError(`Config describe usage: ${describeNode.usage.join(" | ")}.`);
+    }
+    const target = findCommandNode(domain === undefined ? ["config"] : ["config", domain]);
+    if (target === undefined) throw new Error(`Config domain is missing from the catalog: ${domain}.`);
+    emit(renderCommandHelp(target, VERSION), false, describeCommandTree(target));
     return;
   }
 
@@ -401,18 +417,16 @@ export async function main(): Promise<void> {
     throw usageError("Internal lifecycle callback usage is invalid.");
   }
 
-  if (args[0] === "session") {
-    if (args[1] !== "reconcile") {
-      throw usageError(
-        "Session usage: yui session reconcile [--report] [--cleanup]."
-      );
-    }
+  if (args[0] === "session" && args[1] === "reconcile") {
     const options = parseSessionReconcileOptions(args.slice(2));
     const store = openCompatibleFileTaskStore(home);
     const tmux = new TmuxManager(
       resolveTmuxBin(store.getConfig().tmuxBin),
       new NodeCommandExecutor(),
-      { yuiHome: home }
+      {
+        yuiHome: home,
+        historyLimit: resolveTmuxHistoryLimit(store.getConfig().tmuxHistoryLimit)
+      }
     );
     const reconciliation = new SessionOwnerReconciliation({
       home,
@@ -637,6 +651,7 @@ export async function main(): Promise<void> {
     executor,
     {
       yuiHome: home,
+      historyLimit: resolveTmuxHistoryLimit(store.getConfig().tmuxHistoryLimit),
       terminalInput: process.stdin,
       onWarning: (message) => process.stderr.write(`Warning: ${message}\n`)
     }
@@ -707,100 +722,135 @@ export async function main(): Promise<void> {
     return;
   }
 
-  if (resolved[0] === "agent") {
-    const agentArgs = resolved.slice(1);
-    if (agentArgs[0] === "capabilities") {
-      if (agentArgs.length !== 2) {
-        throw usageError("Agent capabilities usage: yui agent capabilities <agent-id>");
-      }
-      const agent = store.getConfiguredAgent(agentArgs[1] ?? "");
-      if (agent === null) throw agentNotFound(agentArgs[1] ?? "");
-      const result = await catalogs.resolve({
-        agent,
-        cwd: store.getConfig().defaultWorkspace ?? process.cwd()
-      });
-      emit(renderAgentConfigurationCatalog(result), false, result);
-      return;
-    }
-    const affectedAgentId = agentArgs[1];
-    const previousAgent = typeof affectedAgentId === "string"
-      ? store.getConfiguredAgent(affectedAgentId)
-      : null;
-    const output = runAgentCommand(
-      agentArgs,
-      store as unknown as AgentCommandStore
-    );
-    if (
-      agentArgs[0] === "add"
-      || agentArgs[0] === "update"
-      || agentArgs[0] === "remove"
-    ) {
-      const currentAgent = typeof affectedAgentId === "string"
-        ? store.getConfiguredAgent(affectedAgentId)
-        : null;
-      const capabilityNotice = currentAgent !== null
-        && (agentArgs[0] === "add" || agentArgs[0] === "update")
-        ? renderAgentConfigurationResolutionNotice(await catalogs.resolve({
-            agent: currentAgent,
-            cwd: store.getConfig().defaultWorkspace ?? process.cwd()
-          }))
-        : "";
-      const scope = agentEnvironmentRefreshScope(
-        previousAgent,
-        currentAgent,
-        store.listConfiguredAgents()
-      );
-      const refresh = await refreshRunningFileTaskControllerEnvironment(
-        home,
+  if (resolved[0] === "config") {
+    const domain = resolved[1];
+    const roleOptions: GlobalRoleCommandOptions = {
+      yuiHome: home,
+      env: process.env
+    };
+    if (domain === "show") {
+      const result = runConfigOverview(
+        resolved.slice(2),
         store,
         process.env,
-        scope
+        resolveCliIdentity(process.env),
+        roleOptions
       );
-      emit(withControllerRefreshWarning(
-        `${output.trimEnd()}${capabilityNotice.length === 0 ? "\n" : `\n${capabilityNotice}`}`,
-        refresh,
-        "Agent environment"
-      ));
+      emit(result.output, false, result.data);
       return;
     }
-    emit(output);
-    return;
-  }
-  if (resolved[0] === "config") {
-    const configArgs = resolved.slice(1);
-    const result = runConfigCommand(configArgs, store);
-    if (
-      configArgs[0] === "set"
-      && configArgs[1] === "reconciliation-interval-seconds"
-    ) {
-      const refresh = await refreshRunningFileTaskControllerConfiguration(
-        home,
-        { environment: process.env }
-      );
-      emit(withControllerRefreshWarning(result.output, refresh, "Controller configuration"));
+    if ((CONFIG_DOMAINS as readonly string[]).includes(domain ?? "")) {
+      const configDomain = domain as ConfigDomain;
+      const domainArgs = resolved.slice(2);
+      const result = runConfigCommand(configDomain, domainArgs, store);
+      if (
+        domainArgs[0] === "set"
+        && domainArgs[1] === "reconciliation-interval-seconds"
+      ) {
+        const refresh = await refreshRunningFileTaskControllerConfiguration(
+          home,
+          { environment: process.env }
+        );
+        emit(withControllerRefreshWarning(result.output, refresh, "Controller configuration"));
+        return;
+      }
+      emit(result.output, false, result.data);
       return;
     }
-    emit(result.output, false, result.data);
-    return;
+    if (domain === "agent") {
+      const agentArgs = resolved.slice(2);
+      if (agentArgs[0] === "capabilities") {
+        if (agentArgs.length !== 2) {
+          throw usageError("Agent capabilities usage: yui config agent capabilities <agent-id>");
+        }
+        const agent = store.getConfiguredAgent(agentArgs[1] ?? "");
+        if (agent === null) throw agentNotFound(agentArgs[1] ?? "");
+        const result = await catalogs.resolve({
+          agent,
+          cwd: store.getConfig().defaultWorkspace ?? process.cwd()
+        });
+        emit(renderAgentConfigurationCatalog(result), false, result);
+        return;
+      }
+      const affectedAgentId = agentArgs[1];
+      const previousAgent = typeof affectedAgentId === "string"
+        ? store.getConfiguredAgent(affectedAgentId)
+        : null;
+      const output = runAgentCommand(
+        agentArgs,
+        store as unknown as AgentCommandStore
+      );
+      if (
+        agentArgs[0] === "add"
+        || agentArgs[0] === "update"
+        || agentArgs[0] === "remove"
+      ) {
+        const currentAgent = typeof affectedAgentId === "string"
+          ? store.getConfiguredAgent(affectedAgentId)
+          : null;
+        const capabilityNotice = currentAgent !== null
+          && (agentArgs[0] === "add" || agentArgs[0] === "update")
+          ? renderAgentConfigurationResolutionNotice(await catalogs.resolve({
+              agent: currentAgent,
+              cwd: store.getConfig().defaultWorkspace ?? process.cwd()
+            }))
+          : "";
+        const scope = agentEnvironmentRefreshScope(
+          previousAgent,
+          currentAgent,
+          store.listConfiguredAgents()
+        );
+        const refresh = await refreshRunningFileTaskControllerEnvironment(
+          home,
+          store,
+          process.env,
+          scope
+        );
+        emit(withControllerRefreshWarning(
+          `${output.trimEnd()}${capabilityNotice.length === 0 ? "\n" : `\n${capabilityNotice}`}`,
+          refresh,
+          "Agent environment"
+        ));
+        return;
+      }
+      emit(output);
+      return;
+    }
+    if (domain === "profile") {
+      const result = runProfileCommand(resolved.slice(2), store);
+      emit(result.output, false, result.data);
+      return;
+    }
+    if (domain === "role") {
+      const result = runGlobalRoleCommand(
+        resolved.slice(2),
+        store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
+        roleOptions
+      );
+      if (typeof result !== "string") {
+        throw new Error("Config Role commands cannot enter a runtime Session.");
+      }
+      emit(result);
+      return;
+    }
+    throw usageError(`Unknown configuration domain: ${domain ?? ""}.`);
   }
   if (resolved[0] === "project") {
     const result = await runProjectCommand(resolved.slice(1), store, { environment: process.env });
     emit(result.output, false, result.data);
     return;
   }
-  if (resolved[0] === "profile") {
-    const result = runProfileCommand(resolved.slice(1), store);
-    emit(result.output, false, result.data);
-    return;
-  }
-  if (resolved[0] === "role") {
+  if (resolved[0] === "session") {
     const roleOptions: GlobalRoleCommandOptions = {
       yuiHome: home,
       env: process.env,
       jsonOutput
     };
+    const sessionArgs = resolved[1] === "enter" || resolved[1] === "context"
+      ? [resolved[1], ...resolved.slice(2)]
+      : ["session", resolved[1] ?? "", ...resolved.slice(2)];
     const result = runGlobalRoleCommand(
-      resolved.slice(1),
+      sessionArgs,
       store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
       roleOptions
     );
@@ -2167,7 +2217,7 @@ async function deltaRecheckPreflightForTaskCommand(
   if (!deltaRecheckEnabled(config)) {
     throw usageError(
       "Delta-recheck is not enabled for this Project's review policy. "
-      + "Set `yui config set review --role <role> --trigger final --delta-recheck enabled` "
+      + "Set `yui config workflow set review --role <role> --trigger final --delta-recheck enabled` "
       + "or request a full Review."
     );
   }
@@ -2361,7 +2411,7 @@ async function executeOperatorSessionControl(
           return;
         }
         const updated = runGlobalRoleCommand(
-          resolution.args.slice(1),
+          resolution.args.slice(2),
           store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
           { yuiHome: home, env: process.env }
         );
@@ -2432,11 +2482,13 @@ async function completionCommand(
   home: string,
   node: import("./cli/commandCatalog.js").CommandNode
 ): Promise<void> {
-  if (args[1] === "candidates") {
-    const separator = args.indexOf("--");
-    const prefix = args[2];
-    if (prefix === undefined || separator !== 3) {
-      throw usageError("Completion candidates usage: yui completion candidates <prefix> -- <words...>");
+  if (args[2] === "candidates") {
+    const separator = args.indexOf("--", 4);
+    const prefix = args[3];
+    if (prefix === undefined || separator !== 4) {
+      throw usageError(
+        "Completion candidates usage: yui config completion candidates <prefix> -- <words...>"
+      );
     }
     const candidates = await resolveCompletionCandidates({
       current: prefix,
@@ -2451,9 +2503,9 @@ async function completionCommand(
   if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
     throw usageError("Completion configuration requires an interactive terminal.");
   }
-  const shell = completionShell(args[1]);
-  if (args.length > (shell === undefined ? 1 : 2)) {
-    throw usageError("Completion usage: yui completion [bash|zsh|fish]");
+  const shell = completionShell(args[2]);
+  if (args.length > (shell === undefined ? 2 : 3)) {
+    throw usageError("Completion usage: yui config completion [bash|zsh|fish]");
   }
   const store = openCompatibleFileTaskStore(home);
   const ioHandle = terminalIo();
@@ -2501,7 +2553,7 @@ async function resolveTerminalArguments(
     // shown explicitly. Other commands first resolve missing positional
     // targets through the generic selector, then enter the focused Role UI.
     if (
-      (operatorArgs[0] === "role" && operatorArgs[1] === "add")
+      (operatorArgs[0] === "config" && operatorArgs[1] === "role" && operatorArgs[2] === "add")
       || (operatorArgs[0] === "task" && operatorArgs[1] === "role" && operatorArgs[2] === "add")
     ) {
       const wizard = await resolveRoleWizardArguments(operatorArgs, ports, handle.io);
@@ -2569,7 +2621,7 @@ async function preflightAgentConfigurationMutation(
 }
 
 function hasModelOrEffortMutation(args: readonly string[]): boolean {
-  const operation = args[0] === "role"
+  const operation = (args[0] === "config" && args[1] === "role")
     || (args[0] === "task" && args[1] === "role");
   return operation && [
     "--model", "--effort", "--clear-model", "--clear-effort"
@@ -2582,8 +2634,8 @@ function configurationMutationAgentId(
 ): string | undefined {
   const explicit = optionValue(args, "--agent");
   if (explicit !== undefined) return explicit;
-  if (args[0] === "role" && args[1] === "update") {
-    return store.getGlobalRole(args[2] ?? "")?.activeAgentId;
+  if (args[0] === "config" && args[1] === "role" && args[2] === "update") {
+    return store.getGlobalRole(args[3] ?? "")?.activeAgentId;
   }
   if (args[0] === "task" && args[1] === "role") {
     if (args[2] === "add") return store.getConfig().defaultAgent;

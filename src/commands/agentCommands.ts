@@ -67,7 +67,7 @@ export function runAgentCommand(args: string[], store: AgentCommandStore): strin
     default:
       throw usageError(command === undefined
         ? "Agent command is required."
-        : `Unknown command: agent ${command}`);
+        : `Unknown command: config agent ${command}`);
   }
 }
 
@@ -97,13 +97,13 @@ function addAgent(args: string[], store: AgentCommandStore): string {
   }
   const created = store.createConfiguredAgentIfAbsent(agent);
   if (created === null) {
-    throw usageError(`Agent already exists: ${id}. Use yui agent update to change it.`);
+    throw usageError(`Agent already exists: ${id}. Use yui config agent update to change it.`);
   }
   return renderAgent(`Added agent ${id}`, created);
 }
 
 function listAgents(args: string[], store: AgentCommandStore): string {
-  assertNoArguments(args, "Agent list usage: yui agent list");
+  assertNoArguments(args, "Agent list usage: yui config agent list");
   const agents = store.listConfiguredAgents();
   if (agents.length === 0) return "No agents configured.\n";
   return `${renderTable(
@@ -127,7 +127,7 @@ function listAgents(args: string[], store: AgentCommandStore): string {
 function showAgent(args: string[], store: AgentCommandStore): string {
   const [rawId, ...rest] = args;
   const id = agentId(rawId);
-  assertNoArguments(rest, "Agent show usage: yui agent show <agent-id>");
+  assertNoArguments(rest, "Agent show usage: yui config agent show <agent-id>");
   const agent = store.getConfiguredAgent(id);
   if (agent === null) throw agentNotFound(id);
   return renderAgent(`Agent: ${id}`, agent);
@@ -205,7 +205,7 @@ function updateAgent(args: string[], store: AgentCommandStore): string {
 function removeAgent(args: string[], store: AgentCommandStore): string {
   const [rawId, ...rest] = args;
   const id = agentId(rawId);
-  assertNoArguments(rest, "Agent remove usage: yui agent remove <agent-id>");
+  assertNoArguments(rest, "Agent remove usage: yui config agent remove <agent-id>");
   const removed = store.transaction((tx) => {
     if (tx.getConfiguredAgent(id) === null) return false;
     if (tx.getConfig().defaultAgent === id) {

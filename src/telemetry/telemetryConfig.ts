@@ -17,9 +17,9 @@ import {
  * diagnostic sidecar. Canonical `runtime.observation` state is always durable
  * and compacted independently; no mode changes lifecycle authority.
  */
-export type TelemetryMode = "legacy" | "dual" | "bounded";
+export type TelemetryMode = "off" | "on";
 
-export const DEFAULT_TELEMETRY_MODE: TelemetryMode = "legacy";
+export const DEFAULT_TELEMETRY_MODE: TelemetryMode = "off";
 
 /** Terminal Run/generation progress rows retained after prune. */
 export const DEFAULT_TERMINAL_KEEP = TELEMETRY_KEEP_PER_GENERATION;
@@ -33,25 +33,6 @@ export const DEFAULT_RUN_CAP = TELEMETRY_RUN_CAP;
  * rows (Tasks × Runs × cap).
  */
 export const MAX_RUN_CAP = 10_000_000;
-
-const TELEMETRY_MODES: readonly TelemetryMode[] = ["legacy", "dual", "bounded"];
-
-/**
- * Resolve the telemetry mode from the durable config value (default `legacy`).
- * Only the three exact values (case-insensitive) are accepted; anything else
- * fails closed at startup instead of silently changing diagnostic retention.
- */
-export function resolveTelemetryMode(value?: unknown): TelemetryMode {
-  if (typeof value !== "string") return DEFAULT_TELEMETRY_MODE;
-  const raw = value.trim().toLowerCase();
-  if (raw === undefined || raw === "") return DEFAULT_TELEMETRY_MODE;
-  if (!TELEMETRY_MODES.includes(raw as TelemetryMode)) {
-    throw new TypeError(
-      `telemetryMode must be one of ${TELEMETRY_MODES.join(", ")}; got ${JSON.stringify(raw)}.`
-    );
-  }
-  return raw as TelemetryMode;
-}
 
 /**
  * Resolve the terminal-Run retention window from the durable config value
