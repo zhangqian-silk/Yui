@@ -2,6 +2,7 @@ import { requireIdentity } from "../domain/validation.js";
 
 export const TASK_RECORD_ID_PREFIXES = {
   workItem: "work-item",
+  contextSnapshot: "context-snapshot",
   agentRun: "agent-run",
   reviewRound: "review-round",
   reviewFinding: "review-finding",

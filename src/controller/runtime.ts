@@ -109,6 +109,15 @@ import {
   type RuntimeResourceSampleIdentity
 } from "./resourceInventory.js";
 import { SessionOwnerReconciliation } from "./sessionOwnerReconciliation.js";
+import { launchBrokerForHome } from "../runtime/launchBroker.js";
+import {
+  classifyRuntimeProcessExit,
+  validateRuntimeProcessExitObservation
+} from "../runtime/processExitObservation.js";
+import { appendGlobalProcessExitObservation } from "../runtime/globalProcessExitStore.js";
+import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
+import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
+import { createTaskEvent } from "../event/taskEvent.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
   store?: TaskStore;
@@ -730,6 +739,94 @@ export function createRuntimeLifecycleDispatcher(
     });
   const lifecycleTails = new Map<string, Promise<void>>();
   return async (method, params) => {
+    if (method === "runtime.process-exit-observe") {
+      const observation = validateRuntimeProcessExitObservation(params as never);
+      const run = observation.taskId === undefined || observation.runId === undefined
+        ? null
+        : store.getAgentRun(observation.taskId, observation.runId);
+      const globalRole = observation.taskId === undefined
+        ? store.getGlobalRole(observation.roleName)
+        : null;
+      const adapterId = run?.effective.adapterId
+        ?? globalRole?.agentBindings[globalRole.activeAgentId]?.adapterId;
+      const driver = adapterId === undefined
+        ? null
+        : builtinAgentDriverRegistry().findByAdapterId(adapterId);
+      const turnTerminalObserved = observation.taskId !== undefined
+        && observation.runId !== undefined
+        && store.listEvents(observation.taskId).some((event) => {
+          const runtime = runtimeObservationFromTaskEvent(event);
+          return runtime !== null
+            && runtime.fence.runId === observation.runId
+            && ["turn.completed", "turn.failed", "turn.cancelled"].includes(runtime.kind)
+            && Date.parse(runtime.receivedAt) <= Date.parse(observation.observedAt);
+        });
+      const turnFailureObserved = observation.taskId !== undefined
+        && observation.runId !== undefined
+        && store.listEvents(observation.taskId).some((event) => {
+          const runtime = runtimeObservationFromTaskEvent(event);
+          return runtime !== null
+            && runtime.fence.runId === observation.runId
+            && runtime.fence.launchId === observation.launchId
+            && runtime.kind === "turn.failed"
+            && Date.parse(runtime.receivedAt) <= Date.parse(observation.observedAt);
+        });
+      const classification = classifyRuntimeProcessExit(observation, {
+        ...(driver === null
+          ? {}
+          : { childLifecycle: driver.capabilities.lifecycle.providerProcess }),
+        turnTerminalObserved,
+        turnFailureObserved
+      });
+      if (observation.taskId === undefined) {
+        const recorded = appendGlobalProcessExitObservation(
+          store.rootDirectory(),
+          observation,
+          classification
+        );
+        return { recorded, scope: "global", classification };
+      }
+      const recorded = store.transaction((tx) => {
+        if (tx.getTask(observation.taskId!) === null) {
+          throw applicationError("INVALID_PARAMS", `Task not found: ${observation.taskId}.`);
+        }
+        const duplicate = tx.listEvents(observation.taskId!).some((event) => (
+          event.type === "runtime.process-exit-observed"
+          && event.payload.observationId === observation.observationId
+        ));
+        if (duplicate) return false;
+        tx.saveEvent(observation.taskId!, createTaskEvent(
+          tx.nextEventId(observation.taskId!),
+          observation.taskId!,
+          "runtime.process-exit-observed",
+          {
+            observationId: observation.observationId,
+            processKind: observation.processKind,
+            roleName: observation.roleName,
+            launchId: observation.launchId,
+            observedAt: observation.observedAt,
+            classification,
+            observation: JSON.stringify(observation)
+          },
+          new Date(observation.observedAt)
+        ));
+        return true;
+      });
+      return { recorded, classification };
+    }
+    if (method === "runtime.launch-redeem") {
+      if (params === null || typeof params !== "object" || Array.isArray(params)) {
+        throw applicationError("INVALID_PARAMS", "Launch redemption params are invalid.");
+      }
+      const launchId = (params as Record<string, unknown>).launchId;
+      const ticket = (params as Record<string, unknown>).ticket;
+      const hostPid = (params as Record<string, unknown>).hostPid;
+      if (typeof launchId !== "string" || typeof ticket !== "string"
+        || !Number.isSafeInteger(hostPid) || (hostPid as number) <= 0) {
+        throw applicationError("INVALID_PARAMS", "Launch redemption identity is invalid.");
+      }
+      return launchBrokerForHome(store.rootDirectory()).redeem(launchId, ticket);
+    }
     if (method === "runtime.replace-agent-environment") {
       if (environmentRefresher === undefined) {
         throw applicationError("METHOD_NOT_FOUND", "Controller method was not found.");

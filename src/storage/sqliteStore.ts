@@ -48,6 +48,10 @@ import {
   validateWorkMailbox
 } from "../coordination/workMailbox.js";
 import type { Decision } from "../decision/decision.js";
+import {
+  validateContextSnapshot,
+  type ContextSnapshot
+} from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from "../executor/agentExecutor.js";
@@ -2110,6 +2114,64 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
+  // -- context snapshots ------------------------------------------------------
+
+  nextContextSnapshotId(taskId: string): string {
+    return this.#nextTaskRecordId(taskId, "contextSnapshot");
+  }
+
+  getContextSnapshot(taskId: string, snapshotId: string): ContextSnapshot | null {
+    return this.#getPayload<ContextSnapshot>(
+      "context_snapshots",
+      "task_id = ? AND snapshot_id = ?",
+      [taskId, snapshotId]
+    );
+  }
+
+  listContextSnapshots(taskId: string): ContextSnapshot[] {
+    return this.#sortById(
+      this.#listPayload<ContextSnapshot>("context_snapshots", "task_id = ?", [taskId]),
+      (snapshot) => snapshot.id
+    );
+  }
+
+  saveContextSnapshot(snapshot: ContextSnapshot): void {
+    const stored = validateContextSnapshot(snapshot);
+    this.#requireTask(stored.taskId);
+    const existing = this.getContextSnapshot(stored.taskId, stored.id);
+    if (existing !== null) {
+      if (!isDeepStrictEqual(existing, stored)) {
+        throw new StorageRecordError(`Context Snapshot is immutable: ${stored.id}.`);
+      }
+      return;
+    }
+    const duplicate = this.#db.prepare(
+      `SELECT snapshot_id FROM context_snapshots
+       WHERE task_id = ? AND scope = ? AND COALESCE(scope_ref, '') = COALESCE(?, '') AND sequence = ?`
+    ).get(stored.taskId, stored.scope, stored.scopeRef ?? null, stored.sequence);
+    if (duplicate !== undefined) {
+      throw new StorageRecordError(
+        `Context Snapshot sequence already exists: ${stored.taskId}/${stored.scope}/${stored.sequence}.`
+      );
+    }
+    this.#mutate(() => {
+      this.#db.prepare(
+        `INSERT INTO context_snapshots
+          (task_id, snapshot_id, scope, scope_ref, sequence, digest, payload, frozen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        stored.taskId,
+        stored.id,
+        stored.scope,
+        stored.scopeRef ?? null,
+        stored.sequence,
+        stored.digest,
+        this.#json(stored),
+        stored.frozenAt
+      );
+    });
+  }
+
   // -- agent runs -------------------------------------------------------------
 
   nextAgentRunId(taskId: string): string { return this.#nextTaskRecordId(taskId, "agentRun"); }
@@ -2152,18 +2214,24 @@ export class SqliteTaskStore implements TaskStore {
       : ` AND tc.task_id IN (${selectedTaskIds.map(() => "?").join(", ")})`;
     const rows = this.#db.prepare(
       `SELECT DISTINCT ar.task_id AS taskId, ar.run_id AS runId, ar.role_name AS roleName,
-              json_extract(ar.payload, '$.providerRetry.nextAttemptAt') AS nextAttemptAt
+              json_extract(ar.payload, '$.providerRetry.state') AS state,
+              CASE json_extract(ar.payload, '$.providerRetry.state')
+                WHEN 'scheduled' THEN json_extract(ar.payload, '$.providerRetry.nextAttemptAt')
+                ELSE json_extract(ar.payload, '$.providerRetry.episodeDeadlineAt')
+              END AS dueAt
        FROM tasks_catalog tc INDEXED BY idx_tasks_active
        JOIN active_runs ap ON ap.task_id = tc.task_id
        JOIN agent_runs ar ON ar.task_id = ap.task_id AND ar.run_id = ap.run_id
        WHERE tc.is_active = 1
          AND ar.status = 'active'
-         AND json_extract(ar.payload, '$.providerRetry.nextAttemptAt') IS NOT NULL${taskPredicate}`
+         AND json_extract(ar.payload, '$.providerRetry.state') IN
+           ('scheduled', 'dispatching', 'awaiting-progress')${taskPredicate}`
     ).all(...(selectedTaskIds ?? [])) as Array<{
       taskId: string;
       runId: string;
       roleName: string;
-      nextAttemptAt: string;
+      state: PendingProviderRetry["state"];
+      dueAt: string;
     }>;
     return rows.sort((left, right) => (
       numericCompare(left.taskId, right.taskId)

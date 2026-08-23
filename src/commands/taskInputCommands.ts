@@ -18,7 +18,7 @@ import {
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import { type Role } from "../role/role.js";
-import type { AgentRun } from "../run/agentRun.js";
+import { agentRunDeliveryReceiptId, type AgentRun } from "../run/agentRun.js";
 import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 import {
@@ -138,7 +138,7 @@ function createRequest(
       roleName: LEADER_ROLE,
       agentId: origin.run.effective.agentId,
       runId: origin.run.id,
-      receiptId: formatAgentRunReceiptId(task.id, origin.run.id),
+      receiptId: agentRunDeliveryReceiptId(origin.run),
       ...(origin.requester.nativeSessionId === undefined
         ? {}
         : { nativeSessionId: origin.requester.nativeSessionId }),

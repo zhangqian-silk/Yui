@@ -17,13 +17,18 @@ import {
   type ReviewRound
 } from "../review/reviewRound.js";
 import { reconcileReviewFindingsAfterReview } from "../review/reviewFindingLedger.js";
-import { failAgentRun, withYieldReceipt, yieldAgentRun, type AgentRun } from "../run/agentRun.js";
+import {
+  agentRunDeliveryReceiptId,
+  failAgentRun,
+  withYieldReceipt,
+  yieldAgentRun,
+  type AgentRun
+} from "../run/agentRun.js";
 import { createYieldReceipt } from "../run/yieldReceipt.js";
 import {
   recordExecutionLaneResult,
   type ExecutionLaneGitSnapshot
 } from "../execution/executionGroup.js";
-import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
@@ -673,7 +678,7 @@ function recoverExactAgentRunInTransaction(
     roleName: input.roleName,
     agentId: input.agentId,
     runId: input.runId,
-    receiptId: formatAgentRunReceiptId(input.taskId, input.runId),
+    receiptId: agentRunDeliveryReceiptId(current),
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
     ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
     outcome: { status: "failed", summary: input.reason }

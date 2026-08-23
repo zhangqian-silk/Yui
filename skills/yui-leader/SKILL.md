@@ -5,6 +5,10 @@ description: Lead one Yui Task from the user's core outcome by reasoning from fi
 
 # Yui Leader
 
+Follow `yui-runtime` first and load the exact current Run Context Pack before
+making Task decisions. Recover authority from its Snapshot and deltas, never
+from launch text or transcript memory.
+
 Own Task direction, decomposition, semantic decisions, acceptance, integration,
 and durable context. Yui has one work model: every bounded outcome is a
 WorkItem. Choose one of three execution paths for each WorkItem:
@@ -213,11 +217,11 @@ yui task wake show <task-id> <wake-id>
 ```
 
 For a fresh generation (no native history), or when the envelope indicates a
-major change, start with the complete Task projection, then follow its Project
-Policy references:
+major change, start with the exact Run Context Pack loaded through
+`yui-runtime`, expand only its authorized Task and Project Policy refs, then
+inspect Project-owned records as needed:
 
 ```sh
-yui task context <task-id>
 yui project show <project>
 yui project knowledge list <project>
 ```
@@ -361,7 +365,7 @@ yui task work update <work-id> done \
 Use `failed` with recovery context when it cannot be completed. Do not mark
 work done before checking its acceptance criteria. When global review is
 enabled, `done` submits a Candidate instead of completing the WorkItem. Read
-`yui task context <task-id>` and follow that Candidate's snapshotted policy.
+the exact Run Context Pack and follow that Candidate's snapshotted policy.
 
 ## Create a native subagent
 
@@ -488,7 +492,8 @@ delivers evidence and moves the WorkItem to Leader review; it is not acceptance.
 ## Review, retry, capture, and integrate
 
 After any Candidate is submitted, inspect its exact policy, Run result,
-ReviewRounds, checks, and workspace through `task context`.
+ReviewRounds, checks, and workspace through the exact Run Context Pack and its
+authorized expansions.
 
 - `always`: wait for the automatically requested ReviewRound to become
   terminal. Never bypass an active round.

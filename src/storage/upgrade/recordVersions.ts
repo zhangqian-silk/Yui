@@ -28,6 +28,7 @@ import {
   CURRENT_CONFIG_SCHEMA_VERSION,
   CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION,
   CURRENT_CHANGE_SET_SCHEMA_VERSION,
+  CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
   CURRENT_DECISION_SCHEMA_VERSION,
   CURRENT_EVENT_SCHEMA_VERSION,
   CURRENT_GLOBAL_ROLE_SCHEMA_VERSION,
@@ -80,6 +81,7 @@ const EXPECTED_DIRECT_RECORD_LOCATORS: Readonly<Record<string, string>> = Object
   managedWorkspace: "state.json#/tasks/*/managedWorkspaces",
   taskRoleSessionSet: "state.json#/tasks/*/roleSessionSets",
   workItem: "state.json#/tasks/*/workItems",
+  contextSnapshot: "state.json#/tasks/*/contextSnapshots",
   agentRun: "state.json#/tasks/*/agentRuns",
   reviewRound: "state.json#/tasks/*/reviewRounds",
   changeSet: "state.json#/tasks/*/changeSets",
@@ -148,6 +150,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
         "state.json#/tasks/*/roleSessionSets"
       ),
       workItem: descriptor(CURRENT_WORK_ITEM_SCHEMA_VERSION, "state.json#/tasks/*/workItems"),
+      contextSnapshot: descriptor(
+        CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+        "state.json#/tasks/*/contextSnapshots"
+      ),
       agentRun: descriptor(CURRENT_AGENT_RUN_SCHEMA_VERSION, "state.json#/tasks/*/agentRuns"),
       reviewRound: descriptor(
         CURRENT_REVIEW_ROUND_SCHEMA_VERSION,

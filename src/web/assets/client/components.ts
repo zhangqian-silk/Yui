@@ -509,7 +509,7 @@ export function runCard(run, t, locale) {
   idRow.append(node("time", "", formatDateTime(run.endedAt || run.updatedAt, locale)));
   card.append(idRow);
 
-  card.append(richText(t("detail.instruction"), run.input, t, { className: "execute-io", threshold: 320 }));
+  card.append(richText(t("detail.instruction"), run.assignment?.directive || run.assignment?.action || "-", t, { className: "execute-io", threshold: 320 }));
   if (run.summary) {
     card.append(richText(t("detail.outcome"), run.summary, t, { className: "execute-io outcome", threshold: 320 }));
   }

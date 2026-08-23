@@ -2,13 +2,16 @@ import {
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
-import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import {
+  formatAgentRunReceiptId,
+  validateTaskRecordReference
+} from "../task/taskRecordReference.js";
 import type {
   LeaderRunDisposition,
   LeaderWaitReason
 } from "../scheduler/actionability.js";
 import {
-  markProviderRetryInFlight,
+  prepareProviderRetryDispatch,
   validateAgentRunProviderRetry,
   type AgentRunProviderRetry
 } from "./providerRetry.js";
@@ -17,9 +20,22 @@ import {
   type YieldReceipt
 } from "./yieldReceipt.js";
 import {
+  validateAgentRunControlRequest,
+  type AgentRunControlRequest
+} from "./runControlRequest.js";
+import {
   validateManagedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
+import {
+  createRunAssignment,
+  createRunBootstrapEnvelope,
+  validateRunAssignment,
+  validateRunBootstrapEnvelope,
+  type RunAssignment,
+  type RunBootstrapEnvelope
+} from "../context/runContextContract.js";
+import type { ContextSnapshotRef } from "../context/contextSnapshot.js";
 
 export type DispatchMode = "new" | "resume";
 export type AgentRunStatus = "active" | "yielded" | "failed";
@@ -27,15 +43,16 @@ export type AgentRunPurpose = "execution" | "review";
 
 export type AgentRun = {
   /**
-   * v7 adds optional Issue 04 retry/receipt fields and Issue 05 Leader
-   * actionability fields in their own namespaces; older readers ignore them.
+   * v8 replaces unbounded launch input with a durable Assignment and a bounded
+   * transport Envelope. Task content is loaded through the exact Context API.
    */
-  schemaVersion: 7;
+  schemaVersion: 9;
   id: string;
   taskId: string;
   roleName: string;
   mode: DispatchMode;
-  input: string;
+  assignment: RunAssignment;
+  bootstrapEnvelope: RunBootstrapEnvelope;
   purpose: AgentRunPurpose;
   workItemId?: string;
   reviewRoundId?: string;
@@ -59,6 +76,12 @@ export type AgentRun = {
    * gate every consumer reads; transport alone never sets it.
    */
   deliveredAt?: string;
+  /**
+   * Receipt of the most recently dispatched input for this Run. It survives
+   * retry-episode recovery so later lifecycle observations remain fenced to
+   * the accepted continuation even after active retry counters are cleared.
+   */
+  deliveryReceiptId?: string;
   summary?: string;
   /**
    * Issue 04 durable in-place retry projection. Present only while an active
@@ -66,6 +89,8 @@ export type AgentRun = {
    * terminalization.
    */
   providerRetry?: AgentRunProviderRetry;
+  /** Bounded same-Session control input; never contains the Run Assignment. */
+  controlRequest?: AgentRunControlRequest;
   /**
    * Issue 04 idempotent yield receipt. Present only on a yielded Run, written
    * in the same transaction as its terminal state.
@@ -95,7 +120,7 @@ export function createAgentRun(
   taskId: string,
   roleName: string,
   mode: DispatchMode,
-  input: string,
+  assignment: RunAssignment | string,
   now: Date,
   context: {
     workItemId?: string;
@@ -111,13 +136,33 @@ export function createAgentRun(
     throw new Error(`Agent run dispatch mode is invalid: ${mode}.`);
   }
   const timestamp = now.toISOString();
+  const normalizedAssignment = typeof assignment === "string"
+    ? createRunAssignment({
+        runId: id,
+        roleName,
+        purpose: context.purpose ?? "execution",
+        action: context.purpose === "review"
+          ? "review-round"
+          : context.workItemId === undefined ? "leader-wake" : "execute-work-item",
+        subject: {
+          taskId,
+          ...(context.workItemId === undefined ? {} : { workItemId: context.workItemId }),
+          ...(context.purpose === "review"
+            ? { reviewRoundId: context.reviewRoundId ?? `legacy-${id}` }
+            : context.reviewRoundId === undefined ? {} : { reviewRoundId: context.reviewRoundId })
+        },
+        directive: assignment,
+        deltaRefIds: []
+      })
+    : validateRunAssignment(assignment);
   return {
-    schemaVersion: 7,
+    schemaVersion: 9,
     id: requireSafeIdentity(id, "Agent run id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
     mode,
-    input: requireText(input, "Agent run input"),
+    assignment: normalizedAssignment,
+    bootstrapEnvelope: createRunBootstrapEnvelope(normalizedAssignment),
     purpose: context.purpose ?? "execution",
     ...(context.workItemId === undefined
       ? {}
@@ -143,6 +188,27 @@ export function createAgentRun(
 
 export function isActiveAgentRun(run: AgentRun): boolean {
   return run.status === "active";
+}
+
+/** Binds a freshly created, not-yet-persisted Run to its frozen Context. */
+export function withAgentRunContextSnapshot(
+  run: AgentRun,
+  snapshot: ContextSnapshotRef,
+  deltaRefIds: readonly string[] = []
+): AgentRun {
+  if (run.status !== "active" || run.pushedAt !== undefined || run.deliveredAt !== undefined) {
+    throw new Error(`Cannot bind Context Snapshot after Run delivery: ${run.id}.`);
+  }
+  const assignment = validateRunAssignment(Object.freeze({
+    ...run.assignment,
+    contextSnapshotRef: snapshot,
+    deltaRefIds
+  }));
+  return validateAgentRun(Object.freeze({
+    ...run,
+    assignment,
+    bootstrapEnvelope: createRunBootstrapEnvelope(assignment)
+  }));
 }
 
 export function markAgentRunPushed(run: AgentRun, now: Date): AgentRun {
@@ -171,13 +237,22 @@ export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
-  if (run.schemaVersion !== 7) throw new Error("Agent run must use schemaVersion 7.");
+  if (run.schemaVersion !== 9) throw new Error("Agent run must use schemaVersion 9.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "agentRun");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {
     throw new Error(`Agent run dispatch mode is invalid: ${String(run.mode)}.`);
   }
-  requireText(run.input, "Agent run input");
+  validateRunAssignment(run.assignment);
+  validateRunBootstrapEnvelope(run.bootstrapEnvelope);
+  if (run.assignment.runId !== run.id || run.assignment.roleName !== run.roleName
+    || run.assignment.subject.taskId !== run.taskId) {
+    throw new Error("Agent run Assignment identity does not match the Run.");
+  }
+  if (JSON.stringify(createRunBootstrapEnvelope(run.assignment))
+    !== JSON.stringify(run.bootstrapEnvelope)) {
+    throw new Error("Agent run Bootstrap Envelope does not match its Assignment.");
+  }
   if (!["execution", "review"].includes(run.purpose)) {
     throw new Error(`Agent run purpose is invalid: ${String(run.purpose)}.`);
   }
@@ -293,6 +368,12 @@ export function validateAgentRun(run: AgentRun): AgentRun {
       throw new Error("Agent run deliveredAt requires a prior pushedAt.");
     }
   }
+  if (run.deliveryReceiptId !== undefined) {
+    requireText(run.deliveryReceiptId, "Agent run deliveryReceiptId");
+    if (run.deliveryReceiptId.length > 256) {
+      throw new Error("Agent run deliveryReceiptId exceeds 256 characters.");
+    }
+  }
   if (run.status === "active") {
     if (run.summary !== undefined || run.endedAt !== undefined) {
       throw new Error("An active Agent run cannot have terminal metadata.");
@@ -323,6 +404,12 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     validateAgentRunProviderRetry(run.providerRetry);
     if (run.status !== "active") {
       throw new Error("A terminal Agent run cannot carry a providerRetry projection.");
+    }
+  }
+  if (run.controlRequest !== undefined) {
+    validateAgentRunControlRequest(run.controlRequest);
+    if (run.status !== "active") {
+      throw new Error("A terminal Agent run cannot carry a controlRequest projection.");
     }
   }
   if (run.yieldReceipt !== undefined) {
@@ -364,6 +451,7 @@ function finishAgentRun(
   if (terminal.providerRetry !== undefined) {
     delete terminal.providerRetry;
   }
+  if (terminal.controlRequest !== undefined) delete terminal.controlRequest;
   return terminal;
 }
 
@@ -383,31 +471,60 @@ export function withProviderRetry(
 
 /**
  * Reopens an active retry-waiting Run for another in-place attempt on its
- * original Native Session: transport markers are reset so the existing
- * delivery path re-pushes the exact same input, the dispatch mode becomes
- * `resume`, and the projection is marked in-flight.
+ * original Native Session. The original Run transport/acceptance timestamps
+ * remain historical facts; the new delivery receipt and `dispatching` retry
+ * state make the delivery path send only the short continuation envelope.
  */
 export function reopenRunForProviderRetry(
   run: AgentRun,
+  receiptId: string,
   now: Date
 ): AgentRun {
   if (run.status !== "active" || run.providerRetry === undefined) {
     throw new Error(`Agent run is not waiting for a provider retry: ${run.id}.`);
   }
   const timestamp = now.toISOString();
-  // Omit the transport markers entirely (not `undefined`, which the file
-  // store rejects) so the delivery path sees an un-pushed Run.
   const {
     providerRetry,
-    pushedAt: _pushedAt,
-    deliveredAt: _deliveredAt,
     ...rest
   } = run;
   return validateAgentRun({
     ...rest,
     mode: "resume",
+    deliveryReceiptId: receiptId,
     updatedAt: timestamp,
-    providerRetry: markProviderRetryInFlight(providerRetry, now)
+    providerRetry: prepareProviderRetryDispatch(providerRetry, receiptId, now)
+  });
+}
+
+/** Any exact correlated provider progress ends the active consecutive-failure episode. */
+export function clearProviderRetryOnProgress(run: AgentRun): AgentRun {
+  if (run.providerRetry === undefined) return run;
+  const { providerRetry: _providerRetry, ...rest } = run;
+  return validateAgentRun(rest as AgentRun);
+}
+
+export function agentRunDeliveryReceiptId(run: AgentRun): string {
+  return run.deliveryReceiptId
+    ?? run.controlRequest?.receiptId
+    ?? run.providerRetry?.lastRetryReceiptId
+    ?? formatAgentRunReceiptId(run.taskId, run.id);
+}
+
+export function withAgentRunControlRequest(
+  run: AgentRun,
+  request: AgentRunControlRequest,
+  now: Date
+): AgentRun {
+  if (run.status !== "active" || run.providerRetry !== undefined) {
+    throw new Error(`Agent run cannot accept a control request: ${run.id}.`);
+  }
+  return validateAgentRun({
+    ...run,
+    mode: "resume",
+    deliveryReceiptId: request.receiptId,
+    controlRequest: validateAgentRunControlRequest(request),
+    updatedAt: now.toISOString()
   });
 }
 

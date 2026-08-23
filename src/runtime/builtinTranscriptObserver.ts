@@ -238,6 +238,7 @@ function normalizedCodexUsage(
   const cachedInputTokens = integer(usage?.cached_input_tokens);
   const reasoningTokens = integer(usage?.reasoning_output_tokens);
   return Object.freeze({
+    semantics: "cumulative-session" as const,
     inputTokens,
     outputTokens,
     ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
@@ -255,6 +256,7 @@ function normalizedClaudeUsage(
   const cacheCreated = integer(usage?.cache_creation_input_tokens) ?? 0;
   const reasoningTokens = integer(object(usage?.output_tokens_details)?.thinking_tokens);
   return Object.freeze({
+    semantics: "cumulative-session" as const,
     inputTokens: directInput + cacheRead + cacheCreated,
     outputTokens,
     cachedInputTokens: cacheRead + cacheCreated,
@@ -280,6 +282,7 @@ function usageFrom(value: unknown): RuntimeUsageSnapshot | undefined {
   const cachedInputTokens = integer(raw?.cachedInputTokens);
   const reasoningTokens = integer(raw?.reasoningTokens);
   return Object.freeze({
+    semantics: "cumulative-session" as const,
     inputTokens,
     outputTokens,
     ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
@@ -300,6 +303,7 @@ function sumUsage(values: readonly RuntimeUsageSnapshot[]): RuntimeUsageSnapshot
     reasoningTokens += usage.reasoningTokens ?? 0;
   }
   return Object.freeze({
+    semantics: "cumulative-session" as const,
     inputTokens,
     outputTokens,
     cachedInputTokens,

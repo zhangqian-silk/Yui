@@ -21,7 +21,17 @@ import type {
 } from "../scheduler/ports.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
-import { compileRoleSessionContext } from "../context/roleSessionContext.js";
+import {
+  compileRoleSessionContext,
+  roleSessionKind
+} from "../context/roleSessionContext.js";
+import { materializeSessionBootstrap } from "../context/sessionBootstrapManifest.js";
+import {
+  serializeRunBootstrapEnvelope,
+  serializeRunHostRecoveryEnvelope
+} from "../context/runContextContract.js";
+import { serializeProviderRetryEnvelope } from "../run/providerRetry.js";
+import type { AgentRun } from "../run/agentRun.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import type { ClaudeAgentConfig, RoleAgentConfig } from "./agentAdapter.js";
 import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
@@ -452,15 +462,29 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       owner,
       sessionPolicy
     );
-    const sessionContext = owner.scope === "task"
-      ? {
-          ...baseSessionContext,
-          developerInstructions: [
-            baseSessionContext.developerInstructions,
-            renderExactControlPlaneInstructions(this.#controlPlane)
-          ].join("\n")
-        }
-      : baseSessionContext;
+    const bootstrap = materializeSessionBootstrap({
+      yuiHome: this.home,
+      role: launchRole,
+      owner,
+      roleKind: roleSessionKind(launchRole, owner, sessionPolicy.purpose),
+      skills: baseSessionContext.skills,
+      controlPlane: this.#controlPlane
+    });
+    if (effective.contextProtocolVersion !== bootstrap.manifest.schemaVersion
+      || effective.sessionManifestCompatibilityDigest
+        !== bootstrap.manifest.compatibilityDigest) {
+      throw new Error(
+        "Effective launch Context protocol identity does not match the materialized Session Manifest."
+      );
+    }
+    const sessionContext = {
+      ...baseSessionContext,
+      developerInstructions: `Read and follow the exact Yui Session Manifest at ${bootstrap.manifestPath}.`,
+      managedContextFile: bootstrap.manifestPath,
+      sessionManifestPath: bootstrap.manifestPath,
+      sessionManifestDigest: bootstrap.manifest.digest,
+      sessionCliPath: bootstrap.sessionCliPath
+    };
     const codexConfig = binding.config.adapterId === "codex"
       ? inspectCodexLaunchConfig({
           environment: {
@@ -507,7 +531,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           owner.taskId,
           managedRun?.workItemId,
           input.runId,
-          this.#controlPlane
+          this.#controlPlane,
+          sessionContext.sessionCliPath
         )
       : binding.config;
     const effectiveConfig = withNativeProjectDirectories(
@@ -546,10 +571,19 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           nativeSessionId: resumeNativeSessionId!
         })
       : adapter.compileNew(compileInput);
-    if (owner.scope === "task" && sessionContext.managedContextFile !== undefined) {
+    for (const path of [
+      bootstrap.manifestPath,
+      bootstrap.sessionCliPath,
+      bootstrap.roleProfilePath,
+      bootstrap.descriptorPath
+    ]) {
       this.#resourceRegistrar().registerSessionContext(
-        sessionContext.managedContextFile,
-        { home: resolve(this.home), taskId: owner.taskId, basis: "descriptor" }
+        path,
+        {
+          home: resolve(this.home),
+          ...(owner.scope === "task" ? { taskId: owner.taskId } : {}),
+          basis: "descriptor"
+        }
       );
     }
 
@@ -578,7 +612,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         );
         // End option parsing before the opaque prompt so a wakeup beginning
         // with '-' can never be reinterpreted as a Codex CLI flag.
-        if (managedRun.pushedAt === undefined) args.push("--", managedRun.input);
+        if (managedRun.pushedAt === undefined) {
+          args.push("--", managedRunLaunchEnvelope(managedRun, input.mode));
+        }
       }
       session = launchMode === "resume"
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
@@ -627,16 +663,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const managedClaudeRun = binding.adapterId === "claude"
       && owner.scope === "task"
       && input.runId !== undefined;
-    if (managedClaudeRun) {
-      command = process.execPath;
-      args = [
-        this.#cliPath,
-        "internal",
-        "managed-claude-run",
-        "--",
-        configured.command,
-        ...args
-      ];
+    if (managedClaudeRun && (managedRun === null || managedRun.status !== "active")) {
+      throw new Error(`Managed Claude Run is no longer active: ${input.runId}.`);
     }
 
     const runtimeDescriptor = owner.scope === "task"
@@ -671,6 +699,18 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const launch = {
       command,
       args,
+      ...(managedRun?.providerRetry !== undefined
+        && managedRun.providerRetry.state !== "dispatching"
+        ? { deferProviderStart: true }
+        : {}),
+      ...(managedClaudeRun
+        ? {
+            providerInput: {
+              kind: "stdin-json-user-message" as const,
+              boundedText: managedRunLaunchEnvelope(managedRun!, input.mode)
+            }
+          }
+        : {}),
       env: {
         ...launchEnvironment,
         YUI_HOME: resolve(this.home),
@@ -681,6 +721,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         YUI_ADAPTER_ID: configured.adapterId,
         YUI_DRIVER_ID: driver.id,
         YUI_WORKSPACE: effectiveWorkspace,
+        YUI_SESSION_MANIFEST: sessionContext.sessionManifestPath,
+        YUI_SESSION_CLI: sessionContext.sessionCliPath,
         ...(jobCallerKey === undefined ? {} : { YUI_JOB_CALLER_KEY: jobCallerKey }),
         ...(runtimeDescriptor === undefined
           ? {}
@@ -706,7 +748,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...(session === null
           ? {}
           : { YUI_NATIVE_SESSION_ID: session.nativeSessionId })
-      }
+      },
+      childLifecycle: driver.capabilities.lifecycle.providerProcess
     };
     const scopedLaunch = owner.scope === "task"
       ? this.#applyWorkspaceScope(owner.taskId, role, launch, workspaceOverride)
@@ -734,6 +777,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       command: string;
       args: readonly string[];
       env: Readonly<Record<string, string>>;
+      providerInput?: Readonly<{
+        kind: "stdin-json-user-message";
+        boundedText: string;
+      }>;
+      childLifecycle: "persistent" | "per-turn";
+      deferProviderStart?: boolean;
     }>,
     workspaceOverride?: ManagedWorkspace
   ): typeof launch {
@@ -787,6 +836,20 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     )));
     return selectEnvironment(source, names);
   }
+}
+
+function managedRunLaunchEnvelope(run: AgentRun, mode: "new" | "resume"): string {
+  if (run.providerRetry?.state === "dispatching") {
+    return serializeProviderRetryEnvelope({
+      taskId: run.taskId,
+      runId: run.id,
+      roleName: run.roleName,
+      retry: run.providerRetry
+    });
+  }
+  return mode === "resume" && run.pushedAt !== undefined
+    ? serializeRunHostRecoveryEnvelope(run.bootstrapEnvelope)
+    : serializeRunBootstrapEnvelope(run.bootstrapEnvelope);
 }
 
 export function nativeAgentWorkspace(
@@ -909,11 +972,13 @@ function managedClaudeControlPlaneConfig(
   taskId: string,
   workItemId: string | undefined,
   runId: string,
-  controlPlane: ExactControlPlaneDescriptor
+  controlPlane: ExactControlPlaneDescriptor,
+  sessionCliPath: string
 ): ClaudeAgentConfig {
   if (config.permission.strategy !== "configured") return config;
   const exact = exactControlPlaneCommandPrefix(controlPlane);
   const managed = [
+    `Bash(${sessionCliPath} task run context ${taskId}/${runId}:*)`,
     `Bash(${exact} --json task context ${taskId})`,
     `Bash(${exact} --json task work list ${taskId})`,
     ...(workItemId === undefined

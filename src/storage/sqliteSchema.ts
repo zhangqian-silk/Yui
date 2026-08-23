@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 16;
+export const SQLITE_SCHEMA_VERSION = 17;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -931,6 +931,26 @@ CREATE TABLE IF NOT EXISTS task_wakes (
 CREATE INDEX IF NOT EXISTS idx_task_wakes_seq ON task_wakes(task_id, seq);
 `;
 
+/** Migration 17: immutable, Task-scoped ContextSnapshot records. */
+const MIGRATION_17_SQL = `
+CREATE TABLE IF NOT EXISTS context_snapshots (
+  task_id     TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  scope       TEXT NOT NULL CHECK (scope IN ('task','workitem','stage')),
+  scope_ref   TEXT,
+  sequence    INTEGER NOT NULL CHECK (sequence > 0),
+  digest      TEXT NOT NULL CHECK (length(digest) = 64),
+  payload     TEXT NOT NULL,
+  frozen_at   TEXT NOT NULL,
+  PRIMARY KEY (task_id, snapshot_id),
+  FOREIGN KEY (task_id) REFERENCES tasks_catalog(task_id) ON DELETE CASCADE,
+  CHECK ((scope = 'task' AND scope_ref IS NULL) OR (scope <> 'task' AND scope_ref IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_context_snapshots_scope_sequence
+  ON context_snapshots(task_id, scope, COALESCE(scope_ref, ''), sequence);
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -953,9 +973,9 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 12, axis: "layout", sql: MIGRATION_12_SQL },
   { version: 13, axis: "layout", sql: MIGRATION_13_SQL },
   { version: 14, axis: "record", recordKind: "workMailbox", sql: MIGRATION_14_SQL },
-  { version: 15, axis: "record", recordKind: "publicationReference", sql: MIGRATION_15_SQL }
-  ,
-  { version: 16, axis: "record", recordKind: "taskWake", sql: MIGRATION_16_SQL }
+  { version: 15, axis: "record", recordKind: "publicationReference", sql: MIGRATION_15_SQL },
+  { version: 16, axis: "record", recordKind: "taskWake", sql: MIGRATION_16_SQL },
+  { version: 17, axis: "record", recordKind: "contextSnapshot", sql: MIGRATION_17_SQL }
 ];
 
 /** Current hot-path indexes whose absence would invalidate a current Home. */
@@ -1270,6 +1290,7 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "role_session_sets",
   "work_items",
   "work_item_candidates",
+  "context_snapshots",
   "agent_runs",
   "active_runs",
   "review_rounds",

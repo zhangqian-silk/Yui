@@ -25,6 +25,18 @@ export function builtinDriverIdForAdapter(adapterId: string): string {
 
 const STRUCTURED_CLI_CAPABILITIES: AgentDriverCapabilities = Object.freeze({
   surfaces: Object.freeze(["interactive-cli"] as const),
+  lifecycle: Object.freeze({
+    host: "persistent" as const,
+    providerProcess: "persistent" as const,
+    nativeConversationResume: "exact" as const,
+    // Yui deliberately does not guess provider compaction behavior from token
+    // counters. A future Driver may upgrade these only with exact native facts.
+    compaction: "unknown" as const,
+    compactionEvents: "unavailable" as const,
+    contextUsage: "cumulative-only" as const,
+    inSessionContinuation: true,
+    deliveryDeduplication: "unsupported" as const
+  }),
   control: Object.freeze({
     start: true,
     resume: true,
@@ -73,6 +85,10 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
     adapterId: "claude",
     capabilities: Object.freeze({
       ...STRUCTURED_CLI_CAPABILITIES,
+      lifecycle: Object.freeze({
+        ...STRUCTURED_CLI_CAPABILITIES.lifecycle,
+        providerProcess: "per-turn" as const
+      }),
       observation: Object.freeze({
         ...STRUCTURED_CLI_CAPABILITIES.observation,
         sessionBootstrap: "preallocated" as const,
@@ -441,6 +457,11 @@ function claudeFailure(
   const details = optionalText(payload.error_details);
   const lastOutput = optionalText(payload.last_assistant_message);
   const parsed = parseClaudeError(code, details);
+  const retryAfterMs = typeof payload.retry_after_ms === "number"
+    && Number.isSafeInteger(payload.retry_after_ms)
+    && payload.retry_after_ms > 0
+    ? payload.retry_after_ms
+    : undefined;
   return {
     failure: {
       ...(parsed.code !== "unknown" ? { errorCode: parsed.code } : {}),
@@ -449,7 +470,8 @@ function claudeFailure(
       ...(lastOutput === undefined ? {} : { lastOutput }),
       ...(payload.run_terminal === true || payload.unrecoverable === true
         ? { runTerminal: true }
-        : {})
+        : {}),
+      ...(retryAfterMs === undefined ? {} : { retryAfterMs })
     },
     summary: [
       "Agent turn failed.",

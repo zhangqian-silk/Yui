@@ -3,6 +3,7 @@ import { usageError } from "../errors/cliError.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { activeRoleAgentBinding } from "../role/role.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import type { DurableJobCaller } from "../controller/jobControl.js";
 
 const LEADER_ROLE = "leader";
@@ -203,7 +204,7 @@ function activeLeaderRunId(
     return undefined;
   }
   const sessions = store.getTaskRoleSessionSet(taskId, LEADER_ROLE);
-  const expectedReceipt = formatAgentRunReceiptId(taskId, run.id);
+  const expectedReceipt = agentRunDeliveryReceiptId(run);
   if (
     sessions === null
     || sessions.inFlight === null
@@ -284,7 +285,7 @@ export function taskLeaderActionRunId(
     || sessions.inFlight === null
     || sessions.inFlight.runId !== runId
     || sessions.inFlight.agentId !== agentId
-    || sessions.inFlight.receiptId !== formatAgentRunReceiptId(taskId, runId)
+    || sessions.inFlight.receiptId !== agentRunDeliveryReceiptId(run)
   ) return undefined;
   if (
     explicitAssertion !== undefined

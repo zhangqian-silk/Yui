@@ -38,6 +38,7 @@ export type ProviderErrorClass =
   | "transient-provider"
   | "transport-uncertain"
   | "policy-denied"
+  | "context-capacity"
   | "session-dead"
   | "invalid-request"
   | "unclassified";
@@ -82,9 +83,14 @@ const SESSION_DEAD_PATTERNS: readonly Pattern[] = [
   { pattern: /session (has )?ended/iu, label: "session-ended" },
   { pattern: /session (is )?dead/iu, label: "session-dead" },
   { pattern: /session terminated/iu, label: "session-terminated" },
-  { pattern: /process exited/iu, label: "process-exited" },
-  { pattern: /pane (is )?dead/iu, label: "pane-dead" },
-  { pattern: /target session/iu, label: "target-session" }
+];
+
+const CONTEXT_CAPACITY_PATTERNS: readonly Pattern[] = [
+  { pattern: /maximum context length/iu, label: "maximum-context-length" },
+  { pattern: /context length exceeded/iu, label: "context-length-exceeded" },
+  { pattern: /context window (is )?(full|exceeded)/iu, label: "context-window-exceeded" },
+  { pattern: /prompt (is )?too long/iu, label: "prompt-too-long" },
+  { pattern: /too many tokens/iu, label: "too-many-tokens" }
 ];
 
 const POLICY_DENIED_PATTERNS: readonly Pattern[] = [
@@ -151,6 +157,7 @@ const CLASS_TABLE: readonly Readonly<{
 }>[] = [
   { errorClass: "session-dead", patterns: SESSION_DEAD_PATTERNS },
   { errorClass: "policy-denied", patterns: POLICY_DENIED_PATTERNS },
+  { errorClass: "context-capacity", patterns: CONTEXT_CAPACITY_PATTERNS },
   { errorClass: "invalid-request", patterns: INVALID_REQUEST_PATTERNS },
   { errorClass: "transient-provider", patterns: TRANSIENT_PROVIDER_PATTERNS },
   { errorClass: "transport-uncertain", patterns: TRANSPORT_UNCERTAIN_PATTERNS }

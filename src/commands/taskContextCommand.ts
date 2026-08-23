@@ -301,7 +301,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
               ? ["    AgentRuns: none."]
               : [
                   `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.profileAccess}/${latestRun.effective.permission.strategy}`,
-                  `      Input: ${compactText(latestRun.input)}`,
+                  `      Assignment: ${latestRun.assignment.action}${latestRun.assignment.directive === undefined ? "" : ` · ${compactText(latestRun.assignment.directive)}`}`,
                   ...(latestRun.summary === undefined
                     ? []
                     : [`      Summary: ${compactText(latestRun.summary)}`])

@@ -322,6 +322,32 @@ export function renderExecutionAudit(
     lines.push("", ...sectionError("storage", report));
   }
 
+  if (report.runtimeProtocol.status === "ok" && report.runtimeProtocol.data !== undefined) {
+    const runtime = report.runtimeProtocol.data;
+    const versions = Object.entries(runtime.contextProtocolVersions)
+      .map(([version, count]) => `${version}:${count}`)
+      .join(", ") || "none";
+    const retryStates = Object.entries(runtime.activeRetryStates)
+      .map(([state, count]) => `${state}:${count}`)
+      .join(", ") || "none";
+    const exits = Object.entries(runtime.processExitClassifications)
+      .map(([classification, count]) => `${classification}:${count}`)
+      .join(", ") || "none";
+    const usage = Object.entries(runtime.usageSemantics)
+      .map(([semantics, count]) => `${semantics}:${count}`)
+      .join(", ") || "none";
+    lines.push(
+      "",
+      `Runtime protocol: context versions ${versions} · manifest compatibility identities ${runtime.manifestCompatibilityDigests}`,
+      `Active retry: ${runtime.activeRetryEpisodes} episode(s) [${retryStates}] · failures ${runtime.activeConsecutiveFailures} · dispatched ${runtime.activeDispatchedRetries}`,
+      `Retry audit: ${runtime.retryClassifiedEvents} classified · ${runtime.retryDispatchedEvents} dispatched · ${runtime.retryRecoveredEvents} recovered · ${runtime.retryExhaustedEvents} exhausted`,
+      `Process exits: ${runtime.processExitObservations} [${exits}] · capacity failures ${runtime.contextCapacityFailures}`,
+      `Context telemetry: usage [${usage}] · native compaction events ${runtime.compactionEvents}`
+    );
+  } else {
+    lines.push("", ...sectionError("runtimeProtocol", report));
+  }
+
   if (report.topLongRunning.status === "ok" && report.topLongRunning.data !== undefined) {
     const entries = report.topLongRunning.data;
     if (entries.length > 0) {

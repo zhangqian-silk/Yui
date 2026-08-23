@@ -17,6 +17,7 @@ import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { markYuiRunInput } from "../run/runIdentity.js";
 import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import {
   effectiveLaunchSnapshotsCompatible,
   effectiveLaunchSnapshotsCompatibleForTaskMain
@@ -33,6 +34,9 @@ import {
   RuntimeLifecycleBusyError,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
+import { serializeRunBootstrapEnvelope } from "../context/runContextContract.js";
+import { serializeProviderRetryEnvelope } from "../run/providerRetry.js";
+import { serializeWorkflowOutcomeRequestEnvelope } from "../run/runControlRequest.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
@@ -79,7 +83,10 @@ export async function processActiveRoleRunDeliveries(
       // re-push guard keys on pushedAt (transport), not deliveredAt (provider
       // acceptance): a pushed-but-unaccepted Run must never be pushed twice —
       // no duplicate Enter while acceptance is still pending.
-      if (run === null || run.pushedAt !== undefined) continue;
+      if (run === null
+        || (run.pushedAt !== undefined
+          && run.providerRetry?.state !== "dispatching"
+          && run.controlRequest?.state !== "dispatching")) continue;
       const taskWorkspace = store.getTaskWorkspace(task.id);
       if (!isSchedulerTaskWorkspaceReady(task, taskWorkspace)) {
         results.push({
@@ -116,7 +123,7 @@ export async function processActiveRoleRunDeliveries(
         role.name,
         run.effective.agentId
       );
-      const receiptId = formatAgentRunReceiptId(task.id, run.id);
+      const receiptId = agentRunDeliveryReceiptId(run);
       const target = { kind: "role", taskId: task.id, roleName: role.name } as const;
       const claim = store.claimWorkMailbox({
         target,
@@ -313,7 +320,21 @@ export async function processActiveRoleRunDeliveries(
         const outcome = await delivery.sendOnce({
           delivery: ready,
           receiptId,
-          text: run.input
+          text: run.controlRequest?.state === "dispatching"
+            ? serializeWorkflowOutcomeRequestEnvelope({
+                taskId: task.id,
+                runId: run.id,
+                roleName: role.name,
+                request: run.controlRequest
+              })
+            : run.providerRetry?.state === "dispatching"
+            ? serializeProviderRetryEnvelope({
+                taskId: task.id,
+                runId: run.id,
+                roleName: role.name,
+                retry: run.providerRetry
+              })
+            : serializeRunBootstrapEnvelope(run.bootstrapEnvelope)
         });
         if (outcome === "busy" || outcome === "unavailable") {
           results.push({

@@ -130,7 +130,7 @@ import { runRuntimeObservationHookCommand } from "./controller/runtimeObservatio
 import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
 import { agentNotFound, CliError, runtimeError, usageError } from "./errors/cliError.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
-import { runManagedClaudeProcess } from "./executor/managedClaudeRunner.js";
+import { runAgentHost } from "./runtime/agentHost.js";
 import {
   TaskWorkspaceCoordinator,
   WorkspaceCleanupBlockedError
@@ -382,42 +382,20 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "internal") {
+    if (args[1] === "agent-host" && args.length === 4) {
+      process.exitCode = await runAgentHost({
+        home,
+        launchId: args[2]!,
+        ticket: args[3]!
+      });
+      return;
+    }
     if (args[1] === "session-notify" && args.length === 3) {
       await runSessionNotifyCommand(args[2], process.env);
       return;
     }
     if (args[1] === "runtime-hook" && args.length === 2) {
       await runRuntimeObservationHookCommand(readFileSync(0, "utf8"), process.env);
-      return;
-    }
-    if (args[1] === "managed-claude-run"
-      && args[2] === "--"
-      && args.length >= 4
-      && verifiedStore !== undefined) {
-      const taskId = process.env.YUI_TASK_ID;
-      const runId = process.env.YUI_RUN_ID;
-      const agentId = process.env.YUI_AGENT_ID;
-      if (taskId === undefined || runId === undefined || agentId === undefined) {
-        throw new Error("Managed Claude run identity is incomplete.");
-      }
-      const run = verifiedStore.getActiveAgentRun(taskId, process.env.YUI_ROLE ?? "");
-      if (run === null || run.id !== runId || run.effective.agentId !== agentId
-        || run.effective.adapterId !== "claude") {
-        throw new Error("Managed Claude run is not the exact active generation.");
-      }
-      const configured = verifiedStore.getConfiguredAgent(agentId);
-      if (configured === null || configured.adapterId !== "claude" || args[3] !== configured.command) {
-        throw new Error("Managed Claude command does not match the active Agent.");
-      }
-      if (!configured.baseArgs.every((value, index) => args[index + 4] === value)) {
-        throw new Error("Managed Claude arguments do not start with the configured base arguments.");
-      }
-      process.exitCode = await runManagedClaudeProcess({
-        command: configured.command,
-        args: args.slice(4),
-        prompt: run.input,
-        environment: process.env
-      });
       return;
     }
     throw usageError("Internal lifecycle callback usage is invalid.");
@@ -818,7 +796,8 @@ export async function main(): Promise<void> {
   if (resolved[0] === "role") {
     const roleOptions: GlobalRoleCommandOptions = {
       yuiHome: home,
-      env: process.env
+      env: process.env,
+      jsonOutput
     };
     const result = runGlobalRoleCommand(
       resolved.slice(1),
@@ -1664,7 +1643,7 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     control.yuiHome
   );
   const runtimeDriverCallback = args[0] === "internal"
-    && (args[1] === "runtime-hook" || args[1] === "managed-claude-run")
+    && args[1] === "runtime-hook"
     && process.env.YUI_DRIVER_ID !== undefined
     ? builtinAgentDriverRegistry().require(process.env.YUI_DRIVER_ID)
     : undefined;

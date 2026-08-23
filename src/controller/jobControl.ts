@@ -25,6 +25,7 @@ import {
 } from "../job/durableJob.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 
 /**
@@ -548,7 +549,7 @@ function assertLeaderActionRun(
     sessions === null
     || sessions.inFlight === null
     || sessions.inFlight.runId !== run.id
-    || sessions.inFlight.receiptId !== expectedReceipt
+    || sessions.inFlight.receiptId !== agentRunDeliveryReceiptId(run)
   ) {
     throw jobControlError(
       "UNAUTHORIZED",

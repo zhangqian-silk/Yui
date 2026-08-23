@@ -194,6 +194,7 @@ const roleChildren: readonly NodeInput[] = [
   },
   { name: "list", summary: "List global Roles." },
   { name: "show", summary: "Show one global Role.", usage: "yui role show <name>" },
+  { name: "context", summary: "Load the exact authorized global Role context.", usage: "yui role context <name>" },
   {
     name: "update",
     summary: "Update a global Role.",
@@ -1303,7 +1304,7 @@ export const ROOT_COMMAND = buildNode({
       name: "role",
       summary: "Manage reusable global Roles and their native sessions.",
       sections: [
-        { id: "inspect", title: "Inspect", entries: ["list", "show"] },
+        { id: "inspect", title: "Inspect", entries: ["list", "show", "context"] },
         { id: "manage", title: "Manage", entries: ["add", "update", "remove", "bind", "unbind"] },
         { id: "sessions", title: "Sessions", entries: ["enter", "session"] }
       ],
@@ -1354,7 +1355,7 @@ export const ROOT_COMMAND = buildNode({
       name: "internal",
       summary: "Internal Yui callbacks.",
       hidden: true,
-      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "runtime-hook", "managed-claude-run"] }],
+      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "runtime-hook"] }],
       children: [
         {
           name: "session-notify",
@@ -1365,11 +1366,6 @@ export const ROOT_COMMAND = buildNode({
           name: "runtime-hook",
           summary: "Record a managed Agent Driver observation from stdin.",
           usage: "yui internal runtime-hook"
-        },
-        {
-          name: "managed-claude-run",
-          summary: "Run one managed Claude turn over the stream-json protocol.",
-          usage: "yui internal managed-claude-run -- <command> [args...]"
         }
       ]
     }

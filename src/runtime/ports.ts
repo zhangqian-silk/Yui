@@ -11,7 +11,10 @@ import type {
 
 export type SessionRuntimeState = "starting" | "running" | "stopped" | "unavailable";
 
-export type RuntimeLaunchRetryReason = "previous-process" | "writable-client";
+export type RuntimeLaunchRetryReason =
+  | "previous-process"
+  | "writable-client"
+  | "provider-child-active";
 
 /** A persisted launch is either temporarily unavailable or permanently lost. */
 export class RuntimeLaunchError extends Error {
@@ -32,7 +35,10 @@ export class RuntimeHostContentionError extends Error {
   readonly name = "RuntimeHostContentionError";
 
   constructor(
-    readonly reason: Extract<RuntimeLaunchRetryReason, "writable-client">,
+    readonly reason: Extract<
+      RuntimeLaunchRetryReason,
+      "writable-client" | "provider-child-active"
+    >,
     message: string
   ) {
     super(message);

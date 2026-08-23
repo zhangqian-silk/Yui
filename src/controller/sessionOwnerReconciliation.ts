@@ -19,6 +19,10 @@ import {
   type SessionTerminationPorts,
   type SessionTerminationResult
 } from "../runtime/index.js";
+import {
+  removeRuntimeStopReceipt,
+  writeRuntimeStopReceipt
+} from "../runtime/runtimeStopReceipt.js";
 import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { tmuxSocketDirectory } from "../tmux/tmuxSocketEndpoint.js";
@@ -204,6 +208,7 @@ export class SessionOwnerReconciliation {
     if (result.outcome === "stop-confirmed") {
       for (const record of result.confirmed) {
         this.#store.removeSessionOwner(record.launchId);
+        removeRuntimeStopReceipt(this.#home, record.launchId);
       }
     }
     return result;
@@ -211,6 +216,9 @@ export class SessionOwnerReconciliation {
 
   #recordTerminationEvent(event: SessionTerminationEvent): void {
     const owner = event.owner;
+    if (event.stage === "stop-requested" && event.launchId !== undefined) {
+      writeRuntimeStopReceipt(this.#home, event.launchId, event.at);
+    }
     if (owner.scope !== "task") return;
     try {
       this.#store.saveEvent(owner.taskId, createTaskEvent(

@@ -192,6 +192,24 @@ export type StorageAudit = Readonly<{
   deploymentsBytes: number | Unsupported;
 }>;
 
+export type RuntimeProtocolAudit = Readonly<{
+  contextProtocolVersions: Readonly<Record<string, number>>;
+  manifestCompatibilityDigests: number;
+  activeRetryEpisodes: number;
+  activeRetryStates: Readonly<Record<string, number>>;
+  activeConsecutiveFailures: number;
+  activeDispatchedRetries: number;
+  retryClassifiedEvents: number;
+  retryDispatchedEvents: number;
+  retryRecoveredEvents: number;
+  retryExhaustedEvents: number;
+  contextCapacityFailures: number;
+  processExitObservations: number;
+  processExitClassifications: Readonly<Record<string, number>>;
+  usageSemantics: Readonly<Record<string, number>>;
+  compactionEvents: number;
+}>;
+
 export type LongRunEntry = Readonly<{
   taskId: string;
   runId: string;
@@ -221,6 +239,7 @@ export type ExecutionAuditReport = Readonly<{
     retired: number;
   }>>;
   storage: AuditSection<StorageAudit>;
+  runtimeProtocol: AuditSection<RuntimeProtocolAudit>;
   topLongRunning: AuditSection<readonly LongRunEntry[]>;
 }>;
 
@@ -271,7 +290,7 @@ function directorySizeBytes(path: string): number | null {
   return total;
 }
 
-const WAKE_REASON_PATTERN = /Yui wakeup reasons: ([^\n.]+)/u;
+const WAKE_REASON_PATTERN = /Wake reasons: ([^\n.]+)/u;
 
 function inWindow(createdAt: string, options: ExecutionAuditOptions): boolean {
   const time = Date.parse(createdAt);
@@ -439,6 +458,7 @@ export function runExecutionAudit(
       providerRetries: section,
       workItems: section,
       storage: section,
+      runtimeProtocol: section,
       topLongRunning: section
     };
   }
@@ -545,7 +565,7 @@ export function runExecutionAudit(
           if (run.roleName !== "leader") continue;
           if (!inWindow(run.createdAt, options)) continue;
           leaderRuns += 1;
-          const match = WAKE_REASON_PATTERN.exec(run.input);
+          const match = WAKE_REASON_PATTERN.exec(run.assignment.directive ?? "");
           if (match === null) continue;
           withWakeReasons += 1;
           const reasons = match[1]!.split(",").map((value) => value.trim()).filter(Boolean);
@@ -901,6 +921,87 @@ export function runExecutionAudit(
     }
   })();
 
+  const runtimeProtocol = ((): AuditSection<RuntimeProtocolAudit> => {
+    try {
+      const protocolVersions = new Map<string, number>();
+      const manifestDigests = new Set<string>();
+      const retryStates = new Map<string, number>();
+      const exitClassifications = new Map<string, number>();
+      const usageSemantics = new Map<string, number>();
+      let activeRetryEpisodes = 0;
+      let activeConsecutiveFailures = 0;
+      let activeDispatchedRetries = 0;
+      let retryClassifiedEvents = 0;
+      let retryDispatchedEvents = 0;
+      let retryRecoveredEvents = 0;
+      let retryExhaustedEvents = 0;
+      let contextCapacityFailures = 0;
+      let processExitObservations = 0;
+      let compactionEvents = 0;
+      for (const taskId of taskIds) {
+        for (const run of store.listAgentRuns(taskId)) {
+          if (!inWindow(run.createdAt, options)) continue;
+          const version = String(run.effective.contextProtocolVersion ?? "legacy");
+          protocolVersions.set(version, (protocolVersions.get(version) ?? 0) + 1);
+          if (run.effective.sessionManifestCompatibilityDigest !== undefined) {
+            manifestDigests.add(run.effective.sessionManifestCompatibilityDigest);
+          }
+          if (run.providerRetry !== undefined) {
+            activeRetryEpisodes += 1;
+            retryStates.set(
+              run.providerRetry.state,
+              (retryStates.get(run.providerRetry.state) ?? 0) + 1
+            );
+            activeConsecutiveFailures += run.providerRetry.consecutiveFailures;
+            activeDispatchedRetries += run.providerRetry.dispatchedRetries;
+          }
+        }
+        for (const event of store.listEvents(taskId)) {
+          if (!inWindow(event.createdAt, options)) continue;
+          if (event.type === "runtime.provider-retry-classified") retryClassifiedEvents += 1;
+          else if (event.type === "runtime.provider-retry-dispatched") retryDispatchedEvents += 1;
+          else if (event.type === "runtime.provider-retry-recovered") retryRecoveredEvents += 1;
+          else if (event.type === "runtime.provider-retry-exhausted") retryExhaustedEvents += 1;
+          else if (event.type === "runtime.context-capacity-failure") contextCapacityFailures += 1;
+          else if (event.type === "runtime.process-exit-observed") {
+            processExitObservations += 1;
+            const classification = event.payload.classification ?? "unknown";
+            exitClassifications.set(
+              classification,
+              (exitClassifications.get(classification) ?? 0) + 1
+            );
+          }
+          const observation = runtimeObservationFromTaskEvent(event);
+          const semantics = observation?.payload.usage?.semantics;
+          if (semantics !== undefined) {
+            usageSemantics.set(semantics, (usageSemantics.get(semantics) ?? 0) + 1);
+          }
+          if (event.type === "runtime.compaction-started"
+            || event.type === "runtime.compaction-completed") compactionEvents += 1;
+        }
+      }
+      return ok({
+        contextProtocolVersions: Object.fromEntries(protocolVersions),
+        manifestCompatibilityDigests: manifestDigests.size,
+        activeRetryEpisodes,
+        activeRetryStates: Object.fromEntries(retryStates),
+        activeConsecutiveFailures,
+        activeDispatchedRetries,
+        retryClassifiedEvents,
+        retryDispatchedEvents,
+        retryRecoveredEvents,
+        retryExhaustedEvents,
+        contextCapacityFailures,
+        processExitObservations,
+        processExitClassifications: Object.fromEntries(exitClassifications),
+        usageSemantics: Object.fromEntries(usageSemantics),
+        compactionEvents
+      });
+    } catch (error) {
+      return failed<RuntimeProtocolAudit>(error);
+    }
+  })();
+
   const topLongRunning = ((): AuditSection<readonly LongRunEntry[]> => {
     try {
       const entries: LongRunEntry[] = [];
@@ -947,6 +1048,7 @@ export function runExecutionAudit(
     providerRetries,
     workItems,
     storage,
+    runtimeProtocol,
     topLongRunning
   };
 }

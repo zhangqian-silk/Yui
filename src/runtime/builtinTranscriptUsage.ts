@@ -25,6 +25,7 @@ export function codexTranscriptUsage(transcript: string): RuntimeUsageSnapshot |
   const report = codexTranscriptUsageReport(transcript);
   if (report === null) return null;
   return Object.freeze({
+    semantics: "cumulative-session" as const,
     inputTokens: report.uncachedInputTokens + report.cacheReadTokens + report.cacheCreatedTokens,
     outputTokens: report.outputTokens,
     ...(report.cacheReadTokens + report.cacheCreatedTokens === 0
@@ -80,6 +81,7 @@ export function claudeTranscriptUsage(transcript: string): RuntimeUsageSnapshot 
   const report = claudeTranscriptUsageReport(transcript);
   if (report === null) return null;
   return Object.freeze({
+    semantics: "cumulative-session" as const,
     inputTokens: report.uncachedInputTokens + report.cacheReadTokens + report.cacheCreatedTokens,
     outputTokens: report.outputTokens,
     ...(report.cacheReadTokens + report.cacheCreatedTokens === 0

@@ -61,6 +61,7 @@ type GlobalRoleStore = GlobalRoleTransactionStore & Readonly<{
 export type GlobalRoleCommandOptions = Readonly<{
   yuiHome?: string;
   env?: NodeJS.ProcessEnv;
+  jsonOutput?: boolean;
 }>;
 
 export type GlobalRoleEnterControl = Readonly<{
@@ -80,6 +81,7 @@ export function runGlobalRoleCommand(
     case "add": return addRole(rest, store, options);
     case "list": return listRoles(rest, store);
     case "show": return showRole(rest, store);
+    case "context": return roleContext(rest, store, options);
     case "update": return updateRole(rest, store, options);
     case "remove": return removeRole(rest, store);
     case "bind": return bindRole(rest, store);
@@ -91,6 +93,79 @@ export function runGlobalRoleCommand(
         ? "Role command is required."
         : `Unknown command: role ${command}`);
   }
+}
+
+function roleContext(
+  args: string[],
+  store: GlobalRoleStore,
+  options: GlobalRoleCommandOptions
+): string {
+  const [rawName, ...rest] = args;
+  const name = roleName(rawName);
+  assertNoArguments(rest, "Role context usage: yui role context <role>");
+  const environment = options.env ?? process.env;
+  if (environment.YUI_SESSION_SCOPE !== undefined) {
+    if (environment.YUI_SESSION_SCOPE !== "global" || environment.YUI_ROLE !== name) {
+      throw usageError("Managed GlobalRole context is outside the exact Session authority.");
+    }
+    if (environment.YUI_SESSION_MANIFEST === undefined
+      || environment.YUI_SESSION_CLI === undefined) {
+      throw usageError("Managed GlobalRole context requires the exact Session Manifest and CLI.");
+    }
+  }
+  const role = requireRole(name, store);
+  const binding = activeRoleAgentBinding(role);
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+  const sessions = store.getGlobalRoleSessionSet(name);
+  const session = sessions?.sessions[role.activeAgentId];
+  const context = Object.freeze({
+    schemaVersion: 1,
+    protocol: "yui-managed-context/v1",
+    identity: {
+      scope: "global",
+      roleName: role.name,
+      roleKind: role.name === "operator" ? "operator" : "global",
+      agentId: binding.agentId,
+      adapterId: binding.adapterId,
+      workspace: role.workspace,
+      effectiveRevision: role.launchRevision,
+      ...(session?.nativeSessionId === undefined
+        ? {}
+        : { nativeSessionId: session.nativeSessionId })
+    },
+    profile: {
+      description: role.description,
+      responsibilities: role.responsibilities ?? [],
+      constraints: role.constraints ?? [],
+      expectedOutput: role.expectedOutput,
+      skillIds: [
+        "yui-runtime",
+        ...(role.name === "operator" ? ["yui-operator"] : []),
+        ...(role.skills ?? [])
+      ]
+    },
+    authority: {
+      view: role.name === "operator" ? "operator" : "global",
+      taskImplementation: false,
+      writableProjectIds: effective.writeProjectIds,
+      allowedActions: role.name === "operator"
+        ? ["route-request", "inspect-catalog", "answer-user-boundary"]
+        : ["perform-global-role-request"]
+    },
+    sessionManifestPath: environment.YUI_SESSION_MANIFEST,
+    sessionCliPath: environment.YUI_SESSION_CLI
+  });
+  if (options.jsonOutput === true) return `${JSON.stringify(context)}\n`;
+  return [
+    `Role Context: ${role.name}`,
+    `Scope: global (${context.identity.roleKind})`,
+    `Agent: ${binding.agentId}/${binding.adapterId}`,
+    `Workspace: ${role.workspace}`,
+    `Effective revision: ${role.launchRevision}`,
+    `Skills: ${context.profile.skillIds.join(", ") || "none"}`,
+    `Authority: ${context.authority.view}; Task implementation: no`,
+    ""
+  ].join("\n");
 }
 
 function addRole(

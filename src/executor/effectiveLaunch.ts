@@ -19,6 +19,11 @@ import {
   type CodexAgentConfig,
   type RoleAgentConfig
 } from "./agentAdapter.js";
+import { roleSessionKind } from "../context/roleSessionContext.js";
+import {
+  SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION,
+  sessionManifestCompatibilityDigest
+} from "../context/sessionProtocolIdentity.js";
 
 export type EffectiveLaunchProfileAccess = WorkerAccess;
 
@@ -45,6 +50,10 @@ type EffectiveLaunchBase = Readonly<{
   context: EffectiveLaunchContext;
   reviewRoundId?: string;
   reviewBaseCommit?: string;
+  /** Absent only on bounded legacy v0 Sessions. */
+  contextProtocolVersion?: typeof SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION;
+  /** Stable Role/Skill compatibility identity, not a per-launch resource path digest. */
+  sessionManifestCompatibilityDigest?: string;
 }>;
 
 export type CodexEffectiveLaunchSnapshot = EffectiveLaunchBase & Readonly<{
@@ -94,6 +103,18 @@ export function resolveEffectiveLaunch(
     writeProjectIds,
     workspace,
     context: snapshotContext(input.role),
+    contextProtocolVersion: SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION,
+    sessionManifestCompatibilityDigest: sessionManifestCompatibilityDigest(
+      input.role.name,
+      roleSessionKind(
+        input.role,
+        "taskId" in input.role
+          ? { scope: "task", taskId: input.role.taskId }
+          : { scope: "global" },
+        input.purpose
+      ),
+      input.role
+    ),
     ...(input.purpose === "review"
       ? {
           reviewRoundId: identity(input.reviewRoundId ?? "", "ReviewRound id"),
@@ -268,6 +289,18 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
     identity(snapshot.reviewRoundId, "Effective ReviewRound id");
     commit(snapshot.reviewBaseCommit, "Effective review base commit");
   }
+  if (snapshot.contextProtocolVersion !== undefined
+    && snapshot.contextProtocolVersion !== SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION) {
+    throw new Error("Effective launch context protocol version is unsupported.");
+  }
+  if (snapshot.sessionManifestCompatibilityDigest !== undefined
+    && !/^[a-f0-9]{64}$/u.test(snapshot.sessionManifestCompatibilityDigest)) {
+    throw new Error("Effective launch Session Manifest compatibility digest is invalid.");
+  }
+  if ((snapshot.contextProtocolVersion === undefined)
+    !== (snapshot.sessionManifestCompatibilityDigest === undefined)) {
+    throw new Error("Effective launch Context protocol compatibility identity is incomplete.");
+  }
   validateWorkspace(snapshot.workspace);
   cloneContext(snapshot.context);
   const config = effectiveLaunchConfigUnchecked(snapshot);
@@ -309,6 +342,8 @@ function snapshotFromConfig(input: Readonly<{
   context: EffectiveLaunchContext;
   reviewRoundId?: string;
   reviewBaseCommit?: string;
+  contextProtocolVersion?: typeof SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION;
+  sessionManifestCompatibilityDigest?: string;
 }>): EffectiveLaunchSnapshot {
   const config = clone(input.config);
   if (config.permission === undefined) {
@@ -338,6 +373,12 @@ function snapshotFromConfig(input: Readonly<{
     writeProjectIds: [...input.writeProjectIds],
     workspace: cloneWorkspace(input.workspace),
     context: cloneContext(input.context),
+    ...(input.contextProtocolVersion === undefined
+      ? {}
+      : { contextProtocolVersion: input.contextProtocolVersion }),
+    ...(input.sessionManifestCompatibilityDigest === undefined
+      ? {}
+      : { sessionManifestCompatibilityDigest: input.sessionManifestCompatibilityDigest }),
     ...review
   };
   const snapshot: EffectiveLaunchSnapshot = config.adapterId === "codex"

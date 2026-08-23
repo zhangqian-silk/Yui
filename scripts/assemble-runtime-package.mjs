@@ -22,7 +22,8 @@ const RUNTIME_SKILLS = [
   "yui-leader",
   "yui-worker",
   "yui-operator",
-  "yui-reviewer"
+  "yui-reviewer",
+  "yui-runtime"
 ];
 const RUNTIME_DOCUMENTS = [
   "README.md",
@@ -155,7 +156,7 @@ if ("scripts" in runtimePackage || "devDependencies" in runtimePackage) {
 const stagedSkills = listRegularFiles(resolve(output, "skills"));
 const expectedSkills = RUNTIME_SKILLS.map((skill) => `${skill}/SKILL.md`).sort();
 if (JSON.stringify(stagedSkills) !== JSON.stringify(expectedSkills)) {
-  throw new Error("Runtime package must contain exactly the three Yui Skill files.");
+  throw new Error("Runtime package must contain exactly the configured Yui Skill files.");
 }
 const stagedRuntime = listRegularFiles(resolve(output, "dist"));
 const expectedRuntime = runtimeSources.map((name) => `${name.slice(0, -3)}.js`).sort();
