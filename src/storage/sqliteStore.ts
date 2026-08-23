@@ -2808,7 +2808,13 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   saveWorkMailbox(mailbox: WorkMailbox): void {
-    const cols = this.#mailboxCols(mailbox.target);
+    let validated: WorkMailbox;
+    try {
+      validated = validateWorkMailbox(mailbox);
+    } catch (error) {
+      throw new StorageRecordError(error instanceof Error ? error.message : String(error));
+    }
+    const cols = this.#mailboxCols(validated.target);
     this.#mutate(() => {
       this.#db.prepare(
         `INSERT INTO mailboxes (target_kind, task_id, role_name, target_key, next_sequence, processing, pending, input_delivery)
@@ -2818,10 +2824,10 @@ export class SqliteTaskStore implements TaskStore {
            input_delivery = excluded.input_delivery`
       ).run(
         cols.targetKind, cols.taskId, cols.roleName, cols.targetKey,
-        mailbox.nextSequence,
-        mailbox.processing === null ? null : this.#json(mailbox.processing),
-        this.#json(mailbox.pending),
-        mailbox.inputDelivery === null ? null : this.#json(mailbox.inputDelivery)
+        validated.nextSequence,
+        validated.processing === null ? null : this.#json(validated.processing),
+        this.#json(validated.pending),
+        validated.inputDelivery === null ? null : this.#json(validated.inputDelivery)
       );
     });
   }
