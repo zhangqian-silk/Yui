@@ -34,6 +34,10 @@ import { builtinAgentDriverRegistry } from "./builtinAgentDrivers.js";
 import { requireSafeIdentity } from "./validation.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
+import {
+  YUI_CONTROL_PLANE_DESCRIPTOR,
+  YUI_TASK_RUNTIME_DESCRIPTOR
+} from "./exactControlPlane.js";
 import { launchBrokerForHome, type AgentHostLaunchPayload } from "./launchBroker.js";
 import {
   AGENT_HOST_CONTROL_PROTOCOL,
@@ -536,6 +540,12 @@ export class TmuxSessionHost implements SessionHostPort {
       return binding;
     }
     const broker = launchBrokerForHome(yuiHome);
+    const frozenControlPlane = planned.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR];
+    const frozenTaskRuntime = planned.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
+    if (request.owner.scope === "task" && request.runId !== undefined
+      && (frozenControlPlane === undefined || frozenTaskRuntime === undefined)) {
+      throw new Error("Managed Task Agent Host launch is missing its frozen control descriptors.");
+    }
     const reservation = broker.reserve(Object.freeze({
       schemaVersion: 1,
       launchId: request.launchId,
@@ -563,7 +573,22 @@ export class TmuxSessionHost implements SessionHostPort {
         YUI_SESSION_SCOPE: request.owner.scope,
         ...(request.owner.scope === "task" ? { YUI_TASK_ID: request.owner.taskId } : {}),
         YUI_ROLE: request.owner.roleName,
-        YUI_LAUNCH_ID: request.launchId
+        YUI_LAUNCH_ID: request.launchId,
+        ...(planned.launch.env.YUI_AGENT_ID === undefined
+          ? {}
+          : { YUI_AGENT_ID: planned.launch.env.YUI_AGENT_ID }),
+        ...(planned.launch.env.YUI_ADAPTER_ID === undefined
+          ? {}
+          : { YUI_ADAPTER_ID: planned.launch.env.YUI_ADAPTER_ID }),
+        ...(planned.launch.env.YUI_WORKSPACE === undefined
+          ? {}
+          : { YUI_WORKSPACE: planned.launch.env.YUI_WORKSPACE }),
+        ...(frozenControlPlane === undefined
+          ? {}
+          : { [YUI_CONTROL_PLANE_DESCRIPTOR]: frozenControlPlane }),
+        ...(frozenTaskRuntime === undefined
+          ? {}
+          : { [YUI_TASK_RUNTIME_DESCRIPTOR]: frozenTaskRuntime })
       }
     };
     let hostCreated: boolean;

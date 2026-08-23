@@ -1,11 +1,13 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, closeSync, fsyncSync, mkdirSync, openSync, rmSync } from "node:fs";
 import { readdir, readFile, rename, unlink } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { createConnection, createServer, type Server } from "node:net";
 import { createInterface } from "node:readline";
 
 import { callController } from "../core/controllerClient.js";
+import { readHomeFilesystemId } from "../core/homeFilesystemIdentity.js";
 import {
   publishStructuredProviderAccepted,
   publishStructuredProviderActivationTerminal,
@@ -565,7 +567,7 @@ export async function runAgentHost(input: Readonly<{
     return snapshot;
   };
 
-  const control = await openHostControl(input.home, payload, () => snapshot, async (request) => {
+  const control = await openAgentHostControl(input.home, payload, () => snapshot, async (request) => {
     if (request.type === "status") {
       return controlResult("status", snapshot);
     }
@@ -706,10 +708,20 @@ export function agentHostControlSocketPath(input: Readonly<{
   roleName: string;
 }>): string {
   const owner = input.scope === "task" ? input.taskId ?? "missing-task" : "global";
-  const digest = Buffer.from(`${input.scope}\0${owner}\0${input.roleName}`, "utf8")
-    .toString("base64url")
-    .slice(0, 80);
-  return resolve(join(input.home, "runtime", "agent-host-control", `${digest}.sock`));
+  const homeDigest = createHash("sha256")
+    .update(readHomeFilesystemId(resolve(input.home)))
+    .digest("hex")
+    .slice(0, 16);
+  const ownerDigest = createHash("sha256")
+    .update(`${input.scope}\0${owner}\0${input.roleName}`)
+    .digest("hex")
+    .slice(0, 16);
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  // Linux sockaddr_un paths have a small fixed budget. Keep the endpoint
+  // independent of a potentially deep YUI_HOME while fencing aliases and
+  // copied Homes by their physical filesystem identity.
+  const root = process.platform === "linux" ? "/tmp" : tmpdir();
+  return join(root, `yui-${uid}`, "agent-host", `${homeDigest}-${ownerDigest}.sock`);
 }
 
 export async function sendAgentHostLaunchControl(input: Readonly<{
@@ -888,14 +900,13 @@ async function replayExitOutbox(home: string): Promise<void> {
   }
 }
 
-async function openHostControl(
+/** Internal socket boundary exported for transport-level verification. */
+export async function openAgentHostControl(
   home: string,
   payload: AgentHostLaunchPayload,
   snapshot: () => AgentHostSnapshot,
   dispatch: (control: AgentHostControl) => Promise<AgentHostControlResult>
 ): Promise<Readonly<{ close(): Promise<void> }>> {
-  const directory = resolve(join(home, "runtime", "agent-host-control"));
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const path = agentHostControlSocketPath({
     home,
     scope: payload.environment.YUI_SESSION_SCOPE ?? "task",
@@ -904,12 +915,17 @@ async function openHostControl(
       : { taskId: payload.environment.YUI_TASK_ID }),
     roleName: payload.environment.YUI_ROLE ?? "unknown-role"
   });
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (await hostControlSocketIsLive(path)) {
     throw new Error(`Agent Host control socket is already owned: ${path}.`);
   }
   rmSync(path, { force: true });
-  const server: Server = createServer((socket) => {
+  const server: Server = createServer({ allowHalfOpen: true }, (socket) => {
     socket.setEncoding("utf8");
+    // A control client can disappear after sending its bounded request. Keep
+    // that connection-local failure from terminating the persistent Host.
+    socket.on("error", () => {});
     let body = "";
     socket.on("data", (chunk) => {
       body += chunk;

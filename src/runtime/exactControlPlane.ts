@@ -576,8 +576,15 @@ export function refreshReusedTaskRuntimeDescriptorSource(
     throw new Error("A managed Task runtime descriptor must use its stable file source.");
   }
   const previous = resolved.descriptor;
-  if (previous.nativeSessionId === undefined
-    || previous.nativeSessionId !== current.nativeSessionId) {
+  if (previous.nativeSessionId === undefined) {
+    if (previous.runId !== current.runId || previous.launchId !== current.launchId) {
+      throw new Error(
+        "Task runtime descriptor source cannot bind a native Session from another generation."
+      );
+    }
+    return refreshExactTaskRuntimeDescriptorSource(source, home, store);
+  }
+  if (previous.nativeSessionId !== current.nativeSessionId) {
     throw new Error(
       "Task runtime descriptor source cannot jump to a replacement native Session."
     );

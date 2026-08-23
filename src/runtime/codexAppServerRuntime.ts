@@ -129,13 +129,23 @@ export class CodexAppServerRuntime implements
     expectedNoActiveTurn: boolean;
     clientUserMessageId?: string;
   }>): Promise<CodexTurnAcceptance> {
-    const snapshot = await this.readConversation(input.conversationId);
-    if (input.expectedNoActiveTurn && snapshot.activeTurnId !== undefined) {
-      return { status: "not-accepted", reason: `active-turn:${snapshot.activeTurnId}` };
+    const requestedThreadId = text(input.conversationId, "Codex thread id");
+    let threadId = requestedThreadId;
+    try {
+      const snapshot = await this.readConversation(requestedThreadId);
+      threadId = snapshot.threadId;
+      if (input.expectedNoActiveTurn && snapshot.activeTurnId !== undefined) {
+        return { status: "not-accepted", reason: `active-turn:${snapshot.activeTurnId}` };
+      }
+    } catch (error) {
+      // A new App Server thread has no materialized Turn history yet. This
+      // exact response proves there cannot be an active Turn, so its first
+      // mutation can proceed without weakening unknown-delivery handling.
+      if (!codexAppServerErrorIsUnmaterialized(error)) throw error;
     }
     try {
       const result = await this.transport.request("turn/start", {
-        threadId: snapshot.threadId,
+        threadId,
         ...(input.clientUserMessageId === undefined
           ? {}
           : { clientUserMessageId: text(input.clientUserMessageId, "Codex input attempt id") }),
@@ -410,6 +420,15 @@ function isNotLoaded(error: unknown): boolean {
   return error instanceof CodexAppServerRequestError
     && (String(error.code).toLowerCase().includes("not_loaded")
       || error.message.toLowerCase().includes("not loaded"));
+}
+
+function codexAppServerErrorIsUnmaterialized(error: unknown): boolean {
+  if (!(error instanceof CodexAppServerRequestError) || Number(error.code) !== -32600) {
+    return false;
+  }
+  return /\bthread\b.*\bnot materialized yet\b.*\bbefore first user message\b/iu.test(
+    error.message
+  );
 }
 
 export function codexAppServerErrorIsMissing(error: unknown): boolean {

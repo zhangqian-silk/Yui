@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 
-import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
+import { findCommandNode, listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
+import { routeInvocation } from "../../dist/cli/invocationRouter.js";
 import {
   assertRegistryCoversBaselineToCurrent,
   createProductionRegistry
@@ -50,6 +59,19 @@ import {
   ProviderTurnRejectedError,
   startStructuredProviderSession
 } from "../../dist/runtime/structuredProviderHost.js";
+import { validateAgentHostLaunchPayload } from "../../dist/runtime/launchBroker.js";
+import {
+  createExactTaskRuntimeDescriptor,
+  exactTaskRuntimeDescriptorPath,
+  refreshReusedTaskRuntimeDescriptorSource,
+  serializeExactDescriptor
+} from "../../dist/runtime/exactControlPlane.js";
+import {
+  AGENT_HOST_CONTROL_PROTOCOL,
+  agentHostControlSocketPath,
+  inspectAgentHost,
+  openAgentHostControl
+} from "../../dist/runtime/agentHost.js";
 import {
   CodexAppServerRuntime,
   CodexAppServerRequestError,
@@ -90,6 +112,60 @@ const bareEnv = {
   HOME: process.env.HOME ?? ""
 };
 
+test("the internal Agent Host callback is registered but remains non-public", () => {
+  const command = findCommandNode(["internal", "agent-host"]);
+  assert.notEqual(command, undefined);
+  assert.equal(findCommandNode(["internal"]).hidden, true);
+  assert.equal(listPublicCommandPaths().includes("internal agent-host"), false);
+});
+
+test("Agent Host control sockets stay bounded and canonical across long Home aliases", (t) => {
+  const base = mkdtempSync(join(tmpdir(), "yui-agent-host-socket-"));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const home = join(base, "a".repeat(80), "b".repeat(80));
+  const alias = join(base, "home-alias");
+  mkdirSync(home, { recursive: true });
+  symlinkSync(home, alias, "dir");
+  const input = { home, scope: "task", taskId: "task-1", roleName: "leader" };
+  const direct = agentHostControlSocketPath(input);
+  const throughAlias = agentHostControlSocketPath({ ...input, home: alias });
+  const otherTask = agentHostControlSocketPath({ ...input, taskId: "task-2" });
+  assert.ok(Buffer.byteLength(direct, "utf8") <= 100, direct);
+  assert.equal(throughAlias, direct);
+  assert.notEqual(otherTask, direct);
+});
+
+test("Agent Host replies after a control client half-closes its request stream", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-agent-host-control-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const snapshot = {
+    schemaVersion: 1,
+    state: "idle",
+    updatedAt: "2026-08-23T00:00:00.000Z"
+  };
+  const payload = {
+    environment: {
+      YUI_SESSION_SCOPE: "task",
+      YUI_TASK_ID: "task-1",
+      YUI_ROLE: "leader"
+    }
+  };
+  const control = await openAgentHostControl(
+    home,
+    payload,
+    () => snapshot,
+    async () => ({ protocol: AGENT_HOST_CONTROL_PROTOCOL, outcome: "status", snapshot })
+  );
+  t.after(() => control.close());
+  const observed = await inspectAgentHost({
+    home,
+    scope: "task",
+    taskId: "task-1",
+    roleName: "leader"
+  });
+  assert.equal(observed.state, "idle");
+});
+
 test("the packaged CLI starts and exposes the core workflow", () => {
   const help = execFileSync(process.execPath, [join(root, "dist", "cli.js"), "help"], {
     cwd: root,
@@ -106,6 +182,18 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   }
   assert.equal(commands.includes("task enter"), false);
   assert.equal(commands.includes("task role enter"), false);
+});
+
+test("the manifest Run Context API is routable but remains non-public", () => {
+  assert.equal(findCommandNode(["task", "run", "context"])?.hidden, true);
+  assert.equal(listPublicCommandPaths().includes("task run context"), false);
+  for (const args of [
+    ["task", "run", "context", "task-1/agent-run-1", "--json"],
+    ["task", "run", "context", "expand", "task-1/agent-run-1", "ref-1", "--mode", "full"],
+    ["task", "run", "context", "delta", "task-1/agent-run-1", "--after", "cursor-1"]
+  ]) {
+    assert.equal(routeInvocation(args).kind, "execute");
+  }
 });
 
 test("the SQLite Task path persists one normal Task and Message", (t) => {
@@ -660,6 +748,62 @@ test("TmuxSessionHost rejects a managed Task planner without structured Agent Ho
   assert.equal(killed, false);
 });
 
+test("TmuxSessionHost forwards the frozen Task descriptors to its internal Agent Host", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-agent-host-env-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  let launched;
+  const planner = {
+    plan: () => ({
+      role: { name: "reviewer", workspace: launchWorkspace },
+      launch: {
+        command: "codex",
+        args: ["app-server", "--stdio"],
+        env: {
+          YUI_HOME: home,
+          YUI_AGENT_ID: "agent",
+          YUI_ADAPTER_ID: "codex",
+          YUI_WORKSPACE: launchWorkspace,
+          YUI_CONTROL_PLANE_DESCRIPTOR: "frozen-control-plane",
+          YUI_TASK_RUNTIME_DESCRIPTOR: "frozen-task-runtime"
+        },
+        childLifecycle: "persistent",
+        deferProviderStart: true,
+        providerControl: {
+          schemaVersion: 1,
+          adapterId: "codex",
+          transport: "codex-app-server-stdio",
+          mode: "new",
+          authority: { epoch: 1, owner: "controller", holderId: "launch-1" }
+        }
+      },
+      session: null,
+      initialTurnRunId: "run-1"
+    })
+  };
+  const tmux = {
+    ensureRoleWindow: (_hostId, _role, launch) => { launched = launch; return true; },
+    probeRoleStatus: () => "running",
+    inspectRolePane: () => ({ target: "tmux:0", dead: false, currentCommand: "node" }),
+    killRole: () => undefined
+  };
+  const host = new TmuxSessionHost(planner, tmux);
+  await host.start(createSessionLaunchRequest({
+    launchId: "launch-1",
+    owner: { scope: "task", taskId: "task-1", roleName: "reviewer" },
+    agentId: "agent",
+    adapterId: "codex",
+    effective: launchEffective,
+    workspace: launchWorkspace,
+    runId: "run-1",
+    mode: "new"
+  }));
+  assert.equal(launched.env.YUI_CONTROL_PLANE_DESCRIPTOR, "frozen-control-plane");
+  assert.equal(launched.env.YUI_TASK_RUNTIME_DESCRIPTOR, "frozen-task-runtime");
+  assert.equal(launched.env.YUI_AGENT_ID, "agent");
+  assert.equal(launched.env.YUI_ADAPTER_ID, "codex");
+  assert.equal(launched.env.YUI_WORKSPACE, launchWorkspace);
+});
+
 test("execution audit projects structured launch failure phase and kind", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-core-smoke-audit-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -814,6 +958,102 @@ test("the Codex App Server adapter keeps attachment and Run boundaries separate"
   assert.deepEqual(calls.map(({ method }) => method), ["thread/read"]);
 });
 
+test("managed Codex passes its selected model through App Server configuration", () => {
+  const adapter = resolveAgentAdapter("codex");
+  const args = adapter.compileManagedControl({
+    agent: {
+      schemaVersion: 2,
+      id: "codex-agent",
+      adapterId: "codex",
+      command: "codex",
+      baseArgs: [],
+      environment: [],
+      createdAt: "2026-08-23T00:00:00.000Z",
+      updatedAt: "2026-08-23T00:00:00.000Z",
+      source: "custom"
+    },
+    config: {
+      adapterId: "codex",
+      model: "model_api/experimental_0821",
+      effort: "low",
+      permission: { strategy: "bypass" }
+    },
+    workspace: root
+  }, "new").argv;
+  assert.equal(args.includes("--model"), false);
+  const model = args.indexOf('model="model_api/experimental_0821"');
+  assert.ok(model > 0);
+  assert.equal(args[model - 1], "--config");
+});
+
+test("a fresh exact Task descriptor binds only its own discovered native Session", (t) => {
+  const now = new Date("2026-08-23T00:00:00.000Z");
+  const { home, store, task } = issue09Setup(now);
+  t.after(() => {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+  const run = createAgentRun(
+    "agent-run-1",
+    task.id,
+    "leader",
+    "new",
+    "discover native identity",
+    now,
+    { effective: issue09Effective }
+  );
+  store.saveActiveAgentRun(run);
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: "leader" },
+    "agent",
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "agent",
+    adapterId: "codex",
+    nativeSessionId: "thread-1",
+    launchId: "launch-1",
+    status: "running",
+    policy: "fixed",
+    effective: issue09Effective
+  }, now);
+  sessions = bindTaskRoleRun(sessions, {
+    agentId: "agent",
+    runId: run.id,
+    receiptId: `agent-run:${task.id}/${run.id}`
+  }, now);
+  store.saveTaskRoleSessionSet(sessions);
+
+  const descriptor = createExactTaskRuntimeDescriptor({
+    controlPlaneDigest: "a".repeat(64),
+    taskId: task.id,
+    roleName: "leader",
+    agentId: "agent",
+    adapterId: "codex",
+    workspace: issue09Effective.workspace.root,
+    runId: run.id,
+    launchId: "launch-1"
+  });
+  const source = exactTaskRuntimeDescriptorPath(home, descriptor);
+  mkdirSync(dirname(source), { recursive: true });
+  writeFileSync(source, `${serializeExactDescriptor(descriptor)}\n`, "utf8");
+
+  const refreshed = refreshReusedTaskRuntimeDescriptorSource(source, home, store, {
+    runId: run.id,
+    launchId: "launch-1",
+    nativeSessionId: "thread-1"
+  });
+  assert.equal(refreshed.nativeSessionId, "thread-1");
+  assert.equal(JSON.parse(readFileSync(source, "utf8")).nativeSessionId, "thread-1");
+
+  writeFileSync(source, `${serializeExactDescriptor(descriptor)}\n`, "utf8");
+  assert.throws(() => refreshReusedTaskRuntimeDescriptorSource(source, home, store, {
+    runId: run.id,
+    launchId: "launch-2",
+    nativeSessionId: "thread-2"
+  }), /cannot bind a native Session from another generation/u);
+});
+
 test("managed Codex waits for App Server Turn acceptance and keeps input off argv", async (t) => {
   const directory = mkdtempSync(join(tmpdir(), "yui-codex-host-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -848,6 +1088,37 @@ test("managed Codex waits for App Server Turn acceptance and keeps input off arg
   assert.equal(receipt.conversationId, "thread-structured-1");
   assert.equal(receipt.nativeTurnId, "turn-structured-1");
   assert.equal(readFileSync(attempts, "utf8"), "turn/start\n");
+  started.session.terminate("SIGTERM");
+  await started.session.waitForExit();
+});
+
+test("managed Codex can submit the first Turn before its thread is materialized", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "yui-codex-unmaterialized-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const server = join(root, "test", "fixtures", "fake-codex-app-server.mjs");
+  const started = await startStructuredProviderSession({
+    schemaVersion: 1,
+    launchId: "launch-codex-unmaterialized",
+    command: process.execPath,
+    args: [server, "unmaterialized"],
+    environment: { PATH: process.env.PATH ?? "" },
+    cwd: directory,
+    childLifecycle: "persistent",
+    startMode: "provider",
+    providerControl: {
+      schemaVersion: 1,
+      adapterId: "codex",
+      transport: "codex-app-server-stdio",
+      mode: "new",
+      authority: { epoch: 1, owner: "controller", holderId: "launch-codex-unmaterialized" }
+    }
+  }, { mirrorOutput: () => {} });
+  const receipt = await started.session.submitTurn({
+    attemptId: "task-1/agentRun/run-1",
+    boundedText: "perform the managed work"
+  });
+  assert.equal(receipt.conversationId, "thread-unmaterialized-1");
+  assert.equal(receipt.nativeTurnId, "turn-structured-1");
   started.session.terminate("SIGTERM");
   await started.session.waitForExit();
 });
@@ -889,6 +1160,28 @@ test("managed Claude accepts only an exact replayed user message", async (t) => 
   );
   started.session.terminate("SIGTERM");
   await started.session.waitForExit();
+});
+
+test("managed Claude new-session control carries its preallocated native identity", () => {
+  const nativeSessionId = "11111111-1111-4111-8111-111111111111";
+  assert.doesNotThrow(() => validateAgentHostLaunchPayload({
+    schemaVersion: 1,
+    launchId: "launch-claude-new",
+    command: "claude",
+    args: ["--session-id", nativeSessionId],
+    environment: { PATH: process.env.PATH ?? "" },
+    cwd: root,
+    childLifecycle: "persistent",
+    startMode: "provider",
+    providerControl: {
+      schemaVersion: 1,
+      adapterId: "claude",
+      transport: "claude-stream-json",
+      mode: "new",
+      nativeSessionId,
+      authority: { epoch: 1, owner: "controller", holderId: "launch-claude-new" }
+    }
+  }));
 });
 
 test("managed Claude keeps new and resume native identity flags mutually exclusive", () => {

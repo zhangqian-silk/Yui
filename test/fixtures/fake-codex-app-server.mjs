@@ -34,6 +34,16 @@ lines.on("line", (line) => {
     return;
   }
   if (request.method === "thread/read") {
+    if (mode === "unmaterialized") {
+      process.stdout.write(`${JSON.stringify({
+        id: request.id,
+        error: {
+          code: -32600,
+          message: `thread thread-${mode}-1 is not materialized yet; includeTurns is unavailable before first user message`
+        }
+      })}\n`);
+      return;
+    }
     reply(request.id, {
       thread: {
         id: request.params.threadId,

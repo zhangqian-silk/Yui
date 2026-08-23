@@ -354,7 +354,12 @@ async function persistAndApply(
     const result = await callController(home, "runtime.observation-apply", entry, {
       timeoutMs: 10_000
     }) as Readonly<{ outcome?: string }>;
-    if (result.outcome !== "applied") {
+    // A fast Provider can accept the initial Turn before the scheduler call
+    // that launched this Host has returned and committed `run.pushed`. The
+    // immutable inbox entry already makes that exact fenced fact durable;
+    // `deferred` therefore means "retained for replay", not delivery failure.
+    // The signal below schedules the replay after the transport transaction.
+    if (result.outcome !== "applied" && result.outcome !== "deferred") {
       throw new Error(`Structured Provider observation was not applied: ${result.outcome ?? "unknown"}.`);
     }
   }

@@ -132,7 +132,8 @@ function validateProviderControl(control: AgentHostProviderControl): void {
   if (control.mode !== "new" && control.mode !== "resume") {
     throw new Error("Agent Host Provider control mode is invalid.");
   }
-  if ((control.mode === "resume") !== (control.nativeSessionId !== undefined)) {
+  const requiresNativeSessionId = control.mode === "resume" || control.adapterId === "claude";
+  if (requiresNativeSessionId !== (control.nativeSessionId !== undefined)) {
     throw new Error("Agent Host Provider resume identity is inconsistent.");
   }
   if (control.nativeSessionId !== undefined) text(control.nativeSessionId, "nativeSessionId");

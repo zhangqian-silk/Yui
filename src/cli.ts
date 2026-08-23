@@ -1614,21 +1614,27 @@ export async function main(): Promise<void> {
       try {
         tmux.attachRole(result.taskId, result.roleName, "read-write");
       } finally {
-        const released = runTaskCommand(
-          ["role", "release", result.taskId, result.roleName],
-          store,
-          { runtime, environment: process.env, yuiHome: home }
-        );
-        if (released.kind !== "authority" || released.action !== "release") {
-          throw runtimeError("Provider authority release returned an invalid result.");
+        const currentTask = store.getTask(result.taskId);
+        // Completing or retiring the Task from inside the takeover Turn owns
+        // Provider shutdown and clears the live binding. Do not turn that
+        // successful terminal transition into a failing best-effort release.
+        if (currentTask?.status === "active") {
+          const released = runTaskCommand(
+            ["role", "release", result.taskId, result.roleName],
+            store,
+            { runtime, environment: process.env, yuiHome: home }
+          );
+          if (released.kind !== "authority" || released.action !== "release") {
+            throw runtimeError("Provider authority release returned an invalid result.");
+          }
+          await syncAuthority(released);
+          emit(released.output);
+          runtime.notifyMailboxChanged({
+            kind: "role",
+            taskId: released.taskId,
+            roleName: released.roleName
+          });
         }
-        await syncAuthority(released);
-        emit(released.output);
-        runtime.notifyMailboxChanged({
-          kind: "role",
-          taskId: released.taskId,
-          roleName: released.roleName
-        });
       }
       return;
     } catch (error) {

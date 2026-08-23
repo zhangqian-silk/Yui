@@ -772,7 +772,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "recover", "yield", "checkpoint"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "recover", "yield", "context", "checkpoint"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
       {
@@ -802,6 +802,28 @@ const taskChildren: readonly NodeInput[] = [
         usage: "yui task run yield <task>/<run> (--summary <text>|--summary-file <path|->)",
         options: ["--summary", "--summary-file"],
         fileOptions: ["--summary-file"]
+      },
+      {
+        name: "context",
+        summary: "Load the exact authorized Run context.",
+        usage: "yui task run context <task>/<run> [--json]",
+        executable: true,
+        hidden: true,
+        sections: [{ id: "load", title: "Commands", entries: ["expand", "delta"] }],
+        children: [
+          {
+            name: "expand",
+            summary: "Expand one authorized Run context reference.",
+            usage: "yui task run context expand <task>/<run> <ref-id> [--mode full]",
+            options: ["--mode"]
+          },
+          {
+            name: "delta",
+            summary: "Load authorized Run context changes after a cursor.",
+            usage: "yui task run context delta <task>/<run> --after <cursor>",
+            options: ["--after"]
+          }
+        ]
       },
       {
         name: "checkpoint",
@@ -1451,8 +1473,17 @@ export const ROOT_COMMAND = buildNode({
       name: "internal",
       summary: "Internal Yui callbacks.",
       hidden: true,
-      sections: [{ id: "callbacks", title: "Callbacks", entries: ["session-notify", "runtime-hook"] }],
+      sections: [{
+        id: "callbacks",
+        title: "Callbacks",
+        entries: ["session-notify", "runtime-hook", "agent-host"]
+      }],
       children: [
+        {
+          name: "agent-host",
+          summary: "Run the persistent structured Provider host.",
+          usage: "yui internal agent-host <launch-id> <ticket>"
+        },
         {
           name: "session-notify",
           summary: "Record a structured native session notification.",

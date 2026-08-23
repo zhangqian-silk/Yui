@@ -341,9 +341,20 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
     _nativeSessionId?: string
   ): CompiledManagedControlLaunch {
     const launch = this.compileNew(input);
+    const argv = [...launch.argv];
+    if (input.config.model !== undefined) {
+      const modelFlag = argv.findIndex((value, index) => (
+        value === "--model" && argv[index + 1] === input.config.model
+      ));
+      if (modelFlag < 0) throw new Error("Managed Codex launch lost its selected model.");
+      argv.splice(modelFlag, 2);
+      // App Server thread/start reads the model from resolved configuration;
+      // the interactive --model shortcut is not inherited by new threads.
+      argv.push("--config", `model=${tomlString(input.config.model)}`);
+    }
     return {
       ...launch,
-      argv: [...launch.argv, "app-server", "--stdio"],
+      argv: [...argv, "app-server", "--stdio"],
       transport: "codex-app-server-stdio"
     };
   }

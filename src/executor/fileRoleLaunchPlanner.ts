@@ -709,15 +709,18 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const providerAuthority = managedControl
       ? this.#providerAuthorityForLaunch(owner.taskId, role.name, input.launchId)
       : undefined;
+    const providerNativeSessionId = binding.adapterId === "claude"
+      ? preallocatedManagedNativeSessionId
+      : resumeNativeSessionId;
     const providerControl: AgentHostProviderControl | undefined = managedControl
       ? {
           schemaVersion: 1,
           adapterId: binding.adapterId,
           transport: managedCompiled!.transport,
           mode: resumeNativeSessionId === undefined ? "new" : "resume",
-          ...(resumeNativeSessionId === undefined
+          ...(providerNativeSessionId === undefined
             ? {}
-            : { nativeSessionId: resumeNativeSessionId }),
+            : { nativeSessionId: providerNativeSessionId }),
           authority: providerAuthority!,
           ...(carriesInitialTurn
             ? {
