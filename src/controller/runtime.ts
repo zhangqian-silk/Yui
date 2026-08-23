@@ -713,13 +713,27 @@ export async function startFileTaskControllerRuntime(
   } catch (error) {
     (options.onError ?? (() => undefined))(error);
   }
+  let resourceClose: Promise<void> | undefined;
+  const closeResources = (): Promise<void> => {
+    resourceClose ??= Promise.all([
+      asyncStoreClient?.close() ?? Promise.resolve(),
+      inventoryClient?.close() ?? Promise.resolve()
+    ]).then(() => undefined);
+    return resourceClose;
+  };
+  const closed = running.closed.then(closeResources);
   return {
     ...running,
+    closed,
     close: async () => {
-      await running.close();
-      // Release the worker's database connections when the worker backend is active.
-      await asyncStoreClient?.close();
-      await inventoryClient?.close();
+      try {
+        await running.close();
+      } finally {
+        // RPC-driven Controller stops resolve `running.closed` without calling
+        // this wrapper. Share one cleanup promise so both lifecycle paths
+        // release the worker connections before the process can linger.
+        await closeResources();
+      }
     },
     store,
     schedulerStore,
