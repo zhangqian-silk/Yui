@@ -199,11 +199,11 @@ export function withAgentRunContextSnapshot(
   if (run.status !== "active" || run.pushedAt !== undefined || run.deliveredAt !== undefined) {
     throw new Error(`Cannot bind Context Snapshot after Run delivery: ${run.id}.`);
   }
-  const assignment = validateRunAssignment(Object.freeze({
+  const assignment = createRunAssignment({
     ...run.assignment,
     contextSnapshotRef: snapshot,
     deltaRefIds
-  }));
+  });
   return validateAgentRun(Object.freeze({
     ...run,
     assignment,
