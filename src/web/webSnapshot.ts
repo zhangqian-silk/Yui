@@ -22,6 +22,7 @@ import {
 import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import type { AgentRun } from "../run/agentRun.js";
+import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
@@ -47,6 +48,7 @@ export type WebDashboardStore = Pick<TaskStore,
   | "getLeaderFailure"
   | "getOperatorNotification"
   | "getRoleSession"
+  | "getConfig"
 > & Readonly<{
   listEvents?: (taskId: string) => readonly TaskEvent[];
 }>;
@@ -171,7 +173,14 @@ export function buildWebTaskDetail(
       .map((run) => [run.roleName, run]));
     const activeRunHealth = runs
       .filter((run) => run.status === "active")
-      .map((run) => projectWebRunRuntimeHealth(reader, taskId, run, events, now));
+      .map((run) => projectWebRunRuntimeHealth(
+        reader,
+        taskId,
+        run,
+        events,
+        now,
+        resolveRuntimeHealth(reader.getConfig().runtimeHealth)
+      ));
     const roles = reader.listRoles(taskId).map((role) => {
       const activeRun = activeRuns.get(role.name);
       const sessions = reader.getTaskRoleSessionSet(taskId, role.name);
@@ -229,7 +238,8 @@ function projectWebRunRuntimeHealth(
   taskId: string,
   run: AgentRun,
   events: readonly TaskEvent[],
-  now: Date
+  now: Date,
+  policy: ReturnType<typeof resolveRuntimeHealth>
 ): Readonly<{
   runId: string;
   roleName: string;
@@ -295,7 +305,8 @@ function projectWebRunRuntimeHealth(
   const classification = classifyRuntimeHealth({
     projection,
     semanticProgressAt: semanticProgress.progressAt,
-    now
+    now,
+    policy
   });
   return {
     runId: run.id,

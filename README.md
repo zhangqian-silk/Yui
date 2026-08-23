@@ -21,21 +21,37 @@ yui setup
 yui doctor
 ```
 
-`setup` is interactive. It detects installed Agent CLIs, asks which Agents to configure, selects the default and Operator Agent, and probes each selected CLI for its current models. It configures the Leader and Operator, then explains that the global Worker configuration is copied into new Task Roles and asks whether Worker should reuse Leader or be configured separately. Model selection is followed by that model's supported reasoning efforts. Setup also confirms the Project workspace outside Yui home and offers shell-completion setup. The picker includes the native CLI default and a custom-value option. Running setup again preserves existing Tasks, Roles, and the installation's Project workspace while allowing safe configuration changes. A successful setup ensures the current Home's detached Controller is running before it returns.
+`setup` is intentionally minimal. It verifies tmux, reuses or creates one
+available Agent, creates the default workspace outside Yui home, and configures
+both Operator and Leader so the user can start Yui and execute Tasks. It does
+not create Worker, Reviewer, Profile, or review-policy configuration, and does
+not ask for model/effort, permission, or shell completion. The required
+Operator and Leader bindings use Yui's adapter default permission strategy
+(`bypass`); further changes belong under `config role`. Running setup again
+preserves already usable Operator and Leader Roles. A successful setup starts
+the current Home's detached Controller before it returns.
 
-Model and effort are per-Agent Role settings, so Operator, Leader, and the global Worker can use different values even when they share an Agent CLI. Interactive Role flows validate those settings against the selected Agent runtime. Worker Profile model and effort fields are provider-neutral child-execution hints and therefore remain explicit, scriptable values rather than Agent capability selections.
+All persistent configuration is under `yui config`. `config show` reports the
+complete effective state, while `config --help` introduces each domain and
+shows examples. The Operator can read the same structured catalog with
+`config describe`, explain current values, effects, choices, and activation
+behavior, then apply only changes the user confirms.
 
-Setup gives every managed Agent binding the explicit `bypass` permission
-strategy. Later Role updates may select `default`, `bypass`, or `configured`;
-the last choice exposes that adapter's native permission enums and tool rules.
+Durable settings are grouped by responsibility: `config system` for Home
+defaults and presentation, `config runtime` for Controller health, concurrency,
+launch, delivery, and Provider retry, `config workflow` for Leader/context/review
+policy, `config resources` for quarantine and GC, and `config tools` for tmux
+and diagnostic telemetry. Configured Agents, global Roles, Profiles, and shell
+completion remain the sibling `config agent|role|profile|completion` domains.
+Use `show`, `set`, and `clear` consistently within each durable-settings domain.
 
-Runtime catalogs are refreshed per command and cached under Yui home. If a live probe times out or fails, Yui shows the last cache for the same Agent launch context and clearly marks it as potentially stale; without a matching cache, it offers CLI defaults and custom values. `yui agent capabilities <id>` exposes the same one-pass catalog, including models, model-specific efforts, and other runtime choices such as permissions, search availability, profiles, settings sources, and service tiers.
+Runtime catalogs are refreshed per command and cached under Yui home. If a live probe times out or fails, Yui shows the last cache for the same Agent launch context and clearly marks it as potentially stale; without a matching cache, it offers CLI defaults and custom values. `yui config agent capabilities <id>` exposes the same one-pass catalog, including models, model-specific efforts, and other runtime choices such as permissions, search availability, profiles, settings sources, and service tiers.
 
 `completion` is also interactive, with or without an explicit shell:
 
 ```sh
-yui completion
-yui completion zsh
+yui config completion
+yui config completion zsh
 ```
 
 Both forms confirm the generated script, installation path, and shell startup-file change. The installed completion is generated from the command catalog, including nested subcommands.
@@ -214,7 +230,8 @@ record-schema change, the integrating branch must supply the complete adjacent
 path (including an explicit `0->1` introduction for a new family) and re-test to
 convergence.
 
-Setup also seeds four reusable Worker Profiles:
+Yui provides four reusable Worker Profile definitions through
+`yui config profile reset`; minimum setup leaves them unconfigured:
 
 ```text
 worker  explorer  implementer  reviewer
@@ -270,16 +287,16 @@ timezone with:
 
 ```sh
 yui config show
-yui config set time-zone Europe/London
+yui config system set time-zone Europe/London
 ```
 
 WorkItem review is one global, optional rule that reuses an existing Global
 Role's Agent, model, permissions, prompt, and Skills:
 
 ```sh
-yui config set review --role reviewer --trigger always
+yui config workflow set review --role reviewer --trigger always
 yui config show
-yui config clear review
+yui config workflow clear review
 ```
 
 For Project-backed software delivery, use `--trigger final` to keep WorkItem
@@ -287,7 +304,7 @@ acceptance and Integration independent and run one fresh ReviewRound over the
 complete frozen integrated Task candidate before completion:
 
 ```sh
-yui config set review --role reviewer --trigger final
+yui config workflow set review --role reviewer --trigger final
 ```
 
 Every result entering Leader acceptance is one explicit candidate on its
@@ -467,7 +484,7 @@ Create a Task-bound Worker instance from the configured global Worker, apply a
 Profile, and dispatch a WorkItem:
 
 ```sh
-yui role show worker
+yui config role show worker
 yui task role add <task-id> implementer --profile implementer
 yui task role show <task-id> implementer
 
@@ -538,7 +555,7 @@ yui task work create <task-id> "Review the implementation" \
   --objective "Return source-backed findings" \
   --accept "Every finding identifies an affected path"
 yui task work update <task-id>/<work-item-id> running
-yui profile show reviewer
+yui config profile show reviewer
 ```
 
 Subagent creation and result delivery happen inside the Leader's native Agent
@@ -686,7 +703,7 @@ entry is read-only unless `--read-write` is requested, preventing observation
 from changing Agent execution.
 
 ```sh
-yui role enter <global-role>
+yui session enter <global-role>
 yui task enter <task-id> [role] [--read-only | --read-write]
 yui task role enter <task-id> <role> [--read-only | --read-write]
 ```
@@ -710,7 +727,7 @@ the terminal Session's immutable effective snapshot in history. Until that
 process terminates, exact control-plane wakes continue through its actual
 snapshot instead of applying desired drift as a hot change.
 
-Use `yui role unbind <global-role> <agent-id>` or `yui task role unbind <task-id> <role> <agent-id>` to retire a dormant binding. The active binding and any non-stopped native session are rejected; a stopped session record is removed atomically with the binding.
+Use `yui config role unbind <global-role> <agent-id>` or `yui task role unbind <task-id> <role> <agent-id>` to retire a dormant binding. The active binding and any non-stopped native session are rejected; a stopped session record is removed atomically with the binding.
 
 Claude session IDs are preallocated at launch. Every managed Task Claude Run
 uses a new finite process; resume starts a new process against the fixed native
@@ -847,9 +864,11 @@ The restored management surface includes:
 ```sh
 yui update
 yui upgrade [--dry-run]
-yui agent add|list|show|capabilities|update|remove
-yui role add|list|show|update|remove|bind|enter
-yui role session record|replace
+yui config agent add|list|show|capabilities|update|remove
+yui config role add|list|show|update|remove|bind|unbind
+yui config profile add|list|show|update|remove|reset
+yui config completion [bash|zsh|fish]
+yui session enter|record|replace|reconcile
 yui project add|clone|refresh|update|discover|list|show|knowledge
 ```
 

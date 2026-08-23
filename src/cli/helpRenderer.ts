@@ -25,6 +25,9 @@ export function renderCommandHelp(node: CommandNode, version: string): string {
       ...node.options.map((option) => `  ${option.padEnd(width)}  ${describeOption(option)}`)
     );
   }
+  if (node.examples.length > 0) {
+    lines.push("", "Examples:", ...node.examples.map((example) => `  ${example}`));
+  }
   return `${lines.join("\n")}\n`;
 }
 

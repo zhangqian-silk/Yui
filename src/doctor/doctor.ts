@@ -42,7 +42,7 @@ import {
 import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
 import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
 import { classifyHome } from "../storage/upgrade/homeClassification.js";
-import { resolveGitBin, resolveTmuxBin } from "../config/yuiConfig.js";
+import { resolveTmuxBin } from "../config/yuiConfig.js";
 import {
   readMigrationReceipt,
   type PersistentMigrationReceipt
@@ -1301,7 +1301,7 @@ function readDurableConfigSafely(
     const config = store.getConfig();
     return {
       tmuxBin: resolveTmuxBin(config.tmuxBin),
-      gitBin: resolveGitBin(config.gitBin)
+      gitBin: "git"
     };
   } catch {
     return { tmuxBin: "tmux", gitBin: "git" };

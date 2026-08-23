@@ -45,31 +45,34 @@ yui setup
 yui doctor
 ```
 
-`setup` 是交互式的：检测已安装的 Agent CLI，选择要配置的 Agent、默认
-Agent 和 Operator Agent，并实时探测所选 CLI 当前支持的模型。它先配置
-Leader 和 Operator，再说明全局 Worker 配置会复制到新建的 Task Role，
-让用户选择 Worker 复用 Leader 配置还是单独配置。模型选择后只展示该模型
-支持的思考强度。随后 setup 会确认位于 Yui home 外部的 Project workspace，
-并询问 shell completion。选择器同时提供原生 CLI 默认值和自定义值入口。
-再次运行不会删除已有 Task/Role，也不会改变当前安装的 Project workspace，
-可用于安全地调整配置。setup 成功返回前会确保当前 Home 的后台 Controller
-已经启动。
+`setup` 被刻意缩减为最小流程：检查 tmux，复用或创建一个可用 Agent，在
+Yui home 外创建默认 workspace，并配置 Operator 与 Leader，使用户可以启动
+Yui 并执行 Task。它不会创建 Worker、Reviewer、Profile 或 review policy，
+也不会询问 model/effort、permission 或 shell completion。Operator 与 Leader
+的必需 binding 使用 Yui 的 adapter 默认 permission strategy（`bypass`）；
+后续调整统一通过 `config role` 完成。再次运行会原样保留已经可用的 Operator
+和 Leader；setup 成功返回前会启动当前 Home 的后台 Controller。
 
-模型与思考强度属于 Agent binding 设置，因此 Operator、Leader 和全局
-Worker 即使使用同一个 Agent CLI，也可以采用不同配置。Profile 中的
-model/effort 只是 native child 的可移植 hint。
+所有持久配置都位于 `yui config` 下。`config show` 展示完整有效状态，
+`config --help` 介绍各配置域并给出示例。Operator 可通过结构化的
+`config describe` 读取配置目录，向用户说明当前值、具体影响、可选值和生效
+方式，并只执行用户确认的修改。
 
-Setup 会为每个受管 Agent binding 显式设置 `bypass` permission strategy。
-后续 Role 更新可选择 `default`、`bypass` 或 `configured`；`configured` 会
-保留对应 adapter 的原生权限枚举与工具规则。
+持久设置按职责分组：`config system` 管理 Home 默认值和展示方式，
+`config runtime` 管理 Controller 健康阈值、并发、启动、投递和 Provider
+重试，`config workflow` 管理 Leader、context 与 review policy，
+`config resources` 管理隔离区和 GC，`config tools` 管理 tmux 与诊断
+telemetry。Agent、全局 Role、Profile 和 shell completion 则继续位于同级的
+`config agent|role|profile|completion` 域。每个持久设置域统一使用
+`show`、`set`、`clear`。
 
-运行时能力目录会在每次命令中刷新，并缓存在 Yui home。实时探测超时或失败时，Yui 会展示同一 Agent 启动上下文最近一次成功的缓存并明确提示数据可能过期；没有匹配缓存时，则提供 CLI 默认值和自定义入口。`yui agent capabilities <id>` 可一次性读取同一份目录，包括模型、逐模型思考强度，以及权限、搜索可用性、profile、settings source、service tier 等其他运行时选项。
+运行时能力目录会在每次命令中刷新，并缓存在 Yui home。实时探测超时或失败时，Yui 会展示同一 Agent 启动上下文最近一次成功的缓存并明确提示数据可能过期；没有匹配缓存时，则提供 CLI 默认值和自定义入口。`yui config agent capabilities <id>` 可一次性读取同一份目录，包括模型、逐模型思考强度，以及权限、搜索可用性、profile、settings source、service tier 等其他运行时选项。
 
 `completion` 无论是否指定 shell，都会进入确认流程：
 
 ```sh
-yui completion
-yui completion zsh
+yui config completion
+yui config completion zsh
 ```
 
 流程会确认生成脚本、安装路径和 shell 启动文件修改。补全脚本直接由命令目录生成，支持二级及更深层子命令。
@@ -116,16 +119,16 @@ yui task activate <task-id>
 
 ```sh
 yui config show
-yui config set time-zone Europe/London
+yui config system set time-zone Europe/London
 ```
 
 WorkItem 审查只有一条可选的全局规则，并直接复用已有 Global Role 的
 Agent、model、权限、prompt 和 Skills：
 
 ```sh
-yui config set review --role reviewer --trigger always
+yui config workflow set review --role reviewer --trigger always
 yui config show
-yui config clear review
+yui config workflow clear review
 ```
 
 对带 Project 的软件交付，可使用 `--trigger final`：WorkItem 验收与
@@ -133,7 +136,7 @@ Integration 保持独立，在 Task 完成前只对所有已集成 Project 的�
 一次 Task 级 ReviewRound：
 
 ```sh
-yui config set review --role reviewer --trigger final
+yui config workflow set review --role reviewer --trigger final
 ```
 
 每个进入 Leader 验收阶段的结果，都会成为原 WorkItem 上一个明确的候选。
@@ -261,7 +264,7 @@ Task/WorkItem 模型，不增加额外任务类型。
 从已配置的全局 Worker 创建 Task Role，应用 Profile 并派发 WorkItem：
 
 ```sh
-yui role show worker
+yui config role show worker
 yui task role add <task-id> implementer --profile implementer
 yui task role show <task-id> implementer
 
@@ -327,7 +330,7 @@ yui task work create <task-id> "审查实现" \
   --objective "返回有源码依据的问题" \
   --accept "每个问题都标明受影响路径"
 yui task work update <task-id>/<work-item-id> running
-yui profile show reviewer
+yui config profile show reviewer
 ```
 
 subagent 的创建与结果返回完全由 Leader 当前 Agent 的 native child 能力
@@ -441,7 +444,7 @@ tmux 会在 pane 创建时固定其历史容量。配置该限制之前创建的
 Global 交互入口在不存在 writer 时保持可写；已有 writer 时自动降级为只读。global Web 对每个 tmux session 只允许一个 writer；Task Web 始终只读。Task CLI 入口除非显式请求 `--read-write`，否则始终只读，避免观察动作改变 Agent 执行。
 
 ```sh
-yui role enter <global-role>
+yui session enter <global-role>
 yui task enter <task-id> [role] [--read-only | --read-write]
 yui task role enter <task-id> <role> [--read-only | --read-write]
 ```
@@ -455,7 +458,7 @@ binding 是预先保存、可随时切换的配置，而不是并行身份。Ope
 并切换。跨 Agent 切换默认复用已保存的 model/effort，只有用户明确选择
 更新时才进入现有配置选择流程。
 
-使用 `yui role unbind <global-role> <agent-id>` 或 `yui task role unbind <task-id> <role> <agent-id>` 可移除休眠 binding。active binding 或任何未 stopped 的 native session 都会被拒绝；stopped session 记录会和 binding 在同一事务中删除。
+使用 `yui config role unbind <global-role> <agent-id>` 或 `yui task role unbind <task-id> <role> <agent-id>` 可移除休眠 binding。active binding 或任何未 stopped 的 native session 都会被拒绝；stopped session 记录会和 binding 在同一事务中删除。
 
 Claude 的 session ID 在启动前分配。每个受管理的 Task Claude Run 都使用新的有限生命周期进程；resume 会针对固定 native session 启动新进程，而不是复用交互式 pane。受管理的 Codex 启动使用 Codex 结构化 `notify` 回调，在 turn 完成后记录 thread ID，不再向模型对话注入 session-bind prompt。
 
@@ -527,9 +530,11 @@ Web 端可以通过与 Terminal 相同的持久化 CLI 路径回答 open InputRe
 
 ```sh
 yui update
-yui agent add|list|show|capabilities|update|remove
-yui role add|list|show|update|remove|bind|enter
-yui role session record|replace
+yui config agent add|list|show|capabilities|update|remove
+yui config role add|list|show|update|remove|bind|unbind
+yui config profile add|list|show|update|remove|reset
+yui config completion [bash|zsh|fish]
+yui session enter|record|replace|reconcile
 yui project add|clone|update|discover|list|show|knowledge
 ```
 

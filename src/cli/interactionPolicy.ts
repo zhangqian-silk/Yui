@@ -1,4 +1,4 @@
-import type { CommandNode } from "./commandCatalog.js";
+import { findCommandNode, type CommandNode } from "./commandCatalog.js";
 
 export type CandidateProviderName =
   | "agent-profiles"
@@ -112,7 +112,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--development": "value"
     }
   },
-  ...["add", "update", "retire", "list", "show"].map((command): InteractionPolicy => ({
+  ...["add", "retire", "list", "show"].map((command): InteractionPolicy => ({
     commandPath: ["project", "knowledge", command],
     selectors: [{
       argumentIndex: 3,
@@ -122,26 +122,24 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     }],
     ...(command === "add"
       ? { trailingOptions: { "--body": "value" as const } }
-      : command === "update"
-        ? { trailingOptions: { "--title": "value" as const, "--body": "value" as const } }
-        : command === "list"
-          ? { trailingOptions: { "--all": "flag" as const } }
-          : {})
+      : command === "list"
+        ? { trailingOptions: { "--all": "flag" as const } }
+        : {})
   })),
   ...["show", "capabilities", "update", "remove"].map((command): InteractionPolicy => ({
-    commandPath: ["agent", command],
+    commandPath: ["config", "agent", command],
     selectors: [{
-      argumentIndex: 2,
+      argumentIndex: 3,
       entity: "agent",
       provider: "configured-agents",
       actionTarget: true
     }],
     ...(command === "remove"
-      ? { confirmation: { action: "Remove Agent", targetArgumentIndex: 2 } }
+      ? { confirmation: { action: "Remove Agent", targetArgumentIndex: 3 } }
       : {})
   })),
   {
-    commandPath: ["role", "add"],
+    commandPath: ["config", "role", "add"],
     selectors: [{
       option: "--agent",
       requiredOption: true,
@@ -158,29 +156,31 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--search": "value"
     }
   },
-  ...["show", "update", "remove", "enter"].map((command): InteractionPolicy => ({
-    commandPath: ["role", command],
+  ...["show", "update", "remove", "enter", "context"].map((command): InteractionPolicy => ({
+    commandPath: command === "enter" || command === "context"
+      ? ["session", command]
+      : ["config", "role", command],
     selectors: [{
-      argumentIndex: 2,
+      argumentIndex: command === "enter" || command === "context" ? 2 : 3,
       entity: "global-role",
       provider: "global-roles",
       actionTarget: true
     }],
     ...(command === "remove"
-      ? { confirmation: { action: "Remove Role", targetArgumentIndex: 2 } }
+      ? { confirmation: { action: "Remove Role", targetArgumentIndex: 3 } }
       : {})
   })),
   ...["bind", "unbind"].map((command): InteractionPolicy => ({
-    commandPath: ["role", command],
+    commandPath: ["config", "role", command],
     selectors: [
-      { argumentIndex: 2, entity: "global-role", provider: "global-roles", actionTarget: true },
-      { argumentIndex: 3, entity: "agent", provider: "configured-agents", actionTarget: false }
+      { argumentIndex: 3, entity: "global-role", provider: "global-roles", actionTarget: true },
+      { argumentIndex: 4, entity: "agent", provider: "configured-agents", actionTarget: false }
     ]
   })),
   ...["record", "replace"].map((command): InteractionPolicy => ({
-    commandPath: ["role", "session", command],
+    commandPath: ["session", command],
     selectors: [{
-      argumentIndex: 3,
+      argumentIndex: 2,
       entity: "global-role",
       provider: "global-roles",
       actionTarget: true
@@ -190,7 +190,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       : { "--native-id": "value" }
   })),
   {
-    commandPath: ["profile", "add"],
+    commandPath: ["config", "profile", "add"],
     selectors: [],
     trailingOptions: {
       "--description": "value", "--instructions": "value",
@@ -198,9 +198,9 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     }
   },
   ...["show", "update", "remove"].map((command): InteractionPolicy => ({
-    commandPath: ["profile", command],
+    commandPath: ["config", "profile", command],
     selectors: [{
-      argumentIndex: 2,
+      argumentIndex: 3,
       entity: "agent-profile",
       provider: "agent-profiles",
       actionTarget: true
@@ -216,7 +216,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
         }
       : {}),
     ...(command === "remove"
-      ? { confirmation: { action: "Remove Agent Profile", targetArgumentIndex: 2 } }
+      ? { confirmation: { action: "Remove Agent Profile", targetArgumentIndex: 3 } }
       : {})
   })),
   taskTarget("show"),
@@ -695,10 +695,33 @@ export function validateInteractionPolicies(
     const path = policy.commandPath.join(" ");
     if (paths.has(path)) throw new Error(`Duplicate interaction policy: ${path}`);
     paths.add(path);
+    const node = findCommandNode(policy.commandPath);
+    if (node === undefined || node.hidden) {
+      throw new Error(`Interaction policy references an unknown command: ${path}`);
+    }
     for (const selector of policy.selectors) {
       if ((selector.argumentIndex === undefined) === (selector.option === undefined)) {
         throw new Error(`Interaction selector must declare exactly one slot: ${path}`);
       }
+      if (selector.argumentIndex !== undefined && (
+        !Number.isInteger(selector.argumentIndex)
+        || selector.argumentIndex < node.path.length - 1
+      )) {
+        throw new Error(`Interaction selector has an invalid argument index: ${path}`);
+      }
+      if (selector.option !== undefined && !node.options.includes(selector.option)) {
+        throw new Error(`Interaction selector references an unknown option: ${path} ${selector.option}`);
+      }
+    }
+    for (const option of Object.keys(policy.trailingOptions ?? {})) {
+      if (!node.options.includes(option)) {
+        throw new Error(`Interaction policy references an unknown trailing option: ${path} ${option}`);
+      }
+    }
+    if (policy.confirmation !== undefined && !policy.selectors.some((selector) =>
+      selector.argumentIndex === policy.confirmation?.targetArgumentIndex
+      && selector.actionTarget)) {
+      throw new Error(`Interaction confirmation has no action target selector: ${path}`);
     }
   }
 }

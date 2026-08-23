@@ -114,6 +114,7 @@ export function projectRoleRunHealth(input: Readonly<{
   deliveredAt?: string;
   now: Date;
   windowMs?: number;
+  diagnosticAfterMs?: number;
   hostLiveness: "present" | "absent" | "unknown";
   nativeSession?: Readonly<{
     status: string;
@@ -128,6 +129,8 @@ export function projectRoleRunHealth(input: Readonly<{
   staleLeaderMailbox?: boolean;
 }>): RoleRunHealthProjection {
   const windowMs = input.windowMs ?? DEFAULT_STALL_WINDOW_MS;
+  const diagnosticAfterMs = input.diagnosticAfterMs
+    ?? DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS;
   if (!Number.isFinite(windowMs) || windowMs <= 0) {
     throw new Error("Role run stall window must be a positive number of milliseconds.");
   }
@@ -142,7 +145,7 @@ export function projectRoleRunHealth(input: Readonly<{
   const candidate = Number.isFinite(candidateAge)
     && (input.deliveredAt === undefined
       ? candidateAge >= windowMs
-      : candidateAge >= DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS);
+      : candidateAge >= diagnosticAfterMs);
   const providerAcceptance = input.providerAcceptance
     ?? (input.deliveredAt === undefined ? "ambiguous" : "accepted");
   const hostLiveness = input.hostLiveness;
@@ -161,7 +164,7 @@ export function projectRoleRunHealth(input: Readonly<{
             : "matching";
   const resourceActivity = hostLiveness === "present"
     && nativeSession === "matching"
-    && resourceEvidenceIsFresh(input.resource, input.now, windowMs)
+    && resourceEvidenceIsFresh(input.resource, input.now, windowMs, diagnosticAfterMs)
     // Residency/RSS and an unchanged cumulative counter are not progress.
     && input.resource?.active === true
     && input.resource?.changed === true;
@@ -703,7 +706,8 @@ export async function reconcileStalledRoleRuns(
   selection?: SchedulerReconcileSelection,
   windowMs = DEFAULT_STALL_WINDOW_MS,
   liveStatuses?: RoleLiveStatusSnapshot,
-  resourceEvidence?: RoleRunResourceEvidenceSnapshot
+  resourceEvidence?: RoleRunResourceEvidenceSnapshot,
+  diagnosticAfterMs = DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS
 ): Promise<RoleRunStallResult[]> {
   // Dirty mailbox passes are intentionally not a second scheduler. Full
   // reconcile owns the all-active-Run scan; dirty passes may still route the
@@ -734,7 +738,12 @@ export async function reconcileStalledRoleRuns(
       }];
     })
   ));
-  const stallCandidates = candidates.filter(({ run }) => isStallCandidate(run, now, windowMs));
+  const stallCandidates = candidates.filter(({ run }) => isStallCandidate(
+    run,
+    now,
+    windowMs,
+    diagnosticAfterMs
+  ));
   if (stallCandidates.length === 0) return [];
   const stallCandidateKeys = new Set(stallCandidates.map(({ task, role }) => (
     `${task.id}\0${role.name}`
@@ -925,7 +934,7 @@ export async function reconcileStalledRoleRuns(
         expectedResourceIdentity,
         progressAt
       )
-      && resourceEvidenceIsFresh(resourceSnapshot, now, windowMs);
+      && resourceEvidenceIsFresh(resourceSnapshot, now, windowMs, diagnosticAfterMs);
     const resource = resourceIsCurrent ? resourceSnapshot : undefined;
     const health = projectRoleRunHealth({
       progressAt,
@@ -935,6 +944,7 @@ export async function reconcileStalledRoleRuns(
         : { deliveredAt: candidate.run.deliveredAt }),
       now,
       windowMs,
+      diagnosticAfterMs,
       hostLiveness: live,
       nativeSession: candidate.session,
       providerAcceptance: candidate.run.deliveredAt === undefined
@@ -1067,7 +1077,8 @@ export async function reconcileStalledRoleRuns(
 function isStallCandidate(
   run: Readonly<{ createdAt: string; deliveredAt?: string }>,
   now: Date,
-  windowMs: number
+  windowMs: number,
+  diagnosticAfterMs: number
 ): boolean {
   const startAt = run.deliveredAt ?? run.createdAt;
   const ageMs = now.getTime() - Date.parse(startAt);
@@ -1076,7 +1087,7 @@ function isStallCandidate(
   // window, but they never enter workflow-stall candidate filtering.
   return run.deliveredAt === undefined
     ? ageMs >= windowMs
-    : ageMs >= DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS;
+    : ageMs >= diagnosticAfterMs;
 }
 
 type ObservedRun = Readonly<{
@@ -1373,12 +1384,13 @@ function hasResourceIdentityText(value: string | undefined): value is string {
 function resourceEvidenceIsFresh(
   evidence: RoleRunResourceEvidence | undefined,
   now: Date,
-  windowMs: number
+  windowMs: number,
+  diagnosticAfterMs = DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS
 ): boolean {
   if (evidence === undefined) return false;
   const observedAt = Date.parse(evidence.observedAt);
   if (!Number.isFinite(observedAt)) return false;
   // A sample from an earlier scheduler window is not a current health signal.
   return observedAt <= now.getTime()
-    && now.getTime() - observedAt < Math.max(windowMs, DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS);
+    && now.getTime() - observedAt < Math.max(windowMs, diagnosticAfterMs);
 }

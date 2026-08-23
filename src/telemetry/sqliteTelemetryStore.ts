@@ -61,7 +61,7 @@ export class SqliteTelemetryStore implements TelemetryStore {
   #closed = false;
 
   constructor(home: string, options: SqliteTelemetryStoreOptions = {}) {
-    this.mode = options.mode ?? "dual";
+    this.mode = options.mode ?? "on";
     this.#path = join(home, COMMITTED_DATABASE_FILENAME);
     this.#terminalKeep = options.terminalKeep ?? DEFAULT_TERMINAL_KEEP;
     this.#runCap = options.runCap ?? DEFAULT_RUN_CAP;
@@ -354,12 +354,20 @@ export class SqliteTelemetryStore implements TelemetryStore {
           OR (excluded.sequence IS telemetry.sequence AND excluded.received_at >= telemetry.received_at)`
     );
     try {
+      const touchedRuns = new Map<string, Readonly<{ taskId: string; runId: string }>>();
       db.transaction(() => {
         for (const entry of batch.values()) {
           upsert.run(
             entry.taskId, entry.roleName, entry.runId, entry.generation, entry.progressId,
             entry.sequence ?? null, JSON.stringify(entry.payload), entry.receivedAt
           );
+          touchedRuns.set(`${entry.taskId}\0${entry.runId}`, {
+            taskId: entry.taskId,
+            runId: entry.runId
+          });
+        }
+        for (const { taskId, runId } of touchedRuns.values()) {
+          this.capRun(taskId, runId);
         }
       })();
       this.#applied += batch.size;

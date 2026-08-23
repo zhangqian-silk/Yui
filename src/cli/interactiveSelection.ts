@@ -85,7 +85,7 @@ export function allowsInteractiveSelection(
   globalJson: boolean
 ): boolean {
   return !globalJson && !args.includes("--json")
-    && !(args[0] === "completion" && args[1] === "candidates");
+    && !(args[0] === "config" && args[1] === "completion" && args[2] === "candidates");
 }
 
 type MissingSlot =

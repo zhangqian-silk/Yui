@@ -84,6 +84,8 @@ const TASK_ROLE_SESSION_SET_FROM_VERSION = 4;
 const TASK_ROLE_SESSION_SET_TO_VERSION = 5;
 const PUBLICATION_REFERENCE_FROM_VERSION = 0;
 const PUBLICATION_REFERENCE_TO_VERSION = 1;
+const CONFIG_FROM_VERSION = 1;
+const CONFIG_TO_VERSION = 2;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -133,6 +135,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       declaredEffects: []
     })
     .registerOfflineMigration(projectOwnershipStep())
+    .registerOfflineMigration(configV2Step())
     .registerCompatible(projectKnowledgeProposalsStep())
     .registerOfflineMigration(taskWorkspaceIdentityStep())
     .registerOfflineMigration(recordFamilyStep(
@@ -206,6 +209,75 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
+}
+
+function configV2Step(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "config",
+    fromVersion: CONFIG_FROM_VERSION,
+    toVersion: CONFIG_TO_VERSION,
+    preconditions: requireConfigV1,
+    transform: migrateConfigV1ToV2,
+    declaredEffects: []
+  };
+}
+
+function requireConfigV1(snapshot: HomeSnapshot): void {
+  const versions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (versions.config !== CONFIG_FROM_VERSION) {
+    throw new Error(`Record config migration requires manifest version ${CONFIG_FROM_VERSION}.`);
+  }
+  if (snapshot.state === null) return;
+  const config = asObject(snapshot.state.config, "Yui config");
+  if (config.schemaVersion !== CONFIG_FROM_VERSION) {
+    throw new Error(`Yui config must use schemaVersion ${CONFIG_FROM_VERSION} before migration.`);
+  }
+}
+
+function migrateConfigV1ToV2(snapshot: HomeSnapshot): HomeSnapshot {
+  requireConfigV1(snapshot);
+  const versions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...versions, config: CONFIG_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const config = asObject(snapshot.state.config, "Yui config");
+  const {
+    providerRetryMaxWindowMs,
+    yieldReceiptReplay: _yieldReceiptReplay,
+    gitBin: _gitBin,
+    telemetryMode,
+    schemaVersion: _schemaVersion,
+    ...retained
+  } = config;
+  const providerRetryMaxWindowSeconds = typeof providerRetryMaxWindowMs === "number"
+    ? Math.ceil(providerRetryMaxWindowMs / 1_000)
+    : undefined;
+  const telemetryEnabled = telemetryMode === undefined
+    ? undefined
+    : telemetryMode === "dual" || telemetryMode === "bounded";
+  return {
+    schemaManifest,
+    state: {
+      ...snapshot.state,
+      config: {
+        ...retained,
+        schemaVersion: CONFIG_TO_VERSION,
+        ...(providerRetryMaxWindowSeconds === undefined
+          ? {}
+          : { providerRetryMaxWindowSeconds }),
+        ...(telemetryEnabled === undefined ? {} : { telemetryEnabled })
+      }
+    }
+  };
 }
 
 function workItemExecutionGroupHistoryStep(): MigrationStep<HomeSnapshot> {

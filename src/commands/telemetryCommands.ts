@@ -3,16 +3,20 @@ import { join } from "node:path";
 
 import { usageError } from "../errors/cliError.js";
 import { STORAGE_SCHEMA_FILE } from "../storage/storageSchema.js";
-import type { TaskStore, YuiConfig } from "../storage/taskStore.js";
+import {
+  CURRENT_CONFIG_SCHEMA_VERSION,
+  type TaskStore,
+  type YuiConfig
+} from "../storage/taskStore.js";
 import { openTaskStore, SqliteTaskStore } from "../storage/sqliteStore.js";
 import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
 import {
   DEFAULT_RUN_CAP,
   DEFAULT_TERMINAL_KEEP,
   resolveRunCap,
-  resolveTelemetryMode,
   resolveTerminalKeep
 } from "../telemetry/telemetryConfig.js";
+import { resolveTelemetryEnabled } from "../config/yuiConfig.js";
 import {
   applyTelemetryCompaction,
   planTelemetryCompaction,
@@ -37,7 +41,11 @@ export type TelemetryCommandOptions = Readonly<{
 
 /** Read the durable config, falling back to defaults when no store is available. */
 function storeConfig(options: TelemetryCommandOptions): YuiConfig {
-  return options.store?.getConfig() ?? { schemaVersion: 1 as const };
+  return options.store?.getConfig() ?? { schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION };
+}
+
+function telemetryMode(config: YuiConfig): "off" | "on" {
+  return resolveTelemetryEnabled(config.telemetryEnabled) ? "on" : "off";
 }
 
 export async function runTelemetryCommand(
@@ -65,7 +73,7 @@ export async function runTelemetryCommand(
 function telemetryStatus(args: string[], options: TelemetryCommandOptions): string {
   const flags = parseFlags(args, new Set([]));
 
-  const mode = resolveTelemetryMode(storeConfig(options).telemetryMode);
+  const mode = telemetryMode(storeConfig(options));
   const telemetry = new SqliteTelemetryStore(options.home, {
     mode,
     terminalKeep: resolveTerminalKeep(storeConfig(options).telemetryTerminalKeep),
@@ -125,7 +133,7 @@ function telemetryPrune(args: string[], options: TelemetryCommandOptions): strin
   const cap = resolveRunCap(storeConfig(options).telemetryRunCap);
   const store = requireStore(options);
   const telemetry = new SqliteTelemetryStore(options.home, {
-    mode: resolveTelemetryMode(storeConfig(options).telemetryMode),
+    mode: telemetryMode(storeConfig(options)),
     terminalKeep: keep,
     runCap: cap
   });
@@ -256,7 +264,7 @@ function telemetryCompact(args: string[], options: TelemetryCommandOptions): str
   copyStoreFiles(resolvedFrom, resolvedStaged);
   const store = openTaskStore(resolvedStaged, backend);
   const telemetry = new SqliteTelemetryStore(resolvedStaged, {
-    mode: "bounded",
+    mode: "on",
     terminalKeep: keep,
     runCap: DEFAULT_RUN_CAP
   });
@@ -303,7 +311,7 @@ function telemetryRead(args: string[], options: TelemetryCommandOptions): string
   const offset = integerOption(args, "--offset", 0);
 
   const telemetry = new SqliteTelemetryStore(options.home, {
-    mode: resolveTelemetryMode(storeConfig(options).telemetryMode),
+    mode: telemetryMode(storeConfig(options)),
     terminalKeep: resolveTerminalKeep(storeConfig(options).telemetryTerminalKeep),
     runCap: resolveRunCap(storeConfig(options).telemetryRunCap)
   });

@@ -91,7 +91,7 @@ export function runGlobalRoleCommand(
     default:
       throw usageError(command === undefined
         ? "Role command is required."
-        : `Unknown command: role ${command}`);
+        : `Unknown command: config role ${command}`);
   }
 }
 
@@ -102,7 +102,7 @@ function roleContext(
 ): string {
   const [rawName, ...rest] = args;
   const name = roleName(rawName);
-  assertNoArguments(rest, "Role context usage: yui role context <role>");
+  assertNoArguments(rest, "Session context usage: yui session context <role>");
   const environment = options.env ?? process.env;
   if (environment.YUI_SESSION_SCOPE !== undefined) {
     if (environment.YUI_SESSION_SCOPE !== "global" || environment.YUI_ROLE !== name) {
@@ -203,7 +203,7 @@ function addRole(
 }
 
 function listRoles(args: string[], store: GlobalRoleStore): string {
-  assertNoArguments(args, "Role list usage: yui role list");
+  assertNoArguments(args, "Role list usage: yui config role list");
   const rows = new Map<string, [string, string, string, string, string, string]>();
   for (const name of SYSTEM_ROLE_NAMES) {
     const role = store.getGlobalRole(name);
@@ -235,7 +235,7 @@ function listRoles(args: string[], store: GlobalRoleStore): string {
 function showRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, ...rest] = args;
   const name = roleName(rawName);
-  assertNoArguments(rest, "Role show usage: yui role show <role>");
+  assertNoArguments(rest, "Role show usage: yui config role show <role>");
   const role = store.getGlobalRole(name);
   if (role === null) {
     if (isSystemRoleName(name)) return renderMissingSystemRole(name);
@@ -306,7 +306,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, rawAgentId, ...rest] = args;
   const name = roleName(rawName);
   const agentId = required(rawAgentId, "Agent id");
-  assertNoArguments(rest, "Role bind usage: yui role bind <role> <agent-id>");
+  assertNoArguments(rest, "Role bind usage: yui config role bind <role> <agent-id>");
   const now = new Date();
   const result = store.transaction((tx) => {
     const role = requireRole(name, tx);
@@ -374,7 +374,7 @@ function assertOperatorAdapterAvailable(
 function removeRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, ...rest] = args;
   const name = roleName(rawName);
-  assertNoArguments(rest, "Role remove usage: yui role remove <role>");
+  assertNoArguments(rest, "Role remove usage: yui config role remove <role>");
   if (isSystemRoleName(name)) throw usageError(`System role cannot be removed: ${name}`);
   store.transaction((tx) => {
     const role = requireRole(name, tx);
@@ -395,7 +395,7 @@ function unbindRole(args: string[], store: GlobalRoleStore): string {
   const [rawName, rawAgentId, ...rest] = args;
   const name = roleName(rawName);
   const agentId = required(rawAgentId, "Agent id");
-  assertNoArguments(rest, "Role unbind usage: yui role unbind <role> <agent-id>");
+  assertNoArguments(rest, "Role unbind usage: yui config role unbind <role> <agent-id>");
   store.transaction((tx) => {
     const role = requireRole(name, tx);
     try {
@@ -419,7 +419,7 @@ function enterRole(
 ): GlobalRoleEnterControl {
   const [rawName, ...rest] = args;
   const name = roleName(rawName);
-  assertNoArguments(rest, "Role enter usage: yui role enter <role>");
+  assertNoArguments(rest, "Role enter usage: yui session enter <role>");
   const role = requireRole(name, store);
   return { kind: "enter", role };
 }
@@ -431,7 +431,7 @@ function roleSession(
 ): string {
   const [command, rawName, ...tail] = args;
   if (command !== "record" && command !== "replace") {
-    throw usageError("Role session usage: yui role session record|replace <role> --native-id <id> [--reason <reason>].");
+    throw usageError("Session usage: yui session record|replace <role> --native-id <id> [--reason <reason>].");
   }
   const name = roleName(rawName);
   const parsed = parseOptions(tail, new Map<string, OptionKind>([

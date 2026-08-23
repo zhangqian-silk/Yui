@@ -71,7 +71,7 @@ export async function resolveGlobalRoleAgentConfigurationArguments(
   ports: SelectionPorts,
   io: SelectionIo
 ): Promise<RoleWizardResolution> {
-  const args = ["role", "update", roleName];
+  const args = ["config", "role", "update", roleName];
   if (!io.interactive || io.json) return { kind: "unchanged", args };
   const role = asRole(await ports.call("role.show", { name: roleName }));
   const binding = role?.agentBindings[agentId];
@@ -82,7 +82,7 @@ export async function resolveGlobalRoleAgentConfigurationArguments(
 }
 
 function isGlobalRoleAdd(args: readonly string[]): boolean {
-  return args[0] === "role" && args[1] === "add";
+  return args[0] === "config" && args[1] === "role" && args[2] === "add";
 }
 
 function isTaskRoleAdd(args: readonly string[]): boolean {
@@ -92,8 +92,8 @@ function isTaskRoleAdd(args: readonly string[]): boolean {
 // Explicit update options always win. This keeps scripts and deliberate
 // non-interactive invocations out of the wizard even when run from a TTY.
 function isGlobalRoleUpdate(args: readonly string[]): boolean {
-  return args.length === 3 && args[0] === "role" && args[1] === "update"
-    && isValue(args[2]);
+  return args.length === 4 && args[0] === "config" && args[1] === "role"
+    && args[2] === "update" && isValue(args[3]);
 }
 
 function isTaskRoleUpdate(args: readonly string[]): boolean {
@@ -106,9 +106,9 @@ async function addGlobalRole(
   ports: SelectionPorts,
   io: SelectionIo
 ): Promise<RoleWizardResolution> {
-  const named = await ensureRoleName(args, 2, io);
+  const named = await ensureRoleName(args, 3, io);
   if (named === undefined) return { kind: "cancelled", args };
-  const explicitSettings = hasExplicitAddSettings(named, 3);
+  const explicitSettings = hasExplicitAddSettings(named, 4);
 
   const agents = await loadAgentSelection(ports);
   const explicitAgent = optionValue(named, "--agent");
@@ -359,7 +359,7 @@ async function updateGlobalRole(
   ports: SelectionPorts,
   io: SelectionIo
 ): Promise<RoleWizardResolution> {
-  const role = asRole(await ports.call("role.show", { name: args[2] }));
+  const role = asRole(await ports.call("role.show", { name: args[3] }));
   if (role === undefined) return { kind: "unchanged", args };
   return updateRole(args, role, ports, io, false);
 }
@@ -443,7 +443,7 @@ async function updateRoleSettings(
     if (target === undefined) return { kind: "cancelled", args };
     return taskRole
       ? { kind: "resolved", args: ["task", "role", "bind", args[3] ?? "", args[4] ?? "", target] }
-      : { kind: "resolved", args: ["role", "bind", args[2] ?? "", target] };
+      : { kind: "resolved", args: ["config", "role", "bind", args[3] ?? "", target] };
   }
   if (field === "workspace") {
     const value = (await io.question(`Workspace [${roleDisplay(role.workspace)}]: `))?.trim();

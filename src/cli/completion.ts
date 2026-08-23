@@ -80,7 +80,7 @@ ${bashDynamicOptionCases(entries)}
   if [[ "$dynamic" == true ]]; then
     while IFS= read -r dynamic_candidate; do
       [[ -n "$dynamic_candidate" ]] && dynamic_candidates+=("$dynamic_candidate")
-    done < <(command ${identity} completion candidates "$current" -- "\${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null)
+    done < <(command ${identity} config completion candidates "$current" -- "\${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null)
     candidates=("\${dynamic_candidates[@]}")
   elif [[ "$current" == -* ]]; then
     case "$path" in
@@ -121,7 +121,7 @@ ${zshDynamicOptionCases(entries)}
   esac
 fi
 if [[ "$dynamic" == true ]]; then
-  dynamic_output="$(command ${identity} completion candidates "$current" -- "\${(@)words[2,CURRENT-1]}" 2>/dev/null)"
+  dynamic_output="$(command ${identity} config completion candidates "$current" -- "\${(@)words[2,CURRENT-1]}" 2>/dev/null)"
   candidates=("\${(@f)dynamic_output}")
 elif [[ "$current" == -* ]]; then
   case "$command_path" in
@@ -178,7 +178,7 @@ function renderFish(entries: readonly Entry[], identity: CliIdentity): string {
     "end",
     `function ${prefix}_dynamic`,
     "  set -l words (commandline -opc)",
-    `  ${identity} completion candidates (commandline -ct) -- $words[2..-1] 2>/dev/null`,
+    `  ${identity} config completion candidates (commandline -ct) -- $words[2..-1] 2>/dev/null`,
     "end"
   ];
   for (const entry of entries) {

@@ -85,7 +85,6 @@ import {
   type RunRecoveryProjection
 } from "../run/recoveryProjection.js";
 import { matchYieldReceipt } from "../run/yieldReceipt.js";
-import { providerRetryConfig, type ProviderRetryConfig } from "../run/providerRetryConfig.js";
 import {
   createReviewRound,
   createTaskReviewRound,
@@ -3837,7 +3836,7 @@ function requestTaskReviewRound(
       if (reviewConfig === null || reviewConfig.deltaRecheck !== "enabled") {
         throw usageError(
           "Delta-recheck is not enabled for this Project's review policy. "
-          + "Set `yui config set review --role <role> --trigger final --delta-recheck enabled` "
+          + "Set `yui config workflow set review --role <role> --trigger final --delta-recheck enabled` "
           + "or request a full Review."
         );
       }
@@ -5930,10 +5929,8 @@ function buildYieldOutcome(
 function replayYieldReceipt(
   run: AgentRun,
   inputSummary: string,
-  options: TaskCommandOptions,
-  retryConfig: ProviderRetryConfig
+  options: TaskCommandOptions
 ): TaskCommandExecution | null {
-  if (!retryConfig.yieldReceiptReplay) return null;
   if (run.yieldReceipt === undefined) return null;
   const outcome = buildYieldOutcome(run, inputSummary, options);
   const match = matchYieldReceipt(run.yieldReceipt, {
@@ -6013,8 +6010,7 @@ function yieldRun(
     const replayed = replayYieldReceipt(
       existing,
       inputSummary,
-      options,
-      providerRetryConfig(store.getConfig())
+      options
     );
     if (replayed !== null) return replayed;
     throw usageError(`Run ${existing.id} is already terminal: ${existing.status}.`);

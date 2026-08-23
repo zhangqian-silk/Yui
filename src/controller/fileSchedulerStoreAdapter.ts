@@ -801,7 +801,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
     if (this.telemetry !== null && input.fence.runId !== undefined) {
       try {
-        this.telemetry.sink.observe(runtimeObservationTelemetryEntry(input));
+        const entry = runtimeObservationTelemetryEntry(input);
+        this.telemetry.sink.observe(entry);
+        const run = this.store.getAgentRun(entry.taskId, input.fence.runId);
+        if (run !== null && run.status !== "active") {
+          void this.telemetry.retention.flush().then(() => {
+            this.telemetry?.retention.pruneGeneration(
+              entry.taskId,
+              entry.roleName,
+              entry.runId,
+              entry.generation
+            );
+          }).catch(() => undefined);
+        }
       } catch {
         // Runtime telemetry is diagnostic; the compact durable state snapshot
         // above remains authoritative when a sidecar is unavailable.
@@ -2989,7 +3001,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           failedNativeTurnId: input.nativeTurnId,
           lastErrorSummary: summary,
           scheduleNextAttempt: false
-        }, now);
+        }, now, configuredProviderRetryPolicy(store));
         if (blocked.outcome === "exhausted") return null;
         store.saveAgentRun(withProviderRetry(run, blocked.retry));
         this.recordProviderRetryClassified(store, input, classification.errorClass, {
@@ -3020,7 +3032,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       failedNativeTurnId: input.nativeTurnId,
       lastErrorSummary: summary,
       ...(input.retryAfterMs === undefined ? {} : { retryAfterMs: input.retryAfterMs })
-    }, now);
+    }, now, configuredProviderRetryPolicy(store));
     if (retryDecision.outcome === "exhausted") {
       this.recordProviderRetryClassified(store, input, classification.errorClass, {
         wouldRetry: "false",
@@ -3034,10 +3046,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         store,
         run,
         retryDecision.reason === "attempts"
-          ? "Provider retry failed after all three in-Session continuation attempts."
+          ? `Provider retry failed after all ${config.delaysMs.length} in-Session continuation attempts.`
           : retryDecision.reason === "retry-after-window"
-            ? "Provider Retry-After exceeded the bounded 600-second episode window."
-            : "Provider retry did not recover within the bounded 600-second episode window.",
+            ? `Provider Retry-After exceeded the bounded ${config.maxWindowMs / 1_000}-second episode window.`
+            : `Provider retry did not recover within the bounded ${config.maxWindowMs / 1_000}-second episode window.`,
         retryDecision.reason === "attempts" ? "attempts-exhausted" : "episode-window-exhausted",
         now
       );
@@ -3103,7 +3115,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       failedNativeTurnId: input.nativeTurnId,
       lastErrorSummary: summary,
       scheduleNextAttempt: false
-    }, now);
+    }, now, configuredProviderRetryPolicy(store));
     if (retryDecision.outcome === "exhausted") return null;
     store.saveAgentRun(withProviderRetry(run, retryDecision.retry));
     this.recordProviderRetryClassified(store, input, "policy-denied", {
@@ -3163,7 +3175,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       failedNativeTurnId: input.nativeTurnId,
       lastErrorSummary: summary,
       scheduleNextAttempt: false
-    }, now);
+    }, now, configuredProviderRetryPolicy(store));
     if (decision.outcome === "exhausted") return null;
     store.saveAgentRun(withProviderRetry(run, decision.retry));
     const driver = this.drivers.requireByAdapterId(input.adapterId);
@@ -3218,7 +3230,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       failedNativeTurnId: input.nativeTurnId,
       lastErrorSummary: summary,
       scheduleNextAttempt: false
-    }, now);
+    }, now, configuredProviderRetryPolicy(store));
     if (decision.outcome === "exhausted") return null;
     store.saveAgentRun(withProviderRetry(run, decision.retry));
     store.saveEvent(input.taskId, createTaskEvent(
@@ -5303,4 +5315,12 @@ function compareCanonicalObservationOrder(
     || (left.sequence ?? -1) - (right.sequence ?? -1)
     || (left.ordinal ?? -1) - (right.ordinal ?? -1)
     || left.eventId.localeCompare(right.eventId);
+}
+
+function configuredProviderRetryPolicy(store: Pick<TaskStore, "getConfig">): Readonly<{
+  delaysMs: readonly number[];
+  maxWindowMs: number;
+}> {
+  const config = providerRetryConfig(store.getConfig());
+  return { delaysMs: config.delaysMs, maxWindowMs: config.maxWindowMs };
 }

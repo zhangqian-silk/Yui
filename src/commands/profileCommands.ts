@@ -41,7 +41,7 @@ export function runProfileCommand(
     default:
       throw usageError(command === undefined
         ? "Profile command is required."
-        : `Unknown command: profile ${command}`);
+        : `Unknown command: config profile ${command}`);
   }
 }
 
@@ -50,7 +50,7 @@ function addProfile(
   store: ProfileCommandStore,
   now: Date
 ): Readonly<{ output: string; data: unknown }> {
-  const usage = "Profile add usage: yui profile add <id> [--access <read|write>] [Profile settings].";
+  const usage = "Profile add usage: yui config profile add <id> [--access <read|write>] [Profile settings].";
   const [id, ...tail] = args;
   if (id === undefined || id.startsWith("--")) throw usageError("Profile id is required.", usage);
   const parsed = parseProfileOptions(tail, false, usage);
@@ -72,7 +72,7 @@ function listProfiles(
   args: readonly string[],
   store: ProfileCommandStore
 ): Readonly<{ output: string; data: unknown }> {
-  noArgs(args, "Profile list usage: yui profile list.");
+  noArgs(args, "Profile list usage: yui config profile list.");
   const profiles = store.listAgentProfiles();
   const output = profiles.length === 0
     ? "No Agent Profiles found.\n"
@@ -99,7 +99,7 @@ function showProfile(
   args: readonly string[],
   store: ProfileCommandStore
 ): Readonly<{ output: string; data: unknown }> {
-  const profile = requireProfile(store, oneArg(args, "Profile show usage: yui profile show <id>."));
+  const profile = requireProfile(store, oneArg(args, "Profile show usage: yui config profile show <id>."));
   return {
     output: `${[
       `Agent Profile: ${profile.id}`,
@@ -120,7 +120,7 @@ function updateProfile(
   store: ProfileCommandStore,
   now: Date
 ): Readonly<{ output: string; data: unknown }> {
-  const usage = "Profile update usage: yui profile update <id> [--access <read|write>] [Profile settings].";
+  const usage = "Profile update usage: yui config profile update <id> [--access <read|write>] [Profile settings].";
   const [id, ...tail] = args;
   if (id === undefined || id.startsWith("--")) throw usageError("Profile id is required.", usage);
   const parsed = parseProfileOptions(tail, true, usage);
@@ -142,9 +142,9 @@ function removeProfile(
   args: readonly string[],
   store: ProfileCommandStore
 ): Readonly<{ output: string; data: unknown }> {
-  const id = oneArg(args, "Profile remove usage: yui profile remove <id>.");
+  const id = oneArg(args, "Profile remove usage: yui config profile remove <id>.");
   if ((BUILTIN_PROFILE_IDS as readonly string[]).includes(id)) {
-    throw usageError(`Built-in Agent Profile cannot be removed: ${id}. Use profile reset instead.`);
+    throw usageError(`Built-in Agent Profile cannot be removed: ${id}. Use yui config profile reset instead.`);
   }
   if (!store.removeAgentProfile(id)) throw usageError(`Agent Profile not found: ${id}.`);
   return { output: `Removed Agent Profile ${id}\n`, data: { profileId: id } };
@@ -155,7 +155,7 @@ function resetProfiles(
   store: ProfileCommandStore,
   now: Date
 ): Readonly<{ output: string; data: unknown }> {
-  noArgs(args, "Profile reset usage: yui profile reset.");
+  noArgs(args, "Profile reset usage: yui config profile reset.");
   store.transaction((tx) => {
     for (const desired of builtinAgentProfileInputs()) {
       const existing = tx.getAgentProfile(desired.id);

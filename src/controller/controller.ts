@@ -27,6 +27,7 @@ import type {
 import { reconcileExitedRoleRuns } from "../scheduler/roleRunLiveness.js";
 import {
   DEFAULT_STALL_WINDOW_MS,
+  DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS,
   reconcileStalledRoleRuns,
   type RoleRunResourceEvidence
 } from "../scheduler/roleRunStall.js";
@@ -92,6 +93,7 @@ const DEFAULT_SIGNAL_WINDOW_MS = 100;
 const DEFAULT_RUNTIME_OBSERVER_INTERVAL_MS = 1_000;
 const DEFAULT_DELIVERY_RETRY_MS = 250;
 const DEFAULT_DELIVERY_RETRY_LIMIT = 60;
+const DEFAULT_DELIVERY_TIMEOUT_MS = 120_000;
 const DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT = 2;
 const DEFAULT_TASK_CONCURRENCY = 4;
 const MAX_TASK_CONCURRENCY = 32;
@@ -125,8 +127,10 @@ export type ControllerRuntimeOptions = Readonly<{
   taskConcurrency?: number;
   deliveryRetryMs?: number;
   deliveryRetryLimit?: number;
+  deliveryTimeoutMs?: number;
   taskOrchestrationRetryLimit?: number;
   stallWindowMs?: number;
+  diagnosticAfterMs?: number;
   now?: () => Date;
   onError?: (error: unknown) => void;
   workspacePreparer?: Pick<TaskWorkspacePreparer, "prepareTaskWorkspace">;
@@ -278,7 +282,8 @@ export async function runControllerSchedulerPass(
   maintenanceFence?: (projectId: string) => boolean,
   onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"],
   blockedTaskIds: ReadonlySet<string> = new Set(),
-  inputDeliveryRecoveryCutoff?: Date
+  inputDeliveryRecoveryCutoff?: Date,
+  diagnosticAfterMs = DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
@@ -401,7 +406,8 @@ export async function runControllerSchedulerPass(
       roleSelection,
       stallWindowMs,
       liveStatuses,
-      resourceEvidence
+      resourceEvidence,
+      diagnosticAfterMs
     );
     await controlEventLoopTurn();
     await reconcileDormantRuntimeOwners(
@@ -1228,9 +1234,12 @@ export class FileTaskController {
     | undefined;
   readonly #deliveryRetryMs: number;
   readonly #deliveryRetryLimit: number;
+  readonly #mailboxDeliveryRetryLimit: number;
+  readonly #deliveryTimeoutMs: number;
   readonly #taskOrchestrationRetryLimit: number;
   readonly #taskConcurrency: number;
   readonly #stallWindowMs: number;
+  readonly #diagnosticAfterMs: number;
   readonly #runtimeEventProcessor: RuntimeEventProcessorPort | AsyncRuntimeEventProcessorPort | undefined;
   readonly #runtimeObserver: AgentRuntimeObserverPort | undefined;
   readonly #runtimeObserverIntervalMs: number;
@@ -1240,6 +1249,7 @@ export class FileTaskController {
   readonly #deliveryRetryAttempts = new Map<MailboxKey, Readonly<{
     identity: string;
     attempts: number;
+    startedAtMs: number;
     terminalFailure?: RoleRunDeliveryFailureIdentity;
   }>>();
   readonly #deliveryRetryTimers = new Map<MailboxKey, NodeJS.Timeout>();
@@ -1313,6 +1323,17 @@ export class FileTaskController {
       DEFAULT_DELIVERY_RETRY_LIMIT,
       "Controller delivery retry limit"
     );
+    this.#deliveryTimeoutMs = positiveInteger(
+      options.deliveryTimeoutMs,
+      DEFAULT_DELIVERY_TIMEOUT_MS,
+      "Controller delivery timeout"
+    );
+    this.#mailboxDeliveryRetryLimit = options.deliveryRetryLimit === undefined
+      ? Math.max(
+          this.#deliveryRetryLimit,
+          Math.ceil(this.#deliveryTimeoutMs / this.#deliveryRetryMs) + 2
+        )
+      : this.#deliveryRetryLimit;
     this.#taskOrchestrationRetryLimit = positiveInteger(
       options.taskOrchestrationRetryLimit,
       DEFAULT_TASK_ORCHESTRATION_RETRY_LIMIT,
@@ -1328,6 +1349,11 @@ export class FileTaskController {
       options.stallWindowMs,
       DEFAULT_STALL_WINDOW_MS,
       "Controller Run stall window"
+    );
+    this.#diagnosticAfterMs = positiveInteger(
+      options.diagnosticAfterMs,
+      DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS,
+      "Controller Run diagnostic threshold"
     );
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
     this.#runtimeObserver = options.runtimeObserver;
@@ -1617,7 +1643,8 @@ export class FileTaskController {
               this.#maintenanceFence,
               this.#onMaintenanceFenceDefer,
               runtimeFailedTaskIds,
-              this.#startedAt
+              this.#startedAt,
+              this.#diagnosticAfterMs
             );
           } else {
             const dirtyPass = await this.#runDirtySchedulerPass(
@@ -1748,7 +1775,8 @@ export class FileTaskController {
         this.#maintenanceFence,
         this.#onMaintenanceFenceDefer,
         blockedTaskIds,
-        this.#startedAt
+        this.#startedAt,
+        this.#diagnosticAfterMs
       ));
     }
     if (
@@ -1801,7 +1829,8 @@ export class FileTaskController {
               this.#maintenanceFence,
               this.#onMaintenanceFenceDefer,
               blockedTaskIds,
-              this.#startedAt
+              this.#startedAt,
+              this.#diagnosticAfterMs
             );
             this.#clearTaskPassRetry(selected.taskScope.taskId);
           } catch (error) {
@@ -2185,10 +2214,12 @@ export class FileTaskController {
       return;
     }
     const attempts = previous?.attempts ?? 0;
+    const startedAtMs = previous?.startedAtMs ?? this.#now().getTime();
     const retryLimit = key.startsWith("task:")
       ? this.#taskOrchestrationRetryLimit
-      : this.#deliveryRetryLimit;
-    if (attempts >= retryLimit) {
+      : this.#mailboxDeliveryRetryLimit;
+    const remainingMs = this.#deliveryTimeoutMs - (this.#now().getTime() - startedAtMs);
+    if (attempts >= retryLimit || remainingMs <= 0) {
       if (key === "operator") this.#operatorStartupRetryArmed = false;
       this.#terminalizePreparedAfterRetryExhaustion(
         key,
@@ -2200,11 +2231,13 @@ export class FileTaskController {
     this.#deliveryRetryAttempts.set(key, {
       identity,
       attempts: attempts + 1,
+      startedAtMs,
       ...(stableTerminalFailure === undefined
         ? {}
         : { terminalFailure: stableTerminalFailure })
     });
     const delayMs = Math.min(
+      remainingMs,
       2_000,
       this.#deliveryRetryMs * (2 ** Math.min(attempts, 3))
     );

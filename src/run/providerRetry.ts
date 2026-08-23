@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import {
+  DEFAULT_PROVIDER_RETRY_DELAYS_SECONDS,
+  DEFAULT_PROVIDER_RETRY_MAX_WINDOW_SECONDS,
+  MAX_PROVIDER_RETRY_ATTEMPTS
+} from "../config/yuiConfig.js";
 import { requireIdentity, requireText, requireTimestamp } from "../domain/validation.js";
 import type { ProviderErrorClass } from "../lifecycle/providerErrorClass.js";
 
@@ -33,19 +38,22 @@ export type AgentRunProviderRetry = Readonly<{
   lastErrorSummary: string;
 }>;
 
-export const PROVIDER_RETRY_DELAYS_MS = Object.freeze([2_000, 5_000, 15_000] as const);
-export const PROVIDER_RETRY_MAX_DISPATCHES = PROVIDER_RETRY_DELAYS_MS.length;
-export const PROVIDER_RETRY_EPISODE_WINDOW_MS = 600_000;
-/** Durable configuration keeps the historical name for compatibility. */
-export const PROVIDER_RETRY_MAX_WINDOW_MS = PROVIDER_RETRY_EPISODE_WINDOW_MS;
+export const PROVIDER_RETRY_DELAYS_MS = Object.freeze(
+  DEFAULT_PROVIDER_RETRY_DELAYS_SECONDS.map((seconds) => seconds * 1_000)
+);
+export const PROVIDER_RETRY_EPISODE_WINDOW_MS =
+  DEFAULT_PROVIDER_RETRY_MAX_WINDOW_SECONDS * 1_000;
 
-export function nextProviderRetryDelayMs(retryIndex: number): number {
+export function nextProviderRetryDelayMs(
+  retryIndex: number,
+  delaysMs: readonly number[] = PROVIDER_RETRY_DELAYS_MS
+): number {
   if (!Number.isSafeInteger(retryIndex)
     || retryIndex < 1
-    || retryIndex > PROVIDER_RETRY_MAX_DISPATCHES) {
+    || retryIndex > delaysMs.length) {
     throw new Error(`Provider retry index is out of range: ${String(retryIndex)}.`);
   }
-  return PROVIDER_RETRY_DELAYS_MS[retryIndex - 1]!;
+  return delaysMs[retryIndex - 1]!;
 }
 
 /**
@@ -56,7 +64,7 @@ export function nextProviderRetryDelayMs(retryIndex: number): number {
 export function providerRetryBudgetExhausted(
   value: AgentRunProviderRetry,
   now: Date,
-  maxWindowMs: number = PROVIDER_RETRY_MAX_WINDOW_MS
+  maxWindowMs: number = PROVIDER_RETRY_EPISODE_WINDOW_MS
 ): boolean {
   if (!Number.isSafeInteger(maxWindowMs) || maxWindowMs <= 0) {
     throw new Error(`Provider retry max window must be a positive integer: ${String(maxWindowMs)}.`);
@@ -87,7 +95,9 @@ export function validateAgentRunProviderRetry(
     || value.dispatchedRetries > value.maxRetries) {
     throw new Error("Agent run providerRetry dispatchedRetries is invalid.");
   }
-  if (value.maxRetries !== PROVIDER_RETRY_MAX_DISPATCHES) {
+  if (!Number.isSafeInteger(value.maxRetries)
+    || value.maxRetries < 1
+    || value.maxRetries > MAX_PROVIDER_RETRY_ATTEMPTS) {
     throw new Error("Agent run providerRetry maxRetries is invalid.");
   }
   requireTimestamp(value.firstFailureAt, "Agent run providerRetry firstFailureAt");
@@ -141,23 +151,33 @@ export type ProviderRetryScheduleDecision =
   | Readonly<{ outcome: "scheduled" | "blocked"; retry: AgentRunProviderRetry }>
   | Readonly<{ outcome: "exhausted"; reason: "attempts" | "window" | "retry-after-window" }>;
 
+export type ProviderRetrySchedulePolicy = Readonly<{
+  delaysMs: readonly number[];
+  maxWindowMs: number;
+}>;
+
 /** Advance one failure episode without ever changing the native Session. */
 export function scheduleProviderRetry(
   previous: AgentRunProviderRetry | undefined,
   input: ScheduleProviderRetryInput,
-  now: Date
+  now: Date,
+  policy: ProviderRetrySchedulePolicy = {
+    delaysMs: PROVIDER_RETRY_DELAYS_MS,
+    maxWindowMs: PROVIDER_RETRY_EPISODE_WINDOW_MS
+  }
 ): ProviderRetryScheduleDecision {
+  validateRetrySchedulePolicy(policy);
   const at = now.toISOString();
   const firstFailureAt = previous?.firstFailureAt ?? at;
   const episodeDeadlineAt = previous?.episodeDeadlineAt
-    ?? new Date(now.getTime() + PROVIDER_RETRY_EPISODE_WINDOW_MS).toISOString();
+    ?? new Date(now.getTime() + policy.maxWindowMs).toISOString();
   if (now.getTime() >= Date.parse(episodeDeadlineAt)) {
     return Object.freeze({ outcome: "exhausted", reason: "window" });
   }
   const consecutiveFailures = (previous?.consecutiveFailures ?? 0) + 1;
   const dispatchedRetries = previous?.dispatchedRetries ?? 0;
   const schedule = input.scheduleNextAttempt ?? true;
-  if (schedule && dispatchedRetries >= PROVIDER_RETRY_MAX_DISPATCHES) {
+  if (schedule && dispatchedRetries >= policy.delaysMs.length) {
     return Object.freeze({ outcome: "exhausted", reason: "attempts" });
   }
   const state: ProviderRetryState = schedule ? "scheduled" : "blocked";
@@ -166,7 +186,7 @@ export function scheduleProviderRetry(
     throw new Error("Provider retry Retry-After must be a positive safe integer.");
   }
   const delayMs = schedule
-    ? Math.max(nextProviderRetryDelayMs(dispatchedRetries + 1), retryAfterMs ?? 0)
+    ? Math.max(nextProviderRetryDelayMs(dispatchedRetries + 1, policy.delaysMs), retryAfterMs ?? 0)
     : undefined;
   const nextAttemptAt = delayMs === undefined
     ? undefined
@@ -188,7 +208,7 @@ export function scheduleProviderRetry(
     errorClass: input.errorClass,
     consecutiveFailures,
     dispatchedRetries,
-    maxRetries: PROVIDER_RETRY_MAX_DISPATCHES,
+    maxRetries: policy.delaysMs.length,
     firstFailureAt,
     lastFailureAt: at,
     episodeDeadlineAt,
@@ -201,6 +221,18 @@ export function scheduleProviderRetry(
     lastErrorSummary: input.lastErrorSummary
   });
   return Object.freeze({ outcome: schedule ? "scheduled" : "blocked", retry });
+}
+
+function validateRetrySchedulePolicy(policy: ProviderRetrySchedulePolicy): void {
+  if (!Number.isSafeInteger(policy.maxWindowMs) || policy.maxWindowMs < 1) {
+    throw new Error("Provider retry max window must be a positive safe integer.");
+  }
+  if (policy.delaysMs.length < 1 || policy.delaysMs.length > MAX_PROVIDER_RETRY_ATTEMPTS
+    || policy.delaysMs.some((delay) => !Number.isSafeInteger(delay) || delay < 1)) {
+    throw new Error(
+      `Provider retry delay schedule must contain 1-${MAX_PROVIDER_RETRY_ATTEMPTS} positive safe integers.`
+    );
+  }
 }
 
 /** Mark that one short continuation request was dispatched and now awaits any correlated progress. */
@@ -282,7 +314,7 @@ export function serializeProviderRetryEnvelope(input: Readonly<{
   return [
     "Yui managed in-Session continuation retry.",
     `task=${requireIdentity(input.taskId, "Provider retry task id")} run=${requireIdentity(input.runId, "Provider retry run id")} role=${requireIdentity(input.roleName, "Provider retry role")}`,
-    `episode=${input.retry.episodeId} retry=${retryOrdinal}/${PROVIDER_RETRY_MAX_DISPATCHES} receipt=${input.retry.lastRetryReceiptId ?? "pending"}`,
+    `episode=${input.retry.episodeId} retry=${retryOrdinal}/${input.retry.maxRetries} receipt=${input.retry.lastRetryReceiptId ?? "pending"}`,
     `failureEvent=${input.retry.failureEventId}`,
     ...(input.retry.failedNativeTurnId === undefined
       ? []

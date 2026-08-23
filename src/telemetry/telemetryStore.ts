@@ -135,11 +135,12 @@ export type SchedulerTelemetry = Readonly<{
   mode: TelemetryMode;
   sink: TelemetrySink;
   reader: TelemetryReader;
+  retention: TelemetryStore;
 }>;
 
-/** No-op sink for `legacy` mode and for callers without a sidecar. */
+/** No-op sink for disabled telemetry and callers without a sidecar. */
 export class NullTelemetrySink implements TelemetrySink {
-  constructor(readonly mode: TelemetryMode = "legacy") {}
+  constructor(readonly mode: TelemetryMode = "off") {}
   observe(_entry: TelemetryProgressEntry): void {}
   health(): TelemetryHealth {
     return {

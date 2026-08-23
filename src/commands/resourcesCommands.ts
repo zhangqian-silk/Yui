@@ -28,7 +28,10 @@ import {
   resourceKindLabel,
   resourceOwnerLabel
 } from "../resources/resourceDiscovery.js";
-import { resolveResourcesGcMode } from "../config/yuiConfig.js";
+import {
+  resolveResourcesGcMode,
+  resolveResourcesQuarantineTtlHours
+} from "../config/yuiConfig.js";
 import type { ResourceRecord } from "../resources/resourceTypes.js";
 
 export type ResourcesCommandResult = Readonly<{
@@ -63,7 +66,7 @@ async function runGcCommand(
   options: ResourcesCommandOptions
 ): Promise<ResourcesCommandResult> {
   const action = parseGcAction(args);
-  const ttlHours = parseTtlHours(args);
+  const ttlHours = parseTtlHours(args, store);
   const now = options.now?.() ?? new Date();
   const home = resolve(store.rootDirectory());
   const mode = resolveGcMode(store);
@@ -140,9 +143,13 @@ function parseGcAction(args: readonly string[]): GcAction {
   return "dry-run";
 }
 
-function parseTtlHours(args: readonly string[]): number {
+function parseTtlHours(args: readonly string[], store: Pick<TaskStore, "getConfig">): number {
   const index = args.indexOf("--quarantine-ttl-hours");
-  if (index === -1) return 24;
+  if (index === -1) {
+    return resolveResourcesQuarantineTtlHours(
+      store.getConfig().resourcesQuarantineTtlHours
+    );
+  }
   const value = Number(args[index + 1]);
   if (!Number.isFinite(value) || value < 1 || value > 24 * 30) {
     throw usageError("Quarantine TTL hours must be between 1 and 720.");

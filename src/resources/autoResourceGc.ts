@@ -20,7 +20,8 @@ import {
 } from "./resourceGc.js";
 import {
   resolveResourcesGcAutoQuarantine,
-  resolveResourcesGcMode
+  resolveResourcesGcMode,
+  resolveResourcesQuarantineTtlHours
 } from "../config/yuiConfig.js";
 
 export type ResourceAutoGcHook = () => Promise<Readonly<{
@@ -57,6 +58,9 @@ export function createResourceAutoGc(options: {
       taskStatusById,
       mode: "quarantine" as const,
       now,
+      quarantineTtlHours: resolveResourcesQuarantineTtlHours(
+        config.resourcesQuarantineTtlHours
+      ),
       environment,
       activeWorkspaceOwnerPaths: collectActiveWorkspaceOwnerPaths(store)
     };
@@ -109,6 +113,9 @@ export async function runAutoResourceGc(
     taskStatusById,
     mode: "quarantine" as const,
     now,
+    quarantineTtlHours: resolveResourcesQuarantineTtlHours(
+      config.resourcesQuarantineTtlHours
+    ),
     activeWorkspaceOwnerPaths: collectActiveWorkspaceOwnerPaths(store)
   };
 

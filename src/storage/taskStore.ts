@@ -31,9 +31,25 @@ import {
 } from "../task/publicationReference.js";
 import {
   reconciliationIntervalMilliseconds,
+  resolveAgentLaunchInactivityTimeoutSeconds,
+  resolveControllerTaskConcurrency,
+  resolveContextBudget,
+  resolveDeliveryTimeoutSeconds,
   resolveLeaderNextActionMode,
+  resolveLeaderSemanticBudgetTurns,
+  resolveProviderRetryAdapters,
+  resolveProviderRetryDelaysSeconds,
+  resolveProviderRetryMaxWindowSeconds,
+  resolveProviderRetryMode,
   resolveResourcesGcAutoQuarantine,
-  resolveResourcesGcMode
+  resolveResourcesGcMode,
+  resolveResourcesQuarantineTtlHours,
+  resolveRuntimeHealth,
+  resolveTelemetryEnabled,
+  resolveTelemetryRunCap,
+  resolveTelemetryTerminalKeep,
+  resolveTmuxBin,
+  resolveTmuxHistoryLimit
 } from "../config/yuiConfig.js";
 import { resolveTimeZone } from "../output/timePresentation.js";
 import {
@@ -194,7 +210,7 @@ import {
 export const STORAGE_STATE_FILE = "state.json";
 /** The root StorageState schema is the persisted aggregate document version. */
 export const CURRENT_STORAGE_STATE_SCHEMA_VERSION = CURRENT_AGGREGATE_SCHEMA_VERSION;
-export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
+export const CURRENT_CONFIG_SCHEMA_VERSION = 2 as const;
 export const CURRENT_HOME_IDENTITY_SCHEMA_VERSION = 1 as const;
 export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 3 as const;
 /**
@@ -298,30 +314,23 @@ export type YuiConfig = Readonly<{
    * adapter; an empty array disables the feature. Defaults to all supported.
    */
   providerRetryAdapters?: string[];
-  /**
-   * Total retry budget per Run lineage in milliseconds. Defaults to
-   * {@link PROVIDER_RETRY_MAX_WINDOW_MS}; once the window elapses the Run
-   * terminalizes with one structured failure.
-   */
-  providerRetryMaxWindowMs?: number;
-  /**
-   * Whether an already-committed yield receipt may be replayed on resend.
-   * Defaults to true; safe by construction (same request → same receipt).
-   */
-  yieldReceiptReplay?: boolean;
+  /** Delay schedule for continuation attempts, in seconds. */
+  providerRetryDelaysSeconds?: number[];
+  /** Total retry budget per Run lineage, in seconds. */
+  providerRetryMaxWindowSeconds?: number;
+  runtimeHealth?: import("../config/yuiConfig.js").RuntimeHealthConfig;
+  controllerTaskConcurrency?: number;
+  agentLaunchInactivityTimeoutSeconds?: number;
+  deliveryTimeoutSeconds?: number;
+  leaderSemanticBudgetTurns?: number;
+  resourcesQuarantineTtlHours?: number;
   /**
    * Path to the tmux binary. Defaults to `tmux` on PATH.
    */
   tmuxBin?: string;
-  /**
-   * Path to the git binary. Defaults to `git` on PATH.
-   */
-  gitBin?: string;
-  /**
-   * Telemetry mode. `legacy` (default) keeps the master-only behavior;
-   * `dual` and `bounded` activate the diagnostic sidecar.
-   */
-  telemetryMode?: "legacy" | "dual" | "bounded";
+  tmuxHistoryLimit?: number;
+  /** Whether optional diagnostic telemetry is active. */
+  telemetryEnabled?: boolean;
   /** Terminal Run/generation progress rows retained after prune. */
   telemetryTerminalKeep?: number;
   /** Hard cap of progress rows per Run while it is still active. */
@@ -3381,12 +3390,33 @@ function observeTaskRecordId(
 
 export function validateYuiConfig(config: YuiConfig): void {
   try {
+    if (config.schemaVersion !== CURRENT_CONFIG_SCHEMA_VERSION) {
+      throw new TypeError(
+        `Yui config must use schemaVersion ${CURRENT_CONFIG_SCHEMA_VERSION}.`
+      );
+    }
     reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
     resolveTimeZone(config.timeZone);
     if (config.review !== undefined) validateReviewConfig(config.review);
     resolveLeaderNextActionMode(config.leaderNextActionMode);
+    resolveContextBudget(config.contextBudget);
     resolveResourcesGcMode(config.resourcesGcMode);
     resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine);
+    resolveResourcesQuarantineTtlHours(config.resourcesQuarantineTtlHours);
+    resolveProviderRetryMode(config.providerRetryMode);
+    resolveProviderRetryAdapters(config.providerRetryAdapters);
+    resolveProviderRetryDelaysSeconds(config.providerRetryDelaysSeconds);
+    resolveProviderRetryMaxWindowSeconds(config.providerRetryMaxWindowSeconds);
+    resolveRuntimeHealth(config.runtimeHealth);
+    resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
+    resolveAgentLaunchInactivityTimeoutSeconds(config.agentLaunchInactivityTimeoutSeconds);
+    resolveDeliveryTimeoutSeconds(config.deliveryTimeoutSeconds);
+    resolveLeaderSemanticBudgetTurns(config.leaderSemanticBudgetTurns);
+    resolveTmuxBin(config.tmuxBin);
+    resolveTmuxHistoryLimit(config.tmuxHistoryLimit);
+    resolveTelemetryEnabled(config.telemetryEnabled);
+    resolveTelemetryTerminalKeep(config.telemetryTerminalKeep);
+    resolveTelemetryRunCap(config.telemetryRunCap);
   } catch (error) {
     throw new StorageRecordError(
       error instanceof Error ? error.message : "Yui reconciliation interval is invalid."

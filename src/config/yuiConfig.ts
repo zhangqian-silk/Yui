@@ -1,12 +1,13 @@
 import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
-import { PROVIDER_RETRY_MAX_WINDOW_MS } from "../run/providerRetry.js";
 import {
   DEFAULT_RUN_CAP,
-  DEFAULT_TELEMETRY_MODE,
   DEFAULT_TERMINAL_KEEP,
-  MAX_RUN_CAP,
-  type TelemetryMode
+  MAX_RUN_CAP
 } from "../telemetry/telemetryConfig.js";
+import {
+  DEFAULT_RUNTIME_HEALTH_POLICY,
+  type RuntimeHealthPolicy
+} from "../runtime/runtimeHealthPolicy.js";
 
 export const DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 120;
 export const MIN_RECONCILIATION_INTERVAL_SECONDS = 5;
@@ -14,6 +15,9 @@ export const MAX_RECONCILIATION_INTERVAL_SECONDS = 300;
 
 export type ResourcesGcMode = "report" | "quarantine";
 export const DEFAULT_RESOURCES_GC_MODE: ResourcesGcMode = "report";
+export const DEFAULT_RESOURCES_QUARANTINE_TTL_HOURS = 24;
+export const MIN_RESOURCES_QUARANTINE_TTL_HOURS = 1;
+export const MAX_RESOURCES_QUARANTINE_TTL_HOURS = 720;
 
 /**
  * Resolves the Resource GC mode. `report` (default) only reports candidates;
@@ -35,6 +39,16 @@ export function resolveResourcesGcAutoQuarantine(value?: unknown): boolean {
   if (value === undefined) return false;
   if (typeof value === "boolean") return value;
   throw new TypeError("resourcesGcAutoQuarantine must be a boolean.");
+}
+
+export function resolveResourcesQuarantineTtlHours(value?: unknown): number {
+  return resolveBoundedPositiveInteger(
+    value,
+    DEFAULT_RESOURCES_QUARANTINE_TTL_HOURS,
+    MIN_RESOURCES_QUARANTINE_TTL_HOURS,
+    MAX_RESOURCES_QUARANTINE_TTL_HOURS,
+    "resourcesQuarantineTtlHours"
+  );
 }
 
 /**
@@ -88,6 +102,9 @@ export function resolveLeaderNextActionMode(value?: unknown): LeaderNextActionMo
 export const PROVIDER_RETRY_MODES = ["off", "shadow", "enforce"] as const;
 export type ProviderRetryMode = (typeof PROVIDER_RETRY_MODES)[number];
 export const DEFAULT_PROVIDER_RETRY_MODE: ProviderRetryMode = "enforce";
+export const DEFAULT_PROVIDER_RETRY_DELAYS_SECONDS = Object.freeze([2, 5, 15] as const);
+export const DEFAULT_PROVIDER_RETRY_MAX_WINDOW_SECONDS = 600;
+export const MAX_PROVIDER_RETRY_ATTEMPTS = 10;
 
 export function resolveProviderRetryMode(value?: unknown): ProviderRetryMode {
   if (value === undefined || value === null) return DEFAULT_PROVIDER_RETRY_MODE;
@@ -137,20 +154,35 @@ export function resolveProviderRetryAdapters(value?: unknown): string[] {
   return adapters;
 }
 
-export function resolveProviderRetryMaxWindowMs(value?: unknown): number {
-  if (value === undefined || value === null) return PROVIDER_RETRY_MAX_WINDOW_MS;
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
-    throw new TypeError("providerRetryMaxWindowMs must be a positive integer.");
+export function resolveProviderRetryDelaysSeconds(value?: unknown): number[] {
+  if (value === undefined || value === null) return [...DEFAULT_PROVIDER_RETRY_DELAYS_SECONDS];
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_PROVIDER_RETRY_ATTEMPTS) {
+    throw new TypeError(
+      `providerRetryDelaysSeconds must contain 1-${MAX_PROVIDER_RETRY_ATTEMPTS} positive integers.`
+    );
   }
-  return value;
+  const delays = value.map((entry) => {
+    if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 1 || entry > 600) {
+      throw new TypeError("providerRetryDelaysSeconds entries must be integers from 1 to 600.");
+    }
+    return entry;
+  });
+  for (let index = 1; index < delays.length; index += 1) {
+    if (delays[index]! < delays[index - 1]!) {
+      throw new TypeError("providerRetryDelaysSeconds must be ordered from shortest to longest.");
+    }
+  }
+  return delays;
 }
 
-export function resolveYieldReceiptReplay(value?: unknown): boolean {
-  if (value === undefined || value === null) return true;
-  if (typeof value !== "boolean") {
-    throw new TypeError("yieldReceiptReplay must be a boolean.");
-  }
-  return value;
+export function resolveProviderRetryMaxWindowSeconds(value?: unknown): number {
+  return resolveBoundedPositiveInteger(
+    value,
+    DEFAULT_PROVIDER_RETRY_MAX_WINDOW_SECONDS,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "providerRetryMaxWindowSeconds"
+  );
 }
 
 // ── Executable paths ──────────────────────────────────────────────────────
@@ -163,31 +195,12 @@ export function resolveTmuxBin(value?: unknown): string {
   return value.trim();
 }
 
-export function resolveGitBin(value?: unknown): string {
-  if (value === undefined || value === null) return "git";
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new TypeError("gitBin must be a non-empty string.");
-  }
-  return value.trim();
-}
-
 // ── Telemetry ─────────────────────────────────────────────────────────────
 
-const TELEMETRY_MODES: readonly TelemetryMode[] = ["legacy", "dual", "bounded"];
-
-export function resolveTelemetryMode(value?: unknown): TelemetryMode {
-  if (value === undefined || value === null) return DEFAULT_TELEMETRY_MODE;
-  if (typeof value !== "string") {
-    throw new TypeError("telemetryMode must be legacy, dual, or bounded.");
-  }
-  const normalized = value.trim().toLowerCase();
-  if (normalized.length === 0) return DEFAULT_TELEMETRY_MODE;
-  if (!TELEMETRY_MODES.includes(normalized as TelemetryMode)) {
-    throw new TypeError(
-      `telemetryMode must be one of ${TELEMETRY_MODES.join(", ")}; got ${JSON.stringify(normalized)}.`
-    );
-  }
-  return normalized as TelemetryMode;
+export function resolveTelemetryEnabled(value?: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value !== "boolean") throw new TypeError("telemetryEnabled must be a boolean.");
+  return value;
 }
 
 export function resolveTelemetryTerminalKeep(value?: unknown): number {
@@ -209,6 +222,106 @@ export function resolveTelemetryRunCap(value?: unknown): number {
     );
   }
   return value;
+}
+
+// ── Runtime and workflow policy ───────────────────────────────────────────
+
+export const DEFAULT_CONTROLLER_TASK_CONCURRENCY = 4;
+export const MAX_CONTROLLER_TASK_CONCURRENCY = 32;
+export const DEFAULT_AGENT_LAUNCH_INACTIVITY_TIMEOUT_SECONDS = 300;
+export const DEFAULT_DELIVERY_TIMEOUT_SECONDS = 120;
+export const DEFAULT_LEADER_SEMANTIC_BUDGET_TURNS = 3;
+export const DEFAULT_TMUX_HISTORY_LIMIT = 100_000;
+
+export type RuntimeHealthConfig = Readonly<{
+  quietAfterSeconds?: number;
+  diagnosticAfterSeconds?: number;
+  stallAfterSeconds?: number;
+}>;
+
+export function resolveRuntimeHealth(configured?: unknown): RuntimeHealthPolicy {
+  if (configured === undefined || configured === null) return DEFAULT_RUNTIME_HEALTH_POLICY;
+  if (typeof configured !== "object" || Array.isArray(configured)) {
+    throw new TypeError("runtimeHealth must be an object.");
+  }
+  const value = configured as RuntimeHealthConfig;
+  const quietAfterMs = resolveBoundedPositiveInteger(
+    value.quietAfterSeconds,
+    DEFAULT_RUNTIME_HEALTH_POLICY.quietAfterMs / 1_000,
+    30,
+    86_400,
+    "runtimeHealth.quietAfterSeconds"
+  ) * 1_000;
+  const diagnosticAfterMs = resolveBoundedPositiveInteger(
+    value.diagnosticAfterSeconds,
+    DEFAULT_RUNTIME_HEALTH_POLICY.diagnosticAfterMs / 1_000,
+    30,
+    86_400,
+    "runtimeHealth.diagnosticAfterSeconds"
+  ) * 1_000;
+  const stallWindowMs = resolveBoundedPositiveInteger(
+    value.stallAfterSeconds,
+    DEFAULT_RUNTIME_HEALTH_POLICY.stallWindowMs / 1_000,
+    60,
+    604_800,
+    "runtimeHealth.stallAfterSeconds"
+  ) * 1_000;
+  if (!(quietAfterMs < diagnosticAfterMs && diagnosticAfterMs < stallWindowMs)) {
+    throw new TypeError(
+      "runtimeHealth thresholds must be ordered quietAfterSeconds < diagnosticAfterSeconds < stallAfterSeconds."
+    );
+  }
+  return Object.freeze({ quietAfterMs, diagnosticAfterMs, stallWindowMs });
+}
+
+export function resolveControllerTaskConcurrency(value?: unknown): number {
+  return resolveBoundedPositiveInteger(
+    value,
+    DEFAULT_CONTROLLER_TASK_CONCURRENCY,
+    1,
+    MAX_CONTROLLER_TASK_CONCURRENCY,
+    "controllerTaskConcurrency"
+  );
+}
+
+export function resolveAgentLaunchInactivityTimeoutSeconds(value?: unknown): number {
+  return resolveBoundedPositiveInteger(
+    value,
+    DEFAULT_AGENT_LAUNCH_INACTIVITY_TIMEOUT_SECONDS,
+    15,
+    3_600,
+    "agentLaunchInactivityTimeoutSeconds"
+  );
+}
+
+export function resolveDeliveryTimeoutSeconds(value?: unknown): number {
+  return resolveBoundedPositiveInteger(
+    value,
+    DEFAULT_DELIVERY_TIMEOUT_SECONDS,
+    5,
+    600,
+    "deliveryTimeoutSeconds"
+  );
+}
+
+export function resolveLeaderSemanticBudgetTurns(value?: unknown): number {
+  return resolveBoundedPositiveInteger(
+    value,
+    DEFAULT_LEADER_SEMANTIC_BUDGET_TURNS,
+    1,
+    20,
+    "leaderSemanticBudgetTurns"
+  );
+}
+
+export function resolveTmuxHistoryLimit(value?: unknown): number {
+  return resolveBoundedPositiveInteger(
+    value,
+    DEFAULT_TMUX_HISTORY_LIMIT,
+    1_000,
+    1_000_000,
+    "tmuxHistoryLimit"
+  );
 }
 
 /**
@@ -265,4 +378,19 @@ export function resolveContextBudget(configured?: unknown): ResolvedContextBudge
     throw new TypeError("contextBudget.softTokens must be smaller than contextBudget.hardTokens.");
   }
   return { softTokens, hardTokens };
+}
+
+function resolveBoundedPositiveInteger(
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+  label: string
+): number {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "number" || !Number.isSafeInteger(value)
+    || value < minimum || value > maximum) {
+    throw new TypeError(`${label} must be an integer from ${minimum} to ${maximum}.`);
+  }
+  return value;
 }
