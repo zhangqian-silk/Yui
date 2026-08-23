@@ -44,10 +44,12 @@ export type MailboxLane = "normal" | "user-correction";
 export type DeliveryMode = "followup" | "steer-if-safe" | "inject";
 
 export type PendingBatch = Readonly<{
+  /** Global mailbox sequence envelope; other batches may occupy gaps inside it. */
   fromSequence: number;
   toSequence: number;
   reasons: readonly string[];
   refs: readonly MailboxEntityRef[];
+  /** Number of signals represented; gaps in the sequence envelope are excluded. */
   requestCount: number;
   firstQueuedAt: string;
   lastQueuedAt: string;
@@ -255,28 +257,32 @@ function appendUnique<T>(
   return result;
 }
 
-function mergeBatches(earlier: PendingBatch, later: PendingBatch): PendingBatch {
+function mergeBatches(left: PendingBatch, right: PendingBatch): PendingBatch {
   const merged: PendingBatch = {
-    fromSequence: earlier.fromSequence,
-    toSequence: later.toSequence,
-    reasons: appendUnique(earlier.reasons, later.reasons, (reason) => reason),
+    fromSequence: Math.min(left.fromSequence, right.fromSequence),
+    toSequence: Math.max(left.toSequence, right.toSequence),
+    reasons: appendUnique(left.reasons, right.reasons, (reason) => reason),
     refs: appendUnique(
-      earlier.refs,
-      later.refs,
+      left.refs,
+      right.refs,
       mailboxEntityRefKey
     ),
-    requestCount: earlier.requestCount + later.requestCount,
-    firstQueuedAt: earlier.firstQueuedAt,
-    lastQueuedAt: later.lastQueuedAt,
-    sources: appendUnique(earlier.sources, later.sources, (source) => source),
-    dedupeKeys: appendUnique(earlier.dedupeKeys, later.dedupeKeys, (key) => key),
-    deliveryModes: appendUnique(earlier.deliveryModes, later.deliveryModes, (mode) => mode),
-    ...((earlier.highestFactRevision ?? later.highestFactRevision) === undefined
+    requestCount: left.requestCount + right.requestCount,
+    firstQueuedAt: Date.parse(left.firstQueuedAt) <= Date.parse(right.firstQueuedAt)
+      ? left.firstQueuedAt
+      : right.firstQueuedAt,
+    lastQueuedAt: Date.parse(left.lastQueuedAt) >= Date.parse(right.lastQueuedAt)
+      ? left.lastQueuedAt
+      : right.lastQueuedAt,
+    sources: appendUnique(left.sources, right.sources, (source) => source),
+    dedupeKeys: appendUnique(left.dedupeKeys, right.dedupeKeys, (key) => key),
+    deliveryModes: appendUnique(left.deliveryModes, right.deliveryModes, (mode) => mode),
+    ...((left.highestFactRevision ?? right.highestFactRevision) === undefined
       ? {}
       : {
           highestFactRevision: Math.max(
-            earlier.highestFactRevision ?? 0,
-            later.highestFactRevision ?? 0
+            left.highestFactRevision ?? 0,
+            right.highestFactRevision ?? 0
           )
         })
   };
@@ -347,17 +353,16 @@ export function validateWorkMailbox(value: unknown): WorkMailbox {
   ].filter(
     (batch): batch is PendingBatch => batch !== null && batch !== undefined
   );
+  const activeDedupeKeys = new Set<string>();
   for (const batch of batches) {
     if (batch.toSequence >= nextSequence) {
       throw new Error("WorkMailbox batch sequence must be lower than nextSequence");
     }
-  }
-  const ranges = batches
-    .map((batch) => [batch.fromSequence, batch.toSequence] as const)
-    .sort((left, right) => left[0] - right[0]);
-  for (let index = 1; index < ranges.length; index += 1) {
-    if (ranges[index - 1]![1] >= ranges[index]![0]) {
-      throw new Error("WorkMailbox batch sequences overlap");
+    for (const dedupeKey of batch.dedupeKeys) {
+      if (activeDedupeKeys.has(dedupeKey)) {
+        throw new Error("WorkMailbox active batches share a dedupe key");
+      }
+      activeDedupeKeys.add(dedupeKey);
     }
   }
   if (inputDelivery !== null && target.kind !== "role" && target.kind !== "operator") {
@@ -473,8 +478,8 @@ function parseBatch(value: unknown, label: string): PendingBatch {
   const fromSequence = requireInteger(batch.fromSequence, 1, `${label} fromSequence`);
   const toSequence = requireInteger(batch.toSequence, fromSequence, `${label} toSequence`);
   const requestCount = requireInteger(batch.requestCount, 1, `${label} requestCount`);
-  if (requestCount !== toSequence - fromSequence + 1) {
-    throw new Error(`${label} requestCount does not match its sequence range`);
+  if (requestCount > toSequence - fromSequence + 1) {
+    throw new Error(`${label} requestCount exceeds its sequence envelope`);
   }
   const reasons = requireStringArray(batch.reasons, `${label} reasons`);
   if (reasons.length === 0) throw new Error(`${label} reasons must not be empty`);
