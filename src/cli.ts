@@ -105,7 +105,11 @@ import {
   runReleaseInstall,
   runReleaseList
 } from "./commands/releaseCommands.js";
-import { reconcileTaskRemoteBaselines } from "./commands/taskCompletionGate.js";
+import {
+  reconcileTaskRemoteBaselines,
+  verifyTaskCompletionPublishedTree,
+  type TaskCompletionPublishedTreeProof
+} from "./commands/taskCompletionGate.js";
 import { runTaskBaseStatusCommand } from "./commands/taskBaseCommands.js";
 import {
   assertTaskBaseFreshnessForCompletion,
@@ -1259,6 +1263,7 @@ export async function main(): Promise<void> {
       }
     }
     let completionSummary: string | undefined;
+    let completionPublishedTreeProof: TaskCompletionPublishedTreeProof | undefined;
     if (resolved[1] === "base" && resolved[2] === "status") {
       const result = await runTaskBaseStatusCommand(resolved.slice(3), store);
       emit(result.output, false, result.data);
@@ -1275,10 +1280,23 @@ export async function main(): Promise<void> {
           : { taskFinalReviewContract })
       });
       if (!completion.completed && !completion.activeTaskReview) {
+        if (completionRequest.acceptedPublishedTreePublicationId !== undefined) {
+          completionPublishedTreeProof = await verifyTaskCompletionPublishedTree(
+            completionRequest.taskId,
+            completionRequest.acceptedPublishedTreePublicationId,
+            store
+          );
+        }
         const freshness = await inspectTaskBaseFreshness(resolved[2], store, {
           refresh: refreshRemote
         });
-        for (const warning of assertTaskBaseFreshnessForCompletion(freshness)) {
+        for (const warning of assertTaskBaseFreshnessForCompletion(freshness, {
+          ...(completionPublishedTreeProof === undefined
+            ? {}
+            : {
+                acceptedPublishedTreeProjectId: completionPublishedTreeProof.projectId
+              })
+        })) {
           process.stderr.write(`Warning: ${warning}\n`);
         }
         // Keep completion offline by default. An explicit refresh is the only
@@ -1368,6 +1386,9 @@ export async function main(): Promise<void> {
             ? {}
             : { taskFinalReviewContract }),
           ...(completionSummary === undefined ? {} : { completionSummary }),
+          ...(completionPublishedTreeProof === undefined
+            ? {}
+            : { completionPublishedTreeProof }),
           ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
           ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
           ...(candidateMaterialization === undefined

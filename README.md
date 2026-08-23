@@ -659,6 +659,22 @@ yui task complete <task-id> --summary-file delivery.txt --refresh-remote
 yui task reopen <task-id>
 ```
 
+When a verified squash-merge Publication records a remote commit that is
+ancestry-divergent from the unchanged, frozen Task-final Review head, a user or
+global Operator may explicitly complete against its identical Git tree:
+
+```sh
+yui task complete <task-id> --summary-file delivery.txt \
+  --accept-published-tree <publication-id>
+```
+
+This does not weaken normal freshness checks. Yui requires the current,
+unsuperseded Publication to be merged and verified, its local commit to equal
+the reviewed physical Task head, its remote commit to be ancestry-divergent,
+and both commits to resolve to the same exact tree. Successful completion
+records the Project, Publication, ReviewRound, both commits, and tree in the
+Task event audit.
+
 Completed Tasks reject messages, dispatch, Provider authority changes, retry, and late yields until explicitly reopened, while retaining Task main for inspection or integration. Every isolated WorkItem worktree must be explicitly cleaned as integrated or abandoned before archive; that cleanup also removes its managed branch. Archive requires `--integrated` or `--abandon` to state the Task main outcome and is allowed only after Task main is clean. It removes managed worktrees but retains Task and WorkItem records. The Task main branch is retained as a recovery artifact instead of being silently deleted.
 Task lifecycle completion/selection only suggests valid source states: Draft for activate, active for complete, and completed for reopen.
 

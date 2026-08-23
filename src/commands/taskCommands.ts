@@ -27,6 +27,10 @@ import {
 } from "../scheduler/roleRunStall.js";
 import { readCommandText } from "./textInput.js";
 import {
+  assertTaskCompletionPublishedTreeProof,
+  type TaskCompletionPublishedTreeProof
+} from "./taskCompletionGate.js";
+import {
   createRoleSessionSet,
   roleAgentSessionResumeMode,
   updateTaskRoleProviderRuntime,
@@ -405,6 +409,8 @@ export type TaskCommandOptions = Readonly<{
   yuiHome?: string;
   /** Completion CLI parsing may read stdin/files before remote reconciliation. */
   completionSummary?: string;
+  /** Explicit Git/publication proof prepared before completion mutation. */
+  completionPublishedTreeProof?: TaskCompletionPublishedTreeProof;
   workItemIntegrationProof?: WorkItemIntegrationProof;
   candidateGitSnapshot?: CandidateGitSnapshot;
   /** Managed Candidate workspace; null is an explicit Gitless/no-workspace preflight. */
@@ -449,11 +455,15 @@ export type TaskCompletionPreflight = Readonly<{
 export function parseTaskCompletionRequest(
   args: string[],
   summaryOverride?: string
-): Readonly<{ taskId: string; summary: string }> {
-  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote].";
+): Readonly<{
+  taskId: string;
+  summary: string;
+  acceptedPublishedTreePublicationId?: string;
+}> {
+  const usage = "Task complete usage: yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote] [--accept-published-tree <publication-id>].";
   const parsed = parseTail(
     args,
-    new Set(["--summary", "--summary-file"]),
+    new Set(["--summary", "--summary-file", "--accept-published-tree"]),
     usage,
     new Set(["--refresh-remote"])
   );
@@ -469,7 +479,14 @@ export function parseTaskCompletionRequest(
     "--summary",
     usage
   );
-  return { taskId: parsed.positionals[0]!, summary };
+  const acceptedPublishedTreePublicationId = parsed.options.get("--accept-published-tree");
+  return {
+    taskId: parsed.positionals[0]!,
+    summary,
+    ...(acceptedPublishedTreePublicationId === undefined
+      ? {}
+      : { acceptedPublishedTreePublicationId })
+  };
 }
 
 /**
@@ -1112,6 +1129,12 @@ function completeTaskCommand(
         finalReview: undefined
       } as const;
     }
+    if (request.acceptedPublishedTreePublicationId !== undefined && actor === "leader") {
+      throw usageError(
+        "A managed Task Leader cannot accept published-tree equivalence; "
+        + "use an explicit user or global Operator task complete command."
+      );
+    }
     const taskFinalContract = preflight.taskFinalReviewContract;
 
     const roles = tx.listRoles(task.id);
@@ -1178,6 +1201,15 @@ function completeTaskCommand(
       } as const;
     }
 
+    const publishedTreeProof = request.acceptedPublishedTreePublicationId === undefined
+      ? undefined
+      : assertTaskCompletionPublishedTreeProof(
+        tx,
+        task,
+        request.acceptedPublishedTreePublicationId,
+        options.completionPublishedTreeProof,
+        actualTaskReviewCandidateForMutation(tx, task, options)
+      );
     // Issue 06: re-validate the full completion readiness inside the
     // transaction (the CAS fence) after final-review preparation.  This is the
     // same pure projection `task next-action` displays, now with the finding
@@ -1204,6 +1236,17 @@ function completeTaskCommand(
       now
     ));
     enqueueWork(tx, { kind: "operator" }, "task-terminal", now, [taskRef(task.id)]);
+    if (publishedTreeProof !== undefined) {
+      recordTaskEvent(tx, task.id, "task.completion-published-tree-accepted", {
+        by: actor,
+        projectId: publishedTreeProof.projectId,
+        publicationId: publishedTreeProof.publicationId,
+        reviewRoundId: publishedTreeProof.reviewRoundId,
+        localCommit: publishedTreeProof.localCommit,
+        remoteCommit: publishedTreeProof.remoteCommit,
+        tree: publishedTreeProof.tree
+      }, now);
+    }
     recordTaskEvent(tx, task.id, "task.completed", { by: actor, summary }, now);
     // A terminal Task must never leave a Task-lane signal that can wake it.
     // The durable records remain intact; only the derived mailbox work is

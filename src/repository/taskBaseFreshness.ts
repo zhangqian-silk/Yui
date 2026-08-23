@@ -66,6 +66,12 @@ export type TaskBaseFreshnessReport = Readonly<{
   entries: readonly TaskBaseFreshness[];
 }>;
 
+export type TaskBaseCompletionOptions = Readonly<{
+  /** One exact Project whose reviewed Task head was explicitly accepted as
+   * tree-identical to its verified merged Publication commit. */
+  acceptedPublishedTreeProjectId?: string;
+}>;
+
 type CaptureInput = Readonly<{
   git: GitWorkspacePort;
   project: Project;
@@ -202,11 +208,14 @@ export async function inspectTaskBaseFreshness(
 }
 
 export function assertTaskBaseFreshnessForCompletion(
-  report: TaskBaseFreshnessReport
+  report: TaskBaseFreshnessReport,
+  options: TaskBaseCompletionOptions = {}
 ): readonly string[] {
   const warnings: string[] = [];
   for (const entry of report.entries) {
-    if (entry.status === "behind" || entry.status === "diverged") {
+    const acceptedPublishedTree = options.acceptedPublishedTreeProjectId === entry.projectId;
+    if ((entry.status === "behind" || entry.status === "diverged")
+      && !acceptedPublishedTree) {
       throw usageError(
         `Task ${report.taskId} Project ${entry.projectId} base is ${entry.status}; `
         + `run 'yui task base status ${report.taskId} --refresh' and choose an explicit delivery base. `

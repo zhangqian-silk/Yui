@@ -109,6 +109,9 @@ export interface GitWorkspacePort {
     ancestor: string,
     descendant: string
   ): Promise<boolean>;
+  /** Exact tree object for a commit. Used when commit ancestry is intentionally
+   * insufficient and content identity is the safety boundary. */
+  resolveTree(repositoryPath: string, commit: string): Promise<string>;
   /** Resolve the local remote-tracking branch for a configured remote URL. */
   inspectRemoteTracking(input: Readonly<{
     repositoryPath: string;
@@ -247,6 +250,13 @@ export interface GitWorkspacePort {
 
 /** The small Git boundary used by project registration and Task workspaces. */
 export class NodeGitWorkspace implements GitWorkspacePort {
+  async resolveTree(repositoryPath: string, commit: string): Promise<string> {
+    return gitLine([
+      "-C", repositoryPath,
+      "rev-parse", "--verify", "--end-of-options", `${commit}^{tree}`
+    ]);
+  }
+
   async findCommitWithSameTreeInHistory(input: Readonly<{
     repositoryPath: string;
     sourceCommit: string;
@@ -255,10 +265,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     const source = (await this.inspect(input.repositoryPath, input.sourceCommit)).baseCommit;
     const history = (await this.inspect(input.repositoryPath, input.historyHead)).baseCommit;
     if (await this.isAncestor(input.repositoryPath, source, history)) return source;
-    const sourceTree = await gitLine([
-      "-C", input.repositoryPath,
-      "rev-parse", "--verify", "--end-of-options", `${source}^{tree}`
-    ]);
+    const sourceTree = await this.resolveTree(input.repositoryPath, source);
     const pageSize = 1000;
     for (let skip = 0; ; skip += pageSize) {
       const output = await git([
