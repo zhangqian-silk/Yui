@@ -1063,6 +1063,8 @@ export class FileTaskStore implements TaskStore {
     }
     return {
       ...base,
+      agentRuns: this.listAgentRuns(taskId),
+      roleSessionSets: this.listRoleSessionSets(taskId),
       managedWorkspaces: values(aggregate.managedWorkspaces, (workspace) => managedWorkspaceKey(workspace.owner)),
       durableJobs: values(aggregate.durableJobs, "id"),
       integrationQueueEntries: values(aggregate.integrationQueue, "id"),
