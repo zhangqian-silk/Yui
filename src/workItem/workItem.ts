@@ -815,6 +815,21 @@ export function currentWorkItemCandidate(
     : undefined;
 }
 
+/**
+ * Resolve the one Candidate that still governs Task delivery semantics.
+ * Awaiting Candidates remain under Leader disposition, while completed
+ * Candidates freeze accepted delivery evidence. Failed, retired, pending,
+ * and running WorkItems retain Candidate history only for audit; older
+ * Candidates on the same WorkItem are superseded by its latest Candidate.
+ */
+export function governingWorkItemCandidate(
+  workItem: WorkItem
+): WorkItemCandidate | undefined {
+  return workItem.status === "awaiting_acceptance" || workItem.status === "completed"
+    ? workItem.candidates.at(-1)
+    : undefined;
+}
+
 export function updateWorkItemWriteProjects(
   workItem: WorkItem,
   writeProjectIds: readonly string[],
