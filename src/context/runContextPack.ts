@@ -197,12 +197,16 @@ export function expandRunContextRef(
   store: TaskStore,
   taskId: string,
   runId: string,
-  refId: string
+  refId: string,
+  refStore?: string
 ): Readonly<{ ref: ContextRef; value: unknown; digest: string }> {
   const pack = buildRunContextPack(store, taskId, runId);
-  const authorized = pack.pointers.filter((ref) => ref.refId === refId);
+  const authorized = pack.pointers.filter((ref) => (
+    ref.refId === refId && (refStore === undefined || ref.store === refStore)
+  ));
+  const selector = refStore === undefined ? refId : `${refStore}/${refId}`;
   if (authorized.length !== 1) {
-    throw new Error(`Run Context ref is not uniquely authorized: ${refId}.`);
+    throw new Error(`Run Context ref is not uniquely authorized: ${selector}.`);
   }
   const run = requireExactRun(store, taskId, runId);
   const snapshotRef = run.assignment.contextSnapshotRef;
@@ -214,7 +218,7 @@ export function expandRunContextRef(
         contextRefIdentity(ref) === contextRefIdentity(authorized[0]!)
       ));
   if (materialized === undefined || materialized.ref.digest !== authorized[0]!.digest) {
-    throw new Error(`Run Context ref is unavailable or drifted: ${refId}.`);
+    throw new Error(`Run Context ref is unavailable or drifted: ${selector}.`);
   }
   const bytes = Buffer.byteLength(JSON.stringify(materialized.value), "utf8");
   if (bytes > RUN_CONTEXT_EXPAND_MAX_BYTES) {
