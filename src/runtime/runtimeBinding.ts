@@ -1,5 +1,9 @@
 import { normalizeRuntimeOwner, type RuntimeOwner } from "./runtimeOwner.js";
 import { requireSafeIdentity, requireText } from "./validation.js";
+import {
+  validateProviderAuthorityFence,
+  type ProviderAuthorityFence
+} from "./providerAuthorityFence.js";
 
 export type RuntimeBinding = Readonly<{
   id: string;
@@ -11,28 +15,37 @@ export type RuntimeBinding = Readonly<{
   hostRef: string;
   /** True only when this lifecycle request created the external Role host. */
   hostCreated?: boolean;
-  /** Exact Task Run whose prompt was submitted by the newly-created host. */
-  initialPromptRunId?: string;
-  /** Controller-derived recovery fence for a reused launch-submitted host. */
-  launchPromptUncertainRunId?: string;
+  /** Exact Task Run whose first structured Turn was acknowledged during launch. */
+  initialTurnRunId?: string;
+  /** Exact Task Run whose first structured Turn may have reached the Provider. */
+  initialTurnDeliveryUnknownRunId?: string;
+  /** Exact Task Run whose first structured Turn received a definitive negative acknowledgement. */
+  initialTurnRejectedRunId?: string;
   nativeSessionId?: string;
+  /** Exact durable single-writer fence used by structured Provider mutation. */
+  providerAuthority?: ProviderAuthorityFence;
 }>;
 
 export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
   const hostCreated = input.hostCreated === undefined
     ? undefined
     : requireBoolean(input.hostCreated, "Runtime host-created flag");
-  const initialPromptRunId = input.initialPromptRunId === undefined
+  const initialTurnRunId = input.initialTurnRunId === undefined
     ? undefined
-    : requireSafeIdentity(input.initialPromptRunId, "Initial prompt Run id");
-  if (initialPromptRunId !== undefined && hostCreated !== true) {
-    throw new TypeError(
-      "An initial prompt Run id requires a newly-created runtime host."
-    );
+    : requireSafeIdentity(input.initialTurnRunId, "Initial Turn Run id");
+  const initialTurnDeliveryUnknownRunId = input.initialTurnDeliveryUnknownRunId === undefined
+    ? undefined
+    : requireSafeIdentity(
+        input.initialTurnDeliveryUnknownRunId,
+        "Delivery-unknown initial Turn Run id"
+      );
+  const initialTurnRejectedRunId = input.initialTurnRejectedRunId === undefined
+    ? undefined
+    : requireSafeIdentity(input.initialTurnRejectedRunId, "Rejected initial Turn Run id");
+  if ([initialTurnRunId, initialTurnDeliveryUnknownRunId, initialTurnRejectedRunId]
+    .filter((value) => value !== undefined).length > 1) {
+    throw new TypeError("Runtime binding must report at most one initial Turn outcome.");
   }
-  const launchPromptUncertainRunId = input.launchPromptUncertainRunId === undefined
-    ? undefined
-    : requireSafeIdentity(input.launchPromptUncertainRunId, "Uncertain launch prompt Run id");
   return {
     id: requireSafeIdentity(input.id, "Runtime binding id"),
     launchId: requireSafeIdentity(input.launchId, "Launch id"),
@@ -41,13 +54,17 @@ export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
     adapterId: requireSafeIdentity(input.adapterId, "Agent adapter id"),
     hostRef: requireText(input.hostRef, "Session host reference"),
     ...(hostCreated === undefined ? {} : { hostCreated }),
-    ...(initialPromptRunId === undefined ? {} : { initialPromptRunId }),
-    ...(launchPromptUncertainRunId === undefined
+    ...(initialTurnRunId === undefined ? {} : { initialTurnRunId }),
+    ...(initialTurnDeliveryUnknownRunId === undefined
       ? {}
-      : { launchPromptUncertainRunId }),
+      : { initialTurnDeliveryUnknownRunId }),
+    ...(initialTurnRejectedRunId === undefined ? {} : { initialTurnRejectedRunId }),
     ...(input.nativeSessionId === undefined
       ? {}
-      : { nativeSessionId: requireText(input.nativeSessionId, "Native session id") })
+      : { nativeSessionId: requireText(input.nativeSessionId, "Native session id") }),
+    ...(input.providerAuthority === undefined
+      ? {}
+      : { providerAuthority: validateProviderAuthorityFence(input.providerAuthority) })
   };
 }
 

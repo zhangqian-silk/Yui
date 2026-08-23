@@ -16,6 +16,7 @@ import {
   createRoleSessionSet,
   markTaskRoleRunDelivered,
   markTaskRoleRunPushed,
+  prepareTaskRoleRunRedispatch,
   recordRoleAgentSession,
   recordTaskRoleTurnBoundary,
   rememberRoleAgentCompletedTurn,
@@ -27,11 +28,20 @@ import {
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 import {
+  acceptProviderTurn,
+  beginProviderTurn,
   createProviderRuntimeBinding,
   endProviderActivation,
+  currentProviderActivation,
+  currentProviderConversation,
+  markProviderTurnDeliveryUnknown,
+  rejectProviderTurn,
+  settleProviderTurn,
   startProviderActivation,
+  supersedeProviderConversation,
   updateProviderConversationRecoverability
 } from "../runtime/providerRuntimeIdentity.js";
+import { decideProviderRecovery } from "../runtime/providerRecoveryDecision.js";
 import {
   hasRecentTurnId
 } from "../executor/turnCompletion.js";
@@ -171,6 +181,7 @@ import {
   releaseInputDelivery as releaseMailboxInputDelivery,
   resolveInputDeliveryNotAccepted as resolveMailboxInputDeliveryNotAccepted,
   releaseProcessing,
+  type InputDelivery,
   type MailboxTarget,
   type WorkMailbox
 } from "../coordination/workMailbox.js";
@@ -362,7 +373,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             nativeSessionId: input.fence.nativeSessionId!,
             turnId: input.fence.nativeTurnId!,
             runId: input.fence.runId,
-            summary: input.payload.summary ?? `Provider Turn failed: ${failureEvidence.code}.`
+            summary: input.payload.summary ?? `Provider Turn failed: ${failureEvidence.code}.`,
+            providerStatus: "failed"
           }, now);
           outcome = boundary.disposition === "obsolete" ? "obsolete" : "applied";
           break;
@@ -1224,7 +1236,82 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return sessions !== null && sessions.inFlight !== null;
   }
 
-  getActiveProviderTurnFence(input: Readonly<{
+  beginAgentHostProviderTurn(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+    launchId: string;
+    nativeSessionId: string;
+    attemptId: string;
+    authorityEpoch: number;
+    authorityOwner: "controller" | "human";
+    holderId: string;
+    now: Date;
+  }>): void {
+    this.store.transaction((store) => {
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const session = sessions?.sessions[input.agentId];
+      const binding = sessions?.providerBinding;
+      if (sessions === null || sessions === undefined
+        || binding === null || binding === undefined
+        || sessions.inFlight?.runId !== input.runId
+        || binding.runId !== input.runId
+        || session?.launchId !== input.launchId
+        || session.nativeSessionId !== input.nativeSessionId
+        || currentProviderConversation(binding).conversationId !== input.nativeSessionId
+        || binding.authority.owner !== input.authorityOwner
+        || binding.authority.epoch !== input.authorityEpoch
+        || binding.authority.holderId !== input.holderId) {
+        throw new Error("Agent Host Provider Turn carries a stale durable writer fence.");
+      }
+      store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(
+        sessions,
+        beginProviderTurn(binding, {
+          attemptId: input.attemptId,
+          authorityEpoch: input.authorityEpoch,
+          submittedAt: input.now.toISOString()
+        }),
+        input.now
+      ));
+    });
+  }
+
+  resolveAgentHostProviderTurnSubmission(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    attemptId: string;
+    status: "rejected" | "delivery-unknown";
+    reason: string;
+    now: Date;
+  }>): void {
+    this.store.transaction((store) => {
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const binding = sessions?.providerBinding;
+      if (sessions === null || sessions === undefined
+        || binding === null || binding === undefined
+        || binding.runId !== input.runId
+        || binding.turn?.attemptId !== input.attemptId
+        || binding.turn.status !== "submitting") {
+        throw new Error("Agent Host Provider Turn submission is no longer current.");
+      }
+      const updated = input.status === "delivery-unknown"
+        ? markProviderTurnDeliveryUnknown(binding, {
+            attemptId: input.attemptId,
+            observedAt: input.now.toISOString(),
+            reason: input.reason
+          })
+        : rejectProviderTurn(binding, {
+            attemptId: input.attemptId,
+            rejectedAt: input.now.toISOString(),
+            reason: input.reason
+          });
+      store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(sessions, updated, input.now));
+    });
+  }
+
+  getProviderAuthorityFence(input: Readonly<{
     taskId: string;
     roleName: string;
     runId: string;
@@ -1234,44 +1321,93 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }>): Readonly<{
     conversationId: string;
     activationId: string;
-    nativeTurnId: string;
+    epoch: number;
+    owner: "controller" | "human" | "none" | "unknown";
+    holderId?: string;
   }> | null {
-    const observations = this.store.listEvents(input.taskId)
-      .map(runtimeObservationFromTaskEvent)
-      .filter((entry): entry is RuntimeObservation => entry !== null
-        && entry.fence.runId === input.runId
-        && entry.fence.roleName === input.roleName
-        && entry.fence.agentId === input.agentId
-        && entry.fence.launchId === input.launchId
-        && entry.fence.nativeSessionId === input.nativeSessionId
-        && entry.fence.nativeTurnId !== undefined)
-      .sort((left, right) => (
-        left.receivedAt.localeCompare(right.receivedAt)
-        || (left.sequence ?? -1) - (right.sequence ?? -1)
-        || (left.ordinal ?? -1) - (right.ordinal ?? -1)
-        || left.semanticKey.localeCompare(right.semanticKey)
-      ));
-    const state = new Map<string, "active" | "terminal">();
-    const fences = new Map<string, RuntimeObservation>();
-    for (const observation of observations) {
-      const turnId = observation.fence.nativeTurnId!;
-      if (observation.kind === "turn.accepted" || observation.kind === "input.accepted") {
-        state.set(turnId, "active");
-        fences.set(turnId, observation);
-      } else if (["turn.completed", "turn.failed", "turn.cancelled"].includes(
-        observation.kind
-      )) {
-        state.set(turnId, "terminal");
-      }
-    }
-    const active = [...state.entries()].filter(([, status]) => status === "active");
-    if (active.length !== 1) return null;
-    const observation = fences.get(active[0]![0])!;
+    const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
+    const session = sessions?.sessions[input.agentId];
+    const binding = sessions?.providerBinding;
+    if (binding === null || binding === undefined
+      || binding.runId !== input.runId
+      || session?.launchId !== input.launchId
+      || session.nativeSessionId !== input.nativeSessionId
+      || currentProviderConversation(binding).conversationId !== input.nativeSessionId) return null;
+    const activation = currentProviderActivation(binding);
+    if (activation === null) return null;
     return {
-      conversationId: observation.fence.conversationId ?? input.nativeSessionId,
-      activationId: observation.fence.activationId ?? input.launchId,
-      nativeTurnId: active[0]![0]
+      conversationId: currentProviderConversation(binding).conversationId,
+      activationId: activation.activationId,
+      ...binding.authority
     };
+  }
+
+  beginRoleRunProviderTurn(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+    launchId: string;
+    nativeSessionId: string;
+    attemptId: string;
+    now: Date;
+  }>): boolean {
+    return this.store.transaction((store) => {
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const session = sessions?.sessions[input.agentId];
+      const binding = sessions?.providerBinding;
+      if (sessions === null || sessions === undefined
+        || binding === null || binding === undefined
+        || sessions.inFlight?.runId !== input.runId
+        || binding.runId !== input.runId
+        || session?.launchId !== input.launchId
+        || session.nativeSessionId !== input.nativeSessionId
+        || currentProviderConversation(binding).conversationId !== input.nativeSessionId
+        || binding.authority.owner !== "controller") return false;
+      store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(
+        sessions,
+        beginProviderTurn(binding, {
+          attemptId: input.attemptId,
+          authorityEpoch: binding.authority.epoch,
+          submittedAt: input.now.toISOString()
+        }),
+        input.now
+      ));
+      return true;
+    });
+  }
+
+  resolveRoleRunProviderSubmission(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    attemptId: string;
+    status: "rejected" | "delivery-unknown";
+    reason: string;
+    now: Date;
+  }>): boolean {
+    return this.store.transaction((store) => {
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const binding = sessions?.providerBinding;
+      if (sessions === null || sessions === undefined
+        || binding === null || binding === undefined
+        || binding.runId !== input.runId
+        || binding.turn?.attemptId !== input.attemptId
+        || binding.turn.status !== "submitting") return false;
+      const updated = input.status === "delivery-unknown"
+        ? markProviderTurnDeliveryUnknown(binding, {
+            attemptId: input.attemptId,
+            observedAt: input.now.toISOString(),
+            reason: input.reason
+          })
+        : rejectProviderTurn(binding, {
+            attemptId: input.attemptId,
+            rejectedAt: input.now.toISOString(),
+            reason: input.reason
+          });
+      store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(sessions, updated, input.now));
+      return true;
+    });
   }
 
   isRoleGenerationProviderReady(input: Readonly<{
@@ -1438,6 +1574,31 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         executionRef: input.executionRef,
         providerFence: input.providerFence
       });
+      if (input.target.kind === "role"
+        && input.executionRef.type === "run"
+        && input.executionRef.taskId === input.target.taskId) {
+        const sessions = store.getTaskRoleSessionSet(input.target.taskId, input.target.roleName);
+        const binding = sessions?.providerBinding;
+        if (sessions === null || sessions === undefined
+          || binding === null || binding === undefined
+          || binding.runId !== input.executionRef.id
+          || binding.authority.owner !== "controller") {
+          throw new Error("Controller does not own the Provider writer authority.");
+        }
+        const conversation = currentProviderConversation(binding);
+        const activation = currentProviderActivation(binding);
+        if (input.providerFence === undefined
+          || conversation.conversationId !== input.providerFence.conversationId
+          || activation?.activationId !== input.providerFence.activationId) {
+          throw new Error("Provider input claim carries a stale Conversation/Activation fence.");
+        }
+        const next = beginProviderTurn(binding, {
+          attemptId: input.attemptId,
+          authorityEpoch: binding.authority.epoch,
+          submittedAt: input.now.toISOString()
+        });
+        store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(sessions, next, input.now));
+      }
       store.saveWorkMailbox(claimed);
       return { status: "claimed", delivery: claimed.inputDelivery! };
     });
@@ -1483,19 +1644,21 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  releaseInputDelivery(target: MailboxTarget, attemptId: string): boolean {
+  releaseInputDelivery(target: MailboxTarget, attemptId: string, now: Date): boolean {
     return this.store.transaction((store) => {
       const mailbox = store.getWorkMailbox(target);
       if (mailbox?.inputDelivery?.attemptId !== attemptId) return false;
+      rejectSubmittingProviderTurn(store, target, mailbox.inputDelivery, now, "Provider write was not attempted.");
       store.saveWorkMailbox(releaseMailboxInputDelivery(mailbox, attemptId));
       return true;
     });
   }
 
-  resolveInputDeliveryNotAccepted(target: MailboxTarget, attemptId: string): boolean {
+  resolveInputDeliveryNotAccepted(target: MailboxTarget, attemptId: string, now: Date): boolean {
     return this.store.transaction((store) => {
       const mailbox = store.getWorkMailbox(target);
       if (mailbox?.inputDelivery?.attemptId !== attemptId) return false;
+      rejectSubmittingProviderTurn(store, target, mailbox.inputDelivery, now, "Provider returned an exact negative acknowledgement.");
       store.saveWorkMailbox(resolveMailboxInputDeliveryNotAccepted(mailbox, attemptId));
       return true;
     });
@@ -1511,6 +1674,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const mailbox = store.getWorkMailbox(target);
       if (mailbox?.inputDelivery?.attemptId !== attemptId) return false;
       const unknown = markMailboxInputDeliveryUnknown(mailbox, attemptId, reason, now);
+      markSubmittingProviderTurnUnknown(store, target, mailbox.inputDelivery, now, reason);
       store.saveWorkMailbox(unknown);
       const taskId = target.kind === "role" ? target.taskId : undefined;
       if (taskId !== undefined) {
@@ -2616,6 +2780,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     turnId: string;
     runId?: string;
     summary: string;
+    providerStatus?: "completed" | "failed" | "cancelled";
   }>, now = new Date()): Readonly<{
     session: RoleAgentSession;
     duplicate: boolean;
@@ -2710,6 +2875,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           : sessions.inFlight === null ? idleStatus : "running",
         effective
       }, now);
+      sessions = settleStructuredProviderTurn(
+        sessions,
+        input.turnId,
+        input.providerStatus ?? "completed",
+        now
+      );
       if (sessions.inFlight === null) {
         sessions = rememberRoleAgentCompletedTurn(
           sessions,
@@ -3058,16 +3229,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     const retry = retryDecision.retry;
     store.saveAgentRun(withProviderRetry(run, retry));
 
-    // Clear the in-flight fence so the original Session can be re-bound and
-    const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-    // re-pushed by the delivery path; the Session itself stays alive.
-    if (sessions !== null && sessions.inFlight !== null) {
-      store.saveTaskRoleSessionSet(clearTaskRoleRun(sessions, {
-        agentId: input.agentId,
-        runId: input.runId,
-        receiptId: agentRunDeliveryReceiptId(run)
-      }, now));
-    }
+    // The in-flight fence and Provider Conversation stay bound while the
+    // retry waits. resolveDueProviderRetries advances only the delivery
+    // receipt immediately before the exact redispatch.
     // Settle the delivery claim so the retry push can re-claim the mailbox.
     const target = runtimeLifecycleTarget({
       scope: "task",
@@ -3406,7 +3570,89 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           || !providerRetryIsDue(run.providerRetry, now)) {
           return;
         }
-        const sessions = store.getTaskRoleSessionSet(entry.taskId, entry.roleName);
+        let sessions = store.getTaskRoleSessionSet(entry.taskId, entry.roleName);
+        const providerBinding = sessions?.providerBinding;
+        let recoveryMode: "new" | "resume" = "resume";
+        if (providerBinding === null || providerBinding === undefined) {
+          deferUnprovenProviderRecovery(
+            store,
+            run,
+            entry.roleName,
+            "Provider Conversation identity is missing; automatic recovery is fenced.",
+            now
+          );
+          return;
+        }
+        const conversation = currentProviderConversation(providerBinding);
+        const roleMailbox = store.getWorkMailbox({
+          kind: "role",
+          taskId: entry.taskId,
+          roleName: entry.roleName
+        });
+        const activeTurnId = providerBinding.turn !== null
+          && ["accepted", "running"].includes(providerBinding.turn.status)
+          ? providerBinding.turn.turnId
+          : undefined;
+        const recovery = decideProviderRecovery({
+          binding: providerBinding,
+          probe: {
+            state: conversation.recoverability === "recoverable"
+              ? "exists"
+              : conversation.recoverability === "unrecoverable" ? "missing" : "unknown",
+            conversationId: conversation.conversationId,
+            ...(activeTurnId === undefined ? {} : { activeTurnId })
+          },
+          unsettledInputDelivery: roleMailbox?.inputDelivery != null
+        });
+        if (recovery.action === "attention") {
+          deferUnprovenProviderRecovery(
+            store,
+            run,
+            entry.roleName,
+            recovery.reason,
+            now
+          );
+          return;
+        }
+        if (recovery.action === "observe-active-turn") {
+          const deferred = deferProviderRetry(run.providerRetry, now);
+          if (deferred === null) {
+            finalizeProviderRetryDeadline(
+              store,
+              run,
+              `Provider Turn ${recovery.turnId} remained active through the bounded recovery deadline.`,
+              "provider-progress-timeout",
+              now
+            );
+          } else {
+            store.saveAgentRun(withProviderRetry(run, deferred));
+          }
+          return;
+        }
+        if (recovery.action === "replace") {
+          if (conversation.recoverability !== "unrecoverable") {
+            deferUnprovenProviderRecovery(
+              store,
+              run,
+              entry.roleName,
+              "Provider replacement lacks an exact missing-Conversation observation.",
+              now
+            );
+            return;
+          }
+          recoveryMode = "new";
+          const currentSession = sessions?.sessions[run.effective.agentId];
+          if (sessions !== null && currentSession !== undefined
+            && currentSession.status !== "broken") {
+            sessions = updateRoleAgentSessionStatus(
+              sessions,
+              run.effective.agentId,
+              "broken",
+              now
+            );
+            store.saveTaskRoleSessionSet(sessions);
+          }
+        }
         const session = sessions?.sessions[run.effective.agentId];
         const identityMatches = session !== undefined
           && session.adapterId === run.effective.adapterId
@@ -3477,11 +3723,20 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         // Reopen the Run on its original Session: reset transport markers,
         // switch to resume, and mark the projection in-flight. The delivery
         // pass re-pushes the exact same input in this same pass.
-        store.saveAgentRun(reopenRunForProviderRetry(
+        const reopenedRun = reopenRunForProviderRetry(
           run,
           `provider-retry-${run.providerRetry.episodeId}-${run.providerRetry.dispatchedRetries + 1}`,
-          now
-        ));
+          now,
+          recoveryMode
+        );
+        store.saveAgentRun(reopenedRun);
+        if (sessions !== null && sessions.inFlight !== null) {
+          store.saveTaskRoleSessionSet(prepareTaskRoleRunRedispatch(sessions, {
+            agentId: run.effective.agentId,
+            runId: run.id,
+            receiptId: agentRunDeliveryReceiptId(reopenedRun)
+          }, now));
+        }
         // The retry decision settled the original delivery claim; re-queue the
         // Role mailbox so the delivery pass can claim and re-push the Run.
         enqueueWork(
@@ -3510,7 +3765,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const sessions = store.getTaskRoleSessionSet(taskId, input.fence.roleName);
       const run = store.getAgentRun(taskId, input.fence.runId!);
       if (sessions === null || sessions.providerBinding === null || run === null
-        || run.id !== sessions.inFlight?.runId
+        || sessions.providerBinding.runId !== input.fence.runId
         || input.fence.conversationId === undefined) {
         recordCanonicalObservationObsolete(store, input, "provider-binding-missing", now);
         return "obsolete";
@@ -3605,16 +3860,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               status: "running",
               effective: run.effective
             }, now);
-            const withProvider = bound.providerBinding !== null || bound.inFlight === null
-              ? bound
-              : bindTaskRoleProviderRuntime(bound, createProviderRuntimeBinding({
-                  providerNamespace: input.fence.driverId,
-                  accountScope: input.fence.agentId,
-                  runId: bound.inFlight.runId,
-                  conversationId: input.fence.conversationId ?? decision.outcome.nativeSessionId,
-                  activationId: input.fence.activationId ?? input.fence.launchId,
-                  startedAt: bound.inFlight.preparedAt
-                }), now);
+            const withProvider = bindOrSupersedeProviderRuntime(bound, input, now);
             store.saveTaskRoleSessionSet(withProvider);
             const driver = this.drivers.require(input.fence.driverId);
             if (driver.capabilities.observation.sessionBootstrap === "discovered"
@@ -3642,21 +3888,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           );
           const currentSession = current?.sessions[input.fence.agentId];
           if (current !== null && current !== undefined
-            && current.providerBinding === null
             && current.inFlight !== null
             && currentSession?.nativeSessionId === input.fence.nativeSessionId) {
-            store.saveTaskRoleSessionSet(bindTaskRoleProviderRuntime(
-              current,
-              createProviderRuntimeBinding({
-                providerNamespace: input.fence.driverId,
-                accountScope: input.fence.agentId,
-                runId: current.inFlight.runId,
-                conversationId: input.fence.conversationId ?? input.fence.nativeSessionId!,
-                activationId: input.fence.activationId ?? input.fence.launchId,
-                startedAt: current.inFlight.preparedAt
-              }),
-              now
-            ));
+            store.saveTaskRoleSessionSet(bindOrSupersedeProviderRuntime(current, input, now));
           }
           return "applied";
         }
@@ -3689,6 +3923,45 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input.fence.taskId!,
           input.fence.runId!
         );
+      const humanAttemptId = input.fence.receiptId;
+      if (humanAttemptId !== undefined && humanAttemptId.startsWith("human:")) {
+        const active = store.getActiveAgentRun(input.fence.taskId!, input.fence.roleName);
+        const sessions = store.getTaskRoleSessionSet(
+          input.fence.taskId!,
+          input.fence.roleName
+        );
+        const session = sessions?.sessions[input.fence.agentId];
+        const binding = sessions?.providerBinding;
+        if (active === null || active.id !== input.fence.runId
+          || sessions === null || sessions === undefined
+          || binding === null || binding === undefined
+          || binding.authority.owner !== "human"
+          || !humanAttemptId.startsWith(`human:${binding.authority.holderId}:`)
+          || binding.turn?.attemptId !== humanAttemptId
+          || session?.launchId !== input.fence.launchId
+          || session.nativeSessionId !== input.fence.nativeSessionId) {
+          recordCanonicalObservationObsolete(store, input, "human-turn-fence-mismatch", now);
+          return "obsolete";
+        }
+        store.saveTaskRoleSessionSet(recordStructuredProviderAcceptance(
+          updateRoleAgentSessionStatus(sessions, input.fence.agentId, "running", now),
+          input,
+          now
+        ));
+        store.saveEvent(input.fence.taskId!, createTaskEvent(
+          store.nextEventId(input.fence.taskId!),
+          input.fence.taskId!,
+          "run.human-input-delivered",
+          {
+            attemptId: humanAttemptId,
+            runId: active.id,
+            authorityEpoch: String(binding.authority.epoch),
+            nativeTurnId: input.fence.nativeTurnId!
+          },
+          now
+        ));
+        return "applied";
+      }
       if (continuation) {
         const active = store.getActiveAgentRun(input.fence.taskId!, input.fence.roleName);
         const sessions = store.getTaskRoleSessionSet(
@@ -3706,10 +3979,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           recordCanonicalObservationObsolete(store, input, "continuation-fence-mismatch", now);
           return "obsolete";
         }
-        store.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
-          sessions,
-          input.fence.agentId,
-          "running",
+        store.saveTaskRoleSessionSet(recordStructuredProviderAcceptance(
+          updateRoleAgentSessionStatus(
+            sessions,
+            input.fence.agentId,
+            "running",
+            now
+          ),
+          input,
           now
         ));
         const role = store.getRole(input.fence.taskId!, input.fence.roleName);
@@ -3765,6 +4042,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (role === null) {
         recordCanonicalObservationObsolete(store, input, "role-missing", now);
         return "obsolete";
+      }
+      const sessions = store.getTaskRoleSessionSet(
+        input.fence.taskId!,
+        input.fence.roleName
+      );
+      if (sessions !== null) {
+        store.saveTaskRoleSessionSet(recordStructuredProviderAcceptance(
+          sessions,
+          input,
+          now
+        ));
       }
       const progressed = clearProviderRetryOnProgress(active);
       if (progressed !== active) {
@@ -5245,6 +5533,198 @@ function compactedRuntimeObservationIds(
     return false;
   };
   return existing.filter(remove).map(({ event }) => event.id);
+}
+
+function recordStructuredProviderAcceptance(
+  sessions: TaskRoleSessionSet,
+  input: RuntimeObservation,
+  now: Date
+): TaskRoleSessionSet {
+  const current = sessions.providerBinding;
+  const attemptId = input.fence.receiptId;
+  const turnId = input.fence.nativeTurnId;
+  if (current === null || attemptId === undefined || turnId === undefined) return sessions;
+  if (current.turn?.attemptId === attemptId
+    && current.turn.turnId === turnId
+    && ["accepted", "running", "completed", "failed", "cancelled"].includes(
+      current.turn.status
+    )) return sessions;
+  const binding = acceptProviderTurn(current, {
+    attemptId,
+    turnId,
+    acceptedAt: input.observedAt ?? input.receivedAt
+  });
+  return updateTaskRoleProviderRuntime(sessions, binding, now);
+}
+
+function bindOrSupersedeProviderRuntime(
+  sessions: TaskRoleSessionSet,
+  input: RuntimeObservation,
+  now: Date
+): TaskRoleSessionSet {
+  if (sessions.inFlight === null) return sessions;
+  const conversationId = input.fence.conversationId ?? input.fence.nativeSessionId!;
+  const activationId = input.fence.activationId ?? input.fence.launchId;
+  if (sessions.providerBinding === null) {
+    return bindTaskRoleProviderRuntime(sessions, createProviderRuntimeBinding({
+      providerNamespace: input.fence.driverId,
+      accountScope: input.fence.agentId,
+      runId: sessions.inFlight.runId,
+      conversationId,
+      activationId,
+      startedAt: sessions.inFlight.preparedAt
+    }), now);
+  }
+  const current = currentProviderConversation(sessions.providerBinding);
+  if (current.conversationId === conversationId) {
+    const active = currentProviderActivation(sessions.providerBinding);
+    if (active?.activationId === activationId) return sessions;
+    if (active !== null) {
+      throw new Error(
+        "Provider Conversation cannot start a second Activation while the current one is active."
+      );
+    }
+    return updateTaskRoleProviderRuntime(
+      sessions,
+      startProviderActivation(sessions.providerBinding, {
+        activationId,
+        startedAt: input.observedAt ?? input.receivedAt
+      }),
+      now
+    );
+  }
+  const turn = sessions.providerBinding.turn;
+  const noUnsettledInputDelivery = turn === null
+    || ["completed", "failed", "cancelled", "rejected"].includes(turn.status);
+  return updateTaskRoleProviderRuntime(
+    sessions,
+    supersedeProviderConversation(sessions.providerBinding, {
+      conversationId,
+      activationId,
+      switchedAt: input.observedAt ?? input.receivedAt,
+      noUnsettledInputDelivery
+    }),
+    now
+  );
+}
+
+function rejectSubmittingProviderTurn(
+  store: TaskStore,
+  target: MailboxTarget,
+  delivery: InputDelivery,
+  now: Date,
+  reason: string
+): void {
+  if (target.kind !== "role"
+    || delivery.executionRef.type !== "run"
+    || delivery.executionRef.taskId !== target.taskId) return;
+  const sessions = store.getTaskRoleSessionSet(target.taskId, target.roleName);
+  const binding = sessions?.providerBinding;
+  if (sessions === null || sessions === undefined
+    || binding === null || binding === undefined
+    || binding.runId !== delivery.executionRef.id
+    || binding.turn?.attemptId !== delivery.attemptId
+    || (binding.turn.status !== "submitting"
+      && binding.turn.status !== "delivery-unknown")) return;
+  store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(
+    sessions,
+    rejectProviderTurn(binding, {
+      attemptId: delivery.attemptId,
+      rejectedAt: now.toISOString(),
+      reason
+    }),
+    now
+  ));
+}
+
+function deferUnprovenProviderRecovery(
+  store: TaskStore,
+  run: AgentRun,
+  roleName: string,
+  reason: string,
+  now: Date
+): void {
+  if (run.providerRetry === undefined) return;
+  const deferred = deferProviderRetry(run.providerRetry, now);
+  if (deferred === null) {
+    finalizeProviderRetryDeadline(
+      store,
+      run,
+      reason,
+      "native-resume-unproven",
+      now
+    );
+    return;
+  }
+  store.saveAgentRun(withProviderRetry(run, deferred));
+  store.saveEvent(run.taskId, createTaskEvent(
+    store.nextEventId(run.taskId),
+    run.taskId,
+    "runtime.provider-recovery-attention",
+    {
+      runId: run.id,
+      roleName,
+      reason,
+      nextAttemptAt: deferred.nextAttemptAt ?? ""
+    },
+    now
+  ));
+  enqueueWork(
+    store,
+    { kind: "operator" },
+    "provider-recovery-attention",
+    now,
+    [
+      { type: "task", id: run.taskId },
+      { type: "run", taskId: run.taskId, id: run.id }
+    ]
+  );
+}
+
+function markSubmittingProviderTurnUnknown(
+  store: TaskStore,
+  target: MailboxTarget,
+  delivery: InputDelivery,
+  now: Date,
+  reason: string
+): void {
+  if (target.kind !== "role"
+    || delivery.executionRef.type !== "run"
+    || delivery.executionRef.taskId !== target.taskId) return;
+  const sessions = store.getTaskRoleSessionSet(target.taskId, target.roleName);
+  const binding = sessions?.providerBinding;
+  if (sessions === null || sessions === undefined
+    || binding === null || binding === undefined
+    || binding.runId !== delivery.executionRef.id
+    || binding.turn?.attemptId !== delivery.attemptId
+    || binding.turn.status !== "submitting") return;
+  store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(
+    sessions,
+    markProviderTurnDeliveryUnknown(binding, {
+      attemptId: delivery.attemptId,
+      observedAt: now.toISOString(),
+      reason
+    }),
+    now
+  ));
+}
+
+function settleStructuredProviderTurn(
+  sessions: TaskRoleSessionSet,
+  turnId: string,
+  status: "completed" | "failed" | "cancelled",
+  now: Date
+): TaskRoleSessionSet {
+  const binding = sessions.providerBinding;
+  if (binding === null || binding.turn === null || binding.turn.turnId !== turnId) {
+    return sessions;
+  }
+  if (["completed", "failed", "cancelled"].includes(binding.turn.status)) return sessions;
+  return updateTaskRoleProviderRuntime(sessions, settleProviderTurn(binding, {
+    turnId,
+    status,
+    settledAt: now.toISOString()
+  }), now);
 }
 
 function confirmedUsageActivityObservation(

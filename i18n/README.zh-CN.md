@@ -435,19 +435,22 @@ Task 生命周期的交互选择只展示有效来源状态：activate 只展示
 
 ## Session 与 tmux
 
-tmux 负责 Agent 进程生命周期及其可观察输出。Global Operator 与 global Role 仍使用原生交互式 CLI；受管理的 Task Claude Run 则为每个 Run 启动一个有限生命周期进程，使用 `--print`、stream-json 输入和 stream-json 输出。Yui 通过 stdin 写入一条以换行结尾的精确 Run JSON user frame，并发排空 stdout/stderr，并通过 Claude session ID 保持原生上下文连续性。因此启动和投递不再依赖 TUI composer、ready 字符、粘贴延迟或模拟 Enter 键；Codex 保留其 adapter 原生的启动 prompt 与结构化 callback 路径。
+受管理的 Task Agent 统一使用混合 Provider Runtime：Controller 与 Agent Host 通过 Provider 原生结构化协议提交和确认输入；tmux/PTY 只负责保持 Host 存活、展示输出，以及在显式人工接管后提供输入网关。受管理输入绝不会作为终端按键、粘贴文本或启动 argv 发送。Codex 使用持久 App Server JSON-RPC 进程；Claude 使用持久 stream-json 进程，并以精确回放的 user message 作为接收确认。
 
-`task enter` 与 `task role enter` 只是附着到已存在的 Task Role pane：不会启动 Controller、准备 workspace、创建或恢复 Agent、唤醒 Role，也不会投递输入。Task attach 默认为 `--read-only`；只有显式指定 `--read-write` 才可交互，并且 Role 存在 active managed Run、受管理的 Claude 进程仍在退出，或同一 pane 已有 writer 时会被拒绝。读写 attach 会先发布 Role 级 tmux writer lease，再复核持久化 Run 状态，从而闭合与 Controller 启动之间的竞态。lease 存续期间只暂停该 Role 的受管理投递且不消耗有界投递重试；detach 会释放 lease，并且只通知已经存在的持久化 Role 工作重新评估，同一 Task 的其他 Role 不受影响。attach 前，Yui 会关闭 readline、退出 raw mode、暂停自身 stdin，再同步把终端交给 tmux。attach 会继承外层终端的真实能力并进入干净的 alternate screen；鼠标滚动只查看 Agent pane 的 100,000 行 tmux 历史，不再混入此前的 shell 或 IDE Terminal 历史。读写 attach 可以使用现有 pane 本身支持的原生交互，但它不参与受管理会话的启动或投递。
+Run、Conversation、Activation 与 Turn 是四个独立身份。Conversation 可以跨多个 Run 和进程；Activation 只代表一次 Provider 进程存活期；Turn 在写入前先持久化。写入超时或结果不明确会进入 `delivery-unknown`，不会自动重发。Provider 进程退出后结束当前 Activation；恢复同一 Conversation 会创建新 Activation 并推进 authority epoch。
 
-tmux 会在 pane 创建时固定其历史容量。配置该限制之前创建的 Role 会保留原容量；Yui 会在 Terminal attach 和 Web 中提示用户退出并重新进入一次，从而在保留 Agent 原生对话的同时创建具有 100,000 行历史的新 pane。
-
-Global 交互入口在不存在 writer 时保持可写；已有 writer 时自动降级为只读。global Web 对每个 tmux session 只允许一个 writer；Task Web 始终只读。Task CLI 入口除非显式请求 `--read-write`，否则始终只读，避免观察动作改变 Agent 执行。
+Task Role 使用以下显式入口：
 
 ```sh
 yui session enter <global-role>
-yui task enter <task-id> [role] [--read-only | --read-write]
-yui task role enter <task-id> <role> [--read-only | --read-write]
+yui task role view <task-id> <role>
+yui task role takeover <task-id> <role>
+yui task role release <task-id> <role>
 ```
+
+`view` 始终只读。`takeover` 要求存在 active managed Run 且没有未决 Turn；它先以持久 CAS 把唯一 writer authority 转给人工 holder，再把相同 epoch 同步给 Agent Host，最后开放 PTY 输入网关。人工输入仍由 Host 转换为结构化 Provider Turn，而不是直接注入 Provider 终端。detach 会自动归还 authority；`release` 即使没有 active Run 也可执行，用于幂等修复中断或未完全同步的接管。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议。
+
+tmux 会在 pane 创建时固定其历史容量。配置该限制之前创建的 Role 会保留原容量；Yui 会在 Terminal attach 和 Web 中提示用户退出并重新进入一次，从而创建具有 100,000 行历史的新 pane。
 
 每个 Role 可绑定多个 Agent，但任一时刻只有一个 active Agent，并为每个
 Agent binding 独立保存 native session。Operator 进一步限制为同一种
@@ -460,7 +463,7 @@ binding 是预先保存、可随时切换的配置，而不是并行身份。Ope
 
 使用 `yui config role unbind <global-role> <agent-id>` 或 `yui task role unbind <task-id> <role> <agent-id>` 可移除休眠 binding。active binding 或任何未 stopped 的 native session 都会被拒绝；stopped session 记录会和 binding 在同一事务中删除。
 
-Claude 的 session ID 在启动前分配。每个受管理的 Task Claude Run 都使用新的有限生命周期进程；resume 会针对固定 native session 启动新进程，而不是复用交互式 pane。受管理的 Codex 启动使用 Codex 结构化 `notify` 回调，在 turn 完成后记录 thread ID，不再向模型对话注入 session-bind prompt。
+Claude 的 session ID 在启动前分配，并由持久 stream-json Provider 进程承载多个 Turn；Codex 使用持久 App Server thread。两者都复用同一套 Conversation、Activation、Turn 与 authority fence，不再向模型对话注入 session-bind prompt。
 
 自动生命周期与投递判断只使用结构化 Hook payload、持久身份、tmux process
 state、receipt 与 pane fence。Yui 不会解析 prompt glyph、进度文本、trust dialog

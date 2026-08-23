@@ -1,5 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
+import {
+  validateProviderAuthorityFence,
+  type ProviderAuthorityFence
+} from "./providerAuthorityFence.js";
 
 export type AgentHostLaunchPayload = Readonly<{
   schemaVersion: 1;
@@ -10,9 +14,18 @@ export type AgentHostLaunchPayload = Readonly<{
   cwd: string;
   childLifecycle: "persistent" | "per-turn";
   startMode: "provider" | "idle";
-  providerInput?: Readonly<{
-    /** Provider-neutral Host primitive; the Adapter owns the JSON wire choice. */
-    kind: "stdin-json-user-message";
+  providerControl?: AgentHostProviderControl;
+}>;
+
+export type AgentHostProviderControl = Readonly<{
+  schemaVersion: 1;
+  adapterId: "codex" | "claude";
+  transport: "codex-app-server-stdio" | "claude-stream-json";
+  mode: "new" | "resume";
+  nativeSessionId?: string;
+  authority: ProviderAuthorityFence;
+  initialTurn?: Readonly<{
+    attemptId: string;
     boundedText: string;
   }>;
 }>;
@@ -103,17 +116,35 @@ function validatePayload(payload: AgentHostLaunchPayload): AgentHostLaunchPayloa
   if (payload.startMode !== "provider" && payload.startMode !== "idle") {
     throw new Error("Agent Host start mode is invalid.");
   }
-  if (payload.providerInput !== undefined) {
-    if (payload.providerInput.kind !== "stdin-json-user-message") {
-      throw new Error("Agent Host Provider input transport is invalid.");
-    }
-    if (typeof payload.providerInput.boundedText !== "string"
-      || payload.providerInput.boundedText.includes("\0")
-      || Buffer.byteLength(payload.providerInput.boundedText, "utf8") > 4 * 1024) {
+  if (payload.providerControl !== undefined) validateProviderControl(payload.providerControl);
+  return payload;
+}
+
+function validateProviderControl(control: AgentHostProviderControl): void {
+  if (control.schemaVersion !== 1) throw new Error("Agent Host Provider control version is invalid.");
+  if (control.adapterId !== "codex" && control.adapterId !== "claude") {
+    throw new Error("Agent Host Provider control adapter is invalid.");
+  }
+  if ((control.adapterId === "codex" && control.transport !== "codex-app-server-stdio")
+    || (control.adapterId === "claude" && control.transport !== "claude-stream-json")) {
+    throw new Error("Agent Host Provider control transport does not match its adapter.");
+  }
+  if (control.mode !== "new" && control.mode !== "resume") {
+    throw new Error("Agent Host Provider control mode is invalid.");
+  }
+  if ((control.mode === "resume") !== (control.nativeSessionId !== undefined)) {
+    throw new Error("Agent Host Provider resume identity is inconsistent.");
+  }
+  if (control.nativeSessionId !== undefined) text(control.nativeSessionId, "nativeSessionId");
+  validateProviderAuthorityFence(control.authority);
+  if (control.initialTurn !== undefined) {
+    text(control.initialTurn.attemptId, "Provider input attemptId");
+    if (typeof control.initialTurn.boundedText !== "string"
+      || control.initialTurn.boundedText.includes("\0")
+      || Buffer.byteLength(control.initialTurn.boundedText, "utf8") > 32 * 1024) {
       throw new Error("Agent Host Provider input must be bounded bootstrap text.");
     }
   }
-  return payload;
 }
 
 function text(value: string, label: string): string {

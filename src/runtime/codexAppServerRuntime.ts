@@ -1,9 +1,12 @@
-import type { ProviderInputRoutingPort } from "./ports.js";
 import type {
   ProviderContinuationMetadataPort,
   ProviderContinuationQueryResult
 } from "./providerRuntimeReconciler.js";
-import type { RuntimeBinding } from "./runtimeBinding.js";
+import type {
+  ProviderControlAdapter,
+  ProviderConversationProbe,
+  ProviderTurnAcceptance
+} from "./providerControl.js";
 
 export type JsonRpcObject = Readonly<Record<string, unknown>>;
 
@@ -44,7 +47,11 @@ export type CodexTurnAcceptance =
  * deliberately not an Activation identity: callers supply the persisted
  * Conversation/Activation fence on every state-changing request.
  */
-export class CodexAppServerRuntime implements ProviderInputRoutingPort, ProviderContinuationMetadataPort {
+export class CodexAppServerRuntime implements
+  ProviderControlAdapter,
+  ProviderContinuationMetadataPort {
+  readonly providerNamespace = "openai/codex";
+
   constructor(private readonly transport: CodexAppServerTransport) {}
 
   async openConversation(input: Readonly<{
@@ -85,6 +92,37 @@ export class CodexAppServerRuntime implements ProviderInputRoutingPort, Provider
     return parseThreadSnapshot(result, id, "unknown");
   }
 
+  async inspectConversation(conversationId: string): Promise<ProviderConversationProbe> {
+    const id = text(conversationId, "Codex thread id");
+    try {
+      const snapshot = await this.readConversation(id);
+      return {
+        state: "exists",
+        conversationId: snapshot.threadId,
+        ...(snapshot.activeTurnId === undefined ? {} : { activeTurnId: snapshot.activeTurnId })
+      };
+    } catch (error) {
+      return {
+        state: codexAppServerErrorIsMissing(error) ? "missing" : "unknown",
+        conversationId: id
+      };
+    }
+  }
+
+  async submitTurn(input: Readonly<{
+    conversationId: string;
+    attemptId: string;
+    text: string;
+    expectedNoActiveTurn: boolean;
+  }>): Promise<ProviderTurnAcceptance> {
+    return this.startTurn({
+      conversationId: input.conversationId,
+      text: input.text,
+      expectedNoActiveTurn: input.expectedNoActiveTurn,
+      clientUserMessageId: input.attemptId
+    });
+  }
+
   async startTurn(input: Readonly<{
     conversationId: string;
     text: string;
@@ -101,7 +139,11 @@ export class CodexAppServerRuntime implements ProviderInputRoutingPort, Provider
         ...(input.clientUserMessageId === undefined
           ? {}
           : { clientUserMessageId: text(input.clientUserMessageId, "Codex input attempt id") }),
-        input: [{ type: "text", text: text(input.text, "Codex Turn input") }]
+        input: [{
+          type: "text",
+          text: text(input.text, "Codex Turn input"),
+          text_elements: []
+        }]
       });
       const turnId = optionalId(result.turnId)
         ?? optionalId(objectMember(result, "turn")?.id);
@@ -137,7 +179,11 @@ export class CodexAppServerRuntime implements ProviderInputRoutingPort, Provider
         ...(input.clientUserMessageId === undefined
           ? {}
           : { clientUserMessageId: text(input.clientUserMessageId, "Codex input attempt id") }),
-        input: [{ type: "text", text: text(input.text, "Codex steer input") }]
+        input: [{
+          type: "text",
+          text: text(input.text, "Codex steer input"),
+          text_elements: []
+        }]
       });
       const acceptedTurnId = optionalId(result.turnId);
       if (acceptedTurnId === expectedTurnId) return { status: "accepted", turnId: acceptedTurnId };
@@ -239,63 +285,6 @@ export class CodexAppServerRuntime implements ProviderInputRoutingPort, Provider
     return { quality: "exact", continuations: Object.freeze(observed) };
   }
 
-  async route(input: Readonly<{
-    binding: RuntimeBinding;
-    attemptId: string;
-    mode: "steer-if-safe" | "inject";
-    text: string;
-    fence: Readonly<{
-      conversationId: string;
-      activationId: string;
-      nativeTurnId?: string;
-    }>;
-  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unsafe" | "unavailable"> {
-    if (input.binding.adapterId !== "codex"
-      || input.binding.nativeSessionId !== input.fence.conversationId
-      || input.binding.launchId !== input.fence.activationId) return "unsafe";
-    if (input.mode === "inject") {
-      return this.injectItems({
-        conversationId: input.fence.conversationId,
-        text: input.text
-      });
-    }
-    if (input.fence.nativeTurnId === undefined) return "unsafe";
-    const outcome = await this.steerTurn({
-      conversationId: input.fence.conversationId,
-      expectedTurnId: input.fence.nativeTurnId,
-      text: input.text,
-      clientUserMessageId: input.attemptId
-    });
-    return outcome.status === "accepted" ? "accepted"
-      : outcome.status === "not-accepted" ? "not-accepted"
-      : "unknown";
-  }
-
-  async reconcile(input: Readonly<{
-    binding: RuntimeBinding;
-    attemptId: string;
-    mode: "followup" | "steer-if-safe" | "inject";
-    fence: Readonly<{
-      conversationId: string;
-      activationId: string;
-      nativeTurnId?: string;
-    }>;
-  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unavailable"> {
-    if (input.binding.adapterId !== "codex"
-      || input.binding.nativeSessionId !== input.fence.conversationId
-      || input.binding.launchId !== input.fence.activationId) return "unavailable";
-    // inject_items has no client receipt/idempotency field in the App Server
-    // protocol. A lost response therefore remains unknown and is never resent.
-    if (input.mode === "inject") return "unknown";
-    try {
-      const snapshot = await this.readConversation(input.fence.conversationId);
-      return threadContainsClientInput(snapshot.raw, input.attemptId)
-        ? "accepted"
-        : "not-accepted";
-    } catch (error) {
-      return isNotLoaded(error) ? "unavailable" : "unknown";
-    }
-  }
 }
 
 /** thread/closed means the loaded Activation ended; the durable thread remains resumable. */
@@ -408,19 +397,6 @@ function optionalTurnStatus(
     : undefined;
 }
 
-function threadContainsClientInput(raw: JsonRpcObject, attemptId: string): boolean {
-  const thread = objectMember(raw, "thread") ?? raw;
-  const turns = Array.isArray(thread.turns) ? thread.turns : [];
-  return turns.some((rawTurn) => {
-    const turn = object(rawTurn);
-    const items = turn === null || !Array.isArray(turn.items) ? [] : turn.items;
-    return items.some((rawItem) => {
-      const item = object(rawItem);
-      return item?.type === "userMessage" && item.clientId === attemptId;
-    });
-  });
-}
-
 function classifyMutationError(error: unknown): CodexTurnAcceptance {
   if (error instanceof CodexAppServerRequestError) {
     if (["INVALID_PARAMS", "NOT_FOUND", "TURN_NOT_ACTIVE", -32602].includes(error.code)) {
@@ -434,6 +410,14 @@ function isNotLoaded(error: unknown): boolean {
   return error instanceof CodexAppServerRequestError
     && (String(error.code).toLowerCase().includes("not_loaded")
       || error.message.toLowerCase().includes("not loaded"));
+}
+
+export function codexAppServerErrorIsMissing(error: unknown): boolean {
+  if (!(error instanceof CodexAppServerRequestError)) return false;
+  if (error.code === "NOT_FOUND") return true;
+  const message = error.message.toLowerCase();
+  return /\b(thread|conversation)\b.*\b(not found|missing|does not exist)\b/u.test(message)
+    || /\b(not found|missing|does not exist)\b.*\b(thread|conversation)\b/u.test(message);
 }
 
 function threadId(result: JsonRpcObject): string {

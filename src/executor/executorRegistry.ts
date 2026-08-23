@@ -18,13 +18,11 @@ import type {
 } from "../tmux/tmuxManager.js";
 import {
   createPromptEnvelope,
-  createRuntimeBinding,
   createSessionLaunchRequest,
   type ActivePromptPushPort,
   type RuntimeBinding,
   type RuntimeLaunchPreStart,
   type RuntimeLaunchPreparationPort,
-  type ProviderInputRoutingPort,
   type SessionHostPort
 } from "../runtime/index.js";
 import type { EffectiveLaunchSnapshot } from "./effectiveLaunch.js";
@@ -39,8 +37,8 @@ export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
   launch: TmuxLaunchPlan;
   session: SchedulerRoleSession | null;
-  /** Exact Run whose first prompt is carried by a fresh Codex launch argv. */
-  initialPromptRunId?: string;
+  /** Exact Run whose first structured Provider Turn is handled by this launch workflow. */
+  initialTurnRunId?: string;
 }>;
 
 export interface RoleLaunchPlanner {
@@ -125,7 +123,6 @@ export type ExecutorRuntimePorts = Readonly<{
   sessionHost: SessionHostPort;
   promptPush: ActivePromptPushPort;
   launchCoordinator?: RuntimeLaunchPreparationPort;
-  providerInputRouting?: ProviderInputRoutingPort;
   /** One advisory resource sample produced alongside the full Role inventory. */
   roleResourceInventory?: (
     panes: readonly TmuxRolePaneState[],
@@ -164,10 +161,6 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     private readonly readiness: AgentReadinessResolver = agentProcessReadinessProbe,
     private readonly runtimePorts?: ExecutorRuntimePorts
   ) {}
-
-  canRouteProviderInput(adapterId: string): boolean {
-    return adapterId === "codex" && this.runtimePorts?.providerInputRouting !== undefined;
-  }
 
   async prepareRoleSession(input: Readonly<{
     taskId: string;
@@ -286,12 +279,22 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         input.runId !== undefined
         && (
           (
-            sessionStarted
-            && (planned?.initialPromptRunId ?? binding?.initialPromptRunId) === input.runId
+            binding?.initialTurnRunId === input.runId
           )
-          || binding?.launchPromptUncertainRunId === input.runId
         )
-          ? { inputSubmittedAtLaunch: true }
+          ? { turnAcceptedDuringLaunch: true }
+          : {}
+      ),
+      ...(
+        input.runId !== undefined
+        && binding?.initialTurnDeliveryUnknownRunId === input.runId
+          ? { turnDeliveryUnknownDuringLaunch: true }
+          : {}
+      ),
+      ...(
+        input.runId !== undefined
+        && binding?.initialTurnRejectedRunId === input.runId
+          ? { turnRejectedDuringLaunch: true }
           : {}
       )
     };
@@ -321,7 +324,9 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     delivery: ReadyRoleDelivery;
     receiptId: string;
     text: string;
-  }>): Promise<"sent" | "already-sent" | "busy" | "unavailable"> {
+  }>): Promise<
+    "sent" | "already-sent" | "busy" | "rejected" | "delivery-unknown" | "unavailable"
+  > {
     const prepared = this.requirePrepared(input.delivery.prepared);
     if (prepared.binding !== undefined && this.runtimePorts !== undefined) {
       const runId = input.delivery.prepared.runId;
@@ -383,72 +388,6 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       this.#prepared.delete(input.delivery.prepared.deliveryId);
     }
     return outcome;
-  }
-
-  async routeProviderInput(input: Readonly<{
-    delivery: ReadyRoleDelivery;
-    attemptId: string;
-    mode: "steer-if-safe" | "inject";
-    text: string;
-    fence: Readonly<{
-      conversationId: string;
-      activationId: string;
-      nativeTurnId?: string;
-    }>;
-  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unsafe" | "unavailable"> {
-    const prepared = this.requirePrepared(input.delivery.prepared);
-    if (prepared.binding === undefined || this.runtimePorts?.providerInputRouting === undefined) {
-      return "unavailable";
-    }
-    try {
-      return await this.runtimePorts.providerInputRouting.route({
-        binding: prepared.binding,
-        attemptId: input.attemptId,
-        mode: input.mode,
-        text: input.text,
-        fence: input.fence
-      });
-    } finally {
-      // A routed mutation is fenced by its durable inputDelivery, not by this
-      // process-local preparation. Never let a later Turn reuse a cached
-      // Activation binding after this attempt (including an unknown result).
-      this.#prepared.delete(input.delivery.prepared.deliveryId);
-    }
-  }
-
-  async reconcileProviderInput(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    agentId: string;
-    adapterId: string;
-    launchId: string;
-    nativeSessionId: string;
-    attemptId: string;
-    mode: "followup" | "steer-if-safe" | "inject";
-    fence: Readonly<{
-      conversationId: string;
-      activationId: string;
-      nativeTurnId?: string;
-    }>;
-  }>): Promise<"accepted" | "not-accepted" | "unknown" | "unavailable"> {
-    if (this.runtimePorts?.providerInputRouting === undefined) {
-      return "unavailable";
-    }
-    return this.runtimePorts.providerInputRouting.reconcile({
-      binding: createRuntimeBinding({
-        id: `metadata:${input.taskId}:${input.roleName}:${input.launchId}`,
-        launchId: input.launchId,
-        owner: { scope: "task", taskId: input.taskId, roleName: input.roleName },
-        agentId: input.agentId,
-        adapterId: input.adapterId,
-        hostRef: "metadata-only",
-        hostCreated: false,
-        nativeSessionId: input.nativeSessionId
-      }),
-      attemptId: input.attemptId,
-      mode: input.mode,
-      fence: input.fence
-    });
   }
 
   async notifyOperatorInputOnce(input: Readonly<{

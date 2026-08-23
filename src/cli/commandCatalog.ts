@@ -600,7 +600,8 @@ const taskChildren: readonly NodeInput[] = [
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
-      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "reset", "enter"
+      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "reset",
+      "view", "takeover", "release"
     ] }],
     children: [
       {
@@ -635,10 +636,19 @@ const taskChildren: readonly NodeInput[] = [
         options: ["--reason"]
       },
       {
-        name: "enter",
-        summary: "Attach to an existing Task Role session without starting it.",
-        usage: "yui task role enter <task> <role> [--read-only | --read-write]",
-        options: ["--read-only", "--read-write"]
+        name: "view",
+        summary: "Attach read-only to a managed Provider presentation surface.",
+        usage: "yui task role view <task> <role>"
+      },
+      {
+        name: "takeover",
+        summary: "Acquire Provider writer authority and enter the PTY input gateway.",
+        usage: "yui task role takeover <task> <role>"
+      },
+      {
+        name: "release",
+        summary: "Return stranded human Provider authority to the Controller.",
+        usage: "yui task role release <task> <role>"
       }
     ]
   },
@@ -1027,12 +1037,6 @@ const taskChildren: readonly NodeInput[] = [
       { name: "show", summary: "Show one ChangeSet.", usage: "yui task change-set show <task>/<change-set>" }
     ]
   },
-  {
-    name: "enter",
-    summary: "Attach to an existing Task Role, defaulting to Leader and read-only.",
-    usage: "yui task enter <task> [role] [--read-only | --read-write]",
-    options: ["--read-only", "--read-write"]
-  }
 ];
 
 export const ROOT_COMMAND = buildNode({
@@ -1407,7 +1411,7 @@ export const ROOT_COMMAND = buildNode({
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
         { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
-        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "enter", "overlap", "change-set"] },
+        { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "continuation", "wake"] }
       ],
       children: taskChildren

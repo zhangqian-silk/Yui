@@ -478,7 +478,8 @@ export function withProviderRetry(
 export function reopenRunForProviderRetry(
   run: AgentRun,
   receiptId: string,
-  now: Date
+  now: Date,
+  mode: "new" | "resume" = "resume"
 ): AgentRun {
   if (run.status !== "active" || run.providerRetry === undefined) {
     throw new Error(`Agent run is not waiting for a provider retry: ${run.id}.`);
@@ -490,7 +491,7 @@ export function reopenRunForProviderRetry(
   } = run;
   return validateAgentRun({
     ...rest,
-    mode: "resume",
+    mode,
     deliveryReceiptId: receiptId,
     updatedAt: timestamp,
     providerRetry: prepareProviderRetryDispatch(providerRetry, receiptId, now)

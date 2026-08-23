@@ -18,12 +18,17 @@ import { activateTask, createTask } from "../../dist/task/task.js";
 import { createDecision } from "../../dist/decision/decision.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
+import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { validateAgentLaunchConfiguration } from "../../dist/executor/agentConfigurationCatalog.js";
+import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
 import { runExecutionAudit } from "../../dist/observability/executionAudit.js";
 import { createAgentRun, failAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import {
+  bindTaskRoleProviderRuntime,
+  bindTaskRoleRun,
+  clearTaskRoleRun,
   createRoleSessionSet,
   recordRoleAgentSession,
   updateRoleAgentSessionStatus
@@ -40,8 +45,29 @@ import {
 import { runtimeObservationSemanticKey } from "../../dist/runtime/runtimeObservation.js";
 import { createPromptEnvelope } from "../../dist/runtime/promptEnvelope.js";
 import {
+  ProviderConversationMissingError,
+  ProviderDeliveryUnknownError,
+  ProviderTurnRejectedError,
+  startStructuredProviderSession
+} from "../../dist/runtime/structuredProviderHost.js";
+import {
   CodexAppServerRuntime,
-  codexNotificationBoundary
+  CodexAppServerRequestError,
+  acceptProviderTurn,
+  beginProviderTurn,
+  codexNotificationBoundary,
+  codexAppServerErrorIsMissing,
+  createRuntimeBinding,
+  createProviderRuntimeBinding,
+  currentProviderAuthority,
+  decideProviderRecovery,
+  endProviderActivation,
+  FencedProviderControl,
+  markProviderTurnDeliveryUnknown,
+  rebindProviderRuntimeRun,
+  settleProviderTurn,
+  startProviderActivation,
+  transferProviderAuthority
 } from "../../dist/runtime/index.js";
 import {
   createWorkMailbox,
@@ -75,6 +101,11 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   for (const command of ["setup", "update", "upgrade", "task create", "task list"]) {
     assert.ok(commands.includes(command), `missing core command: ${command}`);
   }
+  for (const command of ["task role view", "task role takeover", "task role release"]) {
+    assert.ok(commands.includes(command), `missing Provider authority command: ${command}`);
+  }
+  assert.equal(commands.includes("task enter"), false);
+  assert.equal(commands.includes("task role enter"), false);
 });
 
 test("the SQLite Task path persists one normal Task and Message", (t) => {
@@ -414,6 +445,88 @@ test("diagnostic telemetry enforces the configured per-Run cap during writes", a
   );
 });
 
+test("the v6 Task Role Session migration invalidates legacy managed writers", () => {
+  const registry = createProductionRegistry();
+  const step = registry.lookup("record", "taskRoleSessionSet", 5);
+  assert.notEqual(step, undefined);
+  const at = "2026-08-23T00:00:00.000Z";
+  const source = {
+    schemaManifest: {
+      schemaVersion: 1,
+      storageVersion: 7,
+      aggregateSchemaVersion: 20,
+      recordVersions: { taskRoleSessionSet: 5 },
+      updatedAt: at
+    },
+    state: {
+      schemaVersion: 20,
+      tasks: {
+        "task-1": {
+          roleSessionSets: {
+            leader: {
+              schemaVersion: 5,
+              owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+              activeAgentId: "agent-1",
+              sessions: {
+                "agent-1": {
+                  schemaVersion: 3,
+                  agentId: "agent-1",
+                  adapterId: "codex",
+                  nativeSessionId: "thread-legacy",
+                  launchId: "launch-legacy",
+                  status: "running",
+                  updatedAt: at
+                }
+              },
+              inFlight: {
+                agentId: "agent-1",
+                runId: "run-legacy",
+                receiptId: "task-1/agentRun/run-legacy",
+                preparedAt: at
+              },
+              providerBinding: {
+                schemaVersion: 1,
+                providerNamespace: "openai/codex",
+                accountScope: "agent-1",
+                runId: "run-legacy",
+                currentConversationEpoch: 1,
+                conversations: [{
+                  conversationId: "thread-legacy",
+                  epoch: 1,
+                  status: "current",
+                  recoverability: "recoverable",
+                  createdAt: at
+                }],
+                activations: [{
+                  activationId: "launch-legacy",
+                  conversationId: "thread-legacy",
+                  generation: 1,
+                  status: "active",
+                  writerLease: true,
+                  startedAt: at
+                }]
+              },
+              updatedAt: at
+            }
+          }
+        }
+      }
+    }
+  };
+  step.preconditions(source);
+  const migrated = step.transform(source);
+  const set = migrated.state.tasks["task-1"].roleSessionSets.leader;
+  assert.equal(migrated.schemaManifest.recordVersions.taskRoleSessionSet, 6);
+  assert.equal(set.schemaVersion, 6);
+  assert.equal(set.sessions["agent-1"].status, "broken");
+  assert.equal(set.providerBinding.schemaVersion, 2);
+  assert.equal(set.providerBinding.authority.owner, "none");
+  assert.equal(set.providerBinding.turn, null);
+  assert.equal(set.providerBinding.conversations[0].recoverability, "unknown");
+  assert.equal(set.providerBinding.activations[0].status, "failed");
+  assert.equal(Object.hasOwn(set.providerBinding.activations[0], "writerLease"), false);
+});
+
 test("the built-in Agent Drivers are available through the shared registry", () => {
   const drivers = builtinAgentDriverRegistry();
   assert.equal(drivers.requireByAdapterId("codex").id, "openai/codex");
@@ -478,7 +591,7 @@ test("TmuxSessionHost runs launch validation before creating the provider proces
       role: { name: "reviewer", workspace: launchWorkspace },
       launch: { command: "codex", args: ["--model", "gpt-bad"], env: {} },
       session: null,
-      initialPromptRunId: "run-1"
+      initialTurnRunId: "run-1"
     })
   };
   const tmux = {
@@ -513,14 +626,14 @@ test("TmuxSessionHost runs launch validation before creating the provider proces
   );
 });
 
-test("TmuxSessionHost backstops an unresponsive agent and stops the host", async () => {
+test("TmuxSessionHost rejects a managed Task planner without structured Agent Host control", async () => {
   let killed = false;
   const planner = {
     plan: () => ({
       role: { name: "reviewer", workspace: launchWorkspace },
       launch: { command: "codex", args: ["--model", "gpt-good"], env: {} },
       session: null,
-      initialPromptRunId: "run-1"
+      initialTurnRunId: "run-1"
     })
   };
   const tmux = {
@@ -530,10 +643,7 @@ test("TmuxSessionHost backstops an unresponsive agent and stops the host", async
     captureRolePane: () => "",
     killRole: () => { killed = true; }
   };
-  const host = new TmuxSessionHost(planner, tmux, {
-    inactivityTimeoutMs: 25,
-    waitForNativeSession: () => new Promise(() => undefined)
-  });
+  const host = new TmuxSessionHost(planner, tmux);
   await assert.rejects(
     host.start(createSessionLaunchRequest({
       launchId: "launch-1",
@@ -545,15 +655,9 @@ test("TmuxSessionHost backstops an unresponsive agent and stops the host", async
       runId: "run-1",
       mode: "new"
     })),
-    (error) => {
-      assert.ok(error instanceof RuntimeLaunchFailure);
-      assert.equal(error.diagnostic.phase, "native-session-discovery");
-      assert.equal(error.diagnostic.kind, "timeout");
-      assert.match(error.diagnostic.detail, /no signal/);
-      assert.equal(killed, true);
-      return true;
-    }
+    /missing its structured Agent Host contract/
   );
+  assert.equal(killed, false);
 });
 
 test("execution audit projects structured launch failure phase and kind", (t) => {
@@ -708,6 +812,627 @@ test("the Codex App Server adapter keeps attachment and Run boundaries separate"
     conversationId: "thread-1"
   });
   assert.deepEqual(calls.map(({ method }) => method), ["thread/read"]);
+});
+
+test("managed Codex waits for App Server Turn acceptance and keeps input off argv", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "yui-codex-host-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const server = join(root, "test", "fixtures", "fake-codex-app-server.mjs");
+  const attempts = join(directory, "attempts.txt");
+  const started = await startStructuredProviderSession({
+    schemaVersion: 1,
+    launchId: "launch-codex-1",
+    command: process.execPath,
+    args: [server, "structured", attempts],
+    environment: { PATH: process.env.PATH ?? "" },
+    cwd: directory,
+    childLifecycle: "persistent",
+    startMode: "provider",
+    providerControl: {
+      schemaVersion: 1,
+      adapterId: "codex",
+      transport: "codex-app-server-stdio",
+      mode: "new",
+      authority: { epoch: 1, owner: "controller", holderId: "launch-codex-1" },
+      initialTurn: {
+        attemptId: "task-1/agentRun/run-1",
+        boundedText: "perform the managed work"
+      }
+    }
+  }, { mirrorOutput: () => {} });
+  assert.equal(existsSync(attempts), false);
+  const receipt = await started.session.submitTurn({
+    attemptId: "task-1/agentRun/run-1",
+    boundedText: "perform the managed work"
+  });
+  assert.equal(receipt.conversationId, "thread-structured-1");
+  assert.equal(receipt.nativeTurnId, "turn-structured-1");
+  assert.equal(readFileSync(attempts, "utf8"), "turn/start\n");
+  started.session.terminate("SIGTERM");
+  await started.session.waitForExit();
+});
+
+test("managed Claude accepts only an exact replayed user message", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "yui-claude-host-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const server = join(root, "test", "fixtures", "fake-claude-stream.mjs");
+  const started = await startStructuredProviderSession({
+    schemaVersion: 1,
+    launchId: "launch-claude-1",
+    command: process.execPath,
+    args: [server, "11111111-1111-4111-8111-111111111111"],
+    environment: { PATH: process.env.PATH ?? "" },
+    cwd: directory,
+    childLifecycle: "persistent",
+    startMode: "provider",
+    providerControl: {
+      schemaVersion: 1,
+      adapterId: "claude",
+      transport: "claude-stream-json",
+      mode: "resume",
+      nativeSessionId: "11111111-1111-4111-8111-111111111111",
+      authority: { epoch: 1, owner: "controller", holderId: "launch-claude-1" },
+      initialTurn: {
+        attemptId: "task-1/agentRun/run-2",
+        boundedText: "continue the managed work"
+      }
+    }
+  }, { mirrorOutput: () => {} });
+  const receipt = await started.session.submitTurn({
+    attemptId: "task-1/agentRun/run-2",
+    boundedText: "continue the managed work"
+  });
+  assert.equal(receipt.attemptId, "task-1/agentRun/run-2");
+  assert.equal(
+    receipt.nativeTurnId,
+    "claude-input:task-1/agentRun/run-2"
+  );
+  started.session.terminate("SIGTERM");
+  await started.session.waitForExit();
+});
+
+test("managed Claude keeps new and resume native identity flags mutually exclusive", () => {
+  const nativeSessionId = "11111111-1111-4111-8111-111111111111";
+  const adapter = resolveAgentAdapter("claude");
+  const input = {
+    agent: {
+      schemaVersion: 2,
+      id: "claude-agent",
+      adapterId: "claude",
+      command: "claude",
+      baseArgs: [],
+      environment: [],
+      createdAt: "2026-08-23T00:00:00.000Z",
+      updatedAt: "2026-08-23T00:00:00.000Z",
+      source: "custom"
+    },
+    config: { adapterId: "claude", permission: { strategy: "bypass" } },
+    workspace: root
+  };
+  const fresh = adapter.compileManagedControl(input, "new", nativeSessionId).argv;
+  assert.equal(fresh.includes("--resume"), false);
+  assert.deepEqual(fresh.slice(fresh.indexOf("--session-id"), fresh.indexOf("--session-id") + 2), [
+    "--session-id",
+    nativeSessionId
+  ]);
+  const resumed = adapter.compileManagedControl(input, "resume", nativeSessionId).argv;
+  assert.equal(resumed.includes("--session-id"), false);
+  assert.deepEqual(resumed.slice(resumed.indexOf("--resume"), resumed.indexOf("--resume") + 2), [
+    "--resume",
+    nativeSessionId
+  ]);
+});
+
+test("an ambiguous Codex Turn submission is not retried automatically", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "yui-codex-unknown-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const server = join(root, "test", "fixtures", "fake-codex-app-server.mjs");
+  const attempts = join(directory, "attempts.txt");
+  const started = await startStructuredProviderSession({
+      schemaVersion: 1,
+      launchId: "launch-codex-unknown",
+      command: process.execPath,
+      args: [server, "unknown", attempts],
+      environment: { PATH: process.env.PATH ?? "" },
+      cwd: directory,
+      childLifecycle: "persistent",
+      startMode: "provider",
+      providerControl: {
+        schemaVersion: 1,
+        adapterId: "codex",
+        transport: "codex-app-server-stdio",
+        mode: "new",
+        authority: { epoch: 1, owner: "controller", holderId: "launch-codex-unknown" },
+        initialTurn: {
+          attemptId: "task-1/agentRun/run-unknown",
+          boundedText: "do not duplicate this"
+        }
+      }
+    }, { mirrorOutput: () => {} });
+  await assert.rejects(
+    started.session.submitTurn({
+      attemptId: "task-1/agentRun/run-unknown",
+      boundedText: "do not duplicate this"
+    }),
+    ProviderDeliveryUnknownError
+  );
+  await started.session.waitForExit();
+  assert.equal(readFileSync(attempts, "utf8"), "turn/start\n");
+});
+
+test("an exact Codex Turn rejection stays distinct from ambiguous delivery", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "yui-codex-rejected-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const server = join(root, "test", "fixtures", "fake-codex-app-server.mjs");
+  const started = await startStructuredProviderSession({
+    schemaVersion: 1,
+    launchId: "launch-codex-rejected",
+    command: process.execPath,
+    args: [server, "structured"],
+    environment: { PATH: process.env.PATH ?? "" },
+    cwd: directory,
+    childLifecycle: "persistent",
+    startMode: "provider",
+    providerControl: {
+      schemaVersion: 1,
+      adapterId: "codex",
+      transport: "codex-app-server-stdio",
+      mode: "new",
+      authority: { epoch: 1, owner: "controller", holderId: "launch-codex-rejected" }
+    }
+  }, { mirrorOutput: () => {} });
+  await assert.rejects(started.session.submitTurn({
+    attemptId: "task-1/agentRun/run-rejected",
+    boundedText: "this input is definitively rejected"
+  }), ProviderTurnRejectedError);
+  started.session.terminate("SIGTERM");
+  await started.session.waitForExit();
+});
+
+test("managed Codex distinguishes an exact missing Conversation from an unknown probe", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "yui-codex-missing-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const server = join(root, "test", "fixtures", "fake-codex-app-server.mjs");
+  await assert.rejects(startStructuredProviderSession({
+    schemaVersion: 1,
+    launchId: "launch-codex-missing",
+    command: process.execPath,
+    args: [server, "missing"],
+    environment: { PATH: process.env.PATH ?? "" },
+    cwd: directory,
+    childLifecycle: "persistent",
+    startMode: "provider",
+    providerControl: {
+      schemaVersion: 1,
+      adapterId: "codex",
+      transport: "codex-app-server-stdio",
+      mode: "resume",
+      nativeSessionId: "thread-no-longer-exists",
+      authority: { epoch: 3, owner: "controller", holderId: "launch-codex-missing" }
+    }
+  }, { mirrorOutput: () => {} }), (error) => {
+    assert.ok(error instanceof ProviderConversationMissingError);
+    assert.equal(error.conversationId, "thread-no-longer-exists");
+    return true;
+  });
+  assert.equal(codexAppServerErrorIsMissing(
+    new CodexAppServerRequestError(-32601, "method not found")
+  ), false);
+  assert.equal(codexAppServerErrorIsMissing(
+    new CodexAppServerRequestError(-32000, "Codex thread does not exist")
+  ), true);
+});
+
+test("Provider authority handoff fences Controller and human writers by epoch", () => {
+  const startedAt = "2026-08-22T00:00:00.000Z";
+  const initial = createProviderRuntimeBinding({
+    providerNamespace: "openai/codex",
+    accountScope: "agent-1",
+    runId: "agent-run-1",
+    conversationId: "thread-1",
+    activationId: "activation-1",
+    startedAt
+  });
+  assert.deepEqual(currentProviderAuthority(initial), {
+    epoch: 1,
+    owner: "controller",
+    holderId: "activation-1",
+    changedAt: startedAt
+  });
+
+  const human = transferProviderAuthority(initial, {
+    expectedEpoch: 1,
+    expectedOwner: "controller",
+    owner: "human",
+    holderId: "view-1",
+    changedAt: "2026-08-22T00:00:01.000Z"
+  });
+  assert.deepEqual(currentProviderAuthority(human), {
+    epoch: 2,
+    owner: "human",
+    holderId: "view-1",
+    changedAt: "2026-08-22T00:00:01.000Z"
+  });
+
+  assert.throws(() => transferProviderAuthority(human, {
+    expectedEpoch: 1,
+    expectedOwner: "controller",
+    owner: "human",
+    holderId: "view-2",
+    changedAt: "2026-08-22T00:00:02.000Z"
+  }), /authority fence is stale/u);
+
+  const controller = transferProviderAuthority(human, {
+    expectedEpoch: 2,
+    expectedOwner: "human",
+    owner: "controller",
+    holderId: "activation-1",
+    changedAt: "2026-08-22T00:00:03.000Z"
+  });
+  assert.deepEqual(currentProviderAuthority(controller), {
+    epoch: 3,
+    owner: "controller",
+    holderId: "activation-1",
+    changedAt: "2026-08-22T00:00:03.000Z"
+  });
+
+  const ended = endProviderActivation(initial, "activation-1", {
+    status: "failed",
+    endedAt: "2026-08-22T00:10:00.000Z"
+  });
+  const rebound = rebindProviderRuntimeRun(ended, "agent-run-2");
+  const restarted = startProviderActivation(rebound, {
+    activationId: "activation-2",
+    startedAt: "2026-08-22T00:11:00.000Z"
+  });
+  assert.equal(restarted.runId, "agent-run-2");
+  assert.equal(restarted.currentConversationEpoch, 1);
+  assert.equal(restarted.activations.at(-1).generation, 2);
+  assert.deepEqual(currentProviderAuthority(restarted), {
+    epoch: 3,
+    owner: "controller",
+    holderId: "activation-2",
+    changedAt: "2026-08-22T00:11:00.000Z"
+  });
+});
+
+test("structured Provider mutation rejects a stale writer before Adapter dispatch", async () => {
+  let submissions = 0;
+  const control = new FencedProviderControl({
+    providerNamespace: "openai/codex",
+    async inspectConversation(conversationId) {
+      return { state: "exists", conversationId };
+    },
+    async submitTurn() {
+      submissions += 1;
+      return { status: "accepted", turnId: "turn-1" };
+    },
+    async interruptTurn() {
+      return "interrupted";
+    }
+  });
+  const initial = createProviderRuntimeBinding({
+    providerNamespace: "openai/codex",
+    accountScope: "agent-1",
+    runId: "agent-run-1",
+    conversationId: "thread-1",
+    activationId: "activation-1",
+    startedAt: "2026-08-22T00:00:00.000Z"
+  });
+  const human = transferProviderAuthority(initial, {
+    expectedEpoch: 1,
+    expectedOwner: "controller",
+    owner: "human",
+    holderId: "view-1",
+    changedAt: "2026-08-22T00:00:01.000Z"
+  });
+
+  await assert.rejects(control.submitTurn({
+    binding: human,
+    fence: {
+      conversationId: "thread-1",
+      activationId: "activation-1",
+      authorityEpoch: 1,
+      authorityOwner: "controller",
+      holderId: "activation-1"
+    },
+    attemptId: "attempt-stale",
+    text: "must not dispatch"
+  }), /writer fence is stale/u);
+  assert.equal(submissions, 0);
+
+  const accepted = await control.submitTurn({
+    binding: human,
+    fence: {
+      conversationId: "thread-1",
+      activationId: "activation-1",
+      authorityEpoch: 2,
+      authorityOwner: "human",
+      holderId: "view-1"
+    },
+    attemptId: "attempt-1",
+    text: "continue"
+  });
+  assert.deepEqual(accepted, { status: "accepted", turnId: "turn-1" });
+  assert.equal(submissions, 1);
+});
+
+test("Provider Turn acknowledgement is durable before writer handoff", () => {
+  const initial = createProviderRuntimeBinding({
+    providerNamespace: "openai/codex",
+    accountScope: "agent-1",
+    runId: "agent-run-1",
+    conversationId: "thread-1",
+    activationId: "activation-1",
+    startedAt: "2026-08-22T00:00:00.000Z"
+  });
+  const submitting = beginProviderTurn(initial, {
+    attemptId: "attempt-1",
+    authorityEpoch: 1,
+    submittedAt: "2026-08-22T00:00:01.000Z"
+  });
+  assert.throws(() => transferProviderAuthority(submitting, {
+    expectedEpoch: 1,
+    expectedOwner: "controller",
+    owner: "human",
+    holderId: "view-1",
+    changedAt: "2026-08-22T00:00:02.000Z"
+  }), /Turn is unsettled/u);
+
+  const accepted = acceptProviderTurn(submitting, {
+    attemptId: "attempt-1",
+    turnId: "turn-1",
+    acceptedAt: "2026-08-22T00:00:02.000Z"
+  });
+  const settled = settleProviderTurn(accepted, {
+    turnId: "turn-1",
+    status: "completed",
+    settledAt: "2026-08-22T00:00:03.000Z"
+  });
+  const human = transferProviderAuthority(settled, {
+    expectedEpoch: 1,
+    expectedOwner: "controller",
+    owner: "human",
+    holderId: "view-1",
+    changedAt: "2026-08-22T00:00:04.000Z"
+  });
+  assert.equal(human.authority.owner, "human");
+  assert.equal(human.turn?.status, "completed");
+});
+
+test("Runtime binding reports exactly one initial Turn launch outcome", () => {
+  const base = {
+    id: "binding-1",
+    launchId: "launch-1",
+    owner: { scope: "task", taskId: "task-1", roleName: "leader" },
+    agentId: "agent-1",
+    adapterId: "codex",
+    hostRef: "host-1"
+  };
+  assert.equal(createRuntimeBinding({
+    ...base,
+    initialTurnDeliveryUnknownRunId: "run-1"
+  }).initialTurnDeliveryUnknownRunId, "run-1");
+  assert.throws(() => createRuntimeBinding({
+    ...base,
+    initialTurnRunId: "run-1",
+    initialTurnDeliveryUnknownRunId: "run-1"
+  }), /at most one initial Turn outcome/u);
+  assert.equal(createRuntimeBinding({
+    ...base,
+    initialTurnRejectedRunId: "run-1"
+  }).initialTurnRejectedRunId, "run-1");
+});
+
+test("Provider recovery requires exact tri-state evidence before resume or replacement", () => {
+  const startedAt = "2026-08-23T00:00:00.000Z";
+  const binding = createProviderRuntimeBinding({
+    providerNamespace: "openai/codex",
+    accountScope: "default",
+    runId: "run-recovery",
+    conversationId: "conversation-1",
+    activationId: "activation-1",
+    startedAt
+  });
+
+  assert.deepEqual(decideProviderRecovery({
+    binding,
+    probe: { state: "exists", conversationId: "conversation-1" },
+    unsettledInputDelivery: false
+  }), { action: "resume", conversationId: "conversation-1" });
+  assert.deepEqual(decideProviderRecovery({
+    binding,
+    probe: {
+      state: "exists",
+      conversationId: "conversation-1",
+      activeTurnId: "turn-1"
+    },
+    unsettledInputDelivery: false
+  }), {
+    action: "observe-active-turn",
+    conversationId: "conversation-1",
+    turnId: "turn-1"
+  });
+  assert.equal(decideProviderRecovery({
+    binding,
+    probe: { state: "unknown", conversationId: "conversation-1" },
+    unsettledInputDelivery: false
+  }).action, "attention");
+
+  const ended = endProviderActivation(binding, "activation-1", {
+    status: "failed",
+    endedAt: "2026-08-23T00:01:00.000Z",
+    reason: "provider process exited"
+  });
+  assert.deepEqual(decideProviderRecovery({
+    binding: ended,
+    probe: { state: "missing", conversationId: "conversation-1" },
+    unsettledInputDelivery: false
+  }), { action: "replace", conversationId: "conversation-1" });
+  assert.throws(() => decideProviderRecovery({
+    binding,
+    probe: { state: "exists", conversationId: "conversation-other" },
+    unsettledInputDelivery: false
+  }), /different Conversation/u);
+});
+
+test("Provider recovery never replaces a Conversation with unsettled delivery", () => {
+  const startedAt = "2026-08-23T00:00:00.000Z";
+  const initial = createProviderRuntimeBinding({
+    providerNamespace: "anthropic/claude-code",
+    accountScope: "default",
+    runId: "run-uncertain",
+    conversationId: "conversation-1",
+    activationId: "activation-1",
+    startedAt
+  });
+  const submitting = beginProviderTurn(initial, {
+    attemptId: "attempt-1",
+    authorityEpoch: 1,
+    submittedAt: "2026-08-23T00:00:01.000Z"
+  });
+  const uncertain = markProviderTurnDeliveryUnknown(submitting, {
+    attemptId: "attempt-1",
+    observedAt: "2026-08-23T00:00:02.000Z",
+    reason: "stdin write outcome is unknown"
+  });
+  const lateAcceptance = acceptProviderTurn(uncertain, {
+    attemptId: "attempt-1",
+    turnId: "turn-late-ack",
+    acceptedAt: "2026-08-23T00:00:03.000Z"
+  });
+  assert.equal(lateAcceptance.turn.status, "accepted");
+  assert.equal(lateAcceptance.turn.turnId, "turn-late-ack");
+  const ended = endProviderActivation(uncertain, "activation-1", {
+    status: "failed",
+    endedAt: "2026-08-23T00:01:00.000Z",
+    reason: "provider process exited"
+  });
+
+  const decision = decideProviderRecovery({
+    binding: ended,
+    probe: { state: "missing", conversationId: "conversation-1" },
+    unsettledInputDelivery: false
+  });
+  assert.equal(decision.action, "attention");
+  assert.match(decision.reason, /delivery remains unsettled/u);
+  assert.equal(decideProviderRecovery({
+    binding: endProviderActivation(initial, "activation-1", {
+      status: "failed",
+      endedAt: "2026-08-23T00:01:00.000Z"
+    }),
+    probe: { state: "missing", conversationId: "conversation-1" },
+    unsettledInputDelivery: true
+  }).action, "attention");
+  assert.equal(decideProviderRecovery({
+    binding: uncertain,
+    probe: { state: "exists", conversationId: "conversation-1" },
+    unsettledInputDelivery: false
+  }).action, "attention");
+});
+
+test("Task Role takeover and release persist monotonic Provider authority epochs", (t) => {
+  const now = new Date("2026-08-23T00:00:00.000Z");
+  const { home, store, task } = issue09Setup(now);
+  t.after(() => {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+  let sessions = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: "leader" },
+    "agent",
+    now
+  );
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "agent",
+    adapterId: "codex",
+    nativeSessionId: "conversation-takeover",
+    launchId: "activation-takeover",
+    status: "running",
+    policy: "fixed",
+    effective: issue09Effective
+  }, now);
+  sessions = bindTaskRoleRun(sessions, {
+    agentId: "agent",
+    runId: "run-takeover",
+    receiptId: "task/agentRun/run-takeover"
+  }, now);
+  sessions = bindTaskRoleProviderRuntime(sessions, createProviderRuntimeBinding({
+    providerNamespace: "openai/codex",
+    accountScope: "default",
+    runId: "run-takeover",
+    conversationId: "conversation-takeover",
+    activationId: "activation-takeover",
+    startedAt: now.toISOString()
+  }), now);
+  store.saveTaskRoleSessionSet(sessions);
+  store.saveActiveAgentRun(createAgentRun(
+    "run-takeover",
+    task.id,
+    "leader",
+    "new",
+    "human takeover test",
+    now,
+    { effective: issue09Effective }
+  ));
+
+  const takeover = runTaskCommand(
+    ["role", "takeover", task.id, "leader"],
+    store,
+    { now: () => new Date("2026-08-23T00:00:01.000Z") }
+  );
+  assert.equal(takeover.kind, "authority");
+  assert.equal(takeover.action, "takeover");
+  assert.equal(takeover.authority.owner, "human");
+  assert.equal(takeover.authority.epoch, 2);
+  assert.match(takeover.authority.holderId, /^human:/u);
+  const replayedTakeover = runTaskCommand(
+    ["role", "takeover", task.id, "leader"],
+    store,
+    { now: () => new Date("2026-08-23T00:00:01.500Z") }
+  );
+  assert.deepEqual(replayedTakeover.authority, takeover.authority);
+
+  const release = runTaskCommand(
+    ["role", "release", task.id, "leader"],
+    store,
+    { now: () => new Date("2026-08-23T00:00:02.000Z") }
+  );
+  assert.equal(release.kind, "authority");
+  assert.equal(release.action, "release");
+  assert.deepEqual(release.authority, {
+    epoch: 3,
+    owner: "controller",
+    holderId: "activation-takeover"
+  });
+  assert.equal(
+    store.getTaskRoleSessionSet(task.id, "leader").providerBinding.authority.epoch,
+    3
+  );
+  const replayedRelease = runTaskCommand(
+    ["role", "release", task.id, "leader"],
+    store,
+    { now: () => new Date("2026-08-23T00:00:03.000Z") }
+  );
+  assert.deepEqual(replayedRelease.authority, release.authority);
+
+  const cleared = clearTaskRoleRun(
+    store.getTaskRoleSessionSet(task.id, "leader"),
+    {
+      agentId: "agent",
+      runId: "run-takeover",
+      receiptId: "task/agentRun/run-takeover"
+    },
+    new Date("2026-08-23T00:00:04.000Z")
+  );
+  assert.equal(cleared.providerBinding.authority.epoch, 3);
+  const nextRun = bindTaskRoleRun(cleared, {
+    agentId: "agent",
+    runId: "run-next",
+    receiptId: "task/agentRun/run-next"
+  }, new Date("2026-08-23T00:00:05.000Z"));
+  assert.equal(nextRun.providerBinding.runId, "run-next");
+  assert.deepEqual(nextRun.providerBinding.authority, cleared.providerBinding.authority);
 });
 
 test("the runtime coordination core keeps correction lanes and terminal facts stable", () => {

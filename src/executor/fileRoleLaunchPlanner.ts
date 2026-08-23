@@ -79,6 +79,9 @@ import {
   builtinDriverIdForAdapter
 } from "../runtime/builtinAgentDrivers.js";
 import { managedRuntimeAdmission } from "../runtime/agentDriver.js";
+import type { AgentHostProviderControl } from "../runtime/launchBroker.js";
+import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
+import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -354,7 +357,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       input,
       { scope: "task", taskId: task.id },
       taskRoleSessionTitle(task, role.name),
-      compatibleExisting ? existing.nativeSessionId : undefined,
+      input.mode === "resume" && compatibleExisting ? existing.nativeSessionId : undefined,
       runWorkspace,
       effective,
       {
@@ -511,6 +514,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const managedRun = owner.scope === "task" && input.runId !== undefined
       ? this.store.getAgentRun(owner.taskId, input.runId)
       : null;
+    const managedSessionSet = owner.scope === "task" && input.runId !== undefined
+      ? this.store.getTaskRoleSessionSet(owner.taskId, role.name)
+      : null;
     const driver = builtinAgentDriverRegistry().require(
       builtinDriverIdForAdapter(configured.adapterId)
     );
@@ -565,12 +571,37 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const launchMode: RoleSessionLaunchMode = resumeNativeSessionId === undefined
       ? "new"
       : "resume";
-    const compiled = launchMode === "resume"
-      ? adapter.compileResume({
-          ...compileInput,
-          nativeSessionId: resumeNativeSessionId!
-        })
-      : adapter.compileNew(compileInput);
+    const managedControl = owner.scope === "task" && input.runId !== undefined;
+    const preallocatedManagedNativeSessionId = managedControl
+      && binding.adapterId === "claude"
+      && resumeNativeSessionId === undefined
+      ? requireText(
+          input.launchId === undefined
+            ? this.#createNativeSessionId()
+            : nativeSessionIdForLaunch(
+                this.home,
+                input.launchId,
+                input.agentId,
+                input.adapterId
+              ),
+          "Native session id"
+        )
+      : resumeNativeSessionId;
+    const managedCompiled = managedControl
+      ? adapter.compileManagedControl(
+          compileInput,
+          launchMode,
+          preallocatedManagedNativeSessionId
+        )
+      : undefined;
+    const compiled = managedCompiled !== undefined
+      ? managedCompiled
+      : launchMode === "resume"
+        ? adapter.compileResume({
+            ...compileInput,
+            nativeSessionId: resumeNativeSessionId!
+          })
+        : adapter.compileNew(compileInput);
     for (const path of [
       bootstrap.manifestPath,
       bootstrap.sessionCliPath,
@@ -597,62 +628,37 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       if (owner.scope !== "task" || input.runId === undefined) {
         args = addCodexSessionNotify(args, launchMode, this.#cliPath);
       }
-      // A fresh Codex TUI has no provider event before its first prompt. Carry
-      // the exact Run input as the provider's positional launch prompt so it is
-      // submitted only after Codex completes startup; never race terminal bytes
-      // and Enter against TUI initialization.
+      // Managed Codex runs use App Server lifecycle hooks and structured Turn
+      // submission. No Run prompt is placed in argv or written as terminal input.
       if (owner.scope === "task" && input.runId !== undefined) {
         if (managedRun === null || managedRun.status !== "active") {
           throw new Error(`Managed Codex Run is no longer active: ${input.runId}.`);
         }
-        args = addCodexLifecycleHooks(
+        args = managedControl
+          ? addCodexManagedLifecycleHooks(args, this.#cliPath)
+          : addCodexLifecycleHooks(
           args,
           launchMode,
           this.#cliPath
         );
-        // End option parsing before the opaque prompt so a wakeup beginning
-        // with '-' can never be reinterpreted as a Codex CLI flag.
-        if (managedRun.pushedAt === undefined) {
-          args.push("--", managedRunLaunchEnvelope(managedRun, input.mode));
-        }
       }
       session = launchMode === "resume"
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
         : null;
     } else if (launchMode === "new") {
-      if (owner.scope === "task" && input.runId !== undefined) {
-        args.push(
-          "-p",
-          "--output-format", "stream-json",
-          "--input-format", "stream-json",
-          "--verbose"
-        );
-        args.push(
-          "--plugin-dir",
-          ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
-        );
-      }
+      if (managedControl) args.push(
+        "--plugin-dir",
+        ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
+      );
       const nativeSessionId = requireText(
-        input.launchId === undefined
-          ? this.#createNativeSessionId()
-          : nativeSessionIdForLaunch(
-              this.home,
-              input.launchId,
-              input.agentId,
-              input.adapterId
-            ),
+        preallocatedManagedNativeSessionId,
         "Native session id"
       );
-      args.push("--session-id", nativeSessionId);
+      if (!managedControl) args.push("--session-id", nativeSessionId);
+      else if (!args.includes("--session-id")) args.push("--session-id", nativeSessionId);
       session = readySession(input.agentId, binding.adapterId, nativeSessionId, effective);
     } else {
-      if (owner.scope === "task" && input.runId !== undefined) {
-        args.push(
-          "-p",
-          "--output-format", "stream-json",
-          "--input-format", "stream-json",
-          "--verbose"
-        );
+      if (managedControl) {
         args.push(
           "--plugin-dir",
           ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
@@ -696,6 +702,33 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (owner.scope === "task" && (input.mode === "new" || input.mode === "resume")) {
       jobCallerKey = randomBytes(32).toString("hex");
     }
+    const carriesInitialTurn = managedControl
+      && managedRun?.pushedAt === undefined
+      && (managedSessionSet?.providerBinding === null
+        || managedSessionSet?.providerBinding === undefined);
+    const providerAuthority = managedControl
+      ? this.#providerAuthorityForLaunch(owner.taskId, role.name, input.launchId)
+      : undefined;
+    const providerControl: AgentHostProviderControl | undefined = managedControl
+      ? {
+          schemaVersion: 1,
+          adapterId: binding.adapterId,
+          transport: managedCompiled!.transport,
+          mode: resumeNativeSessionId === undefined ? "new" : "resume",
+          ...(resumeNativeSessionId === undefined
+            ? {}
+            : { nativeSessionId: resumeNativeSessionId }),
+          authority: providerAuthority!,
+          ...(carriesInitialTurn
+            ? {
+                initialTurn: {
+                  attemptId: formatAgentRunReceiptId(owner.taskId, input.runId!),
+                  boundedText: managedRunLaunchEnvelope(managedRun!, input.mode)
+                }
+              }
+            : {})
+        }
+      : undefined;
     const launch = {
       command,
       args,
@@ -703,14 +736,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         && managedRun.providerRetry.state !== "dispatching"
         ? { deferProviderStart: true }
         : {}),
-      ...(managedClaudeRun
-        ? {
-            providerInput: {
-              kind: "stdin-json-user-message" as const,
-              boundedText: managedRunLaunchEnvelope(managedRun!, input.mode)
-            }
-          }
-        : {}),
+      ...(providerControl === undefined ? {} : { providerControl }),
       env: {
         ...launchEnvironment,
         YUI_HOME: resolve(this.home),
@@ -763,11 +789,40 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       },
       launch: scopedLaunch,
       session,
-      ...((binding.adapterId === "codex" && managedRun?.pushedAt === undefined
-          || managedClaudeRun) && input.runId !== undefined
-        ? { initialPromptRunId: input.runId }
+      ...(carriesInitialTurn && input.runId !== undefined
+        ? { initialTurnRunId: input.runId }
         : {})
     };
+  }
+
+  #providerAuthorityForLaunch(
+    taskId: string,
+    roleName: string,
+    launchId: string | undefined
+  ): ProviderAuthorityFence {
+    const activationId = requireText(launchId, "Managed Provider Activation id");
+    const binding = this.store.getTaskRoleSessionSet(taskId, roleName)?.providerBinding;
+    if (binding === null || binding === undefined) {
+      return { epoch: 1, owner: "controller", holderId: activationId };
+    }
+    if (binding.authority.owner === "controller") {
+      return {
+        epoch: binding.authority.epoch,
+        owner: "controller",
+        holderId: binding.authority.holderId!
+      };
+    }
+    if (binding.authority.owner === "human") {
+      throw new Error(`Provider writer is held by a human: ${taskId}/${roleName}.`);
+    }
+    if (binding.authority.owner === "none") {
+      return {
+        epoch: binding.authority.epoch + 1,
+        owner: "controller",
+        holderId: activationId
+      };
+    }
+    throw new Error(`Provider writer authority is unknown: ${taskId}/${roleName}.`);
   }
 
   #applyWorkspaceScope(
@@ -777,10 +832,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       command: string;
       args: readonly string[];
       env: Readonly<Record<string, string>>;
-      providerInput?: Readonly<{
-        kind: "stdin-json-user-message";
-        boundedText: string;
-      }>;
+      providerControl?: AgentHostProviderControl;
       childLifecycle: "persistent" | "per-turn";
       deferProviderStart?: boolean;
     }>,
@@ -1102,6 +1154,19 @@ function addCodexLifecycleHooks(
     throw new Error("Codex resume launch shape is invalid.");
   }
   return [...args.slice(0, -2), ...managed, ...args.slice(-2)];
+}
+
+function addCodexManagedLifecycleHooks(args: readonly string[], cliPath: string): string[] {
+  if (args.length < 2 || args.at(-2) !== "app-server" || args.at(-1) !== "--stdio") {
+    throw new Error("Managed Codex App Server launch shape is invalid.");
+  }
+  return [
+    ...args.slice(0, -2),
+    "--enable", "hooks",
+    "--config", codexLifecycleHooksConfig(cliPath),
+    "--dangerously-bypass-hook-trust",
+    ...args.slice(-2)
+  ];
 }
 
 function readySession(

@@ -15,6 +15,7 @@ import {
 } from "./effectiveLaunch.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import {
+  rebindProviderRuntimeRun,
   validateProviderRuntimeBinding,
   type ProviderRuntimeBinding
 } from "../runtime/providerRuntimeIdentity.js";
@@ -79,7 +80,7 @@ export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & 
 };
 
 export type TaskRoleSessionSet = RoleSessionSetBase<TaskRoleSessionOwner> & {
-  schemaVersion: 5;
+  schemaVersion: 6;
   /** Immutable terminal native Sessions superseded by a fresh effective launch. */
   history?: readonly RoleAgentSession[];
   inFlight: TaskRoleInFlight | null;
@@ -136,7 +137,7 @@ export function createRoleSessionSet(
     ? { ...base, schemaVersion: 3 } as GlobalRoleSessionSet
     : {
         ...base,
-        schemaVersion: 5,
+        schemaVersion: 6,
         inFlight: null,
         providerBinding: null
       } as TaskRoleSessionSet;
@@ -470,12 +471,43 @@ export function bindTaskRoleRun(
     throw new Error("Task Role session set already has an in-flight Run.");
   }
   const timestamp = requireDate(preparedAt, "Task Role Run preparedAt");
+  const providerBinding = set.providerBinding === null
+    ? null
+    : rebindProviderRuntimeRun(set.providerBinding, normalized.runId);
   const updated: TaskRoleSessionSet = {
     ...set,
     inFlight: { ...normalized, preparedAt: timestamp },
+    providerBinding,
     updatedAt: timestamp
   };
   return validateRoleSessionSet(updated);
+}
+
+/** Re-fences the same active Run for an exact Provider retry without losing its Conversation. */
+export function prepareTaskRoleRunRedispatch(
+  set: TaskRoleSessionSet,
+  fence: TaskRoleRunFence,
+  preparedAt: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  const normalized = normalizeTaskRoleRunFence(fence);
+  if (set.inFlight === null
+    || set.inFlight.agentId !== normalized.agentId
+    || set.inFlight.runId !== normalized.runId) {
+    throw new Error("Provider retry does not match the in-flight Task Run.");
+  }
+  if (set.providerBinding !== null
+    && set.providerBinding.turn !== null
+    && ["submitting", "accepted", "running", "delivery-unknown"]
+      .includes(set.providerBinding.turn.status)) {
+    throw new Error("Provider retry cannot redispatch an unsettled Turn.");
+  }
+  const timestamp = requireDate(preparedAt, "Task Role retry preparedAt");
+  return validateRoleSessionSet({
+    ...set,
+    inFlight: { ...normalized, preparedAt: timestamp },
+    updatedAt: timestamp
+  });
 }
 
 export function bindTaskRoleProviderRuntime(
@@ -673,7 +705,6 @@ export function clearTaskRoleRun(
   const updated: TaskRoleSessionSet = {
     ...set,
     inFlight: null,
-    providerBinding: null,
     updatedAt: timestamp
   };
   return validateRoleSessionSet(updated);
@@ -765,7 +796,6 @@ export function settleTaskRoleCompletion(
       }
     },
     inFlight: null,
-    providerBinding: null,
     updatedAt: timestamp
   };
   return validateRoleSessionSet(updated);
@@ -800,7 +830,7 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       }
     }
   } else {
-    if (set.schemaVersion !== 5) {
+    if (set.schemaVersion !== 6) {
       throw new Error("Task Role session set schema version is invalid.");
     }
     if (
@@ -842,10 +872,10 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       throw new Error("Task Role in-flight Run Agent must be active.");
     }
     if (providerBinding !== null) {
-      if (inFlight === null || providerBinding.runId !== inFlight.runId) {
+      if (inFlight !== null && providerBinding.runId !== inFlight.runId) {
         throw new Error("Provider Runtime Binding must match the in-flight Run.");
       }
-      const session = taskSet.sessions[inFlight.agentId];
+      const session = taskSet.sessions[inFlight?.agentId ?? set.activeAgentId];
       if (session === undefined) {
         throw new Error("Provider Runtime Binding has no active Role Agent session.");
       }

@@ -425,8 +425,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     trailingOptions: { "--reason": "value" },
     confirmation: { action: "Reset Task Role Session", targetArgumentIndex: 4 }
   },
-  {
-    commandPath: ["task", "role", "enter"],
+  ...["view", "takeover", "release"].map((command): InteractionPolicy => ({
+    commandPath: ["task", "role", command],
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
       {
@@ -436,9 +436,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
         dependsOn: 3,
         actionTarget: true
       }
-    ],
-    trailingOptions: { "--read-only": "flag", "--read-write": "flag" }
-  },
+    ]
+  })),
   {
     commandPath: ["task", "work", "create"],
     selectors: [
@@ -598,11 +597,6 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
           ? { trailingOptions: { "--reason": "value" as const } }
         : {})
   })),
-  {
-    commandPath: ["task", "enter"],
-    selectors: [{ argumentIndex: 2, entity: "task", provider: "tasks", actionTarget: true }],
-    trailingOptions: { "--read-only": "flag", "--read-write": "flag" }
-  },
   {
     commandPath: ["jobs", "retry"],
     selectors: [{ argumentIndex: 2, entity: "job", provider: "jobs", actionTarget: true }]
