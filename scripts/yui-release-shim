@@ -64,7 +64,7 @@ if [ -f "$POINTER" ]; then
     && [ "$ACTIVATE_ARGUMENT_1" = "release" ] \
     && [ "$ACTIVATE_ARGUMENT_2" = "activate" ]; then
     case "$ACTIVATE_ARGUMENT_3" in
-      -h|--help) ;;
+      -*) ;;
       *) ACTIVATE_TARGET="$ACTIVATE_ARGUMENT_3" ;;
     esac
   fi
