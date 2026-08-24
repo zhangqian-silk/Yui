@@ -28,6 +28,15 @@ import {
 } from "../scheduler/roleRunStall.js";
 import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import {
+  hasRuntimeCleanupObligation,
+  isRuntimeLaunchReservation,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
+import {
+  isLinuxProcessLive,
+  listOwnedProcessTree
+} from "../runtime/sessionOwnerIdentity.js";
 import type { Task } from "../task/task.js";
 import {
   formatAgentRunReceiptId,
@@ -388,7 +397,8 @@ function assertInputCancelOrigin(
 }
 
 export function isCurrentGlobalOperator(
-  store: Pick<TaskStore, "getGlobalRole" | "getGlobalRoleSessionSet">,
+  store: Pick<TaskStore, "getGlobalRole" | "getGlobalRoleSessionSet">
+    & Partial<Pick<TaskStore, "getSessionOwner" | "getWorkMailbox">>,
   environment: NodeJS.ProcessEnv
 ): boolean {
   if (
@@ -398,16 +408,32 @@ export function isCurrentGlobalOperator(
   ) return false;
   const role = store.getGlobalRole("operator");
   if (role === null) return false;
-  const sessions = store.getGlobalRoleSessionSet(role.name);
-  const session = activeLiveRoleAgentSession(sessions);
-  if (sessions === null || session === null || sessions.activeAgentId !== role.activeAgentId) {
-    return false;
-  }
   const agentId = exactIdentity(environment.YUI_AGENT_ID);
   const adapterId = exactIdentity(environment.YUI_ADAPTER_ID);
   const launchId = exactIdentity(environment.YUI_LAUNCH_ID);
   const nativeSessionId = exactIdentity(environment.YUI_NATIVE_SESSION_ID);
   const binding = role.agentBindings[role.activeAgentId];
+  if (agentId === undefined
+    || adapterId === undefined
+    || launchId === undefined
+    || binding === undefined
+    || binding.agentId !== agentId
+    || binding.adapterId !== adapterId) return false;
+  const sessions = store.getGlobalRoleSessionSet(role.name);
+  const session = activeLiveRoleAgentSession(sessions);
+  if (sessions === null || session === null || sessions.activeAgentId !== role.activeAgentId) {
+    // Codex learns its native Session ID only after the first Turn. During
+    // that narrow bootstrap window, authenticate against the durable launch
+    // reservation and its strongly attributed live process owner instead.
+    return nativeSessionId === undefined
+      && binding.adapterId === "codex"
+      && currentProcessBelongsToReservedGlobalLaunch(store, {
+        roleName: role.name,
+        agentId,
+        adapterId,
+        launchId
+      });
+  }
   // A fresh Codex launch discovers its native Session asynchronously. Its
   // launch envelope therefore cannot carry YUI_NATIVE_SESSION_ID, but the
   // durable Session still binds that provider identity to the exact launch
@@ -422,17 +448,46 @@ export function isCurrentGlobalOperator(
         && session.launchId !== undefined
         && session.launchId === launchId)
   );
-  return agentId !== undefined
-    && adapterId !== undefined
-    && launchId !== undefined
-    && binding !== undefined
-    && binding.agentId === session.agentId
+  return binding.agentId === session.agentId
     && binding.adapterId === session.adapterId
     && session.agentId === agentId
     && session.adapterId === adapterId
     && session.launchId !== undefined
     && session.launchId === launchId
     && nativeSessionMatches;
+}
+
+function currentProcessBelongsToReservedGlobalLaunch(
+  store: Partial<Pick<TaskStore, "getSessionOwner" | "getWorkMailbox">>,
+  input: Readonly<{
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    launchId: string;
+  }>
+): boolean {
+  if (store.getSessionOwner === undefined || store.getWorkMailbox === undefined) return false;
+  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "global",
+    roleName: input.roleName
+  }));
+  if (!isRuntimeLaunchReservation(mailbox?.processing, input.launchId)
+    || hasRuntimeCleanupObligation(mailbox)) return false;
+  const owner = store.getSessionOwner(input.launchId);
+  if (owner === null
+    || owner.owner.scope !== "global"
+    || owner.owner.roleName !== input.roleName
+    || owner.agentId !== input.agentId
+    || owner.adapterId !== input.adapterId
+    || owner.launchId !== input.launchId
+    || owner.providerRoot.attribution !== "launch-env"
+    || !isLinuxProcessLive(owner.providerRoot.pid, owner.providerRoot.startIdentity)) {
+    return false;
+  }
+  return listOwnedProcessTree(
+    owner.providerRoot.pid,
+    owner.providerRoot.processGroupId
+  ).some(({ pid }) => pid === process.pid);
 }
 
 function inputAnswerer(environment: NodeJS.ProcessEnv | undefined): "user" | "operator" {
