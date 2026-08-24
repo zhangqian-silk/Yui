@@ -12,6 +12,7 @@ import {
   activeLiveRoleAgentSession,
   bindTaskRoleProviderRuntime,
   bindTaskRoleRun,
+  clearTaskRoleProviderRuntimeForCleanup,
   clearTaskRoleRun,
   createRoleSessionSet,
   markTaskRoleRunDelivered,
@@ -20,7 +21,6 @@ import {
   recordRoleAgentSession,
   recordTaskRoleTurnBoundary,
   rememberRoleAgentCompletedTurn,
-  retireTaskRoleSessionsForWorkspace,
   updateRoleAgentSessionStatus,
   updateTaskRoleProviderRuntime,
   type AgentSessionStatus,
@@ -1784,9 +1784,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       markRuntimeOwnerSessionStopped(store, owner, now);
       if (owner.scope === "task") {
         const sessions = store.getTaskRoleSessionSet(owner.taskId, owner.roleName);
-        if (sessions !== null) {
+        if (sessions !== null && sessions.providerBinding !== null) {
           store.saveTaskRoleSessionSet(
-            retireTaskRoleSessionsForWorkspace(sessions, now)
+            clearTaskRoleProviderRuntimeForCleanup(sessions, now)
           );
         }
       }

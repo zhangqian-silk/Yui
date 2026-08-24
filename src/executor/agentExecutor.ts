@@ -338,6 +338,28 @@ export function retireTaskRoleSessionsForWorkspace(
 }
 
 /**
+ * Clears the Provider transport identity after its physical runtime is proven
+ * stopped, without retiring workspace-bound Session records. Workspace
+ * retirement remains a separate, stricter transaction after every supported
+ * placeholder has been terminalized.
+ */
+export function clearTaskRoleProviderRuntimeForCleanup(
+  set: TaskRoleSessionSet,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  if (set.inFlight !== null) {
+    throw new Error("Cannot clear a Task Role Provider runtime with unsettled Run state.");
+  }
+  if (set.providerBinding === null) return set;
+  return validateRoleSessionSet({
+    ...set,
+    providerBinding: null,
+    updatedAt: requireDate(now, "Provider Runtime cleanup timestamp")
+  });
+}
+
+/**
  * Terminalizes only the aggregate-16 Claude placeholder shape after the
  * caller has fenced the Task store and proved that the exact Role has no live
  * native pane. All other nonterminal durable Sessions remain blockers for the
