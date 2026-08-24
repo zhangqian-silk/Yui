@@ -18,6 +18,61 @@ export type OperatorSessionListItem = Readonly<{
   updatedAt: string;
 }>;
 
+export type OperatorWriterStatus = Readonly<{
+  state: "active" | "inactive" | "unrecorded";
+  agentId: string;
+  adapterId: string;
+  sessionRef?: string;
+  nativeSessionId?: string;
+  sessionStatus?: RoleAgentSession["status"];
+}>;
+
+export type OperatorStatusProjection = Readonly<{
+  writer: OperatorWriterStatus;
+  historicalConversations: readonly OperatorSessionListItem[];
+}>;
+
+/** Separates the one selected writer authority from retained conversations. */
+export function projectOperatorStatus(
+  sessions: GlobalRoleSessionSet | null,
+  activeAgentId: string,
+  activeAdapterId: string
+): OperatorStatusProjection {
+  if (sessions === null) {
+    return Object.freeze({
+      writer: { state: "unrecorded", agentId: activeAgentId, adapterId: activeAdapterId },
+      historicalConversations: []
+    });
+  }
+  validateRoleSessionSet(sessions);
+  // The GlobalRole binding is the writer authority. The SessionSet pointer is
+  // retained operational state and may lag a Role update, so it cannot select
+  // a second Operator writer.
+  const active = sessions.sessions[activeAgentId];
+  const matchingActive = active?.adapterId === activeAdapterId ? active : undefined;
+  const activeRef = matchingActive === undefined ? undefined : operatorSessionRef(matchingActive);
+  const historicalConversations = listOperatorSessions(sessions)
+    .filter((entry) => entry.ref !== activeRef)
+    .map((entry) => ({ ...entry, state: "history" as const }));
+  if (matchingActive === undefined) {
+    return Object.freeze({
+      writer: { state: "unrecorded", agentId: activeAgentId, adapterId: activeAdapterId },
+      historicalConversations
+    });
+  }
+  return Object.freeze({
+    writer: {
+      state: matchingActive.status === "stopped" || matchingActive.status === "broken" ? "inactive" : "active",
+      agentId: matchingActive.agentId,
+      adapterId: matchingActive.adapterId,
+      sessionRef: activeRef,
+      nativeSessionId: matchingActive.nativeSessionId,
+      sessionStatus: matchingActive.status
+    },
+    historicalConversations
+  });
+}
+
 type OperatorSessionIdentity = Readonly<{
   agentId: string;
   adapterId: string;

@@ -459,6 +459,7 @@ Submit information through Operator:
 ```sh
 yui operator submit "Compare CSV and JSON compatibility" --task <task-id>
 yui operator submit "Investigate a smaller cache design"
+yui operator status
 yui operator list
 yui operator resume
 yui operator resume --last
@@ -487,13 +488,15 @@ bounded outcome stay in that Task even when they involve multiple Projects.
 A distinct outcome, ownership boundary, or lifecycle creates a separate Task.
 Features, bugs, and questions use the same
 Task/WorkItem model rather than separate workflow types.
-`operator list` shows recent conversations in fixed most-recently-updated order using
+`operator status` shows exactly one GlobalRole-selected writer separately from
+retained historical conversations. `operator list` shows recent conversations in fixed most-recently-updated order using
 their Agent and readable title or preview; native provider session IDs remain
 internal. Until an adapter supplies that metadata, Yui shows the provider plus
 a stable short Yui reference so untitled conversations remain distinguishable.
-`operator resume` opens the same lightweight numbered list, while
-`--last` resumes the newest entry directly. `operator new` starts a clean
-conversation and preserves the previous one in history.
+`operator resume` opens the lightweight numbered history list, while `--last`
+resumes the newest entry directly. Starting a conversation is never a resume
+choice: the explicit `operator new` command starts a clean conversation and
+preserves the previous one in history.
 
 Create a Task-bound Worker instance from the configured global Worker, apply a
 Profile, and dispatch a WorkItem:

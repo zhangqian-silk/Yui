@@ -1284,10 +1284,11 @@ export const ROOT_COMMAND = buildNode({
       sections: [{
         id: "workflow",
         title: "Commands",
-        entries: ["enter", "new", "list", "resume", "submit"]
+        entries: ["enter", "status", "new", "list", "resume", "submit"]
       }],
       children: [
         { name: "enter", summary: "Enter the Operator's native session." },
+        { name: "status", summary: "Show the unique active writer and retained conversation history." },
         {
           name: "new",
           summary: "Start a new Operator session.",
