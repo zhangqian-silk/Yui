@@ -3629,6 +3629,7 @@ function taskReviewCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "request") return requestTaskReviewRound(rest, store, options);
+  if (command === "force-fresh") return forceFreshTaskReviewRound(rest, store, options);
   if (command === "retry") return retryFailedTaskReviewRound(rest, store, options);
   if (command === "group") return resolveReviewExecutionGroup(rest, store, options);
   if (command === "finding") return reviewFindingCommand(rest, store, options);
@@ -4206,6 +4207,275 @@ function requestTaskReviewRound(
       : `Task-final Review is already ${round.status}: ${round.id}\n`,
     { reviewRound: round }
   );
+}
+
+const TASK_FINAL_FORCE_FRESH_EVENT = "review.task-final-force-fresh-requested";
+
+/**
+ * Creates a distinct full Task-final ReviewRound only when the exact previous
+ * Round failed without producing semantic review evidence. The source Round,
+ * Run, findings, workspace, and terminal report remain immutable history; the
+ * linking Event is both the audit record and the idempotence key.
+ */
+function forceFreshTaskReviewRound(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task review force-fresh usage: yui task review force-fresh <task>/<review-round>.";
+  exactPositionals(args, 1, usage);
+  const reference = taskRecordReference(
+    args[0],
+    "reviewRound",
+    "ReviewRound reference",
+    options
+  );
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const source = tx.getReviewRound(reference.taskId, reference.localId);
+    if (source === null) {
+      throw dataError(`ReviewRound not found: ${reference.taskId}/${reference.localId}.`);
+    }
+    const task = requireTask(tx, reference.taskId);
+    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    if (taskActor(options, task.id) !== "leader") {
+      throw usageError("Only the Task Leader may force a fresh Task-final ReviewRound.");
+    }
+    if ((source.scope ?? "work-item") !== "task") {
+      throw usageError(`ReviewRound ${source.id} is not a Task-final ReviewRound.`);
+    }
+
+    const replacementEvents = tx.listEvents(task.id).filter((event) => (
+      event.type === TASK_FINAL_FORCE_FRESH_EVENT
+      && event.payload.sourceReviewRoundId === source.id
+    ));
+    if (replacementEvents.length > 1) {
+      throw dataError(`ReviewRound ${source.id} has duplicate force-fresh audit events.`);
+    }
+    const replacementEvent = replacementEvents[0];
+    if (replacementEvent !== undefined) {
+      const replacementId = replacementEvent.payload.reviewRoundId;
+      const replacement = replacementId === undefined
+        ? null
+        : tx.getReviewRound(task.id, replacementId);
+      if (replacement === null
+        || replacement.id === source.id
+        || (replacement.scope ?? "work-item") !== "task"
+        || replacement.workItemId !== source.workItemId
+        || replacement.candidateId !== source.candidateId
+        || replacement.reviewerRoleName !== source.reviewerRoleName
+        || replacement.deltaRecheck !== undefined
+        || !sameTaskFinalReviewContract(
+          replacement.taskFinalReviewContract,
+          source.taskFinalReviewContract
+        )
+        || !isSameTaskReviewCandidate(replacement.taskCandidate, source.taskCandidate!)
+        || replacementEvent.payload.workItemId !== replacement.workItemId
+        || replacementEvent.payload.candidateId !== replacement.candidateId
+        || replacementEvent.payload.reviewerRoleName !== replacement.reviewerRoleName
+        || replacementEvent.payload.taskCandidate !== JSON.stringify(replacement.taskCandidate)) {
+        throw dataError(`Force-fresh audit for ${source.id} does not match its replacement Round.`);
+      }
+      return { round: replacement, source, created: false } as const;
+    }
+
+    const semanticBlocker = forceFreshSemanticBlocker(tx, source);
+    if (semanticBlocker !== null) {
+      throw usageError(
+        `ReviewRound ${source.id} is not eligible for force-fresh: ${semanticBlocker}`
+      );
+    }
+    if (source.taskCandidate === undefined) {
+      throw dataError(`ReviewRound ${source.id} has no frozen Task candidate.`);
+    }
+    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
+    if (!sameTaskFinalReviewContract(source.taskFinalReviewContract, taskFinalContract)) {
+      throw usageError(`Task final-review contract does not match ReviewRound ${source.id}.`);
+    }
+    if (source.executionGroup !== undefined
+      && (source.executionGroup.strategy.mode !== "fixed"
+        || source.executionGroup.strategy.count !== 1
+        || source.executionGroup.lanes.length !== 1
+        || source.executionGroup.lanes[0]!.roleName !== source.reviewerRoleName)) {
+      throw usageError(
+        `ReviewRound ${source.id} is not a single-Reviewer full Review; force-fresh is refused.`
+      );
+    }
+
+    const item = tx.getWorkItem(task.id, source.workItemId);
+    const candidate = item?.candidates.find(({ id }) => id === source.candidateId);
+    if (item === null || item === undefined || candidate === undefined) {
+      throw dataError(
+        `Final Review anchor Candidate is no longer available: `
+        + `${source.workItemId}/${source.candidateId}.`
+      );
+    }
+    const provenance = taskReviewProvenance(tx, task, options);
+    if (!isSameTaskReviewCandidate(source.taskCandidate, provenance.candidate)) {
+      throw usageError(
+        `Final ReviewRound ${source.id} freezes a candidate that is no longer the current Task candidate.`
+      );
+    }
+    const producerCollision = taskReviewProducerCollision(provenance, source.reviewerRoleName);
+    if (producerCollision !== null) throw usageError(producerCollision);
+
+    const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
+      .filter((entry) => (entry.scope ?? "work-item") === "task"));
+    const sourceIndex = taskRounds.findIndex(({ id }) => id === source.id);
+    if (sourceIndex < 0) {
+      throw dataError(`Final ReviewRound is not in Task history: ${source.id}.`);
+    }
+    const laterRound = taskRounds.slice(sourceIndex + 1).at(-1);
+    if (laterRound !== undefined) {
+      throw usageError(
+        `A newer Task-final ReviewRound already exists after ${source.id}: `
+        + `${laterRound.id}/${laterRound.status}.`
+      );
+    }
+    assertNoConflictingTaskReviewRound(taskRounds, source.id);
+    assertTaskReviewRequestLane(tx, task.id, source.reviewerRoleName);
+
+    let reviewer = tx.getRole(task.id, source.reviewerRoleName);
+    if (reviewer === null) {
+      if (tx.getGlobalRole(source.reviewerRoleName) === null) {
+        throw usageError(`Global Role not found: ${source.reviewerRoleName}.`);
+      }
+      reviewer = createTaskRole(
+        tx,
+        task,
+        source.reviewerRoleName,
+        undefined,
+        now,
+        source.reviewerRoleName
+      );
+      tx.saveRole(task.id, reviewer);
+    }
+
+    let created = createTaskReviewRound(
+      tx.nextReviewRoundId(task.id),
+      task.id,
+      source.workItemId,
+      source.candidateId,
+      source.reviewerRoleName,
+      "leader",
+      source.taskCandidate,
+      now,
+      taskFinalContract
+    );
+    const group = createExecutionGroup(
+      `execution-group-${created.id}`,
+      task.id,
+      {
+        purpose: "review",
+        target: executionTargetForReviewRound(task, created, item, candidate),
+        strategy: { mode: "fixed", count: 1 },
+        lanes: [{ roleName: reviewer.name, reviewRoundId: created.id }]
+      },
+      now
+    );
+    created = { ...created, executionGroup: group };
+    tx.saveReviewRound(task.id, created);
+    recordTaskEvent(tx, task.id, TASK_FINAL_FORCE_FRESH_EVENT, {
+      sourceReviewRoundId: source.id,
+      ...(source.reviewerRunId === undefined ? {} : { sourceReviewerRunId: source.reviewerRunId }),
+      reviewRoundId: created.id,
+      workItemId: created.workItemId,
+      candidateId: created.candidateId,
+      reviewerRoleName: created.reviewerRoleName,
+      taskCandidate: JSON.stringify(created.taskCandidate),
+      reason: "source-round-failed-without-semantic-review",
+      leaderActionRunId: taskLeaderActionRunId(
+        tx,
+        task.id,
+        options.environment,
+        options.yuiHome
+      ) ?? "leader"
+    }, now);
+    return { round: created, source, created: true } as const;
+  });
+  return output(
+    result.created
+      ? `Fresh Task-final Review requested as ${result.round.id} after ${result.source.id}\n`
+      : `Fresh Task-final Review already requested as ${result.round.id} after ${result.source.id}\n`,
+    { reviewRound: result.round, sourceReviewRound: result.source }
+  );
+}
+
+/** Returns the exact semantic evidence that makes a failed Round ineligible. */
+function forceFreshSemanticBlocker(
+  store: TaskWorkflowStore,
+  round: ReviewRound
+): string | null {
+  if (round.status !== "failed") return `source status is ${round.status}, not failed.`;
+  if ((round.checks ?? []).length > 0) return "the Round records review checks.";
+  if (round.evidenceCommit !== undefined) return "the Round records a review evidence commit.";
+  if (round.report !== round.summary) {
+    return "the Round stores a report distinct from its failure summary.";
+  }
+  if (runtimeFailureSummaryHasReviewerOutput(round.report ?? "")) {
+    return "the Round stores non-empty Reviewer output in its runtime failure summary.";
+  }
+  if (round.deltaRecheck?.disposition !== undefined
+    || round.deltaRecheck?.reasoning !== undefined) {
+    return "the Round records a semantic delta-recheck disposition.";
+  }
+  const semanticLane = round.executionGroup?.lanes.find((lane) => (
+    lane.status === "yielded"
+    || lane.status === "completed"
+    || lane.result?.report !== undefined
+    || (lane.result?.checks ?? []).length > 0
+    || (lane.result?.findings ?? []).length > 0
+    || (lane.result?.evidence ?? []).length > 0
+    || lane.result?.evidenceCommit !== undefined
+  ));
+  if (semanticLane !== undefined) {
+    return `Reviewer Lane ${semanticLane.id} delivered semantic evidence.`;
+  }
+  const yieldedRun = store.listAgentRuns(round.taskId).find((run) => (
+    run.purpose === "review"
+    && run.reviewRoundId === round.id
+    && run.status === "yielded"
+  ));
+  if (yieldedRun !== undefined) return `Reviewer Run ${yieldedRun.id} yielded a report.`;
+  const finding = store.listReviewFindings(round.taskId).find((entry) => (
+    entry.firstReviewRoundId === round.id || entry.lastReviewRoundId === round.id
+  ));
+  if (finding !== undefined) return `Review finding ${finding.id} references the Round.`;
+  const semanticEvent = store.listEvents(round.taskId).find((event) => (
+    event.type === "review.completed" && event.payload.reviewRoundId === round.id
+  ));
+  if (semanticEvent !== undefined) return `Review completion Event ${semanticEvent.id} exists.`;
+  if (looksLikeStructuredReviewReport(round.report ?? "")) {
+    return "the Round stores a structured reviewer report.";
+  }
+  return null;
+}
+
+function runtimeFailureSummaryHasReviewerOutput(summary: string): boolean {
+  const match = /(?:^|\n)last_assistant_message:[ \t]*([\s\S]*)$/u.exec(summary);
+  const output = match?.[1];
+  return output !== undefined && output.trim().length > 0;
+}
+
+function looksLikeStructuredReviewReport(report: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(report) as unknown;
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+  const record = parsed as Record<string, unknown>;
+  return [
+    "summary",
+    "report",
+    "checks",
+    "findings",
+    "evidence",
+    "evidenceCommit",
+    "deltaDisposition",
+    "deltaReasoning"
+  ].some((key) => Object.hasOwn(record, key));
 }
 
 /**
