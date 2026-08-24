@@ -4412,6 +4412,9 @@ function forceFreshSemanticBlocker(
   if (round.report !== round.summary) {
     return "the Round stores a report distinct from its failure summary.";
   }
+  if (runtimeFailureSummaryHasReviewerOutput(round.report ?? "")) {
+    return "the Round stores non-empty Reviewer output in its runtime failure summary.";
+  }
   if (round.deltaRecheck?.disposition !== undefined
     || round.deltaRecheck?.reasoning !== undefined) {
     return "the Round records a semantic delta-recheck disposition.";
@@ -4446,6 +4449,12 @@ function forceFreshSemanticBlocker(
     return "the Round stores a structured reviewer report.";
   }
   return null;
+}
+
+function runtimeFailureSummaryHasReviewerOutput(summary: string): boolean {
+  const match = /(?:^|\n)last_assistant_message:[ \t]*([\s\S]*)$/u.exec(summary);
+  const output = match?.[1];
+  return output !== undefined && output.trim().length > 0;
 }
 
 function looksLikeStructuredReviewReport(report: string): boolean {
