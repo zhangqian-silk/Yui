@@ -41,10 +41,12 @@ import {
   readRuntimeStopReceipt,
   removeRuntimeStopReceipt
 } from "./runtimeStopReceipt.js";
+import {
+  AGENT_HOST_CONTROL_TIMEOUT_MS,
+  AGENT_HOST_READY_TIMEOUT_MS
+} from "./runtimeDeadlines.js";
 
 export const AGENT_HOST_CONTROL_PROTOCOL = "yui-agent-host/v2" as const;
-const HOST_CONTROL_TIMEOUT_MS = 35_000;
-const HOST_READY_TIMEOUT_MS = 35_000;
 const HOST_CONTROL_MAX_BYTES = 32 * 1024;
 
 export type AgentHostLaunchControl = Readonly<{
@@ -777,7 +779,7 @@ export async function waitForAgentHostLaunchAck(input: Readonly<{
   requireTurnAck?: boolean;
   timeoutMs?: number;
 }>): Promise<AgentHostSnapshot> {
-  const deadline = Date.now() + (input.timeoutMs ?? HOST_READY_TIMEOUT_MS);
+  const deadline = Date.now() + (input.timeoutMs ?? AGENT_HOST_READY_TIMEOUT_MS);
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
@@ -820,7 +822,7 @@ async function sendAgentHostControl(input: Readonly<{
     const timer = setTimeout(() => {
       client.destroy();
       reject(new Error("Agent Host control request timed out."));
-    }, HOST_CONTROL_TIMEOUT_MS);
+    }, AGENT_HOST_CONTROL_TIMEOUT_MS);
     let settled = false;
     const settle = <T>(callback: (value: T) => void, value: T): void => {
       if (settled) return;

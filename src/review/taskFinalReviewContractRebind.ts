@@ -23,9 +23,14 @@ import {
   validateTaskFinalReviewContract,
   type TaskFinalReviewContract
 } from "./taskFinalReviewContract.js";
+import type { ReviewRound } from "./reviewRound.js";
+import {
+  governingWorkItemCandidate,
+  type WorkItem
+} from "../workItem/workItem.js";
+import { TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT } from "./taskFinalReviewContractEvent.js";
 
-export const TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT =
-  "review.task-final-contract-rebound";
+export { TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT } from "./taskFinalReviewContractEvent.js";
 
 export type TaskFinalReviewReleaseIdentity = Readonly<{
   releaseId: string;
@@ -68,6 +73,44 @@ export type TaskFinalReviewContractRebindProof = Readonly<{
   toRelease: TaskFinalReviewReleaseIdentity;
   handoverId: string;
 }>;
+
+/**
+ * Resolves the effective Task-final Review contract from its immutable Task
+ * records. Mutation and read-model callers share this adapter so a legal
+ * release rebind cannot be interpreted differently by the two paths.
+ */
+export function resolveRecordedTaskFinalReviewContract(
+  taskId: string,
+  workItems: readonly WorkItem[],
+  reviewRounds: readonly ReviewRound[],
+  events: readonly TaskEvent[]
+): TaskFinalReviewContractResolution | undefined {
+  const candidateObservations = workItems.flatMap((item) => {
+    const candidate = governingWorkItemCandidate(item);
+    return candidate?.taskFinalReviewContract === undefined
+      ? []
+      : [{
+          contract: candidate.taskFinalReviewContract,
+          createdAt: candidate.createdAt,
+          source: `Candidate ${item.id}/${candidate.id}`
+        }];
+  });
+  const reviewObservations = reviewRounds.flatMap((round) => (
+    (round.scope ?? "work-item") !== "task"
+    || round.taskFinalReviewContract === undefined
+      ? []
+      : [{
+          contract: round.taskFinalReviewContract,
+          createdAt: round.createdAt,
+          source: `ReviewRound ${round.id}`
+        }]
+  ));
+  return resolveTaskFinalReviewContract(
+    taskId,
+    [...candidateObservations, ...reviewObservations],
+    events
+  );
+}
 
 export function createTaskFinalReviewContractRebind(input: Readonly<{
   taskId: string;

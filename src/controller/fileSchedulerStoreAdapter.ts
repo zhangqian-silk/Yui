@@ -20,6 +20,7 @@ import {
   recordRoleAgentSession,
   recordTaskRoleTurnBoundary,
   rememberRoleAgentCompletedTurn,
+  retireTaskRoleSessionsForWorkspace,
   updateRoleAgentSessionStatus,
   updateTaskRoleProviderRuntime,
   type AgentSessionStatus,
@@ -1779,7 +1780,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           startedAt: now.toISOString()
         }), batchId);
       }
-      markRuntimeOwnerSessionStopped(store, runtimeOwnerFromTarget(target), now);
+      const owner = runtimeOwnerFromTarget(target);
+      markRuntimeOwnerSessionStopped(store, owner, now);
+      if (owner.scope === "task") {
+        const sessions = store.getTaskRoleSessionSet(owner.taskId, owner.roleName);
+        if (sessions !== null) {
+          store.saveTaskRoleSessionSet(
+            retireTaskRoleSessionsForWorkspace(sessions, now)
+          );
+        }
+      }
       saveRuntimeLifecycleMailbox(store, mailbox);
       return true;
     });

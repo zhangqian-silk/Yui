@@ -332,6 +332,7 @@ export function retireTaskRoleSessionsForWorkspace(
     // receive a fresh identity after the Role workspace changes.
     history: [...(set.history ?? []), ...Object.values(set.sessions)],
     sessions: {},
+    providerBinding: null,
     updatedAt: timestamp
   });
 }
@@ -438,6 +439,9 @@ export function roleAgentSessionResumeMode(
     }
     return "new";
   }
+  if (session.status === "stopped" || session.status === "broken") {
+    return "new";
+  }
   const compatible = set.owner.scope === "task"
     ? effectiveLaunchSnapshotsCompatibleForTaskMain(
         session.effective,
@@ -446,13 +450,10 @@ export function roleAgentSessionResumeMode(
       )
     : effectiveLaunchSnapshotsCompatible(session.effective, desired);
   if (compatible) return "resume";
-  if (session.status !== "stopped" && session.status !== "broken") {
-    throw new Error(
-      `Role Agent session is incompatible with the next effective launch: ${agentId}. `
-      + "Stop the existing native process before starting a fresh Session."
-    );
-  }
-  return "new";
+  throw new Error(
+    `Role Agent session is incompatible with the next effective launch: ${agentId}. `
+    + "Stop the existing native process before starting a fresh Session."
+  );
 }
 
 export function bindTaskRoleRun(

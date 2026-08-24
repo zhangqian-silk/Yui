@@ -155,6 +155,18 @@ export class TaskWorkspaceCoordinator {
     return "released";
   }
 
+  /**
+   * Stops one Task Role's physical runtime without changing its workspace.
+   * The caller owns the subsequent atomic record retirement and wake.
+   */
+  async cleanupTaskRoleRuntime(
+    taskId: string,
+    roleName: string
+  ): Promise<"released"> {
+    await this.#stopLiveRoles(taskId, [roleName]);
+    return "released";
+  }
+
   async cleanupReviewRound(
     taskId: string,
     reviewRoundId: string
@@ -490,19 +502,14 @@ export class TaskWorkspaceCoordinator {
     const observedPanes = inspect?.(taskId);
     const live = targets.filter((roleName) => {
       const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
-      const activeSession = sessions === null
-        ? undefined
-        : sessions.activeAgentId === undefined
-          // Narrow test doubles and restored callers predating activeAgentId
-          // still conservatively represent any nonterminal record as live.
-          ? Object.values(sessions.sessions).find(
-              ({ status }) => status !== "stopped" && status !== "broken"
-            )
-          : sessions.sessions[sessions.activeAgentId];
       return observedPanes?.some((pane) => pane.roleName === roleName && !pane.dead) === true
-        || (sessions !== null && activeSession !== undefined
-          && activeSession.status !== "stopped"
-          && activeSession.status !== "broken");
+        // A terminal current Session can still carry a resumable native id or
+        // Provider binding. Exact cleanup retires both before a workspace or
+        // release-control transition is allowed to wake this Role again.
+        || (sessions !== null && (
+          Object.keys(sessions.sessions).length > 0
+          || sessions.providerBinding !== null
+        ));
     });
     if (live.length > 0) await this.runtime.stopTaskRoleSessions(taskId, live);
 

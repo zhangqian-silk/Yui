@@ -32,13 +32,13 @@ import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 import { SessionOwnerReconciliation } from "./sessionOwnerReconciliation.js";
 import { WorkspaceCleanupBlockedError } from "../repository/taskWorkspacePreparer.js";
+import {
+  CONTROLLER_SHUTDOWN_TIMEOUT_MS,
+  LIFECYCLE_REQUEST_TIMEOUT_MS
+} from "../runtime/runtimeDeadlines.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
-// A lifecycle RPC may legitimately occupy the Controller for 30 seconds.
-// Restart must allow that request to drain before deciding shutdown is stuck.
-const SHUTDOWN_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 50;
-const LIFECYCLE_REQUEST_TIMEOUT_MS = 60_000;
 const ENVIRONMENT_REFRESH_TIMEOUT_MS = 500;
 const CONFIGURATION_REFRESH_TIMEOUT_MS = 500;
 const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
@@ -285,7 +285,7 @@ export async function stopFileTaskController(
   const call = options.call ?? callController;
   const shutdownTimeoutMs = positive(
     options.shutdownTimeoutMs,
-    SHUTDOWN_TIMEOUT_MS,
+    CONTROLLER_SHUTDOWN_TIMEOUT_MS,
     "shutdownTimeoutMs"
   );
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
@@ -356,7 +356,7 @@ export async function restartFileTaskController(
   const call = options.call ?? callController;
   const shutdownTimeoutMs = positive(
     options.shutdownTimeoutMs,
-    SHUTDOWN_TIMEOUT_MS,
+    CONTROLLER_SHUTDOWN_TIMEOUT_MS,
     "shutdownTimeoutMs"
   );
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
@@ -723,7 +723,10 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     ) {
       await this.workspacePreparer.prepareTaskWorkspace(taskId);
     }
-    await callFileTaskController(this.home, "scheduler.scan", {}, this.clientOptions);
+    await callFileTaskController(this.home, "scheduler.scan", {}, {
+      ...this.clientOptions,
+      requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
+    });
   }
 }
 

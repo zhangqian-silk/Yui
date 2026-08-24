@@ -69,6 +69,7 @@ import {
   type ContextSnapshot
 } from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import { TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT } from "../review/taskFinalReviewContractEvent.js";
 import {
   validateInputRequest,
   type InputRequest
@@ -1040,6 +1041,8 @@ export class FileTaskStore implements TaskStore {
       changeSets: values(aggregate.changeSets, "id"),
       integrations: values(aggregate.integrationAttempts, "id"),
       reviewRounds: values(aggregate.reviewRounds, "id"),
+      taskFinalReviewContractEvents: values(aggregate.events, "id")
+        .filter((event) => event.type === TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT),
       reviewConfig: this.getReviewConfig(),
       openInputRequests: values(aggregate.inputRequests, "id")
         .filter((request) => request.status === "open"),

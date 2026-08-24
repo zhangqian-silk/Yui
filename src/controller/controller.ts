@@ -49,6 +49,7 @@ import {
 import type { JsonValue } from "../core/protocol.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import { isProjectMaintenanceFenced } from "../repository/projectMaintenanceLock.js";
+import { isHandoverLockHeld } from "../release/runtimeRelease.js";
 import { KeyedWorkQueue } from "../coordination/keyedWorkQueue.js";
 import { MailboxScheduler } from "../coordination/mailboxScheduler.js";
 import { nearestDeadlineBatch } from "../coordination/deadlineScheduler.js";
@@ -171,6 +172,8 @@ export type ControllerRuntimeOptions = Readonly<{
     taskId: string;
     projectIds: readonly string[];
   }>) => void;
+  /** Suppresses new Leader dispatch while a release/rebind handover is live. */
+  leaderWakeFence?: () => boolean;
   /**
    * Reconciles DurableJobs once per scheduler pass: spawns queued detached
    * runners, harvests terminal evidence, and enqueues Leader wakeups.
@@ -283,7 +286,8 @@ export async function runControllerSchedulerPass(
   onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"],
   blockedTaskIds: ReadonlySet<string> = new Set(),
   inputDeliveryRecoveryCutoff?: Date,
-  diagnosticAfterMs = DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS
+  diagnosticAfterMs = DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS,
+  leaderWakeFence?: () => boolean
 ): Promise<ControllerSchedulerResult> {
   const compiledSelection = compileReconcileSelection(scope);
   const selection = includeOperator
@@ -309,10 +313,14 @@ export async function runControllerSchedulerPass(
     selection,
     failedCleanupRoles
   );
-  const wakeupSelection = selectionWithoutFailedLeaderCleanupTasks(
-    store,
-    selection,
-    failedCleanupRoles
+  const availableWakeupSelection = (): SchedulerReconcileSelection => (
+    leaderWakeFence?.() === true
+      ? exactTaskSelection(new Set())
+      : selectionWithoutFailedLeaderCleanupTasks(
+          store,
+          selection,
+          failedCleanupRoles
+        )
   );
   if (selection.full) repairOrphanedActiveTasks(store, now, selection);
   const claimedTaskMailboxes = claimSelectedTaskMailboxes(store, selection, now);
@@ -320,7 +328,7 @@ export async function runControllerSchedulerPass(
     // Durable Leader work that already has a ready Task workspace belongs to
     // the control path. Dispatch it before any unrelated Task workspace I/O;
     // the processor itself retains the fail-closed workspace-ready guard.
-    const initialWakeups = selectedPendingWakeups(store, wakeupSelection);
+    const initialWakeups = selectedPendingWakeups(store, availableWakeupSelection());
     const initialWakeupResults = await processLeaderWakeups(
       store,
       delivery,
@@ -441,16 +449,17 @@ export async function runControllerSchedulerPass(
         : []
     )));
     const laterWakeupTaskIds = new Set(
-      [...selectedPendingWakeups(store, wakeupSelection)].flatMap(([taskId, wakeup]) => {
-        const initial = initialWakeups.get(taskId);
-        return initial === undefined
-          || !pendingWakeupsMatch(initial, wakeup)
-          || waitingInputTaskIds.has(taskId)
-          || workspaceReadyTaskIds.has(taskId)
-          || newlyIdleBusyTaskIds.has(taskId)
-          ? [taskId]
-          : [];
-      })
+      [...selectedPendingWakeups(store, availableWakeupSelection())]
+        .flatMap(([taskId, wakeup]) => {
+          const initial = initialWakeups.get(taskId);
+          return initial === undefined
+            || !pendingWakeupsMatch(initial, wakeup)
+            || waitingInputTaskIds.has(taskId)
+            || workspaceReadyTaskIds.has(taskId)
+            || newlyIdleBusyTaskIds.has(taskId)
+            ? [taskId]
+            : [];
+        })
     );
     const laterWakeups = await processLeaderWakeups(
       store,
@@ -1282,6 +1291,7 @@ export class FileTaskController {
   readonly #onMaintenanceFenceDefer:
     | ControllerRuntimeOptions["onMaintenanceFenceDefer"]
     | undefined;
+  readonly #leaderWakeFence: (() => boolean) | undefined;
   readonly #jobSupervisor: ControllerRuntimeOptions["jobSupervisor"];
   readonly #continuationReconciler: ControllerRuntimeOptions["continuationReconciler"];
   #current: Promise<ControllerSchedulerResult> | undefined;
@@ -1369,6 +1379,7 @@ export class FileTaskController {
     this.#onExpiredEphemeralDomain = options.onExpiredEphemeralDomain;
     this.#maintenanceFence = options.maintenanceFence;
     this.#onMaintenanceFenceDefer = options.onMaintenanceFenceDefer;
+    this.#leaderWakeFence = options.leaderWakeFence;
     this.#jobSupervisor = options.jobSupervisor;
     this.#continuationReconciler = options.continuationReconciler;
     this.#signalScheduler = new MailboxScheduler(
@@ -1644,7 +1655,8 @@ export class FileTaskController {
               this.#onMaintenanceFenceDefer,
               runtimeFailedTaskIds,
               this.#startedAt,
-              this.#diagnosticAfterMs
+              this.#diagnosticAfterMs,
+              this.#leaderWakeFence
             );
           } else {
             const dirtyPass = await this.#runDirtySchedulerPass(
@@ -1776,7 +1788,8 @@ export class FileTaskController {
         this.#onMaintenanceFenceDefer,
         blockedTaskIds,
         this.#startedAt,
-        this.#diagnosticAfterMs
+        this.#diagnosticAfterMs,
+        this.#leaderWakeFence
       ));
     }
     if (
@@ -1830,7 +1843,8 @@ export class FileTaskController {
               this.#onMaintenanceFenceDefer,
               blockedTaskIds,
               this.#startedAt,
-              this.#diagnosticAfterMs
+              this.#diagnosticAfterMs,
+              this.#leaderWakeFence
             );
             this.#clearTaskPassRetry(selected.taskScope.taskId);
           } catch (error) {
@@ -2328,7 +2342,9 @@ export async function startFileTaskController(
   const runtime = new FileTaskController(store, delivery, {
     ...options,
     maintenanceFence: options.maintenanceFence
-      ?? ((projectId: string) => isProjectMaintenanceFenced(home, projectId))
+      ?? ((projectId: string) => isProjectMaintenanceFenced(home, projectId)),
+    leaderWakeFence: options.leaderWakeFence
+      ?? (() => isHandoverLockHeld(home))
   });
   let stopping = false;
   const lifecycleRequests = new Set<Promise<unknown>>();
