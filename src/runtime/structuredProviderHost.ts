@@ -314,6 +314,12 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
         throw error;
       }
     }
+    if (control.sessionTitle !== undefined) {
+      await runtime.setConversationName({
+        conversationId,
+        name: control.sessionTitle
+      });
+    }
     const session = new CodexStructuredProviderSession(
       child,
       exit,

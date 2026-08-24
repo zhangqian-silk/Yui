@@ -116,17 +116,8 @@ export function serializeRunBootstrapEnvelope(value: RunBootstrapEnvelope): stri
     throw new Error("Run bootstrap protocol is unsupported.");
   }
   const normalized = normalizeCommon(value);
-  const subject = Object.entries(normalized.subject)
-    .map(([key, id]) => `${key}:${id}`)
-    .join(",");
-  const snapshot = normalized.contextSnapshotRef;
   const lines = [
     "Yui managed Run. Follow the Session Manifest and injected Skills.",
-    `${normalized.subject.taskId === undefined ? "" : `task=${normalized.subject.taskId} `}run=${normalized.runId} role=${normalized.roleName} action=${normalized.action}`,
-    `purpose=${normalized.purpose} subject=${subject || "global"} snapshot=${snapshot === undefined ? "none" : `${snapshot.id}@${snapshot.digest}`}`,
-    normalized.deltaRefIds.length === 0
-      ? "delta=none"
-      : `delta=${normalized.deltaRefIds.join(",")}`,
     "Load the exact Run context before acting; fail closed if it is unavailable or mismatched."
   ];
   const serialized = lines.join("\n");
@@ -147,7 +138,6 @@ export function serializeRunHostRecoveryEnvelope(
   const normalized = normalizeCommon(value);
   const serialized = [
     "Yui managed Host recovery for an existing Run.",
-    `${normalized.subject.taskId === undefined ? "" : `task=${normalized.subject.taskId} `}run=${normalized.runId} role=${normalized.roleName}`,
     "Resume the same native conversation from its latest durable state. Do not repeat completed work or replay the original Assignment.",
     "Load the exact Run context or delta only if needed, then continue toward the existing workflow outcome."
   ].join("\n");

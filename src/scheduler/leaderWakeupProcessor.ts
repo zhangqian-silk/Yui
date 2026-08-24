@@ -4,6 +4,8 @@ import {
   serializeRunBootstrapEnvelope
 } from "../context/runContextContract.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { prefixYuiTitleInput } from "../run/runIdentity.js";
+import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import {
   effectiveLaunchSnapshotsCompatible,
   effectiveLaunchSnapshotsCompatibleForTaskMain
@@ -413,7 +415,10 @@ export async function processLeaderWakeups(
       const outcome = await delivery.sendOnce({
         delivery: ready,
         receiptId,
-        text: serializeRunBootstrapEnvelope(run.bootstrapEnvelope)
+        text: prefixYuiTitleInput(
+          serializeRunBootstrapEnvelope(run.bootstrapEnvelope),
+          resolveTaskRoleSessionTitle(effectiveSession.title, task, role.name)
+        )
       });
       if (outcome === "busy" || outcome === "unavailable") {
         store.resolveRoleRunProviderSubmission?.({
@@ -682,6 +687,7 @@ function preflightSession(
         adapterId: preflight.adapterId,
         nativeSessionId: preflight.nativeSessionId,
         launchId: preflight.launchId,
+        ...(preflight.sessionTitle === undefined ? {} : { title: preflight.sessionTitle }),
         status: "ready" as const,
         effective: preflight.effective
       };

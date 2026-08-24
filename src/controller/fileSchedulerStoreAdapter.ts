@@ -5255,6 +5255,7 @@ function mapSession(session: RoleAgentSession): SchedulerRoleSession {
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
     ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
+    ...(session.title === undefined ? {} : { title: session.title }),
     status: session.status,
     effective: session.effective,
     updatedAt: session.updatedAt
@@ -5280,6 +5281,7 @@ function saveTaskSession(
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
     ...(launchId === undefined ? {} : { launchId }),
+    ...(session.title === undefined ? {} : { title: session.title }),
     policy: "fixed",
     status,
     effective: session.effective

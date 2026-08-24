@@ -521,9 +521,16 @@ authorized expansions.
   completion; routine retries and routing do not need an InputRequest.
 - A failed review is terminal evidence, not an automatic retry. Retry a
   WorkItem review with a new `task work review`, accept with an explicit
-  rationale, or ask the user. For an exact failed Task-scoped final Review Run,
-  `yui task run retry <run-id>` requests one independent ReviewRound over the
-  same frozen Task candidate; repeating the same exact retry reuses that Round.
+  rationale, or ask the user. `yui task run retry <run-id>` retries an exact
+  failed Task-final Reviewer execution under the same semantic ReviewRound. If
+  that immutable Round is durably proven non-semantic without any review
+  checks, evidence, finding, or ambiguous output—even when a pre-review
+  context/workspace failure historically terminalized it as completed/yielded—
+  the Leader may run
+  `yui task review force-fresh <task>/<review-round>` to create one distinct
+  full Round over the identical frozen heads. It fails closed for every
+  semantic or ambiguous prior result; target the new failed Round explicitly
+  if another non-semantic failure occurs.
 - If the same non-resource user choice or unavailable external fact repeats,
   persist context and create an InputRequest instead of looping. Never use an
   InputRequest to solicit authorization for an unrequested real-resource test;

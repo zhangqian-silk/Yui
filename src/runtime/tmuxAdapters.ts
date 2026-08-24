@@ -474,6 +474,9 @@ export class TmuxSessionHost implements SessionHostPort {
       agentId: request.agentId,
       adapterId: request.adapterId,
       effective: request.effective,
+      ...(planned.launch.env.YUI_SESSION_TITLE === undefined
+        ? {}
+        : { sessionTitle: planned.launch.env.YUI_SESSION_TITLE }),
       ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
       ...(planned.initialTurnRunId === undefined
         ? {}

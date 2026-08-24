@@ -838,7 +838,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "review",
     summary: "Control Task-final ReviewRounds.",
-    sections: [{ id: "manage", title: "Commands", entries: ["request", "rebind", "group", "retry", "finding"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "rebind", "force-fresh", "group", "retry", "finding"] }],
     children: [
       {
         name: "request",
@@ -851,6 +851,11 @@ const taskChildren: readonly NodeInput[] = [
         summary: "Explicitly rebind a frozen Task-final contract after a verified immutable release handover.",
         usage: "yui task review rebind <task> --from-control <digest> --to-control <digest> --from-release <release-id> --to-release <release-id>",
         options: ["--from-control", "--to-control", "--from-release", "--to-release"]
+      },
+      {
+        name: "force-fresh",
+        summary: "Replace one exact terminal non-semantic Task-final Review with a distinct full Round.",
+        usage: "yui task review force-fresh <task>/<review-round>"
       },
       {
         name: "group",
