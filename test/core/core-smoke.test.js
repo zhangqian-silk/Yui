@@ -754,6 +754,42 @@ test("TmuxSessionHost rejects a managed Task planner without structured Agent Ho
   assert.equal(killed, false);
 });
 
+test("TmuxSessionHost launches an interactive global Role without an Agent Host wrapper", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-global-role-launch-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  let launched;
+  const planner = {
+    planGlobalRole: () => ({
+      role: { name: "operator", workspace: launchWorkspace },
+      launch: {
+        command: "codex",
+        args: ["--model", "gpt-good"],
+        env: { YUI_HOME: home },
+        childLifecycle: "persistent"
+      },
+      session: null
+    })
+  };
+  const tmux = {
+    ensureRoleWindow: (_hostId, _role, launch) => { launched = launch; return true; },
+    inspectRolePane: () => ({ target: "tmux:0", dead: false, currentCommand: "codex" }),
+    killRole: () => undefined
+  };
+  const host = new TmuxSessionHost(planner, tmux);
+  const binding = await host.start(createSessionLaunchRequest({
+    launchId: "launch-global-1",
+    owner: { scope: "global", roleName: "operator" },
+    agentId: "agent",
+    adapterId: "codex",
+    effective: launchEffective,
+    workspace: launchWorkspace,
+    mode: "new"
+  }));
+  assert.equal(launched.command, "codex");
+  assert.deepEqual(launched.args, ["--model", "gpt-good"]);
+  assert.equal(binding.hostCreated, true);
+});
+
 test("TmuxSessionHost forwards the frozen Task descriptors to its internal Agent Host", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-agent-host-env-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
