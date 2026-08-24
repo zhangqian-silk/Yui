@@ -60,6 +60,34 @@ Additional rules:
   `yui task workflow resume <task> <workflow> --grant <new-grant>`; the plan,
   source, and all confirmed step evidence are immutable across the rebind.
 
+## Rebinding an active Task-final Review contract
+
+An active Project-backed Task may already have frozen its Task-final Review
+contract in a Candidate when an immutable release handover changes the exact
+control-plane digest. The old contract remains valid audit evidence, but an
+exact Leader launched by the new release cannot present that old control
+identity. The authenticated global Operator may authorize the one direct
+handover explicitly:
+
+```sh
+"$YUI_SESSION_CLI" task review rebind <task> \
+  --from-control <old-digest> --to-control <current-digest> \
+  --from-release <old-release-id> --to-release <current-release-id>
+```
+
+The command verifies the current global Session Manifest, both installed
+immutable releases, the active release pointer, and the completed handover
+receipt while holding the release handover lock. The Task transaction then
+requires the stored contract, Task identity, Reviewer identity and policy,
+and all historical Candidate/Review contract observations to form one exact
+chain. Success appends one `review.task-final-contract-rebound` event with the
+old/new contract and control digests, release identities, handover id, and
+Operator identity. Historical Candidate and Review records are never
+rewritten; later Candidates use the chain's effective contract. Repeating the
+same proof is idempotent, and the first authorization wakes the Task Leader
+with the exact event reference so blocked delivery can resume. A different release path, active ReviewRound,
+unknown release, identity mismatch, or concurrent drift fails closed.
+
 ## Step catalog
 
 The plan is a fixed, predeclared subset of operations. Each plan entry has an

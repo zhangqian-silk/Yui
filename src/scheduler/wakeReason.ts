@@ -24,6 +24,7 @@ export const WAKE_REASON_KINDS = Object.freeze([
   "role-run-failed",
   "job-finished",
   "published-tree-authorized",
+  "review-contract-rebound",
   "force-wake"
 ] as const);
 
