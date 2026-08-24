@@ -31,6 +31,7 @@ import {
   serializeRunHostRecoveryEnvelope
 } from "../context/runContextContract.js";
 import { serializeProviderRetryEnvelope } from "../run/providerRetry.js";
+import { prefixYuiTitleInput } from "../run/runIdentity.js";
 import type { AgentRun } from "../run/agentRun.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import type { ClaudeAgentConfig, RoleAgentConfig } from "./agentAdapter.js";
@@ -40,7 +41,7 @@ import type {
   AgentEnvironmentRefresh,
   AgentEnvironmentRefreshPort
 } from "../runtime/ports.js";
-import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 import {
   isTaskOwnedWorkspace,
@@ -356,7 +357,11 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       role,
       input,
       { scope: "task", taskId: task.id },
-      taskRoleSessionTitle(task, role.name),
+      resolveTaskRoleSessionTitle(
+        input.mode === "resume" ? existing?.title : undefined,
+        task,
+        role.name
+      ),
       input.mode === "resume" && compatibleExisting ? existing.nativeSessionId : undefined,
       runWorkspace,
       effective,
@@ -729,12 +734,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           ...(providerNativeSessionId === undefined
             ? {}
             : { nativeSessionId: providerNativeSessionId }),
+          ...(sessionTitle === undefined ? {} : { sessionTitle }),
           authority: providerAuthority!,
           ...(carriesInitialTurn
             ? {
                 initialTurn: {
                   attemptId: formatAgentRunReceiptId(owner.taskId, input.runId!),
-                  boundedText: managedRunLaunchEnvelope(managedRun!, input.mode)
+                  boundedText: managedRunLaunchEnvelope(
+                    managedRun!,
+                    input.mode,
+                    sessionTitle
+                  )
                 }
               }
             : {})
@@ -801,6 +811,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       },
       launch: scopedLaunch,
       session,
+      ...(sessionTitle === undefined ? {} : { sessionTitle }),
       ...(carriesInitialTurn && input.runId !== undefined
         ? { initialTurnRunId: input.runId }
         : {})
@@ -902,18 +913,24 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   }
 }
 
-function managedRunLaunchEnvelope(run: AgentRun, mode: "new" | "resume"): string {
-  if (run.providerRetry?.state === "dispatching") {
-    return serializeProviderRetryEnvelope({
-      taskId: run.taskId,
-      runId: run.id,
-      roleName: run.roleName,
-      retry: run.providerRetry
-    });
-  }
-  return mode === "resume" && run.pushedAt !== undefined
-    ? serializeRunHostRecoveryEnvelope(run.bootstrapEnvelope)
-    : serializeRunBootstrapEnvelope(run.bootstrapEnvelope);
+function managedRunLaunchEnvelope(
+  run: AgentRun,
+  mode: "new" | "resume",
+  title: string | undefined
+): string {
+  const body = run.providerRetry?.state === "dispatching"
+    ? serializeProviderRetryEnvelope({
+        taskId: run.taskId,
+        runId: run.id,
+        roleName: run.roleName,
+        retry: run.providerRetry
+      })
+    : mode === "resume" && run.pushedAt !== undefined
+      ? serializeRunHostRecoveryEnvelope(run.bootstrapEnvelope)
+      : serializeRunBootstrapEnvelope(run.bootstrapEnvelope);
+  return title === undefined
+    ? body
+    : prefixYuiTitleInput(body, title);
 }
 
 export function nativeAgentWorkspace(

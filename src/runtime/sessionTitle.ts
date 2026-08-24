@@ -1,5 +1,6 @@
 const TITLE_SEPARATOR = " · ";
-export const MAX_SESSION_TITLE_LENGTH = 160;
+export const MAX_SESSION_TITLE_LENGTH = 80;
+const TASK_TITLE_MAX_LENGTH = 20;
 
 type TaskSessionIdentity = Readonly<{
   id: string;
@@ -10,20 +11,37 @@ export function taskRoleSessionTitle(
   task: TaskSessionIdentity,
   roleName: string
 ): string {
-  return sessionTitle(["Yui", task.id, roleLabel(roleName), task.title]);
+  const prefix = `Yui ${roleLabel(roleName)} ${normalizeSegment(task.id)}`;
+  const title = displayTitle(normalizeSegment(task.title), TASK_TITLE_MAX_LENGTH);
+  const full = `${prefix}${TITLE_SEPARATOR}${title}`;
+  if (full.length <= MAX_SESSION_TITLE_LENGTH) return full;
+  if (prefix.length >= MAX_SESSION_TITLE_LENGTH) {
+    return truncate(prefix, MAX_SESSION_TITLE_LENGTH);
+  }
+  const titleLength =
+    MAX_SESSION_TITLE_LENGTH - prefix.length - TITLE_SEPARATOR.length - 1;
+  return `${prefix}${TITLE_SEPARATOR}${displayTitle(title, Math.max(titleLength, 1))}`;
 }
 
-function sessionTitle(segments: readonly string[]): string {
-  const normalized = segments.map(normalizeSegment);
-  const full = normalized.join(TITLE_SEPARATOR);
-  if (full.length <= MAX_SESSION_TITLE_LENGTH) return full;
+export function resolveTaskRoleSessionTitle(
+  existingTitle: string | undefined,
+  task: TaskSessionIdentity,
+  roleName: string
+): string {
+  if (
+    existingTitle !== undefined
+    && existingTitle.length > 0
+    && existingTitle.length <= MAX_SESSION_TITLE_LENGTH
+    && !/[\r\n\0]/u.test(existingTitle)
+  ) {
+    return existingTitle;
+  }
+  return taskRoleSessionTitle(task, roleName);
+}
 
-  const head = normalized.slice(0, -1).join(TITLE_SEPARATOR);
-  const tail = normalized.at(-1)!;
-  const tailLength =
-    MAX_SESSION_TITLE_LENGTH - head.length - TITLE_SEPARATOR.length - 1;
-  if (tailLength < 1) return truncate(full, MAX_SESSION_TITLE_LENGTH);
-  return `${head}${TITLE_SEPARATOR}${truncate(tail, tailLength)}…`;
+function displayTitle(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${truncate(value, maxLength - 1)}…`;
 }
 
 function normalizeSegment(value: string): string {
