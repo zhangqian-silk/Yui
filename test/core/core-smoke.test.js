@@ -28,6 +28,7 @@ import { createDecision } from "../../dist/decision/decision.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import { isCurrentGlobalOperator } from "../../dist/commands/taskInputCommands.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { validateAgentLaunchConfiguration } from "../../dist/executor/agentConfigurationCatalog.js";
 import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
@@ -51,6 +52,10 @@ import {
   RuntimeLaunchFailure,
   TmuxSessionHost
 } from "../../dist/runtime/index.js";
+import {
+  createSessionOwnerIdentity,
+  readLinuxProcessIdentity
+} from "../../dist/runtime/sessionOwnerIdentity.js";
 import { runtimeObservationSemanticKey } from "../../dist/runtime/runtimeObservation.js";
 import { createPromptEnvelope } from "../../dist/runtime/promptEnvelope.js";
 import {
@@ -788,6 +793,80 @@ test("TmuxSessionHost launches an interactive global Role without an Agent Host 
   assert.equal(launched.command, "codex");
   assert.deepEqual(launched.args, ["--model", "gpt-good"]);
   assert.equal(binding.hostCreated, true);
+});
+
+test("the first global Operator turn authenticates through its exact live launch owner", () => {
+  const launchId = "runtime-global:generation:first";
+  const identity = readLinuxProcessIdentity(process.pid);
+  assert.notEqual(identity, undefined);
+  const owner = createSessionOwnerIdentity({
+    owner: { scope: "global", roleName: "operator" },
+    agentId: "codex",
+    adapterId: "codex",
+    launchId,
+    tmux: {
+      serverName: "yui-test",
+      socketPath: "/tmp/yui-test.sock",
+      sessionName: "yui-test-operator",
+      windowName: "operator",
+      panePid: process.pid
+    },
+    providerRoot: {
+      pid: process.pid,
+      startIdentity: identity.startIdentity,
+      processGroupId: identity.processGroupId,
+      processSessionId: identity.processSessionId,
+      attribution: "launch-env"
+    },
+    recordedAt: new Date("2026-08-24T00:00:00.000Z")
+  });
+  const store = {
+    getGlobalRole: () => ({
+      name: "operator",
+      activeAgentId: "codex",
+      agentBindings: { codex: { agentId: "codex", adapterId: "codex" } }
+    }),
+    getGlobalRoleSessionSet: () => null,
+    getSessionOwner: (candidate) => candidate === launchId ? owner : null,
+    getWorkMailbox: () => ({
+      processing: {
+        owner: "runtime-lifecycle",
+        batchId: launchId,
+        batch: { reasons: ["runtime-launch-reserved"] }
+      },
+      pending: { normal: null, userCorrection: null }
+    })
+  };
+  assert.equal(isCurrentGlobalOperator(store, {
+    YUI_SESSION_SCOPE: "global",
+    YUI_ROLE: "operator",
+    YUI_AGENT_ID: "codex",
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: launchId
+  }), true);
+  assert.equal(isCurrentGlobalOperator({
+    ...store,
+    getSessionOwner: () => null
+  }, {
+    YUI_SESSION_SCOPE: "global",
+    YUI_ROLE: "operator",
+    YUI_AGENT_ID: "codex",
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: launchId
+  }), false);
+  assert.equal(isCurrentGlobalOperator({
+    ...store,
+    getSessionOwner: () => ({
+      ...owner,
+      providerRoot: { ...owner.providerRoot, attribution: "pane-pid" }
+    })
+  }, {
+    YUI_SESSION_SCOPE: "global",
+    YUI_ROLE: "operator",
+    YUI_AGENT_ID: "codex",
+    YUI_ADAPTER_ID: "codex",
+    YUI_LAUNCH_ID: launchId
+  }), false);
 });
 
 test("TmuxSessionHost forwards the frozen Task descriptors to its internal Agent Host", async (t) => {
