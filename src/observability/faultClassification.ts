@@ -10,6 +10,10 @@
 import type { AgentRun } from "../run/agentRun.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
+import {
+  classifyReviewRoundOutcome,
+  type ReviewOutcomeEvidenceStore
+} from "../review/reviewOutcomeClassifier.js";
 
 export const FAULT_CLASSES = [
   "provider-transient",
@@ -117,16 +121,18 @@ export function classifyAgentRunFailure(
  * `review-infra`; a completed Round with failed checks is a semantic negative.
  */
 export function classifyReviewRound(
-  round: Pick<ReviewRound, "status" | "checks">
+  round: ReviewRound,
+  evidence?: ReviewOutcomeEvidenceStore
 ): FaultClassification {
-  if (round.status === "failed") {
+  const outcome = classifyReviewRoundOutcome(round, evidence);
+  if (outcome?.kind === "non-semantic") {
     return {
       faultClass: "review-infra",
       basis: "structured",
-      evidence: "round status=failed"
+      evidence: outcome.reason
     };
   }
-  if (round.status === "completed" && (round.checks ?? []).some((c) => c.outcome === "failed")) {
+  if (outcome?.kind === "semantic" && (round.checks ?? []).some((c) => c.outcome === "failed")) {
     const failed = (round.checks ?? [])
       .filter((c) => c.outcome === "failed")
       .map((c) => c.name)

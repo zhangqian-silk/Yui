@@ -19,6 +19,7 @@ import { taskDeliveryPath, type Task } from "../task/task.js";
 import { publicationExternalKey } from "../task/publicationReference.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
+import { isSemanticReviewRound } from "../review/reviewOutcomeClassifier.js";
 import {
   workspaceProjectEntry,
   type ManagedWorkspace,
@@ -85,7 +86,7 @@ export async function verifyTaskCompletionPublishedTree(
   const integrated = taskDeliveryPath(task) === "integrated";
   const latestReview = integrated ? latestTaskFinalReview(store, task.id) : undefined;
   if (integrated && (latestReview === undefined
-    || latestReview.status !== "completed"
+    || !isSemanticReviewRound(latestReview, store)
     || latestReview.taskCandidate === undefined)) {
     throw usageError(
       `Task ${task.id} requires a latest completed Task-final Review before accepting a published tree.`
@@ -211,7 +212,7 @@ export function assertTaskCompletionPublishedTreeProof(
     const latestReview = latestTaskFinalReview(store, task.id);
     if (latestReview === undefined
       || latestReview.id !== proof.reviewRoundId
-      || latestReview.status !== "completed"
+      || !isSemanticReviewRound(latestReview, store)
       || latestReview.taskCandidate === undefined
       || !sameTaskCandidate(latestReview.taskCandidate, actualCandidate)) {
       throw usageError(
@@ -501,7 +502,7 @@ async function hasCompletedTaskFinalReviewForCurrentCandidate(
     .filter((round) => (round.scope ?? "work-item") === "task")
     .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
   const latest = rounds.at(-1);
-  if (latest === undefined || latest.status !== "completed") return false;
+  if (latest === undefined || !isSemanticReviewRound(latest, store)) return false;
   if (latest.taskCandidate === undefined) return false;
 
   const candidateProjects = new Map(
@@ -544,7 +545,7 @@ function hasFrozenTaskBaseline(
   return store.listReviewRounds(taskId)
     .some((round) => (
       (round.scope ?? "work-item") === "task"
-      && round.status === "completed"
+      && isSemanticReviewRound(round, store)
       && round.taskCandidate !== undefined
       && round.taskCandidate.projects.some((entry) => (
         entry.projectId === projectId && entry.commit === currentCommit

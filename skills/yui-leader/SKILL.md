@@ -542,6 +542,11 @@ authorized expansions.
   full Round over the identical frozen heads. It fails closed for every
   semantic or ambiguous prior result; target the new failed Round explicitly
   if another non-semantic failure occurs.
+- Use `task next-action`'s derived Review outcome literally: non-semantic means
+  recover the same frozen head with `force-fresh`; ambiguous means diagnose the
+  inconsistent evidence without creating a Repair WorkItem; only semantic
+  negative evidence may create a repair wave. Non-semantic and ambiguous
+  attempts do not consume the full semantic Review budget.
 - If the same non-resource user choice or unavailable external fact repeats,
   persist context and create an InputRequest instead of looping. Never use an
   InputRequest to solicit authorization for an unrequested real-resource test;

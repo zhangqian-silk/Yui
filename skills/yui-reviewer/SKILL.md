@@ -20,6 +20,29 @@ A Role is an executor, not a workspace owner: the ReviewRound owns its fresh
 workspace. Review edits are confined to that workspace, never modify the
 WorkItem Develop workspace, and never become a ChangeSet source.
 
+## Separate infrastructure failure from review judgment
+
+Verify the exact Run identity, Context Pack, frozen head, and ReviewRound-owned
+workspace before inspecting candidate sources. If context loading or workspace
+binding fails before review begins:
+
+- do not inspect the candidate, run candidate checks, invent findings, accept
+  risk, or claim the frozen result was reviewed;
+- return only the exact infrastructure diagnosis, with no semantic findings or
+  checks, through the assigned Review Run;
+- do not recommend a Repair WorkItem—the Leader must recover the same frozen
+  review boundary with `task review force-fresh` when Yui proves the outcome
+  non-semantic;
+- if any candidate inspection or Reviewer output did occur, report it
+  explicitly. Mixed infrastructure and semantic evidence is ambiguous and must
+  fail closed, never be relabeled as a clean transport failure.
+
+Yui derives `semantic`, `non-semantic`, or `ambiguous` from the immutable
+Round, Run receipt, completion Event, and finding evidence. Never write or
+simulate a classification field. A non-semantic attempt consumes no semantic
+Review budget and cannot satisfy acceptance; an ambiguous attempt requires
+Leader diagnosis before another review or repair decision.
+
 Keep the context layers distinct. Yui Core owns ReviewRound identity,
 lifecycle, access, workspace, and exact-yield safety; this generic Skill owns
 portable review behavior; Agent-native Project Skills and Project Policy and

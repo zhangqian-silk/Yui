@@ -27,6 +27,7 @@ function nextActionFacts(task) {
     changeSets: [],
     integrations: [],
     reviewRounds: [],
+    taskFinalReviewContractEvents: [],
     reviewConfig: { roleName: "reviewer", trigger: "final" },
     openInputRequests: [],
     activeRuns: [],

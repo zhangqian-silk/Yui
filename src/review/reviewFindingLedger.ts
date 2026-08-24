@@ -18,6 +18,7 @@ import {
   type ReviewFindingSeverity
 } from "./reviewFinding.js";
 import type { ReviewCheck, ReviewRound, TaskReviewCandidate } from "./reviewRound.js";
+import type { AgentRun } from "../run/agentRun.js";
 
 /**
  * Issue 06: cross-Round Review finding ledger operations.
@@ -42,6 +43,7 @@ export type ReviewFindingStorePort = Readonly<{
   getConfig(): YuiConfig;
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
+  listAgentRuns(taskId: string): AgentRun[];
   nextReviewFindingId(taskId: string): string;
   getReviewFinding(taskId: string, findingId: string): ReviewFinding | null;
   listReviewFindings(taskId: string): ReviewFinding[];
@@ -182,11 +184,11 @@ export function reconcileReviewFindings(
   if (round === null) {
     return { roundId, skipped: true, reason: "ReviewRound not found.", created: [], updated: [], conflicts: [] };
   }
-  if (!isSemanticReviewRound(round)) {
+  if (!isSemanticReviewRound(round, store)) {
     return {
       roundId,
       skipped: true,
-      reason: "ReviewRound is an execution-attempt failure, not a semantic report.",
+      reason: "ReviewRound is non-semantic or ambiguous, not a proven semantic report.",
       created: [],
       updated: [],
       conflicts: []
@@ -622,7 +624,7 @@ export function reusableTaskReviewEvidence(
 ): ReusableReviewEvidence | null {
   const rounds = store.listReviewRounds(taskId)
     .filter((round) => (round.scope ?? "work-item") === "task"
-      && round.status === "completed"
+      && isSemanticReviewRound(round, store)
       && round.evidenceCommit !== undefined
       && isSameTaskReviewCandidate(round.taskCandidate, candidate))
     .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
@@ -659,7 +661,8 @@ export function buildTaskFinalReviewFindingContext(
   candidate: TaskReviewCandidate
 ): TaskFinalReviewFindingContext {
   const previousSemanticRound = store.listReviewRounds(taskId)
-    .filter((round) => (round.scope ?? "work-item") === "task" && round.status === "completed")
+    .filter((round) => (round.scope ?? "work-item") === "task"
+      && isSemanticReviewRound(round, store))
     .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))
     .at(-1) ?? null;
   const reusableEvidence = reusableTaskReviewEvidence(store, taskId, candidate);

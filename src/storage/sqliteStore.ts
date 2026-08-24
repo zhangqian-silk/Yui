@@ -1041,7 +1041,19 @@ export class SqliteTaskStore implements TaskStore {
         (request) => request.id
       ),
       activeRuns: runs.filter((run) => run.status === "active"),
-      leaderRuns: runs.filter((run) => run.roleName === "leader")
+      leaderRuns: runs.filter((run) => run.roleName === "leader"),
+      reviewOutcomeEvidence: {
+        agentRuns: this.#sortById(
+          this.#listPayload<AgentRun>(
+            "agent_runs",
+            "task_id = ?",
+            [taskId]
+          ).filter((run) => run.purpose === "review"),
+          (run) => run.id
+        ),
+        reviewFindings: this.listReviewFindings(taskId),
+        events: this.listEvents(taskId).filter((event) => event.type === "review.completed")
+      }
     };
   }
 
