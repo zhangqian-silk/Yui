@@ -15,7 +15,7 @@ export function taskRoleSessionTitle(
   const title = displayTitle(normalizeSegment(task.title), TASK_TITLE_MAX_LENGTH);
   const full = `${prefix}${TITLE_SEPARATOR}${title}`;
   if (full.length <= MAX_SESSION_TITLE_LENGTH) return full;
-  if (prefix.length >= MAX_SESSION_TITLE_LENGTH) {
+  if (prefix.length + TITLE_SEPARATOR.length + 1 > MAX_SESSION_TITLE_LENGTH) {
     return truncate(prefix, MAX_SESSION_TITLE_LENGTH);
   }
   const titleLength =

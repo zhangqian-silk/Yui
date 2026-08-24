@@ -34,6 +34,12 @@ import { validateAgentLaunchConfiguration } from "../../dist/executor/agentConfi
 import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
 import { runExecutionAudit } from "../../dist/observability/executionAudit.js";
 import { createAgentRun, failAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
+import {
+  createRunAssignment,
+  createRunBootstrapEnvelope,
+  serializeRunBootstrapEnvelope,
+  serializeRunHostRecoveryEnvelope
+} from "../../dist/context/runContextContract.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import {
   bindTaskRoleProviderRuntime,
@@ -1079,7 +1085,40 @@ test("the Codex App Server adapter keeps attachment and Run boundaries separate"
   assert.deepEqual(calls.map(({ method }) => method), ["thread/read"]);
 });
 
-test("task Role session titles put the Task and Role identity first", () => {
+test("managed Run bootstrap exposes current identity and keeps session titles bounded", () => {
+  const bootstrap = createRunBootstrapEnvelope(createRunAssignment({
+    runId: "agent-run-2",
+    roleName: "leader",
+    purpose: "execution",
+    action: "leader-wake",
+    subject: { taskId: "task-1" },
+    contextSnapshotRef: {
+      schemaVersion: 1,
+      id: "context-snapshot-2",
+      taskId: "task-1",
+      scope: "task",
+      sequence: 2,
+      digest: "a".repeat(64)
+    },
+    deltaRefIds: ["message-2"]
+  }));
+  const serializedBootstrap = serializeRunBootstrapEnvelope(bootstrap);
+  assert.match(
+    serializedBootstrap,
+    /task=task-1 run=agent-run-2 role=leader action=leader-wake/u
+  );
+  assert.match(
+    serializedBootstrap,
+    new RegExp(
+      `purpose=execution subject=taskId:task-1 snapshot=context-snapshot-2@${"a".repeat(64)}`,
+      "u"
+    )
+  );
+  assert.match(serializedBootstrap, /delta=message-2/u);
+  assert.match(
+    serializeRunHostRecoveryEnvelope(bootstrap),
+    /task=task-1 run=agent-run-2 role=leader/u
+  );
   assert.equal(
     taskRoleSessionTitle({ id: "task-1", title: "Ship publication trace" }, "leader"),
     "Yui Leader task-1 · Ship publication tr…"
