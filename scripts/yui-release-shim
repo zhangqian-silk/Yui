@@ -42,18 +42,31 @@ if [ -f "$POINTER" ]; then
   # only an explicit target here. A no-argument activation remains with the
   # active CLI so it can resume the release named by the current pointer.
   ACTIVATE_TARGET=""
-  if [ "$#" -eq 3 ] && [ "$1" = "release" ] && [ "$2" = "activate" ]; then
-    ACTIVATE_TARGET="$3"
-  elif [ "$#" -eq 4 ]; then
-    if [ "$1" = "--json" ] && [ "$2" = "release" ] && [ "$3" = "activate" ]; then
-      ACTIVATE_TARGET="$4"
-    elif [ "$1" = "release" ] && [ "$2" = "--json" ] && [ "$3" = "activate" ]; then
-      ACTIVATE_TARGET="$4"
-    elif [ "$1" = "release" ] && [ "$2" = "activate" ] && [ "$3" = "--json" ]; then
-      ACTIVATE_TARGET="$4"
-    elif [ "$1" = "release" ] && [ "$2" = "activate" ] && [ "$4" = "--json" ]; then
-      ACTIVATE_TARGET="$3"
+  ACTIVATE_ARGUMENT_COUNT=0
+  ACTIVATE_ARGUMENT_1=""
+  ACTIVATE_ARGUMENT_2=""
+  ACTIVATE_ARGUMENT_3=""
+  for ARGUMENT in "$@"; do
+    # `--json` is a global CLI option and may appear anywhere. Ignore it only
+    # for routing classification; the selected CLI still receives the exact
+    # original argument vector below.
+    if [ "$ARGUMENT" = "--json" ]; then
+      continue
     fi
+    ACTIVATE_ARGUMENT_COUNT=$((ACTIVATE_ARGUMENT_COUNT + 1))
+    case "$ACTIVATE_ARGUMENT_COUNT" in
+      1) ACTIVATE_ARGUMENT_1="$ARGUMENT" ;;
+      2) ACTIVATE_ARGUMENT_2="$ARGUMENT" ;;
+      3) ACTIVATE_ARGUMENT_3="$ARGUMENT" ;;
+    esac
+  done
+  if [ "$ACTIVATE_ARGUMENT_COUNT" -eq 3 ] \
+    && [ "$ACTIVATE_ARGUMENT_1" = "release" ] \
+    && [ "$ACTIVATE_ARGUMENT_2" = "activate" ]; then
+    case "$ACTIVATE_ARGUMENT_3" in
+      -h|--help) ;;
+      *) ACTIVATE_TARGET="$ACTIVATE_ARGUMENT_3" ;;
+    esac
   fi
 
   if [ -n "$ACTIVATE_TARGET" ]; then
