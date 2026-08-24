@@ -523,10 +523,8 @@ authorized expansions.
   WorkItem review with a new `task work review`, accept with an explicit
   rationale, or ask the user. `yui task run retry <run-id>` retries an exact
   failed Task-final Reviewer execution under the same semantic ReviewRound. If
-  that immutable Round is durably proven non-semantic without any review
-  checks, evidence, finding, or ambiguous output—even when a pre-review
-  context/workspace failure historically terminalized it as completed/yielded—
-  the Leader may run
+  that immutable Round itself failed without any semantic report, checks,
+  yield, evidence, or finding, the Leader may run
   `yui task review force-fresh <task>/<review-round>` to create one distinct
   full Round over the identical frozen heads. It fails closed for every
   semantic or ambiguous prior result; target the new failed Round explicitly

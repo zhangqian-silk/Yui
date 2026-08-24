@@ -848,7 +848,7 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "force-fresh",
-        summary: "Replace one exact terminal non-semantic Task-final Review with a distinct full Round.",
+        summary: "Replace one exact non-semantic failed Task-final Review with a distinct full Round.",
         usage: "yui task review force-fresh <task>/<review-round>"
       },
       {

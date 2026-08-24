@@ -4213,9 +4213,9 @@ const TASK_FINAL_FORCE_FRESH_EVENT = "review.task-final-force-fresh-requested";
 
 /**
  * Creates a distinct full Task-final ReviewRound only when the exact previous
- * terminal Round durably proves that no semantic review was produced. The
- * source Round, Run, findings, workspace, and terminal report remain immutable
- * history; the linking Event is both the audit record and the idempotence key.
+ * Round failed without producing semantic review evidence. The source Round,
+ * Run, findings, workspace, and terminal report remain immutable history; the
+ * linking Event is both the audit record and the idempotence key.
  */
 function forceFreshTaskReviewRound(
   args: string[],
@@ -4279,10 +4279,10 @@ function forceFreshTaskReviewRound(
       return { round: replacement, source, created: false } as const;
     }
 
-    const recovery = classifyForceFreshReviewRecovery(tx, source);
-    if (recovery.kind === "semantic-or-ambiguous") {
+    const semanticBlocker = forceFreshSemanticBlocker(tx, source);
+    if (semanticBlocker !== null) {
       throw usageError(
-        `ReviewRound ${source.id} is not eligible for force-fresh: ${recovery.reason}`
+        `ReviewRound ${source.id} is not eligible for force-fresh: ${semanticBlocker}`
       );
     }
     if (source.taskCandidate === undefined) {
@@ -4383,7 +4383,7 @@ function forceFreshTaskReviewRound(
       candidateId: created.candidateId,
       reviewerRoleName: created.reviewerRoleName,
       taskCandidate: JSON.stringify(created.taskCandidate),
-      reason: "source-round-terminal-without-semantic-review",
+      reason: "source-round-failed-without-semantic-review",
       leaderActionRunId: taskLeaderActionRunId(
         tx,
         task.id,
@@ -4401,159 +4401,54 @@ function forceFreshTaskReviewRound(
   );
 }
 
-export type ForceFreshReviewRecoveryClassification =
-  | Readonly<{ kind: "non-semantic-terminal"; reason: string }>
-  | Readonly<{ kind: "semantic-or-ambiguous"; reason: string }>;
-
-type ForceFreshReviewEvidenceStore = Pick<
-  TaskWorkflowStore,
-  "listAgentRuns" | "listReviewFindings" | "listEvents"
->;
-
-/**
- * Conservatively classifies an immutable Task-final Review as replaceable.
- * A failed Round keeps the existing no-semantic-evidence behavior. A completed
- * Round needs stronger, mutually corroborating evidence: an explicit internal
- * context/workspace failure, its exact yielded Run and receipt, matching Lane
- * output, and the mechanically emitted empty completion Event.
- * This is command eligibility only; it never rewrites the source outcome or
- * changes the global semantic classifier used by the finding ledger.
- */
-export function classifyForceFreshReviewRecovery(
-  store: ForceFreshReviewEvidenceStore,
+/** Returns the exact semantic evidence that makes a failed Round ineligible. */
+function forceFreshSemanticBlocker(
+  store: TaskWorkflowStore,
   round: ReviewRound
-): ForceFreshReviewRecoveryClassification {
-  const blocked = (reason: string): ForceFreshReviewRecoveryClassification => ({
-    kind: "semantic-or-ambiguous",
-    reason
-  });
-  if (round.status !== "failed" && round.status !== "completed") {
-    return blocked(`source status is ${round.status}, not terminal.`);
-  }
-  if ((round.checks ?? []).length > 0) return blocked("the Round records review checks.");
-  if (round.evidenceCommit !== undefined) {
-    return blocked("the Round records a review evidence commit.");
-  }
+): string | null {
+  if (round.status !== "failed") return `source status is ${round.status}, not failed.`;
+  if ((round.checks ?? []).length > 0) return "the Round records review checks.";
+  if (round.evidenceCommit !== undefined) return "the Round records a review evidence commit.";
   if (round.report !== round.summary) {
-    return blocked("the Round stores a report distinct from its terminal summary.");
+    return "the Round stores a report distinct from its failure summary.";
   }
   if (runtimeFailureSummaryHasReviewerOutput(round.report ?? "")) {
-    return blocked("the Round stores non-empty Reviewer output in its runtime failure summary.");
+    return "the Round stores non-empty Reviewer output in its runtime failure summary.";
   }
   if (round.deltaRecheck?.disposition !== undefined
     || round.deltaRecheck?.reasoning !== undefined) {
-    return blocked("the Round records a semantic delta-recheck disposition.");
+    return "the Round records a semantic delta-recheck disposition.";
   }
-  if (looksLikeStructuredReviewReport(round.report ?? "")) {
-    return blocked("the Round stores a structured reviewer report.");
+  const semanticLane = round.executionGroup?.lanes.find((lane) => (
+    lane.status === "yielded"
+    || lane.status === "completed"
+    || lane.result?.report !== undefined
+    || (lane.result?.checks ?? []).length > 0
+    || (lane.result?.findings ?? []).length > 0
+    || (lane.result?.evidence ?? []).length > 0
+    || lane.result?.evidenceCommit !== undefined
+  ));
+  if (semanticLane !== undefined) {
+    return `Reviewer Lane ${semanticLane.id} delivered semantic evidence.`;
   }
-
-  for (const lane of round.executionGroup?.lanes ?? []) {
-    if (lane.status === "pending" || lane.status === "running") {
-      return blocked(`Reviewer Lane ${lane.id} is still active.`);
-    }
-    if ((lane.result?.checks ?? []).length > 0
-      || (lane.result?.findings ?? []).length > 0
-      || (lane.result?.evidence ?? []).length > 0
-      || lane.result?.evidenceCommit !== undefined
-      || lane.result?.gitSnapshot !== undefined) {
-      return blocked(`Reviewer Lane ${lane.id} delivered semantic evidence.`);
-    }
-    if (lane.status === "yielded" || lane.status === "completed") {
-      if (round.status !== "completed") {
-        return blocked(`Reviewer Lane ${lane.id} delivered terminal output.`);
-      }
-      if (lane.result === undefined
-        || lane.result.summary !== round.summary
-        || lane.result.report !== round.report) {
-        return blocked(`Reviewer Lane ${lane.id} output is absent or differs from the Round.`);
-      }
-    } else if (round.status === "completed") {
-      return blocked(`Completed Round has non-completed Reviewer Lane ${lane.id}/${lane.status}.`);
-    }
-  }
-
-  const reviewRuns = store.listAgentRuns(round.taskId).filter((run) => (
+  const yieldedRun = store.listAgentRuns(round.taskId).find((run) => (
     run.purpose === "review"
     && run.reviewRoundId === round.id
+    && run.status === "yielded"
   ));
-  const activeRun = reviewRuns.find(({ status }) => status === "active");
-  if (activeRun !== undefined) return blocked(`Reviewer Run ${activeRun.id} is still active.`);
-  const failedRunWithOutput = reviewRuns.find((run) => (
-    run.status === "failed" && runtimeFailureSummaryHasReviewerOutput(run.summary ?? "")
-  ));
-  if (failedRunWithOutput !== undefined) {
-    return blocked(`Reviewer Run ${failedRunWithOutput.id} records Reviewer output.`);
-  }
-  const yieldedRuns = reviewRuns.filter(({ status }) => status === "yielded");
-  if (round.status === "failed" && yieldedRuns.length > 0) {
-    return blocked(`Reviewer Run ${yieldedRuns[0]!.id} yielded a report.`);
-  }
-
+  if (yieldedRun !== undefined) return `Reviewer Run ${yieldedRun.id} yielded a report.`;
   const finding = store.listReviewFindings(round.taskId).find((entry) => (
     entry.firstReviewRoundId === round.id || entry.lastReviewRoundId === round.id
   ));
-  if (finding !== undefined) return blocked(`Review finding ${finding.id} references the Round.`);
-
-  const completionEvents = store.listEvents(round.taskId).filter((event) => (
+  if (finding !== undefined) return `Review finding ${finding.id} references the Round.`;
+  const semanticEvent = store.listEvents(round.taskId).find((event) => (
     event.type === "review.completed" && event.payload.reviewRoundId === round.id
   ));
-  if (round.status === "failed") {
-    if (completionEvents.length > 0) {
-      return blocked(`Review completion Event ${completionEvents[0]!.id} exists.`);
-    }
-    return {
-      kind: "non-semantic-terminal",
-      reason: "Failed Round carries no semantic review evidence."
-    };
+  if (semanticEvent !== undefined) return `Review completion Event ${semanticEvent.id} exists.`;
+  if (looksLikeStructuredReviewReport(round.report ?? "")) {
+    return "the Round stores a structured reviewer report.";
   }
-
-  if (!explicitCompletedReviewInfrastructureFailure(round.summary ?? "")) {
-    return blocked("completed Round lacks an explicit internal context/workspace failure.");
-  }
-  if (round.reviewerRunId === undefined
-    || yieldedRuns.length !== 1
-    || yieldedRuns[0]!.id !== round.reviewerRunId) {
-    return blocked("completed Round lacks one exact yielded Reviewer Run.");
-  }
-  const yieldedRun = yieldedRuns[0]!;
-  if (yieldedRun.roleName !== round.reviewerRoleName
-    || yieldedRun.summary !== round.summary
-    || yieldedRun.yieldReceipt === undefined) {
-    return blocked(`Reviewer Run ${yieldedRun.id} does not match the non-semantic Round receipt.`);
-  }
-  const receiptMatch = matchYieldReceipt(yieldedRun.yieldReceipt, {
-    status: "yielded",
-    summary: round.summary ?? "",
-    reviewResult: {
-      report: round.report ?? "",
-      checks: round.checks ?? []
-    }
-  });
-  if (receiptMatch === null || receiptMatch.kind !== "replayed") {
-    return blocked(`Reviewer Run ${yieldedRun.id} yield receipt does not cover the Round outcome.`);
-  }
-  if (completionEvents.length !== 1) {
-    return blocked("completed Round lacks one exact completion Event.");
-  }
-  const completion = completionEvents[0]!;
-  if (completion.payload.workItemId !== round.workItemId
-    || completion.payload.candidateId !== round.candidateId
-    || completion.payload.reviewBaseCommit !== round.reviewBaseCommit
-    || completion.payload.evidenceCommit !== "none"
-    || completion.payload.checks !== "none") {
-    return blocked(`Review completion Event ${completion.id} carries mismatched or semantic evidence.`);
-  }
-  return {
-    kind: "non-semantic-terminal",
-    reason: "Completed Round and yielded Run agree on an explicit pre-review infrastructure failure."
-  };
-}
-
-function explicitCompletedReviewInfrastructureFailure(summary: string): boolean {
-  if (/(?:Role|Review) Run workspace is not the durable owner:/u.test(summary)) return true;
-  return /^\s*(?:Run )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)\b/iu
-    .test(summary);
+  return null;
 }
 
 function runtimeFailureSummaryHasReviewerOutput(summary: string): boolean {
