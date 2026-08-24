@@ -4431,7 +4431,11 @@ export function classifyForceFreshReviewRecovery(
     return blocked(`source status is ${round.status}, not terminal.`);
   }
   if ((round.checks ?? []).length > 0) return blocked("the Round records review checks.");
-  if (round.evidenceCommit !== undefined) {
+  const frozenHeadEvidenceCommit = round.status === "completed"
+    && round.evidenceCommit === round.reviewBaseCommit
+    ? round.evidenceCommit
+    : undefined;
+  if (round.evidenceCommit !== undefined && frozenHeadEvidenceCommit === undefined) {
     return blocked("the Round records a review evidence commit.");
   }
   if (round.report !== round.summary) {
@@ -4455,7 +4459,8 @@ export function classifyForceFreshReviewRecovery(
     if ((lane.result?.checks ?? []).length > 0
       || (lane.result?.findings ?? []).length > 0
       || (lane.result?.evidence ?? []).length > 0
-      || lane.result?.evidenceCommit !== undefined
+      || (lane.result?.evidenceCommit !== undefined
+        && lane.result.evidenceCommit !== frozenHeadEvidenceCommit)
       || lane.result?.gitSnapshot !== undefined) {
       return blocked(`Reviewer Lane ${lane.id} delivered semantic evidence.`);
     }
@@ -4465,7 +4470,8 @@ export function classifyForceFreshReviewRecovery(
       }
       if (lane.result === undefined
         || lane.result.summary !== round.summary
-        || lane.result.report !== round.report) {
+        || lane.result.report !== round.report
+        || lane.result.evidenceCommit !== frozenHeadEvidenceCommit) {
         return blocked(`Reviewer Lane ${lane.id} output is absent or differs from the Round.`);
       }
     } else if (round.status === "completed") {
@@ -4527,7 +4533,10 @@ export function classifyForceFreshReviewRecovery(
     summary: round.summary ?? "",
     reviewResult: {
       report: round.report ?? "",
-      checks: round.checks ?? []
+      checks: round.checks ?? [],
+      ...(frozenHeadEvidenceCommit === undefined
+        ? {}
+        : { evidenceCommit: frozenHeadEvidenceCommit })
     }
   });
   if (receiptMatch === null || receiptMatch.kind !== "replayed") {
@@ -4540,7 +4549,7 @@ export function classifyForceFreshReviewRecovery(
   if (completion.payload.workItemId !== round.workItemId
     || completion.payload.candidateId !== round.candidateId
     || completion.payload.reviewBaseCommit !== round.reviewBaseCommit
-    || completion.payload.evidenceCommit !== "none"
+    || completion.payload.evidenceCommit !== (frozenHeadEvidenceCommit ?? "none")
     || completion.payload.checks !== "none") {
     return blocked(`Review completion Event ${completion.id} carries mismatched or semantic evidence.`);
   }
@@ -4552,6 +4561,9 @@ export function classifyForceFreshReviewRecovery(
 
 function explicitCompletedReviewInfrastructureFailure(summary: string): boolean {
   if (/(?:Role|Review) Run workspace is not the durable owner:/u.test(summary)) return true;
+  if (/^\s*#\s+Review result:\s+(?:context-load|workspace-binding) failure\b/iu.test(summary)) {
+    return true;
+  }
   return /^\s*(?:Run )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)\b/iu
     .test(summary);
 }
