@@ -838,13 +838,18 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "review",
     summary: "Control Task-final ReviewRounds.",
-    sections: [{ id: "manage", title: "Commands", entries: ["request", "group", "retry", "finding"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "force-fresh", "group", "retry", "finding"] }],
     children: [
       {
         name: "request",
         summary: "Request one Task-local final ReviewRound from a Global Role.",
         usage: "yui task review request <task> --role <global-role> [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--delta-recheck]",
         options: ["--role", "--strategy", "--lane-role", "--delta-recheck"]
+      },
+      {
+        name: "force-fresh",
+        summary: "Replace one exact non-semantic failed Task-final Review with a distinct full Round.",
+        usage: "yui task review force-fresh <task>/<review-round>"
       },
       {
         name: "group",
