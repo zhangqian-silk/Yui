@@ -192,10 +192,11 @@ export function taskFinalReviewContractRebindFromEvent(
 }
 
 /**
- * Historical Candidate and Review records remain immutable. Rebind events form
- * one append-only chain, and each observation must carry the contract that was
- * effective when it was created. Any fork, reversion, or reordered evidence
- * fails closed instead of being repaired or silently normalized.
+ * Historical Candidate and Review records remain immutable. Before the first
+ * explicit rebind event, older Yui releases may have emitted successive
+ * control-plane contracts without a rebind event. Preserve that legacy prefix
+ * as a forward-only sequence, then require one strict append-only rebind chain.
+ * Any Reviewer change, reversion, fork, or post-rebind drift fails closed.
  */
 export function resolveTaskFinalReviewContract(
   taskId: string,
@@ -232,12 +233,29 @@ export function resolveTaskFinalReviewContract(
     }
   }
 
-  const initial = orderedEvents[0]?.rebind.fromContract ?? orderedObservations[0]!.contract;
-  if (initial.taskId !== normalizedTaskId) {
-    throw new Error(`Task final-review rebind chain belongs to another Task: ${normalizedTaskId}.`);
+  const initial = orderedObservations[0]!.contract;
+  const reviewerRoleName = initial.reviewerRoleName;
+  const firstRebindAt = orderedEvents[0]?.createdAt;
+  const legacyObservations = firstRebindAt === undefined
+    ? orderedObservations
+    : orderedObservations.filter(({ createdAt }) => createdAt < firstRebindAt);
+  if (legacyObservations.length === 0) {
+    throw new Error(`Task ${normalizedTaskId} has a final-review rebind without an established source contract.`);
   }
   let effective = initial;
-  for (const [index, entry] of orderedEvents.entries()) {
+  const legacyContractDigests = new Set([initial.digest]);
+  for (const observation of legacyObservations) {
+    if (observation.contract.reviewerRoleName !== reviewerRoleName) {
+      throw new Error(`${observation.source} changes the Task final-review Reviewer identity.`);
+    }
+    if (sameTaskFinalReviewContract(observation.contract, effective)) continue;
+    if (legacyContractDigests.has(observation.contract.digest)) {
+      throw new Error(`${observation.source} reverts a legacy Task final-review contract.`);
+    }
+    legacyContractDigests.add(observation.contract.digest);
+    effective = observation.contract;
+  }
+  for (const entry of orderedEvents) {
     const { rebind } = entry;
     if (!sameTaskFinalReviewContract(effective, rebind.fromContract)) {
       throw new Error(`Task final-review rebind chain forks at ${entry.event.id}.`);
@@ -245,18 +263,12 @@ export function resolveTaskFinalReviewContract(
     if (rebind.reviewerRoleName !== initial.reviewerRoleName) {
       throw new Error(`Task final-review rebind changes Reviewer identity at ${entry.event.id}.`);
     }
-    const initialContractEstablished = index > 0 || orderedObservations.some((observation) => (
-      observation.createdAt < entry.createdAt
-      && sameTaskFinalReviewContract(observation.contract, rebind.fromContract)
-    ));
-    if (!initialContractEstablished) {
-      throw new Error(`Task final-review rebind ${entry.event.id} has no established source contract.`);
-    }
     effective = rebind.toContract;
   }
 
   for (const observation of orderedObservations) {
-    let expected = initial;
+    if (firstRebindAt === undefined || observation.createdAt < firstRebindAt) continue;
+    let expected = legacyObservations.at(-1)!.contract;
     for (const entry of orderedEvents) {
       if (entry.createdAt > observation.createdAt) break;
       expected = entry.rebind.toContract;
@@ -341,12 +353,11 @@ export function prepareTaskFinalReviewContractRebindProof(input: Readonly<{
   const handover = readHandoverReceipt(home);
   if (handover === null
     || handover.outcome !== "completed"
-    || handover.previousReleaseId !== fromReleaseId
     || handover.activatedReleaseId !== toReleaseId
     || typeof handover.handoverId !== "string"
     || handover.handoverId.length === 0) {
     throw new Error(
-      "Task final-review rebind requires the exact completed release handover from source to target."
+      "Task final-review rebind requires the completed release handover that activated the target."
     );
   }
   return Object.freeze({

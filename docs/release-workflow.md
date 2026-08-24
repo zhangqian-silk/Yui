@@ -66,8 +66,8 @@ An active Project-backed Task may already have frozen its Task-final Review
 contract in a Candidate when an immutable release handover changes the exact
 control-plane digest. The old contract remains valid audit evidence, but an
 exact Leader launched by the new release cannot present that old control
-identity. The authenticated global Operator may authorize the one direct
-handover explicitly:
+identity. The authenticated global Operator may authorize a direct handover or
+catch an older active Task up to the current release explicitly:
 
 ```sh
 "$YUI_SESSION_CLI" task review rebind <task> \
@@ -76,11 +76,14 @@ handover explicitly:
 ```
 
 The command verifies the current global Session Manifest, both installed
-immutable releases, the active release pointer, and the completed handover
-receipt while holding the release handover lock. The Task transaction then
-requires the stored contract, Task identity, Reviewer identity and policy,
-and all historical Candidate/Review contract observations to form one exact
-chain. Success appends one `review.task-final-contract-rebound` event with the
+immutable releases, the active release pointer, and the completed target
+activation receipt while holding the release handover lock. The source may be
+the immediately previous release or an older installed immutable release when
+the Task skipped one or more handovers. The Task transaction then requires the
+stored contract, Task identity, Reviewer identity and policy. Pre-feature
+contract observations may form one forward-only legacy sequence with the same
+Task and Reviewer; after the first explicit rebind, every transition must be
+event-backed. Success appends one `review.task-final-contract-rebound` event with the
 old/new contract and control digests, release identities, handover id, and
 Operator identity. Historical Candidate and Review records are never
 rewritten; later Candidates use the chain's effective contract. Repeating the
