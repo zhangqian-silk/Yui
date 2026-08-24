@@ -328,8 +328,9 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "create",
     summary: "Create a Draft Task.",
-    usage: "yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--require-integration]",
-    options: ["--project", "--base", "--require-integration"]
+    usage: "yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--delivery <direct|integrated>] [--require-integration]",
+    options: ["--project", "--base", "--delivery", "--require-integration"],
+    optionValues: { "--delivery": ["direct", "integrated"] }
   },
   {
     name: "project",
@@ -352,13 +353,16 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "update",
     summary: "Update Task metadata.",
-    usage: "yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at] [--require-integration]",
+    usage: "yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at] [--delivery <direct|integrated>] [--require-integration]",
     options: [
       "--title", "--description", "--priority", "--tags", "--due-at",
       "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at",
-      "--require-integration"
+      "--delivery", "--require-integration"
     ],
-    optionValues: { "--priority": ["low", "medium", "high", "urgent"] }
+    optionValues: {
+      "--priority": ["low", "medium", "high", "urgent"],
+      "--delivery": ["direct", "integrated"]
+    }
   },
   { name: "activate", summary: "Activate a Draft Task.", usage: "yui task activate <id>" },
   {
@@ -897,9 +901,10 @@ const taskChildren: readonly NodeInput[] = [
           },
           {
             name: "repair-wave",
-            summary: "Group open P1/P2 findings into parallel repair groups by overlap.",
-            usage: "yui task review finding repair-wave <task> [--create]",
-            options: ["--create"]
+            summary: "Consolidate open P1/P2 findings, or explicitly plan parallel repair groups.",
+            usage: "yui task review finding repair-wave <task> [--strategy <consolidated|parallel>] [--create]",
+            options: ["--strategy", "--create"],
+            optionValues: { "--strategy": ["consolidated", "parallel"] }
           },
           {
             name: "extract",

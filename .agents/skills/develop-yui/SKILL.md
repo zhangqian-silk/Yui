@@ -38,6 +38,26 @@ Agent Driver registration.
   Run such validation only when the user explicitly selects that exact resource
   and effect boundary in the current request.
 
+## Select the smallest safe delivery path
+
+Use direct delivery for a single-Project, reproducible, bounded fix only when it
+does not change persistence or migration, permission/authorization, Task/Run/
+Review/Integration cross-record invariants, destructive lifecycle behavior,
+concurrency/recovery, Controller handover, release machinery, or real-resource
+effects. The Leader implements it on clean committed Task main, runs one
+targeted check while changing code, and runs the complete local delivery check
+once on the final commit. Use a bounded native review when useful; if an
+independently managed ReviewRound is required, select or promote to integrated
+delivery before Task main advances.
+
+Use integrated delivery when any excluded boundary is touched, when an
+independent final Review materially protects the control plane, or when the
+outcome spans Projects. Default to one roleless WorkItem, one committed
+Integration, and one Task-final Review. One Review's findings become one
+consolidated Repair WorkItem unless their ownership is independently acceptable
+and explicit parallel execution has real value. A small diff can still be
+integrated; risk is semantic, not line-count based.
+
 ## Implement the current Yui contract
 
 Provide compatibility only through explicit migrations between valid versions
