@@ -15,8 +15,8 @@ import {
 } from "./ports.js";
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
-import { markYuiRunInput } from "../run/runIdentity.js";
-import { taskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import { prefixYuiTitleInput } from "../run/runIdentity.js";
+import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import {
   effectiveLaunchSnapshotsCompatible,
@@ -382,24 +382,28 @@ export async function processActiveRoleRunDeliveries(
         }
         providerSubmissionBegun = true;
         deliveryAttempted = true;
-        const outcome = await delivery.sendOnce({
-          delivery: ready,
-          receiptId,
-          text: run.controlRequest?.state === "dispatching"
-            ? serializeWorkflowOutcomeRequestEnvelope({
-                taskId: task.id,
-                runId: run.id,
-                roleName: role.name,
-                request: run.controlRequest
-              })
-            : run.providerRetry?.state === "dispatching"
+        const launchText = run.controlRequest?.state === "dispatching"
+          ? serializeWorkflowOutcomeRequestEnvelope({
+              taskId: task.id,
+              runId: run.id,
+              roleName: role.name,
+              request: run.controlRequest
+            })
+          : run.providerRetry?.state === "dispatching"
             ? serializeProviderRetryEnvelope({
                 taskId: task.id,
                 runId: run.id,
                 roleName: role.name,
                 retry: run.providerRetry
               })
-            : serializeRunBootstrapEnvelope(run.bootstrapEnvelope)
+            : serializeRunBootstrapEnvelope(run.bootstrapEnvelope);
+        const outcome = await delivery.sendOnce({
+          delivery: ready,
+          receiptId,
+          text: prefixYuiTitleInput(
+            launchText,
+            resolveTaskRoleSessionTitle(session.title, task, role.name)
+          )
         });
         if (outcome === "busy" || outcome === "unavailable") {
           store.resolveRoleRunProviderSubmission?.({
@@ -942,7 +946,7 @@ function continuationInput(
       ? `${ref.type}:${ref.taskId}/${ref.id}`
       : `${ref.type}:${ref.id}`
   ));
-  return markYuiRunInput([
+  return [
     `Yui Task Event Batch: ${attemptId}.`,
     "New durable task events are available for the current Yui Run.",
     "Read the referenced shared context through the Yui CLI, incorporate it, and decide whether to continue work or wait for more results.",
@@ -956,7 +960,7 @@ function continuationInput(
           "Native child results (bounded excerpts; read the referenced event for the full content):",
           ...resultSummaries
         ])
-  ].join("\n"), run.id, taskRoleSessionTitle(task, role.name));
+  ].join("\n");
 }
 
 /**
@@ -1104,6 +1108,7 @@ function preflightSession(
         adapterId: preflight.adapterId,
         nativeSessionId: preflight.nativeSessionId,
         launchId: preflight.launchId,
+        ...(preflight.sessionTitle === undefined ? {} : { title: preflight.sessionTitle }),
         status: "ready" as const,
         effective: preflight.effective
       };

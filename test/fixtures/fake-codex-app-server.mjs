@@ -33,6 +33,11 @@ lines.on("line", (line) => {
     }
     return;
   }
+  if (request.method === "thread/name/set") {
+    if (evidencePath !== undefined) appendFileSync(evidencePath, "thread/name/set\n");
+    reply(request.id, {});
+    return;
+  }
   if (request.method === "thread/read") {
     if (mode === "unmaterialized") {
       process.stdout.write(`${JSON.stringify({

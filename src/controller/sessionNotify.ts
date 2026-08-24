@@ -1,10 +1,6 @@
 import { callController } from "../core/controllerClient.js";
 import type { JsonValue } from "../core/protocol.js";
 import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
-import {
-  yuiRunBodyFromInputMessage,
-  yuiRunIdFromInputMessages
-} from "../run/runIdentity.js";
 import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
 import {
   setCodexThreadName,
@@ -98,9 +94,11 @@ export function parseCodexSessionNotification(
   const nativeSessionId = requireText(payload["thread-id"], "Codex thread-id");
   const turnId = requireText(payload["turn-id"], "Codex turn-id");
   const lastAssistantMessage = requireAssistantMessage(payload["last-assistant-message"]);
-  const runId = yuiRunIdFromInputMessages(payload["input-messages"]);
+  const runId = environment.YUI_RUN_ID === undefined
+    ? undefined
+    : requireText(environment.YUI_RUN_ID, "YUI_RUN_ID");
   const title = environment.YUI_SESSION_TITLE === undefined
-    ? sessionTitleFromInputMessages(payload["input-messages"])
+    ? undefined
     : requireText(environment.YUI_SESSION_TITLE, "YUI_SESSION_TITLE");
   const scope = environment.YUI_SESSION_SCOPE;
   if (scope !== "task" && scope !== "global") {
@@ -165,17 +163,6 @@ function requireAssistantMessage(value: unknown): string {
   return text;
 }
 
-function sessionTitleFromInputMessages(value: unknown): string | undefined {
-  if (!Array.isArray(value)) return undefined;
-  for (const entry of value) {
-    if (typeof entry !== "string") continue;
-    const body = yuiRunBodyFromInputMessage(entry);
-    const normalized = body.trim().replaceAll(/\s+/g, " ");
-    if (normalized.length > 0) return truncateSessionText(normalized);
-  }
-  return undefined;
-}
-
 function shouldSetThreadName(
   home: string,
   params: CodexSessionNotification
@@ -219,13 +206,6 @@ function threadNameRequest(
   } catch {
     return null;
   }
-}
-
-function truncateSessionText(value: string): string {
-  const truncated = value.slice(0, 1_024);
-  return /[\uD800-\uDBFF]$/.test(truncated)
-    ? truncated.slice(0, -1)
-    : truncated;
 }
 
 function isObject(value: unknown): value is Record<string, any> {

@@ -37,6 +37,7 @@ export type PlannedRoleSession = Readonly<{
   role: TmuxRole;
   launch: TmuxLaunchPlan;
   session: SchedulerRoleSession | null;
+  sessionTitle?: string;
   /** Exact Run whose first structured Provider Turn is handled by this launch workflow. */
   initialTurnRunId?: string;
 }>;

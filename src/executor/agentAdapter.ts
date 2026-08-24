@@ -462,7 +462,7 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
   }
 
   compileResume(input: ResumeInput<ClaudeAgentConfig>): CompiledAgentLaunch {
-    const launch = super.compileNew(input);
+    const launch = this.compileNew(input);
     return { ...launch, argv: [...launch.argv, "--resume", nativeId(input.nativeSessionId)] };
   }
   compileManagedControl(
@@ -475,7 +475,7 @@ class ClaudeAdapter extends BaseAdapter<ClaudeAgentConfig> {
     }
     const sessionId = nativeId(nativeSessionId);
     const launch = mode === "new"
-      ? super.compileNew(input)
+      ? this.compileNew(input)
       : this.compileResume({ ...input, nativeSessionId: sessionId });
     return {
       ...launch,
