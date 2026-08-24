@@ -4,6 +4,7 @@ import {
   validateProviderAuthorityFence,
   type ProviderAuthorityFence
 } from "./providerAuthorityFence.js";
+import { AGENT_HOST_LAUNCH_TICKET_TTL_MS } from "./runtimeDeadlines.js";
 
 export type AgentHostLaunchPayload = Readonly<{
   schemaVersion: 1;
@@ -38,7 +39,6 @@ type Reservation = Readonly<{
 }>;
 
 const brokers = new Map<string, LaunchBroker>();
-const TICKET_TTL_MS = 60_000;
 
 /** One Controller-process broker per canonical Home. Payloads never hit disk or tmux. */
 export function launchBrokerForHome(home: string): LaunchBroker {
@@ -73,7 +73,7 @@ export class LaunchBroker {
       throw new Error("Launch ticket is invalid or already consumed.");
     }
     this.#reservations.delete(launchId);
-    if (Date.now() - reservation.createdAt > TICKET_TTL_MS) {
+    if (Date.now() - reservation.createdAt > AGENT_HOST_LAUNCH_TICKET_TTL_MS) {
       throw new Error("Launch ticket expired before redemption.");
     }
     return reservation.payload;

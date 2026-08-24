@@ -206,6 +206,7 @@ import {
 } from "./review/taskFinalReviewContract.js";
 import {
   prepareTaskFinalReviewContractRebindProof,
+  resolveRecordedTaskFinalReviewContract,
   type TaskFinalReviewContractRebindProof
 } from "./review/taskFinalReviewContractRebind.js";
 import type { TaskReviewCandidate } from "./review/reviewRound.js";
@@ -1333,7 +1334,10 @@ export async function main(): Promise<void> {
       }
     }
     let taskFinalReviewRebindProof: TaskFinalReviewContractRebindProof | undefined;
-    let releaseTaskFinalReviewRebindLock: (() => void) | undefined;
+    let taskFinalReviewRebindRequest:
+      | ReturnType<typeof parseTaskFinalReviewContractRebindRequest>
+      | undefined;
+    let releaseTaskFinalReviewHandoverLock: (() => void) | undefined;
     if (resolved[1] === "review" && resolved[2] === "rebind") {
       if (!isCurrentGlobalOperator(store, process.env)) {
         throw usageError(
@@ -1345,9 +1349,18 @@ export async function main(): Promise<void> {
           "Task-final Review contract rebind requires the exact current global Session CLI."
         );
       }
-      const request = parseTaskFinalReviewContractRebindRequest(resolved.slice(3));
+      taskFinalReviewRebindRequest = parseTaskFinalReviewContractRebindRequest(
+        resolved.slice(3)
+      );
+    }
+    if ((resolved[1] === "review"
+        && ["request", "force-fresh", "retry", "rebind"].includes(resolved[2] ?? ""))
+      || resolved[1] === "complete") {
       const handoverLock = acquireHandoverLock(home);
-      releaseTaskFinalReviewRebindLock = handoverLock.release;
+      releaseTaskFinalReviewHandoverLock = handoverLock.release;
+    }
+    if (taskFinalReviewRebindRequest !== undefined) {
+      const request = taskFinalReviewRebindRequest;
       try {
         taskFinalReviewRebindProof = prepareTaskFinalReviewContractRebindProof({
           home,
@@ -1356,11 +1369,34 @@ export async function main(): Promise<void> {
           toControlPlaneDigest: request.toControlPlaneDigest,
           fromReleaseId: request.fromReleaseId,
           toReleaseId: request.toReleaseId,
-          currentControlPlane: exactCurrentControlPlane.descriptor
+          currentControlPlane: exactCurrentControlPlane!.descriptor
         });
+        const workItems = store.listWorkItems(request.taskId);
+        const reviewRounds = store.listReviewRounds(request.taskId);
+        const resolution = resolveRecordedTaskFinalReviewContract(
+          request.taskId,
+          workItems,
+          reviewRounds,
+          store.listEvents(request.taskId)
+        );
+        const activeRound = reviewRounds.find((round) => (
+          (round.scope ?? "work-item") === "task"
+          && (round.status === "pending" || round.status === "running")
+        ));
+        // An exact replay is a true no-op, even when the target Leader is live.
+        // Invalid/stale source tuples also reach the command unchanged so its
+        // transactional diagnosis cannot stop a healthy target runtime.
+        if (resolution?.effective.controlPlaneDigest === request.fromControlPlaneDigest
+          && activeRound === undefined) {
+          // The contract event and wake must never target a Provider
+          // Conversation launched by the source release. Active Runs fail
+          // closed; otherwise stop and retire that runtime under the handover
+          // lock before the transactional event+wake commit.
+          await workspaceCoordinator.cleanupTaskRoleRuntime(request.taskId, "leader");
+        }
       } catch (error) {
-        releaseTaskFinalReviewRebindLock();
-        releaseTaskFinalReviewRebindLock = undefined;
+        releaseTaskFinalReviewHandoverLock!();
+        releaseTaskFinalReviewHandoverLock = undefined;
         throw error;
       }
     }
@@ -1729,9 +1765,9 @@ export async function main(): Promise<void> {
       }
       throw error;
     } finally {
-      if (releaseTaskFinalReviewRebindLock !== undefined) {
-        releaseTaskFinalReviewRebindLock();
-        releaseTaskFinalReviewRebindLock = undefined;
+      if (releaseTaskFinalReviewHandoverLock !== undefined) {
+        releaseTaskFinalReviewHandoverLock();
+        releaseTaskFinalReviewHandoverLock = undefined;
       }
     }
   }

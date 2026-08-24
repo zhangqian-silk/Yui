@@ -12,6 +12,7 @@ import {
   activeLiveRoleAgentSession,
   bindTaskRoleProviderRuntime,
   bindTaskRoleRun,
+  clearTaskRoleProviderRuntimeForCleanup,
   clearTaskRoleRun,
   createRoleSessionSet,
   markTaskRoleRunDelivered,
@@ -1779,7 +1780,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           startedAt: now.toISOString()
         }), batchId);
       }
-      markRuntimeOwnerSessionStopped(store, runtimeOwnerFromTarget(target), now);
+      const owner = runtimeOwnerFromTarget(target);
+      markRuntimeOwnerSessionStopped(store, owner, now);
+      if (owner.scope === "task") {
+        const sessions = store.getTaskRoleSessionSet(owner.taskId, owner.roleName);
+        if (sessions !== null && sessions.providerBinding !== null) {
+          store.saveTaskRoleSessionSet(
+            clearTaskRoleProviderRuntimeForCleanup(sessions, now)
+          );
+        }
+      }
       saveRuntimeLifecycleMailbox(store, mailbox);
       return true;
     });

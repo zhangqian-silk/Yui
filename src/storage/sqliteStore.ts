@@ -53,6 +53,7 @@ import {
   type ContextSnapshot
 } from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import { TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT } from "../review/taskFinalReviewContractEvent.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { TaskMessage } from "../message/message.js";
@@ -1021,6 +1022,14 @@ export class SqliteTaskStore implements TaskStore {
       reviewRounds: this.#sortById(
         this.#listPayload<ReviewRound>("review_rounds", "task_id = ?", [taskId]),
         (round) => round.id
+      ),
+      taskFinalReviewContractEvents: this.#sortById(
+        this.#listPayload<TaskEvent>(
+          "events",
+          "task_id = ? AND type = ?",
+          [taskId, TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT]
+        ),
+        (event) => event.id
       ),
       reviewConfig: this.getReviewConfig(),
       openInputRequests: this.#sortById(

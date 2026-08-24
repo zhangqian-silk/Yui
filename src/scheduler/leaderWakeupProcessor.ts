@@ -171,7 +171,10 @@ export async function processLeaderWakeups(
           `Leader Session is incompatible with desired effective launch: ${task.id}/${role.name}.`
         );
       }
-      const mode = hasNativeSession(existingSession) && compatibleSession ? "resume" : "new";
+      const resumableSession = hasNativeSession(existingSession)
+        && existingSession.status !== "stopped"
+        && existingSession.status !== "broken";
+      const mode = resumableSession && compatibleSession ? "resume" : "new";
       const runId = store.peekNextAgentRunId(task.id);
       const wakeEnvelope = resolveLeaderWakeEnvelope(store, task.id);
       const contextSnapshot = store.freezeLeaderContextSnapshot?.(task.id, role.name, now);

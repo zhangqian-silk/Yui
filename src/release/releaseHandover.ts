@@ -15,6 +15,7 @@
  */
 
 import type { JsonValue } from "../core/protocol.js";
+import { RELEASE_HANDOVER_PROMOTION_TIMEOUT_MS } from "../runtime/runtimeDeadlines.js";
 import {
   acquireHandoverLock,
   isOwnerLive,
@@ -36,15 +37,16 @@ import {
 } from "./runtimeRelease.js";
 
 export const DEFAULT_CANDIDATE_READY_TIMEOUT_MS = 30_000;
-export const DEFAULT_PROMOTION_TIMEOUT_MS = 45_000;
+export const DEFAULT_PROMOTION_TIMEOUT_MS = RELEASE_HANDOVER_PROMOTION_TIMEOUT_MS;
 export const DEFAULT_POLL_INTERVAL_MS = 100;
 /**
  * Optional confirmation debounce after the candidate latches `dualOwner:
  * true`. Defaults to 0: the candidate's own exit grace
- * (`DEFAULT_DUAL_OWNER_GRACE_MS` in `handoverCandidate.ts`, 30s) is the single
- * authoritative old-owner exit window, and the activator trusts the candidate's
- * latched signal. A non-zero value only adds a short extra confirmation before
- * reporting dual-owner; it must never be used to re-litigate the exit grace.
+ * (`DEFAULT_DUAL_OWNER_GRACE_MS` in `handoverCandidate.ts`) is the single
+ * authoritative old-owner exit window. It outlives the complete Controller
+ * shutdown/drain boundary, and the activator trusts the candidate's latched
+ * signal. A non-zero value only adds a short extra confirmation before reporting
+ * dual-owner; it must never be used to re-litigate the exit grace.
  */
 export const DEFAULT_DUAL_OWNER_GRACE_MS = 0;
 
@@ -73,7 +75,7 @@ export type ReleaseActivateOptions = Readonly<{
   /**
    * Optional confirmation debounce after the candidate latches dual-owner.
    * Defaults to 0 (trust the candidate's latched signal immediately). The
-   * candidate's own 30s exit grace is the authoritative old-owner window.
+   * candidate's centralized exit grace is the authoritative old-owner window.
    */
   dualOwnerGraceMs?: number;
 }>;

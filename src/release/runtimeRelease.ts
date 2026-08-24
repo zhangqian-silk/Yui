@@ -424,6 +424,24 @@ export function removeCandidateDiscovery(home: string): void {
  */
 export type HandoverLock = Readonly<{ release: () => void }>;
 
+/**
+ * Read-only scheduler fence for the short release/rebind critical section.
+ * A stale owner does not block work; an unreadable lock fails closed for
+ * bounded Operator diagnosis instead of dispatching across an unknown fence.
+ */
+export function isHandoverLockHeld(home: string): boolean {
+  const lockPath = join(resolve(home), "runtime", "handover.lock");
+  try {
+    const owner = JSON.parse(readFileSync(lockPath, "utf8")) as {
+      pid?: unknown;
+      processStartIdentity?: unknown;
+    };
+    return isHandoverLockLive(owner);
+  } catch (error) {
+    return !isEnoent(error);
+  }
+}
+
 export function acquireHandoverLock(home: string): HandoverLock {
   const lockPath = join(resolve(home), "runtime", "handover.lock");
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });

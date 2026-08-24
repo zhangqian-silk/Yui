@@ -33,6 +33,7 @@ import {
 } from "../release/runtimeRelease.js";
 import { startFileTaskControllerRuntime } from "./runtime.js";
 import { readLinuxProcessStartIdentity } from "./domainIdentity.js";
+import { RELEASE_HANDOVER_OLD_OWNER_GRACE_MS } from "../runtime/runtimeDeadlines.js";
 
 export const CONTROLLER_CANDIDATE_ENV = "YUI_CONTROLLER_CANDIDATE";
 export const CONTROLLER_HANDOVER_ID_ENV = "YUI_CONTROLLER_HANDOVER_ID";
@@ -45,7 +46,7 @@ const DEFAULT_POLL_INTERVAL_MS = 100;
  * a second independent grace (see `DEFAULT_DUAL_OWNER_GRACE_MS` in
  * `releaseHandover.ts`, which is only an optional confirmation debounce).
  */
-export const DEFAULT_DUAL_OWNER_GRACE_MS = 30_000;
+export const DEFAULT_DUAL_OWNER_GRACE_MS = RELEASE_HANDOVER_OLD_OWNER_GRACE_MS;
 
 export type HandoverCandidateOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -131,7 +132,6 @@ export async function runHandoverCandidate(
   }));
 
   advanceFence(home, fence, "candidate-ready", now().toISOString());
-  const committedAt = Date.now();
   let dualOwnerReported = false;
 
   for (;;) {
@@ -159,7 +159,7 @@ export async function runHandoverCandidate(
     if (
       current.phase === "committed"
       && !oldDead
-      && Date.now() - committedAt > dualOwnerGraceMs
+      && committedFenceAgeMs(current, now()) > dualOwnerGraceMs
       && !dualOwnerReported
     ) {
       // The old Controller was told to exit but is still live. Stay read-only
@@ -177,6 +177,14 @@ export async function runHandoverCandidate(
     }
     await delay(pollIntervalMs);
   }
+}
+
+function committedFenceAgeMs(fence: HandoverFence, observedAt: Date): number {
+  const committedAt = Date.parse(fence.updatedAt);
+  if (!Number.isFinite(committedAt)) {
+    throw new Error("Committed handover fence timestamp is invalid.");
+  }
+  return observedAt.getTime() - committedAt;
 }
 
 async function promote(
