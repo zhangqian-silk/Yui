@@ -83,6 +83,16 @@ export class CodexAppServerRuntime implements
     return parseThreadSnapshot(result, id, true);
   }
 
+  async setConversationName(input: Readonly<{
+    conversationId: string;
+    name: string;
+  }>): Promise<void> {
+    await this.transport.request("thread/name/set", {
+      threadId: text(input.conversationId, "Codex thread id"),
+      name: text(input.name, "Codex thread name")
+    });
+  }
+
   async readConversation(conversationId: string): Promise<CodexThreadSnapshot> {
     const id = text(conversationId, "Codex thread id");
     const result = await this.transport.request("thread/read", {

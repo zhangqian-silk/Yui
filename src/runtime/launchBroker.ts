@@ -23,6 +23,7 @@ export type AgentHostProviderControl = Readonly<{
   transport: "codex-app-server-stdio" | "claude-stream-json";
   mode: "new" | "resume";
   nativeSessionId?: string;
+  sessionTitle?: string;
   authority: ProviderAuthorityFence;
   initialTurn?: Readonly<{
     attemptId: string;
@@ -137,6 +138,16 @@ function validateProviderControl(control: AgentHostProviderControl): void {
     throw new Error("Agent Host Provider resume identity is inconsistent.");
   }
   if (control.nativeSessionId !== undefined) text(control.nativeSessionId, "nativeSessionId");
+  if (control.sessionTitle !== undefined) {
+    const title = control.sessionTitle.trim();
+    if (
+      title.length === 0
+      || title.length > 1_024
+      || /[\r\n\0]/u.test(title)
+    ) {
+      throw new Error("Agent Host Provider session title is invalid.");
+    }
+  }
   validateProviderAuthorityFence(control.authority);
   if (control.initialTurn !== undefined) {
     text(control.initialTurn.attemptId, "Provider input attemptId");

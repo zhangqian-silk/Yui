@@ -61,6 +61,11 @@ import {
 } from "../../dist/runtime/structuredProviderHost.js";
 import { validateAgentHostLaunchPayload } from "../../dist/runtime/launchBroker.js";
 import {
+  MAX_SESSION_TITLE_LENGTH,
+  resolveTaskRoleSessionTitle,
+  taskRoleSessionTitle
+} from "../../dist/runtime/sessionTitle.js";
+import {
   createExactTaskRuntimeDescriptor,
   exactTaskRuntimeDescriptorPath,
   refreshReusedTaskRuntimeDescriptorSource,
@@ -959,6 +964,29 @@ test("the Codex App Server adapter keeps attachment and Run boundaries separate"
   assert.deepEqual(calls.map(({ method }) => method), ["thread/read"]);
 });
 
+test("task Role session titles put the Task and Role identity first", () => {
+  assert.equal(
+    taskRoleSessionTitle({ id: "task-1", title: "Ship publication trace" }, "leader"),
+    "Yui Leader task-1 · Ship publication tr…"
+  );
+  const fallback = taskRoleSessionTitle(
+    { id: "x".repeat(MAX_SESSION_TITLE_LENGTH), title: "Ship publication trace" },
+    "leader"
+  );
+  assert.ok(fallback.length <= MAX_SESSION_TITLE_LENGTH);
+  assert.match(fallback, /^Yui Leader x+$/u);
+  const compact = taskRoleSessionTitle(
+    { id: "task-1", title: "1234567890123456789012345" },
+    "leader"
+  );
+  assert.ok(compact.length <= 40);
+  assert.match(compact, /^Yui Leader task-1 · 1234567890123456789…$/u);
+  assert.equal(
+    resolveTaskRoleSessionTitle("x".repeat(160), { id: "task-1", title: "Ship" }, "leader"),
+    taskRoleSessionTitle({ id: "task-1", title: "Ship" }, "leader")
+  );
+});
+
 test("managed Codex passes its selected model through App Server configuration", () => {
   const adapter = resolveAgentAdapter("codex");
   const args = adapter.compileManagedControl({
@@ -1074,6 +1102,7 @@ test("managed Codex waits for App Server Turn acceptance and keeps input off arg
       adapterId: "codex",
       transport: "codex-app-server-stdio",
       mode: "new",
+      sessionTitle: "Yui Leader task-1 · Ship publication trace",
       authority: { epoch: 1, owner: "controller", holderId: "launch-codex-1" },
       initialTurn: {
         attemptId: "task-1/agentRun/run-1",
@@ -1081,14 +1110,17 @@ test("managed Codex waits for App Server Turn acceptance and keeps input off arg
       }
     }
   }, { mirrorOutput: () => {} });
-  assert.equal(existsSync(attempts), false);
+  assert.equal(readFileSync(attempts, "utf8"), "thread/name/set\n");
   const receipt = await started.session.submitTurn({
     attemptId: "task-1/agentRun/run-1",
     boundedText: "perform the managed work"
   });
   assert.equal(receipt.conversationId, "thread-structured-1");
   assert.equal(receipt.nativeTurnId, "turn-structured-1");
-  assert.equal(readFileSync(attempts, "utf8"), "turn/start\n");
+  assert.equal(
+    readFileSync(attempts, "utf8"),
+    "thread/name/set\nturn/start\n"
+  );
   started.session.terminate("SIGTERM");
   await started.session.waitForExit();
 });
@@ -1201,16 +1233,25 @@ test("managed Claude keeps new and resume native identity flags mutually exclusi
       source: "custom"
     },
     config: { adapterId: "claude", permission: { strategy: "bypass" } },
-    workspace: root
+    workspace: root,
+    sessionTitle: "Yui Leader task-1 · Ship publication trace"
   };
   const fresh = adapter.compileManagedControl(input, "new", nativeSessionId).argv;
   assert.equal(fresh.includes("--resume"), false);
+  assert.deepEqual(fresh.slice(fresh.indexOf("--name"), fresh.indexOf("--name") + 2), [
+    "--name",
+    "Yui Leader task-1 · Ship publication trace"
+  ]);
   assert.deepEqual(fresh.slice(fresh.indexOf("--session-id"), fresh.indexOf("--session-id") + 2), [
     "--session-id",
     nativeSessionId
   ]);
   const resumed = adapter.compileManagedControl(input, "resume", nativeSessionId).argv;
   assert.equal(resumed.includes("--session-id"), false);
+  assert.deepEqual(resumed.slice(resumed.indexOf("--name"), resumed.indexOf("--name") + 2), [
+    "--name",
+    "Yui Leader task-1 · Ship publication trace"
+  ]);
   assert.deepEqual(resumed.slice(resumed.indexOf("--resume"), resumed.indexOf("--resume") + 2), [
     "--resume",
     nativeSessionId

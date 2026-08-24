@@ -66,6 +66,7 @@ export type SchedulerRoleSession = Readonly<{
   nativeSessionId?: string;
   /** Exact external-process generation, when runtime coordination recorded it. */
   launchId?: string;
+  title?: string;
   status: "reserved" | "ready" | "running" | "stopped" | "broken";
   effective: EffectiveLaunchSnapshot;
   /** Last durable session transition, when the adapter can expose it. */

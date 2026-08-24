@@ -115,6 +115,12 @@ outcome may bind multiple Projects and independent base refs. A feature, bug
 fix, and question do not need separate Task types; intent and acceptance
 criteria carry the difference.
 
+The Task title is the human-facing label used in Agent session lists. Keep it to
+one concise outcome phrase, ideally within 20 characters. Put request details,
+constraints, and context in the Task description or the first routed Message; do
+not add `Yui`, Role, or Task-id prefixes because Yui adds those when naming
+native sessions.
+
 ```sh
 yui operator submit "<related request>" --task <task-id>
 yui task create "<distinct mission>" \
