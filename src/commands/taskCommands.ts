@@ -4431,11 +4431,13 @@ export function classifyForceFreshReviewRecovery(
     return blocked(`source status is ${round.status}, not terminal.`);
   }
   if ((round.checks ?? []).length > 0) return blocked("the Round records review checks.");
+  if (round.status === "completed" && round.evidenceCommit !== round.reviewBaseCommit) {
+    return blocked("the completed Round lacks an exact frozen-head evidence commit.");
+  }
   const frozenHeadEvidenceCommit = round.status === "completed"
-    && round.evidenceCommit === round.reviewBaseCommit
-    ? round.evidenceCommit
+    ? round.reviewBaseCommit
     : undefined;
-  if (round.evidenceCommit !== undefined && frozenHeadEvidenceCommit === undefined) {
+  if (round.status === "failed" && round.evidenceCommit !== undefined) {
     return blocked("the Round records a review evidence commit.");
   }
   if (round.report !== round.summary) {
@@ -4561,11 +4563,48 @@ export function classifyForceFreshReviewRecovery(
 
 function explicitCompletedReviewInfrastructureFailure(summary: string): boolean {
   if (/(?:Role|Review) Run workspace is not the durable owner:/u.test(summary)) return true;
-  if (/^\s*#\s+Review result:\s+(?:context-load|workspace-binding) failure\b/iu.test(summary)) {
+  if (exactCompletedReviewInfrastructureFailureReport(summary)) {
     return true;
   }
   return /^\s*(?:Run )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)\b/iu
     .test(summary);
+}
+
+function exactCompletedReviewInfrastructureFailureReport(summary: string): boolean {
+  const lines = summary.trim().split(/\r?\n/u);
+  const envelope: readonly RegExp[] = [
+    /^# Review result: (?:context-load|workspace-binding) failure$/u,
+    /^$/u,
+    /^The assigned Run context could not be safely matched to this native session, so no candidate review was performed\.$/u,
+    /^$/u,
+    /^- Run: `[^`\r\n]+`$/u,
+    /^- ReviewRound: `[^`\r\n]+`$/u,
+    /^- Review base commit: `[0-9a-f]{40}`$/u,
+    /^- Frozen target: `[^`\r\n]+`$/u,
+    /^- Authorized workspace from the exact Context Pack: `[^`\r\n]+`$/u,
+    /^- Session-attached workspace: `[^`\r\n]+`$/u,
+    /^- Verification: both paths resolve distinctly and have different filesystem inodes \(`[^`\r\n]+` vs `[^`\r\n]+`\)\.$/u,
+    /^$/u,
+    /^## Findings$/u,
+    /^$/u,
+    /^- Verified-fixed findings: none; review did not start\.$/u,
+    /^- New findings: none; candidate sources were intentionally not inspected\.$/u,
+    /^- Accepted risks: none accepted\.$/u,
+    /^- Residual verification gaps: the complete frozen diff, changed control-flow paths, callers, data-integrity behavior, and required deterministic checks remain unreviewed because the Review workspace binding is mismatched\.$/u,
+    /^$/u,
+    /^## Checks actually run$/u,
+    /^$/u,
+    /^- Exact Context API load: passed for Task\/Run\/Role\/purpose\/subject\/snapshot\/adapter\.$/u,
+    /^- Workspace binding verification: failed\.$/u,
+    /^- Candidate build\/tests\/package checks: not run\.$/u,
+    /^- Real-provider E2E: not run and not authorized\.$/u,
+    /^$/u,
+    /^## Required next action$/u,
+    /^$/u,
+    /^Attach the native Reviewer session to the exact workspace recorded by the Context Pack, or issue a fresh internally consistent Review Run\/Context Pack\. Then perform the complete bounded Task-final review at the frozen head\.$/u
+  ];
+  return lines.length === envelope.length
+    && envelope.every((pattern, index) => pattern.test(lines[index]!));
 }
 
 function runtimeFailureSummaryHasReviewerOutput(summary: string): boolean {
