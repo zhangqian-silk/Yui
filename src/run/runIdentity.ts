@@ -1,9 +1,9 @@
 import { MAX_SESSION_TITLE_LENGTH } from "../runtime/sessionTitle.js";
 
 /**
- * Prefixes managed launch input with the session title only. Unlike
- * continuation input, the run id lives in structured delivery metadata, the
- * launch environment (YUI_RUN_ID), and control hooks.
+ * Prefixes managed launch input with its session title. The bootstrap body
+ * exposes the exact current Run identity to the Agent, while structured
+ * delivery metadata and control hooks retain the delivery fence.
  */
 export function prefixYuiTitleInput(
   input: string,
