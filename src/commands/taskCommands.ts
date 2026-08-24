@@ -32,6 +32,7 @@ import {
 } from "./taskCompletionGate.js";
 import {
   createRoleSessionSet,
+  retireTaskRoleSessionsForWorkspace,
   roleAgentSessionResumeMode,
   updateTaskRoleProviderRuntime,
   updateRoleAgentSessionStatus,
@@ -230,7 +231,7 @@ import {
 import {
   TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT,
   createTaskFinalReviewContractRebind,
-  resolveTaskFinalReviewContract,
+  resolveRecordedTaskFinalReviewContract,
   taskFinalReviewContractRebindPayload,
   type TaskFinalReviewContractRebindProof,
   type TaskFinalReviewContractResolution
@@ -336,32 +337,11 @@ function storedTaskFinalReviewContractResolution(
   store: TaskWorkflowStore,
   taskId: string
 ): TaskFinalReviewContractResolution | undefined {
-  const candidateObservations = store.listWorkItems(taskId)
-    .flatMap((item) => {
-      const candidate = governingWorkItemCandidate(item);
-      return candidate?.taskFinalReviewContract === undefined
-        ? []
-        : [{
-            contract: candidate.taskFinalReviewContract,
-            createdAt: candidate.createdAt,
-            source: `Candidate ${item.id}/${candidate.id}`
-          }];
-    });
-  const reviewObservations = store.listReviewRounds(taskId)
-    .flatMap((round) => (
-      (round.scope ?? "work-item") !== "task"
-      || round.taskFinalReviewContract === undefined
-        ? []
-        : [{
-            contract: round.taskFinalReviewContract,
-            createdAt: round.createdAt,
-            source: `ReviewRound ${round.id}`
-          }]
-    ));
   try {
-    return resolveTaskFinalReviewContract(
+    return resolveRecordedTaskFinalReviewContract(
       taskId,
-      [...candidateObservations, ...reviewObservations],
+      store.listWorkItems(taskId),
+      store.listReviewRounds(taskId),
       store.listEvents(taskId)
     );
   } catch (error) {
@@ -3754,15 +3734,6 @@ function rebindTaskFinalReviewContract(
     if (resolution === undefined) {
       throw usageError(`Task final-review contract is missing for ${task.id}.`);
     }
-    const activeRound = tx.listReviewRounds(task.id).find((round) => (
-      (round.scope ?? "work-item") === "task"
-      && (round.status === "pending" || round.status === "running")
-    ));
-    if (activeRound !== undefined) {
-      throw usageError(
-        `Task final-review contract cannot rebind while ReviewRound ${activeRound.id} is ${activeRound.status}.`
-      );
-    }
     const exactExisting = resolution.rebinds.at(-1);
     if (resolution.effective.controlPlaneDigest === request.toControlPlaneDigest) {
       if (exactExisting !== undefined
@@ -3781,6 +3752,43 @@ function rebindTaskFinalReviewContract(
       throw usageError(
         `Task final-review contract source control-plane digest drifted for ${task.id}.`
       );
+    }
+    const activeRound = tx.listReviewRounds(task.id).find((round) => (
+      (round.scope ?? "work-item") === "task"
+      && (round.status === "pending" || round.status === "running")
+    ));
+    if (activeRound !== undefined) {
+      throw usageError(
+        `Task final-review contract cannot rebind while ReviewRound ${activeRound.id} is ${activeRound.status}.`
+      );
+    }
+    const activeLeaderRun = tx.getActiveAgentRun(task.id, "leader");
+    if (activeLeaderRun !== null) {
+      throw usageError(
+        `Task final-review contract cannot rebind while Leader Run ${activeLeaderRun.id} is active.`
+      );
+    }
+    const leaderSessions = tx.getTaskRoleSessionSet(task.id, "leader");
+    if (leaderSessions !== null) {
+      if (leaderSessions.inFlight !== null) {
+        throw usageError(
+          "Task final-review contract cannot rebind while the Leader runtime has unsettled Run state."
+        );
+      }
+      const liveLeaderSession = Object.values(leaderSessions.sessions).find(
+        ({ status }) => status !== "stopped" && status !== "broken"
+      );
+      if (liveLeaderSession !== undefined) {
+        throw usageError(
+          `Task final-review contract cannot rebind while Leader Session ${liveLeaderSession.agentId} is ${liveLeaderSession.status}.`
+        );
+      }
+      if (Object.keys(leaderSessions.sessions).length > 0
+        || leaderSessions.providerBinding !== null) {
+        tx.saveTaskRoleSessionSet(
+          retireTaskRoleSessionsForWorkspace(leaderSessions, now)
+        );
+      }
     }
     const rebind = createTaskFinalReviewContractRebind({
       taskId: task.id,

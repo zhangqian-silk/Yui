@@ -13,10 +13,10 @@ import type {
   AgentHostLaunchPayload,
   AgentHostProviderControl
 } from "./launchBroker.js";
+import { PROVIDER_ACCEPT_TIMEOUT_MS } from "./runtimeDeadlines.js";
 import { YUI_VERSION } from "../version.js";
 
 const PROVIDER_MESSAGE_MAX_BYTES = 16 * 1024 * 1024;
-const PROVIDER_ACCEPT_TIMEOUT_MS = 60_000;
 
 export type StructuredProviderTurnReceipt = Readonly<{
   attemptId: string;

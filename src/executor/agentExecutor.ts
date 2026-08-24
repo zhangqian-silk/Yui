@@ -332,7 +332,30 @@ export function retireTaskRoleSessionsForWorkspace(
     // receive a fresh identity after the Role workspace changes.
     history: [...(set.history ?? []), ...Object.values(set.sessions)],
     sessions: {},
+    providerBinding: null,
     updatedAt: timestamp
+  });
+}
+
+/**
+ * Clears the Provider transport identity after its physical runtime is proven
+ * stopped, without retiring workspace-bound Session records. Workspace
+ * retirement remains a separate, stricter transaction after every supported
+ * placeholder has been terminalized.
+ */
+export function clearTaskRoleProviderRuntimeForCleanup(
+  set: TaskRoleSessionSet,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  if (set.inFlight !== null) {
+    throw new Error("Cannot clear a Task Role Provider runtime with unsettled Run state.");
+  }
+  if (set.providerBinding === null) return set;
+  return validateRoleSessionSet({
+    ...set,
+    providerBinding: null,
+    updatedAt: requireDate(now, "Provider Runtime cleanup timestamp")
   });
 }
 
@@ -438,6 +461,9 @@ export function roleAgentSessionResumeMode(
     }
     return "new";
   }
+  if (session.status === "stopped" || session.status === "broken") {
+    return "new";
+  }
   const compatible = set.owner.scope === "task"
     ? effectiveLaunchSnapshotsCompatibleForTaskMain(
         session.effective,
@@ -446,13 +472,10 @@ export function roleAgentSessionResumeMode(
       )
     : effectiveLaunchSnapshotsCompatible(session.effective, desired);
   if (compatible) return "resume";
-  if (session.status !== "stopped" && session.status !== "broken") {
-    throw new Error(
-      `Role Agent session is incompatible with the next effective launch: ${agentId}. `
-      + "Stop the existing native process before starting a fresh Session."
-    );
-  }
-  return "new";
+  throw new Error(
+    `Role Agent session is incompatible with the next effective launch: ${agentId}. `
+    + "Stop the existing native process before starting a fresh Session."
+  );
 }
 
 export function bindTaskRoleRun(

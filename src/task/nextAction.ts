@@ -6,10 +6,13 @@ import type { ChangeSet } from "../integration/changeSet.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import {
-  sameTaskFinalReviewContract,
-  validateTaskFinalReviewContract,
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
+import {
+  resolveRecordedTaskFinalReviewContract,
+  type TaskFinalReviewContractResolution
+} from "../review/taskFinalReviewContractRebind.js";
+import type { TaskEvent } from "../event/taskEvent.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { Task } from "./task.js";
 import {
@@ -89,6 +92,8 @@ export type NextActionFacts = Readonly<{
   changeSets: readonly ChangeSet[];
   integrations: readonly IntegrationAttempt[];
   reviewRounds: readonly ReviewRound[];
+  /** Bounded event subset that can change the effective Task-final contract. */
+  taskFinalReviewContractEvents: readonly TaskEvent[];
   reviewConfig: ReviewConfig | null;
   openInputRequests: readonly InputRequest[];
   activeRuns: readonly AgentRun[];
@@ -556,7 +561,9 @@ export function durableStateFingerprint(facts: NextActionFacts): string {
     ...facts.integrations.map((attempt) =>
       `integration:${attempt.id}:${attempt.status}:${attempt.updatedAt}`),
     ...facts.reviewRounds.map((round) =>
-      `review:${round.id}:${round.status}:${round.endedAt ?? ""}`)
+      `review:${round.id}:${round.status}:${round.endedAt ?? ""}`),
+    ...facts.taskFinalReviewContractEvents.map((event) =>
+      `task-final-review-event:${event.id}:${event.createdAt}`)
   ];
   return createHash("sha256").update(parts.join("\n")).digest("hex");
 }
@@ -769,10 +776,18 @@ function selectOpenWorkItem(workItems: readonly WorkItem[]): OpenWorkItemSelecti
 }
 
 function taskFinalReviewContract(facts: NextActionFacts): TaskFinalReviewContract | undefined {
-  const contract = facts.workItems
-    .map((item) => governingWorkItemCandidate(item)?.taskFinalReviewContract)
-    .find((contract) => contract !== undefined);
-  return contract === undefined ? undefined : validateTaskFinalReviewContract(contract);
+  return taskFinalReviewContractResolution(facts)?.effective;
+}
+
+function taskFinalReviewContractResolution(
+  facts: NextActionFacts
+): TaskFinalReviewContractResolution | undefined {
+  return resolveRecordedTaskFinalReviewContract(
+    facts.task.id,
+    facts.workItems,
+    facts.reviewRounds,
+    facts.taskFinalReviewContractEvents
+  );
 }
 
 function taskFinalReviewRequired(facts: NextActionFacts): boolean {
@@ -867,25 +882,28 @@ function detectProtocolInconsistency(facts: NextActionFacts): Inconsistency | nu
   const changeSetIds = new Set(facts.changeSets.map((changeSet) => changeSet.id));
   const workItemById = new Map(facts.workItems.map((item) => [item.id, item]));
 
-  const contractedCandidates = facts.workItems
-    .flatMap((item) => {
+  try {
+    taskFinalReviewContractResolution(facts);
+  } catch (error) {
+    const candidateRefs = facts.workItems.flatMap((item) => {
       const candidate = governingWorkItemCandidate(item);
-      return candidate === undefined ? [] : [{ item, candidate }];
-    })
-    .filter(({ candidate }) => candidate.taskFinalReviewContract !== undefined);
-  if (contractedCandidates.length > 1) {
-    const first = validateTaskFinalReviewContract(contractedCandidates[0]!.candidate.taskFinalReviewContract!);
-    const conflict = contractedCandidates.find(({ candidate }) => (
-      !sameTaskFinalReviewContract(first, candidate.taskFinalReviewContract)
-    ));
-    if (conflict !== undefined) {
-      const refs = contractedCandidates.map(({ item, candidate }) =>
-        ref("candidate", `${item.id}/${candidate.id}`));
-      return {
-        reason: "Task-final Review contracts conflict across Candidates; the completion gate is ambiguous.",
-        conflicts: refs
-      };
-    }
+      return candidate?.taskFinalReviewContract === undefined
+        ? []
+        : [ref("candidate", `${item.id}/${candidate.id}`)];
+    });
+    const reviewRefs = facts.reviewRounds
+      .filter((round) => (
+        (round.scope ?? "work-item") === "task"
+        && round.taskFinalReviewContract !== undefined
+      ))
+      .map((round) => ref("review-round", round.id));
+    const eventRefs = facts.taskFinalReviewContractEvents
+      .map((event) => ref("task-event", event.id));
+    return {
+      reason: "Task-final Review contract history is inconsistent: "
+        + (error instanceof Error ? error.message : String(error)),
+      conflicts: [...candidateRefs, ...reviewRefs, ...eventRefs]
+    };
   }
 
   for (const round of facts.reviewRounds) {
