@@ -484,9 +484,15 @@ export class TmuxSessionHost implements SessionHostPort {
     });
     const yuiHome = planned.launch.env.YUI_HOME;
     const childLifecycle = planned.launch.childLifecycle;
-    // Interactive/global Roles may still be native TUIs. A managed Task Run
-    // has no terminal-write fallback and must expose the Agent Host contract.
-    if (yuiHome === undefined || childLifecycle === undefined) {
+    // Interactive/global Roles remain native TUIs even when their Driver
+    // advertises a persistent child lifecycle. Provider control metadata is
+    // the discriminator for the structured Agent Host path. A managed Task
+    // Run has no terminal-write fallback and must expose that contract.
+    if (
+      yuiHome === undefined
+      || childLifecycle === undefined
+      || planned.launch.providerControl === undefined
+    ) {
       if (request.owner.scope === "task" && request.runId !== undefined) {
         throw new Error("Managed Task Run is missing its structured Agent Host contract.");
       }
