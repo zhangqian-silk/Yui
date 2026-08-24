@@ -2210,14 +2210,6 @@ async function actualTaskReviewCandidateForTaskCommand(
     if (round !== null && (round.scope ?? "work-item") === "task") {
       taskId = reference.taskId;
     }
-  } else if (args[1] === "review"
-    && args[2] === "force-fresh"
-    && args[3] !== undefined) {
-    const reference = cliTaskRecordReference(args[3], "reviewRound", environment);
-    const round = store.getReviewRound(reference.taskId, reference.localId);
-    if (round !== null && (round.scope ?? "work-item") === "task") {
-      taskId = reference.taskId;
-    }
   } else if (args[1] === "work"
     && args[2] === "review"
     && args[3] === "retry"
