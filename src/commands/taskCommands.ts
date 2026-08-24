@@ -227,6 +227,14 @@ import {
   validateTaskFinalReviewContract,
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
+import {
+  TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT,
+  createTaskFinalReviewContractRebind,
+  resolveTaskFinalReviewContract,
+  taskFinalReviewContractRebindPayload,
+  type TaskFinalReviewContractRebindProof,
+  type TaskFinalReviewContractResolution
+} from "../review/taskFinalReviewContractRebind.js";
 import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
 import {
   hasAgentConfigOptions,
@@ -257,6 +265,7 @@ import {
 } from "./taskRoleRuntimeStatus.js";
 import {
   assertNoOpenInputRequests,
+  isCurrentGlobalOperator,
   openInputRequestCount,
   runTaskInputCommand
 } from "./taskInputCommands.js";
@@ -320,20 +329,48 @@ function storedTaskFinalReviewContract(
   store: TaskWorkflowStore,
   taskId: string
 ): TaskFinalReviewContract | undefined {
-  const contracts = store.listWorkItems(taskId)
+  return storedTaskFinalReviewContractResolution(store, taskId)?.effective;
+}
+
+function storedTaskFinalReviewContractResolution(
+  store: TaskWorkflowStore,
+  taskId: string
+): TaskFinalReviewContractResolution | undefined {
+  const candidateObservations = store.listWorkItems(taskId)
     .flatMap((item) => {
       const candidate = governingWorkItemCandidate(item);
       return candidate?.taskFinalReviewContract === undefined
         ? []
-        : [candidate.taskFinalReviewContract];
+        : [{
+            contract: candidate.taskFinalReviewContract,
+            createdAt: candidate.createdAt,
+            source: `Candidate ${item.id}/${candidate.id}`
+          }];
     });
-  const first = contracts[0];
-  if (first === undefined) return undefined;
-  validateTaskFinalReviewContract(first);
-  if (contracts.some((contract) => !sameTaskFinalReviewContract(first, contract))) {
-    throw dataError(`Task ${taskId} contains conflicting final-review contracts.`);
+  const reviewObservations = store.listReviewRounds(taskId)
+    .flatMap((round) => (
+      (round.scope ?? "work-item") !== "task"
+      || round.taskFinalReviewContract === undefined
+        ? []
+        : [{
+            contract: round.taskFinalReviewContract,
+            createdAt: round.createdAt,
+            source: `ReviewRound ${round.id}`
+          }]
+    ));
+  try {
+    return resolveTaskFinalReviewContract(
+      taskId,
+      [...candidateObservations, ...reviewObservations],
+      store.listEvents(taskId)
+    );
+  } catch (error) {
+    throw dataError(
+      error instanceof Error
+        ? error.message
+        : `Task ${taskId} contains conflicting final-review contracts.`
+    );
   }
-  return first;
 }
 
 /**
@@ -441,6 +478,8 @@ export type TaskCommandOptions = Readonly<{
   taskRetirementProof?: TaskRetirementProof;
   /** Verified by exact CLI preflight; never reconstructed from process.env. */
   taskFinalReviewContract?: TaskFinalReviewContract;
+  /** Verified under the release handover lock by the exact global Operator CLI. */
+  taskFinalReviewRebindProof?: TaskFinalReviewContractRebindProof;
   /** Physical Task-main heads verified by the CLI immediately before mutation. */
   actualTaskReviewCandidate?: TaskReviewCandidate;
   /** Issue 07: CLI-verified delta-recheck assessment for `task review request --delta-recheck`. */
@@ -3628,6 +3667,7 @@ function taskReviewCommand(
   options: TaskCommandOptions
 ): TaskCommandExecution {
   const [command, ...rest] = args;
+  if (command === "rebind") return rebindTaskFinalReviewContract(rest, store, options);
   if (command === "request") return requestTaskReviewRound(rest, store, options);
   if (command === "retry") return retryFailedTaskReviewRound(rest, store, options);
   if (command === "group") return resolveReviewExecutionGroup(rest, store, options);
@@ -3635,6 +3675,148 @@ function taskReviewCommand(
   throw usageError(command === undefined
     ? "Task review command is required."
     : `Unknown command: task review ${command}`);
+}
+
+export type TaskFinalReviewContractRebindRequest = Readonly<{
+  taskId: string;
+  fromControlPlaneDigest: string;
+  toControlPlaneDigest: string;
+  fromReleaseId: string;
+  toReleaseId: string;
+}>;
+
+export function parseTaskFinalReviewContractRebindRequest(
+  args: string[]
+): TaskFinalReviewContractRebindRequest {
+  const usage = "Task review rebind usage: yui task review rebind <task> "
+    + "--from-control <digest> --to-control <digest> "
+    + "--from-release <release-id> --to-release <release-id>.";
+  const parsed = parseTail(
+    args,
+    new Set(["--from-control", "--to-control", "--from-release", "--to-release"]),
+    usage
+  );
+  exactPositionals(parsed.positionals, 1, usage);
+  return {
+    taskId: parsed.positionals[0]!,
+    fromControlPlaneDigest: requiredOption(parsed.options, "--from-control"),
+    toControlPlaneDigest: requiredOption(parsed.options, "--to-control"),
+    fromReleaseId: requiredOption(parsed.options, "--from-release"),
+    toReleaseId: requiredOption(parsed.options, "--to-release")
+  };
+}
+
+function rebindTaskFinalReviewContract(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const request = parseTaskFinalReviewContractRebindRequest(args);
+  const environment = options.environment ?? {};
+  const usage = "Task review rebind usage: yui task review rebind <task> "
+    + "--from-control <digest> --to-control <digest> "
+    + "--from-release <release-id> --to-release <release-id>.";
+  if (!isCurrentGlobalOperator(store, environment)) {
+    throw usageError(
+      "Task-final Review contract rebind requires the authenticated global Operator session.",
+      usage
+    );
+  }
+  const proof = options.taskFinalReviewRebindProof;
+  if (proof === undefined
+    || proof.schemaVersion !== 1
+    || proof.taskId !== request.taskId
+    || proof.fromControlPlaneDigest !== request.fromControlPlaneDigest
+    || proof.toControlPlaneDigest !== request.toControlPlaneDigest
+    || proof.fromRelease.releaseId !== request.fromReleaseId
+    || proof.toRelease.releaseId !== request.toReleaseId) {
+    throw usageError(
+      "Task-final Review contract rebind proof is missing or does not match the explicit request.",
+      usage
+    );
+  }
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, request.taskId);
+    if (task.status !== "active") {
+      throw usageError(`Task is not active: ${task.id}.`);
+    }
+    if (task.projectBindings.length === 0) {
+      throw usageError(`Task final-review contract requires a Project-backed Task: ${task.id}.`);
+    }
+    if (!isCurrentGlobalOperator(tx, environment)) {
+      throw usageError(
+        "Task-final Review contract rebind Operator identity drifted before commit."
+      );
+    }
+    const resolution = storedTaskFinalReviewContractResolution(tx, task.id);
+    if (resolution === undefined) {
+      throw usageError(`Task final-review contract is missing for ${task.id}.`);
+    }
+    const activeRound = tx.listReviewRounds(task.id).find((round) => (
+      (round.scope ?? "work-item") === "task"
+      && (round.status === "pending" || round.status === "running")
+    ));
+    if (activeRound !== undefined) {
+      throw usageError(
+        `Task final-review contract cannot rebind while ReviewRound ${activeRound.id} is ${activeRound.status}.`
+      );
+    }
+    const exactExisting = resolution.rebinds.at(-1);
+    if (resolution.effective.controlPlaneDigest === request.toControlPlaneDigest) {
+      if (exactExisting !== undefined
+        && exactExisting.fromContract.controlPlaneDigest === request.fromControlPlaneDigest
+        && exactExisting.toContract.controlPlaneDigest === request.toControlPlaneDigest
+        && exactExisting.fromRelease.releaseId === request.fromReleaseId
+        && exactExisting.toRelease.releaseId === request.toReleaseId
+        && exactExisting.handoverId === proof.handoverId) {
+        return { rebind: exactExisting, changed: false } as const;
+      }
+      throw usageError(
+        `Task final-review contract already targets ${request.toControlPlaneDigest} without the requested proof tuple.`
+      );
+    }
+    if (resolution.effective.controlPlaneDigest !== request.fromControlPlaneDigest) {
+      throw usageError(
+        `Task final-review contract source control-plane digest drifted for ${task.id}.`
+      );
+    }
+    const rebind = createTaskFinalReviewContractRebind({
+      taskId: task.id,
+      reviewerRoleName: resolution.effective.reviewerRoleName,
+      fromContract: resolution.effective,
+      toControlPlaneDigest: proof.toControlPlaneDigest,
+      fromRelease: proof.fromRelease,
+      toRelease: proof.toRelease,
+      handoverId: proof.handoverId,
+      authorizedBy: `operator:${environment.YUI_AGENT_ID ?? "unknown"}`
+    });
+    const event = recordTaskEventRecord(
+      tx,
+      task.id,
+      TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT,
+      taskFinalReviewContractRebindPayload(rebind),
+      now
+    );
+    enqueueWork(
+      tx,
+      leaderMailbox(task.id),
+      wakeReason("review-contract-rebound", event.id),
+      now,
+      [eventRef(task.id, event.id)]
+    );
+    return { rebind, event, changed: true } as const;
+  });
+  if (result.changed) {
+    notifyMailbox(options.runtime, leaderMailbox(request.taskId), request.taskId);
+  }
+  return output(
+    result.changed
+      ? `Rebound Task-final Review contract for ${request.taskId} from `
+        + `${request.fromControlPlaneDigest} to ${request.toControlPlaneDigest}.\n`
+      : `Task-final Review contract rebind is already recorded for ${request.taskId}.\n`,
+    result
+  );
 }
 
 function resolveReviewExecutionGroup(

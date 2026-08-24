@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -82,12 +82,14 @@ import {
   TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
   parseTaskCompletionRequest,
+  parseTaskFinalReviewContractRebindRequest,
   preflightTaskCompletion,
   runTaskCommand,
   normalizedExecutionLanePlan,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
+import { isCurrentGlobalOperator } from "./commands/taskInputCommands.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { runTaskChangeSetCommand } from "./commands/taskChangeSetCommands.js";
 import { runTaskOverlapCommand } from "./commands/taskOverlapCommands.js";
@@ -96,7 +98,11 @@ import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
 import { runWorkflowCommandAsync } from "./commands/workflowCommands.js";
 import { createUpdatePorts } from "./cli/updatePorts.js";
 import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
-import { readRuntimeIdentity, type RuntimeIdentityReceipt } from "./release/runtimeRelease.js";
+import {
+  acquireHandoverLock,
+  readRuntimeIdentity,
+  type RuntimeIdentityReceipt
+} from "./release/runtimeRelease.js";
 import {
   renderReleaseActivateResult,
   renderReleaseInstallResult,
@@ -188,14 +194,20 @@ import {
   assertExactTaskRuntimeState,
   exactControlPlaneDigest,
   extractExactControlArgument,
-  parseExactControlPlaneDescriptor
+  parseExactControlPlaneDescriptor,
+  type ExactControlPlaneDescriptor
 } from "./runtime/exactControlPlane.js";
+import { readSessionBootstrapManifest } from "./context/sessionBootstrapManifest.js";
 import { builtinAgentDriverRegistry } from "./runtime/builtinAgentDrivers.js";
 import {
   createTaskFinalReviewContract,
   extractTaskFinalReviewRequest,
   type TaskFinalReviewContract
 } from "./review/taskFinalReviewContract.js";
+import {
+  prepareTaskFinalReviewContractRebindProof,
+  type TaskFinalReviewContractRebindProof
+} from "./review/taskFinalReviewContractRebind.js";
 import type { TaskReviewCandidate } from "./review/reviewRound.js";
 import { assessDeltaRecheck, type DeltaRecheckPreflight } from "./review/deltaRecheck.js";
 import { deltaRecheckEnabled } from "./review/reviewConfig.js";
@@ -231,7 +243,11 @@ void main().catch((error: unknown) => {
 });
 
 export async function main(): Promise<void> {
-  const { contract: taskFinalReviewContract, verifiedStore } = await preflightManagedTaskControlPlane();
+  const {
+    contract: taskFinalReviewContract,
+    verifiedStore,
+    controlPlane: exactCurrentControlPlane
+  } = await preflightManagedTaskControlPlane();
   if (args.length === 0) {
     emit(renderCommandHelp((await import("./cli/commandCatalog.js")).ROOT_COMMAND, VERSION));
     return;
@@ -1316,6 +1332,38 @@ export async function main(): Promise<void> {
         }
       }
     }
+    let taskFinalReviewRebindProof: TaskFinalReviewContractRebindProof | undefined;
+    let releaseTaskFinalReviewRebindLock: (() => void) | undefined;
+    if (resolved[1] === "review" && resolved[2] === "rebind") {
+      if (!isCurrentGlobalOperator(store, process.env)) {
+        throw usageError(
+          "Task-final Review contract rebind requires the authenticated global Operator session."
+        );
+      }
+      if (exactCurrentControlPlane === undefined) {
+        throw usageError(
+          "Task-final Review contract rebind requires the exact current global Session CLI."
+        );
+      }
+      const request = parseTaskFinalReviewContractRebindRequest(resolved.slice(3));
+      const handoverLock = acquireHandoverLock(home);
+      releaseTaskFinalReviewRebindLock = handoverLock.release;
+      try {
+        taskFinalReviewRebindProof = prepareTaskFinalReviewContractRebindProof({
+          home,
+          taskId: request.taskId,
+          fromControlPlaneDigest: request.fromControlPlaneDigest,
+          toControlPlaneDigest: request.toControlPlaneDigest,
+          fromReleaseId: request.fromReleaseId,
+          toReleaseId: request.toReleaseId,
+          currentControlPlane: exactCurrentControlPlane.descriptor
+        });
+      } catch (error) {
+        releaseTaskFinalReviewRebindLock();
+        releaseTaskFinalReviewRebindLock = undefined;
+        throw error;
+      }
+    }
     let candidateMaterialization: Awaited<ReturnType<typeof candidateMaterializationForTaskCommand>>;
     let candidateMaterializationCommitted = false;
     try {
@@ -1390,6 +1438,9 @@ export async function main(): Promise<void> {
           ...(taskFinalReviewContract === undefined
             ? {}
             : { taskFinalReviewContract }),
+          ...(taskFinalReviewRebindProof === undefined
+            ? {}
+            : { taskFinalReviewRebindProof }),
           ...(completionSummary === undefined ? {} : { completionSummary }),
           ...(completionPublishedTreeProof === undefined
             ? {}
@@ -1677,6 +1728,11 @@ export async function main(): Promise<void> {
         laneDispatchRelease = undefined;
       }
       throw error;
+    } finally {
+      if (releaseTaskFinalReviewRebindLock !== undefined) {
+        releaseTaskFinalReviewRebindLock();
+        releaseTaskFinalReviewRebindLock = undefined;
+      }
     }
   }
   if (resolved[0] === "jobs") {
@@ -1710,6 +1766,10 @@ export async function main(): Promise<void> {
 
 type ManagedTaskControlPlanePreflight = Readonly<{
   contract: TaskFinalReviewContract | undefined;
+  controlPlane: Readonly<{
+    digest: string;
+    descriptor: ExactControlPlaneDescriptor;
+  }> | undefined;
   /**
    * The FileTaskStore instance the exact runtime preflight already opened and
    * read. A same-Home command reuses it instead of opening a second store, so
@@ -1737,14 +1797,14 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
   }
   if (!exactRuntime) {
     if (exactControlInvocation.digest !== undefined) {
-      throw new Error("Exact Task control-plane invocation requires its frozen runtime descriptors.");
+      return await preflightManagedGlobalControlPlane(exactControlInvocation.digest);
     }
     if (taskFinalReviewInvocation.request !== undefined) {
       throw new Error(
         "Task final-review contract requires a verified exact Task control-plane invocation."
       );
     }
-    return { contract: undefined, verifiedStore: undefined };
+    return { contract: undefined, controlPlane: undefined, verifiedStore: undefined };
   }
   if (process.env.YUI_SESSION_SCOPE !== "task") {
     throw new Error("Exact Task control-plane invocation requires a managed Task runtime.");
@@ -1799,7 +1859,13 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
       : {}
   );
   const request = taskFinalReviewInvocation.request;
-  if (request === undefined) return { contract: undefined, verifiedStore };
+  if (request === undefined) {
+    return {
+      contract: undefined,
+      controlPlane: { digest, descriptor: control },
+      verifiedStore
+    };
+  }
   if (runtime.roleName !== "leader") {
     throw new Error("Only the exact Task Leader invocation may establish a final-review contract.");
   }
@@ -1814,7 +1880,57 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
       reviewerRoleName: request.reviewerRoleName,
       controlPlaneDigest: digest
     }),
+    controlPlane: { digest, descriptor: control },
     verifiedStore
+  };
+}
+
+async function preflightManagedGlobalControlPlane(
+  digest: string
+): Promise<ManagedTaskControlPlanePreflight> {
+  if (process.env.YUI_SESSION_SCOPE !== "global") {
+    throw new Error("Exact Task control-plane invocation requires its frozen runtime descriptors.");
+  }
+  if (taskFinalReviewInvocation.request !== undefined) {
+    throw new Error(
+      "Task final-review contract establishment requires a verified exact Task control-plane invocation."
+    );
+  }
+  const manifestPath = process.env.YUI_SESSION_MANIFEST;
+  const sessionCliPath = process.env.YUI_SESSION_CLI;
+  if (manifestPath === undefined || sessionCliPath === undefined) {
+    throw new Error("Exact global control-plane invocation requires its Session Manifest and CLI.");
+  }
+  const manifest = readSessionBootstrapManifest(manifestPath);
+  const expectedRoleKind = process.env.YUI_ROLE === "operator" ? "operator" : "global";
+  if (manifest.owner.scope !== "global"
+    || manifest.roleKind !== expectedRoleKind
+    || resolve(manifest.controlPlane.sessionCliPath) !== resolve(sessionCliPath)
+    || manifest.controlPlane.digest !== digest) {
+    throw new Error("Exact global control-plane invocation does not match its Session Manifest.");
+  }
+  const serializedDescriptor = readFileSync(manifest.controlPlane.descriptorPath, "utf8");
+  const descriptor = parseExactControlPlaneDescriptor(serializedDescriptor);
+  if (exactControlPlaneDigest(descriptor) !== digest
+    || resolve(manifest.controlPlane.descriptorPath) !== resolve(
+      join(descriptor.yuiHome, "runtime", "control-plane", `${digest}.json`)
+    )
+    || resolve(manifestPath) !== resolve(
+      join(descriptor.yuiHome, "runtime", "session-manifests", `${manifest.digest}.json`)
+    )) {
+    throw new Error("Exact global Session Manifest does not match its control-plane descriptor.");
+  }
+  await assertExactControlPlanePreflight({
+    serializedDescriptor,
+    digest,
+    actualExecutable: process.execPath,
+    actualCliEntry: fileURLToPath(import.meta.url),
+    actualHome: resolveYuiHome(process.env)
+  });
+  return {
+    contract: undefined,
+    controlPlane: { digest, descriptor },
+    verifiedStore: openCompatibleFileTaskStore(descriptor.yuiHome)
   };
 }
 

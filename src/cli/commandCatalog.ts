@@ -838,13 +838,19 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "review",
     summary: "Control Task-final ReviewRounds.",
-    sections: [{ id: "manage", title: "Commands", entries: ["request", "group", "retry", "finding"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "rebind", "group", "retry", "finding"] }],
     children: [
       {
         name: "request",
         summary: "Request one Task-local final ReviewRound from a Global Role.",
         usage: "yui task review request <task> --role <global-role> [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--delta-recheck]",
         options: ["--role", "--strategy", "--lane-role", "--delta-recheck"]
+      },
+      {
+        name: "rebind",
+        summary: "Explicitly rebind a frozen Task-final contract after a verified immutable release handover.",
+        usage: "yui task review rebind <task> --from-control <digest> --to-control <digest> --from-release <release-id> --to-release <release-id>",
+        options: ["--from-control", "--to-control", "--from-release", "--to-release"]
       },
       {
         name: "group",
