@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { lstat, mkdir, open, rm, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -56,6 +57,11 @@ import {
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
 import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
+import { readRuntimeIdentity } from "../release/runtimeRelease.js";
+import {
+  findReusableIntegrationCheckEvidence,
+  INTEGRATION_RUNTIME_RELEASE_ENV
+} from "./integrationCheckEvidenceReuse.js";
 
 const executeFile = promisify(execFile);
 
@@ -436,8 +442,6 @@ export class GitIntegrationService {
     gate?: ResolvedVerificationGate
   ): Promise<IntegrationResult> {
     const runtime = this.#runtimePreparation(attempt, managedWorkspace);
-    this.runtimeIsolation.activate(runtime);
-    const environment = await integrationCheckEnvironment(this.environment, runtime);
     const head = await gitLine(["-C", path, "rev-parse", "HEAD^{commit}"]);
     const steps: DurableJobStep[] = gate === undefined
       ? attempt.checkCommands.map((command, index) => ({
@@ -455,6 +459,38 @@ export class GitIntegrationService {
             timeoutMs: 30 * 60_000
           }))
         ];
+    const releaseId = integrationRuntimeReleaseIdentity(this.home);
+    if (gate === undefined && releaseId !== null) {
+      const reusable = findReusableIntegrationCheckEvidence({
+        taskId: attempt.taskId,
+        projectId: attempt.projectId,
+        currentAttemptId: attempt.id,
+        candidateCommit: head,
+        checkCommands: attempt.checkCommands,
+        runtimeReleaseId: releaseId,
+        attempts: this.store.listIntegrationAttempts(attempt.taskId),
+        jobs: this.store.listDurableJobs(attempt.taskId),
+        logExists: (homeRelativePath) => existsSync(join(this.home, homeRelativePath)),
+        logPathFor: (job, relativeLogPath) => (
+          join(job.artifactsLocator, "logs", relativeLogPath)
+        )
+      });
+      if (reusable !== null) {
+        return this.#finalizeGateSuccess(
+          attempt,
+          workspace,
+          repositoryPath,
+          head,
+          [...reusable.checks]
+        );
+      }
+    }
+    this.runtimeIsolation.activate(runtime);
+    const baseEnvironment = await integrationCheckEnvironment(this.environment, runtime);
+    const environment = Object.freeze({
+      ...baseEnvironment,
+      ...(releaseId === null ? {} : { [INTEGRATION_RUNTIME_RELEASE_ENV]: releaseId })
+    });
     // Persist the gate identity before starting the job so a plan edit
     // during the gate never misattributes the evidence on resume.
     let persisted = attempt;
@@ -1230,6 +1266,29 @@ function integrationRuntimeLaunchId(home: string, integrationId: string): string
     .update(resolve(home))
     .digest("hex");
   return `${integrationId}-${homeDigest}`;
+}
+
+/**
+ * Reuse is enabled only for an immutable installed release. Development
+ * checkouts have no content-addressed release identity, so they rerun.
+ */
+function integrationRuntimeReleaseIdentity(home: string): string | null {
+  try {
+    const receipt = readRuntimeIdentity(home);
+    const release = receipt?.activeRelease;
+    if (receipt === null
+      || receipt.mode !== "primary"
+      || receipt.dualOwner
+      || release === null
+      || release === undefined
+      || receipt.packageDigest !== release.packageDigest
+      || receipt.buildId !== release.buildId) {
+      return null;
+    }
+    return release.releaseId;
+  } catch {
+    return null;
+  }
 }
 
 function checkFailureReason(completion: CheckCompletion): string {
