@@ -4516,7 +4516,7 @@ export function classifyForceFreshReviewRecovery(
     };
   }
 
-  if (!explicitCompletedReviewInfrastructureFailure(round.summary ?? "")) {
+  if (!explicitCompletedReviewInfrastructureFailure(round.summary ?? "", round)) {
     return blocked("completed Round lacks an explicit internal context/workspace failure.");
   }
   if (round.reviewerRunId === undefined
@@ -4561,13 +4561,25 @@ export function classifyForceFreshReviewRecovery(
   };
 }
 
-function explicitCompletedReviewInfrastructureFailure(summary: string): boolean {
-  if (/(?:Role|Review) Run workspace is not the durable owner:/u.test(summary)) return true;
+function explicitCompletedReviewInfrastructureFailure(
+  summary: string,
+  round: ReviewRound
+): boolean {
   if (exactCompletedReviewInfrastructureFailureReport(summary)) {
     return true;
   }
-  return /^\s*(?:Run )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)\b/iu
-    .test(summary);
+  const legacyReport = summary.trim();
+  if (legacyReport === `Role Run workspace is not the durable owner: ${
+    round.taskId
+  }/${round.reviewerRoleName}.`
+    || (round.reviewerRunId !== undefined
+      && legacyReport === `Review Run workspace is not the durable owner: ${
+        round.reviewerRunId
+      }.`)) {
+    return true;
+  }
+  return /^(?:Run )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)(?:: (?:failure|mismatch|unavailable|unauthorized|stale|mismatched|malformed))?\.?$/iu
+    .test(legacyReport);
 }
 
 function exactCompletedReviewInfrastructureFailureReport(summary: string): boolean {
