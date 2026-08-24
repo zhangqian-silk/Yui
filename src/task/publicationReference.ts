@@ -6,6 +6,8 @@ import {
 import { validateTaskRecordReference } from "./taskRecordReference.js";
 
 export const PUBLICATION_REFERENCE_SCHEMA_VERSION = 1 as const;
+export const TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT =
+  "task.completion-published-tree-authorized";
 
 export type PublicationProvider = "github" | "gitlab";
 export type PublicationExternalKind = "pull-request" | "merge-request";

@@ -364,8 +364,8 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "complete",
     summary: "Complete an active Task and stop automatic wakeups.",
-    usage: "yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote]",
-    options: ["--summary", "--summary-file", "--refresh-remote"],
+    usage: "yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote] [--accept-published-tree <publication-id>]",
+    options: ["--summary", "--summary-file", "--refresh-remote", "--accept-published-tree"],
     fileOptions: ["--summary-file"]
   },
   {
