@@ -143,17 +143,31 @@ Sections:
   settles, so a suppression is scheduler backpressure, never a failed Run.
 - **sessions** — generations, broken/stopped, resets, lifecycle events, stop
   failures.
-- **reviews** — total/completed/failed, infra vs semantic-negative.
+- **reviews** — total/completed/failed, non-semantic infrastructure vs
+  semantic-negative; mixed evidence remains ambiguous and fail-closed.
 - **integrations** — total/committed/failed, environment failures, gate reuse.
 - **publications** — total/merged/verified/open/closed/superseded external
   PR/MR references.
 - **events** — total, progress vs semantic, obsolete, message count.
 - **workItems** — total/completed/retired.
+- **orchestration** — per-Task delivery path, Run/WorkItem counts, full/delta/
+  non-semantic Reviews, finding yield, Integration attempts/failures/repeated
+  identities/evidence reuse, generations before first durable progress,
+  publication-to-completion latency, terminal workspaces, and non-blocking
+  budget advisories. `--since`/`--until` filters every underlying record family.
 - **storage** — state.json/runtime/deployments byte sizes.
 - **topLongRunning** — longest-running active/yielded runs with exact refs.
 
 Each section degrades independently: a read failure produces an `error` section
 with the error location, without blocking completed sections.
+
+`yui task next-action <task>` shows the same Task-scoped orchestration
+advisories alongside its protocol recommendation. Advisories are derived from
+existing records and never write state or block a legal action. Current
+advisories cover direct-path protocol overhead, initial integrated WorkItem
+fan-out, unexplained review-repair fan-out, repeated exact Integration checks,
+full-Review budget exhaustion without new findings, and the two-generation
+first-progress stop-loss.
 
 ## Rollout
 

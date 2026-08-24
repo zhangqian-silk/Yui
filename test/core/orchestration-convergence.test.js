@@ -35,6 +35,8 @@ import {
   prepareOperatorNewSession,
   projectOperatorStatus
 } from "../../dist/operator/operatorSessionHistory.js";
+import { runExecutionAudit } from "../../dist/observability/executionAudit.js";
+import { projectTaskOrchestration } from "../../dist/observability/orchestrationMetrics.js";
 import {
   classifyReviewRoundOutcome
 } from "../../dist/review/reviewOutcomeClassifier.js";
@@ -686,4 +688,68 @@ test("operator status renders one writer separately from retained history", () =
   assert.match(result.output, /Historical conversations/u);
   assert.equal(result.data.writer.nativeSessionId, "session-2");
   assert.equal(result.data.historicalConversations.length, 1);
+});
+
+test("orchestration metrics expose protocol overhead without treating reuse as a rerun", () => {
+  const task = {
+    ...createTask("task-1", "small bug", now, {
+      projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "main" }]
+    }),
+    status: "active"
+  };
+  const item = createWorkItem("work-item-1", task.id, { title: "unnecessary split" }, later);
+  const metrics = projectTaskOrchestration({
+    task,
+    runs: [],
+    roleSessionSets: [],
+    workItems: [item],
+    changeSets: [],
+    reviewRounds: [],
+    reviewFindings: [],
+    integrations: [attempt({
+      status: "committed",
+      checks: [{
+        name: "npm test",
+        outcome: "passed",
+        details: "Reused successful check evidence from integration-attempt-0/durable-job-1."
+      }]
+    })],
+    durableJobs: [job()],
+    publications: [],
+    decisions: [],
+    events: [],
+    managedWorkspaces: []
+  });
+  assert.equal(metrics.deliveryPath, "direct");
+  assert.equal(metrics.workItems, 1);
+  assert.equal(metrics.integrations.repeatedIdentities, 0);
+  assert.equal(metrics.integrations.evidenceReuses, 1);
+  assert.ok(metrics.advisories.some(({ code }) => code === "direct-protocol-overhead"));
+  assert.ok(!metrics.advisories.some(({ code }) => code === "repeated-integration-check"));
+});
+
+test("execution audit exposes the orchestration projection without writes", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-orchestration-audit-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  store.saveProject(createProject(
+    "project-1", "app", home, { stable: "main", development: "main" }, now
+  ));
+  const task = activateTask(createTask("task-1", "small bug", now, {
+    projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "main" }]
+  }), now);
+  store.saveTask(task);
+  store.saveWorkItem(task.id, createWorkItem("work-item-1", task.id, {
+    title: "unnecessary split"
+  }, later));
+  const before = store.getRevision();
+  const report = runExecutionAudit(home, { taskId: task.id }, {
+    openStore: () => store,
+    directorySize: () => null
+  });
+  assert.equal(report.orchestration.status, "ok");
+  assert.equal(report.orchestration.data.tasks[0].workItems, 1);
+  assert.equal(report.orchestration.data.advisoryCount, 1);
+  assert.equal(store.getRevision(), before);
 });

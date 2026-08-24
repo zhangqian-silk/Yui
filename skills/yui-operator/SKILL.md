@@ -342,6 +342,15 @@ ChangeSet is integrated.
   Run, Agent, receipt, launch, and Session identities; never reconstruct them
   from terminal text or ask the user to paste them.
 - Retry only an explicitly failed recovery Job.
+- When a Leader first-progress stop-loss is reported, inspect its two exact
+  native generations and absence of durable progress. Do not request a third
+  automatic generation or create another Operator. Recover the existing Task
+  only after choosing an explicit valid Leader configuration or a direct
+  maintenance action.
+- Use `yui task next-action <task>` and `yui execution audit` orchestration
+  advisories as read-only cost evidence. They may flag excess WorkItems,
+  repeated Reviews/checks, pre-progress generations, or terminal workspaces;
+  they never authorize acceptance, deletion, or automatic protocol changes.
 
 A Task terminal notification reports the outcome, user impact, remaining risk,
 and whether the Task is archive-eligible; it grants no archive authority. Task
