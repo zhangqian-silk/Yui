@@ -16,7 +16,7 @@ import type {
 import { YUI_VERSION } from "../version.js";
 
 const PROVIDER_MESSAGE_MAX_BYTES = 16 * 1024 * 1024;
-const PROVIDER_ACCEPT_TIMEOUT_MS = 30_000;
+const PROVIDER_ACCEPT_TIMEOUT_MS = 60_000;
 
 export type StructuredProviderTurnReceipt = Readonly<{
   attemptId: string;
