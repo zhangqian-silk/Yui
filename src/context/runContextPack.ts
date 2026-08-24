@@ -1,5 +1,6 @@
 import type { AgentRun } from "../run/agentRun.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
 import { RUN_BOOTSTRAP_MAX_DELTAS } from "./runContextContract.js";
 import {
   contextContentDigest,
@@ -359,6 +360,18 @@ function collectAuthorizedContext(
     }
     for (const message of store.listMessages(task.id).slice(-16)) {
       result.push(materialize("L4", "task-message", message.id, message));
+    }
+    const publishedTreeAuthorizations = [];
+    const events = store.listEvents(task.id);
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]!;
+      if (event.type === "task.completed" || event.type === "task.reopened") break;
+      if (event.type === TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT) {
+        publishedTreeAuthorizations.push(event);
+      }
+    }
+    for (const event of publishedTreeAuthorizations.reverse().slice(-16)) {
+      result.push(materialize("L4", "task-event", event.id, event));
     }
     for (const request of store.listOpenInputRequests([task.id])) {
       result.push(materialize("L4", "input-request", request.id, request));

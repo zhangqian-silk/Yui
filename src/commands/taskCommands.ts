@@ -173,6 +173,7 @@ import {
   formatAgentRunReceiptId,
   resolveTaskRecordReference
 } from "../task/taskRecordReference.js";
+import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
 import {
   projectCompletionReadiness,
   type CompletionBlocker
@@ -344,7 +345,8 @@ function storedTaskFinalReviewContract(
 function taskFinalReviewContractForMutation(
   store: TaskWorkflowStore,
   taskId: string,
-  options: TaskCommandOptions
+  options: TaskCommandOptions,
+  authorization: Readonly<{ allowStoredWithoutSupplied?: boolean }> = {}
 ): TaskFinalReviewContract | undefined {
   const supplied = options.taskFinalReviewContract;
   if (supplied !== undefined) {
@@ -364,6 +366,7 @@ function taskFinalReviewContractForMutation(
   }
   if (stored === undefined) return supplied;
   if (supplied === undefined) {
+    if (authorization.allowStoredWithoutSupplied === true) return stored;
     throw usageError(`Task final-review contract is missing for ${taskId}.`);
   }
   if (!sameTaskFinalReviewContract(stored, supplied)) {
@@ -507,7 +510,8 @@ export function parseTaskCompletionRequest(
 export function preflightTaskCompletion(
   taskId: string,
   store: TaskWorkflowStore,
-  options: TaskCommandOptions = {}
+  options: TaskCommandOptions = {},
+  request: Readonly<{ acceptedPublishedTreePublicationId?: string }> = {}
 ): TaskCompletionPreflight {
   const task = requireTask(store, taskId);
   const actor = taskActor(options, task.id);
@@ -520,7 +524,20 @@ export function preflightTaskCompletion(
   // Resolve and authenticate the durable Task-local gate before any remote
   // fetch or Integration write.  All checks below mirror the transactional
   // completion path, which remains the final CAS fence after reconciliation.
-  const taskFinalReviewContract = taskFinalReviewContractForMutation(store, task.id, options);
+  // A human/global Operator cannot present the exact managed Leader contract.
+  // For the explicit published-tree path only, let that caller authenticate
+  // the stored contract far enough to persist an exact authorization fact.
+  // The same command must return before any contract-governed completion
+  // mutation; the exact Leader later consumes the authorization with the real
+  // contract capability.
+  const authorizingPublishedTree = request.acceptedPublishedTreePublicationId !== undefined
+    && actor !== "leader";
+  const taskFinalReviewContract = taskFinalReviewContractForMutation(
+    store,
+    task.id,
+    options,
+    { allowStoredWithoutSupplied: authorizingPublishedTree }
+  );
   const activeTaskReview = store.listReviewRounds(task.id).some((round) => (
     (round.scope ?? "work-item") === "task"
     && (round.status === "pending" || round.status === "running")
@@ -1122,23 +1139,60 @@ function completeTaskCommand(
   const summary = request.summary;
   const now = clock(options);
   const result = store.transaction((tx) => {
-    const preflight = preflightTaskCompletion(request.taskId, tx, options);
+    const preflight = preflightTaskCompletion(request.taskId, tx, options, request);
     const { task, actor } = preflight;
     if (preflight.completed) {
       return {
         task,
         changed: false,
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
-        finalReview: undefined
+        finalReview: undefined,
+        publishedTreeAuthorization: undefined
       } as const;
     }
-    if (request.acceptedPublishedTreePublicationId !== undefined && actor === "leader") {
-      throw usageError(
-        "A managed Task Leader cannot accept published-tree equivalence; "
-        + "use an explicit user or global Operator task complete command."
-      );
-    }
     const taskFinalContract = preflight.taskFinalReviewContract;
+    const publishedTreeProof = request.acceptedPublishedTreePublicationId === undefined
+      ? undefined
+      : assertTaskCompletionPublishedTreeProof(
+        tx,
+        task,
+        request.acceptedPublishedTreePublicationId,
+        options.completionPublishedTreeProof,
+        actualTaskReviewCandidateForMutation(tx, task, options)
+      );
+    const requiresContractHandoff = publishedTreeProof !== undefined
+      && taskFinalContract !== undefined;
+    if (requiresContractHandoff && actor !== "leader") {
+      const existing = matchingPublishedTreeAuthorization(tx, publishedTreeProof);
+      const event = existing ?? recordTaskEventRecord(
+        tx,
+        task.id,
+        TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT,
+        publishedTreeAuthorizationPayload(actor, publishedTreeProof),
+        now
+      );
+      enqueueWork(
+        tx,
+        leaderMailbox(task.id),
+        wakeReason("published-tree-authorized", event.id),
+        now,
+        [eventRef(task.id, event.id)]
+      );
+      return {
+        task,
+        changed: false,
+        runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
+        finalReview: undefined,
+        publishedTreeAuthorization: {
+          event,
+          proof: publishedTreeProof,
+          created: existing === undefined
+        }
+      } as const;
+    }
+    if (publishedTreeProof !== undefined && actor === "leader") {
+      requirePublishedTreeAuthorization(tx, publishedTreeProof);
+    }
 
     const roles = tx.listRoles(task.id);
     const activeRuns = roles
@@ -1200,19 +1254,10 @@ function completeTaskCommand(
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
         finalReview,
         resumedPendingFinalReview: pendingFinalReviewIds.has(finalReview.id),
-        terminalizedLeaderRun
+        terminalizedLeaderRun,
+        publishedTreeAuthorization: undefined
       } as const;
     }
-
-    const publishedTreeProof = request.acceptedPublishedTreePublicationId === undefined
-      ? undefined
-      : assertTaskCompletionPublishedTreeProof(
-        tx,
-        task,
-        request.acceptedPublishedTreePublicationId,
-        options.completionPublishedTreeProof,
-        actualTaskReviewCandidateForMutation(tx, task, options)
-      );
     // Issue 06: re-validate the full completion readiness inside the
     // transaction (the CAS fence) after final-review preparation.  This is the
     // same pure projection `task next-action` displays, now with the finding
@@ -1273,9 +1318,24 @@ function completeTaskCommand(
       runtimeCleanupTargets,
       finalReview: undefined,
       resumedPendingFinalReview: false,
-      terminalizedLeaderRun
+      terminalizedLeaderRun,
+      publishedTreeAuthorization: undefined
     } as const;
   });
+  if (result.publishedTreeAuthorization !== undefined) {
+    notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+    const authorization = result.publishedTreeAuthorization;
+    return output(
+      authorization.created
+        ? `Authorized published-tree completion for ${result.task.id} as ${authorization.event.id}; exact Task Leader completion is required.\n`
+        : `Published-tree completion is already authorized for ${result.task.id} as ${authorization.event.id}; exact Task Leader completion is required.\n`,
+      {
+        task: result.task,
+        authorizationEvent: authorization.event,
+        publishedTreeProof: authorization.proof
+      }
+    );
+  }
   if (result.changed) {
     for (const target of result.runtimeCleanupTargets) {
       // Cleanup owns an independent lifecycle lane. Never fall back to the
@@ -7137,6 +7197,57 @@ function recordTaskEventRecord(
   return event;
 }
 
+function publishedTreeAuthorizationPayload(
+  actor: Exclude<TaskCompletedBy, "leader">,
+  proof: TaskCompletionPublishedTreeProof
+): TaskEventPayload {
+  return {
+    by: actor,
+    projectId: proof.projectId,
+    publicationId: proof.publicationId,
+    reviewRoundId: proof.reviewRoundId,
+    localCommit: proof.localCommit,
+    remoteCommit: proof.remoteCommit,
+    tree: proof.tree
+  };
+}
+
+function matchingPublishedTreeAuthorization(
+  store: TaskWorkflowStore,
+  proof: TaskCompletionPublishedTreeProof
+): TaskEvent | undefined {
+  const events = store.listEvents(proof.taskId);
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.type === "task.completed" || event.type === "task.reopened") return undefined;
+    if (event.type === TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT
+      && (event.payload.by === "user" || event.payload.by === "operator")
+      && event.payload.projectId === proof.projectId
+      && event.payload.publicationId === proof.publicationId
+      && event.payload.reviewRoundId === proof.reviewRoundId
+      && event.payload.localCommit === proof.localCommit
+      && event.payload.remoteCommit === proof.remoteCommit
+      && event.payload.tree === proof.tree) {
+      return event;
+    }
+  }
+  return undefined;
+}
+
+function requirePublishedTreeAuthorization(
+  store: TaskWorkflowStore,
+  proof: TaskCompletionPublishedTreeProof
+): TaskEvent {
+  const authorization = matchingPublishedTreeAuthorization(store, proof);
+  if (authorization === undefined) {
+    throw usageError(
+      `Published-tree completion requires explicit user or global Operator authorization for `
+      + `${proof.taskId}/${proof.publicationId} at Task-final Review ${proof.reviewRoundId}.`
+    );
+  }
+  return authorization;
+}
+
 /** Keeps a free-text run-fact note bounded so an event payload stays compact. */
 function truncateEventNote(note: string): string {
   const normalized = note.trim();
@@ -8290,6 +8401,10 @@ function workItemRef(taskId: string, id: string): MailboxEntityRef {
 
 function messageRef(taskId: string, id: string): MailboxEntityRef {
   return { type: "message", taskId, id };
+}
+
+function eventRef(taskId: string, id: string): MailboxEntityRef {
+  return { type: "event", taskId, id };
 }
 
 function notifyMailbox(

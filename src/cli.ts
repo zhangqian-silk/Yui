@@ -1278,8 +1278,14 @@ export async function main(): Promise<void> {
         ...(taskFinalReviewContract === undefined
           ? {}
           : { taskFinalReviewContract })
-      });
+      }, completionRequest);
       if (!completion.completed && !completion.activeTaskReview) {
+        // An explicit refresh must fetch the remote object graph before the
+        // Publication proof resolves its exact commit. Without the flag the
+        // command remains offline and preserves the existing proof-first path.
+        const refreshedFreshness = refreshRemote
+          ? await inspectTaskBaseFreshness(resolved[2], store, { refresh: true })
+          : undefined;
         if (completionRequest.acceptedPublishedTreePublicationId !== undefined) {
           completionPublishedTreeProof = await verifyTaskCompletionPublishedTree(
             completionRequest.taskId,
@@ -1287,9 +1293,8 @@ export async function main(): Promise<void> {
             store
           );
         }
-        const freshness = await inspectTaskBaseFreshness(resolved[2], store, {
-          refresh: refreshRemote
-        });
+        const freshness = refreshedFreshness
+          ?? await inspectTaskBaseFreshness(resolved[2], store);
         for (const warning of assertTaskBaseFreshnessForCompletion(freshness, {
           ...(completionPublishedTreeProof === undefined
             ? {}
