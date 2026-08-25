@@ -101,6 +101,94 @@ export function freezeRunContextSnapshot(
   return snapshot;
 }
 
+/**
+ * Freeze the shared, role-neutral ContextSnapshot anchored by one WorkItem
+ * exploration stage Group. AgentRun snapshots remain role-specific; this
+ * record is the durable stage baseline and derives from a fresh WorkItem
+ * snapshot so the Group never depends on ambient latest state.
+ */
+export function freezeExecutionStageContextSnapshot(
+  store: TaskStore,
+  input: Readonly<{
+    taskId: string;
+    workItemId: string;
+    executionGroupId: string;
+  }>,
+  now: Date
+): ContextSnapshot {
+  const task = store.getTask(input.taskId);
+  if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
+  const workItem = store.getWorkItem(input.taskId, input.workItemId);
+  if (workItem === null) throw new Error(`WorkItem not found: ${input.workItemId}.`);
+  const materialized: MaterializedRef[] = [
+    materialize("L2", "task", task.id, task),
+    materialize("L3", "work-item", workItem.id, workItem)
+  ];
+  for (const dependencyId of workItem.dependsOn) {
+    const dependency = store.getWorkItem(task.id, dependencyId);
+    if (dependency === null || dependency.status !== "completed") {
+      throw new Error(`Exploration stage dependency is not accepted: ${dependencyId}.`);
+    }
+    materialized.push(materialize("L3", "accepted-work-item", dependency.id, dependency));
+  }
+  for (const binding of task.projectBindings) {
+    const project = store.getProject(binding.projectId);
+    if (project === null) throw new Error(`Run Project not found: ${binding.projectId}.`);
+    const { knowledge, ...projectPolicy } = project;
+    materialized.push(materialize("L1", "project-policy", project.id, projectPolicy));
+    for (const entry of knowledge.filter(({ status }) => status === "active")) {
+      materialized.push(materialize(
+        "L1",
+        "project-knowledge",
+        `${project.id}:${entry.id}`,
+        { projectId: project.id, ...entry }
+      ));
+    }
+  }
+  const resources = [...new Map(materialized.map((entry) => [
+    contextRefIdentity(entry.ref),
+    entry
+  ])).values()].sort((left, right) => (
+    contextRefIdentity(left.ref).localeCompare(contextRefIdentity(right.ref))
+  ));
+  const previousWorkItem = store.listContextSnapshots(task.id)
+    .filter((candidate) => candidate.scope === "workitem"
+      && candidate.scopeRef === workItem.id)
+    .sort((left, right) => left.sequence - right.sequence)
+    .at(-1);
+  const workItemSnapshot = createContextSnapshot({
+    id: store.nextContextSnapshotId(task.id),
+    taskId: task.id,
+    scope: "workitem",
+    scopeRef: workItem.id,
+    sequence: (previousWorkItem?.sequence ?? 0) + 1,
+    refs: resources.map(({ ref }) => ref),
+    resources,
+    acceptRefs: [`work-item:${workItem.id}:acceptance`],
+    ...(previousWorkItem === undefined
+      ? {}
+      : { parentRef: contextSnapshotRef(previousWorkItem) }),
+    frozenAt: now,
+    frozenBy: "controller"
+  });
+  store.saveContextSnapshot(workItemSnapshot);
+  const stageSnapshot = createContextSnapshot({
+    id: store.nextContextSnapshotId(task.id),
+    taskId: task.id,
+    scope: "stage",
+    scopeRef: input.executionGroupId,
+    sequence: workItemSnapshot.sequence + 1,
+    refs: resources.map(({ ref }) => ref),
+    resources,
+    acceptRefs: [`work-item:${workItem.id}:acceptance`],
+    parentRef: contextSnapshotRef(workItemSnapshot),
+    frozenAt: now,
+    frozenBy: "controller"
+  });
+  store.saveContextSnapshot(stageSnapshot);
+  return stageSnapshot;
+}
+
 /** Bounded changed-ref hint between one frozen Snapshot and its exact parent. */
 export function contextSnapshotDeltaRefIds(
   store: TaskStore,

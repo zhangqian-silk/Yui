@@ -706,8 +706,11 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "dispatch",
         summary: "Dispatch a work item to its Role.",
-        usage: "yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...]",
-        options: ["--input", "--strategy", "--lane-role"]
+        usage: "yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--mode <single|parallel-diverse|ensemble-replicated|adversarial|adaptive-exploration>] [--max-rounds <count>] [--stage-max-attempts <count>]",
+        options: ["--input", "--strategy", "--lane-role", "--mode", "--max-rounds", "--stage-max-attempts"],
+        optionValues: {
+          "--mode": ["single", "parallel-diverse", "ensemble-replicated", "adversarial", "adaptive-exploration"]
+        }
       },
       {
         name: "group",
@@ -717,9 +720,9 @@ const taskChildren: readonly NodeInput[] = [
         children: [{
           name: "resolve",
           summary: "Select Lane outputs and resolve the Worker group.",
-          usage: "yui task work group resolve <task>/<work> --decision <accept|reject|blocked> --summary <text> [--lane <lane-id> ...]",
+          usage: "yui task work group resolve <task>/<work> --decision <accept|reject|retry|blocked> --summary <text> [--lane <lane-id> ...]",
           options: ["--decision", "--summary", "--lane"],
-          optionValues: { "--decision": ["accept", "reject", "blocked"] }
+          optionValues: { "--decision": ["accept", "reject", "retry", "blocked"] }
         }]
       },
       {

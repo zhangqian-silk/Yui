@@ -1,6 +1,15 @@
 import { isDeepStrictEqual } from "node:util";
 
-import { requireIdentity, requireText, requireTimestamp } from "../domain/validation.js";
+import {
+  requireIdentity,
+  requirePositiveInteger,
+  requireText,
+  requireTimestamp
+} from "../domain/validation.js";
+import {
+  validateContextSnapshotRef,
+  type ContextSnapshotRef
+} from "../context/contextSnapshot.js";
 import {
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
@@ -22,6 +31,59 @@ export type ExecutionStrategy = Readonly<
   | { mode: "fixed"; count: number }
   | { mode: "adaptive"; max: number }
 >;
+
+export const WORK_ITEM_EXPLORATION_MODES = [
+  "parallel-diverse",
+  "ensemble-replicated",
+  "adversarial",
+  "adaptive-exploration"
+] as const;
+export const WORK_ITEM_EXECUTION_MODES = [
+  "single",
+  ...WORK_ITEM_EXPLORATION_MODES
+] as const;
+export const WORK_ITEM_EXPLORATION_STAGES = [
+  "plan",
+  "generate",
+  "compare",
+  "synthesize",
+  "verify",
+  "resolve"
+] as const;
+
+export type WorkItemExecutionMode = typeof WORK_ITEM_EXECUTION_MODES[number];
+export type WorkItemExplorationMode = typeof WORK_ITEM_EXPLORATION_MODES[number];
+export type WorkItemExplorationStage = typeof WORK_ITEM_EXPLORATION_STAGES[number];
+
+/** A reference to one immutable Lane result from the immediately prior stage Group. */
+export type ExecutionParentResultRef = Readonly<{
+  executionGroupId: string;
+  executionLaneId: string;
+  resultDigest: string;
+}>;
+
+/** Structural limits enforced before a stage Group or retry can be dispatched. */
+export type ExecutionStageBudget = Readonly<{
+  maxLanes: number;
+  maxAttempts: number;
+}>;
+
+/**
+ * Immutable WorkItem exploration semantics carried by one ExecutionGroup.
+ * The WorkItem's ordered Group history is the state machine; this value does
+ * not introduce another container or graph.
+ */
+export type ExecutionStageContext = Readonly<{
+  schemaVersion: 1;
+  mode: WorkItemExplorationMode;
+  stage: WorkItemExplorationStage;
+  round: number;
+  stageAttempt: number;
+  maxRounds: number;
+  budget: ExecutionStageBudget;
+  contextSnapshotRef: ContextSnapshotRef;
+  parentResults: readonly ExecutionParentResultRef[];
+}>;
 
 /**
  * A target is deliberately a value snapshot rather than a pointer to a live
@@ -119,6 +181,7 @@ export type ExecutionGroup = Readonly<{
   purpose: ExecutionPurpose;
   strategy: ExecutionStrategy;
   target: ExecutionTarget;
+  stage?: ExecutionStageContext;
   lanes: readonly ExecutionLane[];
   resolution?: ExecutionResolution;
   createdAt: string;
@@ -129,6 +192,7 @@ export type ExecutionGroupSummary = Readonly<{
   groupId: string;
   purpose: ExecutionPurpose;
   strategy: ExecutionStrategy;
+  stage?: ExecutionStageContext;
   laneCount: number;
   activeLaneCount: number;
   terminalLaneCount: number;
@@ -166,6 +230,7 @@ export type ExecutionLaneInput = Readonly<{
 export type ExecutionGroupInput = Readonly<{
   purpose: ExecutionPurpose;
   target: ExecutionTarget;
+  stage?: ExecutionStageContext;
   strategy?: ExecutionStrategy;
   lanes?: readonly ExecutionLaneInput[];
   /** Used only when the caller wants the default one-lane group. */
@@ -179,8 +244,10 @@ export function createExecutionGroup(
   now: Date
 ): ExecutionGroup {
   const timestamp = now.toISOString();
+  const groupId = requireIdentity(id, "ExecutionGroup id");
+  const normalizedTaskId = requireIdentity(taskId, "Task id");
   const strategy = normalizeStrategy(input.strategy ?? { mode: "fixed", count: 1 });
-  const target = validateExecutionTarget(input.target, taskId);
+  const target = validateExecutionTarget(input.target, normalizedTaskId);
   const laneInputs = input.lanes === undefined
     ? [{ roleName: input.roleName ?? "leader" }]
     : input.lanes;
@@ -202,11 +269,14 @@ export function createExecutionGroup(
   ));
   return validateExecutionGroup({
     schemaVersion: EXECUTION_GROUP_SCHEMA_VERSION,
-    id: requireIdentity(id, "ExecutionGroup id"),
-    taskId: requireIdentity(taskId, "Task id"),
+    id: groupId,
+    taskId: normalizedTaskId,
     purpose: validatePurpose(input.purpose),
     strategy,
     target,
+    ...(input.stage === undefined
+      ? {}
+      : { stage: validateExecutionStageContext(input.stage, normalizedTaskId, groupId, strategy) }),
     lanes,
     createdAt: timestamp,
     updatedAt: timestamp
@@ -285,6 +355,7 @@ export function assertExecutionGroupTransition(
     || existing.purpose !== candidate.purpose
     || !isDeepStrictEqual(existing.strategy, candidate.strategy)
     || !isDeepStrictEqual(existing.target, candidate.target)
+    || !isDeepStrictEqual(existing.stage, candidate.stage)
     || existing.createdAt !== candidate.createdAt) {
     throw new Error(`ExecutionGroup identity or target changed: ${existing.id}.`);
   }
@@ -534,6 +605,7 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
     groupId: group.id,
     purpose: group.purpose,
     strategy: group.strategy,
+    ...(group.stage === undefined ? {} : { stage: group.stage }),
     laneCount: group.lanes.length,
     activeLaneCount,
     terminalLaneCount,
@@ -571,6 +643,12 @@ export function validateExecutionGroup(group: ExecutionGroup): ExecutionGroup {
   validatePurpose(group.purpose);
   normalizeStrategy(group.strategy);
   validateExecutionTarget(group.target, taskId);
+  if (group.stage !== undefined) {
+    if (group.purpose !== "execution" || group.target.kind !== "work-item") {
+      throw new Error("Only a WorkItem ExecutionGroup can carry exploration stage context.");
+    }
+    validateExecutionStageContext(group.stage, taskId, group.id, group.strategy);
+  }
   if (!Array.isArray(group.lanes) || group.lanes.length === 0) {
     throw new Error("ExecutionGroup requires at least one Lane.");
   }
@@ -601,6 +679,64 @@ export function validateExecutionGroup(group: ExecutionGroup): ExecutionGroup {
   requireTimestamp(group.createdAt, "ExecutionGroup createdAt");
   requireTimestamp(group.updatedAt, "ExecutionGroup updatedAt");
   return group;
+}
+
+export function validateExecutionStageContext(
+  stage: ExecutionStageContext,
+  taskId: string,
+  executionGroupId: string,
+  strategy: ExecutionStrategy
+): ExecutionStageContext {
+  if (stage === null || typeof stage !== "object" || stage.schemaVersion !== 1) {
+    throw new Error("Execution stage context must use schemaVersion 1.");
+  }
+  if (!WORK_ITEM_EXPLORATION_MODES.includes(stage.mode)) {
+    throw new Error("Execution stage mode must be an exploration mode.");
+  }
+  if (!WORK_ITEM_EXPLORATION_STAGES.includes(stage.stage)) {
+    throw new Error("Execution stage is invalid.");
+  }
+  requirePositiveInteger(stage.round, "Execution stage round");
+  requirePositiveInteger(stage.stageAttempt, "Execution stage attempt");
+  requirePositiveInteger(stage.maxRounds, "Execution stage max rounds");
+  if (stage.round > stage.maxRounds) {
+    throw new Error("Execution stage round exceeds maxRounds.");
+  }
+  if (stage.budget === null || typeof stage.budget !== "object") {
+    throw new Error("Execution stage budget is required.");
+  }
+  requirePositiveInteger(stage.budget.maxLanes, "Execution stage max Lanes");
+  requirePositiveInteger(stage.budget.maxAttempts, "Execution stage max attempts");
+  if (stage.stageAttempt > stage.budget.maxAttempts) {
+    throw new Error("Execution stage attempt exceeds its budget.");
+  }
+  const capacity = strategy.mode === "fixed" ? strategy.count : strategy.max;
+  if (stage.budget.maxLanes !== capacity) {
+    throw new Error("Execution stage Lane budget must match its Group strategy capacity.");
+  }
+  const snapshot = validateContextSnapshotRef(stage.contextSnapshotRef);
+  if (snapshot.taskId !== taskId
+    || snapshot.scope !== "stage"
+    || snapshot.scopeRef !== executionGroupId) {
+    throw new Error("Execution stage ContextSnapshot does not match its Group.");
+  }
+  if (!Array.isArray(stage.parentResults)) {
+    throw new Error("Execution stage parentResults are invalid.");
+  }
+  const parents = new Set<string>();
+  for (const parent of stage.parentResults) {
+    const groupId = requireIdentity(parent.executionGroupId, "Parent ExecutionGroup id");
+    const laneId = requireIdentity(parent.executionLaneId, "Parent ExecutionLane id");
+    if (!/^[0-9a-f]{64}$/u.test(parent.resultDigest)) {
+      throw new Error("Parent ExecutionLane result digest must be SHA-256 hex.");
+    }
+    const key = `${groupId}\0${laneId}`;
+    if (parents.has(key)) {
+      throw new Error(`Execution stage parent result is duplicated: ${groupId}/${laneId}.`);
+    }
+    parents.add(key);
+  }
+  return stage;
 }
 
 export function validateExecutionLane(
