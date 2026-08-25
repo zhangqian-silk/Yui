@@ -279,9 +279,11 @@ feature before creating WorkItems. The Leader decides whether a feature is
 small enough to deliver on Task main or large enough for independently owned WorkItems. A WorkItem is
 one substantial requirement for one Worker, not a development step, test run,
 review finding, or local fix. Multiple WorkItems are useful only when distinct
-Workers can advance meaningful requirements independently. Once WorkItems
-produce Git results, their ChangeSets must be integrated into the Leader's
-Task main before Task-final Review or completion.
+Workers can advance meaningful requirements independently. A WorkItem's
+governing Candidate defines its delivery obligation: its current ChangeSets
+must reach committed Integration or an explicit superseded queue disposition
+before Task-final Review or completion. Older Candidate and ChangeSet records
+remain audit evidence without keeping the Task open.
 
 `project refresh` is the explicit network operation for a stable Project checkout. It fetches the
 configured stable branch directly from the Project remote URL and advances only through a clean,
@@ -415,7 +417,9 @@ yui task base status <task-id> --refresh
 The default check is offline and uses local remote-tracking refs. `--refresh`
 is the explicit authorization to query the configured remote; Yui never
 fetches, rebases, merges, or force-pushes as a hidden side effect of Task
-completion.
+completion. Behind, diverged, or unavailable remote state is reported as
+delivery-risk evidence for the Leader; it does not replace the Leader's choice
+of delivery base. A dirty Task workspace remains a completion blocker.
 
 Implementation WorkItems declare the Projects they may modify. Their workspace
 keeps the same relative layout, creates isolated worktrees only for that write
@@ -717,7 +721,7 @@ yui task complete <task-id> --summary-file delivery.txt \
   --accept-published-tree <publication-id>
 ```
 
-This does not weaken normal freshness checks. Yui requires the current,
+This is an independent exact-tree authorization. Yui requires the current,
 unsuperseded Publication to be merged and verified, its local commit to equal
 the physical Task head, its remote commit to be ancestry-divergent, and both
 commits to resolve to the same exact tree. When a Task-final Review obligation
@@ -725,10 +729,10 @@ exists, completion also requires the latest semantic Round to attest the
 accepted Task head; otherwise completion does not invent a ReviewRound.
 `--refresh-remote` fetches
 the remote object graph before resolving that Publication commit. For a Task
-governed by a durable exact final-review contract, the user/Operator command
-persists the exact authorization tuple and wakes the Task Leader; only that
-contract-capable Leader may consume it and complete the Task. Tasks without
-that contract retain the one-step explicit completion path. The Task event
+governed by a durable final-review contract, the stored contract continues to
+require its Reviewer policy, but compatible CLI and Controller updates do not
+need to reproduce its historical control-plane digest. Tasks without that
+contract retain the one-step explicit completion path. The Task event
 audit records the authorization and, on completion, the accepted Project,
 Publication, optional ReviewRound, both commits, and tree.
 
@@ -787,10 +791,11 @@ tmux fixes a pane's history capacity when that pane is created. Existing panes
 retain their configured capacity; managed runtime output remains observable in
 the Agent Host pane without becoming lifecycle or acknowledgement evidence.
 
-Each Role, including a Task-bound Worker instance, can bind multiple configured Agents, has one active Agent, and keeps
-a separate native session per Agent binding. Operator narrows this to at most
-one Agent per adapter—for example, one Codex and one Claude—so its bindings are
-ready-to-switch configurations rather than parallel identities. Operator can
+Each Role, including Operator and a Task-bound Worker instance, can bind multiple
+configured Agents, has one active Agent, and keeps a separate native session per
+Agent binding. Multiple bindings may use the same adapter for different accounts,
+models, profiles, or environment sources. They are ready-to-switch configurations,
+not parallel writers: the active binding remains the unique authority. Operator can
 keep multiple conversations for each binding. `operator new` and
 `operator resume` reuse the single Operator tmux pane: when a process is
 running, Yui asks before stopping it and switching the conversation. On a
@@ -832,7 +837,7 @@ movement cannot conceal a workflow that is not advancing.
 
 Stable Role context is also launch metadata, never a bootstrap turn. Yui passes Role policy and `systemPrompt` through the Agent's native system/developer-instruction channel. Task execution Runs receive the generic Leader or Worker Skill, while review Runs receive the generic Reviewer Skill based on durable Run purpose rather than a configured Role name. These Yui-owned Role Skills define portable orchestration only. Project Skills remain ordinary versioned files in the Project and are discovered, selected, and loaded by the Agent through its native project mechanism; Yui does not scan, parse, copy, or inject them.
 
-Native Codex developer instructions carry compact absolute references only for Yui-owned Role Skills, which Codex reads on demand. Because `developer_instructions` is one scalar setting, Yui inspects every supported Linux Codex layer—`/etc/codex/config.toml`, the user config, the selected `$CODEX_HOME/<name>.config.toml`, project configs, and `/etc/codex/managed_config.toml`—and refuses to replace a value found in any of them. Codex sessions opened without a managed Run use Yui's structured `notify` callback for session presentation and therefore require exclusive ownership of that setting. Managed Runs instead use invocation-local Agent Driver Hooks as their sole lifecycle authority. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Yui-owned Role Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the purpose-specific Role path. Non-Operator global Roles stay neutral and receive no Task orchestration Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker or Reviewer Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
+Native Codex developer instructions carry compact absolute references only for Yui-owned Role Skills, which Codex reads on demand. Yui applies this scalar as an invocation-local override, so existing user, profile, project, and system values do not make the Session unusable and the underlying config file is never mutated. A higher-precedence managed `developer_instructions` value remains a bounded launch blocker because Codex will not let invocation flags replace it. Interactive Codex Sessions apply the same rule to Yui's structured `notify` callback; Doctor reports ordinary overridden sources as context and rejects an effective managed conflict. Managed Runs instead use invocation-local Agent Driver Hooks as their sole lifecycle authority and do not claim `notify`. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Yui-owned Role Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the purpose-specific Role path. Non-Operator global Roles stay neutral and receive no Task orchestration Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker or Reviewer Run assignments remain real mailbox-delivered work messages. An adapter without a native instruction channel must reject this context rather than silently converting it into a first user prompt.
 
 ## Controller and failure handling
 

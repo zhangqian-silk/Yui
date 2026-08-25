@@ -1046,6 +1046,7 @@ export class FileTaskStore implements TaskStore {
       workItems: values(aggregate.workItems, "id"),
       changeSets: values(aggregate.changeSets, "id"),
       integrations: values(aggregate.integrationAttempts, "id"),
+      integrationQueueEntries: values(aggregate.integrationQueue, "id"),
       reviewRounds: values(aggregate.reviewRounds, "id"),
       taskFinalReviewContractEvents: events
         .filter((event) => event.type === TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT),

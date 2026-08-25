@@ -433,7 +433,7 @@ test("terminal child worktrees advise at completion and repair defaults converge
     status: "active"
   };
   const readiness = projectCompletionReadiness(completionFacts(task, {
-    workItems: [{ id: "work-item-1", status: "completed" }],
+    workItems: [{ id: "work-item-1", status: "completed", candidates: [] }],
     managedWorkspaces: [{
       schemaVersion: 2,
       owner: { type: "work-item", taskId: task.id, workItemId: "work-item-1" },

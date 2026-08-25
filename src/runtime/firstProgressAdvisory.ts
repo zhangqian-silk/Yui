@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
@@ -7,43 +5,25 @@ import type { ReviewRound } from "../review/reviewRound.js";
 import type { WorkItem } from "../workItem/workItem.js";
 
 /**
- * Pure first-progress stop-loss. A third fresh native generation is blocked
- * when the first two generations produced no durable Leader action. The
- * projection is rebuilt from existing records; it is not retry state.
+ * Pure first-progress advisory. Two fresh native generations without durable
+ * Leader action are observable as an attention signal, but never replace the
+ * Leader or Operator's decision about whether another generation is useful.
  */
-export type FirstProgressStopLoss = Readonly<{
-  exhausted: boolean;
+export type FirstProgressAdvisory = Readonly<{
+  attentionRecommended: boolean;
   generationsBeforeFirstProgress: number;
   firstGenerationAt?: string;
   firstProgressAt?: string;
-  generationRefs: readonly string[];
-  progressRefs: readonly string[];
-  fingerprint: string;
   reason: string;
 }>;
 
-export type ProviderRetryPolicy = Readonly<{
-  delaysMs: readonly number[];
-  maxWindowMs: number;
-}>;
-
-/** One automatic same-Session continuation is allowed before first progress. */
-export function boundProviderRetryBeforeFirstProgress(
-  policy: ProviderRetryPolicy,
-  projection: Pick<FirstProgressStopLoss, "firstProgressAt">
-): ProviderRetryPolicy {
-  return projection.firstProgressAt === undefined
-    ? Object.freeze({ delaysMs: policy.delaysMs.slice(0, 1), maxWindowMs: policy.maxWindowMs })
-    : policy;
-}
-
-export function projectFirstProgressStopLoss(input: Readonly<{
+export function projectFirstProgressAdvisory(input: Readonly<{
   sessions: TaskRoleSessionSet | null;
   events: readonly TaskEvent[];
   workItems: readonly WorkItem[];
   reviewRounds: readonly ReviewRound[];
   integrations: readonly IntegrationAttempt[];
-}>): FirstProgressStopLoss {
+}>): FirstProgressAdvisory {
   const sessions = input.sessions === null
     ? []
     : [...(input.sessions.history ?? []), ...Object.values(input.sessions.sessions)]
@@ -71,26 +51,17 @@ export function projectFirstProgressStopLoss(input: Readonly<{
   const generationsBeforeFirstProgress = unique.filter((session) => (
     firstProgressAt === undefined || session.createdAt <= firstProgressAt
   )).length;
-  const generationRefs = unique.map((session) => (
-    `${session.nativeSessionId}@${session.launchId ?? session.createdAt}`
-  ));
-  const progressRefs = progress.map(({ ref }) => ref);
-  const exhausted = firstProgressAt === undefined && generationsBeforeFirstProgress >= 2;
-  const fingerprint = createHash("sha256")
-    .update(JSON.stringify({ generationRefs, progressRefs }))
-    .digest("hex");
+  const attentionRecommended = firstProgressAt === undefined
+    && generationsBeforeFirstProgress >= 2;
   return Object.freeze({
-    exhausted,
+    attentionRecommended,
     generationsBeforeFirstProgress,
     ...(firstGenerationAt === undefined ? {} : { firstGenerationAt }),
     ...(firstProgressAt === undefined ? {} : { firstProgressAt }),
-    generationRefs,
-    progressRefs,
-    fingerprint,
-    reason: exhausted
-      ? `${generationsBeforeFirstProgress} fresh Leader generations produced no first durable progress; stop before creating another generation and hand off to the Operator.`
+    reason: attentionRecommended
+      ? `${generationsBeforeFirstProgress} fresh Leader generations produced no first durable progress; Operator attention may be useful before another generation.`
       : firstProgressAt !== undefined
         ? `First durable progress was recorded at ${firstProgressAt}.`
-        : `Fewer than two Leader generations exist before first durable progress.`
+        : "Fewer than two Leader generations exist before first durable progress."
   });
 }

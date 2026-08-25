@@ -2,6 +2,12 @@ import type { DurableJob } from "../job/durableJob.js";
 import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
+import {
+  changeSetDeliverySettled,
+  governingChangeSets,
+  integrationAttemptRequiresSettlement,
+  latestGoverningQueueEntries
+} from "../integration/deliveryObligation.js";
 import { isReviewFindingBlocking, type ReviewFinding } from "../review/reviewFinding.js";
 import { deltaRecheckBlocksAcceptance } from "../review/reviewRound.js";
 import { isSemanticReviewRound } from "../review/reviewOutcomeClassifier.js";
@@ -10,6 +16,7 @@ import {
   REVIEW_FINDINGS_RECONCILE_FAILED_EVENT,
   reviewFindingLedgerWriteFailedFromEvents
 } from "../review/reviewFindingLedger.js";
+import { resolveRecordedTaskFinalReviewContract } from "../review/taskFinalReviewContractRebind.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { ProviderContinuation } from "../runtime/providerContinuation.js";
 import { blockingProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
@@ -136,6 +143,12 @@ export function projectCompletionReadiness(
   const advisories: CompletionAdvisory[] = [];
   const { task } = facts;
   const findingsGate = options.findingsGate ?? true;
+  const taskFinalReviewRequired = resolveRecordedTaskFinalReviewContract(
+    task.id,
+    facts.workItems,
+    facts.reviewRounds,
+    facts.taskFinalReviewContractEvents
+  ) !== undefined;
 
   // A pending/running Task-final Review must be resumed or blocked first.
   for (const round of facts.reviewRounds) {
@@ -169,7 +182,8 @@ export function projectCompletionReadiness(
       || left.id.localeCompare(right.id, undefined, { numeric: true })
     ))
     .at(-1);
-  if (latestCompletedTaskReview !== undefined
+  if (taskFinalReviewRequired
+    && latestCompletedTaskReview !== undefined
     && deltaRecheckBlocksAcceptance(latestCompletedTaskReview)) {
     const round = latestCompletedTaskReview;
     const disposition = round.deltaRecheck!.disposition!;
@@ -218,16 +232,17 @@ export function projectCompletionReadiness(
     });
   }
 
-  // Integration obligations are derived from real independent delivery units.
-  // A Leader-owned Task needs no synthetic WorkItem; once a WorkItem produces a
-  // Git Candidate, that exact unit must be captured and integrated.
+  // Integration obligations follow only the Candidate that currently governs
+  // each independent delivery unit. Superseded Candidate history remains
+  // visible without keeping the Task open forever.
+  const deliveryChangeSets = governingChangeSets(facts.workItems, facts.changeSets);
   for (const item of facts.workItems) {
     if (item.status !== "completed") continue;
     const candidate = item.candidates?.at(-1);
     const hasGitDelivery = candidate?.workspace !== undefined
       || candidate?.gitSnapshot !== undefined;
     if (hasGitDelivery
-      && !facts.changeSets.some((changeSet) => changeSet.workItemId === item.id)) {
+      && !deliveryChangeSets.some((changeSet) => changeSet.workItemId === item.id)) {
       blockers.push({
         code: "integration-evidence-missing",
         ref: ref("work-item", item.id),
@@ -236,10 +251,12 @@ export function projectCompletionReadiness(
       });
     }
   }
-  for (const changeSet of facts.changeSets) {
-    if (facts.integrations.some((attempt) => (
-      attempt.status === "committed" && attempt.changeSetIds.includes(changeSet.id)
-    ))) continue;
+  for (const changeSet of deliveryChangeSets) {
+    if (changeSetDeliverySettled(
+      changeSet,
+      facts.integrations,
+      facts.integrationQueueEntries
+    )) continue;
     blockers.push({
       code: "integration-evidence-missing",
       ref: ref("change-set", changeSet.id),
@@ -248,9 +265,11 @@ export function projectCompletionReadiness(
     });
   }
 
-  // Unresolved Integration Attempts must settle.
+  // Current delivery Attempts and any Attempt that may still be writing must
+  // settle. Historical blocked Attempts remain audit evidence only.
   for (const integration of facts.integrations) {
     if (!UNRESOLVED_INTEGRATION_STATUSES.has(integration.status)) continue;
+    if (!integrationAttemptRequiresSettlement(integration, deliveryChangeSets)) continue;
     blockers.push({
       code: "unresolved-integration",
       ref: ref("integration-attempt", integration.id),
@@ -260,7 +279,10 @@ export function projectCompletionReadiness(
   }
 
   // Unsettled integration queue entries must commit or be superseded.
-  for (const entry of facts.integrationQueueEntries) {
+  for (const entry of latestGoverningQueueEntries(
+    deliveryChangeSets,
+    facts.integrationQueueEntries
+  )) {
     if (entry.status === "committed" || entry.status === "superseded") continue;
     blockers.push({
       code: "unsettled-integration-queue-entry",

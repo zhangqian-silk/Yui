@@ -285,7 +285,6 @@ function updateRole(
     if (changesAgentConfig) {
       const agentId = parsed.one("--agent")?.trim() || role.activeAgentId;
       const agent = requireAgent(agentId, tx);
-      assertOperatorAdapterAvailable(role, agent);
       const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
       bindings = { ...role.agentBindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
     }
@@ -319,7 +318,6 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
       roleName: role.name
     }, "desired Agent binding update");
     const agent = requireAgent(agentId, tx);
-    assertOperatorAdapterAvailable(role, agent);
     const binding = role.agentBindings[agentId] ?? createRoleAgentBinding(definition(agent));
     const withBinding = updateGlobalRole(role, {
       agentBindings: { ...role.agentBindings, [agentId]: binding }
@@ -356,23 +354,6 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
     }
   });
   return presentRole(result.message, result.role, store);
-}
-
-function assertOperatorAdapterAvailable(
-  role: GlobalRole,
-  agent: ConfiguredAgentRecord
-): void {
-  if (role.name !== "operator" || Object.hasOwn(role.agentBindings, agent.id)) return;
-  const existing = Object.values(role.agentBindings).find(
-    (binding) => binding.adapterId === agent.adapterId
-  );
-  if (existing !== undefined) {
-    throw usageError(
-      `Operator already has a ${agent.adapterId} Agent: ${existing.agentId}. `
-      + "Update that Agent's configuration, or activate another adapter and "
-      + "unbind it before binding this Agent."
-    );
-  }
 }
 
 function removeRole(args: string[], store: GlobalRoleStore): string {

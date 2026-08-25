@@ -29,7 +29,6 @@ import type {
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
-import { projectFirstProgressStopLoss } from "../runtime/firstProgressStopLoss.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
@@ -176,30 +175,6 @@ export async function processLeaderWakeups(
         && existingSession.status !== "stopped"
         && existingSession.status !== "broken";
       const mode = resumableSession && compatibleSession ? "resume" : "new";
-      if (mode === "new" && store.getTaskRoleSessionSet !== undefined) {
-        const stopLoss = projectFirstProgressStopLoss({
-          sessions: store.getTaskRoleSessionSet(task.id, role.name),
-          events: store.listEvents?.(task.id) ?? [],
-          workItems: store.listWorkItems?.(task.id) ?? [],
-          reviewRounds: store.listReviewRounds?.(task.id) ?? [],
-          integrations: store.listIntegrationAttempts?.(task.id) ?? []
-        });
-        if (stopLoss.exhausted && store.saveLeaderFirstProgressStopLoss !== undefined) {
-          const saved = store.saveLeaderFirstProgressStopLoss({
-            taskId: task.id,
-            roleName: role.name,
-            expectedFingerprint: stopLoss.fingerprint,
-            now
-          });
-          results.push({
-            taskId: task.id,
-            status: "skipped",
-            reason: saved === "recorded" ? "recovery-blocked" : "state-changed",
-            error: saved === "recorded" ? stopLoss.reason : undefined
-          });
-          continue;
-        }
-      }
       const runId = store.peekNextAgentRunId(task.id);
       const wakeEnvelope = resolveLeaderWakeEnvelope(store, task.id);
       const contextSnapshot = store.freezeLeaderContextSnapshot?.(task.id, role.name, now);

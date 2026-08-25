@@ -373,8 +373,7 @@ function storedTaskFinalReviewContractResolution(
 function taskFinalReviewContractForMutation(
   store: TaskWorkflowStore,
   taskId: string,
-  options: TaskCommandOptions,
-  authorization: Readonly<{ allowStoredWithoutSupplied?: boolean }> = {}
+  options: TaskCommandOptions
 ): TaskFinalReviewContract | undefined {
   const supplied = options.taskFinalReviewContract;
   if (supplied !== undefined) {
@@ -393,10 +392,11 @@ function taskFinalReviewContractForMutation(
     );
   }
   if (stored === undefined) return supplied;
-  if (supplied === undefined) {
-    if (authorization.allowStoredWithoutSupplied === true) return stored;
-    throw usageError(`Task final-review contract is missing for ${taskId}.`);
-  }
+  // Historical exact contracts now express only a durable Reviewer policy.
+  // The persisted contract remains the audit authority, but ordinary
+  // protocol/storage-compatible CLIs may continue the Task without presenting
+  // a release-bound capability on every mutation.
+  if (supplied === undefined) return stored;
   if (!sameTaskFinalReviewContract(stored, supplied)) {
     throw usageError(`Task final-review contract control-plane digest mismatch for ${taskId}.`);
   }
@@ -552,22 +552,13 @@ export function preflightTaskCompletion(
   if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
   if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
 
-  // Resolve and authenticate the durable Task-local gate before any remote
-  // fetch or Integration write.  All checks below mirror the transactional
-  // completion path, which remains the final CAS fence after reconciliation.
-  // A human/global Operator cannot present the exact managed Leader contract.
-  // For the explicit published-tree path only, let that caller authenticate
-  // the stored contract far enough to persist an exact authorization fact.
-  // The same command must return before any contract-governed completion
-  // mutation; the exact Leader later consumes the authorization with the real
-  // contract capability.
-  const authorizingPublishedTree = request.acceptedPublishedTreePublicationId !== undefined
-    && actor !== "leader";
+  // Resolve the durable Task-local Reviewer policy before any remote fetch or
+  // Integration write. Historical control-plane identity is audit evidence,
+  // not a capability that every compatible CLI must reproduce.
   const taskFinalReviewContract = taskFinalReviewContractForMutation(
     store,
     task.id,
-    options,
-    { allowStoredWithoutSupplied: authorizingPublishedTree }
+    options
   );
   const activeTaskReview = store.listReviewRounds(task.id).some((round) => (
     (round.scope ?? "work-item") === "task"
@@ -5875,32 +5866,21 @@ function prepareFinalTaskReview(
   taskFinalContract: TaskFinalReviewContract | undefined,
   options: TaskCommandOptions
 ): ReviewRound | null {
-  // Any Task-final ReviewRound is durable completion evidence/obligation.
-  // Once one exists, later changes to the mutable global review config cannot
-  // weaken the requirement or change its reviewer. Before the first such
-  // Round, the current global `final` config remains an available Reviewer
-  // default but does not establish an obligation by itself.
+  // A Leader-requested ReviewRound is evidence, not policy. Only an explicit
+  // immutable Task contract creates a durable completion obligation; optional
+  // historical Rounds never cause completion to manufacture another Round for
+  // a later head.
+  if (taskFinalContract === undefined || task.projectBindings.length === 0) return null;
   const taskRounds = reviewRoundsByIdentity(store.listReviewRounds(task.id))
     .filter((round) => (
       (round.scope ?? "work-item") === "task"
-      && (taskFinalContract === undefined || sameTaskFinalReviewContract(
+      && sameTaskFinalReviewContract(
         round.taskFinalReviewContract,
         taskFinalContract
-      ))
+      )
     ));
   const establishedRound = taskRounds.at(-1);
-  let config: ReviewConfig | null;
-  if (taskFinalContract !== undefined) {
-    config = taskFinalReviewConfig(taskFinalContract);
-  } else if (establishedRound === undefined) {
-    // The configured Reviewer is available to the Leader, but does not choose
-    // the Task topology. A managed final Review becomes an obligation only
-    // after the Leader requests one (or an immutable Task contract requires it).
-    config = null;
-  } else {
-    config = { roleName: establishedRound.reviewerRoleName, trigger: "final" as const };
-  }
-  if (config === null || task.projectBindings.length === 0) return null;
+  const config = taskFinalReviewConfig(taskFinalContract);
 
   const taskCandidate = taskReviewProvenance(store, task, options).candidate;
   const latest = establishedRound;

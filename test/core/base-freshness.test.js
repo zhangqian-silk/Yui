@@ -110,7 +110,7 @@ const GRAPH = new Map([
   ["D", { parents: ["C"], files: ["app/file-a.txt", "remote-c.txt", "local-d.txt"] }]
 ]);
 
-test("a diverged remote base is classified and blocks delivery (Task-27 path)", async (t) => {
+test("a diverged remote base is classified and reported for delivery judgment", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-base-freshness-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const project = createProject("project-1", "demo", "/repo", { stable: "master", development: "master" }, NOW, { remoteUrl: REMOTE_URL });
@@ -134,11 +134,10 @@ test("a diverged remote base is classified and blocks delivery (Task-27 path)", 
   assert.ok(entry.remoteOnlyChangedFiles.includes("unrelated.txt"));
   assert.match(entry.risk ?? "", /diverged/u);
 
-  await assert.rejects(
-    runTaskBaseStatusCommand([task.id, "--refresh"], store, { git }),
-    /diverged/u
-  );
-  assert.throws(() => assertTaskBaseFreshnessForCompletion(refreshed), /diverged/u);
+  const status = await runTaskBaseStatusCommand([task.id, "--refresh"], store, { git });
+  assert.match(status.output, /status: diverged/u);
+  assert.ok(assertTaskBaseFreshnessForCompletion(refreshed)
+    .some((warning) => warning.includes("diverged")));
   store.close();
 });
 
@@ -199,8 +198,9 @@ test("offline and unreachable remotes stay explicit instead of looking clean", a
   assert.equal(unknownEntry.source, "remote-refresh");
   assert.match(unknownEntry.error ?? "", /fetch failed/u);
 
-  // A refreshed unknown is a hard block; an unrefreshed one only warns.
-  assert.throws(() => assertTaskBaseFreshnessForCompletion(report), /could not be refreshed/u);
+  // Remote availability is evidence for the Leader, not a completion gate.
+  assert.ok(assertTaskBaseFreshnessForCompletion(report)
+    .some((warning) => warning.includes("could not be refreshed")));
   const staleUnknown = await inspectTaskBaseFreshness(task.id, store, { git });
   const warnings = assertTaskBaseFreshnessForCompletion(staleUnknown);
   assert.ok(warnings.some((warning) => warning.includes("unknown")));

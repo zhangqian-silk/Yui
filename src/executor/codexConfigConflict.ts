@@ -7,9 +7,11 @@ import { parse, type TomlTable } from "smol-toml";
 
 export type CodexConfigKeyInspection =
   | Readonly<{ status: "absent" }>
-  | Readonly<{ status: "configured"; source: string }>;
-
-export type CodexDeveloperInstructionsInspection = CodexConfigKeyInspection;
+  | Readonly<{
+      status: "configured";
+      source: string;
+      precedence: "session-overridable" | "managed";
+    }>;
 
 export type CodexLaunchConfigInspection = Readonly<{
   developerInstructions: CodexConfigKeyInspection;
@@ -29,18 +31,14 @@ export type CodexConfigInspectionInput = Readonly<{
 }>;
 
 /**
- * Inspects the local, file-backed Codex configuration layers supported by Yui
- * that can conflict with launch-owned settings. Remote and platform-managed
- * layers are outside this compatibility boundary. Project files are considered
- * only when the directory, project root, or project root is trusted.
+ * Reports the local, file-backed Codex configuration layers supported by Yui.
+ * Yui's invocation-local launch settings take precedence over ordinary local
+ * layers without mutating those files. Higher-precedence managed policy is
+ * reported separately because an invocation cannot override it. Remote
+ * managed layers remain outside this reporting boundary. Project files are
+ * considered only when the directory, project root, or repository root is
+ * trusted.
  */
-export function inspectCodexDeveloperInstructions(
-  input: CodexConfigInspectionInput
-): CodexDeveloperInstructionsInspection {
-  return inspectCodexConfigKeys(input, ["developer_instructions"])
-    .developerInstructions;
-}
-
 export function inspectCodexLaunchConfig(
   input: CodexConfigInspectionInput
 ): CodexLaunchConfigInspection {
@@ -101,12 +99,17 @@ function inspectCodexConfigKeys(
       : discovery
   );
   const candidates = [
-    ...discoveryPaths.map((path) => ({ path, keys })),
+    ...discoveryPaths.map((path) => ({
+      path,
+      keys,
+      precedence: "session-overridable" as const
+    })),
     ...projectPaths.map((path) => ({
       path,
-      keys: keys.filter((key) => key === "developer_instructions")
+      keys: keys.filter((key) => key === "developer_instructions"),
+      precedence: "session-overridable" as const
     })),
-    { path: managedPath, keys }
+    { path: managedPath, keys, precedence: "managed" as const }
   ];
 
   let developerInstructions: CodexConfigKeyInspection = { status: "absent" };
@@ -122,17 +125,41 @@ function inspectCodexConfigKeys(
     } catch (error) {
       throw unreliableInspection(candidate.path, error);
     }
-    if (
-      developerInstructions.status === "absent"
-      && configured.has("developer_instructions")
-    ) {
-      developerInstructions = { status: "configured", source: candidate.path };
+    if (configured.has("developer_instructions")) {
+      developerInstructions = {
+        status: "configured",
+        source: candidate.path,
+        precedence: candidate.precedence
+      };
     }
-    if (notify.status === "absent" && configured.has("notify")) {
-      notify = { status: "configured", source: candidate.path };
+    if (configured.has("notify")) {
+      notify = {
+        status: "configured",
+        source: candidate.path,
+        precedence: candidate.precedence
+      };
     }
   }
   return { developerInstructions, notify };
+}
+
+export function assertCodexLaunchOverridesAvailable(
+  inspection: CodexLaunchConfigInspection,
+  keys: readonly (keyof CodexLaunchConfigInspection)[]
+): void {
+  for (const key of keys) {
+    const configured = inspection[key];
+    if (configured.status !== "configured" || configured.precedence !== "managed") {
+      continue;
+    }
+    const nativeKey = key === "developerInstructions"
+      ? "developer_instructions"
+      : "notify";
+    throw new Error(
+      `Codex ${nativeKey} is controlled by higher-precedence managed configuration at `
+      + `${configured.source}; Yui cannot apply its invocation-local ${nativeKey} value.`
+    );
+  }
 }
 
 function withExactWorkspaceTrust(

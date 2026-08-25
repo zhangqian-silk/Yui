@@ -115,15 +115,14 @@ children through adapter metadata, and routes a later result reference through
 the durable inbox. Do not poll, send a waiting Message, rewrite a checkpoint,
 or yield merely to preserve that native wait.
 
-Before the first durable Leader action, Yui permits at most one automatic
-same-Session Provider continuation. If two fresh Leader generations still
-produce no WorkItem, Review, Integration, or Leader-attributed durable event,
-the Controller stops before a third generation, marks recovery failed, and
-hands the exact evidence to the unique global Operator. Do not bypass that
-stop-loss by manufacturing another Role, Run, Session, or Task. The Operator
-must inspect the failure and explicitly recover or change the configured
-Leader; after first durable progress, ordinary bounded Provider retry policy
-continues to apply.
+Before the first durable Leader action, Yui observes fresh native generations
+that produce no WorkItem, Review, Integration, or Leader-attributed durable
+event. Two such generations create a non-blocking orchestration advisory for
+Leader and Operator judgment; they do not fail the Role, reduce the configured
+Provider retry policy, or prevent another useful generation. Read the evidence
+before retrying, then choose whether to continue, change the configured Leader,
+or perform direct maintenance without manufacturing protocol records merely to
+silence the advisory.
 
 Native child results have an explicit durability boundary. A native subagent is
 best-effort by default: its result returns through the parent Conversation, and

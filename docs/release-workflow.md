@@ -68,10 +68,12 @@ active Task's final-review capability. Managed Sessions use the ordinary
 a replacement Leader presents the contract already established by durable Task
 evidence. No version-aware Operator action is required.
 
-`task review rebind` remains as a recovery command for legacy Tasks that
-already recorded different exact control-plane contracts during an older
-immutable-release handover. The authenticated global Operator may repair that
-historical chain explicitly:
+Historical Tasks may already contain `task review rebind` evidence from an
+older immutable-release handover. That chain remains readable audit history,
+but ordinary Task mutation and completion now reuse the stored Reviewer policy
+through any protocol/storage-compatible CLI; a control-plane digest rebind is
+not required for continuity. The recovery command remains available only to
+repair a genuinely inconsistent historical chain:
 
 ```sh
 yui task review rebind <task> \

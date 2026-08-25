@@ -6,7 +6,6 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
-import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
 import { runOperatorCommand } from "../../dist/commands/operatorCommands.js";
 import {
   createRoleSessionSet,
@@ -43,12 +42,10 @@ import {
 import { createWorkItem } from "../../dist/workItem/workItem.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
 import {
-  boundProviderRetryBeforeFirstProgress,
-  projectFirstProgressStopLoss
-} from "../../dist/runtime/firstProgressStopLoss.js";
+  projectFirstProgressAdvisory
+} from "../../dist/runtime/firstProgressAdvisory.js";
 import {
   createGlobalRole,
-  createRole,
   createRoleAgentBinding
 } from "../../dist/role/role.js";
 import { createProject } from "../../dist/repository/project.js";
@@ -150,7 +147,7 @@ test("Review outcomes distinguish semantic, non-semantic, and ambiguous evidence
   }).kind, "non-semantic");
 });
 
-test("next-action force-refreshes corroborated non-semantic completed Reviews", () => {
+test("optional non-semantic Reviews remain evidence instead of becoming policy", () => {
   const summary = "Role Run workspace is not the durable owner: task-1/reviewer.";
   const round = review({
     scope: "task",
@@ -238,16 +235,13 @@ test("next-action force-refreshes corroborated non-semantic completed Reviews", 
     activeRuns: [],
     leaderRuns: []
   };
-  assert.equal(projectNextAction(facts).kind, "repair-protocol-inconsistency");
+  assert.equal(projectNextAction(facts).kind, "complete-task");
   const action = projectNextAction({
     ...facts,
     reviewOutcomeEvidence: { agentRuns: [run], reviewFindings: [], events: [event] }
   });
-  assert.equal(action.kind, "resume-review");
-  assert.equal(
-    action.recommendedCommand,
-    "yui task review force-fresh task-1/review-round-1"
-  );
+  assert.equal(action.kind, "complete-task");
+  assert.equal(action.alternatives?.[0]?.kind, "request-final-review");
 });
 
 function taskSessions(owner = { scope: "task", taskId: "task-1", roleName: "leader" }) {
@@ -264,7 +258,7 @@ function taskSessions(owner = { scope: "task", taskId: "task-1", roleName: "lead
   return sessions;
 }
 
-test("two generations without first durable progress exhaust the stop-loss", () => {
+test("two generations without first durable progress produce an advisory", () => {
   const first = taskSessions();
   const session = first.sessions.agent;
   const sessions = {
@@ -281,23 +275,16 @@ test("two generations without first durable progress exhaust the stop-loss", () 
     },
     updatedAt: later.toISOString()
   };
-  const exhausted = projectFirstProgressStopLoss({
+  const advisory = projectFirstProgressAdvisory({
     sessions,
     events: [],
     workItems: [],
     reviewRounds: [],
     integrations: []
   });
-  assert.equal(exhausted.exhausted, true);
-  assert.equal(exhausted.generationsBeforeFirstProgress, 2);
-  assert.deepEqual(boundProviderRetryBeforeFirstProgress({
-    delaysMs: [2_000, 5_000, 15_000],
-    maxWindowMs: 600_000
-  }, exhausted), {
-    delaysMs: [2_000],
-    maxWindowMs: 600_000
-  });
-  const progressed = projectFirstProgressStopLoss({
+  assert.equal(advisory.attentionRecommended, true);
+  assert.equal(advisory.generationsBeforeFirstProgress, 2);
+  const progressed = projectFirstProgressAdvisory({
     sessions,
     events: [{
       id: "event-1",
@@ -308,74 +295,8 @@ test("two generations without first durable progress exhaust the stop-loss", () 
     reviewRounds: [],
     integrations: []
   });
-  assert.equal(progressed.exhausted, false);
+  assert.equal(progressed.attentionRecommended, false);
   assert.equal(progressed.firstProgressAt, later.toISOString());
-  assert.deepEqual(boundProviderRetryBeforeFirstProgress({
-    delaysMs: [2_000, 5_000, 15_000],
-    maxWindowMs: 600_000
-  }, progressed), {
-    delaysMs: [2_000, 5_000, 15_000],
-    maxWindowMs: 600_000
-  });
-});
-
-test("the first-progress stop-loss records one durable Operator handoff", (t) => {
-  const home = mkdtempSync(join(tmpdir(), "yui-first-progress-stop-loss-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
-  const store = new SqliteTaskStore(home);
-  t.after(() => store.close());
-  store.saveConfiguredAgent(createConfiguredAgent(
-    "agent", "codex", "codex", [], [], now
-  ));
-  const task = activateTask(createTask("task-1", "stop retry churn", now), now);
-  store.saveTask(task);
-  store.saveRole(task.id, createRole(
-    task.id,
-    "leader",
-    [createRoleAgentBinding({ id: "agent", adapterId: "codex" })],
-    "agent",
-    "/tmp/yui-orchestration",
-    now
-  ));
-  let sessions = taskSessions();
-  sessions = updateRoleAgentSessionStatus(sessions, "agent", "broken", later);
-  sessions = recordRoleAgentSession(sessions, {
-    agentId: "agent",
-    adapterId: "codex",
-    nativeSessionId: "session-2",
-    launchId: "launch-2",
-    status: "running",
-    policy: "fixed",
-    effective
-  }, later);
-  store.saveTaskRoleSessionSet(sessions);
-  const projection = projectFirstProgressStopLoss({
-    sessions,
-    events: [],
-    workItems: [],
-    reviewRounds: [],
-    integrations: []
-  });
-  const adapter = new FileSchedulerStoreAdapter(store);
-  assert.equal(adapter.saveLeaderFirstProgressStopLoss({
-    taskId: task.id,
-    roleName: "leader",
-    expectedFingerprint: projection.fingerprint,
-    now: later
-  }), "recorded");
-  assert.equal(store.getRole(task.id, "leader").status, "failed");
-  assert.match(store.getLeaderFailure(task.id).message, /first-progress stop-loss/u);
-  assert.match(store.getOperatorNotification(task.id).message, /first-progress stop-loss/u);
-  const mailbox = store.getWorkMailbox({ kind: "operator" });
-  assert.equal(mailbox.pending.normal.requestCount, 1);
-  assert.deepEqual(mailbox.pending.normal.reasons, ["leader-first-progress-stop-loss"]);
-  assert.equal(adapter.saveLeaderFirstProgressStopLoss({
-    taskId: task.id,
-    roleName: "leader",
-    expectedFingerprint: projection.fingerprint,
-    now: later
-  }), "state-changed");
-  assert.equal(store.getWorkMailbox({ kind: "operator" }).pending.normal.requestCount, 1);
 });
 
 function job(overrides = {}) {

@@ -216,13 +216,9 @@ export function assertTaskBaseFreshnessForCompletion(
     const acceptedPublishedTree = options.acceptedPublishedTreeProjectId === entry.projectId;
     if ((entry.status === "behind" || entry.status === "diverged")
       && !acceptedPublishedTree) {
-      throw usageError(
-        `Task ${report.taskId} Project ${entry.projectId} base is ${entry.status}; `
-        + `run 'yui task base status ${report.taskId} --refresh' and choose an explicit delivery base. `
-        + "Safe resolutions are to rebase or merge the Task workspace onto the refreshed remote base, "
-        + "create a clean delivery branch from that base and cherry-pick the Task changes, "
-        + "or ask the Leader to resolve it. Continuing without rebasing is allowed only after explicitly "
-        + "recording the unrelated-diff risk."
+      warnings.push(
+        `Project ${entry.projectId} base is ${entry.status}; the Leader must choose the delivery base `
+        + "and account for any remote-only changes."
       );
     }
     if (entry.workspaceClean === false) {
@@ -232,14 +228,10 @@ export function assertTaskBaseFreshnessForCompletion(
       );
     }
     if (entry.status === "unknown") {
-      if (report.refreshed) {
-        throw usageError(
-          `Task ${report.taskId} Project ${entry.projectId} remote base could not be refreshed: `
-          + `${entry.error ?? "unknown error"}`
-        );
-      }
       warnings.push(
-        `Project ${entry.projectId} remote base is unknown; local completion continues without a remote claim.`
+        report.refreshed
+          ? `Project ${entry.projectId} remote base could not be refreshed: ${entry.error ?? "unknown error"}; local completion continues without a remote claim.`
+          : `Project ${entry.projectId} remote base is unknown; local completion continues without a remote claim.`
       );
     }
   }

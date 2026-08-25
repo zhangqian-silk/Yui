@@ -35,7 +35,6 @@ import { prefixYuiTitleInput } from "../run/runIdentity.js";
 import type { AgentRun } from "../run/agentRun.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import type { ClaudeAgentConfig, RoleAgentConfig } from "./agentAdapter.js";
-import { inspectCodexLaunchConfig } from "./codexConfigConflict.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
 import type {
   AgentEnvironmentRefresh,
@@ -82,6 +81,10 @@ import { managedRuntimeAdmission } from "../runtime/agentDriver.js";
 import type { AgentHostProviderControl } from "../runtime/launchBroker.js";
 import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import {
+  assertCodexLaunchOverridesAvailable,
+  inspectCodexLaunchConfig
+} from "./codexConfigConflict.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -443,6 +446,22 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const adapter = resolveAgentAdapter(binding.adapterId);
     const effectiveWorkspace = effective.workspace.root;
     const agentWorkspace = nativeAgentWorkspace(effective.workspace);
+    if (adapter.id === "codex") {
+      const codexConfig = inspectCodexLaunchConfig({
+        environment: launchEnvironment,
+        workspace: agentWorkspace,
+        profile: binding.config.adapterId === "codex"
+          ? binding.config.profile
+          : undefined,
+        trustWorkspace: true
+      });
+      assertCodexLaunchOverridesAvailable(
+        codexConfig,
+        owner.scope !== "task" || input.runId === undefined
+          ? ["developerInstructions", "notify"]
+          : ["developerInstructions"]
+      );
+    }
     const runtimeIsolation = input.runtimeIsolation === undefined
       ? undefined
       : parseTaskRuntimeIsolationDescriptor(JSON.stringify(input.runtimeIsolation));
@@ -490,29 +509,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       sessionManifestDigest: bootstrap.manifest.digest,
       sessionCliPath: bootstrap.sessionCliPath
     };
-    const codexConfig = binding.config.adapterId === "codex"
-      ? inspectCodexLaunchConfig({
-          environment: {
-            ...operationalSourceEnvironment,
-            ...agentSourceEnvironment,
-            ...launchEnvironment
-          },
-          workspace: agentWorkspace,
-          profile: binding.config.profile,
-          trustWorkspace: true
-        })
-      : undefined;
-    if (
-      codexConfig?.notify.status === "configured"
-      && (owner.scope !== "task" || input.runId === undefined)
-    ) {
-      throw new Error(
-        "Codex notify is already configured by "
-        + `${codexConfig.notify.source}; this interactive Yui Session requires exclusive `
-        + "ownership of the structured notify callback and refuses to replace or be replaced "
-        + "by native configuration."
-      );
-    }
     const managedRun = owner.scope === "task" && input.runId !== undefined
       ? this.store.getAgentRun(owner.taskId, input.runId)
       : null;
@@ -550,10 +546,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       config: effectiveConfig,
       workspace: agentWorkspace,
       ...(sessionTitle === undefined ? {} : { sessionTitle }),
-      ...sessionContext,
-      ...(codexConfig === undefined
-        ? {}
-        : { codexDeveloperInstructions: codexConfig.developerInstructions })
+      ...sessionContext
     };
     if (
       input.mode === "resume"

@@ -346,18 +346,11 @@ export interface SchedulerStorePort {
     roleName: string,
     agentId?: string
   ): SchedulerRoleSession | null;
-  /** Read-only generation projection used by the pre-first-progress stop-loss. */
+  /** Read-only generation projection used by orchestration observability. */
   getTaskRoleSessionSet?(
     taskId: string,
     roleName: string
   ): import("../executor/agentExecutor.js").TaskRoleSessionSet | null;
-  /** Atomically records the stop-loss only if its read fingerprint is current. */
-  saveLeaderFirstProgressStopLoss?(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    expectedFingerprint: string;
-    now: Date;
-  }>): "recorded" | "state-changed";
   /** Immutable runtime facts used by the low-frequency stall projection. */
   listEvents?(taskId: string): readonly TaskEvent[];
   /**
