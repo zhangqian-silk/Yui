@@ -3,6 +3,11 @@ import { createHash } from "node:crypto";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
+import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
+import {
+  changeSetDeliverySettled,
+  governingChangeSets
+} from "../integration/deliveryObligation.js";
 import type { AgentRun } from "../run/agentRun.js";
 import {
   deltaRecheckBlocksAcceptance,
@@ -100,6 +105,7 @@ export type NextActionFacts = Readonly<{
   workItems: readonly WorkItem[];
   changeSets: readonly ChangeSet[];
   integrations: readonly IntegrationAttempt[];
+  integrationQueueEntries: readonly IntegrationQueueEntry[];
   reviewRounds: readonly ReviewRound[];
   /** Bounded event subset that can change the effective Task-final contract. */
   taskFinalReviewContractEvents: readonly TaskEvent[];
@@ -383,7 +389,12 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     });
   }
 
-  if (facts.workItems.length === 0 && !taskFinalReviewRequired(facts)) {
+  if (facts.workItems.length === 0
+    && !taskFinalReviewRequired(facts)
+    && !facts.reviewRounds.some((round) => (
+      (round.scope ?? "work-item") === "task"
+      && (round.status === "pending" || round.status === "running")
+    ))) {
     const reviewAlternative = facts.reviewConfig === null
       ? []
       : [{
@@ -429,8 +440,12 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     });
   }
 
-  const unintegrated = facts.changeSets
-    .find((changeSet) => !hasCommittedIntegration(facts.integrations, changeSet.id));
+  const unintegrated = governingChangeSets(facts.workItems, facts.changeSets)
+    .find((changeSet) => !changeSetDeliverySettled(
+      changeSet,
+      facts.integrations,
+      facts.integrationQueueEntries
+    ));
   if (unintegrated !== undefined) {
     return buildAction(facts, {
       kind: "integrate-change-set",
@@ -445,11 +460,13 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     });
   }
 
+  const finalReviewRequired = taskFinalReviewRequired(facts);
   const failedFinal = latestTaskFinalReview(facts.reviewRounds);
   const failedFinalOutcome = failedFinal === undefined
     ? null
     : classifyReviewRoundOutcome(failedFinal, nextActionReviewOutcomeEvidence(facts));
-  if (failedFinal !== undefined && failedFinalOutcome?.kind === "non-semantic") {
+  if (finalReviewRequired
+    && failedFinal !== undefined && failedFinalOutcome?.kind === "non-semantic") {
     return buildAction(facts, {
       kind: "resume-review",
       reason: `Task-final Review ${failedFinal.id} ended before a semantic review was proven.`,
@@ -460,7 +477,8 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       recommendedCommand: `yui task review force-fresh ${task.id}/${failedFinal.id}`
     });
   }
-  if (failedFinal !== undefined && failedFinalOutcome?.kind === "ambiguous") {
+  if (finalReviewRequired
+    && failedFinal !== undefined && failedFinalOutcome?.kind === "ambiguous") {
     return buildAction(facts, {
       kind: "repair-protocol-inconsistency",
       reason: `Task-final Review ${failedFinal.id} has ambiguous semantic and infrastructure evidence: ${failedFinalOutcome.reason}`,
@@ -471,7 +489,8 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       ]
     });
   }
-  if (failedFinal !== undefined
+  if (finalReviewRequired
+    && failedFinal !== undefined
     && failedFinalOutcome?.kind === "semantic"
     && ((failedFinal.checks ?? []).some(({ outcome }) => outcome === "failed")
       || deltaRecheckBlocksAcceptance(failedFinal))) {
@@ -552,7 +571,6 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     });
   }
 
-  const finalReviewRequired = taskFinalReviewRequired(facts);
   if (task.projectBindings.length > 0
     && finalReviewRequired
     && !hasValidFinalReview(facts)) {
@@ -567,7 +585,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         ? [{ fact: "Valid established Task-final Review at the direct head", satisfied: false }]
         : [
             { fact: "All Work Items are terminal", satisfied: true },
-            { fact: "Every ChangeSet is committed", satisfied: true },
+            { fact: "Every governing ChangeSet is settled", satisfied: true },
             { fact: "Valid Task-final Review at the integrated head", satisfied: false }
           ],
       recommendedCommand: facts.workItems.length === 0
@@ -599,11 +617,13 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         : facts.workItems.length === 0
           ? [{ fact: "Task main is clean, committed, and verified", satisfied: false }]
           : [
-            { fact: "Every ChangeSet is committed", satisfied: true },
-            {
-              fact: "Valid Task-final Review at the integrated head",
-              satisfied: hasValidFinalReview(facts)
-            }
+            { fact: "Every governing ChangeSet is settled", satisfied: true },
+            ...(finalReviewRequired
+              ? [{
+                  fact: "Valid Task-final Review at the integrated head",
+                  satisfied: hasValidFinalReview(facts)
+                }]
+              : [])
           ])
     ],
     ...(finalReviewAlternative.length === 0 ? {} : { alternatives: finalReviewAlternative }),
@@ -631,6 +651,8 @@ export function durableStateFingerprint(facts: NextActionFacts): string {
       `change-set:${changeSet.id}:${changeSet.headCommit}`),
     ...facts.integrations.map((attempt) =>
       `integration:${attempt.id}:${attempt.status}:${attempt.updatedAt}`),
+    ...facts.integrationQueueEntries.map((entry) =>
+      `integration-queue:${entry.id}:${entry.status}:${entry.updatedAt}`),
     ...facts.reviewRounds.map((round) =>
       `review:${round.id}:${round.status}:${round.endedAt ?? ""}`),
     ...facts.taskFinalReviewContractEvents.map((event) =>
@@ -867,8 +889,7 @@ function taskFinalReviewContractResolution(
 }
 
 function taskFinalReviewRequired(facts: NextActionFacts): boolean {
-  return taskFinalReviewContract(facts) !== undefined
-    || latestTaskFinalReview(facts.reviewRounds) !== undefined;
+  return taskFinalReviewContract(facts) !== undefined;
 }
 
 function taskFinalReviewRole(facts: NextActionFacts): string | undefined {
@@ -902,17 +923,9 @@ function latestTaskFinalReview(rounds: readonly ReviewRound[]): ReviewRound | un
     .find((round) => (round.scope ?? "work-item") === "task");
 }
 
-function hasCommittedIntegration(
-  integrations: readonly IntegrationAttempt[],
-  changeSetId: string
-): boolean {
-  return integrations.some((attempt) =>
-    attempt.status === "committed" && attempt.changeSetIds.includes(changeSetId));
-}
-
 function needsChangeSetCapture(facts: NextActionFacts, item: WorkItem): boolean {
   if (item.status !== "completed") return false;
-  if (facts.changeSets.some((changeSet) => changeSet.workItemId === item.id)) return false;
+  if (governingChangeSets([item], facts.changeSets).length > 0) return false;
   const candidate = item.candidates.at(-1);
   if (candidate === undefined) return false;
   // A metadata-only Task-main Candidate has no WorkItem Develop

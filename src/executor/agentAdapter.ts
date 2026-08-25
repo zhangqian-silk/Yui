@@ -9,10 +9,6 @@ import {
   validateAgentBaseArguments
 } from "../agent/argumentPolicy.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
-import {
-  inspectCodexDeveloperInstructions,
-  type CodexDeveloperInstructionsInspection
-} from "./codexConfigConflict.js";
 import type {
   AgentConfigurationCatalog,
   AgentConfigurationDiscoveryInput
@@ -121,7 +117,6 @@ export type CompileInput<TConfig extends RoleAgentConfig = RoleAgentConfig> = Re
   managedContextFile?: string;
   sessionManifestPath?: string;
   sessionManifestDigest?: string;
-  codexDeveloperInstructions?: CodexDeveloperInstructionsInspection;
 }>;
 export type ResumeInput<TConfig extends RoleAgentConfig = RoleAgentConfig> =
   CompileInput<TConfig> & Readonly<{ nativeSessionId: string }>;
@@ -311,18 +306,6 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
       `Yui managed Session. Read and follow the Session Manifest at ${input.sessionManifestPath} (digest ${input.sessionManifestDigest ?? "unknown"}). Load each Skill and Role Profile by its manifest path before acting; Task content is available only through the manifest's exact Context API.`
     ];
     if (instructions.length === 0) return workspaceTrust;
-    const nativeInstructions = input.codexDeveloperInstructions
-      ?? inspectCodexDeveloperInstructions({
-        workspace: input.workspace,
-        profile: input.config.profile,
-        trustWorkspace: true
-      });
-    if (nativeInstructions.status === "configured") {
-      throw new Error(
-        "Codex developer_instructions is already configured by "
-        + `${nativeInstructions.source}; Yui refuses to replace native developer instructions.`
-      );
-    }
     return [
       ...workspaceTrust,
       "--config",
@@ -571,40 +554,36 @@ export function inspectAgentCapabilities(
   if (!supported) {
     return snapshot(agent, adapter, {
       status: "unsupported-version", command: agent.command, version,
-      reason: adapter.id === "codex"
-        ? `Minimum supported version is ${adapter.supportedVersion}.`
-        : `Supported version line starts at ${adapter.supportedVersion}.`,
+      reason: `Minimum supported version is ${adapter.supportedVersion}.`,
       probedAt: at
     }, fields, at, [`Installed version ${version} is not supported by adapter ${adapter.id}.`]);
   }
 
   const help = run(agent.command, ["--help"]);
   const helpFailure = failed(help);
-  if (adapter.id === "codex" && helpFailure !== undefined) {
+  if (helpFailure !== undefined) {
     return snapshot(agent, adapter, {
       status: "probe-failed", command: agent.command, version,
-      reason: `Required Codex capability probe failed: ${helpFailure}`, probedAt: at
+      reason: `Required ${adapter.label} capability probe failed: ${helpFailure}`,
+      probedAt: at
     }, fields, at);
   }
-  if (helpFailure === undefined) {
-    const helpOutput = output(help.stdout, help.stderr);
-    fields = fromHelp(agent.adapterId, helpOutput);
-    if (adapter.id === "codex") {
-      const missing = missingCodexCapabilities(helpOutput);
-      if (missing.length > 0) {
-        return snapshot(agent, adapter, {
-          status: "unsupported-version", command: agent.command, version,
-          reason: `Codex CLI is missing required capabilities: ${missing.join(", ")}.`,
-          probedAt: at
-        }, fields, at);
-      }
-      if (compareVersions(version, CODEX_TESTED_THROUGH_VERSION) > 0) {
-        warnings.push(
-          `Installed Codex version ${version} is newer than the latest tested version `
-          + `${CODEX_TESTED_THROUGH_VERSION}; required capabilities were detected.`
-        );
-      }
-    }
+  const helpOutput = output(help.stdout, help.stderr);
+  fields = fromHelp(agent.adapterId, helpOutput);
+  const missing = missingRequiredCapabilities(adapter.id, helpOutput);
+  if (missing.length > 0) {
+    return snapshot(agent, adapter, {
+      status: "unsupported-version", command: agent.command, version,
+      reason: `${adapter.label} CLI is missing required capabilities: ${missing.join(", ")}.`,
+      probedAt: at
+    }, fields, at);
+  }
+  if (adapter.id === "codex"
+    && compareVersions(version, CODEX_TESTED_THROUGH_VERSION) > 0) {
+    warnings.push(
+      `Installed Codex version ${version} is newer than the latest tested version `
+      + `${CODEX_TESTED_THROUGH_VERSION}; required capabilities were detected.`
+    );
   }
   return snapshot(agent, adapter, {
     status: "installed", command: agent.command, version, probedAt: at
@@ -707,9 +686,7 @@ function output(stdout: string, stderr: string): string {
   return value;
 }
 function supports(version: string, adapter: AgentAdapter): boolean {
-  if (adapter.id === "codex") return compareVersions(version, adapter.supportedVersion) >= 0;
-  const left = version.split(".").map(Number), right = adapter.supportedVersion.split(".").map(Number);
-  return left[0] === right[0] && left[1] === right[1] && left[2] >= right[2];
+  return compareVersions(version, adapter.supportedVersion) >= 0;
 }
 
 function compareVersions(leftVersion: string, rightVersion: string): number {
@@ -722,11 +699,26 @@ function compareVersions(leftVersion: string, rightVersion: string): number {
   return 0;
 }
 
-function missingCodexCapabilities(help: string): string[] {
-  const required: readonly (readonly [RegExp, string])[] = [
-    [/(?:^|\s)--config(?:\s|[=<,]|$)/m, "--config"],
-    [/^\s*resume(?:\s|$)/m, "resume"]
-  ];
+function missingRequiredCapabilities(id: AgentAdapterId, help: string): string[] {
+  const required: readonly (readonly [RegExp, string])[] = id === "codex"
+    ? [
+        [/(?:^|\s)--config(?:\s|[=<,]|$)/m, "--config"],
+        [/^\s*resume(?:\s|$)/m, "resume"]
+      ]
+    : [
+        [/(?:^|\s)--append-system-prompt(?:-file|\[-file\])(?:\s|[=<,]|$)/m,
+          "--append-system-prompt-file"],
+        [/(?:^|\s)--resume(?:\s|[=<,]|$)/m, "--resume"],
+        [/(?:^|\s)--session-id(?:\s|[=<,]|$)/m, "--session-id"],
+        [/(?:^|\s)-p(?:\s|[=<,]|$)/m, "-p"],
+        [/(?:^|\s)--output-format(?:\s|[=<,]|$)/m, "--output-format"],
+        [/(?:^|\s)--input-format(?:\s|[=<,]|$)/m, "--input-format"],
+        [/(?:^|\s)--verbose(?:\s|[=<,]|$)/m, "--verbose"],
+        [/(?:^|\s)--replay-user-messages(?:\s|[=<,]|$)/m,
+          "--replay-user-messages"],
+        [/(?:^|\s)--plugin-dir(?:\s|[=<,]|$)/m, "--plugin-dir"],
+        [/(?:^|\s)--name(?:\s|[=<,]|$)/m, "--name"]
+      ];
   return required.flatMap(([pattern, label]) => pattern.test(help) ? [] : [label]);
 }
 

@@ -293,8 +293,9 @@ terminal text. For progress, report:
 - current Brief focus, latest Milestone, blockers, and open InputRequests.
 
 Worker yield is not completion. Describe a result as awaiting Leader review
-until it is accepted; do not report isolated code as delivered before its latest
-ChangeSet is integrated.
+until it is accepted. Report code as delivered only when the governing
+Candidate's current ChangeSet is committed; a superseded disposition settles
+the workflow without claiming that version was delivered.
 
 ## Enter and administer
 
@@ -340,11 +341,10 @@ ChangeSet is integrated.
   Run, Agent, receipt, launch, and Session identities; never reconstruct them
   from terminal text or ask the user to paste them.
 - Retry only an explicitly failed recovery Job.
-- When a Leader first-progress stop-loss is reported, inspect its two exact
-  native generations and absence of durable progress. Do not request a third
-  automatic generation or create another Operator. Recover the existing Task
-  only after choosing an explicit valid Leader configuration or a direct
-  maintenance action.
+- When a Leader first-progress advisory is reported, inspect its native
+  generations and absence of durable progress. It is cost evidence rather than
+  a recovery gate: choose whether another generation, a different configured
+  Leader, or direct maintenance is the smallest useful next action.
 - Use `yui task next-action <task>` and `yui execution audit` orchestration
   advisories as read-only cost evidence. They may flag excess WorkItems,
   repeated Reviews/checks, pre-progress generations, or terminal workspaces;

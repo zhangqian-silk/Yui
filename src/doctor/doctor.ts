@@ -15,7 +15,10 @@ import {
   type AgentProbeResult,
   type CapabilitySnapshot
 } from "../executor/agentAdapter.js";
-import { inspectCodexLaunchConfig } from "../executor/codexConfigConflict.js";
+import {
+  assertCodexLaunchOverridesAvailable,
+  inspectCodexLaunchConfig
+} from "../executor/codexConfigConflict.js";
 import {
   nativeAdditionalDirectories,
   nativeAgentWorkspace,
@@ -1070,14 +1073,11 @@ function checkReviewerLaunch(
           trustWorkspace: true
         })
       : undefined;
-    if (codexConfig?.notify.status === "configured") {
-      return {
-        name: "reviewer launch",
-        status: "invalid",
-        detail: "Codex notify is already configured by "
-          + `${codexConfig.notify.source}; Yui requires exclusive ownership of the structured `
-          + "notify callback and refuses to replace or be replaced by native configuration."
-      };
+    if (codexConfig !== undefined) {
+      assertCodexLaunchOverridesAvailable(
+        codexConfig,
+        ["developerInstructions", "notify"]
+      );
     }
     const reviewerContext = adapter.id === "codex"
       ? compileRoleSessionContext(home, role, { scope: "global" }, { purpose: "review" })
@@ -1091,15 +1091,25 @@ function checkReviewerLaunch(
         ? {}
         : {
             developerInstructions: reviewerContext.developerInstructions,
-            skills: reviewerContext.skills,
-            codexDeveloperInstructions: codexConfig?.developerInstructions
+            skills: reviewerContext.skills
           })
     });
     if (compiled.argv.length === 0) throw new Error("compiled launch argv is empty");
     return {
       name: "reviewer launch",
       status: "ok",
-      detail: `adapter=${adapter.id} strategy=${compiled.sessionStrategy} command=${agent.command} addDirs=${launchConfig.additionalDirectories?.length ?? 0}`
+      detail: [
+        `adapter=${adapter.id}`,
+        `strategy=${compiled.sessionStrategy}`,
+        `command=${agent.command}`,
+        `addDirs=${launchConfig.additionalDirectories?.length ?? 0}`,
+        ...(codexConfig?.developerInstructions.status === "configured"
+          ? [`override=developer_instructions@${codexConfig.developerInstructions.source}`]
+          : []),
+        ...(codexConfig?.notify.status === "configured"
+          ? [`override=notify@${codexConfig.notify.source}`]
+          : [])
+      ].join(" ")
     };
   } catch (error) {
     return {

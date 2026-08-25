@@ -98,9 +98,9 @@ leaves every candidate for the Leader to accept directly or review explicitly.
 `final` keeps WorkItem acceptance and Integration independent and supplies the
 default Reviewer Role when the Leader decides the frozen Task result warrants
 an independent final Review. An immutable Task-final contract can require that
-Review. Once a Task-final Round exists, it remains an obligation; a changed
-Task head requires a new Round and the previous report remains evidence. This
-final Reviewer evaluates the whole
+Review. A Leader-requested Round remains evidence without becoming policy: a
+later Task head does not require another Round unless the Leader requests one
+or an explicit Task contract requires it. This final Reviewer evaluates the whole
 Task, so normal delivery does not pay for a complete review of every WorkItem.
 Review Runs complete only their exact ReviewRound, leave the WorkItem awaiting
 acceptance, and never trigger another review or append a Candidate. Successful

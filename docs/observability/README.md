@@ -167,7 +167,8 @@ existing records and never write state or block a legal action. Current
 advisories cover direct-path protocol overhead, initial integrated WorkItem
 fan-out, unexplained review-repair fan-out, repeated exact Integration checks,
 full-Review budget exhaustion without new findings, and the two-generation
-first-progress stop-loss.
+first-progress advisory threshold. The threshold never blocks a generation or
+changes Provider retry policy.
 
 ## Rollout
 

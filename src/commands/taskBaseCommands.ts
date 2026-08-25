@@ -1,10 +1,8 @@
 import { usageError } from "../errors/cliError.js";
 import type { GitWorkspacePort } from "../repository/gitWorkspace.js";
 import {
-  assertTaskBaseFreshnessForCompletion,
   inspectTaskBaseFreshness,
-  renderTaskBaseFreshnessReport,
-  type TaskBaseFreshnessReport
+  renderTaskBaseFreshnessReport
 } from "../repository/taskBaseFreshness.js";
 import type { TaskStore } from "../storage/taskStore.js";
 
@@ -33,19 +31,9 @@ export async function runTaskBaseStatusCommand(
     git: options.git,
     refresh
   });
-  assertReportIsDeliverySafe(report);
   return {
     kind: "output",
     output: renderTaskBaseFreshnessReport(report),
     data: report
   };
-}
-
-function assertReportIsDeliverySafe(report: TaskBaseFreshnessReport): void {
-  try {
-    assertTaskBaseFreshnessForCompletion(report);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw usageError(`${renderTaskBaseFreshnessReport(report)}${message}`);
-  }
 }

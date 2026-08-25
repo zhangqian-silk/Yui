@@ -278,15 +278,6 @@ function saveMinimumConfiguration(
       scope: "global",
       roleName: SYSTEM_OPERATOR_ROLE
     }, "desired Agent binding update");
-    const duplicateAdapter = Object.values(operator.agentBindings).find(
-      (candidate) => candidate.adapterId === agent.adapterId && candidate.agentId !== agent.id
-    );
-    if (duplicateAdapter !== undefined) {
-      throw usageError(
-        `Operator already has a ${agent.adapterId} Agent: ${duplicateAdapter.agentId}. `
-        + "Use yui config agent update or yui config role bind to repair the Operator configuration."
-      );
-    }
     tx.saveGlobalRole(updateGlobalRole(operator, {
       activeAgentId: agent.id,
       agentBindings: { ...operator.agentBindings, [agent.id]: binding }

@@ -9,7 +9,7 @@ import type { AgentRun } from "../run/agentRun.js";
 import type { ReviewFinding } from "../review/reviewFinding.js";
 import { classifyReviewRoundOutcome } from "../review/reviewOutcomeClassifier.js";
 import type { ReviewRound } from "../review/reviewRound.js";
-import { projectFirstProgressStopLoss } from "../runtime/firstProgressStopLoss.js";
+import { projectFirstProgressAdvisory } from "../runtime/firstProgressAdvisory.js";
 import type { Task } from "../task/task.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { WorkItem } from "../workItem/workItem.js";
@@ -19,7 +19,7 @@ export type OrchestrationAdvisoryCode =
   | "review-repair-fanout"
   | "repeated-integration-check"
   | "review-budget-exhausted"
-  | "provider-first-progress-stop-loss";
+  | "provider-first-progress-advisory";
 
 export type OrchestrationAdvisory = Readonly<{
   code: OrchestrationAdvisoryCode;
@@ -119,14 +119,20 @@ export function projectTaskOrchestration(
     .reduce((total, count) => total + Math.max(0, count - 1), 0);
 
   const leaderSessions = facts.roleSessionSets.find(({ owner }) => owner.roleName === "leader") ?? null;
-  const firstProgress = projectFirstProgressStopLoss({
+  const firstProgress = projectFirstProgressAdvisory({
     sessions: leaderSessions,
     events: facts.events,
     workItems: facts.workItems,
     reviewRounds: facts.reviewRounds,
     integrations: facts.integrations
   });
-  const advisories = projectAdvisories(facts, classifications, fullRounds, repeatedIdentities, firstProgress.exhausted);
+  const advisories = projectAdvisories(
+    facts,
+    classifications,
+    fullRounds,
+    repeatedIdentities,
+    firstProgress.attentionRecommended
+  );
   const publicationAt = facts.task.completedAt === undefined
     ? undefined
     : facts.publications
@@ -179,7 +185,7 @@ function projectAdvisories(
   classifications: ReadonlyMap<string, ReturnType<typeof classifyReviewRoundOutcome>>,
   fullRounds: readonly ReviewRound[],
   repeatedIdentities: number,
-  stopLoss: boolean
+  firstProgressAttention: boolean
 ): OrchestrationAdvisory[] {
   const result: OrchestrationAdvisory[] = [];
   if (facts.task.type === "bugfix" && facts.workItems.length > 0) {
@@ -230,10 +236,10 @@ function projectAdvisories(
       refs: recent.map(({ id }) => `review-round:${id}`)
     });
   }
-  if (stopLoss) {
+  if (firstProgressAttention) {
     result.push({
-      code: "provider-first-progress-stop-loss",
-      reason: "Two fresh Leader generations produced no first durable progress; hand off to the unique Operator before another generation.",
+      code: "provider-first-progress-advisory",
+      reason: "Two fresh Leader generations produced no first durable progress; consider Operator attention before another generation.",
       refs: [facts.task.id]
     });
   }
