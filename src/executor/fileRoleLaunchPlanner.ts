@@ -61,14 +61,13 @@ import {
   assertExactTaskRuntimeState,
   createExactControlPlaneDescriptor,
   createExactTaskRuntimeDescriptor,
-  exactControlPlaneCommandPrefix,
   exactControlPlaneDigest,
   exactTaskRuntimeDescriptorPath,
   serializeExactDescriptor,
   type ExactControlPlaneDescriptor,
   type ExactTaskRuntimeDescriptor
 } from "../runtime/exactControlPlane.js";
-import { readActiveReleasePointer } from "../release/runtimeRelease.js";
+import { detectRunningRelease } from "../release/runtimeRelease.js";
 import {
   parseTaskRuntimeIsolationDescriptor,
   taskRuntimeIsolationEnvironment,
@@ -138,21 +137,19 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     this.#createNativeSessionId = options.createNativeSessionId ?? randomUUID;
     this.#cliPath = canonicalPath(options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url)));
-    // Freeze the complete control identity before any native process exists.
-    // This value is immutable for the planner/Controller lifetime and is never
-    // rewritten through a shared PATH launcher.
-    // Issue 02: bind the active release build ID so a Session created after a
-    // handover cannot mutate a different control plane.
-    const activeRelease = readActiveReleasePointer(this.home);
+    // Internal callbacks retain one exact command identity for receipt fencing.
+    // Interactive Role commands use ordinary `yui`; their continuity is the
+    // Session Manifest plus protocol/storage and durable runtime identity.
+    const runningRelease = detectRunningRelease(this.#cliPath);
     this.#controlPlane = createExactControlPlaneDescriptor({
       executable: process.execPath,
       cliEntry: this.#cliPath,
       yuiHome: this.home,
-      ...(activeRelease === null
+      ...(runningRelease === null
         ? {}
         : {
-            buildId: activeRelease.buildId,
-            activeReleaseDigest: activeRelease.packageDigest
+            buildId: runningRelease.manifest.buildId,
+            activeReleaseDigest: runningRelease.manifest.packageDigest
           })
     });
   }
@@ -541,9 +538,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           binding.config,
           owner.taskId,
           managedRun?.workItemId,
-          input.runId,
-          this.#controlPlane,
-          sessionContext.sessionCliPath
+          input.runId
         )
       : binding.config;
     const effectiveConfig = withNativeProjectDirectories(
@@ -1051,20 +1046,17 @@ function managedClaudeControlPlaneConfig(
   config: ClaudeAgentConfig,
   taskId: string,
   workItemId: string | undefined,
-  runId: string,
-  controlPlane: ExactControlPlaneDescriptor,
-  sessionCliPath: string
+  runId: string
 ): ClaudeAgentConfig {
   if (config.permission.strategy !== "configured") return config;
-  const exact = exactControlPlaneCommandPrefix(controlPlane);
   const managed = [
-    `Bash(${sessionCliPath} task run context ${taskId}/${runId}:*)`,
-    `Bash(${exact} --json task context ${taskId})`,
-    `Bash(${exact} --json task work list ${taskId})`,
+    `Bash(yui task run context ${taskId}/${runId}:*)`,
+    `Bash(yui --json task context ${taskId})`,
+    `Bash(yui --json task work list ${taskId})`,
     ...(workItemId === undefined
       ? []
-      : [`Bash(${exact} --json task work show ${workItemId})`]),
-    `Bash(${exact} task run yield ${runId} --summary-file -:*)`
+      : [`Bash(yui --json task work show ${workItemId})`]),
+    `Bash(yui task run yield ${runId} --summary-file -:*)`
   ];
   const existing = (config.permission.allowedTools ?? [])
     .filter((rule) => !isManagedYuiBashRule(rule));
@@ -1081,18 +1073,6 @@ function isManagedYuiBashRule(rule: string): boolean {
   const normalized = rule.trim();
   return /^Bash\(yui(?:\s|:\*|\*|\))/u.test(normalized)
     || /^Bash\(.*\s--yui-control\s/u.test(normalized);
-}
-
-function renderExactControlPlaneInstructions(
-  descriptor: ExactControlPlaneDescriptor
-): string {
-  const command = exactControlPlaneCommandPrefix(descriptor);
-  return [
-    "Exact Yui control-plane command prefix for this managed Task session:",
-    `\`${command}\``,
-    "Replace the portable bare `yui` token in Yui Role Skills and dispatch instructions with this exact prefix.",
-    "Bare `yui`, a PATH launcher, another checkout CLI, another YUI_HOME, or a changed schema/Controller identity is invalid and fails before Task state is read or written."
-  ].join("\n");
 }
 
 function canonicalPath(path: string): string {

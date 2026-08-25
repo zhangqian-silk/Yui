@@ -450,7 +450,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "message",
     summary: "Manage durable Task messages.",
-    sections: [{ id: "manage", title: "Commands", entries: ["send", "list"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["send", "list", "retire"] }],
     children: [
       {
         name: "send",
@@ -468,6 +468,12 @@ const taskChildren: readonly NodeInput[] = [
         summary: "List Task messages.",
         usage: "yui task message list <id> [--after <timestamp>] [--limit <n>]",
         options: ["--after", "--limit"]
+      },
+      {
+        name: "retire",
+        summary: "Retire an incorrect historical Task Message without deleting its audit record.",
+        usage: "yui task message retire <task>/<message> --reason <text>",
+        options: ["--reason"]
       }
     ]
   },
@@ -776,7 +782,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "recover", "yield", "context", "checkpoint"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "recover", "yield", "context", "checkpoint", "retire"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
       {
@@ -836,6 +842,12 @@ const taskChildren: readonly NodeInput[] = [
         options: ["--note", "--note-file"],
         fileOptions: ["--note-file"],
         hidden: true
+      },
+      {
+        name: "retire",
+        summary: "Retire an incorrect historical Agent Run without deleting its audit record.",
+        usage: "yui task run retire <task>/<run> --reason <text>",
+        options: ["--reason"]
       }
     ]
   },
@@ -1493,7 +1505,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [{
         id: "callbacks",
         title: "Callbacks",
-        entries: ["session-notify", "runtime-hook", "agent-host"]
+        entries: ["session-notify", "runtime-hook", "agent-host", "session-cli-refresh"]
       }],
       children: [
         {
@@ -1510,6 +1522,11 @@ export const ROOT_COMMAND = buildNode({
           name: "runtime-hook",
           summary: "Record a managed Agent Driver observation from stdin.",
           usage: "yui internal runtime-hook"
+        },
+        {
+          name: "session-cli-refresh",
+          summary: "Refresh legacy managed Session CLI wrappers after an update.",
+          usage: "yui internal session-cli-refresh"
         }
       ]
     }

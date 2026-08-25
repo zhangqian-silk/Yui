@@ -32,14 +32,14 @@ export type WorkItemStatus =
 
 export type WorkItemDisposition = Readonly<{
   schemaVersion: 1;
-  by: "leader";
+  by: "leader" | "operator" | "user";
   summary: string;
   retiredAt: string;
   replacementWorkItemId?: string;
 }>;
 
 export type WorkItemDispositionInput = Readonly<{
-  by: "leader";
+  by: "leader" | "operator" | "user";
   summary: string;
   replacementWorkItemId?: string;
 }>;
@@ -909,8 +909,8 @@ function normalizeDisposition(
   input: WorkItemDispositionInput,
   now: Date
 ): WorkItemDisposition {
-  if (input.by !== "leader") {
-    throw new Error("Only the Task Leader may retire a Work Item.");
+  if (input.by !== "leader" && input.by !== "operator" && input.by !== "user") {
+    throw new Error("Work Item retirement actor is invalid.");
   }
   const summary = requireText(input.summary, "Work item disposition summary");
   const replacementWorkItemId = input.replacementWorkItemId;
@@ -919,7 +919,7 @@ function normalizeDisposition(
   }
   const result: WorkItemDisposition = {
     schemaVersion: 1,
-    by: "leader",
+    by: input.by,
     summary,
     retiredAt: now.toISOString(),
     ...(replacementWorkItemId === undefined ? {} : { replacementWorkItemId })
@@ -931,7 +931,9 @@ function validateDisposition(disposition: WorkItemDisposition): WorkItemDisposit
   if (disposition.schemaVersion !== 1) {
     throw new Error("Work Item disposition must use schemaVersion 1.");
   }
-  if (disposition.by !== "leader") {
+  if (disposition.by !== "leader"
+    && disposition.by !== "operator"
+    && disposition.by !== "user") {
     throw new Error("Work Item disposition actor is invalid.");
   }
   requireText(disposition.summary, "Work item disposition summary");

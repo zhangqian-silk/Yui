@@ -29,7 +29,7 @@ import type { MailboxTarget } from "../coordination/workMailbox.js";
 import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
 import { assertControllerStatusIdentity } from "../runtime/exactControlPlane.js";
 import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
-import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
+import { yuiVersionIdentity } from "../version.js";
 import { SessionOwnerReconciliation } from "./sessionOwnerReconciliation.js";
 import { WorkspaceCleanupBlockedError } from "../repository/taskWorkspacePreparer.js";
 import {
@@ -227,13 +227,9 @@ function assertCompatibleControllerStatus(
     );
   }
   const actualVersion = statusRecord.version;
-  const expected = expectedVersion ?? YUI_VERSION;
-  const versionMismatch = expectedVersion === undefined
-    ? typeof actualVersion === "string" && actualVersion !== expected
-    : actualVersion !== expected;
-  if (versionMismatch) {
+  if (expectedVersion !== undefined && actualVersion !== expectedVersion) {
     throw new Error(
-      `Controller version is incompatible (expected ${expected}, found ${
+      `Controller version is incompatible (expected ${expectedVersion}, found ${
         typeof actualVersion === "string" ? actualVersion : "unknown"
       }). `
         + "Run `yui controller restart` before writing new task records."
@@ -245,7 +241,11 @@ function assertCompatibleControllerStatus(
   // path authenticates its executable, argv, and version immediately after
   // readiness in ensureFileTaskControllerIdentity.
   if (expectedVersion === undefined) {
-    assertControllerStatusIdentity(status, yuiVersionIdentity());
+    const identity = yuiVersionIdentity();
+    assertControllerStatusIdentity(status, {
+      ...identity,
+      version: typeof actualVersion === "string" ? actualVersion : identity.version
+    });
   }
 }
 

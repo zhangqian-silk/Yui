@@ -633,6 +633,21 @@ and `task work retire <task>/<work> --summary "..."` to retire obsolete work,
 optionally naming a replacement. WorkItem and Integration
 worktrees and check logs remain available as evidence until explicit cleanup.
 
+Incorrect historical directives and execution attempts can be removed from
+operational projections without deleting their audit records:
+
+```sh
+yui task message retire <task>/<message> --reason "Superseded instruction"
+yui task run retire <task>/<agent-run> --reason "Invalid launch record"
+```
+
+These commands append a retirement fact. Lists and audit views retain the
+original Message, WorkItem, or AgentRun and mark it retired; managed Run context,
+actionability, recovery, review evidence, and scheduling ignore it. Retiring
+an active AgentRun first terminalizes that exact Run, and retirement is
+idempotent. Only the user or global Operator may retire Messages or AgentRuns;
+WorkItems may also be retired by their Task Leader.
+
 For long-running Tasks, the Leader keeps Yui—not a native transcript—as the
 recovery authority. The Task Brief owns the overall technical approach,
 including how coordinated Project changes fit together. WorkItems own the
@@ -766,9 +781,11 @@ running AgentRun and its native Session continue under their immutable
 effective snapshot even if the Role is edited or switched. Resume is allowed
 only when the complete effective snapshot and workspace remain compatible;
 otherwise Yui starts a new Session after the old process has stopped and keeps
-the terminal Session's immutable effective snapshot in history. Until that
-process terminates, exact control-plane wakes continue through its actual
-snapshot instead of applying desired drift as a hot change.
+the terminal Session's immutable effective snapshot in history. Managed
+Sessions invoke the ordinary `yui` command; their Manifest and durable
+Role/Run fences authenticate scope while protocol and storage compatibility
+allow a CLI package or Controller upgrade in place. Exact internal callbacks
+remain fenced to their originating runtime snapshot.
 
 Use `yui config role unbind <global-role> <agent-id>` or `yui task role unbind <task-id> <role> <agent-id>` to retire a dormant binding. The active binding and any non-stopped native session are rejected; a stopped session record is removed atomically with the binding.
 

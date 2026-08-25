@@ -836,7 +836,10 @@ function selectOpenWorkItem(workItems: readonly WorkItem[]): OpenWorkItemSelecti
   const openItems = workItems.filter((item) => OPEN_WORK_ITEM_STATUSES.has(item.status));
   if (openItems.length === 0) return { kind: "none" };
   const eligible = openItems.find((item) => (
-    item.dependsOn.every((dependencyId) => byId.get(dependencyId)?.status === "completed")
+    item.dependsOn.every((dependencyId) => {
+      const status = byId.get(dependencyId)?.status;
+      return status === "completed" || status === "retired";
+    })
   ));
   if (eligible !== undefined) return { kind: "ready", item: eligible };
 
@@ -847,8 +850,10 @@ function selectOpenWorkItem(workItems: readonly WorkItem[]): OpenWorkItemSelecti
       return { kind: "blocked", itemId: current.id, blockedBy: current.id };
     }
     visited.add(current.id);
-    const blockedBy = current.dependsOn
-      .find((dependencyId) => byId.get(dependencyId)?.status !== "completed");
+    const blockedBy = current.dependsOn.find((dependencyId) => {
+      const status = byId.get(dependencyId)?.status;
+      return status !== "completed" && status !== "retired";
+    });
     if (blockedBy === undefined) return { kind: "ready", item: current };
     const dependency = byId.get(blockedBy);
     if (dependency === undefined || !OPEN_WORK_ITEM_STATUSES.has(dependency.status)) {

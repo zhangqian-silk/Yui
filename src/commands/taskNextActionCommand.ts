@@ -19,6 +19,7 @@ import {
   projectTaskOrchestration,
   type OrchestrationAdvisory
 } from "../observability/orchestrationMetrics.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 
 /**
  * Issue 07 (Leader convergence): read-only `yui task next-action <task>`.
@@ -73,9 +74,10 @@ export function runTaskNextActionCommand(
       if (readinessFacts === null) throw taskNotFound(taskId);
       completionReadiness = projectCompletionReadiness(readinessFacts);
     }
+    const events = reader.listEvents(taskId);
     const orchestration = projectTaskOrchestration({
       task: reader.getTask(taskId)!,
-      runs: reader.listAgentRuns(taskId),
+      runs: operationalTaskRecords(reader.listAgentRuns(taskId), events, "agent-run"),
       roleSessionSets: reader.listRoleSessionSets(taskId),
       workItems: reader.listWorkItems(taskId),
       changeSets: reader.listChangeSets(taskId),
@@ -85,7 +87,7 @@ export function runTaskNextActionCommand(
       durableJobs: reader.listDurableJobs(taskId),
       publications: reader.listPublicationReferences(taskId),
       decisions: reader.listDecisions(taskId),
-      events: reader.listEvents(taskId),
+      events,
       managedWorkspaces: reader.listManagedWorkspaces(taskId)
     });
     return {

@@ -23,7 +23,6 @@ import {
 import { nativeSessionIdForLaunch } from "./preallocatedNativeSession.js";
 import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
-import { readActiveReleasePointer } from "../release/runtimeRelease.js";
 
 export const EXACT_CONTROL_ARGUMENT = "--yui-control";
 export const YUI_CONTROL_PLANE_DESCRIPTOR = "YUI_CONTROL_PLANE_DESCRIPTOR";
@@ -86,8 +85,10 @@ export type ExactControlPlanePreflightOptions = Readonly<{
     params: JsonValue
   ) => Promise<JsonValue>;
   checkController?: boolean;
-  /** Issue 02: reads the Home's active release pointer for build-ID gating. */
-  readActiveRelease?: (home: string) => { buildId: string; packageDigest: string } | null;
+}>;
+
+export type CompatibleControlPlanePreflightInput = Readonly<{
+  actualHome: string;
 }>;
 
 export function createExactControlPlaneDescriptor(input: Readonly<{
@@ -309,40 +310,11 @@ export async function assertExactControlPlanePreflight(
     );
   }
 
-  // Issue 02: bind the descriptor to the active release. A descriptor that
-  // carries a build ID must match the Home's active release pointer; a
-  // descriptor without a build ID is rejected once a Home has an active
-  // release (old Sessions cannot mutate a released control plane). Homes
-  // without an active release pointer keep the legacy continuity contract.
-  const readActiveRelease = options.readActiveRelease ?? defaultReadActiveRelease;
-  const activeRelease = readActiveRelease(descriptor.yuiHome);
-  if (descriptor.buildId !== undefined) {
-    if (activeRelease === null) {
-      throw new Error(
-        "Exact control-plane descriptor names a release build but the Home has "
-          + "no active release pointer."
-      );
-    }
-    if (activeRelease.buildId !== descriptor.buildId) {
-      throw new Error(
-        "Exact control-plane release changed since the descriptor was frozen "
-          + `(expected ${descriptor.buildId}, active ${activeRelease.buildId}).`
-      );
-    }
-    if (
-      descriptor.activeReleaseDigest !== undefined
-      && activeRelease.packageDigest !== descriptor.activeReleaseDigest
-    ) {
-      throw new Error(
-        "Exact control-plane release digest does not match the active release pointer."
-      );
-    }
-  } else if (activeRelease !== null) {
-    throw new Error(
-      "Exact control-plane descriptor predates the active release; old Sessions "
-        + "cannot mutate a released control plane. Re-launch through the current release."
-    );
-  }
+  // A frozen descriptor authenticates the command that created it; it no
+  // longer pins the Home's deployment pointer for the lifetime of a Session.
+  // Continuity is the protocol/storage contract checked above and the durable
+  // Task/Role/Run identity checked below. This lets a compatible Controller or
+  // active release advance without invalidating a still-current Session.
 
   if (options.checkController !== false) {
     const call = options.callController ?? defaultCallController;
@@ -354,6 +326,56 @@ export async function assertExactControlPlanePreflight(
     }
   }
   return descriptor;
+}
+
+/**
+ * Compatibility gate for an ordinary `yui` invocation inside a managed
+ * Session. The Session Manifest and durable runtime state authenticate the
+ * actor separately; this gate proves that the current CLI can safely share the
+ * Home with its storage and Controller without pinning package/build identity.
+ */
+export async function assertCompatibleControlPlanePreflight(
+  input: CompatibleControlPlanePreflightInput,
+  options: ExactControlPlanePreflightOptions = {}
+): Promise<YuiVersionIdentity> {
+  const home = canonicalPath(input.actualHome);
+  const identity = validateVersionIdentity(options.identity ?? yuiVersionIdentity());
+  const storage = (options.inspectStorage ?? inspectStorageSchema)(home);
+  if (storage.status !== "current") {
+    const compatibleRecordOnlyOlder = storage.status === "unsupported"
+      && storage.incompatibleComponent === "record"
+      && storage.direction === "older"
+      && storage.currentLayoutVersion === identity.storageLayoutVersion
+      && storage.currentAggregateSchemaVersion === identity.aggregateSchemaVersion;
+    if (!compatibleRecordOnlyOlder) {
+      throw new Error(`Managed control-plane storage is not current: ${storage.status}.`);
+    }
+    (options.openCompatibleStore ?? openCompatibleFileTaskStore)(home).getConfig();
+  }
+  if (storage.currentLayoutVersion !== identity.storageLayoutVersion) {
+    throw new Error(
+      "Managed control-plane storage layout is incompatible "
+        + `(expected ${identity.storageLayoutVersion}, found `
+        + `${storage.currentLayoutVersion ?? "unknown"}).`
+    );
+  }
+  if (storage.currentAggregateSchemaVersion !== identity.aggregateSchemaVersion) {
+    throw new Error(
+      "Managed control-plane aggregate schema is incompatible "
+        + `(expected ${identity.aggregateSchemaVersion}, found `
+        + `${storage.currentAggregateSchemaVersion ?? "unknown"}).`
+    );
+  }
+  if (options.checkController !== false) {
+    const call = options.callController ?? defaultCallController;
+    try {
+      const status = await call(home, "controller.status", {});
+      assertControllerContinuityIdentity(status, identity);
+    } catch (error) {
+      if (!isDefinitelyNotRunning(error)) throw error;
+    }
+  }
+  return identity;
 }
 
 export function assertControllerStatusIdentity(
@@ -819,19 +841,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isDefinitelyNotRunning(error: unknown): boolean {
   return isRecord(error) && error.code === "CONTROLLER_NOT_RUNNING";
-}
-
-function defaultReadActiveRelease(
-  home: string
-): { buildId: string; packageDigest: string } | null {
-  try {
-    const pointer = readActiveReleasePointer(home);
-    return pointer === null
-      ? null
-      : { buildId: pointer.buildId, packageDigest: pointer.packageDigest };
-  } catch {
-    // A damaged pointer fails closed: treat it as an active release the
-    // descriptor cannot match, rather than silently skipping the gate.
-    return { buildId: "unknown", packageDigest: "unknown" };
-  }
 }

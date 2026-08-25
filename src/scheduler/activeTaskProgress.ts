@@ -12,6 +12,7 @@ import {
   computeActionabilityDigest,
   decideOrphanWake
 } from "./actionability.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 
 /**
  * Repairs an active Task that has no durable owner capable of advancing it.
@@ -129,7 +130,11 @@ function findLastLeaderRun(
   store: SchedulerStorePort,
   taskId: string
 ): Pick<import("../run/agentRun.js").AgentRun, "status" | "disposition" | "observedActionabilityDigest"> | null {
-  const runs = store.listAgentRuns?.(taskId) ?? [];
+  const runs = operationalTaskRecords(
+    store.listAgentRuns?.(taskId) ?? [],
+    store.listEvents?.(taskId) ?? [],
+    "agent-run"
+  );
   let latest: typeof runs[number] | null = null;
   for (const run of runs) {
     if (run.roleName !== "leader") continue;

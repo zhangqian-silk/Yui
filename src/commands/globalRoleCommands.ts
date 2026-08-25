@@ -108,9 +108,8 @@ function roleContext(
     if (environment.YUI_SESSION_SCOPE !== "global" || environment.YUI_ROLE !== name) {
       throw usageError("Managed GlobalRole context is outside the exact Session authority.");
     }
-    if (environment.YUI_SESSION_MANIFEST === undefined
-      || environment.YUI_SESSION_CLI === undefined) {
-      throw usageError("Managed GlobalRole context requires the exact Session Manifest and CLI.");
+    if (environment.YUI_SESSION_MANIFEST === undefined) {
+      throw usageError("Managed GlobalRole context requires its Session Manifest.");
     }
   }
   const role = requireRole(name, store);
@@ -153,7 +152,12 @@ function roleContext(
         : ["perform-global-role-request"]
     },
     sessionManifestPath: environment.YUI_SESSION_MANIFEST,
-    sessionCliPath: environment.YUI_SESSION_CLI
+    cliCommand: "yui",
+    // Compatibility hint for already-running Sessions. New instructions use
+    // the stable command name and do not bind behavior to this wrapper path.
+    ...(environment.YUI_SESSION_CLI === undefined
+      ? {}
+      : { legacySessionCliPath: environment.YUI_SESSION_CLI })
   });
   if (options.jsonOutput === true) return `${JSON.stringify(context)}\n`;
   return [

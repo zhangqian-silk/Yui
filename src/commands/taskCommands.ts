@@ -20,6 +20,11 @@ import {
 } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import {
+  createTaskRecordRetirement,
+  isTaskRecordRetired,
+  taskRecordRetirement
+} from "../task/taskRecordRetirement.js";
+import {
   clearMatchingLeaderStallAttention,
   isRoleRunStalled,
   RUN_PROGRESS_EVENT,
@@ -2025,17 +2030,25 @@ function taskMessageCommand(
       messages = messages.slice(-n);
     }
     if (messages.length === 0) return "No messages found.\n";
+    const retirements = new Map(store.listEvents(task.id).flatMap((event) => {
+      const retirement = taskRecordRetirement(event);
+      return retirement?.recordKind === "message"
+        ? [[retirement.recordId, retirement] as const]
+        : [];
+    }));
     const timeZone = store.getConfig().timeZone;
     return `${renderTable(
       `Task messages: ${task.id}`,
       [
         { header: "Message", minWidth: 7, maxWidth: 18 },
+        { header: "Status", minWidth: 6, maxWidth: 9 },
         { header: "Author", minWidth: 6, maxWidth: 18 },
         { header: "Created", minWidth: 10, maxWidth: 28 },
         { header: "Body", minWidth: 8, maxWidth: 72 }
       ],
       messages.map((message) => [
         message.id,
+        retirements.has(message.id) ? "retired" : "active",
         taskMessageAuthorLabel(message.author),
         presentTime(message.createdAt, timeZone),
         message.body
@@ -2043,9 +2056,65 @@ function taskMessageCommand(
       defaultTableWidth()
     )}\n`;
   }
+  if (command === "retire") {
+    return retireMessage(rest, store, options);
+  }
   throw usageError(command === undefined
     ? "Task message command is required."
     : `Unknown command: task message ${command}`);
+}
+
+function retireMessage(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): string {
+  const usage = "Task message retire usage: yui task message retire <task>/<message> --reason <text>.";
+  const parsed = parseTail(args, new Set(["--reason"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const reason = requiredOption(parsed.options, "--reason");
+  const reference = taskRecordReference(
+    parsed.positionals[0],
+    "message",
+    "Message reference",
+    options
+  );
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, reference.taskId);
+    assertTaskOpen(task);
+    const actor = taskActor(options, task.id);
+    if (actor === "leader") {
+      throw usageError("Only the user or global Operator may retire a Task Message.");
+    }
+    const message = tx.listMessages(task.id).find(({ id }) => id === reference.localId);
+    if (message === undefined) {
+      throw dataError(`Task Message not found: ${task.id}/${reference.localId}.`);
+    }
+    const events = tx.listEvents(task.id);
+    if (isTaskRecordRetired(events, "message", message.id)) {
+      return { task, message, changed: false } as const;
+    }
+    // Remove an isolated pending wake for this exact directive. A merged batch
+    // is retained because its other signals remain actionable; context and
+    // actionability projections still filter the retired message below.
+    try {
+      settleExactWorkExecution(tx, leaderMailbox(task.id), messageRef(task.id, message.id));
+    } catch {
+      // Merged pending work cannot be split without losing unrelated signals.
+    }
+    tx.saveEvent(task.id, createTaskRecordRetirement({
+      eventId: tx.nextEventId(task.id),
+      taskId: task.id,
+      recordKind: "message",
+      recordId: message.id,
+      reason,
+      retiredBy: actor
+    }, now));
+    return { task, message, changed: true } as const;
+  });
+  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  return `Retired Task Message ${result.task.id}/${result.message.id}\n`;
 }
 
 /**
@@ -3604,9 +3673,7 @@ function retireWork(
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    if (taskActor(options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may retire a Work Item.");
-    }
+    const actor = taskActor(options, task.id);
     if (replacementWorkItemId !== undefined) {
       const replacement = requireWorkItem(tx, replacementWorkItemId, options);
       if (replacement.taskId !== task.id) {
@@ -3658,7 +3725,7 @@ function retireWork(
       }
     }
     const next = retireWorkItem(item, {
-      by: "leader",
+      by: actor,
       summary,
       ...(replacementWorkItemId === undefined ? {} : { replacementWorkItemId })
     }, now);
@@ -3670,8 +3737,16 @@ function retireWork(
         ...(replacementWorkItemId === undefined
           ? {}
           : { replacementWorkItemId }),
-        ...leaderActionEventPayload(tx, task.id, options)
+        ...(actor === "leader" ? leaderActionEventPayload(tx, task.id, options) : { retiredBy: actor })
       }, now);
+      tx.saveEvent(task.id, createTaskRecordRetirement({
+        eventId: tx.nextEventId(task.id),
+        taskId: task.id,
+        recordKind: "work-item",
+        recordId: next.id,
+        reason: summary,
+        retiredBy: actor
+      }, now));
     }
     return next;
   });
@@ -5107,9 +5182,72 @@ function taskRunCommand(
   if (command === "yield") return yieldRun(rest, store, options);
   if (command === "yield-status") return yieldRunStatus(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
+  if (command === "retire") return retireRun(rest, store, options);
   throw usageError(command === undefined
     ? "Task run command is required."
     : `Unknown command: task run ${command}`);
+}
+
+function retireRun(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task run retire usage: yui task run retire <task>/<run> --reason <text>.";
+  const parsed = parseTail(args, new Set(["--reason"]), usage);
+  exactPositionals(parsed.positionals, 1, usage);
+  const reason = requiredOption(parsed.options, "--reason");
+  const reference = taskRecordReference(
+    parsed.positionals[0],
+    "agentRun",
+    "Agent Run reference",
+    options
+  );
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, reference.taskId);
+    assertTaskOpen(task);
+    const actor = taskActor(options, task.id);
+    if (actor === "leader") {
+      throw usageError("Only the user or global Operator may retire an Agent Run.");
+    }
+    let run = tx.getAgentRun(task.id, reference.localId);
+    if (run === null) throw dataError(`Agent Run not found: ${task.id}/${reference.localId}.`);
+    const events = tx.listEvents(task.id);
+    if (isTaskRecordRetired(events, "agent-run", run.id)) {
+      return { task, run, changed: false } as const;
+    }
+    if (run.status === "active") {
+      const terminal = terminalizeExactTaskRun(tx, {
+        taskId: task.id,
+        roleName: run.roleName,
+        agentId: run.effective.agentId,
+        runId: run.id,
+        receiptId: agentRunDeliveryReceiptId(run),
+        outcome: { status: "failed", summary: `Agent Run retired: ${reason}` }
+      }, now);
+      if (terminal.disposition !== "applied" || terminal.run === null) {
+        throw usageError(
+          `Agent Run changed during retirement: ${run.id}/${terminal.reason ?? "obsolete"}.`
+        );
+      }
+      run = terminal.run;
+    }
+    tx.saveEvent(task.id, createTaskRecordRetirement({
+      eventId: tx.nextEventId(task.id),
+      taskId: task.id,
+      recordKind: "agent-run",
+      recordId: run.id,
+      reason,
+      retiredBy: actor
+    }, now));
+    return { task, run, changed: true } as const;
+  });
+  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  return output(`Retired Agent Run ${result.task.id}/${result.run.id}\n`, {
+    agentRun: result.run,
+    retired: true
+  });
 }
 
 function runContextCommand(
@@ -5213,6 +5351,7 @@ function listRuns(
   const item = requireWorkItem(store, args[0], options);
   const runs = store.listAgentRuns(item.taskId).filter((run) => run.workItemId === item.id);
   if (runs.length === 0) return "No runs found.\n";
+  const events = store.listEvents(item.taskId);
   return `${renderTable(
     `Runs: ${item.id}`,
     [
@@ -5224,6 +5363,7 @@ function listRuns(
       { header: "Profile", minWidth: 7, maxWidth: 8 },
       { header: "Permission", minWidth: 8, maxWidth: 16 },
       { header: "Status", minWidth: 6, maxWidth: 12 },
+      { header: "History", minWidth: 7, maxWidth: 9 },
       { header: "Summary", minWidth: 8, maxWidth: 58 }
     ],
     runs.map((run) => [
@@ -5235,6 +5375,7 @@ function listRuns(
       run.effective.profileAccess,
       run.effective.permission.strategy,
       run.status,
+      isTaskRecordRetired(events, "agent-run", run.id) ? "retired" : "active",
       run.summary ?? "-"
     ]),
     defaultTableWidth()
@@ -6591,15 +6732,26 @@ function showRun(
     const run = requireRun(tx, positionals[0], options);
     const facts = readRunRecoveryFacts(tx, run.taskId, run.id);
     if (facts === null) throw usageError(`Agent Run not found: ${run.taskId}/${run.id}.`, usage);
-    return { run, recovery: projectRunRecovery(facts) };
+    const retirement = tx.listEvents(run.taskId)
+      .map(taskRecordRetirement)
+      .find((entry) => entry?.recordKind === "agent-run" && entry.recordId === run.id) ?? null;
+    return { run, recovery: projectRunRecovery(facts), retirement };
   });
   if (asJson) {
     return { kind: "output" as const, output: `${JSON.stringify(data, null, 2)}\n`, data };
   }
-  return { kind: "output" as const, output: renderRunShow(data.run, data.recovery), data };
+  return {
+    kind: "output" as const,
+    output: renderRunShow(data.run, data.recovery, data.retirement),
+    data
+  };
 }
 
-function renderRunShow(run: AgentRun, recovery: RunRecoveryProjection): string {
+function renderRunShow(
+  run: AgentRun,
+  recovery: RunRecoveryProjection,
+  retirement: ReturnType<typeof taskRecordRetirement>
+): string {
   const lines = [
     `Run: ${run.id}`,
     `Task: ${run.taskId}`,
@@ -6607,6 +6759,10 @@ function renderRunShow(run: AgentRun, recovery: RunRecoveryProjection): string {
     `Purpose: ${run.purpose}`,
     `Mode: ${run.mode}`,
     `Status: ${run.status}`,
+    ...(retirement === null ? [] : [
+      `History: retired by ${retirement.retiredBy}`,
+      `Retirement reason: ${retirement.reason}`
+    ]),
     `Effective: ${run.effective.agentId}/${run.effective.adapterId} r${run.effective.sourceDesiredRevision}`,
     `Created: ${run.createdAt}`,
     ...(run.pushedAt === undefined ? [] : [`Pushed: ${run.pushedAt}`]),
@@ -8029,7 +8185,7 @@ function requireReviewRound(
 
 function taskRecordReference(
   value: string | undefined,
-  kind: "workItem" | "agentRun" | "reviewRound",
+  kind: "workItem" | "agentRun" | "reviewRound" | "message",
   label: string,
   options: TaskCommandOptions
 ) {
@@ -8052,7 +8208,8 @@ function assertWorkItemDependenciesCompleted(
 ): void {
   for (const dependencyId of item.dependsOn) {
     const dependency = store.getWorkItem(item.taskId, dependencyId);
-    if (dependency === null || dependency.status !== "completed") {
+    if (dependency === null
+      || (dependency.status !== "completed" && dependency.status !== "retired")) {
       throw usageError(`Work Item dependency is not completed: ${dependencyId}.`);
     }
   }

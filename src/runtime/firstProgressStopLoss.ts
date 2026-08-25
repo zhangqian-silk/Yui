@@ -59,7 +59,9 @@ export function projectFirstProgressStopLoss(input: Readonly<{
         ...input.events
           .filter((event) => typeof event.payload.leaderRunId === "string")
           .map((event) => ({ at: event.createdAt, ref: `event:${event.id}` })),
-        ...input.workItems.map((item) => ({ at: item.createdAt, ref: `work-item:${item.id}` })),
+        ...input.workItems
+          .filter((item) => item.status !== "retired")
+          .map((item) => ({ at: item.createdAt, ref: `work-item:${item.id}` })),
         ...input.reviewRounds.map((round) => ({ at: round.createdAt, ref: `review-round:${round.id}` })),
         ...input.integrations.map((attempt) => ({ at: attempt.createdAt, ref: `integration-attempt:${attempt.id}` }))
       ]

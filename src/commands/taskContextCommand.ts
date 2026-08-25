@@ -14,6 +14,7 @@ import {
   type ExecutionGroup
 } from "../execution/executionGroup.js";
 import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -48,7 +49,12 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
         roleName: role.name
       }))
     ].filter((mailbox): mailbox is NonNullable<typeof mailbox> => mailbox !== null);
-    const agentRuns = chronological(reader.listAgentRuns(task.id));
+    const events = reader.listEvents(task.id);
+    const agentRuns = chronological(operationalTaskRecords(
+      reader.listAgentRuns(task.id),
+      events,
+      "agent-run"
+    ));
     const reviewRounds = chronological(reader.listReviewRounds(task.id));
     const changeSets = chronological(reader.listChangeSets(task.id));
     const integrations = chronological(reader.listIntegrationAttempts(task.id));
@@ -79,10 +85,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       changeSets,
       integrations,
       publications,
-      messages: reader.listMessages(task.id),
+      messages: operationalTaskRecords(reader.listMessages(task.id), events, "message"),
       openInputRequests: inputRequests.filter((request) => request.status === "open"),
       resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
-      events: reader.listEvents(task.id),
+      events,
       nextAction: projectNextAction(nextActionFacts)
     };
   });
