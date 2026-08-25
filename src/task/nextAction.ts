@@ -31,6 +31,7 @@ import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { Task } from "./task.js";
 import {
   currentWorkItemCandidate,
+  currentWorkItemExecutionGroup,
   governingWorkItemCandidate,
   type WorkItem
 } from "../workItem/workItem.js";
@@ -334,6 +335,18 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         recommendedCommand: `yui task review finding repair-wave ${task.id} --create`
       });
     }
+    const explorationStop = exhaustedExplorationReason(failedWork);
+    if (explorationStop !== undefined) {
+      return buildAction(facts, {
+        kind: "implement-current-work-item",
+        reason: explorationStop,
+        refs: [ref("work-item", failedWork.id)],
+        preconditions: [
+          { fact: "Work Item exploration cannot continue", satisfied: true, ref: ref("work-item", failedWork.id) }
+        ],
+        recommendedCommand: `yui task work retire ${task.id}/${failedWork.id} --summary \"<reason>\"`
+      });
+    }
     return buildAction(facts, {
       kind: "implement-current-work-item",
       reason: `Work Item ${failedWork.id} failed without a Review verdict; retry implementation.`,
@@ -341,7 +354,9 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       preconditions: [
         { fact: "Work Item is failed", satisfied: true, ref: ref("work-item", failedWork.id) }
       ],
-      recommendedCommand: `yui task work update ${task.id}/${failedWork.id} running`
+      recommendedCommand: failedWork.assignee === undefined
+        ? `yui task work update ${task.id}/${failedWork.id} running`
+        : `yui task work dispatch ${task.id}/${failedWork.id}`
     });
   }
 
@@ -635,6 +650,24 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         }),
     recommendedCommand: `yui task complete ${task.id} --summary-file -`
   });
+}
+
+function exhaustedExplorationReason(item: WorkItem): string | undefined {
+  const group = currentWorkItemExecutionGroup(item);
+  if (group?.stage === undefined || group.resolution === undefined) return undefined;
+  if (group.resolution.decision === "reject") {
+    return `Work Item ${item.id} exploration was rejected and has no legal continuation; retire it explicitly.`;
+  }
+  if (group.resolution.decision === "retry"
+    && group.stage.stage === "resolve"
+    && group.stage.round >= group.stage.maxRounds) {
+    return `Work Item ${item.id} exhausted its exploration round budget; retire it explicitly.`;
+  }
+  if ((group.resolution.decision === "retry" || group.resolution.decision === "blocked")
+    && group.stage.stageAttempt >= group.stage.budget.maxAttempts) {
+    return `Work Item ${item.id} exhausted its ${group.stage.stage} stage attempt budget; retire it explicitly.`;
+  }
+  return undefined;
 }
 
 /**

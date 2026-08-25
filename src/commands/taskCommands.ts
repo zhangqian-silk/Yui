@@ -7,6 +7,7 @@ import {
   buildRunContextDelta,
   contextSnapshotDeltaRefIds,
   expandRunContextRef,
+  freezeExecutionStageContextSnapshot,
   freezeRunContextSnapshot
 } from "../context/runContextPack.js";
 import { contextSnapshotRef } from "../context/contextSnapshot.js";
@@ -198,6 +199,7 @@ import {
   currentWorkItemExecutionGroup,
   workItemExecutionGroupById,
   createWorkItem,
+  planWorkItemExplorationStage,
   attachWorkItemExecutionGroup,
   updateWorkItemExecutionGroup,
   retireWorkItem,
@@ -219,11 +221,13 @@ import {
   resolveExecutionGroup,
   restartExecutionLane,
   updateExecutionLane,
+  WORK_ITEM_EXECUTION_MODES,
   type ExecutionGroup,
   type ExecutionLaneGitSnapshot,
   type ExecutionStrategy,
   type ExecutionLaneWorkspace,
-  type ExecutionTarget
+  type ExecutionTarget,
+  type WorkItemExecutionMode
 } from "../execution/executionGroup.js";
 import {
   type ManagedWorkspace
@@ -2814,16 +2818,30 @@ function dispatchWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work dispatch usage: yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...].";
+  const usage = "Task work dispatch usage: yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--mode <single|parallel-diverse|ensemble-replicated|adversarial|adaptive-exploration>] [--max-rounds <count>] [--stage-max-attempts <count>].";
   const parsed = parseMultiValueTail(
     args,
-    new Set(["--input", "--strategy"]),
+    new Set(["--input", "--strategy", "--mode", "--max-rounds", "--stage-max-attempts"]),
     new Set(["--lane-role"]),
     usage
   );
   exactPositionals(parsed.positionals, 1, usage);
   const requestedStrategy = parseExecutionStrategy(parsed.options.get("--strategy"), usage);
   const requestedLaneRoles = parsed.multiOptions.get("--lane-role") ?? [];
+  const requestedMode = parseWorkItemExecutionMode(parsed.options.get("--mode"), usage);
+  const requestedMaxRounds = parseOptionalPositiveInteger(
+    parsed.options.get("--max-rounds"),
+    "--max-rounds",
+    usage
+  );
+  const requestedStageMaxAttempts = parseOptionalPositiveInteger(
+    parsed.options.get("--stage-max-attempts"),
+    "--stage-max-attempts",
+    usage
+  );
+  const explorationMode = requestedMode === undefined || requestedMode === "single"
+    ? undefined
+    : requestedMode;
   const now = clock(options);
   const runs = store.transaction((tx) => {
     const item = requireWorkItem(tx, parsed.positionals[0], options);
@@ -2836,8 +2854,34 @@ function dispatchWork(
       ? currentGroup
       : undefined;
     const expanding = item.status === "running" && existingGroup !== undefined;
-    if (!expanding && item.status !== "pending" && item.status !== "failed") {
+    const continuingExploration = currentGroup?.stage !== undefined
+      && currentGroup.resolution !== undefined
+      && (item.status === "running" || item.status === "failed");
+    const startingExploration = item.executionGroups.length === 0
+      && explorationMode !== undefined;
+    if (!expanding
+      && !continuingExploration
+      && item.status !== "pending"
+      && item.status !== "failed") {
       throw usageError(`Work item ${item.id} cannot be dispatched from ${item.status}.`);
+    }
+    if (requestedMode === "single" && currentGroup?.stage !== undefined) {
+      throw usageError("An exploration WorkItem cannot return to single mode.");
+    }
+    if (explorationMode !== undefined
+      && item.executionGroups.length > 0
+      && currentGroup?.stage === undefined) {
+      throw usageError("A WorkItem cannot enter exploration after single-mode ExecutionGroups.");
+    }
+    if (!startingExploration
+      && !continuingExploration
+      && (requestedMaxRounds !== undefined || requestedStageMaxAttempts !== undefined)) {
+      throw usageError("Exploration limits require an explicit non-single --mode.");
+    }
+    if (existingGroup !== undefined && (requestedMode !== undefined
+      || requestedMaxRounds !== undefined
+      || requestedStageMaxAttempts !== undefined)) {
+      throw usageError(`Execution stage configuration is frozen: ${existingGroup!.id}.`);
     }
     if (item.assignee === undefined) {
       throw usageError(
@@ -2926,14 +2970,31 @@ function dispatchWork(
     });
     let group = existingGroup;
     if (group === undefined) {
+      const groupId = `execution-group-${plans[0]!.runId}`;
+      const stage = !startingExploration && !continuingExploration
+        ? undefined
+        : planWorkItemExplorationStage(item, {
+            ...(explorationMode === undefined ? {} : { mode: explorationMode }),
+            ...(requestedMaxRounds === undefined ? {} : { maxRounds: requestedMaxRounds }),
+            ...(requestedStageMaxAttempts === undefined
+              ? {}
+              : { maxAttempts: requestedStageMaxAttempts }),
+            strategy,
+            contextSnapshotRef: contextSnapshotRef(freezeExecutionStageContextSnapshot(tx, {
+              taskId: task.id,
+              workItemId: item.id,
+              executionGroupId: groupId
+            }, now))
+          });
       group = createExecutionGroup(
-        `execution-group-${plans[0]!.runId}`,
+        groupId,
         task.id,
         {
           purpose: "execution",
           target: executionTargetForWorkItem(task.id, item.id, item.revision, item, workspace),
           strategy,
-          lanes: laneRoles.map((roleName) => ({ roleName }))
+          lanes: laneRoles.map((roleName) => ({ roleName })),
+          ...(stage === undefined ? {} : { stage })
         },
         now
       );
@@ -3002,7 +3063,10 @@ function dispatchWork(
           executionGroupId: runningGroup.id,
           executionLaneId: lane.id
         },
-        directive: `${rawInput}\nFrozen target: ${group.target.fingerprint}.`,
+        directive: `${rawInput}\nFrozen target: ${group.target.fingerprint}.`
+          + (group.stage === undefined
+            ? ""
+            : `\nExploration stage: ${group.stage.stage}; round=${group.stage.round}; attempt=${group.stage.stageAttempt}.`),
         deltaRefIds: []
       });
       createdRuns.push(createAgentRun(
@@ -3102,7 +3166,7 @@ function resolveWorkExecutionGroup(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work group resolve usage: yui task work group resolve <task>/<work> --decision <accept|reject|blocked> --summary <text> [--lane <lane-id> ...].";
+  const usage = "Task work group resolve usage: yui task work group resolve <task>/<work> --decision <accept|reject|retry|blocked> --summary <text> [--lane <lane-id> ...].";
   if (args[0] !== "resolve") throw usageError(usage);
   const parsed = parseMultiValueTail(
     args.slice(1),
@@ -3124,7 +3188,9 @@ function resolveWorkExecutionGroup(
     }
     const group = currentWorkItemExecutionGroup(item);
     if (group === undefined
-      || (group.lanes.length < 2 && group.strategy.mode !== "adaptive")) {
+      || (group.stage === undefined
+        && group.lanes.length < 2
+        && group.strategy.mode !== "adaptive")) {
       throw usageError(`Work Item ${item.id} has no resolvable ExecutionGroup.`);
     }
     if (item.status !== "running") {
@@ -3154,6 +3220,12 @@ function resolveWorkExecutionGroup(
         workItemRef(task.id, item.id)
       ]);
       return { item: failed, group: resolved, reviewDispatch: null };
+    }
+    if (resolved.stage !== undefined && resolved.stage.stage !== "resolve") {
+      enqueueWork(tx, leaderMailbox(task.id), "work-group-resolved", now, [
+        workItemRef(task.id, item.id)
+      ]);
+      return { item: groupedItem, group: resolved, reviewDispatch: null };
     }
     const eligible = resolved.lanes
       .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
@@ -6819,7 +6891,8 @@ function yieldRun(
       if (item === null) throw dataError(`Work item not found for run ${active.id}: ${active.workItemId}.`);
       const currentGroup = currentWorkItemExecutionGroup(item);
       const multiLaneGroup = currentGroup !== undefined
-        && (currentGroup.lanes.length > 1
+        && (currentGroup.stage !== undefined
+          || currentGroup.lanes.length > 1
           || currentGroup.strategy.mode === "adaptive")
         && currentGroup.resolution === undefined;
       if (multiLaneGroup) {
@@ -8809,6 +8882,32 @@ function parseExecutionStrategy(
   );
 }
 
+function parseWorkItemExecutionMode(
+  value: string | undefined,
+  usage: string
+): WorkItemExecutionMode | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim().toLowerCase() as WorkItemExecutionMode;
+  if (WORK_ITEM_EXECUTION_MODES.includes(normalized)) return normalized;
+  throw usageError(
+    `Invalid WorkItem execution mode: ${value}. Use ${WORK_ITEM_EXECUTION_MODES.join(", ")}.`,
+    usage
+  );
+}
+
+function parseOptionalPositiveInteger(
+  value: string | undefined,
+  label: string,
+  usage: string
+): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw usageError(`${label} must be a positive integer.`, usage);
+  }
+  return parsed;
+}
+
 function sameExecutionStrategy(
   left: ExecutionStrategy,
   right: ExecutionStrategy
@@ -8822,9 +8921,11 @@ function sameExecutionStrategy(
 function parseExecutionResolutionDecision(
   value: string | undefined,
   usage: string
-): "accept" | "reject" | "blocked" {
-  if (value === "accept" || value === "reject" || value === "blocked") return value;
-  throw usageError("--decision must be accept, reject, or blocked.", usage);
+): "accept" | "reject" | "retry" | "blocked" {
+  if (value === "accept" || value === "reject" || value === "retry" || value === "blocked") {
+    return value;
+  }
+  throw usageError("--decision must be accept, reject, retry, or blocked.", usage);
 }
 
 function trimmed(value: string | undefined): string | undefined {

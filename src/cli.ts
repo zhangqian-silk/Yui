@@ -2250,6 +2250,7 @@ async function candidateSnapshotForTaskCommand(
       const fixedSingleLane = group?.strategy.mode === "fixed"
         && group.strategy.count === 1
         && group.lanes.length === 1
+        && group.stage === undefined
         && run.workspace.owner.type === "work-item";
       if (fixedSingleLane) return preparer.snapshotCandidateWorkspace(run.workspace);
       return undefined;
@@ -2297,6 +2298,7 @@ async function candidateMaterializationForTaskCommand(
     ? undefined
     : currentWorkItemExecutionGroup(item);
   if (item === null || item === undefined || group === undefined) return undefined;
+  if (group.stage !== undefined && group.stage.stage !== "resolve") return undefined;
   const selected = args.flatMap((value, index) => value === "--lane" && args[index + 1] !== undefined ? [args[index + 1]!] : []);
   try {
     return await preparer.materializeExecutionGroupCandidate(

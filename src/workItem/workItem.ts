@@ -2,9 +2,15 @@ import {
   normalizedUniqueIdentities,
   normalizedUniqueText,
   requireIdentity,
+  requirePositiveInteger,
   requireText,
   requireTimestamp
 } from "../domain/validation.js";
+import {
+  contextContentDigest,
+  validateContextSnapshotRef,
+  type ContextSnapshotRef
+} from "../context/contextSnapshot.js";
 import { validateReviewConfig, type ReviewConfig } from "../review/reviewConfig.js";
 import {
   taskFinalReviewConfig,
@@ -19,7 +25,13 @@ import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 import {
   assertExecutionGroupTransition,
   validateExecutionGroup,
-  type ExecutionGroup
+  WORK_ITEM_EXPLORATION_STAGES,
+  type ExecutionGroup,
+  type ExecutionParentResultRef,
+  type ExecutionStageContext,
+  type ExecutionStrategy,
+  type WorkItemExplorationMode,
+  type WorkItemExplorationStage
 } from "../execution/executionGroup.js";
 
 export type WorkItemStatus =
@@ -107,8 +119,8 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  /** v9 persists every WorkItem ExecutionGroup and the current-group pointer. */
-  schemaVersion: 9;
+  /** v10 lets ExecutionGroup history carry the bounded exploration stage machine. */
+  schemaVersion: 10;
   id: string;
   taskId: string;
   title: string;
@@ -158,7 +170,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 9,
+    schemaVersion: 10,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -454,7 +466,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 9) throw new Error("WorkItem must use schemaVersion 9.");
+  if (workItem.schemaVersion !== 10) throw new Error("WorkItem must use schemaVersion 10.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
@@ -489,6 +501,7 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     }
     groupIds.add(group.id);
   }
+  validateWorkItemExplorationHistory(workItem.executionGroups);
   if (workItem.currentExecutionGroupId !== undefined) {
     requireIdentity(workItem.currentExecutionGroupId, "ExecutionGroup id");
     if (!groupIds.has(workItem.currentExecutionGroupId)) {
@@ -514,6 +527,16 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     candidateIds.add(candidate.id);
     if (candidate.workItemRevision > workItem.revision) {
       throw new Error("Work Item candidate revision cannot exceed the Work Item revision.");
+    }
+    if (candidate.executionGroupId !== undefined) {
+      const group = workItem.executionGroups.find(({ id }) => id === candidate.executionGroupId);
+      if (group?.stage !== undefined) {
+        if (group.stage.stage !== "resolve"
+          || group.resolution?.decision !== "accept"
+          || !group.resolution.selectedLaneIds.includes(candidate.executionLaneId!)) {
+          throw new Error("An exploration Candidate must come from the accepted Resolve stage.");
+        }
+      }
     }
   });
   const currentCandidate = currentWorkItemCandidate(workItem);
@@ -556,6 +579,134 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   return workItem;
 }
 
+export type PlanWorkItemExplorationStageInput = Readonly<{
+  /** Required only when the first exploration Group is planned. */
+  mode?: WorkItemExplorationMode;
+  /** Required only when the first exploration Group is planned. */
+  maxRounds?: number;
+  /** Required for a new stage; retries inherit the frozen stage budget. */
+  maxAttempts?: number;
+  strategy: ExecutionStrategy;
+  contextSnapshotRef: ContextSnapshotRef;
+}>;
+
+/**
+ * Project the next legal exploration stage from immutable WorkItem Group
+ * history. Retry repeats the current stage; retry at Resolve begins the next
+ * round. Reject has no continuation, while blocked follows the same bounded
+ * retry path after the Leader settles any required InputRequest.
+ */
+export function planWorkItemExplorationStage(
+  workItem: WorkItem,
+  input: PlanWorkItemExplorationStageInput
+): ExecutionStageContext {
+  validateWorkItem(workItem);
+  const snapshot = validateContextSnapshotRef(input.contextSnapshotRef);
+  const capacity = executionStrategyCapacity(input.strategy);
+  const current = currentWorkItemExecutionGroup(workItem);
+  if (workItem.executionGroups.length === 0) {
+    if (workItem.status !== "pending" && workItem.status !== "running") {
+      throw new Error(`Work Item cannot begin exploration from ${workItem.status}: ${workItem.id}.`);
+    }
+    if (input.mode === undefined) {
+      throw new Error("The first exploration stage requires a mode.");
+    }
+    return {
+      schemaVersion: 1,
+      mode: input.mode,
+      stage: "plan",
+      round: 1,
+      stageAttempt: 1,
+      maxRounds: requirePositiveInteger(input.maxRounds ?? 1, "Exploration max rounds"),
+      budget: {
+        maxLanes: capacity,
+        maxAttempts: requirePositiveInteger(
+          input.maxAttempts ?? 1,
+          "Exploration stage max attempts"
+        )
+      },
+      contextSnapshotRef: snapshot,
+      parentResults: []
+    };
+  }
+  if (current === undefined || current.stage === undefined) {
+    throw new Error("A Work Item cannot mix single and exploration ExecutionGroups.");
+  }
+  if (current.resolution === undefined) {
+    throw new Error(`Execution stage is still active: ${current.id}.`);
+  }
+  if (input.mode !== undefined && input.mode !== current.stage.mode) {
+    throw new Error("Work Item exploration mode is immutable.");
+  }
+  if (input.maxRounds !== undefined && input.maxRounds !== current.stage.maxRounds) {
+    throw new Error("Work Item exploration maxRounds is immutable.");
+  }
+  const parentResults = selectedParentResults(current);
+  const base = {
+    schemaVersion: 1 as const,
+    mode: current.stage.mode,
+    maxRounds: current.stage.maxRounds,
+    contextSnapshotRef: snapshot,
+    parentResults
+  };
+  if (current.resolution.decision === "reject") {
+    throw new Error(`Rejected exploration has no continuation: ${current.id}.`);
+  }
+  if (current.resolution.decision === "accept") {
+    if (current.stage.stage === "resolve") {
+      throw new Error(`Accepted Resolve stage already completed exploration: ${current.id}.`);
+    }
+    return {
+      ...base,
+      stage: nextExplorationStage(current.stage.stage),
+      round: current.stage.round,
+      stageAttempt: 1,
+      budget: {
+        maxLanes: capacity,
+        maxAttempts: requirePositiveInteger(
+          input.maxAttempts ?? 1,
+          "Exploration stage max attempts"
+        )
+      }
+    };
+  }
+  if (current.stage.stage === "resolve" && current.resolution.decision === "retry") {
+    if (current.stage.round >= current.stage.maxRounds) {
+      throw new Error(`Work Item exploration round budget is exhausted: ${workItem.id}.`);
+    }
+    return {
+      ...base,
+      stage: "plan",
+      round: current.stage.round + 1,
+      stageAttempt: 1,
+      budget: {
+        maxLanes: capacity,
+        maxAttempts: requirePositiveInteger(
+          input.maxAttempts ?? 1,
+          "Exploration stage max attempts"
+        )
+      }
+    };
+  }
+  if (current.stage.stageAttempt >= current.stage.budget.maxAttempts) {
+    throw new Error(`Work Item exploration stage attempt budget is exhausted: ${workItem.id}.`);
+  }
+  if (capacity !== current.stage.budget.maxLanes) {
+    throw new Error("A retried exploration stage must keep its frozen Lane budget.");
+  }
+  if (input.maxAttempts !== undefined
+    && input.maxAttempts !== current.stage.budget.maxAttempts) {
+    throw new Error("A retried exploration stage must keep its frozen attempt budget.");
+  }
+  return {
+    ...base,
+    stage: current.stage.stage,
+    round: current.stage.round,
+    stageAttempt: current.stage.stageAttempt + 1,
+    budget: current.stage.budget
+  };
+}
+
 /** Resolve the WorkItem's current execution iteration. */
 export function currentWorkItemExecutionGroup(
   workItem: WorkItem
@@ -571,6 +722,96 @@ export function workItemExecutionGroupById(
   executionGroupId: string
 ): ExecutionGroup | undefined {
   return workItem.executionGroups.find(({ id }) => id === executionGroupId);
+}
+
+function validateWorkItemExplorationHistory(groups: readonly ExecutionGroup[]): void {
+  const staged = groups.filter(({ stage }) => stage !== undefined);
+  if (staged.length === 0) return;
+  if (staged.length !== groups.length) {
+    throw new Error("A Work Item cannot mix single and exploration ExecutionGroups.");
+  }
+  const first = groups[0]!.stage!;
+  if (first.stage !== "plan"
+    || first.round !== 1
+    || first.stageAttempt !== 1
+    || first.parentResults.length !== 0) {
+    throw new Error("Work Item exploration must begin at Plan round 1 attempt 1.");
+  }
+  for (let index = 1; index < groups.length; index += 1) {
+    const previous = groups[index - 1]!;
+    const current = groups[index]!;
+    const before = previous.stage!;
+    const after = current.stage!;
+    if (previous.resolution === undefined) {
+      throw new Error(`Exploration stage must resolve before its successor: ${previous.id}.`);
+    }
+    if (previous.resolution.decision === "reject") {
+      throw new Error(`Rejected exploration cannot have a successor: ${previous.id}.`);
+    }
+    if (after.mode !== before.mode || after.maxRounds !== before.maxRounds) {
+      throw new Error("Work Item exploration mode and maxRounds are immutable.");
+    }
+    const parents = selectedParentResults(previous);
+    if (JSON.stringify(after.parentResults) !== JSON.stringify(parents)) {
+      throw new Error(`Exploration parentResults do not match ${previous.id}.`);
+    }
+    if (previous.resolution.decision === "accept") {
+      if (before.stage === "resolve"
+        || after.stage !== nextExplorationStage(before.stage)
+        || after.round !== before.round
+        || after.stageAttempt !== 1) {
+        throw new Error(`Exploration stage transition is invalid: ${previous.id}/${current.id}.`);
+      }
+      continue;
+    }
+    if (before.stage === "resolve" && previous.resolution.decision === "retry") {
+      if (before.round >= before.maxRounds
+        || after.stage !== "plan"
+        || after.round !== before.round + 1
+        || after.stageAttempt !== 1) {
+        throw new Error(`Exploration round transition is invalid: ${previous.id}/${current.id}.`);
+      }
+      continue;
+    }
+    if (after.stage !== before.stage
+      || after.round !== before.round
+      || after.stageAttempt !== before.stageAttempt + 1
+      || after.stageAttempt > before.budget.maxAttempts
+      || JSON.stringify(after.budget) !== JSON.stringify(before.budget)) {
+      throw new Error(`Exploration retry transition is invalid: ${previous.id}/${current.id}.`);
+    }
+  }
+}
+
+function selectedParentResults(group: ExecutionGroup): readonly ExecutionParentResultRef[] {
+  if (group.resolution === undefined) {
+    throw new Error(`ExecutionGroup is unresolved: ${group.id}.`);
+  }
+  return group.resolution.selectedLaneIds.map((laneId) => {
+    const lane = group.lanes.find(({ id }) => id === laneId);
+    if (lane?.result === undefined) {
+      throw new Error(`Selected ExecutionLane result is missing: ${group.id}/${laneId}.`);
+    }
+    return {
+      executionGroupId: group.id,
+      executionLaneId: lane.id,
+      resultDigest: contextContentDigest(lane.result)
+    };
+  });
+}
+
+function nextExplorationStage(stage: WorkItemExplorationStage): WorkItemExplorationStage {
+  const index = WORK_ITEM_EXPLORATION_STAGES.indexOf(stage);
+  const next = WORK_ITEM_EXPLORATION_STAGES[index + 1];
+  if (next === undefined) throw new Error("Resolve is the final exploration stage.");
+  return next;
+}
+
+function executionStrategyCapacity(strategy: ExecutionStrategy): number {
+  return requirePositiveInteger(
+    strategy.mode === "fixed" ? strategy.count : strategy.max,
+    "Execution strategy capacity"
+  );
 }
 
 function validateWorkItemExecutionGroup(

@@ -288,6 +288,22 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "完成实现并运行聚焦测试"
 ```
 
+派发默认仍为 `single`。Leader 可在全新 WorkItem 上显式开启有界多路探索；每个
+接受的阶段按 `Plan → Generate → Compare → Synthesize → Verify → Resolve`
+推进，只有接受后的 Resolve 阶段会物化既有的单一 Candidate：
+
+```sh
+yui task work dispatch <task-id>/<work-item-id> \
+  --mode parallel-diverse --max-rounds 2 --stage-max-attempts 2 \
+  --strategy fixed:2 --lane-role critic
+yui task work group resolve <task-id>/<work-item-id> \
+  --decision accept --summary "Plan 证据充分"
+```
+
+每个阶段都是新的不可变 ExecutionGroup；其 ContextSnapshot 与选中的父 Lane
+结果都以持久引用衔接。`retry` 在阶段尝试预算内重做当前阶段，而 Resolve 上的
+`retry` 才进入下一轮，并受最大轮次约束。
+
 每个 Agent binding 只有一套 adapter-specific 权限枚举配置：`default` 遵循
 provider 默认行为；`bypass` 编译 provider 支持的 bypass flag；`configured`
 保留其中显式设置的原生选项。Codex 选项是 `sandbox` 和 `approval`；Claude 选项是

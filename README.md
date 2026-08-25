@@ -532,6 +532,23 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "Implement and run focused tests"
 ```
 
+Dispatch remains `single` by default. A Leader can explicitly enable bounded
+multi-route exploration on a fresh WorkItem; each accepted stage advances
+`Plan → Generate → Compare → Synthesize → Verify → Resolve`, and only the
+accepted Resolve stage materializes the existing single Candidate:
+
+```sh
+yui task work dispatch <task-id>/<work-item-id> \
+  --mode parallel-diverse --max-rounds 2 --stage-max-attempts 2 \
+  --strategy fixed:2 --lane-role critic
+yui task work group resolve <task-id>/<work-item-id> \
+  --decision accept --summary "Plan evidence is sufficient"
+```
+
+Every stage is a new immutable ExecutionGroup. Its ContextSnapshot and selected
+parent Lane results are durable references; `retry` repeats a stage within its
+attempt budget, while `retry` at Resolve begins the next bounded round.
+
 Permission is one adapter-specific enum configuration on each Agent binding:
 `default` follows the provider, `bypass` compiles the provider's supported
 bypass flag, and `configured` retains whichever native options are explicitly
