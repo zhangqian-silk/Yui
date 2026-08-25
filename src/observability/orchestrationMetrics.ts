@@ -10,13 +10,12 @@ import type { ReviewFinding } from "../review/reviewFinding.js";
 import { classifyReviewRoundOutcome } from "../review/reviewOutcomeClassifier.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import { projectFirstProgressStopLoss } from "../runtime/firstProgressStopLoss.js";
-import { taskDeliveryPath, type Task } from "../task/task.js";
+import type { Task } from "../task/task.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { WorkItem } from "../workItem/workItem.js";
 
 export type OrchestrationAdvisoryCode =
-  | "direct-protocol-overhead"
-  | "guarded-workitem-fanout"
+  | "bugfix-workitem-overhead"
   | "review-repair-fanout"
   | "repeated-integration-check"
   | "review-budget-exhausted"
@@ -30,7 +29,7 @@ export type OrchestrationAdvisory = Readonly<{
 
 export type TaskOrchestrationMetrics = Readonly<{
   taskId: string;
-  deliveryPath: ReturnType<typeof taskDeliveryPath>;
+  taskType: string | null;
   timeToFirstProjectCommitMs: number | null;
   runs: Readonly<{
     total: number;
@@ -138,7 +137,7 @@ export function projectTaskOrchestration(
 
   return Object.freeze({
     taskId: facts.task.id,
-    deliveryPath: taskDeliveryPath(facts.task),
+    taskType: facts.task.type ?? null,
     timeToFirstProjectCommitMs: firstCommitAt === undefined
       ? null
       : Math.max(0, Date.parse(firstCommitAt) - Date.parse(facts.task.createdAt)),
@@ -183,24 +182,11 @@ function projectAdvisories(
   stopLoss: boolean
 ): OrchestrationAdvisory[] {
   const result: OrchestrationAdvisory[] = [];
-  if (taskDeliveryPath(facts.task) === "direct"
-    && (facts.workItems.length > 0 || facts.reviewRounds.length > 0 || facts.integrations.length > 0)) {
+  if (facts.task.type === "bugfix" && facts.workItems.length > 0) {
     result.push({
-      code: "direct-protocol-overhead",
-      reason: "Direct delivery accumulated WorkItem, Review, or Integration protocol overhead; keep the fix Leader-direct or explicitly promote it to integrated delivery.",
-      refs: [
-        ...facts.workItems.map(({ id }) => `work-item:${id}`),
-        ...facts.reviewRounds.map(({ id }) => `review-round:${id}`),
-        ...facts.integrations.map(({ id }) => `integration-attempt:${id}`)
-      ]
-    });
-  }
-  const initial = facts.workItems.filter(({ dependsOn }) => dependsOn.length === 0);
-  if (taskDeliveryPath(facts.task) === "integrated" && initial.length > 1) {
-    result.push({
-      code: "guarded-workitem-fanout",
-      reason: `${initial.length} initial WorkItems were created for an integrated Task; start with one bounded fix unless independence is explicit.`,
-      refs: initial.map(({ id }) => `work-item:${id}`)
+      code: "bugfix-workitem-overhead",
+      reason: `Bugfix ${facts.task.id} created ${facts.workItems.length} WorkItem(s); bugfixes are Leader-owned, so reclassify expanding scope as a feature before delegating independent delivery units.`,
+      refs: facts.workItems.map(({ id }) => `work-item:${id}`)
     });
   }
   const repairItems = facts.workItems.filter((item) => (

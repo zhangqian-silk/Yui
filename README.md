@@ -250,8 +250,8 @@ yui project update app --alias app-cli
 yui project refresh app
 yui project list
 
-yui task create "Fix CSV escaping" --project app --delivery direct
-yui task create "Ship CSV export" --project app --delivery integrated
+yui task create "Fix CSV escaping" --project app --type bugfix
+yui task create "Ship CSV export" --project app --type feature
 yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
 yui task show <task-id>
@@ -259,18 +259,16 @@ yui task context <task-id>
 yui task activate <task-id>
 ```
 
-Project delivery is explicit but uses the existing Task schema. `direct` means
-the Leader implements and verifies one low-risk result on clean committed Task
-main; it needs no WorkItem, IntegrationAttempt, or policy-created final
-ReviewRound. `integrated` requires WorkItem, ChangeSet, and committed Integration
-evidence and remains the path for guarded, cross-Project, migration,
-authorization, concurrency/recovery, destructive, and release changes. Global
-final-review policy applies automatically only to integrated delivery. A direct
-Task can use a bounded native review. If an independently managed final Review
-is required, promote before Task main advances; promotion fails closed after a
-commit or delivery evidence exists so earlier work cannot lose ChangeSet
-provenance. Legacy `--require-integration` is an alias for
-`--delivery integrated`, and integrated delivery cannot be downgraded.
+Task type describes intent rather than selecting an execution protocol.
+Software Projects use `bugfix` or `feature`: a bugfix is Leader-owned; if it
+grows into independently owned delivery requirements, reclassify it as a
+feature before creating WorkItems. The Leader decides whether a feature is
+small enough to deliver on Task main or large enough for independently owned WorkItems. A WorkItem is
+one substantial requirement for one Worker, not a development step, test run,
+review finding, or local fix. Multiple WorkItems are useful only when distinct
+Workers can advance meaningful requirements independently. Once WorkItems
+produce Git results, their ChangeSets must be integrated into the Leader's
+Task main before Task-final Review or completion.
 
 `project refresh` is the explicit network operation for a stable Project checkout. It fetches the
 configured stable branch directly from the Project remote URL and advances only through a clean,
@@ -313,9 +311,9 @@ yui config show
 yui config workflow clear review
 ```
 
-For Project-backed software delivery, use `--trigger final` to keep WorkItem
-acceptance and Integration independent and run one fresh ReviewRound over the
-complete frozen integrated Task candidate before completion:
+For Project-backed software delivery, use `--trigger final` to supply the
+default Reviewer Role when the Leader decides the complete frozen Task result
+needs an independent Review:
 
 ```sh
 yui config workflow set review --role reviewer --trigger final
@@ -330,10 +328,13 @@ or a Leader-managed direct result; `leader` leaves the candidate awaiting
 acceptance so the Leader can accept it directly or run
 `yui task work review <task-id>/<work-item-id>`. A configured review rule therefore keeps
 Leader-managed candidates awaiting a decision instead of marking them done.
-`final` does not create WorkItem ReviewRounds; `task complete` queues one
-Task-scoped ReviewRound after every bound Project has a committed Integration,
-and re-queues a new round only when those frozen heads change. The final
-Reviewer follows Project Policy/Knowledge and reports reachable, material,
+`final` does not create WorkItem ReviewRounds or decide Task topology. The
+Leader explicitly requests a Task-scoped Review, unless an immutable Task
+contract requires one. The Round freezes Task main directly, so even a
+Leader-owned Task with no WorkItem can be reviewed. A changed frozen head needs
+a new semantic Round; the same compatible Reviewer Session may continue in its
+stable workspace, while every Run remains bound to its exact Round and head.
+The Reviewer follows Project Policy/Knowledge and reports reachable, material,
 actionable findings across the complete Task.
 A ReviewRound freezes the Candidate's exact Git commit and creates a fresh,
 ReviewRound-owned writable worktree on a unique branch. Its AgentRun may edit,
@@ -385,7 +386,7 @@ expands:
 yui task create "Update authentication" \
   --project backend --project frontend \
   --base backend=develop --base frontend=main \
-  --delivery integrated
+  --type feature
 yui task project add <task-id> shared-sdk --base main
 ```
 
@@ -565,15 +566,15 @@ bounded next options. Yield records immutable Run/Candidate or Review evidence
 only; it does not imply acceptance, WorkItem completion, ChangeSet capture,
 Integration, or Task completion.
 
-For integrated bounded work, the Leader owns one roleless WorkItem and may
-execute it directly or create a native subagent through the current Agent
-conversation. Direct delivery operates on Task main without creating this
-WorkItem:
+For one substantial feature requirement, the Leader may create a WorkItem and
+give it to a native subagent or Task Role Worker. A small Task or bugfix stays
+on Task main. Do not create a WorkItem merely to record implementation steps,
+tests, review, or follow-up fixes:
 
 ```sh
-yui task work create <task-id> "Review the implementation" \
-  --objective "Return source-backed findings" \
-  --accept "Every finding identifies an affected path"
+yui task work create <task-id> "Implement the export API" \
+  --objective "Deliver the independently acceptable export API requirement" \
+  --accept "The API contract and focused validation are complete"
 yui task work update <task-id>/<work-item-id> running
 yui config profile show reviewer
 ```
@@ -706,8 +707,9 @@ yui task complete <task-id> --summary-file delivery.txt \
 This does not weaken normal freshness checks. Yui requires the current,
 unsuperseded Publication to be merged and verified, its local commit to equal
 the physical Task head, its remote commit to be ancestry-divergent, and both
-commits to resolve to the same exact tree. Integrated delivery also requires
-the latest completed Task-final Review; direct delivery does not invent one.
+commits to resolve to the same exact tree. When a Task-final Review obligation
+exists, completion also requires the latest semantic Round to attest the
+accepted Task head; otherwise completion does not invent a ReviewRound.
 `--refresh-remote` fetches
 the remote object graph before resolving that Publication commit. For a Task
 governed by a durable exact final-review contract, the user/Operator command

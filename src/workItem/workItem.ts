@@ -101,7 +101,7 @@ export type WorkItemCandidate = Readonly<{
   /** Snapshot of the WorkItem-owned Develop workspace at candidate time. */
   workspace?: ManagedWorkspace;
   gitSnapshot?: CandidateGitSnapshot;
-  /** Exact base/head boundary for a metadata-only direct Task-main Candidate. */
+  /** Exact base/head boundary for a metadata-only Task-main Candidate. */
   taskMainSnapshot?: DirectTaskMainSnapshot;
   createdAt: string;
 }>;

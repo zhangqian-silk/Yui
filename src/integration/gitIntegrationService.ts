@@ -970,7 +970,7 @@ async function integrationCommitPlan(
       `${changeSet.baseCommit}..${changeSet.headCommit}`
     ])).trim().split("\n").filter(Boolean);
     for (const commit of commits) {
-      // A direct Task-main recovery may capture commits after they are already
+      // A Task-main recovery may capture commits after they are already
       // present on the exact target. Treat those commits as applied rather
       // than attempting an empty cherry-pick; the later checks and CAS still
       // fence the committed Integration to expectedHead.

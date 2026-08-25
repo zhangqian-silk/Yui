@@ -1022,7 +1022,7 @@ export class SqliteTaskStore implements TaskStore {
         id: task.id,
         status: task.status,
         projectBindings: task.projectBindings,
-        requireIntegration: task.requireIntegration
+        type: task.type
       },
       workItems: this.#sortById(
         this.#listPayload<WorkItem>("work_items", "task_id = ?", [taskId]),

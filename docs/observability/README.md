@@ -150,7 +150,7 @@ Sections:
   PR/MR references.
 - **events** — total, progress vs semantic, obsolete, message count.
 - **workItems** — total/completed/retired.
-- **orchestration** — per-Task delivery path, Run/WorkItem counts, full/delta/
+- **orchestration** — per-Task intent type, Run/WorkItem counts, full/delta/
   non-semantic Reviews, finding yield, Integration attempts/failures/repeated
   identities/evidence reuse, generations before first durable progress,
   publication-to-completion latency, terminal workspaces, and non-blocking

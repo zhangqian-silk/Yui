@@ -688,9 +688,6 @@ export function validateExecutionTarget(target: ExecutionTarget, taskId: string)
   if (target.kind === "work-item" && target.workItemId === undefined) {
     throw new Error("WorkItem ExecutionTarget requires a Work Item id.");
   }
-  if (target.kind === "task-final-review" && target.candidateId === undefined) {
-    throw new Error("Task-final ExecutionTarget requires a Candidate id.");
-  }
   if (target.workItemId !== undefined) requireIdentity(target.workItemId, "Work Item id");
   if (target.candidateId !== undefined) requireIdentity(target.candidateId, "Candidate id");
   if (target.contractDigest !== undefined) requireText(target.contractDigest, "Execution contract digest");

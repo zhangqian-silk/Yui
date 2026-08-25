@@ -111,9 +111,9 @@ completion, failure, and rollback are all independent and it can run in parallel
 without waiting on or controlling another Task. Same repository, same file, or a
 potential Git conflict is neutral to Task identity; let rebase, merge, and
 review handle independent changes instead of merging the Tasks. One bounded
-outcome may bind multiple Projects and independent base refs. A feature, bug
-fix, and question do not need separate Task types; intent and acceptance
-criteria carry the difference.
+outcome may bind multiple Projects and independent base refs. Task type records
+Project-defined intent such as `feature` or `bugfix`; it does not determine
+Task identity or execution topology.
 
 The Task title is the human-facing label used in Agent session lists. Keep it to
 one concise outcome phrase, ideally within 20 characters. Put request details,
@@ -126,7 +126,7 @@ yui operator submit "<related request>" --task <task-id>
 yui task create "<distinct mission>" \
   --project <project-a> --project <project-b> \
   --base <project-a>=<ref> --base <project-b>=<ref> \
-  --delivery integrated
+  --type feature
 yui operator submit "<request and routing context>" --task <new-task-id>
 yui task activate <new-task-id>
 ```
@@ -145,25 +145,21 @@ separate Tasks merely because it spans several Projects or files. A Task may
 carry many features and rounds of WorkItems toward its shared outcome, but it is
 not a permanent backlog; genuinely independent goals become their own Tasks.
 
-Choose the Project delivery path before activation and report it with the Task:
+Record Project-defined Task intent and leave execution topology to the Leader.
+For software Projects, use `--type bugfix` or `--type feature`. A bugfix is
+Leader-owned; if it expands into independently owned delivery requirements,
+the Leader reclassifies it as a feature before creating WorkItems. For a
+feature, the Leader decides whether to own the whole result on Task main or
+create substantial WorkItems for different Workers. Never choose a WorkItem
+count at routing time merely from file count, risk labels, or a desire for more
+progress records.
 
-- `--delivery direct` for one bounded, low-risk outcome that Project Policy
-  allows the Leader to implement and verify on Task main. Direct delivery does
-  not require a WorkItem, ChangeSet, IntegrationAttempt, or policy-created
-  managed ReviewRound; it still requires a clean committed managed Task main.
-- `--delivery integrated` when Project Policy requires independent provenance,
-  Integration CAS, or final Review, and whenever the change crosses Projects,
-  storage/migration, permission or authorization, destructive behavior,
-  concurrency/recovery invariants, or release machinery. It requires the
-  WorkItem, ChangeSet, and committed Integration evidence chain.
-- Omit `--delivery` only for a Task with no Project bindings. The legacy
-  `--require-integration` flag remains an alias for `--delivery integrated`.
-
-Risk is a Leader/Project Policy judgment, not a file-count score. When evidence
-changes the risk, promotion from direct to integrated is explicit and
-irreversible; never silently downgrade an integrated Task to make completion
-easier. Do not pre-create WorkItems merely because integrated delivery might
-become necessary later.
+Do not create WorkItems for investigation notes, implementation steps, tests,
+review rounds, findings, or small fixes. A WorkItem is justified only when it
+has its own meaningful requirement, owner, acceptance boundary, and useful
+independent progress—normally enough work for a different Worker to advance in
+parallel. Integration evidence is derived later from WorkItems that actually
+produce isolated Git results.
 
 Managed workspaces are owner-keyed, not Role-keyed: Task main, WorkItem
 Develop, ReviewRound, and IntegrationAttempt each retain their own durable
@@ -178,16 +174,11 @@ outcome: keep it on the original Task, submit only the delta and its reason, and
 let the Leader retire the affected WorkItem, optionally name its replacement,
 and create the replacement. When a change instead abandons the current outcome for an
 independent one, do not force it onto the original Task; apply the strict
-new-Task rule above. If the delta promotes a Project-backed direct Task into
-guarded delivery, first run
-`yui task update <task-id> --delivery integrated`, read back the delivery path,
-and only then submit the delta. Promotion is allowed only while Task main is
-still at its recorded base and no WorkItem, ChangeSet, Integration, or Review
-evidence exists. If implementation already advanced Task main, keep the branch
-intact and either finish under the direct contract or create an integrated
-replacement Task; never manufacture provenance for earlier commits. Bind a
-Project before selecting a delivery path
-for a previously Gitless Task. When a completed Task
+new-Task rule above. If the delta changes the request kind, update the optional
+Task type and submit the delta; the Leader then re-evaluates topology from the
+current Task state without manufacturing WorkItems or provenance for earlier
+commits. Bind a Project before execution when a previously Gitless Task gains
+repository scope. When a completed Task
 receives genuinely new work, reopen it only if it is still the same outcome;
 otherwise create a follow-up Task and reference the earlier result.
 

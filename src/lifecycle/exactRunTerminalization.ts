@@ -126,20 +126,23 @@ export function validateExactRunReviewRound(
       return { disposition: "obsolete", round, reason: "review-lane-workspace-lineage-mismatch" };
     }
   }
-  const item = store.getWorkItem(run.taskId, round.workItemId);
-  if (item === null) {
-    return { disposition: "obsolete", round, reason: "review-work-item-missing" };
-  }
-  const candidate = item.candidates.find(({ id }) => id === round.candidateId);
-  if (candidate === undefined) {
-    return { disposition: "obsolete", round, reason: "review-candidate-missing" };
-  }
-
   const task = store.getTask(run.taskId);
   const taskScope = (round.scope ?? "work-item") === "task";
+  const item = taskScope || round.workItemId === undefined
+    ? null
+    : store.getWorkItem(run.taskId, round.workItemId);
+  if (!taskScope && item === null) {
+    return { disposition: "obsolete", round, reason: "review-work-item-missing" };
+  }
+  const candidate = taskScope
+    ? undefined
+    : item!.candidates.find(({ id }) => id === round.candidateId);
+  if (!taskScope && candidate === undefined) {
+    return { disposition: "obsolete", round, reason: "review-candidate-missing" };
+  }
   const frozenProjects = taskScope
     ? round.taskCandidate?.projects
-    : candidate.gitSnapshot?.projects;
+    : candidate?.gitSnapshot?.projects;
   if (taskScope) {
     if (task === null || round.taskCandidate === undefined) {
       return { disposition: "obsolete", round, reason: "review-task-candidate-missing" };
@@ -152,7 +155,7 @@ export function validateExactRunReviewRound(
       ))) {
       return { disposition: "obsolete", round, reason: "review-frozen-project-scope-drift" };
     }
-  } else if (candidate.gitSnapshot !== undefined
+  } else if (candidate?.gitSnapshot !== undefined
     && candidate.gitSnapshot.reviewBaseCommit !== round.reviewBaseCommit) {
     return { disposition: "obsolete", round, reason: "review-candidate-snapshot-drift" };
   }

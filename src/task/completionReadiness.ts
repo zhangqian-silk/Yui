@@ -218,32 +218,34 @@ export function projectCompletionReadiness(
     });
   }
 
-  // requireIntegration Tasks need the full evidence chain.
-  if (task.requireIntegration === true) {
-    if (facts.workItems.length === 0) {
+  // Integration obligations are derived from real independent delivery units.
+  // A Leader-owned Task needs no synthetic WorkItem; once a WorkItem produces a
+  // Git Candidate, that exact unit must be captured and integrated.
+  for (const item of facts.workItems) {
+    if (item.status !== "completed") continue;
+    const candidate = item.candidates?.at(-1);
+    const hasGitDelivery = candidate?.workspace !== undefined
+      || candidate?.gitSnapshot !== undefined;
+    if (hasGitDelivery
+      && !facts.changeSets.some((changeSet) => changeSet.workItemId === item.id)) {
       blockers.push({
         code: "integration-evidence-missing",
-        ref: ref("task", task.id),
-        reason: `Task ${task.id} requires at least one WorkItem before completion.`,
-        fix: `yui task work create ${task.id} "<objective>"`
+        ref: ref("work-item", item.id),
+        reason: `Completed WorkItem ${item.id} has an uncaptured Git delivery.`,
+        fix: `yui task work capture ${task.id}/${item.id}`
       });
     }
-    if (facts.changeSets.length === 0) {
-      blockers.push({
-        code: "integration-evidence-missing",
-        ref: ref("task", task.id),
-        reason: `Task ${task.id} requires at least one ChangeSet before completion.`,
-        fix: `yui task work capture ${task.id}/<work-item>`
-      });
-    }
-    if (!facts.integrations.some(({ status }) => status === "committed")) {
-      blockers.push({
-        code: "integration-evidence-missing",
-        ref: ref("task", task.id),
-        reason: `Task ${task.id} requires a committed Integration Attempt before completion.`,
-        fix: `yui task integration start ${task.id} --project <project> --change-set <change-set>`
-      });
-    }
+  }
+  for (const changeSet of facts.changeSets) {
+    if (facts.integrations.some((attempt) => (
+      attempt.status === "committed" && attempt.changeSetIds.includes(changeSet.id)
+    ))) continue;
+    blockers.push({
+      code: "integration-evidence-missing",
+      ref: ref("change-set", changeSet.id),
+      reason: `ChangeSet ${changeSet.id} is not part of a committed Integration.`,
+      fix: `yui task integration start ${task.id} --project ${changeSet.projectId} --change-set ${changeSet.id}`
+    });
   }
 
   // Unresolved Integration Attempts must settle.

@@ -23,6 +23,8 @@ const PROJECT_KNOWLEDGE_PROPOSALS_FROM_VERSION = 3;
 const PROJECT_KNOWLEDGE_PROPOSALS_TO_VERSION = 4;
 const TASK_FROM_VERSION = 3;
 const TASK_TO_VERSION = 4;
+const TASK_INTENT_FROM_VERSION = 4;
+const TASK_INTENT_TO_VERSION = 5;
 const WORK_ITEM_FROM_VERSION = 6;
 const WORK_ITEM_TO_VERSION = 7;
 const WORK_ITEM_GIT_SNAPSHOT_FROM_VERSION = 7;
@@ -48,6 +50,8 @@ const REVIEW_ROUND_FROM_VERSION = 2;
 const REVIEW_ROUND_TO_VERSION = 3;
 const REVIEW_ROUND_GIT_SNAPSHOT_FROM_VERSION = 3;
 const REVIEW_ROUND_GIT_SNAPSHOT_TO_VERSION = 4;
+const REVIEW_ROUND_TASK_ANCHOR_FROM_VERSION = 4;
+const REVIEW_ROUND_TASK_ANCHOR_TO_VERSION = 5;
 const ACTIVE_RUN_POINTER_FROM_VERSION = 1;
 const ACTIVE_RUN_POINTER_TO_VERSION = 2;
 const ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION = 2;
@@ -140,6 +144,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(configV2Step())
     .registerCompatible(projectKnowledgeProposalsStep())
     .registerOfflineMigration(taskWorkspaceIdentityStep())
+    .registerOfflineMigration(taskIntentStep())
     .registerOfflineMigration(recordFamilyStep(
       "workItem",
       WORK_ITEM_FROM_VERSION,
@@ -180,6 +185,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       REVIEW_ROUND_GIT_SNAPSHOT_TO_VERSION,
       "reviewRounds"
     ))
+    .registerOfflineMigration(reviewRoundTaskAnchorStep())
     .registerOfflineMigration(recordFamilyStep(
       "activeRunPointer",
       ACTIVE_RUN_POINTER_FROM_VERSION,
@@ -1851,6 +1857,90 @@ function recordFamilyStep(
   };
 }
 
+function reviewRoundTaskAnchorStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "reviewRound",
+    fromVersion: REVIEW_ROUND_TASK_ANCHOR_FROM_VERSION,
+    toVersion: REVIEW_ROUND_TASK_ANCHOR_TO_VERSION,
+    preconditions: (snapshot) => requireRecordFamilyVersion(
+      snapshot,
+      "reviewRound",
+      REVIEW_ROUND_TASK_ANCHOR_FROM_VERSION,
+      "reviewRounds"
+    ),
+    transform: migrateReviewRoundTaskAnchors,
+    declaredEffects: []
+  };
+}
+
+function migrateReviewRoundTaskAnchors(snapshot: HomeSnapshot): HomeSnapshot {
+  requireRecordFamilyVersion(
+    snapshot,
+    "reviewRound",
+    REVIEW_ROUND_TASK_ANCHOR_FROM_VERSION,
+    "reviewRounds"
+  );
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...manifestVersions,
+      reviewRound: REVIEW_ROUND_TASK_ANCHOR_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const aggregate = asObject(rawTask, `Task aggregate ${taskId}`);
+    const rawRounds = aggregate.reviewRounds;
+    if (rawRounds === undefined) {
+      nextTasks[taskId] = { ...aggregate };
+      continue;
+    }
+    const rounds = asObject(rawRounds, `reviewRound map ${taskId}`);
+    const nextRounds: Record<string, unknown> = {};
+    for (const [roundId, rawRound] of Object.entries(rounds)) {
+      const round = asObject(rawRound, `reviewRound ${taskId}/${roundId}`);
+      if (round.scope !== "task") {
+        nextRounds[roundId] = {
+          ...round,
+          schemaVersion: REVIEW_ROUND_TASK_ANCHOR_TO_VERSION
+        };
+        continue;
+      }
+      const workItemId = requiredMigrationText(
+        round.workItemId,
+        `reviewRound ${taskId}/${roundId} WorkItem id`
+      );
+      const candidateId = requiredMigrationText(
+        round.candidateId,
+        `reviewRound ${taskId}/${roundId} Candidate id`
+      );
+      const {
+        workItemId: _workItemId,
+        candidateId: _candidateId,
+        schemaVersion: _schemaVersion,
+        ...retained
+      } = round;
+      nextRounds[roundId] = {
+        ...retained,
+        schemaVersion: REVIEW_ROUND_TASK_ANCHOR_TO_VERSION,
+        legacyAnchor: { workItemId, candidateId }
+      };
+    }
+    nextTasks[taskId] = { ...aggregate, reviewRounds: nextRounds };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
 function agentRunContextProtocolStep(): MigrationStep<HomeSnapshot> {
   return {
     axis: "record",
@@ -3237,6 +3327,91 @@ function migrateTaskV3ToV4(snapshot: HomeSnapshot): HomeSnapshot {
     nextTasks[taskId] = {
       ...aggregate,
       task: { ...task, schemaVersion: TASK_TO_VERSION }
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/**
+ * Task v5 replaces the stored delivery topology switch with an optional,
+ * Project-defined intent. Historical topology is retained as audit context,
+ * but no current workflow decision reads it.
+ */
+function taskIntentStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "task",
+    fromVersion: TASK_INTENT_FROM_VERSION,
+    toVersion: TASK_INTENT_TO_VERSION,
+    preconditions: requireTaskV4Family,
+    transform: migrateTaskV4ToV5,
+    declaredEffects: []
+  };
+}
+
+function requireTaskV4Family(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.task !== TASK_INTENT_FROM_VERSION) {
+    throw new Error(
+      `Record task migration requires manifest version ${TASK_INTENT_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const aggregate = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (aggregate.task === undefined) continue;
+    const record = asObject(aggregate.task, `Task ${taskId}`);
+    if (record.schemaVersion !== TASK_INTENT_FROM_VERSION) {
+      throw new Error(`Task ${taskId} must use schemaVersion ${TASK_INTENT_FROM_VERSION}.`);
+    }
+  }
+}
+
+function migrateTaskV4ToV5(snapshot: HomeSnapshot): HomeSnapshot {
+  requireTaskV4Family(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...manifestVersions, task: TASK_INTENT_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const aggregate = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (aggregate.task === undefined) {
+      nextTasks[taskId] = { ...aggregate };
+      continue;
+    }
+    const task = asObject(aggregate.task, `Task ${taskId}`);
+    const {
+      requireIntegration,
+      schemaVersion: _schemaVersion,
+      ...retained
+    } = task;
+    const projectBindings = Array.isArray(task.projectBindings)
+      ? task.projectBindings
+      : [];
+    const legacyDeliveryPath = projectBindings.length === 0
+      ? undefined
+      : requireIntegration === true ? "integrated" : "direct";
+    nextTasks[taskId] = {
+      ...aggregate,
+      task: {
+        ...retained,
+        schemaVersion: TASK_INTENT_TO_VERSION,
+        ...(legacyDeliveryPath === undefined ? {} : { legacyDeliveryPath })
+      }
     };
   }
   return {

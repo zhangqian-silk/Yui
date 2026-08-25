@@ -5,31 +5,32 @@ runtimes. The user talks to one Operator. The Operator routes each request to
 the right Project and Task; that Task's Leader owns decomposition, execution
 choice, review, integration, and completion.
 
-## One outcome model, two delivery paths
+## One outcome, Leader-chosen execution topology
 
-`Task` is the bounded user outcome. Its delivery path is derived from existing
-fields rather than stored as another state machine: no Project bindings means
-`no-project`; a Project-backed Task without `requireIntegration` is `direct`;
-and `requireIntegration=true` is `integrated`.
+`Task` is the bounded user outcome. Its optional `type` describes intent, not
+execution topology; software Projects normally use `feature` or `bugfix`, while
+other Projects may define their own types. Yui does not store a direct versus
+integrated delivery mode.
 
-Direct delivery lets the Leader implement and verify a low-risk result in the
-managed Task main without creating a WorkItem. Integrated delivery uses
-`WorkItem` as its only bounded execution unit; it holds the objective,
-acceptance criteria, dependencies, assigned Task Role when applicable,
-lifecycle, and compact reviewed result.
+A software bugfix is Leader-owned: the Leader implements and verifies it in the
+managed Task main without manufacturing a WorkItem. If the scope proves to need
+independent delivery owners, reclassify it as a feature before creating those
+units. For a feature, the Leader judges whether the whole result is small
+enough to own in the same way or large enough to need independently owned
+delivery units.
 
-For each integrated WorkItem, a Leader chooses one of three execution paths:
+`WorkItem` means one substantial, independently acceptable requirement with a
+clear owner. Create multiple WorkItems only when multiple Workers can own and
+advance those requirements independently, normally in parallel. Internal
+implementation steps, test runs, review findings, and local fixes remain Run,
+Event, report, or commit evidence under the existing Task or WorkItem; they are
+not new WorkItems.
 
-1. **Direct**: the Leader executes a roleless WorkItem.
-2. **Native subagent**: the Leader creates a child through its current Agent
-   conversation. The child inherits the Leader Agent and is not a Yui entity.
-3. **Task Role AgentRun**: Yui dispatches a Role-bound WorkItem to a
-   Task-managed native Agent Session.
-
-There is no Yui subagent launcher or child-session record. A native child on
-direct delivery remains inside the Leader Session and Task-main boundary; a
-native child implementing integrated work uses the WorkItem lifecycle. Managed
-independent execution additionally records an AgentRun.
+Each WorkItem may use a native subagent inside the Leader conversation or a
+Task Role AgentRun backed by a durable Worker Session. There is no Yui
+subagent launcher or child-session record. AgentRun is an execution attempt,
+not a requirement, and repeated Runs may continue the same compatible Role
+Session.
 
 ## Profiles, Roles, and Agents
 
@@ -49,8 +50,10 @@ independent execution additionally records an AgentRun.
 - A `WorkItemCandidate` is the explicit result currently awaiting Leader
   acceptance. It snapshots the WorkItem revision, summary, and either a
   yielded execution Run or a Leader-managed direct source.
-- `ReviewRound` records review of one candidate under the same WorkItem and
-  references that immutable candidate. It is not another WorkItem.
+- `ReviewRound` records one semantic judgment. A WorkItem Review references
+  that WorkItem's immutable Candidate. A Task-final Review references the
+  frozen Task heads directly and has no synthetic WorkItem/Candidate anchor.
+  It is never another WorkItem.
 
 Adding another Agent requires an explicit adapter implementation. Profiles do
 not choose adapters, own Sessions, or carry credentials.
@@ -65,7 +68,7 @@ effort, round, result, and checks.
 
 ## Lifecycle and acceptance
 
-Integrated Leader-direct and native-subagent WorkItem execution follows:
+Native-subagent WorkItem execution follows:
 
 ```text
 todo -> running -> done | failed
@@ -92,16 +95,12 @@ Every result awaiting acceptance is stored as an explicit WorkItem candidate.
 `always` dispatches a review AgentRun for every candidate, whether it comes
 from a yielded execution Run or a Leader-managed direct result; `leader`
 leaves every candidate for the Leader to accept directly or review explicitly.
-`final` applies automatically only to integrated delivery: it keeps WorkItem
-acceptance and Integration independent, then `task complete` queues one fresh
-Task-scoped ReviewRound over the frozen committed heads of every bound Project.
-A direct Task may use a bounded native review. When a managed final Review is
-required, it must be promoted before Task main advances; promotion fails after
-a commit or delivery evidence exists so earlier work cannot lose ChangeSet
-provenance.
-Any established immutable Task-final contract or Round remains an obligation.
-A changed integrated head queues a new round; the previous report remains
-evidence. This final Reviewer evaluates the whole
+`final` keeps WorkItem acceptance and Integration independent and supplies the
+default Reviewer Role when the Leader decides the frozen Task result warrants
+an independent final Review. An immutable Task-final contract can require that
+Review. Once a Task-final Round exists, it remains an obligation; a changed
+Task head requires a new Round and the previous report remains evidence. This
+final Reviewer evaluates the whole
 Task, so normal delivery does not pay for a complete review of every WorkItem.
 Review Runs complete only their exact ReviewRound, leave the WorkItem awaiting
 acceptance, and never trigger another review or append a Candidate. Successful
@@ -114,9 +113,12 @@ never merges it automatically.
 Roles describe Agent capability, but they do not own repository workspaces. A
 `ManagedWorkspace` is keyed by its durable owner (`Task`, `WorkItem`,
 `ReviewRound`, or `IntegrationAttempt`); an AgentRun carries only a launch
-snapshot. Review workspaces are fresh writable copies at the Candidate's
-frozen commit, so diagnostics cannot redirect Develop or become a ChangeSet
-source. Each ReviewRound has an independent lifecycle and explicit cleanup.
+snapshot. Review workspaces are writable copies at the frozen commit, so
+diagnostics cannot redirect Develop or become a ChangeSet source. Task-final
+Rounds keep independent immutable records but may reassign one clean physical
+workspace to the next Round for the same Reviewer Role. This lets the native
+Reviewer Session continue while every Run remains bound to its exact Round and
+head.
 
 Dependencies are enforced at dispatch. A Role cannot have overlapping active
 Runs, and terminal Task state fences new messages, dispatches, retries, and
@@ -147,8 +149,8 @@ Projects and Task-main context for the rest. The managed dispatch and
 writable set. Provider permission is binding configuration: every managed Role
 defaults to `bypass`, while `default` and `configured` preserve provider-native
 behavior. Provider permission and Profile access intent do not grant Project
-writes. A direct source write requires the exact Leader Task-main owner. An
-integrated source write requires an exact WorkItem write scope and matching
+writes. A Leader-owned source write requires the exact Task-main owner. A
+WorkItem source write requires an exact WorkItem write scope and matching
 managed workspace; a review write instead
 requires an exact ReviewRound owner and frozen Candidate base. Profiles and
 Skills constrain behavior even when provider prompts are bypassed. Provider
@@ -185,9 +187,9 @@ independently acceptable ownership.
 
 Capture at the same HEAD reuses the existing ChangeSet. A repaired HEAD creates
 a new candidate; only the latest reviewed candidate may satisfy acceptance.
-An isolated WorkItem cannot be accepted, or an integrated Task completed, while
-any writable Project's latest result is uncaptured or unintegrated. Direct
-completion instead requires a clean committed exact Task-main snapshot.
+An isolated WorkItem cannot be accepted, or a Task with WorkItems completed,
+while any writable Project's latest result is uncaptured or unintegrated.
+Leader-owned completion instead requires a clean committed exact Task-main snapshot.
 Workspace roots are
 multi-Project; ChangeSets and Integration Attempts remain single-Project Git
 boundaries.

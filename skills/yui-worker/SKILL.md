@@ -9,7 +9,7 @@ Follow `yui-runtime` first. For a managed Run, load its exact Context Pack and
 use only the returned WorkItem, refs, workspace, writable Project IDs, and
 completion actions. The launch Envelope is a pointer, not an execution brief.
 
-Complete only the assigned bounded WorkItem. The Leader owns Task direction,
+Complete only the assigned substantial, independently owned WorkItem. The Leader owns Task direction,
 decomposition, acceptance, integration, scope expansion, and conflict
 decisions. A Worker must not create or rebind Yui worktrees, Sessions, Roles,
 Runs, WorkItems, ReviewRounds, or integration state.
@@ -31,7 +31,9 @@ pack.
 ## Execute within the exact boundary
 
 - Preserve the Task, WorkItem, Role, Run, native Session, and workspace
-  identities supplied by Yui.
+  identities supplied by Yui. A new Run is another attempt or continuation of
+  the same delivery unit; do not request a fresh Role or Session merely because
+  implementation entered another step or repair round.
 - Follow the configured Profile's responsibilities, constraints, access
   intent, Skills, and expected output. Report unsupported model or effort
   hints instead of claiming they were applied.
@@ -56,7 +58,7 @@ authority.
 ## Validate proportionately
 
 Keep investigation, implementation, the smallest targeted check, and ordinary
-finding fixes in one coherent WorkItem round. Run checks that can catch the
+finding fixes in one coherent WorkItem. Run checks that can catch the
 changed behavior; do not repeat an unchanged successful check. Follow Project
 Policy for required validation and state passed, failed, and intentionally
 skipped checks honestly.

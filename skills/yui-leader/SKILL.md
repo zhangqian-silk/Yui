@@ -10,12 +10,9 @@ making Task decisions. Recover authority from its Snapshot and deltas, never
 from launch text or transcript memory.
 
 Own Task direction, decomposition, semantic decisions, acceptance, integration,
-and durable context. Yui has one work model: every bounded outcome is a
-WorkItem. Choose one of three execution paths for each WorkItem:
-
-1. execute it directly as this Leader;
-2. create a native subagent inside this Leader's current Agent conversation;
-3. dispatch it to a Task Role and its independently managed AgentRun.
+and durable context. The Task is the bounded user outcome. A WorkItem is only
+one substantial, independently acceptable requirement with a distinct owner;
+it is not the default container for every edit, check, finding, or repair.
 
 Do not invent another execution entity or a `yui ... subagent` command.
 
@@ -33,16 +30,18 @@ workspace or infer a Lane result from a non-durable checkout.
 
 ## Default to the Leader-first fast path
 
-Start from the Task's recorded delivery path:
+Start from Task intent and make the topology decision yourself:
 
-- **Direct**: for a low-risk Project Task, implement, commit, and verify in the
-  managed Task main. Do not create a WorkItem, ChangeSet, IntegrationAttempt,
-  Worker Role, or managed ReviewRound merely to leave more records.
-- **Integrated**: create one roleless WorkItem for the bounded result. Keep its
-  investigation, implementation, targeted checks, and ordinary review fixes
-  together. Split only for independently acceptable ownership or real parallel
-  value; a phase name is not a reason to create another WorkItem, Role,
-  Session, Run, Message, or Input.
+- **Bugfix**: own it in the Leader Session and managed Task main. Implement,
+  commit, and verify promptly without creating a WorkItem or Worker Role. If
+  investigation proves that independent delivery owners are actually needed,
+  update the Task to `feature` before creating those WorkItems. Request one
+  Task-final Review only when risk warrants independent verification.
+- **Feature**: own a small feature the same way. Create WorkItems only when the
+  feature contains multiple substantial requirements that different Workers
+  can own and advance independently, normally in parallel. One WorkItem per
+  owner/delivery boundary is the goal—not one per phase, file, implementation
+  step, test, finding, or fix.
 
 Choose the executor in this order:
 
@@ -56,23 +55,24 @@ Choose the executor in this order:
    unavailable to the current Agent, or an independently managed Session and
    Run lifecycle.
 
-Do not dispatch a Task Role merely to obtain a fresh context, run a command,
+Do not create or dispatch a WorkItem merely to obtain a fresh context, run a command,
 perform a routine small edit, or add an intermediate review. Direct and native
 execution add no Worker Role, Worker Yui Session, or Worker AgentRun. The exact
 Leader Run remains active until an explicit Yui yield, completion, or exact
 failure; native child lifecycle never decides that Run outcome. Task main is
-the direct path's durable delivery boundary; the WorkItem and its workspace are
-the integrated path's boundary.
+the Leader-owned durable delivery boundary; the WorkItem and its workspace are
+an independently owned requirement's boundary.
 
 Provider-native foreground and background child lifecycle stays owned by the
 current Agent Session. Structured child completion notifications may resume the
 Leader in later provider Turns while the same Yui AgentRun remains active.
 
-A direct Project result uses a clean committed Task main and exact completion
-head proof. An integrated result uses one WorkItem-owned Develop workspace and
-a clean committed Candidate; Candidate, ChangeSet, committed Integration,
+A Leader-owned Project result uses a clean committed Task main and exact
+completion-head proof. A WorkItem result uses its own Develop workspace and a
+clean committed Candidate; Candidate, ChangeSet, committed Integration,
 acceptance, Task-final Review when required, and Task completion remain
-distinct judgments and records.
+distinct judgments and records. Integrate every accepted WorkItem result into
+the single Task main before reviewing or completing the whole Task.
 
 Use this validation and review cadence unless Project Policy requires more:
 
@@ -82,16 +82,15 @@ Use this validation and review cadence unless Project Policy requires more:
 2. Have a native child return one consolidated result for the requested round.
    The Leader inspects that result, the diff, and the acceptance criteria; do
    not create progress handoffs or poll the child.
-3. For direct delivery, run Project Policy's complete local delivery validation
-   once on the final Task-main commit, then complete. Use a bounded native
-   review when useful. If an independently managed final Review is required,
-   promote to integrated before Task main advances. An already established
-   immutable final Review remains binding.
-4. For integrated delivery, capture the Candidate and run the complete delivery
-   validation once on the Integration candidate. Use one independent Task-final
-   Review of the frozen committed heads when policy requires it; do not
-   substitute per-WorkItem ReviewRounds or repeat a successful full check on an
-   unchanged commit.
+3. For Leader-owned delivery, run Project Policy's complete local validation
+   once on the final Task-main commit, then complete or request one Task-final
+   Review when risk warrants it. An established immutable final Review remains
+   binding.
+4. For WorkItem delivery, capture each Candidate and run complete delivery
+   validation once on the Integration candidate. After all results are on Task
+   main, request one independent Task-final Review when risk or contract
+   requires it; do not substitute per-WorkItem ReviewRounds or repeat a
+   successful full check on an unchanged commit.
 
 Yui may reuse a successful Integration check only for the same Task, Project,
 exact candidate commit, ordered check commands, immutable runtime release, and
@@ -532,16 +531,21 @@ authorized expansions.
   terminal. Never bypass an active round.
 - `leader`: decide whether the existing evidence is sufficient. Request Agent
   review with `yui task work review <work-id>` when it adds useful evidence.
-- `final`: for normal software delivery, keep WorkItem acceptance and
-  integration independent, then request one fresh ReviewRound over the frozen,
-  integrated Task candidate before completing the Task. The final Reviewer
-  evaluates the complete result across bound Projects; it is not a second
-  per-WorkItem approval protocol.
+- `final`: keep WorkItem acceptance and integration independent. After all
+  results are integrated into Task main, decide whether risk warrants one
+  Task-final ReviewRound over the frozen Task candidate. A Task contract may
+  require it. The final Reviewer evaluates the complete result across bound
+  Projects; it is not a second per-WorkItem approval protocol.
+- A changed Task head creates a new semantic Task-final Round. Reuse the same
+  compatible Reviewer Role Session and stable workspace when Yui offers it;
+  do not create a new Role or native Session for every Round. Round identity
+  still binds each Run to the exact frozen head.
 - A completed review is advice. Decide whether to accept, reject, review again,
   or ask the user.
 - Route a reachable final-Review finding to the original Worker while that
-  WorkItem is open; otherwise create the smallest Repair WorkItem. Resolve
-  all findings from one final Review in one consolidated Repair WorkItem by
+  WorkItem is open; otherwise fix a small local issue as Leader on Task main.
+  Create a Repair WorkItem only when the repair is itself a substantial,
+  independently owned requirement. Keep related findings in that one unit by
   default. Select `task review finding repair-wave --strategy parallel` only
   when the groups have independently acceptable ownership and the concurrency
   benefit exceeds the added Integration and Review cost. Use Leader/Integration
@@ -726,10 +730,10 @@ results are outstanding: the provider owns their completion notifications, and
 Yui keeps this AgentRun active across intermediate provider Turns. After native
 work drains, continue to Task completion, InputRequest, or final yield.
 
-Complete only after the selected delivery path's evidence is satisfied, Role
-work is terminal, latest isolated results are integrated or deliberately
-abandoned, and user inputs are resolved. Direct delivery has no WorkItem gate;
-integrated delivery retains it. Task completion is a semantic boundary: it
+Complete only after the topology-derived evidence is satisfied, Role work is
+terminal, latest isolated results are integrated or deliberately abandoned,
+and user inputs are resolved. A Leader-owned Task has no WorkItem gate; a Task
+with WorkItems must settle and integrate them. Task completion is a semantic boundary: it
 records exact Project heads, reports terminal-workspace cleanup advisories, and
 notifies the global Operator. It does not stop this Leader. Do not kill tmux
 panes, edit Session records, or add a provider-specific cleanup step. After

@@ -1,6 +1,6 @@
 ---
 name: yui-reviewer
-description: Review the exact frozen WorkItem Candidate or Task-final Integration scope without changing delivery sources.
+description: Review the exact frozen WorkItem Candidate or unified Task-final scope without changing delivery sources.
 ---
 
 # Yui Reviewer
@@ -13,11 +13,16 @@ Review only the exact frozen scope and ReviewRound assigned by the Leader; never
 reinterpret its scope:
 
 - For a WorkItem ReviewRound, inspect that Round's exact frozen Candidate.
-- For a Task-final ReviewRound, inspect the exact frozen committed Integration
-  heads supplied by that Round.
+- For a Task-final ReviewRound, inspect the exact frozen Task-main heads
+  supplied directly by that Round. It has no synthetic WorkItem or Candidate
+  anchor.
 
-A Role is an executor, not a workspace owner: the ReviewRound owns its fresh
-workspace. Review edits are confined to that workspace, never modify the
+A Role is an executor, not a workspace owner: each ReviewRound owns an exact
+workspace record. Consecutive Task-final Rounds for the same Reviewer may
+reassign one clean physical workspace and continue the same compatible native
+Session. Treat the new Run Context Pack and frozen head as the authority even
+when the conversation continues; never reuse an earlier verdict. Review edits
+are confined to that workspace, never modify the
 WorkItem Develop workspace, and never become a ChangeSet source.
 
 ## Separate infrastructure failure from review judgment
@@ -68,17 +73,18 @@ not accept the WorkItem or complete the Task. Preserve the ReviewRound record
 and explicitly clean its workspace after the round is terminal.
 
 For normal software delivery, follow the applicable Project Policy. The
-Leader's default policy schedules one
-independent Task-final Review of the frozen committed Integration result before
-completion instead of scheduling a complete ReviewRound for every WorkItem.
+Leader decides whether risk warrants one independent Task-final Review of the
+frozen Task result instead of scheduling a complete ReviewRound for every WorkItem.
 That scheduling policy does not authorize a Reviewer to decline or reinterpret
 an explicitly or risk-triggered WorkItem ReviewRound already assigned to it.
 Reuse the supplied validation evidence and run only checks needed to close a
 specific gap; do not rerun an unchanged complete suite for ceremony.
 
 Return each reachable finding to the Leader with direct evidence and a bounded
-route to the original execution unit: direct Leader work returns to the Leader,
+route to the original execution unit: Leader-owned work returns to the Leader,
 native work to the same child, and managed work to the same Role and native
-Session. Keep the existing WorkItem when its scope remains open; if the frozen
-final-review boundary requires a repair, recommend only the smallest repair
-WorkItem. Never capture or integrate the ReviewRound's diagnostic workspace.
+Session. Keep the existing WorkItem when its scope remains open. For a small
+Task-main fix, return it to the Leader without recommending another WorkItem;
+recommend a Repair WorkItem only when the repair is itself a substantial,
+independently owned requirement. Never capture or integrate the ReviewRound's
+diagnostic workspace.

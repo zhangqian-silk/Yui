@@ -328,9 +328,9 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "create",
     summary: "Create a Draft Task.",
-    usage: "yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--delivery <direct|integrated>] [--require-integration]",
-    options: ["--project", "--base", "--delivery", "--require-integration"],
-    optionValues: { "--delivery": ["direct", "integrated"] }
+    usage: "yui task create <title> [--type <project-defined-type>] [--project <project> ...] [--base <project>=<ref> ...]",
+    options: ["--type", "--project", "--base"],
+    optionValues: { "--type": ["feature", "bugfix"] }
   },
   {
     name: "project",
@@ -353,15 +353,15 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "update",
     summary: "Update Task metadata.",
-    usage: "yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at] [--delivery <direct|integrated>] [--require-integration]",
+    usage: "yui task update <id> [--title <text>] [--type <project-defined-type>|--clear-type] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at]",
     options: [
-      "--title", "--description", "--priority", "--tags", "--due-at",
+      "--title", "--type", "--description", "--priority", "--tags", "--due-at",
+      "--clear-type",
       "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at",
-      "--delivery", "--require-integration"
     ],
     optionValues: {
       "--priority": ["low", "medium", "high", "urgent"],
-      "--delivery": ["direct", "integrated"]
+      "--type": ["feature", "bugfix"]
     }
   },
   { name: "activate", summary: "Activate a Draft Task.", usage: "yui task activate <id>" },

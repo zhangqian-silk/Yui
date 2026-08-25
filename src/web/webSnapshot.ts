@@ -1,11 +1,6 @@
 import type { TaskStore } from "../storage/taskStore.js";
 import type { InputRequest } from "../input/inputRequest.js";
-import {
-  taskDeliveryPath,
-  type Task,
-  type TaskDeliveryPath,
-  type TaskStatus
-} from "../task/task.js";
+import { type Task, type TaskStatus } from "../task/task.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 import { isRoleRunStalled, latestRunDurableProgressAt } from "../scheduler/roleRunStall.js";
 import type { TaskEvent } from "../event/taskEvent.js";
@@ -63,7 +58,6 @@ type WorkItemCounts = Readonly<Record<WorkItemStatus, number> & {
 }>;
 
 type DashboardTask = Task & Readonly<{
-  deliveryPath: TaskDeliveryPath;
   workItems: WorkItemCounts;
   roleCount: number;
   openInputCount: number;
@@ -123,7 +117,6 @@ export function buildWebDashboardSnapshot(
       });
       return {
         ...task,
-        deliveryPath: taskDeliveryPath(task),
         ...(names.length === 0 ? {} : { projectNames: names }),
         workItems: countWorkItems(reader.listWorkItems(task.id)),
         roleCount: reader.listRoles(task.id).length,
@@ -206,7 +199,6 @@ export function buildWebTaskDetail(
     return {
       task: {
         ...task,
-        deliveryPath: taskDeliveryPath(task),
         ...(projectNames.length === 0 ? {} : { projectNames })
       },
       execution: buildTaskExecutionProjection(reader, taskId),

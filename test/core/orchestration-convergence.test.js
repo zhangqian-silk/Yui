@@ -73,7 +73,7 @@ const effective = {
 
 function review(overrides = {}) {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: "review-round-1",
     taskId: "task-1",
     workItemId: "work-item-1",
@@ -203,7 +203,7 @@ test("next-action force-refreshes corroborated non-semantic completed Reviews", 
       id: "task-1",
       status: "active",
       projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "main" }],
-      requireIntegration: true
+      type: "feature"
     },
     workItems: [item],
     changeSets: [{
@@ -484,8 +484,8 @@ test("Git Integration reuses exact successful evidence without starting another 
     { stable: "main", development: "main" }, now
   ));
   const task = activateTask(createTask("task-1", "reuse checks", now, {
-    projectBindings: [{ projectId: "project-1", directory: "repository", baseRef: "main" }],
-    requireIntegration: true
+    type: "feature",
+    projectBindings: [{ projectId: "project-1", directory: "repository", baseRef: "main" }]
   }), now);
   store.saveTask(task);
   const item = createWorkItem("work-item-1", task.id, { title: "change" }, now);
@@ -693,6 +693,7 @@ test("operator status renders one writer separately from retained history", () =
 test("orchestration metrics expose protocol overhead without treating reuse as a rerun", () => {
   const task = {
     ...createTask("task-1", "small bug", now, {
+      type: "bugfix",
       projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "main" }]
     }),
     status: "active"
@@ -720,11 +721,11 @@ test("orchestration metrics expose protocol overhead without treating reuse as a
     events: [],
     managedWorkspaces: []
   });
-  assert.equal(metrics.deliveryPath, "direct");
+  assert.equal(metrics.taskType, "bugfix");
   assert.equal(metrics.workItems, 1);
   assert.equal(metrics.integrations.repeatedIdentities, 0);
   assert.equal(metrics.integrations.evidenceReuses, 1);
-  assert.ok(metrics.advisories.some(({ code }) => code === "direct-protocol-overhead"));
+  assert.ok(metrics.advisories.some(({ code }) => code === "bugfix-workitem-overhead"));
   assert.ok(!metrics.advisories.some(({ code }) => code === "repeated-integration-check"));
 });
 
@@ -737,6 +738,7 @@ test("execution audit exposes the orchestration projection without writes", (t) 
     "project-1", "app", home, { stable: "main", development: "main" }, now
   ));
   const task = activateTask(createTask("task-1", "small bug", now, {
+    type: "bugfix",
     projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "main" }]
   }), now);
   store.saveTask(task);

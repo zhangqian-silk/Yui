@@ -14,7 +14,6 @@ import {
   planRepairWave,
   type RepairWave
 } from "../task/repairWave.js";
-import { taskDeliveryPath, type TaskDeliveryPath } from "../task/task.js";
 import {
   projectTaskOrchestration,
   type OrchestrationAdvisory
@@ -91,7 +90,7 @@ export function runTaskNextActionCommand(
       managedWorkspaces: reader.listManagedWorkspaces(taskId)
     });
     return {
-      deliveryPath: taskDeliveryPath(facts.task),
+      taskType: facts.task.type ?? null,
       action,
       repairWave,
       completionReadiness,
@@ -110,7 +109,7 @@ export function runTaskNextActionCommand(
     kind: "output" as const,
     output: renderNextAction(
       data.action,
-      data.deliveryPath,
+      data.taskType,
       data.repairWave,
       data.completionReadiness,
       data.knowledgeProposals,
@@ -136,7 +135,7 @@ function repairWaveFor(
 
 function renderNextAction(
   action: NextAction,
-  deliveryPath: TaskDeliveryPath,
+  taskType: string | null,
   repairWave: RepairWave | null,
   completionReadiness: CompletionReadiness | null,
   knowledgeProposals: readonly {
@@ -149,7 +148,7 @@ function renderNextAction(
 ): string {
   const lines = [
     `Task: ${action.taskId}`,
-    `Delivery: ${deliveryPath}`,
+    `Type: ${taskType ?? "unspecified"}`,
     `Next action: ${action.kind}`,
     `Reason: ${action.reason}`,
     ...(action.refs.length === 0

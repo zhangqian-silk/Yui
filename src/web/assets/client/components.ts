@@ -577,7 +577,9 @@ export function reviewCard(round, t, locale) {
   card.append(head);
   const meta = node("div", "record-meta");
   meta.append(node("span", "meta-name", round.reviewerRoleName));
-  meta.append(node("span", "mono", round.workItemId + " · " + round.candidateId));
+  if (round.workItemId && round.candidateId) {
+    meta.append(node("span", "mono", round.workItemId + " · " + round.candidateId));
+  }
   if (round.createdAt) meta.append(node("time", "", formatDateTime(round.createdAt, locale)));
   meta.append(node("span", "", t("detail.reviewBase") + " · " + round.reviewBaseCommit));
   if (round.workspace && round.workspace.root) {

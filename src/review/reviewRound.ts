@@ -21,7 +21,7 @@ import {
 } from "../execution/executionGroup.js";
 export type ReviewRoundStatus = "pending" | "running" | "completed" | "failed";
 export type ReviewRequestSource = "policy" | "leader";
-export type ReviewWorkspaceDisposition = "preserved" | "removed";
+export type ReviewWorkspaceDisposition = "preserved" | "reassigned" | "removed";
 export type ReviewScope = "work-item" | "task";
 
 /**
@@ -89,18 +89,20 @@ export type ReviewYieldReport = Readonly<{
 }>;
 
 export type ReviewRound = {
-  /** v4 adds the persisted ExecutionLane Git snapshot boundary. */
-  schemaVersion: 4;
+  /** v5 removes the synthetic WorkItem/Candidate anchor from Task-final rounds. */
+  schemaVersion: 5;
   id: string;
   taskId: string;
-  workItemId: string;
-  candidateId: string;
+  workItemId?: string;
+  candidateId?: string;
+  /** Historical v4 Task-final anchor retained only as migrated audit context. */
+  legacyAnchor?: Readonly<{ workItemId: string; candidateId: string }>;
   reviewerRoleName: string;
   reviewerRunId?: string;
   reviewBaseCommit: string;
   /** Omitted on legacy records, which are equivalent to `work-item`. */
   scope?: ReviewScope;
-  /** Present only when this round reviews the complete integrated Task. */
+  /** Present only when this round reviews the complete frozen Task. */
   taskCandidate?: TaskReviewCandidate;
   /** Exact Task/control capability that established this Task-final gate. */
   taskFinalReviewContract?: TaskFinalReviewContract;
@@ -135,7 +137,7 @@ export function createReviewRound(
   executionGroup?: ExecutionGroup
 ): ReviewRound {
   return validateReviewRound({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     workItemId: requireIdentity(workItemId, "Work Item id"),
@@ -152,8 +154,6 @@ export function createReviewRound(
 export function createTaskReviewRound(
   id: string,
   taskId: string,
-  workItemId: string,
-  candidateId: string,
   reviewerRoleName: string,
   requestedBy: ReviewRequestSource,
   taskCandidate: TaskReviewCandidate,
@@ -163,11 +163,9 @@ export function createTaskReviewRound(
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
-    workItemId: requireIdentity(workItemId, "Work Item id"),
-    candidateId: requireIdentity(candidateId, "Candidate id"),
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
     reviewBaseCommit: candidate.projects[0]!.commit,
     scope: "task",
@@ -192,8 +190,6 @@ export function createTaskReviewRound(
 export function createTaskDeltaReviewRound(
   id: string,
   taskId: string,
-  workItemId: string,
-  candidateId: string,
   reviewerRoleName: string,
   requestedBy: ReviewRequestSource,
   taskCandidate: TaskReviewCandidate,
@@ -204,11 +200,9 @@ export function createTaskDeltaReviewRound(
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
-    workItemId: requireIdentity(workItemId, "Work Item id"),
-    candidateId: requireIdentity(candidateId, "Candidate id"),
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
     reviewBaseCommit: candidate.projects[0]!.commit,
     scope: "task",
@@ -336,8 +330,7 @@ export function retryTaskReviewRound(round: ReviewRound): ReviewRound {
     schemaVersion: round.schemaVersion,
     id: round.id,
     taskId: round.taskId,
-    workItemId: round.workItemId,
-    candidateId: round.candidateId,
+    ...(round.legacyAnchor === undefined ? {} : { legacyAnchor: round.legacyAnchor }),
     reviewerRoleName: round.reviewerRoleName,
     reviewBaseCommit: round.reviewBaseCommit,
     scope: "task",
@@ -486,7 +479,9 @@ export function recordReviewWorkspaceDisposition(
   if (round.workspace === undefined) {
     throw new Error(`ReviewRound has no managed workspace: ${round.id}.`);
   }
-  if (disposition !== "preserved" && disposition !== "removed") {
+  if (disposition !== "preserved"
+    && disposition !== "reassigned"
+    && disposition !== "removed") {
     throw new Error(`Review workspace disposition is invalid: ${String(disposition)}.`);
   }
   if (round.workspaceDisposition?.kind === disposition) return round;
@@ -541,12 +536,8 @@ export function updateReviewExecutionGroup(
 }
 
 export function validateReviewRound(round: ReviewRound): ReviewRound {
-  if (round.schemaVersion !== 4) throw new Error("ReviewRound must use schemaVersion 4.");
+  if (round.schemaVersion !== 5) throw new Error("ReviewRound must use schemaVersion 5.");
   validateTaskRecordReference({ taskId: round.taskId, localId: round.id }, "reviewRound");
-  validateTaskRecordReference({ taskId: round.taskId, localId: round.workItemId }, "workItem");
-  if (!/^candidate-[1-9]\d*$/.test(round.candidateId)) {
-    throw new Error(`Candidate local id is invalid: ${round.candidateId}.`);
-  }
   requireIdentity(round.reviewerRoleName, "Reviewer Role");
   requireCommit(round.reviewBaseCommit, "Review base commit");
   const scope = round.scope ?? "work-item";
@@ -554,6 +545,18 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     throw new Error(`ReviewRound scope is invalid: ${String(round.scope)}.`);
   }
   if (scope === "task") {
+    if (round.workItemId !== undefined || round.candidateId !== undefined) {
+      throw new Error(`Task ReviewRound cannot use a WorkItem Candidate anchor: ${round.id}.`);
+    }
+    if (round.legacyAnchor !== undefined) {
+      validateTaskRecordReference({
+        taskId: round.taskId,
+        localId: round.legacyAnchor.workItemId
+      }, "workItem");
+      if (!/^candidate-[1-9]\d*$/.test(round.legacyAnchor.candidateId)) {
+        throw new Error(`Legacy Candidate local id is invalid: ${round.legacyAnchor.candidateId}.`);
+      }
+    }
     if (round.taskCandidate === undefined) {
       throw new Error(`Task ReviewRound requires a frozen Task candidate: ${round.id}.`);
     }
@@ -570,9 +573,19 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
         throw new Error(`Task ReviewRound contract uses another Reviewer Role: ${round.id}.`);
       }
     }
-  } else if (round.taskCandidate !== undefined
-    || round.taskFinalReviewContract !== undefined) {
-    throw new Error(`WorkItem ReviewRound cannot carry a Task candidate or contract: ${round.id}.`);
+  } else {
+    if (round.workItemId === undefined || round.candidateId === undefined) {
+      throw new Error(`WorkItem ReviewRound requires a Candidate anchor: ${round.id}.`);
+    }
+    validateTaskRecordReference({ taskId: round.taskId, localId: round.workItemId }, "workItem");
+    if (!/^candidate-[1-9]\d*$/.test(round.candidateId)) {
+      throw new Error(`Candidate local id is invalid: ${round.candidateId}.`);
+    }
+    if (round.taskCandidate !== undefined
+      || round.taskFinalReviewContract !== undefined
+      || round.legacyAnchor !== undefined) {
+      throw new Error(`WorkItem ReviewRound cannot carry Task-final metadata: ${round.id}.`);
+    }
   }
   if (round.executionGroup !== undefined) validateReviewExecutionGroup(round.executionGroup, round);
   validateReviewRequestSource(round.requestedBy);
@@ -623,6 +636,7 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
       throw new Error("Only a terminal ReviewRound workspace can have a disposition.");
     }
     if (round.workspaceDisposition.kind !== "preserved"
+      && round.workspaceDisposition.kind !== "reassigned"
       && round.workspaceDisposition.kind !== "removed") {
       throw new Error("Review workspace disposition is invalid.");
     }
@@ -714,11 +728,12 @@ function validateReviewExecutionGroup(group: ExecutionGroup, round: ReviewRound)
     ? "task-final-review"
     : "work-item";
   if (group.target.kind !== expectedKind
-    || group.target.taskId !== round.taskId
-    || group.target.candidateId !== round.candidateId) {
+    || group.target.taskId !== round.taskId) {
     throw new Error(`ReviewRound ExecutionGroup target is invalid: ${round.id}.`);
   }
-  if (expectedKind === "work-item" && group.target.workItemId !== round.workItemId) {
+  if (expectedKind === "work-item"
+    && (group.target.workItemId !== round.workItemId
+      || group.target.candidateId !== round.candidateId)) {
     throw new Error(`ReviewRound ExecutionGroup WorkItem target is invalid: ${round.id}.`);
   }
   return group;

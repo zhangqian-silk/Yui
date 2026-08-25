@@ -478,6 +478,71 @@ test("the production migration graph advances the normal aggregate path", () => 
   assert.deepEqual(normalizedProject.state.projects["project-1"].knowledge, []);
   assert.equal(normalizedProject.schemaManifest.recordVersions.project, 4);
 
+  const taskStep = registry.lookup("record", "task", 4);
+  assert.notEqual(taskStep, undefined);
+  const taskSnapshot = {
+    schemaManifest: { recordVersions: { task: 4 } },
+    state: {
+      tasks: {
+        "task-1": {
+          task: {
+            schemaVersion: 4,
+            id: "task-1",
+            projectBindings: [{ projectId: "project-1" }],
+            requireIntegration: true
+          }
+        }
+      }
+    }
+  };
+  taskStep.preconditions(taskSnapshot);
+  const migratedTask = taskStep.transform(taskSnapshot);
+  assert.equal(migratedTask.schemaManifest.recordVersions.task, 5);
+  assert.equal(migratedTask.state.tasks["task-1"].task.schemaVersion, 5);
+  assert.equal(migratedTask.state.tasks["task-1"].task.requireIntegration, undefined);
+  assert.equal(migratedTask.state.tasks["task-1"].task.legacyDeliveryPath, "integrated");
+
+  const reviewStep = registry.lookup("record", "reviewRound", 4);
+  assert.notEqual(reviewStep, undefined);
+  const reviewSnapshot = {
+    schemaManifest: { recordVersions: { reviewRound: 4 } },
+    state: {
+      tasks: {
+        "task-1": {
+          reviewRounds: {
+            "review-round-1": {
+              schemaVersion: 4,
+              scope: "task",
+              workItemId: "work-item-1",
+              candidateId: "candidate-1"
+            },
+            "review-round-2": {
+              schemaVersion: 4,
+              scope: "work-item",
+              workItemId: "work-item-2",
+              candidateId: "candidate-2"
+            }
+          }
+        }
+      }
+    }
+  };
+  reviewStep.preconditions(reviewSnapshot);
+  const migratedReviews = reviewStep.transform(reviewSnapshot);
+  const taskRound = migratedReviews.state.tasks["task-1"].reviewRounds["review-round-1"];
+  const workItemRound = migratedReviews.state.tasks["task-1"].reviewRounds["review-round-2"];
+  assert.equal(migratedReviews.schemaManifest.recordVersions.reviewRound, 5);
+  assert.equal(taskRound.schemaVersion, 5);
+  assert.equal(taskRound.workItemId, undefined);
+  assert.equal(taskRound.candidateId, undefined);
+  assert.deepEqual(taskRound.legacyAnchor, {
+    workItemId: "work-item-1",
+    candidateId: "candidate-1"
+  });
+  assert.equal(workItemRound.schemaVersion, 5);
+  assert.equal(workItemRound.workItemId, "work-item-2");
+  assert.equal(workItemRound.candidateId, "candidate-2");
+
   const configStep = registry.lookup("record", "config", 1);
   assert.notEqual(configStep, undefined);
   const configSnapshot = {

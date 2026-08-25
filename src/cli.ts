@@ -2440,39 +2440,6 @@ async function directTaskMainSnapshotForTaskCommand(
   environment: NodeJS.ProcessEnv,
   taskFinalReviewContract?: TaskFinalReviewContract
 ) {
-  const deliveryOption = args.indexOf("--delivery", 3);
-  const deliveryPromotion = args[0] === "task"
-    && args[1] === "update"
-    && args[2] !== undefined
-    && (args.includes("--require-integration", 3)
-      || (deliveryOption >= 0 && args[deliveryOption + 1] === "integrated"));
-  if (deliveryPromotion) {
-    const task = store.getTask(args[2]!);
-    if (task === null
-      || (task.status !== "active" && task.status !== "draft")
-      || task.requireIntegration === true
-      || task.projectBindings.length === 0) {
-      return undefined;
-    }
-    const workspace = store.getTaskWorkspace(task.id);
-    if (task.status === "draft" && workspace === null) return undefined;
-    if (workspace === null
-      || workspace.owner.type !== "task"
-      || workspace.owner.taskId !== task.id) {
-      throw usageError(`Task has no authoritative main workspace: ${task.id}.`);
-    }
-    try {
-      return await preparer.snapshotDirectTaskMain(
-        workspace,
-        task.projectBindings.map(({ projectId }) => projectId)
-      );
-    } catch (error) {
-      throw usageError(
-        `Delivery promotion Task-main verification failed for ${task.id}: `
-        + `${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
   if (taskFinalReviewContract === undefined
     || args[0] !== "task"
     || args[1] !== "work"
@@ -2515,7 +2482,7 @@ async function actualTaskReviewCandidateForTaskCommand(
     if (task === null || task.status !== "active" || task.projectBindings.length === 0) {
       return undefined;
     }
-    // Every Project-backed completion, including direct delivery, must freeze
+    // Every Project-backed completion must freeze
     // a clean committed Task-main snapshot. Review policy only decides whether
     // that head also needs an independent ReviewRound.
     taskId = task.id;
