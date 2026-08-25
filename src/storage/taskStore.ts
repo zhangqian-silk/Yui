@@ -1047,7 +1047,15 @@ export class FileTaskStore implements TaskStore {
       openInputRequests: values(aggregate.inputRequests, "id")
         .filter((request) => request.status === "open"),
       activeRuns: agentRuns.filter((run) => run.status === "active"),
-      leaderRuns: agentRuns.filter((run) => run.roleName === "leader")
+      leaderRuns: agentRuns.filter((run) => run.roleName === "leader"),
+      reviewOutcomeEvidence: {
+        agentRuns: agentRuns.filter((run) => run.purpose === "review"),
+        // The rollback file backend has no finding-ledger records.
+        reviewFindings: [],
+        events: values(aggregate.events, "id").filter((event) => (
+          event.type === "review.completed"
+        ))
+      }
     };
   }
   readCompletionReadinessFacts(taskId: string): CompletionReadinessFacts | null {

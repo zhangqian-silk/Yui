@@ -44,6 +44,10 @@ import {
 } from "../runtime/providerRuntimeIdentity.js";
 import { decideProviderRecovery } from "../runtime/providerRecoveryDecision.js";
 import {
+  boundProviderRetryBeforeFirstProgress,
+  projectFirstProgressStopLoss
+} from "../runtime/firstProgressStopLoss.js";
+import {
   hasRecentTurnId
 } from "../executor/turnCompletion.js";
 import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
@@ -1037,6 +1041,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return session === undefined ? null : mapSession(session);
   }
 
+  getTaskRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null {
+    return this.store.getTaskRoleSessionSet(taskId, roleName);
+  }
+
   listEvents(taskId: string) {
     return this.#taskReadProjection(taskId).events;
   }
@@ -1894,6 +1902,57 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   clearPendingWakeup(taskId: string): void { this.store.clearPendingWakeup(taskId); }
   getLeaderFailure(taskId: string) { return this.store.getLeaderFailure(taskId); }
   getOperatorNotification(taskId: string) { return this.store.getOperatorNotification(taskId); }
+
+  saveLeaderFirstProgressStopLoss(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    expectedFingerprint: string;
+    now: Date;
+  }>): "recorded" | "state-changed" {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.taskId);
+      const role = store.getRole(input.taskId, input.roleName);
+      if (task === null || task.status !== "active" || role === null
+        || store.getLeaderFailure(input.taskId) !== null) {
+        return "state-changed";
+      }
+      const stopLoss = projectFirstProgressStopLoss({
+        sessions: store.getTaskRoleSessionSet(input.taskId, input.roleName),
+        events: store.listEvents(input.taskId),
+        workItems: store.listWorkItems(input.taskId),
+        reviewRounds: store.listReviewRounds(input.taskId),
+        integrations: store.listIntegrationAttempts(input.taskId)
+      });
+      if (!stopLoss.exhausted || stopLoss.fingerprint !== input.expectedFingerprint) {
+        return "state-changed";
+      }
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const lastSession = sessions === null
+        ? undefined
+        : [...(sessions.history ?? []), ...Object.values(sessions.sessions)]
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+          .at(-1);
+      const message = `Leader first-progress stop-loss: ${stopLoss.reason}`;
+      store.saveRole(input.taskId, updateRoleStatus(role, "failed", input.now));
+      store.saveLeaderFailure(recordLeaderFailure(
+        input.taskId,
+        lastSession?.nativeSessionId ?? "(unregistered)",
+        message,
+        input.now,
+        null
+      ));
+      store.saveOperatorNotification(createLeaderRecoveryNotification(
+        input.taskId,
+        message,
+        input.now,
+        store.getOperatorNotification(input.taskId)
+      ));
+      enqueueWork(store, { kind: "operator" }, "leader-first-progress-stop-loss", input.now, [
+        { type: "task", id: input.taskId }
+      ]);
+      return "recorded";
+    });
+  }
 
   saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult {
     return this.store.transaction((store) => {
@@ -3232,7 +3291,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       failedNativeTurnId: input.nativeTurnId,
       lastErrorSummary: summary,
       ...(input.retryAfterMs === undefined ? {} : { retryAfterMs: input.retryAfterMs })
-    }, now, configuredProviderRetryPolicy(store));
+    }, now, configuredProviderRetryPolicy(store, input.taskId, input.roleName));
     if (retryDecision.outcome === "exhausted") {
       this.recordProviderRetryClassified(store, input, classification.errorClass, {
         wouldRetry: "false",
@@ -3246,7 +3305,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         store,
         run,
         retryDecision.reason === "attempts"
-          ? `Provider retry failed after all ${config.delaysMs.length} in-Session continuation attempts.`
+          ? `Provider retry failed after all ${run.providerRetry.maxRetries} in-Session continuation attempts.`
           : retryDecision.reason === "retry-after-window"
             ? `Provider Retry-After exceeded the bounded ${config.maxWindowMs / 1_000}-second episode window.`
             : `Provider retry did not recover within the bounded ${config.maxWindowMs / 1_000}-second episode window.`,
@@ -5828,10 +5887,22 @@ function compareCanonicalObservationOrder(
     || left.eventId.localeCompare(right.eventId);
 }
 
-function configuredProviderRetryPolicy(store: Pick<TaskStore, "getConfig">): Readonly<{
+function configuredProviderRetryPolicy(store: TaskStore, taskId?: string, roleName?: string): Readonly<{
   delaysMs: readonly number[];
   maxWindowMs: number;
 }> {
   const config = providerRetryConfig(store.getConfig());
+  if (taskId !== undefined && roleName === "leader") {
+    const progress = projectFirstProgressStopLoss({
+      sessions: store.getTaskRoleSessionSet(taskId, roleName),
+      events: store.listEvents(taskId),
+      workItems: store.listWorkItems(taskId),
+      reviewRounds: store.listReviewRounds(taskId),
+      integrations: store.listIntegrationAttempts(taskId)
+    });
+    if (progress.firstProgressAt === undefined) {
+      return boundProviderRetryBeforeFirstProgress(config, progress);
+    }
+  }
   return { delaysMs: config.delaysMs, maxWindowMs: config.maxWindowMs };
 }

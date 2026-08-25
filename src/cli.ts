@@ -1441,8 +1441,7 @@ export async function main(): Promise<void> {
         resolved,
         store,
         workspacePreparer,
-        process.env,
-        taskFinalReviewContract
+        process.env
       );
       const deltaRecheckPreflight = await deltaRecheckPreflightForTaskCommand(
         resolved.slice(1),
@@ -2298,6 +2297,39 @@ async function directTaskMainSnapshotForTaskCommand(
   environment: NodeJS.ProcessEnv,
   taskFinalReviewContract?: TaskFinalReviewContract
 ) {
+  const deliveryOption = args.indexOf("--delivery", 3);
+  const deliveryPromotion = args[0] === "task"
+    && args[1] === "update"
+    && args[2] !== undefined
+    && (args.includes("--require-integration", 3)
+      || (deliveryOption >= 0 && args[deliveryOption + 1] === "integrated"));
+  if (deliveryPromotion) {
+    const task = store.getTask(args[2]!);
+    if (task === null
+      || (task.status !== "active" && task.status !== "draft")
+      || task.requireIntegration === true
+      || task.projectBindings.length === 0) {
+      return undefined;
+    }
+    const workspace = store.getTaskWorkspace(task.id);
+    if (task.status === "draft" && workspace === null) return undefined;
+    if (workspace === null
+      || workspace.owner.type !== "task"
+      || workspace.owner.taskId !== task.id) {
+      throw usageError(`Task has no authoritative main workspace: ${task.id}.`);
+    }
+    try {
+      return await preparer.snapshotDirectTaskMain(
+        workspace,
+        task.projectBindings.map(({ projectId }) => projectId)
+      );
+    } catch (error) {
+      throw usageError(
+        `Delivery promotion Task-main verification failed for ${task.id}: `
+        + `${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
   if (taskFinalReviewContract === undefined
     || args[0] !== "task"
     || args[1] !== "work"
@@ -2331,8 +2363,7 @@ async function actualTaskReviewCandidateForTaskCommand(
   args: readonly string[],
   store: TaskStore,
   preparer: FileTaskWorkspacePreparer,
-  environment: NodeJS.ProcessEnv,
-  taskFinalReviewContract?: TaskFinalReviewContract
+  environment: NodeJS.ProcessEnv
 ): Promise<TaskReviewCandidate | undefined> {
   if (args[0] !== "task") return undefined;
   let taskId: string | undefined;
@@ -2341,14 +2372,9 @@ async function actualTaskReviewCandidateForTaskCommand(
     if (task === null || task.status !== "active" || task.projectBindings.length === 0) {
       return undefined;
     }
-    const establishedFinalRound = store.listReviewRounds(task.id).some((round) => (
-      (round.scope ?? "work-item") === "task"
-    ));
-    if (taskFinalReviewContract === undefined
-      && store.getReviewConfig()?.trigger !== "final"
-      && !establishedFinalRound) {
-      return undefined;
-    }
+    // Every Project-backed completion, including direct delivery, must freeze
+    // a clean committed Task-main snapshot. Review policy only decides whether
+    // that head also needs an independent ReviewRound.
     taskId = task.id;
   } else if (args[1] === "review"
     && args[2] === "request"

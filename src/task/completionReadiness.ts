@@ -4,6 +4,7 @@ import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import { isReviewFindingBlocking, type ReviewFinding } from "../review/reviewFinding.js";
 import { deltaRecheckBlocksAcceptance } from "../review/reviewRound.js";
+import { isSemanticReviewRound } from "../review/reviewOutcomeClassifier.js";
 import type { ReviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
 import {
   REVIEW_FINDINGS_RECONCILE_FAILED_EVENT,
@@ -61,11 +62,24 @@ export type CompletionBlocker = Readonly<{
   fix: string;
 }>;
 
+export type CompletionAdvisory = Readonly<{
+  code:
+    | "work-item-workspace-undisposed"
+    | "review-workspace-undisposed"
+    | "integration-workspace-undisposed"
+    | "execution-lane-workspace-undisposed";
+  ref: NextActionRef;
+  reason: string;
+  fix: string;
+}>;
+
 export type CompletionReadiness = Readonly<{
   taskId: string;
   ready: boolean;
   /** All blockers, stably sorted by (code, ref.kind, ref.id). */
   blockers: readonly CompletionBlocker[];
+  /** Terminal workspace cleanup that remains required before archive. */
+  advisories: readonly CompletionAdvisory[];
 }>;
 
 /**
@@ -119,6 +133,7 @@ export function projectCompletionReadiness(
   options: CompletionReadinessOptions = {}
 ): CompletionReadiness {
   const blockers: CompletionBlocker[] = [];
+  const advisories: CompletionAdvisory[] = [];
   const { task } = facts;
   const findingsGate = options.findingsGate ?? true;
 
@@ -142,7 +157,11 @@ export function projectCompletionReadiness(
   // accepted delta) supersedes them instead of blocking completion forever.
   const latestCompletedTaskReview = facts.reviewRounds
     .filter((round) => (
-      (round.scope ?? "work-item") === "task" && round.status === "completed"
+      (round.scope ?? "work-item") === "task" && isSemanticReviewRound(round, {
+        listAgentRuns: () => facts.agentRuns,
+        listReviewFindings: () => facts.reviewFindings,
+        listEvents: () => facts.events
+      })
     ))
     .slice()
     .sort((left, right) => (
@@ -262,11 +281,13 @@ export function projectCompletionReadiness(
     });
   }
 
-  // Undisposed managed workspaces.  The Task-owned main workspace is excluded
-  // (it is cleaned at archive, not at completion).
+  // Terminal child workspaces are cleanup advisories: Task completion is the
+  // semantic delivery boundary, while archive remains the fail-closed resource
+  // reclamation boundary. Missing/non-terminal ownership stays conservative.
   for (const workspace of facts.managedWorkspaces) {
-    const blocker = workspaceBlocker(facts, task.id, workspace);
-    if (blocker !== null) blockers.push(blocker);
+    const disposition = workspaceCompletionDisposition(facts, task.id, workspace);
+    if (disposition?.kind === "blocker") blockers.push(disposition.value);
+    if (disposition?.kind === "advisory") advisories.push(disposition.value);
   }
 
   // Active non-Leader Runs must finish.  The Leader's own Run is terminalized
@@ -319,7 +340,20 @@ export function projectCompletionReadiness(
     return left.ref.id.localeCompare(right.ref.id, undefined, { numeric: true });
   });
 
-  return { taskId: task.id, ready: sorted.length === 0, blockers: sorted };
+  const sortedAdvisories = [...advisories].sort((left, right) => {
+    const codeOrder = left.code.localeCompare(right.code);
+    if (codeOrder !== 0) return codeOrder;
+    const kindOrder = left.ref.kind.localeCompare(right.ref.kind);
+    if (kindOrder !== 0) return kindOrder;
+    return left.ref.id.localeCompare(right.ref.id, undefined, { numeric: true });
+  });
+
+  return {
+    taskId: task.id,
+    ready: sorted.length === 0,
+    blockers: sorted,
+    advisories: sortedAdvisories
+  };
 }
 
 /**
@@ -374,40 +408,44 @@ function providerContinuationBlocksCompletion(
   return conversationIsCurrent && activationIsLive;
 }
 
-function workspaceBlocker(
+type WorkspaceCompletionDisposition =
+  | Readonly<{ kind: "blocker"; value: CompletionBlocker }>
+  | Readonly<{ kind: "advisory"; value: CompletionAdvisory }>;
+
+function workspaceCompletionDisposition(
   facts: CompletionReadinessFacts,
   taskId: string,
   workspace: ManagedWorkspace
-): CompletionBlocker | null {
+): WorkspaceCompletionDisposition | null {
   const owner = workspace.owner;
   switch (owner.type) {
     case "task":
       // The Task main workspace is cleaned at archive, not completion.
       return null;
     case "work-item": {
-      // The preflight has always blocked on WorkItem workspaces.  Project the
-      // blocker regardless of the Work Item status: if the item is still open
-      // the incomplete-work-item blocker fires too, and once it is terminal
-      // the workspace is the exact cleanup target.
-      return {
+      const item = facts.workItems.find((entry) => entry.id === owner.workItemId);
+      const value = {
         code: "work-item-workspace-undisposed",
         ref: ref("work-item", owner.workItemId),
         reason: `Work Item ${owner.workItemId} has an isolated workspace that is not disposed.`,
         fix: `yui task work cleanup ${taskId}/${owner.workItemId} --integrated|--abandon`
-      };
+      } as const;
+      return item !== undefined && (item.status === "completed" || item.status === "retired")
+        ? { kind: "advisory", value }
+        : { kind: "blocker", value };
     }
     case "review-round": {
       const round = facts.reviewRounds.find((entry) => entry.id === owner.reviewRoundId);
-      // A workspace for a still-active Review is covered by the
-      // active-task-review / wait-for-owned-execution path; only project the
-      // cleanup blocker once the Round is terminal.
       if (round !== undefined && !TERMINAL_REVIEW_STATUSES.has(round.status)) return null;
-      return {
+      const value = {
         code: "review-workspace-undisposed",
         ref: ref("review-round", owner.reviewRoundId),
         reason: `ReviewRound ${owner.reviewRoundId} is terminal but its workspace is not cleaned up.`,
         fix: `yui task work review cleanup ${taskId}/${owner.reviewRoundId}`
-      };
+      } as const;
+      return round === undefined
+        ? { kind: "blocker", value }
+        : { kind: "advisory", value };
     }
     case "integration-attempt": {
       const integration = facts.integrations.find(
@@ -416,23 +454,29 @@ function workspaceBlocker(
       if (integration !== undefined && UNRESOLVED_INTEGRATION_STATUSES.has(integration.status)) {
         return null;
       }
-      return {
+      const value = {
         code: "integration-workspace-undisposed",
         ref: ref("integration-attempt", owner.integrationAttemptId),
         reason: `Integration Attempt ${owner.integrationAttemptId} is terminal but its workspace is not cleaned up.`,
         fix: `retry or continue Integration ${owner.integrationAttemptId} so its workspace is reclaimed`
-      };
+      } as const;
+      return integration === undefined
+        ? { kind: "blocker", value }
+        : { kind: "advisory", value };
     }
     case "execution-lane": {
       const lane = findExecutionLane(facts, owner.executionGroupId, owner.executionLaneId);
       if (lane !== undefined && !TERMINAL_LANE_STATUSES.has(lane.status)) return null;
-      return {
+      const value = {
         code: "execution-lane-workspace-undisposed",
         ref: ref("execution-lane", `${owner.executionGroupId}/${owner.executionLaneId}`),
         reason: `Execution Lane ${owner.executionGroupId}/${owner.executionLaneId} `
           + "is terminal but its workspace is not cleaned up.",
         fix: `clean up Execution Lane ${owner.executionGroupId}/${owner.executionLaneId}`
-      };
+      } as const;
+      return lane === undefined
+        ? { kind: "blocker", value }
+        : { kind: "advisory", value };
     }
   }
 }

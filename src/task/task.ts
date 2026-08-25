@@ -11,6 +11,7 @@ export type TaskStatus =
   | "retired"
   | "archived";
 export type TaskCompletedBy = "user" | "operator" | "leader";
+export type TaskDeliveryPath = "no-project" | "direct" | "integrated";
 
 export type TaskProjectBinding = Readonly<{
   projectId: string;
@@ -444,6 +445,18 @@ export function taskProjectBinding(
 
 export function taskHasProjects(task: Task): boolean {
   return task.projectBindings.length > 0;
+}
+
+/**
+ * Delivery is a projection of the existing Task contract, not a second source
+ * of truth. Keeping it derived preserves every stored Task schema while giving
+ * callers one product-level name for the three supported paths.
+ */
+export function taskDeliveryPath(
+  task: Readonly<Pick<Task, "projectBindings" | "requireIntegration">>
+): TaskDeliveryPath {
+  if (task.projectBindings.length === 0) return "no-project";
+  return task.requireIntegration === true ? "integrated" : "direct";
 }
 
 export function taskProjectIds(task: Task): readonly string[] {

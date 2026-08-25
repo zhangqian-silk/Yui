@@ -15,10 +15,11 @@ import {
   type GitRemoteHead
 } from "../repository/gitWorkspace.js";
 import type { Project } from "../repository/project.js";
-import type { Task } from "../task/task.js";
+import { taskDeliveryPath, type Task } from "../task/task.js";
 import { publicationExternalKey } from "../task/publicationReference.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
+import { isSemanticReviewRound } from "../review/reviewOutcomeClassifier.js";
 import {
   workspaceProjectEntry,
   type ManagedWorkspace,
@@ -41,7 +42,7 @@ export type TaskCompletionPublishedTreeProof = Readonly<{
   taskId: string;
   projectId: string;
   publicationId: string;
-  reviewRoundId: string;
+  reviewRoundId?: string;
   localCommit: string;
   remoteCommit: string;
   tree: string;
@@ -50,8 +51,9 @@ export type TaskCompletionPublishedTreeProof = Readonly<{
 /**
  * Verify the one supported ancestry waiver before `task complete` mutates any
  * durable state. The explicit Publication must be the current verified merged
- * record, bind the exact reviewed physical Task head, and name an
- * ancestry-divergent commit with the exact same Git tree.
+ * record, bind the exact physical Task head (and, for integrated delivery, its
+ * completed final Review), and name an ancestry-divergent commit with the
+ * exact same Git tree.
  */
 export async function verifyTaskCompletionPublishedTree(
   taskId: string,
@@ -81,10 +83,11 @@ export async function verifyTaskCompletionPublishedTree(
   }
 
   const workspace = requireTaskWorkspace(store, task);
-  const latestReview = latestTaskFinalReview(store, task.id);
-  if (latestReview === undefined
-    || latestReview.status !== "completed"
-    || latestReview.taskCandidate === undefined) {
+  const integrated = taskDeliveryPath(task) === "integrated";
+  const latestReview = integrated ? latestTaskFinalReview(store, task.id) : undefined;
+  if (integrated && (latestReview === undefined
+    || !isSemanticReviewRound(latestReview, store)
+    || latestReview.taskCandidate === undefined)) {
     throw usageError(
       `Task ${task.id} requires a latest completed Task-final Review before accepting a published tree.`
     );
@@ -98,24 +101,27 @@ export async function verifyTaskCompletionPublishedTree(
         `Task ${task.id} has no writable managed main workspace for Project ${taskBinding.projectId}.`
       );
     }
-    const reviewedCommit = latestReview.taskCandidate.projects.find(({ projectId }) => (
-      projectId === taskBinding.projectId
-    ))?.commit;
-    if (reviewedCommit === undefined) {
-      throw usageError(
-        `Task-final Review ${latestReview.id} omitted Project ${taskBinding.projectId}.`
-      );
-    }
     const actualCommit = (await git.inspect(entry.path, "HEAD")).baseCommit;
-    if (actualCommit !== reviewedCommit) {
-      throw usageError(
-        `Task-final Review ${latestReview.id} does not match Task head `
-        + `${taskBinding.projectId}@${actualCommit}.`
-      );
+    if (latestReview !== undefined) {
+      const reviewedCommit = latestReview.taskCandidate!.projects.find(({ projectId }) => (
+        projectId === taskBinding.projectId
+      ))?.commit;
+      if (reviewedCommit === undefined) {
+        throw usageError(
+          `Task-final Review ${latestReview.id} omitted Project ${taskBinding.projectId}.`
+        );
+      }
+      if (actualCommit !== reviewedCommit) {
+        throw usageError(
+          `Task-final Review ${latestReview.id} does not match Task head `
+          + `${taskBinding.projectId}@${actualCommit}.`
+        );
+      }
     }
     actualHeads.set(taskBinding.projectId, actualCommit);
   }
-  if (actualHeads.size !== latestReview.taskCandidate.projects.length) {
+  if (latestReview !== undefined
+    && actualHeads.size !== latestReview.taskCandidate!.projects.length) {
     throw usageError(
       `Task-final Review ${latestReview.id} Project set does not match Task ${task.id}.`
     );
@@ -172,7 +178,7 @@ export async function verifyTaskCompletionPublishedTree(
     taskId: task.id,
     projectId: publication.projectId,
     publicationId: publication.id,
-    reviewRoundId: latestReview.id,
+    ...(latestReview === undefined ? {} : { reviewRoundId: latestReview.id }),
     localCommit,
     remoteCommit,
     tree: localTree
@@ -202,15 +208,19 @@ export function assertTaskCompletionPublishedTreeProof(
     || publication.remoteCommit !== proof.remoteCommit) {
     throw usageError(`Publication evidence changed before Task completion: ${publication.id}.`);
   }
-  const latestReview = latestTaskFinalReview(store, task.id);
-  if (latestReview === undefined
-    || latestReview.id !== proof.reviewRoundId
-    || latestReview.status !== "completed"
-    || latestReview.taskCandidate === undefined
-    || !sameTaskCandidate(latestReview.taskCandidate, actualCandidate)) {
-    throw usageError(
-      `Task-final Review evidence changed before published-tree completion: ${task.id}.`
-    );
+  if (taskDeliveryPath(task) === "integrated") {
+    const latestReview = latestTaskFinalReview(store, task.id);
+    if (latestReview === undefined
+      || latestReview.id !== proof.reviewRoundId
+      || !isSemanticReviewRound(latestReview, store)
+      || latestReview.taskCandidate === undefined
+      || !sameTaskCandidate(latestReview.taskCandidate, actualCandidate)) {
+      throw usageError(
+        `Task-final Review evidence changed before published-tree completion: ${task.id}.`
+      );
+    }
+  } else if (proof.reviewRoundId !== undefined) {
+    throw usageError(`Direct published-tree proof unexpectedly binds a final Review: ${task.id}.`);
   }
   const actualCommit = actualCandidate.projects.find(({ projectId }) => (
     projectId === proof.projectId
@@ -492,7 +502,7 @@ async function hasCompletedTaskFinalReviewForCurrentCandidate(
     .filter((round) => (round.scope ?? "work-item") === "task")
     .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
   const latest = rounds.at(-1);
-  if (latest === undefined || latest.status !== "completed") return false;
+  if (latest === undefined || !isSemanticReviewRound(latest, store)) return false;
   if (latest.taskCandidate === undefined) return false;
 
   const candidateProjects = new Map(
@@ -535,7 +545,7 @@ function hasFrozenTaskBaseline(
   return store.listReviewRounds(taskId)
     .some((round) => (
       (round.scope ?? "work-item") === "task"
-      && round.status === "completed"
+      && isSemanticReviewRound(round, store)
       && round.taskCandidate !== undefined
       && round.taskCandidate.projects.some((entry) => (
         entry.projectId === projectId && entry.commit === currentCommit

@@ -126,7 +126,7 @@ yui operator submit "<related request>" --task <task-id>
 yui task create "<distinct mission>" \
   --project <project-a> --project <project-b> \
   --base <project-a>=<ref> --base <project-b>=<ref> \
-  --require-integration
+  --delivery integrated
 yui operator submit "<request and routing context>" --task <new-task-id>
 yui task activate <new-task-id>
 ```
@@ -145,11 +145,25 @@ separate Tasks merely because it spans several Projects or files. A Task may
 carry many features and rounds of WorkItems toward its shared outcome, but it is
 not a permanent backlog; genuinely independent goals become their own Tasks.
 
-Use `--require-integration` whenever completing the mission requires changing
-and delivering Project files. Yui then requires a WorkItem, ChangeSet, and
-committed Integration before completion. Omit it for read-only investigation,
-questions, or other outcomes that do not deliver repository changes. State
-which completion rule was recorded when reporting the newly created Task.
+Choose the Project delivery path before activation and report it with the Task:
+
+- `--delivery direct` for one bounded, low-risk outcome that Project Policy
+  allows the Leader to implement and verify on Task main. Direct delivery does
+  not require a WorkItem, ChangeSet, IntegrationAttempt, or policy-created
+  managed ReviewRound; it still requires a clean committed managed Task main.
+- `--delivery integrated` when Project Policy requires independent provenance,
+  Integration CAS, or final Review, and whenever the change crosses Projects,
+  storage/migration, permission or authorization, destructive behavior,
+  concurrency/recovery invariants, or release machinery. It requires the
+  WorkItem, ChangeSet, and committed Integration evidence chain.
+- Omit `--delivery` only for a Task with no Project bindings. The legacy
+  `--require-integration` flag remains an alias for `--delivery integrated`.
+
+Risk is a Leader/Project Policy judgment, not a file-count score. When evidence
+changes the risk, promotion from direct to integrated is explicit and
+irreversible; never silently downgrade an integrated Task to make completion
+easier. Do not pre-create WorkItems merely because integrated delivery might
+become necessary later.
 
 Managed workspaces are owner-keyed, not Role-keyed: Task main, WorkItem
 Develop, ReviewRound, and IntegrationAttempt each retain their own durable
@@ -164,10 +178,16 @@ outcome: keep it on the original Task, submit only the delta and its reason, and
 let the Leader retire the affected WorkItem, optionally name its replacement,
 and create the replacement. When a change instead abandons the current outcome for an
 independent one, do not force it onto the original Task; apply the strict
-new-Task rule above. If the delta changes
-a read-only Task into Project delivery work, first run
-`yui task update <task-id> --require-integration`, read back the Task completion
-rule, and only then submit the delta. When a completed Task
+new-Task rule above. If the delta promotes a Project-backed direct Task into
+guarded delivery, first run
+`yui task update <task-id> --delivery integrated`, read back the delivery path,
+and only then submit the delta. Promotion is allowed only while Task main is
+still at its recorded base and no WorkItem, ChangeSet, Integration, or Review
+evidence exists. If implementation already advanced Task main, keep the branch
+intact and either finish under the direct contract or create an integrated
+replacement Task; never manufacture provenance for earlier commits. Bind a
+Project before selecting a delivery path
+for a previously Gitless Task. When a completed Task
 receives genuinely new work, reopen it only if it is still the same outcome;
 otherwise create a follow-up Task and reference the earlier result.
 
@@ -289,6 +309,12 @@ ChangeSet is integrated.
 
 - Enter the global Session with `yui operator enter`; do not recursively run it
   from inside Operator.
+- Use `yui operator status` to distinguish the one GlobalRole-selected active
+  writer from retained historical conversations. Historical Sessions are
+  evidence only and never a second Operator authority. Use `operator resume`
+  only for an existing explicit conversation; creating a conversation is the
+  separate, deliberate `operator new` action. Recovery must never create an
+  extra Operator Session implicitly.
 - Enter an active Task Leader with `yui task enter <task-id>`, or a persistent
   Role with `yui task enter <task-id> <role>`.
 - Relay explicit Task information with
@@ -316,6 +342,15 @@ ChangeSet is integrated.
   Run, Agent, receipt, launch, and Session identities; never reconstruct them
   from terminal text or ask the user to paste them.
 - Retry only an explicitly failed recovery Job.
+- When a Leader first-progress stop-loss is reported, inspect its two exact
+  native generations and absence of durable progress. Do not request a third
+  automatic generation or create another Operator. Recover the existing Task
+  only after choosing an explicit valid Leader configuration or a direct
+  maintenance action.
+- Use `yui task next-action <task>` and `yui execution audit` orchestration
+  advisories as read-only cost evidence. They may flag excess WorkItems,
+  repeated Reviews/checks, pre-progress generations, or terminal workspaces;
+  they never authorize acceptance, deletion, or automatic protocol changes.
 
 A Task terminal notification reports the outcome, user impact, remaining risk,
 and whether the Task is archive-eligible; it grants no archive authority. Task

@@ -11,6 +11,7 @@ import {
   type ReviewRound,
   type TaskReviewCandidate
 } from "./reviewRound.js";
+import { isSemanticReviewRound } from "./reviewOutcomeClassifier.js";
 
 /**
  * Issue 07: delta-recheck protocol.
@@ -72,11 +73,11 @@ export async function assessDeltaRecheck(input: Readonly<{
   config: ReviewConfig;
 }>): Promise<DeltaRecheckAssessment> {
   const { repositoryPaths, previousRound, candidate, git, config } = input;
-  if (previousRound.status !== "completed"
+  if (!isSemanticReviewRound(previousRound)
     || (previousRound.scope ?? "work-item") !== "task") {
     return {
       kind: "ineligible",
-      reason: "Delta recheck requires a completed Task-final ReviewRound."
+      reason: "Delta recheck requires a semantic completed Task-final ReviewRound."
     };
   }
   if (previousRound.taskCandidate === undefined) {

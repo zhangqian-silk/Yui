@@ -17,6 +17,7 @@ import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
 import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentRun } from "../run/agentRun.js";
+import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import {
   classifyAgentRunFailure,
@@ -33,6 +34,10 @@ import {
   type RuntimeLaunchPhase
 } from "../runtime/launchDiagnostics.js";
 import { UNSUPPORTED, type OptionalFact, type Unsupported } from "./runtimeIdentity.js";
+import {
+  projectTaskOrchestration,
+  type TaskOrchestrationMetrics
+} from "./orchestrationMetrics.js";
 
 export type ExecutionAuditOptions = Readonly<{
   taskId?: string;
@@ -237,6 +242,10 @@ export type ExecutionAuditReport = Readonly<{
     total: number;
     completed: number;
     retired: number;
+  }>>;
+  orchestration: AuditSection<Readonly<{
+    tasks: readonly TaskOrchestrationMetrics[];
+    advisoryCount: number;
   }>>;
   storage: AuditSection<StorageAudit>;
   runtimeProtocol: AuditSection<RuntimeProtocolAudit>;
@@ -457,6 +466,7 @@ export function runExecutionAudit(
       events: section,
       providerRetries: section,
       workItems: section,
+      orchestration: section,
       storage: section,
       runtimeProtocol: section,
       topLongRunning: section
@@ -683,7 +693,7 @@ export function runExecutionAudit(
             else if (round.deltaRecheck.disposition === "finding") deltaFinding += 1;
             else if (round.deltaRecheck.disposition === "requires-full-review") deltaEscalated += 1;
           }
-          const classification = classifyReviewRound(round);
+          const classification = classifyReviewRound(round, store);
           if (classification.faultClass === "review-infra") infraFailed += 1;
           else if (classification.faultClass === "review-semantic-negative") {
             semanticNegative += 1;
@@ -890,6 +900,36 @@ export function runExecutionAudit(
     }
   })();
 
+  const orchestration = ((): ExecutionAuditReport["orchestration"] => {
+    try {
+      const metrics = taskIds.flatMap((taskId) => {
+        const task = store.getTask(taskId);
+        if (task === null) return [];
+        return [projectTaskOrchestration({
+          task,
+          runs: withinWindow(store.listAgentRuns(taskId), options),
+          roleSessionSets: sessionSetsWithinWindow(store.listRoleSessionSets(taskId), options),
+          workItems: withinWindow(store.listWorkItems(taskId), options),
+          changeSets: withinWindow(store.listChangeSets(taskId), options),
+          reviewRounds: withinWindow(store.listReviewRounds(taskId), options),
+          reviewFindings: withinWindow(store.listReviewFindings(taskId), options),
+          integrations: withinWindow(store.listIntegrationAttempts(taskId), options),
+          durableJobs: withinWindow(store.listDurableJobs(taskId), options),
+          publications: withinWindow(store.listPublicationReferences(taskId), options),
+          decisions: withinWindow(store.listDecisions(taskId), options),
+          events: withinWindow(store.listEvents(taskId), options),
+          managedWorkspaces: withinWindow(store.listManagedWorkspaces(taskId), options)
+        })];
+      });
+      return ok({
+        tasks: metrics,
+        advisoryCount: metrics.reduce((total, task) => total + task.advisories.length, 0)
+      });
+    } catch (error) {
+      return failed<{ tasks: readonly TaskOrchestrationMetrics[]; advisoryCount: number }>(error);
+    }
+  })();
+
   const storage = ((): AuditSection<StorageAudit> => {
     try {
       let stateJsonBytes: number | Unsupported = UNSUPPORTED;
@@ -1047,8 +1087,30 @@ export function runExecutionAudit(
     events,
     providerRetries,
     workItems,
+    orchestration,
     storage,
     runtimeProtocol,
     topLongRunning
   };
+}
+
+function withinWindow<T extends Readonly<{ createdAt: string }>>(
+  records: readonly T[],
+  options: ExecutionAuditOptions
+): readonly T[] {
+  return records.filter((record) => inWindow(record.createdAt, options));
+}
+
+function sessionSetsWithinWindow(
+  sets: readonly TaskRoleSessionSet[],
+  options: ExecutionAuditOptions
+): readonly TaskRoleSessionSet[] {
+  if (options.since === undefined && options.until === undefined) return sets;
+  return sets.map((set) => ({
+    ...set,
+    sessions: Object.fromEntries(Object.entries(set.sessions).filter(([, session]) => (
+      inWindow(session.createdAt, options)
+    ))),
+    history: (set.history ?? []).filter((session) => inWindow(session.createdAt, options))
+  }));
 }

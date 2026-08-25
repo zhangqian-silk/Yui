@@ -106,13 +106,24 @@ yui project add app /absolute/workspace/app \
 yui project update app --alias app-cli --development develop
 yui project list
 
-yui task create "交付 CSV 导出" --project app
+yui task create "修复 CSV 转义" --project app --delivery direct
+yui task create "交付 CSV 导出" --project app --delivery integrated
 yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
 yui task show <task-id>
 yui task context <task-id>
 yui task activate <task-id>
 ```
+
+Project 交付路径显式分为两类，但仍复用现有 Task schema。`direct` 用于
+Project Policy 允许的单一低风险修复：Leader 直接在干净且已提交的 Task main
+实现、验证并完成，不要求 WorkItem、IntegrationAttempt 或由全局策略自动创建的
+final ReviewRound。`integrated` 用于受保护、跨 Project、迁移、授权、并发/恢复、
+破坏性或发布改动，并要求 WorkItem、ChangeSet 与 committed Integration 证据。
+全局 final-review 策略只自动约束 integrated Task。direct Task 可使用有边界的原生
+review；若需要独立托管的 final Review，必须在 Task main 前进前提升为 integrated。
+一旦已有提交或交付证据，提升会 fail closed，避免早期修改失去 ChangeSet provenance。
+旧的 `--require-integration` 等价于 `--delivery integrated`，且 integrated 不可降级。
 
 面向用户的时间默认按北京时间（`Asia/Shanghai`）显示；持久化记录和
 `--json` 数据仍使用 UTC/RFC 3339。可通过以下命令查看或修改 IANA 时区：
@@ -150,8 +161,9 @@ AgentRun 不创建新 WorkItem，也不会递归触发审查。审查以自然�
 唤醒 Leader；Leader 决定验收、reject 后在原 Role 与原 Session 中修复、
 再次审查，或通过 InputRequest 询问用户。审查失败会保留为可见证据并
 唤醒 Leader，但不会取代 Leader 的最终判断。
-`final` 不为每个 WorkItem 创建完整 ReviewRound；`task complete` 会在每个绑定
-Project 都有 committed Integration 后排队一次 Task 级 Review。冻结的集成头
+`final` 不为每个 WorkItem 创建完整 ReviewRound；integrated Task 的
+`task complete` 会在每个绑定 Project 都有 committed Integration 后排队一次
+Task 级 Review。direct Task 不会因可变的全局 final 配置自动增加 Review。冻结的集成头
 发生变化时才会重新排队，旧报告仍保留为证据。Reviewer 按 Project Policy/Knowledge
 检查整个 Task，并只报告有直接证据的可达、重要、可行动问题或有限验证缺口。
 所有候选、ReviewRound 和 Leader 决策都集中在原 WorkItem 下；reject
@@ -230,6 +242,7 @@ WorkItem workspace 之间移动时，Yui 会退役已停止的旧 Session；下�
 ```sh
 yui operator submit "比较 CSV 与 JSON 的兼容性" --task <task-id>
 yui operator submit "研究更小的缓存设计"
+yui operator status
 yui operator list
 yui operator resume
 yui operator resume --last
@@ -254,12 +267,13 @@ Operator 会结合 Project Catalog 和现有 Task context 路由请求。同一�
 目标的追加需求、修复、审查和咨询继续进入原 Task，即使它涉及多个 Project。
 目标、所有权边界或生命周期独立时才创建新 Task。需求、Bug 和咨询共用同一
 Task/WorkItem 模型，不增加额外任务类型。
-`operator list` 按固定的最近更新时间倒序展示历史对话，并显示 Agent
+`operator status` 将 GlobalRole 选中的唯一 active writer 与保留的历史对话
+分开展示。`operator list` 按固定的最近更新时间倒序展示历史对话，并显示 Agent
 及可读的标题或摘要；底层 provider session ID 始终保持内部实现细节。
 若 adapter 尚未提供这些元数据，Yui 会显示 provider 和稳定的 Yui
-短引用，确保无标题会话仍可区分。`operator resume` 使用同一个轻量编号列表，
-`--last` 可直接恢复最近一条；
-`operator new` 创建空白对话，并把原对话保留在历史中。
+短引用，确保无标题会话仍可区分。`operator resume` 使用轻量历史编号列表，
+`--last` 可直接恢复最近一条；新建会话不会伪装成 resume 选项，必须显式使用
+`operator new`，并把原对话保留在历史中。
 
 从已配置的全局 Worker 创建 Task Role，应用 Profile 并派发 WorkItem：
 
@@ -430,7 +444,13 @@ yui task complete <task-id> --summary "CSV 导出已交付并验证"
 yui task reopen <task-id>
 ```
 
-completed Task 在显式 reopen 前会拒绝消息、派发、进入 session、重试和迟到的 yield。每个隔离 WorkItem worktree 必须先显式清理，清理时也会删除其受管分支；archive 还必须通过 `--integrated` 或 `--abandon` 明确 Task main 的处理结果，之后才会停止 session 并清理干净的 Task main。Task 与 WorkItem 记录都会保留，Task main 分支作为恢复信息保留，不会被静默删除。
+completed Task 在显式 reopen 前会拒绝消息、派发、进入 session、重试和迟到的
+yield。终态 WorkItem、Review、Integration 与 Lane worktree 会作为非阻塞的
+completion advisory 返回，但必须在 archive 前处理。每个隔离 WorkItem worktree
+仍需显式标记 integrated 或 abandoned，清理时也会删除其受管分支；archive 还必须
+通过 `--integrated` 或 `--abandon` 明确 Task main 的处理结果，之后才会停止
+session 并清理干净的 Task main。Task 与 WorkItem 记录都会保留，Task main 分支
+作为恢复信息保留，不会被静默删除。
 Task 生命周期的交互选择只展示有效来源状态：activate 只展示 Draft，complete 只展示 active，reopen 只展示 completed。
 
 ## Session 与 tmux

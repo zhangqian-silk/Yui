@@ -124,6 +124,7 @@ import {
   planRepairGroups,
   reconcileReviewFindings,
   reconcileReviewFindingsAfterReview,
+  type RepairGroup,
   type ReviewFindingDispositionCommand
 } from "../review/reviewFindingLedger.js";
 import {
@@ -163,6 +164,7 @@ import {
   createTask,
   retireTask,
   reopenTask,
+  taskDeliveryPath,
   updateTaskMetadata,
   type TaskCompletedBy,
   type Task,
@@ -177,6 +179,7 @@ import {
 import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
 import {
   projectCompletionReadiness,
+  type CompletionAdvisory,
   type CompletionBlocker
 } from "../task/completionReadiness.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -228,6 +231,10 @@ import {
   validateTaskFinalReviewContract,
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
+import {
+  classifyReviewRoundOutcome,
+  isSemanticReviewRound
+} from "../review/reviewOutcomeClassifier.js";
 import {
   TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT,
   createTaskFinalReviewContractRebind,
@@ -438,6 +445,7 @@ export type TaskCommandOptions = Readonly<{
   candidateGitSnapshot?: CandidateGitSnapshot;
   /** Managed Candidate workspace; null is an explicit Gitless/no-workspace preflight. */
   candidateWorkspace?: ManagedWorkspace | null;
+  /** CLI-verified clean Task-main snapshot for exact direct capture or safe delivery promotion. */
   directTaskMainSnapshot?: DirectTaskMainSnapshot;
   /** Prepared by the repository/workspace lifecycle before command mutation. */
   executionLaneWorkspaces?: ReadonlyMap<string, ManagedWorkspace>;
@@ -791,12 +799,14 @@ function updateTaskCommand(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const optionNames = new Set(["--title", "--description", "--priority", "--tags", "--due-at"]);
+  const optionNames = new Set([
+    "--title", "--description", "--priority", "--tags", "--due-at", "--delivery"
+  ]);
   const flagOptions = new Set([
     "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at",
     "--require-integration"
   ]);
-  const usage = "Task update usage: yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at] [--require-integration].";
+  const usage = "Task update usage: yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at] [--delivery <direct|integrated>] [--require-integration].";
   const parsed = parseTail(args, optionNames, usage, flagOptions);
   exactPositionals(parsed.positionals, 1, usage);
   if (parsed.options.size === 0) throw usageError("At least one Task metadata option is required.", usage);
@@ -819,21 +829,48 @@ function updateTaskCommand(
   const tags = parsed.options.has("--tags")
     ? parseTaskTags(requiredOption(parsed.options, "--tags"))
     : undefined;
+  const requestedDelivery = parsed.options.has("--delivery")
+    ? parseTaskDelivery(requiredOption(parsed.options, "--delivery"))
+    : undefined;
+  if (requestedDelivery === "direct" && parsed.options.has("--require-integration")) {
+    throw usageError("--delivery direct conflicts with --require-integration.", usage);
+  }
+  const enableIntegration = requestedDelivery === "integrated"
+    || parsed.options.has("--require-integration");
   const now = clock(options);
   const result = store.transaction((tx) => {
     const current = requireTask(tx, parsed.positionals[0]);
     if (current.status === "archived") throw usageError(`Task is archived: ${current.id}.`);
-    if (parsed.options.has("--require-integration") && current.status === "completed") {
+    if ((requestedDelivery !== undefined || parsed.options.has("--require-integration"))
+      && current.projectBindings.length === 0) {
+      throw usageError(
+        `Task ${current.id} has no Project; delivery selection is not applicable.`
+      );
+    }
+    if (requestedDelivery === "direct" && current.requireIntegration === true) {
+      throw usageError(
+        `Task ${current.id} already uses integrated delivery and cannot be downgraded to direct.`
+      );
+    }
+    if (enableIntegration && current.status === "completed") {
       throw usageError(
         `Task ${current.id} is completed; use task reopen before enabling integration evidence.`
       );
     }
+    if (enableIntegration && current.requireIntegration !== true) {
+      assertTaskDeliveryPromotionEligible(tx, current, options.directTaskMainSnapshot);
+    }
     if (
       parsed.options.size === 1
-      && parsed.options.has("--require-integration")
+      && enableIntegration
       && current.requireIntegration === true
     ) {
       return { task: current, integrationState: "already-enabled" as const };
+    }
+    if (parsed.options.size === 1
+      && requestedDelivery === "direct"
+      && taskDeliveryPath(current) === "direct") {
+      return { task: current, integrationState: "already-direct" as const };
     }
     const updated = updateTaskMetadata(current, {
       ...(parsed.options.has("--title") ? { title: requiredOption(parsed.options, "--title") } : {}),
@@ -849,31 +886,107 @@ function updateTaskCommand(
       ...(dueAt === undefined
         ? parsed.options.has("--clear-due-at") ? { dueAt: null } : {}
         : { dueAt }),
-      ...(parsed.options.has("--require-integration") ? { requireIntegration: true } : {})
+      ...(enableIntegration ? { requireIntegration: true } : {})
     }, now);
     tx.saveTask(updated);
     recordTaskEvent(tx, updated.id, "task.updated", {
       status: updated.status,
-      ...(parsed.options.has("--require-integration")
-        ? { completionEvidence: "integration-required" }
-        : {})
+      ...(requestedDelivery === undefined && !parsed.options.has("--require-integration")
+        ? {}
+        : {
+            completionEvidence: enableIntegration
+              ? "integration-required"
+              : "direct",
+            deliveryPath: taskDeliveryPath(updated)
+          })
     }, now);
     enqueueWork(tx, taskMailbox(updated.id), "task-updated", now, [taskRef(updated.id)]);
     return {
       task: updated,
-      integrationState: parsed.options.has("--require-integration")
+      integrationState: enableIntegration
         ? "enabled" as const
-        : "unchanged" as const
+        : requestedDelivery === "direct"
+          ? "direct" as const
+          : "unchanged" as const
     };
   });
-  if (result.integrationState !== "already-enabled") {
+  if (result.integrationState !== "already-enabled"
+    && result.integrationState !== "already-direct") {
     notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
   }
   return result.integrationState === "enabled"
-    ? `Updated task ${result.task.id}\nCompletion evidence enabled: WorkItem, ChangeSet, and committed Integration required\n`
+    ? `Updated task ${result.task.id}\nDelivery: integrated (WorkItem, ChangeSet, and committed Integration required)\n`
     : result.integrationState === "already-enabled"
-      ? `Task ${result.task.id} completion evidence is already enabled\n`
-      : `Updated task ${result.task.id}\n`;
+      ? `Task ${result.task.id} already uses integrated delivery\n`
+      : result.integrationState === "already-direct"
+        ? `Task ${result.task.id} already uses direct delivery\n`
+        : result.integrationState === "direct"
+          ? `Updated task ${result.task.id}\nDelivery: direct\n`
+          : `Updated task ${result.task.id}\n`;
+}
+
+function assertTaskDeliveryPromotionEligible(
+  store: TaskWorkflowStore,
+  task: Task,
+  snapshot: DirectTaskMainSnapshot | undefined
+): void {
+  const evidence = [
+    ...store.listWorkItems(task.id).map(({ id }) => `WorkItem ${id}`),
+    ...store.listChangeSets(task.id).map(({ id }) => `ChangeSet ${id}`),
+    ...store.listIntegrationAttempts(task.id).map(({ id }) => `IntegrationAttempt ${id}`),
+    ...store.listReviewRounds(task.id).map(({ id }) => `ReviewRound ${id}`)
+  ];
+  if (evidence.length > 0) {
+    throw usageError(
+      `Task ${task.id} cannot promote to integrated delivery after delivery evidence exists: `
+      + `${evidence.join(", ")}. Create an integrated replacement Task or keep the current direct contract.`
+    );
+  }
+  if (task.status !== "draft" && task.status !== "active") {
+    throw usageError(
+      `Task ${task.id} must be Draft or Active to promote delivery; current status is ${task.status}.`
+    );
+  }
+  const workspace = store.getTaskWorkspace(task.id);
+  if (task.status === "draft" && workspace === null) return;
+  if (snapshot === undefined) {
+    throw usageError(
+      `Task ${task.id} delivery promotion requires a CLI-verified clean Task-main snapshot.`
+    );
+  }
+  if (workspace === null
+    || workspace.owner.type !== "task"
+    || workspace.owner.taskId !== task.id) {
+    throw usageError(`Task has no authoritative main workspace: ${task.id}.`);
+  }
+  const snapshotIds = snapshot.schemaVersion === 1 && Array.isArray(snapshot.projects)
+    ? snapshot.projects.map(({ projectId }) => projectId)
+    : [];
+  if (snapshotIds.length !== task.projectBindings.length
+    || new Set(snapshotIds).size !== snapshotIds.length) {
+    throw usageError(`Task-main promotion snapshot does not match bound Projects: ${task.id}.`);
+  }
+  for (const binding of task.projectBindings) {
+    const project = snapshot.projects.find(({ projectId }) => projectId === binding.projectId);
+    const entry = workspace.entries.find(({ projectId }) => projectId === binding.projectId);
+    if (project === undefined
+      || entry === undefined
+      || entry.access !== "write"
+      || project.directory !== entry.directory
+      || project.branch !== entry.branch
+      || project.baseCommit !== entry.baseCommit) {
+      throw usageError(
+        `Task-main promotion snapshot changed before mutation: ${task.id}/${binding.projectId}.`
+      );
+    }
+    if (project.headCommit !== project.baseCommit) {
+      throw usageError(
+        `Task ${task.id} main already advanced for Project ${binding.projectId}; `
+        + "cannot promote without losing ChangeSet provenance. Create an integrated replacement "
+        + "Task or keep the current direct contract."
+      );
+    }
+  }
 }
 
 /** Compatibility helper for call sites that cannot yet handle foreground enter. */
@@ -936,10 +1049,17 @@ function createTaskCommand(
   return output(
     `Created Draft task ${created.task.id}: ${created.task.title}\n`
       + `Assigned role: ${created.leader.name}\n`
+      + `Delivery: ${taskDeliveryPath(created.task)}\n`
       + (created.task.requireIntegration
         ? "Completion: WorkItem, ChangeSet, and committed Integration required\n"
-        : "Completion: delivery integration not required\n"),
-    { task: created.task, leader: created.leader }
+        : created.task.projectBindings.length > 0
+          ? "Completion: clean committed Task main required; no WorkItem, ChangeSet, IntegrationAttempt, or managed ReviewRound required\n"
+          : "Completion: no Project delivery evidence required\n"),
+    {
+      task: created.task,
+      leader: created.leader,
+      deliveryPath: taskDeliveryPath(created.task)
+    }
   );
 }
 
@@ -952,10 +1072,10 @@ function parseTaskCreation(
   defaultProjectIds: readonly string[];
   requireIntegration: boolean;
 }> {
-  const usage = "Task create usage: yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--require-integration].";
+  const usage = "Task create usage: yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--delivery <direct|integrated>] [--require-integration].";
   const parsed = parseMultiValueTail(
     args,
-    new Set(),
+    new Set(["--delivery"]),
     new Set(["--project", "--base"]),
     usage,
     new Set(["--require-integration"])
@@ -973,6 +1093,16 @@ function parseTaskCreation(
   });
   if (new Set(projects.map(({ id }) => id)).size !== projects.length) {
     throw usageError("A Task cannot bind the same Project more than once.");
+  }
+  const requestedDelivery = parsed.options.has("--delivery")
+    ? parseTaskDelivery(requiredOption(parsed.options, "--delivery"))
+    : undefined;
+  if ((requestedDelivery !== undefined || parsed.options.has("--require-integration"))
+    && projects.length === 0) {
+    throw usageError("Delivery selection requires at least one --project.", usage);
+  }
+  if (requestedDelivery === "direct" && parsed.options.has("--require-integration")) {
+    throw usageError("--delivery direct conflicts with --require-integration.", usage);
   }
   const bases = new Map<string, string>();
   for (const option of baseOptions) {
@@ -1002,7 +1132,8 @@ function parseTaskCreation(
       baseRef: bases.get(project.id) ?? project.developmentBranch
     })),
     defaultProjectIds,
-    requireIntegration: parsed.options.has("--require-integration")
+    requireIntegration: requestedDelivery === "integrated"
+      || parsed.options.has("--require-integration")
   };
 }
 
@@ -1019,6 +1150,7 @@ function createTaskAggregate(
   store.saveRole(task.id, leader);
   recordTaskEvent(store, task.id, "task.created", {
     status: task.status,
+    deliveryPath: taskDeliveryPath(task),
     ...(defaultProjectIds.length === 0
       ? {}
       : { defaultProjectIds: defaultProjectIds.join(",") })
@@ -1076,11 +1208,16 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Task: ${task.id}`,
     `Title: ${task.title}`,
     `Status: ${task.status}`,
+    `Delivery: ${taskDeliveryPath(task)}`,
     ...(task.description === undefined ? [] : [`Description: ${task.description}`]),
     ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
     ...(task.dueAt === undefined ? [] : [`Due: ${presentTime(task.dueAt, timeZone)}`]),
-    `Completion evidence: ${task.requireIntegration === true ? "required" : "not required"}`,
+    `Completion evidence: ${task.requireIntegration === true
+      ? "WorkItem, ChangeSet, and committed Integration required"
+      : task.projectBindings.length > 0
+        ? "clean committed Task main required"
+        : "no Project evidence required"}`,
     ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(task.completedAt, timeZone)}`]),
     ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
@@ -1111,7 +1248,12 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Created: ${presentTime(task.createdAt, timeZone)}`,
     `Updated: ${presentTime(task.updatedAt, timeZone)}`
   ].join("\n").concat("\n");
-  return output(rendered, { task, counts, hasBrief: brief !== null });
+  return output(rendered, {
+    task,
+    deliveryPath: taskDeliveryPath(task),
+    counts,
+    hasBrief: brief !== null
+  });
 }
 
 function activateTaskCommand(
@@ -1165,11 +1307,15 @@ function completeTaskCommand(
         task,
         changed: false,
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
+        completionAdvisories: [] as CompletionAdvisory[],
         finalReview: undefined,
         publishedTreeAuthorization: undefined
       } as const;
     }
     const taskFinalContract = preflight.taskFinalReviewContract;
+    const actualTaskCandidate = task.projectBindings.length === 0
+      ? undefined
+      : actualTaskReviewCandidateForMutation(tx, task, options);
     const publishedTreeProof = request.acceptedPublishedTreePublicationId === undefined
       ? undefined
       : assertTaskCompletionPublishedTreeProof(
@@ -1177,7 +1323,7 @@ function completeTaskCommand(
         task,
         request.acceptedPublishedTreePublicationId,
         options.completionPublishedTreeProof,
-        actualTaskReviewCandidateForMutation(tx, task, options)
+        actualTaskCandidate!
       );
     const requiresContractHandoff = publishedTreeProof !== undefined
       && taskFinalContract !== undefined;
@@ -1201,6 +1347,7 @@ function completeTaskCommand(
         task,
         changed: false,
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
+        completionAdvisories: [] as CompletionAdvisory[],
         finalReview: undefined,
         publishedTreeAuthorization: {
           event,
@@ -1271,6 +1418,7 @@ function completeTaskCommand(
         task,
         changed: false,
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
+        completionAdvisories: [] as CompletionAdvisory[],
         finalReview,
         resumedPendingFinalReview: pendingFinalReviewIds.has(finalReview.id),
         terminalizedLeaderRun,
@@ -1308,13 +1456,29 @@ function completeTaskCommand(
         by: actor,
         projectId: publishedTreeProof.projectId,
         publicationId: publishedTreeProof.publicationId,
-        reviewRoundId: publishedTreeProof.reviewRoundId,
+        ...(publishedTreeProof.reviewRoundId === undefined
+          ? {}
+          : { reviewRoundId: publishedTreeProof.reviewRoundId }),
         localCommit: publishedTreeProof.localCommit,
         remoteCommit: publishedTreeProof.remoteCommit,
         tree: publishedTreeProof.tree
       }, now);
     }
-    recordTaskEvent(tx, task.id, "task.completed", { by: actor, summary }, now);
+    recordTaskEvent(tx, task.id, "task.completed", {
+      by: actor,
+      summary,
+      deliveryPath: taskDeliveryPath(task),
+      ...(actualTaskCandidate === undefined
+        ? {}
+        : {
+            projectHeads: actualTaskCandidate.projects
+              .map(({ projectId, commit }) => `${projectId}@${commit}`)
+              .join(",")
+          }),
+      ...(readiness.advisories.length === 0
+        ? {}
+        : { cleanupAdvisories: String(readiness.advisories.length) })
+    }, now);
     // A terminal Task must never leave a Task-lane signal that can wake it.
     // The durable records remain intact; only the derived mailbox work is
     // discarded at this lifecycle boundary.
@@ -1335,6 +1499,7 @@ function completeTaskCommand(
       task: completed,
       changed: true,
       runtimeCleanupTargets,
+      completionAdvisories: readiness.advisories,
       finalReview: undefined,
       resumedPendingFinalReview: false,
       terminalizedLeaderRun,
@@ -1374,9 +1539,19 @@ function completeTaskCommand(
       [TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW]: result.terminalizedLeaderRun
     });
   }
-  return output(result.changed
+  const completionOutput = result.changed
     ? `Completed task ${result.task.id}\n`
-    : `Task ${result.task.id} is already completed\n`);
+    : `Task ${result.task.id} is already completed\n`;
+  const advisoryOutput = result.completionAdvisories.length === 0
+    ? ""
+    : `Cleanup advisories (non-blocking; settle before archive):\n`
+      + result.completionAdvisories.map((advisory) => (
+        `- ${advisory.code} (${advisory.ref.kind} ${advisory.ref.id}): ${advisory.fix}`
+      )).join("\n").concat("\n");
+  return output(completionOutput + advisoryOutput, {
+    task: result.task,
+    completionAdvisories: result.completionAdvisories
+  });
 }
 
 function reopenTaskCommand(
@@ -3941,8 +4116,8 @@ function resolveReviewExecutionGroup(
 /**
  * Issue 06: `yui task review finding` — the cross-Round finding ledger CLI.
  * Findings are extracted automatically from completed Rounds; these commands
- * let the Leader inspect the ledger, disposition each finding, and plan the
- * parallel repair wave.
+ * let the Leader inspect the ledger, disposition each finding, and plan one
+ * convergent repair unit by default. Parallel fan-out is explicit.
  */
 function reviewFindingCommand(
   args: string[],
@@ -4031,11 +4206,15 @@ function planReviewRepairWave(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task review finding repair-wave usage: yui task review finding repair-wave <task> [--create].";
-  const parsed = parseTail(args, new Set(), usage, new Set(["--create"]));
+  const usage = "Task review finding repair-wave usage: yui task review finding repair-wave <task> [--strategy <consolidated|parallel>] [--create].";
+  const parsed = parseTail(args, new Set(["--strategy"]), usage, new Set(["--create"]));
   exactPositionals(parsed.positionals, 1, usage);
   const task = requireTask(store, parsed.positionals[0]!);
-  const groups = planRepairGroups(store, task.id);
+  const strategy = parsed.options.get("--strategy") ?? "consolidated";
+  if (strategy !== "consolidated" && strategy !== "parallel") {
+    throw usageError(`Review repair strategy is invalid: ${strategy}.`, usage);
+  }
+  const groups = repairGroupsForStrategy(planRepairGroups(store, task.id), strategy);
   if (groups.length === 0) {
     return output(`No open P1/P2 findings need repair for ${task.id}.\n`);
   }
@@ -4083,8 +4262,8 @@ function planReviewRepairWave(
       + `(${group.findingIds.join(", ")})`
     ));
     return output(
-      `Review repair wave for ${task.id} (${groups.length} group(s)):\n${lines.join("\n")}\n`,
-      { groups: created }
+      `Review repair wave for ${task.id} (${strategy}, ${groups.length} group(s)):\n${lines.join("\n")}\n`,
+      { strategy, groups: created }
     );
   }
   const lines = groups.map((group, index) => {
@@ -4094,7 +4273,29 @@ function planReviewRepairWave(
     return `wave ${index + 1}: ${findings}`
       + ` (paths: ${group.affectedPaths.join(", ") || "none"}; invariants: ${group.invariants.join(", ")})`;
   });
-  return output(`Repair wave for ${task.id} (${groups.length} group(s), run disjoint groups in parallel):\n${lines.join("\n")}\n`);
+  return output(
+    `Repair wave for ${task.id} (${strategy}, ${groups.length} group(s)):\n${lines.join("\n")}\n`
+      + (strategy === "consolidated"
+        ? "Default: keep all findings in one WorkItem; use --strategy parallel only for proven independent ownership.\n"
+        : "Parallel strategy explicitly selected; each disjoint group may become one WorkItem.\n")
+  );
+}
+
+function repairGroupsForStrategy(
+  groups: readonly RepairGroup[],
+  strategy: "consolidated" | "parallel"
+): readonly RepairGroup[] {
+  if (strategy === "parallel" || groups.length <= 1) return groups;
+  const findings = groups.flatMap(({ findings }) => findings)
+    .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
+  return [{
+    groupKey: findings.map(({ id }) => id).join("+"),
+    findings,
+    findingIds: findings.map(({ id }) => id),
+    affectedPaths: [...new Set(groups.flatMap(({ affectedPaths }) => affectedPaths))].sort(),
+    affectedSymbols: [...new Set(groups.flatMap(({ affectedSymbols }) => affectedSymbols))].sort(),
+    invariants: [...new Set(groups.flatMap(({ invariants }) => invariants))].sort()
+  }];
 }
 
 function reviewRepairProjectIds(
@@ -4613,227 +4814,13 @@ export function classifyForceFreshReviewRecovery(
   store: ForceFreshReviewEvidenceStore,
   round: ReviewRound
 ): ForceFreshReviewRecoveryClassification {
-  const blocked = (reason: string): ForceFreshReviewRecoveryClassification => ({
-    kind: "semantic-or-ambiguous",
-    reason
-  });
-  if (round.status !== "failed" && round.status !== "completed") {
-    return blocked(`source status is ${round.status}, not terminal.`);
-  }
-  if ((round.checks ?? []).length > 0) return blocked("the Round records review checks.");
-  if (round.status === "completed" && round.evidenceCommit !== round.reviewBaseCommit) {
-    return blocked("the completed Round lacks an exact frozen-head evidence commit.");
-  }
-  const frozenHeadEvidenceCommit = round.status === "completed"
-    ? round.reviewBaseCommit
-    : undefined;
-  if (round.status === "failed" && round.evidenceCommit !== undefined) {
-    return blocked("the Round records a review evidence commit.");
-  }
-  if (round.report !== round.summary) {
-    return blocked("the Round stores a report distinct from its terminal summary.");
-  }
-  if (runtimeFailureSummaryHasReviewerOutput(round.report ?? "")) {
-    return blocked("the Round stores non-empty Reviewer output in its runtime failure summary.");
-  }
-  if (round.deltaRecheck?.disposition !== undefined
-    || round.deltaRecheck?.reasoning !== undefined) {
-    return blocked("the Round records a semantic delta-recheck disposition.");
-  }
-  if (looksLikeStructuredReviewReport(round.report ?? "")) {
-    return blocked("the Round stores a structured reviewer report.");
-  }
-
-  for (const lane of round.executionGroup?.lanes ?? []) {
-    if (lane.status === "pending" || lane.status === "running") {
-      return blocked(`Reviewer Lane ${lane.id} is still active.`);
-    }
-    if ((lane.result?.checks ?? []).length > 0
-      || (lane.result?.findings ?? []).length > 0
-      || (lane.result?.evidence ?? []).length > 0
-      || (lane.result?.evidenceCommit !== undefined
-        && lane.result.evidenceCommit !== frozenHeadEvidenceCommit)
-      || lane.result?.gitSnapshot !== undefined) {
-      return blocked(`Reviewer Lane ${lane.id} delivered semantic evidence.`);
-    }
-    if (lane.status === "yielded" || lane.status === "completed") {
-      if (round.status !== "completed") {
-        return blocked(`Reviewer Lane ${lane.id} delivered terminal output.`);
-      }
-      if (lane.result === undefined
-        || lane.result.summary !== round.summary
-        || lane.result.report !== round.report
-        || lane.result.evidenceCommit !== frozenHeadEvidenceCommit) {
-        return blocked(`Reviewer Lane ${lane.id} output is absent or differs from the Round.`);
-      }
-    } else if (round.status === "completed") {
-      return blocked(`Completed Round has non-completed Reviewer Lane ${lane.id}/${lane.status}.`);
-    }
-  }
-
-  const reviewRuns = store.listAgentRuns(round.taskId).filter((run) => (
-    run.purpose === "review"
-    && run.reviewRoundId === round.id
-  ));
-  const activeRun = reviewRuns.find(({ status }) => status === "active");
-  if (activeRun !== undefined) return blocked(`Reviewer Run ${activeRun.id} is still active.`);
-  const failedRunWithOutput = reviewRuns.find((run) => (
-    run.status === "failed" && runtimeFailureSummaryHasReviewerOutput(run.summary ?? "")
-  ));
-  if (failedRunWithOutput !== undefined) {
-    return blocked(`Reviewer Run ${failedRunWithOutput.id} records Reviewer output.`);
-  }
-  const yieldedRuns = reviewRuns.filter(({ status }) => status === "yielded");
-  if (round.status === "failed" && yieldedRuns.length > 0) {
-    return blocked(`Reviewer Run ${yieldedRuns[0]!.id} yielded a report.`);
-  }
-
-  const finding = store.listReviewFindings(round.taskId).find((entry) => (
-    entry.firstReviewRoundId === round.id || entry.lastReviewRoundId === round.id
-  ));
-  if (finding !== undefined) return blocked(`Review finding ${finding.id} references the Round.`);
-
-  const completionEvents = store.listEvents(round.taskId).filter((event) => (
-    event.type === "review.completed" && event.payload.reviewRoundId === round.id
-  ));
-  if (round.status === "failed") {
-    if (completionEvents.length > 0) {
-      return blocked(`Review completion Event ${completionEvents[0]!.id} exists.`);
-    }
-    return {
-      kind: "non-semantic-terminal",
-      reason: "Failed Round carries no semantic review evidence."
-    };
-  }
-
-  if (!explicitCompletedReviewInfrastructureFailure(round.summary ?? "", round)) {
-    return blocked("completed Round lacks an explicit internal context/workspace failure.");
-  }
-  if (round.reviewerRunId === undefined
-    || yieldedRuns.length !== 1
-    || yieldedRuns[0]!.id !== round.reviewerRunId) {
-    return blocked("completed Round lacks one exact yielded Reviewer Run.");
-  }
-  const yieldedRun = yieldedRuns[0]!;
-  if (yieldedRun.roleName !== round.reviewerRoleName
-    || yieldedRun.summary !== round.summary
-    || yieldedRun.yieldReceipt === undefined) {
-    return blocked(`Reviewer Run ${yieldedRun.id} does not match the non-semantic Round receipt.`);
-  }
-  const receiptMatch = matchYieldReceipt(yieldedRun.yieldReceipt, {
-    status: "yielded",
-    summary: round.summary ?? "",
-    reviewResult: {
-      report: round.report ?? "",
-      checks: round.checks ?? [],
-      ...(frozenHeadEvidenceCommit === undefined
-        ? {}
-        : { evidenceCommit: frozenHeadEvidenceCommit })
-    }
-  });
-  if (receiptMatch === null || receiptMatch.kind !== "replayed") {
-    return blocked(`Reviewer Run ${yieldedRun.id} yield receipt does not cover the Round outcome.`);
-  }
-  if (completionEvents.length !== 1) {
-    return blocked("completed Round lacks one exact completion Event.");
-  }
-  const completion = completionEvents[0]!;
-  if (completion.payload.workItemId !== round.workItemId
-    || completion.payload.candidateId !== round.candidateId
-    || completion.payload.reviewBaseCommit !== round.reviewBaseCommit
-    || completion.payload.evidenceCommit !== (frozenHeadEvidenceCommit ?? "none")
-    || completion.payload.checks !== "none") {
-    return blocked(`Review completion Event ${completion.id} carries mismatched or semantic evidence.`);
-  }
-  return {
-    kind: "non-semantic-terminal",
-    reason: "Completed Round and yielded Run agree on an explicit pre-review infrastructure failure."
-  };
-}
-
-function explicitCompletedReviewInfrastructureFailure(
-  summary: string,
-  round: ReviewRound
-): boolean {
-  if (exactCompletedReviewInfrastructureFailureReport(summary)) {
-    return true;
-  }
-  const legacyReport = summary.trim();
-  if (legacyReport === `Role Run workspace is not the durable owner: ${
-    round.taskId
-  }/${round.reviewerRoleName}.`
-    || (round.reviewerRunId !== undefined
-      && legacyReport === `Review Run workspace is not the durable owner: ${
-        round.reviewerRunId
-      }.`)) {
-    return true;
-  }
-  return /^(?:Run )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)(?:: (?:failure|mismatch|unavailable|unauthorized|stale|mismatched|malformed))?\.?$/iu
-    .test(legacyReport);
-}
-
-function exactCompletedReviewInfrastructureFailureReport(summary: string): boolean {
-  const lines = summary.trim().split(/\r?\n/u);
-  const envelope: readonly RegExp[] = [
-    /^# Review result: (?:context-load|workspace-binding) failure$/u,
-    /^$/u,
-    /^The assigned Run context could not be safely matched to this native session, so no candidate review was performed\.$/u,
-    /^$/u,
-    /^- Run: `[^`\r\n]+`$/u,
-    /^- ReviewRound: `[^`\r\n]+`$/u,
-    /^- Review base commit: `[0-9a-f]{40}`$/u,
-    /^- Frozen target: `[^`\r\n]+`$/u,
-    /^- Authorized workspace from the exact Context Pack: `[^`\r\n]+`$/u,
-    /^- Session-attached workspace: `[^`\r\n]+`$/u,
-    /^- Verification: both paths resolve distinctly and have different filesystem inodes \(`[^`\r\n]+` vs `[^`\r\n]+`\)\.$/u,
-    /^$/u,
-    /^## Findings$/u,
-    /^$/u,
-    /^- Verified-fixed findings: none; review did not start\.$/u,
-    /^- New findings: none; candidate sources were intentionally not inspected\.$/u,
-    /^- Accepted risks: none accepted\.$/u,
-    /^- Residual verification gaps: the complete frozen diff, changed control-flow paths, callers, data-integrity behavior, and required deterministic checks remain unreviewed because the Review workspace binding is mismatched\.$/u,
-    /^$/u,
-    /^## Checks actually run$/u,
-    /^$/u,
-    /^- Exact Context API load: passed for Task\/Run\/Role\/purpose\/subject\/snapshot\/adapter\.$/u,
-    /^- Workspace binding verification: failed\.$/u,
-    /^- Candidate build\/tests\/package checks: not run\.$/u,
-    /^- Real-provider E2E: not run and not authorized\.$/u,
-    /^$/u,
-    /^## Required next action$/u,
-    /^$/u,
-    /^Attach the native Reviewer session to the exact workspace recorded by the Context Pack, or issue a fresh internally consistent Review Run\/Context Pack\. Then perform the complete bounded Task-final review at the frozen head\.$/u
-  ];
-  return lines.length === envelope.length
-    && envelope.every((pattern, index) => pattern.test(lines[index]!));
-}
-
-function runtimeFailureSummaryHasReviewerOutput(summary: string): boolean {
-  const match = /(?:^|\n)last_assistant_message:[ \t]*([\s\S]*)$/u.exec(summary);
-  const output = match?.[1];
-  return output !== undefined && output.trim().length > 0;
-}
-
-function looksLikeStructuredReviewReport(report: string): boolean {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(report) as unknown;
-  } catch {
-    return false;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
-  const record = parsed as Record<string, unknown>;
-  return [
-    "summary",
-    "report",
-    "checks",
-    "findings",
-    "evidence",
-    "evidenceCommit",
-    "deltaDisposition",
-    "deltaReasoning"
-  ].some((key) => Object.hasOwn(record, key));
+  const classification = classifyReviewRoundOutcome(round, store);
+  return classification?.kind === "non-semantic"
+    ? { kind: "non-semantic-terminal", reason: classification.reason }
+    : {
+        kind: "semantic-or-ambiguous",
+        reason: classification?.reason ?? `source status is ${round.status}, not terminal.`
+      };
 }
 
 /**
@@ -4858,9 +4845,9 @@ function validateDeltaRecheckRequest(
   const previous = store.getReviewRound(taskId, preflight.record.previousReviewRoundId);
   if (previous === null
     || (previous.scope ?? "work-item") !== "task"
-    || previous.status !== "completed") {
+    || !isSemanticReviewRound(previous, store)) {
     throw usageError(
-      `Delta-recheck previous ReviewRound is not a completed Task-final Review: `
+      `Delta-recheck previous ReviewRound is not a semantic completed Task-final Review: `
       + `${preflight.record.previousReviewRoundId}.`
     );
   }
@@ -5625,7 +5612,7 @@ function actualTaskReviewCandidateForMutation(
 ): TaskReviewCandidate {
   if (options.actualTaskReviewCandidate === undefined) {
     throw usageError(
-      `Actual Task Project heads were not verified for final Review: ${task.id}.`
+      `Actual Task Project heads were not verified for delivery: ${task.id}.`
     );
   }
   let actual: TaskReviewCandidate;
@@ -5963,8 +5950,8 @@ function prepareFinalTaskReview(
   // Any Task-final ReviewRound is durable completion evidence/obligation.
   // Once one exists, later changes to the mutable global review config cannot
   // weaken the requirement or change its reviewer. Before the first such
-  // Round, the current global `final` config is still the supported way to
-  // establish the policy and queue that initial Round.
+  // Round, the current global `final` config establishes the initial Round
+  // only for integrated delivery.
   const taskRounds = reviewRoundsByIdentity(store.listReviewRounds(task.id))
     .filter((round) => (
       (round.scope ?? "work-item") === "task"
@@ -5979,7 +5966,15 @@ function prepareFinalTaskReview(
     config = taskFinalReviewConfig(taskFinalContract);
   } else if (establishedRound === undefined) {
     const globalConfig = store.getReviewConfig();
-    config = globalConfig?.trigger === "final" ? globalConfig : null;
+    // Direct delivery is an explicit low-overhead contract. Mutable global
+    // policy must not create a managed Round during direct completion; risk
+    // that warrants one promotes the Task to integrated delivery. Any already-
+    // established Task Round or immutable contract remains authoritative
+    // through the branches above.
+    config = taskDeliveryPath(task) === "integrated"
+      && globalConfig?.trigger === "final"
+      ? globalConfig
+      : null;
   } else {
     config = { roleName: establishedRound.reviewerRoleName, trigger: "final" as const };
   }
@@ -6041,7 +6036,10 @@ function prepareFinalTaskReview(
       }
       return escalated;
     } else {
-      return latest.status === "completed" ? null : latest;
+      return latest.status === "completed"
+        && classifyReviewRoundOutcome(latest, store)?.kind === "semantic"
+        ? null
+        : latest;
     }
   }
 
@@ -7448,9 +7446,9 @@ export function dispatchPreparedReviewRound(
     let deltaContext = "";
     if (taskScope && round.deltaRecheck !== undefined) {
       const previousRound = tx.getReviewRound(taskId, round.deltaRecheck.previousReviewRoundId);
-      if (previousRound === null || previousRound.status !== "completed") {
+      if (previousRound === null || !isSemanticReviewRound(previousRound, tx)) {
         throw new TaskFinalReviewDispatchDriftError(
-          `Delta-recheck previous ReviewRound is unavailable: ${round.deltaRecheck.previousReviewRoundId}.`
+          `Delta-recheck previous semantic ReviewRound is unavailable: ${round.deltaRecheck.previousReviewRoundId}.`
         );
       }
       const diffByProject = options.deltaRecheckDiff;
@@ -7833,7 +7831,9 @@ function publishedTreeAuthorizationPayload(
     by: actor,
     projectId: proof.projectId,
     publicationId: proof.publicationId,
-    reviewRoundId: proof.reviewRoundId,
+    ...(proof.reviewRoundId === undefined
+      ? { reviewAnchor: publishedTreeReviewAnchor(proof) }
+      : { reviewRoundId: proof.reviewRoundId }),
     localCommit: proof.localCommit,
     remoteCommit: proof.remoteCommit,
     tree: proof.tree
@@ -7852,7 +7852,8 @@ function matchingPublishedTreeAuthorization(
       && (event.payload.by === "user" || event.payload.by === "operator")
       && event.payload.projectId === proof.projectId
       && event.payload.publicationId === proof.publicationId
-      && event.payload.reviewRoundId === proof.reviewRoundId
+      && (event.payload.reviewAnchor ?? event.payload.reviewRoundId)
+        === publishedTreeReviewAnchor(proof)
       && event.payload.localCommit === proof.localCommit
       && event.payload.remoteCommit === proof.remoteCommit
       && event.payload.tree === proof.tree) {
@@ -7870,10 +7871,16 @@ function requirePublishedTreeAuthorization(
   if (authorization === undefined) {
     throw usageError(
       `Published-tree completion requires explicit user or global Operator authorization for `
-      + `${proof.taskId}/${proof.publicationId} at Task-final Review ${proof.reviewRoundId}.`
+      + `${proof.taskId}/${proof.publicationId} at ${proof.reviewRoundId === undefined
+        ? "the direct Task-main head"
+        : `Task-final Review ${proof.reviewRoundId}`}.`
     );
   }
   return authorization;
+}
+
+function publishedTreeReviewAnchor(proof: TaskCompletionPublishedTreeProof): string {
+  return proof.reviewRoundId ?? "direct";
 }
 
 /** Keeps a free-text run-fact note bounded so an event payload stays compact. */
@@ -8202,6 +8209,11 @@ function parseWorkCreateArgs(
 function parseTaskPriority(value: string): TaskPriority {
   if (["low", "medium", "high", "urgent"].includes(value)) return value as TaskPriority;
   throw usageError(`Invalid Task priority: ${value}.`);
+}
+
+function parseTaskDelivery(value: string): "direct" | "integrated" {
+  if (value === "direct" || value === "integrated") return value;
+  throw usageError(`Task delivery is invalid: ${value}. Use direct or integrated.`);
 }
 
 function parseTaskTags(value: string): string[] {
