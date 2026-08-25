@@ -228,13 +228,13 @@ export const CURRENT_PROJECT_SCHEMA_VERSION = 4 as const;
 export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
-export const CURRENT_TASK_SCHEMA_VERSION = 4 as const;
+export const CURRENT_TASK_SCHEMA_VERSION = 5 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 9 as const;
-export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 4 as const;
+export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 5 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 4 as const;
 export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
@@ -1041,7 +1041,7 @@ export class FileTaskStore implements TaskStore {
         id: aggregate.task.id,
         status: aggregate.task.status,
         projectBindings: aggregate.task.projectBindings,
-        requireIntegration: aggregate.task.requireIntegration
+        type: aggregate.task.type
       },
       workItems: values(aggregate.workItems, "id"),
       changeSets: values(aggregate.changeSets, "id"),
@@ -1778,22 +1778,20 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(`ReviewRound belongs to another Task: ${stored.taskId}.`);
     }
     const aggregate = this.#requireTaskForWrite(taskId);
-    const item = aggregate.workItems[stored.workItemId];
-    if (item === undefined) {
-      throw new StorageRecordError(`ReviewRound Work Item not found: ${stored.workItemId}.`);
-    }
-    const candidate = item.candidates.find(({ id }) => id === stored.candidateId);
-    if (candidate === undefined) {
-      throw new StorageRecordError(`ReviewRound Candidate not found: ${stored.candidateId}.`);
-    }
-    assertWorkItemCandidateReferences(aggregate, item, candidate, `ReviewRound candidate ${stored.id}`);
-    if ((stored.scope ?? "work-item") === "task"
-      && !sameTaskFinalReviewContract(
-        stored.taskFinalReviewContract,
-        candidate.taskFinalReviewContract
-      )) {
-      throw new StorageRecordError(
-        `Task ReviewRound contract does not match its Candidate: ${stored.id}.`
+    if ((stored.scope ?? "work-item") === "work-item") {
+      const item = aggregate.workItems[stored.workItemId!];
+      if (item === undefined) {
+        throw new StorageRecordError(`ReviewRound Work Item not found: ${stored.workItemId}.`);
+      }
+      const candidate = item.candidates.find(({ id }) => id === stored.candidateId);
+      if (candidate === undefined) {
+        throw new StorageRecordError(`ReviewRound Candidate not found: ${stored.candidateId}.`);
+      }
+      assertWorkItemCandidateReferences(
+        aggregate,
+        item,
+        candidate,
+        `ReviewRound candidate ${stored.id}`
       );
     }
     if (stored.reviewerRunId !== undefined) {
@@ -4386,15 +4384,6 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
     }
   }
   for (const round of Object.values(aggregate.reviewRounds)) {
-    const item = aggregate.workItems[round.workItemId];
-    if (item === undefined) {
-      throw new StorageRecordError(`ReviewRound references are invalid: ${round.id}.`);
-    }
-    const candidate = item.candidates.find(({ id }) => id === round.candidateId);
-    if (candidate === undefined) {
-      throw new StorageRecordError(`ReviewRound Candidate not found: ${round.candidateId}.`);
-    }
-    assertWorkItemCandidateReferences(aggregate, item, candidate, `ReviewRound candidate ${round.id}`);
     if ((round.scope ?? "work-item") === "task") {
       const frozenProjects = round.taskCandidate?.projects ?? [];
       if (frozenProjects.length !== boundProjects.size
@@ -4403,14 +4392,21 @@ function validateCanonicalTaskReferences(state: StorageState, aggregate: StoredT
           `Task ReviewRound Projects do not match Task scope: ${round.id}.`
         );
       }
-      if (!sameTaskFinalReviewContract(
-        round.taskFinalReviewContract,
-        candidate.taskFinalReviewContract
-      )) {
-        throw new StorageRecordError(
-          `Task ReviewRound contract does not match its Candidate: ${round.id}.`
-        );
+    } else {
+      const item = aggregate.workItems[round.workItemId!];
+      if (item === undefined) {
+        throw new StorageRecordError(`ReviewRound references are invalid: ${round.id}.`);
       }
+      const candidate = item.candidates.find(({ id }) => id === round.candidateId);
+      if (candidate === undefined) {
+        throw new StorageRecordError(`ReviewRound Candidate not found: ${round.candidateId}.`);
+      }
+      assertWorkItemCandidateReferences(
+        aggregate,
+        item,
+        candidate,
+        `ReviewRound candidate ${round.id}`
+      );
     }
     if (round.reviewerRunId !== undefined) {
       const reviewerRun = aggregate.agentRuns[round.reviewerRunId];
@@ -4577,7 +4573,9 @@ function assertManagedWorkspaceReferences(
           `${label} ReviewRound workspace must be writable: ${taskId}/${round.id}.`
         );
       }
-      const item = aggregate.workItems[round.workItemId];
+      const item = round.workItemId === undefined
+        ? undefined
+        : aggregate.workItems[round.workItemId];
       const candidate = item?.candidates.find(({ id }) => id === round.candidateId);
       const frozenProjects = round.scope === "task"
         ? round.taskCandidate?.projects

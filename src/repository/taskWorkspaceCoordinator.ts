@@ -176,6 +176,7 @@ export class TaskWorkspaceCoordinator {
     if (round.status !== "completed" && round.status !== "failed") {
       throw new Error(`ReviewRound must be terminal before cleanup: ${round.id}.`);
     }
+    if (round.workspaceDisposition?.kind === "reassigned") return "missing";
     // Hold the per-Project maintenance fence so a concurrent migrate/rebuild/
     // archive cannot interleave with worktree removal.
     const workspace = this.store.getReviewRoundWorkspace(taskId, reviewRoundId);

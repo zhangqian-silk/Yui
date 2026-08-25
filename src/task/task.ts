@@ -11,7 +11,6 @@ export type TaskStatus =
   | "retired"
   | "archived";
 export type TaskCompletedBy = "user" | "operator" | "leader";
-export type TaskDeliveryPath = "no-project" | "direct" | "integrated";
 
 export type TaskProjectBinding = Readonly<{
   projectId: string;
@@ -20,37 +19,41 @@ export type TaskProjectBinding = Readonly<{
 }>;
 
 export type TaskMetadata = {
+  /** Project-defined intent. Software Projects normally use `feature` or `bugfix`. */
+  type?: string;
   description?: string;
   priority?: TaskPriority;
   tags?: string[];
   dueAt?: string;
   projectBindings?: readonly TaskProjectBinding[];
   cwd?: string;
-  requireIntegration?: true;
 };
 
 export type TaskMetadataUpdate = Partial<{
   title: string;
+  type: string | null;
   description: string | null;
   priority: TaskPriority | null;
   tags: string[] | null;
   dueAt: string | null;
   projectBindings: readonly TaskProjectBinding[];
   cwd: string;
-  requireIntegration: true;
 }>;
 
 export type Task = {
-  schemaVersion: 4;
+  schemaVersion: 5;
   id: string;
   title: string;
+  /** Project-defined intent; it describes the request, never its execution topology. */
+  type?: string;
   description?: string;
   priority?: TaskPriority;
   tags?: string[];
   dueAt?: string;
   projectBindings: readonly TaskProjectBinding[];
   cwd?: string;
-  requireIntegration?: true;
+  /** Historical v4 delivery selection retained only as migrated audit context. */
+  legacyDeliveryPath?: "direct" | "integrated";
   /**
    * Durable cross-Home-unique workspace identity, minted once on first workspace
    * preparation and reused forever. Absent only for Tasks that never had a
@@ -76,7 +79,7 @@ export type Task = {
 export function createTask(id: string, title: string, now: Date, metadata: TaskMetadata = {}): Task {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: requireSafeIdentity(id, "Task id"),
     title: requireText(title, "Task title"),
     ...cloneMetadata(metadata),
@@ -255,6 +258,7 @@ export function updateTaskMetadata(
 ): Task {
   const updated: Task = { ...task, updatedAt: now.toISOString() };
   if (metadata.title !== undefined) updated.title = requireText(metadata.title, "Task title");
+  applyOptional(updated, "type", metadata.type);
   applyOptional(updated, "description", metadata.description);
   applyOptional(updated, "priority", metadata.priority);
   applyOptional(updated, "tags", metadata.tags === undefined || metadata.tags === null
@@ -265,11 +269,10 @@ export function updateTaskMetadata(
     updated.projectBindings = normalizeProjectBindings(metadata.projectBindings);
   }
   if (metadata.cwd !== undefined) updated.cwd = requireText(metadata.cwd, "Task workspace");
-  if (metadata.requireIntegration === true) updated.requireIntegration = true;
   return updated;
 }
 
-function applyOptional<K extends "description" | "priority" | "tags" | "dueAt">(
+function applyOptional<K extends "type" | "description" | "priority" | "tags" | "dueAt">(
   task: Task,
   key: K,
   value: Task[K] | null | undefined
@@ -288,9 +291,10 @@ export function isTaskArchived(task: Task): boolean {
 }
 
 export function validateTask(task: Task): Task {
-  if (task.schemaVersion !== 4) throw new Error("Task must use schemaVersion 4.");
+  if (task.schemaVersion !== 5) throw new Error("Task must use schemaVersion 5.");
   requireSafeIdentity(task.id, "Task id");
   requireText(task.title, "Task title");
+  if (task.type !== undefined) requireSafeIdentity(task.type, "Task type");
   if (!(["draft", "active", "completed", "retired", "archived"] as const).includes(task.status)) {
     throw new Error(`Task status is invalid: ${String(task.status)}.`);
   }
@@ -317,8 +321,10 @@ export function validateTask(task: Task): Task {
   if (task.dueAt !== undefined) requireTimestamp(task.dueAt, "Task dueAt");
   normalizeProjectBindings(task.projectBindings);
   if (task.cwd !== undefined) requireText(task.cwd, "Task workspace");
-  if (task.requireIntegration !== undefined && task.requireIntegration !== true) {
-    throw new Error("Task requireIntegration must be true when present.");
+  if (task.legacyDeliveryPath !== undefined
+    && task.legacyDeliveryPath !== "direct"
+    && task.legacyDeliveryPath !== "integrated") {
+    throw new Error("Task legacy delivery path is invalid.");
   }
   const completionFields = [task.completedAt, task.completedBy, task.completionSummary];
   const hasAnyCompletion = completionFields.some((value) => value !== undefined);
@@ -403,13 +409,13 @@ function cloneMetadata(
   metadata: TaskMetadata
 ): TaskMetadata & Readonly<{ projectBindings: readonly TaskProjectBinding[] }> {
   const cloned: TaskMetadata & { projectBindings: readonly TaskProjectBinding[] } = {
+    ...(metadata.type === undefined ? {} : { type: requireSafeIdentity(metadata.type, "Task type") }),
     ...(metadata.description === undefined ? {} : { description: metadata.description }),
     ...(metadata.priority === undefined ? {} : { priority: metadata.priority }),
     ...(metadata.tags === undefined ? {} : { tags: [...metadata.tags] }),
     ...(metadata.dueAt === undefined ? {} : { dueAt: metadata.dueAt }),
     projectBindings: normalizeProjectBindings(metadata.projectBindings ?? []),
-    ...(metadata.cwd === undefined ? {} : { cwd: requireText(metadata.cwd, "Task workspace") }),
-    ...(metadata.requireIntegration === true ? { requireIntegration: true as const } : {})
+    ...(metadata.cwd === undefined ? {} : { cwd: requireText(metadata.cwd, "Task workspace") })
   };
   return cloned;
 }
@@ -445,18 +451,6 @@ export function taskProjectBinding(
 
 export function taskHasProjects(task: Task): boolean {
   return task.projectBindings.length > 0;
-}
-
-/**
- * Delivery is a projection of the existing Task contract, not a second source
- * of truth. Keeping it derived preserves every stored Task schema while giving
- * callers one product-level name for the three supported paths.
- */
-export function taskDeliveryPath(
-  task: Readonly<Pick<Task, "projectBindings" | "requireIntegration">>
-): TaskDeliveryPath {
-  if (task.projectBindings.length === 0) return "no-project";
-  return task.requireIntegration === true ? "integrated" : "direct";
 }
 
 export function taskProjectIds(task: Task): readonly string[] {

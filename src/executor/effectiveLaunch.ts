@@ -198,7 +198,9 @@ export function effectiveLaunchSnapshotsCompatible(
  * configuration with which it started. A later Run may resume that exact
  * Session only when the current durable Task workspace proves that every
  * non-commit workspace identity and every other launch field is unchanged.
- * WorkItem, ReviewRound and ExecutionLane workspaces remain strict.
+ * A Task-final Reviewer workspace is also mutable between semantic Rounds: it
+ * keeps one Role-owned physical identity while its frozen commits and Round
+ * identity advance. WorkItem and ExecutionLane workspaces remain strict.
  */
 export function effectiveLaunchSnapshotsCompatibleForTaskMain(
   existing: EffectiveLaunchSnapshot,
@@ -210,15 +212,39 @@ export function effectiveLaunchSnapshotsCompatibleForTaskMain(
   validateEffectiveLaunchSnapshot(desired);
   if (workspace === null || workspace === undefined) return false;
   validateManagedWorkspace(workspace);
-  if (workspace.owner.type !== "task") return false;
   const durableWorkspace: EffectiveLaunchWorkspace = {
     root: workspace.root,
     entries: workspace.entries.map((entry) => ({ ...entry }))
   };
   if (!isDeepStrictEqual(desired.workspace, durableWorkspace)) return false;
+  if (workspace.owner.type === "review-round") {
+    return effectiveLaunchSnapshotsCompatibleForTaskReview(existing, desired);
+  }
+  if (workspace.owner.type !== "task") return false;
   return isDeepStrictEqual(
     taskMainCompatibleSnapshot(existing),
     taskMainCompatibleSnapshot(desired)
+  );
+}
+
+/**
+ * Same Task Reviewer Role, same stable physical workspace and launch policy,
+ * but a new semantic ReviewRound and frozen head. The native Session keeps its
+ * conversation; each AgentRun still records the new exact Round snapshot.
+ */
+export function effectiveLaunchSnapshotsCompatibleForTaskReview(
+  existing: EffectiveLaunchSnapshot,
+  desired: EffectiveLaunchSnapshot
+): boolean {
+  validateEffectiveLaunchSnapshot(existing);
+  validateEffectiveLaunchSnapshot(desired);
+  if (existing.reviewRoundId === undefined
+    || existing.reviewBaseCommit === undefined
+    || desired.reviewRoundId === undefined
+    || desired.reviewBaseCommit === undefined) return false;
+  return isDeepStrictEqual(
+    taskReviewCompatibleSnapshot(existing),
+    taskReviewCompatibleSnapshot(desired)
   );
 }
 
@@ -252,6 +278,27 @@ function taskMainCompatibleSnapshot(snapshot: EffectiveLaunchSnapshot): unknown 
     workspace: {
       root: workspace.root,
       entries: workspace.entries.map(({ baseCommit: _baseCommit, ...entry }) => entry)
+    }
+  };
+}
+
+function taskReviewCompatibleSnapshot(snapshot: EffectiveLaunchSnapshot): unknown {
+  const {
+    sourceDesiredRevision: _sourceDesiredRevision,
+    reviewRoundId: _reviewRoundId,
+    reviewBaseCommit: _reviewBaseCommit,
+    workspace,
+    ...launch
+  } = snapshot;
+  return {
+    ...launch,
+    workspace: {
+      root: workspace.root,
+      entries: workspace.entries.map(({
+        baseCommit: _baseCommit,
+        baseRef: _baseRef,
+        ...entry
+      }) => entry)
     }
   };
 }

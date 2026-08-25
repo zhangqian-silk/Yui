@@ -322,7 +322,7 @@ export function renderExecutionAudit(
         "Task orchestration metrics",
         [
           { header: "Task", minWidth: 7, maxWidth: 14 },
-          { header: "Delivery", minWidth: 8, maxWidth: 10 },
+          { header: "Type", minWidth: 8, maxWidth: 12 },
           { header: "Runs", minWidth: 4, maxWidth: 6 },
           { header: "WIs", minWidth: 3, maxWidth: 5 },
           { header: "Review F/D/N", minWidth: 12, maxWidth: 16 },
@@ -333,7 +333,7 @@ export function renderExecutionAudit(
         ],
         orchestration.tasks.map((task) => [
           task.taskId,
-          task.deliveryPath,
+          task.taskType ?? "unspecified",
           String(task.runs.total),
           String(task.workItems),
           `${task.reviews.full}/${task.reviews.delta}/${task.reviews.nonSemantic}`,

@@ -106,8 +106,8 @@ yui project add app /absolute/workspace/app \
 yui project update app --alias app-cli --development develop
 yui project list
 
-yui task create "修复 CSV 转义" --project app --delivery direct
-yui task create "交付 CSV 导出" --project app --delivery integrated
+yui task create "修复 CSV 转义" --project app --type bugfix
+yui task create "交付 CSV 导出" --project app --type feature
 yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
 yui task show <task-id>
@@ -115,15 +115,13 @@ yui task context <task-id>
 yui task activate <task-id>
 ```
 
-Project 交付路径显式分为两类，但仍复用现有 Task schema。`direct` 用于
-Project Policy 允许的单一低风险修复：Leader 直接在干净且已提交的 Task main
-实现、验证并完成，不要求 WorkItem、IntegrationAttempt 或由全局策略自动创建的
-final ReviewRound。`integrated` 用于受保护、跨 Project、迁移、授权、并发/恢复、
-破坏性或发布改动，并要求 WorkItem、ChangeSet 与 committed Integration 证据。
-全局 final-review 策略只自动约束 integrated Task。direct Task 可使用有边界的原生
-review；若需要独立托管的 final Review，必须在 Task main 前进前提升为 integrated。
-一旦已有提交或交付证据，提升会 fail closed，避免早期修改失去 ChangeSet provenance。
-旧的 `--require-integration` 等价于 `--delivery integrated`，且 integrated 不可降级。
+Task type 描述需求意图，不选择执行协议。软件 Project 通常使用 `bugfix` 或
+`feature`：bugfix 由 Leader 在 Task main 独立、快速完成；如果范围扩大到需要
+独立 owner，应先改为 feature 再创建 WorkItem。feature 由 Leader 判断是自己直接
+交付，还是拆成由不同 Worker 独立负责、可并行推进的较大
+WorkItem。实现步骤、测试、review finding 和局部修复都不是 WorkItem。只有当一项
+需求本身具有独立 owner 和可验收结果时才创建 WorkItem；一旦 WorkItem 产生 Git
+结果，就必须通过 ChangeSet 和 committed Integration 汇总回 Leader 的 Task main。
 
 面向用户的时间默认按北京时间（`Asia/Shanghai`）显示；持久化记录和
 `--json` 数据仍使用 UTC/RFC 3339。可通过以下命令查看或修改 IANA 时区：
@@ -142,9 +140,8 @@ yui config show
 yui config workflow clear review
 ```
 
-对带 Project 的软件交付，可使用 `--trigger final`：WorkItem 验收与
-Integration 保持独立，在 Task 完成前只对所有已集成 Project 的冻结候选做
-一次 Task 级 ReviewRound：
+对带 Project 的软件交付，可使用 `--trigger final` 提供默认 Reviewer Role；
+是否需要独立的 Task-final Review 仍由 Leader 根据风险判断：
 
 ```sh
 yui config workflow set review --role reviewer --trigger final
@@ -161,11 +158,13 @@ AgentRun 不创建新 WorkItem，也不会递归触发审查。审查以自然�
 唤醒 Leader；Leader 决定验收、reject 后在原 Role 与原 Session 中修复、
 再次审查，或通过 InputRequest 询问用户。审查失败会保留为可见证据并
 唤醒 Leader，但不会取代 Leader 的最终判断。
-`final` 不为每个 WorkItem 创建完整 ReviewRound；integrated Task 的
-`task complete` 会在每个绑定 Project 都有 committed Integration 后排队一次
-Task 级 Review。direct Task 不会因可变的全局 final 配置自动增加 Review。冻结的集成头
-发生变化时才会重新排队，旧报告仍保留为证据。Reviewer 按 Project Policy/Knowledge
-检查整个 Task，并只报告有直接证据的可达、重要、可行动问题或有限验证缺口。
+`final` 不为每个 WorkItem 创建完整 ReviewRound，也不决定 Task 拓扑。Leader
+显式请求 Task 级 Review；不可变 Task contract 也可以强制要求。Task-final Round
+直接冻结 Task main，不需要虚构 WorkItem/Candidate，因此没有 WorkItem 的小任务也能
+review。冻结头变化时创建新的语义 Round；同一 Reviewer 的兼容原生 Session 可以在
+稳定 workspace 中继续，而每个 Run 仍严格绑定自己的 Round 和冻结头。旧报告保留为
+证据。Reviewer 按 Project Policy/Knowledge 检查整个 Task，并只报告有直接证据的
+可达、重要、可行动问题或有限验证缺口。
 所有候选、ReviewRound 和 Leader 决策都集中在原 WorkItem 下；reject
 后的下一轮会复用原执行 Role、Session 与 workspace，并追加新候选。
 

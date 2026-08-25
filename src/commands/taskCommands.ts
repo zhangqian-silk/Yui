@@ -169,7 +169,6 @@ import {
   createTask,
   retireTask,
   reopenTask,
-  taskDeliveryPath,
   updateTaskMetadata,
   type TaskCompletedBy,
   type Task,
@@ -805,13 +804,12 @@ function updateTaskCommand(
   options: TaskCommandOptions
 ): string {
   const optionNames = new Set([
-    "--title", "--description", "--priority", "--tags", "--due-at", "--delivery"
+    "--title", "--type", "--description", "--priority", "--tags", "--due-at"
   ]);
   const flagOptions = new Set([
-    "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at",
-    "--require-integration"
+    "--clear-type", "--clear-description", "--clear-priority", "--clear-tags", "--clear-due-at"
   ]);
-  const usage = "Task update usage: yui task update <id> [--title <text>] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at] [--delivery <direct|integrated>] [--require-integration].";
+  const usage = "Task update usage: yui task update <id> [--title <text>] [--type <project-defined-type>|--clear-type] [--description <text>|--clear-description] [--priority <low|medium|high|urgent>|--clear-priority] [--tags <comma-separated>|--clear-tags] [--due-at <RFC3339>|--clear-due-at].";
   const parsed = parseTail(args, optionNames, usage, flagOptions);
   exactPositionals(parsed.positionals, 1, usage);
   if (parsed.options.size === 0) throw usageError("At least one Task metadata option is required.", usage);
@@ -834,51 +832,15 @@ function updateTaskCommand(
   const tags = parsed.options.has("--tags")
     ? parseTaskTags(requiredOption(parsed.options, "--tags"))
     : undefined;
-  const requestedDelivery = parsed.options.has("--delivery")
-    ? parseTaskDelivery(requiredOption(parsed.options, "--delivery"))
-    : undefined;
-  if (requestedDelivery === "direct" && parsed.options.has("--require-integration")) {
-    throw usageError("--delivery direct conflicts with --require-integration.", usage);
-  }
-  const enableIntegration = requestedDelivery === "integrated"
-    || parsed.options.has("--require-integration");
   const now = clock(options);
   const result = store.transaction((tx) => {
     const current = requireTask(tx, parsed.positionals[0]);
     if (current.status === "archived") throw usageError(`Task is archived: ${current.id}.`);
-    if ((requestedDelivery !== undefined || parsed.options.has("--require-integration"))
-      && current.projectBindings.length === 0) {
-      throw usageError(
-        `Task ${current.id} has no Project; delivery selection is not applicable.`
-      );
-    }
-    if (requestedDelivery === "direct" && current.requireIntegration === true) {
-      throw usageError(
-        `Task ${current.id} already uses integrated delivery and cannot be downgraded to direct.`
-      );
-    }
-    if (enableIntegration && current.status === "completed") {
-      throw usageError(
-        `Task ${current.id} is completed; use task reopen before enabling integration evidence.`
-      );
-    }
-    if (enableIntegration && current.requireIntegration !== true) {
-      assertTaskDeliveryPromotionEligible(tx, current, options.directTaskMainSnapshot);
-    }
-    if (
-      parsed.options.size === 1
-      && enableIntegration
-      && current.requireIntegration === true
-    ) {
-      return { task: current, integrationState: "already-enabled" as const };
-    }
-    if (parsed.options.size === 1
-      && requestedDelivery === "direct"
-      && taskDeliveryPath(current) === "direct") {
-      return { task: current, integrationState: "already-direct" as const };
-    }
     const updated = updateTaskMetadata(current, {
       ...(parsed.options.has("--title") ? { title: requiredOption(parsed.options, "--title") } : {}),
+      ...(parsed.options.has("--type")
+        ? { type: requiredOption(parsed.options, "--type") }
+        : parsed.options.has("--clear-type") ? { type: null } : {}),
       ...(parsed.options.has("--description")
         ? { description: requiredOption(parsed.options, "--description") }
         : parsed.options.has("--clear-description") ? { description: null } : {}),
@@ -890,108 +852,18 @@ function updateTaskCommand(
         : { tags }),
       ...(dueAt === undefined
         ? parsed.options.has("--clear-due-at") ? { dueAt: null } : {}
-        : { dueAt }),
-      ...(enableIntegration ? { requireIntegration: true } : {})
+        : { dueAt })
     }, now);
     tx.saveTask(updated);
     recordTaskEvent(tx, updated.id, "task.updated", {
       status: updated.status,
-      ...(requestedDelivery === undefined && !parsed.options.has("--require-integration")
-        ? {}
-        : {
-            completionEvidence: enableIntegration
-              ? "integration-required"
-              : "direct",
-            deliveryPath: taskDeliveryPath(updated)
-          })
+      ...(updated.type === undefined ? {} : { taskType: updated.type })
     }, now);
     enqueueWork(tx, taskMailbox(updated.id), "task-updated", now, [taskRef(updated.id)]);
-    return {
-      task: updated,
-      integrationState: enableIntegration
-        ? "enabled" as const
-        : requestedDelivery === "direct"
-          ? "direct" as const
-          : "unchanged" as const
-    };
+    return updated;
   });
-  if (result.integrationState !== "already-enabled"
-    && result.integrationState !== "already-direct") {
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-  }
-  return result.integrationState === "enabled"
-    ? `Updated task ${result.task.id}\nDelivery: integrated (WorkItem, ChangeSet, and committed Integration required)\n`
-    : result.integrationState === "already-enabled"
-      ? `Task ${result.task.id} already uses integrated delivery\n`
-      : result.integrationState === "already-direct"
-        ? `Task ${result.task.id} already uses direct delivery\n`
-        : result.integrationState === "direct"
-          ? `Updated task ${result.task.id}\nDelivery: direct\n`
-          : `Updated task ${result.task.id}\n`;
-}
-
-function assertTaskDeliveryPromotionEligible(
-  store: TaskWorkflowStore,
-  task: Task,
-  snapshot: DirectTaskMainSnapshot | undefined
-): void {
-  const evidence = [
-    ...store.listWorkItems(task.id).map(({ id }) => `WorkItem ${id}`),
-    ...store.listChangeSets(task.id).map(({ id }) => `ChangeSet ${id}`),
-    ...store.listIntegrationAttempts(task.id).map(({ id }) => `IntegrationAttempt ${id}`),
-    ...store.listReviewRounds(task.id).map(({ id }) => `ReviewRound ${id}`)
-  ];
-  if (evidence.length > 0) {
-    throw usageError(
-      `Task ${task.id} cannot promote to integrated delivery after delivery evidence exists: `
-      + `${evidence.join(", ")}. Create an integrated replacement Task or keep the current direct contract.`
-    );
-  }
-  if (task.status !== "draft" && task.status !== "active") {
-    throw usageError(
-      `Task ${task.id} must be Draft or Active to promote delivery; current status is ${task.status}.`
-    );
-  }
-  const workspace = store.getTaskWorkspace(task.id);
-  if (task.status === "draft" && workspace === null) return;
-  if (snapshot === undefined) {
-    throw usageError(
-      `Task ${task.id} delivery promotion requires a CLI-verified clean Task-main snapshot.`
-    );
-  }
-  if (workspace === null
-    || workspace.owner.type !== "task"
-    || workspace.owner.taskId !== task.id) {
-    throw usageError(`Task has no authoritative main workspace: ${task.id}.`);
-  }
-  const snapshotIds = snapshot.schemaVersion === 1 && Array.isArray(snapshot.projects)
-    ? snapshot.projects.map(({ projectId }) => projectId)
-    : [];
-  if (snapshotIds.length !== task.projectBindings.length
-    || new Set(snapshotIds).size !== snapshotIds.length) {
-    throw usageError(`Task-main promotion snapshot does not match bound Projects: ${task.id}.`);
-  }
-  for (const binding of task.projectBindings) {
-    const project = snapshot.projects.find(({ projectId }) => projectId === binding.projectId);
-    const entry = workspace.entries.find(({ projectId }) => projectId === binding.projectId);
-    if (project === undefined
-      || entry === undefined
-      || entry.access !== "write"
-      || project.directory !== entry.directory
-      || project.branch !== entry.branch
-      || project.baseCommit !== entry.baseCommit) {
-      throw usageError(
-        `Task-main promotion snapshot changed before mutation: ${task.id}/${binding.projectId}.`
-      );
-    }
-    if (project.headCommit !== project.baseCommit) {
-      throw usageError(
-        `Task ${task.id} main already advanced for Project ${binding.projectId}; `
-        + "cannot promote without losing ChangeSet provenance. Create an integrated replacement "
-        + "Task or keep the current direct contract."
-      );
-    }
-  }
+  notifyMailbox(options.runtime, taskMailbox(result.id), result.id);
+  return `Updated task ${result.id}\n`;
 }
 
 /** Compatibility helper for call sites that cannot yet handle foreground enter. */
@@ -1048,22 +920,19 @@ function createTaskCommand(
   const now = clock(options);
   const created = store.transaction((tx) => createTaskAggregate(tx, parsed.title, {
     projectBindings: parsed.projectBindings,
-    ...(parsed.requireIntegration ? { requireIntegration: true } : {})
+    ...(parsed.type === undefined ? {} : { type: parsed.type })
   }, now, parsed.defaultProjectIds));
   notifyMailbox(options.runtime, taskMailbox(created.task.id), created.task.id);
   return output(
     `Created Draft task ${created.task.id}: ${created.task.title}\n`
       + `Assigned role: ${created.leader.name}\n`
-      + `Delivery: ${taskDeliveryPath(created.task)}\n`
-      + (created.task.requireIntegration
-        ? "Completion: WorkItem, ChangeSet, and committed Integration required\n"
-        : created.task.projectBindings.length > 0
-          ? "Completion: clean committed Task main required; no WorkItem, ChangeSet, IntegrationAttempt, or managed ReviewRound required\n"
-          : "Completion: no Project delivery evidence required\n"),
+      + `Type: ${created.task.type ?? "unspecified"}\n`
+      + (created.task.projectBindings.length > 0
+        ? "Execution: Leader decides whether independent WorkItems are warranted\n"
+        : "Execution: no Project delivery evidence required\n"),
     {
       task: created.task,
-      leader: created.leader,
-      deliveryPath: taskDeliveryPath(created.task)
+      leader: created.leader
     }
   );
 }
@@ -1073,17 +942,16 @@ function parseTaskCreation(
   store: TaskWorkflowStore
 ): Readonly<{
   title: string;
+  type?: string;
   projectBindings: readonly TaskProjectBinding[];
   defaultProjectIds: readonly string[];
-  requireIntegration: boolean;
 }> {
-  const usage = "Task create usage: yui task create <title> [--project <project> ...] [--base <project>=<ref> ...] [--delivery <direct|integrated>] [--require-integration].";
+  const usage = "Task create usage: yui task create <title> [--type <project-defined-type>] [--project <project> ...] [--base <project>=<ref> ...].";
   const parsed = parseMultiValueTail(
     args,
-    new Set(["--delivery"]),
+    new Set(["--type"]),
     new Set(["--project", "--base"]),
-    usage,
-    new Set(["--require-integration"])
+    usage
   );
   exactPositionals(parsed.positionals, 1, usage);
   const projectReferences = parsed.multiOptions.get("--project") ?? [];
@@ -1098,16 +966,6 @@ function parseTaskCreation(
   });
   if (new Set(projects.map(({ id }) => id)).size !== projects.length) {
     throw usageError("A Task cannot bind the same Project more than once.");
-  }
-  const requestedDelivery = parsed.options.has("--delivery")
-    ? parseTaskDelivery(requiredOption(parsed.options, "--delivery"))
-    : undefined;
-  if ((requestedDelivery !== undefined || parsed.options.has("--require-integration"))
-    && projects.length === 0) {
-    throw usageError("Delivery selection requires at least one --project.", usage);
-  }
-  if (requestedDelivery === "direct" && parsed.options.has("--require-integration")) {
-    throw usageError("--delivery direct conflicts with --require-integration.", usage);
   }
   const bases = new Map<string, string>();
   for (const option of baseOptions) {
@@ -1131,14 +989,15 @@ function parseTaskCreation(
     .map(({ id }) => id);
   return {
     title: parsed.positionals[0],
+    ...(parsed.options.has("--type")
+      ? { type: requiredOption(parsed.options, "--type") }
+      : {}),
     projectBindings: projects.map((project) => ({
       projectId: project.id,
       directory: project.name,
       baseRef: bases.get(project.id) ?? project.developmentBranch
     })),
-    defaultProjectIds,
-    requireIntegration: requestedDelivery === "integrated"
-      || parsed.options.has("--require-integration")
+    defaultProjectIds
   };
 }
 
@@ -1155,7 +1014,7 @@ function createTaskAggregate(
   store.saveRole(task.id, leader);
   recordTaskEvent(store, task.id, "task.created", {
     status: task.status,
-    deliveryPath: taskDeliveryPath(task),
+    ...(task.type === undefined ? {} : { taskType: task.type }),
     ...(defaultProjectIds.length === 0
       ? {}
       : { defaultProjectIds: defaultProjectIds.join(",") })
@@ -1213,16 +1072,14 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Task: ${task.id}`,
     `Title: ${task.title}`,
     `Status: ${task.status}`,
-    `Delivery: ${taskDeliveryPath(task)}`,
+    `Type: ${task.type ?? "unspecified"}`,
     ...(task.description === undefined ? [] : [`Description: ${task.description}`]),
     ...(task.priority === undefined ? [] : [`Priority: ${task.priority}`]),
     ...(task.tags === undefined ? [] : [`Tags: ${task.tags.join(", ")}`]),
     ...(task.dueAt === undefined ? [] : [`Due: ${presentTime(task.dueAt, timeZone)}`]),
-    `Completion evidence: ${task.requireIntegration === true
-      ? "WorkItem, ChangeSet, and committed Integration required"
-      : task.projectBindings.length > 0
-        ? "clean committed Task main required"
-        : "no Project evidence required"}`,
+    `Execution topology: ${task.projectBindings.length > 0
+      ? "Leader-owned; WorkItems are optional independent delivery units"
+      : "no Project delivery evidence required"}`,
     ...(task.completedAt === undefined ? [] : [`Completed: ${presentTime(task.completedAt, timeZone)}`]),
     ...(task.completedBy === undefined ? [] : [`Completed by: ${task.completedBy}`]),
     ...(task.completionSummary === undefined ? [] : [`Completion summary: ${task.completionSummary}`]),
@@ -1253,12 +1110,7 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `Created: ${presentTime(task.createdAt, timeZone)}`,
     `Updated: ${presentTime(task.updatedAt, timeZone)}`
   ].join("\n").concat("\n");
-  return output(rendered, {
-    task,
-    deliveryPath: taskDeliveryPath(task),
-    counts,
-    hasBrief: brief !== null
-  });
+  return output(rendered, { task, counts, hasBrief: brief !== null });
 }
 
 function activateTaskCommand(
@@ -1403,7 +1255,7 @@ function completeTaskCommand(
     }
 
     // A final (Task-scoped) review is the Task delivery policy: it reviews the
-    // complete integrated Task heads, not a single WorkItem Candidate. If the
+    // complete frozen Task heads, not a single WorkItem Candidate. If the
     // review config requests a final review, create the Task ReviewRound here
     // and return it for dispatch instead of completing the Task.
     const pendingFinalReviewIds = new Set(tx.listReviewRounds(task.id)
@@ -1472,7 +1324,6 @@ function completeTaskCommand(
     recordTaskEvent(tx, task.id, "task.completed", {
       by: actor,
       summary,
-      deliveryPath: taskDeliveryPath(task),
       ...(actualTaskCandidate === undefined
         ? {}
         : {
@@ -3413,18 +3264,20 @@ function executionTargetForWorkItem(
 function executionTargetForReviewRound(
   task: Task,
   round: ReviewRound,
-  item: WorkItem,
-  candidate: WorkItemCandidate
+  item?: WorkItem,
+  candidate?: WorkItemCandidate
 ): ExecutionTarget {
   const taskScope = (round.scope ?? "work-item") === "task";
+  if (!taskScope && (item === undefined || candidate === undefined)) {
+    throw dataError(`WorkItem ReviewRound target is missing its Candidate: ${round.id}.`);
+  }
   const projects = taskScope
     ? round.taskCandidate?.projects ?? []
-    : candidate.gitSnapshot?.projects ?? [];
+    : candidate!.gitSnapshot?.projects ?? [];
   const fingerprint = JSON.stringify({
     taskId: task.id,
     reviewRoundId: round.id,
-    workItemId: item.id,
-    candidateId: candidate.id,
+    ...(taskScope ? {} : { workItemId: item!.id, candidateId: candidate!.id }),
     scope: taskScope ? "task" : "work-item",
     projects,
     contractDigest: round.taskFinalReviewContract?.digest
@@ -3433,9 +3286,10 @@ function executionTargetForReviewRound(
     schemaVersion: 1,
     kind: taskScope ? "task-final-review" : "work-item",
     taskId: task.id,
-    workItemId: item.id,
-    candidateId: candidate.id,
-    revision: candidate.workItemRevision,
+    ...(taskScope ? {} : { workItemId: item!.id, candidateId: candidate!.id }),
+    // A Task-final ReviewRound is itself the immutable semantic target. Runs
+    // retry that same revision; a changed frozen Task creates a new Round.
+    revision: taskScope ? 1 : candidate!.workItemRevision,
     projects,
     ...(round.taskFinalReviewContract === undefined
       ? {}
@@ -4178,7 +4032,7 @@ function resolveReviewExecutionGroup(
       reconcileReviewFindingsAfterReview(tx, task.id, terminal.id, now);
     }
     enqueueWork(tx, leaderMailbox(task.id), "review-group-resolved", now, [
-      workItemRef(task.id, round.workItemId)
+      ...(round.workItemId === undefined ? [] : [workItemRef(task.id, round.workItemId)])
     ]);
     return terminal;
   });
@@ -4464,7 +4318,6 @@ function requestTaskReviewRound(
     if (producerCollision !== null) {
       throw usageError(producerCollision);
     }
-    const anchor = latestTaskReviewAnchor(tx, task);
     const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id))
       .filter((entry) => (entry.scope ?? "work-item") === "task");
     const exact = taskRounds.filter((entry) => (
@@ -4597,8 +4450,6 @@ function requestTaskReviewRound(
       ? createTaskReviewRound(
           tx.nextReviewRoundId(task.id),
           task.id,
-          anchor.item.id,
-          anchor.candidate.id,
           reviewerRoleName,
           "leader",
           provenance.candidate,
@@ -4608,8 +4459,6 @@ function requestTaskReviewRound(
       : createTaskDeltaReviewRound(
           tx.nextReviewRoundId(task.id),
           task.id,
-          anchor.item.id,
-          anchor.candidate.id,
           reviewerRoleName,
           "leader",
           provenance.candidate,
@@ -4622,7 +4471,7 @@ function requestTaskReviewRound(
       task.id,
       {
         purpose: "review",
-        target: executionTargetForReviewRound(task, created, anchor.item, anchor.candidate),
+        target: executionTargetForReviewRound(task, created),
         strategy,
         lanes: laneRoles.map((roleName) => ({ roleName, reviewRoundId: created.id }))
       },
@@ -4650,8 +4499,6 @@ function requestTaskReviewRound(
     }
     recordTaskEvent(tx, task.id, "review.task-final-requested", {
       reviewRoundId: created.id,
-      workItemId: created.workItemId,
-      candidateId: created.candidateId,
       reviewerRoleName: created.reviewerRoleName,
       requestedBy: created.requestedBy,
       taskCandidate: JSON.stringify(created.taskCandidate),
@@ -4727,8 +4574,6 @@ function forceFreshTaskReviewRound(
       if (replacement === null
         || replacement.id === source.id
         || (replacement.scope ?? "work-item") !== "task"
-        || replacement.workItemId !== source.workItemId
-        || replacement.candidateId !== source.candidateId
         || replacement.reviewerRoleName !== source.reviewerRoleName
         || replacement.deltaRecheck !== undefined
         || !sameTaskFinalReviewContract(
@@ -4736,8 +4581,6 @@ function forceFreshTaskReviewRound(
           source.taskFinalReviewContract
         )
         || !isSameTaskReviewCandidate(replacement.taskCandidate, source.taskCandidate!)
-        || replacementEvent.payload.workItemId !== replacement.workItemId
-        || replacementEvent.payload.candidateId !== replacement.candidateId
         || replacementEvent.payload.reviewerRoleName !== replacement.reviewerRoleName
         || replacementEvent.payload.taskCandidate !== JSON.stringify(replacement.taskCandidate)) {
         throw dataError(`Force-fresh audit for ${source.id} does not match its replacement Round.`);
@@ -4768,14 +4611,6 @@ function forceFreshTaskReviewRound(
       );
     }
 
-    const item = tx.getWorkItem(task.id, source.workItemId);
-    const candidate = item?.candidates.find(({ id }) => id === source.candidateId);
-    if (item === null || item === undefined || candidate === undefined) {
-      throw dataError(
-        `Final Review anchor Candidate is no longer available: `
-        + `${source.workItemId}/${source.candidateId}.`
-      );
-    }
     const provenance = taskReviewProvenance(tx, task, options);
     if (!isSameTaskReviewCandidate(source.taskCandidate, provenance.candidate)) {
       throw usageError(
@@ -4820,8 +4655,6 @@ function forceFreshTaskReviewRound(
     let created = createTaskReviewRound(
       tx.nextReviewRoundId(task.id),
       task.id,
-      source.workItemId,
-      source.candidateId,
       source.reviewerRoleName,
       "leader",
       source.taskCandidate,
@@ -4833,7 +4666,7 @@ function forceFreshTaskReviewRound(
       task.id,
       {
         purpose: "review",
-        target: executionTargetForReviewRound(task, created, item, candidate),
+        target: executionTargetForReviewRound(task, created),
         strategy: { mode: "fixed", count: 1 },
         lanes: [{ roleName: reviewer.name, reviewRoundId: created.id }]
       },
@@ -4845,8 +4678,6 @@ function forceFreshTaskReviewRound(
       sourceReviewRoundId: source.id,
       ...(source.reviewerRunId === undefined ? {} : { sourceReviewerRunId: source.reviewerRunId }),
       reviewRoundId: created.id,
-      workItemId: created.workItemId,
-      candidateId: created.candidateId,
       reviewerRoleName: created.reviewerRoleName,
       taskCandidate: JSON.stringify(created.taskCandidate),
       reason: "source-round-terminal-without-semantic-review",
@@ -5061,17 +4892,9 @@ function retryFailedTaskReviewRound(
       throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
     }
 
-    // Re-read the exact current integrated heads and all ChangeSet-linked
-    // WorkItem producer roles before touching any record. A moved head,
-    // missing anchor, malformed provenance, or reviewer collision fails closed
-    // with the old failed Round byte-for-byte unchanged.
-    const item = tx.getWorkItem(task.id, round.workItemId);
-    if (item === null || item.candidates.every(({ id }) => id !== round.candidateId)) {
-      throw dataError(
-        `Final Review anchor Candidate is no longer available: `
-        + `${round.workItemId}/${round.candidateId}.`
-      );
-    }
+    // Re-read the exact current Task heads and producer roles before touching
+    // any record. A moved head or reviewer collision fails closed with the old
+    // failed Round byte-for-byte unchanged.
     const provenance = taskReviewProvenance(tx, task, options);
     if (!isSameTaskReviewCandidate(round.taskCandidate, provenance.candidate)) {
       throw usageError(
@@ -5153,9 +4976,7 @@ function retryFailedTaskReviewRound(
     const resetRound = retryTaskReviewRound(round);
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "review.task-final-retried", {
-      reviewRoundId: round.id,
-      workItemId: round.workItemId,
-      candidateId: round.candidateId
+      reviewRoundId: round.id
     }, now);
     return { round: resetRound, created: true } as const;
   });
@@ -5388,7 +5209,7 @@ function listRuns(
  * on. This is deliberately narrower than retry: it cannot manufacture a
  * review or fail an arbitrary Round, and every identity/mailbox fence is
  * checked before the old Round changes. The next normal Task completion then
- * creates one fresh Round over the newer integrated heads.
+ * creates one fresh Round over the newer frozen Task heads.
  */
 function settleStaleFinalReviewRun(
   args: string[],
@@ -5434,15 +5255,6 @@ function settleStaleFinalReviewRun(
         `Review Run ${run.id} identity does not match its ReviewRound or frozen Task state changed: ${validation.reason ?? "mismatch"}.`
       );
     }
-    const item = tx.getWorkItem(task.id, round.workItemId);
-    if (item === null) {
-      throw dataError(`Work item not found for run ${run.id}: ${round.workItemId}.`);
-    }
-    const candidate = item.candidates.find(({ id }) => id === round.candidateId);
-    if (candidate === undefined) {
-      throw dataError(`ReviewRound Candidate not found: ${round.candidateId}.`);
-    }
-
     const activeReviewerRun = tx.listAgentRuns(task.id).find((entry) => (
       entry.purpose === "review" && entry.status === "active"
     ));
@@ -5551,7 +5363,6 @@ function settleStaleFinalReviewRun(
     recordTaskEvent(tx, task.id, "run.review-stale-settled", {
       runId: run.id,
       reviewRoundId: round.id,
-      candidateId: candidate.id,
       previousTaskCandidate: JSON.stringify(round.taskCandidate),
       currentTaskCandidate: JSON.stringify(currentTaskCandidate)
     }, now);
@@ -5805,7 +5616,7 @@ function taskReviewProducerCollision(
     .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
   return workItemIds.length === 0
     ? null
-    : `Reviewer Role must be separate from every integrated Candidate producer: `
+    : `Reviewer Role must be separate from every WorkItem Candidate producer: `
       + `${reviewerRoleName} (${workItemIds.join(", ")}).`;
 }
 
@@ -5828,7 +5639,7 @@ function taskReviewProvenance(
 ): TaskReviewProvenance {
   const candidate = actualTaskReviewCandidateForMutation(store, task, options);
   if (expected !== undefined && !isSameTaskReviewCandidate(candidate, expected)) {
-    throw usageError(`Task-final ReviewRound frozen integrated heads changed for its Project set.`);
+    throw usageError(`Task-final ReviewRound frozen Task heads changed for its Project set.`);
   }
   const producerRoles = new Set<string>();
   const producerWorkItemIds = new Map<string, Set<string>>();
@@ -5980,26 +5791,6 @@ function assertNoConflictingTaskReviewRound(
   }
 }
 
-function latestTaskReviewAnchor(
-  store: TaskWorkflowStore,
-  task: Task
-): Readonly<{ item: WorkItem; candidate: WorkItemCandidate }> {
-  const item = [...store.listWorkItems(task.id)]
-    .filter(({ candidates }) => candidates.length > 0)
-    .sort((left, right) => (
-      left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
-    ))
-    .at(-1);
-  if (item === undefined) {
-    throw usageError(`Task ${task.id} has no WorkItem Candidate to anchor its final Review.`);
-  }
-  const candidate = item.candidates.at(-1);
-  if (candidate === undefined) {
-    throw usageError(`Task ${task.id} has no WorkItem Candidate to anchor its final Review.`);
-  }
-  return { item, candidate };
-}
-
 /**
  * Queues a Task-scoped final ReviewRound. The reviewer Role must be separate
  * from the Candidate producer. Returns the round (pending or failed) so the
@@ -6008,8 +5799,6 @@ function latestTaskReviewAnchor(
 function queueTaskReviewRound(
   store: TaskWorkflowStore,
   task: Task,
-  item: WorkItem,
-  candidateId: string,
   config: ReviewConfig,
   taskCandidate: TaskReviewCandidate,
   options: TaskCommandOptions,
@@ -6020,13 +5809,11 @@ function queueTaskReviewRound(
   assertNoConflictingTaskReviewRound(store.listReviewRounds(task.id));
   const provenance = taskReviewProvenance(store, task, options, taskCandidate);
   if (!isSameTaskReviewCandidate(provenance.candidate, taskCandidate)) {
-    throw usageError(`Task-final ReviewRound integrated heads changed before queueing.`);
+    throw usageError(`Task-final ReviewRound frozen Task heads changed before queueing.`);
   }
   const pending = createTaskReviewRound(
     store.nextReviewRoundId(task.id),
     task.id,
-    item.id,
-    candidateId,
     config.roleName,
     requestedBy,
     taskCandidate,
@@ -6091,8 +5878,8 @@ function prepareFinalTaskReview(
   // Any Task-final ReviewRound is durable completion evidence/obligation.
   // Once one exists, later changes to the mutable global review config cannot
   // weaken the requirement or change its reviewer. Before the first such
-  // Round, the current global `final` config establishes the initial Round
-  // only for integrated delivery.
+  // Round, the current global `final` config remains an available Reviewer
+  // default but does not establish an obligation by itself.
   const taskRounds = reviewRoundsByIdentity(store.listReviewRounds(task.id))
     .filter((round) => (
       (round.scope ?? "work-item") === "task"
@@ -6106,16 +5893,10 @@ function prepareFinalTaskReview(
   if (taskFinalContract !== undefined) {
     config = taskFinalReviewConfig(taskFinalContract);
   } else if (establishedRound === undefined) {
-    const globalConfig = store.getReviewConfig();
-    // Direct delivery is an explicit low-overhead contract. Mutable global
-    // policy must not create a managed Round during direct completion; risk
-    // that warrants one promotes the Task to integrated delivery. Any already-
-    // established Task Round or immutable contract remains authoritative
-    // through the branches above.
-    config = taskDeliveryPath(task) === "integrated"
-      && globalConfig?.trigger === "final"
-      ? globalConfig
-      : null;
+    // The configured Reviewer is available to the Leader, but does not choose
+    // the Task topology. A managed final Review becomes an obligation only
+    // after the Leader requests one (or an immutable Task contract requires it).
+    config = null;
   } else {
     config = { roleName: establishedRound.reviewerRoleName, trigger: "final" as const };
   }
@@ -6149,14 +5930,9 @@ function prepareFinalTaskReview(
       && latest.deltaRecheck !== undefined
       && latest.deltaRecheck.disposition === "requires-full-review") {
       // Fall through to queue a full Review for the same candidate.
-      const anchor = taskFinalContract === undefined
-        ? latestTaskReviewAnchor(store, task)
-        : latestTaskReviewContractAnchor(store, task, taskFinalContract);
       const escalated = queueTaskReviewRound(
         store,
         task,
-        anchor.item,
-        anchor.candidate.id,
         config,
         taskCandidate,
         options,
@@ -6184,14 +5960,9 @@ function prepareFinalTaskReview(
     }
   }
 
-  const anchor = taskFinalContract === undefined
-    ? latestTaskReviewAnchor(store, task)
-    : latestTaskReviewContractAnchor(store, task, taskFinalContract);
   return queueTaskReviewRound(
     store,
     task,
-    anchor.item,
-    anchor.candidate.id,
     config,
     taskCandidate,
     options,
@@ -6285,32 +6056,6 @@ function assertPendingFinalReviewWorkspaceEvidence(
   }
 }
 
-function latestTaskReviewContractAnchor(
-  store: TaskWorkflowStore,
-  task: Task,
-  taskFinalContract: TaskFinalReviewContract
-): Readonly<{ item: WorkItem; candidate: WorkItemCandidate }> {
-  const anchor = store.listWorkItems(task.id)
-    .flatMap((item) => {
-      const candidate = governingWorkItemCandidate(item);
-      return candidate !== undefined && sameTaskFinalReviewContract(
-        candidate.taskFinalReviewContract,
-        taskFinalContract
-      )
-        ? [{ item, candidate }]
-        : [];
-    })
-    .sort((left, right) => (
-      left.item.updatedAt.localeCompare(right.item.updatedAt)
-      || left.item.id.localeCompare(right.item.id)
-    ))
-    .at(-1);
-  if (anchor === undefined) {
-    throw usageError(`Task ${task.id} has no WorkItem Candidate to anchor its final Review.`);
-  }
-  return anchor;
-}
-
 /**
  * Leader-only retry of an exact failed Task-final review Run. The old failed
  * Run remains the attempt trail, while the semantic ReviewRound is reset to
@@ -6360,16 +6105,8 @@ function retryFailedReviewRun(
     const currentTaskCandidate = actualTaskReviewCandidateForMutation(tx, task, options);
     if (!isSameTaskReviewCandidate(currentTaskCandidate, round.taskCandidate!)) {
       throw usageError(
-        `Task-final ReviewRound ${round.id} no longer matches the latest committed Integration heads.`
+        `Task-final ReviewRound ${round.id} no longer matches the frozen Task heads.`
       );
-    }
-    const item = tx.getWorkItem(task.id, round.workItemId);
-    if (item === null) {
-      throw dataError(`Work item not found for run ${run.id}: ${round.workItemId}.`);
-    }
-    const candidate = item.candidates.find(({ id }) => id === round.candidateId);
-    if (candidate === undefined) {
-      throw dataError(`ReviewRound Candidate not found: ${round.candidateId}.`);
     }
     const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
       .filter((entry) => (entry.scope ?? "work-item") === "task"));
@@ -6545,8 +6282,7 @@ function retryFailedReviewRun(
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "run.review-retried", {
       runId: run.id,
-      reviewRoundId: round.id,
-      candidateId: candidate.id
+      reviewRoundId: round.id
     }, now);
     return { round: resetRound, previousRun: run, created: true };
   });
@@ -7057,8 +6793,8 @@ function yieldRun(
           const panelGroup = round.executionGroup!;
           recordTaskEvent(tx, task.id, "review-group-ready", {
             reviewRoundId: round.id,
-            workItemId: round.workItemId,
-            candidateId: round.candidateId,
+            ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
+            ...(round.candidateId === undefined ? {} : { candidateId: round.candidateId }),
             executionGroupId: panelGroup.id,
             terminalLanes: String(panelGroup.lanes
               .filter(({ status }) => ["yielded", "completed", "failed"].includes(status)).length),
@@ -7071,8 +6807,8 @@ function yieldRun(
         }
         recordTaskEvent(tx, task.id, "review.completed", {
           reviewRoundId: round.id,
-          workItemId: round.workItemId,
-          candidateId: round.candidateId,
+          ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
+          ...(round.candidateId === undefined ? {} : { candidateId: round.candidateId }),
           reviewBaseCommit: round.reviewBaseCommit,
           evidenceCommit: round.evidenceCommit ?? "none",
           checks: round.checks?.map(({ name, outcome }) => `${name}:${outcome}`)
@@ -7440,17 +7176,12 @@ export function dispatchPreparedReviewRound(
       }
       throw usageError(`ReviewRound workspace is not ready: ${round.id}.`);
     }
-    const item = tx.getWorkItem(taskId, round.workItemId);
-    if (item === null) throw dataError(`ReviewRound Work Item not found: ${round.workItemId}.`);
-    const candidate = item.candidates.find(({ id }) => id === round.candidateId);
-    if (candidate === undefined) {
-      throw dataError(`ReviewRound Candidate not found: ${round.candidateId}.`);
-    }
     const taskScope = (round.scope ?? "work-item") === "task";
+    let item: WorkItem | undefined;
+    let candidate: WorkItemCandidate | undefined;
     if (taskScope) {
-      // A Task-scoped final ReviewRound freezes the integrated Task heads in
-      // its taskCandidate. The WorkItem Candidate snapshot is irrelevant: the
-      // authoritative review base is the first Project's committed head.
+      // A Task-scoped final ReviewRound is anchored directly to its frozen
+      // Task candidate. It deliberately has no synthetic WorkItem Candidate.
       if (round.taskCandidate === undefined) {
         throw new TaskFinalReviewDispatchDriftError(
           `Task ReviewRound ${round.id} has no frozen Task candidate.`
@@ -7461,8 +7192,21 @@ export function dispatchPreparedReviewRound(
           `Task ReviewRound base does not match its frozen Task candidate: ${round.id}.`
         );
       }
-    } else if (candidate.gitSnapshot?.reviewBaseCommit !== round.reviewBaseCommit) {
-      throw usageError(`ReviewRound Candidate snapshot changed: ${round.id}.`);
+    } else {
+      if (round.workItemId === undefined || round.candidateId === undefined) {
+        throw dataError(`WorkItem ReviewRound has no Candidate anchor: ${round.id}.`);
+      }
+      item = tx.getWorkItem(taskId, round.workItemId) ?? undefined;
+      if (item === undefined) {
+        throw dataError(`ReviewRound Work Item not found: ${round.workItemId}.`);
+      }
+      candidate = item.candidates.find(({ id }) => id === round.candidateId);
+      if (candidate === undefined) {
+        throw dataError(`ReviewRound Candidate not found: ${round.candidateId}.`);
+      }
+      if (candidate.gitSnapshot?.reviewBaseCommit !== round.reviewBaseCommit) {
+        throw usageError(`ReviewRound Candidate snapshot changed: ${round.id}.`);
+      }
     }
     const task = requireTask(tx, taskId);
     if ((round.scope ?? "work-item") === "task") {
@@ -7513,7 +7257,7 @@ export function dispatchPreparedReviewRound(
         });
         throw new TaskFinalReviewDispatchDriftError(
           committedIntegrationMoved
-            ? "Task-final ReviewRound frozen integrated heads changed for its Project set."
+            ? "Task-final ReviewRound frozen Task heads changed for its Project set."
             : `Final ReviewRound ${round.id} freezes a candidate that is no longer `
               + "the current Task candidate."
         );
@@ -7588,9 +7332,11 @@ export function dispatchPreparedReviewRound(
         );
       }
     }
-    const candidateLabel = candidate.source.type === "run"
-      ? `candidate Run ${candidate.source.runId}`
-      : `revision ${candidate.workItemRevision}`;
+    const candidateLabel = taskScope
+      ? "frozen Task candidate"
+      : candidate!.source.type === "run"
+        ? `candidate Run ${candidate!.source.runId}`
+        : `revision ${candidate!.workItemRevision}`;
     const frozenHeads = taskScope
       ? round.taskCandidate!.projects
         .map(({ projectId, commit }) => `${projectId}@${commit}`)
@@ -7635,22 +7381,26 @@ export function dispatchPreparedReviewRound(
       ))
       .join(" | ");
     const rawInput = [
-      `Review ${scopeLabel} WorkItem ${item.id} ${candidateLabel}.`,
+      taskScope
+        ? `Review the ${scopeLabel} ${candidateLabel}.`
+        : `Review ${scopeLabel} WorkItem ${item!.id} ${candidateLabel}.`,
       `ReviewRound: ${round.id}`,
       `Review scope: ${taskScope ? "task" : "work-item"}`,
       `Review base commit: ${round.reviewBaseCommit}`,
       ...(taskScope
-        ? [`Frozen integrated Task heads: ${frozenHeads}`]
+        ? [`Frozen Task heads: ${frozenHeads}`]
         : [`Candidate snapshot base: ${round.reviewBaseCommit}`]),
       `Project Policy pointers: ${projectPolicyPointers || "none"}`,
       `Review workspace source: exact workspace attached to this Reviewer Lane`,
-      `Candidate summary: ${candidate.summary}`,
-      `Acceptance criteria: ${item.acceptance.length === 0 ? "none" : item.acceptance.join("; ")}`,
+      `Candidate summary: ${taskScope ? task.title : candidate!.summary}`,
+      `Acceptance criteria: ${taskScope
+        ? "Task objective, maintained decisions, and Project Policy"
+        : item!.acceptance.length === 0 ? "none" : item!.acceptance.join("; ")}`,
       ...(taskScope ? [deltaContext !== "" ? deltaContext : findingContext] : []),
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
       "Keep Yui Core lifecycle safety, generic Reviewer behavior, Project Policy/Knowledge, and the Task Contract separate. Follow Project Policy pointers from the dispatch context for project-specific checks.",
       ...(round.scope === "task" && round.deltaRecheck === undefined
-        ? ["This is the one final Task Review: inspect every bound Project at the frozen integrated heads, and report only reachable, material, actionable P1/P2 findings or bounded verification gaps."]
+        ? ["This is the one final Task Review: inspect every bound Project at the frozen Task heads, and report only reachable, material, actionable P1/P2 findings or bounded verification gaps."]
         : []),
       "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this ReviewRound-owned workspace.",
       "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or the real Yui control-plane home.",
@@ -7718,7 +7468,7 @@ export function dispatchPreparedReviewRound(
         action: "review-round",
         subject: {
           taskId,
-          workItemId: item.id,
+          ...(item === undefined ? {} : { workItemId: item.id }),
           reviewRoundId: round.id,
           executionGroupId: runningGroup.id,
           executionLaneId: lane.id
@@ -7741,7 +7491,7 @@ export function dispatchPreparedReviewRound(
         assignment,
         now,
         {
-          workItemId: item.id,
+          ...(item === undefined ? {} : { workItemId: item.id }),
           purpose: "review",
           reviewRoundId: round.id,
           executionGroupId: runningGroup.id,
@@ -7778,7 +7528,7 @@ export function dispatchPreparedReviewRound(
         taskId,
         roleName: unboundRun.roleName,
         purpose: "review",
-        workItemId: item.id,
+        ...(item === undefined ? {} : { workItemId: item.id }),
         reviewRoundId: round.id
       }, now);
       const created = withAgentRunContextSnapshot(
@@ -7793,7 +7543,7 @@ export function dispatchPreparedReviewRound(
       tx.saveRole(taskId, updateRoleStatus(laneReviewer, "running", now));
       enqueueWork(tx, roleMailbox(taskId, laneReviewer.name), "review-requested", now, [
         runRef(taskId, created.id),
-        workItemRef(taskId, item.id)
+        ...(item === undefined ? [] : [workItemRef(taskId, item.id)])
       ]);
       recordTaskEvent(tx, taskId, "run.review-dispatched", runLaunchEventPayload(created), now);
     }
@@ -7820,7 +7570,7 @@ export function failPendingReviewRound(
     const terminal = finishReviewRound(round, "failed", summary, now);
     tx.saveReviewRound(taskId, terminal);
     enqueueWork(tx, leaderMailbox(taskId), "review-failed", now, [
-      workItemRef(taskId, round.workItemId)
+      ...(round.workItemId === undefined ? [] : [workItemRef(taskId, round.workItemId)])
     ]);
     return terminal;
   });
@@ -8028,7 +7778,7 @@ function requirePublishedTreeAuthorization(
     throw usageError(
       `Published-tree completion requires explicit user or global Operator authorization for `
       + `${proof.taskId}/${proof.publicationId} at ${proof.reviewRoundId === undefined
-        ? "the direct Task-main head"
+        ? "the Leader-owned Task-main head"
         : `Task-final Review ${proof.reviewRoundId}`}.`
     );
   }
@@ -8366,11 +8116,6 @@ function parseWorkCreateArgs(
 function parseTaskPriority(value: string): TaskPriority {
   if (["low", "medium", "high", "urgent"].includes(value)) return value as TaskPriority;
   throw usageError(`Invalid Task priority: ${value}.`);
-}
-
-function parseTaskDelivery(value: string): "direct" | "integrated" {
-  if (value === "direct" || value === "integrated") return value;
-  throw usageError(`Task delivery is invalid: ${value}. Use direct or integrated.`);
 }
 
 function parseTaskTags(value: string): string[] {

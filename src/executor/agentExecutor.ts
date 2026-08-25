@@ -10,6 +10,7 @@ import {
 import {
   effectiveLaunchSnapshotsCompatible,
   effectiveLaunchSnapshotsCompatibleForTaskMain,
+  effectiveLaunchSnapshotsCompatibleForTaskReview,
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
 } from "./effectiveLaunch.js";
@@ -203,7 +204,9 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
     throw new Error(`Role Agent session effective identity is inconsistent: ${agentId}.`);
   }
   if (existing !== undefined && existing.nativeSessionId === nativeSessionId
-    && !effectiveLaunchSnapshotsCompatible(existing.effective, effective)) {
+    && !effectiveLaunchSnapshotsCompatible(existing.effective, effective)
+    && !(set.owner.scope === "task"
+      && effectiveLaunchSnapshotsCompatibleForTaskReview(existing.effective, effective))) {
     throw new Error(`Role Agent session effective launch cannot change: ${agentId}.`);
   }
   if (existing !== undefined && existing.nativeSessionId !== nativeSessionId

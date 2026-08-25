@@ -38,25 +38,29 @@ Agent Driver registration.
   Run such validation only when the user explicitly selects that exact resource
   and effect boundary in the current request.
 
-## Select the smallest safe delivery path
+## Let the Leader choose the smallest useful topology
 
-Use direct delivery for a single-Project, reproducible, bounded fix only when it
-does not change persistence or migration, permission/authorization, Task/Run/
-Review/Integration cross-record invariants, destructive lifecycle behavior,
-concurrency/recovery, Controller handover, release machinery, or real-resource
-effects. The Leader implements it on clean committed Task main, runs one
-targeted check while changing code, and runs the complete local delivery check
-once on the final commit. Use a bounded native review when useful; if an
-independently managed ReviewRound is required, select or promote to integrated
-delivery before Task main advances.
+Classify Yui software work as `bugfix` or `feature`. A reproducible bugfix is
+Leader-owned: implement it on clean committed Task main, run the smallest
+targeted check while changing code, and run the complete local delivery check
+once on the final commit. If it proves to require independent delivery owners,
+reclassify it as a feature before creating WorkItems. Do not create a Worker or
+ReviewRound merely because the fix touches a sensitive subsystem.
 
-Use integrated delivery when any excluded boundary is touched, when an
-independent final Review materially protects the control plane, or when the
-outcome spans Projects. Default to one roleless WorkItem, one committed
-Integration, and one Task-final Review. One Review's findings become one
-consolidated Repair WorkItem unless their ownership is independently acceptable
-and explicit parallel execution has real value. A small diff can still be
-integrated; risk is semantic, not line-count based.
+For a feature, the Leader decides whether to own the complete result or split
+it into substantial requirements for different Workers. Create multiple
+WorkItems only when those requirements have independent ownership and useful
+parallel progress; persistence, authorization, concurrency, recovery, release,
+or multi-Project scope increases implementation and validation risk but does
+not by itself justify extra WorkItems. Investigation, implementation steps,
+tests, findings, and small repair edits stay inside the existing Task or
+WorkItem instead of becoming a record-by-record diary.
+
+Risk controls review and evidence strength. Use one Task-final Review of the
+frozen Task main when it materially protects the control plane, whether or not
+the Task used WorkItems. Route findings to the original owner; the Leader fixes
+small Task-main issues directly, and creates a Repair WorkItem only when the
+repair is itself a substantial independently owned requirement.
 
 ## Implement the current Yui contract
 

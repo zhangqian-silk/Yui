@@ -385,7 +385,7 @@ export function latestRunDurableProgressAt(
       candidates?: readonly Readonly<{ createdAt: string }>[];
     }> | null;
     listReviewRounds?(taskId: string): readonly Readonly<{
-      workItemId: string;
+      workItemId?: string;
       createdAt: string;
       endedAt?: string;
     }>[];

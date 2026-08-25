@@ -15,7 +15,7 @@ import {
   type GitRemoteHead
 } from "../repository/gitWorkspace.js";
 import type { Project } from "../repository/project.js";
-import { taskDeliveryPath, type Task } from "../task/task.js";
+import type { Task } from "../task/task.js";
 import { publicationExternalKey } from "../task/publicationReference.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
@@ -51,7 +51,7 @@ export type TaskCompletionPublishedTreeProof = Readonly<{
 /**
  * Verify the one supported ancestry waiver before `task complete` mutates any
  * durable state. The explicit Publication must be the current verified merged
- * record, bind the exact physical Task head (and, for integrated delivery, its
+ * record, bind the exact physical Task head (and, when WorkItems exist, its
  * completed final Review), and name an ancestry-divergent commit with the
  * exact same Git tree.
  */
@@ -83,13 +83,15 @@ export async function verifyTaskCompletionPublishedTree(
   }
 
   const workspace = requireTaskWorkspace(store, task);
-  const integrated = taskDeliveryPath(task) === "integrated";
-  const latestReview = integrated ? latestTaskFinalReview(store, task.id) : undefined;
-  if (integrated && (latestReview === undefined
-    || !isSemanticReviewRound(latestReview, store)
-    || latestReview.taskCandidate === undefined)) {
+  const latestRecordedReview = latestTaskFinalReview(store, task.id);
+  const latestReview = latestRecordedReview !== undefined
+    && isSemanticReviewRound(latestRecordedReview, store)
+    && latestRecordedReview.taskCandidate !== undefined
+    ? latestRecordedReview
+    : undefined;
+  if (latestRecordedReview !== undefined && latestReview === undefined) {
     throw usageError(
-      `Task ${task.id} requires a latest completed Task-final Review before accepting a published tree.`
+      `Task ${task.id} has an unsettled Task-final Review obligation before accepting a published tree.`
     );
   }
   const git = options.git ?? new NodeGitWorkspace();
@@ -208,7 +210,7 @@ export function assertTaskCompletionPublishedTreeProof(
     || publication.remoteCommit !== proof.remoteCommit) {
     throw usageError(`Publication evidence changed before Task completion: ${publication.id}.`);
   }
-  if (taskDeliveryPath(task) === "integrated") {
+  if (proof.reviewRoundId !== undefined) {
     const latestReview = latestTaskFinalReview(store, task.id);
     if (latestReview === undefined
       || latestReview.id !== proof.reviewRoundId
@@ -219,8 +221,8 @@ export function assertTaskCompletionPublishedTreeProof(
         `Task-final Review evidence changed before published-tree completion: ${task.id}.`
       );
     }
-  } else if (proof.reviewRoundId !== undefined) {
-    throw usageError(`Direct published-tree proof unexpectedly binds a final Review: ${task.id}.`);
+  } else if (latestTaskFinalReview(store, task.id) !== undefined) {
+    throw usageError(`Published-tree proof omitted the Task-final Review: ${task.id}.`);
   }
   const actualCommit = actualCandidate.projects.find(({ projectId }) => (
     projectId === proof.projectId
@@ -318,7 +320,10 @@ export async function reconcileTaskRemoteBaselines(
   // The delivery contract opts Project-backed Tasks into committed
   // Integration evidence.  Metadata-only Tasks retain their existing local
   // completion semantics and have no remote baseline to reconcile here.
-  if (task.projectBindings.length === 0 || task.requireIntegration !== true) return [];
+  if (task.projectBindings.length === 0
+    || !store.listIntegrationAttempts(task.id).some(({ status }) => status === "committed")) {
+    return [];
+  }
   const workspace = requireTaskWorkspace(store, task);
   const git = options.git ?? new NodeGitWorkspace();
   if (git.fetchRemoteHeadIntoWorktree === undefined

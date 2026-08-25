@@ -147,7 +147,7 @@ function replaceTaskCommand(
     createArgs.push("--project", binding.projectId);
     createArgs.push("--base", `${binding.projectId}=${binding.baseRef}`);
   }
-  if (old.requireIntegration) createArgs.push("--require-integration");
+  if (old.type !== undefined) createArgs.push("--type", old.type);
   const created = runTaskCommand(createArgs, store);
   if (created.kind !== "output") {
     throw new Error(`Task replacement could not be created for ${old.id}.`);

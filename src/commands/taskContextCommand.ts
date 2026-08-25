@@ -7,7 +7,6 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import { projectNextAction } from "../task/nextAction.js";
-import { taskDeliveryPath } from "../task/task.js";
 import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 import {
   summarizeExecutionGroup,
@@ -65,7 +64,6 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     }
     return {
       task,
-      deliveryPath: taskDeliveryPath(task),
       execution,
       reviewConfig: reader.getReviewConfig(),
       brief: reader.getTaskBrief(task.id),
@@ -187,12 +185,15 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             workspace.entries.filter(({ access }) => access === "write").length
           } writable / ${workspace.entries.length} Projects)`
         ))),
-    `Delivery: ${taskDeliveryPath(task)}`,
-    `Completion evidence: ${task.requireIntegration
-      ? "WorkItem, ChangeSet, and committed Integration required"
-      : task.projectBindings.length > 0
+    `Type: ${task.type ?? "unspecified"}`,
+    `Execution topology: ${workItems.length === 0
+      ? "Leader-owned Task main"
+      : `${workItems.length} independently owned WorkItem(s), integrated on Task main`}`,
+    `Completion evidence: ${task.projectBindings.length === 0
+      ? "no Project evidence required"
+      : workItems.length === 0
         ? "clean committed Task main required"
-        : "no Project evidence required"}`,
+        : "each delivered WorkItem requires a ChangeSet and committed Integration"}`,
     `Global review: ${reviewConfig === null
       ? "disabled"
       : `${reviewConfig.roleName} (${reviewConfig.trigger})`}`,
@@ -317,11 +318,16 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
                     ? []
                     : [`      Summary: ${compactText(latestRun.summary)}`])
                 ]),
-            ...renderWorkItemReviews(reviewRounds.filter(
+            ...renderReviewRounds(reviewRounds.filter(
               (round) => round.workItemId === item.id
             ))
           ];
         })),
+    "",
+    "Task-final reviews:",
+    ...renderReviewRounds(reviewRounds.filter(
+      (round) => (round.scope ?? "work-item") === "task"
+    )),
     "",
     ...recentSection(
       "AgentRuns",
@@ -452,17 +458,20 @@ function latestStallKind(events: readonly TaskEvent[], runId: string): string {
   return event?.payload.kind ?? "workflow-not-progressing";
 }
 
-function renderWorkItemReviews(
+function renderReviewRounds(
   rounds: ReturnType<TaskStore["listReviewRounds"]>
 ): string[] {
   const latest = rounds.at(-1);
   if (latest === undefined) return ["    ReviewRounds: none."];
+  const target = (latest.scope ?? "work-item") === "task"
+    ? "frozen Task candidate"
+    : `Candidate ${latest.candidateId ?? "unavailable"}`;
   return [
-    `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] ${latest.scope === "task" ? "Task-final" : "WorkItem"} for ${latest.candidateId} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
+    `    ReviewRounds: ${rounds.length}; latest ${latest.id} [${latest.status}] ${latest.scope === "task" ? "Task-final" : "WorkItem"} for ${target} via ${latest.reviewerRoleName} (${latest.requestedBy})`,
     `      Review base: ${latest.reviewBaseCommit}`,
     ...(latest.scope === "task"
       ? [
-          `      Frozen integrated Task heads: ${latest.taskCandidate?.projects
+          `      Frozen Task heads: ${latest.taskCandidate?.projects
             .map(({ projectId, commit }) => `${projectId}@${commit}`).join(", ") ?? "unavailable"}`,
           `      Task-final contract: ${latest.taskFinalReviewContract?.digest ?? "global policy"}`,
           ...(latest.deltaRecheck === undefined
