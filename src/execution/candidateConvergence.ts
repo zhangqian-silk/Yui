@@ -84,11 +84,11 @@ export function candidateConvergenceDirective(stage: ExecutionStageContext): str
     "Use only frozen parent result references; never replay sibling transcripts. Direct sources, executable checks, and frozen artifacts outrank derived analysis or vote counts."
   ];
   const specific: Record<WorkItemExplorationStage, string> = {
-    plan: "Choose artifactType and state the evidence and acceptance plan in the report; parentResultRefs is empty.",
+    plan: "Choose artifactType and state the evidence and acceptance plan in the report. Round 1 has no parent results; later rounds must carry the selected Resolve gap results listed above.",
     generate: "Add candidate={key,claims:[{id,statement,evidenceRefs}],artifactRefs,assumptions,tradeoffs}. Independent hypotheses may be unsupported here, but every evidenceRef must name top-level evidence.",
     compare: "Add comparison={clusters:[{id,resultRefs,rationale}],selectedResultRefs,evidenceBasis:[{resultRef,kind,detail}],contradictions}. Clusters partition every parent exactly once; every selected result needs executable-check, direct-source, or frozen-artifact evidence.",
     synthesize: "Add candidate plus synthesis={strategy,sourceResultRefs,unresolvedContradictions}. strategy is claim-evidence-table for research, decision-matrix for architecture, and frozen-code-selection for code. Code selects one frozen tree; do not splice unfrozen edits.",
-    verify: "Add verification={subjectResultRef,disposition,criteria:[{criterion,status,evidenceRefs}],gaps}. disposition is passed, needs-next-round, or inconclusive. passed requires every criterion passed with evidence and no gaps; code also requires passed executable checks on the unchanged frozen Git snapshot.",
+    verify: "Add verification={subjectResultRef,disposition,criteria:[{criterion,status,evidenceRefs}],gaps}. disposition is passed, needs-next-round, or inconclusive. passed requires criteria to uniquely and completely match the frozen WorkItem acceptance (or its objective when acceptance is empty), with every criterion passed with evidence and no gaps; code also requires passed executable checks on the unchanged frozen Git snapshot.",
     resolve: "Add resolution={subjectResultRef,disposition,rationale}. disposition=candidate only for a passed Verify parent; otherwise disposition=next-round so the Leader can use Resolve retry within the frozen round budget."
   };
   return [...common, specific[stage.stage]].join("\n");
@@ -215,7 +215,7 @@ export function assertIndependentVerificationRoles(
  * evidence, independence and passed-vs-next-round boundaries are enforced.
  */
 export function validateCandidateConvergenceResolution(
-  workItem: Pick<WorkItem, "executionGroups">,
+  workItem: Pick<WorkItem, "objective" | "acceptance" | "executionGroups">,
   group: ExecutionGroup
 ): void {
   const stage = group.stage;
@@ -279,8 +279,32 @@ export function validateCandidateConvergenceResolution(
       }
     }
   }
+  if (stage.stage === "synthesize") {
+    for (const { lane, envelope } of selected) {
+      if (envelope.artifactType !== "code") continue;
+      const selectedGenerateRefs = envelope.synthesis!.sourceResultRefs.flatMap((sourceRef) => {
+        const comparison = convergenceForRef(workItem, sourceRef).comparison;
+        if (comparison === undefined) {
+          throw new Error("Code synthesis source is not a Compare result.");
+        }
+        return comparison.selectedResultRefs;
+      });
+      const uniqueGenerateRefs = [...new Set(selectedGenerateRefs)];
+      if (uniqueGenerateRefs.length !== 1) {
+        throw new Error("Code synthesis must inherit one uniquely selected frozen candidate.");
+      }
+      assertSameGitSnapshot(
+        lane.result!.gitSnapshot,
+        resultForRef(workItem, uniqueGenerateRefs[0]!).gitSnapshot,
+        "Synthesized code Candidate"
+      );
+    }
+  }
   if (stage.stage === "verify") {
     for (const { lane, envelope } of selected) {
+      if (envelope.verification!.disposition === "passed") {
+        assertVerificationCoversAcceptance(workItem, envelope.verification!.criteria);
+      }
       if (envelope.artifactType === "code"
         && envelope.verification!.disposition === "passed") {
         assertSameGitSnapshot(
@@ -292,6 +316,9 @@ export function validateCandidateConvergenceResolution(
     }
   }
   if (stage.stage !== "resolve") return;
+  if (resolution.decision === "accept" && selected.length !== 1) {
+    throw new Error("Candidate convergence Resolve must accept exactly one Lane result.");
+  }
   for (const { lane, envelope } of selected) {
     const verification = convergenceForRef(workItem, envelope.resolution!.subjectResultRef);
     if (verification.verification === undefined) {
@@ -315,6 +342,22 @@ export function validateCandidateConvergenceResolution(
       || verification.verification.disposition === "passed") {
       throw new Error("Resolve retry requires a non-passing Verify result and next-round disposition.");
     }
+  }
+}
+
+function assertVerificationCoversAcceptance(
+  workItem: Pick<WorkItem, "objective" | "acceptance">,
+  criteria: NonNullable<CandidateConvergenceEnvelope["verification"]>["criteria"]
+): void {
+  const requiredCriteria = workItem.acceptance.length === 0
+    ? [workItem.objective]
+    : workItem.acceptance;
+  const declaredCriteria = criteria.map(({ criterion }) => criterion);
+  if (new Set(declaredCriteria).size !== declaredCriteria.length
+    || !sameStringSets(declaredCriteria, requiredCriteria)) {
+    throw new Error(
+      "Passed verification criteria must uniquely and completely match the frozen WorkItem acceptance."
+    );
   }
 }
 
