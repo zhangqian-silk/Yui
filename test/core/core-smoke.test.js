@@ -22,6 +22,10 @@ import {
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { moveSqliteFileSet } from "../../dist/storage/upgrade/sqliteFileSet.js";
 import { createProject } from "../../dist/repository/project.js";
+import {
+  configuredAgentToDefinition,
+  createConfiguredAgent
+} from "../../dist/agent/agent.js";
 import { createPublicationReference } from "../../dist/task/publicationReference.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { createDecision } from "../../dist/decision/decision.js";
@@ -40,7 +44,13 @@ import {
   serializeRunBootstrapEnvelope,
   serializeRunHostRecoveryEnvelope
 } from "../../dist/context/runContextContract.js";
-import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import {
+  createGlobalRole,
+  createRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
+import { FileRoleLaunchPlanner } from "../../dist/executor/fileRoleLaunchPlanner.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import {
   bindTaskRoleProviderRuntime,
   bindTaskRoleRun,
@@ -801,6 +811,74 @@ test("TmuxSessionHost launches an interactive global Role without an Agent Host 
   assert.equal(binding.hostCreated, true);
 });
 
+test("fresh global Role launches do not resume terminal native Sessions", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-global-role-fresh-"));
+  const store = new SqliteTaskStore(home);
+  const now = new Date("2026-08-25T00:00:00.000Z");
+  t.after(() => {
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  for (const adapterId of ["codex", "claude"]) {
+    const agent = createConfiguredAgent(
+      `${adapterId}-agent`,
+      adapterId,
+      adapterId,
+      [],
+      [],
+      now
+    );
+    const role = createGlobalRole(
+      `${adapterId}-operator`,
+      [createRoleAgentBinding(configuredAgentToDefinition(agent))],
+      agent.id,
+      home,
+      now
+    );
+    const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
+    store.saveConfiguredAgent(agent);
+    store.saveGlobalRole(role);
+    let sessions = createRoleSessionSet(
+      { scope: "global", roleName: role.name },
+      agent.id,
+      now
+    );
+    sessions = recordRoleAgentSession(sessions, {
+      agentId: agent.id,
+      adapterId,
+      nativeSessionId: `terminal-${adapterId}`,
+      launchId: `terminal-launch-${adapterId}`,
+      status: "stopped",
+      policy: "fixed",
+      effective
+    }, now);
+    store.saveGlobalRoleSessionSet(sessions);
+
+    const planner = new FileRoleLaunchPlanner(home, store, {
+      environment: {},
+      cliPath: join(root, "dist", "cli.js"),
+      createNativeSessionId: () => `fresh-${adapterId}`
+    });
+    const planned = planner.planGlobalRole({
+      roleName: role.name,
+      agentId: agent.id,
+      adapterId,
+      effective,
+      mode: "new",
+      launchId: `fresh-launch-${adapterId}`
+    });
+    assert.equal(planned.launch.args.includes(`terminal-${adapterId}`), false);
+    if (adapterId === "codex") {
+      assert.equal(planned.launch.args.includes("--resume"), false);
+    } else {
+      const sessionId = planned.launch.args.indexOf("--session-id");
+      assert.ok(sessionId >= 0);
+      assert.notEqual(planned.launch.args[sessionId + 1], `terminal-${adapterId}`);
+    }
+  }
+});
+
 test("the first global Operator turn authenticates through its exact live launch owner", () => {
   const launchId = "runtime-global:generation:first";
   const identity = readLinuxProcessIdentity(process.pid);
@@ -1204,7 +1282,7 @@ test("a fresh exact Task descriptor binds only its own discovered native Session
     agentId: "agent",
     runId: run.id,
     receiptId: `agent-run:${task.id}/${run.id}`
-  }, now);
+  }, now, "new");
   store.saveTaskRoleSessionSet(sessions);
 
   const descriptor = createExactTaskRuntimeDescriptor({
@@ -1845,7 +1923,7 @@ test("Task Role takeover and release persist monotonic Provider authority epochs
     agentId: "agent",
     runId: "run-takeover",
     receiptId: "task/agentRun/run-takeover"
-  }, now);
+  }, now, "new");
   sessions = bindTaskRoleProviderRuntime(sessions, createProviderRuntimeBinding({
     providerNamespace: "openai/codex",
     accountScope: "default",
@@ -1919,9 +1997,32 @@ test("Task Role takeover and release persist monotonic Provider authority epochs
     agentId: "agent",
     runId: "run-next",
     receiptId: "task/agentRun/run-next"
-  }, new Date("2026-08-23T00:00:05.000Z"));
+  }, new Date("2026-08-23T00:00:05.000Z"), "resume");
   assert.equal(nextRun.providerBinding.runId, "run-next");
   assert.deepEqual(nextRun.providerBinding.authority, cleared.providerBinding.authority);
+
+  const freshRun = bindTaskRoleRun(cleared, {
+    agentId: "agent",
+    runId: "run-fresh",
+    receiptId: "task/agentRun/run-fresh"
+  }, new Date("2026-08-23T00:00:06.000Z"), "new");
+  assert.equal(freshRun.providerBinding, null);
+  const freshConversation = bindTaskRoleProviderRuntime(
+    freshRun,
+    createProviderRuntimeBinding({
+      providerNamespace: "openai/codex",
+      accountScope: "default",
+      runId: "run-fresh",
+      conversationId: "conversation-fresh",
+      activationId: "activation-fresh",
+      startedAt: "2026-08-23T00:00:07.000Z"
+    }),
+    new Date("2026-08-23T00:00:07.000Z")
+  );
+  assert.equal(
+    freshConversation.providerBinding.conversations[0].conversationId,
+    "conversation-fresh"
+  );
 });
 
 test("the runtime coordination core keeps correction lanes and terminal facts stable", () => {

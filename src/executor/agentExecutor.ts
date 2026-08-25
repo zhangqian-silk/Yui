@@ -481,7 +481,8 @@ export function roleAgentSessionResumeMode(
 export function bindTaskRoleRun(
   set: TaskRoleSessionSet,
   fence: TaskRoleRunFence,
-  preparedAt: Date
+  preparedAt: Date,
+  mode: "new" | "resume"
 ): TaskRoleSessionSet {
   validateRoleSessionSet(set);
   assertTaskRoleSessionSet(set);
@@ -494,9 +495,9 @@ export function bindTaskRoleRun(
     throw new Error("Task Role session set already has an in-flight Run.");
   }
   const timestamp = requireDate(preparedAt, "Task Role Run preparedAt");
-  const providerBinding = set.providerBinding === null
-    ? null
-    : rebindProviderRuntimeRun(set.providerBinding, normalized.runId);
+  const providerBinding = mode === "resume" && set.providerBinding !== null
+    ? rebindProviderRuntimeRun(set.providerBinding, normalized.runId)
+    : null;
   const updated: TaskRoleSessionSet = {
     ...set,
     inFlight: { ...normalized, preparedAt: timestamp },
