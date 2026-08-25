@@ -168,13 +168,27 @@ export function createProductionRuntimeIdentityPorts(
 
 function readGitHead(packageRoot: string): string | null {
   try {
-    const result = spawnSync(
+    const resolvedPackageRoot = realpathSync(packageRoot);
+    const rootResult = spawnSync(
       "git",
-      ["-C", packageRoot, "rev-parse", "HEAD"],
+      ["-C", resolvedPackageRoot, "rev-parse", "--show-toplevel"],
       { encoding: "utf8", timeout: 1_500, stdio: ["ignore", "pipe", "ignore"] }
     );
-    if (result.status !== 0) return null;
-    const head = result.stdout.trim();
+    if (rootResult.status !== 0) return null;
+    const repositoryRoot = realpathSync(rootResult.stdout.trim());
+    // `git -C` searches parent directories. A globally installed package may
+    // therefore appear to belong to an unrelated repository that happens to
+    // contain the package manager directory (for example ~/.nvm). Only the
+    // package's own checkout is valid source identity evidence.
+    if (repositoryRoot !== resolvedPackageRoot) return null;
+
+    const headResult = spawnSync(
+      "git",
+      ["-C", resolvedPackageRoot, "rev-parse", "HEAD"],
+      { encoding: "utf8", timeout: 1_500, stdio: ["ignore", "pipe", "ignore"] }
+    );
+    if (headResult.status !== 0) return null;
+    const head = headResult.stdout.trim();
     return /^[a-f0-9]{7,40}$/u.test(head) ? head : null;
   } catch {
     return null;
