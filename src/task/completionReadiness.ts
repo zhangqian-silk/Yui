@@ -4,6 +4,7 @@ import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import { isReviewFindingBlocking, type ReviewFinding } from "../review/reviewFinding.js";
 import { deltaRecheckBlocksAcceptance } from "../review/reviewRound.js";
+import { isSemanticReviewRound } from "../review/reviewOutcomeClassifier.js";
 import type { ReviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
 import {
   REVIEW_FINDINGS_RECONCILE_FAILED_EVENT,
@@ -156,7 +157,11 @@ export function projectCompletionReadiness(
   // accepted delta) supersedes them instead of blocking completion forever.
   const latestCompletedTaskReview = facts.reviewRounds
     .filter((round) => (
-      (round.scope ?? "work-item") === "task" && round.status === "completed"
+      (round.scope ?? "work-item") === "task" && isSemanticReviewRound(round, {
+        listAgentRuns: () => facts.agentRuns,
+        listReviewFindings: () => facts.reviewFindings,
+        listEvents: () => facts.events
+      })
     ))
     .slice()
     .sort((left, right) => (

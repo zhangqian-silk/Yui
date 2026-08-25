@@ -4,7 +4,16 @@ import type { InputRequest } from "../input/inputRequest.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { ReviewRound } from "../review/reviewRound.js";
+import {
+  deltaRecheckBlocksAcceptance,
+  type ReviewRound
+} from "../review/reviewRound.js";
+import {
+  classifyReviewRoundOutcome,
+  isSemanticReviewRound,
+  type ReviewOutcomeEvidenceStore
+} from "../review/reviewOutcomeClassifier.js";
+import type { ReviewFinding } from "../review/reviewFinding.js";
 import {
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
@@ -99,6 +108,12 @@ export type NextActionFacts = Readonly<{
   activeRuns: readonly AgentRun[];
   /** Recent Leader Runs (any status), newest last; consumed by the semantic budget. */
   leaderRuns: readonly AgentRun[];
+  /** Bounded corroboration for legacy terminal Review outcome classification. */
+  reviewOutcomeEvidence?: Readonly<{
+    agentRuns: readonly AgentRun[];
+    reviewFindings: readonly ReviewFinding[];
+    events: readonly TaskEvent[];
+  }>;
 }>;
 
 const OPEN_WORK_ITEM_STATUSES = new Set(["pending", "running", "awaiting_acceptance"]);
@@ -438,10 +453,38 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   }
 
   const failedFinal = latestTaskFinalReview(facts.reviewRounds);
-  if (failedFinal !== undefined && failedFinal.status === "failed") {
+  const failedFinalOutcome = failedFinal === undefined
+    ? null
+    : classifyReviewRoundOutcome(failedFinal, nextActionReviewOutcomeEvidence(facts));
+  if (failedFinal !== undefined && failedFinalOutcome?.kind === "non-semantic") {
+    return buildAction(facts, {
+      kind: "resume-review",
+      reason: `Task-final Review ${failedFinal.id} ended before a semantic review was proven.`,
+      refs: [ref("review-round", failedFinal.id)],
+      preconditions: [
+        { fact: "Task-final Review has semantic evidence", satisfied: false, ref: ref("review-round", failedFinal.id) }
+      ],
+      recommendedCommand: `yui task review force-fresh ${task.id}/${failedFinal.id}`
+    });
+  }
+  if (failedFinal !== undefined && failedFinalOutcome?.kind === "ambiguous") {
+    return buildAction(facts, {
+      kind: "repair-protocol-inconsistency",
+      reason: `Task-final Review ${failedFinal.id} has ambiguous semantic and infrastructure evidence: ${failedFinalOutcome.reason}`,
+      refs: [ref("review-round", failedFinal.id)],
+      conflicts: [ref("review-round", failedFinal.id)],
+      preconditions: [
+        { fact: "Review outcome is unambiguously semantic or non-semantic", satisfied: false, ref: ref("review-round", failedFinal.id) }
+      ]
+    });
+  }
+  if (failedFinal !== undefined
+    && failedFinalOutcome?.kind === "semantic"
+    && ((failedFinal.checks ?? []).some(({ outcome }) => outcome === "failed")
+      || deltaRecheckBlocksAcceptance(failedFinal))) {
     return buildAction(facts, {
       kind: "route-review-findings",
-      reason: `Task-final Review ${failedFinal.id} failed; route its open findings into a repair wave on one frozen head.`,
+      reason: `Task-final Review ${failedFinal.id} delivered semantic negative evidence; route its open findings into a repair wave on one frozen head.`,
       refs: [ref("review-round", failedFinal.id)],
       preconditions: [
         { fact: "Task-final Review is failed", satisfied: true, ref: ref("review-round", failedFinal.id) }
@@ -894,7 +937,10 @@ function needsChangeSetCapture(facts: NextActionFacts, item: WorkItem): boolean 
 
 function hasValidFinalReview(facts: NextActionFacts): boolean {
   const final = latestTaskFinalReview(facts.reviewRounds);
-  if (final === undefined || final.status !== "completed") return false;
+  if (final === undefined
+    || !isSemanticReviewRound(final, nextActionReviewOutcomeEvidence(facts))) return false;
+  if ((final.checks ?? []).some(({ outcome }) => outcome === "failed")
+    || deltaRecheckBlocksAcceptance(final)) return false;
   const reviewedCommits = new Set(
     (final.taskCandidate?.projects ?? []).map((project) => project.commit)
   );
@@ -912,6 +958,19 @@ function hasValidFinalReview(facts: NextActionFacts): boolean {
     if (!reviewedCommits.has(head)) return false;
   }
   return true;
+}
+
+/** Adapts the serializable next-action evidence bundle to the shared classifier. */
+export function nextActionReviewOutcomeEvidence(
+  facts: NextActionFacts
+): ReviewOutcomeEvidenceStore | undefined {
+  const evidence = facts.reviewOutcomeEvidence;
+  if (evidence === undefined) return undefined;
+  return {
+    listAgentRuns: () => evidence.agentRuns,
+    listReviewFindings: () => evidence.reviewFindings,
+    listEvents: () => evidence.events
+  };
 }
 
 type Inconsistency = Readonly<{

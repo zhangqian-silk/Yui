@@ -683,7 +683,7 @@ export function runExecutionAudit(
             else if (round.deltaRecheck.disposition === "finding") deltaFinding += 1;
             else if (round.deltaRecheck.disposition === "requires-full-review") deltaEscalated += 1;
           }
-          const classification = classifyReviewRound(round);
+          const classification = classifyReviewRound(round, store);
           if (classification.faultClass === "review-infra") infraFailed += 1;
           else if (classification.faultClass === "review-semantic-negative") {
             semanticNegative += 1;

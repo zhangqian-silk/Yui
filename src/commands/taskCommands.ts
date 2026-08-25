@@ -232,6 +232,10 @@ import {
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
 import {
+  classifyReviewRoundOutcome,
+  isSemanticReviewRound
+} from "../review/reviewOutcomeClassifier.js";
+import {
   TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT,
   createTaskFinalReviewContractRebind,
   resolveRecordedTaskFinalReviewContract,
@@ -4810,227 +4814,13 @@ export function classifyForceFreshReviewRecovery(
   store: ForceFreshReviewEvidenceStore,
   round: ReviewRound
 ): ForceFreshReviewRecoveryClassification {
-  const blocked = (reason: string): ForceFreshReviewRecoveryClassification => ({
-    kind: "semantic-or-ambiguous",
-    reason
-  });
-  if (round.status !== "failed" && round.status !== "completed") {
-    return blocked(`source status is ${round.status}, not terminal.`);
-  }
-  if ((round.checks ?? []).length > 0) return blocked("the Round records review checks.");
-  if (round.status === "completed" && round.evidenceCommit !== round.reviewBaseCommit) {
-    return blocked("the completed Round lacks an exact frozen-head evidence commit.");
-  }
-  const frozenHeadEvidenceCommit = round.status === "completed"
-    ? round.reviewBaseCommit
-    : undefined;
-  if (round.status === "failed" && round.evidenceCommit !== undefined) {
-    return blocked("the Round records a review evidence commit.");
-  }
-  if (round.report !== round.summary) {
-    return blocked("the Round stores a report distinct from its terminal summary.");
-  }
-  if (runtimeFailureSummaryHasReviewerOutput(round.report ?? "")) {
-    return blocked("the Round stores non-empty Reviewer output in its runtime failure summary.");
-  }
-  if (round.deltaRecheck?.disposition !== undefined
-    || round.deltaRecheck?.reasoning !== undefined) {
-    return blocked("the Round records a semantic delta-recheck disposition.");
-  }
-  if (looksLikeStructuredReviewReport(round.report ?? "")) {
-    return blocked("the Round stores a structured reviewer report.");
-  }
-
-  for (const lane of round.executionGroup?.lanes ?? []) {
-    if (lane.status === "pending" || lane.status === "running") {
-      return blocked(`Reviewer Lane ${lane.id} is still active.`);
-    }
-    if ((lane.result?.checks ?? []).length > 0
-      || (lane.result?.findings ?? []).length > 0
-      || (lane.result?.evidence ?? []).length > 0
-      || (lane.result?.evidenceCommit !== undefined
-        && lane.result.evidenceCommit !== frozenHeadEvidenceCommit)
-      || lane.result?.gitSnapshot !== undefined) {
-      return blocked(`Reviewer Lane ${lane.id} delivered semantic evidence.`);
-    }
-    if (lane.status === "yielded" || lane.status === "completed") {
-      if (round.status !== "completed") {
-        return blocked(`Reviewer Lane ${lane.id} delivered terminal output.`);
-      }
-      if (lane.result === undefined
-        || lane.result.summary !== round.summary
-        || lane.result.report !== round.report
-        || lane.result.evidenceCommit !== frozenHeadEvidenceCommit) {
-        return blocked(`Reviewer Lane ${lane.id} output is absent or differs from the Round.`);
-      }
-    } else if (round.status === "completed") {
-      return blocked(`Completed Round has non-completed Reviewer Lane ${lane.id}/${lane.status}.`);
-    }
-  }
-
-  const reviewRuns = store.listAgentRuns(round.taskId).filter((run) => (
-    run.purpose === "review"
-    && run.reviewRoundId === round.id
-  ));
-  const activeRun = reviewRuns.find(({ status }) => status === "active");
-  if (activeRun !== undefined) return blocked(`Reviewer Run ${activeRun.id} is still active.`);
-  const failedRunWithOutput = reviewRuns.find((run) => (
-    run.status === "failed" && runtimeFailureSummaryHasReviewerOutput(run.summary ?? "")
-  ));
-  if (failedRunWithOutput !== undefined) {
-    return blocked(`Reviewer Run ${failedRunWithOutput.id} records Reviewer output.`);
-  }
-  const yieldedRuns = reviewRuns.filter(({ status }) => status === "yielded");
-  if (round.status === "failed" && yieldedRuns.length > 0) {
-    return blocked(`Reviewer Run ${yieldedRuns[0]!.id} yielded a report.`);
-  }
-
-  const finding = store.listReviewFindings(round.taskId).find((entry) => (
-    entry.firstReviewRoundId === round.id || entry.lastReviewRoundId === round.id
-  ));
-  if (finding !== undefined) return blocked(`Review finding ${finding.id} references the Round.`);
-
-  const completionEvents = store.listEvents(round.taskId).filter((event) => (
-    event.type === "review.completed" && event.payload.reviewRoundId === round.id
-  ));
-  if (round.status === "failed") {
-    if (completionEvents.length > 0) {
-      return blocked(`Review completion Event ${completionEvents[0]!.id} exists.`);
-    }
-    return {
-      kind: "non-semantic-terminal",
-      reason: "Failed Round carries no semantic review evidence."
-    };
-  }
-
-  if (!explicitCompletedReviewInfrastructureFailure(round.summary ?? "", round)) {
-    return blocked("completed Round lacks an explicit internal context/workspace failure.");
-  }
-  if (round.reviewerRunId === undefined
-    || yieldedRuns.length !== 1
-    || yieldedRuns[0]!.id !== round.reviewerRunId) {
-    return blocked("completed Round lacks one exact yielded Reviewer Run.");
-  }
-  const yieldedRun = yieldedRuns[0]!;
-  if (yieldedRun.roleName !== round.reviewerRoleName
-    || yieldedRun.summary !== round.summary
-    || yieldedRun.yieldReceipt === undefined) {
-    return blocked(`Reviewer Run ${yieldedRun.id} does not match the non-semantic Round receipt.`);
-  }
-  const receiptMatch = matchYieldReceipt(yieldedRun.yieldReceipt, {
-    status: "yielded",
-    summary: round.summary ?? "",
-    reviewResult: {
-      report: round.report ?? "",
-      checks: round.checks ?? [],
-      ...(frozenHeadEvidenceCommit === undefined
-        ? {}
-        : { evidenceCommit: frozenHeadEvidenceCommit })
-    }
-  });
-  if (receiptMatch === null || receiptMatch.kind !== "replayed") {
-    return blocked(`Reviewer Run ${yieldedRun.id} yield receipt does not cover the Round outcome.`);
-  }
-  if (completionEvents.length !== 1) {
-    return blocked("completed Round lacks one exact completion Event.");
-  }
-  const completion = completionEvents[0]!;
-  if (completion.payload.workItemId !== round.workItemId
-    || completion.payload.candidateId !== round.candidateId
-    || completion.payload.reviewBaseCommit !== round.reviewBaseCommit
-    || completion.payload.evidenceCommit !== (frozenHeadEvidenceCommit ?? "none")
-    || completion.payload.checks !== "none") {
-    return blocked(`Review completion Event ${completion.id} carries mismatched or semantic evidence.`);
-  }
-  return {
-    kind: "non-semantic-terminal",
-    reason: "Completed Round and yielded Run agree on an explicit pre-review infrastructure failure."
-  };
-}
-
-function explicitCompletedReviewInfrastructureFailure(
-  summary: string,
-  round: ReviewRound
-): boolean {
-  if (exactCompletedReviewInfrastructureFailureReport(summary)) {
-    return true;
-  }
-  const legacyReport = summary.trim();
-  if (legacyReport === `Role Run workspace is not the durable owner: ${
-    round.taskId
-  }/${round.reviewerRoleName}.`
-    || (round.reviewerRunId !== undefined
-      && legacyReport === `Review Run workspace is not the durable owner: ${
-        round.reviewerRunId
-      }.`)) {
-    return true;
-  }
-  return /^(?:Run )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)(?:: (?:failure|mismatch|unavailable|unauthorized|stale|mismatched|malformed))?\.?$/iu
-    .test(legacyReport);
-}
-
-function exactCompletedReviewInfrastructureFailureReport(summary: string): boolean {
-  const lines = summary.trim().split(/\r?\n/u);
-  const envelope: readonly RegExp[] = [
-    /^# Review result: (?:context-load|workspace-binding) failure$/u,
-    /^$/u,
-    /^The assigned Run context could not be safely matched to this native session, so no candidate review was performed\.$/u,
-    /^$/u,
-    /^- Run: `[^`\r\n]+`$/u,
-    /^- ReviewRound: `[^`\r\n]+`$/u,
-    /^- Review base commit: `[0-9a-f]{40}`$/u,
-    /^- Frozen target: `[^`\r\n]+`$/u,
-    /^- Authorized workspace from the exact Context Pack: `[^`\r\n]+`$/u,
-    /^- Session-attached workspace: `[^`\r\n]+`$/u,
-    /^- Verification: both paths resolve distinctly and have different filesystem inodes \(`[^`\r\n]+` vs `[^`\r\n]+`\)\.$/u,
-    /^$/u,
-    /^## Findings$/u,
-    /^$/u,
-    /^- Verified-fixed findings: none; review did not start\.$/u,
-    /^- New findings: none; candidate sources were intentionally not inspected\.$/u,
-    /^- Accepted risks: none accepted\.$/u,
-    /^- Residual verification gaps: the complete frozen diff, changed control-flow paths, callers, data-integrity behavior, and required deterministic checks remain unreviewed because the Review workspace binding is mismatched\.$/u,
-    /^$/u,
-    /^## Checks actually run$/u,
-    /^$/u,
-    /^- Exact Context API load: passed for Task\/Run\/Role\/purpose\/subject\/snapshot\/adapter\.$/u,
-    /^- Workspace binding verification: failed\.$/u,
-    /^- Candidate build\/tests\/package checks: not run\.$/u,
-    /^- Real-provider E2E: not run and not authorized\.$/u,
-    /^$/u,
-    /^## Required next action$/u,
-    /^$/u,
-    /^Attach the native Reviewer session to the exact workspace recorded by the Context Pack, or issue a fresh internally consistent Review Run\/Context Pack\. Then perform the complete bounded Task-final review at the frozen head\.$/u
-  ];
-  return lines.length === envelope.length
-    && envelope.every((pattern, index) => pattern.test(lines[index]!));
-}
-
-function runtimeFailureSummaryHasReviewerOutput(summary: string): boolean {
-  const match = /(?:^|\n)last_assistant_message:[ \t]*([\s\S]*)$/u.exec(summary);
-  const output = match?.[1];
-  return output !== undefined && output.trim().length > 0;
-}
-
-function looksLikeStructuredReviewReport(report: string): boolean {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(report) as unknown;
-  } catch {
-    return false;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
-  const record = parsed as Record<string, unknown>;
-  return [
-    "summary",
-    "report",
-    "checks",
-    "findings",
-    "evidence",
-    "evidenceCommit",
-    "deltaDisposition",
-    "deltaReasoning"
-  ].some((key) => Object.hasOwn(record, key));
+  const classification = classifyReviewRoundOutcome(round, store);
+  return classification?.kind === "non-semantic"
+    ? { kind: "non-semantic-terminal", reason: classification.reason }
+    : {
+        kind: "semantic-or-ambiguous",
+        reason: classification?.reason ?? `source status is ${round.status}, not terminal.`
+      };
 }
 
 /**
@@ -5055,9 +4845,9 @@ function validateDeltaRecheckRequest(
   const previous = store.getReviewRound(taskId, preflight.record.previousReviewRoundId);
   if (previous === null
     || (previous.scope ?? "work-item") !== "task"
-    || previous.status !== "completed") {
+    || !isSemanticReviewRound(previous, store)) {
     throw usageError(
-      `Delta-recheck previous ReviewRound is not a completed Task-final Review: `
+      `Delta-recheck previous ReviewRound is not a semantic completed Task-final Review: `
       + `${preflight.record.previousReviewRoundId}.`
     );
   }
@@ -6246,7 +6036,10 @@ function prepareFinalTaskReview(
       }
       return escalated;
     } else {
-      return latest.status === "completed" ? null : latest;
+      return latest.status === "completed"
+        && classifyReviewRoundOutcome(latest, store)?.kind === "semantic"
+        ? null
+        : latest;
     }
   }
 
@@ -7653,9 +7446,9 @@ export function dispatchPreparedReviewRound(
     let deltaContext = "";
     if (taskScope && round.deltaRecheck !== undefined) {
       const previousRound = tx.getReviewRound(taskId, round.deltaRecheck.previousReviewRoundId);
-      if (previousRound === null || previousRound.status !== "completed") {
+      if (previousRound === null || !isSemanticReviewRound(previousRound, tx)) {
         throw new TaskFinalReviewDispatchDriftError(
-          `Delta-recheck previous ReviewRound is unavailable: ${round.deltaRecheck.previousReviewRoundId}.`
+          `Delta-recheck previous semantic ReviewRound is unavailable: ${round.deltaRecheck.previousReviewRoundId}.`
         );
       }
       const diffByProject = options.deltaRecheckDiff;
