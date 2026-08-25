@@ -144,6 +144,19 @@ Input by itself do not block. A blocker reports the total and exact available
 Task/Role/Run/native-session/launch identities and reason, leaves the scene
 unchanged, and tells the user to re-run `yui update` after the listed work clears;
 it never kills, resets, rebinds, retries, or drains on the user's behalf.
+After every listed Turn or Run finishes, the user can stop all idle managed
+Sessions from a normal shell and retry the update:
+
+```sh
+yui session stop --all
+yui update
+```
+
+`session stop --all` first checks every current Session and refuses without
+stopping anything while any Session still has a running Turn/Run or pending
+lifecycle work. When the installed version predates this command, the update
+failure prints an exact-version `npm exec --package=@zq-silk/yui@<version>`
+equivalent so the user can stop Sessions with the staged release before retrying.
 
 Only that user re-run may enter the existing full migration. Once its preflight
 is clear, the update parent captures and stops the exact old Controller PID. The
@@ -764,6 +777,12 @@ Global Operator and global Role sessions remain native interactive CLIs:
 yui session enter <global-role>
 ```
 
+An offline Home migration requires a short maintenance window with no managed
+Agent Session running. Once current Turns and Runs have finished, use
+`yui session stop --all` from a normal shell. The command stops Task and global
+Role Sessions only after every one is idle, and leaves all Sessions untouched
+when any Role is still busy.
+
 tmux fixes a pane's history capacity when that pane is created. Existing panes
 retain their configured capacity; managed runtime output remains observable in
 the Agent Host pane without becoming lifecycle or acknowledgement evidence.
@@ -929,6 +948,7 @@ yui config role add|list|show|update|remove|bind|unbind
 yui config profile add|list|show|update|remove|reset
 yui config completion [bash|zsh|fish]
 yui session enter|record|replace|reconcile
+yui session stop --all
 yui project add|clone|refresh|update|discover|list|show|knowledge
 ```
 

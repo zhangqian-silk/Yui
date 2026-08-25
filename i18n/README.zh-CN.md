@@ -475,12 +475,19 @@ Task Role 使用以下显式入口：
 
 ```sh
 yui session enter <global-role>
+yui session stop --all
 yui task role view <task-id> <role>
 yui task role takeover <task-id> <role>
 yui task role release <task-id> <role>
 ```
 
 `view` 始终只读。`takeover` 要求存在 active managed Run 且没有未决 Turn；它先以持久 CAS 把唯一 writer authority 转给人工 holder，再把相同 epoch 同步给 Agent Host，最后开放 PTY 输入网关。人工输入仍由 Host 转换为结构化 Provider Turn，而不是直接注入 Provider 终端。detach 会自动归还 authority；`release` 即使没有 active Run 也可执行，用于幂等修复中断或未完全同步的接管。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议。
+
+当新版本需要离线迁移 Home 时，应等待当前 Turn/Run 完成，然后从普通 shell
+执行 `yui session stop --all`，再重新执行 `yui update`。停止命令会先整体预检：
+只要仍有 Session 正在运行或存在未决生命周期工作，就不会开始停止；全部空闲
+时才会统一停止 Task Role 和 global Role Session。如果当前安装版本还没有这条
+命令，`yui update` 会给出绑定到目标版本的 `npm exec` 等价命令。
 
 tmux 会在 pane 创建时固定其历史容量。配置该限制之前创建的 Role 会保留原容量；Yui 会在 Terminal attach 和 Web 中提示用户退出并重新进入一次，从而创建具有 100,000 行历史的新 pane。
 

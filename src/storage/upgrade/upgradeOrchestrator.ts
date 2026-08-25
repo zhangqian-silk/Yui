@@ -527,7 +527,7 @@ function describeOfflineBlockers(inventory: OfflineUpgradeInventory): string {
     return `${index + 1}. ${identity.length === 0 ? "identity=unknown" : identity} ` +
       `reason=${reason}`;
   });
-  return `Offline migration blocked by ${inventory.total} active runtime item(s). ` +
+  return `Offline Home migration cannot start while ${inventory.total} runtime obligation(s) remain. ` +
     lines.join("; ");
 }
 
@@ -557,11 +557,19 @@ function offlineInventoryBlocker(
     outcome: "blocked",
     stage: lifecycleOnly ? "drain-incomplete" : "active-sessions",
     message: describeOfflineBlockers(inventory),
-    action: sceneUnchanged
-      ? "No binary, Controller, fence, or Home change was made. Keep working; when every " +
-        "listed runtime obligation is clear, re-run `yui update` so preflight is repeated."
-      : "The Home was not switched. Let every listed runtime obligation settle, then re-run " +
-        "`yui update`; do not kill, reset, rebind, or retry the blocked runtime blindly.",
+    action: lifecycleOnly
+      ? (sceneUnchanged
+          ? "No binary, Controller, fence, or Home change was made. Wait for the listed lifecycle "
+            + "events to settle, then re-run `yui update`."
+          : "The Home was not switched. Wait for the listed lifecycle events to settle, then "
+            + "re-run `yui update`.")
+      : (sceneUnchanged
+          ? "This version requires an offline Home migration with every managed Agent Session "
+            + "stopped. Let the listed Turns or Runs finish, run `yui session stop --all` from a "
+            + "normal shell, then re-run `yui update`. No binary, Controller, fence, or Home "
+            + "change was made."
+          : "The Home was not switched. Let the listed Turns or Runs finish, run "
+            + "`yui session stop --all` from a normal shell, then re-run `yui update`."),
     blockers: inventory.blockers,
     retryCommand: "yui update",
     ...(sceneUnchanged ? { sceneUnchanged: true } : {})

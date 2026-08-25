@@ -284,6 +284,12 @@ const globalSessionChildren: readonly NodeInput[] = [
     options: ["--native-id", "--reason"]
   },
   {
+    name: "stop",
+    summary: "Stop all idle managed Sessions before an offline update.",
+    usage: "yui session stop --all",
+    options: ["--all"]
+  },
+  {
     name: "reconcile",
     summary: "Reconcile durable Session owners with native sessions.",
     usage: "yui session reconcile [--report] [--cleanup]",
@@ -1445,14 +1451,16 @@ export const ROOT_COMMAND = buildNode({
     },
     {
       name: "session",
-      summary: "Load and enter global Role sessions, and reconcile their durable identities.",
+      summary: "Enter, stop, and reconcile managed Role sessions.",
       examples: [
         "yui session context operator --json",
         "yui session enter operator",
+        "yui session stop --all",
         "yui session reconcile --report"
       ],
       sections: [
         { id: "global", title: "Global Role sessions", entries: ["context", "enter", "record", "replace"] },
+        { id: "maintenance", title: "Maintenance", entries: ["stop"] },
         { id: "recovery", title: "Recovery", entries: ["reconcile"] }
       ],
       children: globalSessionChildren
