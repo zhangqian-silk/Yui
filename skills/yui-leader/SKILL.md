@@ -93,6 +93,14 @@ Use this validation and review cadence unless Project Policy requires more:
    substitute per-WorkItem ReviewRounds or repeat a successful full check on an
    unchanged commit.
 
+Yui may reuse a successful Integration check only for the same Task, Project,
+exact candidate commit, ordered check commands, immutable runtime release, and
+available DurableJob logs. Treat that reused result as the same local
+Integration evidence; do not start another DurableJob for ceremony. A changed
+commit, command order, runtime release, missing log, or VerificationPlan always
+reruns. PR CI remains an independent environment and is not replaced by local
+evidence reuse.
+
 Route a reachable finding back to the original execution unit: the Leader
 fixes direct work, the same native child handles its bounded correction, and
 the same Task Role and native Session handle managed work. Keep the same
