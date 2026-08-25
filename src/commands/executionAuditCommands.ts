@@ -311,6 +311,44 @@ export function renderExecutionAudit(
     lines.push("", ...sectionError("workItems", report));
   }
 
+  if (report.orchestration.status === "ok" && report.orchestration.data !== undefined) {
+    const orchestration = report.orchestration.data;
+    lines.push(
+      "",
+      `Orchestration: ${orchestration.tasks.length} Task(s) · ${orchestration.advisoryCount} advisory finding(s)`
+    );
+    if (orchestration.tasks.length > 0) {
+      lines.push(renderTable(
+        "Task orchestration metrics",
+        [
+          { header: "Task", minWidth: 7, maxWidth: 14 },
+          { header: "Delivery", minWidth: 8, maxWidth: 10 },
+          { header: "Runs", minWidth: 4, maxWidth: 6 },
+          { header: "WIs", minWidth: 3, maxWidth: 5 },
+          { header: "Review F/D/N", minWidth: 12, maxWidth: 16 },
+          { header: "Integration A/F/R", minWidth: 17, maxWidth: 20 },
+          { header: "Pre-progress gen", minWidth: 12, maxWidth: 16 },
+          { header: "Terminal ws", minWidth: 10, maxWidth: 12 },
+          { header: "Advice", minWidth: 6, maxWidth: 8 }
+        ],
+        orchestration.tasks.map((task) => [
+          task.taskId,
+          task.deliveryPath,
+          String(task.runs.total),
+          String(task.workItems),
+          `${task.reviews.full}/${task.reviews.delta}/${task.reviews.nonSemantic}`,
+          `${task.integrations.attempts}/${task.integrations.failed}/${task.integrations.repeatedIdentities}`,
+          String(task.providerGenerationsBeforeFirstProgress),
+          String(task.terminalWorkspaceCount),
+          String(task.advisories.length)
+        ]),
+        width
+      ));
+    }
+  } else {
+    lines.push("", ...sectionError("orchestration", report));
+  }
+
   if (report.storage.status === "ok" && report.storage.data !== undefined) {
     const storage = report.storage.data;
     lines.push(

@@ -15,6 +15,10 @@ import {
   type RepairWave
 } from "../task/repairWave.js";
 import { taskDeliveryPath, type TaskDeliveryPath } from "../task/task.js";
+import {
+  projectTaskOrchestration,
+  type OrchestrationAdvisory
+} from "../observability/orchestrationMetrics.js";
 
 /**
  * Issue 07 (Leader convergence): read-only `yui task next-action <task>`.
@@ -69,12 +73,28 @@ export function runTaskNextActionCommand(
       if (readinessFacts === null) throw taskNotFound(taskId);
       completionReadiness = projectCompletionReadiness(readinessFacts);
     }
+    const orchestration = projectTaskOrchestration({
+      task: reader.getTask(taskId)!,
+      runs: reader.listAgentRuns(taskId),
+      roleSessionSets: reader.listRoleSessionSets(taskId),
+      workItems: reader.listWorkItems(taskId),
+      changeSets: reader.listChangeSets(taskId),
+      reviewRounds: reader.listReviewRounds(taskId),
+      reviewFindings: reader.listReviewFindings(taskId),
+      integrations: reader.listIntegrationAttempts(taskId),
+      durableJobs: reader.listDurableJobs(taskId),
+      publications: reader.listPublicationReferences(taskId),
+      decisions: reader.listDecisions(taskId),
+      events: reader.listEvents(taskId),
+      managedWorkspaces: reader.listManagedWorkspaces(taskId)
+    });
     return {
       deliveryPath: taskDeliveryPath(facts.task),
       action,
       repairWave,
       completionReadiness,
-      knowledgeProposals
+      knowledgeProposals,
+      orchestration
     };
   });
   if (asJson) {
@@ -91,7 +111,8 @@ export function runTaskNextActionCommand(
       data.deliveryPath,
       data.repairWave,
       data.completionReadiness,
-      data.knowledgeProposals
+      data.knowledgeProposals,
+      data.orchestration.advisories
     ),
     data
   };
@@ -121,7 +142,8 @@ function renderNextAction(
     proposalId: string;
     title: string;
     sourceTaskId: string;
-  }[]
+  }[],
+  orchestrationAdvisories: readonly OrchestrationAdvisory[]
 ): string {
   const lines = [
     `Task: ${action.taskId}`,
@@ -197,6 +219,14 @@ function renderNextAction(
       ...knowledgeProposals.map((proposal) =>
         `  ${proposal.projectId}/${proposal.proposalId}: ${proposal.title}`
         + ` — review: yui project knowledge proposals list ${proposal.projectId}`)
+    );
+  }
+  if (orchestrationAdvisories.length > 0) {
+    lines.push(
+      `Orchestration advisories (non-blocking): ${orchestrationAdvisories.length}`,
+      ...orchestrationAdvisories.map((advisory) =>
+        `  ${advisory.code}: ${advisory.reason}`
+        + (advisory.refs.length === 0 ? "" : ` — refs ${advisory.refs.join(", ")}`))
     );
   }
   return `${lines.join("\n")}\n`;
