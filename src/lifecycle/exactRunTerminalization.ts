@@ -43,6 +43,7 @@ import { markTaskWakeConsumed } from "../scheduler/taskWake.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   workItemExecutionGroupById,
+  workItemOwnsUnresolvedExecutionLane,
   updateWorkItemExecutionGroup,
   updateWorkItemStatus
 } from "../workItem/workItem.js";
@@ -692,7 +693,13 @@ function recoverExactAgentRunInTransaction(
   const terminal = terminalization.run;
   if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
     const item = store.getWorkItem(input.taskId, terminal.workItemId);
-    if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
+    if (item !== null
+      && !["completed", "failed", "retired"].includes(item.status)
+      && !workItemOwnsUnresolvedExecutionLane(
+        item,
+        terminal.executionGroupId,
+        terminal.executionLaneId
+      )) {
       store.saveWorkItem(input.taskId, updateWorkItemStatus(item, "failed", input.now, input.reason));
     }
   }

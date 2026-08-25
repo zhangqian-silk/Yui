@@ -14,11 +14,15 @@ import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import { mailboxBatches, type WorkMailbox } from "../coordination/workMailbox.js";
 import {
-  summarizeExecutionGroup,
-  type ExecutionGroup,
-  type ExecutionGroupSummary
+  type ExecutionGroup
 } from "../execution/executionGroup.js";
+import {
+  summarizeExecutionGroupHealth,
+  type ExecutionGroupHealthSummary
+} from "../execution/executionHealth.js";
 import { isRoleRunStalled, latestStallProgressAt } from "./roleRunStall.js";
+import { resolveRuntimeHealth } from "../config/yuiConfig.js";
+import type { RuntimeHealthPolicy } from "../runtime/runtimeHealthPolicy.js";
 
 /**
  * Task-first status is a read-model vocabulary. It is deliberately not a new
@@ -105,7 +109,7 @@ export type TaskExecutionProjection = Readonly<{
   activeExecutorCount: number;
   activeRuns: readonly TaskExecutionRun[];
   /** Read-only Leader aggregation for every unified execution Group. */
-  executionGroups: readonly ExecutionGroupSummary[];
+  executionGroups: readonly ExecutionGroupHealthSummary[];
   attention: readonly TaskExecutionAttention[];
   blockers: readonly TaskExecutionBlocker[];
   /** Existing durable wake facts, included for idempotent reconciliation. */
@@ -140,6 +144,7 @@ export type TaskExecutionReadStore = Readonly<{
     launchId?: string;
     status?: string;
   }> | null;
+  getConfig?(): Readonly<{ runtimeHealth?: unknown }>;
 }>;
 
 type TaskExecutionTask = Readonly<Pick<
@@ -176,6 +181,8 @@ export type TaskExecutionFacts = Readonly<{
     launchId?: string;
     status?: string;
   }>[];
+  now?: Date;
+  runtimeHealthPolicy?: RuntimeHealthPolicy;
 }>;
 
 /**
@@ -186,7 +193,8 @@ export type TaskExecutionFacts = Readonly<{
 export function buildTaskExecutionProjection(
   store: TaskExecutionReadStore,
   taskId: string,
-  taskOverride?: TaskExecutionTask
+  taskOverride?: TaskExecutionTask,
+  now = new Date()
 ): TaskExecutionProjection | null {
   const task = store.getTask?.(taskId) ?? taskOverride ?? null;
   if (task === null) return null;
@@ -235,7 +243,9 @@ export function buildTaskExecutionProjection(
     leaderMailbox,
     leaderFailure: store.getLeaderFailure?.(taskId) ?? null,
     operatorNotification: store.getOperatorNotification?.(taskId) ?? null,
-    roleSessions
+    roleSessions,
+    now,
+    runtimeHealthPolicy: resolveRuntimeHealth(store.getConfig?.().runtimeHealth)
   });
 }
 
@@ -279,7 +289,15 @@ export function projectTaskExecution(
     roleSessions = [],
     executionGroups = []
   } = facts;
-  const groupSummaries = executionGroups.map((group) => summarizeExecutionGroup(group));
+  const now = facts.now ?? new Date();
+  const groupSummaries = executionGroups.map((group) => summarizeExecutionGroupHealth({
+    group,
+    runs,
+    sessions: roleSessions,
+    events,
+    now,
+    policy: facts.runtimeHealthPolicy
+  }));
   const render = (input: ProjectionInput): TaskExecutionProjection => projection({
     ...input,
     executionGroups: groupSummaries
@@ -545,7 +563,7 @@ type ProjectionInput = Omit<
   "next" | "taskId" | "taskStatus" | "executionGroups"
 > & Readonly<{
   task: Readonly<Pick<Task, "id" | "status">>;
-  executionGroups?: readonly ExecutionGroupSummary[];
+  executionGroups?: readonly ExecutionGroupHealthSummary[];
 }>;
 
 function projection(input: ProjectionInput): TaskExecutionProjection {

@@ -162,7 +162,8 @@ import { providerContinuationKey } from "../runtime/providerContinuation.js";
 import {
   currentWorkItemExecutionGroup,
   updateWorkItemExecutionGroup,
-  updateWorkItemStatus
+  updateWorkItemStatus,
+  workItemOwnsUnresolvedExecutionLane
 } from "../workItem/workItem.js";
 import { recordExecutionLaneResult } from "../execution/executionGroup.js";
 import {
@@ -2219,11 +2220,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (item !== null && ![
           "completed", "failed", "retired"
         ].includes(item.status)) {
-          const group = currentWorkItemExecutionGroup(item);
-          const groupedPanel = group !== undefined
-            && (group.lanes.length > 1 || group.strategy.mode === "adaptive")
-            && group.resolution === undefined;
-          if (!groupedPanel) {
+          if (!workItemOwnsUnresolvedExecutionLane(
+            item,
+            terminal.executionGroupId,
+            terminal.executionLaneId
+          )) {
             store.saveWorkItem(
               input.taskId,
               updateWorkItemStatus(item, "failed", input.now, summary)
@@ -2457,11 +2458,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             ));
           }
           const laneUpdated = store.getWorkItem(task.id, currentRun.workItemId)!;
-          const laneGroup = currentWorkItemExecutionGroup(laneUpdated);
-          const groupedPanel = laneGroup !== undefined
-            && (laneGroup.lanes.length > 1 || laneGroup.strategy.mode === "adaptive")
-            && laneGroup.resolution === undefined;
-          if (!groupedPanel) {
+          if (!workItemOwnsUnresolvedExecutionLane(
+            laneUpdated,
+            currentRun.executionGroupId,
+            currentRun.executionLaneId
+          )) {
             store.saveWorkItem(
               task.id,
               updateWorkItemStatus(laneUpdated, "failed", input.now, input.summary)
@@ -3050,7 +3051,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         const item = store.getWorkItem(input.taskId, before.workItemId);
         if (item !== null && ![
           "completed", "failed", "retired"
-        ].includes(item.status)) {
+        ].includes(item.status) && !workItemOwnsUnresolvedExecutionLane(
+          item,
+          before.executionGroupId,
+          before.executionLaneId
+        )) {
           store.saveWorkItem(
             input.taskId,
             updateWorkItemStatus(item, "failed", now, summary)
@@ -4884,7 +4889,13 @@ function finalizeProviderRetryDeadline(
   ));
   if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
     const item = store.getWorkItem(run.taskId, terminal.workItemId);
-    if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
+    if (item !== null
+      && !["completed", "failed", "retired"].includes(item.status)
+      && !workItemOwnsUnresolvedExecutionLane(
+        item,
+        terminal.executionGroupId,
+        terminal.executionLaneId
+      )) {
       store.saveWorkItem(run.taskId, updateWorkItemStatus(item, "failed", now, summary));
     }
   }

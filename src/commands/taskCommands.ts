@@ -2858,6 +2858,12 @@ function dispatchWork(
     const existingGroup = currentGroup?.resolution === undefined
       ? currentGroup
       : undefined;
+    if (item.status === "failed" && existingGroup !== undefined) {
+      throw usageError(
+        `Work Item ${item.id} retains unresolved ExecutionGroup ${existingGroup.id}; `
+        + "retry the exact failed AgentRun so completed Lane results remain reusable."
+      );
+    }
     const expanding = item.status === "running" && existingGroup !== undefined;
     const continuingExploration = currentGroup?.stage !== undefined
       && currentGroup.resolution !== undefined
@@ -3049,8 +3055,6 @@ function dispatchWork(
             writableProjectIds: [...item.writeProjectIds]
           };
       const runningLane = lane.status === "failed"
-        || lane.status === "yielded"
-        || lane.status === "completed"
         ? restartExecutionLane(runningGroup, lane.id, {
             runId: plan.runId,
             effective,
@@ -5494,7 +5498,6 @@ function retryRun(
       : currentWorkItemExecutionGroup(retryItem);
     const groupedRunningRetry = retryItem?.status === "running"
       && currentRetryGroup?.id === previous.executionGroupId
-      && (currentRetryGroup?.lanes.length ?? 0) > 1
       && retryLaneBefore?.status === "failed";
     if (retryItem !== null && retryItem.status !== "failed" && !groupedRunningRetry) {
       throw usageError(`Work Item ${retryItem.id} is not retryable from ${retryItem.status}.`);

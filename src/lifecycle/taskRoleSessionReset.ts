@@ -12,7 +12,10 @@ import {
 import type { AgentRun } from "../run/agentRun.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
-import { updateWorkItemStatus } from "../workItem/workItem.js";
+import {
+  updateWorkItemStatus,
+  workItemOwnsUnresolvedExecutionLane
+} from "../workItem/workItem.js";
 import { terminalizeExactTaskRun } from "./exactRunTerminalization.js";
 
 export type ResetTaskRoleSessionResult = Readonly<{
@@ -65,7 +68,13 @@ export function resetTaskRoleSessionGeneration(
     }
     if (activeRun.purpose === "execution" && activeRun.workItemId !== undefined) {
       const item = store.getWorkItem(task.id, activeRun.workItemId);
-      if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
+      if (item !== null
+        && !["completed", "failed", "retired"].includes(item.status)
+        && !workItemOwnsUnresolvedExecutionLane(
+          item,
+          activeRun.executionGroupId,
+          activeRun.executionLaneId
+        )) {
         store.saveWorkItem(task.id, updateWorkItemStatus(item, "failed", now, summary));
       }
     }

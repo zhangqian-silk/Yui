@@ -734,6 +734,27 @@ export function workItemExecutionGroupById(
   return workItem.executionGroups.find(({ id }) => id === executionGroupId);
 }
 
+/**
+ * True when a Run failure belongs to the WorkItem's current unresolved Lane.
+ * Such a failure is Lane-bounded: the WorkItem remains running so the Leader
+ * can reuse completed siblings and retry only this failed attempt.
+ */
+export function workItemOwnsUnresolvedExecutionLane(
+  workItem: Pick<WorkItem, "currentExecutionGroupId" | "executionGroups">,
+  executionGroupId: string | undefined,
+  executionLaneId: string | undefined
+): boolean {
+  if (executionGroupId === undefined
+    || executionLaneId === undefined
+    || workItem.currentExecutionGroupId !== executionGroupId) return false;
+  const group = workItem.executionGroups.find(({ id }) => id === executionGroupId);
+  return group !== undefined
+    && group.resolution === undefined
+    && group.lanes.some(({ id, status }) => (
+      id === executionLaneId && status === "failed"
+    ));
+}
+
 function validateWorkItemExplorationHistory(groups: readonly ExecutionGroup[]): void {
   const staged = groups.filter(({ stage }) => stage !== undefined);
   if (staged.length === 0) return;
