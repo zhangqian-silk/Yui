@@ -549,11 +549,16 @@ export class TmuxSessionHost implements SessionHostPort {
       return binding;
     }
     const broker = launchBrokerForHome(yuiHome);
+    const sessionManifest = planned.launch.env.YUI_SESSION_MANIFEST;
     const frozenControlPlane = planned.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR];
     const frozenTaskRuntime = planned.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
     if (request.owner.scope === "task" && request.runId !== undefined
-      && (frozenControlPlane === undefined || frozenTaskRuntime === undefined)) {
-      throw new Error("Managed Task Agent Host launch is missing its frozen control descriptors.");
+      && (sessionManifest === undefined
+        || frozenControlPlane === undefined
+        || frozenTaskRuntime === undefined)) {
+      throw new Error(
+        "Managed Task Agent Host launch is missing its Session Manifest or frozen control descriptors."
+      );
     }
     const reservation = broker.reserve(Object.freeze({
       schemaVersion: 1,
@@ -592,6 +597,9 @@ export class TmuxSessionHost implements SessionHostPort {
         ...(planned.launch.env.YUI_WORKSPACE === undefined
           ? {}
           : { YUI_WORKSPACE: planned.launch.env.YUI_WORKSPACE }),
+        ...(sessionManifest === undefined
+          ? {}
+          : { YUI_SESSION_MANIFEST: sessionManifest }),
         ...(frozenControlPlane === undefined
           ? {}
           : { [YUI_CONTROL_PLANE_DESCRIPTOR]: frozenControlPlane }),

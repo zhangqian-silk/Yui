@@ -1033,6 +1033,7 @@ test("TmuxSessionHost forwards the frozen Task descriptors to its internal Agent
           YUI_AGENT_ID: "agent",
           YUI_ADAPTER_ID: "codex",
           YUI_WORKSPACE: launchWorkspace,
+          YUI_SESSION_MANIFEST: "/tmp/yui-session-manifest.json",
           YUI_CONTROL_PLANE_DESCRIPTOR: "frozen-control-plane",
           YUI_TASK_RUNTIME_DESCRIPTOR: "frozen-task-runtime"
         },
@@ -1072,6 +1073,7 @@ test("TmuxSessionHost forwards the frozen Task descriptors to its internal Agent
   assert.equal(launched.env.YUI_AGENT_ID, "agent");
   assert.equal(launched.env.YUI_ADAPTER_ID, "codex");
   assert.equal(launched.env.YUI_WORKSPACE, launchWorkspace);
+  assert.equal(launched.env.YUI_SESSION_MANIFEST, "/tmp/yui-session-manifest.json");
 });
 
 test("execution audit projects structured launch failure phase and kind", (t) => {
