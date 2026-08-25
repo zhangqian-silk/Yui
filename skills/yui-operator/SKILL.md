@@ -309,6 +309,12 @@ ChangeSet is integrated.
 
 - Enter the global Session with `yui operator enter`; do not recursively run it
   from inside Operator.
+- Use `yui operator status` to distinguish the one GlobalRole-selected active
+  writer from retained historical conversations. Historical Sessions are
+  evidence only and never a second Operator authority. Use `operator resume`
+  only for an existing explicit conversation; creating a conversation is the
+  separate, deliberate `operator new` action. Recovery must never create an
+  extra Operator Session implicitly.
 - Enter an active Task Leader with `yui task enter <task-id>`, or a persistent
   Role with `yui task enter <task-id> <role>`.
 - Relay explicit Task information with

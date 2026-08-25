@@ -242,6 +242,7 @@ WorkItem workspace 之间移动时，Yui 会退役已停止的旧 Session；下�
 ```sh
 yui operator submit "比较 CSV 与 JSON 的兼容性" --task <task-id>
 yui operator submit "研究更小的缓存设计"
+yui operator status
 yui operator list
 yui operator resume
 yui operator resume --last
@@ -266,12 +267,13 @@ Operator 会结合 Project Catalog 和现有 Task context 路由请求。同一�
 目标的追加需求、修复、审查和咨询继续进入原 Task，即使它涉及多个 Project。
 目标、所有权边界或生命周期独立时才创建新 Task。需求、Bug 和咨询共用同一
 Task/WorkItem 模型，不增加额外任务类型。
-`operator list` 按固定的最近更新时间倒序展示历史对话，并显示 Agent
+`operator status` 将 GlobalRole 选中的唯一 active writer 与保留的历史对话
+分开展示。`operator list` 按固定的最近更新时间倒序展示历史对话，并显示 Agent
 及可读的标题或摘要；底层 provider session ID 始终保持内部实现细节。
 若 adapter 尚未提供这些元数据，Yui 会显示 provider 和稳定的 Yui
-短引用，确保无标题会话仍可区分。`operator resume` 使用同一个轻量编号列表，
-`--last` 可直接恢复最近一条；
-`operator new` 创建空白对话，并把原对话保留在历史中。
+短引用，确保无标题会话仍可区分。`operator resume` 使用轻量历史编号列表，
+`--last` 可直接恢复最近一条；新建会话不会伪装成 resume 选项，必须显式使用
+`operator new`，并把原对话保留在历史中。
 
 从已配置的全局 Worker 创建 Task Role，应用 Profile 并派发 WorkItem：
 

@@ -5,6 +5,7 @@ import {
 } from "../executor/agentExecutor.js";
 import {
   listOperatorSessions,
+  projectOperatorStatus,
   prepareOperatorNewSession,
   prepareOperatorResumeSession
 } from "../operator/operatorSessionHistory.js";
@@ -47,6 +48,7 @@ export function runOperatorCommand(
   const [command, ...rest] = args;
   switch (command) {
     case "list": return listSessions(rest, store, options);
+    case "status": return status(rest, store, options);
     case "new": return newSession(rest, store);
     case "resume": return resumeSession(rest, store);
     case "submit": return submit(rest, store, options);
@@ -55,6 +57,59 @@ export function runOperatorCommand(
         ? "Operator command is required."
         : `Unknown command: operator ${command}`);
   }
+}
+
+function status(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: OperatorCommandOptions
+): TaskCommandExecution {
+  if (args.length !== 0) throw usageError("Operator status usage: yui operator status.");
+  const role = requireOperator(store);
+  const activeBinding = role.agentBindings[role.activeAgentId];
+  if (activeBinding === undefined) {
+    throw usageError(`Operator active Agent is not bound: ${role.activeAgentId}.`);
+  }
+  const projection = projectOperatorStatus(
+    store.getGlobalRoleSessionSet(role.name),
+    role.activeAgentId,
+    activeBinding.adapterId
+  );
+  const writer = projection.writer;
+  const writerLines = [
+    "Operator status",
+    "Active writer:",
+    `  State: ${writer.state}`,
+    `  Agent: ${writer.agentId}`,
+    `  Adapter: ${adapterLabel(writer.adapterId)}`,
+    `  Conversation: ${writer.sessionRef ?? "-"}`,
+    `  Native session: ${writer.nativeSessionId ?? "-"}`,
+    `  Session state: ${writer.sessionStatus ?? "-"}`
+  ];
+  const history = projection.historicalConversations;
+  const historyOutput = history.length === 0
+    ? "Historical conversations: none"
+    : renderTable(
+        "Historical conversations",
+        [
+          { header: "Updated", minWidth: 7, maxWidth: 12 },
+          { header: "Agent", minWidth: 6, maxWidth: 16 },
+          { header: "Conversation", minWidth: 20, maxWidth: 72 },
+          { header: "State", minWidth: 7, maxWidth: 10 }
+        ],
+        history.map((session) => [
+          formatRelativeTimestamp(session.updatedAt, options.now?.() ?? new Date()),
+          adapterLabel(session.adapterId),
+          session.displayTitle,
+          session.state
+        ]),
+        options.width ?? defaultTableWidth()
+      );
+  return {
+    kind: "output",
+    output: `${writerLines.join("\n")}\n\n${historyOutput}\n`,
+    data: projection
+  };
 }
 
 function submit(

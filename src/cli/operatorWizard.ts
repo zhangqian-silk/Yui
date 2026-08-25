@@ -56,11 +56,9 @@ export async function resolveOperatorWizardArguments(
       : { kind: "resolved", args: [...args, "--agent", selected] };
   }
   if (args[1] === "resume" && args.length === 2) {
-    const newSession = "__operator_new_session__";
     const selected = await choose(
       "Resume an Operator session",
-      [
-        ...sessions.map((session) => ({
+      sessions.map((session) => ({
           value: session.ref,
           cells: [
             formatRelativeTimestamp(session.updatedAt, now),
@@ -69,11 +67,6 @@ export async function resolveOperatorWizardArguments(
             session.state
           ]
         })),
-        {
-          value: newSession,
-          cells: ["", "", "Start a new session", "new"]
-        }
-      ],
       [
         { header: "Updated", minWidth: 7, maxWidth: 12 },
         { header: "Agent", minWidth: 6, maxWidth: 12 },
@@ -81,18 +74,9 @@ export async function resolveOperatorWizardArguments(
         { header: "State", minWidth: 7, maxWidth: 10 }
       ],
       io,
-      sessions[0]?.ref ?? newSession,
+      sessions[0]?.ref,
       "session"
     );
-    if (selected === newSession) {
-      return resolveOperatorWizardArguments(
-        ["operator", "new"],
-        role,
-        sessions,
-        io,
-        now
-      );
-    }
     return selected === undefined
       ? { kind: "cancelled", args }
       : { kind: "resolved", args: [...args, selected] };

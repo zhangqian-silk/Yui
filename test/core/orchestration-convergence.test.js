@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { runOperatorCommand } from "../../dist/commands/operatorCommands.js";
 import {
   createRoleSessionSet,
   recordRoleAgentSession,
@@ -31,6 +32,10 @@ import {
 } from "../../dist/job/durableJob.js";
 import { writeRuntimeIdentity } from "../../dist/release/runtimeRelease.js";
 import {
+  prepareOperatorNewSession,
+  projectOperatorStatus
+} from "../../dist/operator/operatorSessionHistory.js";
+import {
   classifyReviewRoundOutcome
 } from "../../dist/review/reviewOutcomeClassifier.js";
 import { createWorkItem } from "../../dist/workItem/workItem.js";
@@ -39,7 +44,11 @@ import {
   boundProviderRetryBeforeFirstProgress,
   projectFirstProgressStopLoss
 } from "../../dist/runtime/firstProgressStopLoss.js";
-import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import {
+  createGlobalRole,
+  createRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
 import { createProject } from "../../dist/repository/project.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
@@ -615,4 +624,66 @@ test("Git Integration reuses exact successful evidence without starting another 
   assert.equal(execFileSync("git", ["rev-parse", "main"], {
     cwd: repository, encoding: "utf8"
   }).trim(), candidate);
+});
+
+test("Operator status separates its unique writer from historical conversations", () => {
+  let sessions = taskSessions({ scope: "global", roleName: "operator" });
+  sessions = updateRoleAgentSessionStatus(sessions, "agent", "stopped", later);
+  sessions = prepareOperatorNewSession(sessions, "agent", later);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "agent",
+    adapterId: "codex",
+    nativeSessionId: "session-2",
+    launchId: "launch-2",
+    status: "running",
+    policy: "fixed",
+    effective
+  }, later);
+  const status = projectOperatorStatus(sessions, "agent", "codex");
+  assert.equal(status.writer.state, "active");
+  assert.equal(status.writer.nativeSessionId, "session-2");
+  assert.equal(status.historicalConversations.length, 1);
+  assert.equal(status.historicalConversations[0].state, "history");
+
+  const drifted = projectOperatorStatus(sessions, "replacement", "claude");
+  assert.equal(drifted.writer.state, "unrecorded");
+  assert.equal(drifted.writer.agentId, "replacement");
+  assert.equal(drifted.historicalConversations.length, 2);
+  assert.ok(drifted.historicalConversations.every(({ state }) => state === "history"));
+
+  const adapterDrifted = projectOperatorStatus(sessions, "agent", "claude");
+  assert.equal(adapterDrifted.writer.state, "unrecorded");
+  assert.equal(adapterDrifted.historicalConversations.length, 2);
+  assert.ok(adapterDrifted.historicalConversations.every(({ state }) => state === "history"));
+});
+
+test("operator status renders one writer separately from retained history", () => {
+  let sessions = taskSessions({ scope: "global", roleName: "operator" });
+  sessions = updateRoleAgentSessionStatus(sessions, "agent", "stopped", later);
+  sessions = prepareOperatorNewSession(sessions, "agent", later);
+  sessions = recordRoleAgentSession(sessions, {
+    agentId: "agent",
+    adapterId: "codex",
+    nativeSessionId: "session-2",
+    launchId: "launch-2",
+    status: "running",
+    policy: "fixed",
+    effective
+  }, later);
+  const role = createGlobalRole(
+    "operator",
+    [createRoleAgentBinding({ id: "agent", adapterId: "codex" })],
+    "agent",
+    "/tmp/yui-orchestration",
+    now
+  );
+  const result = runOperatorCommand(["status"], {
+    getGlobalRole: () => role,
+    getGlobalRoleSessionSet: () => sessions
+  }, { now: () => later });
+  assert.equal(result.kind, "output");
+  assert.match(result.output, /Active writer:\n  State: active/u);
+  assert.match(result.output, /Historical conversations/u);
+  assert.equal(result.data.writer.nativeSessionId, "session-2");
+  assert.equal(result.data.historicalConversations.length, 1);
 });
