@@ -5336,7 +5336,7 @@ function bindTaskRoleRunInFlight(
     agentId,
     runId: run.id,
     receiptId: agentRunDeliveryReceiptId(run)
-  }, now);
+  }, now, run.mode);
   store.saveRoleSessionSet(updated);
 }
 

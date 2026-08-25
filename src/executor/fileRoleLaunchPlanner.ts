@@ -393,7 +393,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       input,
       { scope: "global" },
       undefined,
-      compatibleExisting ? existing.nativeSessionId : undefined,
+      input.mode === "resume" && compatibleExisting ? existing.nativeSessionId : undefined,
       undefined,
       effective,
       { purpose: "execution" }
@@ -585,8 +585,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "codex_exec"
         }
       : {};
-    const preallocatedManagedNativeSessionId = managedControl
-      && binding.adapterId === "claude"
+    const preallocatedNativeSessionId = binding.adapterId === "claude"
       && resumeNativeSessionId === undefined
       ? requireText(
           input.launchId === undefined
@@ -604,7 +603,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       ? adapter.compileManagedControl(
           compileInput,
           launchMode,
-          preallocatedManagedNativeSessionId
+          preallocatedNativeSessionId
         )
       : undefined;
     const compiled = managedCompiled !== undefined
@@ -664,7 +663,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
       );
       const nativeSessionId = requireText(
-        preallocatedManagedNativeSessionId,
+        preallocatedNativeSessionId,
         "Native session id"
       );
       if (!managedControl) args.push("--session-id", nativeSessionId);
@@ -723,7 +722,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       ? this.#providerAuthorityForLaunch(owner.taskId, role.name, input.launchId)
       : undefined;
     const providerNativeSessionId = binding.adapterId === "claude"
-      ? preallocatedManagedNativeSessionId
+      ? preallocatedNativeSessionId
       : resumeNativeSessionId;
     const providerControl: AgentHostProviderControl | undefined = managedControl
       ? {
