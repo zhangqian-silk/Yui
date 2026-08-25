@@ -2300,12 +2300,22 @@ async function candidateMaterializationForTaskCommand(
   if (item === null || item === undefined || group === undefined) return undefined;
   if (group.stage !== undefined && group.stage.stage !== "resolve") return undefined;
   const selected = args.flatMap((value, index) => value === "--lane" && args[index + 1] !== undefined ? [args[index + 1]!] : []);
+  const materializedLaneIds = selected.length === 0
+    ? group.lanes
+      .filter((lane) => lane.status === "yielded" || lane.status === "completed")
+      .map(({ id }) => id)
+    : selected;
+  if (group.stage?.convergence !== undefined
+    && group.stage.stage === "resolve"
+    && materializedLaneIds.length !== 1) {
+    throw usageError("Candidate convergence Resolve must select exactly one Lane before materialization.");
+  }
   try {
     return await preparer.materializeExecutionGroupCandidate(
       item.taskId,
       item.id,
       group.id,
-      selected
+      materializedLaneIds
     );
   } catch (error) {
     throw usageError(error instanceof Error ? error.message : String(error));

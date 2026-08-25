@@ -230,6 +230,11 @@ import {
   type WorkItemExecutionMode
 } from "../execution/executionGroup.js";
 import {
+  assertIndependentVerificationRoles,
+  candidateConvergenceDirective,
+  validateCandidateConvergenceResolution
+} from "../execution/candidateConvergence.js";
+import {
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
@@ -2979,6 +2984,9 @@ function dispatchWork(
             ...(requestedStageMaxAttempts === undefined
               ? {}
               : { maxAttempts: requestedStageMaxAttempts }),
+            ...(startingExploration
+              ? { convergence: { schemaVersion: 1 as const } }
+              : {}),
             strategy,
             contextSnapshotRef: contextSnapshotRef(freezeExecutionStageContextSnapshot(tx, {
               taskId: task.id,
@@ -3002,6 +3010,9 @@ function dispatchWork(
       for (const roleName of laneRoles) {
         group = addExecutionLane(group, { roleName }, now);
       }
+    }
+    if (group.stage !== undefined) {
+      assertIndependentVerificationRoles(item, group.stage, laneRoles);
     }
     const lanes = expanding
       ? group.lanes.slice(-plans.length)
@@ -3066,7 +3077,10 @@ function dispatchWork(
         directive: `${rawInput}\nFrozen target: ${group.target.fingerprint}.`
           + (group.stage === undefined
             ? ""
-            : `\nExploration stage: ${group.stage.stage}; round=${group.stage.round}; attempt=${group.stage.stageAttempt}.`),
+            : `\nExploration stage: ${group.stage.stage}; round=${group.stage.round}; attempt=${group.stage.stageAttempt}.`
+              + (group.stage.convergence === undefined
+                ? ""
+                : `\n${candidateConvergenceDirective(group.stage)}`)),
         deltaRefIds: []
       });
       createdRuns.push(createAgentRun(
@@ -3211,6 +3225,7 @@ function resolveWorkExecutionGroup(
         ? { selectedLaneIds: acceptedLaneIds }
         : selectedLaneIds === undefined ? {} : { selectedLaneIds })
     }, now);
+    validateCandidateConvergenceResolution(item, resolved);
     const groupedItem = updateWorkItemExecutionGroup(item, resolved, now);
     tx.saveWorkItem(task.id, groupedItem);
     if (decision !== "accept") {

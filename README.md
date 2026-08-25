@@ -549,6 +549,18 @@ Every stage is a new immutable ExecutionGroup. Its ContextSnapshot and selected
 parent Lane results are durable references; `retry` repeats a stage within its
 attempt budget, while `retry` at Resolve begins the next bounded round.
 
+New exploration histories also freeze the structured candidate-convergence
+contract. Yui appends the exact stage-local JSON shape to every Lane assignment
+and validates selected reports before the Leader can advance: Compare must
+partition duplicate clusters and justify each selected route with a direct
+source, executable check, or frozen artifact; Synthesize uses a claim/evidence
+table for research, a decision matrix for architecture, and one frozen Git
+snapshot for code. Verify must use a Role independent from the selected
+Synthesize author. Only complete criterion evidence can produce `passed` and
+an accepted Resolve Candidate; explicit gaps produce `next-round` and can only
+continue through bounded Resolve `retry`. Votes and derived analysis remain
+reportable context, but never substitute for direct evidence.
+
 Permission is one adapter-specific enum configuration on each Agent binding:
 `default` follows the provider, `bypass` compiles the provider's supported
 bypass flag, and `configured` retains whichever native options are explicitly

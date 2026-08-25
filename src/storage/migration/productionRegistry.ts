@@ -33,6 +33,8 @@ const WORK_ITEM_GROUP_HISTORY_FROM_VERSION = 8;
 const WORK_ITEM_GROUP_HISTORY_TO_VERSION = 9;
 const WORK_ITEM_EXPLORATION_STAGE_FROM_VERSION = 9;
 const WORK_ITEM_EXPLORATION_STAGE_TO_VERSION = 10;
+const WORK_ITEM_CANDIDATE_CONVERGENCE_FROM_VERSION = 10;
+const WORK_ITEM_CANDIDATE_CONVERGENCE_TO_VERSION = 11;
 const AGENT_RUN_FROM_VERSION = 5;
 const AGENT_RUN_TO_VERSION = 6;
 /**
@@ -164,6 +166,15 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       "workItem",
       WORK_ITEM_EXPLORATION_STAGE_FROM_VERSION,
       WORK_ITEM_EXPLORATION_STAGE_TO_VERSION,
+      "workItems"
+    ))
+    // Candidate convergence is frozen only on newly created exploration
+    // histories. Existing valid T4 histories remain byte-for-byte evidence,
+    // so this adjacent persistent transition advances only the family version.
+    .registerOfflineMigration(recordFamilyStep(
+      "workItem",
+      WORK_ITEM_CANDIDATE_CONVERGENCE_FROM_VERSION,
+      WORK_ITEM_CANDIDATE_CONVERGENCE_TO_VERSION,
       "workItems"
     ))
     .registerOfflineMigration(recordFamilyStep(
