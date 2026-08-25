@@ -26,6 +26,7 @@ import {
   assertExecutionGroupTransition,
   validateExecutionGroup,
   WORK_ITEM_EXPLORATION_STAGES,
+  type CandidateConvergencePolicy,
   type ExecutionGroup,
   type ExecutionParentResultRef,
   type ExecutionStageContext,
@@ -119,8 +120,8 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  /** v10 lets ExecutionGroup history carry the bounded exploration stage machine. */
-  schemaVersion: 10;
+  /** v11 lets new exploration histories freeze the structured convergence policy. */
+  schemaVersion: 11;
   id: string;
   taskId: string;
   title: string;
@@ -170,7 +171,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 10,
+    schemaVersion: 11,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -466,7 +467,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 10) throw new Error("WorkItem must use schemaVersion 10.");
+  if (workItem.schemaVersion !== 11) throw new Error("WorkItem must use schemaVersion 11.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
@@ -588,6 +589,8 @@ export type PlanWorkItemExplorationStageInput = Readonly<{
   maxAttempts?: number;
   strategy: ExecutionStrategy;
   contextSnapshotRef: ContextSnapshotRef;
+  /** Set only on the first stage; every successor inherits the frozen policy. */
+  convergence?: CandidateConvergencePolicy;
 }>;
 
 /**
@@ -611,6 +614,9 @@ export function planWorkItemExplorationStage(
     if (input.mode === undefined) {
       throw new Error("The first exploration stage requires a mode.");
     }
+    if (input.convergence === undefined) {
+      throw new Error("The first exploration stage requires a candidate convergence policy.");
+    }
     return {
       schemaVersion: 1,
       mode: input.mode,
@@ -626,7 +632,8 @@ export function planWorkItemExplorationStage(
         )
       },
       contextSnapshotRef: snapshot,
-      parentResults: []
+      parentResults: [],
+      ...(input.convergence === undefined ? {} : { convergence: input.convergence })
     };
   }
   if (current === undefined || current.stage === undefined) {
@@ -647,7 +654,10 @@ export function planWorkItemExplorationStage(
     mode: current.stage.mode,
     maxRounds: current.stage.maxRounds,
     contextSnapshotRef: snapshot,
-    parentResults
+    parentResults,
+    ...(current.stage.convergence === undefined
+      ? {}
+      : { convergence: current.stage.convergence })
   };
   if (current.resolution.decision === "reject") {
     throw new Error(`Rejected exploration has no continuation: ${current.id}.`);
@@ -748,8 +758,10 @@ function validateWorkItemExplorationHistory(groups: readonly ExecutionGroup[]): 
     if (previous.resolution.decision === "reject") {
       throw new Error(`Rejected exploration cannot have a successor: ${previous.id}.`);
     }
-    if (after.mode !== before.mode || after.maxRounds !== before.maxRounds) {
-      throw new Error("Work Item exploration mode and maxRounds are immutable.");
+    if (after.mode !== before.mode
+      || after.maxRounds !== before.maxRounds
+      || JSON.stringify(after.convergence) !== JSON.stringify(before.convergence)) {
+      throw new Error("Work Item exploration mode, maxRounds and convergence policy are immutable.");
     }
     const parents = selectedParentResults(previous);
     if (JSON.stringify(after.parentResults) !== JSON.stringify(parents)) {

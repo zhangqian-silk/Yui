@@ -304,6 +304,14 @@ yui task work group resolve <task-id>/<work-item-id> \
 结果都以持久引用衔接。`retry` 在阶段尝试预算内重做当前阶段，而 Resolve 上的
 `retry` 才进入下一轮，并受最大轮次约束。
 
+新建探索历史还会冻结结构化候选收敛契约。Yui 将当前阶段的精确 JSON 形状追加到
+每个 Lane assignment，并在 Leader 推进前校验入选报告：Compare 必须显式划分
+重复簇，并以直接来源、可执行检查或冻结产物支持每条入选路线；Synthesize 对调研
+使用 claim/evidence 表、对架构使用决策矩阵、对代码只选择一个冻结 Git snapshot。
+Verify 必须使用与入选 Synthesize 作者不同的 Role。只有逐条验收证据完整时才能得到
+`passed` 并由 Resolve 接受 Candidate；显式 gap 只能形成 `next-round`，再通过有界的
+Resolve `retry` 继续。票数和衍生分析可以作为报告上下文，但不能替代直接证据。
+
 每个 Agent binding 只有一套 adapter-specific 权限枚举配置：`default` 遵循
 provider 默认行为；`bypass` 编译 provider 支持的 bypass flag；`configured`
 保留其中显式设置的原生选项。Codex 选项是 `sandbox` 和 `approval`；Claude 选项是

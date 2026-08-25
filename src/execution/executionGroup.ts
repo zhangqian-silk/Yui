@@ -69,6 +69,14 @@ export type ExecutionStageBudget = Readonly<{
 }>;
 
 /**
+ * Present on exploration histories created under the structured T5 contract.
+ * Older valid histories omit it and retain their frozen T4 resolution rules.
+ */
+export type CandidateConvergencePolicy = Readonly<{
+  schemaVersion: 1;
+}>;
+
+/**
  * Immutable WorkItem exploration semantics carried by one ExecutionGroup.
  * The WorkItem's ordered Group history is the state machine; this value does
  * not introduce another container or graph.
@@ -83,6 +91,7 @@ export type ExecutionStageContext = Readonly<{
   budget: ExecutionStageBudget;
   contextSnapshotRef: ContextSnapshotRef;
   parentResults: readonly ExecutionParentResultRef[];
+  convergence?: CandidateConvergencePolicy;
 }>;
 
 /**
@@ -735,6 +744,12 @@ export function validateExecutionStageContext(
       throw new Error(`Execution stage parent result is duplicated: ${groupId}/${laneId}.`);
     }
     parents.add(key);
+  }
+  if (stage.convergence !== undefined
+    && (stage.convergence === null
+      || typeof stage.convergence !== "object"
+      || stage.convergence.schemaVersion !== 1)) {
+    throw new Error("Candidate convergence policy must use schemaVersion 1.");
   }
   return stage;
 }
