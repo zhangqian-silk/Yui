@@ -61,7 +61,9 @@ import {
 } from "./commands/executionAuditCommands.js";
 import {
   parseSessionReconcileOptions,
-  runSessionReconcileCommand
+  parseSessionStopOptions,
+  runSessionReconcileCommand,
+  runSessionStopCommand
 } from "./commands/sessionCommands.js";
 import { SessionOwnerReconciliation } from "./controller/sessionOwnerReconciliation.js";
 import { runJobCommand } from "./commands/jobCommands.js";
@@ -913,6 +915,22 @@ export async function main(): Promise<void> {
     return;
   }
   if (resolved[0] === "session") {
+    if (resolved[1] === "stop") {
+      const options = parseSessionStopOptions(resolved.slice(2));
+      await ensureFileTaskController(home, { environment: process.env });
+      const candidates = schedulerStore.listRuntimeSessionCandidates();
+      const dormant = schedulerStore.listDormantRuntimeOwners();
+      const result = await runSessionStopCommand({
+        options,
+        candidates,
+        dormant,
+        runtime,
+        environment: process.env
+      });
+      process.exitCode = result.exitCode;
+      emit(result.output, false, result.data);
+      return;
+    }
     const roleOptions: GlobalRoleCommandOptions = {
       yuiHome: home,
       env: process.env,
