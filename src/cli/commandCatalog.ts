@@ -285,7 +285,7 @@ const globalSessionChildren: readonly NodeInput[] = [
   },
   {
     name: "stop",
-    summary: "Stop all idle managed Sessions before an offline update.",
+    summary: "Stop all idle managed Sessions and the Controller before an offline update.",
     usage: "yui session stop --all",
     options: ["--all"]
   },

@@ -487,8 +487,10 @@ yui task role release <task-id> <role>
 当新版本需要离线迁移 Home 时，应等待当前 Turn/Run 完成，然后从普通 shell
 执行 `yui session stop --all`，再重新执行 `yui update`。停止命令会先整体预检：
 只要仍有 Session 正在运行或存在未决生命周期工作，就不会开始停止；全部空闲
-时才会统一停止 Task Role 和 global Role Session。如果当前安装版本还没有这条
-命令，`yui update` 会给出绑定到目标版本的 `npm exec` 等价命令。
+时会先阻止新的 Leader 调度，停止并等待 Controller 完全退出，重新检查运行时
+事实后再停止 Task Role 和 global Role Session。成功后 Controller 保持停止，
+应紧接着执行 `yui update`。如果当前安装版本还没有这条命令，应手动退出提示中
+列出的全部 managed Session；新的 staged CLI 不能写入尚待迁移的旧 Home。
 
 tmux 会在 pane 创建时固定其历史容量。配置该限制之前创建的 Role 会保留原容量；Yui 会在 Terminal attach 和 Web 中提示用户退出并重新进入一次，从而创建具有 100,000 行历史的新 pane。
 

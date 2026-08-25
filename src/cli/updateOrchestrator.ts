@@ -352,16 +352,11 @@ function runStagedUpdate(
     };
   }
   if (preflight.status === "blocked") {
-    const action = preflight.stage === "active-sessions"
-      ? preflight.action + " If the installed `yui` does not recognize `session stop`, run "
-        + `\`npm exec --yes --package=@zq-silk/yui@${staged.version} -- yui session stop --all\` `
-        + "instead, then re-run `yui update`."
-      : preflight.action;
     return {
       outcome: "aborted",
       phase: "preflight",
       message: preflight.message,
-      action,
+      action: preflight.action,
       recoverable: true,
       version: staged.version,
       ...(preflight.blockers === undefined ? {} : { blockers: preflight.blockers }),

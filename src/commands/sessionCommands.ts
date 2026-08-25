@@ -17,8 +17,15 @@ export function parseSessionStopOptions(args: readonly string[]): SessionStopOpt
 }
 
 type SessionStopRuntime = Readonly<{
-  stopTaskRoleSessions(taskId: string, roleNames: readonly string[]): Promise<void>;
-  stopGlobalRoleSession(roleName: string): Promise<void>;
+  beginMaintenance(): Readonly<{ release(): void }>;
+  snapshot(): Readonly<{
+    candidates: readonly RuntimeSessionCandidate[];
+    dormant: readonly DormantRuntimeOwnerCandidate[];
+  }>;
+  drainController(): Promise<void>;
+  stopController(): Promise<Readonly<{ stopped: boolean }>>;
+  startController(): Promise<void>;
+  stopDormantSession(candidate: DormantRuntimeOwnerCandidate): Promise<void>;
 }>;
 
 export type SessionStopResult = Readonly<{
@@ -40,8 +47,6 @@ export type SessionStopResult = Readonly<{
  */
 export async function runSessionStopCommand(input: Readonly<{
   options: SessionStopOptions;
-  candidates: readonly RuntimeSessionCandidate[];
-  dormant: readonly DormantRuntimeOwnerCandidate[];
   runtime: SessionStopRuntime;
   environment?: NodeJS.ProcessEnv;
 }>): Promise<SessionStopResult> {
@@ -51,15 +56,65 @@ export async function runSessionStopCommand(input: Readonly<{
       "Session stop must be run by the user from a normal shell, outside a managed Yui Session."
     );
   }
-  if (input.candidates.length === 0) {
+  const maintenance = input.runtime.beginMaintenance();
+  let completed = false;
+  try {
+    const initial = input.runtime.snapshot();
+    const initiallyBlocked = blockedSessions(initial);
+    if (initiallyBlocked.length > 0) return blockedStopResult(initiallyBlocked);
+
+    // Stop and drain the Controller while the handover fence prevents a new
+    // Leader dispatch. The explicit full pass settles pending runtime inbox and
+    // lifecycle work that may exist without a current Session candidate.
+    await input.runtime.drainController();
+    await input.runtime.stopController();
+    // Re-read the authoritative facts after the drain because a Run that was
+    // already inside a pass may have changed state meanwhile.
+    const settled = input.runtime.snapshot();
+    const blockedAfterDrain = blockedSessions(settled);
+    if (blockedAfterDrain.length > 0) {
+      await input.runtime.startController();
+      return blockedStopResult(blockedAfterDrain);
+    }
+
+    for (const session of settled.candidates) {
+      const candidate = settled.dormant.find((entry) => sameStopCandidate(session, entry));
+      if (candidate === undefined) {
+        throw new Error(`Dormant Session changed during maintenance: ${renderSessionOwner(session)}.`);
+      }
+      await input.runtime.stopDormantSession(candidate);
+    }
+    const count = settled.candidates.length;
+    completed = true;
     return {
-      output: "No managed Sessions are running. Re-run `yui update` to check the remaining runtime state.\n",
-      data: { stopped: [], blocked: [] },
+      output: count === 0
+        ? "No managed Sessions were running. The Controller remains stopped; run `yui update` now.\n"
+        : `Stopped ${count} managed Sessions. The Controller remains stopped; run \`yui update\` now.\n`,
+      data: { stopped: settled.candidates, blocked: [] },
       exitCode: 0
     };
+  } catch (error) {
+    if (!completed) {
+      try {
+        await input.runtime.startController();
+      } catch (restartError) {
+        throw new AggregateError(
+          [error, restartError],
+          "Session maintenance failed and the Controller could not be restarted."
+        );
+      }
+    }
+    throw error;
+  } finally {
+    maintenance.release();
   }
+}
 
-  const blocked = input.candidates.flatMap((session) => {
+function blockedSessions(input: Readonly<{
+  candidates: readonly RuntimeSessionCandidate[];
+  dormant: readonly DormantRuntimeOwnerCandidate[];
+}>): SessionStopResult["data"]["blocked"] {
+  return input.candidates.flatMap((session) => {
     const idle = input.dormant.some((candidate) => sameStopCandidate(session, candidate));
     if (idle) return [];
     return [{
@@ -69,45 +124,24 @@ export async function runSessionStopCommand(input: Readonly<{
         : "runtime-work-pending" as const
     }];
   });
-  if (blocked.length > 0) {
-    const details = blocked.map(({ session, reason }) => (
-      `- ${renderSessionOwner(session)} (${reason === "running"
-        ? "a Turn or Run is still running"
-        : "an active Run or lifecycle operation is still pending"})`
-    ));
-    return {
-      output: [
-        `Cannot stop managed Sessions: ${blocked.length} Session(s) are still busy.`,
-        ...details,
-        "No Session was stopped. Let the listed work finish, then run `yui session stop --all` again."
-      ].join("\n") + "\n",
-      data: { stopped: [], blocked },
-      exitCode: 5
-    };
-  }
+}
 
-  const taskRoles = new Map<string, string[]>();
-  const globalRoles: string[] = [];
-  for (const session of input.candidates) {
-    if (session.owner.scope === "task") {
-      const roles = taskRoles.get(session.owner.taskId) ?? [];
-      roles.push(session.owner.roleName);
-      taskRoles.set(session.owner.taskId, roles);
-    } else {
-      globalRoles.push(session.owner.roleName);
-    }
-  }
-  for (const [taskId, roleNames] of taskRoles) {
-    await input.runtime.stopTaskRoleSessions(taskId, roleNames);
-  }
-  for (const roleName of globalRoles) {
-    await input.runtime.stopGlobalRoleSession(roleName);
-  }
+function blockedStopResult(
+  blocked: SessionStopResult["data"]["blocked"]
+): SessionStopResult {
+  const details = blocked.map(({ session, reason }) => (
+    `- ${renderSessionOwner(session)} (${reason === "running"
+      ? "a Turn or Run is still running"
+      : "an active Run or lifecycle operation is still pending"})`
+  ));
   return {
-    output: `Stopped ${input.candidates.length} managed Sessions. Re-run \`yui update\` to check `
-      + "the remaining runtime state.\n",
-    data: { stopped: input.candidates, blocked: [] },
-    exitCode: 0
+    output: [
+      `Cannot stop managed Sessions: ${blocked.length} Session(s) are still busy.`,
+      ...details,
+      "No Session was stopped. Let the listed work finish, then run `yui session stop --all` again."
+    ].join("\n") + "\n",
+    data: { stopped: [], blocked },
+    exitCode: 5
   };
 }
 

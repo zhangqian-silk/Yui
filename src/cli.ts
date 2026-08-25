@@ -917,14 +917,23 @@ export async function main(): Promise<void> {
   if (resolved[0] === "session") {
     if (resolved[1] === "stop") {
       const options = parseSessionStopOptions(resolved.slice(2));
-      await ensureFileTaskController(home, { environment: process.env });
-      const candidates = schedulerStore.listRuntimeSessionCandidates();
-      const dormant = schedulerStore.listDormantRuntimeOwners();
       const result = await runSessionStopCommand({
         options,
-        candidates,
-        dormant,
-        runtime,
+        runtime: {
+          beginMaintenance: () => acquireHandoverLock(home),
+          snapshot: () => ({
+            candidates: schedulerStore.listRuntimeSessionCandidates(),
+            dormant: schedulerStore.listDormantRuntimeOwners()
+          }),
+          drainController: () => runtime.drainController(),
+          stopController: () => stopFileTaskController(home, {
+            environment: process.env
+          }),
+          startController: async () => {
+            await ensureFileTaskController(home, { environment: process.env });
+          },
+          stopDormantSession: (candidate) => runtime.stopDormantSession(candidate)
+        },
         environment: process.env
       });
       process.exitCode = result.exitCode;

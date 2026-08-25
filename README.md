@@ -154,9 +154,11 @@ yui update
 
 `session stop --all` first checks every current Session and refuses without
 stopping anything while any Session still has a running Turn/Run or pending
-lifecycle work. When the installed version predates this command, the update
-failure prints an exact-version `npm exec --package=@zq-silk/yui@<version>`
-equivalent so the user can stop Sessions with the staged release before retrying.
+lifecycle work. Once clear, it fences new Leader dispatch, stops and drains the
+Controller, rechecks the runtime facts, then stops every exact idle Session. The
+Controller remains stopped so `yui update` can enter its offline window. When the
+installed version predates this command, exit every listed managed Session
+manually instead; a staged new CLI cannot write the older migration-required Home.
 
 Only that user re-run may enter the existing full migration. Once its preflight
 is clear, the update parent captures and stops the exact old Controller PID. The
@@ -785,7 +787,8 @@ An offline Home migration requires a short maintenance window with no managed
 Agent Session running. Once current Turns and Runs have finished, use
 `yui session stop --all` from a normal shell. The command stops Task and global
 Role Sessions only after every one is idle, and leaves all Sessions untouched
-when any Role is still busy.
+when any Role is still busy. On success it also leaves the Controller stopped;
+run `yui update` next rather than resuming ordinary Task work.
 
 tmux fixes a pane's history capacity when that pane is created. Existing panes
 retain their configured capacity; managed runtime output remains observable in
