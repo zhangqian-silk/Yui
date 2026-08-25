@@ -240,8 +240,8 @@ async function activateLocked(
   }
 
   // 6) Switch the active release pointer. This is the atomic commit point:
-  // after it succeeds, the stable launcher and new Sessions resolve the new
-  // release.
+  // after it succeeds, Controller lifecycle operations resolve the new
+  // release. The ordinary CLI and managed Session wrappers stay on `yui`.
   const pointer: ActiveReleasePointer = Object.freeze({
     schemaVersion: 1,
     releaseId,

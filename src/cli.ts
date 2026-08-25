@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -107,6 +108,7 @@ import {
   renderReleaseActivateResult,
   renderReleaseInstallResult,
   renderReleaseList,
+  resolveReleaseActivationDriver,
   runReleaseActivate,
   runReleaseInstall,
   runReleaseList
@@ -249,6 +251,30 @@ void main().catch((error: unknown) => {
 });
 
 export async function main(): Promise<void> {
+  const delegatedDriver = explicitReleaseActivationDriver();
+  if (delegatedDriver !== null) {
+    const delegated = spawnSync(
+      process.execPath,
+      [delegatedDriver, ...process.argv.slice(2)],
+      {
+        cwd: process.cwd(),
+        env: process.env,
+        stdio: "inherit"
+      }
+    );
+    if (delegated.error !== undefined) {
+      throw runtimeError(
+        `Target release activation driver could not start: ${delegated.error.message}`
+      );
+    }
+    if (delegated.signal !== null) {
+      throw runtimeError(
+        `Target release activation driver stopped by signal ${delegated.signal}.`
+      );
+    }
+    process.exitCode = delegated.status ?? 5;
+    return;
+  }
   const {
     contract: taskFinalReviewContract,
     verifiedStore,
@@ -1817,6 +1843,20 @@ export async function main(): Promise<void> {
   throw usageError(
     `Command is not connected to the restored FileTaskStore framework yet: ${resolved[0]}.`,
     renderCommandHelp(invocation.node, VERSION)
+  );
+}
+
+function explicitReleaseActivationDriver(): string | null {
+  if (args.length !== 3
+    || args[0] !== "release"
+    || args[1] !== "activate"
+    || args[2]!.startsWith("-")) {
+    return null;
+  }
+  return resolveReleaseActivationDriver(
+    resolveYuiHome(process.env),
+    args[2]!,
+    fileURLToPath(import.meta.url)
   );
 }
 

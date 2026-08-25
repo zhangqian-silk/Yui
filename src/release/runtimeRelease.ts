@@ -4,9 +4,10 @@
  *
  * A release is a self-contained, content-addressed runtime package unpacked
  * below `runtime/releases/<version>-<package-sha256>/`. The Home's active
- * release pointer (`runtime/active-release.json`) names exactly one release;
- * the stable launcher shim resolves the CLI through that pointer instead of
- * symlinking a development checkout.
+ * release pointer (`runtime/active-release.json`) names exactly one Controller
+ * release. The ordinary CLI remains the globally installed package; only an
+ * explicit target activation delegates to the verified target release CLI so
+ * that release owns its handover protocol and deadlines.
  *
  * The Controller writes its provenance to `runtime/runtime-identity.json` on
  * every start, and a versioned handover fence (`runtime/handover-fence.json`)

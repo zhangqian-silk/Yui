@@ -24,8 +24,10 @@ import {
 } from "../release/releaseHandover.js";
 import {
   assertReleaseIsNotWorktreeOrLinked,
+  detectRunningRelease,
   readActiveReleasePointer,
   readReleaseManifest,
+  readSmokeReceipt,
   releasesDirectory,
   releaseDirectoryFor,
   verifyReleaseIntegrity,
@@ -175,7 +177,7 @@ export function runReleaseList(home: string): ReleaseListResult {
             version: manifest.version,
             buildId: manifest.buildId,
             packageDigest: manifest.packageDigest,
-            smoke: existsSync(join(releaseDir, "smoke-receipt.json"))
+            smoke: hasMatchingSmokeReceipt(releaseDir, manifest)
           };
         } catch {
           return {
@@ -197,6 +199,7 @@ export function resolveInstalledRelease(
   releaseId: string
 ): { releaseDir: string; manifest: ReturnType<typeof readReleaseManifest> } | null {
   const directory = releasesDirectory(home);
+  if (!existsSync(directory)) return null;
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     if (entry.name === releaseId) {
@@ -212,16 +215,47 @@ export function resolveInstalledRelease(
         );
       }
     }
+    const releaseDir = join(directory, entry.name);
+    let manifest: ReturnType<typeof readReleaseManifest>;
     try {
-      const manifest = readReleaseManifest(join(directory, entry.name));
-      if (manifest.buildId === releaseId) {
-        return { releaseDir: join(directory, entry.name), manifest };
-      }
+      manifest = readReleaseManifest(releaseDir);
     } catch {
       continue;
     }
+    if (manifest.buildId !== releaseId) continue;
+    try {
+      return { releaseDir, manifest: verifyReleaseIntegrity(releaseDir) };
+    } catch (error) {
+      throw new Error(
+        `Release ${releaseId} failed integrity verification and may have drifted: `
+          + `${error instanceof Error ? error.message : String(error)}. `
+          + "Reinstall it with `yui release install <source-dir>` before activating.",
+        { cause: error }
+      );
+    }
   }
   return null;
+}
+
+/**
+ * Selects the verified target release CLI as the activation driver. Ordinary
+ * commands remain on the globally installed CLI; only an explicit target
+ * activation crosses into the target package so its handover deadlines and
+ * protocol own the complete operation.
+ */
+export function resolveReleaseActivationDriver(
+  home: string,
+  releaseId: string,
+  currentCliPath: string
+): string | null {
+  const resolved = resolveInstalledRelease(home, releaseId);
+  if (resolved === null) return null;
+  if (!hasMatchingSmokeReceipt(resolved.releaseDir, resolved.manifest)) return null;
+  const running = detectRunningRelease(currentCliPath);
+  if (running !== null && resolve(running.releaseDir) === resolve(resolved.releaseDir)) {
+    return null;
+  }
+  return join(resolved.releaseDir, "dist", "cli.js");
 }
 
 /** Runs the atomic Controller handover for one installed release. */
@@ -256,11 +290,11 @@ export async function runReleaseActivate(
       recoverable: true
     };
   }
-  if (!existsSync(join(resolved.releaseDir, "smoke-receipt.json"))) {
+  if (!hasMatchingSmokeReceipt(resolved.releaseDir, resolved.manifest)) {
     return {
       outcome: "aborted",
       phase: "resolve",
-      message: `Release has no smoke receipt: ${releaseId}.`,
+      message: `Release has no matching smoke receipt: ${releaseId}.`,
       action: "Reinstall the release; the smoke receipt is written at install time.",
       recoverable: true
     };
@@ -280,6 +314,17 @@ export async function runReleaseActivate(
       ? {}
       : { dualOwnerGraceMs: options.dualOwnerGraceMs })
   });
+}
+
+function hasMatchingSmokeReceipt(
+  releaseDir: string,
+  manifest: ReturnType<typeof readReleaseManifest>
+): boolean {
+  const receipt = readSmokeReceipt(releaseDir);
+  return receipt !== null
+    && receipt.version === manifest.version
+    && receipt.buildId === manifest.buildId
+    && receipt.packageDigest === manifest.packageDigest;
 }
 
 /** Renders the install result as concise CLI text. */

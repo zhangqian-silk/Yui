@@ -95,6 +95,22 @@ same proof is idempotent, and the first authorization wakes the Task Leader
 with the exact event reference so blocked delivery can resume. A different release path, active ReviewRound,
 unknown release, identity mismatch, or concurrent drift fails closed.
 
+## CLI and Controller release boundary
+
+The global `yui` command is the stable user and managed-Session interface. It
+does not follow `runtime/active-release.json` for ordinary commands: that
+pointer selects the Controller release, not the CLI package. This keeps CLI,
+Operator Session, and Controller replacement compatible without pinning every
+command to one immutable build.
+
+An explicit `yui release activate <release-id|build-id>` is the one exception.
+The global CLI verifies the installed target release and its matching smoke
+receipt, then delegates the unchanged activation arguments to that target's
+`dist/cli.js`. The target release therefore owns the complete handover protocol
+and timeout hierarchy. A no-target activation, help, `--json`, and every other
+command remain on the global CLI. No separate shell launcher or `yui-legacy`
+binary participates in this path.
+
 ## Step catalog
 
 The plan is a fixed, predeclared subset of operations. Each plan entry has an
