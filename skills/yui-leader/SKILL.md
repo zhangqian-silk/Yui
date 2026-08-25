@@ -108,6 +108,16 @@ children through adapter metadata, and routes a later result reference through
 the durable inbox. Do not poll, send a waiting Message, rewrite a checkpoint,
 or yield merely to preserve that native wait.
 
+Before the first durable Leader action, Yui permits at most one automatic
+same-Session Provider continuation. If two fresh Leader generations still
+produce no WorkItem, Review, Integration, or Leader-attributed durable event,
+the Controller stops before a third generation, marks recovery failed, and
+hands the exact evidence to the unique global Operator. Do not bypass that
+stop-loss by manufacturing another Role, Run, Session, or Task. The Operator
+must inspect the failure and explicitly recover or change the configured
+Leader; after first durable progress, ordinary bounded Provider retry policy
+continues to apply.
+
 Native child results have an explicit durability boundary. A native subagent is
 best-effort by default: its result returns through the parent Conversation, and
 if the parent Session is lost before Yui externalizes the result, rerun the
