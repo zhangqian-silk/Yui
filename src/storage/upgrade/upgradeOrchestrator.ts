@@ -100,6 +100,7 @@ export type UpgradeBlockerStage =
   | "corruption"
   | "active-sessions"
   | "active-runtime"
+  | "runtime-unknown"
   | "drain-incomplete"
   | "coordination"
   | "validate"
@@ -553,23 +554,45 @@ function offlineInventoryBlocker(
   const lifecycleOnly = inventory.blockers.every(({ reason }) => (
     reason === "pending-mailbox" || reason === "pending-inbox"
   ));
-  return {
-    outcome: "blocked",
-    stage: lifecycleOnly ? "drain-incomplete" : "active-sessions",
-    message: describeOfflineBlockers(inventory),
-    action: lifecycleOnly
+  const runtimeUnknown = inventory.blockers.some(({ reason }) => (
+    reason === "native-session-unknown"
+  ));
+  const action = lifecycleOnly
+    ? (sceneUnchanged
+        ? "No binary, Controller, fence, or Home change was made. Wait for the listed lifecycle "
+          + "events to settle, then re-run `yui update`."
+        : "The Home was not switched. Wait for the listed lifecycle events to settle, then "
+          + "re-run `yui update`.")
+    : runtimeUnknown
       ? (sceneUnchanged
-          ? "No binary, Controller, fence, or Home change was made. Wait for the listed lifecycle "
-            + "events to settle, then re-run `yui update`."
-          : "The Home was not switched. Wait for the listed lifecycle events to settle, then "
-            + "re-run `yui update`.")
+          ? "Offline Home migration could not confirm that every native Session is stopped. Run "
+            + "`yui controller status --verbose` from a normal shell and inspect the reported "
+            + "runtime ownership. Use `yui controller cleanup` only for resources it classifies "
+            + "for cleanup, then re-run `yui update`; do not kill unknown processes blindly. No "
+            + "binary, Controller, fence, or Home change was made."
+          : "The Home was not switched because native Session state could not be confirmed. Run "
+            + "`yui controller status --verbose`, inspect the reported ownership, and use "
+            + "`yui controller cleanup` only for resources it classifies for cleanup before "
+            + "retrying; do not kill unknown processes blindly.")
       : (sceneUnchanged
           ? "This version requires an offline Home migration with every managed Agent Session "
-            + "stopped. Let the listed Turns or Runs finish, run `yui session stop --all` from a "
-            + "normal shell, then re-run `yui update`. No binary, Controller, fence, or Home "
-            + "change was made."
-          : "The Home was not switched. Let the listed Turns or Runs finish, run "
-            + "`yui session stop --all` from a normal shell, then re-run `yui update`."),
+            + "stopped. Let the listed Turns or Runs finish. If the installed `yui` supports "
+            + "`session stop --all`, run `yui session stop --all` from a normal shell; otherwise "
+            + "exit every listed managed Session manually. Then re-run `yui update`. No binary, "
+            + "Controller, fence, or Home change was made."
+          : "The Home was not switched. Let the listed Turns or Runs finish. If the installed "
+            + "`yui` supports `session stop --all`, run `yui session stop --all` from a normal "
+            + "shell; otherwise exit every listed managed Session manually. Then re-run "
+            + "`yui update`.");
+  return {
+    outcome: "blocked",
+    stage: lifecycleOnly
+      ? "drain-incomplete"
+      : runtimeUnknown
+        ? "runtime-unknown"
+        : "active-sessions",
+    message: describeOfflineBlockers(inventory),
+    action,
     blockers: inventory.blockers,
     retryCommand: "yui update",
     ...(sceneUnchanged ? { sceneUnchanged: true } : {})

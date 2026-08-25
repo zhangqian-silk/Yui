@@ -7,6 +7,7 @@ import {
   stopOrphanedFileTaskController,
   stopPreviousFileTaskController
 } from "../core/controllerClient.js";
+import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import {
   FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
   type JsonValue
@@ -22,8 +23,9 @@ import {
 } from "../agent/launchEnvironment.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
-import type { TmuxManager } from "../tmux/tmuxManager.js";
+import { yuiTmuxServerName, type TmuxManager } from "../tmux/tmuxManager.js";
 import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
+import type { DormantRuntimeOwnerCandidate } from "../scheduler/ports.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
@@ -36,6 +38,7 @@ import {
   CONTROLLER_SHUTDOWN_TIMEOUT_MS,
   LIFECYCLE_REQUEST_TIMEOUT_MS
 } from "../runtime/runtimeDeadlines.js";
+import { FileTaskRuntimeIsolation } from "../runtime/taskRuntimeIsolation.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 const POLL_INTERVAL_MS = 50;
@@ -686,6 +689,75 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     }
   }
 
+  /** Drain pending runtime facts while an external maintenance fence is held. */
+  async drainController(): Promise<void> {
+    await ensureFileTaskController(this.home, {
+      environment: this.clientOptions.environment
+    });
+    await callFileTaskController(this.home, "scheduler.scan", {}, {
+      ...this.clientOptions,
+      requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
+    });
+  }
+
+  /**
+   * Maintenance-only exact stop used after the Controller has fully exited.
+   * The dormant candidate fences the durable cleanup request; physical owner
+   * records and Task runtime isolation are cleared through the same primitives
+   * as the Controller lifecycle path before the Session becomes stopped.
+   */
+  async stopDormantSession(candidate: DormantRuntimeOwnerCandidate): Promise<void> {
+    const queuedAt = new Date();
+    const target = this.schedulerStore.enqueueRuntimeCleanup(
+      candidate.owner,
+      queuedAt,
+      candidate
+    );
+    if (target === null) {
+      throw new Error(
+        `Dormant Session changed before maintenance cleanup: ${runtimeOwnerLabel(candidate.owner)}.`
+      );
+    }
+    const reconciliation = new SessionOwnerReconciliation({
+      home: this.home,
+      store: this.store,
+      environment: this.clientOptions.environment,
+      tmux: this.tmux
+    });
+    const termination = await reconciliation.terminateOwner(candidate.owner);
+    if (termination.outcome !== "stop-confirmed") {
+      throw new Error(
+        `Role runtime cleanup could not prove physical exit: ${runtimeOwnerLabel(candidate.owner)}; `
+          + termination.remaining
+            .map(({ record, detail }) => `${record.launchId}: ${detail}`)
+            .join("; ")
+      );
+    }
+    if (candidate.owner.scope === "task" && candidate.launchId !== undefined) {
+      const isolation = new FileTaskRuntimeIsolation({
+        runtimeRoot: `${this.home}.task-runtimes`,
+        controlPlane: {
+          yuiHome: this.home,
+          controllerSocketPath: controllerSocketPath(this.store.getHomeIdentity().homeId),
+          tmuxNamespace: yuiTmuxServerName(this.home),
+          globalInstallPaths: [process.execPath]
+        }
+      });
+      isolation.cleanupTaskLaunch({
+        taskId: candidate.owner.taskId,
+        launchId: candidate.launchId,
+        reason: this.store.getTask(candidate.owner.taskId)?.status === "completed"
+          ? "completion"
+          : "interruption"
+      });
+    }
+    if (!this.schedulerStore.completeRuntimeCleanup(target, new Date())) {
+      throw new Error(
+        `Role runtime cleanup state changed before completion: ${runtimeOwnerLabel(candidate.owner)}.`
+      );
+    }
+  }
+
   inspectTaskRolePanes(taskId: string) {
     return this.tmux.inspectTaskRolePanes(taskId);
   }
@@ -728,6 +800,12 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
       requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
     });
   }
+}
+
+function runtimeOwnerLabel(owner: DormantRuntimeOwnerCandidate["owner"]): string {
+  return owner.scope === "task"
+    ? `${owner.taskId}/${owner.roleName}`
+    : `global/${owner.roleName}`;
 }
 
 const MANAGED_RUNTIME_ENVIRONMENT = new Set<string>(
