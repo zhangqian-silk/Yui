@@ -250,13 +250,27 @@ yui project update app --alias app-cli
 yui project refresh app
 yui project list
 
-yui task create "Ship CSV export" --project app
+yui task create "Fix CSV escaping" --project app --delivery direct
+yui task create "Ship CSV export" --project app --delivery integrated
 yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
 yui task show <task-id>
 yui task context <task-id>
 yui task activate <task-id>
 ```
+
+Project delivery is explicit but uses the existing Task schema. `direct` means
+the Leader implements and verifies one low-risk result on clean committed Task
+main; it needs no WorkItem, IntegrationAttempt, or policy-created final
+ReviewRound. `integrated` requires WorkItem, ChangeSet, and committed Integration
+evidence and remains the path for guarded, cross-Project, migration,
+authorization, concurrency/recovery, destructive, and release changes. Global
+final-review policy applies automatically only to integrated delivery. A direct
+Task can use a bounded native review. If an independently managed final Review
+is required, promote before Task main advances; promotion fails closed after a
+commit or delivery evidence exists so earlier work cannot lose ChangeSet
+provenance. Legacy `--require-integration` is an alias for
+`--delivery integrated`, and integrated delivery cannot be downgraded.
 
 `project refresh` is the explicit network operation for a stable Project checkout. It fetches the
 configured stable branch directly from the Project remote URL and advances only through a clean,
@@ -370,7 +384,8 @@ expands:
 ```sh
 yui task create "Update authentication" \
   --project backend --project frontend \
-  --base backend=develop --base frontend=main
+  --base backend=develop --base frontend=main \
+  --delivery integrated
 yui task project add <task-id> shared-sdk --base main
 ```
 
@@ -547,8 +562,10 @@ bounded next options. Yield records immutable Run/Candidate or Review evidence
 only; it does not imply acceptance, WorkItem completion, ChangeSet capture,
 Integration, or Task completion.
 
-For bounded work, the Leader owns a roleless WorkItem and may execute it
-directly or create a native subagent through the current Agent conversation:
+For integrated bounded work, the Leader owns one roleless WorkItem and may
+execute it directly or create a native subagent through the current Agent
+conversation. Direct delivery operates on Task main without creating this
+WorkItem:
 
 ```sh
 yui task work create <task-id> "Review the implementation" \
@@ -660,9 +677,8 @@ yui task reopen <task-id>
 ```
 
 When a verified squash-merge Publication records a remote commit that is
-ancestry-divergent from the unchanged, frozen Task-final Review head, a user or
-global Operator may explicitly authorize completion against its identical Git
-tree:
+ancestry-divergent from the unchanged local Task head, a user or global Operator
+may explicitly authorize completion against its identical Git tree:
 
 ```sh
 yui task complete <task-id> --summary-file delivery.txt \
@@ -671,17 +687,28 @@ yui task complete <task-id> --summary-file delivery.txt \
 
 This does not weaken normal freshness checks. Yui requires the current,
 unsuperseded Publication to be merged and verified, its local commit to equal
-the reviewed physical Task head, its remote commit to be ancestry-divergent,
-and both commits to resolve to the same exact tree. `--refresh-remote` fetches
+the physical Task head, its remote commit to be ancestry-divergent, and both
+commits to resolve to the same exact tree. Integrated delivery also requires
+the latest completed Task-final Review; direct delivery does not invent one.
+`--refresh-remote` fetches
 the remote object graph before resolving that Publication commit. For a Task
 governed by a durable exact final-review contract, the user/Operator command
 persists the exact authorization tuple and wakes the Task Leader; only that
 contract-capable Leader may consume it and complete the Task. Tasks without
 that contract retain the one-step explicit completion path. The Task event
 audit records the authorization and, on completion, the accepted Project,
-Publication, ReviewRound, both commits, and tree.
+Publication, optional ReviewRound, both commits, and tree.
 
-Completed Tasks reject messages, dispatch, Provider authority changes, retry, and late yields until explicitly reopened, while retaining Task main for inspection or integration. Every isolated WorkItem worktree must be explicitly cleaned as integrated or abandoned before archive; that cleanup also removes its managed branch. Archive requires `--integrated` or `--abandon` to state the Task main outcome and is allowed only after Task main is clean. It removes managed worktrees but retains Task and WorkItem records. The Task main branch is retained as a recovery artifact instead of being silently deleted.
+Completed Tasks reject messages, dispatch, Provider authority changes, retry,
+and late yields until explicitly reopened, while retaining Task main for
+inspection or integration. Terminal WorkItem, Review, Integration, and Lane
+worktrees are non-blocking completion advisories, but they must be settled
+before archive. Every isolated WorkItem worktree is explicitly cleaned as
+integrated or abandoned; that cleanup also removes its managed branch. Archive
+requires `--integrated` or `--abandon` to state the Task main outcome and is
+allowed only after Task main is clean. It removes managed worktrees but retains
+Task and WorkItem records. The Task main branch is retained as a recovery
+artifact instead of being silently deleted.
 Task lifecycle completion/selection only suggests valid source states: Draft for activate, active for complete, and completed for reopen.
 
 ## Sessions and tmux

@@ -14,7 +14,7 @@ import {
 } from "../review/taskFinalReviewContractRebind.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
-import type { Task } from "./task.js";
+import { taskDeliveryPath, type Task } from "./task.js";
 import {
   currentWorkItemCandidate,
   governingWorkItemCandidate,
@@ -369,16 +369,42 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   }
 
   if (facts.workItems.length === 0) {
-    return buildAction(facts, {
-      kind: "implement-current-work-item",
-      reason: `Task ${task.id} has no Work Item; create the first unit of work.`,
-      refs: [],
-      preconditions: [
-        { fact: "At least one Work Item exists", satisfied: false },
-        { fact: "Task is active", satisfied: task.status === "active" }
-      ],
-      recommendedCommand: `yui task work create ${task.id} \"<objective>\"`
-    });
+    if (taskDeliveryPath(task) === "direct" && !taskFinalReviewRequired(facts)) {
+      return buildAction(facts, {
+        kind: "complete-task",
+        reason: `Task ${task.id} uses direct delivery; implement and verify the managed Task main, then complete without creating a WorkItem.`,
+        refs: [ref("task", task.id)],
+        preconditions: [
+          { fact: "Task is active", satisfied: task.status === "active", ref: ref("task", task.id) },
+          { fact: "Task main is clean, committed, and verified", satisfied: false }
+        ],
+        recommendedCommand: `yui task complete ${task.id} --summary-file -`,
+        ...(facts.reviewConfig === null
+          ? {}
+          : {
+              alternatives: [{
+                kind: "promote-to-integrated-delivery",
+                reason: "Before Task main advances, promote to integrated delivery when risk warrants an independently managed ReviewRound.",
+                recommendedCommand: `yui task update ${task.id} --delivery integrated`,
+                refs: [ref("task", task.id)]
+              }],
+              judgmentRequired:
+                "Leader must decide whether the work still fits direct delivery or should be promoted before completing it."
+            })
+      });
+    }
+    if (taskDeliveryPath(task) === "integrated") {
+      return buildAction(facts, {
+        kind: "implement-current-work-item",
+        reason: `Task ${task.id} has no Work Item; create the first unit of work.`,
+        refs: [],
+        preconditions: [
+          { fact: "At least one Work Item exists", satisfied: false },
+          { fact: "Task is active", satisfied: task.status === "active" }
+        ],
+        recommendedCommand: `yui task work create ${task.id} \"<objective>\"`
+      });
+    }
   }
 
   const uncaptured = facts.workItems.find((item) => needsChangeSetCapture(facts, item));
@@ -495,20 +521,28 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     && finalReviewRequired
     && !hasValidFinalReview(facts)) {
     const reviewerRole = taskFinalReviewRole(facts);
+    const directWithoutWorkItems = taskDeliveryPath(task) === "direct"
+      && facts.workItems.length === 0;
     return buildAction(facts, {
       kind: "request-final-review",
-      reason: "All Work Items are delivered but no valid Task-final Review attests the integrated head.",
+      reason: directWithoutWorkItems
+        ? "This direct Task already owns a final-Review obligation; completion must prepare or resume a Review of its frozen Task head."
+        : "All Work Items are delivered but no valid Task-final Review attests the integrated head.",
       refs: [ref("task", task.id)],
-      preconditions: [
-        { fact: "All Work Items are terminal", satisfied: true },
-        { fact: "Every ChangeSet is committed", satisfied: true },
-        { fact: "Valid Task-final Review at the integrated head", satisfied: false }
-      ],
-      recommendedCommand: `yui task review request ${task.id} --role ${reviewerRole ?? "<reviewer-role>"}`
+      preconditions: directWithoutWorkItems
+        ? [{ fact: "Valid established Task-final Review at the direct head", satisfied: false }]
+        : [
+            { fact: "All Work Items are terminal", satisfied: true },
+            { fact: "Every ChangeSet is committed", satisfied: true },
+            { fact: "Valid Task-final Review at the integrated head", satisfied: false }
+          ],
+      recommendedCommand: directWithoutWorkItems
+        ? `yui task complete ${task.id} --summary-file -`
+        : `yui task review request ${task.id} --role ${reviewerRole ?? "<reviewer-role>"}`
     });
   }
 
-  const finalReviewOptional = task.projectBindings.length > 0
+  const finalReviewOptional = taskDeliveryPath(task) === "integrated"
     && !finalReviewRequired
     && !hasValidFinalReview(facts);
   const finalReviewAlternative = finalReviewOptional && facts.reviewConfig !== null
@@ -521,13 +555,20 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     : [];
   return buildAction(facts, {
     kind: "complete-task",
-    reason: "The delivery chain is complete; converge the Task instead of creating successor work.",
+    reason: taskDeliveryPath(task) === "direct"
+      ? "The direct Task head and its established obligations are ready; converge the Task without creating successor work."
+      : "The delivery chain is complete; converge the Task instead of creating successor work.",
     refs: [ref("task", task.id)],
     preconditions: [
       { fact: "All Work Items are terminal", satisfied: true },
       ...(task.projectBindings.length === 0
         ? []
-        : [
+        : taskDeliveryPath(task) === "direct"
+          ? [{
+              fact: "Valid established Task-final Review at the direct head",
+              satisfied: hasValidFinalReview(facts)
+            }]
+          : [
             { fact: "Every ChangeSet is committed", satisfied: true },
             {
               fact: "Valid Task-final Review at the integrated head",
@@ -793,7 +834,8 @@ function taskFinalReviewContractResolution(
 function taskFinalReviewRequired(facts: NextActionFacts): boolean {
   return taskFinalReviewContract(facts) !== undefined
     || latestTaskFinalReview(facts.reviewRounds) !== undefined
-    || facts.reviewConfig?.trigger === "final";
+    || (taskDeliveryPath(facts.task) === "integrated"
+      && facts.reviewConfig?.trigger === "final");
 }
 
 function taskFinalReviewRole(facts: NextActionFacts): string | undefined {

@@ -4,12 +4,9 @@ import type { ExecutionFinding } from "../execution/executionGroup.js";
 /**
  * Issue 07 (Leader convergence): minimal repair-wave planning.
  *
- * Given one Review's open findings, produce the smallest set of repair
- * WorkItems that can run in parallel: findings that touch the same path (or
- * whose paths cannot be proven disjoint) stay in one group; findings with
- * distinct parseable paths split into parallel groups. The planner never
- * invents paths — a finding without a parseable path is conservatively merged
- * with every other unprovable finding.
+ * Given one Review's open findings, produce one convergent repair group by
+ * default. Parallel grouping remains an explicit Leader choice for cases where
+ * independent ownership is worth the extra WorkItems and integrations.
  */
 
 export type RepairSeverity = "low" | "medium" | "high" | "critical" | "p1" | "p2";
@@ -35,6 +32,8 @@ export type RepairWave = Readonly<{
   openFindingCount: number;
   groups: readonly RepairWaveGroup[];
 }>;
+
+export type RepairWaveStrategy = "consolidated" | "parallel";
 
 const SEVERITY_RANK: Record<RepairSeverity, number> = {
   p1: 5,
@@ -70,10 +69,26 @@ export function extractReviewFindings(round: ReviewRound): RepairFinding[] {
 
 export function planRepairWave(
   reviewRoundId: string,
-  findings: readonly RepairFinding[]
+  findings: readonly RepairFinding[],
+  strategy: RepairWaveStrategy = "consolidated"
 ): RepairWave {
   if (findings.length === 0) {
     return { reviewRoundId, openFindingCount: 0, groups: [] };
+  }
+  if (strategy === "consolidated") {
+    const ordered = [...findings].sort((left, right) => (
+      left.id.localeCompare(right.id, undefined, { numeric: true })
+    ));
+    return {
+      reviewRoundId,
+      openFindingCount: findings.length,
+      groups: [{
+        id: "repair-1",
+        findingIds: ordered.map(({ id }) => id),
+        paths: [...new Set(ordered.flatMap(({ paths }) => paths))].sort(),
+        reason: "Consolidated by default to minimize repair, integration, and review churn"
+      }]
+    };
   }
   const parent = new Array(findings.length).fill(0).map((_, index) => index);
   const find = (index: number): number => {

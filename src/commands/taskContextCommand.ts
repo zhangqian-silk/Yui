@@ -7,6 +7,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import { projectNextAction } from "../task/nextAction.js";
+import { taskDeliveryPath } from "../task/task.js";
 import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 import {
   summarizeExecutionGroup,
@@ -58,6 +59,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     }
     return {
       task,
+      deliveryPath: taskDeliveryPath(task),
       execution,
       reviewConfig: reader.getReviewConfig(),
       brief: reader.getTaskBrief(task.id),
@@ -179,9 +181,12 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             workspace.entries.filter(({ access }) => access === "write").length
           } writable / ${workspace.entries.length} Projects)`
         ))),
+    `Delivery: ${taskDeliveryPath(task)}`,
     `Completion evidence: ${task.requireIntegration
       ? "WorkItem, ChangeSet, and committed Integration required"
-      : "delivery integration not required"}`,
+      : task.projectBindings.length > 0
+        ? "clean committed Task main required"
+        : "no Project evidence required"}`,
     `Global review: ${reviewConfig === null
       ? "disabled"
       : `${reviewConfig.roleName} (${reviewConfig.trigger})`}`,

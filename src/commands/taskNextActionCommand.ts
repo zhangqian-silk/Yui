@@ -14,6 +14,7 @@ import {
   planRepairWave,
   type RepairWave
 } from "../task/repairWave.js";
+import { taskDeliveryPath, type TaskDeliveryPath } from "../task/task.js";
 
 /**
  * Issue 07 (Leader convergence): read-only `yui task next-action <task>`.
@@ -68,7 +69,13 @@ export function runTaskNextActionCommand(
       if (readinessFacts === null) throw taskNotFound(taskId);
       completionReadiness = projectCompletionReadiness(readinessFacts);
     }
-    return { action, repairWave, completionReadiness, knowledgeProposals };
+    return {
+      deliveryPath: taskDeliveryPath(facts.task),
+      action,
+      repairWave,
+      completionReadiness,
+      knowledgeProposals
+    };
   });
   if (asJson) {
     return {
@@ -81,6 +88,7 @@ export function runTaskNextActionCommand(
     kind: "output" as const,
     output: renderNextAction(
       data.action,
+      data.deliveryPath,
       data.repairWave,
       data.completionReadiness,
       data.knowledgeProposals
@@ -105,6 +113,7 @@ function repairWaveFor(
 
 function renderNextAction(
   action: NextAction,
+  deliveryPath: TaskDeliveryPath,
   repairWave: RepairWave | null,
   completionReadiness: CompletionReadiness | null,
   knowledgeProposals: readonly {
@@ -116,6 +125,7 @@ function renderNextAction(
 ): string {
   const lines = [
     `Task: ${action.taskId}`,
+    `Delivery: ${deliveryPath}`,
     `Next action: ${action.kind}`,
     `Reason: ${action.reason}`,
     ...(action.refs.length === 0
@@ -161,6 +171,14 @@ function renderNextAction(
         ...completionReadiness.blockers.map((blocker) =>
           `  ${blocker.code} (${blocker.ref.kind} ${blocker.ref.id}): ${blocker.reason}`
           + ` — fix: ${blocker.fix}`)
+      );
+    }
+    if (completionReadiness.advisories.length > 0) {
+      lines.push(
+        `Completion advisories (non-blocking): ${completionReadiness.advisories.length}`,
+        ...completionReadiness.advisories.map((advisory) =>
+          `  ${advisory.code} (${advisory.ref.kind} ${advisory.ref.id}): ${advisory.reason}`
+          + ` — fix before archive: ${advisory.fix}`)
       );
     }
   }
