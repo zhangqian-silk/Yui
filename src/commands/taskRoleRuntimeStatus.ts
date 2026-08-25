@@ -36,6 +36,7 @@ import { latestRunDurableProgressAt } from "../scheduler/roleRunStall.js";
 import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 
 export type TaskRoleHealth =
   | "idle"
@@ -284,7 +285,11 @@ function inspectTaskRoleRuntimeStatus(
   // Issue 09: the last Run outcome is a separate axis from the Session
   // lifecycle. A Session that stops after its Run yielded must not retroactively
   // turn that Run into a failure; the status display keeps both visible.
-  const lastRun = store.listAgentRuns(taskId)
+  const lastRun = operationalTaskRecords(
+    store.listAgentRuns(taskId),
+    store.listEvents(taskId),
+    "agent-run"
+  )
     .filter((candidate) => candidate.roleName === role.name)
     .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0]
     ?? null;

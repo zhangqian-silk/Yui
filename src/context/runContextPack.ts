@@ -1,5 +1,6 @@
 import type { AgentRun } from "../run/agentRun.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
 import { RUN_BOOTSTRAP_MAX_DELTAS } from "./runContextContract.js";
 import {
@@ -306,9 +307,11 @@ function collectAuthorizedContext(
     if (view === "worker") {
       for (const dependencyId of item.dependsOn) {
         const dependency = store.getWorkItem(task.id, dependencyId);
-        if (dependency === null || dependency.status !== "completed") {
+        if (dependency === null
+          || (dependency.status !== "completed" && dependency.status !== "retired")) {
           throw new Error(`Run WorkItem dependency is not accepted: ${dependencyId}.`);
         }
+        if (dependency.status === "retired") continue;
         result.push(materialize("L3", "accepted-work-item", dependency.id, dependency));
       }
     }
@@ -340,7 +343,8 @@ function collectAuthorizedContext(
     }
   }
   if (view === "leader") {
-    for (const item of store.listWorkItems(task.id)) {
+    const events = store.listEvents(task.id);
+    for (const item of store.listWorkItems(task.id).filter(({ status }) => status !== "retired")) {
       result.push(materialize("L3", "work-item", item.id, item));
     }
     for (const decision of store.listDecisions(task.id)) {
@@ -355,14 +359,21 @@ function collectAuthorizedContext(
     for (const finding of store.listReviewFindings(task.id)) {
       result.push(materialize("L3", "review-finding", finding.id, finding));
     }
-    for (const agentRun of store.listAgentRuns(task.id).slice(-24)) {
+    for (const agentRun of operationalTaskRecords(
+      store.listAgentRuns(task.id),
+      events,
+      "agent-run"
+    ).slice(-24)) {
       result.push(materialize("L4", "agent-run", agentRun.id, agentRun));
     }
-    for (const message of store.listMessages(task.id).slice(-16)) {
+    for (const message of operationalTaskRecords(
+      store.listMessages(task.id),
+      events,
+      "message"
+    ).slice(-16)) {
       result.push(materialize("L4", "task-message", message.id, message));
     }
     const publishedTreeAuthorizations = [];
-    const events = store.listEvents(task.id);
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const event = events[index]!;
       if (event.type === "task.completed" || event.type === "task.reopened") break;

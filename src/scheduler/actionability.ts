@@ -10,6 +10,8 @@ import {
 } from "../job/durableJob.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { TaskMessage } from "../message/message.js";
+import type { TaskEvent } from "../event/taskEvent.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 
 /**
  * Machine-derived disposition of a terminal Leader Run. The Scheduler uses it
@@ -73,6 +75,7 @@ export type ActionabilityReadStore = Readonly<{
   listDurableJobs?(taskId: string): readonly DurableJob[];
   listInputRequests?(taskId: string): readonly InputRequest[];
   listMessages?(taskId: string): readonly TaskMessage[];
+  listEvents?(taskId: string): readonly TaskEvent[];
 }>;
 
 const TERMINAL_WORK_ITEM_STATUSES = new Set(["completed", "retired"]);
@@ -110,7 +113,12 @@ export function collectTaskActionability(
   }
   const facts: ActionabilityFact[] = [];
 
-  for (const run of store.listAgentRuns(taskId).filter((candidate) => candidate.status === "active")) {
+  const events = store.listEvents?.(taskId) ?? [];
+  for (const run of operationalTaskRecords(
+    store.listAgentRuns(taskId),
+    events,
+    "agent-run"
+  ).filter((candidate) => candidate.status === "active")) {
     facts.push({
       key: `active-run:${run.id}`,
       value: [
@@ -161,7 +169,11 @@ export function collectTaskActionability(
     });
   }
 
-  for (const message of store.listMessages?.(taskId) ?? []) {
+  for (const message of operationalTaskRecords(
+    store.listMessages?.(taskId) ?? [],
+    events,
+    "message"
+  )) {
     if (message.wakePolicy !== "leader") continue;
     facts.push({
       key: `directive:${message.id}`,

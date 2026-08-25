@@ -167,6 +167,7 @@ import {
 import { validateTask, type Task } from "../task/task.js";
 import type { NextActionFacts } from "../task/nextAction.js";
 import type { CompletionReadinessFacts } from "../task/completionReadiness.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import {
   formatAgentRunReceiptId,
   TASK_RECORD_ID_PREFIXES,
@@ -1029,7 +1030,12 @@ export class FileTaskStore implements TaskStore {
   readNextActionFacts(taskId: string): NextActionFacts | null {
     const aggregate = this.#state().tasks[taskId];
     if (aggregate === undefined) return null;
-    const agentRuns = values(aggregate.agentRuns, "id");
+    const events = values(aggregate.events, "id");
+    const agentRuns = operationalTaskRecords(
+      values(aggregate.agentRuns, "id"),
+      events,
+      "agent-run"
+    );
     return {
       task: {
         id: aggregate.task.id,
@@ -1041,7 +1047,7 @@ export class FileTaskStore implements TaskStore {
       changeSets: values(aggregate.changeSets, "id"),
       integrations: values(aggregate.integrationAttempts, "id"),
       reviewRounds: values(aggregate.reviewRounds, "id"),
-      taskFinalReviewContractEvents: values(aggregate.events, "id")
+      taskFinalReviewContractEvents: events
         .filter((event) => event.type === TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT),
       reviewConfig: this.getReviewConfig(),
       openInputRequests: values(aggregate.inputRequests, "id")
@@ -1052,7 +1058,7 @@ export class FileTaskStore implements TaskStore {
         agentRuns: agentRuns.filter((run) => run.purpose === "review"),
         // The rollback file backend has no finding-ledger records.
         reviewFindings: [],
-        events: values(aggregate.events, "id").filter((event) => (
+        events: events.filter((event) => (
           event.type === "review.completed"
         ))
       }
@@ -1074,7 +1080,11 @@ export class FileTaskStore implements TaskStore {
     }
     return {
       ...base,
-      agentRuns: this.listAgentRuns(taskId),
+      agentRuns: operationalTaskRecords(
+        this.listAgentRuns(taskId),
+        values(aggregate.events, "id"),
+        "agent-run"
+      ),
       roleSessionSets: this.listRoleSessionSets(taskId),
       managedWorkspaces: values(aggregate.managedWorkspaces, (workspace) => managedWorkspaceKey(workspace.owner)),
       durableJobs: values(aggregate.durableJobs, "id"),

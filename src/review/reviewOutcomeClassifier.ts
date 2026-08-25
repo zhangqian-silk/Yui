@@ -3,6 +3,10 @@ import type { AgentRun } from "../run/agentRun.js";
 import { matchYieldReceipt } from "../run/yieldReceipt.js";
 import type { ReviewFinding } from "./reviewFinding.js";
 import type { ReviewRound } from "./reviewRound.js";
+import {
+  isTaskRecordRetired,
+  operationalTaskRecords
+} from "../task/taskRecordRetirement.js";
 
 /**
  * Review outcome classification is a read-only projection over existing
@@ -59,6 +63,19 @@ export function classifyReviewRoundOutcome(
   evidence?: ReviewOutcomeEvidenceStore
 ): ReviewOutcomeClassification | null {
   if (round.status !== "completed" && round.status !== "failed") return null;
+
+  if (evidence !== undefined && round.reviewerRunId !== undefined
+    && isTaskRecordRetired(
+      evidence.listEvents(round.taskId),
+      "agent-run",
+      round.reviewerRunId
+    )) {
+    return {
+      kind: "non-semantic",
+      infraKind: "run-identity",
+      reason: `Reviewer Run ${round.reviewerRunId} was retired from operational evidence.`
+    };
+  }
 
   const infraKind = classifyInfraKind(`${round.summary ?? ""}\n${round.report ?? ""}`);
   if (round.status === "failed") {
@@ -139,7 +156,12 @@ function failedRoundSemanticEvidence(
   ));
   if (semanticLane !== undefined) return `Reviewer Lane ${semanticLane.id} delivered semantic evidence.`;
   if (evidence !== undefined) {
-    const reviewRun = evidence.listAgentRuns(round.taskId).find((run) => (
+    const events = evidence.listEvents(round.taskId);
+    const reviewRun = operationalTaskRecords(
+      evidence.listAgentRuns(round.taskId),
+      events,
+      "agent-run"
+    ).find((run) => (
       run.purpose === "review"
       && run.reviewRoundId === round.id
       && (run.status === "yielded" || runtimeFailureSummaryHasReviewerOutput(run.summary ?? ""))
@@ -149,7 +171,7 @@ function failedRoundSemanticEvidence(
       entry.firstReviewRoundId === round.id || entry.lastReviewRoundId === round.id
     ));
     if (finding !== undefined) return `Review finding ${finding.id} references the Round.`;
-    const completion = evidence.listEvents(round.taskId).find((event) => (
+    const completion = events.find((event) => (
       event.type === "review.completed" && event.payload.reviewRoundId === round.id
     ));
     if (completion !== undefined) return `Review completion Event ${completion.id} exists.`;
@@ -202,7 +224,12 @@ function completedInfrastructureCorroborationFailure(
     }
   }
 
-  const runs = store.listAgentRuns(round.taskId).filter((run) => (
+  const allEvents = store.listEvents(round.taskId);
+  const runs = operationalTaskRecords(
+    store.listAgentRuns(round.taskId),
+    allEvents,
+    "agent-run"
+  ).filter((run) => (
     run.purpose === "review" && run.reviewRoundId === round.id
   ));
   const active = runs.find(({ status }) => status === "active");
@@ -240,7 +267,7 @@ function completedInfrastructureCorroborationFailure(
     entry.firstReviewRoundId === round.id || entry.lastReviewRoundId === round.id
   ));
   if (finding !== undefined) return `Review finding ${finding.id} references the Round.`;
-  const events = store.listEvents(round.taskId).filter((event) => (
+  const events = allEvents.filter((event) => (
     event.type === "review.completed" && event.payload.reviewRoundId === round.id
   ));
   if (events.length !== 1) return "Completed Round lacks one exact completion Event.";

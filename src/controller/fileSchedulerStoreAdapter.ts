@@ -51,6 +51,7 @@ import {
   hasRecentTurnId
 } from "../executor/turnCompletion.js";
 import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import {
   buildTaskWakeEnvelope,
   type WakeEnvelope
@@ -924,7 +925,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const latest = latestTaskWake(reader.listTaskWakes(taskId));
       const fromCursor = latest?.toCursor ?? fallbackWakeCursor({
         taskCreatedAt: task.createdAt,
-        leaderRunCreatedAt: reader.listAgentRuns(taskId)
+        leaderRunCreatedAt: operationalTaskRecords(
+          reader.listAgentRuns(taskId),
+          reader.listEvents(taskId),
+          "agent-run"
+        )
           .filter((run) => run.roleName === "leader")
           .at(-1)?.createdAt
       });

@@ -257,6 +257,16 @@ export function createUpdatePorts(
             + "different build than the one that passed preflight."
         );
       }
+      // Existing managed Sessions may have been created by a release that
+      // embedded an exact CLI path/version in its wrapper. Convert those
+      // authenticated, Manifest-referenced wrappers before the replacement
+      // Controller starts so the update cannot strand a live Session.
+      const sessionCliRefresh = run(
+        activeBinary,
+        ["--json", "internal", "session-cli-refresh"],
+        { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
+      );
+      assertSpawnOk(sessionCliRefresh, "refresh managed Session CLI wrappers");
       // Retain the exact path used by both doctor and version verification. The
       // replacement start must not resolve UPDATE_CLI_PATH or npm again.
       verifiedActivatedBinary = activeBinary;

@@ -102,6 +102,10 @@ import { validateTaskWake, type TaskWake } from "../scheduler/taskWake.js";
 import type { Task } from "../task/task.js";
 import type { NextActionFacts } from "../task/nextAction.js";
 import type { CompletionReadinessFacts } from "../task/completionReadiness.js";
+import {
+  operationalTaskRecords,
+  TASK_RECORD_RETIRED_EVENT
+} from "../task/taskRecordRetirement.js";
 import { TASK_RECORD_ID_PREFIXES, type TaskRecordKind } from "../task/taskRecordReference.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import { managedWorkspaceKey, type ManagedWorkspace, type ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
@@ -992,14 +996,27 @@ export class SqliteTaskStore implements TaskStore {
     if (task === null) return null;
     // One indexed query (idx_agent_runs_role_status) covers both the active
     // Runs the projection waits on and the Leader Runs the budget consumes.
-    const runs = this.#sortById(
+    const events = this.#sortById(
+      this.#listPayload<TaskEvent>(
+        "events",
+        "task_id = ? AND type IN (?, ?, ?)",
+        [
+          taskId,
+          TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT,
+          TASK_RECORD_RETIRED_EVENT,
+          "review.completed"
+        ]
+      ),
+      (event) => event.id
+    );
+    const runs = operationalTaskRecords(this.#sortById(
       this.#listPayload<AgentRun>(
         "agent_runs",
         "task_id = ? AND (status = 'active' OR role_name = 'leader')",
         [taskId]
       ),
       (run) => run.id
-    );
+    ), events, "agent-run");
     return {
       task: {
         id: task.id,
@@ -1023,14 +1040,8 @@ export class SqliteTaskStore implements TaskStore {
         this.#listPayload<ReviewRound>("review_rounds", "task_id = ?", [taskId]),
         (round) => round.id
       ),
-      taskFinalReviewContractEvents: this.#sortById(
-        this.#listPayload<TaskEvent>(
-          "events",
-          "task_id = ? AND type = ?",
-          [taskId, TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT]
-        ),
-        (event) => event.id
-      ),
+      taskFinalReviewContractEvents: events
+        .filter((event) => event.type === TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT),
       reviewConfig: this.getReviewConfig(),
       openInputRequests: this.#sortById(
         this.#listPayload<InputRequest>(
@@ -1052,7 +1063,7 @@ export class SqliteTaskStore implements TaskStore {
           (run) => run.id
         ),
         reviewFindings: this.listReviewFindings(taskId),
-        events: this.listEvents(taskId).filter((event) => event.type === "review.completed")
+        events: events.filter((event) => event.type === "review.completed")
       }
     };
   }
@@ -1062,7 +1073,11 @@ export class SqliteTaskStore implements TaskStore {
     if (base === null) return null;
     return {
       ...base,
-      agentRuns: this.listAgentRuns(taskId),
+      agentRuns: operationalTaskRecords(
+        this.listAgentRuns(taskId),
+        this.listEvents(taskId),
+        "agent-run"
+      ),
       roleSessionSets: this.listRoleSessionSets(taskId),
       managedWorkspaces: this.#sortById(
         this.#listPayload<ManagedWorkspace>("managed_workspaces", "task_id = ?", [taskId]),

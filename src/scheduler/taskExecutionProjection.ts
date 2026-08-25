@@ -1,4 +1,5 @@
 import type { TaskEvent } from "../event/taskEvent.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { Role } from "../role/role.js";
@@ -190,7 +191,12 @@ export function buildTaskExecutionProjection(
   const task = store.getTask?.(taskId) ?? taskOverride ?? null;
   if (task === null) return null;
   const roles = store.listRoles?.(taskId) ?? [];
-  const runs = store.listAgentRuns?.(taskId) ?? [];
+  const events = store.listEvents?.(taskId) ?? [];
+  const runs = operationalTaskRecords(
+    store.listAgentRuns?.(taskId) ?? [],
+    events,
+    "agent-run"
+  );
   const leaderMailbox = store.getWorkMailbox?.({
     kind: "role",
     taskId,
@@ -223,7 +229,7 @@ export function buildTaskExecutionProjection(
     ...(store.listIntegrationAttempts === undefined
       ? {}
       : { integrations: store.listIntegrationAttempts(taskId) }),
-    ...(store.listEvents === undefined ? {} : { events: store.listEvents(taskId) }),
+    ...(store.listEvents === undefined ? {} : { events }),
     ...(store.getTaskBrief === undefined ? {} : { brief: store.getTaskBrief(taskId) }),
     pendingWakeup: store.getPendingWakeup?.(taskId) ?? null,
     leaderMailbox,
@@ -244,7 +250,11 @@ export function projectTaskExecutionFromFacts(
 ): TaskExecutionProjection {
   const executionGroups = facts.executionGroups
     ?? collectExecutionGroups(facts.workItems ?? [], facts.reviewRounds ?? []);
-  return projectTaskExecution({ ...facts, executionGroups });
+  return projectTaskExecution({
+    ...facts,
+    runs: operationalTaskRecords(facts.runs, facts.events ?? [], "agent-run"),
+    executionGroups
+  });
 }
 
 /** Alias kept intentionally small for scheduler callers and external read models. */
@@ -724,7 +734,10 @@ function collectBlockers(
         summary: item.outcome ?? `WorkItem ${item.id} is ${item.status}.`
       });
     }
-    if (item.status === "pending" && (item.dependsOn ?? []).some((id) => byId.get(id)?.status !== "completed")) {
+    if (item.status === "pending" && (item.dependsOn ?? []).some((id) => {
+      const status = byId.get(id)?.status;
+      return status !== "completed" && status !== "retired";
+    })) {
       blockers.push({
         kind: "work",
         id: item.id,

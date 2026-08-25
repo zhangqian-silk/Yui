@@ -1,6 +1,6 @@
 ---
 name: yui-runtime
-description: Load and use the exact authorized context for every Yui-managed Leader, Worker, Reviewer, Operator, or custom Role Run, and complete that Run through its bounded control-plane protocol.
+description: Load and use the authorized context for every Yui-managed Leader, Worker, Reviewer, Operator, or custom Role Run, and complete that Run through its bounded control-plane protocol.
 ---
 
 # Yui Runtime
@@ -12,10 +12,10 @@ workspace layout, native transcript, or an earlier Run.
 For every managed Task Run:
 
 1. Read the exact Run identity from the newest Bootstrap Envelope.
-2. Before acting, load its authorized pack with the exact Session CLI:
+2. Before acting, load its authorized pack with the ordinary Yui CLI command:
 
    ```sh
-   "$YUI_SESSION_CLI" task run context "$YUI_TASK_ID/<run-id>" --json
+   yui task run context "$YUI_TASK_ID/<run-id>" --json
    ```
 
 3. Verify that the returned Task, Run, Role, purpose, Snapshot digest, workspace,
@@ -27,7 +27,7 @@ For every managed Task Run:
    `refId`:
 
    ```sh
-   "$YUI_SESSION_CLI" task run context expand "$YUI_TASK_ID/<run-id>" <ref-id> --store <store> --mode full --json
+   yui task run context expand "$YUI_TASK_ID/<run-id>" <ref-id> --store <store> --mode full --json
    ```
 
    A bare `<ref-id>` remains supported only when it identifies exactly one
@@ -42,11 +42,11 @@ The pack's authority view and writable Project IDs are hard boundaries. A
 native subagent inherits the parent Run's refs and authority; it does not gain a
 new Yui actor, Run, Session, or cross-Task read permission.
 
-For a global Operator or custom GlobalRole Session, load the stable exact view
+For a global Operator or custom GlobalRole Session, load the stable authorized view
 before routing or acting:
 
 ```sh
-"$YUI_SESSION_CLI" session context "$YUI_ROLE" --json
+yui session context "$YUI_ROLE" --json
 ```
 
 Global context grants no Task implementation workspace. Read a Task only after

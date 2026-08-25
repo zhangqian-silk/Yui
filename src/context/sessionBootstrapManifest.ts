@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
-import { chmodSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 
 import type { ExactControlPlaneDescriptor } from "../runtime/exactControlPlane.js";
 import {
-  exactControlPlaneCommandPrefix,
   exactControlPlaneDigest,
   serializeExactDescriptor
 } from "../runtime/exactControlPlane.js";
@@ -52,6 +51,18 @@ export type MaterializedSessionBootstrap = Readonly<{
   roleProfilePath: string;
   descriptorPath: string;
 }>;
+
+export type SessionCliRefreshResult = Readonly<{
+  refreshed: number;
+  current: number;
+  skipped: number;
+}>;
+
+const ORDINARY_SESSION_CLI = [
+  "#!/bin/sh",
+  "exec yui \"$@\"",
+  ""
+].join("\n");
 
 /** Read back one immutable Session Manifest and verify its content digest. */
 export function readSessionBootstrapManifest(path: string): SessionBootstrapManifest {
@@ -135,11 +146,10 @@ export function materializeSessionBootstrap(input: Readonly<{
   const descriptorPath = resolve(join(home, "runtime", "control-plane", `${controlDigest}.json`));
   writeImmutableText(descriptorPath, `${serializeExactDescriptor(input.controlPlane)}\n`);
 
-  const sessionCliContent = [
-    "#!/bin/sh",
-    `exec ${exactControlPlaneCommandPrefix(input.controlPlane)} \"$@\"`,
-    ""
-  ].join("\n");
+  // Session identity is carried by the immutable Manifest and durable Role/
+  // Run fences. Resolve the ordinary CLI on every invocation so package or
+  // release upgrades do not invalidate a still-current native Session.
+  const sessionCliContent = ORDINARY_SESSION_CLI;
   const sessionCliDigest = digest(sessionCliContent);
   const sessionCliPath = resolve(join(home, "runtime", "session-cli", `yui-${sessionCliDigest}.sh`));
   writeImmutableText(sessionCliPath, sessionCliContent);
@@ -189,11 +199,11 @@ export function materializeSessionBootstrap(input: Readonly<{
     roleProfileRef: { digest: profileDigest, path: roleProfilePath },
     contextProtocol: input.owner.scope === "global"
       ? {
-          loadCommand: `\"${sessionCliPath}\" session context \"$YUI_ROLE\" --json`
+          loadCommand: "yui session context \"$YUI_ROLE\" --json"
         }
       : {
-          loadCommand: `\"${sessionCliPath}\" task run context \"$YUI_TASK_ID/<run-id>\" --json`,
-          expandCommand: `\"${sessionCliPath}\" task run context expand \"$YUI_TASK_ID/<run-id>\" <ref-id> --store <store> --mode full --json`
+          loadCommand: "yui task run context \"$YUI_TASK_ID/<run-id>\" --json",
+          expandCommand: "yui task run context expand \"$YUI_TASK_ID/<run-id>\" <ref-id> --store <store> --mode full --json"
         }
   };
   const manifest = Object.freeze({ ...body, digest: digest(body) });
@@ -211,6 +221,71 @@ export function materializeSessionBootstrap(input: Readonly<{
     roleProfilePath,
     descriptorPath
   });
+}
+
+/**
+ * Converts wrappers produced before the protocol-compatible Session CLI to an
+ * ordinary `yui` invocation. Only a valid Session Manifest may nominate a
+ * wrapper, and only the exact legacy two-line wrapper shape is changed. The
+ * Manifest and its frozen descriptor stay immutable and continue to
+ * authenticate the Session; repeated refreshes are no-ops.
+ */
+export function refreshManagedSessionCliWrappers(homeInput: string): SessionCliRefreshResult {
+  const home = resolve(homeInput);
+  const manifestDirectory = resolve(join(home, "runtime", "session-manifests"));
+  const sessionCliDirectory = resolve(join(home, "runtime", "session-cli"));
+  if (!existsSync(manifestDirectory)) {
+    return Object.freeze({ refreshed: 0, current: 0, skipped: 0 });
+  }
+
+  const wrapperPaths = new Set<string>();
+  let skipped = 0;
+  for (const name of readdirSync(manifestDirectory).filter((entry) => entry.endsWith(".json"))) {
+    const manifestPath = resolve(join(manifestDirectory, name));
+    try {
+      const manifest = readSessionBootstrapManifest(manifestPath);
+      if (manifestPath !== resolve(join(manifestDirectory, `${manifest.digest}.json`))) {
+        skipped += 1;
+        continue;
+      }
+      const wrapperPath = resolve(manifest.controlPlane.sessionCliPath);
+      if (dirname(wrapperPath) !== sessionCliDirectory) {
+        skipped += 1;
+        continue;
+      }
+      wrapperPaths.add(wrapperPath);
+    } catch {
+      // Historical or incomplete manifests are audit material. They must not
+      // block current Sessions or an otherwise compatible package update.
+      skipped += 1;
+    }
+  }
+
+  let refreshed = 0;
+  let current = 0;
+  for (const wrapperPath of wrapperPaths) {
+    if (!existsSync(wrapperPath)) {
+      skipped += 1;
+      continue;
+    }
+    const content = readFileSync(wrapperPath, "utf8");
+    if (content === ORDINARY_SESSION_CLI) {
+      current += 1;
+      continue;
+    }
+    if (!isLegacyExactSessionCli(content)) {
+      skipped += 1;
+      continue;
+    }
+    writeTextFileAtomically(wrapperPath, ORDINARY_SESSION_CLI);
+    chmodSync(wrapperPath, 0o700);
+    refreshed += 1;
+  }
+  return Object.freeze({ refreshed, current, skipped });
+}
+
+function isLegacyExactSessionCli(content: string): boolean {
+  return /^#!\/bin\/sh\nexec [^\n]+ '--yui-control' '[a-f0-9]{64}' "\$@"\n$/u.test(content);
 }
 
 function writeImmutableText(path: string, content: string): void {

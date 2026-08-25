@@ -3,6 +3,7 @@ import type { TaskMessage } from "../message/message.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { Task } from "../task/task.js";
 import { renderWakeReason } from "../scheduler/wakeReason.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 
 /**
  * Issue 04 (context token budget) — long-term design:
@@ -63,12 +64,13 @@ export function buildTaskWakeEnvelope(
   }
 
   const fromTime = Date.parse(request.fromCursor);
+  const events = reader.listEvents(request.taskId);
   const counts = {
-    events: reader.listEvents(request.taskId)
+    events: events
       .filter((record) => Date.parse(record.createdAt) > fromTime).length,
-    messages: reader.listMessages(request.taskId)
+    messages: operationalTaskRecords(reader.listMessages(request.taskId), events, "message")
       .filter((record) => Date.parse(record.createdAt) > fromTime).length,
-    runs: reader.listAgentRuns(request.taskId)
+    runs: operationalTaskRecords(reader.listAgentRuns(request.taskId), events, "agent-run")
       .filter((record) => Date.parse(record.createdAt) > fromTime).length
   };
 

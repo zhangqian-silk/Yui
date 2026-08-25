@@ -404,6 +404,19 @@ yui task work accept <task-id>/<work-item-id> --summary "验收标准满足。"
 replacement。WorkItem、Integration
 worktree 与检查日志会作为证据保留，直到显式清理。
 
+错误的历史指令或执行记录可以从运行投影中废弃，而不删除审计证据：
+
+```sh
+yui task message retire <task>/<message> --reason "已被新指令替代"
+yui task run retire <task>/<agent-run> --reason "无效的启动记录"
+```
+
+这些命令追加 retirement 事实；列表和审计仍保留并标记原 Message、
+WorkItem 或 AgentRun，而受管 Run 上下文、actionability、恢复、Review 证据和调度会忽略
+它。活动 AgentRun 会先按精确身份终态化；重复废弃是幂等操作。Message 与
+AgentRun 只能由用户或全局 Operator 废弃，WorkItem 也可由所属 Task Leader
+废弃。
+
 长期 Task 不依赖 native transcript 恢复。Leader 每次 yield 前更新 Brief
 的 focus 和 leader summary；材料性技术选择写入 Decision；可独立汇报的
 阶段成果写入 Milestone；只有跨 Task 稳定有效的信息才进入 Project
@@ -481,6 +494,12 @@ binding 是预先保存、可随时切换的配置，而不是并行身份。Ope
 并切换。跨 Agent 切换默认复用已保存的 model/effort，只有用户明确选择
 更新时才进入现有配置选择流程。
 
+受管理 Session 的普通工作流命令统一调用 PATH 中的 `yui`。Session Manifest
+与持久 Role/Run fence 负责身份认证，CLI 和 Controller 只需满足协议与存储兼容，
+不会因包版本升级而使现有 Session 失效；Provider 回调等内部路径仍保留精确围栏。
+`update` 会幂等刷新旧版本生成的精确 CLI wrapper，使历史 Session 也转为这一
+兼容入口。
+
 使用 `yui config role unbind <global-role> <agent-id>` 或 `yui task role unbind <task-id> <role> <agent-id>` 可移除休眠 binding。active binding 或任何未 stopped 的 native session 都会被拒绝；stopped session 记录会和 binding 在同一事务中删除。
 
 Claude 的 session ID 在启动前分配，并由持久 stream-json Provider 进程承载多个 Turn；Codex 使用持久 App Server thread。两者都复用同一套 Conversation、Activation、Turn 与 authority fence，不再向模型对话注入 session-bind prompt。
@@ -502,7 +521,7 @@ yui controller stop
 yui controller restart
 ```
 
-`controller restart` 会用当前安装的 Yui 版本替换 Controller 进程及其调度循环、socket 服务，不会停止或重启已受管的 tmux/Agent 会话。
+`controller restart` 会用当前安装的 Yui 版本替换 Controller 进程及其调度循环、socket 服务，不会停止或重启已受管的 tmux/Agent 会话；普通 Session 命令按协议与存储身份兼容，不要求 Controller 与 CLI 包版本完全相同。
 
 成功的 `setup`、`upgrade` 和 `update` 都会确保当前 Home 有一个运行中的
 Controller；如果之前没有运行，会在完成后启动。只读命令和

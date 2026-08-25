@@ -319,6 +319,13 @@ ChangeSet is integrated.
   Role with `yui task enter <task-id> <role>`.
 - Relay explicit Task information with
   `yui task message send <task-id> "<body>"`.
+- When a proven incorrect historical record is affecting current projections,
+  preserve it as audit evidence and append a reasoned retirement with
+  `yui task message retire <task>/<message> --reason "..."`,
+  `yui task run retire <task>/<run> --reason "..."`, or
+  `yui task work retire <task>/<work> --summary "..."`. Inspect the exact
+  record first; retirement is not a substitute for normal failure recovery or
+  for resolving a still-valid result.
 - Inspect each InputRequest before presenting it. Present questions, choices,
   recommendations, and deadlines exactly only when the request is a user-owned
   boundary (a real choice, authorization, credential, unavailable external

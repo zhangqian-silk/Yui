@@ -60,22 +60,26 @@ Additional rules:
   `yui task workflow resume <task> <workflow> --grant <new-grant>`; the plan,
   source, and all confirmed step evidence are immutable across the rebind.
 
-## Rebinding an active Task-final Review contract
+## Rebinding a legacy Task-final Review contract
 
-An active Project-backed Task may already have frozen its Task-final Review
-contract in a Candidate when an immutable release handover changes the exact
-control-plane digest. The old contract remains valid audit evidence, but an
-exact Leader launched by the new release cannot present that old control
-identity. The authenticated global Operator may authorize a direct handover or
-catch an older active Task up to the current release explicitly:
+Compatible CLI package updates and Controller replacements do not change an
+active Task's final-review capability. Managed Sessions use the ordinary
+`yui` command, compatibility is checked by protocol and storage identity, and
+a replacement Leader presents the contract already established by durable Task
+evidence. No version-aware Operator action is required.
+
+`task review rebind` remains as a recovery command for legacy Tasks that
+already recorded different exact control-plane contracts during an older
+immutable-release handover. The authenticated global Operator may repair that
+historical chain explicitly:
 
 ```sh
-"$YUI_SESSION_CLI" task review rebind <task> \
+yui task review rebind <task> \
   --from-control <old-digest> --to-control <current-digest> \
   --from-release <old-release-id> --to-release <current-release-id>
 ```
 
-The command verifies the current global Session Manifest, both installed
+The legacy recovery verifies the current global Session Manifest, both installed
 immutable releases, the active release pointer, and the completed target
 activation receipt while holding the release handover lock. The source may be
 the immediately previous release or an older installed immutable release when
