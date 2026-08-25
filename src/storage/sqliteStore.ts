@@ -2236,6 +2236,18 @@ export class SqliteTaskStore implements TaskStore {
 
   saveAgentRun(run: AgentRun): void {
     if (run.taskId !== undefined) this.#requireTask(run.taskId);
+    if (run.reviewRoundId !== undefined) {
+      const round = this.getReviewRound(run.taskId, run.reviewRoundId);
+      if (round === null) {
+        throw new StorageRecordError(`Agent run ReviewRound not found: ${run.reviewRoundId}.`);
+      }
+      const laneRole = round.executionGroup?.lanes
+        .find(({ id }) => id === run.executionLaneId)?.roleName;
+      if (round.workItemId !== run.workItemId
+        || (round.reviewerRoleName !== run.roleName && laneRole !== run.roleName)) {
+        throw new StorageRecordError(`Agent run does not match ReviewRound: ${run.id}.`);
+      }
+    }
     this.#mutate(() => {
       this.#db.prepare(
         `INSERT INTO agent_runs (task_id, run_id, role_name, status, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)

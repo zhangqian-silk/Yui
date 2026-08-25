@@ -309,8 +309,8 @@ export function validateAgentRun(run: AgentRun): AgentRun {
     }
   }
   if (run.purpose === "review") {
-    if (run.workItemId === undefined || run.reviewRoundId === undefined) {
-      throw new Error("A review Agent run requires WorkItem and ReviewRound references.");
+    if (run.reviewRoundId === undefined) {
+      throw new Error("A review Agent run requires a ReviewRound reference.");
     }
     if (run.workspace === undefined
       || !((run.workspace.owner.type === "review-round"
