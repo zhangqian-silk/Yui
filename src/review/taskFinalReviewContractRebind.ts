@@ -95,6 +95,15 @@ export function resolveRecordedTaskFinalReviewContract(
           source: `Candidate ${item.id}/${candidate.id}`
         }];
   });
+  const historicalCandidateObservations = workItems.flatMap((item) => (
+    item.candidates
+      .filter((candidate) => candidate.taskFinalReviewContract !== undefined)
+      .map((candidate) => ({
+        contract: candidate.taskFinalReviewContract!,
+        createdAt: candidate.createdAt,
+        source: `Historical Candidate ${item.id}/${candidate.id}`
+      }))
+  ));
   const reviewObservations = reviewRounds.flatMap((round) => (
     (round.scope ?? "work-item") !== "task"
     || round.taskFinalReviewContract === undefined
@@ -108,7 +117,8 @@ export function resolveRecordedTaskFinalReviewContract(
   return resolveTaskFinalReviewContract(
     taskId,
     [...candidateObservations, ...reviewObservations],
-    events
+    events,
+    historicalCandidateObservations
   );
 }
 
@@ -244,7 +254,8 @@ export function taskFinalReviewContractRebindFromEvent(
 export function resolveTaskFinalReviewContract(
   taskId: string,
   observations: readonly TaskFinalReviewContractObservation[],
-  events: readonly TaskEvent[]
+  events: readonly TaskEvent[],
+  historicalObservations: readonly TaskFinalReviewContractObservation[] = []
 ): TaskFinalReviewContractResolution | undefined {
   const normalizedTaskId = requireIdentity(taskId, "Task final-review contract Task id");
   const orderedObservations = [...observations]
@@ -252,6 +263,16 @@ export function resolveTaskFinalReviewContract(
       contract: validateTaskFinalReviewContract(observation.contract),
       createdAt: requireTimestamp(observation.createdAt, "Task final-review observation createdAt"),
       source: requireText(observation.source, "Task final-review observation source")
+    }))
+    .sort(compareCreatedAt);
+  const orderedHistoricalObservations = [...historicalObservations]
+    .map((observation) => ({
+      contract: validateTaskFinalReviewContract(observation.contract),
+      createdAt: requireTimestamp(
+        observation.createdAt,
+        "Task final-review historical observation createdAt"
+      ),
+      source: requireText(observation.source, "Task final-review historical observation source")
     }))
     .sort(compareCreatedAt);
   const orderedEvents = events
@@ -264,27 +285,34 @@ export function resolveTaskFinalReviewContract(
     .sort((left, right) => compareCreatedAt(left, right)
       || left.event.id.localeCompare(right.event.id, undefined, { numeric: true }));
 
-  if (orderedObservations.length === 0) {
-    if (orderedEvents.length > 0) {
-      throw new Error(`Task ${normalizedTaskId} has a final-review rebind without a stored contract.`);
-    }
-    return undefined;
-  }
-  for (const observation of orderedObservations) {
+  if (orderedObservations.length === 0 && orderedEvents.length === 0) return undefined;
+  for (const observation of [...orderedObservations, ...orderedHistoricalObservations]) {
     if (observation.contract.taskId !== normalizedTaskId) {
       throw new Error(`${observation.source} carries a final-review contract for another Task.`);
     }
   }
 
-  const initial = orderedObservations[0]!.contract;
-  const reviewerRoleName = initial.reviewerRoleName;
   const firstRebindAt = orderedEvents[0]?.createdAt;
-  const legacyObservations = firstRebindAt === undefined
+  const primaryLegacyObservations = firstRebindAt === undefined
     ? orderedObservations
     : orderedObservations.filter(({ createdAt }) => createdAt < firstRebindAt);
+  const historicalRebindSource = orderedEvents[0] === undefined
+    ? undefined
+    : orderedHistoricalObservations.find((observation) => (
+        observation.createdAt < orderedEvents[0]!.createdAt
+        && sameTaskFinalReviewContract(
+          observation.contract,
+          orderedEvents[0]!.rebind.fromContract
+        )
+      ));
+  const legacyObservations = primaryLegacyObservations.length > 0
+    ? primaryLegacyObservations
+    : historicalRebindSource === undefined ? [] : [historicalRebindSource];
   if (legacyObservations.length === 0) {
     throw new Error(`Task ${normalizedTaskId} has a final-review rebind without an established source contract.`);
   }
+  const initial = legacyObservations[0]!.contract;
+  const reviewerRoleName = initial.reviewerRoleName;
   let effective = initial;
   const legacyContractDigests = new Set([initial.digest]);
   for (const observation of legacyObservations) {
