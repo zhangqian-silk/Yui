@@ -235,6 +235,7 @@ import {
   type WorkItemExecutionMode
 } from "../execution/executionGroup.js";
 import {
+  executionStageSpendClosed,
   observedExecutionResourceUsage,
   planResourceAdmissions,
   projectExecutionStageResources,
@@ -812,7 +813,7 @@ function queuedResourceLaneIdentities(
           }),
           now
         });
-        if (resources.deadlineReached || resources.exhaustedBudgets.length > 0) return [];
+        if (executionStageSpendClosed(resources)) return [];
       }
       return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
         if (lane.status !== "pending"
@@ -3254,7 +3255,7 @@ function dispatchWork(
           now
         });
     const stageSpendClosed = stageResources !== undefined
-      && (stageResources.deadlineReached || stageResources.exhaustedBudgets.length > 0);
+      && executionStageSpendClosed(stageResources);
     for (let index = 0; index < plans.length; index += 1) {
       const plan = plans[index]!;
       const lane = lanes[index]!;
@@ -5993,7 +5994,7 @@ function retryRun(
           }),
           now
         });
-        if (resources.deadlineReached || resources.exhaustedBudgets.length > 0) {
+        if (executionStageSpendClosed(resources)) {
           throw usageError(
             `Execution stage budget/deadline is exhausted; resolve Group ${retryGroup.id} instead of retrying.`
           );

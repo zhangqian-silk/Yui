@@ -29,7 +29,10 @@ import {
   candidateConvergenceEvidenceSufficient,
   candidateConvergenceStageResultsValid
 } from "../execution/candidateConvergence.js";
-import { routeExecutionStage } from "../execution/resourceBroker.js";
+import {
+  executionStageSpendClosed,
+  routeExecutionStage
+} from "../execution/resourceBroker.js";
 import type { RunRecoveryProjection } from "../run/recoveryProjection.js";
 import {
   type TaskFinalReviewContract
@@ -777,7 +780,7 @@ function exhaustedExplorationReason(
   const resources = executionGroups?.find(({ groupId }) => groupId === group.id)?.resources;
   if ((group.resolution.decision === "retry" || group.resolution.decision === "blocked")
     && resources !== undefined
-    && (resources.deadlineReached || resources.exhaustedBudgets.length > 0)) {
+    && executionStageSpendClosed(resources)) {
     return `Work Item ${item.id} cannot retry its frozen exploration resource budget; retire it explicitly or replace it with a newly authorized delivery boundary.`;
   }
   if ((group.resolution.decision === "retry" || group.resolution.decision === "blocked")
@@ -886,7 +889,7 @@ function buildExecutionStageAction(
         { fact: "Execution stage is unresolved", satisfied: true, ref: refs[1] },
         {
           fact: "Stage deadline or hard budget is exhausted",
-          satisfied: resources.deadlineReached || resources.exhaustedBudgets.length > 0,
+          satisfied: executionStageSpendClosed(resources),
           ref: refs[1]
         },
         { fact: "Acceptance-level evidence is sufficient", satisfied: false, ref: refs[1] }
@@ -902,7 +905,11 @@ function buildExecutionStageAction(
       reason: routing.reason,
       refs,
       preconditions: [
-        { fact: "Structured stage results show material disagreement", satisfied: disagreement === "high", ref: refs[1] },
+        {
+          fact: "Stage quorum is open or structured results show material disagreement",
+          satisfied: !resources.quorumMet || disagreement === "high",
+          ref: refs[1]
+        },
         {
           fact: "Adaptive Lane capacity remains",
           satisfied: group.strategy.mode === "adaptive"
@@ -912,20 +919,26 @@ function buildExecutionStageAction(
       ],
       recommendedCommand:
         `yui task work dispatch ${facts.task.id}/${item.id} --lane-role <independent-role>`,
-      alternatives: [{
-        kind: "deepen-sequential",
-        reason: "Resolve the current evidence and deepen sequentially when another independent Lane has lower value.",
-        recommendedCommand: resolveCommand("accept"),
-        refs
-      }],
-      judgmentRequired:
-        "Leader must choose an unused compatible Task Role for expansion or deliberately select the sequential alternative."
+      ...(resources.quorumMet
+        ? {
+            alternatives: [{
+              kind: "deepen-sequential",
+              reason: "Resolve the current evidence and deepen sequentially when another independent Lane has lower value.",
+              recommendedCommand: resolveCommand("accept"),
+              refs
+            }]
+          }
+        : {}),
+      judgmentRequired: resources.quorumMet
+        ? "Leader must choose an unused compatible Task Role for expansion or deliberately select the sequential alternative."
+        : "Leader must choose an unused compatible Task Role so the frozen stage can satisfy quorum."
     });
   }
   if (routing.action === "deepen-sequential") {
     const resolveRequestsNextRound = group.stage.stage === "resolve";
     const decision = usableLaneIds.length === 0
       || !stageResultsValid
+      || !resources.quorumMet
       || resolveRequestsNextRound
       ? "retry"
       : "accept";
@@ -933,13 +946,16 @@ function buildExecutionStageAction(
       kind: "resolve-execution-stage",
       reason: resolveRequestsNextRound
         ? "Resolve evidence does not establish a Candidate; begin another bounded exploration round."
-        : decision === "retry"
-          ? "The stage has no structurally usable output; resolve it as a bounded retry before redispatch."
-          : routing.reason,
+        : !resources.quorumMet
+          ? "The stage exhausted its Lane capacity before quorum; resolve it as a bounded retry."
+          : decision === "retry"
+            ? "The stage has no structurally usable output; resolve it as a bounded retry before redispatch."
+            : routing.reason,
       refs,
       preconditions: [
         { fact: "No stage Lane remains active or queued", satisfied: true, ref: refs[1] },
-        { fact: "Current stage has structurally usable output", satisfied: stageResultsValid, ref: refs[1] }
+        { fact: "Current stage has structurally usable output", satisfied: stageResultsValid, ref: refs[1] },
+        { fact: "Stage quorum is met", satisfied: resources.quorumMet, ref: refs[1] }
       ],
       recommendedCommand: resolveCommand(decision),
       judgmentRequired: resolveRequestsNextRound
@@ -976,7 +992,7 @@ function buildExecutionStageAction(
         { fact: "At least one Lane is durably queued", satisfied: true, ref: refs[1] },
         {
           fact: "Stage deadline and hard budgets remain open",
-          satisfied: !resources.deadlineReached && resources.exhaustedBudgets.length === 0,
+          satisfied: !executionStageSpendClosed(resources),
           ref: refs[1]
         }
       ],

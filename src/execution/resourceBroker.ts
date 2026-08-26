@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 
-import { requireIdentity, requireTimestamp } from "../domain/validation.js";
+import { requireIdentity, requireText, requireTimestamp } from "../domain/validation.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { AgentRun } from "../run/agentRun.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
@@ -94,6 +94,13 @@ export type ExecutionRoutingDecision = Readonly<{
   retainActiveLaneIds: readonly string[];
   reason: string;
 }>;
+
+/** One shared hard-stop predicate for admission, recovery, and Leader routing. */
+export function executionStageSpendClosed(
+  resources: Pick<ExecutionStageResourceProjection, "deadlineReached" | "exhaustedBudgets">
+): boolean {
+  return resources.deadlineReached || resources.exhaustedBudgets.length > 0;
+}
 
 const DEFAULT_ACTIVE_LANES = 4;
 const DEFAULT_ACTIVE_LANES_PER_TASK = 2;
@@ -356,8 +363,7 @@ export function routeExecutionStage(input: Readonly<{
   const marginal = input.marginalValuePercent === undefined
     ? undefined
     : percentage(input.marginalValuePercent, "Execution marginal value");
-  const budgetPressure = input.resources.deadlineReached
-    || input.resources.exhaustedBudgets.length > 0;
+  const budgetPressure = executionStageSpendClosed(input.resources);
   const marginalLow = marginal !== undefined
     && policy !== undefined
     && marginal < policy.minimumMarginalValuePercent;
@@ -427,14 +433,16 @@ export function routeExecutionStage(input: Readonly<{
   }
   const capacity = group.strategy.mode === "fixed" ? group.strategy.count : group.strategy.max;
   if (group.strategy.mode === "adaptive"
-    && input.disagreement === "high"
-    && group.lanes.length < capacity) {
+    && group.lanes.length < capacity
+    && (!input.resources.quorumMet || input.disagreement === "high")) {
     return Object.freeze({
       action: "expand-parallel",
       earlyTerminationAllowed: false,
       cancelPendingLaneIds: [],
       retainActiveLaneIds: [],
-      reason: "material disagreement and available Lane capacity favor another independent route"
+      reason: input.resources.quorumMet
+        ? "material disagreement and available Lane capacity favor another independent route"
+        : "stage quorum is open and available Lane capacity requires another independent route"
     });
   }
   return Object.freeze({
@@ -582,7 +590,7 @@ function validateLaneIdentity(value: ResourceLaneIdentity): ResourceLaneIdentity
   requireIdentity(value.executionLaneId, "Resource Lane id");
   requireIdentity(value.providerId, "Resource Lane Provider id");
   requireIdentity(value.agentId, "Resource Lane Agent id");
-  if (value.model !== undefined) requireIdentity(value.model, "Resource Lane model");
+  if (value.model !== undefined) requireText(value.model, "Resource Lane model");
   requireTimestamp(value.requestedAt, "Resource Lane request time");
   return Object.freeze({ ...value });
 }

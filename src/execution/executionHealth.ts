@@ -28,6 +28,7 @@ import {
   type ExecutionLane
 } from "./executionGroup.js";
 import {
+  executionStageSpendClosed,
   observedExecutionResourceUsage,
   projectExecutionStageResources,
   type ExecutionStageResourceProjection
@@ -200,6 +201,9 @@ export function actionableExecutionLaneRecoveries(
   return groups
     .filter(({ resolution }) => resolution === undefined)
     .flatMap((group) => group.laneSummaries.flatMap((lane): ActionableExecutionLaneRecovery[] => {
+      if (lane.recovery === "retry-new-agent-run"
+        && group.resources !== undefined
+        && executionStageSpendClosed(group.resources)) return [];
       if (lane.recovery !== "diagnose"
         && lane.recovery !== "terminate-exact-run"
         && lane.recovery !== "retry-new-agent-run") return [];
