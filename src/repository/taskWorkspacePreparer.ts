@@ -1281,7 +1281,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       : this.store.getReviewRound(taskId, lineage.reviewRoundId)?.executionGroup;
     const lane = group?.lanes.find(({ id }) => id === executionLaneId);
     if (group === undefined
-      || lane === undefined || !["completed", "failed", "yielded"].includes(lane.status)) {
+      || lane === undefined || !["completed", "failed", "yielded", "skipped"].includes(lane.status)) {
       throw new Error(`Execution Lane is not terminally resolved: ${taskId}/${executionLaneId}.`);
     }
     const workspace = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (

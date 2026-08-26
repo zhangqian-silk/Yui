@@ -25,7 +25,8 @@ export type ExecutionLaneStatus =
   | "running"
   | "yielded"
   | "completed"
-  | "failed";
+  | "failed"
+  | "skipped";
 
 export type ExecutionStrategy = Readonly<
   | { mode: "fixed"; count: number }
@@ -66,6 +67,25 @@ export type ExecutionParentResultRef = Readonly<{
 export type ExecutionStageBudget = Readonly<{
   maxLanes: number;
   maxAttempts: number;
+  /** Optional only for valid pre-T6 exploration histories. */
+  maxTokens?: number;
+  /** Optional only for valid pre-T6 exploration histories. */
+  maxToolCalls?: number;
+  /** Optional only for valid pre-T6 exploration histories. */
+  maxWallClockSeconds?: number;
+}>;
+
+/**
+ * Stage-local completion economics. Capacity admission remains a Resource
+ * Broker concern; this immutable value says when the Leader has enough
+ * durable output to stop spending the stage budget.
+ */
+export type ExecutionStageResourcePolicy = Readonly<{
+  schemaVersion: 1;
+  quorum: number;
+  deadlineAt: string;
+  stragglerAfterSeconds: number;
+  minimumMarginalValuePercent: number;
 }>;
 
 /**
@@ -89,6 +109,8 @@ export type ExecutionStageContext = Readonly<{
   stageAttempt: number;
   maxRounds: number;
   budget: ExecutionStageBudget;
+  /** Optional only for valid pre-T6 exploration histories. */
+  resources?: ExecutionStageResourcePolicy;
   contextSnapshotRef: ContextSnapshotRef;
   parentResults: readonly ExecutionParentResultRef[];
   convergence?: CandidateConvergencePolicy;
@@ -168,6 +190,8 @@ export type ExecutionLane = Readonly<{
   sessionId?: string;
   reviewRoundId?: string;
   workspace?: ExecutionLaneWorkspace;
+  /** Frozen semantic input retained while Resource Broker backpressure queues the Lane. */
+  directive?: string;
   status: ExecutionLaneStatus;
   result?: ExecutionLaneResult;
   createdAt: string;
@@ -206,6 +230,7 @@ export type ExecutionGroupSummary = Readonly<{
   activeLaneCount: number;
   terminalLaneCount: number;
   failedLaneCount: number;
+  skippedLaneCount: number;
   openHighPriorityFindingIds: readonly string[];
   laneSummaries: readonly Readonly<{
     laneId: string;
@@ -235,6 +260,7 @@ export type ExecutionLaneInput = Readonly<{
   sessionId?: string;
   reviewRoundId?: string;
   workspace?: ExecutionLaneWorkspace;
+  directive?: string;
 }>;
 
 export type ExecutionGroupInput = Readonly<{
@@ -403,12 +429,13 @@ export function updateExecutionLane(
   group: ExecutionGroup,
   laneId: string,
   patch: Readonly<{
-    status?: ExecutionLaneStatus;
+    status?: Exclude<ExecutionLaneStatus, "skipped">;
     effective?: EffectiveLaunchSnapshot;
     runId?: string;
     sessionId?: string;
     reviewRoundId?: string;
     workspace?: ExecutionLaneWorkspace;
+    directive?: string;
   }>,
   now: Date
 ): ExecutionGroup {
@@ -432,6 +459,7 @@ export function updateExecutionLane(
     ...(patch.sessionId === undefined ? {} : { sessionId: requireIdentity(patch.sessionId, "Session id") }),
     ...(patch.reviewRoundId === undefined ? {} : { reviewRoundId: requireIdentity(patch.reviewRoundId, "ReviewRound id") }),
     ...(patch.workspace === undefined ? {} : { workspace: validateLaneWorkspace(patch.workspace) }),
+    ...(patch.directive === undefined ? {} : { directive: requireText(patch.directive, "ExecutionLane directive") }),
     status,
     updatedAt: timestamp,
     ...(terminal && existing.endedAt === undefined ? { endedAt: timestamp } : {})
@@ -457,6 +485,7 @@ export function restartExecutionLane(
     sessionId?: string;
     reviewRoundId?: string;
     workspace?: ExecutionLaneWorkspace;
+    directive?: string;
   }>,
   now: Date
 ): ExecutionGroup {
@@ -481,12 +510,64 @@ export function restartExecutionLane(
     ...(patch.sessionId === undefined ? {} : { sessionId: requireIdentity(patch.sessionId, "Session id") }),
     ...(patch.reviewRoundId === undefined ? {} : { reviewRoundId: requireIdentity(patch.reviewRoundId, "ReviewRound id") }),
     ...(patch.workspace === undefined ? {} : { workspace: validateLaneWorkspace(patch.workspace) }),
+    ...(patch.directive === undefined ? {} : { directive: requireText(patch.directive, "ExecutionLane directive") }),
     status: "running",
     updatedAt: timestamp
   };
   return validateExecutionGroup({
     ...group,
     lanes: group.lanes.map((lane) => lane.id === id ? next : lane),
+    updatedAt: timestamp
+  });
+}
+
+/**
+ * Reopen a failed execution Lane without starting its next Run when Resource
+ * Broker capacity is unavailable. The failed attempt remains in AgentRun
+ * history; the Lane freezes the next launch input until ordinary dispatch can
+ * admit it.
+ */
+export function queueExecutionLaneRetry(
+  group: ExecutionGroup,
+  laneId: string,
+  patch: Readonly<{
+    effective: EffectiveLaunchSnapshot;
+    workspace?: ExecutionLaneWorkspace;
+    directive: string;
+  }>,
+  now: Date
+): ExecutionGroup {
+  validateExecutionGroup(group);
+  if (group.purpose !== "execution") {
+    throw new Error(`Only WorkItem ExecutionLanes can queue a retry: ${group.id}/${laneId}.`);
+  }
+  if (group.resolution !== undefined) {
+    throw new Error(`ExecutionGroup is already resolved: ${group.id}.`);
+  }
+  const existing = group.lanes.find((lane) => lane.id === laneId);
+  if (existing === undefined) throw new Error(`ExecutionLane not found: ${group.id}/${laneId}.`);
+  if (existing.status !== "failed") {
+    throw new Error(`Only a failed ExecutionLane can queue a retry: ${group.id}/${laneId}.`);
+  }
+  const timestamp = now.toISOString();
+  const {
+    runId: _runId,
+    sessionId: _sessionId,
+    result: _result,
+    endedAt: _endedAt,
+    ...base
+  } = existing;
+  const next: ExecutionLane = {
+    ...base,
+    effective: validateEffectiveLaunchSnapshot(patch.effective),
+    ...(patch.workspace === undefined ? {} : { workspace: validateLaneWorkspace(patch.workspace) }),
+    directive: requireText(patch.directive, "ExecutionLane directive"),
+    status: "pending",
+    updatedAt: timestamp
+  };
+  return validateExecutionGroup({
+    ...group,
+    lanes: group.lanes.map((lane) => lane.id === laneId ? next : lane),
     updatedAt: timestamp
   });
 }
@@ -551,6 +632,50 @@ export function recordExecutionLaneResult(
   });
 }
 
+/**
+ * Stop only work that has never started. Running Lanes retain their exact Run
+ * and Session; the Resource Broker never kills a straggler merely to save
+ * budget. Skipped Lanes are terminal but never usable Candidate inputs.
+ */
+export function skipPendingExecutionLanes(
+  group: ExecutionGroup,
+  laneIds: readonly string[],
+  summary: string,
+  now: Date
+): ExecutionGroup {
+  validateExecutionGroup(group);
+  if (group.purpose !== "execution") {
+    throw new Error("Only WorkItem ExecutionLanes can be skipped by resource policy.");
+  }
+  if (group.resolution !== undefined) {
+    throw new Error(`ExecutionGroup is already resolved: ${group.id}.`);
+  }
+  const selected = new Set(laneIds.map((id) => requireIdentity(id, "ExecutionLane id")));
+  if (selected.size === 0) return group;
+  const reason = requireText(summary, "ExecutionLane skip summary");
+  for (const laneId of selected) {
+    const lane = group.lanes.find(({ id }) => id === laneId);
+    if (lane === undefined) throw new Error(`ExecutionLane not found: ${group.id}/${laneId}.`);
+    if (lane.status !== "pending" || lane.runId !== undefined) {
+      throw new Error(`Only an unstarted pending ExecutionLane can be skipped: ${group.id}/${laneId}.`);
+    }
+  }
+  const timestamp = now.toISOString();
+  return validateExecutionGroup({
+    ...group,
+    lanes: group.lanes.map((lane) => selected.has(lane.id)
+      ? {
+          ...lane,
+          status: "skipped" as const,
+          result: { summary: reason },
+          updatedAt: timestamp,
+          endedAt: timestamp
+        }
+      : lane),
+    updatedAt: timestamp
+  });
+}
+
 export function resolveExecutionGroup(
   group: ExecutionGroup,
   input: Readonly<{
@@ -583,6 +708,16 @@ export function resolveExecutionGroup(
     return lane?.status !== "yielded" && lane?.status !== "completed";
   })) {
     throw new Error(`ExecutionGroup accept selects a Lane without usable terminal output: ${group.id}.`);
+  }
+  if (input.decision === "accept" && group.stage?.resources !== undefined) {
+    const usable = group.lanes.filter(({ status }) => (
+      status === "yielded" || status === "completed"
+    )).length;
+    if (usable < group.stage.resources.quorum) {
+      throw new Error(
+        `ExecutionGroup quorum is not met: ${usable}/${group.stage.resources.quorum} usable Lanes.`
+      );
+    }
   }
   if (selected.some((id) => !group.lanes.some((lane) => lane.id === id))) {
     throw new Error(`Execution resolution selects an unknown Lane: ${group.id}.`);
@@ -622,6 +757,7 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
     activeLaneCount,
     terminalLaneCount,
     failedLaneCount: group.lanes.filter(({ status }) => status === "failed").length,
+    skippedLaneCount: group.lanes.filter(({ status }) => status === "skipped").length,
     openHighPriorityFindingIds: openHighPriorityFindingIds(group),
     laneSummaries: group.lanes.map((lane) => ({
       laneId: lane.id,
@@ -720,12 +856,52 @@ export function validateExecutionStageContext(
   }
   requirePositiveInteger(stage.budget.maxLanes, "Execution stage max Lanes");
   requirePositiveInteger(stage.budget.maxAttempts, "Execution stage max attempts");
+  if (stage.budget.maxTokens !== undefined) {
+    requirePositiveInteger(stage.budget.maxTokens, "Execution stage max tokens");
+  }
+  if (stage.budget.maxToolCalls !== undefined) {
+    requirePositiveInteger(stage.budget.maxToolCalls, "Execution stage max tool calls");
+  }
+  if (stage.budget.maxWallClockSeconds !== undefined) {
+    requirePositiveInteger(
+      stage.budget.maxWallClockSeconds,
+      "Execution stage max wall-clock seconds"
+    );
+  }
   if (stage.stageAttempt > stage.budget.maxAttempts) {
     throw new Error("Execution stage attempt exceeds its budget.");
   }
   const capacity = strategy.mode === "fixed" ? strategy.count : strategy.max;
   if (stage.budget.maxLanes !== capacity) {
     throw new Error("Execution stage Lane budget must match its Group strategy capacity.");
+  }
+  if (stage.resources !== undefined) {
+    if (stage.resources === null
+      || typeof stage.resources !== "object"
+      || stage.resources.schemaVersion !== 1) {
+      throw new Error("Execution stage resource policy must use schemaVersion 1.");
+    }
+    if (stage.budget.maxTokens === undefined
+      || stage.budget.maxToolCalls === undefined
+      || stage.budget.maxWallClockSeconds === undefined) {
+      throw new Error(
+        "A resource-scheduled Execution stage requires token, tool-call and wall-clock budgets."
+      );
+    }
+    requirePositiveInteger(stage.resources.quorum, "Execution stage quorum");
+    if (stage.resources.quorum > stage.budget.maxLanes) {
+      throw new Error("Execution stage quorum exceeds its Lane budget.");
+    }
+    requireTimestamp(stage.resources.deadlineAt, "Execution stage deadline");
+    requirePositiveInteger(
+      stage.resources.stragglerAfterSeconds,
+      "Execution stage straggler threshold"
+    );
+    if (!Number.isSafeInteger(stage.resources.minimumMarginalValuePercent)
+      || stage.resources.minimumMarginalValuePercent < 0
+      || stage.resources.minimumMarginalValuePercent > 100) {
+      throw new Error("Execution stage minimum marginal value must be an integer from 0 to 100.");
+    }
   }
   const snapshot = validateContextSnapshotRef(stage.contextSnapshotRef);
   if (snapshot.taskId !== taskId
@@ -772,7 +948,10 @@ export function validateExecutionLane(
     if (group.purpose === "review" && lane.reviewRoundId === undefined) {
       // A review lane may be pending before its ReviewRound is dispatched, but
       // it must acquire that identity before it can run.
-      if (lane.status === "running" || lane.status === "completed" || lane.status === "failed") {
+      if (lane.status === "running"
+        || lane.status === "completed"
+        || lane.status === "failed"
+        || lane.status === "skipped") {
         throw new Error(`Running Reviewer Lane requires a ReviewRound: ${lane.id}.`);
       }
     }
@@ -784,8 +963,17 @@ export function validateExecutionLane(
   if (lane.sessionId !== undefined) requireIdentity(lane.sessionId, "Session id");
   if (lane.reviewRoundId !== undefined) requireIdentity(lane.reviewRoundId, "ReviewRound id");
   if (lane.workspace !== undefined) validateLaneWorkspace(lane.workspace);
-  if (!( ["pending", "running", "yielded", "completed", "failed"] as const).includes(lane.status)) {
+  if (lane.directive !== undefined) requireText(lane.directive, "ExecutionLane directive");
+  if (!( ["pending", "running", "yielded", "completed", "failed", "skipped"] as const).includes(lane.status)) {
     throw new Error(`ExecutionLane status is invalid: ${String(lane.status)}.`);
+  }
+  if (lane.status === "skipped") {
+    if (group !== undefined && group.purpose !== "execution") {
+      throw new Error(`Only WorkItem ExecutionLanes can be skipped: ${lane.id}.`);
+    }
+    if (lane.runId !== undefined || lane.sessionId !== undefined) {
+      throw new Error(`Skipped ExecutionLane must never have started: ${lane.id}.`);
+    }
   }
   if (lane.result !== undefined) validateLaneResult(lane.result);
   requireTimestamp(lane.createdAt, "ExecutionLane createdAt");
@@ -817,6 +1005,7 @@ function createLane(
     ...(input.sessionId === undefined ? {} : { sessionId: requireIdentity(input.sessionId, "Session id") }),
     ...(input.reviewRoundId === undefined ? {} : { reviewRoundId: requireIdentity(input.reviewRoundId, "ReviewRound id") }),
     ...(input.workspace === undefined ? {} : { workspace: validateLaneWorkspace(input.workspace) }),
+    ...(input.directive === undefined ? {} : { directive: requireText(input.directive, "ExecutionLane directive") }),
     status: "pending",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -954,6 +1143,9 @@ function assertExecutionLaneTransition(
   }
   if (isTerminalLane(existing.status)) {
     if (isDeepStrictEqual(existing, candidate)) return;
+    if (existing.status === "skipped") {
+      throw new Error(`Skipped ExecutionLane is immutable: ${existing.id}.`);
+    }
     if (groupPurpose === "review"
       && candidate.status === "pending"
       && candidate.effective === undefined
@@ -962,6 +1154,17 @@ function assertExecutionLaneTransition(
       && candidate.result === undefined
       && candidate.endedAt === undefined
       && isDeepStrictEqual(existing.workspace, candidate.workspace)) {
+      return;
+    }
+    if (groupPurpose === "execution"
+      && existing.status === "failed"
+      && candidate.status === "pending"
+      && candidate.effective !== undefined
+      && candidate.runId === undefined
+      && candidate.sessionId === undefined
+      && candidate.result === undefined
+      && candidate.endedAt === undefined
+      && candidate.directive !== undefined) {
       return;
     }
     if (candidate.status !== "running"
@@ -974,7 +1177,7 @@ function assertExecutionLaneTransition(
   if (existing.status === "running" && candidate.status === "pending") {
     throw new Error(`Running ExecutionLane cannot return to pending: ${existing.id}.`);
   }
-  for (const key of ["effective", "runId", "sessionId", "workspace"] as const) {
+  for (const key of ["effective", "runId", "sessionId", "workspace", "directive"] as const) {
     if (existing[key] !== undefined
       && !isDeepStrictEqual(existing[key], candidate[key])) {
       throw new Error(`ExecutionLane ${key} changed without retry: ${existing.id}.`);
@@ -1006,7 +1209,10 @@ function validatePurpose(purpose: ExecutionPurpose): ExecutionPurpose {
 }
 
 function isTerminalLane(status: ExecutionLaneStatus): boolean {
-  return status === "yielded" || status === "completed" || status === "failed";
+  return status === "yielded"
+    || status === "completed"
+    || status === "failed"
+    || status === "skipped";
 }
 
 function positiveInteger(value: number, label: string): number {

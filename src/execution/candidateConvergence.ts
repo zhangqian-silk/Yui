@@ -345,6 +345,65 @@ export function validateCandidateConvergenceResolution(
   }
 }
 
+/**
+ * Acceptance-level sufficiency proof used by T6 early termination. Earlier
+ * stages can satisfy their local quorum, but only passed Verify evidence (or a
+ * Resolve Candidate backed by it) may authorize stopping for cost reasons.
+ */
+export function candidateConvergenceEvidenceSufficient(
+  workItem: Pick<WorkItem, "objective" | "acceptance" | "executionGroups">,
+  group: ExecutionGroup,
+  selectedLaneIds: readonly string[]
+): boolean {
+  const stage = group.stage;
+  if (stage?.convergence === undefined
+    || (stage.stage !== "verify" && stage.stage !== "resolve")
+    || selectedLaneIds.length === 0) return false;
+  const usable = group.lanes.filter(({ status }) => (
+    status === "yielded" || status === "completed"
+  ));
+  if (selectedLaneIds.some((laneId) => !usable.some(({ id }) => id === laneId))) return false;
+  // Cost policy may never hide contradictory evidence that has already
+  // arrived. Every usable output must independently clear the same acceptance
+  // boundary before never-started siblings can be skipped.
+  return usable.length > 0 && usable.every((lane) => {
+    if (lane.result === undefined) return false;
+    try {
+      const envelope = validateCandidateConvergenceReport(
+        lane.result,
+        stage.stage,
+        stage.parentResults
+      );
+      if (stage.stage === "verify") {
+        if (envelope.verification?.disposition !== "passed") return false;
+        assertVerificationCoversAcceptance(workItem, envelope.verification.criteria);
+        if (envelope.artifactType === "code") {
+          assertSameGitSnapshot(
+            lane.result.gitSnapshot,
+            resultForRef(workItem, envelope.verification.subjectResultRef).gitSnapshot,
+            "Passed code verification"
+          );
+        }
+        return true;
+      }
+      if (envelope.resolution?.disposition !== "candidate") return false;
+      const verification = convergenceForRef(workItem, envelope.resolution.subjectResultRef);
+      if (verification.verification?.disposition !== "passed") return false;
+      assertVerificationCoversAcceptance(workItem, verification.verification.criteria);
+      if (envelope.artifactType === "code") {
+        assertSameGitSnapshot(
+          lane.result.gitSnapshot,
+          resultForRef(workItem, envelope.resolution.subjectResultRef).gitSnapshot,
+          "Resolved code Candidate"
+        );
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
 function assertVerificationCoversAcceptance(
   workItem: Pick<WorkItem, "objective" | "acceptance">,
   criteria: NonNullable<CandidateConvergenceEnvelope["verification"]>["criteria"]

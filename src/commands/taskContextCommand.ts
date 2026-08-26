@@ -642,13 +642,20 @@ function renderExecutionGroup(
   const summary: ExecutionGroupSummary | ExecutionGroupHealthSummary = projected
     ?? summarizeExecutionGroup(group);
   const health = projected?.health;
+  const resources = projected?.resources;
   return [
-    `    Execution Group ${summary.groupId} [${summary.purpose}/${summary.strategy.mode}]: ${summary.activeLaneCount} active / ${summary.terminalLaneCount} terminal; ${summary.failedLaneCount} failed`,
+    `    Execution Group ${summary.groupId} [${summary.purpose}/${summary.strategy.mode}]: ${summary.activeLaneCount} active / ${summary.terminalLaneCount} terminal; ${summary.failedLaneCount} failed; ${summary.skippedLaneCount} skipped`,
     ...(health === undefined
       ? []
       : [
           `      Health: active=${health.activeLaneCount}, silent=${health.silentLaneCount}, suspected-stalled=${health.suspectedStalledLaneCount}, confirmed-dead=${health.confirmedDeadLaneCount}`,
           `      Recovery: reusable=${health.reusableLaneIds.length}, retryable=${health.retryableLaneIds.length}`
+        ]),
+    ...(resources === undefined
+      ? []
+      : [
+          `      Resources: tokens=${resourceUsageLabel(resources.tokens, resources.tokensRemaining, resources.tokensObservable)}; tools=${resourceUsageLabel(resources.toolCalls, resources.toolCallsRemaining, resources.toolCallsObservable)}; wall=${resources.wallClockSeconds}s${resources.wallClockSecondsRemaining === undefined ? "" : `, remaining=${resources.wallClockSecondsRemaining}s`}`,
+          `      Completion: usable=${resources.usableLaneCount}/${group.stage?.resources?.quorum ?? "legacy"}; quorum=${resources.quorumMet ? "met" : "open"}; deadline=${resources.deadlineReached ? "reached" : "open"}; budgets=${resources.exhaustedBudgets.join(",") || "open"}; queued=${resources.pendingLaneIds.length}; stragglers=${resources.stragglerLaneIds.length}`
         ]),
     ...summary.laneSummaries.flatMap((lane) => {
       const laneHealth = projected?.laneSummaries.find(({ laneId }) => laneId === lane.laneId);
@@ -684,4 +691,13 @@ function renderExecutionGroup(
       ? []
       : [`      Resolution: ${summary.resolution.decision} — ${compactText(summary.resolution.summary)}`])
   ];
+}
+
+function resourceUsageLabel(
+  used: number,
+  remaining: number | undefined,
+  observable: boolean
+): string {
+  if (!observable) return `${used} observed (partial)`;
+  return `${used}${remaining === undefined ? "" : `, remaining=${remaining}`}`;
 }

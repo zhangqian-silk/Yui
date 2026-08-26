@@ -69,6 +69,7 @@ export function computeActionabilityDigest(input: ActionabilityDigestInput): str
 export type ActionabilityReadStore = Readonly<{
   getTask(taskId: string): Task | null;
   listAgentRuns(taskId: string): readonly AgentRun[];
+  listActiveTaskIds?(): readonly string[];
   listWorkItems?(taskId: string): readonly WorkItem[];
   listReviewRounds?(taskId: string): readonly ReviewRound[];
   listIntegrationAttempts?(taskId: string): readonly IntegrationAttempt[];
@@ -105,7 +106,8 @@ const CONSUMED_INTEGRATION_STATUSES = new Set(["committed", "superseded"]);
  */
 export function collectTaskActionability(
   store: ActionabilityReadStore,
-  taskId: string
+  taskId: string,
+  now = new Date()
 ): ActionabilityDigestInput {
   const task = store.getTask(taskId);
   if (task === null) {
@@ -130,15 +132,80 @@ export function collectTaskActionability(
     });
   }
 
-  for (const item of store.listWorkItems?.(taskId) ?? []) {
+  const workItems = store.listWorkItems?.(taskId) ?? [];
+  const reviewRounds = store.listReviewRounds?.(taskId) ?? [];
+  for (const item of workItems) {
     if (TERMINAL_WORK_ITEM_STATUSES.has(item.status)) continue;
     facts.push({
       key: `work-item:${item.id}`,
       value: `${item.status}|${item.updatedAt}`
     });
+    for (const group of item.executionGroups) {
+      if (group.resolution !== undefined || group.stage?.resources === undefined) continue;
+      facts.push({
+        key: `resource-deadline:${group.id}`,
+        value: now.getTime() >= Date.parse(group.stage.resources.deadlineAt)
+          ? "reached"
+          : "open"
+      });
+    }
   }
 
-  for (const round of store.listReviewRounds?.(taskId) ?? []) {
+  // A Resource-Broker-queued Lane is durable but deliberately has no active
+  // Run. Include the global active Lane capacity counts only for Tasks that are
+  // actually queued, so capacity release changes their digest and the normal
+  // orphan repair can wake the Leader without polling or a second scheduler.
+  const hasQueuedResourceLane = [
+    ...workItems.flatMap(({ executionGroups }) => executionGroups),
+    ...reviewRounds.flatMap(({ executionGroup }) => (
+      executionGroup === undefined ? [] : [executionGroup]
+    ))
+  ].some((group) => (
+    group.resolution === undefined
+    && group.lanes.some((lane) => (
+      lane.status === "pending"
+      && lane.effective !== undefined
+      && lane.runId === undefined
+    ))
+  ));
+  if (hasQueuedResourceLane && store.listActiveTaskIds !== undefined) {
+    const activeResourceScopes = store.listActiveTaskIds().flatMap((activeTaskId) => (
+      operationalTaskRecords(
+        store.listAgentRuns(activeTaskId),
+        store.listEvents?.(activeTaskId) ?? [],
+        "agent-run"
+      ).flatMap((run) => (
+        run.status !== "active"
+        || run.executionGroupId === undefined
+        || run.executionLaneId === undefined
+          ? []
+          : [
+              "home",
+              `task:${activeTaskId}`,
+              ...(run.workItemId === undefined
+                ? []
+                : [`work-item:${activeTaskId}/${run.workItemId}`]),
+              `group:${activeTaskId}/${run.executionGroupId}`,
+              `provider:${run.effective.adapterId}`,
+              `agent:${run.effective.agentId}`,
+              `model:${run.effective.adapterId}/${run.effective.model ?? "default"}`
+            ]
+      ))
+    ));
+    const activeResourceCounts = new Map<string, number>();
+    for (const scope of activeResourceScopes) {
+      activeResourceCounts.set(scope, (activeResourceCounts.get(scope) ?? 0) + 1);
+    }
+    facts.push({
+      key: "resource-broker:active-capacity",
+      value: [...activeResourceCounts]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([scope, count]) => `${scope}=${count}`)
+        .join("|")
+    });
+  }
+
+  for (const round of reviewRounds) {
     if (round.status === "completed") continue;
     facts.push({
       key: `review:${round.id}`,

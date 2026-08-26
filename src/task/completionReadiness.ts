@@ -121,7 +121,7 @@ const UNRESOLVED_INTEGRATION_STATUSES = new Set([
 ]);
 
 const TERMINAL_REVIEW_STATUSES = new Set(["completed", "failed"]);
-const TERMINAL_LANE_STATUSES = new Set(["completed", "failed", "yielded"]);
+const TERMINAL_LANE_STATUSES = new Set(["completed", "failed", "yielded", "skipped"]);
 
 export type CompletionReadinessOptions = Readonly<{
   /**

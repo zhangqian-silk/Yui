@@ -244,6 +244,18 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         }
         const reviewRun = activeReviewRoundRun(activeReview, facts.activeRuns);
         if (reviewRun === undefined) {
+          if (reviewGroupHasResourceQueue(activeReview)) {
+            return buildAction(facts, {
+              kind: "resume-review",
+              reason: `ReviewRound ${activeReview.id} has Reviewer Lanes waiting for Resource Broker capacity.`,
+              refs: [reviewRef],
+              preconditions: [
+                { fact: "A Reviewer Lane is durably queued", satisfied: true, ref: reviewRef },
+                { fact: "Resource capacity is available", satisfied: false }
+              ],
+              recommendedCommand: `yui task work review ${task.id}/${candidateReady.id}`
+            });
+          }
           const runRef = ref("agent-run", activeReview.reviewerRunId);
           return buildAction(facts, {
             kind: "repair-protocol-inconsistency",
@@ -558,6 +570,19 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       }
       const reviewRun = activeReviewRoundRun(activeFinal, facts.activeRuns);
       if (reviewRun === undefined) {
+        if (reviewGroupHasResourceQueue(activeFinal)) {
+          return buildAction(facts, {
+            kind: "resume-review",
+            reason: `Task-final ReviewRound ${activeFinal.id} has Reviewer Lanes waiting for Resource Broker capacity.`,
+            refs: [reviewRef],
+            preconditions: [
+              { fact: "A Reviewer Lane is durably queued", satisfied: true, ref: reviewRef },
+              { fact: "Resource capacity is available", satisfied: false }
+            ],
+            recommendedCommand:
+              `yui task review request ${task.id} --role ${activeFinal.reviewerRoleName}`
+          });
+        }
         const runRef = ref("agent-run", activeFinal.reviewerRunId);
         return buildAction(facts, {
           kind: "repair-protocol-inconsistency",
@@ -858,6 +883,15 @@ function reviewGroupAwaitingResolution(round: ReviewRound): boolean {
       TERMINAL_REVIEW_LANE_STATUSES.has(lane.status));
 }
 
+function reviewGroupHasResourceQueue(round: ReviewRound): boolean {
+  return round.executionGroup !== undefined
+    && round.executionGroup.resolution === undefined
+    && round.executionGroup.lanes.some((lane) => (
+      lane.status === "pending"
+      && lane.runId === undefined
+    ));
+}
+
 function buildResolveReviewGroupAction(
   facts: NextActionFacts,
   round: ReviewRound
@@ -921,6 +955,7 @@ function reviewRoundConflict(
       };
     }
     if (activeReviewRoundRun(round, activeRuns) === undefined) {
+      if (reviewGroupHasResourceQueue(round)) return null;
       const runRef = ref("agent-run", round.reviewerRunId);
       return {
         reason: `ReviewRound ${round.id} references Reviewer Run ${round.reviewerRunId}, but that Run is not active.`,

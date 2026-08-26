@@ -66,7 +66,7 @@ export function repairOrphanedActiveTasks(
     // reaches here; every other needs-leader-action state already has a
     // durable owner (candidate, integration, or pending wake) and is exempt.
     if (projection.reason === "no-executor") {
-      if (admitOrphanWake(store, task.id) === "suppress") continue;
+      if (admitOrphanWake(store, task.id, now) === "suppress") continue;
     }
 
     const taskWorkspace = store.getTaskWorkspace(task.id);
@@ -102,13 +102,15 @@ export function repairOrphanedActiveTasks(
  */
 function admitOrphanWake(
   store: SchedulerStorePort,
-  taskId: string
+  taskId: string,
+  now: Date
 ): "wake" | "suppress" {
   let digest: string;
   try {
     const input = collectTaskActionability(
       store as Parameters<typeof collectTaskActionability>[0],
-      taskId
+      taskId,
+      now
     );
     digest = computeActionabilityDigest(input);
   } catch (error) {

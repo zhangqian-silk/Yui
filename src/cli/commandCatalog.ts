@@ -706,8 +706,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "dispatch",
         summary: "Dispatch a work item to its Role.",
-        usage: "yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--mode <single|parallel-diverse|ensemble-replicated|adversarial|adaptive-exploration>] [--max-rounds <count>] [--stage-max-attempts <count>]",
-        options: ["--input", "--strategy", "--lane-role", "--mode", "--max-rounds", "--stage-max-attempts"],
+        usage: "yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--mode <single|parallel-diverse|ensemble-replicated|adversarial|adaptive-exploration>] [--max-rounds <count>] [--stage-max-attempts <count>] [--stage-max-tokens <count>] [--stage-max-tool-calls <count>] [--stage-max-seconds <count>] [--stage-quorum <count>] [--stage-straggler-seconds <count>] [--stage-min-marginal-value <0-100>]",
+        options: ["--input", "--strategy", "--lane-role", "--mode", "--max-rounds", "--stage-max-attempts", "--stage-max-tokens", "--stage-max-tool-calls", "--stage-max-seconds", "--stage-quorum", "--stage-straggler-seconds", "--stage-min-marginal-value"],
         optionValues: {
           "--mode": ["single", "parallel-diverse", "ensemble-replicated", "adversarial", "adaptive-exploration"]
         }
@@ -720,8 +720,8 @@ const taskChildren: readonly NodeInput[] = [
         children: [{
           name: "resolve",
           summary: "Select Lane outputs and resolve the Worker group.",
-          usage: "yui task work group resolve <task>/<work> --decision <accept|reject|retry|blocked> --summary <text> [--lane <lane-id> ...]",
-          options: ["--decision", "--summary", "--lane"],
+          usage: "yui task work group resolve <task>/<work> --decision <accept|reject|retry|blocked> --summary <text> [--lane <lane-id> ...] [--early-stop <marginal-value-percent>]",
+          options: ["--decision", "--summary", "--lane", "--early-stop"],
           optionValues: { "--decision": ["accept", "reject", "retry", "blocked"] }
         }]
       },

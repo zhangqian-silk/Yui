@@ -220,8 +220,10 @@ import {
   addExecutionLane,
   createExecutionGroup,
   recordExecutionLaneResult,
+  queueExecutionLaneRetry,
   resolveExecutionGroup,
   restartExecutionLane,
+  skipPendingExecutionLanes,
   updateExecutionLane,
   WORK_ITEM_EXECUTION_MODES,
   type ExecutionGroup,
@@ -232,7 +234,21 @@ import {
   type WorkItemExecutionMode
 } from "../execution/executionGroup.js";
 import {
+  observedExecutionResourceUsage,
+  planResourceAdmissions,
+  projectExecutionStageResources,
+  resolveResourceBrokerPolicy,
+  routeExecutionStage,
+  type ResourceLaneIdentity
+} from "../execution/resourceBroker.js";
+import {
+  resolveContextBudget,
+  resolveControllerTaskConcurrency,
+  resolveRuntimeHealth
+} from "../config/yuiConfig.js";
+import {
   assertIndependentVerificationRoles,
+  candidateConvergenceEvidenceSufficient,
   candidateConvergenceDirective,
   validateCandidateConvergenceResolution
 } from "../execution/candidateConvergence.js";
@@ -693,6 +709,7 @@ export function normalizedExecutionLaneRoles(
 
 export type NormalizedExecutionLanePlan = Readonly<{
   expanding: boolean;
+  resumingQueued: boolean;
   roles: readonly string[];
   strategy: ExecutionStrategy;
   capacity: number;
@@ -712,9 +729,21 @@ export function normalizedExecutionLanePlan(input: Readonly<{
   phase?: "dispatch" | "retry";
 }>): NormalizedExecutionLanePlan {
   const retry = input.phase === "retry" || input.retryLaneId !== undefined;
-  const expanding = !retry && input.status === "running" && input.existingGroup !== undefined;
+  const queued = !retry && input.status === "running" && input.existingGroup !== undefined
+    && input.requestedRoles.length === 0
+    ? input.existingGroup.lanes.filter(({ status, effective }) => (
+        status === "pending" && effective !== undefined
+      ))
+    : [];
+  const resumingQueued = queued.length > 0;
+  const expanding = !retry
+    && !resumingQueued
+    && input.status === "running"
+    && input.existingGroup !== undefined;
   const roles = retry
     ? []
+    : resumingQueued
+      ? queued.map(({ roleName }) => roleName)
     : normalizedExecutionLaneRoles(input.assignee, input.requestedRoles, expanding);
   const strategy = input.existingGroup?.strategy
     ?? input.requestedStrategy
@@ -722,6 +751,8 @@ export function normalizedExecutionLanePlan(input: Readonly<{
   const capacity = strategy.mode === "fixed" ? strategy.count : strategy.max;
   const requestedCount = retry
     ? input.existingGroup?.lanes.length ?? 0
+    : resumingQueued
+      ? input.existingGroup!.lanes.length
     : expanding
       ? input.existingGroup!.lanes.length + roles.length
       : roles.length;
@@ -729,10 +760,91 @@ export function normalizedExecutionLanePlan(input: Readonly<{
     ? [input.retryLaneId]
     : retry
       ? []
+      : resumingQueued
+        ? queued.map(({ id }) => id)
       : input.existingGroup === undefined
       ? roles.map((_, index) => `${input.nextGroupId}-lane-${index + 1}`)
       : roles.map((_, index) => `${input.existingGroup!.id}-lane-${input.existingGroup!.lanes.length + index + 1}`);
-  return { expanding, roles, strategy, capacity, requestedCount, laneIds };
+  return { expanding, resumingQueued, roles, strategy, capacity, requestedCount, laneIds };
+}
+
+function activeResourceLaneIdentities(store: TaskWorkflowStore): ResourceLaneIdentity[] {
+  return store.listActiveTaskIds().flatMap((taskId) => (
+    store.listAgentRuns(taskId).flatMap((run): ResourceLaneIdentity[] => {
+      if (run.status !== "active"
+        || run.executionGroupId === undefined
+        || run.executionLaneId === undefined) return [];
+      return [{
+        taskId,
+        ...(run.workItemId === undefined ? {} : { workItemId: run.workItemId }),
+        executionGroupId: run.executionGroupId,
+        executionLaneId: run.executionLaneId,
+        providerId: run.effective.adapterId,
+        agentId: run.effective.agentId,
+        ...(run.effective.model === undefined ? {} : { model: run.effective.model }),
+        requestedAt: run.createdAt
+      }];
+    })
+  ));
+}
+
+function queuedResourceLaneIdentities(
+  store: TaskWorkflowStore,
+  now: Date
+): ResourceLaneIdentity[] {
+  return store.listActiveTaskIds().flatMap((taskId) => {
+    const taskRuns = store.listAgentRuns(taskId);
+    const taskEvents = store.listEvents(taskId);
+    const workItemLanes = store.listWorkItems(taskId).flatMap((item) => {
+      const group = currentWorkItemExecutionGroup(item);
+      if (group === undefined || group.resolution !== undefined) return [];
+      if (group.stage !== undefined) {
+        const resources = projectExecutionStageResources({
+          group,
+          stageGroups: item.executionGroups,
+          usage: observedExecutionResourceUsage({
+            group,
+            stageGroups: item.executionGroups,
+            runs: taskRuns,
+            events: taskEvents
+          }),
+          now
+        });
+        if (resources.deadlineReached || resources.exhaustedBudgets.length > 0) return [];
+      }
+      return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
+        if (lane.status !== "pending" || lane.effective === undefined) return [];
+        return [{
+          taskId,
+          workItemId: item.id,
+          executionGroupId: group.id,
+          executionLaneId: lane.id,
+          providerId: lane.effective.adapterId,
+          agentId: lane.effective.agentId,
+          ...(lane.effective.model === undefined ? {} : { model: lane.effective.model }),
+          requestedAt: lane.updatedAt
+        }];
+      });
+    });
+    const reviewLanes = store.listReviewRounds(taskId).flatMap((round) => {
+      const group = round.executionGroup;
+      if (group === undefined || group.resolution !== undefined) return [];
+      return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
+        if (lane.status !== "pending" || lane.effective === undefined) return [];
+        return [{
+          taskId,
+          ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
+          executionGroupId: group.id,
+          executionLaneId: lane.id,
+          providerId: lane.effective.adapterId,
+          agentId: lane.effective.agentId,
+          ...(lane.effective.model === undefined ? {} : { model: lane.effective.model }),
+          requestedAt: lane.updatedAt
+        }];
+      });
+    });
+    return [...workItemLanes, ...reviewLanes];
+  });
 }
 
 function taskProjectCommand(
@@ -2825,10 +2937,22 @@ function dispatchWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work dispatch usage: yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--mode <single|parallel-diverse|ensemble-replicated|adversarial|adaptive-exploration>] [--max-rounds <count>] [--stage-max-attempts <count>].";
+  const usage = "Task work dispatch usage: yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--mode <single|parallel-diverse|ensemble-replicated|adversarial|adaptive-exploration>] [--max-rounds <count>] [--stage-max-attempts <count>] [--stage-max-tokens <count>] [--stage-max-tool-calls <count>] [--stage-max-seconds <count>] [--stage-quorum <count>] [--stage-straggler-seconds <count>] [--stage-min-marginal-value <0-100>].";
   const parsed = parseMultiValueTail(
     args,
-    new Set(["--input", "--strategy", "--mode", "--max-rounds", "--stage-max-attempts"]),
+    new Set([
+      "--input",
+      "--strategy",
+      "--mode",
+      "--max-rounds",
+      "--stage-max-attempts",
+      "--stage-max-tokens",
+      "--stage-max-tool-calls",
+      "--stage-max-seconds",
+      "--stage-quorum",
+      "--stage-straggler-seconds",
+      "--stage-min-marginal-value"
+    ]),
     new Set(["--lane-role"]),
     usage
   );
@@ -2846,11 +2970,49 @@ function dispatchWork(
     "--stage-max-attempts",
     usage
   );
+  const requestedStageMaxTokens = parseOptionalPositiveInteger(
+    parsed.options.get("--stage-max-tokens"),
+    "--stage-max-tokens",
+    usage
+  );
+  const requestedStageMaxToolCalls = parseOptionalPositiveInteger(
+    parsed.options.get("--stage-max-tool-calls"),
+    "--stage-max-tool-calls",
+    usage
+  );
+  const requestedStageMaxSeconds = parseOptionalPositiveInteger(
+    parsed.options.get("--stage-max-seconds"),
+    "--stage-max-seconds",
+    usage
+  );
+  const requestedStageQuorum = parseOptionalPositiveInteger(
+    parsed.options.get("--stage-quorum"),
+    "--stage-quorum",
+    usage
+  );
+  const requestedStageStragglerSeconds = parseOptionalPositiveInteger(
+    parsed.options.get("--stage-straggler-seconds"),
+    "--stage-straggler-seconds",
+    usage
+  );
+  const requestedStageMinMarginalValue = parseOptionalPercentage(
+    parsed.options.get("--stage-min-marginal-value"),
+    "--stage-min-marginal-value",
+    usage
+  );
+  const requestedResourceOptions = [
+    requestedStageMaxTokens,
+    requestedStageMaxToolCalls,
+    requestedStageMaxSeconds,
+    requestedStageQuorum,
+    requestedStageStragglerSeconds,
+    requestedStageMinMarginalValue
+  ];
   const explorationMode = requestedMode === undefined || requestedMode === "single"
     ? undefined
     : requestedMode;
   const now = clock(options);
-  const runs = store.transaction((tx) => {
+  const dispatch = store.transaction((tx) => {
     const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
@@ -2888,12 +3050,15 @@ function dispatchWork(
     }
     if (!startingExploration
       && !continuingExploration
-      && (requestedMaxRounds !== undefined || requestedStageMaxAttempts !== undefined)) {
+      && (requestedMaxRounds !== undefined
+        || requestedStageMaxAttempts !== undefined
+        || requestedResourceOptions.some((value) => value !== undefined))) {
       throw usageError("Exploration limits require an explicit non-single --mode.");
     }
     if (existingGroup !== undefined && (requestedMode !== undefined
       || requestedMaxRounds !== undefined
-      || requestedStageMaxAttempts !== undefined)) {
+      || requestedStageMaxAttempts !== undefined
+      || requestedResourceOptions.some((value) => value !== undefined))) {
       throw usageError(`Execution stage configuration is frozen: ${existingGroup!.id}.`);
     }
     if (item.assignee === undefined) {
@@ -2968,7 +3133,10 @@ function dispatchWork(
     if (requestedCount > available) {
       throw usageError(`ExecutionGroup Lane count ${requestedCount} exceeds its ${strategy.mode} capacity ${available}.`);
     }
-    if (strategy.mode === "fixed" && !expanding && laneRoles.length !== strategy.count) {
+    if (strategy.mode === "fixed"
+      && !lanePlan.expanding
+      && !lanePlan.resumingQueued
+      && laneRoles.length !== strategy.count) {
       throw usageError(`fixed:${strategy.count} requires exactly ${strategy.count} --lane-role values.`);
     }
     const roles = laneRoles.map((name) => requireRole(tx, task.id, name));
@@ -2986,22 +3154,47 @@ function dispatchWork(
       const groupId = `execution-group-${plans[0]!.runId}`;
       const stage = !startingExploration && !continuingExploration
         ? undefined
-        : planWorkItemExplorationStage(item, {
-            ...(explorationMode === undefined ? {} : { mode: explorationMode }),
-            ...(requestedMaxRounds === undefined ? {} : { maxRounds: requestedMaxRounds }),
-            ...(requestedStageMaxAttempts === undefined
-              ? {}
-              : { maxAttempts: requestedStageMaxAttempts }),
-            ...(startingExploration
-              ? { convergence: { schemaVersion: 1 as const } }
-              : {}),
-            strategy,
-            contextSnapshotRef: contextSnapshotRef(freezeExecutionStageContextSnapshot(tx, {
-              taskId: task.id,
-              workItemId: item.id,
-              executionGroupId: groupId
-            }, now))
-          });
+        : (() => {
+            const config = tx.getConfig();
+            const contextBudget = resolveContextBudget(config.contextBudget);
+            const health = resolveRuntimeHealth(config.runtimeHealth);
+            const maxWallClockSeconds = requestedStageMaxSeconds
+              ?? Math.floor(health.stallWindowMs / 1_000);
+            const quorum = requestedStageQuorum
+              ?? (strategy.mode === "fixed" ? strategy.count : 1);
+            if (quorum > available) {
+              throw usageError(`Execution stage quorum ${quorum} exceeds Lane capacity ${available}.`);
+            }
+            return planWorkItemExplorationStage(item, {
+              ...(explorationMode === undefined ? {} : { mode: explorationMode }),
+              ...(requestedMaxRounds === undefined ? {} : { maxRounds: requestedMaxRounds }),
+              ...(requestedStageMaxAttempts === undefined
+                ? {}
+                : { maxAttempts: requestedStageMaxAttempts }),
+              ...(startingExploration
+                ? { convergence: { schemaVersion: 1 as const } }
+                : {}),
+              resourceBudget: {
+                maxTokens: requestedStageMaxTokens ?? contextBudget.hardTokens * available,
+                maxToolCalls: requestedStageMaxToolCalls ?? 100 * available,
+                maxWallClockSeconds
+              },
+              resources: {
+                schemaVersion: 1 as const,
+                quorum,
+                deadlineAt: new Date(now.getTime() + maxWallClockSeconds * 1_000).toISOString(),
+                stragglerAfterSeconds: requestedStageStragglerSeconds
+                  ?? Math.floor(health.quietAfterMs / 1_000),
+                minimumMarginalValuePercent: requestedStageMinMarginalValue ?? 10
+              },
+              strategy,
+              contextSnapshotRef: contextSnapshotRef(freezeExecutionStageContextSnapshot(tx, {
+                taskId: task.id,
+                workItemId: item.id,
+                executionGroupId: groupId
+              }, now))
+            });
+          })();
       group = createExecutionGroup(
         groupId,
         task.id,
@@ -3014,7 +3207,7 @@ function dispatchWork(
         },
         now
       );
-    } else if (expanding) {
+    } else if (lanePlan.expanding) {
       for (const roleName of laneRoles) {
         group = addExecutionLane(group, { roleName }, now);
       }
@@ -3022,28 +3215,65 @@ function dispatchWork(
     if (group.stage !== undefined) {
       assertIndependentVerificationRoles(item, group.stage, laneRoles);
     }
-    const lanes = expanding
+    const lanes = lanePlan.resumingQueued
+      ? lanePlan.laneIds.map((laneId) => group.lanes.find(({ id }) => id === laneId)!)
+      : lanePlan.expanding
       ? group.lanes.slice(-plans.length)
       : group.lanes.slice(0, plans.length);
     if (lanes.length !== plans.length) throw new Error(`ExecutionGroup Lane planning drift: ${group.id}.`);
     const createdRuns: AgentRun[] = [];
+    const queuedAdmissions: string[] = [];
     let runningGroup: ExecutionGroup = group;
+    const config = tx.getConfig();
+    const controllerConcurrency = resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
+    const brokerPolicy = resolveResourceBrokerPolicy({
+      maxActiveLanes: controllerConcurrency,
+      maxActiveLanesPerProvider: controllerConcurrency,
+      maxQueuedLanesPerGroup: Math.max(controllerConcurrency, available)
+    });
+    const activeResources = activeResourceLaneIdentities(tx);
+    const queuedResources = queuedResourceLaneIdentities(tx, now);
+    const stageResources = group.stage === undefined
+      ? undefined
+      : projectExecutionStageResources({
+          group,
+          stageGroups: [...item.executionGroups, group],
+          usage: observedExecutionResourceUsage({
+            group,
+            stageGroups: [...item.executionGroups, group],
+            runs: tx.listAgentRuns(task.id),
+            events: tx.listEvents(task.id)
+          }),
+          now
+        });
+    const stageSpendClosed = stageResources !== undefined
+      && (stageResources.deadlineReached || stageResources.exhaustedBudgets.length > 0);
     for (let index = 0; index < plans.length; index += 1) {
       const plan = plans[index]!;
       const lane = lanes[index]!;
       const laneIsolated = plans.length > 1 || group.lanes.length > 1 || group.strategy.mode === "adaptive";
+      const storedLaneWorkspace = laneIsolated
+        ? tx.getManagedWorkspace({
+            type: "execution-lane",
+            taskId: task.id,
+            executionGroupId: group.id,
+            executionLaneId: lane.id,
+            purpose: "execution",
+            workItemId: item.id
+          }) ?? undefined
+        : undefined;
       const laneManagedWorkspace = laneIsolated
-        ? options.executionLaneWorkspaces?.get(lane.id)
+        ? options.executionLaneWorkspaces?.get(lane.id) ?? storedLaneWorkspace
         : runWorkspace;
       if (laneIsolated && laneManagedWorkspace === undefined && options.yuiHome !== undefined) {
         throw usageError(`Execution Lane workspace preflight is missing: ${group.id}/${lane.id}.`);
       }
-      const effective = resolveEffectiveLaunch({
-        role: plan.role,
-        purpose: "execution",
-        ...(laneManagedWorkspace === undefined ? {} : { workspace: laneManagedWorkspace }),
-        workItemWriteProjectIds: item.writeProjectIds
-      });
+      const effective = lane.effective ?? resolveEffectiveLaunch({
+          role: plan.role,
+          purpose: "execution",
+          ...(laneManagedWorkspace === undefined ? {} : { workspace: laneManagedWorkspace }),
+          workItemWriteProjectIds: item.writeProjectIds
+        });
       const sessions = tx.getTaskRoleSessionSet(task.id, plan.role.name);
       const dispatchMode = roleAgentSessionResumeMode(
         sessions,
@@ -3056,17 +3286,61 @@ function dispatchWork(
             root: laneManagedWorkspace.root,
             writableProjectIds: [...item.writeProjectIds]
           };
+      const request: ResourceLaneIdentity = {
+        taskId: task.id,
+        workItemId: item.id,
+        executionGroupId: group.id,
+        executionLaneId: lane.id,
+        providerId: effective.adapterId,
+        agentId: effective.agentId,
+        ...(effective.model === undefined ? {} : { model: effective.model }),
+        requestedAt: lane.effective === undefined ? now.toISOString() : lane.updatedAt
+      };
+      const admission = planResourceAdmissions({
+        policy: brokerPolicy,
+        active: activeResources,
+        queued: queuedResources.filter(({ taskId, executionGroupId, executionLaneId }) => !(
+          taskId === request.taskId
+          && executionGroupId === request.executionGroupId
+          && executionLaneId === request.executionLaneId
+        )),
+        requests: [request]
+      })[0]!;
+      const frozenDirective = lane.directive ?? rawInput;
+      if (stageSpendClosed || admission.decision !== "admitted") {
+        if (lane.effective === undefined || lane.directive === undefined) {
+          runningGroup = updateExecutionLane(runningGroup, lane.id, {
+            effective,
+            workspace: laneWorkspace,
+            directive: frozenDirective
+          }, now);
+        }
+        queuedAdmissions.push(
+          stageSpendClosed
+            ? `${lane.id}: stage budget/deadline reached`
+            : `${lane.id}: ${admission.reason}`
+        );
+        if (!queuedResources.some(({ taskId, executionGroupId, executionLaneId }) => (
+          taskId === request.taskId
+          && executionGroupId === request.executionGroupId
+          && executionLaneId === request.executionLaneId
+        ))) queuedResources.push(request);
+        continue;
+      }
+      activeResources.push(request);
       const runningLane = lane.status === "failed"
         ? restartExecutionLane(runningGroup, lane.id, {
             runId: plan.runId,
             effective,
-            workspace: laneWorkspace
+            workspace: laneWorkspace,
+            directive: frozenDirective
           }, now)
         : updateExecutionLane(runningGroup, lane.id, {
             status: "running",
             runId: plan.runId,
             effective,
-            workspace: laneWorkspace
+            workspace: laneWorkspace,
+            directive: frozenDirective
           }, now);
       runningGroup = runningLane;
       const assignment = createRunAssignment({
@@ -3080,10 +3354,13 @@ function dispatchWork(
           executionGroupId: runningGroup.id,
           executionLaneId: lane.id
         },
-        directive: `${rawInput}\nFrozen target: ${group.target.fingerprint}.`
+        directive: `${frozenDirective}\nFrozen target: ${group.target.fingerprint}.`
           + (group.stage === undefined
             ? ""
             : `\nExploration stage: ${group.stage.stage}; round=${group.stage.round}; attempt=${group.stage.stageAttempt}.`
+              + (group.stage.resources === undefined
+                ? ""
+                : `\nResource budget: tokens=${group.stage.budget.maxTokens}; tools=${group.stage.budget.maxToolCalls}; wall=${group.stage.budget.maxWallClockSeconds}s; quorum=${group.stage.resources.quorum}; deadline=${group.stage.resources.deadlineAt}; straggler=${group.stage.resources.stragglerAfterSeconds}s.`)
               + (group.stage.convergence === undefined
                 ? ""
                 : `\n${candidateConvergenceDirective(group.stage)}`)),
@@ -3164,7 +3441,7 @@ function dispatchWork(
         contextSnapshotDeltaRefIds(tx, snapshot)
       );
       createdRuns[index] = runWithLineage;
-      const role = plans[index]!.role;
+      const role = requireRole(tx, task.id, unboundRun.roleName);
       tx.saveAgentRun(runWithLineage);
       tx.saveActiveAgentRun(runWithLineage);
       tx.saveRole(task.id, updateRoleStatus(role, "running", now));
@@ -3174,11 +3451,18 @@ function dispatchWork(
       ]);
       recordTaskEvent(tx, task.id, "run.dispatched", runLaunchEventPayload(runWithLineage), now);
     }
-    return createdRuns;
+    return { runs: createdRuns, queuedAdmissions, group: runningGroup };
   });
-  for (const run of runs) notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
-  const first = runs[0]!;
-  return `Dispatch queued for ${first.taskId}/${first.roleName} (${first.id})${runs.length > 1 ? `; ${runs.length} Lanes` : ""}\n`;
+  for (const run of dispatch.runs) {
+    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
+  }
+  const backpressure = dispatch.queuedAdmissions.length === 0
+    ? ""
+    : `; ${dispatch.queuedAdmissions.length} Lane(s) retained pending by Resource Broker`;
+  const first = dispatch.runs[0];
+  return first === undefined
+    ? `No Lane admitted; ${dispatch.queuedAdmissions.join("; ")}\n`
+    : `Dispatch queued for ${first.taskId}/${first.roleName} (${first.id})${dispatch.runs.length > 1 ? `; ${dispatch.runs.length} Lanes` : ""}${backpressure}\n`;
 }
 
 function resolveWorkExecutionGroup(
@@ -3186,11 +3470,11 @@ function resolveWorkExecutionGroup(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task work group resolve usage: yui task work group resolve <task>/<work> --decision <accept|reject|retry|blocked> --summary <text> [--lane <lane-id> ...].";
+  const usage = "Task work group resolve usage: yui task work group resolve <task>/<work> --decision <accept|reject|retry|blocked> --summary <text> [--lane <lane-id> ...] [--early-stop <marginal-value-percent>].";
   if (args[0] !== "resolve") throw usageError(usage);
   const parsed = parseMultiValueTail(
     args.slice(1),
-    new Set(["--decision", "--summary"]),
+    new Set(["--decision", "--summary", "--early-stop"]),
     new Set(["--lane"]),
     usage
   );
@@ -3198,6 +3482,11 @@ function resolveWorkExecutionGroup(
   const decision = parseExecutionResolutionDecision(parsed.options.get("--decision"), usage);
   const summary = requiredOption(parsed.options, "--summary");
   const selectedLaneIds = parsed.multiOptions.get("--lane");
+  const earlyStopMarginalValue = parseOptionalPercentage(
+    parsed.options.get("--early-stop"),
+    "--early-stop",
+    usage
+  );
   const now = clock(options);
   const result = store.transaction((tx) => {
     const item = requireWorkItem(tx, parsed.positionals[0], options);
@@ -3206,7 +3495,7 @@ function resolveWorkExecutionGroup(
     if (taskActor(options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may resolve an ExecutionGroup.");
     }
-    const group = currentWorkItemExecutionGroup(item);
+    let group = currentWorkItemExecutionGroup(item);
     if (group === undefined
       || (group.stage === undefined
         && group.lanes.length < 2
@@ -3216,11 +3505,81 @@ function resolveWorkExecutionGroup(
     if (item.status !== "running") {
       throw usageError(`Work Item ${item.id} cannot resolve from ${item.status}.`);
     }
+    if (decision !== "accept" && group.stage?.resources !== undefined) {
+      const activeLaneIds = group.lanes
+        .filter(({ status }) => status === "running")
+        .map(({ id }) => id);
+      if (activeLaneIds.length > 0) {
+        throw usageError(
+          `Active Lanes must settle before ${decision}; Resource Broker will not kill them: ${activeLaneIds.join(", ")}.`
+        );
+      }
+      group = skipPendingExecutionLanes(
+        group,
+        group.lanes.filter(({ status }) => status === "pending").map(({ id }) => id),
+        `Leader resolved the stage as ${decision} before queued Lanes started.`,
+        now
+      );
+    }
     const acceptedLaneIds = decision === "accept"
       ? selectedLaneIds ?? group.lanes
         .filter((lane) => lane.status === "yielded" || lane.status === "completed")
         .map(({ id }) => id)
       : undefined;
+    if (earlyStopMarginalValue !== undefined) {
+      if (decision !== "accept" || acceptedLaneIds === undefined) {
+        throw usageError("--early-stop requires --decision accept.");
+      }
+      if (group.stage?.resources === undefined) {
+        throw usageError("--early-stop requires a T6 resource-scheduled exploration stage.");
+      }
+      const resources = projectExecutionStageResources({
+        group,
+        stageGroups: item.executionGroups,
+        usage: observedExecutionResourceUsage({
+          group,
+          stageGroups: item.executionGroups,
+          runs: tx.listAgentRuns(task.id),
+          events: tx.listEvents(task.id)
+        }),
+        now
+      });
+      const routing = routeExecutionStage({
+        group,
+        resources,
+        evidenceSufficient: candidateConvergenceEvidenceSufficient(
+          item,
+          group,
+          acceptedLaneIds
+        ),
+        disagreement: "unknown",
+        marginalValuePercent: earlyStopMarginalValue
+      });
+      if (!routing.earlyTerminationAllowed) {
+        throw usageError(
+          "Early termination is forbidden until quorum and acceptance-level evidence are sufficient."
+        );
+      }
+      if (routing.action !== "resolve" && routing.retainActiveLaneIds.length === 0) {
+        throw usageError(routing.reason);
+      }
+      group = skipPendingExecutionLanes(
+        group,
+        routing.cancelPendingLaneIds,
+        `Stopped after quorum and sufficient evidence; observed marginal value ${earlyStopMarginalValue}%.`,
+        now
+      );
+      if (routing.retainActiveLaneIds.length > 0) {
+        const waiting = updateWorkItemExecutionGroup(item, group, now);
+        tx.saveWorkItem(task.id, waiting);
+        return {
+          item: waiting,
+          group,
+          reviewDispatch: null,
+          waitingForStragglers: true
+        };
+      }
+    }
     const resolutionSummary = acceptedLaneIds === undefined
       ? summary
       : aggregateExecutionLaneSummary(summary, group, acceptedLaneIds);
@@ -3240,13 +3599,23 @@ function resolveWorkExecutionGroup(
       enqueueWork(tx, leaderMailbox(task.id), "work-group-resolved", now, [
         workItemRef(task.id, item.id)
       ]);
-      return { item: failed, group: resolved, reviewDispatch: null };
+      return {
+        item: failed,
+        group: resolved,
+        reviewDispatch: null,
+        waitingForStragglers: false
+      };
     }
     if (resolved.stage !== undefined && resolved.stage.stage !== "resolve") {
       enqueueWork(tx, leaderMailbox(task.id), "work-group-resolved", now, [
         workItemRef(task.id, item.id)
       ]);
-      return { item: groupedItem, group: resolved, reviewDispatch: null };
+      return {
+        item: groupedItem,
+        group: resolved,
+        reviewDispatch: null,
+        waitingForStragglers: false
+      };
     }
     const eligible = resolved.lanes
       .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
@@ -3286,8 +3655,19 @@ function resolveWorkExecutionGroup(
       runRef(task.id, eligible.id),
       workItemRef(task.id, item.id)
     ]);
-    return { item: candidate, group: resolved, reviewDispatch };
+    return {
+      item: candidate,
+      group: resolved,
+      reviewDispatch,
+      waitingForStragglers: false
+    };
   });
+  if (result.waitingForStragglers) {
+    return output(
+      `Stopped pending spend for ${result.group.id}; active stragglers are retained until they settle: ${result.group.lanes.filter(({ status }) => status === "running").map(({ id }) => id).join(", ")}\n`,
+      { workItem: result.item, executionGroup: result.group }
+    );
+  }
   if (result.reviewDispatch?.run !== null && result.reviewDispatch?.run !== undefined) {
     notifyReviewMailbox(
       options,
@@ -3784,7 +4164,14 @@ function reviewWork(
         && (round.status === "pending" || round.status === "running")
       ))).at(-1);
     if (activeRound !== undefined) {
-      if (activeRound.status === "pending" && activeRound.reviewerRunId === undefined) {
+      const resourceQueued = activeRound.executionGroup !== undefined
+        && activeRound.executionGroup.resolution === undefined
+        && activeRound.executionGroup.lanes.some((lane) => (
+          lane.status === "pending"
+          && lane.runId === undefined
+        ));
+      if ((activeRound.status === "pending" && activeRound.reviewerRunId === undefined)
+        || (activeRound.status === "running" && resourceQueued)) {
         return { round: activeRound, run: null, resumed: true as const };
       }
       throw usageError(`ReviewRound is already active: ${activeRound.id}/${activeRound.status}.`);
@@ -3808,7 +4195,7 @@ function reviewWork(
   }
   if (result.resumed) {
     return output(
-      `Review request ${result.round.id} is pending; resuming dispatch.\n`,
+      `Review request ${result.round.id} has pending Lanes; resuming dispatch.\n`,
       { reviewRound: result.round }
     );
   }
@@ -4421,6 +4808,11 @@ function requestTaskReviewRound(
       }
       assertNoConflictingTaskReviewRound(taskRounds, exact.id);
       if (requestedLaneRoles.length === 0) {
+        if (exact.status === "running"
+          && exact.executionGroup?.resolution === undefined
+          && exact.executionGroup?.lanes.some((lane) => (
+            lane.status === "pending" && lane.runId === undefined
+          ))) return exact;
         assertTaskReviewRequestLane(tx, task.id, reviewerRoleName, exact);
         return exact;
       }
@@ -5536,7 +5928,6 @@ function retryRun(
         ? tx.getTaskWorkspace(task.id)
         : tx.getWorkItemWorkspace(task.id, retryItem.id))
       ?? undefined;
-    const runId = tx.nextAgentRunId(task.id);
     const retryGroup = retryItem === null || previous.executionGroupId === undefined
       ? undefined
       : workItemExecutionGroupById(retryItem, previous.executionGroupId);
@@ -5560,20 +5951,82 @@ function retryRun(
       ...(retryManagedWorkspace === undefined ? {} : { workspace: retryManagedWorkspace }),
       ...(retryItem === null ? {} : { workItemWriteProjectIds: retryItem.writeProjectIds })
     });
+    const laneWorkspace = retryManagedWorkspace === undefined
+      ? undefined
+      : {
+          root: retryManagedWorkspace.root,
+          writableProjectIds: [...(retryItem?.writeProjectIds ?? [])]
+        };
+    const retryDirective = retryLane?.directive
+      ?? previous.assignment.directive
+      ?? retryItem?.objective
+      ?? `Retry Run ${previous.id}.`;
+    let queuedReason: string | undefined;
+    if (retryGroup !== undefined && retryLane !== undefined && retryItem !== null) {
+      const config = tx.getConfig();
+      const controllerConcurrency = resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
+      const capacity = retryGroup.strategy.mode === "fixed"
+        ? retryGroup.strategy.count
+        : retryGroup.strategy.max;
+      const policy = resolveResourceBrokerPolicy({
+        maxActiveLanes: controllerConcurrency,
+        maxActiveLanesPerProvider: controllerConcurrency,
+        maxQueuedLanesPerGroup: Math.max(controllerConcurrency, capacity)
+      });
+      if (retryGroup.stage !== undefined) {
+        const stageGroups = retryItem.executionGroups;
+        const resources = projectExecutionStageResources({
+          group: retryGroup,
+          stageGroups,
+          usage: observedExecutionResourceUsage({
+            group: retryGroup,
+            stageGroups,
+            runs: tx.listAgentRuns(task.id),
+            events: tx.listEvents(task.id)
+          }),
+          now
+        });
+        if (resources.deadlineReached || resources.exhaustedBudgets.length > 0) {
+          throw usageError(
+            `Execution stage budget/deadline is exhausted; resolve Group ${retryGroup.id} instead of retrying.`
+          );
+        }
+      }
+      const admission = planResourceAdmissions({
+        policy,
+        active: activeResourceLaneIdentities(tx),
+        queued: queuedResourceLaneIdentities(tx, now),
+        requests: [{
+          taskId: task.id,
+          workItemId: retryItem.id,
+          executionGroupId: retryGroup.id,
+          executionLaneId: retryLane.id,
+          providerId: effective.adapterId,
+          agentId: effective.agentId,
+          ...(effective.model === undefined ? {} : { model: effective.model }),
+          requestedAt: now.toISOString()
+        }]
+      })[0]!;
+      if (admission.decision === "blocked") {
+        throw usageError(`Execution Lane retry queue is full: ${admission.reason}.`);
+      }
+      if (admission.decision === "queued") queuedReason = admission.reason;
+    }
+    const runId = queuedReason === undefined ? tx.nextAgentRunId(task.id) : undefined;
     const runningGroup = retryGroup === undefined || retryLane === undefined
       ? undefined
-      : restartExecutionLane(retryGroup, retryLane.id, {
-          runId,
-          effective,
-          ...(retryManagedWorkspace === undefined
-            ? {}
-            : {
-                workspace: {
-                  root: retryManagedWorkspace.root,
-                  writableProjectIds: [...(retryItem?.writeProjectIds ?? [])]
-                }
-              })
-        }, now);
+      : queuedReason === undefined
+        ? restartExecutionLane(retryGroup, retryLane.id, {
+            runId: runId!,
+            effective,
+            ...(laneWorkspace === undefined ? {} : { workspace: laneWorkspace }),
+            directive: retryDirective
+          }, now)
+        : queueExecutionLaneRetry(retryGroup, retryLane.id, {
+            effective,
+            ...(laneWorkspace === undefined ? {} : { workspace: laneWorkspace }),
+            directive: retryDirective
+          }, now);
     // Restart the bound lane and reopen the failed WorkItem as two ordered
     // single-step record revisions, matching the dispatch path. Folding both
     // transforms into one save would move the WorkItem two revisions at once,
@@ -5594,6 +6047,15 @@ function retryRun(
         tx.saveWorkItem(task.id, retriedItemWithGroup);
       }
     }
+    if (queuedReason !== undefined) {
+      return {
+        kind: "queued" as const,
+        taskId: task.id,
+        roleName: role.name,
+        laneId: retryLane!.id,
+        reason: queuedReason
+      };
+    }
     const retrySnapshot = freezeRunContextSnapshot(tx, {
       taskId: task.id,
       roleName: role.name,
@@ -5601,7 +6063,7 @@ function retryRun(
       ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId })
     }, now);
     const assignment = createRunAssignment({
-      runId,
+      runId: runId!,
       roleName: role.name,
       purpose: previous.assignment.purpose,
       action: previous.workItemId === undefined ? previous.assignment.action : "repair-work-item",
@@ -5620,7 +6082,7 @@ function retryRun(
       deltaRefIds: contextSnapshotDeltaRefIds(tx, retrySnapshot)
     });
     const created = createAgentRun(
-      runId,
+      runId!,
       task.id,
       role.name,
       roleAgentSessionResumeMode(sessions, effective.agentId, effective),
@@ -5657,6 +6119,11 @@ function retryRun(
     }, now);
     return { kind: "run" as const, run: created };
   });
+  if (retried.kind === "queued") {
+    return output(
+      `Retry retained pending for ${retried.taskId}/${retried.laneId}: ${retried.reason}\n`
+    );
+  }
   notifyMailbox(
     options.runtime,
     roleMailbox(retried.run.taskId, retried.run.roleName),
@@ -6996,7 +7463,7 @@ function yieldRun(
       if (multiLaneGroup) {
         executionGroupPending = true;
         executionGroupReady = currentGroup!.lanes.every(({ status }) => (
-          ["yielded", "completed", "failed"].includes(status)
+          ["yielded", "completed", "failed", "skipped"].includes(status)
         ));
         if (executionGroupReady) {
           recordTaskEvent(tx, task.id, "execution-group-ready", {
@@ -7150,7 +7617,7 @@ function leaderYieldReceipt(
     if (projection === null) return null;
     const disposition = deriveLeaderRunDisposition(projection.status, task.status);
     const digest = computeActionabilityDigest(
-      collectTaskActionability(tx, task.id)
+      collectTaskActionability(tx, task.id, now)
     );
     const waitReason = disposition === "waiting" || disposition === "blocked"
       ? leaderWaitReason(projection)
@@ -7311,7 +7778,7 @@ export function dispatchPreparedReviewRound(
   reviewRoundId: string,
   store: TaskWorkflowStore,
   options: TaskCommandOptions = {}
-): AgentRun {
+): AgentRun | null {
   const now = clock(options);
   const runs = store.transaction((tx) => {
     const round = tx.getReviewRound(taskId, reviewRoundId);
@@ -7579,17 +8046,28 @@ export function dispatchPreparedReviewRound(
       return laneReviewer;
     });
     const createdRuns: AgentRun[] = [];
+    const config = tx.getConfig();
+    const controllerConcurrency = resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
+    const capacity = runningGroup.strategy.mode === "fixed"
+      ? runningGroup.strategy.count
+      : runningGroup.strategy.max;
+    const brokerPolicy = resolveResourceBrokerPolicy({
+      maxActiveLanes: controllerConcurrency,
+      maxActiveLanesPerProvider: controllerConcurrency,
+      maxQueuedLanesPerGroup: Math.max(controllerConcurrency, capacity)
+    });
+    const activeResources = activeResourceLaneIdentities(tx);
+    const queuedResources = queuedResourceLaneIdentities(tx, now);
     for (let index = 0; index < reviewers.length; index += 1) {
       const lane = dispatchLanes[index]!;
       const laneReviewer = reviewers[index]!;
-      const runId = tx.nextAgentRunId(taskId);
       const laneManagedWorkspace = runningGroup.lanes.length > 1 || runningGroup.strategy.mode === "adaptive"
         ? options.executionLaneWorkspaces?.get(lane.id)
         : round.workspace;
       if (laneManagedWorkspace === undefined && options.yuiHome !== undefined) {
         throw usageError(`Review Lane workspace preflight is missing: ${runningGroup.id}/${lane.id}.`);
       }
-      const effective = resolveEffectiveLaunch({
+      const effective = lane.effective ?? resolveEffectiveLaunch({
         role: laneReviewer,
         purpose: "review",
         workspace: laneManagedWorkspace ?? round.workspace,
@@ -7605,6 +8083,43 @@ export function dispatchPreparedReviewRound(
               .filter(({ access }) => access === "write")
               .map(({ projectId }) => projectId)
           };
+      const request: ResourceLaneIdentity = {
+        taskId,
+        ...(item === undefined ? {} : { workItemId: item.id }),
+        executionGroupId: runningGroup.id,
+        executionLaneId: lane.id,
+        providerId: effective.adapterId,
+        agentId: effective.agentId,
+        ...(effective.model === undefined ? {} : { model: effective.model }),
+        requestedAt: lane.effective === undefined ? now.toISOString() : lane.updatedAt
+      };
+      const admission = planResourceAdmissions({
+        policy: brokerPolicy,
+        active: activeResources,
+        queued: queuedResources.filter(({ taskId: queuedTaskId, executionGroupId, executionLaneId }) => !(
+          queuedTaskId === request.taskId
+          && executionGroupId === request.executionGroupId
+          && executionLaneId === request.executionLaneId
+        )),
+        requests: [request]
+      })[0]!;
+      if (admission.decision !== "admitted") {
+        if (lane.effective === undefined) {
+          runningGroup = updateExecutionLane(runningGroup, lane.id, {
+            reviewRoundId: round.id,
+            effective,
+            workspace: laneWorkspace
+          }, now);
+        }
+        if (!queuedResources.some(({ taskId: queuedTaskId, executionGroupId, executionLaneId }) => (
+          queuedTaskId === request.taskId
+          && executionGroupId === request.executionGroupId
+          && executionLaneId === request.executionLaneId
+        ))) queuedResources.push(request);
+        continue;
+      }
+      activeResources.push(request);
+      const runId = tx.nextAgentRunId(taskId);
       const assignment = createRunAssignment({
         runId,
         roleName: laneReviewer.name,
@@ -7648,7 +8163,7 @@ export function dispatchPreparedReviewRound(
     const roundWithGroup = round.executionGroup === undefined
       ? attachReviewExecutionGroup(round, runningGroup)
       : updateReviewExecutionGroup(round, runningGroup);
-    const persistedRound = round.status === "pending"
+    const persistedRound = round.status === "pending" && createdRuns.length > 0
       ? startReviewRound(roundWithGroup, createdRuns[0]!.id)
       : roundWithGroup;
     // Save the aggregate before adopting prepared Lane workspaces.  The
@@ -7681,7 +8196,7 @@ export function dispatchPreparedReviewRound(
         contextSnapshotDeltaRefIds(tx, snapshot)
       );
       createdRuns[index] = created;
-      const laneReviewer = reviewers[index]!;
+      const laneReviewer = requireRole(tx, taskId, unboundRun.roleName);
       tx.saveAgentRun(created);
       tx.saveActiveAgentRun(created);
       tx.saveRole(taskId, updateRoleStatus(laneReviewer, "running", now));
@@ -7696,7 +8211,7 @@ export function dispatchPreparedReviewRound(
   for (const run of runs) {
     notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
   }
-  return runs[0]!;
+  return runs[0] ?? null;
 }
 
 export function failPendingReviewRound(
@@ -8995,6 +9510,19 @@ function parseOptionalPositiveInteger(
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
     throw usageError(`${label} must be a positive integer.`, usage);
+  }
+  return parsed;
+}
+
+function parseOptionalPercentage(
+  value: string | undefined,
+  label: string,
+  usage: string
+): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > 100) {
+    throw usageError(`${label} must be an integer from 0 to 100.`, usage);
   }
   return parsed;
 }

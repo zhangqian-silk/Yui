@@ -29,7 +29,9 @@ import {
   type CandidateConvergencePolicy,
   type ExecutionGroup,
   type ExecutionParentResultRef,
+  type ExecutionStageBudget,
   type ExecutionStageContext,
+  type ExecutionStageResourcePolicy,
   type ExecutionStrategy,
   type WorkItemExplorationMode,
   type WorkItemExplorationStage
@@ -120,8 +122,8 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  /** v11 lets new exploration histories freeze the structured convergence policy. */
-  schemaVersion: 11;
+  /** v12 lets new exploration stages freeze unified resource budgets and completion policy. */
+  schemaVersion: 12;
   id: string;
   taskId: string;
   title: string;
@@ -171,7 +173,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 11,
+    schemaVersion: 12,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -467,7 +469,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 11) throw new Error("WorkItem must use schemaVersion 11.");
+  if (workItem.schemaVersion !== 12) throw new Error("WorkItem must use schemaVersion 12.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
@@ -587,6 +589,13 @@ export type PlanWorkItemExplorationStageInput = Readonly<{
   maxRounds?: number;
   /** Required for a new stage; retries inherit the frozen stage budget. */
   maxAttempts?: number;
+  /** Required for a new T6 stage; valid migrated pre-T6 retries may omit it. */
+  resourceBudget?: Pick<
+    ExecutionStageBudget,
+    "maxTokens" | "maxToolCalls" | "maxWallClockSeconds"
+  >;
+  /** Required for a new T6 stage; retries inherit the exact frozen policy. */
+  resources?: ExecutionStageResourcePolicy;
   strategy: ExecutionStrategy;
   contextSnapshotRef: ContextSnapshotRef;
   /** Set only on the first stage; every successor inherits the frozen policy. */
@@ -617,6 +626,8 @@ export function planWorkItemExplorationStage(
     if (input.convergence === undefined) {
       throw new Error("The first exploration stage requires a candidate convergence policy.");
     }
+    const resourceBudget = requireNewStageResourceBudget(input.resourceBudget);
+    const resources = requireNewStageResources(input.resources);
     return {
       schemaVersion: 1,
       mode: input.mode,
@@ -629,8 +640,10 @@ export function planWorkItemExplorationStage(
         maxAttempts: requirePositiveInteger(
           input.maxAttempts ?? 1,
           "Exploration stage max attempts"
-        )
+        ),
+        ...resourceBudget
       },
+      resources,
       contextSnapshotRef: snapshot,
       parentResults: [],
       ...(input.convergence === undefined ? {} : { convergence: input.convergence })
@@ -666,6 +679,8 @@ export function planWorkItemExplorationStage(
     if (current.stage.stage === "resolve") {
       throw new Error(`Accepted Resolve stage already completed exploration: ${current.id}.`);
     }
+    const resourceBudget = requireNewStageResourceBudget(input.resourceBudget);
+    const resources = requireNewStageResources(input.resources);
     return {
       ...base,
       stage: nextExplorationStage(current.stage.stage),
@@ -676,14 +691,18 @@ export function planWorkItemExplorationStage(
         maxAttempts: requirePositiveInteger(
           input.maxAttempts ?? 1,
           "Exploration stage max attempts"
-        )
-      }
+        ),
+        ...resourceBudget
+      },
+      resources
     };
   }
   if (current.stage.stage === "resolve" && current.resolution.decision === "retry") {
     if (current.stage.round >= current.stage.maxRounds) {
       throw new Error(`Work Item exploration round budget is exhausted: ${workItem.id}.`);
     }
+    const resourceBudget = requireNewStageResourceBudget(input.resourceBudget);
+    const resources = requireNewStageResources(input.resources);
     return {
       ...base,
       stage: "plan",
@@ -694,8 +713,10 @@ export function planWorkItemExplorationStage(
         maxAttempts: requirePositiveInteger(
           input.maxAttempts ?? 1,
           "Exploration stage max attempts"
-        )
-      }
+        ),
+        ...resourceBudget
+      },
+      resources
     };
   }
   if (current.stage.stageAttempt >= current.stage.budget.maxAttempts) {
@@ -713,7 +734,8 @@ export function planWorkItemExplorationStage(
     stage: current.stage.stage,
     round: current.stage.round,
     stageAttempt: current.stage.stageAttempt + 1,
-    budget: current.stage.budget
+    budget: current.stage.budget,
+    ...(current.stage.resources === undefined ? {} : { resources: current.stage.resources })
   };
 }
 
@@ -810,10 +832,38 @@ function validateWorkItemExplorationHistory(groups: readonly ExecutionGroup[]): 
       || after.round !== before.round
       || after.stageAttempt !== before.stageAttempt + 1
       || after.stageAttempt > before.budget.maxAttempts
-      || JSON.stringify(after.budget) !== JSON.stringify(before.budget)) {
+      || JSON.stringify(after.budget) !== JSON.stringify(before.budget)
+      || JSON.stringify(after.resources) !== JSON.stringify(before.resources)) {
       throw new Error(`Exploration retry transition is invalid: ${previous.id}/${current.id}.`);
     }
   }
+}
+
+function requireNewStageResourceBudget(
+  value: PlanWorkItemExplorationStageInput["resourceBudget"]
+): Required<NonNullable<PlanWorkItemExplorationStageInput["resourceBudget"]>> {
+  if (value?.maxTokens === undefined
+    || value.maxToolCalls === undefined
+    || value.maxWallClockSeconds === undefined) {
+    throw new Error("A new exploration stage requires token, tool-call and wall-clock budgets.");
+  }
+  return {
+    maxTokens: requirePositiveInteger(value.maxTokens, "Exploration stage max tokens"),
+    maxToolCalls: requirePositiveInteger(value.maxToolCalls, "Exploration stage max tool calls"),
+    maxWallClockSeconds: requirePositiveInteger(
+      value.maxWallClockSeconds,
+      "Exploration stage max wall-clock seconds"
+    )
+  };
+}
+
+function requireNewStageResources(
+  value: PlanWorkItemExplorationStageInput["resources"]
+): ExecutionStageResourcePolicy {
+  if (value === undefined) {
+    throw new Error("A new exploration stage requires resource completion policy.");
+  }
+  return value;
 }
 
 function selectedParentResults(group: ExecutionGroup): readonly ExecutionParentResultRef[] {

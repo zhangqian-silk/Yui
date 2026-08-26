@@ -27,6 +27,11 @@ import {
   type ExecutionGroupSummary,
   type ExecutionLane
 } from "./executionGroup.js";
+import {
+  observedExecutionResourceUsage,
+  projectExecutionStageResources,
+  type ExecutionStageResourceProjection
+} from "./resourceBroker.js";
 
 export type ExecutionLaneRuntimeHealth =
   | "active"
@@ -67,6 +72,7 @@ export type ExecutionGroupHealthSummary = Readonly<
   Omit<ExecutionGroupSummary, "laneSummaries"> & {
     laneSummaries: readonly Readonly<LaneSummary & ExecutionLaneHealthProjection>[];
     health: Omit<ExecutionGroupHealthProjection, "groupId" | "lanes">;
+    resources?: ExecutionStageResourceProjection;
   }
 >;
 
@@ -107,6 +113,8 @@ export type ExecutionHealthSession = Readonly<{
 
 export type ExecutionGroupHealthInput = Readonly<{
   group: ExecutionGroup;
+  /** WorkItem history used to aggregate retry spend for an exploration stage. */
+  stageGroups?: readonly ExecutionGroup[];
   runs: readonly ExecutionHealthRun[];
   sessions: readonly ExecutionHealthSession[];
   events: readonly TaskEvent[];
@@ -148,6 +156,19 @@ export function summarizeExecutionGroupHealth(
 ): ExecutionGroupHealthSummary {
   const summary = summarizeExecutionGroup(input.group);
   const projection = projectExecutionGroupHealth(input);
+  const resources = input.group.stage === undefined
+    ? undefined
+    : projectExecutionStageResources({
+        group: input.group,
+        ...(input.stageGroups === undefined ? {} : { stageGroups: input.stageGroups }),
+        usage: observedExecutionResourceUsage({
+          group: input.group,
+          ...(input.stageGroups === undefined ? {} : { stageGroups: input.stageGroups }),
+          runs: input.runs,
+          events: input.events
+        }),
+        now: input.now
+      });
   const healthByLane = new Map(projection.lanes.map((lane) => [lane.laneId, lane]));
   return Object.freeze({
     ...summary,
@@ -162,7 +183,8 @@ export function summarizeExecutionGroupHealth(
       confirmedDeadLaneCount: projection.confirmedDeadLaneCount,
       reusableLaneIds: projection.reusableLaneIds,
       retryableLaneIds: projection.retryableLaneIds
-    })
+    }),
+    ...(resources === undefined ? {} : { resources })
   });
 }
 
@@ -234,6 +256,14 @@ function projectExecutionLaneHealth(
       resultReusable: false,
       reason: "the exact Lane attempt is durably failed; a retry must create a new AgentRun",
       evidence: ["execution-lane-terminal-failure"]
+    });
+  }
+  if (lane.status === "skipped") {
+    return projection(lane, {
+      recovery: "none",
+      resultReusable: false,
+      reason: "the Lane was never started after sufficient stage evidence made further spend unnecessary",
+      evidence: ["execution-lane-resource-skip"]
     });
   }
   if (lane.status === "pending") {
