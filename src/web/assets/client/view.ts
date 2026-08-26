@@ -14,6 +14,8 @@ import {
   messageCard,
   metaItem,
   metricTile,
+  observabilityMetricCard,
+  dagGraph,
   overviewRow,
   pagedList,
   pathMetaItem,
@@ -290,6 +292,9 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   // the attention/blocker facts behind it.
   const band = executionBand(data.execution, t, locale);
   if (band) summaryBody.append(band);
+  const observability = data.observability || (data.execution && data.execution.observability);
+  const metrics = observabilityMetricCard(observability, t);
+  if (metrics) summaryBody.append(metrics);
 
   if (task.completionSummary) {
     const conclusion = node("div", "conclusion");
@@ -364,6 +369,16 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       "detail-health",
       sectionHead(t("detail.runtimeHealth"), { count: stalledRuns.length }),
       runtimeHealthBody
+    ));
+  }
+
+  if (observability && observability.dag) {
+    const dagBody = node("div", "section-body");
+    dagBody.append(dagGraph(observability.dag, t));
+    scaffold.append(anchorSection(
+      "detail-dag",
+      sectionHead(t("detail.dag"), { count: observability.dag.nodes.length }),
+      dagBody
     ));
   }
 
