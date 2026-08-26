@@ -10,10 +10,13 @@ import { projectNextAction } from "../task/nextAction.js";
 import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 import {
   summarizeExecutionGroup,
-  type ExecutionGroup
+  type ExecutionGroup,
+  type ExecutionGroupSummary
 } from "../execution/executionGroup.js";
+import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
 import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+import { projectExecutionLaneRunRecoveries } from "../run/recoveryProjection.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -29,13 +32,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     throw usageError("Task context usage: yui task context <task>.");
   }
   const taskId = args[0].trim();
+  const now = new Date();
   const data = store.transaction((reader) => {
     const task = reader.getTask(taskId);
     if (task === null) throw taskNotFound(taskId);
     const workItems = reader.listWorkItems(task.id);
     const inputRequests = reader.listInputRequests(task.id);
     const roles = reader.listRoles(task.id);
-    const execution = buildTaskExecutionProjection(reader, task.id, task);
+    const execution = buildTaskExecutionProjection(reader, task.id, task, now);
     if (execution === null) {
       throw new Error(`Task execution projection disappeared: ${task.id}.`);
     }
@@ -87,7 +91,15 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       openInputRequests: inputRequests.filter((request) => request.status === "open"),
       resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
       events,
-      nextAction: projectNextAction(nextActionFacts)
+      nextAction: projectNextAction({
+        ...nextActionFacts,
+        executionGroups: execution.executionGroups,
+        runRecoveries: projectExecutionLaneRunRecoveries(
+          reader,
+          task.id,
+          execution.executionGroups
+        )
+      })
     };
   });
   const {
@@ -122,6 +134,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
   const displayedExecutionCarriers = execution.monitoring === "active"
     ? execution.activeRuns
     : [];
+  const executionGroupsById = new Map(execution.executionGroups.map((group) => [
+    group.groupId,
+    group
+  ]));
 
   const lines = [
     `Task context: ${task.id}`,
@@ -292,7 +308,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
             }`,
             ...(currentWorkItemExecutionGroup(item) === undefined
               ? []
-              : renderExecutionGroup(currentWorkItemExecutionGroup(item)!)),
+              : renderExecutionGroup(
+                  currentWorkItemExecutionGroup(item)!,
+                  executionGroupsById.get(currentWorkItemExecutionGroup(item)!.id)
+                )),
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
@@ -320,14 +339,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
                 ]),
             ...renderReviewRounds(reviewRounds.filter(
               (round) => round.workItemId === item.id
-            ))
+            ), executionGroupsById)
           ];
         })),
     "",
     "Task-final reviews:",
     ...renderReviewRounds(reviewRounds.filter(
       (round) => (round.scope ?? "work-item") === "task"
-    )),
+    ), executionGroupsById),
     "",
     ...recentSection(
       "AgentRuns",
@@ -459,7 +478,8 @@ function latestStallKind(events: readonly TaskEvent[], runId: string): string {
 }
 
 function renderReviewRounds(
-  rounds: ReturnType<TaskStore["listReviewRounds"]>
+  rounds: ReturnType<TaskStore["listReviewRounds"]>,
+  executionGroupsById: ReadonlyMap<string, ExecutionGroupHealthSummary> = new Map()
 ): string[] {
   const latest = rounds.at(-1);
   if (latest === undefined) return ["    ReviewRounds: none."];
@@ -503,7 +523,10 @@ function renderReviewRounds(
       : [`      Review summary: ${compactText(latest.summary)}`]),
     ...(latest.executionGroup === undefined
       ? []
-      : renderExecutionGroup(latest.executionGroup).map((line) => `    ${line.trimStart()}`))
+      : renderExecutionGroup(
+          latest.executionGroup,
+          executionGroupsById.get(latest.executionGroup.id)
+        ).map((line) => `    ${line.trimStart()}`))
   ];
 }
 
@@ -612,27 +635,48 @@ function managedWorkspaceLabel(
   }
 }
 
-function renderExecutionGroup(group: ExecutionGroup): string[] {
-  const summary = summarizeExecutionGroup(group);
+function renderExecutionGroup(
+  group: ExecutionGroup,
+  projected?: ExecutionGroupHealthSummary
+): string[] {
+  const summary: ExecutionGroupSummary | ExecutionGroupHealthSummary = projected
+    ?? summarizeExecutionGroup(group);
+  const health = projected?.health;
   return [
     `    Execution Group ${summary.groupId} [${summary.purpose}/${summary.strategy.mode}]: ${summary.activeLaneCount} active / ${summary.terminalLaneCount} terminal; ${summary.failedLaneCount} failed`,
-    ...summary.laneSummaries.flatMap((lane) => [
-      `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}) [${lane.status}]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,
-      ...(lane.report === undefined ? [] : [`        Report: ${compactText(lane.report)}`]),
-      ...(lane.checks === undefined || lane.checks.length === 0
-        ? []
-        : [`        Checks: ${lane.checks.map(({ name, outcome }) => `${name}:${outcome}`).join(", ")}`]),
-      ...(lane.findings === undefined || lane.findings.length === 0
-        ? []
-        : [`        Findings: ${lane.findings.map(({ id, severity, status }) => `${id}:${severity}/${status}`).join(", ")}`]),
-      ...(lane.evidence === undefined || lane.evidence.length === 0
-        ? []
-        : [`        Evidence: ${lane.evidence.length} item(s)`]),
-      ...(lane.evidenceCommit === undefined
-        ? []
-        : [`        Evidence commit: ${lane.evidenceCommit}`]),
-      ...(lane.decision === undefined ? [] : [`        Decision: ${lane.decision}`])
-    ]),
+    ...(health === undefined
+      ? []
+      : [
+          `      Health: active=${health.activeLaneCount}, silent=${health.silentLaneCount}, suspected-stalled=${health.suspectedStalledLaneCount}, confirmed-dead=${health.confirmedDeadLaneCount}`,
+          `      Recovery: reusable=${health.reusableLaneIds.length}, retryable=${health.retryableLaneIds.length}`
+        ]),
+    ...summary.laneSummaries.flatMap((lane) => {
+      const laneHealth = projected?.laneSummaries.find(({ laneId }) => laneId === lane.laneId);
+      return [
+        `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}${
+          lane.runId === undefined ? "" : `, run ${lane.runId}`
+        }) [${lane.status}${
+          laneHealth?.runtimeHealth === undefined ? "" : `/${laneHealth.runtimeHealth}`
+        }]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,
+        ...(laneHealth !== undefined && laneHealth.recovery !== "none"
+          ? [`        Recovery: ${laneHealth.recovery}; ${compactText(laneHealth.reason)}`]
+          : []),
+        ...(lane.report === undefined ? [] : [`        Report: ${compactText(lane.report)}`]),
+        ...(lane.checks === undefined || lane.checks.length === 0
+          ? []
+          : [`        Checks: ${lane.checks.map(({ name, outcome }) => `${name}:${outcome}`).join(", ")}`]),
+        ...(lane.findings === undefined || lane.findings.length === 0
+          ? []
+          : [`        Findings: ${lane.findings.map(({ id, severity, status }) => `${id}:${severity}/${status}`).join(", ")}`]),
+        ...(lane.evidence === undefined || lane.evidence.length === 0
+          ? []
+          : [`        Evidence: ${lane.evidence.length} item(s)`]),
+        ...(lane.evidenceCommit === undefined
+          ? []
+          : [`        Evidence commit: ${lane.evidenceCommit}`]),
+        ...(lane.decision === undefined ? [] : [`        Decision: ${lane.decision}`])
+      ];
+    }),
     ...(summary.openHighPriorityFindingIds.length === 0
       ? []
       : [`      Open high findings: ${summary.openHighPriorityFindingIds.join(", ")}`]),

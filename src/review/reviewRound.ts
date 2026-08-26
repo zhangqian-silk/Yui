@@ -315,7 +315,10 @@ export function finishReviewRound(
  * returns to pending so infrastructure retries do not manufacture a new
  * semantic ReviewRound or duplicate findings.
  */
-export function retryTaskReviewRound(round: ReviewRound): ReviewRound {
+export function retryTaskReviewRound(
+  round: ReviewRound,
+  executionLaneId?: string
+): ReviewRound {
   validateReviewRound(round);
   if ((round.scope ?? "work-item") !== "task") {
     throw new Error(`Only a Task-final ReviewRound can be retried in place: ${round.id}.`);
@@ -325,7 +328,7 @@ export function retryTaskReviewRound(round: ReviewRound): ReviewRound {
   }
   const retryExecutionGroup = round.executionGroup === undefined
     ? undefined
-    : retryReviewExecutionGroup(round);
+    : retryReviewExecutionGroup(round, executionLaneId);
   return validateReviewRound({
     schemaVersion: round.schemaVersion,
     id: round.id,
@@ -364,12 +367,50 @@ export function retryTaskReviewRound(round: ReviewRound): ReviewRound {
   });
 }
 
-function retryReviewExecutionGroup(round: ReviewRound): ExecutionGroup {
+/** Keep a running panel Round active while retrying only its exact failed Lane. */
+export function retryRunningReviewExecutionLane(
+  round: ReviewRound,
+  executionLaneId: string,
+  runId: string,
+  now: Date
+): ReviewRound {
+  validateReviewRound(round);
+  if (round.status !== "running" || round.executionGroup === undefined) {
+    throw new Error(`ReviewRound ${round.id} has no running ExecutionGroup.`);
+  }
+  const lane = round.executionGroup.lanes.find(({ id }) => id === executionLaneId);
+  if (lane === undefined || lane.status !== "failed" || lane.runId !== runId) {
+    throw new Error(
+      `Review retry does not target the current failed Lane attempt: `
+      + `${round.executionGroup.id}/${executionLaneId}/${runId}.`
+    );
+  }
+  return updateReviewExecutionGroup(
+    round,
+    retryReviewExecutionGroup(round, executionLaneId, now)
+  );
+}
+
+function retryReviewExecutionGroup(
+  round: ReviewRound,
+  executionLaneId: string | undefined,
+  retryAt?: Date
+): ExecutionGroup {
   const previous = round.executionGroup!;
-  const attemptTime = Date.parse(round.endedAt ?? round.createdAt);
-  const now = new Date(attemptTime);
+  if (executionLaneId !== undefined) {
+    const exactLane = previous.lanes.find(({ id }) => id === executionLaneId);
+    if (exactLane === undefined || exactLane.status !== "failed") {
+      throw new Error(
+        `Review retry Lane is not failed: ${previous.id}/${executionLaneId}.`
+      );
+    }
+  }
+  const now = retryAt ?? new Date(Date.parse(round.endedAt ?? round.createdAt));
   const lanes = previous.lanes.map((lane) => (
-    resetReviewExecutionLane(previous, lane.id, now)
+    lane.status === "failed"
+      && (executionLaneId === undefined || lane.id === executionLaneId)
+      ? resetReviewExecutionLane(previous, lane.id, now)
+      : lane
   ));
   return validateExecutionGroup({
     ...previous,

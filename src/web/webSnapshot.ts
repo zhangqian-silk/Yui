@@ -110,7 +110,7 @@ export function buildWebDashboardSnapshot(
       const needsAttentionCount = reader.listAgentRuns(task.id)
         .filter((run) => run.status === "active" && isRoleRunStalled(events, run.id))
         .length;
-      const execution = buildTaskExecutionProjection(reader, task.id);
+      const execution = buildTaskExecutionProjection(reader, task.id, task, now);
       const names = task.projectBindings.flatMap(({ projectId }) => {
         const name = projectNames.get(projectId);
         return name === undefined ? [] : [name];
@@ -201,7 +201,7 @@ export function buildWebTaskDetail(
         ...task,
         ...(projectNames.length === 0 ? {} : { projectNames })
       },
-      execution: buildTaskExecutionProjection(reader, taskId),
+      execution: buildTaskExecutionProjection(reader, taskId, task, now),
       brief: reader.getTaskBrief(taskId),
       roles,
       workItems: reader.listWorkItems(taskId).map((item) => {

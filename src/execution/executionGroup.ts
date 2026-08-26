@@ -211,6 +211,7 @@ export type ExecutionGroupSummary = Readonly<{
     laneId: string;
     roleName: string;
     ordinal: number;
+    runId?: string;
     status: ExecutionLaneStatus;
     summary?: string;
     report?: string;
@@ -443,9 +444,9 @@ export function updateExecutionLane(
 }
 
 /**
- * Reopens a failed/yielded lane for an explicit WorkItem retry.  The lane
- * keeps its identity and frozen Group target, while the previous result stays
- * in the event/Candidate history rather than being silently overwritten.
+ * Reopens only a failed Lane for an explicit WorkItem retry. Completed and
+ * yielded results are immutable reusable outputs; retrying them would erase
+ * the Group's durable evidence instead of recovering unfinished work.
  */
 export function restartExecutionLane(
   group: ExecutionGroup,
@@ -466,8 +467,10 @@ export function restartExecutionLane(
   const id = requireIdentity(laneId, "ExecutionLane id");
   const existing = group.lanes.find((lane) => lane.id === id);
   if (existing === undefined) throw new Error(`ExecutionLane not found: ${group.id}/${id}.`);
-  if (!isTerminalLane(existing.status)) {
-    throw new Error(`ExecutionLane is not retryable: ${group.id}/${id}.`);
+  if (existing.status !== "failed") {
+    throw new Error(
+      `Only failed ExecutionLanes can start a new AgentRun: ${group.id}/${id}.`
+    );
   }
   const timestamp = now.toISOString();
   const { result: _result, endedAt: _endedAt, ...base } = existing;
@@ -624,6 +627,7 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
       laneId: lane.id,
       roleName: lane.roleName,
       ordinal: lane.ordinal,
+      ...(lane.runId === undefined ? {} : { runId: lane.runId }),
       status: lane.status,
       ...(lane.result === undefined ? {} : {
         summary: lane.result.summary,

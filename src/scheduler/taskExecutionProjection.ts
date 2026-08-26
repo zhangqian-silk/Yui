@@ -14,11 +14,16 @@ import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import { mailboxBatches, type WorkMailbox } from "../coordination/workMailbox.js";
 import {
-  summarizeExecutionGroup,
-  type ExecutionGroup,
-  type ExecutionGroupSummary
+  type ExecutionGroup
 } from "../execution/executionGroup.js";
+import {
+  actionableExecutionLaneRecoveries,
+  summarizeExecutionGroupHealth,
+  type ExecutionGroupHealthSummary
+} from "../execution/executionHealth.js";
 import { isRoleRunStalled, latestStallProgressAt } from "./roleRunStall.js";
+import { resolveRuntimeHealth } from "../config/yuiConfig.js";
+import type { RuntimeHealthPolicy } from "../runtime/runtimeHealthPolicy.js";
 
 /**
  * Task-first status is a read-model vocabulary. It is deliberately not a new
@@ -50,6 +55,7 @@ export type TaskExecutionOwner =
 export type TaskExecutionAction =
   | "advance-task"
   | "wait-for-agents"
+  | "recover-execution"
   | "answer-input"
   | "inspect-attention"
   | "recover-leader"
@@ -105,7 +111,7 @@ export type TaskExecutionProjection = Readonly<{
   activeExecutorCount: number;
   activeRuns: readonly TaskExecutionRun[];
   /** Read-only Leader aggregation for every unified execution Group. */
-  executionGroups: readonly ExecutionGroupSummary[];
+  executionGroups: readonly ExecutionGroupHealthSummary[];
   attention: readonly TaskExecutionAttention[];
   blockers: readonly TaskExecutionBlocker[];
   /** Existing durable wake facts, included for idempotent reconciliation. */
@@ -140,6 +146,7 @@ export type TaskExecutionReadStore = Readonly<{
     launchId?: string;
     status?: string;
   }> | null;
+  getConfig?(): Readonly<{ runtimeHealth?: unknown }>;
 }>;
 
 type TaskExecutionTask = Readonly<Pick<
@@ -176,6 +183,8 @@ export type TaskExecutionFacts = Readonly<{
     launchId?: string;
     status?: string;
   }>[];
+  now?: Date;
+  runtimeHealthPolicy?: RuntimeHealthPolicy;
 }>;
 
 /**
@@ -186,7 +195,8 @@ export type TaskExecutionFacts = Readonly<{
 export function buildTaskExecutionProjection(
   store: TaskExecutionReadStore,
   taskId: string,
-  taskOverride?: TaskExecutionTask
+  taskOverride?: TaskExecutionTask,
+  now = new Date()
 ): TaskExecutionProjection | null {
   const task = store.getTask?.(taskId) ?? taskOverride ?? null;
   if (task === null) return null;
@@ -235,7 +245,9 @@ export function buildTaskExecutionProjection(
     leaderMailbox,
     leaderFailure: store.getLeaderFailure?.(taskId) ?? null,
     operatorNotification: store.getOperatorNotification?.(taskId) ?? null,
-    roleSessions
+    roleSessions,
+    now,
+    runtimeHealthPolicy: resolveRuntimeHealth(store.getConfig?.().runtimeHealth)
   });
 }
 
@@ -279,7 +291,16 @@ export function projectTaskExecution(
     roleSessions = [],
     executionGroups = []
   } = facts;
-  const groupSummaries = executionGroups.map((group) => summarizeExecutionGroup(group));
+  const now = facts.now ?? new Date();
+  const groupSummaries = executionGroups.map((group) => summarizeExecutionGroupHealth({
+    group,
+    runs,
+    sessions: roleSessions,
+    events,
+    now,
+    policy: facts.runtimeHealthPolicy
+  }));
+  const laneRecovery = actionableExecutionLaneRecoveries(groupSummaries)[0];
   const render = (input: ProjectionInput): TaskExecutionProjection => projection({
     ...input,
     executionGroups: groupSummaries
@@ -356,8 +377,9 @@ export function projectTaskExecution(
   ));
   const hasLeaderMismatch = attention.some((item) => item.kind === "identity-mismatch");
 
-  if (attention.length > 0) {
+  const renderAttention = (): TaskExecutionProjection => {
     const first = attention[0];
+    if (first === undefined) throw new Error("Task execution attention disappeared.");
     const progressingWithAttention = first.kind === "checkpoint-overdue"
       && healthyExecutionCarriers.length > 0;
     return render({
@@ -377,6 +399,9 @@ export function projectTaskExecution(
       blockers,
       pendingWakeup
     });
+  };
+  if (attention.length > 0 && hasLeaderMismatch) {
+    return renderAttention();
   }
   if (openInputs.length > 0) {
     return render({
@@ -394,6 +419,30 @@ export function projectTaskExecution(
       blockers,
       pendingWakeup
     });
+  }
+  if (laneRecovery !== undefined) {
+    return render({
+      task,
+      status: laneRecovery.runtimeHealth === "confirmed-dead"
+        ? "attention"
+        : "needs-leader-action",
+      owner: "leader",
+      action: "recover-execution",
+      summary: `Execution Lane ${laneRecovery.laneId} in ${laneRecovery.groupId}`
+        + ` requires ${laneRecovery.recovery}`
+        + (laneRecovery.runId === undefined ? "." : ` for exact Run ${laneRecovery.runId}.`),
+      reason: `execution-lane-${laneRecovery.recovery}`,
+      monitoring,
+      failClosed: false,
+      activeRuns: activeRunViews,
+      activeExecutorCount: activeExecutors.length,
+      attention,
+      blockers,
+      pendingWakeup
+    });
+  }
+  if (attention.length > 0) {
+    return renderAttention();
   }
   if (blockedIntegration || failedWork || hasLeaderMismatch) {
     return render({
@@ -545,7 +594,7 @@ type ProjectionInput = Omit<
   "next" | "taskId" | "taskStatus" | "executionGroups"
 > & Readonly<{
   task: Readonly<Pick<Task, "id" | "status">>;
-  executionGroups?: readonly ExecutionGroupSummary[];
+  executionGroups?: readonly ExecutionGroupHealthSummary[];
 }>;
 
 function projection(input: ProjectionInput): TaskExecutionProjection {
@@ -573,12 +622,38 @@ function collectExecutionGroups(
   workItems: readonly WorkItem[],
   reviewRounds: readonly ReviewRound[]
 ): ExecutionGroup[] {
+  const workItemsById = new Map(workItems.map((item) => [item.id, item]));
+  const orderedRounds = [...reviewRounds].sort((left, right) => (
+    left.id.localeCompare(right.id, undefined, { numeric: true })
+  ));
+  const latestTaskRound = orderedRounds
+    .filter((round) => (round.scope ?? "work-item") === "task")
+    .at(-1);
+  const latestWorkItemRounds = new Map<string, ReviewRound>();
+  for (const round of orderedRounds) {
+    if ((round.scope ?? "work-item") === "task"
+      || round.workItemId === undefined
+      || round.candidateId === undefined) continue;
+    const item = workItemsById.get(round.workItemId);
+    if (item === undefined
+      || item.status === "retired"
+      || item.candidates.at(-1)?.id !== round.candidateId) continue;
+    latestWorkItemRounds.set(`${round.workItemId}\0${round.candidateId}`, round);
+  }
+  const operationalReviewRoundIds = new Set([
+    ...(latestTaskRound === undefined ? [] : [latestTaskRound.id]),
+    ...[...latestWorkItemRounds.values()].map(({ id }) => id)
+  ]);
   const groups = [
-    ...workItems.flatMap((item) => {
+    ...workItems.filter(({ status }) => status !== "retired").flatMap((item) => {
       const group = currentWorkItemExecutionGroup(item);
       return group === undefined ? [] : [group];
     }),
-    ...reviewRounds.flatMap((round) => round.executionGroup === undefined ? [] : [round.executionGroup])
+    ...reviewRounds.flatMap((round) => (
+      !operationalReviewRoundIds.has(round.id) || round.executionGroup === undefined
+        ? []
+        : [round.executionGroup]
+    ))
   ];
   const seen = new Set<string>();
   return groups.filter((group) => {

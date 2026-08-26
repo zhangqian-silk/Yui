@@ -33,6 +33,7 @@ import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
+import { runOwnsBlockingProviderContinuation } from "../runtime/runtimeContinuationProjection.js";
 import {
   clearMatchingLeaderStallAttention,
   latestRunDurableProgressAt,
@@ -43,6 +44,7 @@ import { markTaskWakeConsumed } from "../scheduler/taskWake.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   workItemExecutionGroupById,
+  workItemOwnsUnresolvedExecutionLane,
   updateWorkItemExecutionGroup,
   updateWorkItemStatus
 } from "../workItem/workItem.js";
@@ -375,6 +377,14 @@ export function terminalizeExactTaskRun(
   if (!matchesLaunchFence(store, sessions, input)) {
     return obsolete(run, "launch-fence-mismatch");
   }
+  if (runOwnsBlockingProviderContinuation(store.listEvents(input.taskId), {
+    taskId: run.taskId,
+    roleName: run.roleName,
+    runId: run.id,
+    agentId: run.effective.agentId
+  })) {
+    return obsolete(run, "provider-continuation-writer-owned");
+  }
 
   // Validate the exact ReviewRound, Candidate, stored workspace, and frozen
   // Project heads before any mailbox or Round write.
@@ -692,7 +702,13 @@ function recoverExactAgentRunInTransaction(
   const terminal = terminalization.run;
   if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
     const item = store.getWorkItem(input.taskId, terminal.workItemId);
-    if (item !== null && !["completed", "failed", "retired"].includes(item.status)) {
+    if (item !== null
+      && !["completed", "failed", "retired"].includes(item.status)
+      && !workItemOwnsUnresolvedExecutionLane(
+        item,
+        terminal.executionGroupId,
+        terminal.executionLaneId
+      )) {
       store.saveWorkItem(input.taskId, updateWorkItemStatus(item, "failed", input.now, input.reason));
     }
   }
