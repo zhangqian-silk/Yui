@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import type { AgentRun } from "../run/agentRun.js";
 import type { Task, TaskStatus } from "../task/task.js";
-import type { WorkItem } from "../workItem/workItem.js";
+import {
+  currentWorkItemExecutionGroup,
+  type WorkItem
+} from "../workItem/workItem.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import {
@@ -12,6 +15,12 @@ import type { InputRequest } from "../input/inputRequest.js";
 import type { TaskMessage } from "../message/message.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+import {
+  executionStageSpendClosed,
+  observedExecutionResourceUsage,
+  projectExecutionStageResources,
+  type ResourceLaneIdentity
+} from "../execution/resourceBroker.js";
 
 /**
  * Machine-derived disposition of a terminal Leader Run. The Scheduler uses it
@@ -81,6 +90,80 @@ export type ActionabilityReadStore = Readonly<{
 
 const TERMINAL_WORK_ITEM_STATUSES = new Set(["completed", "retired"]);
 const CONSUMED_INTEGRATION_STATUSES = new Set(["committed", "superseded"]);
+
+export type ResourceQueueProjectionStore = Readonly<{
+  listActiveTaskIds(): readonly string[];
+  listAgentRuns(taskId: string): readonly AgentRun[];
+  listWorkItems(taskId: string): readonly WorkItem[];
+  listReviewRounds(taskId: string): readonly ReviewRound[];
+  listEvents(taskId: string): readonly TaskEvent[];
+}>;
+
+/** Exact durable Broker queue shared by admission and wake actionability. */
+export function projectQueuedResourceLaneIdentities(
+  store: ResourceQueueProjectionStore,
+  now: Date
+): ResourceLaneIdentity[] {
+  return store.listActiveTaskIds().flatMap((taskId) => {
+    const taskRuns = store.listAgentRuns(taskId);
+    const taskEvents = store.listEvents(taskId);
+    const workItemLanes = store.listWorkItems(taskId).flatMap((item) => {
+      if (item.status !== "running") return [];
+      const group = currentWorkItemExecutionGroup(item);
+      if (group === undefined || group.resolution !== undefined) return [];
+      if (group.stage !== undefined) {
+        const resources = projectExecutionStageResources({
+          group,
+          stageGroups: item.executionGroups,
+          usage: observedExecutionResourceUsage({
+            group,
+            stageGroups: item.executionGroups,
+            runs: taskRuns,
+            events: taskEvents
+          }),
+          now
+        });
+        if (executionStageSpendClosed(resources)) return [];
+      }
+      return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
+        if (lane.status !== "pending"
+          || lane.effective === undefined
+          || lane.runId !== undefined) return [];
+        return [{
+          taskId,
+          workItemId: item.id,
+          executionGroupId: group.id,
+          executionLaneId: lane.id,
+          providerId: lane.effective.adapterId,
+          agentId: lane.effective.agentId,
+          ...(lane.effective.model === undefined ? {} : { model: lane.effective.model }),
+          requestedAt: lane.updatedAt
+        }];
+      });
+    });
+    const reviewLanes = store.listReviewRounds(taskId).flatMap((round) => {
+      if (round.status !== "pending" && round.status !== "running") return [];
+      const group = round.executionGroup;
+      if (group === undefined || group.resolution !== undefined) return [];
+      return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
+        if (lane.status !== "pending"
+          || lane.effective === undefined
+          || lane.runId !== undefined) return [];
+        return [{
+          taskId,
+          ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
+          executionGroupId: group.id,
+          executionLaneId: lane.id,
+          providerId: lane.effective.adapterId,
+          agentId: lane.effective.agentId,
+          ...(lane.effective.model === undefined ? {} : { model: lane.effective.model }),
+          requestedAt: lane.updatedAt
+        }];
+      });
+    });
+    return [...workItemLanes, ...reviewLanes];
+  });
+}
 
 /**
  * True only when the Task still owns a Resource-Broker-queued Lane that a
@@ -177,10 +260,25 @@ export function collectTaskActionability(
   }
 
   // A Resource-Broker-queued Lane is durable but deliberately has no active
-  // Run. Include the global active Lane capacity counts only for Tasks that are
-  // actually queued, so capacity release changes their digest and the normal
-  // orphan repair can wake the Leader without polling or a second scheduler.
-  const hasQueuedResourceLane = hasDispatchableQueuedResourceLane(store, taskId);
+  // Run. Include the global capacity and fair-queue projection only for Tasks
+  // that are actually queued, so either capacity or an older reservation being
+  // released changes their digest without polling or a second scheduler.
+  const queueProjectionAvailable = store.listActiveTaskIds !== undefined
+    && store.listWorkItems !== undefined
+    && store.listReviewRounds !== undefined
+    && store.listEvents !== undefined;
+  const queuedResourceLanes = queueProjectionAvailable
+    ? projectQueuedResourceLaneIdentities({
+        listActiveTaskIds: () => store.listActiveTaskIds!(),
+        listAgentRuns: (candidateTaskId) => store.listAgentRuns(candidateTaskId),
+        listWorkItems: (candidateTaskId) => store.listWorkItems!(candidateTaskId),
+        listReviewRounds: (candidateTaskId) => store.listReviewRounds!(candidateTaskId),
+        listEvents: (candidateTaskId) => store.listEvents!(candidateTaskId)
+      }, now)
+    : [];
+  const hasQueuedResourceLane = queueProjectionAvailable
+    ? queuedResourceLanes.some((lane) => lane.taskId === taskId)
+    : hasDispatchableQueuedResourceLane(store, taskId);
   if (hasQueuedResourceLane && store.listActiveTaskIds !== undefined) {
     const activeResourceScopes = store.listActiveTaskIds().flatMap((activeTaskId) => (
       operationalTaskRecords(
@@ -216,6 +314,24 @@ export function collectTaskActionability(
         .map(([scope, count]) => `${scope}=${count}`)
         .join("|")
     });
+    if (queueProjectionAvailable) {
+      facts.push({
+        key: "resource-broker:fair-queue",
+        value: queuedResourceLanes
+          .map((lane) => [
+            lane.requestedAt,
+            lane.taskId,
+            lane.workItemId ?? "",
+            lane.executionGroupId,
+            lane.executionLaneId,
+            lane.providerId,
+            lane.agentId,
+            lane.model ?? "default"
+          ].join("|"))
+          .sort()
+          .join("\n")
+      });
+    }
   }
 
   for (const round of reviewRounds) {

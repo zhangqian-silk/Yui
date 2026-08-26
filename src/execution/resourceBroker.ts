@@ -173,10 +173,11 @@ export function planResourceAdmissions(input: Readonly<{
   for (const raw of input.requests) {
     const request = validateLaneIdentity(raw);
     const directLimits = activeLimits(policy, active, request);
+    const activeLaneKeys = new Set(active.map(resourceLaneKey));
     const queuedBefore = [
       ...queued,
       ...decisions.filter(({ decision }) => decision === "queued").map(({ request }) => request)
-    ];
+    ].filter((candidate) => !activeLaneKeys.has(resourceLaneKey(candidate)));
     const fairReservations = directLimits.length === 0
       ? reservableOlderQueuedLanes(policy, active, queuedBefore, request)
       : [];
@@ -196,10 +197,7 @@ export function planResourceAdmissions(input: Readonly<{
       }));
       continue;
     }
-    const groupQueued = [
-      ...queued,
-      ...decisions.filter(({ decision }) => decision === "queued").map(({ request }) => request)
-    ].filter(({ taskId, executionGroupId }) => (
+    const groupQueued = queuedBefore.filter(({ taskId, executionGroupId }) => (
       taskId === request.taskId && executionGroupId === request.executionGroupId
     )).length;
     if (groupQueued >= policy.maxQueuedLanesPerGroup) {

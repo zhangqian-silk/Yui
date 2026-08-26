@@ -89,6 +89,7 @@ import {
   preflightTaskCompletion,
   runTaskCommand,
   normalizedExecutionLanePlan,
+  resolvedExecutionStageRetryGroup,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
@@ -2382,6 +2383,9 @@ async function prepareExecutionLaneWorkspacesForCommand(
     requestedRoles: roles,
     requestedStrategy,
     existingGroup: group === undefined ? undefined : group,
+    resolvedRetryGroup: isDispatch
+      ? resolvedExecutionStageRetryGroup(currentGroup)
+      : undefined,
     status: item.status,
     nextGroupId: `execution-group-${store.peekNextAgentRunId(item.taskId)}`,
     retryLaneId,
@@ -2399,8 +2403,7 @@ async function prepareExecutionLaneWorkspacesForCommand(
     if (!same) throw usageError(`ExecutionGroup strategy is frozen: ${group.id}.`);
   }
   const laneCount = plan.requestedCount;
-  const strategyArg = args.find((value) => value.startsWith("adaptive:") || value.startsWith("fixed:"));
-  const adaptive = strategyArg?.startsWith("adaptive:") === true || group?.strategy.mode === "adaptive";
+  const adaptive = plan.strategy.mode === "adaptive";
   const needsIsolation = adaptive || laneCount > 1 || (group?.lanes.length ?? 0) > 1;
   if (!needsIsolation) return undefined;
   const groupId = group?.id ?? `execution-group-${store.peekNextAgentRunId(item.taskId)}`;

@@ -322,7 +322,8 @@ import { renderWakeReason, wakeReason } from "../scheduler/wakeReason.js";
 import {
   collectTaskActionability,
   computeActionabilityDigest,
-  deriveLeaderRunDisposition
+  deriveLeaderRunDisposition,
+  projectQueuedResourceLaneIdentities
 } from "../scheduler/actionability.js";
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import {
@@ -719,12 +720,25 @@ export type NormalizedExecutionLanePlan = Readonly<{
   laneIds: readonly string[];
 }>;
 
+/** A bounded same-stage retry repeats the frozen topology and Lane owners. */
+export function resolvedExecutionStageRetryGroup(
+  group: ExecutionGroup | undefined
+): ExecutionGroup | undefined {
+  if (group?.stage === undefined || group.resolution === undefined) return undefined;
+  if (group.resolution.decision !== "retry"
+    && group.resolution.decision !== "blocked") return undefined;
+  return group.stage.stage === "resolve" && group.resolution.decision === "retry"
+    ? undefined
+    : group;
+}
+
 /** Derive the complete Worker Lane plan once for both preflight and mutation. */
 export function normalizedExecutionLanePlan(input: Readonly<{
   assignee: string;
   requestedRoles: readonly string[];
   requestedStrategy?: ExecutionStrategy;
   existingGroup?: Pick<ExecutionGroup, "id" | "lanes" | "strategy">;
+  resolvedRetryGroup?: Pick<ExecutionGroup, "lanes" | "strategy">;
   status: WorkItemStatus;
   nextGroupId: string;
   retryLaneId?: string;
@@ -746,9 +760,12 @@ export function normalizedExecutionLanePlan(input: Readonly<{
     ? []
     : resumingQueued
       ? queued.map(({ roleName }) => roleName)
+    : input.resolvedRetryGroup !== undefined && input.requestedRoles.length === 0
+      ? input.resolvedRetryGroup.lanes.map(({ roleName }) => roleName)
     : normalizedExecutionLaneRoles(input.assignee, input.requestedRoles, expanding);
   const strategy = input.existingGroup?.strategy
     ?? input.requestedStrategy
+    ?? input.resolvedRetryGroup?.strategy
     ?? { mode: "fixed", count: roles.length };
   const capacity = strategy.mode === "fixed" ? strategy.count : strategy.max;
   const requestedCount = retry
@@ -788,71 +805,6 @@ function activeResourceLaneIdentities(store: TaskWorkflowStore): ResourceLaneIde
       }];
     })
   ));
-}
-
-function queuedResourceLaneIdentities(
-  store: TaskWorkflowStore,
-  now: Date
-): ResourceLaneIdentity[] {
-  return store.listActiveTaskIds().flatMap((taskId) => {
-    const taskRuns = store.listAgentRuns(taskId);
-    const taskEvents = store.listEvents(taskId);
-    const workItemLanes = store.listWorkItems(taskId).flatMap((item) => {
-      if (item.status !== "running") return [];
-      const group = currentWorkItemExecutionGroup(item);
-      if (group === undefined || group.resolution !== undefined) return [];
-      if (group.stage !== undefined) {
-        const resources = projectExecutionStageResources({
-          group,
-          stageGroups: item.executionGroups,
-          usage: observedExecutionResourceUsage({
-            group,
-            stageGroups: item.executionGroups,
-            runs: taskRuns,
-            events: taskEvents
-          }),
-          now
-        });
-        if (executionStageSpendClosed(resources)) return [];
-      }
-      return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
-        if (lane.status !== "pending"
-          || lane.effective === undefined
-          || lane.runId !== undefined) return [];
-        return [{
-          taskId,
-          workItemId: item.id,
-          executionGroupId: group.id,
-          executionLaneId: lane.id,
-          providerId: lane.effective.adapterId,
-          agentId: lane.effective.agentId,
-          ...(lane.effective.model === undefined ? {} : { model: lane.effective.model }),
-          requestedAt: lane.updatedAt
-        }];
-      });
-    });
-    const reviewLanes = store.listReviewRounds(taskId).flatMap((round) => {
-      if (round.status !== "pending" && round.status !== "running") return [];
-      const group = round.executionGroup;
-      if (group === undefined || group.resolution !== undefined) return [];
-      return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
-        if (lane.status !== "pending"
-          || lane.effective === undefined
-          || lane.runId !== undefined) return [];
-        return [{
-          taskId,
-          ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
-          executionGroupId: group.id,
-          executionLaneId: lane.id,
-          providerId: lane.effective.adapterId,
-          agentId: lane.effective.agentId,
-          ...(lane.effective.model === undefined ? {} : { model: lane.effective.model }),
-          requestedAt: lane.updatedAt
-        }];
-      });
-    });
-    return [...workItemLanes, ...reviewLanes];
-  });
 }
 
 function taskProjectCommand(
@@ -3040,6 +2992,7 @@ function dispatchWork(
     const continuingExploration = currentGroup?.stage !== undefined
       && currentGroup.resolution !== undefined
       && (item.status === "running" || item.status === "failed");
+    const resolvedRetryGroup = resolvedExecutionStageRetryGroup(currentGroup);
     const startingExploration = item.executionGroups.length === 0
       && explorationMode !== undefined;
     if (!expanding
@@ -3119,6 +3072,7 @@ function dispatchWork(
       requestedRoles: requestedLaneRoles,
       requestedStrategy,
       existingGroup,
+      resolvedRetryGroup,
       status: item.status,
       nextGroupId: `execution-group-${tx.peekNextAgentRunId(task.id)}`,
       retryLaneId: undefined,
@@ -3240,7 +3194,7 @@ function dispatchWork(
       maxQueuedLanesPerGroup: Math.max(controllerConcurrency, available)
     });
     const activeResources = activeResourceLaneIdentities(tx);
-    const queuedResources = queuedResourceLaneIdentities(tx, now);
+    const queuedResources = projectQueuedResourceLaneIdentities(tx, now);
     const stageResources = group.stage === undefined
       ? undefined
       : projectExecutionStageResources({
@@ -6003,7 +5957,7 @@ function retryRun(
       const admission = planResourceAdmissions({
         policy,
         active: activeResourceLaneIdentities(tx),
-        queued: queuedResourceLaneIdentities(tx, now),
+        queued: projectQueuedResourceLaneIdentities(tx, now),
         requests: [{
           taskId: task.id,
           workItemId: retryItem.id,
@@ -8065,7 +8019,7 @@ export function dispatchPreparedReviewRound(
       maxQueuedLanesPerGroup: Math.max(controllerConcurrency, capacity)
     });
     const activeResources = activeResourceLaneIdentities(tx);
-    const queuedResources = queuedResourceLaneIdentities(tx, now);
+    const queuedResources = projectQueuedResourceLaneIdentities(tx, now);
     const reviewBaseline = dispatchLanes.length === 0
       ? undefined
       : freezeReviewStageContextSnapshot(tx, {
