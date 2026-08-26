@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import type { AgentRun } from "../run/agentRun.js";
 import type { Task, TaskStatus } from "../task/task.js";
-import type { WorkItem } from "../workItem/workItem.js";
+import {
+  currentWorkItemExecutionGroup,
+  type WorkItem
+} from "../workItem/workItem.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import {
@@ -12,6 +15,12 @@ import type { InputRequest } from "../input/inputRequest.js";
 import type { TaskMessage } from "../message/message.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+import {
+  executionStageSpendClosed,
+  observedExecutionResourceUsage,
+  projectExecutionStageResources,
+  type ResourceLaneIdentity
+} from "../execution/resourceBroker.js";
 
 /**
  * Machine-derived disposition of a terminal Leader Run. The Scheduler uses it
@@ -69,6 +78,7 @@ export function computeActionabilityDigest(input: ActionabilityDigestInput): str
 export type ActionabilityReadStore = Readonly<{
   getTask(taskId: string): Task | null;
   listAgentRuns(taskId: string): readonly AgentRun[];
+  listActiveTaskIds?(): readonly string[];
   listWorkItems?(taskId: string): readonly WorkItem[];
   listReviewRounds?(taskId: string): readonly ReviewRound[];
   listIntegrationAttempts?(taskId: string): readonly IntegrationAttempt[];
@@ -80,6 +90,105 @@ export type ActionabilityReadStore = Readonly<{
 
 const TERMINAL_WORK_ITEM_STATUSES = new Set(["completed", "retired"]);
 const CONSUMED_INTEGRATION_STATUSES = new Set(["committed", "superseded"]);
+
+export type ResourceQueueProjectionStore = Readonly<{
+  listActiveTaskIds(): readonly string[];
+  listAgentRuns(taskId: string): readonly AgentRun[];
+  listWorkItems(taskId: string): readonly WorkItem[];
+  listReviewRounds(taskId: string): readonly ReviewRound[];
+  listEvents(taskId: string): readonly TaskEvent[];
+}>;
+
+/** Exact durable Broker queue shared by admission and wake actionability. */
+export function projectQueuedResourceLaneIdentities(
+  store: ResourceQueueProjectionStore,
+  now: Date
+): ResourceLaneIdentity[] {
+  return store.listActiveTaskIds().flatMap((taskId) => {
+    const taskRuns = store.listAgentRuns(taskId);
+    const taskEvents = store.listEvents(taskId);
+    const workItemLanes = store.listWorkItems(taskId).flatMap((item) => {
+      if (item.status !== "running") return [];
+      const group = currentWorkItemExecutionGroup(item);
+      if (group === undefined || group.resolution !== undefined) return [];
+      if (group.stage !== undefined) {
+        const resources = projectExecutionStageResources({
+          group,
+          stageGroups: item.executionGroups,
+          usage: observedExecutionResourceUsage({
+            group,
+            stageGroups: item.executionGroups,
+            runs: taskRuns,
+            events: taskEvents
+          }),
+          now
+        });
+        if (executionStageSpendClosed(resources)) return [];
+      }
+      return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
+        if (lane.status !== "pending"
+          || lane.effective === undefined
+          || lane.runId !== undefined) return [];
+        return [{
+          taskId,
+          workItemId: item.id,
+          executionGroupId: group.id,
+          executionLaneId: lane.id,
+          providerId: lane.effective.adapterId,
+          agentId: lane.effective.agentId,
+          ...(lane.effective.model === undefined ? {} : { model: lane.effective.model }),
+          requestedAt: lane.updatedAt
+        }];
+      });
+    });
+    const reviewLanes = store.listReviewRounds(taskId).flatMap((round) => {
+      if (round.status !== "pending" && round.status !== "running") return [];
+      const group = round.executionGroup;
+      if (group === undefined || group.resolution !== undefined) return [];
+      return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
+        if (lane.status !== "pending"
+          || lane.effective === undefined
+          || lane.runId !== undefined) return [];
+        return [{
+          taskId,
+          ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
+          executionGroupId: group.id,
+          executionLaneId: lane.id,
+          providerId: lane.effective.adapterId,
+          agentId: lane.effective.agentId,
+          ...(lane.effective.model === undefined ? {} : { model: lane.effective.model }),
+          requestedAt: lane.updatedAt
+        }];
+      });
+    });
+    return [...workItemLanes, ...reviewLanes];
+  });
+}
+
+/**
+ * True only when the Task still owns a Resource-Broker-queued Lane that a
+ * later Leader dispatch may start. Terminal owners retain their immutable
+ * Group history, but can never reserve live queue capacity.
+ */
+export function hasDispatchableQueuedResourceLane(
+  store: Pick<ActionabilityReadStore, "listWorkItems" | "listReviewRounds">,
+  taskId: string
+): boolean {
+  const workItemGroups = (store.listWorkItems?.(taskId) ?? [])
+    .filter(({ status }) => status === "running")
+    .flatMap(({ executionGroups }) => executionGroups);
+  const reviewGroups = (store.listReviewRounds?.(taskId) ?? [])
+    .filter(({ status }) => status === "pending" || status === "running")
+    .flatMap(({ executionGroup }) => executionGroup === undefined ? [] : [executionGroup]);
+  return [...workItemGroups, ...reviewGroups].some((group) => (
+    group.resolution === undefined
+    && group.lanes.some((lane) => (
+      lane.status === "pending"
+      && lane.effective !== undefined
+      && lane.runId === undefined
+    ))
+  ));
+}
 
 /**
  * Fold a Task's durable records into the normalized actionable facts. This
@@ -105,7 +214,8 @@ const CONSUMED_INTEGRATION_STATUSES = new Set(["committed", "superseded"]);
  */
 export function collectTaskActionability(
   store: ActionabilityReadStore,
-  taskId: string
+  taskId: string,
+  now = new Date()
 ): ActionabilityDigestInput {
   const task = store.getTask(taskId);
   if (task === null) {
@@ -130,15 +240,101 @@ export function collectTaskActionability(
     });
   }
 
-  for (const item of store.listWorkItems?.(taskId) ?? []) {
+  const workItems = store.listWorkItems?.(taskId) ?? [];
+  const reviewRounds = store.listReviewRounds?.(taskId) ?? [];
+  for (const item of workItems) {
     if (TERMINAL_WORK_ITEM_STATUSES.has(item.status)) continue;
     facts.push({
       key: `work-item:${item.id}`,
       value: `${item.status}|${item.updatedAt}`
     });
+    for (const group of item.executionGroups) {
+      if (group.resolution !== undefined || group.stage?.resources === undefined) continue;
+      facts.push({
+        key: `resource-deadline:${group.id}`,
+        value: now.getTime() >= Date.parse(group.stage.resources.deadlineAt)
+          ? "reached"
+          : "open"
+      });
+    }
   }
 
-  for (const round of store.listReviewRounds?.(taskId) ?? []) {
+  // A Resource-Broker-queued Lane is durable but deliberately has no active
+  // Run. Include the global capacity and fair-queue projection only for Tasks
+  // that are actually queued, so either capacity or an older reservation being
+  // released changes their digest without polling or a second scheduler.
+  const queueProjectionAvailable = store.listActiveTaskIds !== undefined
+    && store.listWorkItems !== undefined
+    && store.listReviewRounds !== undefined
+    && store.listEvents !== undefined;
+  const queuedResourceLanes = queueProjectionAvailable
+    ? projectQueuedResourceLaneIdentities({
+        listActiveTaskIds: () => store.listActiveTaskIds!(),
+        listAgentRuns: (candidateTaskId) => store.listAgentRuns(candidateTaskId),
+        listWorkItems: (candidateTaskId) => store.listWorkItems!(candidateTaskId),
+        listReviewRounds: (candidateTaskId) => store.listReviewRounds!(candidateTaskId),
+        listEvents: (candidateTaskId) => store.listEvents!(candidateTaskId)
+      }, now)
+    : [];
+  const hasQueuedResourceLane = queueProjectionAvailable
+    ? queuedResourceLanes.some((lane) => lane.taskId === taskId)
+    : hasDispatchableQueuedResourceLane(store, taskId);
+  if (hasQueuedResourceLane && store.listActiveTaskIds !== undefined) {
+    const activeResourceScopes = store.listActiveTaskIds().flatMap((activeTaskId) => (
+      operationalTaskRecords(
+        store.listAgentRuns(activeTaskId),
+        store.listEvents?.(activeTaskId) ?? [],
+        "agent-run"
+      ).flatMap((run) => (
+        run.status !== "active"
+        || run.executionGroupId === undefined
+        || run.executionLaneId === undefined
+          ? []
+          : [
+              "home",
+              `task:${activeTaskId}`,
+              ...(run.workItemId === undefined
+                ? []
+                : [`work-item:${activeTaskId}/${run.workItemId}`]),
+              `group:${activeTaskId}/${run.executionGroupId}`,
+              `provider:${run.effective.adapterId}`,
+              `agent:${run.effective.agentId}`,
+              `model:${run.effective.adapterId}/${run.effective.model ?? "default"}`
+            ]
+      ))
+    ));
+    const activeResourceCounts = new Map<string, number>();
+    for (const scope of activeResourceScopes) {
+      activeResourceCounts.set(scope, (activeResourceCounts.get(scope) ?? 0) + 1);
+    }
+    facts.push({
+      key: "resource-broker:active-capacity",
+      value: [...activeResourceCounts]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([scope, count]) => `${scope}=${count}`)
+        .join("|")
+    });
+    if (queueProjectionAvailable) {
+      facts.push({
+        key: "resource-broker:fair-queue",
+        value: queuedResourceLanes
+          .map((lane) => [
+            lane.requestedAt,
+            lane.taskId,
+            lane.workItemId ?? "",
+            lane.executionGroupId,
+            lane.executionLaneId,
+            lane.providerId,
+            lane.agentId,
+            lane.model ?? "default"
+          ].join("|"))
+          .sort()
+          .join("\n")
+      });
+    }
+  }
+
+  for (const round of reviewRounds) {
     if (round.status === "completed") continue;
     facts.push({
       key: `review:${round.id}`,

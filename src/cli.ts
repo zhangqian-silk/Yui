@@ -89,6 +89,7 @@ import {
   preflightTaskCompletion,
   runTaskCommand,
   normalizedExecutionLanePlan,
+  resolvedExecutionStageRetryGroup,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
@@ -1590,10 +1591,12 @@ export async function main(): Promise<void> {
           : store.getReviewRound(requestedRound.taskId, requestedRound.id);
         let reviewOutput = "";
         let reviewData: unknown;
+        const resumesReviewDispatch = (resolved[1] === "review" && resolved[2] === "request")
+          || (resolved[1] === "work" && resolved[2] === "review")
+          || (resolved[1] === "run" && resolved[2] === "retry");
         const reviewDispatchNeeded = requestedRound?.status === "pending"
           || (requestedRound?.status === "running"
-            && resolved[1] === "review"
-            && resolved[2] === "request"
+            && resumesReviewDispatch
             && persistedRequestedRound?.executionGroup?.lanes.some((lane) => (
               lane.status === "pending" && lane.runId === undefined
             )) === true);
@@ -1649,10 +1652,12 @@ export async function main(): Promise<void> {
                   : { deltaRecheckDiff: deltaRecheckPreflight.diffByProject })
               }
             );
-            reviewOutput = `Review queued as ${requestedRound.id} (${run.id})\n`;
+            reviewOutput = run === null
+              ? `Review ${requestedRound.id} retained pending by Resource Broker\n`
+              : `Review queued as ${requestedRound.id} (${run.id})\n`;
             reviewData = {
               reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
-              reviewRun: run,
+              ...(run === null ? {} : { reviewRun: run }),
               workspace
             };
           } catch (error) {
@@ -2299,6 +2304,12 @@ async function candidateMaterializationForTaskCommand(
     : currentWorkItemExecutionGroup(item);
   if (item === null || item === undefined || group === undefined) return undefined;
   if (group.stage !== undefined && group.stage.stage !== "resolve") return undefined;
+  // Early termination first stops never-started spend. Active stragglers are
+  // deliberately retained, so the command records that stop and leaves the
+  // group unresolved. Do not merge Lane output into the WorkItem Candidate
+  // until those active Lanes settle and the Leader resolves the group again.
+  if (args.includes("--early-stop")
+    && group.lanes.some(({ status }) => status === "running")) return undefined;
   const selected = args.flatMap((value, index) => value === "--lane" && args[index + 1] !== undefined ? [args[index + 1]!] : []);
   const materializedLaneIds = selected.length === 0
     ? group.lanes
@@ -2372,6 +2383,9 @@ async function prepareExecutionLaneWorkspacesForCommand(
     requestedRoles: roles,
     requestedStrategy,
     existingGroup: group === undefined ? undefined : group,
+    resolvedRetryGroup: isDispatch
+      ? resolvedExecutionStageRetryGroup(currentGroup)
+      : undefined,
     status: item.status,
     nextGroupId: `execution-group-${store.peekNextAgentRunId(item.taskId)}`,
     retryLaneId,
@@ -2389,8 +2403,7 @@ async function prepareExecutionLaneWorkspacesForCommand(
     if (!same) throw usageError(`ExecutionGroup strategy is frozen: ${group.id}.`);
   }
   const laneCount = plan.requestedCount;
-  const strategyArg = args.find((value) => value.startsWith("adaptive:") || value.startsWith("fixed:"));
-  const adaptive = strategyArg?.startsWith("adaptive:") === true || group?.strategy.mode === "adaptive";
+  const adaptive = plan.strategy.mode === "adaptive";
   const needsIsolation = adaptive || laneCount > 1 || (group?.lanes.length ?? 0) > 1;
   if (!needsIsolation) return undefined;
   const groupId = group?.id ?? `execution-group-${store.peekNextAgentRunId(item.taskId)}`;

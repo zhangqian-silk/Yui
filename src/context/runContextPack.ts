@@ -71,8 +71,51 @@ export function freezeRunContextSnapshot(
     "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId" | "workspace"
   >>,
   now: Date,
-  frozenBy: "leader" | "controller" = "controller"
+  frozenBy: "leader" | "controller" = "controller",
+  baselineRef?: ContextSnapshotRef
 ): ContextSnapshot {
+  if (baselineRef !== undefined) {
+    const baseline = store.getContextSnapshot(run.taskId, baselineRef.id);
+    if (baseline === null
+      || baseline.taskId !== run.taskId
+      || baselineRef.taskId !== run.taskId
+      || baseline.digest !== baselineRef.digest
+      || baseline.sequence !== baselineRef.sequence
+      || baseline.scope !== "stage"
+      || baselineRef.scope !== baseline.scope
+      || baseline.scopeRef !== baselineRef.scopeRef) {
+      throw new Error(`Run Context baseline is missing or drifted: ${baselineRef.id}.`);
+    }
+    validateContextSnapshot(baseline);
+    const overlays = collectRunContextOverlays(store, run);
+    const resources = [...new Map([...baseline.resources, ...overlays].map((entry) => [
+      contextRefIdentity(entry.ref),
+      entry
+    ])).values()].sort((left, right) => (
+      contextRefIdentity(left.ref).localeCompare(contextRefIdentity(right.ref))
+    ));
+    const previous = store.listContextSnapshots(run.taskId)
+      .filter((candidate) => candidate.scope === baseline.scope
+        && candidate.scopeRef === baseline.scopeRef)
+      .sort((left, right) => left.sequence - right.sequence)
+      .at(-1);
+    const snapshot = createContextSnapshot({
+      id: store.nextContextSnapshotId(run.taskId),
+      taskId: run.taskId,
+      scope: baseline.scope,
+      scopeRef: baseline.scopeRef,
+      sequence: (previous?.sequence ?? baseline.sequence) + 1,
+      refs: resources.map(({ ref }) => ref),
+      resources,
+      ...(baseline.repoCommit === undefined ? {} : { repoCommit: baseline.repoCommit }),
+      acceptRefs: baseline.acceptRefs,
+      parentRef: contextSnapshotRef(baseline),
+      frozenAt: now,
+      frozenBy
+    });
+    store.saveContextSnapshot(snapshot);
+    return snapshot;
+  }
   const scope: ContextSnapshotScope = run.reviewRoundId !== undefined
     ? "stage"
     : run.workItemId !== undefined
@@ -187,6 +230,66 @@ export function freezeExecutionStageContextSnapshot(
   });
   store.saveContextSnapshot(stageSnapshot);
   return stageSnapshot;
+}
+
+/**
+ * Freeze the role-neutral baseline for one Reviewer ExecutionGroup before
+ * admission. Delayed or retried sibling Lanes reuse the same immutable
+ * ReviewRound/Task/Project values and add only their Role overlay.
+ */
+export function freezeReviewStageContextSnapshot(
+  store: TaskStore,
+  input: Readonly<{
+    taskId: string;
+    reviewRoundId: string;
+    executionGroupId: string;
+  }>,
+  now: Date
+): ContextSnapshot {
+  const existing = store.listContextSnapshots(input.taskId)
+    .filter((candidate) => candidate.scope === "stage"
+      && candidate.scopeRef === input.executionGroupId
+      && candidate.parentRef === undefined)
+    .sort((left, right) => left.sequence - right.sequence)
+    .at(0);
+  if (existing !== undefined) return validateContextSnapshot(existing);
+
+  const round = store.getReviewRound(input.taskId, input.reviewRoundId);
+  if (round === null) throw new Error(`ReviewRound not found: ${input.reviewRoundId}.`);
+  const materialized = collectAuthorizedContext(store, {
+    taskId: input.taskId,
+    roleName: round.reviewerRoleName,
+    purpose: "review",
+    ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
+    reviewRoundId: round.id
+  }).filter(({ ref }) => (
+    ref.store !== "role-profile" && ref.store !== "managed-workspace"
+  ));
+  if (!materialized.some(({ ref }) => (
+    ref.store === "review-round" && ref.refId === round.id
+  ))) {
+    throw new Error(`ReviewRound Context baseline is unavailable: ${round.id}.`);
+  }
+  const resources = [...new Map(materialized.map((entry) => [
+    contextRefIdentity(entry.ref),
+    entry
+  ])).values()].sort((left, right) => (
+    contextRefIdentity(left.ref).localeCompare(contextRefIdentity(right.ref))
+  ));
+  const snapshot = createContextSnapshot({
+    id: store.nextContextSnapshotId(input.taskId),
+    taskId: input.taskId,
+    scope: "stage",
+    scopeRef: input.executionGroupId,
+    sequence: 1,
+    refs: resources.map(({ ref }) => ref),
+    resources,
+    acceptRefs: round.workItemId === undefined ? [] : [`work-item:${round.workItemId}:acceptance`],
+    frozenAt: now,
+    frozenBy: "controller"
+  });
+  store.saveContextSnapshot(snapshot);
+  return snapshot;
 }
 
 /** Bounded changed-ref hint between one frozen Snapshot and its exact parent. */
@@ -373,21 +476,7 @@ function collectAuthorizedContext(
   if (brief !== null && view === "leader") {
     result.push(materialize("L2", "task-brief", task.id, brief));
   }
-  const role = store.getRole(task.id, run.roleName);
-  if (role === null) throw new Error(`Run Role not found: ${task.id}/${run.roleName}.`);
-  result.push(materialize("L1", "role-profile", role.name, {
-    name: role.name,
-    defaultAccess: role.defaultAccess,
-    description: role.description,
-    responsibilities: role.responsibilities ?? [],
-    constraints: role.constraints ?? [],
-    expectedOutput: role.expectedOutput,
-    skills: role.skills ?? [],
-    launchRevision: role.launchRevision
-  }));
-  if ("workspace" in run && run.workspace !== undefined) {
-    result.push(materialize("L3", "managed-workspace", `${run.taskId}/${run.roleName}`, run.workspace));
-  }
+  result.push(...collectRunContextOverlays(store, run));
   if (run.workItemId !== undefined) {
     const item = store.getWorkItem(task.id, run.workItemId);
     if (item === null) throw new Error(`Run WorkItem not found: ${run.workItemId}.`);
@@ -480,6 +569,38 @@ function collectAuthorizedContext(
   return [...unique.values()].sort((left, right) => (
     contextRefIdentity(left.ref).localeCompare(contextRefIdentity(right.ref))
   ));
+}
+
+/** Lane-specific context that may be layered over an immutable stage base. */
+function collectRunContextOverlays(
+  store: TaskStore,
+  run: Readonly<Pick<
+    AgentRun,
+    "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId" | "workspace"
+  >>
+): MaterializedRef[] {
+  const role = store.getRole(run.taskId, run.roleName);
+  if (role === null) throw new Error(`Run Role not found: ${run.taskId}/${run.roleName}.`);
+  return [
+    materialize("L1", "role-profile", role.name, {
+      name: role.name,
+      defaultAccess: role.defaultAccess,
+      description: role.description,
+      responsibilities: role.responsibilities ?? [],
+      constraints: role.constraints ?? [],
+      expectedOutput: role.expectedOutput,
+      skills: role.skills ?? [],
+      launchRevision: role.launchRevision
+    }),
+    ...("workspace" in run && run.workspace !== undefined
+      ? [materialize(
+          "L3",
+          "managed-workspace",
+          `${run.taskId}/${run.roleName}`,
+          run.workspace
+        )]
+      : [])
+  ];
 }
 
 function materialize(layer: ContextRef["layer"], store: string, refId: string, value: unknown): MaterializedRef {

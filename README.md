@@ -540,7 +540,9 @@ accepted Resolve stage materializes the existing single Candidate:
 ```sh
 yui task work dispatch <task-id>/<work-item-id> \
   --mode parallel-diverse --max-rounds 2 --stage-max-attempts 2 \
-  --strategy fixed:2 --lane-role critic
+  --strategy fixed:2 --lane-role critic \
+  --stage-max-tokens 240000 --stage-max-tool-calls 200 \
+  --stage-max-seconds 1800 --stage-quorum 2
 yui task work group resolve <task-id>/<work-item-id> \
   --decision accept --summary "Plan evidence is sufficient"
 ```
@@ -548,6 +550,28 @@ yui task work group resolve <task-id>/<work-item-id> \
 Every stage is a new immutable ExecutionGroup. Its ContextSnapshot and selected
 parent Lane results are durable references; `retry` repeats a stage within its
 attempt budget, while `retry` at Resolve begins the next bounded round.
+
+Each new stage also freezes one Resource Broker contract: token, tool-call and
+wall-clock budgets; quorum and deadline; a straggler window; and the minimum
+marginal value for more Lane spend. Omitted values reuse the existing context
+budget and runtime-health windows; stage retries share the original cumulative
+spend and absolute deadline. Execution, Lane retry, and Reviewer-panel
+admission all count active Lanes at Home, Task, WorkItem, Group, Provider,
+Agent, and model scopes. Capacity pressure keeps the excess Lane durably
+pending instead of failing the Group. Capacity release or deadline arrival
+wakes the Leader through the existing actionability path; rerunning the same
+dispatch resumes the frozen input. Released capacity is reserved for the
+oldest currently admissible waiter, while a Provider- or Agent-blocked queue
+head does not prevent independent scopes from making progress. Provider rate
+limits still use the existing in-place retry window and therefore never fan
+out into sibling failures.
+
+The Leader may add `--early-stop <0-100>` to an accepting Group resolution.
+Yui permits it only after quorum and T5's passed Verify/Resolve evidence prove
+sufficiency. It may skip Lanes that never started; active stragglers are
+reported and retained, never killed automatically for cost. If evidence is
+insufficient, budget or deadline exhaustion blocks the stage for Leader
+judgment instead of turning thin evidence into success.
 
 New exploration histories also freeze the structured candidate-convergence
 contract. Yui appends the exact stage-local JSON shape to every Lane assignment

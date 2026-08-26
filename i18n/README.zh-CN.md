@@ -295,7 +295,9 @@ yui task work dispatch <task-id>/<work-item-id> --input "完成实现并运行�
 ```sh
 yui task work dispatch <task-id>/<work-item-id> \
   --mode parallel-diverse --max-rounds 2 --stage-max-attempts 2 \
-  --strategy fixed:2 --lane-role critic
+  --strategy fixed:2 --lane-role critic \
+  --stage-max-tokens 240000 --stage-max-tool-calls 200 \
+  --stage-max-seconds 1800 --stage-quorum 2
 yui task work group resolve <task-id>/<work-item-id> \
   --decision accept --summary "Plan 证据充分"
 ```
@@ -303,6 +305,22 @@ yui task work group resolve <task-id>/<work-item-id> \
 每个阶段都是新的不可变 ExecutionGroup；其 ContextSnapshot 与选中的父 Lane
 结果都以持久引用衔接。`retry` 在阶段尝试预算内重做当前阶段，而 Resolve 上的
 `retry` 才进入下一轮，并受最大轮次约束。
+
+每个新阶段还会冻结一份 Resource Broker 契约：token、工具调用和墙钟预算，
+quorum 与 deadline，straggler 窗口，以及继续增加 Lane 所需的最低边际价值。
+省略这些参数时复用现有 context budget 与 runtime-health 时间窗；同一阶段的 retry
+累计原有花费并共享绝对 deadline。执行、Lane retry 和 Reviewer panel 准入统一核算
+Home、Task、WorkItem、Group、Provider、Agent 和模型层级的活动 Lane；容量不足的
+Lane 会耐久保留为 pending，不会把整个 Group 判失败。容量释放或 deadline 到达会沿
+既有 actionability 路径唤醒 Leader，重跑同一 dispatch 即按冻结输入继续。释放的
+容量优先留给最早且当前可准入的等待 Lane；受 Provider 或 Agent 限制的队首
+不会阻塞独立资源域继续推进。Provider 限流仍沿用既有的原地重试窗口，不会扩散成
+兄弟 Lane 失败。
+
+Leader 可在接受 Group 时增加 `--early-stop <0-100>`。只有 quorum 已满足且 T5 的
+Verify/Resolve 证据证明验收充分时，Yui 才允许提前终止；它只跳过从未启动的 Lane，
+运行中的 straggler 会被报告并保留，不会因为省费被自动杀死。证据不足时，预算或
+deadline 耗尽会把阶段留给 Leader 决议，绝不会把薄证据转换成成功。
 
 新建探索历史还会冻结结构化候选收敛契约。Yui 将当前阶段的精确 JSON 形状追加到
 每个 Lane assignment，并在 Leader 推进前校验入选报告：Compare 必须显式划分

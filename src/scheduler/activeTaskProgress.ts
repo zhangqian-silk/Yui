@@ -10,7 +10,8 @@ import { projectTaskExecution } from "./taskExecutionProjection.js";
 import {
   collectTaskActionability,
   computeActionabilityDigest,
-  decideOrphanWake
+  decideOrphanWake,
+  hasDispatchableQueuedResourceLane
 } from "./actionability.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 
@@ -40,6 +41,7 @@ export function repairOrphanedActiveTasks(
       return run === null ? [] : [run];
     });
     const hasInFlightTurn = roles.some((role) => store.hasInFlightTurn(task.id, role.name));
+    const hasLeaderInFlightTurn = store.hasInFlightTurn(task.id, "leader");
     const leaderTarget = { kind: "role", taskId: task.id, roleName: "leader" } as const;
     const leaderMailbox = store.getWorkMailbox(leaderTarget);
     const projection = projectTaskExecution({
@@ -51,22 +53,26 @@ export function repairOrphanedActiveTasks(
       leaderFailure: store.getLeaderFailure(task.id),
       operatorNotification: store.getOperatorNotification(task.id)
     });
+    const queuedAlongsideActiveSibling = hasDispatchableQueuedResourceLane(store, task.id)
+      && !activeRuns.some(({ roleName }) => roleName === "leader")
+      && activeRuns.some(({ roleName }) => roleName !== "leader")
+      && projection.status === "waiting-on-agents";
     if (
-      hasInFlightTurn
+      (queuedAlongsideActiveSibling ? hasLeaderInFlightTurn : hasInFlightTurn)
       || store.hasOpenInputRequest(task.id)
       || store.getLeaderFailure(task.id) !== null
       || store.getOperatorNotification(task.id) !== null
-      || projection.status !== "needs-leader-action"
+      || (projection.status !== "needs-leader-action" && !queuedAlongsideActiveSibling)
       || hasUnclaimedLeaderWork(store, task.id, leaderMailbox)
     ) {
       continue;
     }
 
-    // Issue 05: digest-based admission. Only the "no-executor" orphan path
-    // reaches here; every other needs-leader-action state already has a
-    // durable owner (candidate, integration, or pending wake) and is exempt.
-    if (projection.reason === "no-executor") {
-      if (admitOrphanWake(store, task.id) === "suppress") continue;
+    // Digest admission covers both an ownerless Task and a resource-queued
+    // Task with active siblings. The latter wakes only when capacity/deadline
+    // actionability changes, so repeated full scans remain silent.
+    if (projection.reason === "no-executor" || queuedAlongsideActiveSibling) {
+      if (admitOrphanWake(store, task.id, now) === "suppress") continue;
     }
 
     const taskWorkspace = store.getTaskWorkspace(task.id);
@@ -102,13 +108,15 @@ export function repairOrphanedActiveTasks(
  */
 function admitOrphanWake(
   store: SchedulerStorePort,
-  taskId: string
+  taskId: string,
+  now: Date
 ): "wake" | "suppress" {
   let digest: string;
   try {
     const input = collectTaskActionability(
       store as Parameters<typeof collectTaskActionability>[0],
-      taskId
+      taskId,
+      now
     );
     digest = computeActionabilityDigest(input);
   } catch (error) {

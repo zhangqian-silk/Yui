@@ -35,6 +35,8 @@ const WORK_ITEM_EXPLORATION_STAGE_FROM_VERSION = 9;
 const WORK_ITEM_EXPLORATION_STAGE_TO_VERSION = 10;
 const WORK_ITEM_CANDIDATE_CONVERGENCE_FROM_VERSION = 10;
 const WORK_ITEM_CANDIDATE_CONVERGENCE_TO_VERSION = 11;
+const WORK_ITEM_RESOURCE_SCHEDULING_FROM_VERSION = 11;
+const WORK_ITEM_RESOURCE_SCHEDULING_TO_VERSION = 12;
 const AGENT_RUN_FROM_VERSION = 5;
 const AGENT_RUN_TO_VERSION = 6;
 /**
@@ -175,6 +177,14 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       "workItem",
       WORK_ITEM_CANDIDATE_CONVERGENCE_FROM_VERSION,
       WORK_ITEM_CANDIDATE_CONVERGENCE_TO_VERSION,
+      "workItems"
+    ))
+    // Existing v11 histories remain valid immutable evidence without a T6
+    // resource policy. Newly planned stages always freeze the full policy.
+    .registerOfflineMigration(recordFamilyStep(
+      "workItem",
+      WORK_ITEM_RESOURCE_SCHEDULING_FROM_VERSION,
+      WORK_ITEM_RESOURCE_SCHEDULING_TO_VERSION,
       "workItems"
     ))
     .registerOfflineMigration(recordFamilyStep(

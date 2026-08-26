@@ -292,14 +292,20 @@ export function projectTaskExecution(
     executionGroups = []
   } = facts;
   const now = facts.now ?? new Date();
-  const groupSummaries = executionGroups.map((group) => summarizeExecutionGroupHealth({
-    group,
-    runs,
-    sessions: roleSessions,
-    events,
-    now,
-    policy: facts.runtimeHealthPolicy
-  }));
+  const groupSummaries = executionGroups.map((group) => {
+    const stageGroups = workItems.find((item) => (
+      item.executionGroups.some(({ id }) => id === group.id)
+    ))?.executionGroups;
+    return summarizeExecutionGroupHealth({
+      group,
+      ...(stageGroups === undefined ? {} : { stageGroups }),
+      runs,
+      sessions: roleSessions,
+      events,
+      now,
+      policy: facts.runtimeHealthPolicy
+    });
+  });
   const laneRecovery = actionableExecutionLaneRecoveries(groupSummaries)[0];
   const render = (input: ProjectionInput): TaskExecutionProjection => projection({
     ...input,

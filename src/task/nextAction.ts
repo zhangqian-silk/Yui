@@ -24,6 +24,15 @@ import {
   type ActionableExecutionLaneRecovery,
   type ExecutionGroupHealthSummary
 } from "../execution/executionHealth.js";
+import {
+  candidateConvergenceDisagreement,
+  candidateConvergenceEvidenceSufficient,
+  candidateConvergenceStageResultsValid
+} from "../execution/candidateConvergence.js";
+import {
+  executionStageSpendClosed,
+  routeExecutionStage
+} from "../execution/resourceBroker.js";
 import type { RunRecoveryProjection } from "../run/recoveryProjection.js";
 import {
   type TaskFinalReviewContract
@@ -63,6 +72,7 @@ export type NextActionKind =
   | "integrate-change-set"
   | "request-final-review"
   | "route-review-findings"
+  | "resolve-execution-stage"
   | "resolve-review-group"
   | "resume-review"
   | "recover-execution-lane"
@@ -244,6 +254,18 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         }
         const reviewRun = activeReviewRoundRun(activeReview, facts.activeRuns);
         if (reviewRun === undefined) {
+          if (reviewGroupHasResourceQueue(activeReview)) {
+            return buildAction(facts, {
+              kind: "resume-review",
+              reason: `ReviewRound ${activeReview.id} has Reviewer Lanes waiting for Resource Broker capacity.`,
+              refs: [reviewRef],
+              preconditions: [
+                { fact: "A Reviewer Lane is durably queued", satisfied: true, ref: reviewRef },
+                { fact: "Resource capacity is available", satisfied: false }
+              ],
+              recommendedCommand: `yui task work review ${task.id}/${candidateReady.id}`
+            });
+          }
           const runRef = ref("agent-run", activeReview.reviewerRunId);
           return buildAction(facts, {
             kind: "repair-protocol-inconsistency",
@@ -352,7 +374,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         recommendedCommand: `yui task review finding repair-wave ${task.id} --create`
       });
     }
-    const explorationStop = exhaustedExplorationReason(failedWork);
+    const explorationStop = exhaustedExplorationReason(failedWork, facts.executionGroups);
     if (explorationStop !== undefined) {
       return buildAction(facts, {
         kind: "implement-current-work-item",
@@ -395,6 +417,8 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   }
   if (openWork?.kind === "ready") {
     const item = openWork.item;
+    const stageAction = buildExecutionStageAction(facts, item);
+    if (stageAction !== null) return stageAction;
     const refs = [ref("work-item", item.id)];
     return buildAction(facts, {
       kind: "implement-current-work-item",
@@ -558,6 +582,19 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       }
       const reviewRun = activeReviewRoundRun(activeFinal, facts.activeRuns);
       if (reviewRun === undefined) {
+        if (reviewGroupHasResourceQueue(activeFinal)) {
+          return buildAction(facts, {
+            kind: "resume-review",
+            reason: `Task-final ReviewRound ${activeFinal.id} has Reviewer Lanes waiting for Resource Broker capacity.`,
+            refs: [reviewRef],
+            preconditions: [
+              { fact: "A Reviewer Lane is durably queued", satisfied: true, ref: reviewRef },
+              { fact: "Resource capacity is available", satisfied: false }
+            ],
+            recommendedCommand:
+              `yui task review request ${task.id} --role ${activeFinal.reviewerRoleName}`
+          });
+        }
         const runRef = ref("agent-run", activeFinal.reviewerRunId);
         return buildAction(facts, {
           kind: "repair-protocol-inconsistency",
@@ -726,7 +763,10 @@ function buildExecutionLaneRecoveryAction(
   });
 }
 
-function exhaustedExplorationReason(item: WorkItem): string | undefined {
+function exhaustedExplorationReason(
+  item: WorkItem,
+  executionGroups: readonly ExecutionGroupHealthSummary[] | undefined
+): string | undefined {
   const group = currentWorkItemExecutionGroup(item);
   if (group?.stage === undefined || group.resolution === undefined) return undefined;
   if (group.resolution.decision === "reject") {
@@ -736,6 +776,12 @@ function exhaustedExplorationReason(item: WorkItem): string | undefined {
     && group.stage.stage === "resolve"
     && group.stage.round >= group.stage.maxRounds) {
     return `Work Item ${item.id} exhausted its exploration round budget; retire it explicitly.`;
+  }
+  const resources = executionGroups?.find(({ groupId }) => groupId === group.id)?.resources;
+  if ((group.resolution.decision === "retry" || group.resolution.decision === "blocked")
+    && resources !== undefined
+    && executionStageSpendClosed(resources)) {
+    return `Work Item ${item.id} cannot retry its frozen exploration resource budget; retire it explicitly or replace it with a newly authorized delivery boundary.`;
   }
   if ((group.resolution.decision === "retry" || group.resolution.decision === "blocked")
     && group.stage.stageAttempt >= group.stage.budget.maxAttempts) {
@@ -805,6 +851,168 @@ function buildAction(
   };
 }
 
+function buildExecutionStageAction(
+  facts: NextActionFacts,
+  item: WorkItem
+): NextAction | null {
+  const group = currentWorkItemExecutionGroup(item);
+  if (group?.stage?.resources === undefined || group.resolution !== undefined) return null;
+  const projected = facts.executionGroups?.find(({ groupId }) => groupId === group.id);
+  const resources = projected?.resources;
+  if (resources === undefined) return null;
+  const usableLaneIds = group.lanes.filter(({ status }) => (
+    status === "yielded" || status === "completed"
+  )).map(({ id }) => id);
+  const stageResultsValid = candidateConvergenceStageResultsValid(group);
+  const disagreement = candidateConvergenceDisagreement(group);
+  const routing = routeExecutionStage({
+    group,
+    resources,
+    evidenceSufficient: candidateConvergenceEvidenceSufficient(
+      item,
+      group,
+      usableLaneIds
+    ),
+    disagreement
+  });
+  const refs = [ref("work-item", item.id), ref("execution-group", group.id)];
+  const resolveCommand = (decision: "accept" | "retry" | "blocked", suffix = "") => (
+    `yui task work group resolve ${facts.task.id}/${item.id}`
+    + ` --decision ${decision} --summary \"<stage decision>\"${suffix}`
+  );
+  if (routing.action === "blocked") {
+    return buildAction(facts, {
+      kind: "resolve-execution-stage",
+      reason: `${routing.reason}; dispatch would preserve the same pending Lanes without starting them.`,
+      refs,
+      preconditions: [
+        { fact: "Execution stage is unresolved", satisfied: true, ref: refs[1] },
+        {
+          fact: "Stage deadline or hard budget is exhausted",
+          satisfied: executionStageSpendClosed(resources),
+          ref: refs[1]
+        },
+        { fact: "Acceptance-level evidence is sufficient", satisfied: false, ref: refs[1] }
+      ],
+      recommendedCommand: resolveCommand("blocked"),
+      judgmentRequired:
+        "Leader must record the resource-blocked stage, then retire or replace the delivery boundary; the frozen budget cannot be reopened by redispatch."
+    });
+  }
+  if (routing.action === "expand-parallel") {
+    return buildAction(facts, {
+      kind: "resolve-execution-stage",
+      reason: routing.reason,
+      refs,
+      preconditions: [
+        {
+          fact: "Stage quorum is open or structured results show material disagreement",
+          satisfied: !resources.quorumMet || disagreement === "high",
+          ref: refs[1]
+        },
+        {
+          fact: "Adaptive Lane capacity remains",
+          satisfied: group.strategy.mode === "adaptive"
+            && group.lanes.length < group.strategy.max,
+          ref: refs[1]
+        }
+      ],
+      recommendedCommand:
+        `yui task work dispatch ${facts.task.id}/${item.id} --lane-role <independent-role>`,
+      ...(resources.quorumMet
+        ? {
+            alternatives: [{
+              kind: "deepen-sequential",
+              reason: "Resolve the current evidence and deepen sequentially when another independent Lane has lower value.",
+              recommendedCommand: resolveCommand("accept"),
+              refs
+            }]
+          }
+        : {}),
+      judgmentRequired: resources.quorumMet
+        ? "Leader must choose an unused compatible Task Role for expansion or deliberately select the sequential alternative."
+        : "Leader must choose an unused compatible Task Role so the frozen stage can satisfy quorum."
+    });
+  }
+  if (routing.action === "deepen-sequential") {
+    const resolveRequestsNextRound = group.stage.stage === "resolve";
+    const decision = usableLaneIds.length === 0
+      || !stageResultsValid
+      || !resources.quorumMet
+      || resolveRequestsNextRound
+      ? "retry"
+      : "accept";
+    return buildAction(facts, {
+      kind: "resolve-execution-stage",
+      reason: resolveRequestsNextRound
+        ? "Resolve evidence does not establish a Candidate; begin another bounded exploration round."
+        : !resources.quorumMet
+          ? "The stage exhausted its Lane capacity before quorum; resolve it as a bounded retry."
+          : decision === "retry"
+            ? "The stage has no structurally usable output; resolve it as a bounded retry before redispatch."
+            : routing.reason,
+      refs,
+      preconditions: [
+        { fact: "No stage Lane remains active or queued", satisfied: true, ref: refs[1] },
+        { fact: "Current stage has structurally usable output", satisfied: stageResultsValid, ref: refs[1] },
+        { fact: "Stage quorum is met", satisfied: resources.quorumMet, ref: refs[1] }
+      ],
+      recommendedCommand: resolveCommand(decision),
+      judgmentRequired: resolveRequestsNextRound
+        ? "Leader must judge whether the frozen round budget permits another exploration round or the WorkItem should be retired."
+        : decision === "retry"
+          ? "Leader must judge whether the frozen attempt budget permits one retry or the WorkItem should be retired."
+          : "Leader must select the usable stage evidence before advancing to the next bounded stage."
+    });
+  }
+  if (routing.action === "resolve") {
+    const earlyStop = routing.cancelPendingLaneIds.length === 0
+      ? ""
+      : " --early-stop <observed-marginal-value>";
+    return buildAction(facts, {
+      kind: "resolve-execution-stage",
+      reason: routing.reason,
+      refs,
+      preconditions: [
+        { fact: "Stage quorum is met", satisfied: resources.quorumMet, ref: refs[1] },
+        { fact: "Acceptance-level evidence is sufficient", satisfied: true, ref: refs[1] }
+      ],
+      recommendedCommand: resolveCommand("accept", earlyStop),
+      judgmentRequired: routing.cancelPendingLaneIds.length === 0
+        ? "Leader must select and accept the evidence that satisfies the stage contract."
+        : "Leader must record the observed marginal value before skipping never-started pending Lanes."
+    });
+  }
+  if (resources.pendingLaneIds.length > 0 && resources.activeLaneIds.length === 0) {
+    return buildAction(facts, {
+      kind: "implement-current-work-item",
+      reason: `ExecutionGroup ${group.id} has queued Lanes and an open resource budget; retry Broker admission after the capacity wake.`,
+      refs,
+      preconditions: [
+        { fact: "At least one Lane is durably queued", satisfied: true, ref: refs[1] },
+        {
+          fact: "Stage deadline and hard budgets remain open",
+          satisfied: !executionStageSpendClosed(resources),
+          ref: refs[1]
+        }
+      ],
+      recommendedCommand: `yui task work dispatch ${facts.task.id}/${item.id}`
+    });
+  }
+  if (resources.activeLaneIds.length > 0) {
+    return buildAction(facts, {
+      kind: "repair-protocol-inconsistency",
+      reason: `ExecutionGroup ${group.id} retains active Lanes but no delegated AgentRun is active.`,
+      refs,
+      conflicts: refs,
+      preconditions: [
+        { fact: "Every active Lane has an active exact AgentRun", satisfied: false, ref: refs[1] }
+      ]
+    });
+  }
+  return null;
+}
+
 function latestActiveWorkItemReview(
   rounds: readonly ReviewRound[],
   item: WorkItem,
@@ -856,6 +1064,15 @@ function reviewGroupAwaitingResolution(round: ReviewRound): boolean {
     && isPanelReviewRound(round)
     && round.executionGroup.lanes.every((lane) =>
       TERMINAL_REVIEW_LANE_STATUSES.has(lane.status));
+}
+
+function reviewGroupHasResourceQueue(round: ReviewRound): boolean {
+  return round.executionGroup !== undefined
+    && round.executionGroup.resolution === undefined
+    && round.executionGroup.lanes.some((lane) => (
+      lane.status === "pending"
+      && lane.runId === undefined
+    ));
 }
 
 function buildResolveReviewGroupAction(
@@ -921,6 +1138,7 @@ function reviewRoundConflict(
       };
     }
     if (activeReviewRoundRun(round, activeRuns) === undefined) {
+      if (reviewGroupHasResourceQueue(round)) return null;
       const runRef = ref("agent-run", round.reviewerRunId);
       return {
         reason: `ReviewRound ${round.id} references Reviewer Run ${round.reviewerRunId}, but that Run is not active.`,
