@@ -20,6 +20,7 @@ import {
   DEFAULT_RUNTIME_HEALTH_POLICY,
   type RuntimeHealthPolicy
 } from "../runtime/runtimeHealthPolicy.js";
+import { runOwnsBlockingProviderContinuation } from "../runtime/runtimeContinuationProjection.js";
 import {
   summarizeExecutionGroup,
   type ExecutionGroup,
@@ -196,6 +197,28 @@ function projectExecutionLaneHealth(
   input: ExecutionGroupHealthInput,
   policy: RuntimeHealthPolicy
 ): ExecutionLaneHealthProjection {
+  const run = lane.runId === undefined
+    ? undefined
+    : input.runs.find((candidate) => exactLaneRun(candidate, input.group, lane));
+  const continuationAgentId = run?.effective.agentId ?? lane.effective?.agentId;
+  if (lane.status !== "completed"
+    && lane.status !== "yielded"
+    && lane.runId !== undefined
+    && continuationAgentId !== undefined
+    && runOwnsBlockingProviderContinuation(input.events, {
+      taskId: input.group.taskId,
+      roleName: lane.roleName,
+      runId: lane.runId,
+      agentId: continuationAgentId
+    })) {
+    return projection(lane, {
+      runtimeHealth: "active",
+      recovery: "none",
+      resultReusable: false,
+      reason: "the exact Run still owns an unsettled Provider continuation writer",
+      evidence: ["runtime-continuation-writer-owned"]
+    });
+  }
   if (lane.status === "completed" || lane.status === "yielded") {
     return projection(lane, {
       recovery: "reuse-result",
@@ -222,9 +245,6 @@ function projectExecutionLaneHealth(
     });
   }
 
-  const run = lane.runId === undefined
-    ? undefined
-    : input.runs.find((candidate) => exactLaneRun(candidate, input.group, lane));
   if (run === undefined) {
     return projection(lane, {
       runtimeHealth: "suspected-stalled",
@@ -272,7 +292,7 @@ function projectExecutionLaneHealth(
   if (observations.some((observation) => (
     observation.kind === "turn.failed"
     && observation.payload.failure?.runTerminal === true
-  ))) {
+  )) && !unsettledChildWork) {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
       recovery: "terminate-exact-run",

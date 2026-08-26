@@ -622,12 +622,38 @@ function collectExecutionGroups(
   workItems: readonly WorkItem[],
   reviewRounds: readonly ReviewRound[]
 ): ExecutionGroup[] {
+  const workItemsById = new Map(workItems.map((item) => [item.id, item]));
+  const orderedRounds = [...reviewRounds].sort((left, right) => (
+    left.id.localeCompare(right.id, undefined, { numeric: true })
+  ));
+  const latestTaskRound = orderedRounds
+    .filter((round) => (round.scope ?? "work-item") === "task")
+    .at(-1);
+  const latestWorkItemRounds = new Map<string, ReviewRound>();
+  for (const round of orderedRounds) {
+    if ((round.scope ?? "work-item") === "task"
+      || round.workItemId === undefined
+      || round.candidateId === undefined) continue;
+    const item = workItemsById.get(round.workItemId);
+    if (item === undefined
+      || item.status === "retired"
+      || item.candidates.at(-1)?.id !== round.candidateId) continue;
+    latestWorkItemRounds.set(`${round.workItemId}\0${round.candidateId}`, round);
+  }
+  const operationalReviewRoundIds = new Set([
+    ...(latestTaskRound === undefined ? [] : [latestTaskRound.id]),
+    ...[...latestWorkItemRounds.values()].map(({ id }) => id)
+  ]);
   const groups = [
-    ...workItems.flatMap((item) => {
+    ...workItems.filter(({ status }) => status !== "retired").flatMap((item) => {
       const group = currentWorkItemExecutionGroup(item);
       return group === undefined ? [] : [group];
     }),
-    ...reviewRounds.flatMap((round) => round.executionGroup === undefined ? [] : [round.executionGroup])
+    ...reviewRounds.flatMap((round) => (
+      !operationalReviewRoundIds.has(round.id) || round.executionGroup === undefined
+        ? []
+        : [round.executionGroup]
+    ))
   ];
   const seen = new Set<string>();
   return groups.filter((group) => {

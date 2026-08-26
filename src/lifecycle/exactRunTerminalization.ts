@@ -33,6 +33,7 @@ import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
+import { runOwnsBlockingProviderContinuation } from "../runtime/runtimeContinuationProjection.js";
 import {
   clearMatchingLeaderStallAttention,
   latestRunDurableProgressAt,
@@ -375,6 +376,14 @@ export function terminalizeExactTaskRun(
   }
   if (!matchesLaunchFence(store, sessions, input)) {
     return obsolete(run, "launch-fence-mismatch");
+  }
+  if (runOwnsBlockingProviderContinuation(store.listEvents(input.taskId), {
+    taskId: run.taskId,
+    roleName: run.roleName,
+    runId: run.id,
+    agentId: run.effective.agentId
+  })) {
+    return obsolete(run, "provider-continuation-writer-owned");
   }
 
   // Validate the exact ReviewRound, Candidate, stored workspace, and frozen

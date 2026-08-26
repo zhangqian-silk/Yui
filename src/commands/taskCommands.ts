@@ -111,6 +111,7 @@ import {
   finishReviewRound,
   parseReviewYieldReport,
   recordReviewWorkspaceDisposition,
+  retryRunningReviewExecutionLane,
   retryTaskReviewRound,
   startReviewRound,
   updateReviewExecutionGroup,
@@ -159,7 +160,8 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import {
   blockingProviderContinuations,
-  projectProviderContinuations
+  projectProviderContinuations,
+  runOwnsBlockingProviderContinuation
 } from "../runtime/runtimeContinuationProjection.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import {
@@ -5475,6 +5477,17 @@ function retryRun(
     }
     const task = requireTask(tx, previous.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    if (runOwnsBlockingProviderContinuation(tx.listEvents(task.id), {
+      taskId: previous.taskId,
+      roleName: previous.roleName,
+      runId: previous.id,
+      agentId: previous.effective.agentId
+    })) {
+      throw usageError(
+        `Run ${previous.id} still owns an unsettled Provider continuation; `
+        + "reconcile it before retrying the Lane."
+      );
+    }
     const role = requireRole(tx, task.id, previous.roleName);
     if (tx.getActiveAgentRun(task.id, role.name) !== null) {
       throw usageError(`${task.id}/${role.name} already has an active run.`);
@@ -5496,9 +5509,25 @@ function retryRun(
     const currentRetryGroup = retryItem === null
       ? undefined
       : currentWorkItemExecutionGroup(retryItem);
+    const retriesExecutionLane = previous.executionGroupId !== undefined;
+    const exactCurrentLane = !retriesExecutionLane || (
+      retryItem !== null
+      && currentRetryGroup !== undefined
+      && currentRetryGroup.id === previous.executionGroupId
+      && currentRetryGroup.resolution === undefined
+      && retryLaneBefore !== undefined
+      && retryLaneBefore.id === previous.executionLaneId
+      && retryLaneBefore.status === "failed"
+      && retryLaneBefore.runId === previous.id
+    );
+    if (!exactCurrentLane) {
+      throw usageError(
+        `Run ${previous.id} no longer owns the current failed Execution Lane.`
+      );
+    }
     const groupedRunningRetry = retryItem?.status === "running"
-      && currentRetryGroup?.id === previous.executionGroupId
-      && retryLaneBefore?.status === "failed";
+      && retriesExecutionLane
+      && exactCurrentLane;
     if (retryItem !== null && retryItem.status !== "failed" && !groupedRunningRetry) {
       throw usageError(`Work Item ${retryItem.id} is not retryable from ${retryItem.status}.`);
     }
@@ -6149,6 +6178,17 @@ function retryFailedReviewRun(
     }
     const task = requireTask(tx, run.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    if (runOwnsBlockingProviderContinuation(tx.listEvents(task.id), {
+      taskId: run.taskId,
+      roleName: run.roleName,
+      runId: run.id,
+      agentId: run.effective.agentId
+    })) {
+      throw usageError(
+        `Review Run ${run.id} still owns an unsettled Provider continuation; `
+        + "reconcile it before retrying the Lane."
+      );
+    }
     if (taskActor(options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may retry a failed final review Run.");
     }
@@ -6162,6 +6202,31 @@ function retryFailedReviewRun(
         + "for a new Candidate."
       );
     }
+    const retryLane = run.executionLaneId === undefined
+      ? undefined
+      : round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
+    if (run.executionGroupId !== undefined && (
+      round.executionGroup?.id !== run.executionGroupId
+      || retryLane === undefined
+      || retryLane.runId !== run.id
+      || retryLane.roleName !== run.roleName
+    )) {
+      throw usageError(
+        `Review Run ${run.id} no longer owns its exact Review Lane attempt.`
+      );
+    }
+    const panelGroup = round.executionGroup !== undefined
+      && (round.executionGroup.lanes.length > 1
+        || round.executionGroup.strategy.mode === "adaptive");
+    const runningPanelLaneRetry = round.status === "running"
+      && panelGroup
+      && retryLane?.status === "failed";
+    if (round.status === "running" && panelGroup && !runningPanelLaneRetry) {
+      throw usageError(
+        `Review Run ${run.id} is not the current failed Lane attempt in running Round ${round.id}.`
+      );
+    }
+    const retryReviewerRoleName = retryLane?.roleName ?? round.reviewerRoleName;
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
     if (!sameTaskFinalReviewContract(round.taskFinalReviewContract, taskFinalContract)) {
       throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
@@ -6195,7 +6260,7 @@ function retryFailedReviewRun(
     }
     const allReviewerRounds = reviewRoundsByIdentity(
       tx.listReviewRounds(task.id).filter((entry) => (
-        entry.reviewerRoleName === round.reviewerRoleName
+        entry.reviewerRoleName === retryReviewerRoleName
       ))
     );
     assertNoConflictingTaskReviewRound(tx.listReviewRounds(task.id), round.id);
@@ -6209,40 +6274,40 @@ function retryFailedReviewRun(
       );
     }
 
-    const reviewerMailboxTarget = roleMailbox(task.id, round.reviewerRoleName);
+    const reviewerMailboxTarget = roleMailbox(task.id, retryReviewerRoleName);
     const reviewerMailbox = tx.getWorkMailbox(reviewerMailboxTarget);
     const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
     const runtimeMailbox = tx.getWorkMailbox(runtimeLifecycleTarget({
       scope: "task",
       taskId: task.id,
-      roleName: round.reviewerRoleName
+      roleName: retryReviewerRoleName
     }));
 
     const hasMailboxWork = (mailbox: ReturnType<typeof tx.getWorkMailbox>): boolean => (
       mailbox !== null && workMailboxHasWork(mailbox)
     );
 
-    const reviewer = requireRole(tx, task.id, round.reviewerRoleName);
+    const reviewer = requireRole(tx, task.id, retryReviewerRoleName);
     const activePointer = tx.getActiveAgentRun(task.id, reviewer.name);
     const activeReviewerRuns = tx.listAgentRuns(task.id).filter((entry) => (
       entry.roleName === reviewer.name && entry.status === "active"
     ));
 
-   // Issue 06: a completed same-Round retry is a no-write idempotent result.
-   if (round.status === "completed") {
-     if (activePointer !== null || activeReviewerRuns.length > 0) {
-       throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
-     }
-     if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-       throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
-     }
+    // Issue 06: a completed same-Round retry is a no-write idempotent result.
+    if (round.status === "completed") {
+      if (activePointer !== null || activeReviewerRuns.length > 0) {
+        throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
+      }
+      if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
+        throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
+      }
       return { round, previousRun: run, created: false };
-   }
+    }
 
     // Issue 06: a running same Round is reusable only with its exact active
     // Run and mailbox execution. A stranded Run (no active pointer) falls
     // through and resets the Round after the identity fences below.
-    if (round.status === "running") {
+    if (round.status === "running" && !runningPanelLaneRetry) {
       const reviewerRunId = round.reviewerRunId;
       const activeMatches = reviewerRunId !== undefined
         && activePointer !== null
@@ -6272,18 +6337,18 @@ function retryFailedReviewRun(
         );
       }
       if (activeMatches) return { round, previousRun: run, created: false };
-   }
+    }
 
-   // Issue 06: an already-pending Round is the idempotent retry result.
-   if (round.status === "pending") {
-     if (activePointer !== null || activeReviewerRuns.length > 0) {
-       throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
-     }
-     if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-       throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
-     }
+    // Issue 06: an already-pending Round is the idempotent retry result.
+    if (round.status === "pending") {
+      if (activePointer !== null || activeReviewerRuns.length > 0) {
+        throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
+      }
+      if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
+        throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
+      }
       return { round, previousRun: run, created: false };
-   }
+    }
 
     if (activePointer !== null || activeReviewerRuns.length > 0) {
       throw usageError(`Reviewer Role already has an active run: ${reviewer.name}.`);
@@ -6324,6 +6389,21 @@ function retryFailedReviewRun(
         throw usageError(`Reviewer mailbox has merged pending work: ${reviewer.name}.`);
       }
       settleExactWorkExecution(tx, reviewerMailboxTarget, exactOldRunRef);
+    }
+    if (runningPanelLaneRetry) {
+      const resetRound = retryRunningReviewExecutionLane(
+        round,
+        retryLane!.id,
+        run.id,
+        now
+      );
+      tx.saveReviewRound(task.id, resetRound);
+      recordTaskEvent(tx, task.id, "run.review-retried", {
+        runId: run.id,
+        reviewRoundId: round.id,
+        executionLaneId: retryLane!.id
+      }, now);
+      return { round: resetRound, previousRun: run, created: true };
     }
     // Terminalize the old stranded Round only after every identity and mailbox
     // fence has passed. The outer transaction rolls back if Round creation fails.
@@ -7342,13 +7422,6 @@ export function dispatchPreparedReviewRound(
         );
       }
       throw roleNotFound(round.reviewerRoleName);
-    }
-    if (tx.getActiveAgentRun(taskId, reviewer.name) !== null) {
-      const message = `Reviewer Role already has an active run: ${reviewer.name}.`;
-      if ((round.scope ?? "work-item") === "task") {
-        throw new TaskFinalReviewDispatchDriftError(message);
-      }
-      throw usageError(message);
     }
     const storedWorkspace = tx.getReviewRoundWorkspace(taskId, round.id);
     if (storedWorkspace === null

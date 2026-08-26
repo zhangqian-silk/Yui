@@ -52,3 +52,21 @@ export function blockingProviderContinuations(
     continuationOwnsWriterUmbrella(entry) || entry.identityConflict
   ));
 }
+
+/** Exact Run-scoped writer fence shared by terminalization and retry paths. */
+export function runOwnsBlockingProviderContinuation(
+  events: readonly TaskEvent[],
+  owner: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+  }>
+): boolean {
+  return blockingProviderContinuations(events).some((continuation) => (
+    continuation.taskId === owner.taskId
+    && continuation.roleName === owner.roleName
+    && continuation.runId === owner.runId
+    && continuation.identity.accountScope === owner.agentId
+  ));
+}
