@@ -34,6 +34,7 @@ export type WebDashboardStore = Pick<TaskStore,
   | "listRoles"
   | "getTaskRoleSessionSet"
   | "listWorkItems"
+  | "listContextSnapshots"
   | "listAgentRuns"
   | "listReviewRounds"
   | "listInputRequests"
@@ -196,18 +197,25 @@ export function buildWebTaskDetail(
           && effectiveLaunch.sourceDesiredRevision !== role.launchRevision
       };
     });
+    const execution = buildTaskExecutionProjection(reader, taskId, task, now);
+    if (execution === null) return null;
+    const workItemObservability = new Map(
+      execution.observability.workItems.map((item) => [item.workItemId, item])
+    );
     return {
       task: {
         ...task,
         ...(projectNames.length === 0 ? {} : { projectNames })
       },
-      execution: buildTaskExecutionProjection(reader, taskId, task, now),
+      execution,
+      observability: execution.observability,
       brief: reader.getTaskBrief(taskId),
       roles,
       workItems: reader.listWorkItems(taskId).map((item) => {
         const group = currentWorkItemExecutionGroup(item);
         return {
           ...item,
+          observability: workItemObservability.get(item.id),
           ...(group === undefined ? {} : { currentExecution: summarizeExecutionGroup(group) })
         };
       }),

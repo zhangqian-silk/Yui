@@ -21,6 +21,7 @@ export const RESPONSIVE_STYLES = `
   body.detail-active .detail-back{display:grid}
   .detail{overflow:visible}
   .overview-duo{grid-template-columns:1fr}
+  .observability-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
   /* Terminal panel overlays full-screen instead of occupying a grid column */
   .terminal-panel{position:fixed;inset:0;z-index:70;grid-column:auto;height:100vh;border-left:0}
 }
@@ -34,6 +35,7 @@ export const RESPONSIVE_STYLES = `
   .topbar{flex-wrap:nowrap;gap:10px}
   .detail-tabs{mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent);-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent)}
   .record-cols{grid-template-columns:1fr}
+  .observability-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 `;

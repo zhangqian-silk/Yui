@@ -6,6 +6,7 @@ import { formatTimestamp } from "../output/timePresentation.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
+import type { WorkItemObservabilityProjection } from "../scheduler/taskObservabilityProjection.js";
 import { projectNextAction } from "../task/nextAction.js";
 import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 import {
@@ -138,6 +139,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     group.groupId,
     group
   ]));
+  const observability = execution.observability;
 
   const lines = [
     `Task context: ${task.id}`,
@@ -184,6 +186,10 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       : displayedExecutionCarriers.map((run) => (
           `    ${run.roleName}: ${run.id} [${run.status}; ${run.delivered ? "accepted" : "delivery-pending"}]`
         ))),
+    "Observability:",
+    `  DAG: ${observability.dag.nodes.length} node(s), ${observability.dag.edges.length} edge(s); ready=${observability.dag.readyIds.join(", ") || "none"}; blocked=${observability.dag.blockedIds.join(", ") || "none"}`,
+    `  Cost: tokens=${resourceUsageLabel(observability.cost.tokens, undefined, observability.cost.tokensObservable)}; tools=${resourceUsageLabel(observability.cost.toolCalls, undefined, observability.cost.toolCallsObservable)}; wall=${observability.cost.wallClockSeconds}s; lanes=${observability.cost.laneCount}; groups=${observability.cost.groupCount}; retries=${observability.cost.retryCount}; marginal-value=unavailable`,
+    `  Context: snapshots=${observability.context.snapshotCount}; bytes=${observability.context.totalBytes === null ? "partial" : observability.context.totalBytes}; peak-input=${observability.context.observedInputPeakTokens}; compression=unavailable`,
     ...(task.projectBindings.length === 0
       ? []
       : [
@@ -306,6 +312,11 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
                 ? "none"
                 : item.writeProjectIds.join(", ")
             }`,
+            ...(observability.workItems.find(({ workItemId }) => workItemId === item.id) === undefined
+              ? []
+              : [renderWorkItemObservability(
+                  observability.workItems.find(({ workItemId }) => workItemId === item.id)!
+                )]),
             ...(currentWorkItemExecutionGroup(item) === undefined
               ? []
               : renderExecutionGroup(
@@ -662,9 +673,12 @@ function renderExecutionGroup(
       return [
         `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}${
           lane.runId === undefined ? "" : `, run ${lane.runId}`
-        }) [${lane.status}${
+          }) [${lane.status}${
           laneHealth?.runtimeHealth === undefined ? "" : `/${laneHealth.runtimeHealth}`
-        }]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,
+          }]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,
+        ...(lane.effective === undefined
+          ? []
+          : [`        Config: ${lane.effective.adapterId}/${lane.effective.model ?? "default"}/${lane.effective.effort ?? "default"}; profile=${lane.effective.profileAccess}`]),
         ...(laneHealth !== undefined && laneHealth.recovery !== "none"
           ? [`        Recovery: ${laneHealth.recovery}; ${compactText(laneHealth.reason)}`]
           : []),
@@ -700,4 +714,13 @@ function resourceUsageLabel(
 ): string {
   if (!observable) return `${used} observed (partial)`;
   return `${used}${remaining === undefined ? "" : `, remaining=${remaining}`}`;
+}
+
+function renderWorkItemObservability(
+  item: WorkItemObservabilityProjection
+): string {
+  const stages = item.stages.map((stage) => (
+    `${stage.stage ?? "single"}${stage.round === undefined ? "" : `#${stage.round}`}${stage.stageAttempt === undefined ? "" : `/a${stage.stageAttempt}`}`
+  )).join(", ");
+  return `    Observability: stages=${stages || "none"}; tokens=${item.cost.tokens}; tools=${item.cost.toolCalls}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; peak-input=${item.context.observedInputPeakTokens}; evidence=${item.evidenceCount}; open-findings=${item.openFindingCount}; compression=${item.context.compressionStatus}`;
 }

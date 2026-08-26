@@ -271,6 +271,7 @@ function buildTaskOverviewEntry(
     leaderFailure,
     operatorNotification,
     roleSessions,
+    contextSnapshots: store.listContextSnapshots(task.id),
     now,
     runtimeHealthPolicy
   });
@@ -574,6 +575,9 @@ function renderVerboseDetails(
         : formatTimestamp(task.summaryUpdatedAt, timeZone)}`,
       `  Execution: ${task.execution.status} (${task.execution.owner}); ${task.execution.summary}`,
       `  Monitoring: ${task.execution.monitoring}; attention: ${task.execution.attention.length}`,
+      `  DAG: ${task.execution.observability.dag.nodes.length} nodes, ${task.execution.observability.dag.edges.length} edges; ready=${task.execution.observability.dag.readyIds.join(", ") || "none"}; blocked=${task.execution.observability.dag.blockedIds.join(", ") || "none"}`,
+      `  Cost: tokens=${task.execution.observability.cost.tokens}${task.execution.observability.cost.tokensObservable ? "" : " (partial)"}; tools=${task.execution.observability.cost.toolCalls}${task.execution.observability.cost.toolCallsObservable ? "" : " (partial)"}; wall=${task.execution.observability.cost.wallClockSeconds}s; retries=${task.execution.observability.cost.retryCount}`,
+      `  Context: snapshots=${task.execution.observability.context.snapshotCount}; bytes=${task.execution.observability.context.totalBytes ?? "partial"}; peak-input=${task.execution.observability.context.observedInputPeakTokens}; compression=unavailable`,
       `  Projects: ${task.projectBindings.length === 0
         ? "none"
         : task.projectBindings.map(({ directory, projectId, baseRef }) => (

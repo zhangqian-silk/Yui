@@ -8,6 +8,19 @@ All observability features are **read-only**: they never wake a Leader, write
 Task state, or change business behavior. Collection failures degrade to
 `unsupported`/`unavailable` without affecting the control plane.
 
+## Task execution projection
+
+`task context`, `task list --verbose`, and the Web task detail consume the same
+derived execution projection. It adds a read-only Task DAG (`ready`, `blocked`,
+dependency edge status, and transitive root causes), WorkItem stage/round and
+Lane configuration details, historical Group drilldown, and cost/context
+summaries. Costs are the exact token/tool observations Yui can prove plus
+bounded wall-clock duration; an unobservable total is marked partial rather
+than inferred. Context metrics are snapshot references, serialized byte sizes,
+and observed input peaks. Provider compression and marginal-value observations
+remain explicitly unavailable until the runtime records those facts, so the UI
+never fabricates them.
+
 ## Agent runtime status
 
 `yui task role status <task> <role>` projects the provider-independent Agent

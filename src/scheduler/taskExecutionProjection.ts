@@ -21,6 +21,11 @@ import {
   summarizeExecutionGroupHealth,
   type ExecutionGroupHealthSummary
 } from "../execution/executionHealth.js";
+import {
+  buildTaskObservabilityProjection,
+  type TaskObservabilityProjection
+} from "./taskObservabilityProjection.js";
+import type { ContextSnapshot } from "../context/contextSnapshot.js";
 import { isRoleRunStalled, latestStallProgressAt } from "./roleRunStall.js";
 import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 import type { RuntimeHealthPolicy } from "../runtime/runtimeHealthPolicy.js";
@@ -112,6 +117,8 @@ export type TaskExecutionProjection = Readonly<{
   activeRuns: readonly TaskExecutionRun[];
   /** Read-only Leader aggregation for every unified execution Group. */
   executionGroups: readonly ExecutionGroupHealthSummary[];
+  /** Shared DAG, cost, context, and stage projection for CLI/Web consumers. */
+  observability: TaskObservabilityProjection;
   attention: readonly TaskExecutionAttention[];
   blockers: readonly TaskExecutionBlocker[];
   /** Existing durable wake facts, included for idempotent reconciliation. */
@@ -147,6 +154,7 @@ export type TaskExecutionReadStore = Readonly<{
     status?: string;
   }> | null;
   getConfig?(): Readonly<{ runtimeHealth?: unknown }>;
+  listContextSnapshots?(taskId: string): readonly ContextSnapshot[];
 }>;
 
 type TaskExecutionTask = Readonly<Pick<
@@ -183,6 +191,7 @@ export type TaskExecutionFacts = Readonly<{
     launchId?: string;
     status?: string;
   }>[];
+  contextSnapshots?: readonly ContextSnapshot[];
   now?: Date;
   runtimeHealthPolicy?: RuntimeHealthPolicy;
 }>;
@@ -229,6 +238,9 @@ export function buildTaskExecutionProjection(
           store.listReviewRounds?.(taskId) ?? []
         ),
     workItems: store.listWorkItems?.(taskId) ?? [],
+    ...(store.listContextSnapshots === undefined
+      ? {}
+      : { contextSnapshots: store.listContextSnapshots(taskId) }),
     inputRequests: store.listInputRequests?.(taskId) ?? [],
     ...(store.listReviewRounds === undefined
       ? {}
@@ -306,10 +318,24 @@ export function projectTaskExecution(
       policy: facts.runtimeHealthPolicy
     });
   });
+  const observabilityGroups = uniqueExecutionGroups([
+    ...executionGroups,
+    ...workItems.flatMap((item) => item.executionGroups)
+  ]);
+  const observability = buildTaskObservabilityProjection({
+    workItems,
+    executionGroups: observabilityGroups,
+    groupSummaries,
+    runs,
+    events,
+    contextSnapshots: facts.contextSnapshots,
+    now
+  });
   const laneRecovery = actionableExecutionLaneRecoveries(groupSummaries)[0];
   const render = (input: ProjectionInput): TaskExecutionProjection => projection({
     ...input,
-    executionGroups: groupSummaries
+    executionGroups: groupSummaries,
+    observability
   });
   const activeRuns = runs.filter((run) => run.status === "active");
   const activeRunViews = activeRuns.map((run) => ({
@@ -597,13 +623,15 @@ export function projectTaskExecution(
 
 type ProjectionInput = Omit<
   TaskExecutionProjection,
-  "next" | "taskId" | "taskStatus" | "executionGroups"
+  "next" | "taskId" | "taskStatus" | "executionGroups" | "observability"
 > & Readonly<{
   task: Readonly<Pick<Task, "id" | "status">>;
   executionGroups?: readonly ExecutionGroupHealthSummary[];
 }>;
 
-function projection(input: ProjectionInput): TaskExecutionProjection {
+function projection(
+  input: ProjectionInput & Readonly<{ observability: TaskObservabilityProjection }>
+): TaskExecutionProjection {
   return {
     taskId: input.task.id,
     taskStatus: input.task.status,
@@ -617,11 +645,21 @@ function projection(input: ProjectionInput): TaskExecutionProjection {
     activeExecutorCount: input.activeExecutorCount,
     activeRuns: input.activeRuns,
     executionGroups: input.executionGroups ?? [],
+    observability: input.observability,
     attention: input.attention,
     blockers: input.blockers,
     pendingWakeup: input.pendingWakeup,
     next: { owner: input.owner, action: input.action }
   };
+}
+
+function uniqueExecutionGroups(groups: readonly ExecutionGroup[]): ExecutionGroup[] {
+  const seen = new Set<string>();
+  return groups.filter((group) => {
+    if (seen.has(group.id)) return false;
+    seen.add(group.id);
+    return true;
+  });
 }
 
 function collectExecutionGroups(

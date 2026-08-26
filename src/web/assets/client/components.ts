@@ -175,12 +175,37 @@ export function executionGroupCard(summary, t, locale) {
   head.append(pills);
   card.append(head);
 
+  if (summary.stage) {
+    const stage = node("div", "record-meta execution-stage-meta");
+    stage.append(node("span", "mono", t("detail.stage") + " · " + (summary.stage.stage || "—")));
+    stage.append(node("span", "", t("detail.round") + " · " + String(summary.stage.round)));
+    stage.append(node("span", "", t("detail.stageAttempt") + " · " + String(summary.stage.stageAttempt)));
+    stage.append(chip(t("mode." + summary.stage.mode)));
+    card.append(stage);
+  }
+  if (summary.resources) {
+    const resources = summary.resources;
+    const budget = node("div", "record-meta execution-resource-meta");
+    budget.append(node("span", "", t("detail.cost") + " · "
+      + formatResource(resources.tokens, resources.tokensRemaining, resources.tokensObservable) + " tokens"));
+    budget.append(node("span", "", formatResource(resources.toolCalls, resources.toolCallsRemaining, resources.toolCallsObservable) + " tools"));
+    budget.append(node("span", "", resources.wallClockSeconds + "s"));
+    budget.append(node("span", "", t("detail.quorum") + " · "
+      + resources.usableLaneCount + "/" + (summary.stage.resources?.quorum || "—")));
+    card.append(budget);
+  }
+
   const lanes = node("div", "lane-list");
   summary.laneSummaries.forEach(function (lane) {
     const row = node("div", "lane-row");
     row.append(statusDot(lane.status));
     row.append(node("span", "lane-role", lane.roleName));
     row.append(node("span", "lane-status", t("lane." + lane.status)));
+    if (lane.effective) {
+      const config = [lane.effective.adapterId, lane.effective.model, lane.effective.effort]
+        .filter(function (value) { return value; }).join(" · ");
+      if (config) row.append(chip(config));
+    }
     if (lane.summary) {
       row.append(node("span", "lane-summary", lane.summary));
     }
@@ -200,6 +225,63 @@ export function executionGroupCard(summary, t, locale) {
     card.append(res);
   }
   return card;
+}
+
+function formatResource(used, remaining, observable) {
+  const value = String(used) + (remaining === undefined ? "" : "/" + String(used + remaining));
+  return observable === false ? value + "*" : value;
+}
+
+export function observabilityMetricCard(observability, t) {
+  if (!observability) return null;
+  const card = node("div", "observability-metrics");
+  const cost = observability.cost || {};
+  const context = observability.context || {};
+  card.append(metricTile(t("detail.tokens"), cost.tokens + (cost.tokensObservable === false ? "*" : "")));
+  card.append(metricTile(t("detail.toolCalls"), cost.toolCalls + (cost.toolCallsObservable === false ? "*" : "")));
+  card.append(metricTile(t("detail.wallClock"), cost.wallClockSeconds + "s"));
+  card.append(metricTile(t("detail.ready"), (observability.dag?.readyIds || []).length, { hot: true }));
+  card.append(metricTile(t("detail.contextSnapshots"), context.snapshotCount));
+  card.append(metricTile(t("detail.contextPeak"), context.observedInputPeakTokens));
+  const contextMeta = node("div", "record-meta observability-context-meta");
+  contextMeta.append(node("span", "", t("detail.contextBytes") + " · "
+    + (context.totalBytes === null ? t("detail.partial") : context.totalBytes + " B")));
+  contextMeta.append(node("span", "", t("detail.compression") + " · " + t("detail.unavailable")));
+  contextMeta.append(node("span", "", t("detail.marginalValue") + " · " + t("detail.unavailable")));
+  card.append(contextMeta);
+  return card;
+}
+
+export function dagGraph(dag, t) {
+  if (!dag || !dag.nodes || !dag.nodes.length) return emptyRow(t);
+  const graph = node("div", "dag-graph");
+  const edgeByTarget = {};
+  (dag.edges || []).forEach(function (edge) {
+    if (!edgeByTarget[edge.to]) edgeByTarget[edge.to] = [];
+    edgeByTarget[edge.to].push(edge);
+  });
+  dag.nodes.forEach(function (item) {
+    const row = node("div", "dag-node is-" + item.projectedStatus);
+    const top = node("div", "dag-node-head");
+    top.append(statusDot(item.projectedStatus), node("strong", "dag-node-title", item.title));
+    top.append(pill(t, "dag", item.projectedStatus));
+    if ((dag.readyIds || []).indexOf(item.id) >= 0) top.append(chip(t("dag.ready"), "is-active"));
+    row.append(top);
+    const edges = edgeByTarget[item.id] || [];
+    if (edges.length) {
+      const deps = node("div", "dag-node-deps");
+      deps.append(node("small", "", t("dag.dependsOn")));
+      edges.forEach(function (edge) {
+        deps.append(chip(edge.from + " · " + t("dag.edge." + edge.status), "is-" + edge.status));
+      });
+      row.append(deps);
+    }
+    if (item.rootCauseIds && item.rootCauseIds.length) {
+      row.append(node("small", "dag-root-cause", t("dag.rootCause") + " · " + item.rootCauseIds.join(" ← ")));
+    }
+    graph.append(row);
+  });
+  return graph;
 }
 
 // --- WorkItem Candidates -----------------------------------------------------
@@ -471,6 +553,40 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
   // Leader's resolution when the iteration is settled.
   if (item.currentExecution) {
     body.append(executionGroupCard(item.currentExecution, t, locale));
+  }
+
+  if (item.observability) {
+    const observability = item.observability;
+    if (observability.executionGroups && observability.executionGroups.length) {
+      observability.executionGroups.forEach(function (group) {
+        if (!item.currentExecution || group.groupId !== item.currentExecution.groupId) {
+          body.append(executionGroupCard(group, t, locale));
+        }
+      });
+    }
+    const metrics = node("div", "record-meta work-item-observability");
+    metrics.append(node("span", "", t("detail.cost") + " · "
+      + observability.cost.tokens + " tokens"));
+    metrics.append(node("span", "", observability.cost.toolCalls + " tools"));
+    metrics.append(node("span", "", observability.cost.wallClockSeconds + "s"));
+    metrics.append(node("span", "", t("detail.contextSnapshots") + " · "
+      + observability.context.snapshotCount));
+    metrics.append(node("span", "", t("detail.evidence") + " · "
+      + observability.evidenceCount));
+    if (observability.openFindingCount > 0) {
+      metrics.append(chip(t("detail.openFindings") + " · " + observability.openFindingCount, "is-danger"));
+    }
+    body.append(metrics);
+    if (observability.stages && observability.stages.length) {
+      const stages = node("div", "chip-row work-item-stages");
+      observability.stages.forEach(function (stage) {
+        const label = (stage.stage || "single")
+          + (stage.round === undefined ? "" : " #" + stage.round)
+          + (stage.resolution ? " · " + stage.resolution : "");
+        stages.append(chip(label, stage.groupId === observability.currentGroupId ? "is-active" : ""));
+      });
+      body.append(stages);
+    }
   }
 
   // Review candidates submitted for this WorkItem, newest first.
