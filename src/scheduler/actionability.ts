@@ -83,6 +83,31 @@ const TERMINAL_WORK_ITEM_STATUSES = new Set(["completed", "retired"]);
 const CONSUMED_INTEGRATION_STATUSES = new Set(["committed", "superseded"]);
 
 /**
+ * True only when the Task still owns a Resource-Broker-queued Lane that a
+ * later Leader dispatch may start. Terminal owners retain their immutable
+ * Group history, but can never reserve live queue capacity.
+ */
+export function hasDispatchableQueuedResourceLane(
+  store: Pick<ActionabilityReadStore, "listWorkItems" | "listReviewRounds">,
+  taskId: string
+): boolean {
+  const workItemGroups = (store.listWorkItems?.(taskId) ?? [])
+    .filter(({ status }) => status === "running")
+    .flatMap(({ executionGroups }) => executionGroups);
+  const reviewGroups = (store.listReviewRounds?.(taskId) ?? [])
+    .filter(({ status }) => status === "pending" || status === "running")
+    .flatMap(({ executionGroup }) => executionGroup === undefined ? [] : [executionGroup]);
+  return [...workItemGroups, ...reviewGroups].some((group) => (
+    group.resolution === undefined
+    && group.lanes.some((lane) => (
+      lane.status === "pending"
+      && lane.effective !== undefined
+      && lane.runId === undefined
+    ))
+  ));
+}
+
+/**
  * Fold a Task's durable records into the normalized actionable facts. This
  * function only reads; it never starts a Controller, queues a wake, writes a
  * Message, or mutates any record.
@@ -155,19 +180,7 @@ export function collectTaskActionability(
   // Run. Include the global active Lane capacity counts only for Tasks that are
   // actually queued, so capacity release changes their digest and the normal
   // orphan repair can wake the Leader without polling or a second scheduler.
-  const hasQueuedResourceLane = [
-    ...workItems.flatMap(({ executionGroups }) => executionGroups),
-    ...reviewRounds.flatMap(({ executionGroup }) => (
-      executionGroup === undefined ? [] : [executionGroup]
-    ))
-  ].some((group) => (
-    group.resolution === undefined
-    && group.lanes.some((lane) => (
-      lane.status === "pending"
-      && lane.effective !== undefined
-      && lane.runId === undefined
-    ))
-  ));
+  const hasQueuedResourceLane = hasDispatchableQueuedResourceLane(store, taskId);
   if (hasQueuedResourceLane && store.listActiveTaskIds !== undefined) {
     const activeResourceScopes = store.listActiveTaskIds().flatMap((activeTaskId) => (
       operationalTaskRecords(

@@ -8,6 +8,7 @@ import {
   contextSnapshotDeltaRefIds,
   expandRunContextRef,
   freezeExecutionStageContextSnapshot,
+  freezeReviewStageContextSnapshot,
   freezeRunContextSnapshot
 } from "../context/runContextPack.js";
 import { contextSnapshotRef } from "../context/contextSnapshot.js";
@@ -796,6 +797,7 @@ function queuedResourceLaneIdentities(
     const taskRuns = store.listAgentRuns(taskId);
     const taskEvents = store.listEvents(taskId);
     const workItemLanes = store.listWorkItems(taskId).flatMap((item) => {
+      if (item.status !== "running") return [];
       const group = currentWorkItemExecutionGroup(item);
       if (group === undefined || group.resolution !== undefined) return [];
       if (group.stage !== undefined) {
@@ -813,7 +815,9 @@ function queuedResourceLaneIdentities(
         if (resources.deadlineReached || resources.exhaustedBudgets.length > 0) return [];
       }
       return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
-        if (lane.status !== "pending" || lane.effective === undefined) return [];
+        if (lane.status !== "pending"
+          || lane.effective === undefined
+          || lane.runId !== undefined) return [];
         return [{
           taskId,
           workItemId: item.id,
@@ -827,10 +831,13 @@ function queuedResourceLaneIdentities(
       });
     });
     const reviewLanes = store.listReviewRounds(taskId).flatMap((round) => {
+      if (round.status !== "pending" && round.status !== "running") return [];
       const group = round.executionGroup;
       if (group === undefined || group.resolution !== undefined) return [];
       return group.lanes.flatMap((lane): ResourceLaneIdentity[] => {
-        if (lane.status !== "pending" || lane.effective === undefined) return [];
+        if (lane.status !== "pending"
+          || lane.effective === undefined
+          || lane.runId !== undefined) return [];
         return [{
           taskId,
           ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
@@ -3434,7 +3441,7 @@ function dispatchWork(
         roleName: unboundRun.roleName,
         purpose: "execution",
         workItemId: item.id
-      }, now);
+      }, now, "controller", runningGroup.stage?.contextSnapshotRef);
       const runWithLineage = withAgentRunContextSnapshot(
         unboundRun,
         contextSnapshotRef(snapshot),
@@ -6061,7 +6068,7 @@ function retryRun(
       roleName: role.name,
       purpose: "execution",
       ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId })
-    }, now);
+    }, now, "controller", retryGroup?.stage?.contextSnapshotRef);
     const assignment = createRunAssignment({
       runId: runId!,
       roleName: role.name,
@@ -8058,6 +8065,13 @@ export function dispatchPreparedReviewRound(
     });
     const activeResources = activeResourceLaneIdentities(tx);
     const queuedResources = queuedResourceLaneIdentities(tx, now);
+    const reviewBaseline = dispatchLanes.length === 0
+      ? undefined
+      : freezeReviewStageContextSnapshot(tx, {
+          taskId,
+          reviewRoundId: round.id,
+          executionGroupId: runningGroup.id
+        }, now);
     for (let index = 0; index < reviewers.length; index += 1) {
       const lane = dispatchLanes[index]!;
       const laneReviewer = reviewers[index]!;
@@ -8189,7 +8203,9 @@ export function dispatchPreparedReviewRound(
         purpose: "review",
         ...(item === undefined ? {} : { workItemId: item.id }),
         reviewRoundId: round.id
-      }, now);
+      }, now, "controller", reviewBaseline === undefined
+        ? undefined
+        : contextSnapshotRef(reviewBaseline));
       const created = withAgentRunContextSnapshot(
         unboundRun,
         contextSnapshotRef(snapshot),
