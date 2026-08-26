@@ -195,6 +195,11 @@ changes Provider retry policy.
    gates; the basic identity and audit remain. No business-state rollback is
    needed.
 
+For the multi-Agent quality/cost comparison and staged enablement gates, use
+the [T10 evaluation contract](../multi-agent-evaluation.md). It consumes
+deterministic mock/replay evidence and keeps `single` as the default; this
+observability document does not authorize real Provider or production tests.
+
 ## Rollback
 
 - **Status fields**: set `YUI_STATUS_IDENTITY=0`. The identity section is
