@@ -11,6 +11,10 @@ import type {
   TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
 import type { AgentRun } from "./agentRun.js";
+import {
+  actionableExecutionLaneRecoveries,
+  type ExecutionGroupHealthSummary
+} from "../execution/executionHealth.js";
 
 /**
  * Issue 08: read-only projection of the exact recovery position for one Run.
@@ -177,6 +181,27 @@ export function readRunRecoveryFacts(
       runId
     )
   };
+}
+
+/**
+ * Resolve the exact live-Run recovery plans referenced by Lane health. Failed
+ * terminal Lanes use `task run retry` directly and therefore need no live-Run
+ * recovery projection here.
+ */
+export function projectExecutionLaneRunRecoveries(
+  store: RunRecoveryStore,
+  taskId: string,
+  groups: readonly ExecutionGroupHealthSummary[]
+): RunRecoveryProjection[] {
+  const runIds = new Set(actionableExecutionLaneRecoveries(groups).flatMap((lane) => (
+    lane.runId === undefined || lane.recovery === "retry-new-agent-run"
+      ? []
+      : [lane.runId]
+  )));
+  return [...runIds].flatMap((runId) => {
+    const facts = readRunRecoveryFacts(store, taskId, runId);
+    return facts === null ? [] : [projectRunRecovery(facts)];
+  });
 }
 
 /**

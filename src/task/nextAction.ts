@@ -20,6 +20,12 @@ import {
 } from "../review/reviewOutcomeClassifier.js";
 import type { ReviewFinding } from "../review/reviewFinding.js";
 import {
+  actionableExecutionLaneRecoveries,
+  type ActionableExecutionLaneRecovery,
+  type ExecutionGroupHealthSummary
+} from "../execution/executionHealth.js";
+import type { RunRecoveryProjection } from "../run/recoveryProjection.js";
+import {
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
 import {
@@ -59,6 +65,7 @@ export type NextActionKind =
   | "route-review-findings"
   | "resolve-review-group"
   | "resume-review"
+  | "recover-execution-lane"
   | "wait-for-owned-execution"
   | "resolve-input"
   | "complete-task"
@@ -121,6 +128,10 @@ export type NextActionFacts = Readonly<{
     reviewFindings: readonly ReviewFinding[];
     events: readonly TaskEvent[];
   }>;
+  /** Current unresolved Lane health supplied by canonical Task read surfaces. */
+  executionGroups?: readonly ExecutionGroupHealthSummary[];
+  /** Exact live-Run recovery plans for Lane actions that use `task run recover`. */
+  runRecoveries?: readonly RunRecoveryProjection[];
 }>;
 
 const OPEN_WORK_ITEM_STATUSES = new Set(["pending", "running", "awaiting_acceptance"]);
@@ -163,6 +174,12 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       )),
       recommendedCommand: inconsistency.recommendedCommand
     });
+  }
+
+  const laneRecovery = actionableExecutionLaneRecoveries(facts.executionGroups ?? [])
+    .find(hasExactRun);
+  if (laneRecovery !== undefined) {
+    return buildExecutionLaneRecoveryAction(facts, laneRecovery);
   }
 
   const activeLeader = facts.activeRuns.find((run) => run.roleName === "leader");
@@ -649,6 +666,63 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
             "Leader must decide whether the frozen Task result is safe to complete or needs one optional Task-final Review."
         }),
     recommendedCommand: `yui task complete ${task.id} --summary-file -`
+  });
+}
+
+type NextActionLaneRecovery = ActionableExecutionLaneRecovery & Readonly<{ runId: string }>;
+
+function hasExactRun(
+  lane: ActionableExecutionLaneRecovery
+): lane is NextActionLaneRecovery {
+  return lane.runId !== undefined;
+}
+
+function buildExecutionLaneRecoveryAction(
+  facts: NextActionFacts,
+  lane: NextActionLaneRecovery
+): NextAction {
+  const refs = [
+    ref("execution-group", lane.groupId),
+    ref("execution-lane", lane.laneId),
+    ref("agent-run", lane.runId)
+  ];
+  if (lane.recovery === "retry-new-agent-run") {
+    return buildAction(facts, {
+      kind: "recover-execution-lane",
+      reason: `Execution Lane ${lane.laneId} is durably failed; retry only exact Run ${lane.runId} and retain sibling results.`,
+      refs,
+      preconditions: [
+        { fact: "Execution Lane is failed and unresolved", satisfied: true, ref: refs[1] },
+        { fact: "Exact failed AgentRun is retained", satisfied: true, ref: refs[2] }
+      ],
+      recommendedCommand: `yui task run retry ${facts.task.id}/${lane.runId}`
+    });
+  }
+
+  const action = lane.recovery === "diagnose" ? "diagnose" : "terminate";
+  const recovery = facts.runRecoveries?.find(({ runId }) => runId === lane.runId);
+  const plan = recovery?.actions.find((candidate) => candidate.action === action);
+  return buildAction(facts, {
+    kind: "recover-execution-lane",
+    reason: lane.recovery === "diagnose"
+      ? `Execution Lane ${lane.laneId} needs bounded diagnostics for exact Run ${lane.runId}.`
+      : `Execution Lane ${lane.laneId} has confirmed death evidence; terminate exact Run ${lane.runId}.`,
+    refs,
+    preconditions: [
+      { fact: `Lane recovery is ${lane.recovery}`, satisfied: true, ref: refs[1] },
+      {
+        fact: `Exact Run exposes a current ${action} recovery plan`,
+        satisfied: plan !== undefined,
+        ref: refs[2]
+      }
+    ],
+    ...(plan === undefined ? {} : { recommendedCommand: plan.command }),
+    ...(plan !== undefined && recovery?.judgmentRequired === undefined
+      ? {}
+      : {
+          judgmentRequired: recovery?.judgmentRequired
+            ?? `Inspect yui task run show ${facts.task.id}/${lane.runId}; its exact recovery fence is unavailable.`
+        })
   });
 }
 

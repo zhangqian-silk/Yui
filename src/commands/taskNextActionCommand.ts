@@ -19,6 +19,8 @@ import {
   type OrchestrationAdvisory
 } from "../observability/orchestrationMetrics.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
+import { projectExecutionLaneRunRecoveries } from "../run/recoveryProjection.js";
 
 /**
  * Issue 07 (Leader convergence): read-only `yui task next-action <task>`.
@@ -43,6 +45,7 @@ export function runTaskNextActionCommand(
     throw usageError(usage);
   }
   const taskId = positionals[0].trim();
+  const now = new Date();
   const data = store.transaction((reader) => {
     // Issue 06: the lightweight facts drive the action on every call; the
     // heavier readiness facts (full event fold, workspaces, jobs, ledger) are
@@ -50,8 +53,19 @@ export function runTaskNextActionCommand(
     // read path cheap during execution.
     const facts = reader.readNextActionFacts(taskId);
     if (facts === null) throw taskNotFound(taskId);
-    const action = projectNextAction(facts);
-    const repairWave = repairWaveFor(action, facts);
+    const execution = buildTaskExecutionProjection(reader, taskId, undefined, now);
+    if (execution === null) throw taskNotFound(taskId);
+    const actionFacts: NextActionFacts = {
+      ...facts,
+      executionGroups: execution.executionGroups,
+      runRecoveries: projectExecutionLaneRunRecoveries(
+        reader,
+        taskId,
+        execution.executionGroups
+      )
+    };
+    const action = projectNextAction(actionFacts);
+    const repairWave = repairWaveFor(action, actionFacts);
     // Issue 12: surface pending Knowledge promotion proposals for the Task's
     // bound Projects as a non-blocking advisory. The proposals are workflow
     // state, not completion blockers: an Operator reviews them separately.

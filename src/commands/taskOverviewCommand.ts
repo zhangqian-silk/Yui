@@ -20,6 +20,7 @@ import {
   projectTaskExecutionFromFacts,
   type TaskExecutionProjection
 } from "../scheduler/taskExecutionProjection.js";
+import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 
 export type TaskListOptions = Readonly<{
   all: boolean;
@@ -135,11 +136,13 @@ export function parseTaskListOptions(args: readonly string[]): TaskListOptions {
 
 export function buildTaskOverview(
   store: TaskStore,
-  options: TaskListOptions
+  options: TaskListOptions,
+  now = new Date()
 ): TaskOverviewResult {
+  const runtimeHealthPolicy = resolveRuntimeHealth(store.getConfig().runtimeHealth);
   const tasks = store.listTasks()
     .filter((task) => options.all || task.status !== "archived")
-    .map((task) => buildTaskOverviewEntry(task, store));
+    .map((task) => buildTaskOverviewEntry(task, store, now, runtimeHealthPolicy));
   return { tasks };
 }
 
@@ -183,7 +186,12 @@ export function renderTaskOverview(
   return `${output}\n\n${renderVerboseDetails(result.tasks, timeZone)}\n`;
 }
 
-function buildTaskOverviewEntry(task: Task, store: TaskStore): TaskOverview {
+function buildTaskOverviewEntry(
+  task: Task,
+  store: TaskStore,
+  now: Date,
+  runtimeHealthPolicy: ReturnType<typeof resolveRuntimeHealth>
+): TaskOverview {
   const brief = store.getTaskBrief(task.id);
   const roles = store.listRoles(task.id);
   const leaderRole = roles.find((role) => role.name === "leader") ?? null;
@@ -262,7 +270,9 @@ function buildTaskOverviewEntry(task: Task, store: TaskStore): TaskOverview {
     leaderMailbox,
     leaderFailure,
     operatorNotification,
-    roleSessions
+    roleSessions,
+    now,
+    runtimeHealthPolicy
   });
   return {
     ...task,

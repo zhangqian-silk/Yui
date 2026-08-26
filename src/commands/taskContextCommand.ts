@@ -16,6 +16,7 @@ import {
 import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
 import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+import { projectExecutionLaneRunRecoveries } from "../run/recoveryProjection.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -31,13 +32,14 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     throw usageError("Task context usage: yui task context <task>.");
   }
   const taskId = args[0].trim();
+  const now = new Date();
   const data = store.transaction((reader) => {
     const task = reader.getTask(taskId);
     if (task === null) throw taskNotFound(taskId);
     const workItems = reader.listWorkItems(task.id);
     const inputRequests = reader.listInputRequests(task.id);
     const roles = reader.listRoles(task.id);
-    const execution = buildTaskExecutionProjection(reader, task.id, task);
+    const execution = buildTaskExecutionProjection(reader, task.id, task, now);
     if (execution === null) {
       throw new Error(`Task execution projection disappeared: ${task.id}.`);
     }
@@ -89,7 +91,15 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       openInputRequests: inputRequests.filter((request) => request.status === "open"),
       resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
       events,
-      nextAction: projectNextAction(nextActionFacts)
+      nextAction: projectNextAction({
+        ...nextActionFacts,
+        executionGroups: execution.executionGroups,
+        runRecoveries: projectExecutionLaneRunRecoveries(
+          reader,
+          task.id,
+          execution.executionGroups
+        )
+      })
     };
   });
   const {
@@ -643,7 +653,9 @@ function renderExecutionGroup(
     ...summary.laneSummaries.flatMap((lane) => {
       const laneHealth = projected?.laneSummaries.find(({ laneId }) => laneId === lane.laneId);
       return [
-        `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}) [${lane.status}${
+        `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}${
+          lane.runId === undefined ? "" : `, run ${lane.runId}`
+        }) [${lane.status}${
           laneHealth?.runtimeHealth === undefined ? "" : `/${laneHealth.runtimeHealth}`
         }]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,
         ...(laneHealth !== undefined && laneHealth.recovery !== "none"

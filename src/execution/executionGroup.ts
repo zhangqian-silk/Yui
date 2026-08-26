@@ -211,6 +211,7 @@ export type ExecutionGroupSummary = Readonly<{
     laneId: string;
     roleName: string;
     ordinal: number;
+    runId?: string;
     status: ExecutionLaneStatus;
     summary?: string;
     report?: string;
@@ -626,6 +627,7 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
       laneId: lane.id,
       roleName: lane.roleName,
       ordinal: lane.ordinal,
+      ...(lane.runId === undefined ? {} : { runId: lane.runId }),
       status: lane.status,
       ...(lane.result === undefined ? {} : {
         summary: lane.result.summary,

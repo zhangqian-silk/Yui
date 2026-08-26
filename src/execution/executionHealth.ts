@@ -69,6 +69,14 @@ export type ExecutionGroupHealthSummary = Readonly<
   }
 >;
 
+export type ActionableExecutionLaneRecovery = Readonly<{
+  groupId: string;
+  laneId: string;
+  runId?: string;
+  runtimeHealth?: ExecutionLaneRuntimeHealth;
+  recovery: "diagnose" | "terminate-exact-run" | "retry-new-agent-run";
+}>;
+
 export type ExecutionHealthRun = Pick<
   AgentRun,
   | "id"
@@ -157,6 +165,32 @@ export function summarizeExecutionGroupHealth(
   });
 }
 
+/** Unresolved Lane recovery in deterministic operational priority order. */
+export function actionableExecutionLaneRecoveries(
+  groups: readonly ExecutionGroupHealthSummary[]
+): ActionableExecutionLaneRecovery[] {
+  const priority = {
+    "terminate-exact-run": 0,
+    "retry-new-agent-run": 1,
+    diagnose: 2
+  } as const;
+  return groups
+    .filter(({ resolution }) => resolution === undefined)
+    .flatMap((group) => group.laneSummaries.flatMap((lane): ActionableExecutionLaneRecovery[] => {
+      if (lane.recovery !== "diagnose"
+        && lane.recovery !== "terminate-exact-run"
+        && lane.recovery !== "retry-new-agent-run") return [];
+      return [{
+        groupId: group.groupId,
+        laneId: lane.laneId,
+        ...(lane.runId === undefined ? {} : { runId: lane.runId }),
+        ...(lane.runtimeHealth === undefined ? {} : { runtimeHealth: lane.runtimeHealth }),
+        recovery: lane.recovery
+      }];
+    }))
+    .sort((left, right) => priority[left.recovery] - priority[right.recovery]);
+}
+
 function projectExecutionLaneHealth(
   lane: ExecutionLane,
   input: ExecutionGroupHealthInput,
@@ -225,6 +259,9 @@ function projectExecutionLaneHealth(
     && candidate.adapterId === run.effective.adapterId
   ));
   const observations = exactRunObservations(input.events, run, session);
+  const runtime = runtimeProjection(observations, input.events, run);
+  const activeChildOperation = runtime !== null
+    && Object.values(runtime.operations).some(({ kind }) => kind === "subagent");
   if (observations.some((observation) => (
     observation.kind === "turn.failed"
     && observation.payload.failure?.runTerminal === true
@@ -238,17 +275,35 @@ function projectExecutionLaneHealth(
     });
   }
 
+  const runtimeTerminalEvidence = runtime === null
+    ? []
+    : [
+        ...(runtime.host === "exited" ? ["runtime-host-exited"] : []),
+        ...(runtime.session === "ended" || runtime.session === "failed"
+          ? [`runtime-session-${runtime.session}`]
+          : [])
+      ];
+  if (runtimeTerminalEvidence.length > 0 && !activeChildOperation) {
+    return projection(lane, {
+      runtimeHealth: "confirmed-dead",
+      recovery: "terminate-exact-run",
+      resultReusable: false,
+      reason: "the exact runtime host or Session is terminal and no active child operation remains",
+      evidence: runtimeTerminalEvidence
+    });
+  }
+
   const exit = latestExactProcessExit(input.events, run, session);
   const sessionDead = session?.status === "stopped" || session?.status === "broken";
   if (sessionDead
     && exit !== null
     && isAbnormalExit(exit.classification)
-    && input.now.getTime() - Date.parse(exit.observation.observedAt) >= policy.diagnosticAfterMs) {
+    && !activeChildOperation) {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
       recovery: "terminate-exact-run",
       resultReusable: false,
-      reason: "the exact Session and process exit independently confirm death after the diagnostic grace period",
+      reason: "the exact Session and abnormal process exit independently confirm death",
       evidence: ["native-session-terminal", `process-exit:${exit.classification}`]
     });
   }
@@ -265,7 +320,6 @@ function projectExecutionLaneHealth(
     });
   }
 
-  const runtime = runtimeProjection(observations, input.events, run);
   const activeOperation = runtime !== null && Object.keys(runtime.operations).length > 0;
   const lastActivityAt = runtime?.lastRuntimeActivityAt
     ?? run.deliveredAt

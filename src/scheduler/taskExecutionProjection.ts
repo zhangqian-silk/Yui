@@ -17,6 +17,7 @@ import {
   type ExecutionGroup
 } from "../execution/executionGroup.js";
 import {
+  actionableExecutionLaneRecoveries,
   summarizeExecutionGroupHealth,
   type ExecutionGroupHealthSummary
 } from "../execution/executionHealth.js";
@@ -54,6 +55,7 @@ export type TaskExecutionOwner =
 export type TaskExecutionAction =
   | "advance-task"
   | "wait-for-agents"
+  | "recover-execution"
   | "answer-input"
   | "inspect-attention"
   | "recover-leader"
@@ -298,6 +300,7 @@ export function projectTaskExecution(
     now,
     policy: facts.runtimeHealthPolicy
   }));
+  const laneRecovery = actionableExecutionLaneRecoveries(groupSummaries)[0];
   const render = (input: ProjectionInput): TaskExecutionProjection => projection({
     ...input,
     executionGroups: groupSummaries
@@ -374,8 +377,9 @@ export function projectTaskExecution(
   ));
   const hasLeaderMismatch = attention.some((item) => item.kind === "identity-mismatch");
 
-  if (attention.length > 0) {
+  const renderAttention = (): TaskExecutionProjection => {
     const first = attention[0];
+    if (first === undefined) throw new Error("Task execution attention disappeared.");
     const progressingWithAttention = first.kind === "checkpoint-overdue"
       && healthyExecutionCarriers.length > 0;
     return render({
@@ -395,6 +399,9 @@ export function projectTaskExecution(
       blockers,
       pendingWakeup
     });
+  };
+  if (attention.length > 0 && hasLeaderMismatch) {
+    return renderAttention();
   }
   if (openInputs.length > 0) {
     return render({
@@ -412,6 +419,30 @@ export function projectTaskExecution(
       blockers,
       pendingWakeup
     });
+  }
+  if (laneRecovery !== undefined) {
+    return render({
+      task,
+      status: laneRecovery.runtimeHealth === "confirmed-dead"
+        ? "attention"
+        : "needs-leader-action",
+      owner: "leader",
+      action: "recover-execution",
+      summary: `Execution Lane ${laneRecovery.laneId} in ${laneRecovery.groupId}`
+        + ` requires ${laneRecovery.recovery}`
+        + (laneRecovery.runId === undefined ? "." : ` for exact Run ${laneRecovery.runId}.`),
+      reason: `execution-lane-${laneRecovery.recovery}`,
+      monitoring,
+      failClosed: false,
+      activeRuns: activeRunViews,
+      activeExecutorCount: activeExecutors.length,
+      attention,
+      blockers,
+      pendingWakeup
+    });
+  }
+  if (attention.length > 0) {
+    return renderAttention();
   }
   if (blockedIntegration || failedWork || hasLeaderMismatch) {
     return render({
