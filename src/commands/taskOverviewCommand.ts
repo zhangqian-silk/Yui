@@ -82,7 +82,7 @@ export type TaskOverviewBlocker = Readonly<{
 export type TaskOverviewNext = Readonly<{
   action: string;
   owner: string;
-  kind: TaskOverviewBlocker["kind"] | "wakeup" | "summary";
+  kind: TaskOverviewBlocker["kind"] | "execution" | "wakeup" | "summary";
   id?: string;
   summary: string;
 }>;
@@ -219,7 +219,7 @@ function buildTaskOverviewEntry(
     operatorNotification
   );
   const blockers = collectBlockers(workItems, openInputRequests, attention);
-  const next = deriveNextAction(
+  const legacyNext = deriveNextAction(
     task,
     brief,
     workItems,
@@ -274,6 +274,14 @@ function buildTaskOverviewEntry(
     now,
     runtimeHealthPolicy
   });
+  const next: TaskOverviewNext | null = execution.action === "recover-execution"
+    ? {
+        action: execution.action,
+        owner: execution.owner,
+        kind: "execution",
+        summary: execution.summary
+      }
+    : legacyNext;
   return {
     ...task,
     brief,

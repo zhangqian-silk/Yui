@@ -260,8 +260,15 @@ function projectExecutionLaneHealth(
   ));
   const observations = exactRunObservations(input.events, run, session);
   const runtime = runtimeProjection(observations, input.events, run);
-  const activeChildOperation = runtime !== null
-    && Object.values(runtime.operations).some(({ kind }) => kind === "subagent");
+  const unsettledContinuation = runtime !== null
+    && Object.values(runtime.continuations).some((continuation) => (
+      continuation.execution === "active"
+      || continuation.execution === "unknown"
+      || continuation.identityConflict
+    ));
+  const unsettledChildWork = runtime !== null
+    && (Object.values(runtime.operations).some(({ kind }) => kind === "subagent")
+      || unsettledContinuation);
   if (observations.some((observation) => (
     observation.kind === "turn.failed"
     && observation.payload.failure?.runTerminal === true
@@ -283,12 +290,12 @@ function projectExecutionLaneHealth(
           ? [`runtime-session-${runtime.session}`]
           : [])
       ];
-  if (runtimeTerminalEvidence.length > 0 && !activeChildOperation) {
+  if (runtimeTerminalEvidence.length > 0 && !unsettledChildWork) {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
       recovery: "terminate-exact-run",
       resultReusable: false,
-      reason: "the exact runtime host or Session is terminal and no active child operation remains",
+      reason: "the exact runtime host or Session is terminal and no unsettled child work remains",
       evidence: runtimeTerminalEvidence
     });
   }
@@ -298,7 +305,7 @@ function projectExecutionLaneHealth(
   if (sessionDead
     && exit !== null
     && isAbnormalExit(exit.classification)
-    && !activeChildOperation) {
+    && !unsettledChildWork) {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
       recovery: "terminate-exact-run",
@@ -320,7 +327,8 @@ function projectExecutionLaneHealth(
     });
   }
 
-  const activeOperation = runtime !== null && Object.keys(runtime.operations).length > 0;
+  const activeOperation = runtime !== null
+    && (Object.keys(runtime.operations).length > 0 || unsettledContinuation);
   const lastActivityAt = runtime?.lastRuntimeActivityAt
     ?? run.deliveredAt
     ?? run.pushedAt
@@ -331,10 +339,14 @@ function projectExecutionLaneHealth(
       runtimeHealth: "active",
       recovery: "none",
       resultReusable: false,
-      reason: activeOperation
-        ? "the exact runtime reports an active operation"
+      reason: unsettledContinuation
+        ? "the exact runtime reports unsettled continuation work"
+        : activeOperation
+          ? "the exact runtime reports an active operation"
         : "the exact Run has recent structured runtime activity",
-      evidence: activeOperation ? ["runtime-operation-active"] : ["runtime-activity-recent"]
+      evidence: unsettledContinuation
+        ? ["runtime-continuation-unsettled"]
+        : activeOperation ? ["runtime-operation-active"] : ["runtime-activity-recent"]
     });
   }
   return projection(lane, {
