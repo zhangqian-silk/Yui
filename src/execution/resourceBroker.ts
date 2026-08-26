@@ -61,7 +61,7 @@ export type ResourceAdmission = Readonly<{
 export type ExecutionResourceUsage = Readonly<{
   tokens: number;
   toolCalls: number;
-  /** False means the Provider did not expose enough exact usage to enforce it. */
+  /** False means the exact total is unavailable; tokens remains a proven lower bound. */
   tokensObservable?: boolean;
   /** False means the Agent Driver did not expose tool-operation identity. */
   toolCallsObservable?: boolean;
@@ -292,7 +292,7 @@ export function projectExecutionStageResources(input: Readonly<{
   const tokensObservable = input.usage.tokensObservable ?? true;
   const toolCallsObservable = input.usage.toolCallsObservable ?? true;
   const exhaustedBudgets: ("tokens" | "tool-calls" | "wall-clock")[] = [];
-  if (tokensObservable && stage?.budget.maxTokens !== undefined
+  if (stage?.budget.maxTokens !== undefined
     && tokens >= stage.budget.maxTokens) exhaustedBudgets.push("tokens");
   if (toolCallsObservable && stage?.budget.maxToolCalls !== undefined
     && toolCalls >= stage.budget.maxToolCalls) exhaustedBudgets.push("tool-calls");

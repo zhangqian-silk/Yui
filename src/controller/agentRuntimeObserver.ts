@@ -102,26 +102,37 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         // latency can change completion order without changing observation
         // identity or the canonical sequence assigned to a source.
         const sequence = sequenceBase + index;
-        if (existingState === undefined && freshSession && state.usage === undefined) {
-          const zero = Object.freeze({
-            semantics: "cumulative-session" as const,
-            inputTokens: 0,
-            outputTokens: 0
-          });
-          this.inbox.enqueueObservation(createRuntimeObservation({
-            schemaVersion: 2,
-            eventId: observationId("baseline", fence, source.sourceId, "zero"),
-            semanticKey: observationId("baseline", fence, source.sourceId, "zero"),
-            kind: "activity.observed",
-            authority: "controller",
-            receivedAt: at,
-            sequence,
-            ordinal: 1,
-            fence,
-            payload: { activity: "model", usage: zero }
-          }));
-          state.usage = zero;
-          dirty.add(`role:${fence.taskId}/${fence.roleName}`);
+        if (existingState === undefined && state.usage === undefined) {
+          // A fresh native Session begins at zero. A resumed Session instead
+          // freezes its first cumulative sample as this Run's lower-bound
+          // baseline so later samples can prove spend without charging usage
+          // that belongs to an earlier Run in the same native conversation.
+          const baseline = freshSession
+            ? Object.freeze({
+                semantics: "cumulative-session" as const,
+                inputTokens: 0,
+                outputTokens: 0
+              })
+            : sample.usage?.semantics === "cumulative-session"
+              ? sample.usage
+              : undefined;
+          if (baseline !== undefined) {
+            const baselineKey = freshSession ? "zero" : JSON.stringify(baseline);
+            this.inbox.enqueueObservation(createRuntimeObservation({
+              schemaVersion: 2,
+              eventId: observationId("baseline", fence, source.sourceId, baselineKey),
+              semanticKey: observationId("baseline", fence, source.sourceId, baselineKey),
+              kind: "activity.observed",
+              authority: freshSession ? "controller" : "driver-inferred",
+              receivedAt: at,
+              sequence,
+              ordinal: 1,
+              fence,
+              payload: { activity: "model", usage: baseline }
+            }));
+            state.usage = baseline;
+            dirty.add(`role:${fence.taskId}/${fence.roleName}`);
+          }
         }
         const health = JSON.stringify([sample.status, sample.detail ?? null]);
         if (state.health !== health) {

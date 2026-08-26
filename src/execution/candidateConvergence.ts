@@ -404,6 +404,74 @@ export function candidateConvergenceEvidenceSufficient(
   });
 }
 
+/**
+ * Project only disagreement that structured convergence results make durable.
+ * Unknown or malformed reports never manufacture an expansion signal.
+ */
+export function candidateConvergenceDisagreement(
+  group: ExecutionGroup
+): "unknown" | "low" | "high" {
+  const stage = group.stage;
+  if (stage?.convergence === undefined || stage.stage === "plan") return "unknown";
+  const envelopes = usableCandidateConvergenceEnvelopes(group);
+  if (envelopes === null || envelopes.length === 0) return "unknown";
+  if (stage.stage === "generate") {
+    return new Set(envelopes.map(({ candidate }) => candidate!.key)).size > 1
+      ? "high"
+      : "low";
+  }
+  if (stage.stage === "compare") {
+    return envelopes.some(({ comparison }) => (
+      comparison!.contradictions.length > 0 || comparison!.clusters.length > 1
+    )) || new Set(envelopes.map(({ comparison }) => JSON.stringify(
+      [...comparison!.selectedResultRefs].sort()
+    ))).size > 1 ? "high" : "low";
+  }
+  if (stage.stage === "synthesize") {
+    return envelopes.some(({ synthesis }) => synthesis!.unresolvedContradictions.length > 0)
+      || new Set(envelopes.map(({ candidate }) => candidate!.key)).size > 1
+      ? "high"
+      : "low";
+  }
+  if (stage.stage === "verify") {
+    const signatures = envelopes.map(({ verification }) => JSON.stringify({
+      disposition: verification!.disposition,
+      criteria: verification!.criteria.map(({ criterion, status }) => ({ criterion, status }))
+        .sort((left, right) => left.criterion.localeCompare(right.criterion)),
+      gaps: [...verification!.gaps].sort()
+    }));
+    return new Set(signatures).size > 1 ? "high" : "low";
+  }
+  const dispositions = envelopes.map(({ resolution }) => resolution!.disposition);
+  return new Set(dispositions).size > 1 ? "high" : "low";
+}
+
+/** True only when every usable structured Lane result satisfies its frozen stage contract. */
+export function candidateConvergenceStageResultsValid(group: ExecutionGroup): boolean {
+  if (group.stage?.convergence === undefined) return true;
+  const envelopes = usableCandidateConvergenceEnvelopes(group);
+  return envelopes !== null && envelopes.length > 0;
+}
+
+function usableCandidateConvergenceEnvelopes(
+  group: ExecutionGroup
+): CandidateConvergenceEnvelope[] | null {
+  const stage = group.stage;
+  if (stage?.convergence === undefined) return [];
+  const usable = group.lanes.filter(({ status, result }) => (
+    (status === "yielded" || status === "completed") && result !== undefined
+  ));
+  try {
+    return usable.map(({ result }) => validateCandidateConvergenceReport(
+      result!,
+      stage.stage,
+      stage.parentResults
+    ));
+  } catch {
+    return null;
+  }
+}
+
 function assertVerificationCoversAcceptance(
   workItem: Pick<WorkItem, "objective" | "acceptance">,
   criteria: NonNullable<CandidateConvergenceEnvelope["verification"]>["criteria"]
