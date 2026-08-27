@@ -104,9 +104,31 @@ export type KnowledgeProposal = Readonly<{
  */
 export type ProjectOwnership = "managed" | "external";
 
+/**
+ * Lifecycle status of a Project Catalog entry.
+ *
+ * - `active`: usable for new Task bindings and Project maintenance.
+ * - `retired`: auditable soft deprecation. The catalog record, checkout, and
+ *   every historical reference are retained, but the Project cannot be bound
+ *   to new work or maintained. Hard removal goes through `project delete` and
+ *   still preserves Task/Run/Review/Integration/Publication evidence.
+ */
+export type ProjectStatus = "active" | "retired";
+
+/**
+ * Audit record for a Project's soft retirement. Present only while the
+ * Project is retired; the reason and actor make the deprecation reviewable
+ * without deleting any historical evidence that references the Project.
+ */
+export type ProjectRetirement = Readonly<{
+  reason: string;
+  retiredBy: "user" | "operator";
+  retiredAt: string;
+}>;
+
 /** A durable Project Catalog entry maintained by Yui. */
 export type Project = Readonly<{
-  schemaVersion: 4;
+  schemaVersion: 5;
   id: string;
   name: string;
   aliases: readonly string[];
@@ -115,6 +137,9 @@ export type Project = Readonly<{
   remoteUrl?: string;
   stableBranch: string;
   developmentBranch: string;
+  status: ProjectStatus;
+  /** Present only while `status` is `retired`. */
+  retirement?: ProjectRetirement;
   knowledge: readonly ProjectKnowledge[];
   /**
    * Leader-proposed Knowledge candidates awaiting an Operator decision. The
@@ -145,7 +170,7 @@ export function createProject(
 ): Project {
   const timestamp = now.toISOString();
   return validateProject({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: requireIdentity(id, "Project id"),
     name: validateProjectName(name),
     aliases: normalizeAliases(metadata.aliases ?? [], name),
@@ -156,6 +181,7 @@ export function createProject(
       : { remoteUrl: requireText(metadata.remoteUrl, "Project remote URL") }),
     stableBranch: requireGitRef(branches.stable, "Project stable branch"),
     developmentBranch: requireGitRef(branches.development, "Project development branch"),
+    status: "active" as const,
     knowledge: [],
     knowledgeProposals: [],
     createdAt: timestamp,
@@ -165,6 +191,45 @@ export function createProject(
 
 export function validateProjectName(value: string): string {
   return requireIdentity(value, "Project name");
+}
+
+/**
+ * Soft-retire a Project: mark it retired and record the audit trail. The
+ * catalog record, checkout, and every historical Task/Run/Review/Integration/
+ * Publication reference are retained. Retiring an already-retired Project
+ * fails closed; a retired Project must be deleted (or kept) as-is.
+ */
+export function retireProject(
+  project: Project,
+  reason: string,
+  by: "user" | "operator",
+  now: Date
+): Project {
+  if (project.status === "retired") {
+    throw new Error(`Project is already retired: ${project.id}.`);
+  }
+  const timestamp = now.toISOString();
+  return validateProject({
+    ...project,
+    status: "retired" as const,
+    retirement: {
+      reason: requireText(reason, "Project retirement reason"),
+      retiredBy: by,
+      retiredAt: timestamp
+    },
+    updatedAt: timestamp
+  });
+}
+
+/**
+ * Refuse a mutation or new binding against a retired Project. Read-only
+ * inspection (`project show`, `project diagnose`, knowledge reads) remains
+ * allowed, so historical evidence stays auditable.
+ */
+export function assertProjectActive(project: Project, action: string): void {
+  if (project.status === "retired") {
+    throw new Error(`Project is retired and cannot ${action}: ${project.id}.`);
+  }
 }
 
 export function addProjectKnowledge(
@@ -434,6 +499,27 @@ export function resolveProject(
   return matches[0] ?? null;
 }
 
+/**
+ * Projection of every durable reference the Task ledger holds to a Project,
+ * used by the lifecycle commands' fail-closed gates. `boundTaskIds` covers
+ * historical (completed/retired/archived) bindings too, because their
+ * Task/Run/Review/Integration/Publication evidence must stay resolvable;
+ * `activeTaskIds` and the unresolved-delivery lists cover open work.
+ */
+export type ProjectReferenceSummary = Readonly<{
+  projectId: string;
+  /** Every Task binding this Project, including historical (audit evidence). */
+  boundTaskIds: readonly string[];
+  /** Tasks in `active` status that bind this Project. */
+  activeTaskIds: readonly string[];
+  /** Non-terminal Work Items (`task/work`) inside the active Tasks. */
+  unresolvedWorkItemRefs: readonly string[];
+  /** Active Agent Runs (`task/run`) inside the active Tasks. */
+  activeRunRefs: readonly string[];
+  /** Running or blocked Integration Attempts inside the active Tasks. */
+  unresolvedIntegrationRefs: readonly string[];
+}>;
+
 export function assertProjectCatalog(
   projects: readonly Project[]
 ): void {
@@ -458,14 +544,30 @@ export function assertProjectCatalog(
 }
 
 export function validateProject(project: Project): Project {
-  if (project.schemaVersion !== 4) {
-    throw new Error("Project must use schemaVersion 4.");
+  if (project.schemaVersion !== 5) {
+    throw new Error("Project must use schemaVersion 5.");
   }
   requireIdentity(project.id, "Project id");
   requireIdentity(project.name, "Project name");
   normalizeAliases(project.aliases, project.name);
   if (project.ownership !== "managed" && project.ownership !== "external") {
     throw new Error(`Project ownership is invalid: ${String(project.ownership)}.`);
+  }
+  if (project.status !== "active" && project.status !== "retired") {
+    throw new Error(`Project status is invalid: ${String(project.status)}.`);
+  }
+  if (project.status === "retired") {
+    const retirement = project.retirement;
+    if (retirement === undefined) {
+      throw new Error(`Retired Project must carry its retirement record: ${project.id}.`);
+    }
+    requireText(retirement.reason, "Project retirement reason");
+    if (retirement.retiredBy !== "user" && retirement.retiredBy !== "operator") {
+      throw new Error("Project retirement actor is invalid.");
+    }
+    requireTimestamp(retirement.retiredAt, "Project retirement retiredAt");
+  } else if (project.retirement !== undefined) {
+    throw new Error(`Active Project must not carry a retirement record: ${project.id}.`);
   }
   const references = new Set<string>();
   for (const reference of [project.id, project.name, ...project.aliases]) {

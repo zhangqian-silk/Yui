@@ -246,6 +246,25 @@ export interface GitWorkspacePort {
     integrationId: string;
     discardChanges?: boolean;
   }>): Promise<GitWorkspaceRemoval>;
+  /**
+   * Hard-reset a canonical Project checkout's current branch to an exact
+   * commit. Fails closed on a dirty tree or a moved HEAD (compare-and-swap),
+   * so a concurrent change is never discarded. Used by `project reset` after
+   * the remote baseline has been verified.
+   */
+  resetToCommit(input: Readonly<{
+    repositoryPath: string;
+    expectedHead: string;
+    targetCommit: string;
+  }>): Promise<void>;
+  /** List the worktree paths registered in a repository (root first). */
+  listWorktrees(repositoryPath: string): Promise<readonly string[]>;
+  /** One-line log entries for the commits reachable from `headCommit` but not `baseCommit`. */
+  listCommitsBetween(input: Readonly<{
+    repositoryPath: string;
+    baseCommit: string;
+    headCommit: string;
+  }>): Promise<readonly string[]>;
 }
 
 /** The small Git boundary used by project registration and Task workspaces. */
@@ -1062,6 +1081,53 @@ export class NodeGitWorkspace implements GitWorkspacePort {
         { cause: error }
       );
     }
+  }
+
+  async resetToCommit(input: Readonly<{
+    repositoryPath: string;
+    expectedHead: string;
+    targetCommit: string;
+  }>): Promise<void> {
+    const root = await canonicalDirectory(input.repositoryPath, "Project");
+    const expectedHead = requireText(input.expectedHead, "Expected head");
+    const targetCommit = requireText(input.targetCommit, "Target commit");
+    if (!await this.isClean(root)) {
+      throw new Error(`Project checkout must be clean before reset: ${root}.`);
+    }
+    const currentHead = (await this.inspect(root, "HEAD")).baseCommit;
+    if (currentHead.toLowerCase() !== expectedHead.toLowerCase()) {
+      throw new Error(`Project checkout changed before reset: ${root} (${currentHead}).`);
+    }
+    // Verify the target commit resolves before moving the branch.
+    await gitLine(["-C", root, "rev-parse", "--verify", "--end-of-options", `${targetCommit}^{commit}`]);
+    await git(["-C", root, "reset", "--hard", targetCommit]);
+    const restoredHead = (await this.inspect(root, "HEAD")).baseCommit;
+    if (restoredHead.toLowerCase() !== targetCommit.toLowerCase() || !await this.isClean(root)) {
+      throw new Error(`Project checkout did not reset to the exact target commit: ${root}.`);
+    }
+  }
+
+  async listWorktrees(repositoryPath: string): Promise<readonly string[]> {
+    const root = await canonicalDirectory(repositoryPath, "Project");
+    const output = await git(["-C", root, "worktree", "list", "--porcelain"]);
+    return output
+      .split(/\r?\n/u)
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length).trim());
+  }
+
+  async listCommitsBetween(input: Readonly<{
+    repositoryPath: string;
+    baseCommit: string;
+    headCommit: string;
+  }>): Promise<readonly string[]> {
+    const root = await canonicalDirectory(input.repositoryPath, "Project");
+    const range = `${requireText(input.baseCommit, "Base commit")}..${requireText(input.headCommit, "Head commit")}`;
+    const output = await git(["-C", root, "log", "--oneline", range]);
+    return output
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
   }
 
   async #assertRefreshCheckout(

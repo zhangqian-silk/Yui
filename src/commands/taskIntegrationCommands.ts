@@ -1,5 +1,5 @@
 import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
-import { resolveProject } from "../repository/project.js";
+import { assertProjectActive, resolveProject } from "../repository/project.js";
 import { workspaceProjectEntry } from "../worktree/managedWorkspace.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
@@ -161,6 +161,7 @@ async function start(
     ? store.getProject(projectIds[0])
     : resolveProject(store.listProjects(), requestedProject);
   if (project === null) throw usageError(`Project not found: ${requestedProject ?? projectIds[0]}.`);
+  assertProjectActive(project, "start an Integration");
   if (project.id !== projectIds[0]) {
     throw usageError(`ChangeSets belong to another Project: ${projectIds[0]}.`);
   }

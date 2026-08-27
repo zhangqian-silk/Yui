@@ -294,6 +294,49 @@ files as dirty, preserves ignored files, and refuses missing remotes or refs and
 When the configured branch is `HEAD`, refresh resolves the remote's symbolic default branch for that
 operation and requires the checkout to be on that branch; detached or mismatched checkouts fail.
 
+### Project lifecycle
+
+Divergence and end-of-life are explicit, Operator-authority operations with fail-closed gates.
+Every destructive command refuses a managed Task Session (run it from an Operator or user
+terminal), an active Task binding, a dirty checkout, and an unreachable or unverified remote.
+
+```sh
+yui project diagnose app
+yui project reset app
+yui project reset app --discard-local
+yui project replace app --discard-local
+yui project retire app --reason "superseded by app-ng"
+yui project delete app --confirm app
+yui project delete app --checkout --confirm app
+```
+
+`project reset` handles the divergence `project refresh` refuses. Without `--discard-local` it is
+a dry run: it fetches and verifies the remote baseline, and when the checkout has diverged it
+refuses while listing the exact local commits that would be discarded. With `--discard-local` it
+hard-resets the clean checkout to the verified remote commit (a plain fast-forward when the
+checkout is merely behind). `project replace` goes further for Home-managed checkouts: it clones
+the remote into a staging directory, verifies both branches, copies the Yui-local refs
+(`refs/heads/yui/`, `refs/yui/archive/`) so historical evidence keeps resolving, then swaps the
+checkout on disk while the catalog record keeps its path. Replace refuses linked worktrees (Task
+or Integration workspaces) and dirty checkouts, and requires `--discard-local`. The swap is
+recoverable: the previous checkout is parked at a backup path and restored on any failure, a
+catalog refusal rolls the swap back, and a crash mid-swap is healed on the next run (a crash
+before the swap leaves only a removable staging clone).
+
+`project retire` is the auditable soft deprecation: it records who retired the Project, when, and
+why, while retaining the catalog record, checkout, and every historical
+Task/Run/Review/Integration/Publication reference. A retired Project cannot be refreshed,
+updated, migrated, reset, replaced, maintained through Knowledge writes (add/retire/propose/
+accept/reject), or bound to new Tasks, WorkItems, or Integrations; Knowledge reads (`list`,
+`show`, `proposals list/show`) stay open so the evidence stays auditable.
+`project delete` is the separate hard-removal decision: it requires a retired Project, an exact
+`--confirm <project-id>` acknowledgment, and fails closed while any Task record references the
+Project. `--checkout` additionally removes the Home-managed checkout (external checkouts are
+user-owned and must be removed manually): it first refuses linked worktrees and dirty checkouts,
+then moves the checkout to a tombstone before removing the catalog record, restoring it on any
+failure so the catalog and checkout never disagree unrecoverably. `project show` and
+`project list` display the lifecycle status and retirement record.
+
 Use `task context` as the first detailed read of an existing Task. It combines the Task, Brief, active Decisions, recent Milestones, Roles, current and recent WorkItems with their Runs, recent Messages, open and resolved InputRequests, and recent Events. Terminal output keeps histories and long text compact; `yui --json task context <task-id>` returns the complete records in the top-level `data` field.
 
 Leader wakeups stay deliberately small: the wake envelope carries only the
@@ -1011,6 +1054,7 @@ yui config completion [bash|zsh|fish]
 yui session enter|record|replace|reconcile
 yui session stop --all
 yui project add|clone|refresh|update|discover|list|show|knowledge
+yui project reset|replace|retire|delete
 ```
 
 `yui update` stages the newly published package **side by side** — it never

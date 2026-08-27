@@ -1,14 +1,20 @@
 import { existsSync } from "node:fs";
-import { readdir, rm } from "node:fs/promises";
+import { readdir, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import {
+  healCheckoutSwap,
+  restoreCheckoutSwap,
+  swapManagedCheckout
+} from "../repository/checkoutSwap.js";
 import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
 import { acquireProjectMaintenanceLock } from "../repository/projectMaintenanceLock.js";
 import {
   addProjectKnowledge,
   addKnowledgeProposal,
+  assertProjectActive,
   decideKnowledgeProposal,
   createProject,
   findKnowledgeProposal,
@@ -17,6 +23,7 @@ import {
   knowledgeProposalFingerprint,
   managedProjectPath,
   planKnowledgeAcceptance,
+  retireProject,
   retireProjectKnowledge,
   resolveProject,
   updateProjectKnowledge,
@@ -27,7 +34,8 @@ import {
   type KnowledgeProposalSource,
   type ProjectKnowledgeProvenance,
   type Project,
-  type ProjectOwnership
+  type ProjectOwnership,
+  type ProjectReferenceSummary
 } from "../repository/project.js";
 import { projectActor } from "./taskActor.js";
 import type { Decision } from "../decision/decision.js";
@@ -39,6 +47,7 @@ export type ProjectCommandStore = Readonly<{
   nextProjectId(): string;
   createProjectIfAbsent(project: Project): Project | null;
   saveProject(project: Project): void;
+  removeProject(projectId: string): boolean;
   listProjects(): Project[];
   getConfig(): Readonly<{ defaultWorkspace?: string }>;
   /** The persistent Home root; managed Project repositories live below it. */
@@ -47,13 +56,16 @@ export type ProjectCommandStore = Readonly<{
   getTask?(id: string): Task | null;
   getDecision?(taskId: string, decisionId: string): Decision | null;
   getMilestone?(taskId: string, milestoneId: string): Milestone | null;
+  /** Task-ledger references to a Project for the lifecycle fail-closed gates. */
+  summarizeProjectReferences(projectId: string): ProjectReferenceSummary;
 }>;
 
 export type ProjectCommandOptions = Readonly<{
   git?: Pick<
     GitWorkspacePort,
     "inspect" | "headRef" | "isClean" | "refresh" | "clone" | "ensureLocalBranch"
-      | "resolveRemoteBaseline" | "copyRefs" | "isAncestor"
+      | "resolveRemoteBaseline" | "copyRefs" | "isAncestor" | "resetToCommit"
+      | "listWorktrees" | "listCommitsBetween"
   >;
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
@@ -104,6 +116,18 @@ export async function runProjectCommand(
       data: { project }
     };
   }
+  if (command === "reset") {
+    return resetProject(rest, store, options);
+  }
+  if (command === "replace") {
+    return replaceProject(rest, store, options);
+  }
+  if (command === "retire") {
+    return retireProjectCommand(rest, store, options);
+  }
+  if (command === "delete") {
+    return deleteProjectCommand(rest, store, options);
+  }
   if (command === "discover") {
     const discovered = await discoverProjects(rest, store, options);
     return { output: renderDiscoveredProjects(discovered), data: { projects: discovered } };
@@ -144,6 +168,7 @@ async function refreshProject(
     throw usageError("Project refresh usage: yui project refresh <project>.");
   }
   const project = requireProject(store, args[0]!);
+  assertProjectActive(project, "refresh");
   if (project.remoteUrl === undefined) {
     throw usageError(`Project refresh requires a remote URL: ${project.id}.`);
   }
@@ -396,6 +421,7 @@ async function migrateProject(
   const usage = "Project migrate usage: yui project migrate <project> [--preflight].";
   const parsed = parseMigrateArguments(args, usage);
   const project = requireProject(store, parsed.project);
+  assertProjectActive(project, "migrate");
   if (project.ownership === "managed") {
     throw usageError(`Project is already Home-managed: ${project.id}.`);
   }
@@ -621,6 +647,7 @@ async function updateProject(
   const usage = "Project update usage: yui project update <project> [--alias <name> ...|--clear-aliases] [--remote <url>|--clear-remote] [--stable <ref>] [--development <ref>].";
   const parsed = parseProjectUpdateArguments(args, usage);
   const current = requireProject(store, parsed.reference);
+  assertProjectActive(current, "update");
   const now = (options.now ?? (() => new Date()))();
   const patch = {
     ...(parsed.aliases === undefined ? {} : { aliases: parsed.aliases }),
@@ -663,6 +690,616 @@ async function updateProject(
     tx.saveProject(updated);
     return updated;
   });
+}
+
+/**
+ * Lifecycle commands (reset/replace/retire/delete) are Operator authority:
+ * they discard commits, replace checkouts, or remove catalog records, so a
+ * managed Task Session may never drive them. A plain terminal is the human
+ * Operator; a managed global Session must be the Operator role.
+ */
+function assertProjectOperator(options: ProjectCommandOptions, action: string): void {
+  const actor = projectActor(options.environment);
+  if (actor === "agent") {
+    throw usageError(
+      `Project lifecycle commands are Operator authority; a managed Task Session cannot ${action} a Project. `
+      + "Run this command from an Operator or user terminal."
+    );
+  }
+}
+
+/**
+ * Fail-closed gate for the destructive lifecycle commands: an active Task
+ * binding means the canonical checkout and catalog record are in active use,
+ * so reset/replace/retire refuse until the Task is settled. Historical
+ * (completed/retired/archived) bindings are reported but never block — their
+ * evidence lives in the Task records themselves.
+ */
+function assertNoActiveTaskBinding(
+  store: ProjectCommandStore,
+  project: Project,
+  action: string
+): ProjectReferenceSummary {
+  const references = store.summarizeProjectReferences(project.id);
+  if (references.activeTaskIds.length > 0) {
+    const delivery = [
+      ...references.unresolvedWorkItemRefs,
+      ...references.activeRunRefs,
+      ...references.unresolvedIntegrationRefs
+    ];
+    throw usageError(
+      `Project cannot be ${action} while an active Task binds it: ${project.id}. `
+      + `Active Tasks: ${references.activeTaskIds.join(", ")}.`
+      + (delivery.length === 0 ? "" : ` Unresolved delivery: ${delivery.join(", ")}.`)
+      + " Complete, retire, or archive those Tasks first."
+    );
+  }
+  return references;
+}
+
+/**
+ * Controlled reset of a canonical Project checkout to its verified remote
+ * baseline. Handles the local/remote divergence that `project refresh`
+ * (clean fast-forward only) refuses: with `--discard-local` the checkout is
+ * hard-reset to the fetched remote commit, explicitly discarding the local
+ * commits listed in the refusal. Every destructive path is fail-closed:
+ * Operator authority, no active Task binding, clean checkout on its stable
+ * branch, reachable verified remote, and the per-Project maintenance fence.
+ */
+async function resetProject(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): Promise<ProjectCommandExecution> {
+  const usage = "Project reset usage: yui project reset <project> [--discard-local].";
+  const parsed = parseResetArguments(args, usage);
+  const project = requireProject(store, parsed.project);
+  assertProjectOperator(options, "reset");
+  assertProjectActive(project, "reset");
+  if (project.remoteUrl === undefined) {
+    throw usageError(`Project reset requires a remote URL: ${project.id}.`);
+  }
+  if (project.stableBranch !== project.developmentBranch) {
+    throw usageError(
+      `Project reset requires matching stable and development branches: ${project.id}.`
+    );
+  }
+  const git = options.git ?? new NodeGitWorkspace();
+  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  try {
+    // Re-read under the fence so a concurrent catalog change can never drive
+    // a destructive Git effect from a stale snapshot.
+    const current = requireProject(store, project.id);
+    assertProjectActive(current, "reset");
+    if (current.path !== project.path
+      || current.remoteUrl !== project.remoteUrl
+      || current.stableBranch !== project.stableBranch
+      || current.developmentBranch !== project.developmentBranch) {
+      throw new Error(`Project changed while resetting: ${project.id}.`);
+    }
+    assertNoActiveTaskBinding(store, current, "reset");
+    const head = await git.inspect(current.path, "HEAD");
+    if (!await git.isClean(head.root)) {
+      throw usageError(
+        `Project checkout must be clean before reset: ${current.id}. `
+        + "Commit, stash, or discard uncommitted changes first."
+      );
+    }
+    const branch = await git.headRef(head.root);
+    if (branch !== current.stableBranch) {
+      const found = branch === "HEAD" ? "detached HEAD" : branch;
+      throw usageError(
+        `Project checkout must be on its stable branch ${current.stableBranch} before reset (found ${found}).`
+      );
+    }
+    // Fetch and verify the advertised remote baseline. An unreachable remote
+    // or a ref that moves mid-fetch fails closed here, before any local effect.
+    const remote = await git.resolveRemoteBaseline({
+      repositoryPath: head.root,
+      remoteUrl: current.remoteUrl,
+      developmentRef: current.stableBranch
+    });
+    const localCommit = head.baseCommit.toLowerCase();
+    const remoteCommit = remote.commit.toLowerCase();
+    if (localCommit === remoteCommit) {
+      return {
+        output: `Project ${current.id} is already at the remote baseline ${remoteCommit}.\n`,
+        data: {
+          project: current,
+          fromCommit: localCommit,
+          toCommit: remoteCommit,
+          changed: false,
+          discarded: []
+        }
+      };
+    }
+    const isAncestor = await git.isAncestor(head.root, localCommit, remoteCommit);
+    if (!isAncestor) {
+      const discarded = await git.listCommitsBetween({
+        repositoryPath: head.root,
+        baseCommit: remoteCommit,
+        headCommit: localCommit
+      });
+      if (!parsed.discardLocal) {
+        throw usageError(
+          `Project ${current.id} has diverged from ${current.remoteUrl}: local ${localCommit} `
+          + `is not an ancestor of remote ${remoteCommit}.\n`
+          + "Local commits that would be discarded:\n"
+          + discarded.map((entry) => `  ${entry}`).join("\n")
+          + "\nRe-run with --discard-local to hard-reset the checkout to the remote baseline."
+        );
+      }
+      await git.resetToCommit({
+        repositoryPath: head.root,
+        expectedHead: localCommit,
+        targetCommit: remoteCommit
+      });
+      return {
+        output: `Reset project ${current.id}: ${localCommit} -> ${remoteCommit} `
+          + `(discarded ${discarded.length} local commit(s)).\n`,
+        data: {
+          project: current,
+          fromCommit: localCommit,
+          toCommit: remoteCommit,
+          changed: true,
+          discarded
+        }
+      };
+    }
+    // Behind only: the verified reset is a clean fast-forward.
+    await git.resetToCommit({
+      repositoryPath: head.root,
+      expectedHead: localCommit,
+      targetCommit: remoteCommit
+    });
+    return {
+      output: `Reset project ${current.id}: ${localCommit} -> ${remoteCommit} (fast-forward).\n`,
+      data: {
+        project: current,
+        fromCommit: localCommit,
+        toCommit: remoteCommit,
+        changed: true,
+        discarded: []
+      }
+    };
+  } finally {
+    releaseMaintenance();
+  }
+}
+
+/**
+ * Replace a Home-managed canonical checkout with a fresh clone from its
+ * remote, preserving the catalog binding and Yui-local refs. For checkouts
+ * whose divergence or corruption is too severe for `project reset`. The
+ * discard is explicit (`--discard-local`), the remote is verified before the
+ * swap, and Task/Integration worktrees are protected by a linked-worktree
+ * gate. The swap itself is recoverable: the previous checkout is parked at a
+ * backup path and restored on any failure, and a crash mid-swap is healed on
+ * the next run (a crash before the swap leaves only a removable staging
+ * clone).
+ */
+async function replaceProject(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): Promise<ProjectCommandExecution> {
+  const usage = "Project replace usage: yui project replace <project> --discard-local.";
+  const parsed = parseReplaceArguments(args, usage);
+  const project = requireProject(store, parsed.project);
+  assertProjectOperator(options, "replace");
+  assertProjectActive(project, "replace");
+  if (project.ownership !== "managed") {
+    throw usageError(
+      `Project replace only applies to Home-managed checkouts: ${project.id}. `
+      + "External checkouts are user-owned; re-register or repair them with `yui project update`/`yui project add`."
+    );
+  }
+  if (project.remoteUrl === undefined) {
+    throw usageError(`Project replace requires a remote URL: ${project.id}.`);
+  }
+  if (!parsed.discardLocal) {
+    throw usageError(
+      `Project replace discards the current checkout and re-clones from ${project.remoteUrl}. `
+      + "Re-run with --discard-local to acknowledge that the checkout and any uncommitted state will be discarded."
+    );
+  }
+  const git = options.git ?? new NodeGitWorkspace();
+  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  try {
+    const current = requireProject(store, project.id);
+    assertProjectActive(current, "replace");
+    if (current.path !== project.path
+      || current.remoteUrl !== project.remoteUrl
+      || current.ownership !== project.ownership
+      || current.stableBranch !== project.stableBranch
+      || current.developmentBranch !== project.developmentBranch) {
+      throw new Error(`Project changed while replacing: ${project.id}.`);
+    }
+    assertNoActiveTaskBinding(store, current, "replace");
+    const backup = join(store.rootDirectory(), "projects", `.replace-backup-${current.id}`);
+    // Heal a crashed earlier swap before any new destructive step, so the
+    // prechecks below always see a valid checkout.
+    await healCheckoutSwap({ currentPath: current.path, backupPath: backup });
+    // A linked worktree (Task/Integration workspace) shares this repository's
+    // object store and would be broken by a wholesale checkout replacement.
+    const worktrees = await git.listWorktrees(current.path);
+    const linked = worktrees.filter((path) => path !== current.path);
+    if (linked.length > 0) {
+      throw usageError(
+        `Project checkout has linked worktrees that would break: ${current.id}.\n`
+        + linked.map((path) => `  ${path}`).join("\n")
+        + "\nClean up Task/Integration workspaces first (e.g. `yui task work cleanup`, `yui task integration cleanup`)."
+      );
+    }
+    if (!await git.isClean(current.path)) {
+      throw usageError(
+        `Project checkout must be clean before replace: ${current.id}. `
+        + "Commit, stash, or discard uncommitted changes first."
+      );
+    }
+    const staging = join(store.rootDirectory(), "projects", `.replace-${current.id}`);
+    if (existsSync(staging)) {
+      // A crashed earlier attempt can only leave its own staging clone behind.
+      await rm(staging, { recursive: true, force: true });
+    }
+    let prepared = false;
+    try {
+      const head = await git.clone({
+        remoteUrl: current.remoteUrl,
+        destination: staging,
+        ...(current.stableBranch === "HEAD" ? {} : { branch: current.stableBranch })
+      });
+      prepared = true;
+      const stable = current.stableBranch === "HEAD"
+        ? head
+        : await git.inspect(staging, current.stableBranch);
+      if (head.baseCommit !== stable.baseCommit) {
+        throw new Error(`Project checkout is not on its stable ref: ${current.stableBranch}.`);
+      }
+      if (current.developmentBranch !== current.stableBranch) {
+        await git.ensureLocalBranch(staging, current.developmentBranch);
+      }
+      await assertRemoteBranchesVerified(
+        git,
+        staging,
+        current.remoteUrl,
+        [
+          { ref: current.stableBranch, localCommit: head.baseCommit },
+          ...(current.developmentBranch === current.stableBranch
+            ? []
+            : [{
+              ref: current.developmentBranch,
+              localCommit: (await git.inspect(staging, current.developmentBranch)).baseCommit
+            }])
+        ]
+      );
+      // Preserve Yui-local refs (Task branches, archive refs) so historical
+      // evidence keeps resolving after the checkout is replaced.
+      const copyRefs = git.copyRefs;
+      if (typeof copyRefs !== "function") {
+        throw new Error(`Git workspace cannot preserve local Yui refs for Project: ${project.id}.`);
+      }
+      await copyRefs.call(git, {
+        sourceRepositoryPath: current.path,
+        destinationRepositoryPath: staging,
+        patterns: ["refs/heads/yui/", "refs/yui/archive/"]
+      });
+      const oldHead = (await git.inspect(current.path, "HEAD")).baseCommit;
+      // Swap the checkout on disk without ever leaving the registered path
+      // without a repository: the previous checkout is parked at the backup
+      // path first and restored on any failure. The backup is removed only
+      // after the catalog transaction commits, so a crash in between stays
+      // recoverable (healed at the top of the next run).
+      await swapManagedCheckout({ currentPath: current.path, stagingPath: staging, backupPath: backup });
+      let switched: Project;
+      try {
+        switched = store.transaction((tx) => {
+          const latest = requireProject(tx, current.id);
+          if (latest.path !== current.path || latest.ownership !== current.ownership) {
+            throw new Error(`Project changed while replacing: ${current.id}.`);
+          }
+          const next = validateProject({
+            ...latest,
+            updatedAt: (options.now ?? (() => new Date()))().toISOString()
+          });
+          tx.saveProject(next);
+          return next;
+        });
+      } catch (error) {
+        try {
+          await restoreCheckoutSwap({ currentPath: current.path, backupPath: backup });
+        } catch (rollbackError) {
+          throw new Error(
+            `Project replace failed and checkout rollback was incomplete: ${messageOf(error)}; `
+            + `rollback failed: ${messageOf(rollbackError)}. `
+            + `The previous checkout remains parked at ${backup}.`
+          );
+        }
+        throw error;
+      }
+      let backupLeftover = false;
+      try {
+        await rm(backup, { recursive: true, force: true });
+      } catch {
+        backupLeftover = true;
+      }
+      const newHead = (await git.inspect(current.path, "HEAD")).baseCommit;
+      return {
+        output: `Replaced project ${current.id} checkout: ${oldHead} -> ${newHead} `
+          + `(re-cloned from ${current.remoteUrl}).\n`
+          + (backupLeftover
+            ? `The previous checkout could not be removed; delete it manually: ${backup}.\n`
+            : ""),
+        data: { project: switched, fromCommit: oldHead, toCommit: newHead }
+      };
+    } catch (error) {
+      if (prepared && existsSync(staging)) {
+        await rm(staging, { recursive: true, force: true });
+      }
+      throw error;
+    }
+  } finally {
+    releaseMaintenance();
+  }
+}
+
+/**
+ * Auditable soft deprecation. The catalog record, checkout, and every
+ * historical Task/Run/Review/Integration/Publication reference are retained;
+ * the Project can no longer be bound to new work or maintained. Hard removal
+ * is a separate `project delete` decision.
+ */
+function retireProjectCommand(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): ProjectCommandExecution {
+  const usage = "Project retire usage: yui project retire <project> --reason <text>.";
+  const parsed = parseRetireArguments(args, usage);
+  const project = requireProject(store, parsed.project);
+  assertProjectOperator(options, "retire");
+  assertProjectActive(project, "retire");
+  const actor = projectActor(options.environment);
+  const retiredBy = actor === "operator" ? "operator" as const : "user" as const;
+  const now = (options.now ?? (() => new Date()))();
+  const retired = store.transaction((tx) => {
+    const latest = requireProject(tx, project.id);
+    assertProjectActive(latest, "retire");
+    assertNoActiveTaskBinding(tx, latest, "retire");
+    const next = retireProject(latest, parsed.reason, retiredBy, now);
+    tx.saveProject(next);
+    return { project: next, references: tx.summarizeProjectReferences(next.id) };
+  });
+  const lines = [
+    `Retired project ${retired.project.id} (${retired.project.name})`,
+    `Reason: ${parsed.reason}`,
+    `Retired by: ${retiredBy} at ${retired.project.retirement?.retiredAt ?? "?"}`,
+    "The catalog record, checkout, and historical Task/Run/Review/Integration/Publication evidence are retained.",
+    ...(retired.references.boundTaskIds.length === 0
+      ? []
+      : [`Historical Task bindings retained: ${retired.references.boundTaskIds.join(", ")}.`]),
+    "Use `yui project delete` to remove the catalog record once no Task references it."
+  ];
+  return {
+    output: lines.join("\n").concat("\n"),
+    data: { project: retired.project, references: retired.references }
+  };
+}
+
+/**
+ * Hard removal of a retired Project catalog record, optionally including its
+ * Home-managed checkout. Deletion is deliberately two-phase (retire first)
+ * and doubly acknowledged (--confirm with the exact Project id), and it fails
+ * closed while any Task record references the Project so historical evidence
+ * stays resolvable. With `--checkout`, every fail-closed precheck (linked
+ * worktrees, dirty checkout) runs before any destruction, and the checkout is
+ * moved to a tombstone before the catalog record is removed; any failure
+ * restores it, so catalog and checkout never disagree unrecoverably.
+ */
+async function deleteProjectCommand(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): Promise<ProjectCommandExecution> {
+  const usage = "Project delete usage: yui project delete <project> [--checkout] --confirm <project-id>.";
+  const parsed = parseDeleteArguments(args, usage);
+  const project = requireProject(store, parsed.project);
+  assertProjectOperator(options, "delete");
+  if (project.status !== "retired") {
+    throw usageError(
+      `Project must be retired before it can be deleted: ${project.id}. `
+      + "Use `yui project retire <project> --reason <text>` first; retirement keeps the audit trail."
+    );
+  }
+  if (parsed.confirm !== project.id) {
+    throw usageError(
+      `Project delete requires --confirm ${project.id} to acknowledge removal of the catalog record`
+      + `${parsed.checkout ? " and the checkout" : ""}.`
+    );
+  }
+  if (parsed.checkout && project.ownership !== "managed") {
+    throw usageError(
+      `Project delete --checkout only applies to Home-managed checkouts: ${project.id}. `
+      + "External checkouts are user-owned; remove them manually after deleting the binding."
+    );
+  }
+  if (!parsed.checkout) {
+    const removed = removeRetiredProjectRecord(store, project.id);
+    return {
+      output: `Deleted project ${removed.id} (catalog record; checkout retained at ${removed.path}).\n`,
+      data: { project: removed, checkoutRemoved: false }
+    };
+  }
+  // --checkout: prechecks first, then a rename/tombstone two-phase flow. The
+  // checkout moves to a tombstone before the catalog record is removed, and
+  // every failure restores it, so the catalog never loses its recoverable
+  // entry while a live checkout (or its failure) is still in play.
+  const tombstone = join(store.rootDirectory(), "projects", `.delete-${project.id}`);
+  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  try {
+    // Heal a crashed earlier attempt before the prechecks run.
+    await healCheckoutSwap({ currentPath: project.path, backupPath: tombstone });
+    if (existsSync(project.path)) {
+      const git = options.git ?? new NodeGitWorkspace();
+      const worktrees = await git.listWorktrees(project.path);
+      const linked = worktrees.filter((path) => path !== project.path);
+      if (linked.length > 0) {
+        throw usageError(
+          `Project checkout has linked worktrees that would break: ${project.id}.\n`
+          + linked.map((path) => `  ${path}`).join("\n")
+          + "\nClean up Task/Integration workspaces first (e.g. `yui task work cleanup`, `yui task integration cleanup`)."
+        );
+      }
+      if (!await git.isClean(project.path)) {
+        throw usageError(
+          `Project checkout must be clean before delete: ${project.id}. `
+          + "Commit, stash, or discard uncommitted changes first, or delete the catalog record only without --checkout."
+        );
+      }
+      // Phase 1: park the checkout. The catalog record still exists, so
+      // phase 2 must complete or roll the rename back.
+      await rename(project.path, tombstone);
+    }
+    // Phase 2: remove the catalog record, restoring the checkout on failure.
+    let removed: Project;
+    try {
+      removed = removeRetiredProjectRecord(store, project.id);
+    } catch (error) {
+      if (existsSync(tombstone) && !existsSync(project.path)) {
+        try {
+          await rename(tombstone, project.path);
+        } catch (rollbackError) {
+          throw new Error(
+            `Project delete failed and checkout rollback was incomplete: ${messageOf(error)}; `
+            + `rollback failed: ${messageOf(rollbackError)}. `
+            + `The checkout remains parked at ${tombstone}.`
+          );
+        }
+      }
+      throw error;
+    }
+    // Phase 3: the catalog record is gone, so the tombstone is unreferenced
+    // garbage. Removal is best-effort; a leftover is reported, never silent.
+    let tombstoneLeftover = false;
+    if (existsSync(tombstone)) {
+      try {
+        await rm(tombstone, { recursive: true, force: true });
+      } catch {
+        tombstoneLeftover = true;
+      }
+    }
+    return {
+      output: `Deleted project ${removed.id} and its checkout at ${removed.path}.\n`
+        + (tombstoneLeftover
+          ? `The checkout tombstone could not be removed; delete it manually: ${tombstone}.\n`
+          : ""),
+      data: { project: removed, checkoutRemoved: true }
+    };
+  } finally {
+    releaseMaintenance();
+  }
+}
+
+/**
+ * The catalog side of `project delete`: re-read under a transaction, re-assert
+ * the retired state and the absence of any Task reference, then remove the
+ * record. Fails closed with the record intact on every refusal.
+ */
+function removeRetiredProjectRecord(store: ProjectCommandStore, projectId: string): Project {
+  return store.transaction((tx) => {
+    const latest = requireProject(tx, projectId);
+    if (latest.status !== "retired") {
+      throw new Error(`Project changed while deleting: ${projectId}.`);
+    }
+    const references = tx.summarizeProjectReferences(latest.id);
+    if (references.boundTaskIds.length > 0) {
+      throw usageError(
+        `Project cannot be deleted while Task records reference it: ${latest.id}. `
+        + `Bound Tasks: ${references.boundTaskIds.join(", ")}. `
+        + "Historical Task/Run/Review/Integration/Publication evidence must stay resolvable; keep the Project retired instead."
+      );
+    }
+    if (!tx.removeProject(latest.id)) {
+      throw new Error(`Project was already removed: ${latest.id}.`);
+    }
+    return latest;
+  });
+}
+
+function parseResetArguments(
+  args: readonly string[],
+  usage: string
+): Readonly<{ project: string; discardLocal: boolean }> {
+  const positionals: string[] = [];
+  let discardLocal = false;
+  for (const value of args) {
+    if (value === "--discard-local") {
+      discardLocal = true;
+      continue;
+    }
+    if (value.startsWith("--")) throw usageError(`Unknown option: ${value}. ${usage}`);
+    positionals.push(value);
+  }
+  if (positionals.length !== 1) throw usageError(usage);
+  return { project: requireText(positionals[0]!, "Project reference"), discardLocal };
+}
+
+function parseReplaceArguments(
+  args: readonly string[],
+  usage: string
+): Readonly<{ project: string; discardLocal: boolean }> {
+  return parseResetArguments(args, usage);
+}
+
+function parseRetireArguments(
+  args: readonly string[],
+  usage: string
+): Readonly<{ project: string; reason: string }> {
+  const positionals: string[] = [];
+  let reason: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (value === "--reason") {
+      const next = args[index + 1];
+      if (next === undefined || next.startsWith("--")) throw usageError(`--reason is required. ${usage}`);
+      reason = requireText(next, "--reason");
+      index += 1;
+      continue;
+    }
+    if (value.startsWith("--")) throw usageError(`Unknown option: ${value}. ${usage}`);
+    positionals.push(value);
+  }
+  if (positionals.length !== 1) throw usageError(usage);
+  if (reason === undefined) throw usageError(`--reason is required. ${usage}`);
+  return { project: requireText(positionals[0]!, "Project reference"), reason };
+}
+
+function parseDeleteArguments(
+  args: readonly string[],
+  usage: string
+): Readonly<{ project: string; checkout: boolean; confirm: string }> {
+  const positionals: string[] = [];
+  let checkout = false;
+  let confirm: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (value === "--checkout") {
+      checkout = true;
+      continue;
+    }
+    if (value === "--confirm") {
+      const next = args[index + 1];
+      if (next === undefined || next.startsWith("--")) throw usageError(`--confirm is required. ${usage}`);
+      confirm = requireText(next, "--confirm");
+      index += 1;
+      continue;
+    }
+    if (value.startsWith("--")) throw usageError(`Unknown option: ${value}. ${usage}`);
+    positionals.push(value);
+  }
+  if (positionals.length !== 1) throw usageError(usage);
+  if (confirm === undefined) throw usageError(`--confirm is required. ${usage}`);
+  return { project: requireText(positionals[0]!, "Project reference"), checkout, confirm };
 }
 
 function renderAddedProject(created: Project): string {
@@ -720,6 +1357,7 @@ function listProjects(args: readonly string[], store: ProjectCommandStore): stri
     [
       { header: "Project", minWidth: 8, maxWidth: 24 },
       { header: "Name", minWidth: 4, maxWidth: 28 },
+      { header: "Status", minWidth: 6, maxWidth: 8 },
       { header: "Ownership", minWidth: 9, maxWidth: 10 },
       { header: "Path", minWidth: 8, maxWidth: 64 },
       { header: "Stable", minWidth: 6, maxWidth: 24 },
@@ -728,6 +1366,7 @@ function listProjects(args: readonly string[], store: ProjectCommandStore): stri
     projects.map((project) => [
       project.id,
       project.name,
+      project.status,
       project.ownership,
       project.path,
       project.stableBranch,
@@ -743,6 +1382,13 @@ function showProject(args: readonly string[], store: ProjectCommandStore): strin
   return [
     `Project: ${project.id}`,
     `Name: ${project.name}`,
+    `Status: ${project.status}`,
+    ...(project.retirement === undefined
+      ? []
+      : [
+        `Retired by: ${project.retirement.retiredBy} at ${project.retirement.retiredAt}`,
+        `Retirement reason: ${project.retirement.reason}`
+      ]),
     `Ownership: ${project.ownership}`,
     `Aliases: ${project.aliases.length === 0 ? "-" : project.aliases.join(", ")}`,
     `Path: ${project.path}`,
@@ -772,6 +1418,7 @@ function projectKnowledge(
     assertKnowledgeOperator(options, "add");
     const added = store.transaction((tx) => {
       const project = requireProject(tx, parsed.positionals[0]!);
+      assertProjectActive(project, "add project knowledge");
       const id = nextKnowledgeId(project);
       tx.saveProject(addProjectKnowledge(
         project,
@@ -870,6 +1517,7 @@ function projectKnowledge(
     assertKnowledgeOperator(options, "retire");
     const updated = store.transaction((tx) => {
       const project = requireProject(tx, rest[0]!);
+      assertProjectActive(project, "retire project knowledge");
       const next = retireProjectKnowledge(
         project,
         rest[1]!,
@@ -1033,6 +1681,7 @@ function proposeKnowledge(
   const now = (options.now ?? (() => new Date()))();
   const result = store.transaction((tx) => {
     const project = requireProject(tx, parsed.project);
+    assertProjectActive(project, "propose project knowledge");
     const source = requireProposalEvidence(tx, parsed);
     const fingerprint = knowledgeProposalFingerprint({
       projectId: project.id,
@@ -1278,6 +1927,7 @@ function acceptKnowledgeProposal(
   const now = (options.now ?? (() => new Date()))();
   const accepted = store.transaction((tx) => {
     const project = requireProject(tx, parsed.project);
+    assertProjectActive(project, "accept project knowledge");
     const proposal = findKnowledgeProposal(project, parsed.proposal);
     if (proposal === null) {
       throw usageError(`Knowledge proposal not found: ${parsed.proposal}.`);
@@ -1376,6 +2026,7 @@ function rejectKnowledgeProposal(
   const decidedBy = actor === "operator" ? "operator" as const : "user" as const;
   const rejected = store.transaction((tx) => {
     const project = requireProject(tx, parsed.positionals[0]!);
+    assertProjectActive(project, "reject project knowledge");
     const proposal = findKnowledgeProposal(project, parsed.positionals[1]!);
     if (proposal === null) {
       throw usageError(`Knowledge proposal not found: ${parsed.positionals[1]!}.`);
@@ -1670,4 +2321,8 @@ function requireText(value: string, label: string): string {
     throw usageError(`${label} is required.`);
   }
   return normalized;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

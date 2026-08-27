@@ -21,6 +21,8 @@ const PROJECT_FROM_VERSION = 2;
 const PROJECT_TO_VERSION = 3;
 const PROJECT_KNOWLEDGE_PROPOSALS_FROM_VERSION = 3;
 const PROJECT_KNOWLEDGE_PROPOSALS_TO_VERSION = 4;
+const PROJECT_LIFECYCLE_FROM_VERSION = 4;
+const PROJECT_LIFECYCLE_TO_VERSION = 5;
 const TASK_FROM_VERSION = 3;
 const TASK_TO_VERSION = 4;
 const TASK_INTENT_FROM_VERSION = 4;
@@ -149,6 +151,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(projectOwnershipStep())
     .registerOfflineMigration(configV2Step())
     .registerCompatible(projectKnowledgeProposalsStep())
+    .registerCompatible(projectLifecycleStep())
     .registerOfflineMigration(taskWorkspaceIdentityStep())
     .registerOfflineMigration(taskIntentStep())
     .registerOfflineMigration(recordFamilyStep(
@@ -3290,6 +3293,104 @@ function normalizeProjectV3ToV4(snapshot: HomeSnapshot): HomeSnapshot {
     state: { ...snapshot.state, projects: nextProjects }
   };
 }
+
+/**
+ * Project v5 adds the lifecycle status (`active`/`retired`) plus the
+ * retirement audit record. Historical Projects are all active; the step only
+ * defaults the new field, so it is a compatible adjacent migration.
+ */
+function projectLifecycleStep(): CompatibleStep<HomeSnapshot> {
+  return {
+    kind: "compatible",
+    axis: "record",
+    recordKind: "project",
+    fromVersion: PROJECT_LIFECYCLE_FROM_VERSION,
+    toVersion: PROJECT_LIFECYCLE_TO_VERSION,
+    defaults: [
+      "status defaults to active on every Project"
+    ],
+    validateSource: (snapshot) => requireProjectV4Shape(snapshot),
+    normalize: (snapshot) => normalizeProjectV4ToV5(snapshot)
+  };
+}
+
+function requireProjectV4Shape(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.project !== PROJECT_LIFECYCLE_FROM_VERSION) {
+    throw new Error(
+      `Record project compatible step requires manifest version ${PROJECT_LIFECYCLE_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const projects = snapshot.state.projects;
+  if (projects === undefined) return;
+  const map = asObject(projects, "project map");
+  const allowed = new Set<string>(PROJECT_V4_FIELDS);
+  for (const [projectId, rawProject] of Object.entries(map)) {
+    const project = asObject(rawProject, `Project ${projectId}`);
+    if (project.schemaVersion !== PROJECT_LIFECYCLE_FROM_VERSION) {
+      throw new Error(
+        `Project ${projectId} must use schemaVersion ${PROJECT_LIFECYCLE_FROM_VERSION}.`
+      );
+    }
+    const unknown = Object.keys(project).find((key) => !allowed.has(key));
+    if (unknown !== undefined) {
+      throw new Error(
+        `Project ${projectId} has an unknown v4 field: ${unknown}.`
+      );
+    }
+  }
+}
+
+function normalizeProjectV4ToV5(snapshot: HomeSnapshot): HomeSnapshot {
+  requireProjectV4Shape(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...manifestVersions, project: PROJECT_LIFECYCLE_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const projects = snapshot.state.projects;
+  if (projects === undefined) {
+    return { schemaManifest, state: { ...snapshot.state } };
+  }
+  const map = asObject(projects, "project map");
+  const nextProjects: Record<string, unknown> = {};
+  for (const [projectId, rawProject] of Object.entries(map)) {
+    const project = asObject(rawProject, `Project ${projectId}`);
+    nextProjects[projectId] = {
+      ...project,
+      schemaVersion: PROJECT_LIFECYCLE_TO_VERSION,
+      status: "active"
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, projects: nextProjects }
+  };
+}
+
+const PROJECT_V4_FIELDS = [
+  "schemaVersion",
+  "id",
+  "name",
+  "aliases",
+  "path",
+  "ownership",
+  "remoteUrl",
+  "stableBranch",
+  "developmentBranch",
+  "knowledge",
+  "knowledgeProposals",
+  "createdAt",
+  "updatedAt"
+] as const;
 
 /**
  * Task v4 adds the optional durable workspace identity. Historical Tasks have
