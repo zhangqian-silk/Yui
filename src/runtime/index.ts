@@ -11,6 +11,16 @@ export {
   type TranscriptUsageReport
 } from "./builtinTranscriptUsage.js";
 export {
+  projectSessionTokenMetrics,
+  resolveSessionTokenIdentity,
+  unobservedSessionTokenMetrics,
+  type SessionCumulativeTokenMetric,
+  type SessionMaximumRequestInputMetric,
+  type SessionTokenIdentity,
+  type SessionTokenIdentityInput,
+  type SessionTokenMetrics
+} from "./sessionTokenMetrics.js";
+export {
   createRuntimeBinding,
   type RuntimeBinding
 } from "./runtimeBinding.js";

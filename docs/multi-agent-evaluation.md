@@ -19,7 +19,7 @@ Every arm is judged in this order:
    contract and has independently sufficient evidence.
 2. **Safety** — Review defects, integration failures, error amplification, and
    recovery behavior stay within the gate.
-3. **Context** — the added routes do not exceed the context budget or create
+3. **Context** — the added routes do not exceed the bounded context envelope or create
    unexplained context growth.
 4. **Cost and latency** — only exact token/tool observations and bounded
    wall-clock observations are counted.

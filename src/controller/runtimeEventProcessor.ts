@@ -504,16 +504,9 @@ export function coalesceRuntimeProgress(
     const representedByIndex = new Map<number, string[]>();
     for (const indices of indicesByStream.values()) {
       const hasUsage = segment[indices[0]!]!.observation.payload.usage !== undefined;
-      const retainedPositions = hasUsage ? [0] : [];
-      if (hasUsage) {
-        for (let position = 1; position < indices.length; position += 1) {
-          const previous = segment[indices[position - 1]!]!.observation.payload.usage!;
-          const current = segment[indices[position]!]!.observation.payload.usage!;
-          if (runtimeUsageTotal(current) < runtimeUsageTotal(previous)) {
-            retainedPositions.push(position);
-          }
-        }
-      }
+      // Usage facts are the authoritative history for read-only Session token
+      // deltas, so their numeric values never decide ingress coalescing.
+      const retainedPositions = hasUsage ? indices.map((_, position) => position) : [];
       const lastPosition = indices.length - 1;
       if (retainedPositions.at(-1) !== lastPosition) retainedPositions.push(lastPosition);
       let previousRetainedPosition = -1;
@@ -623,10 +616,6 @@ function progressStreamKey(event: RuntimeObservationInboxEvent): string {
     payload.activity,
     payload.usage === undefined ? "signal" : "usage"
   ]);
-}
-
-function runtimeUsageTotal(usage: Readonly<{ inputTokens: number; outputTokens: number }>): number {
-  return usage.inputTokens + usage.outputTokens;
 }
 
 function isRuntimeActivityEvent(

@@ -242,7 +242,6 @@ export function observabilityMetricCard(observability, t) {
   card.append(metricTile(t("detail.wallClock"), cost.wallClockSeconds + "s"));
   card.append(metricTile(t("detail.ready"), (observability.dag?.readyIds || []).length, { hot: true }));
   card.append(metricTile(t("detail.contextSnapshots"), context.snapshotCount));
-  card.append(metricTile(t("detail.contextPeak"), context.observedInputPeakTokens));
   const contextMeta = node("div", "record-meta observability-context-meta");
   contextMeta.append(node("span", "", t("detail.contextBytes") + " · "
     + (context.totalBytes === null ? t("detail.partial") : context.totalBytes + " B")));
@@ -773,6 +772,17 @@ export function roleCard(role, task, t, locale, actions) {
     }
     eff.append(node("span", "", role.launchDrift ? t("launch.drift") : t("launch.current")));
     card.append(eff);
+  }
+
+  if (role.sessionTokens) {
+    const tokenMeta = node("div", "record-meta");
+    const cumulative = role.sessionTokens.cumulativeTotal || {};
+    const maximum = role.sessionTokens.maximumRequestInput || {};
+    tokenMeta.append(node("span", "", t("detail.sessionTotalTokens") + " · "
+      + (cumulative.status === "observed" ? cumulative.totalTokens : t("detail.unobserved"))));
+    tokenMeta.append(node("span", "", t("detail.maximumRequestInputTokens") + " · "
+      + (maximum.status === "observed" ? maximum.inputTokens : t("detail.unobserved"))));
+    card.append(tokenMeta);
   }
 
   if (role.description) card.append(richText(null, role.description, t, { muted: true }));

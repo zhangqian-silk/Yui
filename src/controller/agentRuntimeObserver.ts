@@ -159,21 +159,21 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           && !sameUsage(state.usage, sample.usage);
         const activityChanged = sample.activityId !== undefined
           && sample.activityId !== state.activityId;
-        if (usageChanged || (activityChanged && state.cursor !== undefined)) {
+        if (usageChanged) {
           const usage = sample.usage;
           this.inbox.enqueueObservation(createRuntimeObservation({
             schemaVersion: 2,
             eventId: observationId(
-              "activity",
+              "usage",
               fence,
               source.sourceId,
-              JSON.stringify([usage ?? null, sample.activityId ?? null])
+              JSON.stringify(usage)
             ),
             semanticKey: observationId(
-              "activity",
+              "usage",
               fence,
               source.sourceId,
-              JSON.stringify([usage ?? null, sample.activityId ?? null])
+              JSON.stringify(usage)
             ),
             kind: "activity.observed",
             authority: "driver-inferred",
@@ -183,8 +183,25 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             fence,
             payload: {
               activity: sample.activity ?? "model",
-              ...(sample.activityId === undefined ? {} : { activityId: sample.activityId }),
               ...(usage === undefined ? {} : { usage })
+            }
+          }));
+          dirty.add(`role:${fence.taskId}/${fence.roleName}`);
+        }
+        if (activityChanged && state.cursor !== undefined) {
+          this.inbox.enqueueObservation(createRuntimeObservation({
+            schemaVersion: 2,
+            eventId: observationId("activity", fence, source.sourceId, sample.activityId!),
+            semanticKey: observationId("activity", fence, source.sourceId, sample.activityId!),
+            kind: "activity.observed",
+            authority: "driver-inferred",
+            receivedAt: at,
+            sequence,
+            ordinal: 3,
+            fence,
+            payload: {
+              activity: sample.activity ?? "model",
+              activityId: sample.activityId!
             }
           }));
           dirty.add(`role:${fence.taskId}/${fence.roleName}`);
@@ -268,6 +285,10 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           observation.kind === "activity.observed"
           && observation.payload.usage !== undefined
         )).at(-1);
+        const persistedActivity = exact.filter((observation) => (
+          observation.kind === "activity.observed"
+          && observation.payload.activityId !== undefined
+        )).at(-1);
         const persistedHealth = exact.filter((observation) => (
           observation.kind === "observer.health"
           && observation.payload.sourceId === source.sourceId
@@ -293,9 +314,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             ...(persistedUsage?.payload.usage === undefined
               ? {}
               : { usage: persistedUsage.payload.usage }),
-            ...(persistedUsage?.payload.activityId === undefined
+            ...(persistedActivity?.payload.activityId === undefined
               ? {}
-              : { activityId: persistedUsage.payload.activityId }),
+              : { activityId: persistedActivity.payload.activityId }),
             ...(persistedHealth === undefined
               ? {}
               : {

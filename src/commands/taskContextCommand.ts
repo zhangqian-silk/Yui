@@ -189,7 +189,19 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     "Observability:",
     `  DAG: ${observability.dag.nodes.length} node(s), ${observability.dag.edges.length} edge(s); ready=${observability.dag.readyIds.join(", ") || "none"}; blocked=${observability.dag.blockedIds.join(", ") || "none"}`,
     `  Cost: tokens=${resourceUsageLabel(observability.cost.tokens, undefined, observability.cost.tokensObservable)}; tools=${resourceUsageLabel(observability.cost.toolCalls, undefined, observability.cost.toolCallsObservable)}; wall=${observability.cost.wallClockSeconds}s; lanes=${observability.cost.laneCount}; groups=${observability.cost.groupCount}; retries=${observability.cost.retryCount}; marginal-value=unavailable`,
-    `  Context: snapshots=${observability.context.snapshotCount}; bytes=${observability.context.totalBytes === null ? "partial" : observability.context.totalBytes}; peak-input=${observability.context.observedInputPeakTokens}; compression=unavailable`,
+    `  Context: snapshots=${observability.context.snapshotCount}; bytes=${observability.context.totalBytes === null ? "partial" : observability.context.totalBytes}; compression=unavailable`,
+    "  Session tokens:",
+    ...(observability.sessionTokens.length === 0
+      ? ["    unobserved"]
+      : observability.sessionTokens.map(({ roleName, agentId, metrics }) => {
+          const total = metrics.cumulativeTotal.status === "observed"
+            ? metrics.cumulativeTotal.totalTokens
+            : "unobserved";
+          const maximum = metrics.maximumRequestInput.status === "observed"
+            ? metrics.maximumRequestInput.inputTokens
+            : "unobserved";
+          return `    ${roleName}/${agentId}: total=${total}; max-request-input=${maximum}`;
+        })),
     ...(task.projectBindings.length === 0
       ? []
       : [
@@ -722,5 +734,5 @@ function renderWorkItemObservability(
   const stages = item.stages.map((stage) => (
     `${stage.stage ?? "single"}${stage.round === undefined ? "" : `#${stage.round}`}${stage.stageAttempt === undefined ? "" : `/a${stage.stageAttempt}`}`
   )).join(", ");
-  return `    Observability: stages=${stages || "none"}; tokens=${item.cost.tokens}; tools=${item.cost.toolCalls}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; peak-input=${item.context.observedInputPeakTokens}; evidence=${item.evidenceCount}; open-findings=${item.openFindingCount}; compression=${item.context.compressionStatus}`;
+  return `    Observability: stages=${stages || "none"}; tokens=${item.cost.tokens}; tools=${item.cost.toolCalls}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; evidence=${item.evidenceCount}; open-findings=${item.openFindingCount}; compression=${item.context.compressionStatus}`;
 }

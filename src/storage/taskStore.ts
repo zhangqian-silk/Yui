@@ -299,11 +299,7 @@ export type YuiConfig = Readonly<{
    * Homes without it default to `display`, so no config migration is needed.
    */
   leaderNextActionMode?: "display" | "warn" | "enforce";
-  /**
-   * Issue 04 (context token budget): per-Session-generation input peak
-   * thresholds. Optional additive field; Homes without it use the defaults,
-   * so no config migration is needed.
-   */
+  /** Compatibility-only retired context-budget values; never behavioral. */
   contextBudget?: import("../config/yuiConfig.js").ContextBudgetConfig;
   /**
    * Issue 01 in-place Provider retry mode. `enforce` (default) keeps the

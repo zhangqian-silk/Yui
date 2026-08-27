@@ -140,7 +140,6 @@ function parseCodexLines(
   state: Readonly<Record<string, unknown>>
 ): ParsedSample {
   let usage = usageFrom(state.usage);
-  let activityId: string | undefined;
   let malformed = 0;
   for (const line of lines) {
     const entry = jsonObject(line);
@@ -154,12 +153,10 @@ function parseCodexLines(
     const candidate = normalizedCodexUsage(object(object(payload.info)?.total_token_usage));
     if (candidate === undefined) continue;
     usage = candidate;
-    activityId = `usage:${candidate.inputTokens}:${candidate.outputTokens}`;
   }
   return Object.freeze({
     state: Object.freeze({ ...(usage === undefined ? {} : { usage }) }),
     ...(usage === undefined ? {} : { usage }),
-    ...(activityId === undefined ? {} : { activityId }),
     ...(malformed === 0 ? {} : { degraded: `${malformed} malformed transcript line(s) ignored.` })
   });
 }
@@ -186,7 +183,7 @@ function parseClaudeLines(
       : `message:${identity(message?.id)}`;
     if (key === undefined) continue;
     messages[key] = usage;
-    activityId = `${key}:${usage.inputTokens}:${usage.outputTokens}`;
+    activityId = key;
   }
   const keys = Object.keys(messages);
   let degraded = malformed === 0 ? undefined : `${malformed} malformed transcript line(s) ignored.`;

@@ -577,7 +577,18 @@ function renderVerboseDetails(
       `  Monitoring: ${task.execution.monitoring}; attention: ${task.execution.attention.length}`,
       `  DAG: ${task.execution.observability.dag.nodes.length} nodes, ${task.execution.observability.dag.edges.length} edges; ready=${task.execution.observability.dag.readyIds.join(", ") || "none"}; blocked=${task.execution.observability.dag.blockedIds.join(", ") || "none"}`,
       `  Cost: tokens=${task.execution.observability.cost.tokens}${task.execution.observability.cost.tokensObservable ? "" : " (partial)"}; tools=${task.execution.observability.cost.toolCalls}${task.execution.observability.cost.toolCallsObservable ? "" : " (partial)"}; wall=${task.execution.observability.cost.wallClockSeconds}s; retries=${task.execution.observability.cost.retryCount}`,
-      `  Context: snapshots=${task.execution.observability.context.snapshotCount}; bytes=${task.execution.observability.context.totalBytes ?? "partial"}; peak-input=${task.execution.observability.context.observedInputPeakTokens}; compression=unavailable`,
+      `  Context: snapshots=${task.execution.observability.context.snapshotCount}; bytes=${task.execution.observability.context.totalBytes ?? "partial"}; compression=unavailable`,
+      `  Session tokens: ${task.execution.observability.sessionTokens.length === 0
+        ? "unobserved"
+        : task.execution.observability.sessionTokens.map(({ roleName, metrics }) => {
+            const total = metrics.cumulativeTotal.status === "observed"
+              ? metrics.cumulativeTotal.totalTokens
+              : "unobserved";
+            const maximum = metrics.maximumRequestInput.status === "observed"
+              ? metrics.maximumRequestInput.inputTokens
+              : "unobserved";
+            return `${roleName}: total=${total}, max-request-input=${maximum}`;
+          }).join("; ")}`,
       `  Projects: ${task.projectBindings.length === 0
         ? "none"
         : task.projectBindings.map(({ directory, projectId, baseRef }) => (

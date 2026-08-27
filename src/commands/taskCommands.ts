@@ -235,6 +235,7 @@ import {
   type WorkItemExecutionMode
 } from "../execution/executionGroup.js";
 import {
+  DEFAULT_EXECUTION_STAGE_TOKEN_BUDGET_PER_LANE,
   executionStageSpendClosed,
   observedExecutionResourceUsage,
   planResourceAdmissions,
@@ -244,7 +245,6 @@ import {
   type ResourceLaneIdentity
 } from "../execution/resourceBroker.js";
 import {
-  resolveContextBudget,
   resolveControllerTaskConcurrency,
   resolveRuntimeHealth
 } from "../config/yuiConfig.js";
@@ -3122,7 +3122,6 @@ function dispatchWork(
         ? undefined
         : (() => {
             const config = tx.getConfig();
-            const contextBudget = resolveContextBudget(config.contextBudget);
             const health = resolveRuntimeHealth(config.runtimeHealth);
             const maxWallClockSeconds = requestedStageMaxSeconds
               ?? Math.floor(health.stallWindowMs / 1_000);
@@ -3141,7 +3140,8 @@ function dispatchWork(
                 ? { convergence: { schemaVersion: 1 as const } }
                 : {}),
               resourceBudget: {
-                maxTokens: requestedStageMaxTokens ?? contextBudget.hardTokens * available,
+                maxTokens: requestedStageMaxTokens
+                  ?? DEFAULT_EXECUTION_STAGE_TOKEN_BUDGET_PER_LANE * available,
                 maxToolCalls: requestedStageMaxToolCalls ?? 100 * available,
                 maxWallClockSeconds
               },

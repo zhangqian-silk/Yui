@@ -29,6 +29,10 @@ import type { ContextSnapshot } from "../context/contextSnapshot.js";
 import { isRoleRunStalled, latestStallProgressAt } from "./roleRunStall.js";
 import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 import type { RuntimeHealthPolicy } from "../runtime/runtimeHealthPolicy.js";
+import {
+  projectSessionTokenMetrics,
+  resolveSessionTokenIdentity
+} from "../runtime/sessionTokenMetrics.js";
 
 /**
  * Task-first status is a read-model vocabulary. It is deliberately not a new
@@ -322,6 +326,14 @@ export function projectTaskExecution(
     ...executionGroups,
     ...workItems.flatMap((item) => item.executionGroups)
   ]);
+  const sessionTokens = roleSessions.map((session) => {
+    const identity = resolveSessionTokenIdentity({ taskId: task.id, ...session });
+    return Object.freeze({
+      roleName: session.roleName,
+      agentId: session.agentId,
+      metrics: projectSessionTokenMetrics(events, identity)
+    });
+  });
   const observability = buildTaskObservabilityProjection({
     workItems,
     executionGroups: observabilityGroups,
@@ -329,6 +341,7 @@ export function projectTaskExecution(
     runs,
     events,
     contextSnapshots: facts.contextSnapshots,
+    sessionTokens,
     now
   });
   const laneRecovery = actionableExecutionLaneRecoveries(groupSummaries)[0];

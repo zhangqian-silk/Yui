@@ -105,17 +105,23 @@ Once native operations drain, the normal workflow-outcome grace applies again.
 
 ## Token evidence
 
-Usage is a cumulative normalized snapshot:
+Usage is a normalized, read-only Session projection:
 
 - `inputTokens` and `outputTokens` are totals;
 - cached input and reasoning tokens are breakdowns, not values to add again;
-- a fresh native Session persists a zero baseline before its first sample, so
-  its first positive total proves work performed by that new generation;
-- a resumed Session's first cumulative snapshot establishes its baseline and
-  proves no new activity by itself;
-- only a strictly larger input-plus-output total proves new activity;
-- an unchanged or reset counter updates the baseline but does not fabricate
-  activity.
+- cumulative total consumption is `inputTokens + outputTokens` for one exact
+  Task/Role/launch/native Session/session generation;
+- maximum request input is the direct `request-context` input value, or the
+  largest non-negative delta between consecutive `cumulative-session` input
+  snapshots in that same generation;
+- `remaining-context` is capacity evidence and is never reported as spend;
+- missing, mixed, rolled-back, or identity-ambiguous facts are `unobserved`
+  rather than guessed.
+
+Token values never advance runtime health, trigger wake/retry or Session
+replacement, affect scheduling or resource admission, or change Task, Review,
+Integration, and Publication state. Explicit runtime activity identity remains
+a separate observation fact.
 
 Codex snapshots come from the latest structured rollout `token_count`. Claude
 Code snapshots are the de-duplicated sum of assistant usage records in its

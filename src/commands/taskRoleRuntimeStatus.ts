@@ -37,6 +37,11 @@ import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+import {
+  projectSessionTokenMetrics,
+  resolveSessionTokenIdentity,
+  type SessionTokenMetrics
+} from "../runtime/sessionTokenMetrics.js";
 
 export type TaskRoleHealth =
   | "idle"
@@ -94,6 +99,7 @@ export type TaskRoleRuntimeStatus = Readonly<{
   freshLaunchAllowed: boolean;
   tmux: TaskRoleTmuxStatus;
   workspace: TaskRoleWorkspaceStatus;
+  sessionTokens: SessionTokenMetrics;
   runtime: Readonly<{
     driverId: string;
     status: RuntimeDisplayStatus;
@@ -192,6 +198,12 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
                 : ` (${status.runtime.observerDetail})`
             }`
       ].filter((value): value is string => value !== undefined).join("; ");
+  const sessionTokens = [
+    `total=${sessionCumulativeTokenLabel(status.sessionTokens)}`,
+    `max-request-input=${status.sessionTokens.maximumRequestInput.status === "observed"
+      ? status.sessionTokens.maximumRequestInput.inputTokens
+      : "unobserved"}`
+  ].join("; ");
   return [
     `Task Role status: ${status.taskId}/${status.roleName}`,
     "",
@@ -214,6 +226,7 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
       : "none"}`,
     `  Native session   ${nativeSession}`,
     `  Agent runtime    ${runtime}`,
+    `  Session tokens   ${sessionTokens}`,
     `  Runtime cleanup  ${status.runtimeCleanupPending ? "pending" : "none"}`,
     `  Fresh launch     ${status.freshLaunchAllowed ? "allowed" : "blocked"}`,
     `  tmux pane        ${tmux}`,
@@ -326,6 +339,12 @@ function inspectTaskRoleRuntimeStatus(
     ? { managed: false, path: role.workspace }
     : { ...managedWorkspace, managed: true };
   const events = store.listEvents(taskId);
+  const sessionTokens = projectSessionTokenMetrics(
+    events,
+    resolveSessionTokenIdentity(nativeSession === null
+      ? null
+      : { taskId, roleName: role.name, ...nativeSession })
+  );
   const runtime = projectTaskRoleRuntime(
     activeRun,
     nativeSession,
@@ -381,9 +400,22 @@ function inspectTaskRoleRuntimeStatus(
     nativeSession,
     tmux,
     workspace,
+    sessionTokens,
     runtime,
     stall
   };
+}
+
+function sessionCumulativeTokenLabel(metrics: SessionTokenMetrics): string {
+  const total = metrics.cumulativeTotal;
+  if (total.status === "unobserved") return "unobserved";
+  const breakdown = [
+    `input=${total.inputTokens}`,
+    `output=${total.outputTokens}`,
+    ...(total.cachedInputTokens === undefined ? [] : [`cached-input=${total.cachedInputTokens}`]),
+    ...(total.reasoningTokens === undefined ? [] : [`reasoning=${total.reasoningTokens}`])
+  ];
+  return `${total.totalTokens} (${breakdown.join(", ")})`;
 }
 
 function latestStallKind(

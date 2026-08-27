@@ -1,12 +1,6 @@
 import type { RuntimeUsageSnapshot } from "./runtimeObservation.js";
 
-/**
- * Issue 04 (context token budget): per-transcript usage report that keeps
- * uncached input, cache read, cache creation, output, and the largest single
- * request peak as separate dimensions. Cache-read accumulation is processed
- * volume, not unique context size; callers must never infer auto-compaction
- * from these totals.
- */
+/** Diagnostic transcript report; never a lifecycle or resource decision input. */
 export type TranscriptUsageReport = Readonly<{
   /** Provider requests (assistant messages / token-count snapshots) observed. */
   requests: number;
@@ -35,13 +29,13 @@ export function codexTranscriptUsage(transcript: string): RuntimeUsageSnapshot |
 }
 
 export function codexTranscriptUsageReport(transcript: string): TranscriptUsageReport | null {
-  // Codex token_count events are cumulative session snapshots. Per-request
-  // input is the delta between consecutive snapshots; the first snapshot is
-  // treated as one full request.
+  // Codex token_count events are cumulative Session snapshots. Per-request
+  // input is the non-negative delta between consecutive snapshots; the first
+  // snapshot only establishes the generation baseline.
   let latestInput = 0;
   let latestCached = 0;
   let latestOutput = 0;
-  let previous = 0;
+  let previous: number | undefined;
   let peak = 0;
   let requests = 0;
   let seen = false;
@@ -59,8 +53,10 @@ export function codexTranscriptUsageReport(transcript: string): TranscriptUsageR
     requests += 1;
     seen = true;
     const total = inputTokens + cachedInputTokens;
-    const delta = Math.max(0, total - previous);
-    if (delta > peak) peak = delta;
+    if (previous !== undefined) {
+      const delta = Math.max(0, total - previous);
+      if (delta > peak) peak = delta;
+    }
     previous = total;
     latestInput = inputTokens;
     latestCached = cachedInputTokens;

@@ -11,6 +11,8 @@ import {
 } from "./executionGroup.js";
 
 export const RESOURCE_BROKER_POLICY_SCHEMA_VERSION = 1 as const;
+/** Independent execution-cost policy; unrelated to legacy Session context thresholds. */
+export const DEFAULT_EXECUTION_STAGE_TOKEN_BUDGET_PER_LANE = 120_000;
 
 /**
  * One conservative Home-wide admission policy. Limits are counted
