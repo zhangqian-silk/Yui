@@ -444,7 +444,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }
     if (outcome === "applied"
       && input.kind === "activity.observed"
-      && input.payload.activityId !== undefined) {
+      && input.payload.activityId !== undefined
+      && input.payload.usage === undefined) {
       this.clearProviderRetryForProgress(input, "correlated-activity", now);
     }
     if (outcome === "applied") this.persistRuntimeObservation(input, now);

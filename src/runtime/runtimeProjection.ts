@@ -285,18 +285,21 @@ export function projectRuntimeObservation(
     }
     case "activity.observed": {
       const usage = event.payload.usage;
+      const lifecycleActivity = event.payload.activityId !== undefined
+        && usage === undefined;
       const projected = next(current, {
         ...(usage === undefined ? {} : { usage: Object.freeze({ ...usage }) }),
-        ...(event.payload.activityId === undefined ? {} : {
+        ...(lifecycleActivity ? {
           session: current.turn === "waiting" ? "active" : current.session,
           turn: current.turn === "waiting" ? "accepted" : current.turn,
           waitingReason: undefined,
           waitId: undefined
-        })
+        } : {})
       });
       // Token counters are read-only measurements. Only a separate explicit
-      // activity identity may advance runtime health or waiting state.
-      if (event.payload.activityId === undefined) return projected;
+      // activity observation may advance runtime health or waiting state;
+      // usage activityId values identify requests only for token projection.
+      if (!lifecycleActivity) return projected;
       return withActivity(projected, event.payload.activity!, at);
     }
     case "observer.health":

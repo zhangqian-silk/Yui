@@ -319,6 +319,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         const persistedActivity = generation.filter((observation) => (
           observation.kind === "activity.observed"
           && observation.payload.activityId !== undefined
+          && observation.payload.usage === undefined
         )).at(-1);
         const persistedHealth = generation.filter((observation) => (
           observation.kind === "observer.health"
