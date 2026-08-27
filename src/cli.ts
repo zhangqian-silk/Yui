@@ -122,6 +122,7 @@ import {
   type TaskCompletionPublishedTreeProof
 } from "./commands/taskCompletionGate.js";
 import { runTaskBaseStatusCommand } from "./commands/taskBaseCommands.js";
+import { runTaskUpstreamCommand } from "./commands/taskUpstreamCommands.js";
 import {
   assertTaskBaseFreshnessForCompletion,
   inspectTaskBaseFreshness
@@ -1361,6 +1362,11 @@ export async function main(): Promise<void> {
       emit(result.output, false, result.data);
       return;
     }
+    if (resolved[1] === "upstream") {
+      const result = await runTaskUpstreamCommand(resolved.slice(2), store);
+      emit(result.output, false, result.data);
+      return;
+    }
     if (resolved[1] === "complete" && resolved[2] !== undefined) {
       const completionRequest = parseTaskCompletionRequest(resolved.slice(2));
       completionSummary = completionRequest.summary;
@@ -1538,6 +1544,16 @@ export async function main(): Promise<void> {
       const laneSnapshotPreflight = executionLaneGitSnapshot === undefined
         ? undefined
         : executionLaneGitSnapshot;
+      // RFC Phase 3: prepare the Task workspace before activation so a
+      // preparation failure keeps the Task in Draft instead of leaving it
+      // Active without a workspace.
+      if (resolved[1] === "activate") {
+        const taskId = resolved[2];
+        const task = taskId === undefined ? null : store.getTask(taskId);
+        if (task !== null && task.status === "draft") {
+          await workspacePreparer.prepareTaskWorkspace(task.id);
+        }
+      }
       const result = runTaskCommand(
         resolved.slice(1),
         store,
@@ -1685,46 +1701,6 @@ export async function main(): Promise<void> {
             );
             reviewOutput = `Review could not start: ${message}\n`;
             reviewData = { reviewRound: failed };
-          }
-        }
-        if (resolved[1] === "create") {
-          const created = result.data as {
-            task?: { id?: string; projectBindings?: readonly unknown[] }
-          } | undefined;
-          if (created?.task?.id !== undefined) {
-            let workspace;
-            try {
-              workspace = await workspacePreparer.prepareTaskWorkspace(created.task.id);
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              workspace = {
-                taskId: created.task.id,
-                status: "failed" as const,
-                error: message
-              };
-            }
-            const latest = store.getTask(created.task.id);
-            const leader = store.getRole(created.task.id, "leader");
-            if (latest !== null && leader !== null) {
-              const warning = workspace.status === "failed"
-                ? `Main worktree is not ready: ${workspace.error ?? "unknown error"}.\n`
-                  + `After correcting the Git problem, run yui task reconcile ${created.task.id}.\n`
-                : "";
-              emit(`${result.output}${warning}`, false, {
-                ...created,
-                task: latest,
-                leader,
-                workspace
-              });
-              return;
-            }
-          }
-        }
-        if (resolved[1] === "activate") {
-          const taskId = resolved[2];
-          const task = taskId === undefined ? null : store.getTask(taskId);
-          if (task?.status === "active") {
-            await workspacePreparer.prepareTaskWorkspace(task.id);
           }
         }
         if (resolved[1] === "project" && resolved[2] === "add") {

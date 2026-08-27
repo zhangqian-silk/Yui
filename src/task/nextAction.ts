@@ -76,6 +76,7 @@ export type NextActionKind =
   | "resolve-review-group"
   | "resume-review"
   | "recover-execution-lane"
+  | "replace-leader-session"
   | "wait-for-owned-execution"
   | "resolve-input"
   | "complete-task"
@@ -190,6 +191,41 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     .find(hasExactRun);
   if (laneRecovery !== undefined) {
     return buildExecutionLaneRecoveryAction(facts, laneRecovery);
+  }
+
+  // Quick Win (EXE-03): a resume Run that failed before durable Provider
+  // acceptance must not be retried against the same native Session.  The
+  // authoritative next action is to replace the Session, not to retry the
+  // same delivery.  The guard only applies while the failed resume Run is the
+  // *latest* Leader Run: once a newer Run exists (the fresh-Session launch),
+  // the historical failure is stale and must not keep recommending a Session
+  // replacement.
+  const latestLeaderRun = facts.leaderRuns.at(-1);
+  const failedResumeWithoutAcceptance = latestLeaderRun !== undefined
+    && latestLeaderRun.mode === "resume"
+    && latestLeaderRun.status === "failed"
+    && latestLeaderRun.deliveredAt === undefined
+    ? latestLeaderRun
+    : undefined;
+  if (failedResumeWithoutAcceptance !== undefined) {
+    return buildAction(facts, {
+      kind: "replace-leader-session",
+      reason: `Leader resume Run ${failedResumeWithoutAcceptance.id} failed before Provider acceptance; `
+        + "the native Session is proven unusable for this delivery. Replace it with a fresh Session "
+        + "after exact cleanup/reset.",
+      refs: [ref("agent-run", failedResumeWithoutAcceptance.id)],
+      preconditions: [
+        { fact: "Resume Run failed without durable acceptance", satisfied: true, ref: ref("agent-run", failedResumeWithoutAcceptance.id) },
+        { fact: "Old Session is cleaned up or reset before fresh launch", satisfied: false }
+      ],
+      // The failed resume Run is already terminal, so `task run recover
+      // --action replace-session` (which requires an active Run) cannot act
+      // on it.  The working recovery is to reset the Role's Session
+      // generation, then clear the Leader failure so the next wake launches
+      // a fresh Session (the failed-resume guard in the wakeup processor
+      // forces mode=new for the next launch).
+      recommendedCommand: `yui task role reset ${task.id} leader --reason "resume failed before acceptance" && yui jobs retry leader-recovery:${task.id}`
+    });
   }
 
   const activeLeader = facts.activeRuns.find((run) => run.roleName === "leader");

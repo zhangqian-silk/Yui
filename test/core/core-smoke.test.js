@@ -15,6 +15,7 @@ import test from "node:test";
 
 import { findCommandNode, listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { routeInvocation } from "../../dist/cli/invocationRouter.js";
+import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
 import {
   assertRegistryCoversBaselineToCurrent,
   createProductionRegistry
@@ -133,10 +134,7 @@ const root = resolve(import.meta.dirname, "../..");
 
 // Strip managed Task runtime descriptors so the packaged CLI is exercised
 // directly instead of being refused by the exact control-plane guard.
-const bareEnv = {
-  PATH: process.env.PATH ?? "",
-  HOME: process.env.HOME ?? ""
-};
+const bareEnv = sanitizedTestEnv();
 
 test("the internal Agent Host callback is registered but remains non-public", () => {
   const command = findCommandNode(["internal", "agent-host"]);

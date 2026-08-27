@@ -43,9 +43,12 @@ import type {
 import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { nativeSessionIdForLaunch } from "../runtime/preallocatedNativeSession.js";
 import {
-  isTaskOwnedWorkspace,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
+import {
+  classifyWorkspacePreflight,
+  formatWorkspacePreflightError
+} from "./workspacePreflightClassification.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
   effectiveLaunchSnapshotsCompatibleForTaskMain,
@@ -256,19 +259,16 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     }
     const runWorkspace = activeRun?.workspace;
     const main = this.store.getTaskWorkspace(task.id);
-    if (!isTaskOwnedWorkspace(
-      main,
-      task.id,
-      task.cwd,
-      task.projectBindings.map(({ projectId, directory }) => ({ projectId, directory }))
-    )) {
-      throw new Error(`Role workspace is not ready: ${input.taskId}/${input.roleName}.`);
-    }
-    if (runWorkspace !== undefined) {
-      const durableRunWorkspace = this.store.getManagedWorkspace(runWorkspace.owner);
-      if (durableRunWorkspace === null || !isDeepStrictEqual(durableRunWorkspace, runWorkspace)) {
-        throw new Error(`Role Run workspace is not the durable owner: ${input.taskId}/${input.roleName}.`);
-      }
+    // Quick Win (EXE-04/EXE-08): classify workspace preflight failures so
+    // split-brain state is never reported as a transient Provider failure.
+    const preflight = classifyWorkspacePreflight(
+      this.store,
+      task,
+      input.roleName,
+      activeRun === null ? null : { id: activeRun.id, workspace: activeRun.workspace }
+    );
+    if (preflight !== null) {
+      throw new Error(formatWorkspacePreflightError(preflight));
     }
     const assignedWorkItem = this.store.listWorkItems(task.id).find((item) =>
       item.assignee === role.name
