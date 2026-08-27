@@ -53,7 +53,7 @@ export type ProjectCommandOptions = Readonly<{
   git?: Pick<
     GitWorkspacePort,
     "inspect" | "headRef" | "isClean" | "refresh" | "clone" | "ensureLocalBranch"
-      | "resolveRemoteBaseline" | "copyRefs"
+      | "resolveRemoteBaseline" | "copyRefs" | "isAncestor"
   >;
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
@@ -84,6 +84,9 @@ export async function runProjectCommand(
         : `Project ${refreshed.project.id} is already current at ${refreshed.toCommit}\n`,
       data: refreshed
     };
+  }
+  if (command === "diagnose") {
+    return diagnoseProject(rest, store, options);
   }
   if (command === "migrate") {
     const migrated = await migrateProject(rest, store, options);
@@ -149,12 +152,75 @@ async function refreshProject(
       `Project refresh requires matching stable and development branches: ${project.id}.`
     );
   }
-  const refreshed = await (options.git ?? new NodeGitWorkspace()).refresh({
-    repositoryPath: project.path,
-    remoteUrl: project.remoteUrl,
-    stableRef: project.stableBranch
-  });
-  return { project, ...refreshed };
+  // RFC Phase 1: hold the per-Project maintenance fence for the whole refresh
+  // so Task workspace preparation and other maintenance cannot interleave
+  // with the canonical branch/working-tree move.
+  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  try {
+    const refreshed = await (options.git ?? new NodeGitWorkspace()).refresh({
+      repositoryPath: project.path,
+      remoteUrl: project.remoteUrl,
+      stableRef: project.stableBranch
+    });
+    return { project, ...refreshed };
+  } finally {
+    releaseMaintenance();
+  }
+}
+
+/**
+ * RFC Phase 1: diagnose a managed Project's divergence without mutating it.
+ * Shows the canonical HEAD, remote advertised SHA, and whether the checkout
+ * can be fast-forwarded. Does not auto-reset or rebase.
+ */
+async function diagnoseProject(
+  args: readonly string[],
+  store: ProjectCommandStore,
+  options: ProjectCommandOptions
+): Promise<ProjectCommandExecution> {
+  if (args.length !== 1) {
+    throw usageError("Project diagnose usage: yui project diagnose <project>.");
+  }
+  const project = requireProject(store, args[0]!);
+  if (project.remoteUrl === undefined) {
+    return {
+      output: `Project ${project.id} has no remote URL; nothing to diagnose.\n`,
+      data: { project, diagnosis: "no-remote" }
+    };
+  }
+  const git = options.git ?? new NodeGitWorkspace();
+  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  try {
+    const current = await git.inspect(project.path, "HEAD");
+    const remote = await git.resolveRemoteBaseline({
+      repositoryPath: project.path,
+      remoteUrl: project.remoteUrl,
+      developmentRef: project.developmentBranch
+    });
+    const isAncestor = await git.isAncestor(project.path, current.baseCommit, remote.commit);
+    const diverged = !isAncestor && current.baseCommit !== remote.commit;
+    const lines = [
+      `Project: ${project.id}`,
+      `  canonical HEAD: ${current.baseCommit}`,
+      `  remote ${project.developmentBranch}: ${remote.commit}`,
+      `  status: ${current.baseCommit === remote.commit ? "up-to-date" : diverged ? "diverged" : "behind"}`,
+      ...(diverged
+        ? ["  The canonical checkout has local commits not on the remote.",
+           "  Use `yui project refresh` only after resolving the divergence manually."]
+        : [])
+    ];
+    return {
+      output: lines.join("\n") + "\n",
+      data: {
+        project,
+        diagnosis: diverged ? "diverged" : current.baseCommit === remote.commit ? "up-to-date" : "behind",
+        canonicalHead: current.baseCommit,
+        remoteHead: remote.commit
+      }
+    };
+  } finally {
+    releaseMaintenance();
+ }
 }
 
 type DiscoveredProject = Readonly<{

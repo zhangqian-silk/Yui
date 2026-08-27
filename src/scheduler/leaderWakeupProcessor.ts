@@ -174,7 +174,23 @@ export async function processLeaderWakeups(
       const resumableSession = hasNativeSession(existingSession)
         && existingSession.status !== "stopped"
         && existingSession.status !== "broken";
-      const mode = resumableSession && compatibleSession ? "resume" : "new";
+      // Quick Win (EXE-03): a resume Run that failed before durable Provider
+      // acceptance must not be retried against the same native Session.  The
+      // Session is proven unusable for this delivery; the next launch must be
+      // a fresh Session after exact cleanup/reset.  The guard only applies
+      // while the failed resume Run is the *latest* Run for the Role: once a
+      // newer Run exists (the fresh-Session launch), the historical failure
+      // is stale and must not permanently disable resume for the Role.
+      const latestRoleRun = store.listAgentRuns?.(task.id)
+        ?.filter((run) => run.roleName === role.name)
+        .at(-1);
+      const failedResumeWithoutAcceptance = latestRoleRun !== undefined
+        && latestRoleRun.mode === "resume"
+        && latestRoleRun.status === "failed"
+        && latestRoleRun.deliveredAt === undefined;
+      const mode = resumableSession && compatibleSession && !failedResumeWithoutAcceptance
+        ? "resume"
+        : "new";
       const runId = store.peekNextAgentRunId(task.id);
       const wakeEnvelope = resolveLeaderWakeEnvelope(store, task.id);
       const contextSnapshot = store.freezeLeaderContextSnapshot?.(task.id, role.name, now);

@@ -9,16 +9,14 @@ import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { FileTaskStore } from "../../dist/storage/taskStore.js";
 import { createProject } from "../../dist/repository/project.js";
 import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
+import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
 const cli = join(root, "dist", "cli.js");
 
 // Strip managed Task runtime descriptors so the packaged CLI is exercised
 // directly instead of being refused by the exact control-plane guard.
-const bareEnv = {
-  PATH: process.env.PATH ?? "",
-  HOME: process.env.HOME ?? ""
-};
+const bareEnv = sanitizedTestEnv();
 
 // Task-27 failure path: a Task completes with "delivery integration not
 // required" (changeSets=0, integrations=0) and the external PR/squash-commit

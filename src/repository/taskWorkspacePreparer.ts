@@ -2315,6 +2315,24 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     options: Readonly<{ latestRemote?: boolean }>
   ): Promise<TaskWorkspaceRebuildResult> {
     if (task.workspaceIdentity !== undefined) {
+      // Quick Win (EXE-08): an identity-bearing Task cannot silently "resume"
+      // when --latest is requested.  The resume branch only cleans legacy
+      // refs and reclaims orphans; it never re-pins the baseline.  Reporting
+      // success here would manufacture a split-brain state where the physical
+      // Task branch moves but the binding, ManagedWorkspace, and Run snapshot
+      // stay on the old commit.  Refuse explicitly and point at the correct
+      // tools instead.
+      if (options.latestRemote === true) {
+        throw new Error(
+          `Task ${task.id} already owns a workspace identity; `
+          + "`task rebuild --latest` cannot re-pin its baseline in place. "
+          + "Use `yui task base status " + task.id + "` to inspect the current "
+          + "binding, ManagedWorkspace, physical HEAD, and Run snapshot. "
+          + "For an Active Task, integrate upstream changes through the "
+          + "normal Leader-driven integration path; for a Draft Task with no "
+          + "execution evidence, recreate the Task workspace."
+        );
+      }
       const current = this.store.getTaskWorkspace(task.id);
       if (current !== null && current.owner.type === "task") {
         await ensureWorkspaceView(current.root, current.entries);

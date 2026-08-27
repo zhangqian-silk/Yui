@@ -431,6 +431,19 @@ const taskChildren: readonly NodeInput[] = [
     options: ["--latest"]
   },
   {
+    name: "upstream",
+    summary: "Integrate upstream changes into an Active Task workspace.",
+    sections: [{ id: "manage", title: "Commands", entries: ["integrate"] }],
+    children: [
+      {
+        name: "integrate",
+        summary: "Merge the remote development head into the Task workspace.",
+        usage: "yui task upstream integrate <task> [--latest] [--project <project>]",
+        options: ["--latest", "--project"]
+      }
+    ]
+  },
+  {
     name: "history",
     summary: "Inspect and archive legacy Task refs in the Home repository.",
     sections: [{ id: "manage", title: "Commands", entries: ["list", "archive"] }],
@@ -1335,7 +1348,7 @@ export const ROOT_COMMAND = buildNode({
     {
       name: "project",
       summary: "Manage Projects, stable checkouts, branches, and Yui knowledge.",
-      sections: [{ id: "manage", title: "Commands", entries: ["add", "clone", "refresh", "migrate", "update", "discover", "list", "show", "knowledge"] }],
+      sections: [{ id: "manage", title: "Commands", entries: ["add", "clone", "refresh", "diagnose", "migrate", "update", "discover", "list", "show", "knowledge"] }],
       children: [
         {
           name: "add",
@@ -1354,6 +1367,11 @@ export const ROOT_COMMAND = buildNode({
           name: "refresh",
           summary: "Fast-forward a clean stable checkout from its configured remote.",
           usage: "yui project refresh <project>"
+        },
+        {
+          name: "diagnose",
+          summary: "Show canonical HEAD vs remote head without mutating the checkout.",
+          usage: "yui project diagnose <project>"
         },
         {
           name: "migrate",
@@ -1472,7 +1490,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile", "upstream"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "continuation", "wake"] }
       ],

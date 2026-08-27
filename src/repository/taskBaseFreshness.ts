@@ -47,6 +47,12 @@ export type TaskBaseFreshness = Readonly<{
   source: TaskBaseFreshnessSource;
   workspacePath: string;
   workspaceClean: boolean | null;
+  /** Physical HEAD of the workspace checkout, when resolvable. */
+  physicalHead?: string;
+  /** Active Run workspace snapshot baseCommit, when an active Run exists. */
+  runSnapshotCommit?: string;
+  /** Active Run id whose workspace snapshot is reported. */
+  runSnapshotRunId?: string;
   trackedRef?: string;
   trackedCommit?: string;
   remoteOnlyChangedFiles: readonly string[];
@@ -154,11 +160,27 @@ export async function inspectTaskBaseFreshness(
   const task = requireTask(store, taskId);
   const git = options.git ?? newGitWorkspace();
   const workspace = store.getTaskWorkspace(taskId);
+  // Collect active Run workspace snapshots once so every Project entry can
+  // report whether a live Run is pinned to a different commit.
+  const activeRuns = store.listAgentRuns(taskId)
+    .filter((run) => run.status === "active" && run.workspace !== undefined);
   const entries = await Promise.all(task.projectBindings.map(async (binding) => {
     const project = requireProject(store, binding.projectId);
     const entry = workspace === null ? undefined : workspaceProjectEntry(workspace, project.id);
     const baseCommit = await resolveBaseCommit(git, project, binding, entry);
     const workspacePath = entry?.path ?? project.path;
+    let physicalHead: string | undefined;
+    try {
+      physicalHead = (await git.inspect(workspacePath)).baseCommit;
+    } catch {
+      physicalHead = undefined;
+    }
+    // Find the first active Run whose workspace snapshot covers this Project.
+    const runSnapshot = activeRuns.find((run) => {
+      if (run.workspace === undefined) return false;
+      const runEntry = workspaceProjectEntry(run.workspace, project.id);
+      return runEntry !== undefined;
+    });
     const provenance = latestBaseProvenance(store.listEvents(taskId), project.id);
     const tracked = await resolveTracked(git, project, workspacePath, options.refresh === true);
     const status = await classifyStatus(git, workspacePath, project, baseCommit, tracked);
@@ -179,6 +201,13 @@ export async function inspectTaskBaseFreshness(
       source: tracked?.source ?? (project.remoteUrl === undefined ? "not-applicable" : "compatibility-projection"),
       workspacePath,
       workspaceClean,
+      ...(physicalHead === undefined ? {} : { physicalHead }),
+      ...(runSnapshot?.workspace === undefined
+        ? {}
+        : {
+            runSnapshotCommit: workspaceProjectEntry(runSnapshot.workspace, project.id)?.baseCommit,
+            runSnapshotRunId: runSnapshot.id
+          }),
       ...(tracked === undefined ? {} : {
         trackedRef: tracked.ref,
         trackedCommit: tracked.commit,
@@ -249,6 +278,8 @@ export function renderTaskBaseFreshnessReport(report: TaskBaseFreshnessReport): 
     lines.push(
       `- ${entry.directory}: ${entry.projectId} @ ${entry.baseCommit}`,
       `  status: ${entry.status}; workspace: ${entry.workspaceClean === null ? "unknown" : entry.workspaceClean ? "clean" : "dirty"}`,
+      `  physical HEAD: ${entry.physicalHead ?? "-"}`,
+      `  Run snapshot: ${entry.runSnapshotCommit ?? "-"}${entry.runSnapshotRunId === undefined ? "" : ` (${entry.runSnapshotRunId})`}`,
       `  observed remote: ${entry.observedRemoteUrl ?? "-"}`,
       `  tracked: ${entry.trackedCommit ?? "-"}${entry.trackedRef === undefined ? "" : ` (${entry.trackedRef})`}`,
       `  observed: ${entry.observedTrackingCommit ?? "-"}${entry.observedAt === undefined ? "" : ` at ${entry.observedAt}`}`
