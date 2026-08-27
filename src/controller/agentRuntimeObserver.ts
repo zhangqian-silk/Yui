@@ -30,8 +30,9 @@ type ObserverState = {
   cursor?: AgentRuntimeObserverCursor;
   health?: string;
   usage?: RuntimeUsageSnapshot;
-  usageSemanticKey?: string;
+  usageEventId?: string;
   usageOccurrenceId?: string;
+  usageOccurrenceCheckpoint?: string;
   activityId?: string;
 };
 
@@ -84,8 +85,8 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         // restart so rereading the bounded transcript tail cannot manufacture a
         // fresh activity edge from tokens that were already observed.
         const state = existingState ?? { ...persistedState };
-        const restoredUsageSemanticKey = existingState === undefined
-          ? persistedState.usageSemanticKey
+        const restoredUsageEventId = existingState === undefined
+          ? persistedState.usageEventId
           : undefined;
         const driver = this.drivers.require(fence.driverId);
         const observer = driver.runtime.observer;
@@ -95,7 +96,10 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           sample = await observer.sample(source, state.cursor, {
             ...(state.usageOccurrenceId === undefined
               ? {}
-              : { latestOccurrenceId: state.usageOccurrenceId })
+              : { latestOccurrenceId: state.usageOccurrenceId }),
+            ...(state.usageOccurrenceCheckpoint === undefined
+              ? {}
+              : { latestCheckpoint: state.usageOccurrenceCheckpoint })
           });
         } catch (error) {
           sample = Object.freeze({
@@ -155,10 +159,13 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               }
             }));
             state.usage = baseline;
-            state.usageSemanticKey = identity.semanticKey;
+            state.usageEventId = identity.eventId;
             state.usageOccurrenceId = completeFreshBaseline
               ? undefined
               : latestOccurrence!.occurrenceId;
+            state.usageOccurrenceCheckpoint = completeFreshBaseline
+              ? undefined
+              : latestOccurrence!.resumeCheckpoint;
             if (!completeFreshBaseline) usages = [];
           }
         }
@@ -185,11 +192,11 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         }
         const activityChanged = sample.activityId !== undefined
           && sample.activityId !== state.activityId;
-        if (restoredUsageSemanticKey !== undefined) {
+        if (restoredUsageEventId !== undefined) {
           let persistedIndex = -1;
           for (let usageIndex = usages.length - 1; usageIndex >= 0; usageIndex -= 1) {
-            if (usageObservationIdentity(fence, source.sourceId, usages[usageIndex]!).semanticKey
-              === restoredUsageSemanticKey) {
+            if (usageObservationIdentity(fence, source.sourceId, usages[usageIndex]!).eventId
+              === restoredUsageEventId) {
               persistedIndex = usageIndex;
               break;
             }
@@ -234,8 +241,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             }
           }));
           state.usage = occurrence.usage;
-          state.usageSemanticKey = identity.semanticKey;
+          state.usageEventId = identity.eventId;
           state.usageOccurrenceId = occurrence.occurrenceId;
+          state.usageOccurrenceCheckpoint = occurrence.resumeCheckpoint;
         });
         if (activityChanged && state.cursor !== undefined) {
           this.inbox.enqueueObservation(createRuntimeObservation({
@@ -348,9 +356,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           observation.kind === "observer.health"
           && observation.payload.sourceId === source.sourceId
         )).at(-1);
-        const persistedUsageOccurrenceId = persistedUsage === undefined
+        const persistedUsageResume = persistedUsage === undefined
           ? undefined
-          : usageOccurrenceId(persistedUsage.semanticKey);
+          : usageObservationResume(persistedUsage.semanticKey);
         result.push(Object.freeze({
           key: JSON.stringify([
             fence.taskId,
@@ -373,10 +381,15 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             ...(persistedUsage === undefined
               ? {}
               : {
-                  usageSemanticKey: persistedUsage.semanticKey,
-                  ...(persistedUsageOccurrenceId === undefined
+                  usageEventId: persistedUsage.eventId,
+                  ...(persistedUsageResume === undefined
                     ? {}
-                    : { usageOccurrenceId: persistedUsageOccurrenceId })
+                    : {
+                        usageOccurrenceId: persistedUsageResume.occurrenceId,
+                        ...(persistedUsageResume.checkpoint === undefined
+                          ? {}
+                          : { usageOccurrenceCheckpoint: persistedUsageResume.checkpoint })
+                      })
                 }),
             ...(persistedActivity?.payload.activityId === undefined
               ? {}
@@ -450,25 +463,46 @@ function observationId(
 function usageObservationIdentity(
   fence: RuntimeObservationFence,
   sourceId: string,
-  occurrence: Readonly<{ occurrenceId: string }>
+  occurrence: Readonly<{ occurrenceId: string; resumeCheckpoint?: string }>
 ): Readonly<{ eventId: string; semanticKey: string }> {
   const eventId = tokenObservationId("usage", fence, sourceId, occurrence.occurrenceId);
   const encodedOccurrenceId = Buffer.from(occurrence.occurrenceId, "utf8").toString("base64url");
   return Object.freeze({
     eventId,
-    semanticKey: `${eventId}:occurrence:${encodedOccurrenceId}`
+    semanticKey: `${eventId}:occurrence:${encodedOccurrenceId}${
+      occurrence.resumeCheckpoint === undefined
+        ? ""
+        : `:checkpoint:${Buffer.from(occurrence.resumeCheckpoint, "utf8").toString("base64url")}`
+    }`
   });
 }
 
-function usageOccurrenceId(semanticKey: string): string | undefined {
-  const marker = ":occurrence:";
-  const index = semanticKey.lastIndexOf(marker);
-  if (index < 0) return undefined;
-  const encoded = semanticKey.slice(index + marker.length);
-  if (encoded.length === 0) return undefined;
+function usageObservationResume(
+  semanticKey: string
+): Readonly<{ occurrenceId: string; checkpoint?: string }> | undefined {
+  const occurrenceMarker = ":occurrence:";
+  const checkpointMarker = ":checkpoint:";
+  const occurrenceIndex = semanticKey.lastIndexOf(occurrenceMarker);
+  if (occurrenceIndex < 0) return undefined;
+  const checkpointIndex = semanticKey.indexOf(
+    checkpointMarker,
+    occurrenceIndex + occurrenceMarker.length
+  );
+  const encodedOccurrence = semanticKey.slice(
+    occurrenceIndex + occurrenceMarker.length,
+    checkpointIndex < 0 ? undefined : checkpointIndex
+  );
+  if (encodedOccurrence.length === 0) return undefined;
   try {
-    const decoded = Buffer.from(encoded, "base64url").toString("utf8");
-    return decoded.length === 0 ? undefined : decoded;
+    const occurrenceId = Buffer.from(encodedOccurrence, "base64url").toString("utf8");
+    if (occurrenceId.length === 0) return undefined;
+    if (checkpointIndex < 0) return Object.freeze({ occurrenceId });
+    const encodedCheckpoint = semanticKey.slice(checkpointIndex + checkpointMarker.length);
+    if (encodedCheckpoint.length === 0) return undefined;
+    const checkpoint = Buffer.from(encodedCheckpoint, "base64url").toString("utf8");
+    return checkpoint.length === 0
+      ? undefined
+      : Object.freeze({ occurrenceId, checkpoint });
   } catch {
     return undefined;
   }

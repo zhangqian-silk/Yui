@@ -23,6 +23,7 @@ type JsonlCursor = Readonly<{
   state: Readonly<Record<string, unknown>>;
   continuityEpoch: string;
   fileFingerprint?: string;
+  fileCtimeMs?: number;
 }>;
 
 type ParsedSample = Readonly<{
@@ -37,11 +38,19 @@ type TranscriptLine = Readonly<{
   offset: number;
   continuityEpoch: string;
   fileFingerprint: string;
+  observedFileSize: number;
+  observedFileCtimeMs: number;
 }>;
 
 type TranscriptCheckpoint = Readonly<{
+  occurrenceId: string;
   continuityEpoch: string;
   fileFingerprint: string;
+  offset: number;
+  length: number;
+  digest: string;
+  observedFileSize: number;
+  observedFileCtimeMs: number;
 }>;
 
 const INITIAL_CONTINUITY_EPOCH = "initial";
@@ -101,16 +110,33 @@ async function sampleJsonl(
 
   const fileFingerprint = transcriptFileFingerprint(metadata);
   const checkpoint = previous === undefined
-    ? transcriptCheckpoint(resume?.latestOccurrenceId)
+    ? transcriptCheckpoint(resume?.latestCheckpoint, resume?.latestOccurrenceId)
     : undefined;
+  let checkpointMatches = false;
+  if (previous === undefined && checkpoint !== undefined) {
+    try {
+      checkpointMatches = await matchesTranscriptCheckpoint(
+        source.locator,
+        metadata,
+        fileFingerprint,
+        checkpoint
+      );
+    } catch (error) {
+      return unavailable(previous, error);
+    }
+  }
   const reset = previous !== undefined && (
     previous.fileFingerprint === undefined
+    || previous.fileFingerprint !== fileFingerprint
     || metadata.size < previous.offset
-    || (metadata.size === previous.offset && previous.fileFingerprint !== fileFingerprint)
+    || (metadata.size === previous.offset && (
+      previous.fileCtimeMs === undefined
+      || previous.fileCtimeMs !== metadata.ctimeMs
+    ))
   );
   const offlineReset = previous === undefined
     && checkpoint !== undefined
-    && checkpoint.fileFingerprint !== fileFingerprint;
+    && !checkpointMatches;
   const initial = previous === undefined || reset;
   const continuityEpoch = reset || offlineReset
     ? rotateContinuityEpoch(
@@ -165,7 +191,9 @@ async function sampleJsonl(
       content,
       offset: lineOffset,
       continuityEpoch,
-      fileFingerprint
+      fileFingerprint,
+      observedFileSize: metadata.size,
+      observedFileCtimeMs: metadata.ctimeMs
     });
     lineOffset += Buffer.byteLength(content, "utf8") + 1;
     return line;
@@ -187,7 +215,8 @@ async function sampleJsonl(
     remainder: boundedRemainder,
     state: parsed.state,
     continuityEpoch,
-    fileFingerprint
+    fileFingerprint,
+    fileCtimeMs: metadata.ctimeMs
   });
   const fellBehind = start + bytes.length < metadata.size;
   const detail = parsed.degraded
@@ -230,7 +259,7 @@ function parseCodexLines(
     if (candidate === undefined) continue;
     usage = candidate;
     usages.push(Object.freeze({
-      occurrenceId: transcriptOccurrenceId(line),
+      ...transcriptOccurrence(line),
       usage: candidate
     }));
   }
@@ -274,7 +303,7 @@ function parseClaudeLines(
       bounded = true;
     }
     usages.push(Object.freeze({
-      occurrenceId: transcriptOccurrenceId(line),
+      ...transcriptOccurrence(line),
       activityId: key,
       usage
     }));
@@ -291,17 +320,30 @@ function parseClaudeLines(
   });
 }
 
-function transcriptOccurrenceId(line: TranscriptLine): string {
+function transcriptOccurrence(
+  line: TranscriptLine
+): Readonly<{ occurrenceId: string; resumeCheckpoint: string }> {
   // The durable semantic key retains this bounded checkpoint. A Controller
   // restart can therefore reuse the epoch only when the sampled file is still
   // the same continuity, without persisting the process-local cursor itself.
   const digest = createHash("sha256").update(line.content).digest("hex");
-  return `transcript-v1:${Buffer.from(JSON.stringify({
+  const occurrenceId = `transcript-v1:${Buffer.from(JSON.stringify({
     continuityEpoch: line.continuityEpoch,
     fileFingerprint: line.fileFingerprint,
     offset: line.offset,
     digest
   }), "utf8").toString("base64url")}`;
+  const resumeCheckpoint = `transcript-checkpoint-v1:${Buffer.from(JSON.stringify({
+    occurrenceId,
+    continuityEpoch: line.continuityEpoch,
+    fileFingerprint: line.fileFingerprint,
+    offset: line.offset,
+    length: Buffer.byteLength(line.content, "utf8"),
+    digest,
+    observedFileSize: line.observedFileSize,
+    observedFileCtimeMs: line.observedFileCtimeMs
+  }), "utf8").toString("base64url")}`;
+  return Object.freeze({ occurrenceId, resumeCheckpoint });
 }
 
 function initialContinuityEpoch(fileFingerprint: string): string {
@@ -321,35 +363,78 @@ function continuityEpoch(previous: string, fileFingerprint: string): string {
 function transcriptFileFingerprint(metadata: Readonly<{
   dev: number;
   ino: number;
-  size: number;
-  ctimeMs: number;
 }>): string {
   return `sha256:${createHash("sha256").update(JSON.stringify([
     metadata.dev,
-    metadata.ino,
-    metadata.size,
-    metadata.ctimeMs
+    metadata.ino
   ])).digest("hex")}`;
 }
 
-function transcriptCheckpoint(occurrenceId: string | undefined): TranscriptCheckpoint | undefined {
-  const prefix = "transcript-v1:";
-  if (occurrenceId === undefined || !occurrenceId.startsWith(prefix)) return undefined;
+async function matchesTranscriptCheckpoint(
+  locator: string,
+  metadata: Readonly<{ size: number; ctimeMs: number }>,
+  fileFingerprint: string,
+  checkpoint: TranscriptCheckpoint
+): Promise<boolean> {
+  if (checkpoint.fileFingerprint !== fileFingerprint
+    || metadata.size < checkpoint.observedFileSize) return false;
+  if (metadata.size === checkpoint.observedFileSize) {
+    return metadata.ctimeMs === checkpoint.observedFileCtimeMs;
+  }
+  if (checkpoint.offset + checkpoint.length + 1 > metadata.size) return false;
+  const handle = await open(locator, "r");
+  try {
+    const bytes = Buffer.alloc(checkpoint.length + 1);
+    const read = await handle.read(bytes, 0, bytes.length, checkpoint.offset);
+    return read.bytesRead === bytes.length
+      && bytes.at(-1) === 0x0a
+      && createHash("sha256")
+        .update(bytes.subarray(0, checkpoint.length))
+        .digest("hex") === checkpoint.digest;
+  } finally {
+    await handle.close();
+  }
+}
+
+function transcriptCheckpoint(
+  raw: string | undefined,
+  occurrenceId: string | undefined
+): TranscriptCheckpoint | undefined {
+  const prefix = "transcript-checkpoint-v1:";
+  if (raw === undefined || occurrenceId === undefined || !raw.startsWith(prefix)) return undefined;
   try {
     const value: unknown = JSON.parse(Buffer.from(
-      occurrenceId.slice(prefix.length),
+      raw.slice(prefix.length),
       "base64url"
     ).toString("utf8"));
     if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
     const checkpoint = value as Record<string, unknown>;
-    return typeof checkpoint.continuityEpoch !== "string"
+    return checkpoint.occurrenceId !== occurrenceId
+      || typeof checkpoint.continuityEpoch !== "string"
       || checkpoint.continuityEpoch.length === 0
       || typeof checkpoint.fileFingerprint !== "string"
       || checkpoint.fileFingerprint.length === 0
+      || !Number.isSafeInteger(checkpoint.offset)
+      || (checkpoint.offset as number) < 0
+      || !Number.isSafeInteger(checkpoint.length)
+      || (checkpoint.length as number) < 0
+      || typeof checkpoint.digest !== "string"
+      || checkpoint.digest.length === 0
+      || !Number.isSafeInteger(checkpoint.observedFileSize)
+      || (checkpoint.observedFileSize as number) < 0
+      || typeof checkpoint.observedFileCtimeMs !== "number"
+      || !Number.isFinite(checkpoint.observedFileCtimeMs)
+      || checkpoint.observedFileCtimeMs < 0
       ? undefined
       : Object.freeze({
+          occurrenceId,
           continuityEpoch: checkpoint.continuityEpoch,
-          fileFingerprint: checkpoint.fileFingerprint
+          fileFingerprint: checkpoint.fileFingerprint,
+          offset: checkpoint.offset as number,
+          length: checkpoint.length as number,
+          digest: checkpoint.digest,
+          observedFileSize: checkpoint.observedFileSize as number,
+          observedFileCtimeMs: checkpoint.observedFileCtimeMs
         });
   } catch {
     return undefined;
@@ -363,13 +448,18 @@ function normalizeCursor(input: AgentRuntimeObserverCursor | undefined): JsonlCu
   const state = input.state;
   const continuityEpoch = input.continuityEpoch;
   const fileFingerprint = input.fileFingerprint;
+  const fileCtimeMs = input.fileCtimeMs;
   if (!Number.isSafeInteger(offset) || (offset as number) < 0
     || typeof remainder !== "string"
     || state === null || typeof state !== "object" || Array.isArray(state)
     || (continuityEpoch !== undefined
       && (typeof continuityEpoch !== "string" || continuityEpoch.length === 0))
     || (fileFingerprint !== undefined
-      && (typeof fileFingerprint !== "string" || fileFingerprint.length === 0))) return undefined;
+      && (typeof fileFingerprint !== "string" || fileFingerprint.length === 0))
+    || (fileCtimeMs !== undefined
+      && (typeof fileCtimeMs !== "number" || !Number.isFinite(fileCtimeMs) || fileCtimeMs < 0))) {
+    return undefined;
+  }
   return Object.freeze({
     offset: offset as number,
     remainder,
@@ -377,7 +467,8 @@ function normalizeCursor(input: AgentRuntimeObserverCursor | undefined): JsonlCu
     continuityEpoch: typeof continuityEpoch === "string"
       ? continuityEpoch
       : INITIAL_CONTINUITY_EPOCH,
-    ...(typeof fileFingerprint === "string" ? { fileFingerprint } : {})
+    ...(typeof fileFingerprint === "string" ? { fileFingerprint } : {}),
+    ...(typeof fileCtimeMs === "number" ? { fileCtimeMs } : {})
   });
 }
 
