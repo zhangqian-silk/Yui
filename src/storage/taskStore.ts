@@ -1744,8 +1744,9 @@ export class FileTaskStore implements TaskStore {
       if (round === undefined) {
         throw new StorageRecordError(`Agent run ReviewRound not found: ${stored.reviewRoundId}.`);
       }
+      const roundWorkItemId = round.workItemId ?? round.legacyAnchor?.workItemId;
       const laneRole = round.executionGroup?.lanes.find(({ id }) => id === stored.executionLaneId)?.roleName;
-      if (round.workItemId !== stored.workItemId
+      if (roundWorkItemId !== stored.workItemId
         || (round.reviewerRoleName !== stored.roleName && laneRole !== stored.roleName)) {
         throw new StorageRecordError(`Agent run does not match ReviewRound: ${stored.id}.`);
       }

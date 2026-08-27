@@ -2241,9 +2241,10 @@ export class SqliteTaskStore implements TaskStore {
       if (round === null) {
         throw new StorageRecordError(`Agent run ReviewRound not found: ${run.reviewRoundId}.`);
       }
+      const roundWorkItemId = round.workItemId ?? round.legacyAnchor?.workItemId;
       const laneRole = round.executionGroup?.lanes
         .find(({ id }) => id === run.executionLaneId)?.roleName;
-      if (round.workItemId !== run.workItemId
+      if (roundWorkItemId !== run.workItemId
         || (round.reviewerRoleName !== run.roleName && laneRole !== run.roleName)) {
         throw new StorageRecordError(`Agent run does not match ReviewRound: ${run.id}.`);
       }
