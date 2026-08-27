@@ -148,7 +148,6 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             }));
             state.usage = baseline;
             state.usageSemanticKey = semanticKey;
-            dirty.add(`role:${fence.taskId}/${fence.roleName}`);
             if (!completeFreshBaseline) usages = [];
           }
         }
@@ -184,7 +183,20 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               break;
             }
           }
-          if (persistedIndex >= 0) usages = usages.slice(persistedIndex + 1);
+          if (persistedIndex >= 0) {
+            usages = usages.slice(persistedIndex + 1);
+          } else if (state.usage?.semantics === "cumulative-session") {
+            // The durable counter proves the latest cumulative total, but an
+            // initial bounded read that cannot recover that occurrence may
+            // have skipped intermediate request boundaries while the
+            // Controller was stopped. Preserve the total and fail closed only
+            // for the derived maximum-request metric.
+            usages = usages.map((occurrence) => (
+              occurrence.usage.semantics !== "cumulative-session"
+                ? occurrence
+                : Object.freeze({ ...occurrence, observationQuality: "partial" as const })
+            ));
+          }
         }
         usages.forEach((occurrence, usageIndex) => {
           const semanticKey = usageObservationId(fence, source.sourceId, occurrence);
@@ -212,7 +224,6 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           }));
           state.usage = occurrence.usage;
           state.usageSemanticKey = semanticKey;
-          dirty.add(`role:${fence.taskId}/${fence.roleName}`);
         });
         if (activityChanged && state.cursor !== undefined) {
           this.inbox.enqueueObservation(createRuntimeObservation({
