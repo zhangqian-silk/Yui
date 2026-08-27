@@ -6,7 +6,8 @@ import type {
   AgentDriverNativeHook,
   AgentRuntimeObserverCursor,
   AgentRuntimeObserverSample,
-  AgentRuntimeObserverSource
+  AgentRuntimeObserverSource,
+  AgentRuntimeUsageOccurrence
 } from "./agentDriver.js";
 import type { RuntimeUsageSnapshot } from "./runtimeObservation.js";
 
@@ -23,9 +24,14 @@ type JsonlCursor = Readonly<{
 
 type ParsedSample = Readonly<{
   state: Readonly<Record<string, unknown>>;
-  usage?: RuntimeUsageSnapshot;
+  usages: readonly AgentRuntimeUsageOccurrence[];
   activityId?: string;
   degraded?: string;
+}>;
+
+type TranscriptLine = Readonly<{
+  content: string;
+  offset: number;
 }>;
 
 export function transcriptObserverSource(
@@ -68,7 +74,10 @@ export async function claudeTranscriptObserver(
 async function sampleJsonl(
   source: AgentRuntimeObserverSource,
   rawCursor: AgentRuntimeObserverCursor | undefined,
-  parse: (lines: readonly string[], state: Readonly<Record<string, unknown>>) => ParsedSample
+  parse: (
+    lines: readonly TranscriptLine[],
+    state: Readonly<Record<string, unknown>>
+  ) => ParsedSample
 ): Promise<AgentRuntimeObserverSample> {
   const previous = normalizeCursor(rawCursor);
   let metadata;
@@ -102,17 +111,34 @@ async function sampleJsonl(
   }
 
   let text = `${initial ? "" : previous?.remainder ?? ""}${bytes.toString("utf8")}`;
+  let textOffset = initial
+    ? start
+    : previous!.offset - Buffer.byteLength(previous!.remainder, "utf8");
   if (initial && start > 0) {
     const firstLineEnd = text.indexOf("\n");
-    text = firstLineEnd < 0 ? "" : text.slice(firstLineEnd + 1);
+    if (firstLineEnd < 0) {
+      textOffset += Buffer.byteLength(text, "utf8");
+      text = "";
+    } else {
+      const discarded = text.slice(0, firstLineEnd + 1);
+      textOffset += Buffer.byteLength(discarded, "utf8");
+      text = text.slice(firstLineEnd + 1);
+    }
   }
   const complete = text.endsWith("\n");
   const split = text.split("\n");
   const remainder = complete ? "" : split.pop() ?? "";
+  if (complete) split.pop();
+  let lineOffset = textOffset;
+  const lines = split.map((content): TranscriptLine => {
+    const line = Object.freeze({ content, offset: lineOffset });
+    lineOffset += Buffer.byteLength(content, "utf8") + 1;
+    return line;
+  });
   const boundedRemainder = Buffer.byteLength(remainder, "utf8") <= MAX_REMAINDER_BYTES
     ? remainder
     : "";
-  const parsed = parse(split, initial ? {} : previous?.state ?? {});
+  const parsed = parse(lines, initial ? {} : previous?.state ?? {});
   const nextCursor = Object.freeze({
     offset: start + bytes.length,
     remainder: boundedRemainder,
@@ -127,7 +153,7 @@ async function sampleJsonl(
     cursor: nextCursor,
     status: detail === undefined ? "healthy" : "degraded",
     ...(detail === undefined ? {} : { detail }),
-    ...(parsed.usage === undefined ? {} : { usage: parsed.usage }),
+    ...(parsed.usages.length === 0 ? {} : { usages: parsed.usages }),
     ...(parsed.activityId === undefined ? {} : {
       activity: "model" as const,
       activityId: parsed.activityId
@@ -136,15 +162,16 @@ async function sampleJsonl(
 }
 
 function parseCodexLines(
-  lines: readonly string[],
+  lines: readonly TranscriptLine[],
   state: Readonly<Record<string, unknown>>
 ): ParsedSample {
   let usage = usageFrom(state.usage);
+  const usages: AgentRuntimeUsageOccurrence[] = [];
   let malformed = 0;
   for (const line of lines) {
-    const entry = jsonObject(line);
+    const entry = jsonObject(line.content);
     if (entry === null) {
-      if (line.trim().length > 0) malformed += 1;
+      if (line.content.trim().length > 0) malformed += 1;
       continue;
     }
     if (entry.type !== "event_msg") continue;
@@ -153,25 +180,31 @@ function parseCodexLines(
     const candidate = normalizedCodexUsage(object(object(payload.info)?.total_token_usage));
     if (candidate === undefined) continue;
     usage = candidate;
+    usages.push(Object.freeze({
+      occurrenceId: `byte:${line.offset}`,
+      usage: candidate
+    }));
   }
   return Object.freeze({
     state: Object.freeze({ ...(usage === undefined ? {} : { usage }) }),
-    ...(usage === undefined ? {} : { usage }),
+    usages: Object.freeze(usages),
     ...(malformed === 0 ? {} : { degraded: `${malformed} malformed transcript line(s) ignored.` })
   });
 }
 
 function parseClaudeLines(
-  lines: readonly string[],
+  lines: readonly TranscriptLine[],
   state: Readonly<Record<string, unknown>>
 ): ParsedSample {
   const messages = messageState(state.messages);
+  const usages: AgentRuntimeUsageOccurrence[] = [];
   let activityId: string | undefined;
   let malformed = 0;
+  let bounded = false;
   for (const line of lines) {
-    const entry = jsonObject(line);
+    const entry = jsonObject(line.content);
     if (entry === null) {
-      if (line.trim().length > 0) malformed += 1;
+      if (line.content.trim().length > 0) malformed += 1;
       continue;
     }
     if (entry.type !== "assistant") continue;
@@ -184,17 +217,28 @@ function parseClaudeLines(
     if (key === undefined) continue;
     messages[key] = usage;
     activityId = key;
+    const keys = Object.keys(messages);
+    if (keys.length > MAX_CLAUDE_MESSAGES) {
+      for (const oldKey of keys.slice(0, keys.length - MAX_CLAUDE_MESSAGES)) {
+        delete messages[oldKey];
+      }
+      bounded = true;
+    }
+    const cumulative = sumUsage(Object.values(messages));
+    if (cumulative !== undefined) {
+      usages.push(Object.freeze({
+        occurrenceId: `byte:${line.offset}`,
+        usage: cumulative
+      }));
+    }
   }
-  const keys = Object.keys(messages);
   let degraded = malformed === 0 ? undefined : `${malformed} malformed transcript line(s) ignored.`;
-  if (keys.length > MAX_CLAUDE_MESSAGES) {
-    for (const key of keys.slice(0, keys.length - MAX_CLAUDE_MESSAGES)) delete messages[key];
+  if (bounded) {
     degraded = "Claude transcript message baseline was bounded to the newest entries.";
   }
-  const usage = sumUsage(Object.values(messages));
   return Object.freeze({
     state: Object.freeze({ messages: Object.freeze(messages) }),
-    ...(usage === undefined ? {} : { usage }),
+    usages: Object.freeze(usages),
     ...(activityId === undefined ? {} : { activityId }),
     ...(degraded === undefined ? {} : { degraded })
   });

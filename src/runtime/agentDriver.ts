@@ -119,11 +119,18 @@ export type AgentRuntimeObserverSource = Readonly<{
 
 export type AgentRuntimeObserverCursor = Readonly<Record<string, unknown>>;
 
+export type AgentRuntimeUsageOccurrence = Readonly<{
+  /** Stable identity for one ordered usage fact from this observer source. */
+  occurrenceId: string;
+  usage: RuntimeUsageSnapshot;
+}>;
+
 export type AgentRuntimeObserverSample = Readonly<{
   cursor: AgentRuntimeObserverCursor;
   status: "healthy" | "degraded" | "unavailable";
   detail?: string;
-  usage?: RuntimeUsageSnapshot;
+  /** Every usage occurrence found in this bounded sample, in source order. */
+  usages?: readonly AgentRuntimeUsageOccurrence[];
   activity?: "model" | "tool" | "subagent" | "provider" | "resource";
   activityId?: string;
 }>;

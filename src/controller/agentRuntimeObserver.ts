@@ -31,6 +31,7 @@ type ObserverState = {
   cursor?: AgentRuntimeObserverCursor;
   health?: string;
   usage?: RuntimeUsageSnapshot;
+  usageSemanticKey?: string;
   activityId?: string;
 };
 
@@ -102,13 +103,15 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         // latency can change completion order without changing observation
         // identity or the canonical sequence assigned to a source.
         const sequence = sequenceBase + index;
-        if (existingState === undefined && state.usage === undefined) {
+        let usages = sample.usages ?? [];
+        if (state.usage === undefined) {
           // Cumulative counters need a lower bound: a fresh native Session
           // begins at zero, while a resumed Session freezes its first sample
           // so earlier conversation usage is not charged to this Run. Request
           // snapshots already describe one complete occurrence and must not be
           // mixed with a synthetic cumulative fact.
-          const baseline = sample.usage?.semantics !== "cumulative-session"
+          const latestOccurrence = usages.at(-1);
+          const baseline = latestOccurrence?.usage.semantics !== "cumulative-session"
             ? undefined
             : freshSession
               ? Object.freeze({
@@ -116,13 +119,16 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
                   inputTokens: 0,
                   outputTokens: 0
                 })
-              : sample.usage;
+              : latestOccurrence.usage;
           if (baseline !== undefined) {
-            const baselineKey = freshSession ? "zero" : JSON.stringify(baseline);
+            const baselineKey = freshSession ? "zero" : latestOccurrence!.occurrenceId;
+            const semanticKey = freshSession
+              ? observationId("baseline", fence, source.sourceId, baselineKey)
+              : usageObservationId(fence, source.sourceId, latestOccurrence!);
             this.inbox.enqueueObservation(createRuntimeObservation({
               schemaVersion: 2,
               eventId: observationId("baseline", fence, source.sourceId, baselineKey),
-              semanticKey: observationId("baseline", fence, source.sourceId, baselineKey),
+              semanticKey,
               kind: "activity.observed",
               authority: freshSession ? "controller" : "driver-inferred",
               receivedAt: at,
@@ -132,7 +138,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               payload: { activity: "model", usage: baseline }
             }));
             state.usage = baseline;
+            state.usageSemanticKey = semanticKey;
             dirty.add(`role:${fence.taskId}/${fence.roleName}`);
+            if (!freshSession) usages = [];
           }
         }
         const health = JSON.stringify([sample.status, sample.detail ?? null]);
@@ -156,42 +164,40 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           state.health = health;
           dirty.add(`role:${fence.taskId}/${fence.roleName}`);
         }
-        const usage = sample.usage;
         const activityChanged = sample.activityId !== undefined
           && sample.activityId !== state.activityId;
-        if (usage !== undefined && (usage.semantics === "request-context"
-          ? activityChanged
-          : !sameUsage(state.usage, usage))) {
-          const usageIdentity = usage.semantics === "request-context"
-            ? `request:${sample.activityId!}`
-            : `snapshot:${JSON.stringify(usage)}`;
+        if (existingState === undefined && state.usageSemanticKey !== undefined) {
+          let persistedIndex = -1;
+          for (let usageIndex = usages.length - 1; usageIndex >= 0; usageIndex -= 1) {
+            if (usageObservationId(fence, source.sourceId, usages[usageIndex]!)
+              === state.usageSemanticKey) {
+              persistedIndex = usageIndex;
+              break;
+            }
+          }
+          if (persistedIndex >= 0) usages = usages.slice(persistedIndex + 1);
+        }
+        usages.forEach((occurrence, usageIndex) => {
+          const semanticKey = usageObservationId(fence, source.sourceId, occurrence);
           this.inbox.enqueueObservation(createRuntimeObservation({
             schemaVersion: 2,
-            eventId: observationId(
-              "usage",
-              fence,
-              source.sourceId,
-              usageIdentity
-            ),
-            semanticKey: observationId(
-              "usage",
-              fence,
-              source.sourceId,
-              usageIdentity
-            ),
+            eventId: semanticKey,
+            semanticKey,
             kind: "activity.observed",
             authority: "driver-inferred",
             receivedAt: at,
             sequence,
-            ordinal: 2,
+            ordinal: 2 + usageIndex,
             fence,
             payload: {
               activity: sample.activity ?? "model",
-              usage
+              usage: occurrence.usage
             }
           }));
+          state.usage = occurrence.usage;
+          state.usageSemanticKey = semanticKey;
           dirty.add(`role:${fence.taskId}/${fence.roleName}`);
-        }
+        });
         if (activityChanged && state.cursor !== undefined) {
           this.inbox.enqueueObservation(createRuntimeObservation({
             schemaVersion: 2,
@@ -201,7 +207,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             authority: "driver-inferred",
             receivedAt: at,
             sequence,
-            ordinal: 3,
+            ordinal: 2 + usages.length,
             fence,
             payload: {
               activity: sample.activity ?? "model",
@@ -210,7 +216,6 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           }));
           dirty.add(`role:${fence.taskId}/${fence.roleName}`);
         }
-        if (usage !== undefined) state.usage = usage;
         if (sample.activityId !== undefined) state.activityId = sample.activityId;
         this.#states.set(key, state);
       }
@@ -318,6 +323,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             ...(persistedUsage?.payload.usage === undefined
               ? {}
               : { usage: persistedUsage.payload.usage }),
+            ...(persistedUsage === undefined
+              ? {}
+              : { usageSemanticKey: persistedUsage.semanticKey }),
             ...(persistedActivity?.payload.activityId === undefined
               ? {}
               : { activityId: persistedActivity.payload.activityId }),
@@ -387,14 +395,10 @@ function observationId(
     .digest("hex")}`;
 }
 
-function sameUsage(
-  left: RuntimeUsageSnapshot | undefined,
-  right: RuntimeUsageSnapshot
-): boolean {
-  return left !== undefined
-    && left.semantics === right.semantics
-    && left.inputTokens === right.inputTokens
-    && left.outputTokens === right.outputTokens
-    && left.cachedInputTokens === right.cachedInputTokens
-    && left.reasoningTokens === right.reasoningTokens;
+function usageObservationId(
+  fence: RuntimeObservationFence,
+  sourceId: string,
+  occurrence: Readonly<{ occurrenceId: string }>
+): string {
+  return observationId("usage", fence, sourceId, occurrence.occurrenceId);
 }

@@ -123,15 +123,17 @@ replacement, affect scheduling or resource admission, or change Task, Review,
 Integration, and Publication state. Explicit runtime activity identity remains
 a separate observation fact.
 
-Codex snapshots come from the latest structured rollout `token_count`. Claude
-Code snapshots are the de-duplicated sum of assistant usage records in its
-structured transcript. `turn.accepted` persists only the Driver-owned source
-descriptor. A Controller-owned sampler tails that source independently of
-Hooks, keeps an opaque per-source cursor, reads bounded increments, and emits
-only changed cumulative usage. It never rescans a full transcript on the Hook
-path. After Controller restart it restores the latest durable usage and
-activity identity before rereading a bounded tail, so historical tokens cannot
-be reported as a fresh activity edge.
+Codex snapshots preserve every structured rollout `token_count` occurrence.
+Claude Code snapshots preserve the ordered cumulative result after each
+de-duplicated assistant usage record in its structured transcript.
+`turn.accepted` persists only the Driver-owned source descriptor. A
+Controller-owned sampler tails that source independently of Hooks, keeps an
+opaque per-source cursor, reads bounded increments, and emits each usage
+occurrence in source order with a stable occurrence identity. It never rescans
+a full transcript on the Hook path. After Controller restart it restores the
+latest durable usage occurrence and activity identity before rereading a
+bounded tail, so replayed history remains idempotent and cannot become a fresh
+activity edge.
 
 Claude additionally maps `MessageDisplay` streaming events to explicit model
 activity. Codex currently relies on its incremental transcript source because
@@ -144,11 +146,12 @@ stream while preserving the same source/sample contract and canonical events.
 ## Bounded durability
 
 `runtime.observation` is a compact state boundary, not an append-only
-transcript. The exact Run retains one latest cumulative usage baseline and one
-latest confirmed activity boundary; completed operation pairs are removed;
-terminal observations clear obsolete operation and waiting snapshots. Detailed
-high-volume diagnostics may go to the telemetry sidecar, but Task state retains
-only what restart-safe projection needs.
+transcript. The exact Run retains the ordered canonical usage occurrences
+needed for cumulative deltas and one latest confirmed activity boundary;
+completed operation pairs are removed; terminal observations clear obsolete
+operation and waiting snapshots. Detailed high-volume diagnostics may go to
+the telemetry sidecar, but Task state retains only what restart-safe projection
+needs.
 
 ## Native child result durability
 

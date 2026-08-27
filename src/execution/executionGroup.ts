@@ -67,7 +67,7 @@ export type ExecutionParentResultRef = Readonly<{
 export type ExecutionStageBudget = Readonly<{
   maxLanes: number;
   maxAttempts: number;
-  /** Optional only for valid pre-T6 exploration histories. */
+  /** Compatibility/display threshold only; observed tokens never gate behavior. */
   maxTokens?: number;
   /** Optional only for valid pre-T6 exploration histories. */
   maxToolCalls?: number;
@@ -78,7 +78,8 @@ export type ExecutionStageBudget = Readonly<{
 /**
  * Stage-local completion economics. Capacity admission remains a Resource
  * Broker concern; this immutable value says when the Leader has enough
- * durable output to stop spending the stage budget.
+ * durable output to stop behavioral tool-call or wall-clock spending. Token
+ * observations remain cost context only.
  */
 export type ExecutionStageResourcePolicy = Readonly<{
   schemaVersion: 1;

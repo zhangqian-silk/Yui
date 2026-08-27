@@ -600,11 +600,14 @@ Every stage is a new immutable ExecutionGroup. Its ContextSnapshot and selected
 parent Lane results are durable references; `retry` repeats a stage within its
 attempt budget, while `retry` at Resolve begins the next bounded round.
 
-Each new stage also freezes one Resource Broker contract: token, tool-call and
-wall-clock budgets; quorum and deadline; a straggler window; and the minimum
-marginal value for more Lane spend. Omitted values reuse the existing context
-budget and runtime-health windows; stage retries share the original cumulative
-spend and absolute deadline. Execution, Lane retry, and Reviewer-panel
+Each new stage also freezes one Resource Broker contract: behavioral tool-call
+and wall-clock budgets; a display-only token threshold; quorum and deadline; a
+straggler window; and the minimum marginal value for more Lane spend. Omitted
+values reuse the existing context budget and runtime-health windows; stage
+retries share the original cumulative observations and absolute deadline.
+Observed token totals and the configured token threshold are cost context only:
+they never close spend, block admission, suppress scheduling, or stop a Lane.
+Execution, Lane retry, and Reviewer-panel
 admission all count active Lanes at Home, Task, WorkItem, Group, Provider,
 Agent, and model scopes. Capacity pressure keeps the excess Lane durably
 pending instead of failing the Group. Capacity release or deadline arrival
@@ -619,8 +622,9 @@ The Leader may add `--early-stop <0-100>` to an accepting Group resolution.
 Yui permits it only after quorum and T5's passed Verify/Resolve evidence prove
 sufficiency. It may skip Lanes that never started; active stragglers are
 reported and retained, never killed automatically for cost. If evidence is
-insufficient, budget or deadline exhaustion blocks the stage for Leader
-judgment instead of turning thin evidence into success.
+insufficient, behavioral tool-call/wall-clock budget or deadline exhaustion
+blocks the stage for Leader judgment instead of turning thin evidence into
+success.
 
 New exploration histories also freeze the structured candidate-convergence
 contract. Yui appends the exact stage-local JSON shape to every Lane assignment
