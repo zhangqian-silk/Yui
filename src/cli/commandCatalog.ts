@@ -1348,7 +1348,10 @@ export const ROOT_COMMAND = buildNode({
     {
       name: "project",
       summary: "Manage Projects, stable checkouts, branches, and Yui knowledge.",
-      sections: [{ id: "manage", title: "Commands", entries: ["add", "clone", "refresh", "diagnose", "migrate", "update", "discover", "list", "show", "knowledge"] }],
+      sections: [
+        { id: "manage", title: "Commands", entries: ["add", "clone", "refresh", "diagnose", "migrate", "update", "discover", "list", "show", "knowledge"] },
+        { id: "lifecycle", title: "Lifecycle (Operator authority)", entries: ["reset", "replace", "retire", "delete"] }
+      ],
       children: [
         {
           name: "add",
@@ -1378,6 +1381,30 @@ export const ROOT_COMMAND = buildNode({
           summary: "Move an external Project into a Home-managed repository.",
           usage: "yui project migrate <project> [--preflight]",
           options: ["--preflight"]
+        },
+        {
+          name: "reset",
+          summary: "Hard-reset a canonical checkout to its verified remote baseline (Operator authority).",
+          usage: "yui project reset <project> [--discard-local]",
+          options: ["--discard-local"]
+        },
+        {
+          name: "replace",
+          summary: "Re-clone a Home-managed checkout from its remote, preserving Yui refs (Operator authority).",
+          usage: "yui project replace <project> --discard-local",
+          options: ["--discard-local"]
+        },
+        {
+          name: "retire",
+          summary: "Soft-deprecate a Project; record and evidence are retained (Operator authority).",
+          usage: "yui project retire <project> --reason <text>",
+          options: ["--reason"]
+        },
+        {
+          name: "delete",
+          summary: "Remove a retired Project's catalog record and optionally its checkout (Operator authority).",
+          usage: "yui project delete <project> [--checkout] --confirm <project-id>",
+          options: ["--checkout", "--confirm"]
         },
         {
           name: "update",

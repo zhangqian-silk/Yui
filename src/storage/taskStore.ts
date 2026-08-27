@@ -114,7 +114,8 @@ import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.j
 import {
   assertProjectCatalog,
   validateProject,
-  type Project
+  type Project,
+  type ProjectReferenceSummary
 } from "../repository/project.js";
 import {
   generateHomeIdentity,
@@ -224,7 +225,7 @@ export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 3 as const;
  * below, but are not independent record-axis families.
  */
 export const CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION = 2 as const;
-export const CURRENT_PROJECT_SCHEMA_VERSION = 4 as const;
+export const CURRENT_PROJECT_SCHEMA_VERSION = 5 as const;
 export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
@@ -486,6 +487,13 @@ export type TaskStore = {
   listProjects(): Project[];
   getProject(id: string): Project | null;
   removeProject(id: string): boolean;
+  /**
+   * Project reference projection for the lifecycle fail-closed gates: every
+   * Task binding a Project (including historical), the subset still active,
+   * and the unresolved delivery (Work Items, Agent Runs, Integration
+   * Attempts) inside those active Tasks.
+   */
+  summarizeProjectReferences(projectId: string): ProjectReferenceSummary;
   saveAgentProfile(profile: AgentProfile): void;
   createAgentProfileIfAbsent(profile: AgentProfile): AgentProfile | null;
   listAgentProfiles(): AgentProfile[];
@@ -870,6 +878,39 @@ export class FileTaskStore implements TaskStore {
       }
       return this.#remove((state) => state.projects, id);
     });
+  }
+
+  summarizeProjectReferences(projectId: string): ProjectReferenceSummary {
+    const boundTasks = this.listTasks().filter((task) =>
+      task.projectBindings.some((binding) => binding.projectId === projectId)
+    );
+    const activeTasks = boundTasks.filter((task) => task.status === "active");
+    const unresolvedWorkItemRefs: string[] = [];
+    const activeRunRefs: string[] = [];
+    const unresolvedIntegrationRefs: string[] = [];
+    for (const task of activeTasks) {
+      for (const workItem of this.listWorkItems(task.id)) {
+        if (workItem.status !== "completed" && workItem.status !== "retired") {
+          unresolvedWorkItemRefs.push(`${task.id}/${workItem.id}`);
+        }
+      }
+      for (const run of this.listAgentRuns(task.id)) {
+        if (run.status === "active") activeRunRefs.push(`${task.id}/${run.id}`);
+      }
+      for (const attempt of this.listIntegrationAttempts(task.id)) {
+        if (attempt.status === "running" || attempt.status === "blocked") {
+          unresolvedIntegrationRefs.push(`${task.id}/${attempt.id}`);
+        }
+      }
+    }
+    return {
+      projectId,
+      boundTaskIds: boundTasks.map(({ id }) => id),
+      activeTaskIds: activeTasks.map(({ id }) => id),
+      unresolvedWorkItemRefs,
+      activeRunRefs,
+      unresolvedIntegrationRefs
+    };
   }
 
   saveAgentProfile(profile: AgentProfile): void {

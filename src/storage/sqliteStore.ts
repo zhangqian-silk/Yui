@@ -75,7 +75,7 @@ import {
   type ReviewFinding
 } from "../review/reviewFinding.js";
 import { reviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
-import type { Project } from "../repository/project.js";
+import type { Project, ProjectReferenceSummary } from "../repository/project.js";
 import {
   generateHomeIdentity,
   validateHomeIdentity,
@@ -843,7 +843,47 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   removeProject(id: string): boolean {
-    return this.#mutate(() => this.#db.prepare("DELETE FROM projects WHERE id = ?").run(id).changes > 0);
+    return this.#mutate(() => {
+      if (this.listTasks().some((task) => task.projectBindings.some(
+        (binding) => binding.projectId === id
+      ))) {
+        throw new StorageRecordError(`Project is still used by a Task: ${id}`);
+      }
+      return this.#db.prepare("DELETE FROM projects WHERE id = ?").run(id).changes > 0;
+    });
+  }
+
+  summarizeProjectReferences(projectId: string): ProjectReferenceSummary {
+    const boundTasks = this.listTasks().filter((task) =>
+      task.projectBindings.some((binding) => binding.projectId === projectId)
+    );
+    const activeTasks = boundTasks.filter((task) => task.status === "active");
+    const unresolvedWorkItemRefs: string[] = [];
+    const activeRunRefs: string[] = [];
+    const unresolvedIntegrationRefs: string[] = [];
+    for (const task of activeTasks) {
+      for (const workItem of this.listWorkItems(task.id)) {
+        if (workItem.status !== "completed" && workItem.status !== "retired") {
+          unresolvedWorkItemRefs.push(`${task.id}/${workItem.id}`);
+        }
+      }
+      for (const run of this.listAgentRuns(task.id)) {
+        if (run.status === "active") activeRunRefs.push(`${task.id}/${run.id}`);
+      }
+      for (const attempt of this.listIntegrationAttempts(task.id)) {
+        if (attempt.status === "running" || attempt.status === "blocked") {
+          unresolvedIntegrationRefs.push(`${task.id}/${attempt.id}`);
+        }
+      }
+    }
+    return {
+      projectId,
+      boundTaskIds: boundTasks.map(({ id }) => id),
+      activeTaskIds: activeTasks.map(({ id }) => id),
+      unresolvedWorkItemRefs,
+      activeRunRefs,
+      unresolvedIntegrationRefs
+    };
   }
 
   // -- agent profiles ---------------------------------------------------------

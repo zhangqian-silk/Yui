@@ -192,7 +192,7 @@ import {
 } from "../task/completionReadiness.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
-import { resolveProject, type Project } from "../repository/project.js";
+import { assertProjectActive, resolveProject, type Project } from "../repository/project.js";
 import { acquireProjectMaintenanceLocks } from "../repository/projectMaintenanceLock.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
@@ -849,6 +849,7 @@ function taskProjectCommand(
     }
     const project = resolveProject(tx.listProjects(), parsed.positionals[1]);
     if (project === null) throw usageError(`Project not found: ${parsed.positionals[1]}.`);
+    assertProjectActive(project, "bind to a Task");
     const next = addTaskProjectBinding(task, {
       projectId: project.id,
       directory: parsed.options.get("--directory") ?? project.name,
@@ -1036,6 +1037,7 @@ function parseTaskCreation(
   const projects = projectReferences.map((reference) => {
     const project = resolveProject(store.listProjects(), reference);
     if (project === null) throw usageError(`Project not found: ${reference}.`);
+    assertProjectActive(project, "bind to a Task");
     return project;
   });
   if (new Set(projects.map(({ id }) => id)).size !== projects.length) {
@@ -2644,6 +2646,7 @@ function createWork(
         reference
       );
       if (project === null) throw usageError(`Task Project not found: ${reference}.`);
+      assertProjectActive(project, "scope a Work Item");
       return project.id;
     });
     const baseRefs: WorkItemProjectBaseRef[] = parsed.baseRefs.map(({ project, baseRef }) => {
@@ -2718,6 +2721,7 @@ function updateWorkScope(
         reference
       );
       if (project === null) throw usageError(`Task Project not found: ${reference}.`);
+      assertProjectActive(project, "scope a Work Item");
       return project.id;
     });
     const requested = new Set(requestedProjectIds);
