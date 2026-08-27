@@ -313,10 +313,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (adapterId === null) {
       return this.recordObsoleteCanonicalObservation(input, "driver-or-run-mismatch", now);
     }
-    if (this.store.listEvents(taskId).some((event) => (
-      event.type === RUNTIME_OBSERVATION_TASK_EVENT
-      && event.payload.semanticKey === input.semanticKey
-    ))) return "applied";
+    if (hasPersistedRuntimeObservation(this.store.listEvents(taskId), input)) return "applied";
     let outcome: ProviderLifecycleObservation;
     switch (input.kind) {
       case "session.started":
@@ -476,10 +473,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     now: Date
   ): ProviderLifecycleObservation {
     return this.store.transaction((store) => {
-      if (store.listEvents(input.fence.taskId!).some((event) => (
-        event.type === RUNTIME_OBSERVATION_TASK_EVENT
-        && event.payload.semanticKey === input.semanticKey
-      ))) return "applied";
+      if (hasPersistedRuntimeObservation(store.listEvents(input.fence.taskId!), input)) {
+        return "applied";
+      }
       const run = store.getAgentRun(input.fence.taskId!, input.fence.runId!);
       const active = store.getActiveAgentRun(input.fence.taskId!, input.fence.roleName);
       const sessions = store.getTaskRoleSessionSet(input.fence.taskId!, input.fence.roleName);
@@ -669,10 +665,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     this.store.transaction((store) => {
       const taskId = input.fence.taskId!;
       const events = store.listEvents(taskId);
-      if (events.some((event) => (
-        event.type === RUNTIME_OBSERVATION_TASK_EVENT
-        && event.payload.semanticKey === input.semanticKey
-      ))) return;
+      if (hasPersistedRuntimeObservation(events, input)) return;
       if (usageSnapshotIsSuperseded(events, input)) return;
       const removable = compactedRuntimeObservationIds(events, input);
       if (removable.length > 0) store.removeEvents(taskId, removable);
@@ -5750,6 +5743,22 @@ function usageSnapshotIsSuperseded(
       && observation.payload.usage !== undefined
       && runtimeObservationFenceMatches(observation.fence, incoming.fence)
       && observationIsStrictlyNewer(observation, incoming));
+}
+
+function hasPersistedRuntimeObservation(
+  events: readonly TaskEvent[],
+  incoming: RuntimeObservation
+): boolean {
+  const usageIdentity = incoming.kind === "activity.observed"
+    && incoming.payload.usage !== undefined
+    ? incoming.eventId
+    : undefined;
+  return events.some((event) => (
+    event.type === RUNTIME_OBSERVATION_TASK_EVENT
+    && (usageIdentity === undefined
+      ? event.payload.semanticKey === incoming.semanticKey
+      : event.payload.eventId === usageIdentity)
+  ));
 }
 
 function observationIsStrictlyNewer(

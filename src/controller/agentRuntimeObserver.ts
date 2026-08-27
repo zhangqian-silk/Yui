@@ -78,7 +78,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
     await forEachConcurrent(
       active,
       this.#maxConcurrentSamples,
-      async ({ key, fence, source, freshSession, persistedState }, index) => {
+      async ({ key, fence, source, persistedState }, index) => {
         const existingState = this.#states.get(key);
         // Cursor state is intentionally process-local, but the latest canonical
         // usage/activity baseline is durable. Rehydrate it after Controller
@@ -116,17 +116,19 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         const sequence = sequenceBase + index;
         let usages = sample.usages ?? [];
         if (state.usage === undefined) {
-          // Cumulative counters need a lower bound: a fresh native Session
-          // begins at zero, while a resumed Session freezes its first sample
-          // so earlier conversation usage is not charged to this Run. Request
-          // snapshots already describe one complete occurrence and must not be
-          // mixed with a synthetic cumulative fact.
+          // Cumulative counters need a lower bound. An exact initial sample
+          // proves the complete Session-generation history even when the
+          // current Run resumed that Session, so preserve every occurrence and
+          // anchor it at zero. A partial sample cannot prove the omitted request
+          // boundaries; retain only its latest total as a partial baseline.
+          // Request snapshots already describe one complete occurrence and must
+          // not be mixed with a synthetic cumulative fact.
           const latestOccurrence = usages.at(-1);
-          const completeFreshBaseline = freshSession
-            && latestOccurrence?.observationQuality !== "partial";
+          const completeHistory = latestOccurrence?.usage.semantics === "cumulative-session"
+            && usages.every(({ observationQuality }) => observationQuality !== "partial");
           const baseline = latestOccurrence?.usage.semantics !== "cumulative-session"
             ? undefined
-            : completeFreshBaseline
+            : completeHistory
               ? Object.freeze({
                   semantics: "cumulative-session" as const,
                   inputTokens: 0,
@@ -134,8 +136,8 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
                 })
               : latestOccurrence.usage;
           if (baseline !== undefined) {
-            const baselineKey = completeFreshBaseline ? "zero" : latestOccurrence!.occurrenceId;
-            const identity = completeFreshBaseline
+            const baselineKey = completeHistory ? "zero" : latestOccurrence!.occurrenceId;
+            const identity = completeHistory
               ? tokenObservationIdentity("baseline", fence, source.sourceId, baselineKey)
               : usageObservationIdentity(fence, source.sourceId, latestOccurrence!);
             this.inbox.enqueueObservation(createRuntimeObservation({
@@ -143,7 +145,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               eventId: identity.eventId,
               semanticKey: identity.semanticKey,
               kind: "activity.observed",
-              authority: completeFreshBaseline ? "controller" : "driver-inferred",
+              authority: completeHistory ? "controller" : "driver-inferred",
               receivedAt: at,
               sequence,
               ordinal: 1,
@@ -152,7 +154,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
                 activity: "model",
                 sourceId: source.sourceId,
                 usage: baseline,
-                ...(completeFreshBaseline
+                ...(completeHistory
                   || latestOccurrence?.observationQuality === undefined
                   ? {}
                   : { observationQuality: latestOccurrence.observationQuality })
@@ -160,13 +162,13 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             }));
             state.usage = baseline;
             state.usageEventId = identity.eventId;
-            state.usageOccurrenceId = completeFreshBaseline
+            state.usageOccurrenceId = completeHistory
               ? undefined
               : latestOccurrence!.occurrenceId;
-            state.usageOccurrenceCheckpoint = completeFreshBaseline
+            state.usageOccurrenceCheckpoint = completeHistory
               ? undefined
               : latestOccurrence!.resumeCheckpoint;
-            if (!completeFreshBaseline) usages = [];
+            if (!completeHistory) usages = [];
           }
         }
         const health = JSON.stringify([sample.status, sample.detail ?? null]);
@@ -275,14 +277,12 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
     key: string;
     fence: RuntimeObservationFence & Required<Pick<RuntimeObservationFence, "taskId" | "runId">>;
     source: AgentRuntimeObserverSource;
-    freshSession: boolean;
     persistedState: ObserverState;
   }>[] {
     const result: Array<Readonly<{
       key: string;
       fence: RuntimeObservationFence & Required<Pick<RuntimeObservationFence, "taskId" | "runId">>;
       source: AgentRuntimeObserverSource;
-      freshSession: boolean;
       persistedState: ObserverState;
     }>> = [];
     const indexedTaskIds = this.store.listActiveTaskIds?.();
@@ -373,7 +373,6 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           ]),
           fence,
           source,
-          freshSession: run.mode === "new",
           persistedState: Object.freeze({
             ...(persistedUsage?.payload.usage === undefined
               ? {}

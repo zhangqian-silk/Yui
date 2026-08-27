@@ -258,6 +258,18 @@ export class FileRuntimeEventInbox {
     // UpgradeFenceError after the cutover holder releases the lock.
     return withUpgradeCoordinationLock(this.home, () => {
       this.hooks.afterAdmission?.();
+      if (event.type === "runtime-observation"
+        && event.observation.kind === "activity.observed"
+        && event.observation.payload.usage !== undefined) {
+        const existing = this.list().find((candidate) => (
+          candidate.type === "runtime-observation"
+          && candidate.taskId === event.taskId
+          && candidate.observation.eventId === event.observation.eventId
+        ));
+        if (existing !== undefined) {
+          return { event: existing as TEvent, created: false };
+        }
+      }
       return this.publishUnlocked(event);
     });
   }
