@@ -83,6 +83,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         // restart so rereading the bounded transcript tail cannot manufacture a
         // fresh activity edge from tokens that were already observed.
         const state = existingState ?? { ...persistedState };
+        const restoredUsageSemanticKey = existingState === undefined
+          ? persistedState.usageSemanticKey
+          : undefined;
         const driver = this.drivers.require(fence.driverId);
         const observer = driver.runtime.observer;
         if (observer === undefined) return;
@@ -174,11 +177,11 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         }
         const activityChanged = sample.activityId !== undefined
           && sample.activityId !== state.activityId;
-        if (existingState === undefined && state.usageSemanticKey !== undefined) {
+        if (restoredUsageSemanticKey !== undefined) {
           let persistedIndex = -1;
           for (let usageIndex = usages.length - 1; usageIndex >= 0; usageIndex -= 1) {
             if (usageObservationId(fence, source.sourceId, usages[usageIndex]!)
-              === state.usageSemanticKey) {
+              === restoredUsageSemanticKey) {
               persistedIndex = usageIndex;
               break;
             }

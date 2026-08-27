@@ -20,6 +20,7 @@ type JsonlCursor = Readonly<{
   offset: number;
   remainder: string;
   state: Readonly<Record<string, unknown>>;
+  continuityEpoch: string;
 }>;
 
 type ParsedSample = Readonly<{
@@ -32,7 +33,10 @@ type ParsedSample = Readonly<{
 type TranscriptLine = Readonly<{
   content: string;
   offset: number;
+  continuityEpoch: string;
 }>;
+
+const INITIAL_CONTINUITY_EPOCH = "initial";
 
 export function transcriptObserverSource(
   driverId: string,
@@ -86,6 +90,9 @@ async function sampleJsonl(
 
   const reset = previous !== undefined && metadata.size < previous.offset;
   const initial = previous === undefined || reset;
+  const continuityEpoch = reset
+    ? rotateContinuityEpoch(previous.continuityEpoch)
+    : previous?.continuityEpoch ?? INITIAL_CONTINUITY_EPOCH;
   const start = initial
     ? Math.max(0, metadata.size - MAX_INITIAL_TAIL_BYTES)
     : previous.offset;
@@ -127,7 +134,7 @@ async function sampleJsonl(
   if (complete) split.pop();
   let lineOffset = textOffset;
   const lines = split.map((content): TranscriptLine => {
-    const line = Object.freeze({ content, offset: lineOffset });
+    const line = Object.freeze({ content, offset: lineOffset, continuityEpoch });
     lineOffset += Buffer.byteLength(content, "utf8") + 1;
     return line;
   });
@@ -146,7 +153,8 @@ async function sampleJsonl(
   const nextCursor = Object.freeze({
     offset: start + bytes.length,
     remainder: boundedRemainder,
-    state: parsed.state
+    state: parsed.state,
+    continuityEpoch
   });
   const fellBehind = start + bytes.length < metadata.size;
   const detail = parsed.degraded
@@ -250,11 +258,15 @@ function parseClaudeLines(
 }
 
 function transcriptOccurrenceId(line: TranscriptLine): string {
-  // Offsets distinguish repeated identical records in one append-only stream;
-  // the content digest keeps identity stable across replay while preventing a
-  // truncate/rewrite at the same offset from colliding with the old fact.
+  // Offsets distinguish repeated identical records in one append-only stream,
+  // while the cursor-persisted epoch rotates across truncate/reset boundaries.
+  // The content digest keeps each identity deterministic on bounded replay.
   const digest = createHash("sha256").update(line.content).digest("hex");
-  return `byte:${line.offset}:sha256:${digest}`;
+  return `epoch:${line.continuityEpoch}:byte:${line.offset}:sha256:${digest}`;
+}
+
+function rotateContinuityEpoch(previous: string): string {
+  return `sha256:${createHash("sha256").update(previous).digest("hex")}`;
 }
 
 function normalizeCursor(input: AgentRuntimeObserverCursor | undefined): JsonlCursor | undefined {
@@ -262,13 +274,19 @@ function normalizeCursor(input: AgentRuntimeObserverCursor | undefined): JsonlCu
   const offset = input.offset;
   const remainder = input.remainder;
   const state = input.state;
+  const continuityEpoch = input.continuityEpoch;
   if (!Number.isSafeInteger(offset) || (offset as number) < 0
     || typeof remainder !== "string"
-    || state === null || typeof state !== "object" || Array.isArray(state)) return undefined;
+    || state === null || typeof state !== "object" || Array.isArray(state)
+    || (continuityEpoch !== undefined
+      && (typeof continuityEpoch !== "string" || continuityEpoch.length === 0))) return undefined;
   return Object.freeze({
     offset: offset as number,
     remainder,
-    state: state as Readonly<Record<string, unknown>>
+    state: state as Readonly<Record<string, unknown>>,
+    continuityEpoch: typeof continuityEpoch === "string"
+      ? continuityEpoch
+      : INITIAL_CONTINUITY_EPOCH
   });
 }
 
@@ -277,7 +295,12 @@ function unavailable(
   error: unknown
 ): AgentRuntimeObserverSample {
   return Object.freeze({
-    cursor: cursor ?? Object.freeze({ offset: 0, remainder: "", state: Object.freeze({}) }),
+    cursor: cursor ?? Object.freeze({
+      offset: 0,
+      remainder: "",
+      state: Object.freeze({}),
+      continuityEpoch: INITIAL_CONTINUITY_EPOCH
+    }),
     status: "unavailable",
     detail: error instanceof Error ? error.message : String(error)
   });
