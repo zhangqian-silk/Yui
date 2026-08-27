@@ -42,12 +42,8 @@ export function transcriptObserverSource(
   const locator = input.payload.transcript_path;
   if (typeof locator !== "string" || !isAbsolute(locator) || locator.includes("\0")) return null;
   const sessionId = identity(input.payload.session_id) ?? "session";
-  const turnId = identity(input.payload.prompt_id)
-    ?? identity(input.payload.turn_id)
-    ?? input.occurrenceId
-    ?? "turn";
   const digest = createHash("sha256")
-    .update(JSON.stringify([driverId, sessionId, turnId, locator]))
+    .update(JSON.stringify([driverId, sessionId, locator]))
     .digest("hex");
   return Object.freeze({
     schemaVersion: 1,
@@ -139,6 +135,13 @@ async function sampleJsonl(
     ? remainder
     : "";
   const parsed = parse(lines, initial ? {} : previous?.state ?? {});
+  const clippedBaseline = initial && start > 0;
+  const usages = clippedBaseline
+    ? parsed.usages.map((occurrence) => Object.freeze({
+        ...occurrence,
+        observationQuality: "partial" as const
+      }))
+    : parsed.usages;
   const nextCursor = Object.freeze({
     offset: start + bytes.length,
     remainder: boundedRemainder,
@@ -146,6 +149,9 @@ async function sampleJsonl(
   });
   const fellBehind = start + bytes.length < metadata.size;
   const detail = parsed.degraded
+    ?? (clippedBaseline
+      ? "Initial transcript history was clipped; request-boundary evidence is partial."
+      : undefined)
     ?? (fellBehind ? "Transcript observer is catching up with a bounded read." : undefined)
     ?? (reset ? "Transcript was truncated; observer baseline was reset." : undefined)
     ?? (remainder !== boundedRemainder ? "Oversized partial transcript line was discarded." : undefined);
@@ -153,7 +159,7 @@ async function sampleJsonl(
     cursor: nextCursor,
     status: detail === undefined ? "healthy" : "degraded",
     ...(detail === undefined ? {} : { detail }),
-    ...(parsed.usages.length === 0 ? {} : { usages: parsed.usages }),
+    ...(usages.length === 0 ? {} : { usages: Object.freeze(usages) }),
     ...(parsed.activityId === undefined ? {} : {
       activity: "model" as const,
       activityId: parsed.activityId
@@ -224,13 +230,11 @@ function parseClaudeLines(
       }
       bounded = true;
     }
-    const cumulative = sumUsage(Object.values(messages));
-    if (cumulative !== undefined) {
-      usages.push(Object.freeze({
-        occurrenceId: `byte:${line.offset}`,
-        usage: cumulative
-      }));
-    }
+    usages.push(Object.freeze({
+      occurrenceId: `byte:${line.offset}`,
+      activityId: key,
+      usage
+    }));
   }
   let degraded = malformed === 0 ? undefined : `${malformed} malformed transcript line(s) ignored.`;
   if (bounded) {
@@ -297,7 +301,7 @@ function normalizedClaudeUsage(
   const cacheCreated = integer(usage?.cache_creation_input_tokens) ?? 0;
   const reasoningTokens = integer(object(usage?.output_tokens_details)?.thinking_tokens);
   return Object.freeze({
-    semantics: "cumulative-session" as const,
+    semantics: "request-context" as const,
     inputTokens: directInput + cacheRead + cacheCreated,
     outputTokens,
     cachedInputTokens: cacheRead + cacheCreated,
@@ -328,27 +332,6 @@ function usageFrom(value: unknown): RuntimeUsageSnapshot | undefined {
     outputTokens,
     ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
     ...(reasoningTokens === undefined ? {} : { reasoningTokens })
-  });
-}
-
-function sumUsage(values: readonly RuntimeUsageSnapshot[]): RuntimeUsageSnapshot | undefined {
-  if (values.length === 0) return undefined;
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cachedInputTokens = 0;
-  let reasoningTokens = 0;
-  for (const usage of values) {
-    inputTokens += usage.inputTokens;
-    outputTokens += usage.outputTokens;
-    cachedInputTokens += usage.cachedInputTokens ?? 0;
-    reasoningTokens += usage.reasoningTokens ?? 0;
-  }
-  return Object.freeze({
-    semantics: "cumulative-session" as const,
-    inputTokens,
-    outputTokens,
-    cachedInputTokens,
-    ...(reasoningTokens === 0 ? {} : { reasoningTokens })
   });
 }
 

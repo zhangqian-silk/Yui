@@ -88,7 +88,8 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
       observation: Object.freeze({
         ...STRUCTURED_CLI_CAPABILITIES.observation,
         sessionBootstrap: "preallocated" as const,
-        preInputReadiness: "exact" as const
+        preInputReadiness: "exact" as const,
+        usage: "event-snapshot" as const
       })
     }),
     runtime: Object.freeze({

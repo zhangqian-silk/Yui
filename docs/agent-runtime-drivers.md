@@ -114,6 +114,9 @@ Usage is a normalized, read-only Session projection:
 - maximum request input is the direct `request-context` input value, or the
   largest non-negative delta between consecutive `cumulative-session` input
   snapshots in that same generation;
+- every `request-context` snapshot carries a provider-stable `activityId`, so
+  delivery replay replaces the same request while distinct requests remain
+  independently countable;
 - `remaining-context` is capacity evidence and is never reported as spend;
 - missing, mixed, rolled-back, or identity-ambiguous facts are `unobserved`
   rather than guessed.
@@ -124,16 +127,20 @@ Integration, and Publication state. Explicit runtime activity identity remains
 a separate observation fact.
 
 Codex snapshots preserve every structured rollout `token_count` occurrence.
-Claude Code snapshots preserve the ordered cumulative result after each
-de-duplicated assistant usage record in its structured transcript.
+Claude Code exposes each de-duplicated assistant message as a request snapshot;
+later streaming records with the same message id replace that request.
 `turn.accepted` persists only the Driver-owned source descriptor. A
 Controller-owned sampler tails that source independently of Hooks, keeps an
 opaque per-source cursor, reads bounded increments, and emits each usage
 occurrence in source order with a stable occurrence identity. It never rescans
-a full transcript on the Hook path. After Controller restart it restores the
-latest durable usage occurrence and activity identity before rereading a
-bounded tail, so replayed history remains idempotent and cannot become a fresh
-activity edge.
+a full transcript on the Hook path. Source and cursor continuity are scoped to
+the exact Session generation rather than one native Turn. After Controller
+restart it restores the latest durable usage occurrence and activity identity
+before rereading a bounded tail, so replayed history remains idempotent and
+cannot become a fresh activity edge. A clipped initial tail marks its evidence
+partial: a cumulative source may still expose its exact latest total, but
+maximum request input remains unobserved; a request-snapshot source leaves both
+metrics unobserved instead of guessing from partial history.
 
 Claude additionally maps `MessageDisplay` streaming events to explicit model
 activity. Codex currently relies on its incremental transcript source because

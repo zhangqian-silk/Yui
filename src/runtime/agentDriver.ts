@@ -122,6 +122,10 @@ export type AgentRuntimeObserverCursor = Readonly<Record<string, unknown>>;
 export type AgentRuntimeUsageOccurrence = Readonly<{
   /** Stable identity for one ordered usage fact from this observer source. */
   occurrenceId: string;
+  /** Stable provider request identity when the usage is request-scoped. */
+  activityId?: string;
+  /** Partial means the observer cannot prove the complete request baseline. */
+  observationQuality?: "exact" | "partial";
   usage: RuntimeUsageSnapshot;
 }>;
 

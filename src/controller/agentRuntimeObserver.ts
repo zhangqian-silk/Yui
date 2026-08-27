@@ -9,7 +9,6 @@ import { AgentDriverRegistry } from "../runtime/agentDriver.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import {
   createRuntimeObservation,
-  runtimeObservationFenceMatches,
   runtimeObservationFromTaskEvent,
   type RuntimeObservation,
   type RuntimeObservationFence,
@@ -111,9 +110,11 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           // snapshots already describe one complete occurrence and must not be
           // mixed with a synthetic cumulative fact.
           const latestOccurrence = usages.at(-1);
+          const completeFreshBaseline = freshSession
+            && latestOccurrence?.observationQuality !== "partial";
           const baseline = latestOccurrence?.usage.semantics !== "cumulative-session"
             ? undefined
-            : freshSession
+            : completeFreshBaseline
               ? Object.freeze({
                   semantics: "cumulative-session" as const,
                   inputTokens: 0,
@@ -121,26 +122,34 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
                 })
               : latestOccurrence.usage;
           if (baseline !== undefined) {
-            const baselineKey = freshSession ? "zero" : latestOccurrence!.occurrenceId;
-            const semanticKey = freshSession
-              ? observationId("baseline", fence, source.sourceId, baselineKey)
+            const baselineKey = completeFreshBaseline ? "zero" : latestOccurrence!.occurrenceId;
+            const semanticKey = completeFreshBaseline
+              ? tokenObservationId("baseline", fence, source.sourceId, baselineKey)
               : usageObservationId(fence, source.sourceId, latestOccurrence!);
             this.inbox.enqueueObservation(createRuntimeObservation({
               schemaVersion: 2,
-              eventId: observationId("baseline", fence, source.sourceId, baselineKey),
+              eventId: semanticKey,
               semanticKey,
               kind: "activity.observed",
-              authority: freshSession ? "controller" : "driver-inferred",
+              authority: completeFreshBaseline ? "controller" : "driver-inferred",
               receivedAt: at,
               sequence,
               ordinal: 1,
               fence,
-              payload: { activity: "model", usage: baseline }
+              payload: {
+                activity: "model",
+                sourceId: source.sourceId,
+                usage: baseline,
+                ...(completeFreshBaseline
+                  || latestOccurrence?.observationQuality === undefined
+                  ? {}
+                  : { observationQuality: latestOccurrence.observationQuality })
+              }
             }));
             state.usage = baseline;
             state.usageSemanticKey = semanticKey;
             dirty.add(`role:${fence.taskId}/${fence.roleName}`);
-            if (!freshSession) usages = [];
+            if (!completeFreshBaseline) usages = [];
           }
         }
         const health = JSON.stringify([sample.status, sample.detail ?? null]);
@@ -191,6 +200,13 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             fence,
             payload: {
               activity: sample.activity ?? "model",
+              sourceId: source.sourceId,
+              ...(occurrence.activityId === undefined
+                ? {}
+                : { activityId: occurrence.activityId }),
+              ...(occurrence.observationQuality === undefined
+                ? {}
+                : { observationQuality: occurrence.observationQuality }),
               usage: occurrence.usage
             }
           }));
@@ -211,6 +227,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             fence,
             payload: {
               activity: sample.activity ?? "model",
+              sourceId: source.sourceId,
               activityId: sample.activityId!
             }
           }));
@@ -253,10 +270,12 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
       // by Run and sort each group once so every active Run can reuse the same
       // ordered slice instead of repeatedly filtering/sorting all E events.
       const observationsByRunId = new Map<string, RuntimeObservation[]>();
+      const taskObservations: RuntimeObservation[] = [];
       for (const event of this.store.listEvents(task.id)) {
         const observation = runtimeObservationFromTaskEvent(event);
         const runId = observation?.fence.runId;
         if (observation === null || runId === undefined) continue;
+        taskObservations.push(observation);
         const grouped = observationsByRunId.get(runId);
         if (grouped === undefined) {
           observationsByRunId.set(runId, [observation]);
@@ -267,6 +286,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
       for (const observations of observationsByRunId.values()) {
         observations.sort(compareObservations);
       }
+      taskObservations.sort(compareObservations);
       for (const run of this.store.listAgentRuns(task.id)) {
         if (run.status !== "active"
           || this.store.getActiveAgentRun(task.id, run.roleName)?.id !== run.id) continue;
@@ -288,17 +308,19 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         }
         const fence = accepted.fence as RuntimeObservationFence
           & Required<Pick<RuntimeObservationFence, "taskId" | "runId">>;
-        const exact = observations
-          .filter((observation) => runtimeObservationFenceMatches(fence, observation.fence));
-        const persistedUsage = exact.filter((observation) => (
+        const generation = taskObservations.filter((observation) => (
+          sessionGenerationFenceMatches(fence, observation.fence)
+          && observation.payload.sourceId === source.sourceId
+        ));
+        const persistedUsage = generation.filter((observation) => (
           observation.kind === "activity.observed"
           && observation.payload.usage !== undefined
         )).at(-1);
-        const persistedActivity = exact.filter((observation) => (
+        const persistedActivity = generation.filter((observation) => (
           observation.kind === "activity.observed"
           && observation.payload.activityId !== undefined
         )).at(-1);
-        const persistedHealth = exact.filter((observation) => (
+        const persistedHealth = generation.filter((observation) => (
           observation.kind === "observer.health"
           && observation.payload.sourceId === source.sourceId
         )).at(-1);
@@ -312,8 +334,6 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             fence.launchId,
             fence.sessionGenerationId,
             fence.nativeSessionId,
-            fence.nativeTurnId,
-            fence.receiptId,
             source.sourceId
           ]),
           fence,
@@ -400,5 +420,43 @@ function usageObservationId(
   sourceId: string,
   occurrence: Readonly<{ occurrenceId: string }>
 ): string {
-  return observationId("usage", fence, sourceId, occurrence.occurrenceId);
+  return tokenObservationId("usage", fence, sourceId, occurrence.occurrenceId);
+}
+
+function tokenObservationId(
+  kind: string,
+  fence: RuntimeObservationFence,
+  sourceId: string,
+  value: string
+): string {
+  return `runtime-observer-${createHash("sha256").update(JSON.stringify([
+    kind,
+    fence.taskId ?? null,
+    fence.roleName,
+    fence.agentId,
+    fence.driverId,
+    fence.launchId,
+    fence.sessionGenerationId,
+    fence.nativeSessionId ?? null,
+    sourceId,
+    value
+  ])).digest("hex")}`;
+}
+
+function sessionGenerationFenceMatches(
+  expected: RuntimeObservationFence,
+  actual: RuntimeObservationFence
+): boolean {
+  for (const field of [
+    "taskId",
+    "roleName",
+    "agentId",
+    "driverId",
+    "launchId",
+    "sessionGenerationId",
+    "nativeSessionId"
+  ] as const) {
+    if (expected[field] !== actual[field]) return false;
+  }
+  return true;
 }

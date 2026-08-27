@@ -130,14 +130,18 @@ function projectRequestSnapshots(
   identity: SessionTokenIdentity,
   observations: readonly RuntimeObservation[]
 ): SessionTokenMetrics {
+  if (observations.some(({ payload }) => (
+    payload.observationQuality === "partial"
+    || payload.observationQuality === "unavailable"
+  ))) return unobservedSessionTokenMetrics(identity);
   const requests = new Map<string, RuntimeUsageSnapshot>();
   for (const observation of observations) {
     const usage = observation.payload.usage!;
-    const previous = requests.get(observation.semanticKey);
-    if (previous !== undefined && !sameUsage(previous, usage)) {
-      return unobservedSessionTokenMetrics(identity);
-    }
-    requests.set(observation.semanticKey, usage);
+    const requestId = observation.payload.activityId ?? observation.semanticKey;
+    // Structured providers may publish multiple snapshots for one stable
+    // request identity. The latest snapshot supersedes the earlier delivery;
+    // replays with the same identity never become a second request.
+    requests.set(requestId, usage);
   }
   const values = [...requests.values()];
   const inputTokens = safeSum(values.map((usage) => usage.inputTokens));
@@ -175,6 +179,10 @@ function projectCumulativeSnapshots(
   observations: readonly RuntimeObservation[]
 ): SessionTokenMetrics {
   const values = observations.map(({ payload }) => payload.usage!);
+  const requestBoundaryIncomplete = observations.some(({ payload }) => (
+    payload.observationQuality === "partial"
+    || payload.observationQuality === "unavailable"
+  ));
   let counterRollback = false;
   let maximumRequestInput: number | null = null;
   for (let index = 1; index < values.length; index += 1) {
@@ -206,7 +214,9 @@ function projectCumulativeSnapshots(
   return Object.freeze({
     identity: Object.freeze({ ...identity }),
     cumulativeTotal,
-    maximumRequestInput: counterRollback || maximumRequestInput === null
+    maximumRequestInput: counterRollback
+      || requestBoundaryIncomplete
+      || maximumRequestInput === null
       ? UNOBSERVED
       : Object.freeze({ status: "observed" as const, inputTokens: maximumRequestInput })
   });
@@ -231,14 +241,6 @@ function compareObservations(left: RuntimeObservation, right: RuntimeObservation
     || (left.sequence ?? -1) - (right.sequence ?? -1)
     || (left.ordinal ?? -1) - (right.ordinal ?? -1)
     || left.eventId.localeCompare(right.eventId);
-}
-
-function sameUsage(left: RuntimeUsageSnapshot, right: RuntimeUsageSnapshot): boolean {
-  return left.semantics === right.semantics
-    && left.inputTokens === right.inputTokens
-    && left.outputTokens === right.outputTokens
-    && left.cachedInputTokens === right.cachedInputTokens
-    && left.reasoningTokens === right.reasoningTokens;
 }
 
 function safeSum(values: readonly number[]): number | null {

@@ -72,7 +72,7 @@ function observation(
 ): RuntimeObservation {
   const requestOccurrenceId = mapped.kind === "activity.observed"
     && mapped.payload.usage?.semantics === "request-context"
-    ? requireRequestOccurrenceId(input.occurrenceId)
+    ? requireRequestOccurrenceId(mapped.payload.activityId)
     : undefined;
   const eventId = hookEventId(input, mapped, requestOccurrenceId);
   const fence = { ...input.fence, ...mapped.fence };
@@ -124,7 +124,7 @@ function hookEventId(
 
 function requireRequestOccurrenceId(value: string | undefined): string {
   if (value === undefined || value.trim().length === 0 || value.includes("\0")) {
-    throw new Error("Request-context usage requires a stable occurrence id.");
+    throw new Error("Request-context usage requires a stable activity id.");
   }
   return value.trim();
 }
