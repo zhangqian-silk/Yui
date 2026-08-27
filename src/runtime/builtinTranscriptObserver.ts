@@ -136,7 +136,8 @@ async function sampleJsonl(
     : "";
   const parsed = parse(lines, initial ? {} : previous?.state ?? {});
   const clippedBaseline = initial && start > 0;
-  const usages = clippedBaseline
+  const discontinuousBaseline = clippedBaseline || reset;
+  const usages = discontinuousBaseline
     ? parsed.usages.map((occurrence) => Object.freeze({
         ...occurrence,
         observationQuality: "partial" as const
@@ -187,7 +188,7 @@ function parseCodexLines(
     if (candidate === undefined) continue;
     usage = candidate;
     usages.push(Object.freeze({
-      occurrenceId: `byte:${line.offset}`,
+      occurrenceId: transcriptOccurrenceId(line),
       usage: candidate
     }));
   }
@@ -231,7 +232,7 @@ function parseClaudeLines(
       bounded = true;
     }
     usages.push(Object.freeze({
-      occurrenceId: `byte:${line.offset}`,
+      occurrenceId: transcriptOccurrenceId(line),
       activityId: key,
       usage
     }));
@@ -246,6 +247,14 @@ function parseClaudeLines(
     ...(activityId === undefined ? {} : { activityId }),
     ...(degraded === undefined ? {} : { degraded })
   });
+}
+
+function transcriptOccurrenceId(line: TranscriptLine): string {
+  // Offsets distinguish repeated identical records in one append-only stream;
+  // the content digest keeps identity stable across replay while preventing a
+  // truncate/rewrite at the same offset from colliding with the old fact.
+  const digest = createHash("sha256").update(line.content).digest("hex");
+  return `byte:${line.offset}:sha256:${digest}`;
 }
 
 function normalizeCursor(input: AgentRuntimeObserverCursor | undefined): JsonlCursor | undefined {
