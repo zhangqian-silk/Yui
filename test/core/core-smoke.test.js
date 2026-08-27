@@ -22,6 +22,7 @@ import {
 } from "../../dist/storage/migration/index.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { moveSqliteFileSet } from "../../dist/storage/upgrade/sqliteFileSet.js";
+import { populateSqliteFromState } from "../../dist/storage/upgrade/sqliteStateMigration.js";
 import { createProject } from "../../dist/repository/project.js";
 import {
   configuredAgentToDefinition,
@@ -39,6 +40,11 @@ import { validateAgentLaunchConfiguration } from "../../dist/executor/agentConfi
 import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
 import { runExecutionAudit } from "../../dist/observability/executionAudit.js";
 import { createAgentRun, failAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
+import {
+  attachReviewRoundWorkspace,
+  createTaskReviewRound,
+  startReviewRound
+} from "../../dist/review/reviewRound.js";
 import {
   createRunAssignment,
   createRunBootstrapEnvelope,
@@ -570,6 +576,98 @@ test("the production migration graph advances the normal aggregate path", () => 
     providerRetryMaxWindowSeconds: 13,
     telemetryEnabled: true
   });
+});
+
+test("SQLite migration preserves ReviewRound-backed Agent Runs", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-review-run-migration-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const now = new Date("2026-08-27T00:00:00.000Z");
+  const commit = "a".repeat(40);
+  const project = createProject(
+    "project-1",
+    "app",
+    "/tmp/app",
+    { stable: "master", development: "master" },
+    now
+  );
+  const task = createTask("task-1", "migrate review history", now, {
+    projectBindings: [{ projectId: project.id, directory: "app", baseRef: "master" }]
+  });
+  const round = createTaskReviewRound(
+    "review-round-1",
+    task.id,
+    "reviewer",
+    "leader",
+    {
+      schemaVersion: 1,
+      projects: [{ projectId: project.id, commit }]
+    },
+    now
+  );
+  const workspace = {
+    schemaVersion: 2,
+    owner: { type: "review-round", taskId: task.id, reviewRoundId: round.id },
+    root: "/tmp/task-1/review-round-1",
+    entries: [{
+      projectId: project.id,
+      directory: "app",
+      access: "write",
+      path: "/tmp/task-1/review-round-1/app",
+      branch: "yui/task-1/reviewer",
+      baseRef: commit,
+      baseCommit: commit
+    }],
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString()
+  };
+  const runningRound = startReviewRound(
+    attachReviewRoundWorkspace(round, workspace),
+    "agent-run-1"
+  );
+  const run = createAgentRun(
+    "agent-run-1",
+    task.id,
+    "reviewer",
+    "new",
+    "review the frozen Task candidate",
+    now,
+    {
+      purpose: "review",
+      reviewRoundId: runningRound.id,
+      workspace,
+      effective: {
+        schemaVersion: 2,
+        sourceDesiredRevision: 1,
+        agentId: "codex",
+        adapterId: "codex",
+        profileAccess: "write",
+        search: false,
+        permission: { strategy: "default" },
+        writeProjectIds: [project.id],
+        workspace: { root: workspace.root, entries: workspace.entries },
+        context: {},
+        reviewRoundId: runningRound.id,
+        reviewBaseCommit: commit
+      }
+    }
+  );
+  const databaseFilename = "review-history.db";
+
+  populateSqliteFromState(home, {
+    projects: { [project.id]: project },
+    tasks: {
+      [task.id]: {
+        task,
+        agentRuns: { [run.id]: run },
+        reviewRounds: { [runningRound.id]: runningRound }
+      }
+    }
+  }, databaseFilename);
+
+  const migrated = new SqliteTaskStore(home, { databaseFilename });
+  t.after(() => migrated.close());
+  assert.equal(migrated.getReviewRound(task.id, runningRound.id)?.id, runningRound.id);
+  assert.equal(migrated.getAgentRun(task.id, run.id)?.reviewRoundId, runningRound.id);
 });
 
 test("Provider retry scheduling consumes the configured delays and total window", () => {
