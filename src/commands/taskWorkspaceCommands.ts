@@ -128,8 +128,13 @@ function replaceTaskCommand(
   if (oldId === undefined) throw usageError(usage);
   const old = store.getTask(oldId);
   if (old === null) throw usageError(`Task not found: ${oldId}.`);
-  if (old.status === "draft" || old.status === "active") {
-    throw usageError(`Task is open and can be rebuilt instead of replaced: ${old.id}.`);
+  if (old.status === "draft") {
+    throw usageError(
+      `Draft Task ${old.id} owns no workspace to replace or rebuild; activate it or retire it and create a new Draft.`
+    );
+  }
+  if (old.status === "active") {
+    throw usageError(`Active Task can be rebuilt instead of replaced: ${old.id}.`);
   }
   let title = `Replaces ${old.id}: ${old.title}`;
   for (let index = 1; index < args.length; index += 1) {
