@@ -146,6 +146,11 @@ test("the production migration preserves ReviewRound-backed Agent Runs", (t) => 
     now,
     { evidenceCommit: commit }
   );
+  const migratedRound = {
+    ...completedRound,
+    legacyAnchor: { workItemId: "work-item-1", candidateId: "candidate-1" }
+  };
+  const migratedRun = { ...run, workItemId: migratedRound.legacyAnchor.workItemId };
   const databaseFilename = "migration.db";
 
   populateSqliteFromState(home, {
@@ -153,16 +158,16 @@ test("the production migration preserves ReviewRound-backed Agent Runs", (t) => 
     tasks: {
       [task.id]: {
         task,
-        agentRuns: { [run.id]: run },
-        reviewRounds: { [completedRound.id]: completedRound }
+        agentRuns: { [migratedRun.id]: migratedRun },
+        reviewRounds: { [migratedRound.id]: migratedRound }
       }
     }
   }, databaseFilename);
 
   const migrated = new SqliteTaskStore(home, { databaseFilename });
   t.after(() => migrated.close());
-  assert.equal(migrated.getReviewRound(task.id, completedRound.id)?.status, "completed");
-  assert.equal(migrated.getAgentRun(task.id, run.id)?.reviewRoundId, completedRound.id);
+  assert.equal(migrated.getReviewRound(task.id, migratedRound.id)?.status, "completed");
+  assert.equal(migrated.getAgentRun(task.id, migratedRun.id)?.reviewRoundId, migratedRound.id);
 });
 
 test("the built-in Agent Drivers are available through the shared registry", () => {
