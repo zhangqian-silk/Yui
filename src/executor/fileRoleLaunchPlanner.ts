@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { chmodSync, realpathSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,7 +48,8 @@ import {
 } from "../worktree/managedWorkspace.js";
 import {
   classifyWorkspacePreflight,
-  formatWorkspacePreflightError
+  formatWorkspacePreflightError,
+  type WorkspacePhysicalInspector
 } from "./workspacePreflightClassification.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
@@ -93,6 +95,7 @@ export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   createNativeSessionId?: () => string;
   cliPath?: string;
+  inspectWorkspacePhysicalState?: WorkspacePhysicalInspector;
 }>;
 
 export type GlobalRoleLaunchPlanInput = Readonly<{
@@ -118,6 +121,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   #nativeAgentEnvironment: NodeJS.ProcessEnv;
   readonly #createNativeSessionId: () => string;
   readonly #cliPath: string;
+  readonly #inspectWorkspacePhysicalState: WorkspacePhysicalInspector;
   readonly #controlPlane: ExactControlPlaneDescriptor;
   #resourceRegistrarValue: ResourceRegistrar | undefined;
 
@@ -141,6 +145,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       sourceEnvironment
     );
     this.#createNativeSessionId = options.createNativeSessionId ?? randomUUID;
+    this.#inspectWorkspacePhysicalState = options.inspectWorkspacePhysicalState
+      ?? inspectWorkspacePhysicalState;
     this.#cliPath = canonicalPath(options.cliPath
       ?? fileURLToPath(new URL("../cli.js", import.meta.url)));
     // Internal callbacks retain one exact command identity for receipt fencing.
@@ -265,7 +271,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       this.store,
       task,
       input.roleName,
-      activeRun === null ? null : { id: activeRun.id, workspace: activeRun.workspace }
+      activeRun === null ? null : { id: activeRun.id, workspace: activeRun.workspace },
+      this.#inspectWorkspacePhysicalState
     );
     if (preflight !== null) {
       throw new Error(formatWorkspacePreflightError(preflight));
@@ -1076,6 +1083,38 @@ function canonicalPath(path: string): string {
     return absolute;
   }
 }
+
+const inspectWorkspacePhysicalState: WorkspacePhysicalInspector = (entry) => {
+  const headResult = spawnSync(
+    "git",
+    ["-C", entry.path, "rev-parse", "HEAD"],
+    { encoding: "utf8", shell: false, timeout: 5_000 }
+  );
+  if (headResult.error !== undefined || headResult.status !== 0) {
+    throw new Error(
+      `Managed workspace physical HEAD could not be inspected: ${entry.projectId} @ ${entry.path}.`
+    );
+  }
+  const physicalCommit = headResult.stdout.trim().toLowerCase();
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(physicalCommit)) {
+    throw new Error(`Managed workspace physical HEAD is invalid: ${entry.projectId}.`);
+  }
+  const ancestorResult = spawnSync(
+    "git",
+    ["-C", entry.path, "merge-base", "--is-ancestor", entry.baseCommit, physicalCommit],
+    { encoding: "utf8", shell: false, timeout: 5_000 }
+  );
+  if (ancestorResult.error !== undefined
+    || (ancestorResult.status !== 0 && ancestorResult.status !== 1)) {
+    throw new Error(
+      `Managed workspace lineage could not be inspected: ${entry.projectId} @ ${entry.path}.`
+    );
+  }
+  return {
+    physicalCommit,
+    recordedBaseIsAncestor: ancestorResult.status === 0
+  };
+};
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\"'\"'")}'`;

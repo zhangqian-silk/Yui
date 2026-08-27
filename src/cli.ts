@@ -160,7 +160,8 @@ import {
 } from "./repository/taskWorkspaceCoordinator.js";
 import {
   FileTaskWorkspacePreparer,
-  ReviewRoundWorkspaceEvidenceError
+  ReviewRoundWorkspaceEvidenceError,
+  type TaskWorkspaceActivation
 } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema } from "./storage/storageSchema.js";
 import {
@@ -1544,14 +1545,16 @@ export async function main(): Promise<void> {
       const laneSnapshotPreflight = executionLaneGitSnapshot === undefined
         ? undefined
         : executionLaneGitSnapshot;
-      // RFC Phase 3: prepare the Task workspace before activation so a
-      // preparation failure keeps the Task in Draft instead of leaving it
-      // Active without a workspace.
-      if (resolved[1] === "activate") {
+      // Physical preparation may precede the durable write, but Task status,
+      // workspace identity/cwd, and ManagedWorkspace ownership are adopted by
+      // one transaction. A failed attempt therefore leaves the Task Draft and
+      // owning no writable workspace.
+      let taskWorkspaceActivation: TaskWorkspaceActivation | undefined;
+      if (resolved[1] === "activate" && resolved.length === 3) {
         const taskId = resolved[2];
         const task = taskId === undefined ? null : store.getTask(taskId);
         if (task !== null && task.status === "draft") {
-          await workspacePreparer.prepareTaskWorkspace(task.id);
+          taskWorkspaceActivation = await workspacePreparer.activateTaskWorkspace(task.id);
         }
       }
       const result = runTaskCommand(
@@ -1577,6 +1580,7 @@ export async function main(): Promise<void> {
             ? {}
             : { candidateWorkspace: candidateMaterialization.workspace ?? null }),
           ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
+          ...(taskWorkspaceActivation === undefined ? {} : { taskWorkspaceActivation }),
           ...(laneDispatchProjectPaths === undefined ? {} : { laneDispatchProjectPaths }),
           ...(directTaskMainSnapshot === undefined ? {} : { directTaskMainSnapshot }),
           ...(actualTaskReviewCandidate === undefined

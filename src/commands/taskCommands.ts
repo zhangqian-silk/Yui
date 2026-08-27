@@ -194,6 +194,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
 import { assertProjectActive, resolveProject, type Project } from "../repository/project.js";
 import { acquireProjectMaintenanceLocks } from "../repository/projectMaintenanceLock.js";
+import type { TaskWorkspaceActivation } from "../repository/taskWorkspacePreparer.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
@@ -483,6 +484,8 @@ export type TaskCommandOptions = Readonly<{
   directTaskMainSnapshot?: DirectTaskMainSnapshot;
   /** Prepared by the repository/workspace lifecycle before command mutation. */
   executionLaneWorkspaces?: ReadonlyMap<string, ManagedWorkspace>;
+  /** Atomic Draft -> active plus Task-main workspace adoption completed by CLI preflight. */
+  taskWorkspaceActivation?: TaskWorkspaceActivation;
   /**
    * Under-fence Project path snapshot captured when a new Group's Lane
    * workspaces were prepared. The dispatch aggregate CAS revalidates the Task
@@ -1195,25 +1198,33 @@ function activateTaskCommand(
   options: TaskCommandOptions
 ): string {
   exactPositionals(args, 1, "Task activate usage: yui task activate <task>.");
-  const now = clock(options);
+  const activation = options.taskWorkspaceActivation;
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
     if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
+    if (task.status === "retired") throw usageError(`Task is retired: ${task.id}.`);
     if (task.status === "completed") {
       throw usageError(`Task ${task.id} is completed; use task reopen before activating it.`);
     }
-    if (task.status === "active") return { task, changed: false } as const;
-    const active = activateTask(task, now);
-    tx.saveTask(active);
-    // Project-backed Tasks keep this durable wake pending until the
-    // Controller has prepared and recorded the Task workspace.
-    enqueueWork(tx, leaderMailbox(task.id), "task-created", now, [taskRef(task.id)]);
-    enqueueWork(tx, taskMailbox(task.id), "task-activated", now, [taskRef(task.id)]);
-    recordTaskEvent(tx, task.id, "task.activated", {
-      fromStatus: task.status,
-      status: active.status
-    }, now);
-    return { task: active, changed: true } as const;
+    if (task.status === "active") {
+      if (activation === undefined) return { task, changed: false } as const;
+      const workspace = tx.getTaskWorkspace(task.id);
+      if (activation.taskId !== task.id
+        || activation.task.id !== task.id
+        || activation.task.status !== "active"
+        || !isDeepStrictEqual(activation.task.workspaceIdentity, task.workspaceIdentity)
+        || activation.path !== task.cwd
+        || workspace === null
+        || workspace.owner.type !== "task"
+        || workspace.owner.taskId !== task.id
+        || workspace.root !== task.cwd) {
+        throw usageError(`Task workspace activation proof does not match ${task.id}.`);
+      }
+      return { task, changed: activation.changed } as const;
+    }
+    throw usageError(
+      `Task ${task.id} activation requires atomic workspace adoption through the CLI preflight.`
+    );
   });
   if (result.changed) {
     notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);

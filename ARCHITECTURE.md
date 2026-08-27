@@ -128,10 +128,14 @@ late results until explicitly reopened.
 
 Stable Project checkouts are read-only references. Task identity follows one
 bounded outcome rather than Project count. A Task binds zero or more Projects,
-records an independent base ref for each binding, and owns one workspace root
-containing a managed main worktree for each binding. The
-`<workspace>/tasks/<task>/main` root is a logical multi-Project container, not a
-Git repository. Each Project child (for example
+records an independent base ref for each binding, and adopts one workspace root
+only when it becomes active. A Draft owns planning state and Project bindings,
+not a writable Workspace. Activation prepares physical worktrees first and then
+commits status, workspace identity, cwd, and durable Workspace ownership in one
+TaskStore transaction; failure discards unadopted resources and leaves the Task
+Draft. The active Workspace contains a managed main worktree for each binding.
+The `<workspace>/tasks/<task>/main` root is a logical multi-Project container,
+not a Git repository. Each Project child (for example
 `<workspace>/tasks/<task>/main/yui`) is the supported Git cwd and points to
 `<workspace>/worktree/<project>/<task>/main`; Git commands run in that child.
 For a single-Project workspace, the native Agent starts in that Project's
@@ -141,6 +145,11 @@ registers every Project worktree through the provider's native
 additional-directory mechanism. The active Leader may append a Project when the
 same outcome expands; replacing an existing binding is not a scope-repair
 mechanism.
+
+Before a Role launch, Yui verifies that every physical Project HEAD still
+descends from its Workspace's recorded base. Normal committed progress is
+allowed; a reset or repoint outside that lineage is reported as
+`physical-drift` and fails closed before Provider launch.
 
 A WorkItem can read the full Task workspace but has an explicit Project write
 scope. Isolation creates a second root with independent worktrees for writable

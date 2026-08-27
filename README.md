@@ -274,6 +274,12 @@ yui task context <task-id>
 yui task activate <task-id>
 ```
 
+A Draft stores planning state and Project bindings only; it does not adopt a
+writable managed Workspace. `task activate` prepares every bound Project first,
+then commits the Task's `active` status and Task-owned Workspace together. A
+preparation or consistency failure leaves the Task Draft and reports the
+workspace diagnosis instead of exposing a partially adopted execution root.
+
 Task type describes intent rather than selecting an execution protocol.
 Software Projects use `bugfix` or `feature`: a bugfix is Leader-owned; if it
 grows into independently owned delivery requirements, reclassify it as a
