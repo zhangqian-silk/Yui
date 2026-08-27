@@ -31,6 +31,7 @@ type ObserverState = {
   health?: string;
   usage?: RuntimeUsageSnapshot;
   usageSemanticKey?: string;
+  usageOccurrenceId?: string;
   activityId?: string;
 };
 
@@ -91,7 +92,11 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         if (observer === undefined) return;
         let sample: AgentRuntimeObserverSample;
         try {
-          sample = await observer.sample(source, state.cursor);
+          sample = await observer.sample(source, state.cursor, {
+            ...(state.usageOccurrenceId === undefined
+              ? {}
+              : { latestOccurrenceId: state.usageOccurrenceId })
+          });
         } catch (error) {
           sample = Object.freeze({
             cursor: state.cursor ?? Object.freeze({}),
@@ -126,13 +131,13 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               : latestOccurrence.usage;
           if (baseline !== undefined) {
             const baselineKey = completeFreshBaseline ? "zero" : latestOccurrence!.occurrenceId;
-            const semanticKey = completeFreshBaseline
-              ? tokenObservationId("baseline", fence, source.sourceId, baselineKey)
-              : usageObservationId(fence, source.sourceId, latestOccurrence!);
+            const identity = completeFreshBaseline
+              ? tokenObservationIdentity("baseline", fence, source.sourceId, baselineKey)
+              : usageObservationIdentity(fence, source.sourceId, latestOccurrence!);
             this.inbox.enqueueObservation(createRuntimeObservation({
               schemaVersion: 2,
-              eventId: semanticKey,
-              semanticKey,
+              eventId: identity.eventId,
+              semanticKey: identity.semanticKey,
               kind: "activity.observed",
               authority: completeFreshBaseline ? "controller" : "driver-inferred",
               receivedAt: at,
@@ -150,7 +155,10 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               }
             }));
             state.usage = baseline;
-            state.usageSemanticKey = semanticKey;
+            state.usageSemanticKey = identity.semanticKey;
+            state.usageOccurrenceId = completeFreshBaseline
+              ? undefined
+              : latestOccurrence!.occurrenceId;
             if (!completeFreshBaseline) usages = [];
           }
         }
@@ -180,7 +188,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         if (restoredUsageSemanticKey !== undefined) {
           let persistedIndex = -1;
           for (let usageIndex = usages.length - 1; usageIndex >= 0; usageIndex -= 1) {
-            if (usageObservationId(fence, source.sourceId, usages[usageIndex]!)
+            if (usageObservationIdentity(fence, source.sourceId, usages[usageIndex]!).semanticKey
               === restoredUsageSemanticKey) {
               persistedIndex = usageIndex;
               break;
@@ -202,11 +210,11 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           }
         }
         usages.forEach((occurrence, usageIndex) => {
-          const semanticKey = usageObservationId(fence, source.sourceId, occurrence);
+          const identity = usageObservationIdentity(fence, source.sourceId, occurrence);
           this.inbox.enqueueObservation(createRuntimeObservation({
             schemaVersion: 2,
-            eventId: semanticKey,
-            semanticKey,
+            eventId: identity.eventId,
+            semanticKey: identity.semanticKey,
             kind: "activity.observed",
             authority: "driver-inferred",
             receivedAt: at,
@@ -226,7 +234,8 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             }
           }));
           state.usage = occurrence.usage;
-          state.usageSemanticKey = semanticKey;
+          state.usageSemanticKey = identity.semanticKey;
+          state.usageOccurrenceId = occurrence.occurrenceId;
         });
         if (activityChanged && state.cursor !== undefined) {
           this.inbox.enqueueObservation(createRuntimeObservation({
@@ -339,6 +348,9 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           observation.kind === "observer.health"
           && observation.payload.sourceId === source.sourceId
         )).at(-1);
+        const persistedUsageOccurrenceId = persistedUsage === undefined
+          ? undefined
+          : usageOccurrenceId(persistedUsage.semanticKey);
         result.push(Object.freeze({
           key: JSON.stringify([
             fence.taskId,
@@ -360,7 +372,12 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               : { usage: persistedUsage.payload.usage }),
             ...(persistedUsage === undefined
               ? {}
-              : { usageSemanticKey: persistedUsage.semanticKey }),
+              : {
+                  usageSemanticKey: persistedUsage.semanticKey,
+                  ...(persistedUsageOccurrenceId === undefined
+                    ? {}
+                    : { usageOccurrenceId: persistedUsageOccurrenceId })
+                }),
             ...(persistedActivity?.payload.activityId === undefined
               ? {}
               : { activityId: persistedActivity.payload.activityId }),
@@ -430,12 +447,41 @@ function observationId(
     .digest("hex")}`;
 }
 
-function usageObservationId(
+function usageObservationIdentity(
   fence: RuntimeObservationFence,
   sourceId: string,
   occurrence: Readonly<{ occurrenceId: string }>
-): string {
-  return tokenObservationId("usage", fence, sourceId, occurrence.occurrenceId);
+): Readonly<{ eventId: string; semanticKey: string }> {
+  const eventId = tokenObservationId("usage", fence, sourceId, occurrence.occurrenceId);
+  const encodedOccurrenceId = Buffer.from(occurrence.occurrenceId, "utf8").toString("base64url");
+  return Object.freeze({
+    eventId,
+    semanticKey: `${eventId}:occurrence:${encodedOccurrenceId}`
+  });
+}
+
+function usageOccurrenceId(semanticKey: string): string | undefined {
+  const marker = ":occurrence:";
+  const index = semanticKey.lastIndexOf(marker);
+  if (index < 0) return undefined;
+  const encoded = semanticKey.slice(index + marker.length);
+  if (encoded.length === 0) return undefined;
+  try {
+    const decoded = Buffer.from(encoded, "base64url").toString("utf8");
+    return decoded.length === 0 ? undefined : decoded;
+  } catch {
+    return undefined;
+  }
+}
+
+function tokenObservationIdentity(
+  kind: string,
+  fence: RuntimeObservationFence,
+  sourceId: string,
+  value: string
+): Readonly<{ eventId: string; semanticKey: string }> {
+  const eventId = tokenObservationId(kind, fence, sourceId, value);
+  return Object.freeze({ eventId, semanticKey: eventId });
 }
 
 function tokenObservationId(

@@ -119,6 +119,11 @@ export type AgentRuntimeObserverSource = Readonly<{
 
 export type AgentRuntimeObserverCursor = Readonly<Record<string, unknown>>;
 
+export type AgentRuntimeObserverResume = Readonly<{
+  /** Latest source occurrence recovered from canonical runtime.observation history. */
+  latestOccurrenceId?: string;
+}>;
+
 export type AgentRuntimeUsageOccurrence = Readonly<{
   /** Stable identity for one ordered usage fact from this observer source. */
   occurrenceId: string;
@@ -178,7 +183,8 @@ export type AgentDriver = AgentDriverDescriptor & Readonly<{
       source(input: AgentDriverNativeHook): AgentRuntimeObserverSource | null;
       sample(
         source: AgentRuntimeObserverSource,
-        cursor?: AgentRuntimeObserverCursor
+        cursor?: AgentRuntimeObserverCursor,
+        resume?: AgentRuntimeObserverResume
       ): Promise<AgentRuntimeObserverSample>;
     }>;
   }>;
