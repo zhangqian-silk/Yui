@@ -103,19 +103,20 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         // identity or the canonical sequence assigned to a source.
         const sequence = sequenceBase + index;
         if (existingState === undefined && state.usage === undefined) {
-          // A fresh native Session begins at zero. A resumed Session instead
-          // freezes its first cumulative sample as this Run's lower-bound
-          // baseline so later samples can prove spend without charging usage
-          // that belongs to an earlier Run in the same native conversation.
-          const baseline = freshSession
-            ? Object.freeze({
-                semantics: "cumulative-session" as const,
-                inputTokens: 0,
-                outputTokens: 0
-              })
-            : sample.usage?.semantics === "cumulative-session"
-              ? sample.usage
-              : undefined;
+          // Cumulative counters need a lower bound: a fresh native Session
+          // begins at zero, while a resumed Session freezes its first sample
+          // so earlier conversation usage is not charged to this Run. Request
+          // snapshots already describe one complete occurrence and must not be
+          // mixed with a synthetic cumulative fact.
+          const baseline = sample.usage?.semantics !== "cumulative-session"
+            ? undefined
+            : freshSession
+              ? Object.freeze({
+                  semantics: "cumulative-session" as const,
+                  inputTokens: 0,
+                  outputTokens: 0
+                })
+              : sample.usage;
           if (baseline !== undefined) {
             const baselineKey = freshSession ? "zero" : JSON.stringify(baseline);
             this.inbox.enqueueObservation(createRuntimeObservation({
@@ -155,25 +156,28 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           state.health = health;
           dirty.add(`role:${fence.taskId}/${fence.roleName}`);
         }
-        const usageChanged = sample.usage !== undefined
-          && !sameUsage(state.usage, sample.usage);
+        const usage = sample.usage;
         const activityChanged = sample.activityId !== undefined
           && sample.activityId !== state.activityId;
-        if (usageChanged) {
-          const usage = sample.usage;
+        if (usage !== undefined && (usage.semantics === "request-context"
+          ? activityChanged
+          : !sameUsage(state.usage, usage))) {
+          const usageIdentity = usage.semantics === "request-context"
+            ? `request:${sample.activityId!}`
+            : `snapshot:${JSON.stringify(usage)}`;
           this.inbox.enqueueObservation(createRuntimeObservation({
             schemaVersion: 2,
             eventId: observationId(
               "usage",
               fence,
               source.sourceId,
-              JSON.stringify(usage)
+              usageIdentity
             ),
             semanticKey: observationId(
               "usage",
               fence,
               source.sourceId,
-              JSON.stringify(usage)
+              usageIdentity
             ),
             kind: "activity.observed",
             authority: "driver-inferred",
@@ -183,7 +187,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             fence,
             payload: {
               activity: sample.activity ?? "model",
-              ...(usage === undefined ? {} : { usage })
+              usage
             }
           }));
           dirty.add(`role:${fence.taskId}/${fence.roleName}`);
@@ -206,7 +210,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           }));
           dirty.add(`role:${fence.taskId}/${fence.roleName}`);
         }
-        if (sample.usage !== undefined) state.usage = sample.usage;
+        if (usage !== undefined) state.usage = usage;
         if (sample.activityId !== undefined) state.activityId = sample.activityId;
         this.#states.set(key, state);
       }

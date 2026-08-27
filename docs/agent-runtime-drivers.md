@@ -85,8 +85,8 @@ fact.
 Yui maintains two independent clocks:
 
 1. **Runtime activity** answers whether the Agent CLI has recently shown
-   structured work. Tool/subagent boundaries and positive token deltas refresh
-   it. A live tmux pane alone does not.
+   structured work. Tool/subagent boundaries and explicit activity identities
+   refresh it; token usage snapshots and a live tmux pane do not.
 2. **Workflow progress** answers whether the managed Task advanced through a
    Yui outcome such as a checkpoint, yield, block, Candidate, Review, or
    completion. Tokens, CPU, RSS, and provider Turn completion never refresh

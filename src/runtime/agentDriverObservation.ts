@@ -70,18 +70,24 @@ function observation(
   input: AgentDriverObservationInput,
   mapped: AgentDriverMappedHook
 ): RuntimeObservation {
-  const eventId = hookEventId(input, mapped);
+  const requestOccurrenceId = mapped.kind === "activity.observed"
+    && mapped.payload.usage?.semantics === "request-context"
+    ? requireRequestOccurrenceId(input.occurrenceId)
+    : undefined;
+  const eventId = hookEventId(input, mapped, requestOccurrenceId);
   const fence = { ...input.fence, ...mapped.fence };
   return createRuntimeObservation({
     schemaVersion: 2,
     eventId,
-    semanticKey: runtimeObservationSemanticKey({
-      eventId,
-      kind: mapped.kind,
-      fence,
-      ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
-      payload: mapped.payload
-    }),
+    semanticKey: requestOccurrenceId === undefined
+      ? runtimeObservationSemanticKey({
+          eventId,
+          kind: mapped.kind,
+          fence,
+          ...(input.sequence === undefined ? {} : { sequence: input.sequence }),
+          payload: mapped.payload
+        })
+      : `provider-request:${eventId}`,
     kind: mapped.kind,
     authority: "provider-structured",
     receivedAt: input.receivedAt,
@@ -101,14 +107,24 @@ function requireMatchingDriver(input: AgentDriverObservationInput): void {
 
 function hookEventId(
   input: AgentDriverObservationInput,
-  mapped: AgentDriverMappedHook
+  mapped: AgentDriverMappedHook,
+  requestOccurrenceId?: string
 ): string {
   const digest = createHash("sha256").update(JSON.stringify([
     input.driver.id,
     input.hookEventName,
     input.fence,
     mapped.kind,
-    mapped.payload
+    ...(requestOccurrenceId === undefined
+      ? [mapped.payload]
+      : [{ requestOccurrenceId }])
   ])).digest("hex");
   return `runtime-observation-${digest}`;
+}
+
+function requireRequestOccurrenceId(value: string | undefined): string {
+  if (value === undefined || value.trim().length === 0 || value.includes("\0")) {
+    throw new Error("Request-context usage requires a stable occurrence id.");
+  }
+  return value.trim();
 }

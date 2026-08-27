@@ -226,7 +226,7 @@ export function buildTaskExecutionProjection(
     roleName: "leader"
   }) ?? null;
   const roleSessions = roles.flatMap((role) => {
-    const session = store.getRoleSession?.(taskId, role.name, role.activeAgentId);
+    const session = store.getRoleSession?.(taskId, role.name);
     return session === null || session === undefined
       ? []
       : [{ roleName: role.name, ...session }];
