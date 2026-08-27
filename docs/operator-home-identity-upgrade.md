@@ -107,11 +107,13 @@ refs.
 
 ## 5. Rebuild eligible Tasks or replace terminal Tasks
 
-### Draft or active Tasks with no evidence
+### Active Tasks with no evidence
 
-A Task with no Run, WorkItem, ChangeSet, or IntegrationAttempt can be rebuilt
-in place. The rebuild mints a canonical workspace identity, re-creates the
-managed worktrees under the identity-derived branch
+An active Task with no Run, WorkItem, ChangeSet, or IntegrationAttempt can be
+rebuilt in place. A Draft owns no writable workspace; activate a clean Draft
+through `yui task activate` so Workspace adoption and activation commit
+together. The active-Task rebuild mints a canonical workspace identity and
+re-creates the managed worktrees under the identity-derived branch
 (`yui/task-N-<8hex>/main`), and archives the legacy refs:
 
 ```sh
@@ -144,7 +146,7 @@ The successor is a fresh draft Task; the original terminal Task is untouched.
 ```sh
 yui doctor          # storage and schema health
 yui project list    # every Project shows the expected ownership
-yui task list       # Tasks prepare under the identity-derived layout
+yui task list       # active Tasks use the identity-derived layout
 ```
 
 ## Failure handling
@@ -155,8 +157,9 @@ Every command in this sequence is safe to re-run after a failure:
 - **Project migration** — the unfinished managed clone is removed on failure;
   retry `yui project migrate <project>`.
 - **History archive** — idempotent; already-archived refs are skipped.
-- **Task rebuild** — resumable; the old layout stays usable until the rebuild
-  completes.
+- **Task rebuild** — active-Task only and resumable; the old layout stays usable
+  until the rebuild completes. Draft activation adopts its first Workspace
+  atomically instead.
 - **Task replace** — creates a new Task; a failed attempt leaves no partial
   state.
 

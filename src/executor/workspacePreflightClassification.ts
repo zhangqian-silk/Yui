@@ -3,7 +3,19 @@ import { isDeepStrictEqual } from "node:util";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
-import { isTaskOwnedWorkspace } from "../worktree/managedWorkspace.js";
+import {
+  isTaskOwnedWorkspace,
+  type WorkspaceProjectEntry
+} from "../worktree/managedWorkspace.js";
+
+export type WorkspacePhysicalInspection = Readonly<{
+  physicalCommit: string;
+  recordedBaseIsAncestor: boolean;
+}>;
+
+export type WorkspacePhysicalInspector = (
+  entry: WorkspaceProjectEntry
+) => WorkspacePhysicalInspection;
 
 function ownerLabel(owner: ManagedWorkspace["owner"]): string {
   switch (owner.type) {
@@ -67,7 +79,8 @@ export function classifyWorkspacePreflight(
   store: TaskStore,
   task: Task,
   roleName: string,
-  activeRun: { id: string; workspace?: ManagedWorkspace } | null
+  activeRun: { id: string; workspace?: ManagedWorkspace } | null,
+  inspectPhysical?: WorkspacePhysicalInspector
 ): WorkspacePreflightClassification | null {
   const main = store.getTaskWorkspace(task.id);
   const bindings = task.projectBindings.map(
@@ -134,6 +147,28 @@ export function classifyWorkspacePreflight(
     }
   }
 
+  // 3. Physical validation: committed work may advance a managed branch, so
+  // HEAD need not equal its recorded base. It must, however, still descend
+  // from that immutable boundary. A reset/repoint outside the lineage is
+  // physical drift and must fail before Provider launch.
+  if (inspectPhysical !== undefined) {
+    const effective = activeRun?.workspace ?? main;
+    for (const entry of effective.entries) {
+      const physical = inspectPhysical(entry);
+      if (!physical.recordedBaseIsAncestor) {
+        return {
+          kind: "physical-drift",
+          reason: `Managed workspace physical HEAD left its recorded lineage: ${task.id}/${roleName}.`,
+          taskId: task.id,
+          roleName,
+          projectId: entry.projectId,
+          expectedCommit: entry.baseCommit,
+          physicalCommit: physical.physicalCommit
+        };
+      }
+    }
+  }
+
   return null;
 }
 
@@ -162,7 +197,7 @@ export function formatWorkspacePreflightError(
         + "` to inspect the split state, then repair or re-sync the workspace.");
       break;
     case "physical-drift":
-      lines.push(`  Project ${classification.projectId}: expected ${classification.expectedCommit}, physical HEAD is ${classification.physicalCommit}.`);
+      lines.push(`  Project ${classification.projectId}: recorded base ${classification.expectedCommit}, physical HEAD is ${classification.physicalCommit}.`);
       lines.push("  The physical workspace has drifted from the recorded baseline.");
       lines.push("  Use `yui task base status " + classification.taskId + "` to inspect the drift.");
       break;

@@ -11,6 +11,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { retireTaskRoleSessionsForWorkspace } from "../executor/agentExecutor.js";
+import { formatWorkspacePreflightError } from "../executor/workspacePreflightClassification.js";
 import { updateRole, type TaskRole } from "../role/role.js";
 import {
   hasRuntimeCleanupObligation,
@@ -24,9 +25,12 @@ import {
 } from "../review/reviewRound.js";
 import { StorageConflictError, type TaskStore } from "../storage/taskStore.js";
 import {
+  activateTask,
   bindTaskWorkspaceIdentity,
   type Task
 } from "../task/task.js";
+import { createTaskEvent } from "../event/taskEvent.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import {
   createCandidateGitSnapshot,
   createDirectTaskMainSnapshot,
@@ -40,6 +44,7 @@ import {
 } from "../workItem/workItem.js";
 import {
   createManagedWorkspace,
+  isTaskOwnedWorkspace,
   managedWorkspaceKey,
   managedWorktreeName,
   sameManagedWorkspaceIdentity,
@@ -100,6 +105,11 @@ export type TaskWorkspacePreparation = Readonly<{
   status: "ready" | "failed";
   path?: string;
   error?: string;
+}>;
+
+export type TaskWorkspaceActivation = TaskWorkspacePreparation & Readonly<{
+  task: Task;
+  changed: boolean;
 }>;
 
 export type TaskWorkspaceCleanup = Readonly<{
@@ -175,6 +185,7 @@ export class ReviewRoundWorkspaceEvidenceError extends Error {
 
 export interface TaskWorkspacePreparer {
   prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation>;
+  activateTaskWorkspace(taskId: string): Promise<TaskWorkspaceActivation>;
 }
 
 /**
@@ -214,7 +225,51 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const task = requireTask(this.store, taskId);
         const { release, current } = this.#acquireTaskProjectMaintenanceLocks(task);
         try {
-          return await this.#prepareTaskWorkspaceLocked(current.id);
+          return await this.#prepareTaskWorkspaceLocked(current.id, false);
+        } finally {
+          release();
+        }
+      } catch (error) {
+        if (error instanceof StorageConflictError
+          && attempt < TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Prepare every physical Task-main resource and adopt it in the same store
+   * transaction that moves the Task from Draft to active. A Draft never owns a
+   * durable writable workspace before this boundary, and any failed attempt
+   * discards its unadopted refs/worktrees.
+   */
+  async activateTaskWorkspace(taskId: string): Promise<TaskWorkspaceActivation> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const task = requireTask(this.store, taskId);
+        if (task.status === "active") {
+          const workspace = this.store.getTaskWorkspace(task.id);
+          if (!isTaskOwnedWorkspace(
+            workspace,
+            task.id,
+            task.cwd,
+            task.projectBindings.map(({ projectId, directory }) => ({ projectId, directory }))
+          )) {
+            throw new Error(`Active Task workspace adoption is invalid: ${task.id}.`);
+          }
+          return {
+            task,
+            taskId: task.id,
+            status: "ready",
+            ...(task.cwd === undefined ? {} : { path: task.cwd }),
+            changed: false
+          };
+        }
+        const { release, current } = this.#acquireTaskProjectMaintenanceLocks(task);
+        try {
+          return await this.#prepareTaskWorkspaceLocked(current.id, true);
         } finally {
           release();
         }
@@ -279,60 +334,101 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     return this.#acquireTaskProjectMaintenanceLocks(requireTask(this.store, taskId));
   }
 
-  async #prepareTaskWorkspaceLocked(taskId: string): Promise<TaskWorkspacePreparation> {
+  async #prepareTaskWorkspaceLocked(
+    taskId: string,
+    activate: boolean
+  ): Promise<TaskWorkspaceActivation> {
     const task = requireTask(this.store, taskId);
-    if (!["draft", "active"].includes(task.status)) {
+    if (activate && task.status !== "draft") {
+      throw new Error(`Only a Draft Task can atomically adopt a workspace: ${task.id}/${task.status}.`);
+    }
+    if (!activate && task.status === "draft") {
+      throw new Error(
+        `Draft Task workspace must be adopted by task activation: ${task.id}.`
+      );
+    }
+    if (!activate && task.status !== "active") {
       throw new Error(`Task is not open for workspace preparation: ${task.id}.`);
     }
-    if (task.projectBindings.length === 0) {
-      const existing = this.store.getTaskWorkspace(task.id);
-      const root = this.#taskWorkspaceRoot(task.id);
-      if (existing !== null && (
-        existing.owner.type !== "task"
-        || existing.owner.taskId !== task.id
-        || existing.root !== root
-        || existing.entries.length !== 0
-      )) {
-        throw new Error(`Gitless Task workspace ownership is invalid: ${task.id}.`);
-      }
-      // Gitless Tasks still need a durable runtime owner. The empty view is
-      // Task-specific, so launches cannot fall back to a global workspace or
-      // repository root while no Project is bound.
-      await ensureWorkspaceView(root, []);
-      const workspace = createManagedWorkspace({
-        owner: { type: "task", taskId: task.id },
-        root,
-        entries: []
-      }, this.now());
-      this.#registerWorkspace(workspace);
-      this.store.transaction((tx) => {
-        const latest = requireTask(tx, task.id);
-        if (!['draft', 'active'].includes(latest.status)
-          || latest.projectBindings.length !== 0) {
-          throw new Error(`Task changed while preparing its Gitless workspace: ${task.id}.`);
-        }
-        const current = tx.getTaskWorkspace(task.id);
-        // `createManagedWorkspace` stamps a fresh updatedAt on every call.
-        // Gitless preparation is idempotent, so compare only stable identity
-        // and retain the existing durable record verbatim.
-        if (current !== null && !sameManagedWorkspaceIdentity(current, workspace)) {
-          throw new Error(`Gitless Task workspace changed during preparation: ${task.id}.`);
-        }
-        const timestamp = this.now();
-        if (latest.cwd !== root) {
-          tx.saveTask({ ...latest, cwd: root, updatedAt: timestamp.toISOString() });
-        }
-        if (current === null) tx.saveManagedWorkspace(workspace);
-        for (const role of tx.listRoles(task.id)) {
-          if (role.workspace !== root) {
-            retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
-            tx.saveRole(task.id, updateRole(role, { workspace: root }, timestamp));
-          }
-        }
-      });
-      return { taskId, status: "ready", path: root };
-    }
     const existing = this.store.getTaskWorkspace(task.id);
+    if (activate && (
+      task.workspaceIdentity !== undefined
+      || task.cwd !== undefined
+      || existing !== null
+    )) {
+      throw new Error(
+        `Draft Task already has adopted workspace state: ${task.id}. `
+        + "Inspect it with `yui task base status`, then retire and recreate the Draft."
+      );
+    }
+    if (!activate && existing === null) {
+      throw new Error(
+        `Active Task has no durable workspace owner: ${task.id}. `
+        + "Use `yui task base status` to diagnose the incomplete activation."
+      );
+    }
+    if (task.projectBindings.length === 0) {
+      const root = this.#taskWorkspaceRoot(task.id);
+      try {
+        if (existing !== null && (
+          existing.owner.type !== "task"
+          || existing.owner.taskId !== task.id
+          || existing.root !== root
+          || existing.entries.length !== 0
+        )) {
+          throw new Error(`Gitless Task workspace ownership is invalid: ${task.id}.`);
+        }
+        // Gitless Tasks still need a durable runtime owner. The empty view is
+        // Task-specific, so launches cannot fall back to a global workspace or
+        // repository root while no Project is bound.
+        await ensureWorkspaceView(root, []);
+        const workspace = createManagedWorkspace({
+          owner: { type: "task", taskId: task.id },
+          root,
+          entries: []
+        }, this.now());
+        this.#registerWorkspace(workspace);
+        const persisted = this.store.transaction((tx) => {
+          const latest = requireTask(tx, task.id);
+          if (latest.status !== task.status
+            || latest.projectBindings.length !== 0) {
+            throw new Error(`Task changed while preparing its Gitless workspace: ${task.id}.`);
+          }
+          const current = tx.getTaskWorkspace(task.id);
+          // `createManagedWorkspace` stamps a fresh updatedAt on every call.
+          // Gitless preparation is idempotent, so compare only stable identity
+          // and retain the existing durable record verbatim.
+          if (current !== null && !sameManagedWorkspaceIdentity(current, workspace)) {
+            throw new Error(`Gitless Task workspace changed during preparation: ${task.id}.`);
+          }
+          const timestamp = this.now();
+          let next = latest.cwd === root
+            ? latest
+            : { ...latest, cwd: root, updatedAt: timestamp.toISOString() };
+          if (activate) next = activateTask(next, timestamp);
+          if (!isDeepStrictEqual(next, latest)) tx.saveTask(next);
+          if (current === null) tx.saveManagedWorkspace(workspace);
+          for (const role of tx.listRoles(task.id)) {
+            if (role.workspace !== root) {
+              retireWorkspaceBoundSession(tx, task.id, role.name, timestamp);
+              tx.saveRole(task.id, updateRole(role, { workspace: root }, timestamp));
+            }
+          }
+          if (activate) recordTaskActivation(tx, latest, next, timestamp);
+          return next;
+        });
+        return {
+          task: persisted,
+          taskId,
+          status: "ready",
+          path: root,
+          changed: activate
+        };
+      } catch (error) {
+        if (activate) await removeWorkspaceView(root);
+        throw error;
+      }
+    }
     if (existing !== null && existing.owner.type !== "task") {
       throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
@@ -421,6 +517,18 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           roleName: MAIN_WORKTREE,
           baseRef: previous?.baseCommit ?? baseline.baseRef
         });
+        if (previous !== undefined
+          && !await this.git.isAncestor(physical.path, previous.baseCommit, physical.baseCommit)) {
+          throw new Error(formatWorkspacePreflightError({
+            kind: "physical-drift",
+            reason: `Task main physical HEAD left its recorded lineage: ${task.id}/${project.id}.`,
+            taskId: task.id,
+            roleName: LEADER_ROLE,
+            projectId: project.id,
+            expectedCommit: previous.baseCommit,
+            physicalCommit: physical.baseCommit
+          }));
+        }
         if (baseline.expectedCommit !== undefined
           && physical.baseCommit !== baseline.expectedCommit) {
           throw new Error(
@@ -444,7 +552,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             path: physical.path,
             branch: physical.branch,
             baseRef: previous?.baseRef ?? baseline.recordedBaseRef,
-            baseCommit: physical.baseCommit
+            baseCommit: previous?.baseCommit ?? physical.baseCommit
           },
           provenance
         });
@@ -456,9 +564,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         entries: prepared.map(({ entry }) => entry)
       }, this.now());
       this.#registerWorkspace(workspace);
-      this.store.transaction((tx) => {
+      const persisted = this.store.transaction((tx) => {
         const latest = requireTask(tx, task.id);
-        if (!["draft", "active"].includes(latest.status)) {
+        if (latest.status !== task.status) {
           throw new Error(`Task changed while preparing its workspace: ${task.id}.`);
         }
         if (!isDeepStrictEqual(latest.projectBindings, task.projectBindings)) {
@@ -522,6 +630,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         if (persistedTask.cwd !== root) {
           persistedTask = { ...persistedTask, cwd: root, updatedAt: timestamp.toISOString() };
         }
+        if (activate) persistedTask = activateTask(persistedTask, timestamp);
         if (!isDeepStrictEqual(persistedTask, latest)) {
           tx.saveTask(persistedTask);
         }
@@ -576,13 +685,22 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             tx.saveRole(task.id, updateRole(role, { workspace: target }, timestamp));
           }
         }
+        if (activate) recordTaskActivation(tx, latest, persistedTask, timestamp);
+        return persistedTask;
       });
-      return { taskId, status: "ready", path: root };
+      return {
+        task: persisted,
+        taskId,
+        status: "ready",
+        path: root,
+        changed: activate
+      };
     } catch (error) {
       // A failed or conflicted preparation owns no durable record: drop the
       // branches too, so a retry mints a clean identity without half-created
       // refs behind. Adopted (already catalogued) worktrees are never touched.
       await this.#discardUnadoptedEntries(task, taskSegment, prepared, MAIN_WORKTREE, true);
+      if (activate) await removeWorkspaceView(root);
       throw error;
     }
   }
@@ -600,7 +718,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   ): Promise<TaskWorkspacePreparation> {
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.#prepareTaskWorkspaceLocked(taskId);
+        return await this.#prepareTaskWorkspaceLocked(taskId, false);
       } catch (error) {
         if (!(error instanceof StorageConflictError)
           || attempt >= TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
@@ -2286,8 +2404,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     options: Readonly<{ latestRemote?: boolean }> = {}
   ): Promise<TaskWorkspaceRebuildResult> {
     const task = requireTask(this.store, taskId);
-    if (!["draft", "active"].includes(task.status)) {
-      throw new Error(`Only a draft or active Task can be rebuilt in place: ${task.id}/${task.status}.`);
+    if (task.status !== "active") {
+      throw new Error(`Only an active Task can rebuild its adopted workspace: ${task.id}/${task.status}.`);
     }
     // The rebuild holds every touched Project's maintenance fence for its
     // whole duration, so the Controller defers preparation and no other
@@ -3015,6 +3133,35 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       }
     });
   }
+}
+
+function recordTaskActivation(
+  store: TaskStore,
+  previous: Task,
+  active: Task,
+  now: Date
+): void {
+  enqueueWork(
+    store,
+    { kind: "role", taskId: active.id, roleName: LEADER_ROLE },
+    "task-created",
+    now,
+    [{ type: "task", id: active.id }]
+  );
+  enqueueWork(
+    store,
+    { kind: "task", taskId: active.id },
+    "task-activated",
+    now,
+    [{ type: "task", id: active.id }]
+  );
+  store.saveEvent(active.id, createTaskEvent(
+    store.nextEventId(active.id),
+    active.id,
+    "task.activated",
+    { fromStatus: previous.status, status: active.status },
+    now
+  ));
 }
 
 function requireTask(store: TaskStore, taskId: string): Task {
