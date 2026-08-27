@@ -392,11 +392,15 @@ export function populateSqliteFromState(
         for (const snapshot of Object.values(stored.contextSnapshots)) {
           store.saveContextSnapshot(snapshot as unknown as ContextSnapshot);
         }
-        for (const run of Object.values(stored.agentRuns)) {
-          store.saveAgentRun(run as unknown as AgentRun);
-        }
+        // Review Agent Runs carry a strict reference to their ReviewRound, so
+        // persist the parent records before any Run that belongs to one. A
+        // ReviewRound may name its Reviewer Run, but saveReviewRound deliberately
+        // accepts that forward reference while the fresh database is populated.
         for (const round of Object.values(stored.reviewRounds)) {
           store.saveReviewRound(taskId, round as unknown as ReviewRound);
+        }
+        for (const run of Object.values(stored.agentRuns)) {
+          store.saveAgentRun(run as unknown as AgentRun);
         }
         for (const changeSet of Object.values(stored.changeSets)) {
           store.saveChangeSet(taskId, changeSet as unknown as ChangeSet);
