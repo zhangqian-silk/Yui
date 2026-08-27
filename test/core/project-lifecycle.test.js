@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -203,6 +203,51 @@ test("project replace requires --discard-local", async (t) => {
   );
 });
 
+test("project replace refuses a dirty checkout", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  writeFileSync(join(checkout, "uncommitted.txt"), "dirty\n");
+  const headBefore = git(["rev-parse", "HEAD"], checkout);
+
+  await assert.rejects(
+    runProjectCommand(["replace", "project-1", "--discard-local"], store, { now: () => now, environment: userEnv }),
+    /clean/u
+  );
+  // The refusal must not have moved the checkout or left swap debris.
+  assert.equal(git(["rev-parse", "HEAD"], checkout), headBefore);
+  assert.ok(existsSync(join(checkout, "uncommitted.txt")));
+  assert.ok(!existsSync(join(home, "projects", ".replace-project-1")));
+  assert.ok(!existsSync(join(home, "projects", ".replace-backup-project-1")));
+});
+
+test("project replace heals a crashed swap and completes", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const { remote, seed, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  commitFile(seed, "remote2.txt", "remote2\n", "remote work 2");
+  git(["push", "origin", "master"], seed);
+  // Simulate a crash between the two swap renames: the live checkout is gone
+  // and the previous checkout is parked at the backup path.
+  const backup = join(home, "projects", ".replace-backup-project-1");
+  renameSync(checkout, backup);
+
+  const result = await runProjectCommand(
+    ["replace", "project-1", "--discard-local"],
+    store,
+    { now: () => now, environment: userEnv }
+  );
+  const remoteHead = git(["--git-dir", remote, "rev-parse", "master"], home);
+  assert.match(result.output, /Replaced project project-1/u);
+  assert.equal(git(["rev-parse", "HEAD"], checkout), remoteHead);
+  assert.ok(existsSync(join(checkout, "remote2.txt")));
+  assert.ok(!existsSync(join(checkout, "local.txt")), "the discarded local commit must be gone");
+  assert.ok(!existsSync(backup), "the backup must be removed after the healed swap");
+  assert.ok(!existsSync(join(home, "projects", ".replace-project-1")), "the staging clone must be gone");
+});
+
 test("project retire records the audit trail and blocks further mutation", async (t) => {
   const home = newHome(t);
   const store = newStore(t, home);
@@ -314,6 +359,104 @@ test("project delete removes the catalog record and, with --checkout, the manage
   assert.match(result.output, /Deleted project project-1/u);
   assert.equal(store.listProjects().length, 0);
   assert.ok(!existsSync(checkout), "the managed checkout must be removed with --checkout");
+  assert.ok(!existsSync(join(home, "projects", ".delete-project-1")), "the tombstone must be gone");
+});
+
+test("project delete --checkout refuses linked worktrees before touching the catalog", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  await runProjectCommand(["retire", "project-1", "--reason", "done"], store, { now: () => now, environment: userEnv });
+  // A linked worktree that shares the checkout's object store.
+  const linked = join(home, "linked-wt");
+  git(["worktree", "add", "--detach", linked, "HEAD"], checkout);
+  t.after(() => rmSync(linked, { recursive: true, force: true }));
+
+  await assert.rejects(
+    runProjectCommand(
+      ["delete", "project-1", "--checkout", "--confirm", "project-1"],
+      store,
+      { now: () => now, environment: userEnv }
+    ),
+    /linked worktrees/u
+  );
+  // The refusal must leave both the catalog record and the checkout intact.
+  assert.equal(store.listProjects().length, 1, "the catalog record must survive the refusal");
+  assert.ok(existsSync(checkout), "the checkout must survive the refusal");
+  assert.ok(existsSync(join(checkout, "local.txt")));
+  assert.ok(!existsSync(join(home, "projects", ".delete-project-1")), "no tombstone may be left behind");
+});
+
+test("project delete --checkout refuses a dirty checkout", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  await runProjectCommand(["retire", "project-1", "--reason", "done"], store, { now: () => now, environment: userEnv });
+  writeFileSync(join(checkout, "uncommitted.txt"), "dirty\n");
+
+  await assert.rejects(
+    runProjectCommand(
+      ["delete", "project-1", "--checkout", "--confirm", "project-1"],
+      store,
+      { now: () => now, environment: userEnv }
+    ),
+    /clean/u
+  );
+  assert.equal(store.listProjects().length, 1, "the catalog record must survive the refusal");
+  assert.ok(existsSync(join(checkout, "uncommitted.txt")), "the dirty checkout must be untouched");
+  assert.ok(!existsSync(join(home, "projects", ".delete-project-1")), "no tombstone may be left behind");
+});
+
+test("project delete --checkout restores the checkout when the catalog removal is refused", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  // A historical (completed) Task binding keeps the catalog removal refused.
+  const task = createTask(store.nextTaskId(), "Shipped feature", now, {
+    projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "master" }]
+  });
+  store.saveTask(task);
+  await runProjectCommand(["retire", "project-1", "--reason", "done"], store, { now: () => now, environment: userEnv });
+  const headBefore = git(["rev-parse", "HEAD"], checkout);
+
+  await assert.rejects(
+    runProjectCommand(
+      ["delete", "project-1", "--checkout", "--confirm", "project-1"],
+      store,
+      { now: () => now, environment: userEnv }
+    ),
+    /Task records reference/u
+  );
+  // The two-phase flow must have rolled the tombstone rename back: catalog
+  // record and checkout agree as if the delete never ran.
+  assert.equal(store.listProjects().length, 1, "the catalog record must survive the refusal");
+  assert.equal(git(["rev-parse", "HEAD"], checkout), headBefore, "the checkout must be restored intact");
+  assert.ok(existsSync(join(checkout, "local.txt")));
+  assert.ok(!existsSync(join(home, "projects", ".delete-project-1")), "the tombstone must be gone after rollback");
+});
+
+test("project delete --checkout heals a crashed first attempt", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  await runProjectCommand(["retire", "project-1", "--reason", "done"], store, { now: () => now, environment: userEnv });
+  // Simulate a crash after phase 1: the checkout is parked at its tombstone.
+  const tombstone = join(home, "projects", ".delete-project-1");
+  renameSync(checkout, tombstone);
+
+  const result = await runProjectCommand(
+    ["delete", "project-1", "--checkout", "--confirm", "project-1"],
+    store,
+    { now: () => now, environment: userEnv }
+  );
+  assert.match(result.output, /Deleted project project-1/u);
+  assert.equal(store.listProjects().length, 0);
+  assert.ok(!existsSync(checkout), "the restored checkout must be removed by the healed run");
+  assert.ok(!existsSync(tombstone), "the tombstone must be gone");
 });
 
 test("task create refuses to bind a retired Project", async (t) => {
@@ -327,6 +470,43 @@ test("task create refuses to bind a retired Project", async (t) => {
     () => runTaskCommand(["create", "New delivery", "--project", "project-1"], store, { now: () => now, environment: userEnv }),
     /retired/u
   );
+});
+
+test("a retired Project refuses every knowledge write while keeping reads", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  await runProjectCommand(["retire", "project-1", "--reason", "done"], store, { now: () => now, environment: userEnv });
+
+  const writeAttempts = [
+    ["knowledge", "add", "project-1", "title", "--body", "body"],
+    ["knowledge", "retire", "project-1", "knowledge-1"],
+    ["knowledge", "propose", "project-1", "--title", "t", "--body", "b", "--task", "task-1"],
+    ["knowledge", "accept", "project-1", "proposal-1"],
+    ["knowledge", "reject", "project-1", "proposal-1", "--reason", "x"]
+  ];
+  for (const args of writeAttempts) {
+    await assert.rejects(
+      runProjectCommand(args, store, { now: () => now, environment: userEnv }),
+      /retired/u,
+      `expected ${args.join(" ")} to be refused on a retired Project`
+    );
+  }
+  // No write may have landed.
+  const retired = store.listProjects().find(({ id }) => id === "project-1");
+  assert.equal(retired.knowledge.length, 0);
+  assert.equal(retired.knowledgeProposals.length, 0);
+
+  // Read-only inspection stays open so historical evidence stays auditable.
+  const listed = await runProjectCommand(["knowledge", "list", "project-1"], store, { now: () => now, environment: userEnv });
+  assert.match(listed.output, /No project knowledge found/u);
+  const proposals = await runProjectCommand(
+    ["knowledge", "proposals", "list", "project-1"],
+    store,
+    { now: () => now, environment: userEnv }
+  );
+  assert.ok(proposals.output.length > 0, "the proposals read path must stay open");
 });
 
 test("the production migration upgrades Project v4 records to v5 with active status", () => {

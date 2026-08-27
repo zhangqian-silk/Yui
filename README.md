@@ -318,18 +318,24 @@ checkout is merely behind). `project replace` goes further for Home-managed chec
 the remote into a staging directory, verifies both branches, copies the Yui-local refs
 (`refs/heads/yui/`, `refs/yui/archive/`) so historical evidence keeps resolving, then swaps the
 checkout on disk while the catalog record keeps its path. Replace refuses linked worktrees (Task
-or Integration workspaces) and requires `--discard-local`; a crash before the swap leaves only a
-removable staging clone.
+or Integration workspaces) and dirty checkouts, and requires `--discard-local`. The swap is
+recoverable: the previous checkout is parked at a backup path and restored on any failure, a
+catalog refusal rolls the swap back, and a crash mid-swap is healed on the next run (a crash
+before the swap leaves only a removable staging clone).
 
 `project retire` is the auditable soft deprecation: it records who retired the Project, when, and
 why, while retaining the catalog record, checkout, and every historical
 Task/Run/Review/Integration/Publication reference. A retired Project cannot be refreshed,
-updated, migrated, reset, replaced, or bound to new Tasks, WorkItems, or Integrations.
+updated, migrated, reset, replaced, maintained through Knowledge writes (add/retire/propose/
+accept/reject), or bound to new Tasks, WorkItems, or Integrations; Knowledge reads (`list`,
+`show`, `proposals list/show`) stay open so the evidence stays auditable.
 `project delete` is the separate hard-removal decision: it requires a retired Project, an exact
 `--confirm <project-id>` acknowledgment, and fails closed while any Task record references the
 Project. `--checkout` additionally removes the Home-managed checkout (external checkouts are
-user-owned and must be removed manually). `project show` and `project list` display the lifecycle
-status and retirement record.
+user-owned and must be removed manually): it first refuses linked worktrees and dirty checkouts,
+then moves the checkout to a tombstone before removing the catalog record, restoring it on any
+failure so the catalog and checkout never disagree unrecoverably. `project show` and
+`project list` display the lifecycle status and retirement record.
 
 Use `task context` as the first detailed read of an existing Task. It combines the Task, Brief, active Decisions, recent Milestones, Roles, current and recent WorkItems with their Runs, recent Messages, open and resolved InputRequests, and recent Events. Terminal output keeps histories and long text compact; `yui --json task context <task-id>` returns the complete records in the top-level `data` field.
 

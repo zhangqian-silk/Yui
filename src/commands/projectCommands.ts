@@ -4,6 +4,11 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import {
+  healCheckoutSwap,
+  restoreCheckoutSwap,
+  swapManagedCheckout
+} from "../repository/checkoutSwap.js";
 import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
 import { acquireProjectMaintenanceLock } from "../repository/projectMaintenanceLock.js";
 import {
@@ -868,8 +873,10 @@ async function resetProject(
  * whose divergence or corruption is too severe for `project reset`. The
  * discard is explicit (`--discard-local`), the remote is verified before the
  * swap, and Task/Integration worktrees are protected by a linked-worktree
- * gate. A crash before the swap leaves only a removable staging clone; a
- * crash during the swap leaves an intact catalog so the command can retry.
+ * gate. The swap itself is recoverable: the previous checkout is parked at a
+ * backup path and restored on any failure, and a crash mid-swap is healed on
+ * the next run (a crash before the swap leaves only a removable staging
+ * clone).
  */
 async function replaceProject(
   args: readonly string[],
@@ -909,6 +916,10 @@ async function replaceProject(
       throw new Error(`Project changed while replacing: ${project.id}.`);
     }
     assertNoActiveTaskBinding(store, current, "replace");
+    const backup = join(store.rootDirectory(), "projects", `.replace-backup-${current.id}`);
+    // Heal a crashed earlier swap before any new destructive step, so the
+    // prechecks below always see a valid checkout.
+    await healCheckoutSwap({ currentPath: current.path, backupPath: backup });
     // A linked worktree (Task/Integration workspace) shares this repository's
     // object store and would be broken by a wholesale checkout replacement.
     const worktrees = await git.listWorktrees(current.path);
@@ -918,6 +929,12 @@ async function replaceProject(
         `Project checkout has linked worktrees that would break: ${current.id}.\n`
         + linked.map((path) => `  ${path}`).join("\n")
         + "\nClean up Task/Integration workspaces first (e.g. `yui task work cleanup`, `yui task integration cleanup`)."
+      );
+    }
+    if (!await git.isClean(current.path)) {
+      throw usageError(
+        `Project checkout must be clean before replace: ${current.id}. `
+        + "Commit, stash, or discard uncommitted changes first."
       );
     }
     const staging = join(store.rootDirectory(), "projects", `.replace-${current.id}`);
@@ -968,27 +985,51 @@ async function replaceProject(
         patterns: ["refs/heads/yui/", "refs/yui/archive/"]
       });
       const oldHead = (await git.inspect(current.path, "HEAD")).baseCommit;
-      // Swap the checkout on disk; the catalog record keeps its path. A crash
-      // between rm and rename leaves no checkout but an intact catalog, so
-      // the command can be retried cleanly.
-      await rm(current.path, { recursive: true, force: true });
-      await rename(staging, current.path);
-      const switched = store.transaction((tx) => {
-        const latest = requireProject(tx, current.id);
-        if (latest.path !== current.path || latest.ownership !== current.ownership) {
-          throw new Error(`Project changed while replacing: ${current.id}.`);
-        }
-        const next = validateProject({
-          ...latest,
-          updatedAt: (options.now ?? (() => new Date()))().toISOString()
+      // Swap the checkout on disk without ever leaving the registered path
+      // without a repository: the previous checkout is parked at the backup
+      // path first and restored on any failure. The backup is removed only
+      // after the catalog transaction commits, so a crash in between stays
+      // recoverable (healed at the top of the next run).
+      await swapManagedCheckout({ currentPath: current.path, stagingPath: staging, backupPath: backup });
+      let switched: Project;
+      try {
+        switched = store.transaction((tx) => {
+          const latest = requireProject(tx, current.id);
+          if (latest.path !== current.path || latest.ownership !== current.ownership) {
+            throw new Error(`Project changed while replacing: ${current.id}.`);
+          }
+          const next = validateProject({
+            ...latest,
+            updatedAt: (options.now ?? (() => new Date()))().toISOString()
+          });
+          tx.saveProject(next);
+          return next;
         });
-        tx.saveProject(next);
-        return next;
-      });
+      } catch (error) {
+        try {
+          await restoreCheckoutSwap({ currentPath: current.path, backupPath: backup });
+        } catch (rollbackError) {
+          throw new Error(
+            `Project replace failed and checkout rollback was incomplete: ${messageOf(error)}; `
+            + `rollback failed: ${messageOf(rollbackError)}. `
+            + `The previous checkout remains parked at ${backup}.`
+          );
+        }
+        throw error;
+      }
+      let backupLeftover = false;
+      try {
+        await rm(backup, { recursive: true, force: true });
+      } catch {
+        backupLeftover = true;
+      }
       const newHead = (await git.inspect(current.path, "HEAD")).baseCommit;
       return {
         output: `Replaced project ${current.id} checkout: ${oldHead} -> ${newHead} `
-          + `(re-cloned from ${current.remoteUrl}).\n`,
+          + `(re-cloned from ${current.remoteUrl}).\n`
+          + (backupLeftover
+            ? `The previous checkout could not be removed; delete it manually: ${backup}.\n`
+            : ""),
         data: { project: switched, fromCommit: oldHead, toCommit: newHead }
       };
     } catch (error) {
@@ -1050,7 +1091,10 @@ function retireProjectCommand(
  * Home-managed checkout. Deletion is deliberately two-phase (retire first)
  * and doubly acknowledged (--confirm with the exact Project id), and it fails
  * closed while any Task record references the Project so historical evidence
- * stays resolvable.
+ * stays resolvable. With `--checkout`, every fail-closed precheck (linked
+ * worktrees, dirty checkout) runs before any destruction, and the checkout is
+ * moved to a tombstone before the catalog record is removed; any failure
+ * restores it, so catalog and checkout never disagree unrecoverably.
  */
 async function deleteProjectCommand(
   args: readonly string[],
@@ -1079,10 +1123,93 @@ async function deleteProjectCommand(
       + "External checkouts are user-owned; remove them manually after deleting the binding."
     );
   }
-  const removed = store.transaction((tx) => {
-    const latest = requireProject(tx, project.id);
+  if (!parsed.checkout) {
+    const removed = removeRetiredProjectRecord(store, project.id);
+    return {
+      output: `Deleted project ${removed.id} (catalog record; checkout retained at ${removed.path}).\n`,
+      data: { project: removed, checkoutRemoved: false }
+    };
+  }
+  // --checkout: prechecks first, then a rename/tombstone two-phase flow. The
+  // checkout moves to a tombstone before the catalog record is removed, and
+  // every failure restores it, so the catalog never loses its recoverable
+  // entry while a live checkout (or its failure) is still in play.
+  const tombstone = join(store.rootDirectory(), "projects", `.delete-${project.id}`);
+  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  try {
+    // Heal a crashed earlier attempt before the prechecks run.
+    await healCheckoutSwap({ currentPath: project.path, backupPath: tombstone });
+    if (existsSync(project.path)) {
+      const git = options.git ?? new NodeGitWorkspace();
+      const worktrees = await git.listWorktrees(project.path);
+      const linked = worktrees.filter((path) => path !== project.path);
+      if (linked.length > 0) {
+        throw usageError(
+          `Project checkout has linked worktrees that would break: ${project.id}.\n`
+          + linked.map((path) => `  ${path}`).join("\n")
+          + "\nClean up Task/Integration workspaces first (e.g. `yui task work cleanup`, `yui task integration cleanup`)."
+        );
+      }
+      if (!await git.isClean(project.path)) {
+        throw usageError(
+          `Project checkout must be clean before delete: ${project.id}. `
+          + "Commit, stash, or discard uncommitted changes first, or delete the catalog record only without --checkout."
+        );
+      }
+      // Phase 1: park the checkout. The catalog record still exists, so
+      // phase 2 must complete or roll the rename back.
+      await rename(project.path, tombstone);
+    }
+    // Phase 2: remove the catalog record, restoring the checkout on failure.
+    let removed: Project;
+    try {
+      removed = removeRetiredProjectRecord(store, project.id);
+    } catch (error) {
+      if (existsSync(tombstone) && !existsSync(project.path)) {
+        try {
+          await rename(tombstone, project.path);
+        } catch (rollbackError) {
+          throw new Error(
+            `Project delete failed and checkout rollback was incomplete: ${messageOf(error)}; `
+            + `rollback failed: ${messageOf(rollbackError)}. `
+            + `The checkout remains parked at ${tombstone}.`
+          );
+        }
+      }
+      throw error;
+    }
+    // Phase 3: the catalog record is gone, so the tombstone is unreferenced
+    // garbage. Removal is best-effort; a leftover is reported, never silent.
+    let tombstoneLeftover = false;
+    if (existsSync(tombstone)) {
+      try {
+        await rm(tombstone, { recursive: true, force: true });
+      } catch {
+        tombstoneLeftover = true;
+      }
+    }
+    return {
+      output: `Deleted project ${removed.id} and its checkout at ${removed.path}.\n`
+        + (tombstoneLeftover
+          ? `The checkout tombstone could not be removed; delete it manually: ${tombstone}.\n`
+          : ""),
+      data: { project: removed, checkoutRemoved: true }
+    };
+  } finally {
+    releaseMaintenance();
+  }
+}
+
+/**
+ * The catalog side of `project delete`: re-read under a transaction, re-assert
+ * the retired state and the absence of any Task reference, then remove the
+ * record. Fails closed with the record intact on every refusal.
+ */
+function removeRetiredProjectRecord(store: ProjectCommandStore, projectId: string): Project {
+  return store.transaction((tx) => {
+    const latest = requireProject(tx, projectId);
     if (latest.status !== "retired") {
-      throw new Error(`Project changed while deleting: ${project.id}.`);
+      throw new Error(`Project changed while deleting: ${projectId}.`);
     }
     const references = tx.summarizeProjectReferences(latest.id);
     if (references.boundTaskIds.length > 0) {
@@ -1097,31 +1224,6 @@ async function deleteProjectCommand(
     }
     return latest;
   });
-  if (parsed.checkout) {
-    const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), removed.id);
-    try {
-      if (existsSync(removed.path)) {
-        const git = options.git ?? new NodeGitWorkspace();
-        const worktrees = await git.listWorktrees(removed.path);
-        const linked = worktrees.filter((path) => path !== removed.path);
-        if (linked.length > 0) {
-          throw usageError(
-            `Project checkout has linked worktrees that would break: ${removed.id}.\n`
-            + linked.map((path) => `  ${path}`).join("\n")
-          );
-        }
-        await rm(removed.path, { recursive: true, force: true });
-      }
-    } finally {
-      releaseMaintenance();
-    }
-  }
-  return {
-    output: parsed.checkout
-      ? `Deleted project ${removed.id} and its checkout at ${removed.path}.\n`
-      : `Deleted project ${removed.id} (catalog record; checkout retained at ${removed.path}).\n`,
-    data: { project: removed, checkoutRemoved: parsed.checkout }
-  };
 }
 
 function parseResetArguments(
@@ -1316,6 +1418,7 @@ function projectKnowledge(
     assertKnowledgeOperator(options, "add");
     const added = store.transaction((tx) => {
       const project = requireProject(tx, parsed.positionals[0]!);
+      assertProjectActive(project, "add project knowledge");
       const id = nextKnowledgeId(project);
       tx.saveProject(addProjectKnowledge(
         project,
@@ -1414,6 +1517,7 @@ function projectKnowledge(
     assertKnowledgeOperator(options, "retire");
     const updated = store.transaction((tx) => {
       const project = requireProject(tx, rest[0]!);
+      assertProjectActive(project, "retire project knowledge");
       const next = retireProjectKnowledge(
         project,
         rest[1]!,
@@ -1577,6 +1681,7 @@ function proposeKnowledge(
   const now = (options.now ?? (() => new Date()))();
   const result = store.transaction((tx) => {
     const project = requireProject(tx, parsed.project);
+    assertProjectActive(project, "propose project knowledge");
     const source = requireProposalEvidence(tx, parsed);
     const fingerprint = knowledgeProposalFingerprint({
       projectId: project.id,
@@ -1822,6 +1927,7 @@ function acceptKnowledgeProposal(
   const now = (options.now ?? (() => new Date()))();
   const accepted = store.transaction((tx) => {
     const project = requireProject(tx, parsed.project);
+    assertProjectActive(project, "accept project knowledge");
     const proposal = findKnowledgeProposal(project, parsed.proposal);
     if (proposal === null) {
       throw usageError(`Knowledge proposal not found: ${parsed.proposal}.`);
@@ -1920,6 +2026,7 @@ function rejectKnowledgeProposal(
   const decidedBy = actor === "operator" ? "operator" as const : "user" as const;
   const rejected = store.transaction((tx) => {
     const project = requireProject(tx, parsed.positionals[0]!);
+    assertProjectActive(project, "reject project knowledge");
     const proposal = findKnowledgeProposal(project, parsed.positionals[1]!);
     if (proposal === null) {
       throw usageError(`Knowledge proposal not found: ${parsed.positionals[1]!}.`);
@@ -2214,4 +2321,8 @@ function requireText(value: string, label: string): string {
     throw usageError(`${label} is required.`);
   }
   return normalized;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
