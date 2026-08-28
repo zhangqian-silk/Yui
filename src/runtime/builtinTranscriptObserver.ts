@@ -253,8 +253,9 @@ function parseCodexLines(
   state: Readonly<Record<string, unknown>>
 ): ParsedSample {
   let usage = usageFrom(state.usage);
-  // Keep a recognized-but-incomplete request boundary across bounded samples.
-  // The next complete occurrence carries the durable partial-quality evidence.
+  // Keep every recognized-but-incomplete request boundary durable. Reuse the
+  // last complete cumulative total as a partial marker until the next exact
+  // occurrence restores the numeric counter.
   let usageContinuityGap = state.usageContinuityGap === true;
   const usages: AgentRuntimeUsageOccurrence[] = [];
   let malformed = 0;
@@ -273,6 +274,13 @@ function parseCodexLines(
     if (payload.info === null) continue;
     const candidate = normalizedCodexUsage(object(object(payload.info)?.total_token_usage));
     if (candidate === undefined) {
+      if (usage !== undefined) {
+        usages.push(Object.freeze({
+          ...transcriptOccurrence(line),
+          observationQuality: "partial" as const,
+          usage
+        }));
+      }
       usageContinuityGap = true;
       incompleteUsage += 1;
       continue;
