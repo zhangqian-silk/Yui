@@ -101,6 +101,8 @@ export type TaskExecutionRun = Readonly<{
   purpose: AgentRun["purpose"];
   delivered: boolean;
   status: AgentRun["status"];
+  workItemId?: string;
+  reviewRoundId?: string;
   executionGroupId?: string;
   executionLaneId?: string;
 }>;
@@ -116,7 +118,6 @@ export type TaskExecutionProjection = Readonly<{
   reason: string;
   monitoring: "active" | "stopped";
   failClosed: boolean;
-  activeExecutorCount: number;
   activeRuns: readonly TaskExecutionRun[];
   /** Read-only Leader aggregation for every unified execution Group. */
   executionGroups: readonly ExecutionGroupHealthSummary[];
@@ -352,6 +353,8 @@ export function projectTaskExecution(
     purpose: run.purpose,
     delivered: run.deliveredAt !== undefined,
     status: run.status,
+    ...(run.workItemId === undefined ? {} : { workItemId: run.workItemId }),
+    ...(run.reviewRoundId === undefined ? {} : { reviewRoundId: run.reviewRoundId }),
     ...(run.executionGroupId === undefined ? {} : { executionGroupId: run.executionGroupId }),
     ...(run.executionLaneId === undefined ? {} : { executionLaneId: run.executionLaneId })
   }));
@@ -372,7 +375,6 @@ export function projectTaskExecution(
       monitoring,
       failClosed: false,
       activeRuns: activeRunViews,
-      activeExecutorCount: 0,
       attention: [],
       blockers: [],
       pendingWakeup
@@ -390,16 +392,22 @@ export function projectTaskExecution(
   });
   const openInputs = inputRequests.filter((request) => request.status === "open");
   const blockers = collectBlockers(workItems, reviewRounds, integrations, openInputs, task);
-  const activeExecutors = activeRuns.filter((run) => isExecutionCarrier(run));
-  const activeWorkers = activeExecutors.filter((run) => run.roleName !== "leader");
-  const healthyExecutionCarriers = activeWorkers.filter((run) => (
+  const activeExecutionRuns = activeRuns.filter((run) => run.purpose === "execution");
+  const activeReviewRuns = activeRuns.filter((run) => run.purpose === "review");
+  const activeDelegatedExecutions = activeExecutionRuns.filter((run) => (
+    run.roleName !== "leader"
+  ));
+  const healthyActiveRuns = activeRuns.filter((run) => (
     run.deliveredAt !== undefined
     && !attention.some((item) => item.runId === run.id)
   ));
   const activeLeader = activeRuns.find((run) => run.roleName === "leader");
-  const pendingDelivery = activeRuns.some((run) => run.deliveredAt === undefined);
+  const pendingDeliveryRuns = activeRuns.filter((run) => run.deliveredAt === undefined);
   const hasPendingLeaderWork = pendingWakeup !== null
-    || leaderMailbox?.pending !== null && leaderMailbox?.pending !== undefined;
+    || leaderMailbox !== null && (
+      leaderMailbox.pending.normal !== null
+      || leaderMailbox.pending.userCorrection !== null
+    );
   const recoveryPending = isRecoveryPending(
     pendingWakeup,
     leaderMailbox,
@@ -419,20 +427,19 @@ export function projectTaskExecution(
     const first = attention[0];
     if (first === undefined) throw new Error("Task execution attention disappeared.");
     const progressingWithAttention = first.kind === "checkpoint-overdue"
-      && healthyExecutionCarriers.length > 0;
+      && healthyActiveRuns.length > 0;
     return render({
       task,
       status: progressingWithAttention ? "progressing-with-attention" : "attention",
       owner: first.owner,
       action: "inspect-attention",
       summary: progressingWithAttention
-        ? `${healthyExecutionCarriers.length} healthy execution carrier(s) remain while ${first.summary}`
+        ? `${healthyActiveRuns.length} healthy active Run(s) remain while ${first.summary}`
         : first.summary,
       reason: progressingWithAttention ? "progressing-with-attention" : first.kind,
       monitoring,
       failClosed: hasLeaderMismatch || attention.some((item) => item.failClosed === true),
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
@@ -452,7 +459,6 @@ export function projectTaskExecution(
       monitoring,
       failClosed: false,
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
@@ -473,7 +479,6 @@ export function projectTaskExecution(
       monitoring,
       failClosed: false,
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
@@ -493,7 +498,6 @@ export function projectTaskExecution(
       monitoring,
       failClosed: hasLeaderMismatch,
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
@@ -511,83 +515,124 @@ export function projectTaskExecution(
       monitoring,
       failClosed: leaderFailure !== null,
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
     });
   }
-  if (pendingDelivery) {
+  const leaderDeliveryPending = pendingDeliveryRuns.some((run) => run.roleName === "leader");
+  if (leaderDeliveryPending) {
     return render({
       task,
       status: "recovering",
       owner: "leader",
       action: "recover-leader",
-      summary: "An active Run is awaiting provider acceptance; delivery remains fail-closed.",
+      summary: "The active Leader Run is awaiting provider acceptance; delivery remains fail-closed.",
       reason: "delivery-pending",
       monitoring,
       failClosed: false,
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
-      attention,
-      blockers,
-      pendingWakeup
-    });
-  }
-  if (activeWorkers.length > 0 && activeLeader === undefined) {
-    return render({
-      task,
-      status: "waiting-on-agents",
-      owner: roleOwner(activeWorkers[0].roleName),
-      action: "wait-for-agents",
-      summary: `${activeWorkers.length} delegated execution Run(s) are active; Leader is waiting for their result.`,
-      reason: "delegated-work-active",
-      monitoring,
-      failClosed: false,
-      activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
     });
   }
   if (activeLeader !== undefined) {
+    const concurrentExecutionCount = activeDelegatedExecutions.length;
+    const concurrentReviewCount = activeReviewRuns.length;
+    const concurrentSummary = [
+      concurrentExecutionCount === 0
+        ? null
+        : `${concurrentExecutionCount} delegated execution Run(s)`,
+      concurrentReviewCount === 0
+        ? null
+        : `${concurrentReviewCount} Review Run(s)`
+    ].filter((value): value is string => value !== null).join(" and ");
     return render({
       task,
-      status: activeWorkers.length > 0 ? "waiting-on-agents" : "working",
+      status: "working",
       owner: "leader",
-      action: activeWorkers.length > 0 ? "wait-for-agents" : "advance-task",
-      summary: activeWorkers.length > 0
-        ? `Leader Run is active while ${activeWorkers.length} delegated Run(s) continue.`
-        : "Leader Run is actively advancing the Task.",
-      reason: activeWorkers.length > 0 ? "leader-and-delegates-active" : "leader-run-active",
+      action: "advance-task",
+      summary: concurrentSummary.length === 0
+        ? "Leader Run is actively advancing the Task."
+        : `Leader Run is actively advancing the Task alongside ${concurrentSummary}.`,
+      reason: concurrentSummary.length === 0 ? "leader-run-active" : "leader-and-agents-active",
       monitoring,
       failClosed: false,
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
     });
   }
-  if (activeExecutors.length > 0) {
+  if (hasPendingLeaderWork) {
+    return render({
+      task,
+      status: "needs-leader-action",
+      owner: "leader",
+      action: "advance-task",
+      summary: "A durable Leader wake is pending; concurrent AgentRuns remain visible but do not suppress it.",
+      reason: "leader-wake-pending",
+      monitoring,
+      failClosed: false,
+      activeRuns: activeRunViews,
+      attention,
+      blockers,
+      pendingWakeup
+    });
+  }
+  if (pendingDeliveryRuns.length > 0) {
+    return render({
+      task,
+      status: "recovering",
+      owner: "leader",
+      action: "recover-execution",
+      summary: `${pendingDeliveryRuns.length} active delegated AgentRun(s) are awaiting provider acceptance; delivery remains fail-closed.`,
+      reason: "delivery-pending",
+      monitoring,
+      failClosed: false,
+      activeRuns: activeRunViews,
+      attention,
+      blockers,
+      pendingWakeup
+    });
+  }
+  if (activeDelegatedExecutions.length > 0) {
+    const reviewSuffix = activeReviewRuns.length === 0
+      ? ""
+      : `; ${activeReviewRuns.length} Review Run(s) are also active`;
     return render({
       task,
       status: "waiting-on-agents",
-      owner: roleOwner(activeExecutors[0].roleName),
+      owner: roleOwner(activeDelegatedExecutions[0].roleName),
       action: "wait-for-agents",
-      summary: `${activeExecutors.length} delegated execution Run(s) are active.`,
+      summary: `${activeDelegatedExecutions.length} delegated execution Run(s) are active${reviewSuffix}.`,
       reason: "delegated-work-active",
       monitoring,
       failClosed: false,
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
     });
   }
-  if (candidateReady || unresolvedIntegration || hasPendingLeaderWork) {
+  if (activeReviewRuns.length > 0) {
+    return render({
+      task,
+      status: "waiting-on-agents",
+      owner: "reviewer",
+      action: "wait-for-agents",
+      summary: `${activeReviewRuns.length} Review Run(s) are evaluating frozen candidates; newer facts can still wake the Leader.`,
+      reason: "review-active",
+      monitoring,
+      failClosed: false,
+      activeRuns: activeRunViews,
+      attention,
+      blockers,
+      pendingWakeup
+    });
+  }
+  if (candidateReady || unresolvedIntegration) {
     return render({
       task,
       status: "needs-leader-action",
@@ -595,22 +640,19 @@ export function projectTaskExecution(
       action: "advance-task",
       summary: candidateReady
         ? "A WorkItem Candidate is awaiting Leader action."
-        : unresolvedIntegration
-          ? "An Integration or validation record needs Leader action."
-          : "A durable Leader wake is pending.",
+        : "An Integration or validation record needs Leader action.",
       reason: candidateReady
         ? "candidate-ready"
-        : unresolvedIntegration ? "integration-pending" : "leader-wake-pending",
+        : "integration-pending",
       monitoring,
       failClosed: false,
       activeRuns: activeRunViews,
-      activeExecutorCount: activeExecutors.length,
       attention,
       blockers,
       pendingWakeup
     });
   }
-    return render({
+  return render({
     task,
     status: "needs-leader-action",
     owner: "leader",
@@ -620,7 +662,6 @@ export function projectTaskExecution(
     monitoring,
     failClosed: false,
     activeRuns: activeRunViews,
-    activeExecutorCount: activeExecutors.length,
     attention,
     blockers,
     pendingWakeup
@@ -648,7 +689,6 @@ function projection(
     reason: input.reason,
     monitoring: input.monitoring,
     failClosed: input.failClosed,
-    activeExecutorCount: input.activeExecutorCount,
     activeRuns: input.activeRuns,
     executionGroups: input.executionGroups ?? [],
     observability: input.observability,
@@ -890,16 +930,6 @@ function collectBlockers(
     });
   }
   return blockers;
-}
-
-function isExecutionCarrier(run: AgentRun): boolean {
-  return run.purpose === "review"
-    || run.roleName === "leader"
-    // A scheduler-only projection may not have the WorkItem fold available
-    // (for example during a recovery read). An active non-Leader Role is still
-    // an execution carrier; omitting it would falsely wake the Leader.
-    || run.workItemId !== undefined
-    || run.roleName !== "leader";
 }
 
 function roleOwner(roleName: string): TaskExecutionOwner {

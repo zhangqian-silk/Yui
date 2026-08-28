@@ -540,7 +540,16 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
         ));
         return;
       }
-      const nativeTurnId = `claude-input:${waiter.attemptId}`;
+      const nativeTurnId = optionalId(message.uuid);
+      if (nativeTurnId === undefined) {
+        clearTimeout(waiter.timer);
+        this.#waiter = undefined;
+        waiter.reject(new ProviderDeliveryUnknownError(
+          "Claude replayed input without a native message identity.",
+          waiter.attemptId
+        ));
+        return;
+      }
       this.#activeTurnId = nativeTurnId;
       clearTimeout(waiter.timer);
       this.#waiter = undefined;

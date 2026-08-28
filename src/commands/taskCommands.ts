@@ -125,6 +125,11 @@ import {
   verifyDeltaRecheckDiff,
   type DeltaRecheckPreflight
 } from "../review/deltaRecheck.js";
+import { isAcceptedTaskReviewBaseline } from "../review/reviewAcceptance.js";
+import {
+  projectReviewerAvailability,
+  type ReviewerBusy
+} from "../review/reviewerAvailability.js";
 import {
   buildTaskFinalReviewFindingContext,
   dispositionReviewFinding,
@@ -348,11 +353,6 @@ export class TaskFinalReviewDispatchDriftError extends CliError {
 }
 
 /** Process-local command metadata; symbols never enter JSON output or durable state. */
-export const RESUMED_PENDING_FINAL_REVIEW = Symbol("resumed-pending-final-review");
-export const TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW = Symbol(
-  "terminalized-leader-before-final-review"
-);
-
 function taskFinalReviewDispatchDrift(error: unknown): TaskFinalReviewDispatchDriftError {
   return new TaskFinalReviewDispatchDriftError(
     error instanceof Error ? error.message : String(error),
@@ -504,7 +504,7 @@ export type TaskCommandOptions = Readonly<{
   taskFinalReviewContract?: TaskFinalReviewContract;
   /** Verified under the release handover lock by the exact global Operator CLI. */
   taskFinalReviewRebindProof?: TaskFinalReviewContractRebindProof;
-  /** Physical Task-main heads verified by the CLI immediately before mutation. */
+  /** Physical Task-main heads verified by the CLI immediately before command execution. */
   actualTaskReviewCandidate?: TaskReviewCandidate;
   /** Issue 07: CLI-verified delta-recheck assessment for `task review request --delta-recheck`. */
   deltaRecheckPreflight?: DeltaRecheckPreflight;
@@ -520,6 +520,9 @@ export type TaskCompletionPreflight = Readonly<{
   activeTaskReview: boolean;
   taskFinalReviewContract?: TaskFinalReviewContract;
 }>;
+
+/** Normal scheduling result when a Reviewer slot is temporarily occupied. */
+export type ReviewRequestBusy = ReviewerBusy;
 
 export function parseTaskCompletionRequest(
   args: string[],
@@ -663,8 +666,16 @@ export function runTaskCommand(
     case "update": return output(updateTaskCommand(rest, store, options));
     case "list": return listTaskCommand(rest, store);
     case "show": return showTaskCommand(rest, store);
-    case "context": return runTaskContextCommand(rest, store);
-    case "next-action": return runTaskNextActionCommand(rest, store);
+    case "context": return runTaskContextCommand(
+      rest,
+      store,
+      options.actualTaskReviewCandidate ?? null
+    );
+    case "next-action": return runTaskNextActionCommand(
+      rest,
+      store,
+      options.actualTaskReviewCandidate ?? null
+    );
     case "activate": return output(activateTaskCommand(rest, store, options));
     case "complete": return completeTaskCommand(rest, store, options);
     case "reopen": return output(reopenTaskCommand(rest, store, options));
@@ -1312,7 +1323,6 @@ function completeTaskCommand(
     // actor-dependent and stays here; every other blocker is re-validated by
     // the post-Review readiness fence below.
 
-    let terminalizedLeaderRun = false;
     const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
     if (leaderEntry !== undefined) {
       if (actor !== "leader") {
@@ -1337,18 +1347,12 @@ function completeTaskCommand(
           `Task Leader Run changed during completion: ${leaderEntry.run.id}/${terminal.reason}.`
         );
       }
-      terminalizedLeaderRun = true;
     }
 
     // A final (Task-scoped) review is the Task delivery policy: it reviews the
     // complete frozen Task heads, not a single WorkItem Candidate. If the
     // review config requests a final review, create the Task ReviewRound here
     // and return it for dispatch instead of completing the Task.
-    const pendingFinalReviewIds = new Set(tx.listReviewRounds(task.id)
-      .filter((round) => (
-        (round.scope ?? "work-item") === "task" && round.status === "pending"
-      ))
-      .map(({ id }) => id));
     const finalReview = prepareFinalTaskReview(
       tx,
       task,
@@ -1363,8 +1367,6 @@ function completeTaskCommand(
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
         completionAdvisories: [] as CompletionAdvisory[],
         finalReview,
-        resumedPendingFinalReview: pendingFinalReviewIds.has(finalReview.id),
-        terminalizedLeaderRun,
         publishedTreeAuthorization: undefined
       } as const;
     }
@@ -1435,8 +1437,6 @@ function completeTaskCommand(
       runtimeCleanupTargets,
       completionAdvisories: readiness.advisories,
       finalReview: undefined,
-      resumedPendingFinalReview: false,
-      terminalizedLeaderRun,
       publishedTreeAuthorization: undefined
     } as const;
   });
@@ -1468,9 +1468,7 @@ function completeTaskCommand(
       : `Final Task Review is blocked: ${result.finalReview.summary ?? result.finalReview.id}.`;
     return output(`${status}\n`, {
       task: result.task,
-      reviewRound: result.finalReview,
-      [RESUMED_PENDING_FINAL_REVIEW]: result.resumedPendingFinalReview,
-      [TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW]: result.terminalizedLeaderRun
+      reviewRound: result.finalReview
     });
   }
   const completionOutput = result.changed
@@ -4726,14 +4724,6 @@ function requestTaskReviewRound(
     }
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
     if (deltaRecheckRequested) {
-      const reviewConfig = tx.getReviewConfig();
-      if (reviewConfig === null || reviewConfig.deltaRecheck !== "enabled") {
-        throw usageError(
-          "Delta-recheck is not enabled for this Project's review policy. "
-          + "Set `yui config workflow set review --role <role> --trigger final --delta-recheck enabled` "
-          + "or request a full Review."
-        );
-      }
       if (taskFinalContract !== undefined) {
         throw usageError("Delta-recheck is not supported with a Task-final review contract.");
       }
@@ -4749,22 +4739,33 @@ function requestTaskReviewRound(
     }
     const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id))
       .filter((entry) => (entry.scope ?? "work-item") === "task");
+    const latestNonAcceptingDelta = deltaRecheckRequested
+      ? undefined
+      : taskRounds.filter((entry) => (
+          entry.reviewerRoleName === reviewerRoleName
+          && entry.deltaRecheck !== undefined
+          && deltaRecheckBlocksAcceptance(entry)
+          && isSameTaskReviewCandidate(entry.taskCandidate, provenance.candidate)
+        )).at(-1);
     const exact = taskRounds.filter((entry) => (
       entry.reviewerRoleName === reviewerRoleName
+      && (deltaRecheckRequested
+        ? entry.deltaRecheck !== undefined
+        : entry.deltaRecheck === undefined)
       && (taskFinalContract === undefined || sameTaskFinalReviewContract(
         entry.taskFinalReviewContract,
         taskFinalContract
       ))
       && isSameTaskReviewCandidate(entry.taskCandidate, provenance.candidate)
     )).at(-1);
+    if (exact?.status === "failed") {
+      throw usageError(
+        `Explicit Task-final ReviewRound ${exact.id} is failed for this exact candidate; resolve it before requesting again.`
+      );
+    }
     if (exact !== undefined
-      && (deltaRecheckRequested || !deltaRecheckBlocksAcceptance(exact))) {
-      if (exact.status === "failed") {
-        throw usageError(
-          `Explicit Task-final ReviewRound ${exact.id} is failed for this exact candidate; resolve it before requesting again.`
-        );
-      }
-      assertNoConflictingTaskReviewRound(taskRounds, exact.id);
+      && (exact.status === "pending" || exact.status === "running")) {
+      assertNoConflictingTaskReviewRound(taskRounds, exact.id, reviewerRoleName);
       if (requestedLaneRoles.length === 0) {
         if (exact.status === "running"
           && exact.executionGroup?.resolution === undefined
@@ -4797,9 +4798,10 @@ function requestTaskReviewRound(
       )).length > strategy.max) {
         throw usageError(`Reviewer Lane count exceeds adaptive capacity ${strategy.max}.`);
       }
-      let appended = exact.executionGroup;
       for (const laneRoleName of laneRoles) {
-        const existingLane = appended.lanes.find(({ roleName }) => roleName === laneRoleName);
+        const existingLane = exact.executionGroup.lanes.find(({ roleName }) => (
+          roleName === laneRoleName
+        ));
         if (existingLane !== undefined) {
           if (existingLane.runId === undefined) continue;
           if (existingLane.status !== "running") continue;
@@ -4815,30 +4817,29 @@ function requestTaskReviewRound(
           if (taskReviewProducerCollision(provenance, laneRoleName) !== null) {
             throw usageError(`Reviewer Role must be separate from the Candidate producer: ${laneRoleName}.`);
           }
-          assertTaskReviewRequestLane(tx, task.id, laneRoleName);
-          let laneRole = tx.getRole(task.id, laneRoleName);
-          if (laneRole === null) {
-            laneRole = createTaskRole(tx, task, laneRoleName, undefined, now, laneRoleName);
-            tx.saveRole(task.id, laneRole);
-          }
-          appended = addExecutionLane(appended, {
-            roleName: laneRole.name,
-            reviewRoundId: exact.id
-          }, now);
+          const availability = projectReviewerAvailability(tx, task.id, laneRoleName);
+          if (availability.kind === "busy") return availability;
         }
+      }
+      let appended = exact.executionGroup;
+      for (const laneRoleName of laneRoles) {
+        if (appended.lanes.some(({ roleName }) => roleName === laneRoleName)) continue;
+        let laneRole = tx.getRole(task.id, laneRoleName);
+        if (laneRole === null) {
+          laneRole = createTaskRole(tx, task, laneRoleName, undefined, now, laneRoleName);
+          tx.saveRole(task.id, laneRole);
+        }
+        appended = addExecutionLane(appended, {
+          roleName: laneRole.name,
+          reviewRoundId: exact.id
+        }, now);
       }
       const updated = updateReviewExecutionGroup(exact, appended);
       tx.saveReviewRound(task.id, updated);
       return updated;
     }
-    assertNoConflictingTaskReviewRound(taskRounds);
-    assertTaskReviewRequestLane(tx, task.id, reviewerRoleName);
-
-    let reviewer = tx.getRole(task.id, reviewerRoleName);
-    if (reviewer === null) {
-      reviewer = createTaskRole(tx, task, reviewerRoleName, undefined, now, reviewerRoleName);
-      tx.saveRole(task.id, reviewer);
-    }
+    const primaryAvailability = projectReviewerAvailability(tx, task.id, reviewerRoleName);
+    if (primaryAvailability.kind === "busy") return primaryAvailability;
     const laneRoles = requestedLaneRoles.length === 0
       ? [reviewerRoleName]
       : requestedLaneRoles[0] === reviewerRoleName
@@ -4857,15 +4858,23 @@ function requestTaskReviewRound(
       if (tx.getGlobalRole(laneRoleName) === null && tx.getRole(task.id, laneRoleName) === null) {
         throw usageError(`Global Role not found: ${laneRoleName}.`);
       }
-      let laneRole = tx.getRole(task.id, laneRoleName);
-      if (laneRole === null) {
-        laneRole = createTaskRole(tx, task, laneRoleName, undefined, now, laneRoleName);
-        tx.saveRole(task.id, laneRole);
+      const availability = projectReviewerAvailability(tx, task.id, laneRoleName);
+      if (availability.kind === "busy") return availability;
+      if (taskReviewProducerCollision(provenance, laneRoleName) !== null) {
+        throw usageError(`Reviewer Role must be separate from the Candidate producer: ${laneRoleName}.`);
       }
-      if (taskReviewProducerCollision(provenance, laneRole.name) !== null) {
-        throw usageError(`Reviewer Role must be separate from the Candidate producer: ${laneRole.name}.`);
+    }
+    for (const laneRoleName of laneRoles) {
+      if (tx.getRole(task.id, laneRoleName) === null) {
+        tx.saveRole(task.id, createTaskRole(
+          tx,
+          task,
+          laneRoleName,
+          undefined,
+          now,
+          laneRoleName
+        ));
       }
-      assertTaskReviewRequestLane(tx, task.id, laneRole.name);
     }
     let deltaRecord: DeltaRecheckPreflight["record"] | undefined;
     if (deltaRecheckRequested) {
@@ -4875,7 +4884,6 @@ function requestTaskReviewRound(
       deltaRecord = validateDeltaRecheckRequest(
         tx,
         task.id,
-        reviewerRoleName,
         provenance.candidate,
         options.deltaRecheckPreflight
       );
@@ -4918,15 +4926,14 @@ function requestTaskReviewRound(
     tx.saveReviewRound(task.id, created);
     // Issue 07: when a full Review is created after a non-accepting delta
     // disposition, record the escalation lineage on the delta Round.
-    if (exact !== undefined
-      && deltaRecheckBlocksAcceptance(exact)
+    if (latestNonAcceptingDelta !== undefined
       && created.deltaRecheck === undefined
-      && exact.deltaRecheck !== undefined
-      && exact.deltaRecheck.escalatedToReviewRoundId === undefined) {
+      && latestNonAcceptingDelta.deltaRecheck !== undefined
+      && latestNonAcceptingDelta.deltaRecheck.escalatedToReviewRoundId === undefined) {
       tx.saveReviewRound(task.id, {
-        ...exact,
+        ...latestNonAcceptingDelta,
         deltaRecheck: {
-          ...exact.deltaRecheck,
+          ...latestNonAcceptingDelta.deltaRecheck,
           escalatedToReviewRoundId: created.id
         }
       });
@@ -4946,13 +4953,25 @@ function requestTaskReviewRound(
     }, now);
     return created;
   });
+  if ("kind" in round && round.kind === "busy") {
+    return output(
+      `Reviewer ${round.reviewerRoleName} is busy (${round.phase}`
+        + `${round.activeRunId === undefined ? "" : `; Run ${round.activeRunId}`}); `
+        + `${round.activeReviewRoundId === undefined
+          ? ""
+          : `active ReviewRound ${round.activeReviewRoundId}; `}`
+        + `retry after ${round.retryAfterSeconds}s or choose another Reviewer.\n`,
+      { reviewRequest: round }
+    );
+  }
+  const requestedRound = round as ReviewRound;
   return output(
-    round.status === "pending"
-      ? round.deltaRecheck === undefined
-        ? `Task-final Review requested as ${round.id}\n`
-        : `Task-final delta-recheck requested as ${round.id} (rechecks ${round.deltaRecheck.previousReviewRoundId})\n`
-      : `Task-final Review is already ${round.status}: ${round.id}\n`,
-    { reviewRound: round }
+    requestedRound.status === "pending"
+      ? requestedRound.deltaRecheck === undefined
+        ? `Task-final Review requested as ${requestedRound.id}\n`
+        : `Task-final delta-recheck requested as ${requestedRound.id} (rechecks ${requestedRound.deltaRecheck.previousReviewRoundId})\n`
+      : `Task-final Review is already ${requestedRound.status}: ${requestedRound.id}\n`,
+    { reviewRound: requestedRound }
   );
 }
 
@@ -5060,14 +5079,16 @@ function forceFreshTaskReviewRound(
     if (sourceIndex < 0) {
       throw dataError(`Final ReviewRound is not in Task history: ${source.id}.`);
     }
-    const laterRound = taskRounds.slice(sourceIndex + 1).at(-1);
+    const laterRound = taskRounds.slice(sourceIndex + 1).find((entry) => (
+      entry.reviewerRoleName === source.reviewerRoleName
+    ));
     if (laterRound !== undefined) {
       throw usageError(
         `A newer Task-final ReviewRound already exists after ${source.id}: `
         + `${laterRound.id}/${laterRound.status}.`
       );
     }
-    assertNoConflictingTaskReviewRound(taskRounds, source.id);
+    assertNoConflictingTaskReviewRound(taskRounds, source.id, source.reviewerRoleName);
     assertTaskReviewRequestLane(tx, task.id, source.reviewerRoleName);
 
     let reviewer = tx.getRole(task.id, source.reviewerRoleName);
@@ -5172,7 +5193,6 @@ export function classifyForceFreshReviewRecovery(
 function validateDeltaRecheckRequest(
   store: TaskWorkflowStore,
   taskId: string,
-  reviewerRoleName: string,
   candidate: TaskReviewCandidate,
   preflight: DeltaRecheckPreflight | undefined
 ): DeltaRecheckPreflight["record"] {
@@ -5184,17 +5204,10 @@ function validateDeltaRecheckRequest(
   }
   const previous = store.getReviewRound(taskId, preflight.record.previousReviewRoundId);
   if (previous === null
-    || (previous.scope ?? "work-item") !== "task"
-    || !isSemanticReviewRound(previous, store)) {
+    || !isAcceptedTaskReviewBaseline(store, previous)) {
     throw usageError(
-      `Delta-recheck previous ReviewRound is not a semantic completed Task-final Review: `
+      `Delta-recheck previous ReviewRound is not an accepted Task-final baseline: `
       + `${preflight.record.previousReviewRoundId}.`
-    );
-  }
-  if (previous.reviewerRoleName !== reviewerRoleName) {
-    throw usageError(
-      `Delta-recheck Reviewer Role must match the previous acceptance: `
-      + `${previous.reviewerRoleName}.`
     );
   }
   if (previous.reviewBaseCommit !== preflight.record.previousBaseCommit) {
@@ -5207,7 +5220,7 @@ function validateDeltaRecheckRequest(
     && previous.deltaRecheck.disposition !== "equivalent-and-accepted") {
     throw usageError(
       `Delta-recheck cannot extend ${previous.id}: its disposition is `
-      + `${previous.deltaRecheck.disposition}. Resolve it with a full Review first.`
+      + `${previous.deltaRecheck.disposition}. The Leader must choose the next Review action.`
     );
   }
   if (candidate.projects[0]!.commit === preflight.record.previousBaseCommit) {
@@ -5350,14 +5363,16 @@ function retryFailedTaskReviewRound(
     }
     // Issue 06: infra retries reuse the same semantic Round ID. Any later
     // Round supersedes this one; an active Round for the same Reviewer blocks.
-    const conflictingLater = reviewerRounds.slice(roundIndex + 1).at(-1);
+    const conflictingLater = reviewerRounds.slice(roundIndex + 1).find((entry) => (
+      entry.reviewerRoleName === round.reviewerRoleName
+    ));
     if (conflictingLater !== undefined) {
       throw usageError(
         `A newer conflicting final ReviewRound already exists after ${round.id}: `
         + `${conflictingLater.id}/${conflictingLater.status}.`
       );
     }
-    assertNoConflictingTaskReviewRound(reviewerRounds, round.id);
+    assertNoConflictingTaskReviewRound(reviewerRounds, round.id, round.reviewerRoleName);
     const activeRound = reviewerRounds.find((entry) => (
       entry.id !== round.id
       && entry.reviewerRoleName === round.reviewerRoleName
@@ -5690,7 +5705,9 @@ function settleStaleFinalReviewRun(
       );
     }
     const activeReviewerRun = tx.listAgentRuns(task.id).find((entry) => (
-      entry.purpose === "review" && entry.status === "active"
+      entry.purpose === "review"
+      && entry.roleName === round.reviewerRoleName
+      && entry.status === "active"
     ));
     const activeRoleRun = tx.getActiveAgentRun(task.id, round.reviewerRoleName);
     if (activeReviewerRun !== undefined || activeRoleRun !== null) {
@@ -5706,7 +5723,9 @@ function settleStaleFinalReviewRun(
     if (roundIndex < 0) {
       throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
     }
-    const laterRound = taskRounds.slice(roundIndex + 1).at(-1);
+    const laterRound = taskRounds.slice(roundIndex + 1).find((entry) => (
+      entry.reviewerRoleName === round.reviewerRoleName
+    ));
     if (laterRound !== undefined) {
       throw usageError(
         `A later final ReviewRound already exists: ${laterRound.id}/${laterRound.status}.`
@@ -6303,13 +6322,13 @@ function isSameTaskReviewCandidate(
 }
 
 /**
- * A Task can have at most one live Task-final ReviewRound. An exact existing
- * Round may be reused by an idempotent caller; every other pending/running
- * Round is a conflicting lane regardless of its Reviewer Role.
+ * One Reviewer Role has one live Task-final Review lane. Different Reviewer
+ * Roles own independent Session/Workspace slots and may review concurrently.
  */
 function assertNoConflictingTaskReviewRound(
   rounds: readonly ReviewRound[],
-  reusableRoundIds: string | readonly string[] = []
+  reusableRoundIds: string | readonly string[] = [],
+  reviewerRoleName?: string
 ): void {
   const reusable = new Set(
     typeof reusableRoundIds === "string" ? [reusableRoundIds] : reusableRoundIds
@@ -6318,6 +6337,7 @@ function assertNoConflictingTaskReviewRound(
     !reusable.has(entry.id)
     && (entry.scope ?? "work-item") === "task"
     && (entry.status === "pending" || entry.status === "running")
+    && (reviewerRoleName === undefined || entry.reviewerRoleName === reviewerRoleName)
   ));
   if (conflicting !== undefined) {
     throw usageError(
@@ -6327,9 +6347,9 @@ function assertNoConflictingTaskReviewRound(
 }
 
 /**
- * Queues a Task-scoped final ReviewRound. The reviewer Role must be separate
- * from the Candidate producer. Returns the round (pending or failed) so the
- * caller can surface it to the CLI for workspace preparation and dispatch.
+ * Queues a Task-scoped final ReviewRound only after the Reviewer lane passes
+ * its mechanical preflight. Busy or unavailable preparation never becomes a
+ * failed semantic ReviewRound.
  */
 function queueTaskReviewRound(
   store: TaskWorkflowStore,
@@ -6341,10 +6361,30 @@ function queueTaskReviewRound(
   requestedBy: ReviewRequestSource = "policy",
   taskFinalContract?: TaskFinalReviewContract
 ): ReviewRound {
-  assertNoConflictingTaskReviewRound(store.listReviewRounds(task.id));
   const provenance = taskReviewProvenance(store, task, options, taskCandidate);
   if (!isSameTaskReviewCandidate(provenance.candidate, taskCandidate)) {
     throw usageError(`Task-final ReviewRound frozen Task heads changed before queueing.`);
+  }
+  const producerCollision = taskReviewProducerCollision(provenance, config.roleName);
+  if (producerCollision !== null) {
+    throw usageError(producerCollision);
+  }
+  const availability = projectReviewerAvailability(store, task.id, config.roleName);
+  if (availability.kind === "busy") {
+    throw usageError(
+      `Reviewer ${config.roleName} is busy (${availability.phase}`
+        + `${availability.activeRunId === undefined ? "" : `; Run ${availability.activeRunId}`}); `
+        + `retry after ${availability.retryAfterSeconds}s.`
+    );
+  }
+  let reviewer = store.getRole(task.id, config.roleName);
+  if (reviewer === null) {
+    const globalRole = store.getGlobalRole(config.roleName);
+    if (globalRole === null) {
+      throw usageError(`Global Role not found: ${config.roleName}.`);
+    }
+    reviewer = createTaskRole(store, task, config.roleName, undefined, now, config.roleName);
+    store.saveRole(task.id, reviewer);
   }
   const pending = createTaskReviewRound(
     store.nextReviewRoundId(task.id),
@@ -6356,43 +6396,6 @@ function queueTaskReviewRound(
     taskFinalContract
   );
   store.saveReviewRound(task.id, pending);
-  const producerCollision = taskReviewProducerCollision(provenance, config.roleName);
-  if (producerCollision !== null) {
-    const failed = finishReviewRound(
-      pending,
-      "failed",
-      producerCollision,
-      now
-    );
-    store.saveReviewRound(task.id, failed);
-    return failed;
-  }
-  let reviewer = store.getRole(task.id, config.roleName);
-  if (reviewer === null) {
-    const globalRole = store.getGlobalRole(config.roleName);
-    if (globalRole === null) {
-      const failed = finishReviewRound(
-        pending,
-        "failed",
-        `Global Role not found: ${config.roleName}.`,
-        now
-      );
-      store.saveReviewRound(task.id, failed);
-      return failed;
-    }
-    reviewer = createTaskRole(store, task, config.roleName, undefined, now, config.roleName);
-    store.saveRole(task.id, reviewer);
-  }
-  if (store.getActiveAgentRun(task.id, reviewer.name) !== null) {
-    const failed = finishReviewRound(
-      pending,
-      "failed",
-      `Reviewer Role already has an active run: ${reviewer.name}.`,
-      now
-    );
-    store.saveReviewRound(task.id, failed);
-    return failed;
-  }
   return pending;
 }
 
@@ -6447,41 +6450,10 @@ function prepareFinalTaskReview(
     // review evidence. Do not create duplicate rounds on repeated completion
     // attempts. A failed round remains a blocker until the Leader changes the
     // candidate or otherwise resolves the failed evidence explicitly.
-    // Issue 07: a completed delta-recheck that did not accept the head is not
-    // final evidence.  A `requires-full-review` disposition escalates to a new
-    // full Review; a `finding` disposition stays a blocker for the Leader.
-    if (latest.status === "completed"
-      && latest.deltaRecheck !== undefined
-      && latest.deltaRecheck.disposition === "requires-full-review") {
-      // Fall through to queue a full Review for the same candidate.
-      const escalated = queueTaskReviewRound(
-        store,
-        task,
-        config,
-        taskCandidate,
-        options,
-        now,
-        establishedRound?.requestedBy ?? "policy",
-        taskFinalContract
-      );
-      // Record the escalation lineage on the delta Round so the full Review
-      // is traceable from the non-accepting delta disposition.
-      if (latest.deltaRecheck.escalatedToReviewRoundId === undefined) {
-        store.saveReviewRound(task.id, {
-          ...latest,
-          deltaRecheck: {
-            ...latest.deltaRecheck,
-            escalatedToReviewRoundId: escalated.id
-          }
-        });
-      }
-      return escalated;
-    } else {
-      return latest.status === "completed"
-        && classifyReviewRoundOutcome(latest, store)?.kind === "semantic"
-        ? null
-        : latest;
-    }
+    // A non-accepting delta is durable evidence for the Leader, not an
+    // instruction for Core to manufacture a full Review. Completion remains
+    // blocked until the Leader explicitly chooses and obtains valid evidence.
+    return isAcceptedTaskReviewBaseline(store, latest) ? null : latest;
   }
 
   return queueTaskReviewRound(
@@ -6527,7 +6499,11 @@ function resumablePendingFinalTaskReview(
       `Final ReviewRound ${round.id} freezes a candidate that is no longer the current Task candidate.`
     );
   }
-  assertNoConflictingTaskReviewRound(store.listReviewRounds(task.id), round.id);
+  assertNoConflictingTaskReviewRound(
+    store.listReviewRounds(task.id),
+    round.id,
+    round.reviewerRoleName
+  );
   const reviewer = store.getRole(task.id, round.reviewerRoleName);
   if (reviewer === null || reviewer.name !== round.reviewerRoleName) {
     throw usageError(`Pending final ReviewRound Reviewer identity changed: ${round.id}.`);
@@ -6674,7 +6650,9 @@ function retryFailedReviewRun(
     if (roundIndex < 0) {
       throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
     }
-    const laterRound = taskRounds.slice(roundIndex + 1).at(-1);
+    const laterRound = taskRounds.slice(roundIndex + 1).find((entry) => (
+      entry.reviewerRoleName === retryReviewerRoleName
+    ));
     if (laterRound !== undefined && !isSameTaskReviewCandidate(
       laterRound.taskCandidate,
       round.taskCandidate!
@@ -6688,7 +6666,11 @@ function retryFailedReviewRun(
         entry.reviewerRoleName === retryReviewerRoleName
       ))
     );
-    assertNoConflictingTaskReviewRound(tx.listReviewRounds(task.id), round.id);
+    assertNoConflictingTaskReviewRound(
+      tx.listReviewRounds(task.id),
+      round.id,
+      retryReviewerRoleName
+    );
     const activeRound = allReviewerRounds.find((entry) => (
       entry.id !== round.id
       && (entry.status === "pending" || entry.status === "running")
@@ -7858,10 +7840,16 @@ export function dispatchPreparedReviewRound(
       throw usageError(message);
     }
     if (taskScope) {
+      const requestedReviewers = new Set(
+        round.executionGroup?.lanes.map(({ roleName }) => roleName)
+          ?? [round.reviewerRoleName]
+      );
       const conflicting = tx.listReviewRounds(task.id).find((entry) => (
         entry.id !== round.id
         && (entry.scope ?? "work-item") === "task"
         && (entry.status === "pending" || entry.status === "running")
+        && (entry.executionGroup?.lanes.some(({ roleName }) => requestedReviewers.has(roleName))
+          ?? requestedReviewers.has(entry.reviewerRoleName))
         && !(entry.status === "running"
           && entry.reviewerRunId !== undefined
           && tx.getAgentRun(task.id, entry.reviewerRunId)?.status === "failed")
@@ -7915,9 +7903,9 @@ export function dispatchPreparedReviewRound(
     let deltaContext = "";
     if (taskScope && round.deltaRecheck !== undefined) {
       const previousRound = tx.getReviewRound(taskId, round.deltaRecheck.previousReviewRoundId);
-      if (previousRound === null || !isSemanticReviewRound(previousRound, tx)) {
+      if (previousRound === null || !isAcceptedTaskReviewBaseline(tx, previousRound)) {
         throw new TaskFinalReviewDispatchDriftError(
-          `Delta-recheck previous semantic ReviewRound is unavailable: ${round.deltaRecheck.previousReviewRoundId}.`
+          `Delta-recheck accepted baseline is unavailable: ${round.deltaRecheck.previousReviewRoundId}.`
         );
       }
       const diffByProject = options.deltaRecheckDiff;
@@ -7967,9 +7955,9 @@ export function dispatchPreparedReviewRound(
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
       "Keep Yui Core lifecycle safety, generic Reviewer behavior, Project Policy/Knowledge, and the Task Contract separate. Follow Project Policy pointers from the dispatch context for project-specific checks.",
       ...(round.scope === "task" && round.deltaRecheck === undefined
-        ? ["This is the one final Task Review: inspect every bound Project at the frozen Task heads, and report only reachable, material, actionable P1/P2 findings or bounded verification gaps."]
+        ? ["This is a full Task Review: inspect every bound Project at the frozen Task heads, and report only reachable, material, actionable P1/P2 findings or bounded verification gaps."]
         : []),
-      "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this ReviewRound-owned workspace.",
+      "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this stable Reviewer workspace at the exact ReviewRound snapshot.",
       "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or the real Yui control-plane home.",
       "Use the exact --summary-file - body to report complete findings, evidence, checks actually run, uncertainty, and recommended next actions in clear Markdown or JSON. Yui preserves the full report; no fixed wording or field list is required. If you include evidenceCommit, it must match the managed Review workspace.",
       "Report reviewBaseCommit, exact checks/results, material findings, and uncertainty. Review yield completes only this Round and creates no Candidate or ChangeSet.",
@@ -8193,7 +8181,13 @@ export function failPendingReviewRound(
     if (round.status !== "pending") return round;
     const terminal = finishReviewRound(round, "failed", summary, now);
     tx.saveReviewRound(taskId, terminal);
+    const event = recordTaskEventRecord(tx, taskId, "review.failed-to-start", {
+      reviewRoundId: terminal.id,
+      reviewerRoleName: terminal.reviewerRoleName,
+      reason: summary
+    }, now);
     enqueueWork(tx, leaderMailbox(taskId), "review-failed", now, [
+      eventRef(taskId, event.id),
       ...(round.workItemId === undefined ? [] : [workItemRef(taskId, round.workItemId)])
     ]);
     return terminal;

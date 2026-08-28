@@ -161,7 +161,9 @@ function hasUnclaimedLeaderWork(
   taskId: string,
   leaderMailbox: ReturnType<SchedulerStorePort["getWorkMailbox"]>
 ): boolean {
-  if (leaderMailbox === null) return store.getPendingWakeup(taskId) !== null;
-  return leaderMailbox?.processing === null
-    && leaderMailbox.pending !== null;
+  if (store.getPendingWakeup(taskId) !== null) return true;
+  if (leaderMailbox === null) return false;
+  return leaderMailbox.processing === null
+    && (leaderMailbox.pending.normal !== null
+      || leaderMailbox.pending.userCorrection !== null);
 }

@@ -102,6 +102,8 @@ const PUBLICATION_REFERENCE_FROM_VERSION = 0;
 const PUBLICATION_REFERENCE_TO_VERSION = 1;
 const CONFIG_FROM_VERSION = 1;
 const CONFIG_TO_VERSION = 2;
+const CONFIG_REVIEW_CONTROLS_FROM_VERSION = 2;
+const CONFIG_REVIEW_CONTROLS_TO_VERSION = 3;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -152,6 +154,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     })
     .registerOfflineMigration(projectOwnershipStep())
     .registerOfflineMigration(configV2Step())
+    .registerOfflineMigration(configReviewControlsRemovalStep())
     .registerCompatible(projectKnowledgeProposalsStep())
     .registerCompatible(projectLifecycleStep())
     .registerOfflineMigration(taskWorkspaceIdentityStep())
@@ -319,6 +322,77 @@ function migrateConfigV1ToV2(snapshot: HomeSnapshot): HomeSnapshot {
           ? {}
           : { providerRetryMaxWindowSeconds }),
         ...(telemetryEnabled === undefined ? {} : { telemetryEnabled })
+      }
+    }
+  };
+}
+
+/** Removes retired Core controls for the Leader-owned Delta decision. */
+function configReviewControlsRemovalStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "config",
+    fromVersion: CONFIG_REVIEW_CONTROLS_FROM_VERSION,
+    toVersion: CONFIG_REVIEW_CONTROLS_TO_VERSION,
+    preconditions: requireConfigV2,
+    transform: migrateConfigV2ToV3,
+    declaredEffects: []
+  };
+}
+
+function requireConfigV2(snapshot: HomeSnapshot): void {
+  const versions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (versions.config !== CONFIG_REVIEW_CONTROLS_FROM_VERSION) {
+    throw new Error(
+      `Record config migration requires manifest version ${CONFIG_REVIEW_CONTROLS_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const config = asObject(snapshot.state.config, "Yui config");
+  if (config.schemaVersion !== CONFIG_REVIEW_CONTROLS_FROM_VERSION) {
+    throw new Error(
+      `Yui config must use schemaVersion ${CONFIG_REVIEW_CONTROLS_FROM_VERSION} before migration.`
+    );
+  }
+}
+
+function migrateConfigV2ToV3(snapshot: HomeSnapshot): HomeSnapshot {
+  requireConfigV2(snapshot);
+  const versions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...versions, config: CONFIG_REVIEW_CONTROLS_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const config = asObject(snapshot.state.config, "Yui config");
+  const review = config.review === undefined
+    ? undefined
+    : asObject(config.review, "Yui review config");
+  const migratedReview = review === undefined
+    ? undefined
+    : (() => {
+        const {
+          deltaRecheck: _retiredSwitch,
+          deltaRecheckMaxChangedLines: _retiredLineThreshold,
+          deltaRecheckMaxChangedFiles: _retiredFileThreshold,
+          ...retained
+        } = review;
+        return retained;
+      })();
+  return {
+    schemaManifest,
+    state: {
+      ...snapshot.state,
+      config: {
+        ...config,
+        schemaVersion: CONFIG_REVIEW_CONTROLS_TO_VERSION,
+        ...(migratedReview === undefined ? {} : { review: migratedReview })
       }
     }
   };

@@ -2,6 +2,7 @@ import type { TaskEvent } from "../event/taskEvent.js";
 import type { TaskMessage } from "../message/message.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { Task } from "../task/task.js";
+import type { ReviewRound } from "../review/reviewRound.js";
 import { renderWakeReason } from "../scheduler/wakeReason.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 
@@ -9,10 +10,11 @@ import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
  * Issue 04 (context token budget) — long-term design:
  *
  * A Leader wake is a NOTIFICATION, not a context dump. The wake envelope
- * carries only what the Agent cannot reconstruct from durable records:
- * the wake id, the aggregated reason tags, and the delta window. The Agent
- * reads the delta content on demand with `yui task wake show <wake-id>` and
- * the full projection with `yui task context <task>`.
+ * carries only what the Agent needs for immediate orientation: the wake id,
+ * aggregated reason tags, delta window, and a bounded list of active frozen
+ * Task Reviews. The Agent reads delta content on demand with
+ * `yui task wake show <wake-id>` and the full projection with
+ * `yui task context <task>`.
  *
  * The envelope is mode-agnostic: fresh generations and resumed generations
  * receive the same minimal text. The native Session is a disposable cache of
@@ -45,12 +47,13 @@ export type WakeEnvelope = Readonly<{
   text: string;
 }>;
 
-/** Narrow read surface — the envelope only needs orientation + delta counts. */
+/** Narrow read surface — the envelope only needs orientation, active Reviews and delta counts. */
 export type WakeEnvelopeReader = Readonly<{
   getTask(taskId: string): Task | null;
   listEvents(taskId: string): readonly TaskEvent[];
   listMessages(taskId: string): readonly TaskMessage[];
   listAgentRuns(taskId: string): readonly AgentRun[];
+  listReviewRounds(taskId: string): readonly ReviewRound[];
 }>;
 
 export function buildTaskWakeEnvelope(
@@ -73,12 +76,30 @@ export function buildTaskWakeEnvelope(
     runs: operationalTaskRecords(reader.listAgentRuns(request.taskId), events, "agent-run")
       .filter((record) => Date.parse(record.createdAt) > fromTime).length
   };
+  const activeReviews = reader.listReviewRounds(request.taskId).filter((round) => (
+    (round.scope ?? "work-item") === "task"
+    && (round.status === "pending" || round.status === "running")
+  ));
+  const reviewOrientation = activeReviews.slice(0, 3).map((round) => {
+    const projects = round.taskCandidate?.projects ?? [];
+    const heads = projects.slice(0, 2).map(({ projectId, commit }) => (
+      `${projectId}@${commit.slice(0, 12)}`
+    )).join("+");
+    return `${round.id}/${round.reviewerRoleName}`
+      + `/${round.deltaRecheck === undefined ? "full" : "delta"}`
+      + `[${round.status}]`
+      + `@${heads || round.reviewBaseCommit.slice(0, 12)}`
+      + `${projects.length > 2 ? `+${projects.length - 2}` : ""}`;
+  }).join(", ");
 
   const lines: string[] = [
     `Wake: ${request.wakeId} — delta since ${request.fromCursor}`,
     `  Reasons: ${renderReasons(request.reasons)}`,
     `  Changed: ${counts.events} events, ${counts.messages} messages, ${counts.runs} runs`
       + ` → yui task wake show ${request.taskId} ${request.wakeId}`,
+    `  Active Task Reviews: ${activeReviews.length === 0
+      ? "none"
+      : `${reviewOrientation}${activeReviews.length > 3 ? `, … (+${activeReviews.length - 3})` : ""}`}`,
     `Full context: yui task context ${request.taskId}`
   ];
 

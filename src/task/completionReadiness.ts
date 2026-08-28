@@ -17,6 +17,7 @@ import {
   reviewFindingLedgerWriteFailedFromEvents
 } from "../review/reviewFindingLedger.js";
 import { resolveRecordedTaskFinalReviewContract } from "../review/taskFinalReviewContractRebind.js";
+import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { ProviderContinuation } from "../runtime/providerContinuation.js";
 import { blockingProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
@@ -143,12 +144,13 @@ export function projectCompletionReadiness(
   const advisories: CompletionAdvisory[] = [];
   const { task } = facts;
   const findingsGate = options.findingsGate ?? true;
-  const taskFinalReviewRequired = resolveRecordedTaskFinalReviewContract(
+  const taskFinalReviewContract = resolveRecordedTaskFinalReviewContract(
     task.id,
     facts.workItems,
     facts.reviewRounds,
     facts.taskFinalReviewContractEvents
-  ) !== undefined;
+  )?.effective;
+  const taskFinalReviewRequired = taskFinalReviewContract !== undefined;
 
   // A pending/running Task-final Review must be resumed or blocked first.
   for (const round of facts.reviewRounds) {
@@ -170,11 +172,16 @@ export function projectCompletionReadiness(
   // accepted delta) supersedes them instead of blocking completion forever.
   const latestCompletedTaskReview = facts.reviewRounds
     .filter((round) => (
-      (round.scope ?? "work-item") === "task" && isSemanticReviewRound(round, {
-        listAgentRuns: () => facts.agentRuns,
-        listReviewFindings: () => facts.reviewFindings,
-        listEvents: () => facts.events
-      })
+      (round.scope ?? "work-item") === "task"
+      && (taskFinalReviewContract === undefined || sameTaskFinalReviewContract(
+        round.taskFinalReviewContract,
+        taskFinalReviewContract
+      ))
+      && isSemanticReviewRound(round, {
+          listAgentRuns: () => facts.agentRuns,
+          listReviewFindings: () => facts.reviewFindings,
+          listEvents: () => facts.events
+        })
     ))
     .slice()
     .sort((left, right) => (

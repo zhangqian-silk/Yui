@@ -167,7 +167,7 @@ Sections:
   non-semantic Reviews, finding yield, Integration attempts/failures/repeated
   identities/evidence reuse, generations before first durable progress,
   publication-to-completion latency, terminal workspaces, and non-blocking
-  budget advisories. `--since`/`--until` filters every underlying record family.
+  cost advisories. `--since`/`--until` filters every underlying record family.
 - **storage** — state.json/runtime/deployments byte sizes.
 - **topLongRunning** — longest-running active/yielded runs with exact refs.
 
@@ -175,13 +175,17 @@ Each section degrades independently: a read failure produces an `error` section
 with the error location, without blocking completed sections.
 
 `yui task next-action <task>` shows the same Task-scoped orchestration
-advisories alongside its protocol recommendation. Advisories are derived from
-existing records and never write state or block a legal action. Current
+advisories alongside its protocol recommendation. It also shows the canonical
+active AgentRun projection with each Run's purpose and WorkItem/ReviewRound
+binding, so Review activity is never presented as delegated implementation.
+Advisories are derived from existing records and never write state or block a
+legal action. Current
 advisories cover direct-path protocol overhead, initial integrated WorkItem
 fan-out, unexplained review-repair fan-out, repeated exact Integration checks,
-full-Review budget exhaustion without new findings, and the two-generation
-first-progress advisory threshold. The threshold never blocks a generation or
-changes Provider retry policy.
+same-Reviewer/same-candidate full Review repetition without new findings, and
+the two-generation first-progress advisory threshold. No Review advisory is a
+budget or blocks a legal action; the first-progress threshold never changes
+Provider retry policy.
 
 ## Rollout
 

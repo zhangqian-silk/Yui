@@ -227,7 +227,7 @@ export function renderExecutionAudit(
             `Delta-rechecks: ${reviews.deltaRechecks.total} total · `
               + `${reviews.deltaRechecks.equivalentAndAccepted} accepted · `
               + `${reviews.deltaRechecks.finding} finding · `
-              + `${reviews.deltaRechecks.requiresFullReview} escalated to full Review`
+              + `${reviews.deltaRechecks.requiresFullReview} requiring Leader decision`
           ])
     );
   } else {

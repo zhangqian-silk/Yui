@@ -117,7 +117,7 @@ export function classifyReviewRoundOutcome(
       };
 }
 
-/** True only when a Round may consume semantic Review budget or feed findings. */
+/** True only when a Round contains semantic Reviewer evidence. */
 export function isSemanticReviewRound(
   round: ReviewRound,
   evidence?: ReviewOutcomeEvidenceStore

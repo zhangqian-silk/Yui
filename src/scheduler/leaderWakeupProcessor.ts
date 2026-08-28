@@ -8,7 +8,7 @@ import { prefixYuiTitleInput } from "../run/runIdentity.js";
 import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import {
   effectiveLaunchSnapshotsCompatible,
-  effectiveLaunchSnapshotsCompatibleForTaskMain
+  effectiveLaunchSnapshotsCompatibleForTaskSession
 } from "../executor/effectiveLaunch.js";
 import {
   hasRuntimeLifecycleWork,
@@ -155,10 +155,9 @@ export async function processLeaderWakeups(
       const compatibleSession = existingSession !== null
         && (reopening
           ? effectiveLaunchSnapshotsCompatible(existingSession.effective, role.effective)
-          : effectiveLaunchSnapshotsCompatibleForTaskMain(
+          : effectiveLaunchSnapshotsCompatibleForTaskSession(
               existingSession.effective,
-              role.effective,
-              role.managedWorkspace
+              role.effective
             ));
       const reopenIdentityDrift = reopening
         && hasNativeSession(existingSession)
@@ -631,10 +630,9 @@ function validateReadySession(
     throw new Error(`Ready session belongs to another Agent: ${session.agentId}.`);
   }
   const compatible = mode === "resume"
-    ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+    ? effectiveLaunchSnapshotsCompatibleForTaskSession(
         session.effective,
-        effective,
-        role.managedWorkspace
+        effective
       )
     : effectiveLaunchSnapshotsCompatible(session.effective, effective);
   if (!compatible) {

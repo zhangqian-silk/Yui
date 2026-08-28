@@ -58,7 +58,7 @@ import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import {
   effectiveLaunchWithTaskMainWorkspace,
   effectiveLaunchSnapshotsCompatible,
-  effectiveLaunchSnapshotsCompatibleForTaskMain,
+  effectiveLaunchSnapshotsCompatibleForTaskSession,
   resolveEffectiveLaunch,
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
@@ -334,6 +334,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           launchId: input.fence.launchId,
           nativeSessionId: input.fence.nativeSessionId!,
           turnId: input.fence.nativeTurnId!,
+          attemptId: input.fence.receiptId,
           runId: input.fence.runId,
           summary: input.payload.summary ?? "Agent turn completed without a workflow outcome."
         };
@@ -372,6 +373,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             launchId: input.fence.launchId,
             nativeSessionId: input.fence.nativeSessionId!,
             turnId: input.fence.nativeTurnId!,
+            attemptId: input.fence.receiptId,
             runId: input.fence.runId,
             summary: input.payload.summary ?? `Provider Turn failed: ${failureEvidence.code}.`,
             providerStatus: "failed"
@@ -2747,6 +2749,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     launchId?: string;
     nativeSessionId: string;
     turnId: string;
+    attemptId?: string;
     runId?: string;
     summary: string;
     providerStatus?: "completed" | "failed" | "cancelled";
@@ -2768,6 +2771,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input.agentId,
           now
         );
+      const canonicalTurnId = canonicalStructuredProviderTurnId(
+        sessions,
+        input.turnId,
+        input.attemptId
+      );
       const existing = sessions.sessions[input.agentId];
       const owner = {
         scope: "task" as const,
@@ -2799,7 +2807,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         throw new Error("Runtime turn completion does not match the effective launch identity.");
       }
       if (effectiveExisting !== undefined
-        && hasRecentTurnId(effectiveExisting.recentCompletedTurnIds, input.turnId)) {
+        && hasRecentTurnId(effectiveExisting.recentCompletedTurnIds, canonicalTurnId)) {
         return { session: effectiveExisting, duplicate: true };
       }
       if (sessions.inFlight === null
@@ -2846,7 +2854,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }, now);
       sessions = settleStructuredProviderTurn(
         sessions,
-        input.turnId,
+        canonicalTurnId,
         input.providerStatus ?? "completed",
         now
       );
@@ -2855,7 +2863,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           sessions,
           input.agentId,
           input.nativeSessionId,
-          input.turnId,
+          canonicalTurnId,
           now
         );
         store.saveTaskRoleSessionSet(sessions);
@@ -2884,7 +2892,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       sessions = recordTaskRoleTurnBoundary(sessions, {
         agentId: input.agentId,
         nativeSessionId: input.nativeSessionId,
-        turnId: input.turnId
+        turnId: canonicalTurnId
       }, now);
       store.saveTaskRoleSessionSet(sessions);
       completeRuntimeHookReservation(store, owner, input.launchId);
@@ -4956,10 +4964,9 @@ function recordTaskRuntimeNativeSession(
   const effective = input.effective === undefined
     ? resolvedEffective
     : validateEffectiveLaunchSnapshot(input.effective);
-  if (!effectiveLaunchSnapshotsCompatibleForTaskMain(
+  if (!effectiveLaunchSnapshotsCompatibleForTaskSession(
     resolvedEffective,
-    effective,
-    store.getTaskWorkspace(input.taskId)
+    effective
   )) {
     throw new Error("Reserved native Session effective launch changed before persistence.");
   }
@@ -5134,11 +5141,9 @@ function taskSessionEffective(
       );
     }
     if (existing !== undefined) {
-      const workspace = active.workspace ?? store.getTaskWorkspace(taskId);
-      if (!effectiveLaunchSnapshotsCompatibleForTaskMain(
+      if (!effectiveLaunchSnapshotsCompatibleForTaskSession(
         existing.effective,
-        active.effective,
-        workspace
+        active.effective
       )) {
         throw new Error(
           `Native Session effective launch does not match the active Run: ${taskId}/${roleName}.`
@@ -5495,7 +5500,6 @@ function recordStructuredProviderAcceptance(
   const turnId = input.fence.nativeTurnId;
   if (current === null || attemptId === undefined || turnId === undefined) return sessions;
   if (current.turn?.attemptId === attemptId
-    && current.turn.turnId === turnId
     && ["accepted", "running", "completed", "failed", "cancelled"].includes(
       current.turn.status
     )) return sessions;
@@ -5505,6 +5509,25 @@ function recordStructuredProviderAcceptance(
     acceptedAt: input.observedAt ?? input.receivedAt
   });
   return updateTaskRoleProviderRuntime(sessions, binding, now);
+}
+
+/**
+ * A Provider may expose the same accepted input through more than one exact
+ * observation surface. Preserve the first native Turn identity bound to the
+ * durable attempt; a later transport alias may settle that same attempt but
+ * must neither replace nor strand the canonical identity.
+ */
+function canonicalStructuredProviderTurnId(
+  sessions: TaskRoleSessionSet,
+  observedTurnId: string,
+  attemptId: string | undefined
+): string {
+  const turn = sessions.providerBinding?.turn;
+  return attemptId !== undefined
+    && turn?.attemptId === attemptId
+    && turn.turnId !== undefined
+    ? turn.turnId
+    : observedTurnId;
 }
 
 function bindOrSupersedeProviderRuntime(

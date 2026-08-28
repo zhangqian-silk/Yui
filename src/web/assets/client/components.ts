@@ -114,9 +114,9 @@ export function executionBand(projection, t, locale) {
   head.append(pill(t, "exec.status", projection.status));
   head.append(node("span", "exec-band-owner",
     t("exec.owner." + projection.owner) + " · " + t("exec.action." + projection.action)));
-  if (projection.activeExecutorCount > 0) {
+  if (projection.activeRuns && projection.activeRuns.length > 0) {
     head.append(node("span", "exec-band-executors",
-      projection.activeExecutorCount + " " + t("exec.executors")));
+      projection.activeRuns.length + " " + t("exec.executors")));
   }
   if (projection.monitoring === "stopped") {
     head.append(node("span", "exec-band-stopped", t("exec.monitoring.stopped")));

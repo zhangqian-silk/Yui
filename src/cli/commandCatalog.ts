@@ -139,8 +139,7 @@ function durableConfigDomainNode(domain: ConfigDomain): NodeInput {
   const values = CONFIG_KEY_VALUES.filter(({ name }) => keys.includes(name));
   const options = domain === "workflow"
     ? [
-        "--soft-tokens", "--hard-tokens", "--role", "--trigger", "--finding-ledger",
-        "--delta-recheck", "--delta-recheck-max-lines", "--delta-recheck-max-files"
+        "--soft-tokens", "--hard-tokens", "--role", "--trigger", "--finding-ledger"
       ]
     : domain === "runtime"
       ? ["--quiet-after-seconds", "--diagnostic-after-seconds", "--stall-after-seconds"]
@@ -166,8 +165,7 @@ function durableConfigDomainNode(domain: ConfigDomain): NodeInput {
         optionValues: domain === "workflow"
           ? {
               "--trigger": ["always", "leader", "final"],
-              "--finding-ledger": ["shadow", "enforce"],
-              "--delta-recheck": ["enabled", "disabled"]
+              "--finding-ledger": ["shadow", "enforce"]
             }
           : {}
       },

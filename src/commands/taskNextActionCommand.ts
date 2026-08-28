@@ -19,8 +19,22 @@ import {
   type OrchestrationAdvisory
 } from "../observability/orchestrationMetrics.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
-import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
+import {
+  buildTaskExecutionProjection,
+  type TaskExecutionProjection,
+  type TaskExecutionRun
+} from "../scheduler/taskExecutionProjection.js";
 import { projectExecutionLaneRunRecoveries } from "../run/recoveryProjection.js";
+import {
+  projectReviewDecision,
+  type ReviewDecisionProjection
+} from "../review/reviewDecision.js";
+import type { TaskReviewCandidate } from "../review/reviewRound.js";
+
+type NextActionExecutionView = Readonly<Pick<
+  TaskExecutionProjection,
+  "status" | "owner" | "action" | "reason" | "summary" | "activeRuns"
+>>;
 
 /**
  * Issue 07 (Leader convergence): read-only `yui task next-action <task>`.
@@ -36,7 +50,8 @@ import { projectExecutionLaneRunRecoveries } from "../run/recoveryProjection.js"
  */
 export function runTaskNextActionCommand(
   args: string[],
-  store: TaskStore
+  store: TaskStore,
+  currentTaskReviewCandidate: TaskReviewCandidate | null = null
 ): { kind: "output"; output: string; data?: unknown } {
   const usage = "Task next-action usage: yui task next-action <task> [--json].";
   const positionals = args.filter((arg) => arg !== "--json");
@@ -57,6 +72,7 @@ export function runTaskNextActionCommand(
     if (execution === null) throw taskNotFound(taskId);
     const actionFacts: NextActionFacts = {
       ...facts,
+      currentTaskReviewCandidate,
       executionGroups: execution.executionGroups,
       runRecoveries: projectExecutionLaneRunRecoveries(
         reader,
@@ -88,13 +104,29 @@ export function runTaskNextActionCommand(
       completionReadiness = projectCompletionReadiness(readinessFacts);
     }
     const events = reader.listEvents(taskId);
+    const task = reader.getTask(taskId)!;
+    const operationalRuns = operationalTaskRecords(
+      reader.listAgentRuns(taskId),
+      events,
+      "agent-run"
+    );
+    const reviewRounds = reader.listReviewRounds(taskId);
+    const reviewDecision = projectReviewDecision({
+      store: reader,
+      task,
+      roles: reader.listRoles(taskId),
+      runs: operationalRuns,
+      rounds: reviewRounds,
+      reviewConfig: reader.getReviewConfig(),
+      currentCandidate: currentTaskReviewCandidate
+    });
     const orchestration = projectTaskOrchestration({
-      task: reader.getTask(taskId)!,
-      runs: operationalTaskRecords(reader.listAgentRuns(taskId), events, "agent-run"),
+      task,
+      runs: operationalRuns,
       roleSessionSets: reader.listRoleSessionSets(taskId),
       workItems: reader.listWorkItems(taskId),
       changeSets: reader.listChangeSets(taskId),
-      reviewRounds: reader.listReviewRounds(taskId),
+      reviewRounds,
       reviewFindings: reader.listReviewFindings(taskId),
       integrations: reader.listIntegrationAttempts(taskId),
       durableJobs: reader.listDurableJobs(taskId),
@@ -109,6 +141,8 @@ export function runTaskNextActionCommand(
       repairWave,
       completionReadiness,
       knowledgeProposals,
+      reviewDecision,
+      execution: nextActionExecutionView(execution),
       orchestration
     };
   });
@@ -127,6 +161,8 @@ export function runTaskNextActionCommand(
       data.repairWave,
       data.completionReadiness,
       data.knowledgeProposals,
+      data.reviewDecision,
+      data.execution,
       data.orchestration.advisories
     ),
     data
@@ -158,6 +194,8 @@ function renderNextAction(
     title: string;
     sourceTaskId: string;
   }[],
+  reviewDecision: ReviewDecisionProjection,
+  execution: NextActionExecutionView,
   orchestrationAdvisories: readonly OrchestrationAdvisory[]
 ): string {
   const lines = [
@@ -165,6 +203,11 @@ function renderNextAction(
     `Type: ${taskType ?? "unspecified"}`,
     `Next action: ${action.kind}`,
     `Reason: ${action.reason}`,
+    `Execution view: ${execution.status}; owner/action=${execution.owner}/${execution.action}; reason=${execution.reason}; ${execution.summary}`,
+    `Active AgentRuns (${execution.activeRuns.length}):`,
+    ...(execution.activeRuns.length === 0
+      ? ["  none"]
+      : execution.activeRuns.map((run) => `  ${renderActiveRun(run)}`)),
     ...(action.refs.length === 0
       ? ["Refs: none"]
       : ["Refs:", ...action.refs.map((ref) => `  ${ref.kind}: ${ref.id}`)]),
@@ -181,6 +224,20 @@ function renderNextAction(
     ...(action.judgmentRequired === undefined
       ? []
       : [`Judgment: ${action.judgmentRequired}`]),
+    `Review state: active=${reviewDecision.activeReviews.length}; reviewers=${reviewDecision.reviewers
+      .map(({ reviewerRoleName, status }) => `${reviewerRoleName}:${status}`).join(", ") || "none"}`,
+    ...(reviewDecision.activeReviews.length === 0
+      ? []
+      : [
+          "Frozen Reviews: " + reviewDecision.activeReviews.map((review) => (
+            `${review.reviewRoundId}/${review.reviewerRoleName}`
+              + `[${review.status}; current=${review.candidateRelation}; `
+              + `${review.frozenCandidate?.projects.map(({ projectId, commit }) => (
+                `${projectId}@${commit.slice(0, 12)}`
+              )).join(", ") ?? "heads-unavailable"}]`
+          )).join("; ")
+        ]),
+    `Delta support: ${reviewDecision.delta.technicalAvailability}; ${reviewDecision.delta.reason}`,
     ...(action.alternatives === undefined || action.alternatives.length === 0
       ? []
       : [
@@ -245,4 +302,31 @@ function renderNextAction(
     );
   }
   return `${lines.join("\n")}\n`;
+}
+
+function renderActiveRun(run: TaskExecutionRun): string {
+  const subject = run.reviewRoundId === undefined
+    ? run.workItemId === undefined ? "task" : `work-item=${run.workItemId}`
+    : `review-round=${run.reviewRoundId}`;
+  const lane = run.executionGroupId === undefined
+    ? ""
+    : `; group=${run.executionGroupId}${
+      run.executionLaneId === undefined ? "" : `; lane=${run.executionLaneId}`
+    }`;
+  return `${run.id} [${run.purpose}/${run.status}; role=${run.roleName}; ${
+    run.delivered ? "accepted" : "delivery-pending"
+  }; ${subject}${lane}]`;
+}
+
+function nextActionExecutionView(
+  execution: TaskExecutionProjection
+): NextActionExecutionView {
+  return {
+    status: execution.status,
+    owner: execution.owner,
+    action: execution.action,
+    reason: execution.reason,
+    summary: execution.summary,
+    activeRuns: execution.activeRuns
+  };
 }

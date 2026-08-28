@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type { Decision } from "../decision/decision.js";
 import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { TaskEvent } from "../event/taskEvent.js";
@@ -18,7 +20,7 @@ export type OrchestrationAdvisoryCode =
   | "bugfix-workitem-overhead"
   | "review-repair-fanout"
   | "repeated-integration-check"
-  | "review-budget-exhausted"
+  | "repeated-full-review"
   | "provider-first-progress-advisory";
 
 export type OrchestrationAdvisory = Readonly<{
@@ -229,10 +231,17 @@ function projectAdvisories(
   const recent = semanticFull.slice(-3);
   const recentIds = new Set(recent.map(({ id }) => id));
   const newFinding = facts.reviewFindings.some(({ firstReviewRoundId }) => recentIds.has(firstReviewRoundId));
-  if (semanticFull.length > 2 && !newFinding) {
+  const sameCandidate = recent.length === 3
+    && recent.every((round) => isDeepStrictEqual(
+      round.taskCandidate,
+      recent[0]!.taskCandidate
+    ));
+  const sameReviewer = recent.length === 3
+    && recent.every((round) => round.reviewerRoleName === recent[0]!.reviewerRoleName);
+  if (sameCandidate && sameReviewer && !newFinding) {
     result.push({
-      code: "review-budget-exhausted",
-      reason: `${semanticFull.length} full semantic Reviews ran and the latest three produced no new finding; stop repeating full rounds without a changed head or new risk.`,
+      code: "repeated-full-review",
+      reason: `The same Reviewer completed three full semantic Reviews of the same frozen candidate without a new finding; this is a cost advisory, not a Review limit.`,
       refs: recent.map(({ id }) => `review-round:${id}`)
     });
   }

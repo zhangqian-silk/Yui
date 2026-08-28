@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import type { InputRequest } from "../input/inputRequest.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
@@ -9,10 +10,8 @@ import {
   governingChangeSets
 } from "../integration/deliveryObligation.js";
 import type { AgentRun } from "../run/agentRun.js";
-import {
-  deltaRecheckBlocksAcceptance,
-  type ReviewRound
-} from "../review/reviewRound.js";
+import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
+import { isAcceptedTaskReviewBaselineFromEvidence } from "../review/reviewAcceptance.js";
 import {
   classifyReviewRoundOutcome,
   isSemanticReviewRound,
@@ -35,6 +34,7 @@ import {
 } from "../execution/resourceBroker.js";
 import type { RunRecoveryProjection } from "../run/recoveryProjection.js";
 import {
+  sameTaskFinalReviewContract,
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
 import {
@@ -143,6 +143,8 @@ export type NextActionFacts = Readonly<{
   executionGroups?: readonly ExecutionGroupHealthSummary[];
   /** Exact live-Run recovery plans for Lane actions that use `task run recover`. */
   runRecoveries?: readonly RunRecoveryProjection[];
+  /** CLI-verified physical Task heads; null means no durable candidate is currently available. */
+  currentTaskReviewCandidate?: TaskReviewCandidate | null;
 }>;
 
 const OPEN_WORK_ITEM_STATUSES = new Set(["pending", "running", "awaiting_acceptance"]);
@@ -383,14 +385,18 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     });
   }
 
-  const activeWorkers = facts.activeRuns.filter((run) => run.roleName !== "leader");
-  if (activeWorkers.length > 0) {
+  // AgentRun purpose owns routing. Review Runs remain attached to their exact
+  // ReviewRound branches below instead of being mistaken for Worker delivery.
+  const activeDelegatedExecutions = facts.activeRuns.filter((run) => (
+    run.purpose === "execution" && run.roleName !== "leader"
+  ));
+  if (activeDelegatedExecutions.length > 0) {
     return buildAction(facts, {
       kind: "wait-for-owned-execution",
-      reason: `${activeWorkers.length} delegated Run(s) are active; wait for their delivery.`,
-      refs: activeWorkers.map((run) => ref("agent-run", run.id)),
-      preconditions: activeWorkers.map((run) => (
-        { fact: `Delegated Run ${run.id} is active`, satisfied: true, ref: ref("agent-run", run.id) }
+      reason: `${activeDelegatedExecutions.length} delegated execution Run(s) are active; wait for their delivery.`,
+      refs: activeDelegatedExecutions.map((run) => ref("agent-run", run.id)),
+      preconditions: activeDelegatedExecutions.map((run) => (
+        { fact: `Execution Run ${run.id} is active`, satisfied: true, ref: ref("agent-run", run.id) }
       ))
     });
   }
@@ -553,7 +559,8 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   }
 
   const finalReviewRequired = taskFinalReviewRequired(facts);
-  const failedFinal = latestTaskFinalReview(facts.reviewRounds);
+  const finalReviewContract = taskFinalReviewContract(facts);
+  const failedFinal = latestTaskFinalReview(facts.reviewRounds, finalReviewContract);
   const failedFinalOutcome = failedFinal === undefined
     ? null
     : classifyReviewRoundOutcome(failedFinal, nextActionReviewOutcomeEvidence(facts));
@@ -584,8 +591,37 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   if (finalReviewRequired
     && failedFinal !== undefined
     && failedFinalOutcome?.kind === "semantic"
+    && failedFinal.deltaRecheck?.disposition === "requires-full-review") {
+    return buildAction(facts, {
+      kind: "request-final-review",
+      reason: `Delta Recheck ${failedFinal.id} could not establish equivalence; Yui recorded the result and left the next Review action to the Leader.`,
+      refs: [ref("review-round", failedFinal.id)],
+      preconditions: [
+        { fact: "Current frozen head has accepting final Review evidence", satisfied: false }
+      ],
+      alternatives: [
+        {
+          kind: "request-full-review",
+          reason: "Request a full Review when independent evidence is still required.",
+          recommendedCommand:
+            `yui task review request ${task.id} --role ${failedFinal.reviewerRoleName}`,
+          refs: [ref("review-round", failedFinal.id)]
+        },
+        {
+          kind: "continue-leader-work",
+          reason: "Inspect directly, change the candidate, or choose another Reviewer as Task risk requires.",
+          refs: [ref("review-round", failedFinal.id)]
+        }
+      ],
+      judgmentRequired:
+        "Leader must choose full Review, another Reviewer, direct inspection, or more development; Core will not auto-escalate."
+    });
+  }
+  if (finalReviewRequired
+    && failedFinal !== undefined
+    && failedFinalOutcome?.kind === "semantic"
     && ((failedFinal.checks ?? []).some(({ outcome }) => outcome === "failed")
-      || deltaRecheckBlocksAcceptance(failedFinal))) {
+      || failedFinal.deltaRecheck?.disposition === "finding")) {
     return buildAction(facts, {
       kind: "route-review-findings",
       reason: `Task-final Review ${failedFinal.id} delivered semantic negative evidence; route its open findings into a repair wave on one frozen head.`,
@@ -597,7 +633,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     });
   }
 
-  const activeFinal = latestTaskFinalReview(facts.reviewRounds);
+  const activeFinal = latestTaskFinalReview(facts.reviewRounds, finalReviewContract);
   if (activeFinal !== undefined
     && (activeFinal.status === "pending" || activeFinal.status === "running")) {
     const reviewRef = ref("review-round", activeFinal.id);
@@ -644,12 +680,27 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       }
       return buildAction(facts, {
         kind: "wait-for-owned-execution",
-        reason: `Reviewer Run ${reviewRun.id} is executing Task-final Review ${activeFinal.id}.`,
+        reason: `Reviewer Run ${reviewRun.id} is executing frozen Task-final Review ${activeFinal.id}; this Review does not globally pause Leader decisions on newer facts.`,
         refs: [reviewRef, ref("agent-run", reviewRun.id)],
         preconditions: [
           { fact: "Task-final ReviewRound is running", satisfied: true, ref: reviewRef },
           { fact: "Reviewer Run is active", satisfied: true, ref: ref("agent-run", reviewRun.id) }
-        ]
+        ],
+        alternatives: [
+          {
+            kind: "continue-leader-work",
+            reason: "Process new user input or advance a later candidate while preserving this frozen Review.",
+            refs: [reviewRef]
+          },
+          {
+            kind: "request-another-reviewer",
+            reason: "Use another available Reviewer slot when an independent view adds value.",
+            recommendedCommand: `yui task review request ${task.id} --role <other-reviewer-role>`,
+            refs: [reviewRef]
+          }
+        ],
+        judgmentRequired:
+          "Leader decides whether the current facts justify waiting, continuing development, direct review, or another Reviewer."
       });
     }
     if (activeFinal.reviewerRunId !== undefined) {
@@ -701,11 +752,16 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
 
   const finalReviewOptional = !finalReviewRequired
     && !hasValidFinalReview(facts);
-  const finalReviewAlternative = finalReviewOptional && facts.reviewConfig !== null
+  const unresolvedDelta = failedFinal?.deltaRecheck?.disposition === "requires-full-review";
+  const optionalReviewer = facts.reviewConfig?.roleName
+    ?? (unresolvedDelta ? failedFinal?.reviewerRoleName : undefined);
+  const finalReviewAlternative = finalReviewOptional && optionalReviewer !== undefined
     ? [{
         kind: "request-final-review",
-        reason: "Request an independent Task-final Review when the Leader wants extra assurance before completion.",
-        recommendedCommand: `yui task review request ${task.id} --role ${facts.reviewConfig.roleName}`,
+        reason: unresolvedDelta
+          ? `Delta Recheck ${failedFinal!.id} returned requires-full-review; request full independent evidence when the Leader judges it necessary.`
+          : "Request an independent Task-final Review when the Leader wants extra assurance before completion.",
+        recommendedCommand: `yui task review request ${task.id} --role ${optionalReviewer}`,
         refs: [ref("task", task.id)]
       }]
     : [];
@@ -736,7 +792,9 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       ? {}
       : {
           judgmentRequired:
-            "Leader must decide whether the frozen Task result is safe to complete or needs one optional Task-final Review."
+            unresolvedDelta
+              ? "Leader must route the non-accepting Delta result: full Review, another Reviewer, direct inspection, more development, or completion when policy permits."
+              : "Leader must decide whether the frozen Task result is safe to complete or needs one optional Task-final Review."
         }),
     recommendedCommand: `yui task complete ${task.id} --summary-file -`
   });
@@ -1278,10 +1336,19 @@ function latestFailedReviewFor(
     .find((round) => round.workItemId === workItemId && round.status === "failed");
 }
 
-function latestTaskFinalReview(rounds: readonly ReviewRound[]): ReviewRound | undefined {
+function latestTaskFinalReview(
+  rounds: readonly ReviewRound[],
+  contract?: TaskFinalReviewContract
+): ReviewRound | undefined {
   return [...rounds]
     .reverse()
-    .find((round) => (round.scope ?? "work-item") === "task");
+    .find((round) => (
+      (round.scope ?? "work-item") === "task"
+      && (contract === undefined || sameTaskFinalReviewContract(
+        round.taskFinalReviewContract,
+        contract
+      ))
+    ));
 }
 
 function needsChangeSetCapture(facts: NextActionFacts, item: WorkItem): boolean {
@@ -1300,11 +1367,24 @@ function needsChangeSetCapture(facts: NextActionFacts, item: WorkItem): boolean 
 }
 
 function hasValidFinalReview(facts: NextActionFacts): boolean {
-  const final = latestTaskFinalReview(facts.reviewRounds);
-  if (final === undefined
-    || !isSemanticReviewRound(final, nextActionReviewOutcomeEvidence(facts))) return false;
-  if ((final.checks ?? []).some(({ outcome }) => outcome === "failed")
-    || deltaRecheckBlocksAcceptance(final)) return false;
+  const contract = taskFinalReviewContract(facts);
+  const final = [...facts.reviewRounds]
+    .reverse()
+    .find((round) => (
+      (round.scope ?? "work-item") === "task"
+      && (contract === undefined || sameTaskFinalReviewContract(
+        round.taskFinalReviewContract,
+        contract
+      ))
+    ));
+  if (final === undefined || !isAcceptedTaskReviewBaselineFromEvidence(
+    final,
+    nextActionReviewOutcomeEvidence(facts)
+  )) return false;
+  if (facts.currentTaskReviewCandidate !== undefined) {
+    return facts.currentTaskReviewCandidate !== null
+      && isDeepStrictEqual(final.taskCandidate, facts.currentTaskReviewCandidate);
+  }
   const reviewedCommits = new Set(
     (final.taskCandidate?.projects ?? []).map((project) => project.commit)
   );

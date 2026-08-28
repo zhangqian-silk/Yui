@@ -18,12 +18,17 @@ reinterpret its scope:
   anchor.
 
 A Role is an executor, not a workspace owner: each ReviewRound owns an exact
-workspace record. Consecutive Task-final Rounds for the same Reviewer may
-reassign one clean physical workspace and continue the same compatible native
-Session. Treat the new Run Context Pack and frozen head as the authority even
-when the conversation continues; never reuse an earlier verdict. Review edits
-are confined to that workspace, never modify the
+workspace record. Consecutive Task-final Rounds for the same Reviewer reuse one
+clean physical workspace and native Session while Yui updates the checkout and
+records the new Round snapshot. Treat the new Run Context Pack and frozen head
+as the authority even when the conversation continues; never reuse an earlier
+verdict. Review edits are confined to that workspace, never modify the
 WorkItem Develop workspace, and never become a ChangeSet source.
+
+For a dispatched Review, the Run Context Pack identifies the ReviewRound,
+frozen Project commits, and assigned workspace. Inspect those exact commits.
+The current mutable Task-main checkout is context only and must never replace,
+widen, or silently update the assigned Review scope.
 
 ## Separate infrastructure failure from review judgment
 
@@ -44,9 +49,25 @@ binding fails before review begins:
 
 Yui derives `semantic`, `non-semantic`, or `ambiguous` from the immutable
 Round, Run receipt, completion Event, and finding evidence. Never write or
-simulate a classification field. A non-semantic attempt consumes no semantic
-Review budget and cannot satisfy acceptance; an ambiguous attempt requires
+simulate a classification field. A non-semantic attempt cannot satisfy
+acceptance; an ambiguous attempt requires
 Leader diagnosis before another review or repair decision.
+
+The Review scope remains the current Run's frozen candidate even if the Leader
+handles new user input or advances Task main while this Review is running. Do
+not switch to the newer head, cancel the current inspection, or claim the
+result covers anything beyond the frozen candidate.
+
+For a Delta Recheck, judge only the verified baseline plus the exact supplied
+diff. Return exactly one explicit disposition with reasoning:
+
+- `equivalent-and-accepted` when the new candidate preserves the accepted
+  semantics and evidence;
+- `finding` for a reachable material defect;
+- `requires-full-review` when equivalence cannot be established.
+
+Never create or request a follow-up Round yourself: `requires-full-review`, a
+finding, and every uncertainty return to the Leader for routing.
 
 Keep the context layers distinct. Yui Core owns ReviewRound identity,
 lifecycle, access, workspace, and exact-yield safety; this generic Skill owns

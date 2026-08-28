@@ -53,7 +53,7 @@ import {
 } from "./workspacePreflightClassification.js";
 import { activeLiveRoleAgentSession } from "./agentExecutor.js";
 import {
-  effectiveLaunchSnapshotsCompatibleForTaskMain,
+  effectiveLaunchSnapshotsCompatibleForTaskSession,
   effectiveLaunchSnapshotsCompatible,
   effectiveRoleForLaunch,
   resolveEffectiveLaunch,
@@ -349,10 +349,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const existing = sessionSet?.sessions[effective.agentId];
     const compatibleExisting = existing !== undefined
       && (input.mode === "resume"
-        ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+        ? effectiveLaunchSnapshotsCompatibleForTaskSession(
             existing.effective,
-            effective,
-            runWorkspace ?? workspace
+            effective
           )
         : effectiveLaunchSnapshotsCompatible(existing.effective, effective));
     if (input.mode === "resume" && !compatibleExisting) {
@@ -518,9 +517,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     };
     const managedRun = owner.scope === "task" && input.runId !== undefined
       ? this.store.getAgentRun(owner.taskId, input.runId)
-      : null;
-    const managedSessionSet = owner.scope === "task" && input.runId !== undefined
-      ? this.store.getTaskRoleSessionSet(owner.taskId, role.name)
       : null;
     const driver = builtinAgentDriverRegistry().require(
       builtinDriverIdForAdapter(configured.adapterId)
@@ -702,10 +698,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (owner.scope === "task" && (input.mode === "new" || input.mode === "resume")) {
       jobCallerKey = randomBytes(32).toString("hex");
     }
+    // Every managed launch for an unpushed Run owns that Run's first Provider
+    // write, whether it creates or resumes the native Conversation. Keeping
+    // resume on the same launch handshake prevents a durable AgentRun from
+    // existing without a corresponding Provider Turn.
     const carriesInitialTurn = managedControl
-      && managedRun?.pushedAt === undefined
-      && (managedSessionSet?.providerBinding === null
-        || managedSessionSet?.providerBinding === undefined);
+      && managedRun?.pushedAt === undefined;
     const providerAuthority = managedControl
       ? this.#providerAuthorityForLaunch(owner.taskId, role.name, input.launchId)
       : undefined;
