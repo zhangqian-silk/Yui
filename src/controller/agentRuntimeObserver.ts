@@ -121,13 +121,18 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           // proves the complete Session-generation history even when the
           // current Run resumed that Session, so preserve every occurrence and
           // anchor it at zero. A partial sample cannot prove the omitted request
-          // boundaries; retain only its latest total as a partial baseline.
+          // boundaries; retain its latest total as a partial baseline, plus the
+          // smallest ordered witness if the visible counter already rolled back.
           // Request snapshots already describe one complete occurrence and must
           // not be mixed with a synthetic cumulative fact.
           const usageOccurrences = usages.filter(hasUsageSnapshot);
           const latestOccurrence = usageOccurrences.at(-1);
           const completeHistory = latestOccurrence?.usage.semantics === "cumulative-session"
             && usages.every(({ observationQuality }) => observationQuality !== "partial");
+          const rollbackWitness = latestOccurrence?.usage.semantics === "cumulative-session"
+            && !completeHistory
+            ? cumulativeRollbackWitness(usageOccurrences)
+            : [];
           const baseline = latestOccurrence?.usage.semantics !== "cumulative-session"
             ? undefined
             : completeHistory
@@ -137,7 +142,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
                   outputTokens: 0
                 })
               : latestOccurrence.usage;
-          if (baseline !== undefined) {
+          if (baseline !== undefined && rollbackWitness.length === 0) {
             const baselineKey = completeHistory ? "zero" : latestOccurrence!.occurrenceId;
             const identity = completeHistory
               ? tokenObservationIdentity("baseline", fence, source.sourceId, baselineKey)
@@ -171,6 +176,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               : latestOccurrence!.resumeCheckpoint;
             if (!completeHistory) usages = [];
           }
+          if (rollbackWitness.length > 0) usages = rollbackWitness;
         }
         const health = JSON.stringify([sample.status, sample.detail ?? null]);
         if (state.health !== health) {
@@ -444,6 +450,29 @@ function hasUsageSnapshot(
   occurrence: AgentRuntimeUsageOccurrence
 ): occurrence is AgentRuntimeUsageOccurrence & { usage: RuntimeUsageSnapshot } {
   return occurrence.usage !== undefined;
+}
+
+function cumulativeRollbackWitness(
+  occurrences: readonly (AgentRuntimeUsageOccurrence & { usage: RuntimeUsageSnapshot })[]
+): readonly AgentRuntimeUsageOccurrence[] {
+  const cumulative = occurrences.filter(({ usage }) => (
+    usage.semantics === "cumulative-session"
+  ));
+  const latest = cumulative.at(-1);
+  for (let index = 1; index < cumulative.length; index += 1) {
+    const previous = cumulative[index - 1]!;
+    const current = cumulative[index]!;
+    if (current.usage.inputTokens >= previous.usage.inputTokens
+      && current.usage.outputTokens >= previous.usage.outputTokens) continue;
+    const witness = latest === current
+      ? [previous, current]
+      : [previous, current, latest!];
+    return Object.freeze(witness.map((occurrence) => Object.freeze({
+      ...occurrence,
+      observationQuality: "partial" as const
+    })));
+  }
+  return Object.freeze([]);
 }
 
 function numericCompare(left: string, right: string): number {
