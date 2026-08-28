@@ -204,11 +204,20 @@ async function sampleJsonl(
   const parsed = parse(lines, initial ? {} : previous?.state ?? {});
   const clippedBaseline = initial && start > 0;
   const discontinuousBaseline = clippedBaseline || reset || offlineReset;
+  // A verified checkpoint inside this bounded read proves continuity only for
+  // the occurrences that follow it. Everything earlier remains partial.
+  const recoveredCheckpointIndex = checkpointMatches && checkpoint !== undefined
+    ? parsed.usages.findIndex(({ occurrenceId }) => occurrenceId === checkpoint.occurrenceId)
+    : -1;
   const usages = discontinuousBaseline
-    ? parsed.usages.map((occurrence) => Object.freeze({
-        ...occurrence,
-        observationQuality: "partial" as const
-      }))
+    ? parsed.usages.map((occurrence, index) => (
+        recoveredCheckpointIndex >= 0 && index > recoveredCheckpointIndex
+          ? occurrence
+          : Object.freeze({
+              ...occurrence,
+              observationQuality: "partial" as const
+            })
+      ))
     : parsed.usages;
   const nextCursor = Object.freeze({
     offset: start + bytes.length,
