@@ -55,7 +55,6 @@ import type { CapabilityGrant } from "../../grant/capabilityGrant.js";
 import type { ReleaseWorkflow } from "../../release/releaseWorkflow.js";
 import type { PublicationReference } from "../../task/publicationReference.js";
 import type { LeaderFailure } from "../../scheduler/leaderFailure.js";
-import type { OperatorNotification } from "../../scheduler/operatorNotification.js";
 import type { TaskWake } from "../../scheduler/taskWake.js";
 import type { Task } from "../../task/task.js";
 import type { WorkItem } from "../../workItem/workItem.js";
@@ -524,9 +523,6 @@ export function populateSqliteFromState(
         }
         if (stored.leaderFailure !== null) {
           store.saveLeaderFailure(stored.leaderFailure as unknown as LeaderFailure);
-        }
-        if (stored.operatorNotification !== null) {
-          store.saveOperatorNotification(stored.operatorNotification as unknown as OperatorNotification);
         }
         // Per-task ID high-water marks.
         for (const [kind, highWater] of Object.entries(stored.idHighWaterMarks)) {
@@ -1054,7 +1050,7 @@ export function readStateFromSqlite(
       "SELECT task_id, payload, brief FROM task_records"
     ).all() as Array<{ task_id: string; payload: string; brief: string | null }>;
     for (const row of taskRows) {
-      tasks[row.task_id] = {
+      const aggregate: Record<string, unknown> = {
         schemaVersion: storedTaskVersion,
         task: JSON.parse(row.payload) as unknown,
         brief: row.brief === null ? null : (JSON.parse(row.brief) as unknown),
@@ -1078,12 +1074,13 @@ export function readStateFromSqlite(
         events: {},
         wakes: {},
         leaderFailure: null,
-        operatorNotification: null,
         idHighWaterMarks: {},
         capabilityGrants: {},
         releaseWorkflows: {},
         publicationReferences: {}
       };
+      if (storedTaskVersion <= 17) aggregate.operatorNotification = null;
+      tasks[row.task_id] = aggregate;
     }
 
     // Per-task record families, keyed by their state.json map keys.
@@ -1182,7 +1179,7 @@ export function readStateFromSqlite(
       const stored = requireTaskAggregate(tasks, row.task_id, row.kind);
       if (row.kind === "leader-failure") {
         stored.leaderFailure = JSON.parse(row.payload) as unknown;
-      } else {
+      } else if (storedTaskVersion <= 17) {
         stored.operatorNotification = JSON.parse(row.payload) as unknown;
       }
     }

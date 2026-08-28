@@ -5,6 +5,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
+import {
+  claimPending,
+  completeProcessing,
+  createWorkMailbox,
+  enqueueSignal,
+  releaseProcessing
+} from "../../dist/coordination/workMailbox.js";
+import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { createProject } from "../../dist/repository/project.js";
 import {
@@ -14,7 +22,11 @@ import {
   startReviewRound
 } from "../../dist/review/reviewRound.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
+import { createAsyncRuntimeObserver } from "../../dist/controller/runtimeEventProcessor.js";
+import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
+import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
 import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
+import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import {
   assertRegistryCoversBaselineToCurrent,
@@ -174,4 +186,114 @@ test("the built-in Agent Drivers are available through the shared registry", () 
   const drivers = builtinAgentDriverRegistry();
   assert.equal(drivers.requireByAdapterId("codex").id, "openai/codex");
   assert.equal(drivers.requireByAdapterId("claude").id, "anthropic/claude-code");
+});
+
+test("Operator batches durable refs and defers the whole batch while busy", async () => {
+  const now = new Date("2026-08-28T00:00:00.000Z");
+  const event = createTaskEvent(
+    "event-1",
+    "task-1",
+    "task.completed",
+    { by: "leader", summary: "Done." },
+    now
+  );
+  let mailbox = enqueueSignal(createWorkMailbox({ kind: "operator" }), {
+    reason: "task-terminal",
+    refs: [{ type: "event", taskId: event.taskId, id: event.id }],
+    occurredAt: now.toISOString()
+  });
+  let startedTurns = 0;
+  const store = {
+    getWorkMailbox: () => mailbox,
+    claimWorkMailbox: ({ batchId, owner, now: claimedAt }) => {
+      mailbox = claimPending(mailbox, { batchId, owner, startedAt: claimedAt.toISOString() });
+      return { status: "claimed", processing: mailbox.processing };
+    },
+    completeWorkMailbox: (_target, batchId) => {
+      mailbox = completeProcessing(mailbox, batchId);
+      return true;
+    },
+    releaseWorkMailbox: (_target, batchId) => {
+      mailbox = releaseProcessing(mailbox, batchId);
+      return true;
+    },
+    getInputRequest: () => null,
+    listEvents: () => [event],
+    getOperatorDeliveryTarget: () => ({ roleName: "operator", adapterId: "codex" }),
+    markOperatorTurnStarted: () => {
+      startedTurns += 1;
+    }
+  };
+  const delivered = [];
+  const result = await processOperatorInputNotifications(store, {
+    notifyOperatorInputOnce: async (input) => {
+      delivered.push(input);
+      return "sent";
+    }
+  }, undefined, now);
+
+  assert.equal(delivered.length, 1);
+  assert.match(delivered[0].text, /yui task event show task-1 event-1/u);
+  assert.equal(result[0].status, "sent");
+  assert.equal(startedTurns, 1);
+  assert.equal(mailbox.processing, null);
+  assert.equal(mailbox.pending.normal, null);
+
+  mailbox = enqueueSignal(mailbox, {
+    reason: "task-terminal",
+    refs: [{ type: "event", taskId: event.taskId, id: event.id }],
+    occurredAt: now.toISOString()
+  });
+  const deferred = await processOperatorInputNotifications(store, {
+    notifyOperatorInputOnce: async () => "not-ready"
+  }, undefined, now);
+  assert.equal(deferred[0].reason, "operator-not-ready");
+  assert.equal(startedTurns, 1);
+  assert.equal(mailbox.processing, null);
+  assert.notEqual(mailbox.pending.normal, null);
+});
+
+test("the async runtime observer preserves completion classification", async () => {
+  const calls = [];
+  const observer = createAsyncRuntimeObserver(async (method) => {
+    calls.push(method);
+    return method === "classifyGlobalRuntimeTurnCompleted" ? "apply" : "deferred";
+  });
+
+  assert.equal(await observer.classifyRuntimeTurnCompleted({}), "deferred");
+  assert.equal(await observer.classifyGlobalRuntimeTurnCompleted({}), "apply");
+  assert.deepEqual(calls, [
+    "classifyRuntimeTurnCompleted",
+    "classifyGlobalRuntimeTurnCompleted"
+  ]);
+});
+
+test("Claude global Stop hooks publish the native completion boundary", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-claude-global-hook-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  let signal;
+  await runRuntimeObservationHookCommand(JSON.stringify({
+    hook_event_name: "Stop",
+    session_id: "claude-session-1",
+    last_assistant_message: "Done."
+  }), {
+    YUI_SESSION_SCOPE: "global",
+    YUI_HOME: home,
+    YUI_DRIVER_ID: "anthropic/claude-code",
+    YUI_ADAPTER_ID: "claude",
+    YUI_ROLE: "operator",
+    YUI_AGENT_ID: "claude",
+    YUI_LAUNCH_ID: "launch-1",
+    YUI_NATIVE_SESSION_ID: "claude-session-1"
+  }, async (_home, _method, params) => {
+    signal = params;
+    return null;
+  }, new Date("2026-08-28T00:00:00.000Z"), { sequence: () => 1 });
+
+  const [event] = new FileRuntimeEventInbox(home).list();
+  assert.equal(event.type, "native-turn-completed");
+  assert.equal(event.scope, "global");
+  assert.equal(event.adapterId, "claude");
+  assert.equal(event.summary, "Done.");
+  assert.deepEqual(signal, { key: "global-role:operator" });
 });

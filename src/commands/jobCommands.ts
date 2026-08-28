@@ -86,18 +86,14 @@ function collectJobs(store: TaskStore): PresentedJob[] {
       });
     }
     const failure = store.getLeaderFailure(task.id);
-    const notification = store.getOperatorNotification(task.id);
-    const recoveryNotification = notification?.type === "leader-recovery-failed"
-      ? notification
-      : null;
-    if (failure !== null || recoveryNotification !== null) {
+    if (failure !== null) {
       jobs.push({
         id: `${RECOVERY_PREFIX}${task.id}`,
         taskId: task.id,
         kind: "leader-recovery",
         status: "failed",
-        detail: failure?.message ?? recoveryNotification?.message ?? "Leader recovery failed.",
-        updatedAt: failure?.lastFailedAt ?? recoveryNotification?.updatedAt ?? task.updatedAt
+        detail: failure.message,
+        updatedAt: failure.lastFailedAt
       });
     }
   }
@@ -126,14 +122,10 @@ function retryJob(
     if (task.status !== "active") {
       throw usageError(`Leader recovery can only be retried for an active Task: ${task.id}.`);
     }
-    if (
-      tx.getLeaderFailure(task.id) === null
-      && tx.getOperatorNotification(task.id)?.type !== "leader-recovery-failed"
-    ) {
+    if (tx.getLeaderFailure(task.id) === null) {
       throw usageError(`Job not found: ${id}.`);
     }
     tx.clearLeaderFailure(task.id);
-    tx.clearOperatorNotification(task.id);
     enqueueWork(
       tx,
       { kind: "role", taskId: task.id, roleName: "leader" },

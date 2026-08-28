@@ -331,7 +331,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(task_id, type, occurred_at);
 
--- Per-task scheduler projections (leaderFailure, operatorNotification).
+-- Per-task scheduler projections. operator-notification is a retired legacy
+-- kind retained only so old layout-7 Homes can be read by the upgrade path.
 CREATE TABLE IF NOT EXISTS task_projections (
   task_id    TEXT NOT NULL,
   kind       TEXT NOT NULL CHECK (kind IN ('leader-failure','operator-notification')),

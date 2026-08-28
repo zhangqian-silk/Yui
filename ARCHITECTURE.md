@@ -19,6 +19,16 @@ units. For a feature, the Leader judges whether the whole result is small
 enough to own in the same way or large enough to need independently owned
 delivery units.
 
+Operator updates have one durable path. Domain and runtime transitions first
+append an immutable TaskEvent; user-owned questions append an InputRequest.
+Only those record references enter the global Operator mailbox. The Controller
+batches pending references into one receipt-backed synthetic user message for
+the existing interactive Operator and defers the complete batch while that
+Operator is busy or unavailable. The message carries CLI read pointers rather
+than copied Task or Provider narrative. No lower layer calls the Operator, no
+mutable notification projection duplicates the event history, and no Goal or
+polling protocol is required to follow work.
+
 `WorkItem` means one substantial, independently acceptable requirement with a
 clear owner. Create multiple WorkItems only when multiple Workers can own and
 advance those requirements independently, normally in parallel. Internal

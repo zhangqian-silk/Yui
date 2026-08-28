@@ -484,7 +484,7 @@ yui task input request <task-id> --question "默认使用哪种格式？" \
 
 推荐项会明确展示给用户；如果截止时间前没有回答，独立的最近 deadline timer 会唤醒 Controller，原子采用这个确定选项，并排队恢复固定的 Leader session。自由文本和必须由用户回答的请求永远不会自动解决。
 
-`task input list` 是权威的全局开放输入 Inbox；可附加 Task ID 限定范围，或使用 `--all` 查看已回答和已取消的请求。Controller 还会尝试向已有且结构化状态为 ready 的 Operator process 投递一次带回执的提示；它不会为了通知而启动或打断 Operator。process 不可用或 pane fence 已变化时，请求仍保留在 Inbox，并在后续 Controller 定向处理中重新尝试。该路径不会读取或分类 Agent 终端文本。用户和 Operator 都可回答。存在开放请求时，无关的 pending wake 不会绕过等待，Task 也不能 complete 或 archive。原 Leader 也可执行 `yui task input cancel <task-id> <input-id> --reason "..."`，取消会排队恢复该固定 Leader session。
+`task input list` 是权威的全局开放输入 Inbox；可附加 Task ID 限定范围，或使用 `--all` 查看已回答和已取消的请求。Task 完成、退役、Leader attention、stall 和开放输入只以不可变 TaskEvent 或 InputRequest 引用进入全局 Operator mailbox。Controller 把一个待处理 batch 合并成一条带回执的 `[Yui updates]` user message，仅投递给已有且 ready 的 Operator；Operator 再通过 CLI 读取引用记录，判断哪些信息值得呈现。Operator 正在运行或不可用时，Yui 不启动也不打断它，整批引用保持持久化，并在原生 turn 完成或后续 Controller 处理中重试。该路径是 user message，不是 tool call，也不会读取或分类 Agent 终端文本。用户和 Operator 都可回答。存在开放请求时，无关的 pending wake 不会绕过等待，Task 也不能 complete 或 archive。原 Leader 也可执行 `yui task input cancel <task-id> <input-id> --reason "..."`，取消会排队恢复该固定 Leader session。
 
 ```sh
 yui task context <task-id>

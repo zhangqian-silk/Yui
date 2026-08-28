@@ -3,7 +3,6 @@ import type { TaskEvent } from "../event/taskEvent.js";
 import { usageError } from "../errors/cliError.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
-import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import {
   isRoleRunStalled,
   latestStallProgressAt
@@ -201,7 +200,6 @@ function buildTaskOverviewEntry(
   const agentRuns = store.listAgentRuns(task.id);
   const events = store.listEvents(task.id);
   const leaderFailure = store.getLeaderFailure(task.id);
-  const operatorNotification = store.getOperatorNotification(task.id);
   const leaderMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
   const pendingWakeup = pendingWakeupProjection(leaderMailbox);
   const reviewRounds = store.listReviewRounds(task.id);
@@ -215,8 +213,7 @@ function buildTaskOverviewEntry(
     task,
     agentRuns,
     events,
-    leaderFailure,
-    operatorNotification
+    leaderFailure
   );
   const blockers = collectBlockers(workItems, openInputRequests, attention);
   const legacyNext = deriveNextAction(
@@ -269,7 +266,6 @@ function buildTaskOverviewEntry(
     pendingWakeup,
     leaderMailbox,
     leaderFailure,
-    operatorNotification,
     roleSessions,
     contextSnapshots: store.listContextSnapshots(task.id),
     now,
@@ -309,39 +305,17 @@ function collectAttention(
   task: Task,
   runs: readonly AgentRun[],
   events: readonly TaskEvent[],
-  failure: LeaderFailure | null,
-  notification: OperatorNotification | null
+  failure: LeaderFailure | null
 ): TaskOverviewAttention[] {
   const items: TaskOverviewAttention[] = [];
-  if (failure !== null || notification?.type === "leader-recovery-failed") {
+  if (failure !== null) {
     items.push({
       kind: "leader-recovery",
       id: `leader-recovery:${task.id}`,
       status: "failed",
       owner: "operator",
-      summary: failure?.message
-        ?? (notification?.type === "leader-recovery-failed"
-          ? notification.message
-          : "Leader recovery failed."),
-      updatedAt: failure?.lastFailedAt
-        ?? (notification?.type === "leader-recovery-failed"
-          ? notification.updatedAt
-          : task.updatedAt)
-    });
-  }
-  const notificationStall = notification?.type === "leader-stalled"
-    ? notification
-    : null;
-  if (notificationStall !== null) {
-    items.push({
-      kind: "leader-stalled",
-      id: `leader-stall:${notificationStall.runId}:${notificationStall.progressAt}`,
-      status: "needs-attention",
-      owner: "operator",
-      summary: notificationStall.message,
-      updatedAt: notificationStall.updatedAt,
-      runId: notificationStall.runId,
-      roleName: "leader"
+      summary: failure.message,
+      updatedAt: failure.lastFailedAt
     });
   }
   for (const run of runs) {
@@ -350,7 +324,6 @@ function collectAttention(
       || run.status !== "active"
       || !isRoleRunStalled(events, run.id)
     ) continue;
-    if (notificationStall?.runId === run.id) continue;
     const progressAt = latestStallProgressAt(events, run.id) ?? run.updatedAt;
     items.push({
       kind: "leader-stalled",

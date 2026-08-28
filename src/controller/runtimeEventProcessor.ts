@@ -285,7 +285,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     const event = candidate.event;
     let outcome: "applied" | "deferred" | "obsolete" = "applied";
     if (event.type === "native-turn-completed") {
-      outcome = this.applyCodex(event, now);
+      outcome = this.applyNativeTurnCompleted(event, now);
     } else if (event.type === "runtime-observation") {
       outcome = this.applyRuntimeObservation(event, now);
     } else {
@@ -384,7 +384,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     void event;
   }
 
-  private applyCodex(
+  private applyNativeTurnCompleted(
     event: RuntimeTurnCompletedEvent,
     now: Date
   ): "applied" | "deferred" | "obsolete" {
@@ -801,6 +801,12 @@ export function createAsyncRuntimeObserver(invoke: AsyncObserverInvoker): AsyncR
       withNow("observeRuntimeObservation", input, now) as Promise<ProviderLifecycleObservation>,
     observeRuntimeTurnCompleted: (input, now) => withNow("observeRuntimeTurnCompleted", input, now),
     observeGlobalRuntimeTurnCompleted: (input, now) => withNow("observeGlobalRuntimeTurnCompleted", input, now),
+    classifyRuntimeTurnCompleted: (input) => (
+      call("classifyRuntimeTurnCompleted", [input]) as Promise<"apply" | "deferred" | "obsolete">
+    ),
+    classifyGlobalRuntimeTurnCompleted: (input) => (
+      call("classifyGlobalRuntimeTurnCompleted", [input]) as Promise<"apply" | "obsolete">
+    ),
     observeObsoleteRuntimeEvent: (input, now) => withNow("observeObsoleteRuntimeEvent", input, now)
   };
 }
@@ -848,7 +854,7 @@ export class AsyncRuntimeEventProcessor {
       try {
         let outcome: "applied" | "deferred" | "obsolete" = "applied";
         if (event.type === "native-turn-completed") {
-          outcome = await this.applyCodex(event, now);
+          outcome = await this.applyNativeTurnCompleted(event, now);
         } else if (event.type === "runtime-observation") {
           outcome = await this.applyRuntimeObservation(event, now);
         } else {
@@ -931,7 +937,7 @@ export class AsyncRuntimeEventProcessor {
     return outcome;
   }
 
-  private async applyCodex(
+  private async applyNativeTurnCompleted(
     event: RuntimeTurnCompletedEvent,
     now: Date
   ): Promise<"applied" | "deferred" | "obsolete"> {

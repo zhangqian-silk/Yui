@@ -1732,13 +1732,14 @@ export class FileTaskController {
             this.#clearDeliveryRetry(key);
             this.#scheduleTaskPassRetry({ taskId, keys: [key] });
           }
+          const runtimeAdvanced = (firstRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
+            || (secondRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0;
           if (
             scope.kind === "full"
             || scope.keys.some((key) => key !== "operator")
-            || (firstRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
-            || (secondRuntimeDrain?.acknowledgedEventIds.length ?? 0) > 0
+            || runtimeAdvanced
           ) {
-            this.#signalOperatorMailbox();
+            this.#signalOperatorMailbox(runtimeAdvanced);
           }
         } catch (error) {
           if (scope.kind === "full") {
@@ -1911,7 +1912,7 @@ export class FileTaskController {
     this.#scheduleNextInputDeadline();
   }
 
-  #signalOperatorMailbox(): void {
+  #signalOperatorMailbox(retryReady = false): void {
     if (this.#stopped) return;
     const mailbox = this.store.getWorkMailbox({ kind: "operator" });
     const identity = operatorMailboxBatchIdentity(mailbox);
@@ -1919,7 +1920,10 @@ export class FileTaskController {
       this.#lastOperatorSignalIdentity = undefined;
       return;
     }
-    if (identity !== this.#lastOperatorSignalIdentity) {
+    if (
+      identity !== this.#lastOperatorSignalIdentity
+      || (retryReady && this.store.getOperatorDeliveryTarget() !== null)
+    ) {
       this.#operatorSignalScheduler.signal("operator");
       this.#lastOperatorSignalIdentity = identity;
     }
@@ -2137,13 +2141,7 @@ export class FileTaskController {
     if (operatorRetries.length > 0) {
       retry.set("operator", {
         identity: operatorRetries.map((notification) => (
-          "inputRequestId" in notification
-            ? `input:${notification.inputRequestId}`
-            : "recoveryTaskId" in notification
-              ? `recovery:${notification.recoveryTaskId}`
-              : "stallTaskId" in notification
-                ? `stall:${notification.stallTaskId}`
-              : `terminal:${notification.terminalTaskId}`
+          `${notification.sourceKind}:${notification.taskId}:${notification.sourceId}`
         )).join("|")
       });
     } else if (result.inputNotifications.some(

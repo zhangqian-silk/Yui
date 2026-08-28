@@ -96,7 +96,6 @@ import {
 } from "../job/durableJob.js";
 import type { GlobalRole, TaskRole } from "../role/role.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
-import type { OperatorNotification } from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import { validateTaskWake, type TaskWake } from "../scheduler/taskWake.js";
 import type { Task } from "../task/task.js";
@@ -2962,7 +2961,7 @@ export class SqliteTaskStore implements TaskStore {
    */
   // -- scheduler projections -----------------------------------------------------
 
-  #getProjection<T>(taskId: string, kind: "leader-failure" | "operator-notification"): T | null {
+  #getProjection<T>(taskId: string, kind: "leader-failure"): T | null {
     const row = this.#db.prepare(
       "SELECT payload FROM task_projections WHERE task_id = ? AND kind = ?"
     ).get(taskId, kind) as { payload: string | null } | undefined;
@@ -2970,7 +2969,7 @@ export class SqliteTaskStore implements TaskStore {
     return this.#parse<T>(row.payload);
   }
 
-  #saveProjection(taskId: string, kind: "leader-failure" | "operator-notification", value: object): void {
+  #saveProjection(taskId: string, kind: "leader-failure", value: object): void {
     this.#requireTask(taskId);
     this.#mutate(() => {
       this.#db.prepare(
@@ -2980,7 +2979,7 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
-  #clearProjection(taskId: string, kind: "leader-failure" | "operator-notification"): void {
+  #clearProjection(taskId: string, kind: "leader-failure"): void {
     this.#mutate(() => {
       this.#db.prepare("UPDATE task_projections SET payload = NULL, updated_at = ? WHERE task_id = ? AND kind = ?")
         .run(this.#now(), taskId, kind);
@@ -2997,18 +2996,6 @@ export class SqliteTaskStore implements TaskStore {
 
   clearLeaderFailure(taskId: string): void {
     this.#clearProjection(taskId, "leader-failure");
-  }
-
-  getOperatorNotification(taskId: string): OperatorNotification | null {
-    return this.#getProjection<OperatorNotification>(taskId, "operator-notification");
-  }
-
-  saveOperatorNotification(notification: OperatorNotification): void {
-    this.#saveProjection(notification.taskId, "operator-notification", notification);
-  }
-
-  clearOperatorNotification(taskId: string): void {
-    this.#clearProjection(taskId, "operator-notification");
   }
 
   // -- pending wakeups (leader-role work-mailbox projection, mirrors taskStore.ts) --

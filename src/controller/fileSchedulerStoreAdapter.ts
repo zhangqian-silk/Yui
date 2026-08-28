@@ -127,9 +127,10 @@ import type {
 } from "../scheduler/ports.js";
 import { recordLeaderFailure } from "../scheduler/leaderFailure.js";
 import {
-  createLeaderRecoveryNotification,
-  createLeaderStallNotification
-} from "../scheduler/operatorNotification.js";
+  enqueueOperatorEvent,
+  recordLeaderAttentionRequired,
+  routeRoleEvent
+} from "../scheduler/operatorEvent.js";
 import { pendingWakeupsMatch } from "../scheduler/pendingWakeup.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import { wakeReason } from "../scheduler/wakeReason.js";
@@ -139,7 +140,6 @@ import {
   latestRunEventTime,
   latestStallEvidenceKey,
   isRoleRunStalled,
-  clearMatchingLeaderStallAttention,
   RUN_PROGRESS_EVENT,
   RUN_RECOVERED_EVENT,
   RUN_STALLED_EVENT
@@ -639,15 +639,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             "Yui preserved the Run because Session/host termination is not a workflow outcome.",
             "Inspect native-child and mailbox facts, then explicitly continue, reset, or request user input."
           ].join(" ");
-          store.saveOperatorNotification(createLeaderRecoveryNotification(
-            input.fence.taskId!,
-            message,
-            now,
-            store.getOperatorNotification(input.fence.taskId!)
-          ));
-          enqueueWork(store, { kind: "operator" }, "leader-runtime-detached", now, [
-            { type: "run", taskId: input.fence.taskId!, id: active.id }
-          ]);
+          recordLeaderAttentionRequired(store, {
+            taskId: input.fence.taskId!,
+            reason: "leader-runtime-detached",
+            payload: { message, runId: active.id },
+            now
+          });
         } else {
           enqueueWork(store, {
             kind: "role",
@@ -671,13 +668,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const removable = compactedRuntimeObservationIds(events, input);
       if (removable.length > 0) store.removeEvents(taskId, removable);
       const observationEventId = store.nextEventId(taskId);
-      store.saveEvent(taskId, createTaskEvent(
+      const observationEvent = createTaskEvent(
         observationEventId,
         taskId,
         RUNTIME_OBSERVATION_TASK_EVENT,
         runtimeObservationTaskEventPayload(input),
         now
-      ));
+      );
+      store.saveEvent(taskId, observationEvent);
       if (input.kind === "native-work.snapshot"
         && input.payload.snapshotComplete === true
         && input.payload.observationQuality === "exact") {
@@ -784,12 +782,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         // Route a Yui wake only when that parent is gone and another observer
         // supplied the child's terminal fact.
         if (role !== null && (session?.status === "stopped" || session?.status === "broken")) {
-          enqueueWork(store, role.name === "leader"
-            ? { kind: "operator" }
-            : { kind: "role", taskId, roleName: "leader" },
-          "detached-native-subagent-terminal",
-          now,
-          [{ type: "run", taskId, id: input.fence.runId! }]);
+          routeRoleEvent(
+            store,
+            observationEvent,
+            role.name,
+            "detached-native-subagent-terminal",
+            now
+          );
         }
       }
     });
@@ -871,9 +870,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.withRuntimeEventTransaction(execute);
   }
 
-  getPresentationContext() {
-    return { timeZone: this.store.getConfig().timeZone };
-  }
   listTasks() { return this.store.listTasks(); }
   listActiveTaskIds(): readonly string[] {
     return [...this.store.listActiveTaskIds()].sort((left, right) => (
@@ -945,6 +941,21 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       roleName: SYSTEM_OPERATOR_ROLE,
       adapterId: effectiveSession.effective.adapterId
     } as const;
+  }
+
+  markOperatorTurnStarted(now: Date): void {
+    this.store.transaction((store) => {
+      const sessions = store.getGlobalRoleSessionSet(SYSTEM_OPERATOR_ROLE);
+      if (sessions === null) return;
+      const active = sessions.sessions[sessions.activeAgentId];
+      if (active === undefined || active.status !== "ready") return;
+      store.saveGlobalRoleSessionSet(updateRoleAgentSessionStatus(
+        sessions,
+        sessions.activeAgentId,
+        "running",
+        now
+      ));
+    });
   }
 
   resolveExpiredInputRecommendations(now: Date, taskIds?: ReadonlySet<string>) {
@@ -1111,17 +1122,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       );
       store.saveEvent(task.id, event);
       if (role.name === "leader") {
-        store.saveOperatorNotification(createLeaderStallNotification(
-          task.id,
-          run.id,
-          input.progressAt,
-          input.evidenceKey,
-          input.now,
-          store.getOperatorNotification(task.id)
-        ));
-        enqueueWork(store, { kind: "operator" }, "leader-run-stalled", input.now, [
-          { type: "task", id: task.id }
-        ]);
+        enqueueOperatorEvent(store, event, "leader-run-stalled", input.now);
       } else {
         queueLeaderWakeup(store, task.id, wakeReason("role-run-stalled"), input.now);
       }
@@ -1196,7 +1197,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           },
           input.now
         ));
-        clearMatchingLeaderStallAttention(store, task.id, run.id);
       }
       return existing && !recovered ? "already-recorded" : "recorded";
     });
@@ -1659,23 +1659,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const unknown = markMailboxInputDeliveryUnknown(mailbox, attemptId, reason, now);
       markSubmittingProviderTurnUnknown(store, target, mailbox.inputDelivery, now, reason);
       store.saveWorkMailbox(unknown);
-      const taskId = target.kind === "role" ? target.taskId : undefined;
-      if (taskId !== undefined) {
-        store.saveEvent(taskId, createTaskEvent(
+      if (target.kind === "role") {
+        const taskId = target.taskId;
+        const event = createTaskEvent(
           store.nextEventId(taskId),
           taskId,
           "run.input-delivery-unknown",
           { attemptId, reason },
           now
-        ));
-        enqueueWork(store, { kind: "operator" }, "run-input-delivery-unknown", now, [
-          unknown.inputDelivery!.executionRef
-        ], {
-          source: "input-router",
-          dedupeKey: `input-delivery-unknown:${attemptId}`,
-          deliveryMode: "followup",
-          lane: "normal"
-        });
+        );
+        store.saveEvent(taskId, event);
+        routeRoleEvent(store, event, target.roleName, "run-input-delivery-unknown", now);
       }
       return true;
     });
@@ -1856,7 +1850,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
   clearPendingWakeup(taskId: string): void { this.store.clearPendingWakeup(taskId); }
   getLeaderFailure(taskId: string) { return this.store.getLeaderFailure(taskId); }
-  getOperatorNotification(taskId: string) { return this.store.getOperatorNotification(taskId); }
 
   saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult {
     return this.store.transaction((store) => {
@@ -1943,7 +1936,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }, "running", input.now);
       }
       store.clearLeaderFailure(input.task.id);
-      store.clearOperatorNotification(input.task.id);
       return "claimed";
     });
   }
@@ -2156,7 +2148,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       );
 
       const terminal = result.run;
-      store.saveEvent(input.taskId, createTaskEvent(
+      const deliveryFailureEvent = createTaskEvent(
         store.nextEventId(input.taskId),
         input.taskId,
         "runtime.role-delivery-failed",
@@ -2166,7 +2158,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           outcome: terminal.status
         },
         input.now
-      ));
+      );
+      store.saveEvent(input.taskId, deliveryFailureEvent);
 
       if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
         const item = store.getWorkItem(input.taskId, terminal.workItemId);
@@ -2187,17 +2180,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
 
       if (input.roleName !== "leader") {
-        enqueueWork(
+        routeRoleEvent(
           store,
-          { kind: "role", taskId: input.taskId, roleName: "leader" },
+          deliveryFailureEvent,
+          input.roleName,
           terminal.purpose === "review" ? "review-failed" : "role-run-failed",
-          input.now,
-          [
-            { type: "run", taskId: input.taskId, id: terminal.id },
-            ...(terminal.workItemId === undefined
-              ? []
-                : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
-          ]
+          input.now
         );
       } else {
         const failedRole = store.getRole(input.taskId, input.roleName);
@@ -2214,21 +2202,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input.now,
           store.getLeaderFailure(input.taskId)
         ));
-        store.saveOperatorNotification(createLeaderRecoveryNotification(
-          input.taskId,
-          summary,
-          input.now,
-          store.getOperatorNotification(input.taskId)
-        ));
-        enqueueWork(
+        routeRoleEvent(
           store,
-          { kind: "operator" },
+          deliveryFailureEvent,
+          input.roleName,
           "leader-run-failed",
-          input.now,
-          [
-            { type: "task", id: input.taskId },
-            { type: "run", taskId: input.taskId, id: terminal.id }
-          ]
+          input.now
         );
       }
       return "failed";
@@ -2285,15 +2264,15 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         store.getLeaderFailure(input.task.id)
       );
       store.saveLeaderFailure(failure);
-      store.saveOperatorNotification(createLeaderRecoveryNotification(
-        input.task.id,
-        input.notification.message,
-        input.now,
-        store.getOperatorNotification(input.task.id)
-      ));
-      enqueueWork(store, { kind: "operator" }, "leader-recovery-failed", input.now, [
-        { type: "task", id: input.task.id }
-      ]);
+      recordLeaderAttentionRequired(store, {
+        taskId: input.task.id,
+        reason: "leader-recovery-failed",
+        payload: {
+          message: input.failure.message,
+          runId: active.id
+        },
+        now: input.now
+      });
       return "failed";
     });
   }
@@ -2353,7 +2332,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           outcome: { status: "failed", summary: input.summary }
         }, input.now);
         if (terminal.disposition !== "applied") return "state-changed";
-        clearMatchingLeaderStallAttention(store, task.id, currentRun.id);
         store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));
         stopTaskSessionIfPresent(
           store,
@@ -2379,7 +2357,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
       }
       store.saveAgentRun(failAgentRun(currentRun, input.summary, input.now));
-      clearMatchingLeaderStallAttention(store, task.id, currentRun.id);
       store.clearActiveAgentRun(task.id, role.name);
       clearTaskRoleRunInFlight(store, role, currentRun, input.now);
       if (mailbox !== null && processing !== null && processing !== undefined) {
@@ -3023,7 +3000,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         );
       }
 
-      store.saveEvent(input.taskId, createTaskEvent(
+      const failureEvent = createTaskEvent(
         store.nextEventId(input.taskId),
         input.taskId,
         "runtime.turn-failed",
@@ -3034,39 +3011,18 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           outcome: terminal.status
         },
         now
-      ));
+      );
+      store.saveEvent(input.taskId, failureEvent);
 
-      if (input.roleName !== "leader") {
-        enqueueWork(
-          store,
-          { kind: "role", taskId: input.taskId, roleName: "leader" },
-          before.purpose === "review" ? "review-failed" : "role-run-failed",
-          now,
-          [
-            { type: "run", taskId: input.taskId, id: terminal.id },
-            ...(terminal.workItemId === undefined
-              ? []
-              : [{ type: "work-item" as const, taskId: input.taskId, id: terminal.workItemId }])
-          ]
-        );
-      } else {
-        store.saveOperatorNotification(createLeaderRecoveryNotification(
-          input.taskId,
-          summary,
-          now,
-          store.getOperatorNotification(input.taskId)
-        ));
-        enqueueWork(
-          store,
-          { kind: "operator" },
-          "leader-run-failed",
-          now,
-          [
-            { type: "task", id: input.taskId },
-            { type: "run", taskId: input.taskId, id: terminal.id }
-          ]
-        );
-      }
+      routeRoleEvent(
+        store,
+        failureEvent,
+        input.roleName,
+        input.roleName !== "leader" && before.purpose === "review"
+          ? "review-failed"
+          : input.roleName === "leader" ? "leader-run-failed" : "role-run-failed",
+        now
+      );
       return { disposition: "applied", runId: input.runId };
     });
   }
@@ -3171,19 +3127,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }, now, configuredProviderRetryPolicy(store));
         if (blocked.outcome === "exhausted") return null;
         store.saveAgentRun(withProviderRetry(run, blocked.retry));
-        this.recordProviderRetryClassified(store, input, classification.errorClass, {
+        const classifiedEvent = this.recordProviderRetryClassified(store, input, classification.errorClass, {
           wouldRetry: "false",
           shadow: "false",
           note: "delivery-deduplication-unproven"
         }, now);
-        enqueueWork(
+        routeRoleEvent(
           store,
-          input.roleName === "leader"
-            ? { kind: "operator" }
-            : { kind: "role", taskId: input.taskId, roleName: "leader" },
+          classifiedEvent,
+          input.roleName,
           "provider-delivery-uncertain",
-          now,
-          [{ type: "run", taskId: input.taskId, id: input.runId }]
+          now
         );
         return { disposition: "applied", runId: input.runId };
       }
@@ -3278,38 +3232,20 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }, now, configuredProviderRetryPolicy(store));
     if (retryDecision.outcome === "exhausted") return null;
     store.saveAgentRun(withProviderRetry(run, retryDecision.retry));
-    this.recordProviderRetryClassified(store, input, "policy-denied", {
+    const classifiedEvent = this.recordProviderRetryClassified(store, input, "policy-denied", {
       wouldRetry: "false",
       shadow: "false",
       note: "policy-denied-blocker"
     }, now);
-    if (input.roleName !== "leader") {
-      enqueueWork(
-        store,
-        { kind: "role", taskId: input.taskId, roleName: "leader" },
-        "provider-policy-blocked",
-        now,
-        [{ type: "run", taskId: input.taskId, id: input.runId }]
-      );
-    } else {
-      const message = `Leader Run ${input.runId} is blocked by Provider policy: ${summary}`;
-      store.saveOperatorNotification(createLeaderRecoveryNotification(
-        input.taskId,
-        message,
-        now,
-        store.getOperatorNotification(input.taskId)
-      ));
-      enqueueWork(
-        store,
-        { kind: "operator" },
-        "leader-provider-policy-blocked",
-        now,
-        [
-          { type: "task", id: input.taskId },
-          { type: "run", taskId: input.taskId, id: input.runId }
-        ]
-      );
-    }
+    routeRoleEvent(
+      store,
+      classifiedEvent,
+      input.roleName,
+      input.roleName === "leader"
+        ? "leader-provider-policy-blocked"
+        : "provider-policy-blocked",
+      now
+    );
     return { disposition: "applied", runId: input.runId };
   }
 
@@ -3339,7 +3275,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (decision.outcome === "exhausted") return null;
     store.saveAgentRun(withProviderRetry(run, decision.retry));
     const driver = this.drivers.requireByAdapterId(input.adapterId);
-    store.saveEvent(input.taskId, createTaskEvent(
+    const capacityEvent = createTaskEvent(
       store.nextEventId(input.taskId),
       input.taskId,
       "runtime.context-capacity-failure",
@@ -3356,20 +3292,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           : "await-provider-native-recovery"
       },
       now
-    ));
+    );
+    store.saveEvent(input.taskId, capacityEvent);
     this.recordProviderRetryClassified(store, input, "context-capacity", {
       wouldRetry: "false",
       shadow: "false",
       note: "provider-native-capacity-recovery-only"
     }, now);
-    enqueueWork(
+    routeRoleEvent(
       store,
-      input.roleName === "leader"
-        ? { kind: "operator" }
-        : { kind: "role", taskId: input.taskId, roleName: "leader" },
+      capacityEvent,
+      input.roleName,
       "provider-context-capacity-recovery-required",
-      now,
-      [{ type: "run", taskId: input.taskId, id: input.runId }]
+      now
     );
     return { disposition: "applied", runId: input.runId };
   }
@@ -3393,7 +3328,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }, now, configuredProviderRetryPolicy(store));
     if (decision.outcome === "exhausted") return null;
     store.saveAgentRun(withProviderRetry(run, decision.retry));
-    store.saveEvent(input.taskId, createTaskEvent(
+    const recoverabilityEvent = createTaskEvent(
       store.nextEventId(input.taskId),
       input.taskId,
       "runtime.native-session-recoverability-unproven",
@@ -3406,15 +3341,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         requiredEvidence: "exact-native-resume-outcome"
       },
       now
-    ));
-    enqueueWork(
+    );
+    store.saveEvent(input.taskId, recoverabilityEvent);
+    routeRoleEvent(
       store,
-      input.roleName === "leader"
-        ? { kind: "operator" }
-        : { kind: "role", taskId: input.taskId, roleName: "leader" },
+      recoverabilityEvent,
+      input.roleName,
       "native-session-recoverability-unproven",
-      now,
-      [{ type: "run", taskId: input.taskId, id: input.runId }]
+      now
     );
     return { disposition: "applied", runId: input.runId };
   }
@@ -3425,8 +3359,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     errorClass: string,
     extra: Readonly<Record<string, string | undefined>>,
     now: Date
-  ): void {
-    store.saveEvent(input.taskId, createTaskEvent(
+  ): TaskEvent {
+    const event = createTaskEvent(
       store.nextEventId(input.taskId),
       input.taskId,
       "runtime.provider-retry-classified",
@@ -3438,7 +3372,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ...extra
       },
       now
-    ));
+    );
+    store.saveEvent(input.taskId, event);
+    return event;
   }
 
   /**
@@ -3673,11 +3609,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             return;
           }
           store.saveAgentRun(withProviderRetry(run, deferred));
-          if (!store.listEvents(entry.taskId).some((event) => (
+          let attentionEvent = store.listEvents(entry.taskId).find((event) => (
             event.type === "runtime.provider-retry-native-resume-unproven"
             && event.payload.runId === run.id
-          ))) {
-            store.saveEvent(entry.taskId, createTaskEvent(
+          ));
+          if (attentionEvent === undefined) {
+            attentionEvent = createTaskEvent(
               store.nextEventId(entry.taskId),
               entry.taskId,
               "runtime.provider-retry-native-resume-unproven",
@@ -3687,17 +3624,15 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
                 dispatchedRetries: String(run.providerRetry.dispatchedRetries)
               },
               now
-            ));
+            );
+            store.saveEvent(entry.taskId, attentionEvent);
           }
-          enqueueWork(
+          routeRoleEvent(
             store,
-            { kind: "operator" },
+            attentionEvent,
+            entry.roleName,
             "provider-retry-native-resume-unproven",
-            now,
-            [
-              { type: "task", id: entry.taskId },
-              { type: "run", taskId: entry.taskId, id: run.id }
-            ]
+            now
           );
           return;
         }
@@ -4309,11 +4244,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           "Runtime turn completion does not match the global launch reservation."
         );
       }
+      const nativeSessionId = globalCompletionNativeSessionId(existing, input);
       const effectiveExisting = nativeTransitionExisting(
         store,
         owner,
         existing,
-        input.nativeSessionId,
+        nativeSessionId,
         input.launchId,
         "Runtime turn completion conflicts with the fixed global Role session."
       );
@@ -4328,7 +4264,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       current = recordRoleAgentSession(current, {
         agentId: input.agentId,
         adapterId: input.adapterId,
-        nativeSessionId: input.nativeSessionId,
+        nativeSessionId,
         ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
         title: effectiveExisting?.title ?? input.title,
         preview: effectiveExisting?.preview ?? (
@@ -4341,7 +4277,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       current = rememberRoleAgentCompletedTurn(
         current,
         input.agentId,
-        input.nativeSessionId,
+        nativeSessionId,
         input.turnId,
         now
       );
@@ -4370,13 +4306,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       existing === undefined
       && !runtimeHookMatchesReservation(this.store, owner, input.launchId)
     ) return "obsolete";
+    const nativeSessionId = globalCompletionNativeSessionId(existing, input);
     let effectiveExisting: RoleAgentSession | undefined;
     try {
       effectiveExisting = nativeTransitionExisting(
         this.store,
         owner,
         existing,
-        input.nativeSessionId,
+        nativeSessionId,
         input.launchId,
         "Runtime turn completion conflicts with the fixed global Role session."
       );
@@ -4825,7 +4762,7 @@ function finalizeProviderRetryDeadline(
   }, now);
   if (terminalization.disposition !== "applied" || terminalization.run === null) return false;
   const terminal = terminalization.run;
-  store.saveEvent(run.taskId, createTaskEvent(
+  const exhaustionEvent = createTaskEvent(
     store.nextEventId(run.taskId),
     run.taskId,
     "runtime.provider-retry-exhausted",
@@ -4839,7 +4776,8 @@ function finalizeProviderRetryDeadline(
       elapsedMs: String(Math.max(0, now.getTime() - Date.parse(retry.firstFailureAt)))
     },
     now
-  ));
+  );
+  store.saveEvent(run.taskId, exhaustionEvent);
   if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
     const item = store.getWorkItem(run.taskId, terminal.workItemId);
     if (item !== null
@@ -4867,25 +4805,14 @@ function finalizeProviderRetryDeadline(
       now,
       store.getLeaderFailure(run.taskId)
     ));
-    store.saveOperatorNotification(createLeaderRecoveryNotification(
-      run.taskId,
-      summary,
-      now,
-      store.getOperatorNotification(run.taskId)
-    ));
-    enqueueWork(store, { kind: "operator" }, "provider-retry-exhausted", now, [
-      { type: "task", id: run.taskId },
-      { type: "run", taskId: run.taskId, id: run.id }
-    ]);
-  } else {
-    enqueueWork(
-      store,
-      { kind: "role", taskId: run.taskId, roleName: "leader" },
-      "provider-retry-exhausted",
-      now,
-      [{ type: "run", taskId: run.taskId, id: run.id }]
-    );
   }
+  routeRoleEvent(
+    store,
+    exhaustionEvent,
+    run.roleName,
+    "provider-retry-exhausted",
+    now
+  );
   return true;
 }
 
@@ -5124,6 +5051,26 @@ function nativeTransitionExisting(
     return undefined;
   }
   throw new Error(conflictMessage);
+}
+
+function globalCompletionNativeSessionId(
+  existing: RoleAgentSession | undefined,
+  input: Readonly<{
+    agentId: string;
+    adapterId: string;
+    launchId?: string;
+    nativeSessionId: string;
+  }>
+): string {
+  // Codex app-server and its notify Hook expose different native IDs for the
+  // same launch. The launch generation remains the authoritative fence.
+  return input.adapterId === "codex"
+    && input.launchId !== undefined
+    && existing?.launchId === input.launchId
+    && existing.agentId === input.agentId
+    && existing.adapterId === input.adapterId
+    ? existing.nativeSessionId
+    : input.nativeSessionId;
 }
 
 function mapRole(
@@ -5660,7 +5607,7 @@ function deferUnprovenProviderRecovery(
     return;
   }
   store.saveAgentRun(withProviderRetry(run, deferred));
-  store.saveEvent(run.taskId, createTaskEvent(
+  const attentionEvent = createTaskEvent(
     store.nextEventId(run.taskId),
     run.taskId,
     "runtime.provider-recovery-attention",
@@ -5671,16 +5618,14 @@ function deferUnprovenProviderRecovery(
       nextAttemptAt: deferred.nextAttemptAt ?? ""
     },
     now
-  ));
-  enqueueWork(
+  );
+  store.saveEvent(run.taskId, attentionEvent);
+  routeRoleEvent(
     store,
-    { kind: "operator" },
+    attentionEvent,
+    roleName,
     "provider-recovery-attention",
-    now,
-    [
-      { type: "task", id: run.taskId },
-      { type: "run", taskId: run.taskId, id: run.id }
-    ]
+    now
   );
 }
 

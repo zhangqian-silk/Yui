@@ -436,7 +436,8 @@ CREATE TABLE events (
 );
 CREATE INDEX idx_events_type_time ON events(task_id, type, occurred_at);
 
--- Per-task scheduler projections (today: leaderFailure, operatorNotification).
+-- Per-task scheduler projections. operator-notification is retained only as
+-- a legacy migration kind; current state uses immutable TaskEvent records.
 CREATE TABLE task_projections (
   task_id    TEXT NOT NULL,
   kind       TEXT NOT NULL CHECK (kind IN ('leader-failure','operator-notification')),

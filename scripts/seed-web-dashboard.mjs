@@ -34,7 +34,6 @@ import {
 } from "../dist/run/agentRun.js";
 import { createYieldReceipt } from "../dist/run/yieldReceipt.js";
 import { recordLeaderFailure } from "../dist/scheduler/leaderFailure.js";
-import { createLeaderRecoveryNotification } from "../dist/scheduler/operatorNotification.js";
 import { mergePendingWakeup } from "../dist/scheduler/pendingWakeup.js";
 import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
 import { ensureYuiHome, FileTaskStore } from "../dist/storage/taskStore.js";
@@ -120,7 +119,7 @@ store.transaction((writer) => {
   writer.saveConfiguredAgent(codex);
   writer.saveConfiguredAgent(claude);
   writer.saveConfig({
-    schemaVersion: 1,
+    schemaVersion: 2,
     defaultAgent: "codex",
     defaultWorkspace: resolve(yuiHome, "workspace"),
     currentTaskId: "task-1",
@@ -440,7 +439,6 @@ store.transaction((writer) => {
 
   writer.savePendingWakeup(mergePendingWakeup("task-6", "leader-recovery", at("2026-07-23T05:01:00Z"), null));
   writer.saveLeaderFailure(recordLeaderFailure("task-6", "native-session-failed", "Leader pane exited during recovery.", at("2026-07-23T05:02:00Z"), null));
-  writer.saveOperatorNotification(createLeaderRecoveryNotification("task-6", "Manual recovery is required for the release worker.", at("2026-07-23T05:03:00Z"), null));
 });
 
 console.log(`Seeded web dashboard at ${yuiHome}`);

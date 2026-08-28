@@ -155,10 +155,6 @@ import {
   CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
   type LeaderFailure
 } from "../scheduler/leaderFailure.js";
-import {
-  CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
-  type OperatorNotification
-} from "../scheduler/operatorNotification.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import {
   CURRENT_TASK_WAKE_SCHEMA_VERSION,
@@ -383,7 +379,7 @@ export function executionLaneActiveRunKeyParts(key: string):
 type TaskIdHighWaterMarks = Record<TaskRecordKind, number>;
 
 /** The schema version of each persisted `state.json#/tasks/*` aggregate. */
-export const CURRENT_STORED_TASK_SCHEMA_VERSION = 17 as const;
+export const CURRENT_STORED_TASK_SCHEMA_VERSION = 18 as const;
 
 /**
  * Persisted nested-record versions consumed by this store's strict parser.
@@ -434,7 +430,6 @@ type StoredTask = {
   releaseWorkflows: Record<string, ReleaseWorkflow>;
   publicationReferences: Record<string, PublicationReference>;
   leaderFailure: LeaderFailure | null;
-  operatorNotification: OperatorNotification | null;
 };
 
 type StorageState = {
@@ -701,9 +696,6 @@ export type TaskStore = {
   getLeaderFailure(taskId: string): LeaderFailure | null;
   saveLeaderFailure(failure: LeaderFailure): void;
   clearLeaderFailure(taskId: string): void;
-  getOperatorNotification(taskId: string): OperatorNotification | null;
-  saveOperatorNotification(notification: OperatorNotification): void;
-  clearOperatorNotification(taskId: string): void;
 };
 
 export class FileTaskStore implements TaskStore {
@@ -2546,24 +2538,21 @@ export class FileTaskStore implements TaskStore {
     this.saveWorkMailbox(consumePendingBatch(mailbox, "normal"));
   }
   getLeaderFailure(taskId: string): LeaderFailure | null { return optional(this.#state().tasks[taskId]?.leaderFailure ?? undefined); }
-  saveLeaderFailure(value: LeaderFailure): void { this.#saveSingleton(value.taskId, "leaderFailure", value, "Leader failure"); }
-  clearLeaderFailure(taskId: string): void { this.#clearSingleton(taskId, "leaderFailure"); }
-  getOperatorNotification(taskId: string): OperatorNotification | null { return optional(this.#state().tasks[taskId]?.operatorNotification ?? undefined); }
-  saveOperatorNotification(value: OperatorNotification): void { this.#saveSingleton(value.taskId, "operatorNotification", value, "Operator notification"); }
-  clearOperatorNotification(taskId: string): void { this.#clearSingleton(taskId, "operatorNotification"); }
-
-  #saveSingleton<K extends "leaderFailure" | "operatorNotification">(
-    taskId: string, key: K, value: StoredTask[K], label: string
-  ): void {
-    const schemaVersion = key === "leaderFailure"
-      ? CURRENT_LEADER_FAILURE_SCHEMA_VERSION
-      : CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION;
-    const stored = identified<StoredTask[K]>(value, schemaVersion, "taskId", taskId, label);
-    this.#requireTaskForWrite(taskId);
-    this.#mutate((state) => { state.tasks[taskId][key] = stored; });
+  saveLeaderFailure(value: LeaderFailure): void {
+    const stored = identified<LeaderFailure>(
+      value,
+      CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
+      "taskId",
+      value.taskId,
+      "Leader failure"
+    );
+    this.#requireTaskForWrite(value.taskId);
+    this.#mutate((state) => { state.tasks[value.taskId].leaderFailure = stored; });
   }
-  #clearSingleton(key: string, field: "leaderFailure" | "operatorNotification"): void {
-    this.#mutate((state) => { if (state.tasks[key] !== undefined) state.tasks[key][field] = null; });
+  clearLeaderFailure(taskId: string): void {
+    this.#mutate((state) => {
+      if (state.tasks[taskId] !== undefined) state.tasks[taskId].leaderFailure = null;
+    });
   }
   #saveTaskRecord<K extends "messages">(
     taskId: string, key: K, value: StoredTask[K][string], label: string
@@ -2834,8 +2823,7 @@ function emptyStoredTask(task: Task): StoredTask {
     capabilityGrants: {},
     releaseWorkflows: {},
     publicationReferences: {},
-    leaderFailure: null,
-    operatorNotification: null
+    leaderFailure: null
   };
 }
 
@@ -3088,8 +3076,7 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     "capabilityGrants",
     "releaseWorkflows",
     "publicationReferences",
-    "leaderFailure",
-    "operatorNotification"
+    "leaderFailure"
   ], `Task aggregate ${taskId}`);
   parseMap(aggregate.changeSets, (record, key) => {
     const changeSet = identifiedChangeSet(record, key);
@@ -3377,14 +3364,14 @@ function parseStoredTask(value: unknown, taskId: string): StoredTask {
     }
     return reference;
   }, "publicationReferences");
-  for (const [key, label] of [["leaderFailure", "Leader failure"], ["operatorNotification", "Operator notification"]] as const) {
-    const record = aggregate[key];
-    if (record !== null) {
-      const schemaVersion = key === "leaderFailure"
-        ? CURRENT_LEADER_FAILURE_SCHEMA_VERSION
-        : CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION;
-      identified(record, schemaVersion, "taskId", taskId, label);
-    }
+  if (aggregate.leaderFailure !== null) {
+    identified(
+      aggregate.leaderFailure,
+      CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
+      "taskId",
+      taskId,
+      "Leader failure"
+    );
   }
   validateTaskIdHighWaterCoverage(aggregate, taskId);
   return aggregate;
