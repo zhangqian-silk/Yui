@@ -268,6 +268,9 @@ function parseCodexLines(
     if (entry.type !== "event_msg") continue;
     const payload = object(entry.payload);
     if (payload?.type !== "token_count") continue;
+    // Codex also emits token_count records that carry rate limits only. They
+    // contain no usage occurrence and therefore create no request boundary.
+    if (payload.info === null) continue;
     const candidate = normalizedCodexUsage(object(object(payload.info)?.total_token_usage));
     if (candidate === undefined) {
       usageContinuityGap = true;

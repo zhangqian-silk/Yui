@@ -155,9 +155,8 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
                 sourceId: source.sourceId,
                 usage: baseline,
                 ...(completeHistory
-                  || latestOccurrence?.observationQuality === undefined
                   ? {}
-                  : { observationQuality: latestOccurrence.observationQuality })
+                  : { observationQuality: "partial" as const })
               }
             }));
             state.usage = baseline;
