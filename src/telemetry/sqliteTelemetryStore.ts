@@ -313,7 +313,7 @@ export class SqliteTelemetryStore implements TelemetryStore {
       db.pragma("foreign_keys = ON");
       db.pragma("busy_timeout = 5000");
       db.pragma("wal_autocheckpoint = 1000");
-      migrateSqliteSchema(db);
+      migrateSqliteSchema(db, { mode: "validate" });
       this.#db = db;
       return db;
     } catch (error) {

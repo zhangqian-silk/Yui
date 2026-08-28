@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+
+import Database from "better-sqlite3";
 
 import { createTaskMessage } from "../../dist/message/message.js";
 import { createProject } from "../../dist/repository/project.js";
@@ -20,7 +22,12 @@ import {
   assertRegistryCoversBaselineToCurrent,
   createProductionRegistry
 } from "../../dist/storage/migration/index.js";
+import { writeTextFileAtomically } from "../../dist/storage/durableFile.js";
+import { SQLITE_SCHEMA_VERSION } from "../../dist/storage/sqliteSchema.js";
+import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
+import { createSqliteRecordMigrationTarget } from "../../dist/storage/upgrade/sqliteRecordMigrationTarget.js";
+import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { populateSqliteFromState } from "../../dist/storage/upgrade/sqliteStateMigration.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
@@ -66,7 +73,7 @@ test("the SQLite Task path persists one normal Task and Message", (t) => {
   reopened.close();
 });
 
-test("the production migration preserves ReviewRound-backed Agent Runs", (t) => {
+test("the production migration is atomic and preserves ReviewRound-backed Agent Runs", (t) => {
   const registry = createProductionRegistry();
   assert.doesNotThrow(() => assertRegistryCoversBaselineToCurrent(registry));
 
@@ -165,9 +172,64 @@ test("the production migration preserves ReviewRound-backed Agent Runs", (t) => 
   }, databaseFilename);
 
   const migrated = new SqliteTaskStore(home, { databaseFilename });
-  t.after(() => migrated.close());
   assert.equal(migrated.getReviewRound(task.id, migratedRound.id)?.status, "completed");
   assert.equal(migrated.getAgentRun(task.id, migratedRun.id)?.reviewRoundId, migratedRound.id);
+  migrated.close();
+
+  const databasePath = join(home, databaseFilename);
+  const database = new Database(databasePath);
+  database.prepare("DELETE FROM schema_migrations WHERE version = ?").run(SQLITE_SCHEMA_VERSION);
+  const before = database.prepare(
+    "SELECT version, axis, record_kind, applied_at, checksum FROM schema_migrations ORDER BY version"
+  ).all();
+  const schemaBefore = database.prepare(
+    "SELECT type, name, sql FROM sqlite_master WHERE name IS NOT NULL ORDER BY type, name"
+  ).all();
+  database.close();
+
+  assert.throws(() => {
+    const reopened = new SqliteTaskStore(home, { databaseFilename });
+    reopened.close();
+  }, /pending SQLite schema migration .*offline staged upgrade/iu);
+
+  const unchanged = new Database(databasePath, { readonly: true });
+  assert.deepEqual(unchanged.prepare(
+    "SELECT version, axis, record_kind, applied_at, checksum FROM schema_migrations ORDER BY version"
+  ).all(), before);
+  assert.deepEqual(unchanged.prepare(
+    "SELECT type, name, sql FROM sqlite_master WHERE name IS NOT NULL ORDER BY type, name"
+  ).all(), schemaBefore);
+  unchanged.close();
+
+  const atomicHome = mkdtempSync(join(tmpdir(), "yui-migration-atomicity-smoke-"));
+  t.after(() => rmSync(atomicHome, { recursive: true, force: true }));
+  ensureStorageSchema(atomicHome);
+  const current = new SqliteTaskStore(atomicHome);
+  current.close();
+  const committedDatabasePath = join(atomicHome, "yui.db");
+  const schemaPath = join(atomicHome, "schema.json");
+  const committedDatabaseBefore = readFileSync(committedDatabasePath);
+  const committedSchemaBefore = readFileSync(schemaPath);
+  let schemaWrites = 0;
+  const target = createSqliteRecordMigrationTarget({
+    home: atomicHome,
+    latest: latestStorageVersionState(),
+    registry,
+    now: () => now,
+    writeSchemaFile(path, content) {
+      schemaWrites += 1;
+      writeTextFileAtomically(path, content);
+      if (schemaWrites === 1) throw new Error("injected post-rename schema failure");
+    }
+  });
+  target.writeFreshOutput(target.readSource());
+  assert.throws(
+    () => target.atomicSwitchWithBackup(),
+    /injected post-rename schema failure/u
+  );
+  assert.deepEqual(readFileSync(committedDatabasePath), committedDatabaseBefore);
+  assert.deepEqual(readFileSync(schemaPath), committedSchemaBefore);
+  assert.equal(existsSync(target.stagedDbPath), false);
 });
 
 test("the built-in Agent Drivers are available through the shared registry", () => {

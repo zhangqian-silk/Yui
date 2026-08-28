@@ -145,6 +145,7 @@ import {
 } from "../verification/gateArtifact.js";
 import {
   migrateSqliteSchema,
+  SqliteSchemaMigrationError,
   SQLITE_AGGREGATE_VERSION,
   SQLITE_LAYOUT_VERSION,
   TELEMETRY_KEEP_PER_GENERATION,
@@ -157,10 +158,9 @@ export type SqliteTaskStoreOptions = Readonly<{
   /** Override the database filename (defaults to "yui.db"). */
   databaseFilename?: string;
   /**
-   * Migration bulk-load mode. The staged state.json→SQLite migration populates
-   * the sidecar database while the upgrade fence is active (the migration IS
-   * the upgrade), so the per-write fence admission check is skipped. Production
-   * stores never set this.
+   * Migration mode for a disposable sidecar database. It may create a fresh
+   * stage or advance an existing snapshot copy while the offline upgrade fence
+   * is active. The authoritative `yui.db` is never legal in this mode.
    */
   migration?: boolean;
 }>;
@@ -291,16 +291,31 @@ export class SqliteTaskStore implements TaskStore {
     this.#migration = _options.migration ?? false;
     mkdirSync(rootDir, { recursive: true, mode: 0o700 });
     const filename = _options.databaseFilename ?? "yui.db";
-    this.#db = new Database(join(rootDir, filename));
-    // §4.1 / §9: WAL, no fsync weakening, FKs on, busy timeout for CLI contention.
-    this.#db.pragma("journal_mode = WAL");
-    this.#db.pragma("synchronous = FULL");
-    this.#db.pragma("foreign_keys = ON");
-    this.#db.pragma("busy_timeout = 5000");
-    this.#db.pragma("wal_autocheckpoint = 1000");
-    migrateSqliteSchema(this.#db);
-    this.#seedHomeMeta();
-    this.#seedConfig();
+    const databasePath = join(rootDir, filename);
+    const databaseExisted = existsSync(databasePath);
+    if (this.#migration && filename === "yui.db") {
+      throw new SqliteSchemaMigrationError(
+        "offline migration mode cannot open the authoritative yui.db",
+        "admission"
+      );
+    }
+    this.#db = new Database(databasePath);
+    try {
+      // §4.1 / §9: WAL, no fsync weakening, FKs on, busy timeout for CLI contention.
+      this.#db.pragma("journal_mode = WAL");
+      this.#db.pragma("synchronous = FULL");
+      this.#db.pragma("foreign_keys = ON");
+      this.#db.pragma("busy_timeout = 5000");
+      this.#db.pragma("wal_autocheckpoint = 1000");
+      migrateSqliteSchema(this.#db, {
+        mode: this.#migration || !databaseExisted ? "apply" : "validate"
+      });
+      this.#seedHomeMeta();
+      this.#seedConfig();
+    } catch (error) {
+      this.#db.close();
+      throw error;
+    }
   }
 
   rootDirectory(): string { return this.#rootDir; }

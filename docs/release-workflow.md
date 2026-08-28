@@ -105,6 +105,13 @@ pointer selects the Controller release, not the CLI package. This keeps CLI,
 Operator Session, and Controller replacement compatible without pinning every
 command to one immutable build.
 
+A source-checkout or otherwise unverified local CLI is not this published
+interface. When `YUI_HOME` already names an active release, such a CLI fails
+before opening storage and reports its build/source, the durable Home identity,
+and its invocation class. `make install-local` continues to default to the
+checkout's isolated `output/dev/home`; explicitly pointing that launcher at a
+release-owned Home is rejected.
+
 An explicit `yui release activate <release-id|build-id>` is the one exception.
 The global CLI verifies the installed target release and its matching smoke
 receipt, then delegates the unchanged activation arguments to that target's

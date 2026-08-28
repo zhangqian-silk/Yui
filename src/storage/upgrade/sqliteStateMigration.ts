@@ -22,6 +22,7 @@
  * dropped, duplicated, or mutated record.
  */
 import { createHash } from "node:crypto";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 
@@ -78,6 +79,48 @@ export const STAGED_DATABASE_FILENAME = "yui.db.staged";
 
 /** The committed database filename. */
 export const COMMITTED_DATABASE_FILENAME = "yui.db";
+
+/** Disposable, schema-current snapshot used to reconstruct an older source. */
+export const MIGRATION_SOURCE_DATABASE_FILENAME = "yui.db.migration-source";
+
+/**
+ * Reconstruct a migration snapshot without advancing the authoritative DB.
+ *
+ * `VACUUM INTO` takes a consistent SQLite snapshot, including committed WAL
+ * state, without writing the source. Pending physical migrations are then
+ * applied only to that disposable copy before the current reader enumerates
+ * record families that may not exist in the older source schema.
+ */
+export function readMigrationSourceStateFromSqlite(home: string): Record<string, unknown> {
+  const sourcePath = join(home, COMMITTED_DATABASE_FILENAME);
+  const snapshotPath = join(home, MIGRATION_SOURCE_DATABASE_FILENAME);
+  if (existsSync(snapshotPath)) {
+    throw new Error(
+      `Refusing to overwrite an existing SQLite migration-source snapshot: ${snapshotPath}. `
+      + "Discard it and retry."
+    );
+  }
+
+  try {
+    const source = new Database(sourcePath, { readonly: true });
+    try {
+      source.prepare("VACUUM INTO ?").run(snapshotPath);
+    } finally {
+      source.close();
+    }
+
+    const stagedStore = new SqliteTaskStore(home, {
+      databaseFilename: MIGRATION_SOURCE_DATABASE_FILENAME,
+      migration: true
+    });
+    stagedStore.close();
+    return readStateFromSqlite(home, MIGRATION_SOURCE_DATABASE_FILENAME);
+  } finally {
+    rmSync(snapshotPath, { force: true });
+    rmSync(`${snapshotPath}-wal`, { force: true });
+    rmSync(`${snapshotPath}-shm`, { force: true });
+  }
+}
 
 /**
  * Preserve SQLite-owned durable state that intentionally sits outside the
@@ -926,8 +969,11 @@ export function verifySqliteChecksums(
  *
  * The database is opened read-only; this function never writes.
  */
-export function readStateFromSqlite(home: string): Record<string, unknown> {
-  const dbPath = join(home, COMMITTED_DATABASE_FILENAME);
+export function readStateFromSqlite(
+  home: string,
+  databaseFilename = COMMITTED_DATABASE_FILENAME
+): Record<string, unknown> {
+  const dbPath = join(home, databaseFilename);
   const db = new Database(dbPath, { readonly: true });
   try {
     const manifest = readStorageSchemaManifest(home);

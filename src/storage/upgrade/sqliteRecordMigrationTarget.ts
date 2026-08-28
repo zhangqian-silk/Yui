@@ -65,7 +65,7 @@ import {
   computeDbFamilyChecksums,
   computeStateFamilyChecksums,
   populateSqliteFromState,
-  readStateFromSqlite
+  readMigrationSourceStateFromSqlite
 } from "./sqliteStateMigration.js";
 
 export type SqliteRecordMigrationTargetOptions = Readonly<{
@@ -86,6 +86,8 @@ export type SqliteRecordMigrationTargetOptions = Readonly<{
    * genuine ambiguous-switch path. Production never overrides it.
    */
   renameImpl?: (from: string, to: string) => void;
+  /** Test seam for a schema sidecar write that fails before or after rename. */
+  writeSchemaFile?: (path: string, content: string) => void;
 }>;
 
 export type SqliteRecordMigrationTarget = MigrationTarget<HomeSnapshot> & Readonly<{
@@ -103,6 +105,7 @@ export function createSqliteRecordMigrationTarget(
   const now = options.now ?? (() => new Date());
   const callerPid = options.callerPid ?? process.pid;
   const promoteRename = options.renameImpl ?? renameSync;
+  const writeSchemaFile = options.writeSchemaFile ?? writeTextFileAtomically;
   const stagedDbPath = join(home, STAGED_DATABASE_FILENAME);
   const committedDbPath = join(home, COMMITTED_DATABASE_FILENAME);
 
@@ -130,7 +133,7 @@ export function createSqliteRecordMigrationTarget(
     readSource(): HomeSnapshot {
       const manifestRaw = readFileSync(join(home, STORAGE_SCHEMA_FILE), "utf8");
       const schemaManifest = parseJsonObject(manifestRaw, STORAGE_SCHEMA_FILE);
-      const state = readStateFromSqlite(home);
+      const state = readMigrationSourceStateFromSqlite(home);
       return Object.freeze({ schemaManifest, state });
     },
 
@@ -199,6 +202,8 @@ export function createSqliteRecordMigrationTarget(
       }
       const stamp = now().toISOString().replace(/[:.]/g, "-");
       let backupPath: string | undefined;
+      const schemaPath = join(home, STORAGE_SCHEMA_FILE);
+      const sourceSchemaText = readFileSync(schemaPath, "utf8");
 
       // Phase 1: back up the existing yui.db, then promote the sidecar.
       try {
@@ -238,15 +243,21 @@ export function createSqliteRecordMigrationTarget(
       // critical section. The layout version is unchanged.
       try {
         if (stagedSchemaManifest !== null) {
-          writeTextFileAtomically(
-            join(home, STORAGE_SCHEMA_FILE),
+          writeSchemaFile(
+            schemaPath,
             `${JSON.stringify(stagedSchemaManifest, null, 2)}\n`
           );
         }
       } catch (error) {
-        // The database is promoted but schema.json could not be advanced.
-        // Attempt to restore the original database; if that fails, the Home
-        // is ambiguous and must be recovered manually.
+        // A durable writer can report an fsync failure after its atomic rename,
+        // so "write threw" does not prove schema.json stayed old. Restore both
+        // the exact source sidecar and database before claiming no switch.
+        let rollbackError: unknown;
+        try {
+          writeSchemaFile(schemaPath, sourceSchemaText);
+        } catch (restoreError) {
+          rollbackError = restoreError;
+        }
         try {
           if (backupPath !== undefined && existsSync(backupPath)) {
             removeSqliteFileSet(committedDbPath);
@@ -254,16 +265,19 @@ export function createSqliteRecordMigrationTarget(
           } else {
             removeSqliteFileSet(committedDbPath);
           }
-        } catch {
+        } catch (restoreError) {
+          rollbackError ??= restoreError;
+        }
+        if (rollbackError !== undefined) {
           writeInterruptedMarker(home, backupPath ?? committedDbPath, stagedDbPath, now);
           throw new AmbiguousSwitchError({
             homePath: home,
             backupPath: backupPath ?? committedDbPath,
             stagingPath: stagedDbPath,
             detail:
-              `SQLite database was promoted but schema.json could not be advanced (${messageOf(error)}), ` +
-              `and the automatic rollback also failed. The database is at ${committedDbPath}; ` +
-              `recover by advancing schema.json recordVersions or restoring the backup.`
+              `SQLite database was promoted but schema.json could not be durably advanced (${messageOf(error)}), ` +
+              `and the database/schema rollback also failed (${messageOf(rollbackError)}). ` +
+              `Inspect ${committedDbPath}, ${schemaPath}, and the backup before recovery.`
           });
         }
         throw error;
@@ -290,7 +304,7 @@ export function createSqliteRecordMigrationTarget(
   function readSourceFresh(): HomeSnapshot {
     const manifestRaw = readFileSync(join(home, STORAGE_SCHEMA_FILE), "utf8");
     const schemaManifest = parseJsonObject(manifestRaw, STORAGE_SCHEMA_FILE);
-    const state = readStateFromSqlite(home);
+    const state = readMigrationSourceStateFromSqlite(home);
     return Object.freeze({ schemaManifest, state });
   }
 

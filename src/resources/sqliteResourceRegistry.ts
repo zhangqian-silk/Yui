@@ -47,7 +47,7 @@ export class SqliteResourceRegistry {
     this.#db.pragma("journal_mode = WAL");
     this.#db.pragma("foreign_keys = ON");
     this.#db.pragma("busy_timeout = 5000");
-    migrateSqliteSchema(this.#db);
+    migrateSqliteSchema(this.#db, { mode: "validate" });
   }
 
   load(): ResourceRegistryState {

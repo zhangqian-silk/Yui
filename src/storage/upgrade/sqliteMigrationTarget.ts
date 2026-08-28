@@ -81,6 +81,8 @@ export type SqliteMigrationTargetOptions = Readonly<{
   now?: () => Date;
   /** This process's pid, for foreign-writer detection. */
   callerPid?: number;
+  /** Test seam for a schema sidecar write that fails before or after rename. */
+  writeSchemaFile?: (path: string, content: string) => void;
 }>;
 
 export type SqliteMigrationTarget = MigrationTarget<HomeSnapshot> & Readonly<{
@@ -97,6 +99,7 @@ export function createSqliteMigrationTarget(
   const registry = options.registry;
   const now = options.now ?? (() => new Date());
   const callerPid = options.callerPid ?? process.pid;
+  const writeSchemaFile = options.writeSchemaFile ?? writeTextFileAtomically;
   const stagedDbPath = join(home, STAGED_DATABASE_FILENAME);
   const committedDbPath = join(home, COMMITTED_DATABASE_FILENAME);
 
@@ -205,6 +208,12 @@ export function createSqliteMigrationTarget(
       }
       const stamp = now().toISOString().replace(/[:.]/g, "-");
       let backupPath: string | undefined;
+      const schemaPath = join(home, STORAGE_SCHEMA_FILE);
+      const sourceSchemaText = readFileSync(schemaPath, "utf8");
+      const receiptPath = migrationReceiptPath(home);
+      const sourceReceiptText = existsSync(receiptPath)
+        ? readFileSync(receiptPath, "utf8")
+        : null;
 
       // Phase 1: back up any existing yui.db, then promote the sidecar.
       try {
@@ -242,8 +251,8 @@ export function createSqliteMigrationTarget(
       // Phase 2: advance schema.json to layout 7 in the same critical section.
       try {
         if (stagedSchemaManifest !== null) {
-          writeTextFileAtomically(
-            join(home, STORAGE_SCHEMA_FILE),
+          writeSchemaFile(
+            schemaPath,
             `${JSON.stringify(stagedSchemaManifest, null, 2)}\n`
           );
         }
@@ -265,9 +274,20 @@ export function createSqliteMigrationTarget(
           });
         }
       } catch (error) {
-        // The database is promoted but schema.json could not be advanced.
-        // Attempt to restore the original database; if that fails, the Home
-        // is ambiguous and must be recovered manually.
+        // A sidecar or receipt writer can fail after an atomic rename. Restore
+        // the exact source metadata as well as the database before claiming the
+        // layout switch did not commit.
+        let rollbackError: unknown;
+        try {
+          writeSchemaFile(schemaPath, sourceSchemaText);
+          if (sourceReceiptText === null) {
+            rmSync(receiptPath, { force: true });
+          } else {
+            writeSchemaFile(receiptPath, sourceReceiptText);
+          }
+        } catch (restoreError) {
+          rollbackError = restoreError;
+        }
         try {
           if (backupPath !== undefined && existsSync(backupPath)) {
             removeSqliteFileSet(committedDbPath);
@@ -275,15 +295,18 @@ export function createSqliteMigrationTarget(
           } else {
             removeSqliteFileSet(committedDbPath);
           }
-        } catch {
+        } catch (restoreError) {
+          rollbackError ??= restoreError;
+        }
+        if (rollbackError !== undefined) {
           throw new AmbiguousSwitchError({
             homePath: home,
             backupPath: backupPath ?? committedDbPath,
             stagingPath: stagedDbPath,
             detail:
-              `SQLite database was promoted but schema.json could not be advanced (${messageOf(error)}), ` +
-              `and the automatic rollback also failed. The database is at ${committedDbPath}; ` +
-              `recover by advancing schema.json storageVersion to ${latest.layout} or restoring the backup.`
+              `SQLite database was promoted but schema.json or its receipt could not be durably advanced (${messageOf(error)}), ` +
+              `and the database/metadata rollback also failed (${messageOf(rollbackError)}). ` +
+              `Inspect ${committedDbPath}, ${schemaPath}, ${receiptPath}, and the backup before recovery.`
           });
         }
         throw error;
