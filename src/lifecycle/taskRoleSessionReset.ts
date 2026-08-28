@@ -3,7 +3,7 @@ import { resetTaskRoleSession } from "../executor/agentExecutor.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import { createTaskMessage } from "../message/message.js";
 import { updateRoleStatus } from "../role/role.js";
-import { createLeaderRecoveryNotification } from "../scheduler/operatorNotification.js";
+import { enqueueOperatorEvent } from "../scheduler/operatorEvent.js";
 import { recordLeaderFailure } from "../scheduler/leaderFailure.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
@@ -108,7 +108,7 @@ export function resetTaskRoleSessionGeneration(
     }
   );
   store.saveMessage(task.id, message);
-  store.saveEvent(task.id, createTaskEvent(
+  const resetEvent = createTaskEvent(
     store.nextEventId(task.id),
     task.id,
     "runtime.role-session-reset",
@@ -121,7 +121,8 @@ export function resetTaskRoleSessionGeneration(
         : { nativeSessionId: current.nativeSessionId })
     },
     now
-  ));
+  );
+  store.saveEvent(task.id, resetEvent);
 
   if (role.name === "leader") {
     const nativeSessionId = current?.nativeSessionId ?? `reset-${task.id}`;
@@ -132,21 +133,7 @@ export function resetTaskRoleSessionGeneration(
       now,
       store.getLeaderFailure(task.id)
     ));
-    store.saveOperatorNotification(createLeaderRecoveryNotification(
-      task.id,
-      summary,
-      now,
-      store.getOperatorNotification(task.id)
-    ));
-    enqueueWork(store, { kind: "operator" }, "leader-run-failed", now, [
-      { type: "task", id: task.id },
-      { type: "message", taskId: task.id, id: message.id },
-      ...(activeRun === null ? [] : [{
-        type: "run" as const,
-        taskId: task.id,
-        id: activeRun.id
-      }])
-    ]);
+    enqueueOperatorEvent(store, resetEvent, "leader-run-failed", now);
   } else {
     enqueueWork(store, { kind: "role", taskId: task.id, roleName: "leader" }, "role-run-failed", now, [
       { type: "message", taskId: task.id, id: message.id },

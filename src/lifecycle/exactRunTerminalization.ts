@@ -35,7 +35,6 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import { runOwnsBlockingProviderContinuation } from "../runtime/runtimeContinuationProjection.js";
 import {
-  clearMatchingLeaderStallAttention,
   latestRunDurableProgressAt,
   RUN_RECOVERY_APPLIED_EVENT,
   RUN_RECOVERY_REQUESTED_EVENT
@@ -719,7 +718,6 @@ function recoverExactAgentRunInTransaction(
     { ...eventPayload, status: "terminated" },
     input.now
   ));
-  clearMatchingLeaderStallAttention(store, input.taskId, input.runId);
   if (input.roleName !== "leader") {
     enqueueWork(
       store,

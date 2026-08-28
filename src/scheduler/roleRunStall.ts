@@ -9,7 +9,6 @@ import {
   type SchedulerStorePort,
   type TmuxDeliveryPort
 } from "./ports.js";
-import type { OperatorNotification } from "./operatorNotification.js";
 import type { RoleLiveStatusSnapshot } from "./roleRunLiveness.js";
 import { nextPendingBatch } from "../coordination/workMailbox.js";
 import {
@@ -47,31 +46,6 @@ const ACTIVITY_EVENT_TYPES = new Set([
   "integration.completed",
   "integration.failed"
 ]);
-
-/** The smallest storage boundary needed to clear a resolved Leader stall. */
-export type LeaderStallAttentionStore = Readonly<{
-  getOperatorNotification(taskId: string): OperatorNotification | null;
-  clearOperatorNotification(taskId: string): void;
-}>;
-
-/**
- * Clear only the Operator projection raised for this exact Leader Run. A
- * later Run (or a recovery notification of another kind) must remain intact;
- * callers use this helper from every supported recovery/terminalization path
- * so attention cleanup cannot drift between CLI and runtime code.
- */
-export function clearMatchingLeaderStallAttention(
-  store: LeaderStallAttentionStore,
-  taskId: string,
-  runId: string
-): boolean {
-  const notification = store.getOperatorNotification(taskId);
-  if (notification?.type !== "leader-stalled" || notification.runId !== runId) {
-    return false;
-  }
-  store.clearOperatorNotification(taskId);
-  return true;
-}
 
 export type RoleRunStallKind = "delivery-stalled" | "workflow-not-progressing";
 export type RoleRunStallClassification =

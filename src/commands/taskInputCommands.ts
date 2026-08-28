@@ -22,7 +22,6 @@ import { agentRunDeliveryReceiptId, type AgentRun } from "../run/agentRun.js";
 import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 import {
-  clearMatchingLeaderStallAttention,
   isRoleRunStalled,
   RUN_RECOVERED_EVENT
 } from "../scheduler/roleRunStall.js";
@@ -139,9 +138,13 @@ function createRequest(
     const wasStalled = isRoleRunStalled(tx.listEvents(task.id), origin.run.id);
     tx.saveInputRequest(task.id, created);
     enqueueWork(tx, { kind: "operator" }, "input-requested", now, [
-      { type: "input", taskId: task.id, id: created.id },
-      { type: "run", taskId: task.id, id: origin.run.id }
-    ]);
+      { type: "input", taskId: task.id, id: created.id }
+    ], {
+      source: "input-request",
+      dedupeKey: `operator-input:${task.id}:${created.id}`,
+      deliveryMode: "followup",
+      lane: "normal"
+    });
     const terminal = terminalizeExactTaskRun(tx, {
       taskId: task.id,
       roleName: LEADER_ROLE,
@@ -169,7 +172,6 @@ function createRequest(
         kind: "input-request"
       }, now);
     }
-    clearMatchingLeaderStallAttention(tx, task.id, origin.run.id);
     recordTaskEvent(tx, task.id, "input.requested", {
       requestId: created.id,
       requesterRunId: created.requester.runId,

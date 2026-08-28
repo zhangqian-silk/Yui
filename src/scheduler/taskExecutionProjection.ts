@@ -7,7 +7,6 @@ import type { Task, TaskStatus } from "../task/task.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { LeaderFailure } from "./leaderFailure.js";
-import type { OperatorNotification } from "./operatorNotification.js";
 import { currentWorkItemExecutionGroup, type WorkItem } from "../workItem/workItem.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
@@ -149,7 +148,6 @@ export type TaskExecutionReadStore = Readonly<{
   getWorkMailbox?(target: WorkMailbox["target"]): WorkMailbox | null;
   getPendingWakeup?(taskId: string): PendingWakeup | null;
   getLeaderFailure?(taskId: string): LeaderFailure | null;
-  getOperatorNotification?(taskId: string): OperatorNotification | null;
   getRoleSession?(taskId: string, roleName: string, agentId?: string): Readonly<{
     agentId: string;
     adapterId: string;
@@ -185,7 +183,6 @@ export type TaskExecutionFacts = Readonly<{
   pendingWakeup?: PendingWakeup | null;
   leaderMailbox?: WorkMailbox | null;
   leaderFailure?: LeaderFailure | null;
-  operatorNotification?: OperatorNotification | null;
   executionGroups?: readonly ExecutionGroup[];
   roleSessions?: readonly Readonly<{
     roleName: string;
@@ -260,7 +257,6 @@ export function buildTaskExecutionProjection(
     pendingWakeup: store.getPendingWakeup?.(taskId) ?? null,
     leaderMailbox,
     leaderFailure: store.getLeaderFailure?.(taskId) ?? null,
-    operatorNotification: store.getOperatorNotification?.(taskId) ?? null,
     roleSessions,
     now,
     runtimeHealthPolicy: resolveRuntimeHealth(store.getConfig?.().runtimeHealth)
@@ -303,7 +299,6 @@ export function projectTaskExecution(
     pendingWakeup = null,
     leaderMailbox = null,
     leaderFailure = null,
-    operatorNotification = null,
     roleSessions = [],
     executionGroups = []
   } = facts;
@@ -390,7 +385,6 @@ export function projectTaskExecution(
     activeRuns,
     events,
     leaderFailure,
-    operatorNotification,
     roleSessions,
     inputRequests
   });
@@ -409,8 +403,7 @@ export function projectTaskExecution(
   const recoveryPending = isRecoveryPending(
     pendingWakeup,
     leaderMailbox,
-    leaderFailure,
-    operatorNotification
+    leaderFailure
   );
   const failedWork = workItems.some((item) => item.status === "failed");
   const candidateReady = workItems.some((item) => item.status === "awaiting_acceptance");
@@ -726,7 +719,6 @@ function collectAttention(input: Readonly<{
   activeRuns: readonly AgentRun[];
   events: readonly TaskEvent[];
   leaderFailure: LeaderFailure | null;
-  operatorNotification: OperatorNotification | null;
   roleSessions: readonly Readonly<{
     roleName: string;
     agentId: string;
@@ -736,27 +728,14 @@ function collectAttention(input: Readonly<{
   inputRequests: readonly InputRequest[];
 }>): TaskExecutionAttention[] {
   const result: TaskExecutionAttention[] = [];
-  const { task, activeRuns, events, leaderFailure, operatorNotification } = input;
-  if (leaderFailure !== null || operatorNotification?.type === "leader-recovery-failed") {
+  const { task, activeRuns, events, leaderFailure } = input;
+  if (leaderFailure !== null) {
     result.push({
       kind: "leader-recovery",
       id: `leader-recovery:${task.id}`,
       owner: "operator",
-      summary: leaderFailure?.message
-        ?? (operatorNotification?.type === "leader-recovery-failed"
-          ? operatorNotification.message
-          : "Leader recovery failed."),
-      ...(leaderFailure === null ? {} : { failClosed: true })
-    });
-  }
-  if (operatorNotification?.type === "leader-stalled") {
-    result.push({
-      kind: "leader-stalled",
-      id: `leader-stall:${operatorNotification.runId}:${operatorNotification.progressAt}`,
-      owner: "operator",
-      summary: operatorNotification.message,
-      runId: operatorNotification.runId,
-      roleName: "leader"
+      summary: leaderFailure.message,
+      failClosed: true
     });
   }
   for (const run of activeRuns) {
@@ -934,10 +913,9 @@ function roleOwner(roleName: string): TaskExecutionOwner {
 function isRecoveryPending(
   wakeup: PendingWakeup | null,
   mailbox: WorkMailbox | null,
-  failure: LeaderFailure | null,
-  notification: OperatorNotification | null
+  failure: LeaderFailure | null
 ): boolean {
-  if (failure !== null || notification?.type === "leader-recovery-failed") return false;
+  if (failure !== null) return false;
   const reasons = [
     ...(wakeup?.reasons ?? []),
     ...(mailbox === null ? [] : mailboxBatches(mailbox).flatMap((batch) => batch.reasons))

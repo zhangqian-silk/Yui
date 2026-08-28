@@ -1,156 +1,56 @@
+import type { TaskEvent } from "../event/taskEvent.js";
 import type { InputRequest } from "../input/inputRequest.js";
-import type {
-  LeaderRecoveryOperatorNotification,
-  LeaderStallNotification,
-  OperatorNotification,
-  TaskTerminalOperatorNotification
-} from "../scheduler/operatorNotification.js";
-import { formatTimestamp } from "../output/timePresentation.js";
-import {
-  formatInputRequestReceiptId,
-  formatTaskRecordReference
-} from "../task/taskRecordReference.js";
 
-type OperatorPresentationBase = Readonly<{
-  taskId: string;
+export type OperatorPresentationItem =
+  | Readonly<{ kind: "input-request"; request: InputRequest }>
+  | Readonly<{ kind: "task-event"; event: TaskEvent }>;
+
+export type OperatorPresentation = Readonly<{
   receiptId: string;
   text: string;
 }>;
 
-export type OperatorPresentation = OperatorPresentationBase & Readonly<{
-  category: "attention" | "information";
-  source: Readonly<
-    | { kind: "input-request"; taskId: string; localId: string }
-    | { kind: "leader-recovery"; id: string }
-    | { kind: "leader-stall"; id: string }
-    | { kind: "task-terminal"; id: string }
-  >;
-}>;
+/**
+ * One mailbox batch becomes one short synthetic user message. The durable
+ * records remain the context authority; this wake text carries only stable
+ * identities and exact CLI reads, never copied Task or Provider narrative.
+ */
+export function createOperatorBatchPresentation(
+  batchId: string,
+  items: readonly OperatorPresentationItem[]
+): OperatorPresentation {
+  if (items.length === 0) throw new Error("Operator presentation requires at least one item.");
+  return {
+    receiptId: `operator-batch:${batchId}`,
+    text: [
+      "[Yui updates]",
+      "Yui recorded the following durable updates. Inspect the referenced records and present only information that changes the user's understanding, authorization, or next action.",
+      ...items.flatMap(renderItem)
+    ].join("\n")
+  };
+}
 
-export type OperatorAttentionPresentation = OperatorPresentation & Readonly<{
-  category: "attention";
-}>;
-
-export type OperatorInformationPresentation = OperatorPresentation & Readonly<{
-  category: "information";
-}>;
-
-export type OperatorPresentationContext = Readonly<{
-  timeZone?: unknown;
-}>;
-
-export function createInputRequestOperatorPresentation(
-  request: InputRequest,
-  context: OperatorPresentationContext
-): OperatorAttentionPresentation {
-  const policy = request.policy;
-  const recommendation = policy.kind === "recommended"
-    ? request.choices.find(({ key }) => key === policy.recommendedChoiceKey)
-    : undefined;
-  if (policy.kind === "recommended" && recommendation === undefined) {
-    throw new Error(
-      `Input request ${request.id} recommendation ${policy.recommendedChoiceKey} is missing.`
-    );
+function renderItem(item: OperatorPresentationItem): string[] {
+  if (item.kind === "input-request") {
+    const { request } = item;
+    return [
+      `- User input requested: ${request.taskId}/${request.id}`,
+      `  Inspect: yui task input show ${request.taskId}/${request.id}`
+    ];
   }
-
-  return {
-    category: "attention",
-    taskId: request.taskId,
-    receiptId: formatInputRequestReceiptId(request.taskId, request.id),
-    source: { kind: "input-request", taskId: request.taskId, localId: request.id },
-    text: [
-      "A Task Leader is waiting for a boundary decision. Inspect it before involving the user.",
-      "Present it only when it is a user-owned choice, authorization, credential, unavailable external fact, or irreversible operation.",
-      `If it is an implementation, scheduling, review, or recoverable runtime choice, do not present it to the user; return it to the Leader with: yui task input cancel ${request.taskId} ${request.id} --reason \"Operator returned: not a user-owned boundary\"`,
-      "For a user-owned boundary, do not answer it yourself; do not answer or choose on the user's behalf; relay the user's exact response only.",
-      `Task: ${request.taskId}`,
-      `Input: ${request.id}`,
-      `Question: ${request.question}`,
-      ...(request.choices.length === 0
-        ? ["Answer type: free text"]
-        : ["Choices:", ...request.choices.map(({ key, label }) => `  ${key}: ${label}`)]),
-      ...(policy.kind === "required"
-        ? ["Decision policy: this requires the user's response; there is no automatic fallback."]
-        : [
-            `Agent recommendation: ${recommendation!.key}: ${recommendation!.label}`,
-            `Automatic fallback after: ${formatTimestamp(policy.timeoutAt, context.timeZone)}`
-          ]),
-      `Inspect: yui task input show ${formatTaskRecordReference(
-        request.taskId, request.id, "inputRequest"
-      )}`,
-      request.choices.length === 0
-        ? `After the user replies: yui task input answer ${formatTaskRecordReference(
-            request.taskId, request.id, "inputRequest"
-          )} --text "<answer>"`
-        : `After the user chooses: yui task input answer ${formatTaskRecordReference(
-            request.taskId, request.id, "inputRequest"
-          )} --choice <key>`
-    ].join("\n")
-  };
+  const { event } = item;
+  return [
+    `- ${eventLabel(event)}: ${event.taskId}/${event.id}`,
+    `  Inspect: yui task event show ${event.taskId} ${event.id}`
+  ];
 }
 
-export function createLeaderRecoveryOperatorPresentation(
-  notification: LeaderRecoveryOperatorNotification
-): OperatorAttentionPresentation {
-  return {
-    category: "attention",
-    taskId: notification.taskId,
-    receiptId: `leader-recovery:${notification.taskId}:${notification.createdAt}`,
-    source: { kind: "leader-recovery", id: notification.taskId },
-    text: [
-      "A Task cannot recover its Leader automatically and needs user attention.",
-      `Task: ${notification.taskId}`,
-      `Failure: ${notification.message}`,
-      `Inspect: yui task show ${notification.taskId}`,
-      "Recovery status: yui jobs list",
-      `Retry after inspection: yui jobs retry leader-recovery:${notification.taskId}`
-    ].join("\n")
-  };
-}
-
-export function createLeaderStallOperatorPresentation(
-  notification: LeaderStallNotification
-): OperatorAttentionPresentation {
-  return {
-    category: "attention",
-    taskId: notification.taskId,
-    receiptId: `leader-stall:${notification.taskId}:${notification.runId}:${notification.progressAt}`,
-    source: {
-      kind: "leader-stall",
-      id: `${notification.runId}:${notification.progressAt}`
-    },
-    text: [
-      "A Task Leader is truly stalled and needs user attention.",
-      `Task: ${notification.taskId}`,
-      `Leader Run: ${notification.runId}`,
-      `lastProgressAt: ${notification.progressAt}`,
-      "Classification: truly-stalled",
-      `Evidence: ${notification.evidenceKey}`,
-      "Controller preserved the exact Run/Session fence and performed no automatic Enter, reset, retry, kill, or Session replacement.",
-      `Inspect: yui task context ${notification.taskId}`,
-      "Choose the supported continuation, reset, retry, Agent change, or user-input action only after inspection."
-    ].join("\n")
-  };
-}
-
-export function createTaskTerminalOperatorPresentation(
-  notification: TaskTerminalOperatorNotification
-): OperatorInformationPresentation {
-  const action = notification.status === "completed" ? "completed" : "retired";
-  const actor = notification.by === "leader"
-    ? "its Leader"
-    : notification.by === "operator"
-      ? "the Operator"
-      : "the user";
-  return {
-    category: "information",
-    taskId: notification.taskId,
-    receiptId: `task-terminal:${notification.taskId}:${notification.status}:${notification.createdAt}`,
-    source: { kind: "task-terminal", id: notification.taskId },
-    text: [
-      `Task ${notification.taskId} was ${action} by ${actor}.`,
-      `Summary: ${notification.summary}`,
-      `Inspect: yui task show ${notification.taskId}`
-    ].join("\n")
-  };
+function eventLabel(event: TaskEvent): string {
+  switch (event.type) {
+    case "task.completed": return "Task completed";
+    case "task.retired": return "Task retired";
+    case "leader.attention-required": return "Task Leader needs attention";
+    case "run.stalled": return "Task Leader stalled";
+    default: return `Task event ${event.type}`;
+  }
 }

@@ -47,7 +47,7 @@ export type RuntimeTurnCompletedInput = Readonly<{
   taskId?: string;
   roleName: string;
   agentId: string;
-  adapterId: "codex";
+  adapterId: "codex" | "claude";
   launchId?: string;
   nativeSessionId: string;
   turnId: string;
@@ -139,7 +139,7 @@ export class FileRuntimeEventInbox {
   enqueueTurnCompleted(
     input: RuntimeTurnCompletedInput
   ): RuntimeEventEnqueueResult<RuntimeTurnCompletedEvent> {
-    const normalized = normalizeCodexInput(input);
+    const normalized = normalizeNativeTurnCompletedInput(input);
     return this.publish(Object.freeze({
       schemaVersion: 1,
       id: runtimeEventId("native-turn-completed", normalized),
@@ -410,7 +410,9 @@ function runtimeEventId(
   return `turn-${createHash("sha256").update(JSON.stringify(common)).digest("hex")}`;
 }
 
-function normalizeCodexInput(input: RuntimeTurnCompletedInput): RuntimeTurnCompletedInput {
+function normalizeNativeTurnCompletedInput(
+  input: RuntimeTurnCompletedInput
+): RuntimeTurnCompletedInput {
   const scope = input.scope;
   if (scope !== "task" && scope !== "global") throw invalidEvent();
   if (typeof input.summary !== "string" || input.summary.includes("\0")) throw invalidEvent();
@@ -432,7 +434,8 @@ function normalizeCodexInput(input: RuntimeTurnCompletedInput): RuntimeTurnCompl
       : { title: requireIdentityText(input.title, "Session title") }),
     summary: truncateUtf8(input.summary.trim(), MAX_RUNTIME_TURN_SUMMARY_BYTES)
   } as const;
-  if (common.adapterId !== "codex" || common.summary.length === 0) throw invalidEvent();
+  if ((common.adapterId !== "codex" && common.adapterId !== "claude")
+    || common.summary.length === 0) throw invalidEvent();
   return scope === "task"
     ? { ...common, taskId: requireIdentityText(input.taskId, "Task id") }
     : common;
@@ -461,7 +464,7 @@ function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
   if (!isObject(value)) throw invalidEvent();
   switch (value.type) {
     case "runtime-observation": return parseRuntimeObservationEvent(value);
-    case "native-turn-completed": return parseCodexEvent(value);
+    case "native-turn-completed": return parseNativeTurnCompletedEvent(value);
     case "durable-job-terminal": return parseDurableJobTerminalEvent(value);
     default: throw invalidEvent();
   }
@@ -513,7 +516,7 @@ function parseDurableJobTerminalEvent(
   });
 }
 
-function parseCodexEvent(value: Record<string, any>): RuntimeTurnCompletedEvent {
+function parseNativeTurnCompletedEvent(value: Record<string, any>): RuntimeTurnCompletedEvent {
   const scope = value.scope;
   const expected = scope === "task"
     ? [
@@ -534,7 +537,7 @@ function parseCodexEvent(value: Record<string, any>): RuntimeTurnCompletedEvent 
     || value.schemaVersion !== 1
     || !hasExactKeys(value, expected)) throw invalidEvent();
   const receivedAt = requireTimestamp(value.receivedAt);
-  const normalized = normalizeCodexInput({
+  const normalized = normalizeNativeTurnCompletedInput({
     scope,
     ...(scope === "task" ? { taskId: value.taskId } : {}),
     roleName: value.roleName,

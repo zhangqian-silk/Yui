@@ -82,6 +82,8 @@ const STORED_TASK_JOB_CALLER_KEY_HASHES_FROM_VERSION = 15;
 const STORED_TASK_JOB_CALLER_KEY_HASHES_TO_VERSION = 16;
 const STORED_TASK_WAKES_FROM_VERSION = 16;
 const STORED_TASK_WAKES_TO_VERSION = 17;
+const STORED_TASK_EVENT_NOTICES_FROM_VERSION = 17;
+const STORED_TASK_EVENT_NOTICES_TO_VERSION = 18;
 const TASK_WAKE_FROM_VERSION = 0;
 const TASK_WAKE_TO_VERSION = 1;
 const STORED_TASK_PUBLICATION_REFERENCES_FROM_VERSION = 16;
@@ -239,6 +241,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerCompatible(storedTaskDurableJobsStep())
     .registerCompatible(storedTaskJobCallerKeyHashesStep())
     .registerCompatible(storedTaskWakesAndPublicationReferencesStep())
+    .registerOfflineMigration(storedTaskEventNoticesStep())
     .registerCompatible(taskWakeIntroductionStep())
     .registerCompatible(durableJobIntroductionStep())
     .registerOfflineMigration(capabilityGrantIntroductionStep())
@@ -1480,6 +1483,340 @@ function normalizeStoredTaskV16ToV17(snapshot: HomeSnapshot): HomeSnapshot {
   return {
     schemaManifest,
     state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/** StoredTask v18 retires the mutable OperatorNotification projection. */
+function storedTaskEventNoticesStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "storedTask",
+    fromVersion: STORED_TASK_EVENT_NOTICES_FROM_VERSION,
+    toVersion: STORED_TASK_EVENT_NOTICES_TO_VERSION,
+    preconditions: requireStoredTaskV17OperatorNoticeShape,
+    transform: normalizeStoredTaskV17ToV18,
+    declaredEffects: ["operator-mailbox-event-references"]
+  };
+}
+
+const STORED_TASK_V17_FIELDS = [
+  "schemaVersion",
+  "task",
+  "idHighWaterMarks",
+  "brief",
+  "changeSets",
+  "integrationAttempts",
+  "integrationQueue",
+  "durableJobs",
+  "roles",
+  "managedWorkspaces",
+  "roleSessionSets",
+  "jobCallerKeyHashes",
+  "workItems",
+  "contextSnapshots",
+  "agentRuns",
+  "reviewRounds",
+  "activeRuns",
+  "messages",
+  "inputRequests",
+  "decisions",
+  "milestones",
+  "events",
+  "wakes",
+  "capabilityGrants",
+  "releaseWorkflows",
+  "publicationReferences",
+  "leaderFailure",
+  "operatorNotification"
+] as const;
+
+function requireStoredTaskV17OperatorNoticeShape(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.storedTask !== STORED_TASK_EVENT_NOTICES_FROM_VERSION) {
+    throw new Error(
+      `Record storedTask compatible step requires manifest version ${STORED_TASK_EVENT_NOTICES_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (task.schemaVersion !== STORED_TASK_EVENT_NOTICES_FROM_VERSION) {
+      throw new Error(
+        `Task aggregate ${taskId} must use schemaVersion ${STORED_TASK_EVENT_NOTICES_FROM_VERSION}.`
+      );
+    }
+    const allowed = new Set<string>(STORED_TASK_V17_FIELDS);
+    const unknown = Object.keys(task).find((key) => !allowed.has(key));
+    if (unknown !== undefined) {
+      throw new Error(`Task aggregate ${taskId} has an unknown v17 field: ${unknown}.`);
+    }
+    const missing = STORED_TASK_V17_FIELDS.find((key) => !Object.hasOwn(task, key));
+    if (missing !== undefined) {
+      throw new Error(`Task aggregate ${taskId} is missing v17 field: ${missing}.`);
+    }
+    if (task.operatorNotification !== null) {
+      requireLegacyOperatorNotice(task.operatorNotification, taskId);
+    }
+  }
+}
+
+function requireLegacyOperatorNotice(value: unknown, taskId: string): void {
+  const notice = asObject(value, `Operator notification ${taskId}`);
+  if (notice.schemaVersion !== 1 || notice.taskId !== taskId) {
+    throw new Error(`Operator notification identity is invalid: ${taskId}.`);
+  }
+  if (notice.type === "leader-recovery-failed") {
+    requireLegacyNoticeText(notice.message, `Operator notification message ${taskId}`);
+  } else if (notice.type === "leader-stalled") {
+    requireLegacyNoticeText(notice.message, `Operator notification message ${taskId}`);
+    requireLegacyNoticeText(notice.runId, `Operator notification Run ${taskId}`);
+    requireLegacyNoticeTimestamp(notice.progressAt, `Operator notification progress ${taskId}`);
+    requireLegacyNoticeText(notice.evidenceKey, `Operator notification evidence ${taskId}`);
+    if (notice.classification !== "truly-stalled") {
+      throw new Error(`Operator notification classification is invalid: ${taskId}.`);
+    }
+  } else if (notice.type === "task-terminal") {
+    if (notice.status !== "completed" && notice.status !== "retired") {
+      throw new Error(`Operator notification Task status is invalid: ${taskId}.`);
+    }
+    if (!["user", "operator", "leader"].includes(String(notice.by))) {
+      throw new Error(`Operator notification Task actor is invalid: ${taskId}.`);
+    }
+    requireLegacyNoticeText(notice.summary, `Operator notification summary ${taskId}`);
+  } else {
+    throw new Error(`Operator notification type is invalid: ${taskId}.`);
+  }
+  requireLegacyNoticeTimestamp(notice.createdAt, `Operator notification createdAt ${taskId}`);
+  requireLegacyNoticeTimestamp(notice.updatedAt, `Operator notification updatedAt ${taskId}`);
+}
+
+function requireLegacyNoticeText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0 || value.includes("\0")) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return value;
+}
+
+function requireLegacyNoticeTimestamp(value: unknown, label: string): string {
+  const timestamp = requireLegacyNoticeText(value, label);
+  if (!Number.isFinite(Date.parse(timestamp))) throw new Error(`${label} is invalid.`);
+  return timestamp;
+}
+
+function normalizeStoredTaskV17ToV18(snapshot: HomeSnapshot): HomeSnapshot {
+  requireStoredTaskV17OperatorNoticeShape(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...versions,
+      storedTask: STORED_TASK_EVENT_NOTICES_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  const legacyNotices = new Map<string, Record<string, unknown> | null>();
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    legacyNotices.set(
+      taskId,
+      task.operatorNotification === null
+        ? null
+        : asObject(task.operatorNotification, `Operator notification ${taskId}`)
+    );
+    const nextTask: Record<string, unknown> = {
+      ...task,
+      schemaVersion: STORED_TASK_EVENT_NOTICES_TO_VERSION,
+      events: { ...asObject(task.events, `Task events ${taskId}`) },
+      idHighWaterMarks: {
+        ...asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`)
+      }
+    };
+    delete nextTask.operatorNotification;
+    nextTasks[taskId] = nextTask;
+  }
+
+  const eventByTask = new Map<string, string>();
+  const eventRefForTask = (taskId: string): Record<string, unknown> => {
+    const existing = eventByTask.get(taskId);
+    if (existing !== undefined) return { type: "event", taskId, id: existing };
+    const task = asObject(nextTasks[taskId], `Task aggregate ${taskId}`);
+    const events = asObject(task.events, `Task events ${taskId}`);
+    const marks = asObject(task.idHighWaterMarks, `Task id high-water marks ${taskId}`);
+    let sequence = Number(marks.event ?? 0) + 1;
+    if (!Number.isSafeInteger(sequence) || sequence < 1) {
+      throw new Error(`Task event high-water mark is invalid: ${taskId}.`);
+    }
+    while (events[`event-${sequence}`] !== undefined) sequence += 1;
+    const eventId = `event-${sequence}`;
+    const notice = legacyNotices.get(taskId) ?? null;
+    const migrated = migratedOperatorNoticeEvent(taskId, eventId, notice, task);
+    events[eventId] = migrated;
+    marks.event = sequence;
+    eventByTask.set(taskId, eventId);
+    return { type: "event", taskId, id: eventId };
+  };
+
+  const mailboxes = asObject(snapshot.state.mailboxes, "state mailboxes");
+  const nextMailboxes: Record<string, unknown> = {};
+  for (const [key, rawMailbox] of Object.entries(mailboxes)) {
+    const mailbox = asObject(rawMailbox, `WorkMailbox ${key}`);
+    const target = asObject(mailbox.target, `WorkMailbox target ${key}`);
+    nextMailboxes[key] = target.kind === "operator"
+      ? rewriteLegacyOperatorMailbox(mailbox, key, eventRefForTask)
+      : { ...mailbox };
+  }
+  for (const [taskId, notice] of legacyNotices) {
+    if (notice !== null) eventRefForTask(taskId);
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks, mailboxes: nextMailboxes }
+  };
+}
+
+function migratedOperatorNoticeEvent(
+  taskId: string,
+  eventId: string,
+  notice: Record<string, unknown> | null,
+  taskAggregate: Record<string, unknown>
+): Record<string, unknown> {
+  const task = asObject(taskAggregate.task, `Task ${taskId}`);
+  const timestamp = String(notice?.updatedAt ?? task.updatedAt ?? task.createdAt ?? "");
+  if (!Number.isFinite(Date.parse(timestamp))) {
+    throw new Error(`Legacy Operator notice timestamp is invalid: ${taskId}.`);
+  }
+  const type = notice?.type;
+  if (notice !== null && type === "task-terminal") {
+    const status = String(notice.status ?? "");
+    if (status !== "completed" && status !== "retired") {
+      throw new Error(`Legacy terminal Operator notice status is invalid: ${taskId}.`);
+    }
+    return {
+      schemaVersion: 2,
+      id: eventId,
+      taskId,
+      type: `task.${status}`,
+      payload: {
+        status,
+        by: String(notice.by ?? "operator"),
+        summary: String(notice.summary ?? "Task reached a terminal state."),
+        migratedFrom: "operator-notification"
+      },
+      createdAt: timestamp
+    };
+  }
+  if (notice !== null && type === "leader-stalled") {
+    return {
+      schemaVersion: 2,
+      id: eventId,
+      taskId,
+      type: "run.stalled",
+      payload: {
+        runId: String(notice.runId ?? "unknown"),
+        roleName: "leader",
+        progressAt: String(notice.progressAt ?? timestamp),
+        classification: "truly-stalled",
+        evidenceKey: String(notice.evidenceKey ?? "legacy-operator-notification"),
+        migratedFrom: "operator-notification"
+      },
+      createdAt: timestamp
+    };
+  }
+  return {
+    schemaVersion: 2,
+    id: eventId,
+    taskId,
+    type: "leader.attention-required",
+    payload: {
+      reason: type === "leader-recovery-failed"
+        ? "leader-recovery-failed"
+        : "legacy-operator-mailbox",
+      message: String(notice?.message ?? "Inspect the migrated Operator notice."),
+      migratedFrom: notice === null ? "operator-mailbox" : "operator-notification"
+    },
+    createdAt: timestamp
+  };
+}
+
+function rewriteLegacyOperatorMailbox(
+  mailbox: Record<string, unknown>,
+  key: string,
+  eventRefForTask: (taskId: string) => Record<string, unknown>
+): Record<string, unknown> {
+  const rewriteRef = (rawRef: unknown): Record<string, unknown> => {
+    const ref = asObject(rawRef, `WorkMailbox ${key} entity ref`);
+    if (ref.type === "input" || ref.type === "event") return { ...ref };
+    const taskId = ref.type === "task" ? ref.id : ref.taskId;
+    if (typeof taskId !== "string" || taskId.trim().length === 0) {
+      throw new Error(`Legacy Operator mailbox ref has no Task identity: ${key}.`);
+    }
+    return eventRefForTask(taskId);
+  };
+  const rewriteBatch = (rawBatch: unknown, label: string): Record<string, unknown> => {
+    const batch = asObject(rawBatch, label);
+    if (!Array.isArray(batch.refs)) throw new Error(`${label} refs must be an array.`);
+    const sourceRefs = batch.refs.map((rawRef) => asObject(rawRef, `${label} entity ref`));
+    const semanticTaskIds = new Set(sourceRefs.flatMap((ref) => (
+      (ref.type === "input" || ref.type === "event") && typeof ref.taskId === "string"
+        ? [ref.taskId]
+        : []
+    )));
+    const refs: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    for (const sourceRef of sourceRefs) {
+      const referencedTaskId = sourceRef.type === "task" ? sourceRef.id : sourceRef.taskId;
+      if (sourceRef.type !== "input"
+        && sourceRef.type !== "event"
+        && typeof referencedTaskId === "string"
+        && semanticTaskIds.has(referencedTaskId)) {
+        continue;
+      }
+      const ref = rewriteRef(sourceRef);
+      const identity = `${String(ref.type)}\0${String(ref.taskId ?? "")}\0${String(ref.id)}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      refs.push(ref);
+    }
+    return { ...batch, refs };
+  };
+  const rewriteProcessing = (raw: unknown): Record<string, unknown> | null => {
+    if (raw === null) return null;
+    const processing = asObject(raw, `WorkMailbox ${key} processing`);
+    return {
+      ...processing,
+      batch: rewriteBatch(processing.batch, `WorkMailbox ${key} processing batch`),
+      ...(processing.executionRef === undefined
+        ? {}
+        : { executionRef: rewriteRef(processing.executionRef) })
+    };
+  };
+  const rewriteDelivery = (raw: unknown): Record<string, unknown> | null => {
+    if (raw === null) return null;
+    const delivery = asObject(raw, `WorkMailbox ${key} input delivery`);
+    return {
+      ...delivery,
+      batch: rewriteBatch(delivery.batch, `WorkMailbox ${key} input delivery batch`),
+      executionRef: rewriteRef(delivery.executionRef)
+    };
+  };
+  const pending = asObject(mailbox.pending, `WorkMailbox ${key} pending lanes`);
+  return {
+    ...mailbox,
+    processing: rewriteProcessing(mailbox.processing),
+    pending: {
+      ...pending,
+      normal: pending.normal === null
+        ? null
+        : rewriteBatch(pending.normal, `WorkMailbox ${key} normal batch`),
+      userCorrection: pending.userCorrection === null
+        ? null
+        : rewriteBatch(pending.userCorrection, `WorkMailbox ${key} correction batch`)
+    },
+    inputDelivery: rewriteDelivery(mailbox.inputDelivery)
   };
 }
 

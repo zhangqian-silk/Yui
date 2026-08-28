@@ -27,7 +27,6 @@ import {
   taskRecordRetirement
 } from "../task/taskRecordRetirement.js";
 import {
-  clearMatchingLeaderStallAttention,
   isRoleRunStalled,
   RUN_PROGRESS_EVENT,
   RUN_RECOVERED_EVENT
@@ -317,7 +316,7 @@ import {
   taskActor as resolveTaskActor,
   taskLeaderActionRunId
 } from "./taskActor.js";
-import { createTaskTerminalNotification } from "../scheduler/operatorNotification.js";
+import { enqueueOperatorEvent } from "../scheduler/operatorEvent.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import { renderWakeReason, wakeReason } from "../scheduler/wakeReason.js";
 import {
@@ -1386,15 +1385,6 @@ function completeTaskCommand(
     tx.saveTask(completed);
     tx.clearPendingWakeup(task.id);
     tx.clearLeaderFailure(task.id);
-    tx.clearOperatorNotification(task.id);
-    tx.saveOperatorNotification(createTaskTerminalNotification(
-      task.id,
-      "completed",
-      actor,
-      summary,
-      now
-    ));
-    enqueueWork(tx, { kind: "operator" }, "task-terminal", now, [taskRef(task.id)]);
     if (publishedTreeProof !== undefined) {
       recordTaskEvent(tx, task.id, "task.completion-published-tree-accepted", {
         by: actor,
@@ -1408,7 +1398,7 @@ function completeTaskCommand(
         tree: publishedTreeProof.tree
       }, now);
     }
-    recordTaskEvent(tx, task.id, "task.completed", {
+    const terminalEvent = recordTaskEvent(tx, task.id, "task.completed", {
       by: actor,
       summary,
       ...(actualTaskCandidate === undefined
@@ -1422,6 +1412,7 @@ function completeTaskCommand(
         ? {}
         : { cleanupAdvisories: String(readiness.advisories.length) })
     }, now);
+    enqueueOperatorEvent(tx, terminalEvent, "task-terminal", now);
     // A terminal Task must never leave a Task-lane signal that can wake it.
     // The durable records remain intact; only the derived mailbox work is
     // discarded at this lifecycle boundary.
@@ -1523,7 +1514,6 @@ function reopenTaskCommand(
       if (task.status !== "completed") throw usageError(`Task is not completed: ${task.id}.`);
       const active = reopenTask(task, now);
       tx.saveTask(active);
-      tx.clearOperatorNotification(task.id);
       const reopenedReason = wakeReason("task-reopened");
       enqueueWork(tx, leaderMailbox(task.id), reopenedReason, now, [taskRef(task.id)]);
       enqueueWork(tx, taskMailbox(task.id), reopenedReason, now, [taskRef(task.id)]);
@@ -1600,7 +1590,6 @@ function archiveTaskCommand(
     tx.saveTask(archived);
     tx.clearPendingWakeup(task.id);
     tx.clearLeaderFailure(task.id);
-    tx.clearOperatorNotification(task.id);
     for (const role of tx.listRoles(task.id)) {
       tx.removeWorkMailbox(roleMailbox(task.id, role.name));
     }
@@ -1735,26 +1724,18 @@ function retireTaskCommand(
     }
     tx.clearPendingWakeup(task.id);
     tx.clearLeaderFailure(task.id);
-    tx.clearOperatorNotification(task.id);
     const retired = retireTask(task, {
       by: actor,
       summary,
       ...(replacementTaskId === undefined ? {} : { replacementTaskId })
     }, now);
     tx.saveTask(retired);
-    tx.saveOperatorNotification(createTaskTerminalNotification(
-      task.id,
-      "retired",
-      actor,
-      summary,
-      now
-    ));
-    enqueueWork(tx, { kind: "operator" }, "task-terminal", now, [taskRef(task.id)]);
-    recordTaskEvent(tx, task.id, "task.retired", {
+    const terminalEvent = recordTaskEvent(tx, task.id, "task.retired", {
       by: actor,
       summary,
       ...(replacementTaskId === undefined ? {} : { replacementTaskId })
     }, now);
+    enqueueOperatorEvent(tx, terminalEvent, "task-terminal", now);
     return { task: retired, changed: true } as const;
   });
   if (result.changed) {
@@ -7366,7 +7347,6 @@ function yieldRun(
         kind: "yield"
       }, now);
     }
-    clearMatchingLeaderStallAttention(tx, task.id, active.id);
     if (active.purpose === "review") {
       const round = active.reviewRoundId === undefined
         ? null
@@ -7678,7 +7658,6 @@ function checkpointRun(
         kind: "checkpoint"
       }, now);
     }
-    clearMatchingLeaderStallAttention(tx, task.id, run.id);
     return progress;
   });
   return `Checkpoint recorded for ${parsed.positionals[0]} (${event.id}).\n`;
@@ -8344,8 +8323,8 @@ function recordTaskEvent(
   type: string,
   payload: TaskEventPayload,
   now: Date
-): void {
-  recordTaskEventRecord(store, taskId, type, payload, now);
+): TaskEvent {
+  return recordTaskEventRecord(store, taskId, type, payload, now);
 }
 
 function leaderActionEventPayload(

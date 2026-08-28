@@ -3,10 +3,6 @@ import type { Decision } from "../decision/decision.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { LeaderFailure } from "./leaderFailure.js";
-import type {
-  LeaderRecoveryOperatorNotification,
-  OperatorNotification
-} from "./operatorNotification.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { AgentRun } from "../run/agentRun.js";
 import type { PendingProviderRetry } from "../run/providerRetry.js";
@@ -273,7 +269,6 @@ export type LeaderDispatchFailurePersistence = Readonly<{
   session: SchedulerRoleSession | null;
   claimed: Readonly<{ run: SchedulerAgentRun; wakeup: PendingWakeup }>;
   failure: LeaderFailure;
-  notification: LeaderRecoveryOperatorNotification;
   now: Date;
 }>;
 
@@ -294,7 +289,6 @@ export type RunProgressFacts = Readonly<{
  * Role/session-set model and performs each multi-record persistence operation.
  */
 export interface SchedulerStorePort {
-  getPresentationContext(): Readonly<{ timeZone?: unknown }>;
   listTasks(): readonly SchedulerTask[];
   /**
    * Indexed active-Task selection for full Controller reconciliation. Stores
@@ -312,6 +306,8 @@ export interface SchedulerStorePort {
   listOpenInputRequests(taskIds?: readonly string[]): readonly InputRequest[];
   getInputRequest(taskId: string, inputRequestId: string): InputRequest | null;
   getOperatorDeliveryTarget(): SchedulerOperatorDeliveryTarget | null;
+  /** Marks a submitted Operator turn busy until its exact native completion. */
+  markOperatorTurnStarted(now: Date): void;
   resolveExpiredInputRecommendations(
     now: Date,
     taskIds?: ReadonlySet<string>
@@ -528,7 +524,6 @@ export interface SchedulerStorePort {
   recordWakeSuppression?(taskId: string, reason: string, now: Date): void;
 
   getLeaderFailure(taskId: string): LeaderFailure | null;
-  getOperatorNotification(taskId: string): OperatorNotification | null;
   getTaskBrief(taskId: string): TaskBrief | null;
   listDecisions(taskId: string): readonly Decision[];
   listMilestones(taskId: string): readonly Milestone[];
@@ -552,7 +547,7 @@ export interface SchedulerStorePort {
   saveRoleRunDeliveryFailure(
     input: RoleRunDeliveryFailurePersistence
   ): "failed" | "state-changed";
-  /** Persist LeaderFailure, OperatorNotification and failed/broken runtime state. */
+  /** Persist LeaderFailure, its semantic attention event, and failed/broken runtime state. */
   saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
   /** Fail the exact Run and its WorkItem or ReviewRound, clear active-run, and stop the Role session. */
   saveExitedRoleRun(input: ExitedRoleRunPersistence): "failed" | "state-changed";

@@ -16,7 +16,6 @@ import {
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
-import { createLeaderRecoveryNotification } from "./operatorNotification.js";
 import type {
   PreparedRoleDelivery,
   SchedulerRole,
@@ -597,12 +596,6 @@ export async function processLeaderWakeups(
             message,
             now,
             store.getLeaderFailure(task.id)
-          ),
-          notification: createLeaderRecoveryNotification(
-            task.id,
-            message,
-            now,
-            store.getOperatorNotification(task.id)
           ),
           now
         });

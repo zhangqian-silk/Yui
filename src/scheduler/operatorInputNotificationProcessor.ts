@@ -1,12 +1,9 @@
+import type { TaskEvent } from "../event/taskEvent.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import {
-  createInputRequestOperatorPresentation,
-  createLeaderRecoveryOperatorPresentation,
-  createLeaderStallOperatorPresentation,
-  createTaskTerminalOperatorPresentation,
-  type OperatorPresentation
+  createOperatorBatchPresentation,
+  type OperatorPresentationItem
 } from "../interaction/operatorPresentation.js";
-import type { OperatorNotification } from "./operatorNotification.js";
 import type {
   SchedulerReconcileSelection,
   SchedulerStorePort,
@@ -14,22 +11,20 @@ import type {
 } from "./ports.js";
 import { mailboxHasWork, nextPendingBatch } from "../coordination/workMailbox.js";
 
-type OperatorNotificationOutcome = Readonly<{
+type OperatorDeliveryOutcome = Readonly<{
+  sourceKind: "input" | "event";
+  sourceId: string;
   taskId: string;
   status: "sent" | "already-sent" | "skipped" | "failed";
   reason?: "operator-unavailable" | "operator-not-ready" | "delivery-unsupported";
   error?: string;
 }>;
 
-export type OperatorInputNotificationResult =
-  | (OperatorNotificationOutcome & Readonly<{ inputRequestId: string }>)
-  | (OperatorNotificationOutcome & Readonly<{ recoveryTaskId: string }>)
-  | (OperatorNotificationOutcome & Readonly<{ stallTaskId: string }>)
-  | (OperatorNotificationOutcome & Readonly<{ terminalTaskId: string }>);
+export type OperatorInputNotificationResult = OperatorDeliveryOutcome;
 
 type PendingOperatorAttention =
   | Readonly<{ kind: "input"; request: InputRequest }>
-  | Readonly<{ kind: "notification"; notification: OperatorNotification }>;
+  | Readonly<{ kind: "event"; event: TaskEvent }>;
 
 export async function processOperatorInputNotifications(
   store: SchedulerStorePort,
@@ -52,18 +47,19 @@ export async function processOperatorInputNotifications(
   });
   if (claim.status === "empty") return [];
   const processing = claim.processing;
-  const requests: PendingOperatorAttention[] = processing.batch.refs
-    .flatMap((ref) => ref.type === "input"
-      ? [store.getInputRequest(ref.taskId, ref.id)]
-      : [])
-    .filter((request): request is InputRequest => request !== null && request.status === "open")
-    .map((request) => ({ kind: "input", request }));
-  const notifications: PendingOperatorAttention[] = processing.batch.refs
-    .filter((ref) => ref.type === "task")
-    .map((ref) => store.getOperatorNotification(ref.id))
-    .filter((notification): notification is OperatorNotification => notification !== null)
-    .map((notification) => ({ kind: "notification", notification }));
-  const attentions = deduplicateAttention([...requests, ...notifications]);
+  const attentions = deduplicateAttention(processing.batch.refs.flatMap(
+    (ref): PendingOperatorAttention[] => {
+      if (ref.type === "input") {
+        const request = store.getInputRequest(ref.taskId, ref.id);
+        return request !== null && request.status === "open"
+          ? [{ kind: "input" as const, request }]
+          : [];
+      }
+      if (ref.type !== "event" || store.listEvents === undefined) return [];
+      const event = store.listEvents(ref.taskId).find(({ id }) => id === ref.id);
+      return event === undefined ? [] : [{ kind: "event", event }];
+    }
+  ));
   if (attentions.length === 0) {
     store.completeWorkMailbox(targetMailbox, processing.batchId);
     return [];
@@ -75,60 +71,36 @@ export async function processOperatorInputNotifications(
     return attentions.map((attention) => skipped(attention, reason));
   }
 
-  const results: OperatorInputNotificationResult[] = [];
-  for (const [index, attention] of attentions.entries()) {
-    try {
-      const presentation = createAttentionPresentation(attention, store);
-      const outcome = await delivery.notifyOperatorInputOnce({
-        ...target,
-        receiptId: presentation.receiptId,
-        text: presentation.text
-      });
-      if (outcome === "unavailable") {
-        store.releaseWorkMailbox(targetMailbox, processing.batchId);
-        results.push(skipped(attention, "operator-unavailable"));
-        results.push(...attentions.slice(index + 1).map((pending) => (
-          skipped(pending, "operator-unavailable")
-        )));
-        break;
-      } else if (outcome === "not-ready") {
-        store.releaseWorkMailbox(targetMailbox, processing.batchId);
-        results.push(skipped(attention, "operator-not-ready"));
-        results.push(...attentions.slice(index + 1).map((pending) => (
-          skipped(pending, "operator-not-ready")
-        )));
-        break;
-      } else {
-        results.push({
-          ...attentionIdentity(attention),
-          status: outcome
-        });
-        if (outcome === "sent") {
-          if (index === attentions.length - 1) {
-            store.completeWorkMailbox(targetMailbox, processing.batchId);
-          } else {
-            store.releaseWorkMailbox(targetMailbox, processing.batchId);
-          }
-          results.push(...attentions.slice(index + 1).map((pending) => (
-            skipped(pending, "operator-not-ready")
-          )));
-          break;
-        }
-      }
-    } catch (error) {
+  try {
+    const presentation = createOperatorBatchPresentation(
+      processing.batchId,
+      attentions.map(toPresentationItem)
+    );
+    const outcome = await delivery.notifyOperatorInputOnce({
+      ...target,
+      receiptId: presentation.receiptId,
+      text: presentation.text
+    });
+    if (outcome === "unavailable" || outcome === "not-ready") {
       store.releaseWorkMailbox(targetMailbox, processing.batchId);
-      results.push({
-        ...attentionIdentity(attention),
-        status: "failed",
-        error: error instanceof Error ? error.message : String(error)
-      });
-      break;
+      const reason = outcome === "unavailable" ? "operator-unavailable" : "operator-not-ready";
+      return attentions.map((attention) => skipped(attention, reason));
     }
-  }
-  if (results.length > 0 && results.every((result) => result.status === "already-sent")) {
+    if (outcome === "sent") store.markOperatorTurnStarted(now);
     store.completeWorkMailbox(targetMailbox, processing.batchId);
+    return attentions.map((attention) => ({
+      ...attentionIdentity(attention),
+      status: outcome
+    }));
+  } catch (error) {
+    store.releaseWorkMailbox(targetMailbox, processing.batchId);
+    const detail = error instanceof Error ? error.message : String(error);
+    return attentions.map((attention) => ({
+      ...attentionIdentity(attention),
+      status: "failed",
+      error: detail
+    }));
   }
-  return results;
 }
 
 function skipped(
@@ -142,45 +114,27 @@ function skipped(
   };
 }
 
-function attentionIdentity(attention: PendingOperatorAttention):
-  | Readonly<{ inputRequestId: string; taskId: string }>
-  | Readonly<{ recoveryTaskId: string; taskId: string }>
-  | Readonly<{ stallTaskId: string; taskId: string }>
-  | Readonly<{ terminalTaskId: string; taskId: string }> {
-  if (attention.kind === "input") {
-    return { inputRequestId: attention.request.id, taskId: attention.request.taskId };
-  }
-  if (attention.notification.type === "leader-recovery-failed") {
-    return {
-        recoveryTaskId: attention.notification.taskId,
-        taskId: attention.notification.taskId
-      };
-  }
-  if (attention.notification.type === "leader-stalled") {
-    return {
-      stallTaskId: attention.notification.taskId,
-      taskId: attention.notification.taskId
-    };
-  }
-  return {
-        terminalTaskId: attention.notification.taskId,
-        taskId: attention.notification.taskId
+function attentionIdentity(attention: PendingOperatorAttention): Pick<
+  OperatorInputNotificationResult,
+  "sourceKind" | "sourceId" | "taskId"
+> {
+  return attention.kind === "input"
+    ? {
+        sourceKind: "input",
+        sourceId: attention.request.id,
+        taskId: attention.request.taskId
+      }
+    : {
+        sourceKind: "event",
+        sourceId: attention.event.id,
+        taskId: attention.event.taskId
       };
 }
 
-function createAttentionPresentation(
-  attention: PendingOperatorAttention,
-  store: SchedulerStorePort
-): OperatorPresentation {
-  if (attention.kind === "input") {
-    return createInputRequestOperatorPresentation(attention.request, store.getPresentationContext());
-  }
-  if (attention.notification.type === "leader-recovery-failed") {
-    return createLeaderRecoveryOperatorPresentation(attention.notification);
-  }
-  return attention.notification.type === "leader-stalled"
-    ? createLeaderStallOperatorPresentation(attention.notification)
-    : createTaskTerminalOperatorPresentation(attention.notification);
+function toPresentationItem(attention: PendingOperatorAttention): OperatorPresentationItem {
+  return attention.kind === "input"
+    ? { kind: "input-request", request: attention.request }
+    : { kind: "task-event", event: attention.event };
 }
 
 function deduplicateAttention(
@@ -188,11 +142,8 @@ function deduplicateAttention(
 ): PendingOperatorAttention[] {
   const seen = new Set<string>();
   return attentions.filter((attention) => {
-    const key = attention.kind === "input"
-      ? `input:${attention.request.taskId}:${attention.request.id}`
-      : attention.notification.type === "leader-stalled"
-        ? `stall:${attention.notification.taskId}:${attention.notification.runId}:${attention.notification.progressAt}`
-        : `recovery:${attention.notification.taskId}:${attention.notification.createdAt}`;
+    const identity = attentionIdentity(attention);
+    const key = `${identity.sourceKind}:${identity.taskId}:${identity.sourceId}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

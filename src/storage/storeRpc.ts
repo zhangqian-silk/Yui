@@ -202,7 +202,6 @@ const READ_ONLY_STORE_METHODS: ReadonlySet<string> = new Set([
   "getPendingWakeup",
   "listPendingWakeups",
   "getLeaderFailure",
-  "getOperatorNotification",
   "listTelemetry",
   "countTelemetry",
   "hasOutboxEntry",

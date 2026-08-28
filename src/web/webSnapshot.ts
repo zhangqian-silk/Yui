@@ -51,7 +51,6 @@ export type WebDashboardStore = Pick<TaskStore,
   | "getWorkMailbox"
   | "getPendingWakeup"
   | "getLeaderFailure"
-  | "getOperatorNotification"
   | "getRoleSession"
   | "getConfig"
 > & Readonly<{

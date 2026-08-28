@@ -628,6 +628,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     let args = [...compiled.argv];
     let command = configured.command;
     let session: SchedulerRoleSession | null;
+    if (binding.adapterId === "claude" && (managedControl || owner.scope === "global")) {
+      args.push("--plugin-dir", ensureClaudeLifecyclePlugin(this.home, this.#cliPath));
+    }
     if (binding.adapterId === "codex") {
       // Global/interactive Codex sessions still use notify for presentation.
       // Managed Runs use the structured Driver Hook as their sole lifecycle
@@ -653,10 +656,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
         : null;
     } else if (launchMode === "new") {
-      if (managedControl) args.push(
-        "--plugin-dir",
-        ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
-      );
       const nativeSessionId = requireText(
         preallocatedNativeSessionId,
         "Native session id"
@@ -665,12 +664,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       else if (!args.includes("--session-id")) args.push("--session-id", nativeSessionId);
       session = readySession(input.agentId, binding.adapterId, nativeSessionId, effective);
     } else {
-      if (managedControl) {
-        args.push(
-          "--plugin-dir",
-          ensureManagedClaudeLifecyclePlugin(this.home, this.#cliPath)
-        );
-      }
       session = readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective);
     }
     const managedClaudeRun = binding.adapterId === "claude"
@@ -1003,13 +996,13 @@ function workspaceScopeEnvironment(
   };
 }
 
-function ensureManagedClaudeLifecyclePlugin(home: string, cliPath: string): string {
+function ensureClaudeLifecyclePlugin(home: string, cliPath: string): string {
   const root = join(resolve(home), "runtime", "claude-lifecycle-plugin");
   writeTextFileAtomically(
     join(root, ".claude-plugin", "plugin.json"),
     `${JSON.stringify({
       name: "yui-runtime-lifecycle",
-      description: "Yui-owned exact Run lifecycle transport",
+      description: "Yui-owned native lifecycle transport",
       version: "1.0.0"
     }, null, 2)}\n`
   );

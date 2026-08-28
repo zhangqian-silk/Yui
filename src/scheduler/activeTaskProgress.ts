@@ -50,8 +50,7 @@ export function repairOrphanedActiveTasks(
       runs: activeRuns,
       pendingWakeup: store.getPendingWakeup(task.id),
       leaderMailbox,
-      leaderFailure: store.getLeaderFailure(task.id),
-      operatorNotification: store.getOperatorNotification(task.id)
+      leaderFailure: store.getLeaderFailure(task.id)
     });
     const queuedAlongsideActiveSibling = hasDispatchableQueuedResourceLane(store, task.id)
       && !activeRuns.some(({ roleName }) => roleName === "leader")
@@ -61,7 +60,6 @@ export function repairOrphanedActiveTasks(
       (queuedAlongsideActiveSibling ? hasLeaderInFlightTurn : hasInFlightTurn)
       || store.hasOpenInputRequest(task.id)
       || store.getLeaderFailure(task.id) !== null
-      || store.getOperatorNotification(task.id) !== null
       || (projection.status !== "needs-leader-action" && !queuedAlongsideActiveSibling)
       || hasUnclaimedLeaderWork(store, task.id, leaderMailbox)
     ) {

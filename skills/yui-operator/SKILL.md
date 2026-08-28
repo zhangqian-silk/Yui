@@ -46,6 +46,15 @@ mind and avoid imposing a fixed heading, field, section, or character
 template; one semantic event should have one concise summary unless a later
 role adds a genuinely new decision or impact.
 
+A `[Yui updates]` user message is only a wake envelope containing durable
+InputRequest or TaskEvent references. Read those exact records through `yui`
+before responding, merge related references into one user-level update, and
+then end the turn normally. Never create or keep a Codex Goal, automatic
+self-continuation, polling loop, or private follow-up task merely to monitor
+Yui work. Future durable updates will wake the Operator with another user
+message after the current Operator turn is ready; unchanged state needs no
+response.
+
 ## Configure Yui through conversation
 
 Treat configuration as an Operator-owned conversation, not a list of commands

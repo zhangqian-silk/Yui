@@ -62,6 +62,10 @@ export async function runRuntimeObservationHookCommand(
   now: Date = new Date(),
   dependencies: RuntimeObservationHookDependencies = {}
 ): Promise<void> {
+  if (environment.YUI_SESSION_SCOPE === "global") {
+    await runGlobalRuntimeTurnHook(stdinJson, environment, call, now, dependencies);
+    return;
+  }
   const parsed = parseRuntimeObservationHook(stdinJson, environment, now, dependencies);
   const inbox = new FileRuntimeEventInbox(parsed.home);
   for (const observation of parsed.observations) inbox.enqueueObservation(observation);
@@ -79,6 +83,68 @@ export async function runRuntimeObservationHookCommand(
     },
     { timeoutMs: 100 }
   ).catch(() => {});
+}
+
+async function runGlobalRuntimeTurnHook(
+  stdinJson: string | undefined,
+  environment: NodeJS.ProcessEnv,
+  call: ControllerCall,
+  now: Date,
+  dependencies: RuntimeObservationHookDependencies
+): Promise<void> {
+  const payload = parseObject(stdinJson);
+  const hookEventName = requireIdentity(payload.hook_event_name, "Agent Driver Hook event name");
+  if (hookEventName !== "Stop" && hookEventName !== "StopFailure") return;
+
+  const driverId = requireIdentity(environment.YUI_DRIVER_ID, "Agent Driver id");
+  const driver = (dependencies.drivers ?? builtinAgentDriverRegistry()).require(driverId);
+  if (driver.adapterId !== "claude" || environment.YUI_ADAPTER_ID !== driver.adapterId) {
+    throw new Error("Global runtime Hook requires the Claude adapter.");
+  }
+  const occurrenceId = `${now.toISOString()}:${(dependencies.sequence ?? monotonicSequence)()}`;
+  const nativeHook = Object.freeze({ hookEventName, payload, occurrenceId });
+  const nativeSessionId = requireIdentity(
+    driver.runtime.nativeSessionId(nativeHook),
+    "Agent Driver native Session id"
+  );
+  if (nativeSessionId !== requireIdentity(
+    environment.YUI_NATIVE_SESSION_ID,
+    "YUI native session id"
+  )) {
+    throw new Error("Global runtime Hook native Session does not match its launch envelope.");
+  }
+  const home = requireIdentity(environment.YUI_HOME, "YUI_HOME");
+  const roleName = requireIdentity(environment.YUI_ROLE, "Role name");
+  new FileRuntimeEventInbox(home, () => now).enqueueTurnCompleted({
+    scope: "global",
+    roleName,
+    agentId: requireIdentity(environment.YUI_AGENT_ID, "Agent id"),
+    adapterId: "claude",
+    launchId: requireIdentity(environment.YUI_LAUNCH_ID, "Launch id"),
+    nativeSessionId,
+    turnId: optionalIdentity(driver.runtime.nativeTurnId(nativeHook)) ?? occurrenceId,
+    ...(environment.YUI_SESSION_TITLE === undefined
+      ? {}
+      : { title: requireIdentity(environment.YUI_SESSION_TITLE, "Session title") }),
+    summary: globalHookSummary(payload, hookEventName)
+  });
+  await call(
+    home,
+    "scheduler.signal",
+    { key: runtimeLifecycleSignalKey({ scope: "global", roleName }) },
+    { timeoutMs: 100 }
+  ).catch(() => {});
+}
+
+function globalHookSummary(
+  payload: Readonly<Record<string, unknown>>,
+  hookEventName: "Stop" | "StopFailure"
+): string {
+  for (const field of ["last_assistant_message", "summary", "message", "error"]) {
+    const value = payload[field];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return hookEventName === "Stop" ? "Native Turn completed." : "Native Turn failed.";
 }
 
 export function parseRuntimeObservationHook(

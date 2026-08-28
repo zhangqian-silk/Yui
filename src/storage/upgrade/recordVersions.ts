@@ -52,7 +52,6 @@ import {
   CURRENT_WORK_MAILBOX_SCHEMA_VERSION
 } from "../taskStore.js";
 import { CURRENT_LEADER_FAILURE_SCHEMA_VERSION } from "../../scheduler/leaderFailure.js";
-import { CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION } from "../../scheduler/operatorNotification.js";
 import { CURRENT_TASK_WAKE_SCHEMA_VERSION } from "../../scheduler/taskWake.js";
 import { CURRENT_DURABLE_JOB_SCHEMA_VERSION } from "../../job/durableJob.js";
 import type { RecordAxisEntry, StorageVersionState } from "../migration/index.js";
@@ -201,8 +200,10 @@ function getCurrentRecordDescriptors(): Readonly<Record<string, RecordAxisEntry>
         CURRENT_LEADER_FAILURE_SCHEMA_VERSION,
         "state.json#/tasks/*/leaderFailure"
       ),
+      // Historical family retained in the version graph so StoredTask v17
+      // Homes can migrate; current v18 aggregates never store this field.
       operatorNotification: descriptor(
-        CURRENT_OPERATOR_NOTIFICATION_SCHEMA_VERSION,
+        1,
         "state.json#/tasks/*/operatorNotification"
       ),
       workMailbox: descriptor(CURRENT_WORK_MAILBOX_SCHEMA_VERSION, "state.json#/mailboxes")
