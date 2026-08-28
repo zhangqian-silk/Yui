@@ -23,6 +23,10 @@ import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import type { AgentRun } from "../run/agentRun.js";
 import { resolveRuntimeHealth } from "../config/yuiConfig.js";
+import {
+  projectSessionTokenMetrics,
+  resolveSessionTokenIdentity
+} from "../runtime/sessionTokenMetrics.js";
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
@@ -189,6 +193,12 @@ export function buildWebTaskDetail(
       const effectiveLaunch = activeRun?.effective ?? activeSession?.effective ?? null;
       return {
         ...role,
+        sessionTokens: projectSessionTokenMetrics(
+          events,
+          resolveSessionTokenIdentity(activeSession === undefined
+            ? null
+            : { taskId, roleName: role.name, ...activeSession })
+        ),
         effectiveLaunch,
         effectiveLaunchSource: activeRun === undefined
           ? activeSession === undefined ? null : "session"

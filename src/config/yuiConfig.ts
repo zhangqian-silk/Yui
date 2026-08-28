@@ -325,13 +325,9 @@ export function resolveTmuxHistoryLimit(value?: unknown): number {
 }
 
 /**
- * Issue 04 (context token budget): thresholds for one native Session
- * generation's observed per-request input peak, measured in tokens. When the
- * peak crosses the soft threshold the Leader wake carries a checkpoint
- * advisory; when it crosses the hard threshold the scheduler retires the
- * generation and starts a fresh one instead of waiting for provider-side
- * auto-compaction. The fields are additive and optional — Homes without them
- * keep these defaults, so no config migration is required.
+ * Compatibility parser for the retired context-budget setting. Existing
+ * Homes may retain these values, but no runtime, scheduler, or lifecycle path
+ * consumes them. Session Token metrics are an independent read-only view.
  */
 export const DEFAULT_CONTEXT_SOFT_TOKENS = 100_000;
 export const DEFAULT_CONTEXT_HARD_TOKENS = 120_000;

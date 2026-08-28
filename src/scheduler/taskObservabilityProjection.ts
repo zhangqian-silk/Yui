@@ -7,7 +7,7 @@ import {
   type ExecutionStageResourceProjection
 } from "../execution/resourceBroker.js";
 import type { AgentRun } from "../run/agentRun.js";
-import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
+import type { SessionTokenMetrics } from "../runtime/sessionTokenMetrics.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
 
@@ -76,10 +76,15 @@ export type TaskContextProjection = Readonly<{
   snapshots: readonly ContextSnapshotMetric[];
   totalBytes: number | null;
   largestBytes: number | null;
-  observedInputPeakTokens: number;
   compressionEvents: number | null;
   compressionRatio: number | null;
   compressionStatus: "unavailable";
+}>;
+
+export type TaskSessionTokenProjection = Readonly<{
+  roleName: string;
+  agentId: string;
+  metrics: SessionTokenMetrics;
 }>;
 
 export type WorkItemObservabilityProjection = Readonly<{
@@ -112,6 +117,8 @@ export type TaskObservabilityProjection = Readonly<{
   workItems: readonly WorkItemObservabilityProjection[];
   cost: TaskCostProjection;
   context: TaskContextProjection;
+  /** Per-generation read-only token metrics; never an aggregate decision input. */
+  sessionTokens: readonly TaskSessionTokenProjection[];
 }>;
 
 export type TaskObservabilityInput = Readonly<{
@@ -121,6 +128,7 @@ export type TaskObservabilityInput = Readonly<{
   runs: readonly AgentRun[];
   events: readonly TaskEvent[];
   contextSnapshots?: readonly ContextSnapshot[];
+  sessionTokens?: readonly TaskSessionTokenProjection[];
   now?: Date;
 }>;
 
@@ -159,7 +167,7 @@ export function buildTaskObservabilityProjection(
       });
     });
     const itemCost = projectCost(groups, input.runs, input.events, now);
-    const itemContext = projectContext(groups, input.runs, input.events, input.contextSnapshots);
+    const itemContext = projectContext(groups, input.runs, input.contextSnapshots);
     const evidence = groups.flatMap((group) => group.lanes.flatMap((lane) => (
       lane.result?.evidence ?? []
     )));
@@ -183,8 +191,14 @@ export function buildTaskObservabilityProjection(
     });
   });
   const cost = projectCost(input.executionGroups, input.runs, input.events, now);
-  const context = projectContext(input.executionGroups, input.runs, input.events, input.contextSnapshots);
-  return Object.freeze({ dag, workItems, cost, context });
+  const context = projectContext(input.executionGroups, input.runs, input.contextSnapshots);
+  return Object.freeze({
+    dag,
+    workItems,
+    cost,
+    context,
+    sessionTokens: Object.freeze([...(input.sessionTokens ?? [])])
+  });
 }
 
 function projectDag(workItems: readonly WorkItem[]): TaskDagProjection {
@@ -336,7 +350,6 @@ function projectCost(
 function projectContext(
   groups: readonly ExecutionGroup[],
   runs: readonly AgentRun[],
-  events: readonly TaskEvent[],
   snapshots?: readonly ContextSnapshot[]
 ): TaskContextProjection {
   const refs = new Map<string, {
@@ -370,17 +383,11 @@ function projectContext(
       });
     });
   const sizes = metrics.flatMap(({ byteSize }) => byteSize === null ? [] : [byteSize]);
-  const observedInputPeakTokens = events.flatMap((event) => {
-    const observation = runtimeObservationFromTaskEvent(event);
-    const inputTokens = observation?.payload.usage?.inputTokens;
-    return inputTokens === undefined ? [] : [inputTokens];
-  }).reduce((peak, value) => Math.max(peak, value), 0);
   return Object.freeze({
     snapshotCount: metrics.length,
     snapshots: Object.freeze(metrics),
     totalBytes: sizes.length === metrics.length ? sizes.reduce((sum, size) => sum + size, 0) : null,
     largestBytes: sizes.length === 0 ? null : Math.max(...sizes),
-    observedInputPeakTokens,
     compressionEvents: null,
     compressionRatio: null,
     compressionStatus: "unavailable"

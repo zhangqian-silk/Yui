@@ -53,14 +53,6 @@ import {
   type WakeEnvelope
 } from "../context/wakeNotification.js";
 import { createTaskWake, fallbackWakeCursor, latestTaskWake } from "../scheduler/taskWake.js";
-import {
-  rolloverTaskRoleSessionForContextBudget,
-  type ContextBudgetRolloverResult
-} from "../lifecycle/contextBudgetRollover.js";
-import {
-  resolveContextBudget,
-  type ResolvedContextBudget
-} from "../config/yuiConfig.js";
 import { answerInputRequest } from "../input/inputRequest.js";
 import { activeRoleAgentBinding, updateRoleStatus } from "../role/role.js";
 import {
@@ -210,6 +202,7 @@ import type { AgentDriverRegistry } from "../runtime/agentDriver.js";
 import {
   RUNTIME_OBSERVATION_TASK_EVENT,
   createRuntimeObservation,
+  isRuntimeTokenEvidence,
   runtimeObservationFenceMatches,
   runtimeObservationFromTaskEvent,
   runtimeObservationRunFenceMatches,
@@ -321,10 +314,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (adapterId === null) {
       return this.recordObsoleteCanonicalObservation(input, "driver-or-run-mismatch", now);
     }
-    if (this.store.listEvents(taskId).some((event) => (
-      event.type === RUNTIME_OBSERVATION_TASK_EVENT
-      && event.payload.semanticKey === input.semanticKey
-    ))) return "applied";
+    if (hasPersistedRuntimeObservation(this.store.listEvents(taskId), input)) return "applied";
     let outcome: ProviderLifecycleObservation;
     switch (input.kind) {
       case "session.started":
@@ -452,7 +442,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }
     if (outcome === "applied"
       && input.kind === "activity.observed"
-      && input.payload.activityId !== undefined) {
+      && input.payload.activityId !== undefined
+      && input.payload.usage === undefined) {
       this.clearProviderRetryForProgress(input, "correlated-activity", now);
     }
     if (outcome === "applied") this.persistRuntimeObservation(input, now);
@@ -483,10 +474,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     now: Date
   ): ProviderLifecycleObservation {
     return this.store.transaction((store) => {
-      if (store.listEvents(input.fence.taskId!).some((event) => (
-        event.type === RUNTIME_OBSERVATION_TASK_EVENT
-        && event.payload.semanticKey === input.semanticKey
-      ))) return "applied";
+      if (hasPersistedRuntimeObservation(store.listEvents(input.fence.taskId!), input)) {
+        return "applied";
+      }
       const run = store.getAgentRun(input.fence.taskId!, input.fence.runId!);
       const active = store.getActiveAgentRun(input.fence.taskId!, input.fence.roleName);
       const sessions = store.getTaskRoleSessionSet(input.fence.taskId!, input.fence.roleName);
@@ -676,18 +666,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     this.store.transaction((store) => {
       const taskId = input.fence.taskId!;
       const events = store.listEvents(taskId);
-      if (events.some((event) => (
-        event.type === RUNTIME_OBSERVATION_TASK_EVENT
-        && event.payload.semanticKey === input.semanticKey
-      ))) return;
+      if (hasPersistedRuntimeObservation(events, input)) return;
       if (usageSnapshotIsSuperseded(events, input)) return;
-      const confirmedActivity = confirmedUsageActivityObservation(events, input);
-      const removable = [
-        ...compactedRuntimeObservationIds(events, input),
-        ...(confirmedActivity === null
-          ? []
-          : compactedRuntimeObservationIds(events, confirmedActivity))
-      ];
+      const removable = compactedRuntimeObservationIds(events, input);
       if (removable.length > 0) store.removeEvents(taskId, removable);
       const observationEventId = store.nextEventId(taskId);
       store.saveEvent(taskId, createTaskEvent(
@@ -811,15 +792,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           [{ type: "run", taskId, id: input.fence.runId! }]);
         }
       }
-      if (confirmedActivity !== null) {
-        store.saveEvent(taskId, createTaskEvent(
-          store.nextEventId(taskId),
-          taskId,
-          RUNTIME_OBSERVATION_TASK_EVENT,
-          runtimeObservationTaskEventPayload(confirmedActivity),
-          now
-        ));
-      }
     });
     if (this.telemetry !== null && input.fence.runId !== undefined) {
       try {
@@ -938,25 +910,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       });
     });
   }
-  rolloverTaskRoleSessionForContextBudget(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    peakTokens: number;
-    hardTokens: number;
-    now: Date;
-  }>): ContextBudgetRolloverResult | null {
-    return this.store.transaction((reader) => rolloverTaskRoleSessionForContextBudget(
-      reader,
-      input.taskId,
-      input.roleName,
-      { peakTokens: input.peakTokens, hardTokens: input.hardTokens },
-      input.now
-    ));
-  }
-  getContextBudget(): ResolvedContextBudget {
-    return resolveContextBudget(this.store.getConfig().contextBudget);
-  }
-
   listRoles(taskId: string): SchedulerRole[] {
     return this.store.listRoles(taskId).map((role) => mapRole(this.store, role));
   }
@@ -5526,11 +5479,10 @@ function runtimeObservationTelemetryEntry(
 }
 
 /**
- * Runtime observations are a current-state snapshot, not an append-only
- * semantic history. Retain active operations, one latest usage baseline, and
- * one latest confirmed activity boundary so a token stream remains
- * O(active operations) per Run without losing the delta that was already
- * proven before an unchanged later snapshot arrived.
+ * Usage observations and incomplete request boundaries are authoritative
+ * read-only history: retain each one so consecutive deltas remain projectable.
+ * Other activity observations are a current explicit boundary and may replace
+ * their predecessor. Token evidence never becomes lifecycle activity.
  */
 function compactedRuntimeObservationIds(
   events: readonly TaskEvent[],
@@ -5550,9 +5502,9 @@ function compactedRuntimeObservationIds(
   });
   const remove = ({ observation }: typeof existing[number]): boolean => {
     if (incoming.kind === "activity.observed") {
+      if (isRuntimeTokenEvidence(incoming)) return false;
       return observation.kind === "activity.observed"
-        && (observation.payload.usage === undefined)
-          === (incoming.payload.usage === undefined);
+        && !isRuntimeTokenEvidence(observation);
     }
     if (incoming.kind === "operation.started") {
       return (observation.kind === "operation.started"
@@ -5778,43 +5730,6 @@ function settleStructuredProviderTurn(
   }), now);
 }
 
-function confirmedUsageActivityObservation(
-  events: readonly TaskEvent[],
-  incoming: RuntimeObservation
-): RuntimeObservation | null {
-  const usage = incoming.payload.usage;
-  if (incoming.kind !== "activity.observed" || usage === undefined) return null;
-  const previous = events
-    .map(runtimeObservationFromTaskEvent)
-    .filter((observation): observation is RuntimeObservation => (
-      observation !== null
-      && observation.kind === "activity.observed"
-      && observation.payload.usage !== undefined
-      && runtimeObservationFenceMatches(observation.fence, incoming.fence)
-    ))
-    .sort(compareCanonicalObservationOrder)
-    .at(-1)?.payload.usage;
-  if (previous === undefined
-    || usage.inputTokens + usage.outputTokens
-      <= previous.inputTokens + previous.outputTokens) return null;
-  const digest = createHash("sha256")
-    .update(`confirmed-runtime-activity\0${incoming.eventId}`)
-    .digest("hex");
-  return createRuntimeObservation({
-    schemaVersion: 2,
-    eventId: `runtime-activity-${digest}`,
-    semanticKey: `runtime-activity-${digest}`,
-    kind: "activity.observed",
-    authority: "controller",
-    receivedAt: incoming.receivedAt,
-    ...(incoming.observedAt === undefined ? {} : { observedAt: incoming.observedAt }),
-    ...(incoming.sequence === undefined ? {} : { sequence: incoming.sequence }),
-    ...(incoming.ordinal === undefined ? {} : { ordinal: incoming.ordinal }),
-    fence: incoming.fence,
-    payload: { activity: incoming.payload.activity ?? "model" }
-  });
-}
-
 function usageSnapshotIsSuperseded(
   events: readonly TaskEvent[],
   incoming: RuntimeObservation
@@ -5829,6 +5744,21 @@ function usageSnapshotIsSuperseded(
       && observation.payload.usage !== undefined
       && runtimeObservationFenceMatches(observation.fence, incoming.fence)
       && observationIsStrictlyNewer(observation, incoming));
+}
+
+function hasPersistedRuntimeObservation(
+  events: readonly TaskEvent[],
+  incoming: RuntimeObservation
+): boolean {
+  const usageIdentity = isRuntimeTokenEvidence(incoming)
+    ? incoming.eventId
+    : undefined;
+  return events.some((event) => (
+    event.type === RUNTIME_OBSERVATION_TASK_EVENT
+    && (usageIdentity === undefined
+      ? event.payload.semanticKey === incoming.semanticKey
+      : event.payload.eventId === usageIdentity)
+  ));
 }
 
 function observationIsStrictlyNewer(

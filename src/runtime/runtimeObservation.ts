@@ -128,6 +128,22 @@ export type RuntimeObservation = Readonly<{
   payload: RuntimeObservationPayload;
 }>;
 
+/**
+ * Numeric usage and value-less partial request boundaries are both durable
+ * token-projection evidence. The latter deliberately carries no activityId so
+ * it cannot be mistaken for lifecycle progress.
+ */
+export function isRuntimeTokenEvidence(
+  observation: Pick<RuntimeObservation, "kind" | "payload">
+): boolean {
+  return observation.kind === "activity.observed"
+    && (observation.payload.usage !== undefined
+      || (observation.payload.sourceId !== undefined
+        && observation.payload.activityId === undefined
+        && (observation.payload.observationQuality === "partial"
+          || observation.payload.observationQuality === "unavailable")));
+}
+
 const KINDS: readonly RuntimeObservationKind[] = [
   "host.observed",
   "session.started",

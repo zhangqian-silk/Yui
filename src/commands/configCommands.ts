@@ -2,8 +2,6 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { usageError } from "../errors/cliError.js";
 import {
-  DEFAULT_CONTEXT_HARD_TOKENS,
-  DEFAULT_CONTEXT_SOFT_TOKENS,
   DEFAULT_AGENT_LAUNCH_INACTIVITY_TIMEOUT_SECONDS,
   DEFAULT_CONTROLLER_TASK_CONCURRENCY,
   DEFAULT_DELIVERY_TIMEOUT_SECONDS,
@@ -442,10 +440,10 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
   },
   {
     key: "context-budget",
-    showLabel: "Context budget",
+    showLabel: "Legacy context budget (inactive)",
     showValue: (config) => {
       const budget = resolveContextBudget(config.contextBudget);
-      return `soft ${budget.softTokens} / hard ${budget.hardTokens} tokens`;
+      return `inactive; legacy soft ${budget.softTokens} / hard ${budget.hardTokens} tokens`;
     },
     set(args, store) {
       if (args.length !== 2 && args.length !== 4) throw usageError(CONTEXT_BUDGET_SET_USAGE);
@@ -471,14 +469,14 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
       };
       const resolved = resolveContextBudget({ ...current, ...next });
       saveConfigKey(store, (config) => ({ ...config, contextBudget: resolved }));
-      return `Context budget set to soft ${resolved.softTokens} / hard ${resolved.hardTokens} tokens\n`;
+      return `Legacy context budget stored as soft ${resolved.softTokens} / hard ${resolved.hardTokens} tokens (inactive)\n`;
     },
     clear(store) {
       saveConfigKey(store, (config) => {
         const { contextBudget: _removed, ...rest } = config;
         return rest;
       });
-      return `Context budget reset to soft ${DEFAULT_CONTEXT_SOFT_TOKENS} / hard ${DEFAULT_CONTEXT_HARD_TOKENS} tokens\n`;
+      return "Legacy context budget cleared; Session Token metrics remain read-only\n";
     }
   },
   {

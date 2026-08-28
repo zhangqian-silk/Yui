@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { withUpgradeCoordinationLock } from "../storage/upgradeCoordination.js";
 import {
   createRuntimeObservation,
+  isRuntimeTokenEvidence,
   type RuntimeObservation
 } from "../runtime/runtimeObservation.js";
 
@@ -258,6 +259,17 @@ export class FileRuntimeEventInbox {
     // UpgradeFenceError after the cutover holder releases the lock.
     return withUpgradeCoordinationLock(this.home, () => {
       this.hooks.afterAdmission?.();
+      if (event.type === "runtime-observation"
+        && isRuntimeTokenEvidence(event.observation)) {
+        const existing = this.list().find((candidate) => (
+          candidate.type === "runtime-observation"
+          && candidate.taskId === event.taskId
+          && candidate.observation.eventId === event.observation.eventId
+        ));
+        if (existing !== undefined) {
+          return { event: existing as TEvent, created: false };
+        }
+      }
       return this.publishUnlocked(event);
     });
   }

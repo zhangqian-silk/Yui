@@ -119,11 +119,41 @@ export type AgentRuntimeObserverSource = Readonly<{
 
 export type AgentRuntimeObserverCursor = Readonly<Record<string, unknown>>;
 
+export type AgentRuntimeObserverResume = Readonly<{
+  /** Latest source occurrence recovered from canonical runtime.observation history. */
+  latestOccurrenceId?: string;
+  /** Source-owned restart evidence recovered from the same canonical fact. */
+  latestCheckpoint?: string;
+}>;
+
+type AgentRuntimeUsageOccurrenceIdentity = Readonly<{
+  /** Stable identity for one ordered usage fact from this observer source. */
+  occurrenceId: string;
+  /** Source-owned evidence for resuming after the process-local cursor is lost. */
+  resumeCheckpoint?: string;
+}>;
+
+export type AgentRuntimeUsageOccurrence =
+  | Readonly<AgentRuntimeUsageOccurrenceIdentity & {
+    /** Stable provider request identity when the usage is request-scoped. */
+    activityId?: string;
+    /** Partial means the observer cannot prove the complete request baseline. */
+    observationQuality?: "exact" | "partial";
+    usage: RuntimeUsageSnapshot;
+  }>
+  | Readonly<AgentRuntimeUsageOccurrenceIdentity & {
+    /** A recognized request boundary whose token values are unavailable. */
+    observationQuality: "partial";
+    activityId?: undefined;
+    usage?: undefined;
+  }>;
+
 export type AgentRuntimeObserverSample = Readonly<{
   cursor: AgentRuntimeObserverCursor;
   status: "healthy" | "degraded" | "unavailable";
   detail?: string;
-  usage?: RuntimeUsageSnapshot;
+  /** Every usage occurrence or incomplete request boundary, in source order. */
+  usages?: readonly AgentRuntimeUsageOccurrence[];
   activity?: "model" | "tool" | "subagent" | "provider" | "resource";
   activityId?: string;
 }>;
@@ -167,7 +197,8 @@ export type AgentDriver = AgentDriverDescriptor & Readonly<{
       source(input: AgentDriverNativeHook): AgentRuntimeObserverSource | null;
       sample(
         source: AgentRuntimeObserverSource,
-        cursor?: AgentRuntimeObserverCursor
+        cursor?: AgentRuntimeObserverCursor,
+        resume?: AgentRuntimeObserverResume
       ): Promise<AgentRuntimeObserverSample>;
     }>;
   }>;

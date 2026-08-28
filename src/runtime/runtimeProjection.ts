@@ -285,16 +285,22 @@ export function projectRuntimeObservation(
     }
     case "activity.observed": {
       const usage = event.payload.usage;
-      if (usage !== undefined && !usageAdvanced(current.usage, usage)) {
-        return next(current, { usage: Object.freeze({ ...usage }) });
-      }
-      return withActivity(next(current, {
+      const lifecycleActivity = event.payload.activityId !== undefined
+        && usage === undefined;
+      const projected = next(current, {
         ...(usage === undefined ? {} : { usage: Object.freeze({ ...usage }) }),
-        session: current.turn === "waiting" ? "active" : current.session,
-        turn: current.turn === "waiting" ? "accepted" : current.turn,
-        waitingReason: undefined,
-        waitId: undefined
-      }), event.payload.activity!, at);
+        ...(lifecycleActivity ? {
+          session: current.turn === "waiting" ? "active" : current.session,
+          turn: current.turn === "waiting" ? "accepted" : current.turn,
+          waitingReason: undefined,
+          waitId: undefined
+        } : {})
+      });
+      // Token counters are read-only measurements. Only a separate explicit
+      // activity observation may advance runtime health or waiting state;
+      // usage activityId values identify requests only for token projection.
+      if (!lifecycleActivity) return projected;
+      return withActivity(projected, event.payload.activity!, at);
     }
     case "observer.health":
       return next(current, {
@@ -643,24 +649,6 @@ function next(
     health,
     runActivity
   });
-}
-
-function usageAdvanced(
-  previous: RuntimeUsageSnapshot | undefined,
-  current: RuntimeUsageSnapshot
-): boolean {
-  if (current.semantics === "remaining-context") return false;
-  if (current.semantics === "request-context") return usageTotal(current) > 0;
-  // A first cumulative snapshot may contain history from a resumed native
-  // Session. It establishes a baseline but cannot prove current progress.
-  if (previous === undefined || previous.semantics !== "cumulative-session") return false;
-  return usageTotal(current) > usageTotal(previous);
-}
-
-function usageTotal(usage: RuntimeUsageSnapshot): number {
-  // cachedInputTokens and reasoningTokens are breakdowns of the normalized
-  // input/output totals, not additional usage.
-  return usage.inputTokens + usage.outputTokens;
 }
 
 function dominantOperation(

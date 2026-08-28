@@ -308,7 +308,7 @@ yui task work group resolve <task-id>/<work-item-id> \
 
 每个新阶段还会冻结一份 Resource Broker 契约：token、工具调用和墙钟预算，
 quorum 与 deadline，straggler 窗口，以及继续增加 Lane 所需的最低边际价值。
-省略这些参数时复用现有 context budget 与 runtime-health 时间窗；同一阶段的 retry
+省略这些参数时使用独立的执行成本默认值与 runtime-health 时间窗；同一阶段的 retry
 累计原有花费并共享绝对 deadline。执行、Lane retry 和 Reviewer panel 准入统一核算
 Home、Task、WorkItem、Group、Provider、Agent 和模型层级的活动 Lane；容量不足的
 Lane 会耐久保留为 pending，不会把整个 Group 判失败。容量释放或 deadline 到达会沿

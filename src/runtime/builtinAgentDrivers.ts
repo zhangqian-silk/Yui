@@ -68,8 +68,8 @@ const STRUCTURED_CLI_CAPABILITIES: AgentDriverCapabilities = Object.freeze({
     preInputReadiness: "unavailable",
     promptAcceptance: "exact",
     turnLifecycle: "exact",
-    // Model activity is inferred from usage deltas; these are the operation
-    // boundaries the current Hook surfaces actually expose.
+    // Transcript sources may emit an explicit activity identity separately
+    // from usage snapshots. Numeric token values never decide runtime health.
     operations: Object.freeze(["tool", "subagent"] as const),
     waiting: Object.freeze(["permission"] as const),
     usage: "streaming-cumulative",
@@ -88,7 +88,8 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
       observation: Object.freeze({
         ...STRUCTURED_CLI_CAPABILITIES.observation,
         sessionBootstrap: "preallocated" as const,
-        preInputReadiness: "exact" as const
+        preInputReadiness: "exact" as const,
+        usage: "event-snapshot" as const
       })
     }),
     runtime: Object.freeze({

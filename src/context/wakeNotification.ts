@@ -20,7 +20,7 @@ import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
  * the checkpoint.
  */
 
-/** Structural guardrail: the envelope must stay an order of magnitude below any context budget. */
+/** Structural guardrail: the envelope stays far below a normal model context window. */
 export const WAKE_ENVELOPE_HARD_BYTES = 2_000;
 
 /** Maximum reason tags rendered before elision to a count. */

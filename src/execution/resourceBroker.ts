@@ -11,6 +11,8 @@ import {
 } from "./executionGroup.js";
 
 export const RESOURCE_BROKER_POLICY_SCHEMA_VERSION = 1 as const;
+/** Compatibility/display default; observed tokens never close execution spend. */
+export const DEFAULT_EXECUTION_STAGE_TOKEN_BUDGET_PER_LANE = 120_000;
 
 /**
  * One conservative Home-wide admission policy. Limits are counted
@@ -83,7 +85,8 @@ export type ExecutionStageResourceProjection = Readonly<{
   quorumMet: boolean;
   quorumReachedAt?: string;
   deadlineReached: boolean;
-  exhaustedBudgets: readonly ("tokens" | "tool-calls" | "wall-clock")[];
+  /** Behavioral limits only; observed token totals remain display-only. */
+  exhaustedBudgets: readonly ("tool-calls" | "wall-clock")[];
   stragglerLaneIds: readonly string[];
 }>;
 
@@ -99,7 +102,9 @@ export type ExecutionRoutingDecision = Readonly<{
 export function executionStageSpendClosed(
   resources: Pick<ExecutionStageResourceProjection, "deadlineReached" | "exhaustedBudgets">
 ): boolean {
-  return resources.deadlineReached || resources.exhaustedBudgets.length > 0;
+  return resources.deadlineReached
+    || resources.exhaustedBudgets.includes("tool-calls")
+    || resources.exhaustedBudgets.includes("wall-clock");
 }
 
 const DEFAULT_ACTIVE_LANES = 4;
@@ -296,9 +301,7 @@ export function projectExecutionStageResources(input: Readonly<{
     : undefined;
   const tokensObservable = input.usage.tokensObservable ?? true;
   const toolCallsObservable = input.usage.toolCallsObservable ?? true;
-  const exhaustedBudgets: ("tokens" | "tool-calls" | "wall-clock")[] = [];
-  if (stage?.budget.maxTokens !== undefined
-    && tokens >= stage.budget.maxTokens) exhaustedBudgets.push("tokens");
+  const exhaustedBudgets: ("tool-calls" | "wall-clock")[] = [];
   if (toolCallsObservable && stage?.budget.maxToolCalls !== undefined
     && toolCalls >= stage.budget.maxToolCalls) exhaustedBudgets.push("tool-calls");
   if (stage?.budget.maxWallClockSeconds !== undefined
