@@ -86,8 +86,6 @@ export type SqliteRecordMigrationTargetOptions = Readonly<{
    * genuine ambiguous-switch path. Production never overrides it.
    */
   renameImpl?: (from: string, to: string) => void;
-  /** Test seam for a schema sidecar write that fails before or after rename. */
-  writeSchemaFile?: (path: string, content: string) => void;
 }>;
 
 export type SqliteRecordMigrationTarget = MigrationTarget<HomeSnapshot> & Readonly<{
@@ -105,7 +103,6 @@ export function createSqliteRecordMigrationTarget(
   const now = options.now ?? (() => new Date());
   const callerPid = options.callerPid ?? process.pid;
   const promoteRename = options.renameImpl ?? renameSync;
-  const writeSchemaFile = options.writeSchemaFile ?? writeTextFileAtomically;
   const stagedDbPath = join(home, STAGED_DATABASE_FILENAME);
   const committedDbPath = join(home, COMMITTED_DATABASE_FILENAME);
 
@@ -243,7 +240,7 @@ export function createSqliteRecordMigrationTarget(
       // critical section. The layout version is unchanged.
       try {
         if (stagedSchemaManifest !== null) {
-          writeSchemaFile(
+          writeTextFileAtomically(
             schemaPath,
             `${JSON.stringify(stagedSchemaManifest, null, 2)}\n`
           );
@@ -254,7 +251,7 @@ export function createSqliteRecordMigrationTarget(
         // the exact source sidecar and database before claiming no switch.
         let rollbackError: unknown;
         try {
-          writeSchemaFile(schemaPath, sourceSchemaText);
+          writeTextFileAtomically(schemaPath, sourceSchemaText);
         } catch (restoreError) {
           rollbackError = restoreError;
         }

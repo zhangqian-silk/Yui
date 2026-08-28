@@ -81,8 +81,6 @@ export type SqliteMigrationTargetOptions = Readonly<{
   now?: () => Date;
   /** This process's pid, for foreign-writer detection. */
   callerPid?: number;
-  /** Test seam for a schema sidecar write that fails before or after rename. */
-  writeSchemaFile?: (path: string, content: string) => void;
 }>;
 
 export type SqliteMigrationTarget = MigrationTarget<HomeSnapshot> & Readonly<{
@@ -99,7 +97,6 @@ export function createSqliteMigrationTarget(
   const registry = options.registry;
   const now = options.now ?? (() => new Date());
   const callerPid = options.callerPid ?? process.pid;
-  const writeSchemaFile = options.writeSchemaFile ?? writeTextFileAtomically;
   const stagedDbPath = join(home, STAGED_DATABASE_FILENAME);
   const committedDbPath = join(home, COMMITTED_DATABASE_FILENAME);
 
@@ -251,7 +248,7 @@ export function createSqliteMigrationTarget(
       // Phase 2: advance schema.json to layout 7 in the same critical section.
       try {
         if (stagedSchemaManifest !== null) {
-          writeSchemaFile(
+          writeTextFileAtomically(
             schemaPath,
             `${JSON.stringify(stagedSchemaManifest, null, 2)}\n`
           );
@@ -279,11 +276,11 @@ export function createSqliteMigrationTarget(
         // layout switch did not commit.
         let rollbackError: unknown;
         try {
-          writeSchemaFile(schemaPath, sourceSchemaText);
+          writeTextFileAtomically(schemaPath, sourceSchemaText);
           if (sourceReceiptText === null) {
             rmSync(receiptPath, { force: true });
           } else {
-            writeSchemaFile(receiptPath, sourceReceiptText);
+            writeTextFileAtomically(receiptPath, sourceReceiptText);
           }
         } catch (restoreError) {
           rollbackError = restoreError;

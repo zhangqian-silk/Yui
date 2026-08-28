@@ -109,12 +109,18 @@ export function readMigrationSourceStateFromSqlite(home: string): Record<string,
       source.close();
     }
 
+    // Physical migration 14 rewrites the WorkMailbox family while adding its
+    // current columns. Preserve the source rows before applying it so the
+    // logical record migration still sees and transforms v1 exactly once.
+    const sourceMailboxes = readWorkMailboxesFromSqlite(snapshotPath);
     const stagedStore = new SqliteTaskStore(home, {
       databaseFilename: MIGRATION_SOURCE_DATABASE_FILENAME,
       migration: true
     });
     stagedStore.close();
-    return readStateFromSqlite(home, MIGRATION_SOURCE_DATABASE_FILENAME);
+    const state = readStateFromSqlite(home, MIGRATION_SOURCE_DATABASE_FILENAME);
+    state.mailboxes = sourceMailboxes;
+    return state;
   } finally {
     rmSync(snapshotPath, { force: true });
     rmSync(`${snapshotPath}-wal`, { force: true });
@@ -821,6 +827,20 @@ function readWorkMailboxRows(db: Database.Database): WorkMailboxRow[] {
       hasInputDelivery ? ", input_delivery" : ""
     } FROM mailboxes ORDER BY target_key`
   ).all() as WorkMailboxRow[];
+}
+
+function readWorkMailboxesFromSqlite(dbPath: string): Record<string, unknown> {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const mailboxes: Record<string, unknown> = {};
+    for (const row of readWorkMailboxRows(db)) {
+      const mailbox = rowToMailbox(row);
+      mailboxes[mailboxTargetKey(mailbox.target as MailboxTarget)] = mailbox;
+    }
+    return mailboxes;
+  } finally {
+    db.close();
+  }
 }
 
 /**
