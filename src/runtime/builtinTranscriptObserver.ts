@@ -274,13 +274,11 @@ function parseCodexLines(
     if (payload.info === null) continue;
     const candidate = normalizedCodexUsage(object(object(payload.info)?.total_token_usage));
     if (candidate === undefined) {
-      if (usage !== undefined) {
-        usages.push(Object.freeze({
-          ...transcriptOccurrence(line),
-          observationQuality: "partial" as const,
-          usage
-        }));
-      }
+      usages.push(Object.freeze({
+        ...transcriptOccurrence(line),
+        observationQuality: "partial" as const,
+        ...(usage === undefined ? {} : { usage })
+      }));
       usageContinuityGap = true;
       incompleteUsage += 1;
       continue;
@@ -325,6 +323,10 @@ function parseClaudeLines(
     const message = object(entry.message);
     const usage = normalizedClaudeUsage(object(message?.usage));
     if (usage === undefined) {
+      usages.push(Object.freeze({
+        ...transcriptOccurrence(line),
+        observationQuality: "partial" as const
+      }));
       usageContinuityGap = true;
       incompleteUsage += 1;
       continue;
@@ -333,6 +335,10 @@ function parseClaudeLines(
       ? identity(entry.uuid) === undefined ? undefined : `entry:${identity(entry.uuid)}`
       : `message:${identity(message?.id)}`;
     if (key === undefined) {
+      usages.push(Object.freeze({
+        ...transcriptOccurrence(line),
+        observationQuality: "partial" as const
+      }));
       usageContinuityGap = true;
       incompleteUsage += 1;
       continue;

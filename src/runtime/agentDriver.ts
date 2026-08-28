@@ -126,23 +126,33 @@ export type AgentRuntimeObserverResume = Readonly<{
   latestCheckpoint?: string;
 }>;
 
-export type AgentRuntimeUsageOccurrence = Readonly<{
+type AgentRuntimeUsageOccurrenceIdentity = Readonly<{
   /** Stable identity for one ordered usage fact from this observer source. */
   occurrenceId: string;
   /** Source-owned evidence for resuming after the process-local cursor is lost. */
   resumeCheckpoint?: string;
-  /** Stable provider request identity when the usage is request-scoped. */
-  activityId?: string;
-  /** Partial means the observer cannot prove the complete request baseline. */
-  observationQuality?: "exact" | "partial";
-  usage: RuntimeUsageSnapshot;
 }>;
+
+export type AgentRuntimeUsageOccurrence =
+  | Readonly<AgentRuntimeUsageOccurrenceIdentity & {
+    /** Stable provider request identity when the usage is request-scoped. */
+    activityId?: string;
+    /** Partial means the observer cannot prove the complete request baseline. */
+    observationQuality?: "exact" | "partial";
+    usage: RuntimeUsageSnapshot;
+  }>
+  | Readonly<AgentRuntimeUsageOccurrenceIdentity & {
+    /** A recognized request boundary whose token values are unavailable. */
+    observationQuality: "partial";
+    activityId?: undefined;
+    usage?: undefined;
+  }>;
 
 export type AgentRuntimeObserverSample = Readonly<{
   cursor: AgentRuntimeObserverCursor;
   status: "healthy" | "degraded" | "unavailable";
   detail?: string;
-  /** Every usage occurrence found in this bounded sample, in source order. */
+  /** Every usage occurrence or incomplete request boundary, in source order. */
   usages?: readonly AgentRuntimeUsageOccurrence[];
   activity?: "model" | "tool" | "subagent" | "provider" | "resource";
   activityId?: string;

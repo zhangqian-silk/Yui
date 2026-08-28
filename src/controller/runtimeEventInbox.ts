@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { withUpgradeCoordinationLock } from "../storage/upgradeCoordination.js";
 import {
   createRuntimeObservation,
+  isRuntimeTokenEvidence,
   type RuntimeObservation
 } from "../runtime/runtimeObservation.js";
 
@@ -259,8 +260,7 @@ export class FileRuntimeEventInbox {
     return withUpgradeCoordinationLock(this.home, () => {
       this.hooks.afterAdmission?.();
       if (event.type === "runtime-observation"
-        && event.observation.kind === "activity.observed"
-        && event.observation.payload.usage !== undefined) {
+        && isRuntimeTokenEvidence(event.observation)) {
         const existing = this.list().find((candidate) => (
           candidate.type === "runtime-observation"
           && candidate.taskId === event.taskId

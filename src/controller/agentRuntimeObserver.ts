@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import type {
   AgentRuntimeObserverCursor,
   AgentRuntimeObserverSample,
-  AgentRuntimeObserverSource
+  AgentRuntimeObserverSource,
+  AgentRuntimeUsageOccurrence
 } from "../runtime/agentDriver.js";
 import { AgentDriverRegistry } from "../runtime/agentDriver.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
@@ -123,7 +124,8 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
           // boundaries; retain only its latest total as a partial baseline.
           // Request snapshots already describe one complete occurrence and must
           // not be mixed with a synthetic cumulative fact.
-          const latestOccurrence = usages.at(-1);
+          const usageOccurrences = usages.filter(hasUsageSnapshot);
+          const latestOccurrence = usageOccurrences.at(-1);
           const completeHistory = latestOccurrence?.usage.semantics === "cumulative-session"
             && usages.every(({ observationQuality }) => observationQuality !== "partial");
           const baseline = latestOccurrence?.usage.semantics !== "cumulative-session"
@@ -211,7 +213,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             // Controller was stopped. Preserve the total and fail closed only
             // for the derived maximum-request metric.
             usages = usages.map((occurrence) => (
-              occurrence.usage.semantics !== "cumulative-session"
+              occurrence.usage?.semantics !== "cumulative-session"
                 ? occurrence
                 : Object.freeze({ ...occurrence, observationQuality: "partial" as const })
             ));
@@ -232,19 +234,21 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             payload: {
               activity: sample.activity ?? "model",
               sourceId: source.sourceId,
-              ...(occurrence.activityId === undefined
+              ...(occurrence.usage === undefined || occurrence.activityId === undefined
                 ? {}
                 : { activityId: occurrence.activityId }),
               ...(occurrence.observationQuality === undefined
                 ? {}
                 : { observationQuality: occurrence.observationQuality }),
-              usage: occurrence.usage
+              ...(occurrence.usage === undefined ? {} : { usage: occurrence.usage })
             }
           }));
-          state.usage = occurrence.usage;
-          state.usageEventId = identity.eventId;
-          state.usageOccurrenceId = occurrence.occurrenceId;
-          state.usageOccurrenceCheckpoint = occurrence.resumeCheckpoint;
+          if (occurrence.usage !== undefined) {
+            state.usage = occurrence.usage;
+            state.usageEventId = identity.eventId;
+            state.usageOccurrenceId = occurrence.occurrenceId;
+            state.usageOccurrenceCheckpoint = occurrence.resumeCheckpoint;
+          }
         });
         if (activityChanged && state.cursor !== undefined) {
           this.inbox.enqueueObservation(createRuntimeObservation({
@@ -434,6 +438,12 @@ function sampleConcurrency(value: number | undefined): number {
     );
   }
   return resolved;
+}
+
+function hasUsageSnapshot(
+  occurrence: AgentRuntimeUsageOccurrence
+): occurrence is AgentRuntimeUsageOccurrence & { usage: RuntimeUsageSnapshot } {
+  return occurrence.usage !== undefined;
 }
 
 function numericCompare(left: string, right: string): number {

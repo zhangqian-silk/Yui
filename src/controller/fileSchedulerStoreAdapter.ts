@@ -202,6 +202,7 @@ import type { AgentDriverRegistry } from "../runtime/agentDriver.js";
 import {
   RUNTIME_OBSERVATION_TASK_EVENT,
   createRuntimeObservation,
+  isRuntimeTokenEvidence,
   runtimeObservationFenceMatches,
   runtimeObservationFromTaskEvent,
   runtimeObservationRunFenceMatches,
@@ -5478,10 +5479,10 @@ function runtimeObservationTelemetryEntry(
 }
 
 /**
- * Usage observations are authoritative read-only history: retain each one so
- * consecutive deltas remain projectable. Other activity observations are a
- * current explicit boundary and may replace their predecessor. Numeric token
- * changes are never promoted into lifecycle activity.
+ * Usage observations and incomplete request boundaries are authoritative
+ * read-only history: retain each one so consecutive deltas remain projectable.
+ * Other activity observations are a current explicit boundary and may replace
+ * their predecessor. Token evidence never becomes lifecycle activity.
  */
 function compactedRuntimeObservationIds(
   events: readonly TaskEvent[],
@@ -5501,9 +5502,9 @@ function compactedRuntimeObservationIds(
   });
   const remove = ({ observation }: typeof existing[number]): boolean => {
     if (incoming.kind === "activity.observed") {
-      if (incoming.payload.usage !== undefined) return false;
+      if (isRuntimeTokenEvidence(incoming)) return false;
       return observation.kind === "activity.observed"
-        && observation.payload.usage === undefined;
+        && !isRuntimeTokenEvidence(observation);
     }
     if (incoming.kind === "operation.started") {
       return (observation.kind === "operation.started"
@@ -5749,8 +5750,7 @@ function hasPersistedRuntimeObservation(
   events: readonly TaskEvent[],
   incoming: RuntimeObservation
 ): boolean {
-  const usageIdentity = incoming.kind === "activity.observed"
-    && incoming.payload.usage !== undefined
+  const usageIdentity = isRuntimeTokenEvidence(incoming)
     ? incoming.eventId
     : undefined;
   return events.some((event) => (

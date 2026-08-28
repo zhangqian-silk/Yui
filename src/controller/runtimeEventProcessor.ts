@@ -6,7 +6,10 @@ import type {
   RuntimeObservationInboxEvent,
   RuntimeTurnCompletedEvent
 } from "./runtimeEventInbox.js";
-import type { RuntimeObservation } from "../runtime/runtimeObservation.js";
+import {
+  isRuntimeTokenEvidence,
+  type RuntimeObservation
+} from "../runtime/runtimeObservation.js";
 import type { AgentDriverRegistry } from "../runtime/agentDriver.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 
@@ -503,9 +506,9 @@ export function coalesceRuntimeProgress(
     }
     const representedByIndex = new Map<number, string[]>();
     for (const indices of indicesByStream.values()) {
-      const hasUsage = segment[indices[0]!]!.observation.payload.usage !== undefined;
-      // Usage facts are the authoritative history for read-only Session token
-      // deltas, so their numeric values never decide ingress coalescing.
+      const hasUsage = isRuntimeTokenEvidence(segment[indices[0]!]!.observation);
+      // Usage facts and incomplete boundaries are authoritative history for
+      // read-only Session token projection, so ingress never coalesces them.
       const retainedPositions = hasUsage ? indices.map((_, position) => position) : [];
       const lastPosition = indices.length - 1;
       if (retainedPositions.at(-1) !== lastPosition) retainedPositions.push(lastPosition);
@@ -614,7 +617,7 @@ function progressStreamKey(event: RuntimeObservationInboxEvent): string {
     fence.nativeSessionId ?? null,
     fence.runId ?? null,
     payload.activity,
-    payload.usage === undefined ? "signal" : "usage"
+    isRuntimeTokenEvidence(event.observation) ? "usage" : "signal"
   ]);
 }
 

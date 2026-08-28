@@ -1,6 +1,7 @@
 import type { TaskEvent } from "../event/taskEvent.js";
 import { builtinDriverIdForAdapter } from "./builtinAgentDrivers.js";
 import {
+  isRuntimeTokenEvidence,
   runtimeObservationFromTaskEvent,
   type RuntimeObservation,
   type RuntimeUsageSnapshot
@@ -93,16 +94,18 @@ export function projectSessionTokenMetrics(
     .map(runtimeObservationFromTaskEvent)
     .filter((observation): observation is RuntimeObservation => (
       observation !== null
-      && observation.kind === "activity.observed"
-      && observation.payload.usage !== undefined
+      && isRuntimeTokenEvidence(observation)
       && matchesSessionGeneration(observation, identity)
     ))
     .sort(compareObservations);
+  const incompleteBoundaries = observations.filter(({ payload }) => (
+    payload.usage === undefined
+  ));
   const request = observations.filter(({ payload }) => (
-    payload.usage!.semantics === "request-context"
+    payload.usage?.semantics === "request-context"
   ));
   const cumulative = observations.filter(({ payload }) => (
-    payload.usage!.semantics === "cumulative-session"
+    payload.usage?.semantics === "cumulative-session"
   ));
 
   // A generation cannot switch counter semantics without an explicit fact
@@ -111,8 +114,12 @@ export function projectSessionTokenMetrics(
   if (request.length > 0 && cumulative.length > 0) {
     return unobservedSessionTokenMetrics(identity);
   }
-  if (request.length > 0) return projectRequestSnapshots(identity, request);
-  if (cumulative.length > 0) return projectCumulativeSnapshots(identity, cumulative);
+  if (request.length > 0) {
+    return projectRequestSnapshots(identity, request, incompleteBoundaries.length > 0);
+  }
+  if (cumulative.length > 0) {
+    return projectCumulativeSnapshots(identity, cumulative, incompleteBoundaries.length > 0);
+  }
   return unobservedSessionTokenMetrics(identity);
 }
 
@@ -128,9 +135,10 @@ export function unobservedSessionTokenMetrics(
 
 function projectRequestSnapshots(
   identity: SessionTokenIdentity,
-  observations: readonly RuntimeObservation[]
+  observations: readonly RuntimeObservation[],
+  hasIncompleteBoundary: boolean
 ): SessionTokenMetrics {
-  if (observations.some(({ payload }) => (
+  if (hasIncompleteBoundary || observations.some(({ payload }) => (
     payload.observationQuality === "partial"
     || payload.observationQuality === "unavailable"
   ))) return unobservedSessionTokenMetrics(identity);
@@ -176,10 +184,11 @@ function projectRequestSnapshots(
 
 function projectCumulativeSnapshots(
   identity: SessionTokenIdentity,
-  observations: readonly RuntimeObservation[]
+  observations: readonly RuntimeObservation[],
+  hasIncompleteBoundary: boolean
 ): SessionTokenMetrics {
   const values = observations.map(({ payload }) => payload.usage!);
-  const requestBoundaryIncomplete = observations.some(({ payload }) => (
+  const requestBoundaryIncomplete = hasIncompleteBoundary || observations.some(({ payload }) => (
     payload.observationQuality === "partial"
     || payload.observationQuality === "unavailable"
   ));
