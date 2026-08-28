@@ -253,8 +253,12 @@ function parseCodexLines(
   state: Readonly<Record<string, unknown>>
 ): ParsedSample {
   let usage = usageFrom(state.usage);
+  // Keep a recognized-but-incomplete request boundary across bounded samples.
+  // The next complete occurrence carries the durable partial-quality evidence.
+  let usageContinuityGap = state.usageContinuityGap === true;
   const usages: AgentRuntimeUsageOccurrence[] = [];
   let malformed = 0;
+  let incompleteUsage = 0;
   for (const line of lines) {
     const entry = jsonObject(line.content);
     if (entry === null) {
@@ -265,17 +269,27 @@ function parseCodexLines(
     const payload = object(entry.payload);
     if (payload?.type !== "token_count") continue;
     const candidate = normalizedCodexUsage(object(object(payload.info)?.total_token_usage));
-    if (candidate === undefined) continue;
+    if (candidate === undefined) {
+      usageContinuityGap = true;
+      incompleteUsage += 1;
+      continue;
+    }
     usage = candidate;
     usages.push(Object.freeze({
       ...transcriptOccurrence(line),
+      ...(usageContinuityGap ? { observationQuality: "partial" as const } : {}),
       usage: candidate
     }));
+    usageContinuityGap = false;
   }
+  const degraded = transcriptParseDetail(malformed, incompleteUsage);
   return Object.freeze({
-    state: Object.freeze({ ...(usage === undefined ? {} : { usage }) }),
+    state: Object.freeze({
+      ...(usage === undefined ? {} : { usage }),
+      ...(usageContinuityGap ? { usageContinuityGap: true } : {})
+    }),
     usages: Object.freeze(usages),
-    ...(malformed === 0 ? {} : { degraded: `${malformed} malformed transcript line(s) ignored.` })
+    ...(degraded === undefined ? {} : { degraded })
   });
 }
 
@@ -284,9 +298,11 @@ function parseClaudeLines(
   state: Readonly<Record<string, unknown>>
 ): ParsedSample {
   const messages = messageState(state.messages);
+  let usageContinuityGap = state.usageContinuityGap === true;
   const usages: AgentRuntimeUsageOccurrence[] = [];
   let activityId: string | undefined;
   let malformed = 0;
+  let incompleteUsage = 0;
   let bounded = false;
   for (const line of lines) {
     const entry = jsonObject(line.content);
@@ -297,11 +313,19 @@ function parseClaudeLines(
     if (entry.type !== "assistant") continue;
     const message = object(entry.message);
     const usage = normalizedClaudeUsage(object(message?.usage));
-    if (usage === undefined) continue;
+    if (usage === undefined) {
+      usageContinuityGap = true;
+      incompleteUsage += 1;
+      continue;
+    }
     const key = identity(message?.id) === undefined
       ? identity(entry.uuid) === undefined ? undefined : `entry:${identity(entry.uuid)}`
       : `message:${identity(message?.id)}`;
-    if (key === undefined) continue;
+    if (key === undefined) {
+      usageContinuityGap = true;
+      incompleteUsage += 1;
+      continue;
+    }
     messages[key] = usage;
     activityId = key;
     const keys = Object.keys(messages);
@@ -314,19 +338,35 @@ function parseClaudeLines(
     usages.push(Object.freeze({
       ...transcriptOccurrence(line),
       activityId: key,
+      ...(usageContinuityGap ? { observationQuality: "partial" as const } : {}),
       usage
     }));
+    usageContinuityGap = false;
   }
-  let degraded = malformed === 0 ? undefined : `${malformed} malformed transcript line(s) ignored.`;
-  if (bounded) {
-    degraded = "Claude transcript message baseline was bounded to the newest entries.";
-  }
+  const degraded = transcriptParseDetail(malformed, incompleteUsage, bounded);
   return Object.freeze({
-    state: Object.freeze({ messages: Object.freeze(messages) }),
+    state: Object.freeze({
+      messages: Object.freeze(messages),
+      ...(usageContinuityGap ? { usageContinuityGap: true } : {})
+    }),
     usages: Object.freeze(usages),
     ...(activityId === undefined ? {} : { activityId }),
     ...(degraded === undefined ? {} : { degraded })
   });
+}
+
+function transcriptParseDetail(
+  malformed: number,
+  incompleteUsage: number,
+  bounded = false
+): string | undefined {
+  const details: string[] = [];
+  if (malformed > 0) details.push(`${malformed} malformed transcript line(s) ignored.`);
+  if (incompleteUsage > 0) {
+    details.push(`${incompleteUsage} incomplete usage record(s) created a request-boundary gap.`);
+  }
+  if (bounded) details.push("Claude transcript message baseline was bounded to the newest entries.");
+  return details.length === 0 ? undefined : details.join(" ");
 }
 
 function transcriptOccurrence(
