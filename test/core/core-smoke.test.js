@@ -165,9 +165,9 @@ test("the production migration preserves ReviewRound-backed Agent Runs", (t) => 
   }, databaseFilename);
 
   const migrated = new SqliteTaskStore(home, { databaseFilename });
-  t.after(() => migrated.close());
   assert.equal(migrated.getReviewRound(task.id, migratedRound.id)?.status, "completed");
   assert.equal(migrated.getAgentRun(task.id, migratedRun.id)?.reviewRoundId, migratedRound.id);
+  migrated.close();
 });
 
 test("the built-in Agent Drivers are available through the shared registry", () => {

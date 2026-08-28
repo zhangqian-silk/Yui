@@ -108,6 +108,10 @@ import {
   type RuntimeIdentityReceipt
 } from "./release/runtimeRelease.js";
 import {
+  assertCliHomeReleaseFence,
+  describeCliHomeInvocation
+} from "./release/cliHomeReleaseFence.js";
+import {
   renderReleaseActivateResult,
   renderReleaseInstallResult,
   renderReleaseList,
@@ -193,6 +197,7 @@ import {
   operatorSessionRef
 } from "./operator/operatorSessionHistory.js";
 import { YUI_VERSION, yuiVersionIdentity } from "./version.js";
+import { SqliteSchemaMigrationError } from "./storage/sqliteSchema.js";
 import {
   YUI_CONTROL_PLANE_DESCRIPTOR,
   YUI_TASK_RUNTIME_DESCRIPTOR,
@@ -248,14 +253,47 @@ void main().catch((error: unknown) => {
     process.exitCode = error.exitCode;
     return;
   }
-  const message = error instanceof Error ? error.message : String(error);
+  const message = runtimeFailureMessage(error);
   process.stderr.write(`${jsonOutput
     ? JSON.stringify({ ok: false, code: "RUNTIME_ERROR", message, details: {} })
     : `RUNTIME_ERROR: ${message}`}\n`);
   process.exitCode = 5;
 });
 
+function runtimeFailureMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!(error instanceof SqliteSchemaMigrationError)) return message;
+  try {
+    return `${message}\n${describeCliHomeInvocation({
+      home: resolveYuiHome(process.env),
+      packageRoot: fileURLToPath(new URL("../", import.meta.url)),
+      entryPath: fileURLToPath(import.meta.url)
+    })}`;
+  } catch {
+    return message;
+  }
+}
+
 export async function main(): Promise<void> {
+  const home = resolveYuiHome(process.env);
+  const routedForFence = args.length === 0 ? undefined : routeInvocation(args);
+  const managedInvocation = process.env.YUI_SESSION_SCOPE === "task"
+    || process.env.YUI_SESSION_SCOPE === "global"
+    || process.env[YUI_CONTROL_PLANE_DESCRIPTOR] !== undefined
+    || process.env[YUI_TASK_RUNTIME_DESCRIPTOR] !== undefined;
+  const homeFreeInvocation = args.length === 0
+    || (args[0] === "version" && args.length === 1)
+    || routedForFence?.kind === "help"
+    || routedForFence?.kind === "path-error"
+    || routedForFence?.kind === "incomplete";
+  if (managedInvocation || !homeFreeInvocation) {
+    assertCliHomeReleaseFence({
+      home,
+      packageRoot: fileURLToPath(new URL("../", import.meta.url)),
+      entryPath: fileURLToPath(import.meta.url),
+      args
+    });
+  }
   const delegatedDriver = explicitReleaseActivationDriver();
   if (delegatedDriver !== null) {
     const delegated = spawnSync(
@@ -320,7 +358,6 @@ export async function main(): Promise<void> {
     return;
   }
 
-  const home = resolveYuiHome(process.env);
   if (args[0] === "release") {
     const subcommand = args[1];
     if (subcommand === "install" && args.length === 3) {

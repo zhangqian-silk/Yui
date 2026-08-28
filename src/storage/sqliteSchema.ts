@@ -1019,12 +1019,20 @@ const SCHEMA_MIGRATIONS_SQL = `
  * layout migrations.  A database with any sqlite_master object is therefore
  * diagnosed as corrupt/partially initialized and left untouched.
  */
-function ensureMigrationLedger(db: Database.Database): boolean {
+function ensureMigrationLedger(
+  db: Database.Database,
+  mode: SqliteSchemaMigrationMode
+): boolean {
   const objects = db.prepare(
     "SELECT type, name FROM sqlite_master WHERE name IS NOT NULL"
   ).all() as Array<{ type: unknown; name: unknown }>;
   const ledger = objects.find(({ name }) => name === "schema_migrations");
   if (ledger === undefined) {
+    if (mode === "validate") {
+      throw new SqliteSchemaMigrationError(
+        "schema_migrations ledger is missing from an existing database"
+      );
+    }
     if (objects.length !== 0) {
       throw new SqliteSchemaMigrationError(
         "schema_migrations ledger is missing from a non-empty database"
@@ -1233,20 +1241,43 @@ export interface MigrationResult {
   readonly version: number;
 }
 
+export type SqliteSchemaMigrationMode = "apply" | "validate";
+
+export type SqliteSchemaMigrationOptions = Readonly<{
+  /**
+   * `apply` is reserved for a new database or the disposable staged database
+   * owned by the offline upgrade path. `validate` is the only legal ordinary
+   * open mode for an existing authoritative database.
+   */
+  mode: SqliteSchemaMigrationMode;
+}>;
+
 /**
- * Apply pending migrations idempotently inside transactions.
+ * Apply or validate schema migrations without letting an ordinary open mutate
+ * an existing authoritative database.
  *
- * Each migration runs in its own transaction: the DDL and the
+ * In `apply` mode each migration runs in its own transaction: the DDL and the
  * `schema_migrations` bookkeeping commit atomically, so a crash mid-migration
- * rolls back and the next open re-applies cleanly. Re-running on a current
- * database performs no work (every version is already recorded).
+ * rolls back and the disposable staged database can be rebuilt cleanly.
+ * `validate` mode rejects a pending version before executing any migration.
  */
-export function migrateSqliteSchema(db: Database.Database): MigrationResult {
-  const ledgerWasCreated = ensureMigrationLedger(db);
+export function migrateSqliteSchema(
+  db: Database.Database,
+  options: SqliteSchemaMigrationOptions
+): MigrationResult {
+  const ledgerWasCreated = ensureMigrationLedger(db, options.mode);
   // Validate the complete ledger before touching any pending migration.  This
   // prevents a manually altered or partially recorded ledger from silently
   // skipping the partial-index/projection migrations added after a valid Home.
   const applied = validateAppliedMigrations(db, ledgerWasCreated);
+  const pending = MIGRATIONS.filter((migration) => !applied.has(migration.version));
+  if (options.mode === "validate" && pending.length > 0) {
+    throw new SqliteSchemaMigrationError(
+      `pending SQLite schema migration ${pending[0]!.version}; `
+        + "run the offline staged upgrade before opening this database",
+      "admission"
+    );
+  }
   const newlyApplied: number[] = [];
   for (const migration of MIGRATIONS) {
     if (applied.has(migration.version)) continue;
