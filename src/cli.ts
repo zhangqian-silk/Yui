@@ -80,9 +80,6 @@ import { runProfileCommand } from "./commands/profileCommands.js";
 import {
   dispatchPreparedReviewRound,
   failPendingReviewRound,
-  RESUMED_PENDING_FINAL_REVIEW,
-  TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW,
-  TaskFinalReviewDispatchDriftError,
   preserveReviewRoundWorkspace,
   parseTaskCompletionRequest,
   parseTaskFinalReviewContractRebindRequest,
@@ -164,7 +161,6 @@ import {
 } from "./repository/taskWorkspaceCoordinator.js";
 import {
   FileTaskWorkspacePreparer,
-  ReviewRoundWorkspaceEvidenceError,
   type TaskWorkspaceActivation
 } from "./repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema } from "./storage/storageSchema.js";
@@ -228,7 +224,7 @@ import {
 } from "./review/taskFinalReviewContractRebind.js";
 import type { TaskReviewCandidate } from "./review/reviewRound.js";
 import { assessDeltaRecheck, type DeltaRecheckPreflight } from "./review/deltaRecheck.js";
-import { deltaRecheckEnabled } from "./review/reviewConfig.js";
+import { isAcceptedTaskReviewBaseline } from "./review/reviewAcceptance.js";
 import { NodeGitWorkspace } from "./repository/gitWorkspace.js";
 import {
   currentWorkItemExecutionGroup,
@@ -1706,29 +1702,35 @@ export async function main(): Promise<void> {
                 ...(storedRound?.deltaRecheck === undefined
                   || deltaRecheckPreflight === undefined
                   ? {}
-                  : { deltaRecheckDiff: deltaRecheckPreflight.diffByProject })
+                  : {
+                      deltaRecheckDiff: deltaRecheckPreflight.diffByProject
+                    })
               }
             );
             reviewOutput = run === null
               ? `Review ${requestedRound.id} retained pending by Resource Broker\n`
               : `Review queued as ${requestedRound.id} (${run.id})\n`;
             reviewData = {
+              reviewRequest: run === null
+                ? {
+                    kind: "busy",
+                    reviewerRoleName: requestedRound.reviewerRoleName,
+                    phase: "resource-broker",
+                    activeReviewRoundId: requestedRound.id,
+                    retryable: true,
+                    retryAfterSeconds: 5
+                  }
+                : {
+                    kind: "started",
+                    reviewerRoleName: requestedRound.reviewerRoleName,
+                    reviewRoundId: requestedRound.id,
+                    runId: run.id
+                  },
               reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
               ...(run === null ? {} : { reviewRun: run }),
               workspace
             };
           } catch (error) {
-            const currentRound = store.getReviewRound(
-              requestedRound.taskId,
-              requestedRound.id
-            );
-            if (requestedRound.resumedPendingFinalReview
-              && !requestedRound.terminalizedLeaderRun
-              && (error instanceof ReviewRoundWorkspaceEvidenceError
-                || error instanceof TaskFinalReviewDispatchDriftError)
-              && (currentRound?.scope ?? "work-item") === "task") {
-              throw error;
-            }
             const message = error instanceof Error ? error.message : String(error);
             await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(
               executionLaneWorkspaces
@@ -1738,10 +1740,24 @@ export async function main(): Promise<void> {
               requestedRound.id,
               message,
               store,
-              { runtime, environment: process.env, yuiHome: home }
+              {
+                runtime,
+                environment: process.env,
+                yuiHome: home
+              }
             );
-            reviewOutput = `Review could not start: ${message}\n`;
-            reviewData = { reviewRound: failed };
+            reviewOutput = `Review could not start: ${message}\n`
+              + "The failed ReviewRound was retained for Leader routing.\n";
+            reviewData = {
+              reviewRequest: {
+                kind: "unavailable",
+                reviewerRoleName: requestedRound.reviewerRoleName,
+                reviewRoundId: failed.id,
+                reason: message,
+                retryable: true
+              },
+              reviewRound: failed
+            };
           }
         }
         if (resolved[1] === "project" && resolved[2] === "add") {
@@ -2546,6 +2562,7 @@ async function actualTaskReviewCandidateForTaskCommand(
 ): Promise<TaskReviewCandidate | undefined> {
   if (args[0] !== "task") return undefined;
   let taskId: string | undefined;
+  let decisionSupportRead = false;
   if (args[1] === "complete" && args[2] !== undefined) {
     const task = store.getTask(args[2]);
     if (task === null || task.status !== "active" || task.projectBindings.length === 0) {
@@ -2597,9 +2614,18 @@ async function actualTaskReviewCandidateForTaskCommand(
       && (round.scope ?? "work-item") === "task") {
       taskId = reference.taskId;
     }
+  } else if ((args[1] === "context" || args[1] === "next-action")
+    && args[2] !== undefined) {
+    taskId = store.getTask(args[2])?.id;
+    decisionSupportRead = true;
   }
   if (taskId === undefined || store.getTask(taskId)?.status !== "active") return undefined;
-  return snapshotActualTaskReviewCandidate(taskId, store, preparer);
+  try {
+    return await snapshotActualTaskReviewCandidate(taskId, store, preparer);
+  } catch (error) {
+    if (decisionSupportRead && error instanceof CliError) return undefined;
+    throw error;
+  }
 }
 
 async function snapshotActualTaskReviewCandidate(
@@ -2647,9 +2673,8 @@ async function snapshotActualTaskReviewCandidate(
 /**
  * Issue 07: computes the delta-recheck assessment for `task review request
  * --delta-recheck`.  Runs only for that exact command; every other command
- * returns undefined.  The assessment's deterministic gates (contiguous base,
- * attempt thresholds, evidence-file overlap) fail closed here; the Reviewer
- * still owns the semantic equivalence decision.
+ * returns undefined. Technical evidence boundaries fail closed here; semantic
+ * risk remains a Leader and Project-policy decision.
  */
 async function deltaRecheckPreflightForTaskCommand(
   args: readonly string[],
@@ -2664,26 +2689,12 @@ async function deltaRecheckPreflightForTaskCommand(
   if (taskId === undefined) return undefined;
   const task = store.getTask(taskId);
   if (task === null || task.status !== "active") return undefined;
-  const config = store.getReviewConfig();
-  if (!deltaRecheckEnabled(config)) {
-    throw usageError(
-      "Delta-recheck is not enabled for this Project's review policy. "
-      + "Set `yui config workflow set review --role <role> --trigger final --delta-recheck enabled` "
-      + "or request a full Review."
-    );
-  }
-  const reviewConfig = config!;
   if (actualTaskReviewCandidate === undefined) return undefined;
   // The previous Round is the latest completed Task-final Round that accepted
   // a head (a full Review or an equivalent-and-accepted delta).  A
   // non-accepted delta cannot be the base for a new delta.
   const previous = [...store.listReviewRounds(task.id)]
-    .filter((round) => (
-      (round.scope ?? "work-item") === "task"
-      && round.status === "completed"
-      && (round.deltaRecheck === undefined
-        || round.deltaRecheck.disposition === "equivalent-and-accepted")
-    ))
+    .filter((round) => isAcceptedTaskReviewBaseline(store, round))
     .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))
     .at(-1);
   if (previous === undefined) {
@@ -2703,12 +2714,11 @@ async function deltaRecheckPreflightForTaskCommand(
     repositoryPaths,
     previousRound: previous,
     candidate: actualTaskReviewCandidate,
-    git: new NodeGitWorkspace(),
-    config: reviewConfig
+    git: new NodeGitWorkspace()
   });
   if (assessment.kind === "ineligible") {
     throw usageError(
-      `Delta-recheck is not allowed: ${assessment.reason} Request a full Review instead.`
+      `Delta-recheck is technically unavailable: ${assessment.reason}`
     );
   }
   return assessment.preflight;
@@ -2773,27 +2783,27 @@ async function executionLaneGitSnapshotForTaskCommand(
 function reviewRoundFromCommandData(data: unknown): Readonly<{
   id: string;
   taskId: string;
+  reviewerRoleName: string;
   status: string;
-  resumedPendingFinalReview: boolean;
-  terminalizedLeaderRun: boolean;
 }> | undefined {
   if (typeof data !== "object" || data === null || !("reviewRound" in data)) return undefined;
   const round = (data as { reviewRound?: unknown }).reviewRound;
   if (typeof round !== "object" || round === null) return undefined;
-  const value = round as { id?: unknown; taskId?: unknown; status?: unknown };
+  const value = round as {
+    id?: unknown;
+    taskId?: unknown;
+    reviewerRoleName?: unknown;
+    status?: unknown;
+  };
   return typeof value.id === "string"
     && typeof value.taskId === "string"
+    && typeof value.reviewerRoleName === "string"
     && typeof value.status === "string"
     ? {
         id: value.id,
         taskId: value.taskId,
-        status: value.status,
-        resumedPendingFinalReview: (
-          data as { [RESUMED_PENDING_FINAL_REVIEW]?: unknown }
-        )[RESUMED_PENDING_FINAL_REVIEW] === true,
-        terminalizedLeaderRun: (
-          data as { [TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW]?: unknown }
-        )[TERMINALIZED_LEADER_BEFORE_FINAL_REVIEW] === true
+        reviewerRoleName: value.reviewerRoleName,
+        status: value.status
       }
     : undefined;
 }

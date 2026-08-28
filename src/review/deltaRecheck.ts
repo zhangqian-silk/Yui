@@ -1,11 +1,6 @@
 import { createHash } from "node:crypto";
 
 import {
-  deltaRecheckMaxChangedFiles,
-  deltaRecheckMaxChangedLines,
-  type ReviewConfig
-} from "./reviewConfig.js";
-import {
   validateDeltaRecheckRecord,
   type DeltaRecheckRecord,
   type ReviewRound,
@@ -16,12 +11,12 @@ import { isSemanticReviewRound } from "./reviewOutcomeClassifier.js";
 /**
  * Issue 07: delta-recheck protocol.
  *
- * A delta-recheck is a Task-final ReviewRound that rechecks a small, proven
- * diff on top of an already-accepted frozen head.  It never copies the old
+ * A delta-recheck is a Task-final ReviewRound that rechecks a proven diff on
+ * top of an already-accepted frozen head.  It never copies the old
  * acceptance: the new head always receives a fresh Reviewer disposition, and
- * any uncertainty escalates to a full Review.  The control plane enforces the
- * deterministic gates (contiguous base, attempt thresholds, evidence-file
- * overlap); the Reviewer alone judges semantic equivalence.
+ * any uncertainty returns to the Leader. The control plane enforces only the
+ * technical evidence boundary (accepted baseline, contiguous base, exact
+ * scope and reproducible diff).
  */
 
 /** Minimal Git boundary satisfied structurally by NodeGitWorkspace. */
@@ -60,9 +55,8 @@ export type DeltaRecheckAssessment = Readonly<
 >;
 
 /**
- * Assesses whether a delta-recheck may be attempted.  Every deterministic
- * gate fails closed here; semantic equivalence is always left to the
- * Reviewer's explicit disposition.
+ * Assesses whether a trustworthy delta can be constructed. Only technical
+ * unavailability fails closed; Agents retain the semantic judgment.
  */
 export async function assessDeltaRecheck(input: Readonly<{
   /** Exact repository for every Project in the frozen Task candidate. */
@@ -70,9 +64,8 @@ export async function assessDeltaRecheck(input: Readonly<{
   previousRound: ReviewRound;
   candidate: TaskReviewCandidate;
   git: DeltaRecheckGitPort;
-  config: ReviewConfig;
 }>): Promise<DeltaRecheckAssessment> {
-  const { repositoryPaths, previousRound, candidate, git, config } = input;
+  const { repositoryPaths, previousRound, candidate, git } = input;
   if (!isSemanticReviewRound(previousRound)
     || (previousRound.scope ?? "work-item") !== "task") {
     return {
@@ -89,6 +82,12 @@ export async function assessDeltaRecheck(input: Readonly<{
   const previousByProject = new Map(
     previousRound.taskCandidate.projects.map((project) => [project.projectId, project.commit])
   );
+  if (previousByProject.size !== candidate.projects.length) {
+    return {
+      kind: "ineligible",
+      reason: "Delta recheck Project scope differs from the accepted baseline."
+    };
+  }
   const diffByProject: Record<string, string> = {};
   const changedFiles: string[] = [];
   let addedLines = 0;
@@ -155,33 +154,6 @@ export async function assessDeltaRecheck(input: Readonly<{
       reason: "Frozen heads are unchanged; the previous acceptance already covers this candidate."
     };
   }
-  const maxFiles = deltaRecheckMaxChangedFiles(config);
-  if (changedFiles.length > maxFiles) {
-    return {
-      kind: "ineligible",
-      reason: `Delta recheck attempt threshold exceeded: ${changedFiles.length} changed file(s) > ${maxFiles}.`
-    };
-  }
-  const maxLines = deltaRecheckMaxChangedLines(config);
-  if (addedLines + deletedLines > maxLines) {
-    return {
-      kind: "ineligible",
-      reason: `Delta recheck attempt threshold exceeded: ${addedLines + deletedLines} changed line(s) > ${maxLines}.`
-    };
-  }
-  // Evidence overlap: a diff touching a file the previous Round cited as
-  // evidence cannot be proven equivalent by a delta recheck.
-  const evidencePaths = extractEvidencePaths(previousRound);
-  const overlapping = changedFiles.filter((file) => (
-    evidencePaths.some((evidence) => pathEvidenceMatches(evidence, file))
-  ));
-  if (overlapping.length > 0) {
-    return {
-      kind: "ineligible",
-      reason: "Delta recheck cannot prove evidence validity for changed evidence file(s): "
-        + `${overlapping.join(", ")}.`
-    };
-  }
   const record = validateDeltaRecheckRecord({
     schemaVersion: 1,
     previousReviewRoundId: previousRound.id,
@@ -224,7 +196,7 @@ export function buildDeltaRecheckDispatchContext(input: Readonly<{
     "- finding: the diff introduces a material problem; report it as a finding.",
     "- requires-full-review: you cannot prove equivalence (uncertainty, cross-scope,",
     "  semantic change, evidence doubt). This is the safe default.",
-    "Path/line thresholds only allowed this attempt; they never imply safety.",
+    "Yui verified only the technical delta boundary; the Leader selected this mode.",
     `Previous accepted ReviewRound: ${previousRound.id}@${record.previousBaseCommit}`,
     `Previous acceptance summary: ${compact(previousRound.summary ?? previousRound.report ?? "")}`,
     ...(round.taskCandidate?.projects.map((project) => {
@@ -270,16 +242,6 @@ function digestDiff(diffByProject: Readonly<Record<string, string>>): string {
   return createHash("sha256").update(canonical).digest("hex");
 }
 
-/**
- * Extracts path-like evidence references from the previous Round's report.
- * Free-form evidence that is not a path is still passed to the Reviewer in
- * the dispatch context; only path-like entries drive the deterministic gate.
- */
-function extractEvidencePaths(round: ReviewRound): string[] {
-  return previousEvidenceReferences(round)
-    .filter((entry) => isPathLike(entry));
-}
-
 /** All path-like evidence references from Markdown or JSON Review reports. */
 function previousEvidenceReferences(round: ReviewRound): string[] {
   const report = round.report ?? "";
@@ -307,9 +269,8 @@ function extractDeclaredEvidence(report: string): string[] {
 
 /**
  * Reviewer reports intentionally accept clear Markdown or JSON without a
- * fixed schema. Extract conservative repo-relative path tokens from the full
- * preserved report so evidence overlap cannot be bypassed by presentation
- * format, nested JSON, Markdown links, backticks, or line-qualified paths.
+ * fixed schema. Extract likely repo-relative references from the preserved
+ * report so the next Reviewer can inspect the earlier evidence directly.
  */
 function extractEvidenceReferences(report: string): string[] {
   const references = report.match(
@@ -327,12 +288,4 @@ function isPathLike(value: string): boolean {
   // shell/argument metacharacters.
   if (/[;&|`$(){}!<>]/u.test(value)) return false;
   return value.includes("/") || /\.[A-Za-z0-9]{1,12}$/u.test(value);
-}
-
-function pathEvidenceMatches(evidencePath: string, changedFile: string): boolean {
-  const normalizedEvidence = evidencePath.replace(/^\.\//u, "").replace(/\/+$/u, "");
-  const normalizedFile = changedFile.replace(/^\.\//u, "").replace(/\/+$/u, "");
-  if (normalizedEvidence === normalizedFile) return true;
-  // A directory-level evidence reference covers every file under it.
-  return normalizedFile.startsWith(`${normalizedEvidence}/`);
 }

@@ -323,12 +323,14 @@ Choose before creating the WorkItem:
 Keep review execution separate from implementation. No global Reviewer is
 required: when review is disabled, inspect and decide directly or delegate a
 bounded review to a native subagent or ordinary Worker. When a managed
-ReviewRound is explicitly configured, its reviewer uses the single built-in
-write-capable `reviewer` Profile, but Yui grants that capability only inside a
-fresh ReviewRound-owned worktree created from its exact frozen scope:
+ReviewRound is explicitly requested, its reviewer uses the single built-in
+write-capable `reviewer` Profile. Each Task Reviewer Role keeps one stable,
+isolated Session and physical workspace slot; every ReviewRound updates that
+slot to its exact frozen scope and records a new immutable ownership snapshot:
 the assigned WorkItem Candidate or the committed Integration heads of a
 Task-final Review. Never reuse the Candidate/Worker workspace or its
-implementation Role Session. Codex and Claude may use their normal configured
+implementation Role Session. Multiple Reviewer Roles use independent slots
+and may run in parallel. Codex and Claude may use their normal configured
 full capability in that isolated worktree; the behavioral boundary forbids
 push, Integration, Task mutation, other workspaces, stable checkouts, and the
 real Yui control-plane home. When
@@ -526,8 +528,8 @@ authorized expansions.
   bounded evidence-gathering review to a native subagent or ordinary Worker,
   then make the Leader-owned accept/reject decision. Do not create a Reviewer
   Role merely to satisfy an old setup convention.
-- `always`: wait for the automatically requested ReviewRound to become
-  terminal. Never bypass an active round.
+- `always`: keep the Candidate decision pending until its required ReviewRound
+  is terminal. The Review does not globally pause unrelated Leader work.
 - `leader`: decide whether the existing evidence is sufficient. Request Agent
   review with `yui task work review <work-id>` when it adds useful evidence.
 - `final`: keep WorkItem acceptance and integration independent. After all
@@ -535,10 +537,39 @@ authorized expansions.
   Task-final ReviewRound over the frozen Task candidate. A Task contract may
   require it. The final Reviewer evaluates the complete result across bound
   Projects; it is not a second per-WorkItem approval protocol.
-- A changed Task head creates a new semantic Task-final Round. Reuse the same
-  compatible Reviewer Role Session and stable workspace when Yui offers it;
-  do not create a new Role or native Session for every Round. Round identity
-  still binds each Run to the exact frozen head.
+- Before choosing a Task-final Review action, read `task context` or
+  `task next-action` and inspect every active AgentRun's purpose and exact
+  WorkItem/ReviewRound binding, the current durable heads, active Reviews,
+  each Reviewer's availability, the latest accepted baseline, candidate
+  relation, and Delta facts. These are decision support, not an autopilot;
+  a Review Run is evidence in progress, not a global Task lock.
+- A changed Task head may justify a new semantic Task-final Round. Reuse the
+  same Reviewer Role Session and stable workspace; Round id, full versus Delta
+  mode, desired revision, and frozen commit do not require a replacement
+  Session. Round identity still binds each Run to the exact frozen head.
+- An active Task-final Review freezes candidate A only. Continue handling new
+  user input and, when appropriate, advance candidate B. Always consume A's
+  result, then route it as exact evidence for A, a baseline for descendant B,
+  or historical evidence for a diverged candidate. Do not cancel or discard A
+  merely because Task main moved.
+- Read active Review facts directly from its ReviewRound: frozen Project
+  commits define that Review's evidence boundary; current candidate relation,
+  active Run, and workspace references describe current execution. Do not infer
+  a Task lock or wait for a synthetic freeze lifecycle before advancing Task
+  main.
+- If Yui reports a Reviewer `busy`, wait for the suggested interval, select a
+  different Reviewer, review directly, or continue other work. Busy is a
+  scheduling fact, not a failed Review and not a reason to reset the Session.
+- Prefer Delta Recheck for a technically available, contiguous change over an
+  accepted baseline when the semantic risk is bounded. Use the exact changed
+  files, line counts, diff, previous evidence, Task intent, and Project Policy
+  to choose full Review, Delta, direct Review, another Reviewer, or no Review;
+  Yui does not choose the mode from generic thresholds.
+- Delta `requires-full-review` returns control to the Leader. Decide whether a
+  full Review, another Reviewer, direct inspection, or more development is
+  useful; Yui must not auto-create the next Round. `repeated-full-review` is a
+  cost advisory for an unchanged candidate/Reviewer intent, never an exhausted
+  budget or a prohibition on new evidence.
 - A completed review is advice. Decide whether to accept, reject, review again,
   or ask the user.
 - Route a reachable final-Review finding to the original Worker while that
@@ -563,11 +594,16 @@ authorized expansions.
   full Round over the identical frozen heads. It fails closed for every
   semantic or ambiguous prior result; target the new failed Round explicitly
   if another non-semantic failure occurs.
+- For `review.failed-to-start`, open the referenced ReviewRound and inspect its
+  exact reason, frozen candidate, and workspace when present. Decide whether to
+  retry, explicitly clean a conflicting workspace, select another Reviewer, or
+  continue other work. Preserve the failed Round as request history and do not
+  turn these choices into an automatic retry or cleanup loop.
 - Use `task next-action`'s derived Review outcome literally: non-semantic means
   recover the same frozen head with `force-fresh`; ambiguous means diagnose the
   inconsistent evidence without creating a Repair WorkItem; only semantic
-  negative evidence may create a repair wave. Non-semantic and ambiguous
-  attempts do not consume the full semantic Review budget.
+  negative evidence may create a repair wave. There is no semantic Review
+  budget; exact candidate/Reviewer/intent retries reuse existing evidence.
 - If the same non-resource user choice or unavailable external fact repeats,
   persist context and create an InputRequest instead of looping. Never use an
   InputRequest to solicit authorization for an unrequested real-resource test;
@@ -612,10 +648,11 @@ accept an isolated result while any writable Project's latest ChangeSet is
 unintegrated.
 
 Workspace ownership is not Role ownership. The WorkItem owns its Develop
-workspace even when a Task Role executes there; each ReviewRound owns a fresh
-workspace from the Candidate's frozen commit, and each IntegrationAttempt owns
-its candidate worktree. Dispatch attaches snapshots only. Review workspace
-cleanup is explicit, and review edits can never feed WorkItem ChangeSet capture.
+workspace even when a Task Role executes there; a Task Reviewer Role keeps one
+stable physical workspace while each ReviewRound owns the exact frozen
+workspace evidence for its Run, and each IntegrationAttempt owns its candidate
+worktree. Dispatch attaches snapshots only. Review workspace cleanup is
+explicit, and review edits can never feed WorkItem ChangeSet capture.
 
 Yui validates a candidate and advances the target with compare-and-swap. A
 failed candidate does not advance the target. Inspect and resolve semantic

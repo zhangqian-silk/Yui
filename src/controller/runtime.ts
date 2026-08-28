@@ -36,7 +36,7 @@ import {
 } from "../executor/agentExecutor.js";
 import {
   effectiveLaunchSnapshotsCompatible,
-  effectiveLaunchSnapshotsCompatibleForTaskMain,
+  effectiveLaunchSnapshotsCompatibleForTaskSession,
   effectiveLaunchConfig,
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
@@ -1015,8 +1015,7 @@ export function createRuntimeLifecycleDispatcher(
     const mode = roleAgentSessionResumeMode(
       sessions,
       effective.agentId,
-      effective,
-      managedWorkspace
+      effective
     );
     const session = sessions?.sessions[effective.agentId];
     const owner = request.scope === "task"
@@ -1170,10 +1169,9 @@ function assertRuntimeLaunchRequestCurrent(
       throw new Error(`Native session changed: ${request.owner.roleName}.`);
     }
     const sessionEffectiveCompatible = request.owner.scope === "task"
-      ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+      ? effectiveLaunchSnapshotsCompatibleForTaskSession(
           session.effective,
-          request.effective,
-          request.managedWorkspace
+          request.effective
         )
       : effectiveLaunchSnapshotsCompatible(session.effective, request.effective);
     if (!sessionEffectiveCompatible) {

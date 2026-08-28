@@ -193,58 +193,24 @@ export function effectiveLaunchSnapshotsCompatible(
 }
 
 /**
- * A Task-owned main workspace is a mutable checkout: Integration advances its
- * durable Git heads while an idle native Session keeps the immutable launch
- * configuration with which it started. A later Run may resume that exact
- * Session only when the current durable Task workspace proves that every
- * non-commit workspace identity and every other launch field is unchanged.
- * A Task-final Reviewer workspace is also mutable between semantic Rounds: it
- * keeps one Role-owned physical identity while its frozen commits and Round
- * identity advance. WorkItem and ExecutionLane workspaces remain strict.
+ * Task Role Sessions keep one physical workspace while Run-scoped facts move.
+ * Candidate commits, ReviewRound identity and desired-revision bookkeeping do
+ * not define a native Session. Agent, adapter, permission, model, sandbox,
+ * manifest, Role context and physical workspace identity still do.
  */
-export function effectiveLaunchSnapshotsCompatibleForTaskMain(
+export function effectiveLaunchSnapshotsCompatibleForTaskSession(
   existing: EffectiveLaunchSnapshot,
-  desired: EffectiveLaunchSnapshot,
-  workspace: ManagedWorkspace | null | undefined
+  desired: EffectiveLaunchSnapshot
 ): boolean {
   if (effectiveLaunchSnapshotsCompatible(existing, desired)) return true;
   validateEffectiveLaunchSnapshot(existing);
   validateEffectiveLaunchSnapshot(desired);
-  if (workspace === null || workspace === undefined) return false;
-  validateManagedWorkspace(workspace);
-  const durableWorkspace: EffectiveLaunchWorkspace = {
-    root: workspace.root,
-    entries: workspace.entries.map((entry) => ({ ...entry }))
-  };
-  if (!isDeepStrictEqual(desired.workspace, durableWorkspace)) return false;
-  if (workspace.owner.type === "review-round") {
-    return effectiveLaunchSnapshotsCompatibleForTaskReview(existing, desired);
+  if ((existing.reviewRoundId === undefined) !== (desired.reviewRoundId === undefined)) {
+    return false;
   }
-  if (workspace.owner.type !== "task") return false;
   return isDeepStrictEqual(
-    taskMainCompatibleSnapshot(existing),
-    taskMainCompatibleSnapshot(desired)
-  );
-}
-
-/**
- * Same Task Reviewer Role, same stable physical workspace and launch policy,
- * but a new semantic ReviewRound and frozen head. The native Session keeps its
- * conversation; each AgentRun still records the new exact Round snapshot.
- */
-export function effectiveLaunchSnapshotsCompatibleForTaskReview(
-  existing: EffectiveLaunchSnapshot,
-  desired: EffectiveLaunchSnapshot
-): boolean {
-  validateEffectiveLaunchSnapshot(existing);
-  validateEffectiveLaunchSnapshot(desired);
-  if (existing.reviewRoundId === undefined
-    || existing.reviewBaseCommit === undefined
-    || desired.reviewRoundId === undefined
-    || desired.reviewBaseCommit === undefined) return false;
-  return isDeepStrictEqual(
-    taskReviewCompatibleSnapshot(existing),
-    taskReviewCompatibleSnapshot(desired)
+    taskSessionCompatibleSnapshot(existing),
+    taskSessionCompatibleSnapshot(desired)
   );
 }
 
@@ -267,22 +233,7 @@ export function effectiveLaunchWithTaskMainWorkspace(
   });
 }
 
-function taskMainCompatibleSnapshot(snapshot: EffectiveLaunchSnapshot): unknown {
-  const {
-    sourceDesiredRevision: _sourceDesiredRevision,
-    workspace,
-    ...launch
-  } = snapshot;
-  return {
-    ...launch,
-    workspace: {
-      root: workspace.root,
-      entries: workspace.entries.map(({ baseCommit: _baseCommit, ...entry }) => entry)
-    }
-  };
-}
-
-function taskReviewCompatibleSnapshot(snapshot: EffectiveLaunchSnapshot): unknown {
+function taskSessionCompatibleSnapshot(snapshot: EffectiveLaunchSnapshot): unknown {
   const {
     sourceDesiredRevision: _sourceDesiredRevision,
     reviewRoundId: _reviewRoundId,

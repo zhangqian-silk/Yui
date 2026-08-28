@@ -20,7 +20,7 @@ import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import {
   effectiveLaunchSnapshotsCompatible,
-  effectiveLaunchSnapshotsCompatibleForTaskMain
+  effectiveLaunchSnapshotsCompatibleForTaskSession
 } from "../executor/effectiveLaunch.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
 import { RuntimeLaunchFailure } from "../runtime/launchDiagnostics.js";
@@ -1049,10 +1049,9 @@ function requireResumeSession(
   if (session === null || !hasText(session.nativeSessionId)) {
     throw new Error(`Role resume has no fixed native session: ${role.taskId}/${role.name}.`);
   }
-  if (!effectiveLaunchSnapshotsCompatibleForTaskMain(
+  if (!effectiveLaunchSnapshotsCompatibleForTaskSession(
     session.effective,
-    effective,
-    role.managedWorkspace
+    effective
   )) {
     throw new Error(`Role resume effective snapshot drifted: ${role.taskId}/${role.name}.`);
   }
@@ -1160,20 +1159,18 @@ function validateRoleSession(
     throw new Error(`Ready Role session identity changed: ${role.taskId}/${role.name}.`);
   }
   const compatible = mode === "resume"
-    ? effectiveLaunchSnapshotsCompatibleForTaskMain(
+    ? effectiveLaunchSnapshotsCompatibleForTaskSession(
         session.effective,
-        effective,
-        role.managedWorkspace
+        effective
       )
     : effectiveLaunchSnapshotsCompatible(session.effective, effective);
   if (!compatible) {
     throw new Error(`Ready Role session effective snapshot changed: ${role.taskId}/${role.name}.`);
   }
   if (existing?.nativeSessionId !== undefined
-    && effectiveLaunchSnapshotsCompatibleForTaskMain(
+    && effectiveLaunchSnapshotsCompatibleForTaskSession(
       existing.effective,
-      effective,
-      role.managedWorkspace
+      effective
     )
     && session.nativeSessionId !== existing.nativeSessionId) {
     throw new Error(`Ready Role session changed the fixed native session id: ${role.taskId}/${role.name}.`);

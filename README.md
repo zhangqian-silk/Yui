@@ -396,14 +396,16 @@ acceptance so the Leader can accept it directly or run
 Leader-managed candidates awaiting a decision instead of marking them done.
 `final` does not create WorkItem ReviewRounds or decide Task topology. The
 Leader explicitly requests a Task-scoped Review, unless an immutable Task
-contract requires one. The Round freezes Task main directly, so even a
-Leader-owned Task with no WorkItem can be reviewed. A changed frozen head needs
-a new semantic Round; the same compatible Reviewer Session may continue in its
+contract requires one. The Round snapshots the exact Task-main Project heads
+directly, so even a Leader-owned Task with no WorkItem can be reviewed without
+locking the mutable Task workspace. A changed frozen head needs a new semantic
+Round; the same Reviewer Session continues in its
 stable workspace, while every Run remains bound to its exact Round and head.
 The Reviewer follows Project Policy/Knowledge and reports reachable, material,
 actionable findings across the complete Task.
-A ReviewRound freezes the Candidate's exact Git commit and creates a fresh,
-ReviewRound-owned writable worktree on a unique branch. Its AgentRun may edit,
+A ReviewRound freezes the Candidate's exact Git commit and updates the
+Reviewer Role's stable writable workspace to that head while recording exact
+Round-owned workspace evidence. Its AgentRun may edit,
 test, and optionally commit diagnostic evidence there, but never changes the
 Candidate or Worker workspace and never creates another WorkItem, Candidate,
 ChangeSet, or recursive review. The result wakes the Leader, who decides whether
@@ -411,6 +413,17 @@ to route evidence to the original Worker, accept, reject and redispatch that
 Worker in its existing Session, review again, or request user input.
 A failed review remains visible evidence and wakes the Leader, but does not
 take that decision away from the Leader.
+Task context and next-action expose direct Review facts: every frozen Project
+commit, its relation to the current candidate, the active Run, and the Reviewer
+workspace. A request that fails after Round creation retains the ReviewRound
+and reports its exact reason; the Leader opens that Round and decides whether
+to retry, inspect or clean the workspace, use another Reviewer, or continue
+other work.
+An active Task-final Review freezes only its own candidate; it does not prevent
+the Leader from processing new input or advancing a later candidate. Delta
+Recheck is always available when Yui can prove an accepted contiguous baseline
+and exact diff. Yui does not select a mode from generic size thresholds;
+`requires-full-review` returns to the Leader without creating another Round.
 Candidate history, every ReviewRound, and the Leader decision remain grouped
 under the original WorkItem. A rejected result creates a new Candidate on the
 next dispatch while reusing the original execution Role, Session, and

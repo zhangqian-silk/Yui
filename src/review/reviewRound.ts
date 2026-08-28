@@ -27,7 +27,7 @@ export type ReviewScope = "work-item" | "task";
 /**
  * Issue 07: the only dispositions a delta-recheck Reviewer may return.
  * `equivalent-and-accepted` accepts the new frozen head; `finding` records
- * blocking findings; `requires-full-review` escalates to a full Review.
+ * findings; `requires-full-review` returns explicit uncertainty to the Leader.
  */
 export type DeltaRecheckDisposition =
   | "equivalent-and-accepted"
@@ -296,7 +296,7 @@ export function finishReviewRound(
     return terminal;
   }
   // Fail closed: a completed delta Round without an explicit, valid
-  // disposition escalates to a full Review.  Uncertainty never accepts.
+  // disposition remains non-accepting for Leader routing. Uncertainty never accepts.
   const disposition = result.deltaDisposition ?? "requires-full-review";
   const reasoning = result.deltaReasoning ?? result.report ?? summary;
   return validateReviewRound({

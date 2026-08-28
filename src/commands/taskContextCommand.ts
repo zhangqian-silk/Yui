@@ -18,6 +18,8 @@ import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.j
 import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { projectExecutionLaneRunRecoveries } from "../run/recoveryProjection.js";
+import { projectReviewDecision } from "../review/reviewDecision.js";
+import type { TaskReviewCandidate } from "../review/reviewRound.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -28,7 +30,11 @@ const TERMINAL_WORK_ITEM_STATUSES = new Set([
   "retired"
 ]);
 
-export function runTaskContextCommand(args: string[], store: TaskStore) {
+export function runTaskContextCommand(
+  args: string[],
+  store: TaskStore,
+  currentTaskReviewCandidate: TaskReviewCandidate | null = null
+) {
   if (args.length !== 1 || args[0]?.trim().length === 0) {
     throw usageError("Task context usage: yui task context <task>.");
   }
@@ -60,6 +66,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       "agent-run"
     ));
     const reviewRounds = chronological(reader.listReviewRounds(task.id));
+    const reviewConfig = reader.getReviewConfig();
     const changeSets = chronological(reader.listChangeSets(task.id));
     const integrations = chronological(reader.listIntegrationAttempts(task.id));
     const publications = chronological(reader.listPublicationReferences(task.id));
@@ -70,7 +77,16 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     return {
       task,
       execution,
-      reviewConfig: reader.getReviewConfig(),
+      reviewConfig,
+      reviewDecision: projectReviewDecision({
+        store: reader,
+        task,
+        roles,
+        runs: agentRuns,
+        rounds: reviewRounds,
+        reviewConfig,
+        currentCandidate: currentTaskReviewCandidate
+      }),
       brief: reader.getTaskBrief(task.id),
       activeDecisions: reader.listDecisions(task.id)
         .filter((decision) => decision.status === "active"),
@@ -94,6 +110,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
       events,
       nextAction: projectNextAction({
         ...nextActionFacts,
+        currentTaskReviewCandidate,
         executionGroups: execution.executionGroups,
         runRecoveries: projectExecutionLaneRunRecoveries(
           reader,
@@ -107,6 +124,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     task,
     execution,
     reviewConfig,
+    reviewDecision,
     brief,
     activeDecisions,
     milestones,
@@ -132,9 +150,7 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
   const displayedWorkItems = currentAndRecentWorkItems(workItems);
   const displayedOpenInputRequests = openInputRequests.slice(-RECENT_RECORD_LIMIT);
   const displayedResolvedInputRequests = resolvedInputRequests.slice(-RECENT_RECORD_LIMIT);
-  const displayedExecutionCarriers = execution.monitoring === "active"
-    ? execution.activeRuns
-    : [];
+  const displayedActiveRuns = execution.activeRuns;
   const executionGroupsById = new Map(execution.executionGroups.map((group) => [
     group.groupId,
     group
@@ -180,11 +196,17 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     `  Attention: ${execution.attention.length === 0
       ? "none"
       : execution.attention.map(({ kind, owner }) => `${kind}/${owner}`).join(", ")}`,
-    `  Active execution carriers (${displayedExecutionCarriers.length}):`,
-    ...(displayedExecutionCarriers.length === 0
+    `  Active AgentRuns (${displayedActiveRuns.length}):`,
+    ...(displayedActiveRuns.length === 0
       ? ["    None."]
-      : displayedExecutionCarriers.map((run) => (
-          `    ${run.roleName}: ${run.id} [${run.status}; ${run.delivered ? "accepted" : "delivery-pending"}]`
+      : displayedActiveRuns.map((run) => (
+          `    ${run.roleName}: ${run.id} [${run.status}/${run.purpose}; ${
+            run.delivered ? "accepted" : "delivery-pending"
+          }${run.workItemId === undefined ? "" : `; work-item=${run.workItemId}`}${
+            run.reviewRoundId === undefined ? "" : `; review-round=${run.reviewRoundId}`
+          }${run.executionGroupId === undefined ? "" : `; group=${run.executionGroupId}`}${
+            run.executionLaneId === undefined ? "" : `; lane=${run.executionLaneId}`
+          }]`
         ))),
     "Observability:",
     `  DAG: ${observability.dag.nodes.length} node(s), ${observability.dag.edges.length} edge(s); ready=${observability.dag.readyIds.join(", ") || "none"}; blocked=${observability.dag.blockedIds.join(", ") || "none"}`,
@@ -231,6 +253,34 @@ export function runTaskContextCommand(args: string[], store: TaskStore) {
     `Global review: ${reviewConfig === null
       ? "disabled"
       : `${reviewConfig.roleName} (${reviewConfig.trigger})`}`,
+    "Review decision support:",
+    `  Current durable heads: ${reviewDecision.currentCandidate?.projects
+      .map(({ projectId, commit }) => `${projectId}@${commit.slice(0, 12)}`).join(", ")
+      ?? "unavailable"}`,
+    "  Active Reviews:",
+    ...(reviewDecision.activeReviews.length === 0
+      ? ["    - none"]
+      : reviewDecision.activeReviews.map((review) => (
+          `    - ${review.reviewRoundId}/${review.reviewerRoleName}/${review.mode}`
+            + ` [${review.status}; current=${review.candidateRelation}]`
+            + ` heads=${review.frozenCandidate?.projects.map(({ projectId, commit }) => (
+              `${projectId}@${commit.slice(0, 12)}`
+            )).join(", ") ?? "unavailable"}`
+            + `${review.workspaceRoot === undefined
+              ? ""
+              : ` workspace=${review.workspaceRoot}`}`
+        ))),
+    `  Reviewer slots: ${reviewDecision.reviewers.length === 0
+      ? "none configured"
+      : reviewDecision.reviewers.map((reviewer) => (
+          `${reviewer.reviewerRoleName}=${reviewer.status}`
+            + `${reviewer.activeRunId === undefined ? "" : `(${reviewer.activeRunId})`}`
+        )).join(", ")}`,
+    `  Accepted baseline: ${reviewDecision.latestAcceptedBaseline === null
+      ? "none"
+      : `${reviewDecision.latestAcceptedBaseline.reviewRoundId}`
+        + ` [${reviewDecision.latestAcceptedBaseline.relationToCurrent}]`}`,
+    `  Delta: ${reviewDecision.delta.technicalAvailability}; ${reviewDecision.delta.reason}`,
     "",
     "Brief:",
     ...(brief === null

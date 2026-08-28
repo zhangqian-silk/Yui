@@ -9,12 +9,10 @@ import {
 } from "./turnCompletion.js";
 import {
   effectiveLaunchSnapshotsCompatible,
-  effectiveLaunchSnapshotsCompatibleForTaskMain,
-  effectiveLaunchSnapshotsCompatibleForTaskReview,
+  effectiveLaunchSnapshotsCompatibleForTaskSession,
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
 } from "./effectiveLaunch.js";
-import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import {
   rebindProviderRuntimeRun,
   validateProviderRuntimeBinding,
@@ -206,7 +204,7 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
   if (existing !== undefined && existing.nativeSessionId === nativeSessionId
     && !effectiveLaunchSnapshotsCompatible(existing.effective, effective)
     && !(set.owner.scope === "task"
-      && effectiveLaunchSnapshotsCompatibleForTaskReview(existing.effective, effective))) {
+      && effectiveLaunchSnapshotsCompatibleForTaskSession(existing.effective, effective))) {
     throw new Error(`Role Agent session effective launch cannot change: ${agentId}.`);
   }
   if (existing !== undefined && existing.nativeSessionId !== nativeSessionId
@@ -441,8 +439,7 @@ export function rememberRoleAgentCompletedTurn<TSet extends RoleSessionSet>(
 export function roleAgentSessionResumeMode(
   set: RoleSessionSet | null,
   agentId: string,
-  desired: EffectiveLaunchSnapshot,
-  workspace?: ManagedWorkspace
+  desired: EffectiveLaunchSnapshot
 ): "new" | "resume" {
   if (set === null) return "new";
   validateRoleSessionSet(set);
@@ -468,11 +465,7 @@ export function roleAgentSessionResumeMode(
     return "new";
   }
   const compatible = set.owner.scope === "task"
-    ? effectiveLaunchSnapshotsCompatibleForTaskMain(
-        session.effective,
-        desired,
-        workspace
-      )
+    ? effectiveLaunchSnapshotsCompatibleForTaskSession(session.effective, desired)
     : effectiveLaunchSnapshotsCompatible(session.effective, desired);
   if (compatible) return "resume";
   throw new Error(

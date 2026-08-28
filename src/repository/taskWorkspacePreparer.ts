@@ -644,9 +644,10 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           );
         }
         for (const role of tx.listRoles(task.id)) {
-          // The Role field is only a cwd/snapshot hint.  Preserve the hint for
-          // an active WorkItem assignment; the durable owner is the WorkItem,
-          // not this Role record.  Other Roles use Task main.
+          // The Role field is only a cwd/snapshot hint. Preserve it while a
+          // durable WorkItem or ReviewRound workspace owns that cwd; Task-main
+          // preparation must not move a Reviewer Session out from under an
+          // active or retained ReviewRound. Other Roles use Task main.
           // Prefer the active Run's exact WorkItem for this Role; fall back
           // to the first queued WorkItem only when no active Run owns the Role.
           const activeRoleRun = tx.getActiveAgentRun(task.id, role.name);
@@ -667,7 +668,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           const assignedWorkspace = assignedItem === undefined
             ? null
             : tx.getWorkItemWorkspace(task.id, assignedItem.id);
-          const target = assignedWorkspace?.root ?? root;
+          const reviewWorkspace = tx.listManagedWorkspaces(task.id).find((candidate) => {
+            if (candidate.owner.type !== "review-round"
+              || candidate.root !== role.workspace) return false;
+            return tx.getReviewRound(task.id, candidate.owner.reviewRoundId)
+              ?.reviewerRoleName === role.name;
+          });
+          const target = assignedWorkspace?.root ?? reviewWorkspace?.root ?? root;
           if (role.workspace !== target) {
             if (
               assignedItem === undefined

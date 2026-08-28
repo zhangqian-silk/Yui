@@ -209,7 +209,7 @@ import {
 export const STORAGE_STATE_FILE = "state.json";
 /** The root StorageState schema is the persisted aggregate document version. */
 export const CURRENT_STORAGE_STATE_SCHEMA_VERSION = CURRENT_AGGREGATE_SCHEMA_VERSION;
-export const CURRENT_CONFIG_SCHEMA_VERSION = 2 as const;
+export const CURRENT_CONFIG_SCHEMA_VERSION = 3 as const;
 export const CURRENT_HOME_IDENTITY_SCHEMA_VERSION = 1 as const;
 export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 3 as const;
 /**
