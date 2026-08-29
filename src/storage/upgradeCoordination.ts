@@ -50,12 +50,17 @@ const COORDINATION_LOCK_MIN_AGE_MS = 1_000;
  * A hook that passed a check before an upgrade placed its fence either owns the
  * lock and finishes before cutover, or waits and receives an explicit
  * UpgradeFenceError after the cutover holder releases it.  There is no second
- * scan or retry protocol hidden in this helper.
+ * scan or retry protocol hidden in this helper. A staged updater child passes
+ * its already-authenticated parent fence owner through this same boundary.
  */
-export function withUpgradeCoordinationLock<T>(home: string, execute: () => T): T {
+export function withUpgradeCoordinationLock<T>(
+  home: string,
+  execute: () => T,
+  fenceOwnerPid: number = process.pid
+): T {
   const release = acquireUpgradeCoordinationLock(home);
   try {
-    assertUpgradeAdmission(home);
+    assertUpgradeAdmission(home, fenceOwnerPid);
     return execute();
   } finally {
     release();
@@ -70,8 +75,11 @@ export function withUpgradeCoordinationLock<T>(home: string, execute: () => T): 
  * avoiding a permanent post-promote hook deadlock.  A malformed marker with a
  * missing Home still fails closed because its recovery phase cannot be trusted.
  */
-export function assertUpgradeAdmission(home: string): void {
-  assertHomeWritable(home);
+export function assertUpgradeAdmission(
+  home: string,
+  fenceOwnerPid: number = process.pid
+): void {
+  assertHomeWritable(home, fenceOwnerPid);
   const progressPath = switchProgressPath(home);
   if (!existsSync(progressPath)) return;
   const homeInitialized = existsSync(join(home, STORAGE_SCHEMA_FILE));
