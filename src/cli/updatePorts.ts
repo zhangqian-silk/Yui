@@ -1019,10 +1019,29 @@ function runControllerCommandOutput(
   const result = spawn(
     command,
     args,
-    { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
+    {
+      cwd: process.cwd(),
+      env: {
+        ...environment,
+        YUI_HOME: home,
+        // The restart child participates in the handover owned by this parent
+        // update process. Without the owner PID it waits on its parent's live
+        // lock as though a foreign update owned the Home, then times out.
+        YUI_UPDATE_HANDOVER_OWNER_PID: String(process.pid)
+      },
+      shell: false
+    }
   );
   if (result.error !== undefined || result.status !== 0) {
-    throw new Error(`Controller ${method} failed (exit ${result.status ?? "null"}).`);
+    const detail = structuredErrorMessage(result) ?? result.stderr.toString("utf8").trim();
+    const error = new Error(
+      `Controller ${method} failed (exit ${result.status ?? "null"})${
+        detail.length === 0 ? "." : `: ${detail}`
+      }`
+    );
+    const code = controllerErrorCodeFromResult(result);
+    if (code !== undefined) Object.assign(error, { code });
+    throw error;
   }
   const parsed = JSON.parse(result.stdout.toString("utf8")) as unknown;
   if (!isRecord(parsed) || parsed.ok !== true) {
