@@ -879,6 +879,11 @@ function matchesLaunchFence(
   sessions: TaskRoleSessionSet | null,
   input: ExactRunTerminalizationInput
 ): boolean {
+  // A resumed Run shares the native Provider Session whose process environment
+  // was created for an earlier Run. Once that exact native Session has passed
+  // matchesSessionFence, its immutable per-launch environment is not a second
+  // Run identity. Opaque hosts still require the launch fence below.
+  if (input.nativeSessionId !== undefined) return true;
   if (input.launchId === undefined) return true;
   const session = sessions?.sessions[input.agentId] as
     | (TaskRoleSessionSet["sessions"][string] & { launchId?: string })
@@ -907,7 +912,9 @@ function settleLaunchReservation(
   const session = sessions?.sessions[input.agentId] as
     | (TaskRoleSessionSet["sessions"][string] & { launchId?: string })
     | undefined;
-  const launchId = input.launchId ?? session?.launchId;
+  const launchId = input.nativeSessionId === undefined
+    ? input.launchId ?? session?.launchId
+    : session?.launchId;
   if (launchId === undefined || !isRuntimeLaunchReservation(reservation, launchId)) return;
   const settled = completeProcessing(mailbox!, reservation!.batchId);
   if (settled.processing === null && settled.pending === null) {
