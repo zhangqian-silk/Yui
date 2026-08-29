@@ -1,12 +1,13 @@
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import type { TaskCompletedBy } from "../task/task.js";
 
 export type Milestone = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   taskId: string;
   title: string;
   summary: string;
-  createdBy: "leader";
+  createdBy: TaskCompletedBy;
   createdAt: string;
 };
 
@@ -15,17 +16,25 @@ export function createMilestone(
   taskId: string,
   title: string,
   summary: string,
+  createdBy: TaskCompletedBy,
   now: Date
 ): Milestone {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: validateTaskRecordReference({ taskId, localId: id }, "milestone").localId,
     taskId: requireSafeIdentity(taskId, "Task id"),
     title: requireText(title, "Milestone title"),
     summary: requireText(summary, "Milestone summary"),
-    createdBy: "leader",
+    createdBy: requireTaskControlActor(createdBy),
     createdAt: now.toISOString()
   };
+}
+
+function requireTaskControlActor(value: TaskCompletedBy): TaskCompletedBy {
+  if (value !== "user" && value !== "operator" && value !== "leader") {
+    throw new Error(`Milestone createdBy is invalid: ${String(value)}.`);
+  }
+  return value;
 }
 
 function requireSafeIdentity(value: string, label: string): string {

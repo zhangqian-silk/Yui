@@ -6,6 +6,7 @@ import {
   requireTimestamp
 } from "../domain/validation.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import type { TaskCompletedBy } from "../task/task.js";
 import {
   normalizeCheckResult,
   type CheckResult
@@ -27,12 +28,12 @@ export type ConflictReport = Readonly<{
 export type ResolutionDecision = Readonly<{
   action: "manual-resolution" | "reject";
   rationale: string;
-  decidedBy: "leader";
+  decidedBy: TaskCompletedBy;
   decidedAt: string;
 }>;
 
 export type IntegrationAttempt = Readonly<{
-  schemaVersion: 4;
+  schemaVersion: 5;
   id: string;
   taskId: string;
   projectId: string;
@@ -77,7 +78,7 @@ export function createIntegrationAttempt(
 ): IntegrationAttempt {
   const timestamp = now.toISOString();
   return validateIntegrationAttempt({
-    schemaVersion: 4,
+    schemaVersion: 5,
     id: input.id,
     taskId: input.taskId,
     projectId: input.projectId,
@@ -119,7 +120,7 @@ export function recordIntegrationCheckJob(
   });
 }
 
-export function requireLeaderDecision(
+export function requireResolutionDecision(
   attempt: IntegrationAttempt,
   report: ConflictReport,
   now: Date
@@ -146,6 +147,7 @@ export function requireLeaderDecision(
 export function recordResolutionDecision(
   attempt: IntegrationAttempt,
   decision: Omit<ResolutionDecision, "decidedBy" | "decidedAt">,
+  decidedBy: TaskCompletedBy,
   now: Date
 ): IntegrationAttempt {
   validateIntegrationAttempt(attempt);
@@ -162,12 +164,19 @@ export function recordResolutionDecision(
     resolution: {
       action: decision.action,
       rationale: requireText(decision.rationale, "Resolution rationale"),
-      decidedBy: "leader",
+      decidedBy: requireTaskControlActor(decidedBy),
       decidedAt: timestamp
     },
     updatedAt: timestamp,
     ...(decision.action === "reject" ? { endedAt: timestamp } : {})
   });
+}
+
+function requireTaskControlActor(value: TaskCompletedBy): TaskCompletedBy {
+  if (value !== "user" && value !== "operator" && value !== "leader") {
+    throw new Error(`Integration decision actor is invalid: ${String(value)}.`);
+  }
+  return value;
 }
 
 const TERMINAL_STATUSES = ["committed", "superseded", "failed"];
@@ -228,8 +237,8 @@ export function supersedeIntegration(
 }
 
 export function validateIntegrationAttempt(attempt: IntegrationAttempt): IntegrationAttempt {
-  if (attempt.schemaVersion !== 4) {
-    throw new Error("IntegrationAttempt must use schemaVersion 4.");
+  if (attempt.schemaVersion !== 5) {
+    throw new Error("IntegrationAttempt must use schemaVersion 5.");
   }
   validateTaskRecordReference({
     taskId: attempt.taskId,
@@ -277,9 +286,7 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
       throw new Error(`Resolution action is invalid: ${String(attempt.resolution.action)}.`);
     }
     requireText(attempt.resolution.rationale, "Resolution rationale");
-    if (attempt.resolution.decidedBy !== "leader") {
-      throw new Error("Only the Leader may record a ResolutionDecision.");
-    }
+    requireTaskControlActor(attempt.resolution.decidedBy);
     requireTimestamp(attempt.resolution.decidedAt, "Resolution decidedAt");
   }
   attempt.checks?.forEach(normalizeCheckResult);

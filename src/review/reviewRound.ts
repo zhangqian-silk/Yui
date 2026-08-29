@@ -4,6 +4,7 @@ import {
   requireTimestamp
 } from "../domain/validation.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import type { TaskCompletedBy } from "../task/task.js";
 import {
   validateTaskFinalReviewContract,
   type TaskFinalReviewContract
@@ -20,7 +21,7 @@ import {
   type ExecutionGroup
 } from "../execution/executionGroup.js";
 export type ReviewRoundStatus = "pending" | "running" | "completed" | "failed";
-export type ReviewRequestSource = "policy" | "leader";
+export type ReviewRequestSource = "policy" | TaskCompletedBy;
 export type ReviewWorkspaceDisposition = "preserved" | "reassigned" | "removed";
 export type ReviewScope = "work-item" | "task";
 
@@ -89,8 +90,8 @@ export type ReviewYieldReport = Readonly<{
 }>;
 
 export type ReviewRound = {
-  /** v5 removes the synthetic WorkItem/Candidate anchor from Task-final rounds. */
-  schemaVersion: 5;
+  /** v6 records the real Task-control Agent for explicit review requests. */
+  schemaVersion: 6;
   id: string;
   taskId: string;
   workItemId?: string;
@@ -137,7 +138,7 @@ export function createReviewRound(
   executionGroup?: ExecutionGroup
 ): ReviewRound {
   return validateReviewRound({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     workItemId: requireIdentity(workItemId, "Work Item id"),
@@ -163,7 +164,7 @@ export function createTaskReviewRound(
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
@@ -200,7 +201,7 @@ export function createTaskDeltaReviewRound(
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
@@ -317,6 +318,7 @@ export function finishReviewRound(
  */
 export function retryTaskReviewRound(
   round: ReviewRound,
+  requestedBy: TaskCompletedBy,
   executionLaneId?: string
 ): ReviewRound {
   validateReviewRound(round);
@@ -360,7 +362,7 @@ export function retryTaskReviewRound(
     // Keep the historical attempt Group and Lane addressable from AgentRun
     // history while resetting the Lane for another dispatch attempt.
     ...(retryExecutionGroup === undefined ? {} : { executionGroup: retryExecutionGroup }),
-    requestedBy: "leader",
+    requestedBy: validateReviewRequestSource(requestedBy),
     status: "pending",
     ...(round.workspace === undefined ? {} : { workspace: round.workspace }),
     createdAt: round.createdAt
@@ -577,7 +579,7 @@ export function updateReviewExecutionGroup(
 }
 
 export function validateReviewRound(round: ReviewRound): ReviewRound {
-  if (round.schemaVersion !== 5) throw new Error("ReviewRound must use schemaVersion 5.");
+  if (round.schemaVersion !== 6) throw new Error("ReviewRound must use schemaVersion 6.");
   validateTaskRecordReference({ taskId: round.taskId, localId: round.id }, "reviewRound");
   requireIdentity(round.reviewerRoleName, "Reviewer Role");
   requireCommit(round.reviewBaseCommit, "Review base commit");
@@ -862,7 +864,10 @@ function requireCommit(value: string, label: string): string {
 }
 
 function validateReviewRequestSource(source: ReviewRequestSource): ReviewRequestSource {
-  if (source !== "policy" && source !== "leader") {
+  if (source !== "policy"
+    && source !== "user"
+    && source !== "operator"
+    && source !== "leader") {
     throw new Error(`Review request source is invalid: ${String(source)}.`);
   }
   return source;

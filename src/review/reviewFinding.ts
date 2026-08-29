@@ -34,8 +34,8 @@ export const BLOCKING_FINDING_DISPOSITIONS: readonly ReviewFindingDisposition[] 
   "fixed-pending-review"
 ];
 
-/** Dispositions the Leader may set explicitly. */
-export const LEADER_FINDING_DISPOSITIONS: readonly ReviewFindingDisposition[] = [
+/** Dispositions a Task-control Agent may set explicitly. */
+export const TASK_CONTROL_FINDING_DISPOSITIONS: readonly ReviewFindingDisposition[] = [
   "fixed-pending-review",
   "verified-fixed",
   "accepted-risk",
@@ -195,7 +195,7 @@ export function disposeReviewFinding(
   input: ReviewFindingDispositionInput
 ): ReviewFinding {
   validateReviewFinding(finding);
-  if (!LEADER_FINDING_DISPOSITIONS.includes(input.disposition)) {
+  if (!TASK_CONTROL_FINDING_DISPOSITIONS.includes(input.disposition)) {
     throw new Error(`ReviewFinding disposition is not a Leader decision: ${input.disposition}.`);
   }
   if (finding.disposition !== "open" && finding.disposition !== "fixed-pending-review") {

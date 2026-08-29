@@ -13,7 +13,6 @@ import type {
 } from "../job/durableJob.js";
 import type { DurableJobCaller } from "./jobControl.js";
 import { resolveJobCaller } from "../commands/taskActor.js";
-import type { JobCallerStore } from "../commands/taskActor.js";
 import {
   callFileTaskController,
   type FileControllerClientOptions
@@ -170,18 +169,15 @@ function parseJobResult(value: JsonValue): DurableJob {
  */
 export function createControllerIntegrationJobPort(
   home: string,
-  clientOptions: FileControllerClientOptions & Readonly<{ store?: JobCallerStore }> = {}
+  clientOptions: FileControllerClientOptions = {}
 ): IntegrationJobPort {
-  const { store, ...controllerOptions } = clientOptions;
   return {
     async startCheckJob(input) {
       const owner: DurableJobOwner = {
         kind: "integration-attempt",
         integrationAttemptId: input.integrationId
       };
-      // rr8/rr12: Bind the Integration-issued job to the caller's managed
-      // identity. A user-scope caller carries a verified Leader assertion.
-      const caller = resolveJobCaller(controllerOptions.environment, input.taskId, store);
+      const caller = resolveJobCaller(clientOptions.environment, input.taskId);
       const { job } = await startDurableJob(home, {
         taskId: input.taskId,
         owner,
@@ -191,16 +187,16 @@ export function createControllerIntegrationJobPort(
         env: input.env,
         steps: input.steps,
         caller
-      }, controllerOptions);
+      }, clientOptions);
       return job;
     },
     async getJob(taskId, jobId) {
-      return getDurableJob(home, taskId, jobId, controllerOptions);
+      return getDurableJob(home, taskId, jobId, clientOptions);
     },
     async cancelJob(taskId, jobId) {
       // rr8/rr12: Bind the cancel request to the caller's managed identity.
-      const caller = resolveJobCaller(controllerOptions.environment, taskId, store);
-      await cancelDurableJob(home, taskId, jobId, caller, controllerOptions);
+      const caller = resolveJobCaller(clientOptions.environment, taskId);
+      await cancelDurableJob(home, taskId, jobId, caller, clientOptions);
     }
   };
 }

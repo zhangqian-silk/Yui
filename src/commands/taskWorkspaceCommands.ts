@@ -169,6 +169,7 @@ function replaceTaskCommand(
     `Replaces ${old.id}`,
     `Replacement Task for ${old.id} (${old.status}); the original Task, its refs, `
       + "and its evidence are preserved and were not rewritten.",
+    "user",
     now
   );
   store.saveMilestone(replacement.id, milestone);

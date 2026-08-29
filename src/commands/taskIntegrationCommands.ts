@@ -256,7 +256,7 @@ async function runIntegration(
   const output = result.status === "committed"
     ? `Integrated ${result.attempt.changeSetIds.join(", ")} into ${result.attempt.targetRef} with CAS (${result.attempt.id})\n`
     : result.status === "blocked"
-      ? `Integration ${result.attempt.id} requires a Leader resolution decision in ${result.workspace.path}\n`
+      ? `Integration ${result.attempt.id} requires a Task Agent resolution decision in ${result.workspace.path}\n`
       : result.status === "checks-running"
         ? `Integration ${result.attempt.id} checks are running as DurableJob ${result.job.id}; run 'yui task integration continue ${result.attempt.taskId}/${result.attempt.id}' when the job finishes\n`
         : `Integration ${result.attempt.id} failed; target ref was not advanced\n`;
@@ -279,20 +279,18 @@ function resolveDecision(
   const resolved = store.transaction((tx) => {
     const integration = requireIntegration(tx, parsed.positionals[0], environment);
     const task = requireActiveIntegrationTask(tx, integration);
-    if (taskLocalActor(tx, environment, task.id, home) !== "leader") {
-      throw usageError("Only the Task Leader can resolve an Integration conflict.");
-    }
+    const actor = taskLocalActor(tx, environment, task.id, home);
     const updated = recordResolutionDecision(integration, {
       action: selectedOption as "manual-resolution" | "reject",
       rationale
-    }, now());
+    }, actor, now());
     tx.saveIntegrationAttempt(updated.taskId, updated);
     return updated;
   });
   return {
     output: selectedOption === "manual-resolution"
-      ? `Leader selected manual resolution for ${resolved.id}; resolve its candidate worktree, then run integration continue\n`
-      : `Leader rejected Integration ${resolved.id}\n`,
+      ? `Selected manual resolution for ${resolved.id}; resolve its candidate worktree, then run integration continue\n`
+      : `Rejected Integration ${resolved.id}\n`,
     data: { integration: resolved }
   };
 }
@@ -370,8 +368,8 @@ function supersedeIntegrationCommand(
   }
   const reason = parsed.one.get("--reason");
   if (reason === undefined) throw usageError(usage);
-  // Only the Task Leader (or Operator/user) may supersede a committed
-  // Integration: it rewrites delivery-baseline evidence and audit history.
+  // Superseding a committed Integration rewrites delivery-baseline evidence
+  // and audit history, so it remains an explicit Task-control decision.
   taskLocalActor(store, environment, integration.taskId, home);
   // A queue-backed committed Attempt cannot be superseded: the queue entry
   // would remain in its current status while its Attempt becomes "superseded",

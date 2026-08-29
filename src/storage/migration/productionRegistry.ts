@@ -60,6 +60,8 @@ const REVIEW_ROUND_GIT_SNAPSHOT_FROM_VERSION = 3;
 const REVIEW_ROUND_GIT_SNAPSHOT_TO_VERSION = 4;
 const REVIEW_ROUND_TASK_ANCHOR_FROM_VERSION = 4;
 const REVIEW_ROUND_TASK_ANCHOR_TO_VERSION = 5;
+const REVIEW_ROUND_ACTOR_FROM_VERSION = 5;
+const REVIEW_ROUND_ACTOR_TO_VERSION = 6;
 const ACTIVE_RUN_POINTER_FROM_VERSION = 1;
 const ACTIVE_RUN_POINTER_TO_VERSION = 2;
 const ACTIVE_RUN_POINTER_NAMESPACE_FROM_VERSION = 2;
@@ -72,6 +74,10 @@ const INTEGRATION_ATTEMPT_FROM_VERSION = 2;
 const INTEGRATION_ATTEMPT_TO_VERSION = 3;
 const INTEGRATION_ATTEMPT_GATE_IDENTITY_FROM_VERSION = 3;
 const INTEGRATION_ATTEMPT_GATE_IDENTITY_TO_VERSION = 4;
+const INTEGRATION_ATTEMPT_ACTOR_FROM_VERSION = 4;
+const INTEGRATION_ATTEMPT_ACTOR_TO_VERSION = 5;
+const MILESTONE_ACTOR_FROM_VERSION = 1;
+const MILESTONE_ACTOR_TO_VERSION = 2;
 const INTEGRATION_QUEUE_FROM_VERSION = 0;
 const INTEGRATION_QUEUE_TO_VERSION = 1;
 const CONTEXT_SNAPSHOT_FROM_VERSION = 0;
@@ -224,6 +230,12 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     ))
     .registerOfflineMigration(reviewRoundTaskAnchorStep())
     .registerOfflineMigration(recordFamilyStep(
+      "reviewRound",
+      REVIEW_ROUND_ACTOR_FROM_VERSION,
+      REVIEW_ROUND_ACTOR_TO_VERSION,
+      "reviewRounds"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
       "activeRunPointer",
       ACTIVE_RUN_POINTER_FROM_VERSION,
       ACTIVE_RUN_POINTER_TO_VERSION,
@@ -238,6 +250,18 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
       INTEGRATION_ATTEMPT_GATE_IDENTITY_FROM_VERSION,
       INTEGRATION_ATTEMPT_GATE_IDENTITY_TO_VERSION,
       "integrationAttempts"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
+      "integrationAttempt",
+      INTEGRATION_ATTEMPT_ACTOR_FROM_VERSION,
+      INTEGRATION_ATTEMPT_ACTOR_TO_VERSION,
+      "integrationAttempts"
+    ))
+    .registerOfflineMigration(recordFamilyStep(
+      "milestone",
+      MILESTONE_ACTOR_FROM_VERSION,
+      MILESTONE_ACTOR_TO_VERSION,
+      "milestones"
     ))
     .registerOfflineMigration(integrationQueueIntroductionStep())
     .registerOfflineMigration(contextSnapshotIntroductionStep())
@@ -2276,7 +2300,8 @@ function recordFamilyStep(
   recordKind: string,
   fromVersion: number,
   toVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces" | "integrationAttempts"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+    | "managedWorkspaces" | "integrationAttempts" | "milestones"
 ): MigrationStep<HomeSnapshot> {
   return {
     axis: "record",
@@ -2644,7 +2669,8 @@ function requireRecordFamilyVersion(
   snapshot: HomeSnapshot,
   recordKind: string,
   fromVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces" | "integrationAttempts"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+    | "managedWorkspaces" | "integrationAttempts" | "milestones"
 ): void {
   const manifestVersions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
   if (manifestVersions[recordKind] !== fromVersion) {
@@ -2675,7 +2701,8 @@ function migrateRecordFamily(
   recordKind: string,
   fromVersion: number,
   toVersion: number,
-  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns" | "managedWorkspaces" | "integrationAttempts"
+  taskMapKey: "workItems" | "agentRuns" | "reviewRounds" | "activeRuns"
+    | "managedWorkspaces" | "integrationAttempts" | "milestones"
 ): HomeSnapshot {
   // Keep the same source-shape checks in the transform so a direct caller
   // cannot bypass the migration's precondition contract.

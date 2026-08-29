@@ -154,7 +154,7 @@ import {
   type ReviewFindingDispositionCommand
 } from "../review/reviewFindingLedger.js";
 import {
-  LEADER_FINDING_DISPOSITIONS,
+  TASK_CONTROL_FINDING_DISPOSITIONS,
   type ReviewFindingDisposition
 } from "../review/reviewFinding.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
@@ -202,7 +202,6 @@ import {
   formatAgentRunReceiptId,
   resolveTaskRecordReference
 } from "../task/taskRecordReference.js";
-import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
 import {
   projectCompletionReadiness,
   type CompletionAdvisory,
@@ -637,9 +636,6 @@ export function preflightTaskCompletion(
 
   const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
   if (leaderEntry !== undefined) {
-    if (actor !== "leader") {
-      throw usageError(`Task ${task.id} has an active Leader run.`);
-    }
     if (leaderEntry.run.workItemId !== undefined) {
       throw usageError(`Task ${task.id} has running work: ${leaderEntry.run.workItemId}.`);
     }
@@ -871,9 +867,7 @@ function taskProjectCommand(
   const updated = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
     assertTaskOpen(task);
-    if (task.status === "active" && taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may add a Project to an active Task.");
-    }
+    taskActor(tx, options, task.id);
     const project = resolveProject(tx.listProjects(), parsed.positionals[1]);
     if (project === null) throw usageError(`Project not found: ${parsed.positionals[1]}.`);
     assertProjectActive(project, "bind to a Task");
@@ -1277,8 +1271,7 @@ function completeTaskCommand(
         changed: false,
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
         completionAdvisories: [] as CompletionAdvisory[],
-        finalReview: undefined,
-        publishedTreeAuthorization: undefined
+        finalReview: undefined
       } as const;
     }
     const taskFinalContract = preflight.taskFinalReviewContract;
@@ -1294,41 +1287,6 @@ function completeTaskCommand(
         options.completionPublishedTreeProof,
         actualTaskCandidate!
       );
-    const requiresContractHandoff = publishedTreeProof !== undefined
-      && taskFinalContract !== undefined;
-    if (requiresContractHandoff && actor !== "leader") {
-      const existing = matchingPublishedTreeAuthorization(tx, publishedTreeProof);
-      const event = existing ?? recordTaskEventRecord(
-        tx,
-        task.id,
-        TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT,
-        publishedTreeAuthorizationPayload(actor, publishedTreeProof),
-        now
-      );
-      enqueueWork(
-        tx,
-        leaderMailbox(task.id),
-        wakeReason("published-tree-authorized", event.id),
-        now,
-        [eventRef(task.id, event.id)]
-      );
-      return {
-        task,
-        changed: false,
-        runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
-        completionAdvisories: [] as CompletionAdvisory[],
-        finalReview: undefined,
-        publishedTreeAuthorization: {
-          event,
-          proof: publishedTreeProof,
-          created: existing === undefined
-        }
-      } as const;
-    }
-    if (publishedTreeProof !== undefined && actor === "leader") {
-      requirePublishedTreeAuthorization(tx, publishedTreeProof);
-    }
-
     const roles = tx.listRoles(task.id);
     const activeRuns = roles
       .map((role) => ({ role, run: tx.getActiveAgentRun(task.id, role.name) }))
@@ -1340,9 +1298,6 @@ function completeTaskCommand(
 
     const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
     if (leaderEntry !== undefined) {
-      if (actor !== "leader") {
-        throw usageError(`Task ${task.id} has an active Leader run.`);
-      }
       if (leaderEntry.run.workItemId !== undefined) {
         throw usageError(`Task ${task.id} has running work: ${leaderEntry.run.workItemId}.`);
       }
@@ -1382,7 +1337,6 @@ function completeTaskCommand(
         runtimeCleanupTargets: [] as RuntimeLifecycleTarget[],
         completionAdvisories: [] as CompletionAdvisory[],
         finalReview,
-        publishedTreeAuthorization: undefined
       } as const;
     }
     // Issue 06: re-validate the full completion readiness inside the
@@ -1451,24 +1405,9 @@ function completeTaskCommand(
       changed: true,
       runtimeCleanupTargets,
       completionAdvisories: readiness.advisories,
-      finalReview: undefined,
-      publishedTreeAuthorization: undefined
+      finalReview: undefined
     } as const;
   });
-  if (result.publishedTreeAuthorization !== undefined) {
-    notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
-    const authorization = result.publishedTreeAuthorization;
-    return output(
-      authorization.created
-        ? `Authorized published-tree completion for ${result.task.id} as ${authorization.event.id}; exact Task Leader completion is required.\n`
-        : `Published-tree completion is already authorized for ${result.task.id} as ${authorization.event.id}; exact Task Leader completion is required.\n`,
-      {
-        task: result.task,
-        authorizationEvent: authorization.event,
-        publishedTreeProof: authorization.proof
-      }
-    );
-  }
   if (result.changed) {
     for (const target of result.runtimeCleanupTargets) {
       // Cleanup owns an independent lifecycle lane. Never fall back to the
@@ -1813,10 +1752,7 @@ export function validateTaskArchiveRequest(
 ): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
   const request = parseTaskArchiveArguments(args);
   const task = requireTask(store, request.taskId);
-  const actor = taskActor(store, options, task.id);
-  if (actor === "leader") {
-    throw usageError("Only the global Operator may archive a Task from a managed Session.");
-  }
+  taskActor(store, options, task.id);
   if (task.status !== "archived"
     && task.status !== "completed"
     && task.status !== "retired") {
@@ -2778,9 +2714,7 @@ function updateWorkScope(
   const updated = store.transaction((tx) => {
     const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may change a Work Item Project scope.");
-    }
+    taskActor(tx, options, task.id);
     if (tx.getActiveAgentRun(task.id, item.assignee ?? "") !== null) {
       throw usageError(`Stop the active Work Item Run before changing scope: ${item.id}.`);
     }
@@ -2838,11 +2772,7 @@ function updateWork(
     const task = requireTask(tx, current.taskId);
     assertTaskOpen(task);
     if (current.assignee === undefined) {
-      if (taskActor(tx, options, task.id) !== "leader") {
-        throw usageError(
-          `Only the Task Leader may update unassigned Work Item execution: ${current.id}.`
-        );
-      }
+      taskActor(tx, options, task.id);
       if (status === "running") {
         assertWorkItemDependenciesCompleted(tx, current);
       }
@@ -3103,9 +3033,7 @@ function dispatchWork(
         + "then execute it directly or create native subagents in the Leader Session."
       );
     }
-    if (expanding && taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may expand a running ExecutionGroup.");
-    }
+    if (expanding) taskActor(tx, options, task.id);
     assertWorkItemDependenciesCompleted(tx, item);
     const workspace = tx.getWorkItemWorkspace(task.id, item.id);
     if (workspace?.owner.type === "work-item"
@@ -3531,9 +3459,7 @@ function resolveWorkExecutionGroup(
     const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "resolving an ExecutionGroup"));
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may resolve an ExecutionGroup.");
-    }
+    taskActor(tx, options, task.id);
     let group = currentWorkItemExecutionGroup(item);
     if (group === undefined
       || (group.stage === undefined
@@ -3817,9 +3743,7 @@ function acceptWork(
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may accept a Work Item.");
-    }
+    const actor = taskActor(tx, options, task.id);
     if (item.status !== "awaiting_acceptance") {
       throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
     }
@@ -3900,9 +3824,9 @@ function acceptWork(
       ...(candidate.source.type === "run"
         ? { runId: candidate.source.runId }
         : { workItemRevision: String(candidate.workItemRevision) }),
-      acceptedBy: "leader",
+      acceptedBy: actor,
       summary,
-      ...leaderActionEventPayload(tx, item.taskId, options)
+      ...(actor === "leader" ? leaderActionEventPayload(tx, item.taskId, options) : {})
     }, now);
     return completed;
   });
@@ -3988,9 +3912,7 @@ function rejectWork(
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may reject a Work Item.");
-    }
+    const actor = taskActor(tx, options, task.id);
     if (item.status !== "awaiting_acceptance") {
       throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
     }
@@ -4004,7 +3926,7 @@ function rejectWork(
     recordTaskEvent(tx, item.taskId, "work.rejected", {
       workItemId: item.id,
       candidateId: candidate.id,
-      rejectedBy: "leader",
+      rejectedBy: actor,
       summary
     }, now);
     return failed;
@@ -4180,9 +4102,7 @@ function reviewWork(
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may request a Work Item review.");
-    }
+    const requestedBy = taskActor(tx, options, task.id);
     if (item.status !== "awaiting_acceptance") {
       throw usageError(`Work Item is not awaiting acceptance: ${item.id}/${item.status}.`);
     }
@@ -4219,7 +4139,7 @@ function reviewWork(
       tx,
       item,
       config,
-      "leader",
+      requestedBy,
       now
     );
     return { ...queued, resumed: false as const };
@@ -4247,7 +4167,7 @@ function reviewWork(
 }
 
 /**
- * Leader-controlled recovery for a failed Task-final ReviewRound that never
+ * Task-control recovery for a failed Task-final ReviewRound that never
  * created a Reviewer Run. This is deliberately separate from `task run retry`:
  * that command requires an exact failed Agent Run and remains the only retry
  * path for a failed provider execution. Here the old terminal Round is an
@@ -4464,9 +4384,7 @@ function resolveReviewExecutionGroup(
     const round = requireReviewRound(tx, parsed.positionals[0], options);
     const task = requireTask(tx, round.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "resolving a Review ExecutionGroup"));
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may resolve a Reviewer ExecutionGroup.");
-    }
+    taskActor(tx, options, task.id);
     const group = round.executionGroup;
     if (group === undefined
       || (group.lanes.length < 2 && group.strategy.mode !== "adaptive")) {
@@ -4611,7 +4529,7 @@ function disposeReviewFindingCommand(
   );
   exactPositionals(parsed.positionals, 1, usage);
   const disposition = requiredOption(parsed.options, "--disposition") as ReviewFindingDisposition;
-  if (!LEADER_FINDING_DISPOSITIONS.includes(disposition)) {
+  if (!TASK_CONTROL_FINDING_DISPOSITIONS.includes(disposition)) {
     throw usageError(`Review finding disposition is invalid: ${disposition}.`);
   }
   const now = clock(options);
@@ -4622,12 +4540,12 @@ function disposeReviewFindingCommand(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, reference.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "dispositioning a review finding"));
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may disposition a review finding.");
-    }
+    const actor = taskActor(tx, options, task.id);
     const command: ReviewFindingDispositionCommand = {
       disposition,
-      by: taskLeaderActionRunId(tx, task.id, options.environment, options.yuiHome) ?? "leader",
+      by: actor === "leader"
+        ? taskLeaderActionRunId(tx, task.id, options.environment, options.yuiHome) ?? actor
+        : actor,
       ...(parsed.options.get("--note") === undefined ? {} : { note: parsed.options.get("--note")! }),
       ...(parsed.options.get("--work-item") === undefined ? {} : { workItemId: parsed.options.get("--work-item")! }),
       ...(parsed.options.get("--commit") === undefined ? {} : { commit: parsed.options.get("--commit")! }),
@@ -4664,9 +4582,7 @@ function planReviewRepairWave(
       if (currentTask.status !== "active") {
         throw usageError(inactiveTaskMessage(currentTask, "creating a review repair wave"));
       }
-      if (taskActor(tx, options, currentTask.id) !== "leader") {
-        throw usageError("Only the Task Leader may create a review repair wave.");
-      }
+      taskActor(tx, options, currentTask.id);
       const openItems = tx.listWorkItems(currentTask.id)
         .filter((item) => item.status === "pending" || item.status === "running");
       return groups.map((group) => {
@@ -4799,9 +4715,7 @@ function requestTaskReviewRound(
   const round = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may request a Task-final Review.");
-    }
+    const requestedBy = taskActor(tx, options, task.id);
     if (task.projectBindings.length === 0) {
       throw usageError(`Task ${task.id} has no bound Projects for a Task-final Review.`);
     }
@@ -4976,7 +4890,7 @@ function requestTaskReviewRound(
           tx.nextReviewRoundId(task.id),
           task.id,
           reviewerRoleName,
-          "leader",
+          requestedBy,
           provenance.candidate,
           now,
           taskFinalContract
@@ -4985,7 +4899,7 @@ function requestTaskReviewRound(
           tx.nextReviewRoundId(task.id),
           task.id,
           reviewerRoleName,
-          "leader",
+          requestedBy,
           provenance.candidate,
           deltaRecord,
           now,
@@ -5087,9 +5001,7 @@ function forceFreshTaskReviewRound(
     }
     const task = requireTask(tx, reference.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may force a fresh Task-final ReviewRound.");
-    }
+    const requestedBy = taskActor(tx, options, task.id);
     if ((source.scope ?? "work-item") !== "task") {
       throw usageError(`ReviewRound ${source.id} is not a Task-final ReviewRound.`);
     }
@@ -5194,7 +5106,7 @@ function forceFreshTaskReviewRound(
       tx.nextReviewRoundId(task.id),
       task.id,
       source.reviewerRoleName,
-      "leader",
+      requestedBy,
       source.taskCandidate,
       now,
       taskFinalContract
@@ -5219,12 +5131,8 @@ function forceFreshTaskReviewRound(
       reviewerRoleName: created.reviewerRoleName,
       taskCandidate: JSON.stringify(created.taskCandidate),
       reason: "source-round-terminal-without-semantic-review",
-      leaderActionRunId: taskLeaderActionRunId(
-        tx,
-        task.id,
-        options.environment,
-        options.yuiHome
-      ) ?? "leader"
+      requestedBy,
+      ...(requestedBy === "leader" ? leaderActionEventPayload(tx, task.id, options) : {})
     }, now);
     return { round: created, source, created: true } as const;
   });
@@ -5397,9 +5305,7 @@ function retryFailedTaskReviewRound(
     }
     const task = requireTask(tx, reference.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may retry a failed Task-final ReviewRound.");
-    }
+    const requestedBy = taskActor(tx, options, task.id);
     if ((round.scope ?? "work-item") !== "task") {
       throw usageError(`ReviewRound ${round.id} is not a failed Task-final ReviewRound.`);
     }
@@ -5505,7 +5411,7 @@ function retryFailedTaskReviewRound(
     // Issue 06: infra retry resets the same semantic Round to pending instead
     // of manufacturing a new Round, so Round count and finding identity stay
     // stable across execution-attempt failures.
-    const resetRound = retryTaskReviewRound(round);
+    const resetRound = retryTaskReviewRound(round, requestedBy);
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "review.task-final-retried", {
       reviewRoundId: round.id
@@ -5819,9 +5725,7 @@ function settleStaleFinalReviewRun(
     }
     const task = requireTask(tx, run.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may settle a stale final review Run.");
-    }
+    const actor = taskActor(tx, options, task.id);
     const round = tx.getReviewRound(task.id, run.reviewRoundId);
     if (round === null) {
       throw dataError(`ReviewRound not found for run ${run.id}: ${run.reviewRoundId}.`);
@@ -5958,7 +5862,9 @@ function settleStaleFinalReviewRun(
       runId: run.id,
       reviewRoundId: round.id,
       previousTaskCandidate: JSON.stringify(round.taskCandidate),
-      currentTaskCandidate: JSON.stringify(currentTaskCandidate)
+      currentTaskCandidate: JSON.stringify(currentTaskCandidate),
+      settledBy: actor,
+      ...(actor === "leader" ? leaderActionEventPayload(tx, task.id, options) : {})
     }, now);
     return { run, round: terminal, changed: true } as const;
   });
@@ -6705,7 +6611,7 @@ function assertPendingFinalReviewWorkspaceEvidence(
 }
 
 /**
- * Leader-only retry of an exact failed Task-final review Run. The old failed
+ * Task-control retry of an exact failed Task-final review Run. The old failed
  * Run remains the attempt trail, while the semantic ReviewRound is reset to
  * pending under its existing identity. Every identity and frozen-head fence is
  * checked inside one transaction so a partial fail-old-without-reset state can
@@ -6738,9 +6644,7 @@ function retryFailedReviewRun(
         + "reconcile it before retrying the Lane."
       );
     }
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may retry a failed final review Run.");
-    }
+    const requestedBy = taskActor(tx, options, task.id);
     const round = tx.getReviewRound(task.id, run.reviewRoundId);
     if (round === null) {
       throw dataError(`ReviewRound not found for run ${run.id}: ${run.reviewRoundId}.`);
@@ -6983,7 +6887,7 @@ function retryFailedReviewRun(
     // Issue 06: infra retry resets the same semantic Round to pending instead
     // of manufacturing a new Round, so Round count and finding identity stay
     // stable across execution-attempt failures.
-    const resetRound = retryTaskReviewRound(roundToReset, run.executionLaneId);
+    const resetRound = retryTaskReviewRound(roundToReset, requestedBy, run.executionLaneId);
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "run.review-retried", {
       runId: run.id,
@@ -7042,9 +6946,7 @@ function recoverRun(
     const active = requireRun(tx, parsed.positionals[0], options);
     const task = requireTask(tx, active.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "recovering a run"));
-    if (taskActor(tx, options, task.id) !== "leader") {
-      throw usageError("Only the Task Leader may control exact Agent Run recovery.");
-    }
+    taskActor(tx, options, task.id);
     const roleName = parsed.options.get("--role") ?? active.roleName;
     if (roleName !== active.roleName) {
       throw usageError(`Recovery Role does not match Run ${active.id}: ${roleName}.`);
@@ -7960,7 +7862,7 @@ export function queueReviewRound(
   store: TaskWorkflowStore,
   item: WorkItem,
   config: ReviewConfig,
-  requestedBy: "policy" | "leader",
+  requestedBy: ReviewRequestSource,
   now: Date
 ): Readonly<{ round: ReviewRound; run: AgentRun | null }> {
   const candidate = requireWorkItemCandidate(item);
@@ -8667,66 +8569,6 @@ function recordTaskEventRecord(
   return event;
 }
 
-function publishedTreeAuthorizationPayload(
-  actor: Exclude<TaskCompletedBy, "leader">,
-  proof: TaskCompletionPublishedTreeProof
-): TaskEventPayload {
-  return {
-    by: actor,
-    projectId: proof.projectId,
-    publicationId: proof.publicationId,
-    ...(proof.reviewRoundId === undefined
-      ? { reviewAnchor: publishedTreeReviewAnchor(proof) }
-      : { reviewRoundId: proof.reviewRoundId }),
-    localCommit: proof.localCommit,
-    remoteCommit: proof.remoteCommit,
-    tree: proof.tree
-  };
-}
-
-function matchingPublishedTreeAuthorization(
-  store: TaskWorkflowStore,
-  proof: TaskCompletionPublishedTreeProof
-): TaskEvent | undefined {
-  const events = store.listEvents(proof.taskId);
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]!;
-    if (event.type === "task.completed" || event.type === "task.reopened") return undefined;
-    if (event.type === TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT
-      && (event.payload.by === "user" || event.payload.by === "operator")
-      && event.payload.projectId === proof.projectId
-      && event.payload.publicationId === proof.publicationId
-      && (event.payload.reviewAnchor ?? event.payload.reviewRoundId)
-        === publishedTreeReviewAnchor(proof)
-      && event.payload.localCommit === proof.localCommit
-      && event.payload.remoteCommit === proof.remoteCommit
-      && event.payload.tree === proof.tree) {
-      return event;
-    }
-  }
-  return undefined;
-}
-
-function requirePublishedTreeAuthorization(
-  store: TaskWorkflowStore,
-  proof: TaskCompletionPublishedTreeProof
-): TaskEvent {
-  const authorization = matchingPublishedTreeAuthorization(store, proof);
-  if (authorization === undefined) {
-    throw usageError(
-      `Published-tree completion requires explicit user or global Operator authorization for `
-      + `${proof.taskId}/${proof.publicationId} at ${proof.reviewRoundId === undefined
-        ? "the Leader-owned Task-main head"
-        : `Task-final Review ${proof.reviewRoundId}`}.`
-    );
-  }
-  return authorization;
-}
-
-function publishedTreeReviewAnchor(proof: TaskCompletionPublishedTreeProof): string {
-  return proof.reviewRoundId ?? "direct";
-}
-
 /** Keeps a free-text run-fact note bounded so an event payload stays compact. */
 function truncateEventNote(note: string): string {
   const normalized = note.trim();
@@ -9319,10 +9161,15 @@ function taskMilestoneCommand(
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
-      if (taskActor(tx, options, task.id) !== "leader") {
-        throw usageError("Only the Task Leader can add a Milestone.");
-      }
-      const milestone = createMilestone(tx.nextMilestoneId(task.id), task.id, title, summary, now);
+      const actor = taskActor(tx, options, task.id);
+      const milestone = createMilestone(
+        tx.nextMilestoneId(task.id),
+        task.id,
+        title,
+        summary,
+        actor,
+        now
+      );
       tx.saveMilestone(task.id, milestone);
       recordTaskEvent(tx, task.id, "milestone.added", {
         milestoneId: milestone.id,

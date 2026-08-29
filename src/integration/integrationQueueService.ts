@@ -30,6 +30,7 @@ import {
 import { gateArtifactCoversCheckCommands } from "../verification/verificationGateService.js";
 import type { ChangeSet } from "./changeSet.js";
 import type { WorkItemCandidate } from "../workItem/workItem.js";
+import type { TaskCompletedBy } from "../task/task.js";
 
 /**
  * The serialized integration queue.  Every item gets a fresh apply on the
@@ -918,7 +919,7 @@ export async function reconcileIntegrationQueueEntry(
 
 /**
  * A conflicted entry may carry a blocked IntegrationAttempt waiting for a
- * leader decision.  Requeue or supersede IS that decision — the blocked
+ * Task Agent decision. Requeue or supersede IS that decision — the blocked
  * attempt is abandoned — so resolve it as rejected (terminal `failed`)
  * rather than leaving it to block Task retirement.
  */
@@ -927,6 +928,7 @@ function resolveBlockedAttempt(
   taskId: string,
   entry: IntegrationQueueEntry,
   decision: "requeue" | "supersede",
+  decidedBy: TaskCompletedBy,
   now: () => Date
 ): void {
   if (entry.integrationAttemptId === undefined) return;
@@ -935,7 +937,7 @@ function resolveBlockedAttempt(
   const rejected = recordResolutionDecision(attempt, {
     action: "reject",
     rationale: `Integration Attempt rejected by queue ${decision}.`
-  }, now());
+  }, decidedBy, now());
   store.saveIntegrationAttempt(taskId, rejected);
 }
 
@@ -969,6 +971,7 @@ export function requeueIntegrationQueueEntry(
   store: TaskStore,
   taskId: string,
   entryId: string,
+  decidedBy: TaskCompletedBy,
   now: () => Date = () => new Date()
 ): IntegrationQueueEntry {
   // The committed-Attempt guard, the blocked-Attempt finalization, and the
@@ -982,7 +985,7 @@ export function requeueIntegrationQueueEntry(
       throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
     }
     assertRecoverableAttempt(tx, taskId, entry, "requeue");
-    resolveBlockedAttempt(tx, taskId, entry, "requeue", now);
+    resolveBlockedAttempt(tx, taskId, entry, "requeue", decidedBy, now);
     const waiting = markIntegrationQueueRequeued(entry, now());
     tx.saveIntegrationQueueEntry(taskId, waiting);
     return waiting;
@@ -994,6 +997,7 @@ export function supersedeIntegrationQueueEntry(
   taskId: string,
   entryId: string,
   reason: string,
+  decidedBy: TaskCompletedBy,
   now: () => Date = () => new Date()
 ): IntegrationQueueEntry {
   return store.transaction((tx) => {
@@ -1002,7 +1006,7 @@ export function supersedeIntegrationQueueEntry(
       throw new Error(`Integration queue entry not found: ${taskId}/${entryId}.`);
     }
     assertRecoverableAttempt(tx, taskId, entry, "supersede");
-    resolveBlockedAttempt(tx, taskId, entry, "supersede", now);
+    resolveBlockedAttempt(tx, taskId, entry, "supersede", decidedBy, now);
     const superseded = markIntegrationQueueSuperseded(entry, reason, now());
     tx.saveIntegrationQueueEntry(taskId, superseded);
     return superseded;
