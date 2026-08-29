@@ -392,6 +392,9 @@ export async function processActiveRoleRunDeliveries(
               run,
               session: existingSession,
               summary: error.message,
+              leaderRecovery: role.name === "leader" && error.diagnostic.kind === "config"
+                ? "blocked"
+                : "automatic",
               now
             });
             results.push({
@@ -468,6 +471,7 @@ export async function processActiveRoleRunDeliveries(
             run,
             session: existingSession,
             summary: `Role Run could not start: ${message}`,
+            leaderRecovery: "automatic",
             now
           });
           results.push({

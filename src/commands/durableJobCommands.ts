@@ -9,7 +9,7 @@ import {
 } from "../controller/jobClient.js";
 import type { DurableJobOwner, DurableJobStep } from "../job/durableJob.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { resolveJobCaller, taskActor } from "./taskActor.js";
+import { resolveJobCaller, taskLocalActor } from "./taskActor.js";
 
 /**
  * The textual `--owner` forms accepted by `job start`. The public help text in
@@ -131,16 +131,16 @@ async function acknowledgeJob(
   // rr5/f5(a): only the Task Leader may acknowledge an
   // unknown-needs-attention job. A non-Leader (Worker, Operator, or plain
   // user) is rejected at the CLI boundary.
-  const actor = taskActor(options.environment, ref.taskId);
+  if (options.store === undefined) {
+    throw usageError(
+      "job acknowledge requires a Task store to resolve the Leader assertion."
+    );
+  }
+  const actor = taskLocalActor(options.store, options.environment, ref.taskId, options.home);
   if (actor !== "leader") {
     throw usageError(
       "Only the Task Leader may acknowledge a DurableJob: "
       + `${ref.taskId}.`
-    );
-  }
-  if (options.store === undefined) {
-    throw usageError(
-      "job acknowledge requires a Task store to resolve the Leader assertion."
     );
   }
   // Carry the full managed task caller, including its ephemeral launch key.

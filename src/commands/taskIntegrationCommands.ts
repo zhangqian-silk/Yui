@@ -13,7 +13,7 @@ import {
 } from "../integration/integrationAttempt.js";
 import { GitIntegrationService, type IntegrationJobPort } from "../integration/gitIntegrationService.js";
 import { runTaskIntegrationQueueCommand } from "./taskIntegrationQueueCommands.js";
-import { taskActor } from "./taskActor.js";
+import { taskLocalActor } from "./taskActor.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 import {
   runDeliveryGuardPreflight,
@@ -39,10 +39,12 @@ export async function runTaskIntegrationCommand(
     return continueIntegration(rest, store, home, now, options);
   }
   if (command === "resolve") {
-    return resolveDecision(rest, store, now, options.environment);
+    return resolveDecision(rest, store, now, options.environment, home);
   }
-  if (command === "abort") return abortIntegration(rest, store, now(), options);
-  if (command === "supersede") return supersedeIntegrationCommand(rest, store, now(), options.environment);
+  if (command === "abort") return abortIntegration(rest, store, now(), options, home);
+  if (command === "supersede") {
+    return supersedeIntegrationCommand(rest, store, now(), options.environment, home);
+  }
   if (command === "cleanup") {
     return cleanupIntegration(rest, store, home, options.environment);
   }
@@ -68,6 +70,7 @@ async function cleanupIntegration(
     );
   }
   const integration = requireIntegration(store, args[0], environment);
+  taskLocalActor(store, environment, integration.taskId, home);
   if (integration.status !== "committed"
     && integration.status !== "superseded"
     && integration.status !== "failed") {
@@ -130,6 +133,7 @@ async function start(
   if (task.status !== "active") {
     throw usageError(`Task is not active: ${task.id}/${task.status}.`);
   }
+  taskLocalActor(store, options.environment, task.id, home);
   const changeSetIds = parsed.many.get("--change-set") ?? [];
   if (changeSetIds.length === 0) throw usageError("--change-set is required.", usage);
   const changeSets = changeSetIds.map((id) => {
@@ -182,6 +186,7 @@ async function start(
   // record creation are atomic, so a concurrent Leader cannot sneak a
   // duplicate Integration between the guard and the write.
   const integration = store.transaction((tx) => {
+    taskLocalActor(tx, options.environment, task.id, home);
     const guard = runDeliveryGuardPreflight(tx, task.id, {
       kind: "integration-start",
       projectId: project.id,
@@ -218,6 +223,7 @@ async function continueIntegration(
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const integration = requireIntegration(store, parsed.positionals[0], options.environment);
   requireActiveIntegrationTask(store, integration);
+  taskLocalActor(store, options.environment, integration.taskId, home);
   if (
     integration.status !== "validating"
     && integration.status !== "running"
@@ -261,24 +267,28 @@ function resolveDecision(
   args: readonly string[],
   store: TaskStore,
   now: () => Date,
-  environment: NodeJS.ProcessEnv | undefined
+  environment: NodeJS.ProcessEnv | undefined,
+  home: string
 ): Readonly<{ output: string; data: unknown }> {
   const usage = "Task Integration resolve usage: yui task integration resolve <task>/<integration> --option <manual-resolution|reject> --rationale <text>.";
   const parsed = parseRepeatable(args, new Set(), new Set(["--option", "--rationale"]), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
-  const integration = requireIntegration(store, parsed.positionals[0], environment);
-  const task = requireActiveIntegrationTask(store, integration);
-  if (taskActor(environment, task.id) !== "leader") {
-    throw usageError("Only the Task Leader can resolve an Integration conflict.");
-  }
   const selectedOption = parsed.one.get("--option");
   const rationale = parsed.one.get("--rationale");
   if (selectedOption === undefined || rationale === undefined) throw usageError(usage);
-  const resolved = recordResolutionDecision(integration, {
-    action: selectedOption as "manual-resolution" | "reject",
-    rationale
-  }, now());
-  store.saveIntegrationAttempt(resolved.taskId, resolved);
+  const resolved = store.transaction((tx) => {
+    const integration = requireIntegration(tx, parsed.positionals[0], environment);
+    const task = requireActiveIntegrationTask(tx, integration);
+    if (taskLocalActor(tx, environment, task.id, home) !== "leader") {
+      throw usageError("Only the Task Leader can resolve an Integration conflict.");
+    }
+    const updated = recordResolutionDecision(integration, {
+      action: selectedOption as "manual-resolution" | "reject",
+      rationale
+    }, now());
+    tx.saveIntegrationAttempt(updated.taskId, updated);
+    return updated;
+  });
   return {
     output: selectedOption === "manual-resolution"
       ? `Leader selected manual resolution for ${resolved.id}; resolve its candidate worktree, then run integration continue\n`
@@ -291,13 +301,15 @@ async function abortIntegration(
   args: readonly string[],
   store: TaskStore,
   now: Date,
-  options: TaskIntegrationCommandOptions
+  options: TaskIntegrationCommandOptions,
+  home: string
 ): Promise<Readonly<{ output: string; data: unknown }>> {
   const usage = "Task Integration abort usage: yui task integration abort <task>/<integration> --reason <text>.";
   const parsed = parseRepeatable(args, new Set(), new Set(["--reason"]), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const integration = requireIntegration(store, parsed.positionals[0], options.environment);
   requireActiveIntegrationTask(store, integration);
+  taskLocalActor(store, options.environment, integration.taskId, home);
   if (integration.status !== "running" && integration.status !== "blocked") {
     throw usageError(
       `Integration cannot be aborted from ${integration.status}: ${integration.id}.`
@@ -324,6 +336,7 @@ async function abortIntegration(
         `Integration cannot be aborted from ${current.status}: ${current.id}.`
       );
     }
+    taskLocalActor(tx, options.environment, current.taskId, home);
     const aborted = updateIntegrationAttempt(current, {
       status: "failed",
       checks: [
@@ -342,7 +355,8 @@ function supersedeIntegrationCommand(
   args: readonly string[],
   store: TaskStore,
   now: Date,
-  environment: NodeJS.ProcessEnv | undefined
+  environment: NodeJS.ProcessEnv | undefined,
+  home: string
 ): Readonly<{ output: string; data: unknown }> {
   const usage = "Task Integration supersede usage: yui task integration supersede <task>/<integration> --reason <text>.";
   const parsed = parseRepeatable(args, new Set(), new Set(["--reason"]), usage);
@@ -358,7 +372,7 @@ function supersedeIntegrationCommand(
   if (reason === undefined) throw usageError(usage);
   // Only the Task Leader (or Operator/user) may supersede a committed
   // Integration: it rewrites delivery-baseline evidence and audit history.
-  taskActor(environment, integration.taskId);
+  taskLocalActor(store, environment, integration.taskId, home);
   // A queue-backed committed Attempt cannot be superseded: the queue entry
   // would remain in its current status while its Attempt becomes "superseded",
   // leaving contradictory terminal records that never converge. This covers
@@ -384,6 +398,7 @@ function supersedeIntegrationCommand(
         `Integration cannot be superseded from ${current.status}: ${current.id}.`
       );
     }
+    taskLocalActor(tx, environment, current.taskId, home);
     const superseded = supersedeIntegration(current, reason, now);
     tx.saveIntegrationAttempt(superseded.taskId, superseded);
     return {

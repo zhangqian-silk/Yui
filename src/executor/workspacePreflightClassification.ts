@@ -1,10 +1,9 @@
-import { isDeepStrictEqual } from "node:util";
-
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import {
   isTaskOwnedWorkspace,
+  sameManagedWorkspaceIdentity,
   type WorkspaceProjectEntry
 } from "../worktree/managedWorkspace.js";
 
@@ -107,11 +106,13 @@ export function classifyWorkspacePreflight(
   }
 
   // 2. Run snapshot validation: when the active Run carries a workspace
-  //    snapshot it must match the durable ManagedWorkspace exactly.  A
-  //    mismatch means the Run was created against a stale baseline.
+  //    snapshot its launch-stable identity must match the durable
+  //    ManagedWorkspace. Audit timestamps may change without changing the
+  //    owner, root, or Project entries authorized for the Run.
   if (activeRun?.workspace !== undefined) {
     const durableRunWorkspace = store.getManagedWorkspace(activeRun.workspace.owner);
-    if (durableRunWorkspace === null || !isDeepStrictEqual(durableRunWorkspace, activeRun.workspace)) {
+    if (durableRunWorkspace === null
+      || !sameManagedWorkspaceIdentity(durableRunWorkspace, activeRun.workspace)) {
       const diff: string[] = [];
       if (durableRunWorkspace === null) {
         diff.push(`durable ManagedWorkspace for owner ${JSON.stringify(activeRun.workspace.owner)} is missing`);

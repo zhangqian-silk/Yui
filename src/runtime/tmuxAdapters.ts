@@ -439,9 +439,17 @@ export class TmuxSessionHost implements SessionHostPort {
         : { environment: request.environment }),
       ...(request.mode === "resume" ? { nativeSessionId: request.nativeSessionId } : {})
     };
-    const planned = request.owner.scope === "task"
-      ? this.planner.plan({ taskId: request.owner.taskId, ...input })
-      : this.planner.planGlobalRole(input);
+    let planned: RuntimePlannedSession;
+    try {
+      planned = request.owner.scope === "task"
+        ? this.planner.plan({ taskId: request.owner.taskId, ...input })
+        : this.planner.planGlobalRole(input);
+    } catch (error) {
+      throw toRuntimeLaunchFailure(error, "validation", {
+        cwd: request.workspace,
+        agentId: request.agentId
+      });
+    }
     if (planned.role.name !== request.owner.roleName) {
       throw new Error("Planned Role does not match the runtime owner.");
     }

@@ -2465,7 +2465,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           }
         }
       }
-      store.saveRole(task.id, updateRoleStatus(role, "exited", input.now));
+      const blocksAutomaticLeaderRecovery = role.name === "leader"
+        && input.leaderRecovery === "blocked";
+      store.saveRole(task.id, updateRoleStatus(
+        role,
+        blocksAutomaticLeaderRecovery ? "failed" : "exited",
+        input.now
+      ));
       stopTaskSessionIfPresent(
         store,
         task.id,
@@ -2473,6 +2479,26 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         currentRun.effective.agentId,
         input.now
       );
+      if (blocksAutomaticLeaderRecovery) {
+        const failure = recordLeaderFailure(
+          task.id,
+          input.session?.nativeSessionId ?? "(unregistered)",
+          input.summary,
+          input.now,
+          store.getLeaderFailure(task.id)
+        );
+        store.saveLeaderFailure(failure);
+        recordLeaderAttentionRequired(store, {
+          taskId: task.id,
+          reason: "leader-recovery-failed",
+          payload: {
+            message: failure.message,
+            runId: currentRun.id
+          },
+          now: input.now
+        });
+        return "failed";
+      }
       queueLeaderWakeup(
         store,
         task.id,

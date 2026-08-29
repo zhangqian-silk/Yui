@@ -273,6 +273,8 @@ export type ExitedRoleRunPersistence = Readonly<{
   run: SchedulerAgentRun;
   session: SchedulerRoleSession | null;
   summary: string;
+  /** Static pre-accept failures fail closed instead of creating another Leader generation. */
+  leaderRecovery: "automatic" | "blocked";
   now: Date;
 }>;
 
