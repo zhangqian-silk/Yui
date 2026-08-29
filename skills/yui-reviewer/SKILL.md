@@ -88,10 +88,13 @@ only its named resource, effect, and isolation boundary; never broaden it. A
 real Agent may develop or review code, but that does not authorize a real
 provider/model test.
 
-Report reachable material defects, verification gaps, checks actually run, and
-bounded next actions. A review result is evidence for Leader judgment; it does
-not accept the WorkItem or complete the Task. Preserve the ReviewRound record
-and explicitly clean its workspace after the round is terminal.
+Complete the assigned frozen-scope review before yielding. Accumulate all
+reachable findings, verification gaps, checks actually run, and bounded next
+actions, then submit them together in one Review Run result; do not yield as
+soon as the first finding is discovered. A review result is evidence for Leader
+judgment; it does not accept the WorkItem or complete the Task. Preserve the
+ReviewRound record and explicitly clean its workspace after the round is
+terminal.
 
 For normal software delivery, follow the applicable Project Policy. The
 Leader decides whether risk warrants one independent Task-final Review of the

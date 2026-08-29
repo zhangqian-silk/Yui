@@ -32,8 +32,9 @@ import {
   serializeRunHostRecoveryEnvelope
 } from "../context/runContextContract.js";
 import { serializeProviderRetryEnvelope } from "../run/providerRetry.js";
+import { serializeWorkflowOutcomeRequestEnvelope } from "../run/runControlRequest.js";
 import { prefixYuiTitleInput } from "../run/runIdentity.js";
-import type { AgentRun } from "../run/agentRun.js";
+import { agentRunDeliveryReceiptId, type AgentRun } from "../run/agentRun.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import type { ClaudeAgentConfig, RoleAgentConfig } from "./agentAdapter.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
@@ -84,8 +85,9 @@ import {
 } from "../runtime/builtinAgentDrivers.js";
 import { managedRuntimeAdmission } from "../runtime/agentDriver.js";
 import type { AgentHostProviderControl } from "../runtime/launchBroker.js";
+import { freshConversationLaunchAllowed } from "../runtime/conversationSwitch.js";
 import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
-import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { currentProviderActivation } from "../runtime/providerRuntimeIdentity.js";
 import {
   assertCodexLaunchOverridesAvailable,
   inspectCodexLaunchConfig
@@ -357,6 +359,22 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (input.mode === "resume" && !compatibleExisting) {
       throw new Error(
         `Task Role resume effective snapshot drifted: ${task.id}/${role.name}.`
+      );
+    }
+    if (input.mode === "new" && sessionSet !== null
+      && !freshConversationLaunchAllowed({
+        sessions: sessionSet,
+        events: this.store.listEvents(task.id),
+        mailbox: this.store.getWorkMailbox({
+          kind: "role",
+          taskId: task.id,
+          roleName: role.name
+        }),
+        roleName: role.name,
+        ...(input.runId === undefined ? {} : { candidateRunId: input.runId })
+      })) {
+      throw new Error(
+        `Fresh Provider Conversation is not authorized: ${task.id}/${role.name}.`
       );
     }
     return this.#compile(
@@ -690,10 +708,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (runtimeDescriptor !== undefined && runtimeDescriptorSource !== undefined) {
       this.#writeExactTaskRuntimeDescriptor(runtimeDescriptor, runtimeDescriptorSource);
     }
-    // rr13/rr26: Generate a per-Session DurableJob caller key for every
-    // task-scope launch, including resume.  Resume/ensure may reuse a live
-    // host, so its candidate hash is committed by TmuxSessionHost only when
-    // hostCreated=true; otherwise the live process keeps its existing key.
+    // Generate a candidate per-Provider-process DurableJob caller key for
+    // every task-scope launch. A reused live Conversation keeps the key that
+    // its process inherited; a new Host or a Conversation replacement commits
+    // the fresh candidate only after Provider dispatch is observed.
     let jobCallerKey: string | undefined;
     if (owner.scope === "task" && (input.mode === "new" || input.mode === "resume")) {
       jobCallerKey = randomBytes(32).toString("hex");
@@ -702,39 +720,75 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     // write, whether it creates or resumes the native Conversation. Keeping
     // resume on the same launch handshake prevents a durable AgentRun from
     // existing without a corresponding Provider Turn.
-    const carriesInitialTurn = managedControl
-      && managedRun?.pushedAt === undefined;
+    if (managedControl && (managedRun === null || managedRun.status !== "active")) {
+      throw new Error(`Managed Run is no longer active: ${input.runId}.`);
+    }
+    const carriesInitialTurn = managedControl && (
+      managedRun!.pushedAt === undefined
+      || managedRun!.providerRetry?.state === "dispatching"
+      || managedRun!.controlRequest?.state === "dispatching"
+    );
     const providerAuthority = managedControl
-      ? this.#providerAuthorityForLaunch(owner.taskId, role.name, input.launchId)
+      ? this.#providerAuthorityForLaunch(
+          owner.taskId,
+          role.name,
+          input.launchId,
+          input.mode
+        )
       : undefined;
     const providerNativeSessionId = binding.adapterId === "claude"
       ? preallocatedNativeSessionId
       : resumeNativeSessionId;
-    const providerControl: AgentHostProviderControl | undefined = managedControl
+    const initialTurn = carriesInitialTurn
       ? {
+          attemptId: agentRunDeliveryReceiptId(managedRun!),
+          boundedText: managedRunLaunchEnvelope(managedRun!, input.mode, sessionTitle)
+        }
+      : undefined;
+    const providerControl: AgentHostProviderControl | undefined = !managedControl
+      ? undefined
+      : initialTurn === undefined
+        ? {
           schemaVersion: 1,
           adapterId: binding.adapterId,
           transport: managedCompiled!.transport,
-          mode: resumeNativeSessionId === undefined ? "new" : "resume",
-          ...(providerNativeSessionId === undefined
-            ? {}
-            : { nativeSessionId: providerNativeSessionId }),
+          kind: "ensure",
+          mode: "resume",
+          nativeSessionId: requireText(
+            providerNativeSessionId,
+            "Managed Provider ensure native session id"
+          ),
           ...(sessionTitle === undefined ? {} : { sessionTitle }),
-          authority: providerAuthority!,
-          ...(carriesInitialTurn
-            ? {
-                initialTurn: {
-                  attemptId: formatAgentRunReceiptId(owner.taskId, input.runId!),
-                  boundedText: managedRunLaunchEnvelope(
-                    managedRun!,
-                    input.mode,
-                    sessionTitle
-                  )
-                }
-              }
-            : {})
+          authority: providerAuthority!
         }
-      : undefined;
+        : resumeNativeSessionId === undefined
+          ? {
+              schemaVersion: 1,
+              adapterId: binding.adapterId,
+              transport: managedCompiled!.transport,
+              kind: "new",
+              mode: "new",
+              ...(providerNativeSessionId === undefined
+                ? {}
+                : { nativeSessionId: providerNativeSessionId }),
+              ...(sessionTitle === undefined ? {} : { sessionTitle }),
+              authority: providerAuthority!,
+              initialTurn
+            }
+          : {
+              schemaVersion: 1,
+              adapterId: binding.adapterId,
+              transport: managedCompiled!.transport,
+              kind: "resume",
+              mode: "resume",
+              nativeSessionId: requireText(
+                providerNativeSessionId,
+                "Managed Provider resume native session id"
+              ),
+              ...(sessionTitle === undefined ? {} : { sessionTitle }),
+              authority: providerAuthority!,
+              initialTurn
+            };
     const launch = {
       command,
       args,
@@ -806,7 +860,8 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   #providerAuthorityForLaunch(
     taskId: string,
     roleName: string,
-    launchId: string | undefined
+    launchId: string | undefined,
+    mode: "new" | "resume"
   ): ProviderAuthorityFence {
     const activationId = requireText(launchId, "Managed Provider Activation id");
     const binding = this.store.getTaskRoleSessionSet(taskId, roleName)?.providerBinding;
@@ -814,6 +869,19 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       return { epoch: 1, owner: "controller", holderId: activationId };
     }
     if (binding.authority.owner === "controller") {
+      if (mode === "new") {
+        const activation = currentProviderActivation(binding);
+        if (activation === null || binding.authority.holderId !== activation.activationId) {
+          throw new Error(`Provider Activation is not exact: ${taskId}/${roleName}.`);
+        }
+        // An actor-requested switch first ends the idle old Activation (+1)
+        // and then binds the replacement Activation (+1).
+        return {
+          epoch: binding.authority.epoch + 2,
+          owner: "controller",
+          holderId: activationId
+        };
+      }
       return {
         epoch: binding.authority.epoch,
         owner: "controller",
@@ -910,6 +978,13 @@ function managedRunLaunchEnvelope(
         roleName: run.roleName,
         retry: run.providerRetry
       })
+    : run.controlRequest?.state === "dispatching"
+      ? serializeWorkflowOutcomeRequestEnvelope({
+          taskId: run.taskId,
+          runId: run.id,
+          roleName: run.roleName,
+          request: run.controlRequest
+        })
     : mode === "resume" && run.pushedAt !== undefined
       ? serializeRunHostRecoveryEnvelope(run.bootstrapEnvelope)
       : serializeRunBootstrapEnvelope(run.bootstrapEnvelope);

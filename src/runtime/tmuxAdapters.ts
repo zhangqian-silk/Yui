@@ -97,10 +97,9 @@ export interface RuntimeRoleLaunchPlannerPort {
     environment?: Readonly<Record<string, string>>;
   }>): RuntimePlannedSession;
   /**
-   * Persist a caller key only after the host adapter has confirmed that a
-   * native process was actually created. Resume/ensure calls may reuse a live
-   * host, in which case rotating the durable hash would invalidate the live
-   * process's key.
+   * Persist a caller key only after the host adapter has confirmed that its
+   * Provider process exists. A live Conversation resume retains its inherited
+   * key; a Conversation replacement inside a reused Host owns a fresh one.
    */
   commitTaskCallerKey?(input: Readonly<{
     taskId: string;
@@ -683,7 +682,10 @@ export class TmuxSessionHost implements SessionHostPort {
     }
     if (
       providerDispatchObserved
-      && hostCreated
+      // A fresh Host always starts a Provider process. mode=new also starts
+      // one inside a reused Host by replacing (or creating) the native
+      // Conversation. Same-Conversation resume must retain its inherited key.
+      && (hostCreated || request.mode === "new")
       && request.owner.scope === "task"
       && planned.launch.env.YUI_JOB_CALLER_KEY !== undefined
       && this.planner.commitTaskCallerKey !== undefined

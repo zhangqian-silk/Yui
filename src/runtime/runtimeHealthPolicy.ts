@@ -4,17 +4,17 @@
  *
  * The layers are deliberately time-based and conservative: short silence is
  * normal for high-reasoning-effort turns, large reviews, and tool waits.
- * Only deterministic dead/broken evidence or the durable semantic stall
- * window authorizes recovery; quiet time alone never resets a Run.
+ * Time-based layers authorize display hints and coalesced read-only diagnosis
+ * only. They never reset a Run or replace a Provider Conversation.
  */
 
 /** Runtime silence after which a live turn is surfaced as "quiet" (hint only). */
 export const RUNTIME_QUIET_AFTER_MS = 5 * 60_000;
 
-/** No durable semantic progress after which a read-only diagnostic is warranted. */
-export const RUNTIME_DIAGNOSTIC_AFTER_MS = 10 * 60_000;
+/** No durable semantic progress after which the checkpoint is displayed as overdue. */
+export const RUNTIME_DIAGNOSTIC_AFTER_MS = 15 * 60_000;
 
-/** No durable semantic progress after which the scheduler raises a stall candidate. */
+/** No durable semantic progress before one coalesced read-only runtime probe is due. */
 export const SEMANTIC_STALL_WINDOW_MS = 30 * 60_000;
 
 export type RuntimeHealthPolicy = Readonly<{

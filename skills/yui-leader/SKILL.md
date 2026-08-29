@@ -338,7 +338,9 @@ creating an explicit Task Role binding, also set and read back the required
 model and effort instead of relying on CLI defaults.
 Every managed reviewer must deliver through the current Run's exact
 `--summary-file -` yield command; a final response alone is not a durable
-handoff.
+handoff. Read the completed result as one review batch and route all reported
+findings together; do not manufacture another ReviewRound merely because one
+finding was handled before the rest of the batch.
 
 A direct or native-subagent WorkItem is roleless. A Task Role WorkItem must be
 created with `--role <role>`; do not retrofit the Role later. Reuse a compatible
@@ -782,8 +784,9 @@ yui task complete <task-id> --summary "<outcome, validation, and remaining risks
 ```
 
 Retire obsolete WorkItems with `yui task work retire <task>/<work> --summary
-"..."`, optionally using `--replacement`. If the current Role generation is
-unusable, reset it with `yui task role reset <task> <role> --reason "..."` and
-let Yui derive all runtime identities from durable state. Archiving is a
+"..."`, optionally using `--replacement`. If the current Provider Conversation
+cannot continue, request a bounded switch with
+`yui task role session switch <task> <role> --reason "..."`; the current
+Conversation remains authoritative until Yui safely binds the replacement. Archiving is a
 separate global Operator lifecycle action. It performs the final Task-owned
 runtime and clean-worktree teardown, including this Leader.

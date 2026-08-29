@@ -15,8 +15,6 @@ import {
 } from "./ports.js";
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
-import { prefixYuiTitleInput } from "../run/runIdentity.js";
-import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import {
   effectiveLaunchSnapshotsCompatible,
@@ -24,7 +22,6 @@ import {
 } from "../executor/effectiveLaunch.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
 import { RuntimeLaunchFailure } from "../runtime/launchDiagnostics.js";
-import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { mailboxHasWork, nextPendingBatch } from "../coordination/workMailbox.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
@@ -34,16 +31,13 @@ import {
   RuntimeLifecycleBusyError,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
-import { serializeRunBootstrapEnvelope } from "../context/runContextContract.js";
-import { serializeProviderRetryEnvelope } from "../run/providerRetry.js";
-import { serializeWorkflowOutcomeRequestEnvelope } from "../run/runControlRequest.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
   taskId: string;
   roleName: string;
   runId: string;
   status: "delivered" | "already-delivered" | "skipped" | "failed";
-  reason?: "workspace-not-ready" | "launch-failed" | "generation-lost" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "writer-attached" | "delivery-uncertain" | "delivery-unsupported";
+  reason?: "workspace-not-ready" | "launch-failed" | "generation-lost" | "provider-rejected" | "mailbox-empty" | "mailbox-busy" | "not-ready" | "runtime-unavailable" | "writer-attached" | "delivery-uncertain" | "delivery-unsupported";
   error?: string;
   terminalFailure?: Omit<RoleRunDeliveryFailurePersistence, "now">;
   terminalized?: boolean;
@@ -163,9 +157,14 @@ export async function processActiveRoleRunDeliveries(
       let preparedSession: SchedulerRoleSession | null = existingSession;
       let preStartFencePersisted = false;
       let deliveryAttempted = false;
-      let providerSubmissionBegun = false;
       try {
-        const nativeSessionId = run.mode === "resume"
+        // Workflow-outcome control is always another Turn on the already-bound
+        // Conversation. Provider retry alone may carry an exact missing-
+        // Conversation decision and therefore retains its explicit new mode.
+        const launchMode = run.controlRequest?.state === "dispatching"
+          ? "resume" as const
+          : run.mode;
+        const nativeSessionId = launchMode === "resume"
           ? requireResumeSession(role, run.effective, existingSession)
           : undefined;
         prepared = await delivery.prepareRoleSession({
@@ -178,7 +177,7 @@ export async function processActiveRoleRunDeliveries(
           ...(run.workspace === undefined
             ? {}
             : { managedWorkspace: run.workspace }),
-          mode: run.mode,
+          mode: launchMode,
           runId: run.id,
           ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
           beforeHostStart: (preflight) => {
@@ -195,7 +194,7 @@ export async function processActiveRoleRunDeliveries(
               role,
               run.effective,
               existingSession,
-              run.mode,
+              launchMode,
               preflight
             );
             preStartFencePersisted = true;
@@ -259,20 +258,37 @@ export async function processActiveRoleRunDeliveries(
           now
         });
         if (ready.prepared.turnRejectedDuringLaunch === true) {
-          delivery.forgetPrepared?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            ...(ready.prepared.launchId === undefined
-              ? {}
-              : { launchId: ready.prepared.launchId })
+          const persisted = store.saveRoleRunDeliveryFailure({
+            ...roleRunDeliveryFailure(
+              run,
+              processing.batchId,
+              session,
+              ready.prepared.launchId
+            ),
+            summary: `Provider conclusively rejected the exact initial Run input: ${run.id}.`,
+            cleanupRequired: false,
+            now
           });
+          if (persisted === "failed") {
+            delivery.forgetPrepared?.({
+              taskId: task.id,
+              roleName: role.name,
+              runId: run.id,
+              ...(ready.prepared.launchId === undefined
+                ? {}
+                : { launchId: ready.prepared.launchId })
+            });
+          }
           results.push({
             taskId: task.id,
             roleName: role.name,
             runId: run.id,
-            status: "skipped",
-            reason: "not-ready"
+            status: persisted === "failed" ? "failed" : "skipped",
+            reason: "provider-rejected",
+            terminalized: persisted === "failed",
+            ...(persisted === "failed"
+              ? {}
+              : { error: "Run state changed while recording exact Provider rejection." })
           });
           continue;
         }
@@ -334,180 +350,11 @@ export async function processActiveRoleRunDeliveries(
           });
           continue;
         }
-        // Pre-input readiness gate. For an adapter whose capability proves a
-        // native event fires before the first prompt (e.g. Claude SessionStart),
-        // a freshly-started host must not be pushed until that provider-ready
-        // fact has been folded. Unsupported adapters (e.g. Codex) have no
-        // pre-input event, so their push proceeds and acceptance is confirmed
-        // only by the later exact provider-accepted fold. The gate reads the
-        // adapter capability and the durable ready projection — never a sleep,
-        // screen scrape, or pane/PID inference — and fails closed for a
-        // supported adapter whose readiness cannot be confirmed.
-        if (
-          ready.prepared.sessionStarted
-          && builtinAgentDriverRegistry().requireByAdapterId(run.effective.adapterId)
-            .capabilities.observation.preInputReadiness === "exact"
-          && !providerReadyForPush(store, {
-            taskId: task.id,
-            roleName: role.name,
-            agentId: run.effective.agentId,
-            ...(ready.prepared.launchId === undefined ? {} : { launchId: ready.prepared.launchId }),
-            ...(session?.nativeSessionId === undefined
-              ? {}
-              : { nativeSessionId: session.nativeSessionId })
-          })
-        ) {
-          results.push({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            status: "skipped",
-            reason: "not-ready"
-          });
-          continue;
-        }
-        if (session === null || session.launchId === undefined
-          || !hasText(session.nativeSessionId)
-          || store.beginRoleRunProviderTurn?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            agentId: run.effective.agentId,
-            launchId: session.launchId,
-            nativeSessionId: session.nativeSessionId,
-            attemptId: receiptId,
-            now
-          }) !== true) {
-          throw new Error("Provider Turn intent could not be durably fenced before delivery.");
-        }
-        providerSubmissionBegun = true;
-        deliveryAttempted = true;
-        const launchText = run.controlRequest?.state === "dispatching"
-          ? serializeWorkflowOutcomeRequestEnvelope({
-              taskId: task.id,
-              runId: run.id,
-              roleName: role.name,
-              request: run.controlRequest
-            })
-          : run.providerRetry?.state === "dispatching"
-            ? serializeProviderRetryEnvelope({
-                taskId: task.id,
-                runId: run.id,
-                roleName: role.name,
-                retry: run.providerRetry
-              })
-            : serializeRunBootstrapEnvelope(run.bootstrapEnvelope);
-        const outcome = await delivery.sendOnce({
-          delivery: ready,
-          receiptId,
-          text: prefixYuiTitleInput(
-            launchText,
-            resolveTaskRoleSessionTitle(session.title, task, role.name)
-          )
-        });
-        if (outcome === "busy" || outcome === "unavailable") {
-          store.resolveRoleRunProviderSubmission?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            attemptId: receiptId,
-            status: "rejected",
-            reason: outcome === "busy"
-              ? "Agent Host was busy before Provider mutation."
-              : "Agent Host was unavailable before Provider mutation.",
-            now
-          });
-          providerSubmissionBegun = false;
-          results.push({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            status: "skipped",
-            reason: outcome === "busy" ? "not-ready" : "runtime-unavailable",
-            terminalFailure: roleRunDeliveryFailure(
-              run,
-              processing.batchId,
-              session,
-              ready.prepared.launchId
-            )
-          });
-          continue;
-        }
-        if (outcome === "rejected") {
-          store.resolveRoleRunProviderSubmission?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            attemptId: receiptId,
-            status: "rejected",
-            reason: "Provider returned an exact negative acknowledgement.",
-            now
-          });
-          providerSubmissionBegun = false;
-          results.push({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            status: "skipped",
-            reason: "not-ready"
-          });
-          continue;
-        }
-        if (outcome === "delivery-unknown") {
-          store.resolveRoleRunProviderSubmission?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            attemptId: receiptId,
-            status: "delivery-unknown",
-            reason: "Provider Turn delivery is ambiguous; automatic retry is fenced.",
-            now
-          });
-          providerSubmissionBegun = false;
-          store.saveRoleRunDelivery({
-            task,
-            role,
-            run,
-            session,
-            ...(ready.prepared.launchId === undefined
-              ? {}
-              : { launchId: ready.prepared.launchId }),
-            now
-          });
-          results.push({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            status: "skipped",
-            reason: "delivery-uncertain"
-          });
-          continue;
-        }
-        const status = outcome === "sent" ? "delivered" : "already-delivered";
-        store.saveRoleRunDelivery({
-          task,
-          role,
-          run,
-          session,
-          ...(ready.prepared.launchId === undefined
-            ? {}
-            : { launchId: ready.prepared.launchId }),
-          now
-        });
-        results.push({ taskId: task.id, roleName: role.name, runId: run.id, status });
+        throw new Error(
+          "Managed Provider launch completed without an initial Turn outcome."
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (providerSubmissionBegun) {
-          store.resolveRoleRunProviderSubmission?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            attemptId: receiptId,
-            status: "delivery-unknown",
-            reason: message,
-            now
-          });
-        }
         // Scheduler single-flight backpressure: the Role runtime lifecycle
         // lane was busy when the launch was reserved. The Run stays
         // active-unpushed and its mailbox claim is retained; the next pass
@@ -1167,14 +1014,6 @@ function validateRoleSession(
   if (!compatible) {
     throw new Error(`Ready Role session effective snapshot changed: ${role.taskId}/${role.name}.`);
   }
-  if (existing?.nativeSessionId !== undefined
-    && effectiveLaunchSnapshotsCompatibleForTaskSession(
-      existing.effective,
-      effective
-    )
-    && session.nativeSessionId !== existing.nativeSessionId) {
-    throw new Error(`Ready Role session changed the fixed native session id: ${role.taskId}/${role.name}.`);
-  }
   if (mode === "resume" && session.nativeSessionId !== existing?.nativeSessionId) {
     throw new Error(`Role resume changed the fixed native session id: ${role.taskId}/${role.name}.`);
   }
@@ -1189,23 +1028,4 @@ function validateRoleSession(
 
 function hasText(value: string | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0;
-}
-
-/**
- * Fail-closed readiness check for a supported-readiness adapter's first push.
- * When the store cannot answer (no implementation), the push is held rather than
- * proceeding blind — a supported adapter must have a proven provider-ready fold.
- */
-function providerReadyForPush(
-  store: SchedulerStorePort,
-  input: Readonly<{
-    taskId: string;
-    roleName: string;
-    agentId: string;
-    launchId?: string;
-    nativeSessionId?: string;
-  }>
-): boolean {
-  if (store.isRoleGenerationProviderReady === undefined) return false;
-  return store.isRoleGenerationProviderReady(input);
 }

@@ -34,6 +34,7 @@ import {
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import { runOwnsBlockingProviderContinuation } from "../runtime/runtimeContinuationProjection.js";
+import { runHasActiveRuntimeOperations } from "../runtime/runtimeObservation.js";
 import {
   latestRunDurableProgressAt,
   RUN_RECOVERY_APPLIED_EVENT,
@@ -310,7 +311,6 @@ export type ExactRunTerminalizationResult = Readonly<{
 export type ExactAgentRunRecoveryAction =
   | "diagnose"
   | "retry"
-  | "replace-session"
   | "terminate";
 
 export type ExactAgentRunRecoveryInput = Readonly<{
@@ -335,7 +335,7 @@ export type ExactAgentRunRecoveryResult = Readonly<{
   run: AgentRun | null;
   progressAt?: string;
   reason?: string;
-  /** Retry/session replacement are requests only; the Leader must perform the next exact action. */
+  /** Diagnose/retry are requests only; the Leader must perform the next exact action. */
   requiresExplicitFollowup?: boolean;
 }>;
 
@@ -525,7 +525,7 @@ export function terminalizeExactTaskRun(
 /**
  * Leader-controlled recovery boundary for one active AgentRun. This primitive
  * validates every durable fence in one transaction and records only a
- * structured request for retry/session replacement. It never writes terminal
+ * structured request for same-Run diagnosis/retry. It never writes terminal
  * bytes, retries a provider input, kills a host, or silently rebinds a native
  * generation. Explicit termination is the sole action that changes Run state.
  */
@@ -612,6 +612,35 @@ function recoverExactAgentRunInTransaction(
   }
   if (!matchesRecoverySessionFence(store, input)) {
     return stateChanged("session-or-launch-fence-mismatch");
+  }
+  const recoveryBlocker = exactRecoveryExecutionBlocker(store, current);
+  if (recoveryBlocker !== null) {
+    return {
+      disposition: "blocked",
+      action: input.action,
+      run: current,
+      progressAt: progress.progressAt,
+      reason: recoveryBlocker
+    };
+  }
+  if (input.action === "terminate") {
+    const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+    const session = sessions?.sessions[input.agentId];
+    const providerTurn = sessions?.providerBinding?.turn;
+    const exactTerminalEvidence = session?.status === "stopped"
+      || session?.status === "broken"
+      || providerTurn?.status === "failed"
+      || providerTurn?.status === "cancelled"
+      || providerTurn?.status === "rejected";
+    if (!exactTerminalEvidence) {
+      return {
+        disposition: "blocked",
+        action: input.action,
+        run: current,
+        progressAt: progress.progressAt,
+        reason: "runtime-not-terminal"
+      };
+    }
   }
   if (
     input.providerAcceptance === "ambiguous"
@@ -735,6 +764,42 @@ function recoverExactAgentRunInTransaction(
   };
 }
 
+function exactRecoveryExecutionBlocker(
+  store: TaskStore,
+  run: AgentRun
+): string | null {
+  const sessions = store.getTaskRoleSessionSet(run.taskId, run.roleName);
+  const binding = sessions?.providerBinding;
+  const mailbox = store.getWorkMailbox({
+    kind: "role",
+    taskId: run.taskId,
+    roleName: run.roleName
+  });
+  if (mailbox?.inputDelivery != null) return "provider-input-delivery-unsettled";
+  if (runOwnsBlockingProviderContinuation(store.listEvents(run.taskId), {
+    taskId: run.taskId,
+    roleName: run.roleName,
+    runId: run.id,
+    agentId: run.effective.agentId
+  })) return "provider-continuation-writer-owned";
+  if (runHasActiveRuntimeOperations(store.listEvents(run.taskId), {
+    taskId: run.taskId,
+    roleName: run.roleName,
+    runId: run.id,
+    agentId: run.effective.agentId
+  })) return "provider-operation-active";
+  if (run.deliveredAt !== undefined
+    && (binding === null || binding?.turn === null)) return "provider-turn-state-missing";
+  if (binding === null || binding === undefined) return null;
+  if (["submitting", "accepted", "running", "delivery-unknown"].includes(
+    binding.turn?.status ?? ""
+  )) return "provider-turn-unsettled";
+  if (binding.authority.owner === "human" || binding.authority.owner === "unknown") {
+    return "provider-writer-authority-unavailable";
+  }
+  return null;
+}
+
 function matchesRecoverySessionFence(
   store: TaskStore,
   input: ExactAgentRunRecoveryInput
@@ -748,8 +813,7 @@ function matchesRecoverySessionFence(
   const session = sessions.sessions[input.agentId];
   if (session === undefined) return false;
   if (session.agentId !== input.agentId || session.adapterId !== input.adapterId) return false;
-  // A dead Session is precisely when replace-session/terminate recovery is
-  // needed. Preserve its exact identity as the CAS fence; only same-Session
+  // Preserve a dead Session's exact identity as the CAS fence; only same-Session
   // retry is invalid once the native process is stopped or broken.
   if ((session.status === "stopped" || session.status === "broken")
     && input.action === "retry") return false;

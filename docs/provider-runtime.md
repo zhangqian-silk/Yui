@@ -186,8 +186,8 @@ and Turn contract. The v5-to-v6 migration:
 - resets current Conversation recoverability to `unknown`;
 - does not reconnect an old TUI or pre-contract runtime as a structured Host.
 
-An operator must establish a fresh managed generation (or explicitly reset the
-Role when required) before those historical Tasks can write again.
+An operator must establish a fresh managed generation (or explicitly request a
+Conversation switch when required) before those historical Tasks can write again.
 
 ## Required invariants
 

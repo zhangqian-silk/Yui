@@ -627,7 +627,7 @@ const taskChildren: readonly NodeInput[] = [
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
-      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "reset",
+      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "session",
       "view", "takeover", "release"
     ] }],
     children: [
@@ -657,10 +657,15 @@ const taskChildren: readonly NodeInput[] = [
       { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "yui task role bind <task> <role> <agent-id>" },
       { name: "unbind", summary: "Unbind a dormant Agent from a Task Role.", usage: "yui task role unbind <task> <role> <agent-id>" },
       {
-        name: "reset",
-        summary: "Fail current work, forget the native Session, and request verified cleanup.",
-        usage: "yui task role reset <task> <role> --reason <text>",
-        options: ["--reason"]
+        name: "session",
+        summary: "Manage the Provider Conversation bound to a Task Role.",
+        sections: [{ id: "manage", title: "Commands", entries: ["switch"] }],
+        children: [{
+          name: "switch",
+          summary: "Request a fresh Conversation after the current one reaches a safe boundary.",
+          usage: "yui task role session switch <task> <role> --reason <text>",
+          options: ["--reason"]
+        }]
       },
       {
         name: "view",
@@ -823,7 +828,7 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "recover",
         summary: "Record one exact Leader-controlled Run recovery decision.",
-        usage: "yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> (--expected-progress-at <timestamp>|--from-next-action <fingerprint>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
+        usage: "yui task run recover <task>/<run> --action <diagnose|retry|terminate> (--expected-progress-at <timestamp>|--from-next-action <fingerprint>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
         options: ["--action", "--expected-progress-at", "--progress-at", "--from-next-action", "--provider-acceptance", "--reason", "--role", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
       },
       {

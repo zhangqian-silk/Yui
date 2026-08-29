@@ -14,6 +14,8 @@ import {
   type EffectiveLaunchSnapshot
 } from "./effectiveLaunch.js";
 import {
+  currentProviderActivation,
+  endProviderActivation,
   rebindProviderRuntimeRun,
   validateProviderRuntimeBinding,
   type ProviderRuntimeBinding
@@ -257,6 +259,25 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
 }
 
 /**
+ * Atomically archives the quiescent old native Session and binds the Provider
+ * Conversation selected by an already-authorized switch. Authorization is
+ * deliberately owned by the Controller caller, not inferred here.
+ */
+export function replaceTaskRoleAgentSessionForConversationSwitch(
+  set: TaskRoleSessionSet,
+  input: RecordRoleAgentSessionInput,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  const existing = set.sessions[input.agentId];
+  if (existing === undefined || existing.nativeSessionId === input.nativeSessionId) {
+    return recordRoleAgentSession(set, input, now);
+  }
+  const terminalized = updateRoleAgentSessionStatus(set, input.agentId, "stopped", now);
+  return recordRoleAgentSession(terminalized, input, now);
+}
+
+/**
  * Session titles and previews can originate in native Agent output. Keep them
  * single-line and inert before they are persisted or rendered in a terminal.
  */
@@ -335,28 +356,6 @@ export function retireTaskRoleSessionsForWorkspace(
     sessions: {},
     providerBinding: null,
     updatedAt: timestamp
-  });
-}
-
-/**
- * Clears the Provider transport identity after its physical runtime is proven
- * stopped, without retiring workspace-bound Session records. Workspace
- * retirement remains a separate, stricter transaction after every supported
- * placeholder has been terminalized.
- */
-export function clearTaskRoleProviderRuntimeForCleanup(
-  set: TaskRoleSessionSet,
-  now: Date
-): TaskRoleSessionSet {
-  validateRoleSessionSet(set);
-  if (set.inFlight !== null) {
-    throw new Error("Cannot clear a Task Role Provider runtime with unsettled Run state.");
-  }
-  if (set.providerBinding === null) return set;
-  return validateRoleSessionSet({
-    ...set,
-    providerBinding: null,
-    updatedAt: requireDate(now, "Provider Runtime cleanup timestamp")
   });
 }
 
@@ -491,7 +490,10 @@ export function bindTaskRoleRun(
     throw new Error("Task Role session set already has an in-flight Run.");
   }
   const timestamp = requireDate(preparedAt, "Task Role Run preparedAt");
-  const providerBinding = mode === "resume" && set.providerBinding !== null
+  // A fresh Conversation is a two-phase replacement: keep the old binding as
+  // current evidence until the new Provider session is observed and atomically
+  // superseded. Homes with no prior Conversation still start from null.
+  const providerBinding = set.providerBinding !== null
     ? rebindProviderRuntimeRun(set.providerBinding, normalized.runId)
     : null;
   const updated: TaskRoleSessionSet = {
@@ -569,6 +571,47 @@ export function updateTaskRoleProviderRuntime(
     providerBinding: normalized,
     updatedAt: requireDate(updatedAt, "Provider Runtime Binding timestamp")
   });
+}
+
+/**
+ * Records an exact local Host exit without forgetting the Provider
+ * Conversation. The ended Activation releases writer authority, while the
+ * current Conversation and any unsettled Turn remain durable recovery fences.
+ */
+export function stopTaskRoleRuntimeAfterPhysicalExit(
+  set: TaskRoleSessionSet,
+  now: Date
+): TaskRoleSessionSet {
+  validateRoleSessionSet(set);
+  const active = set.sessions[set.activeAgentId];
+  if (active === undefined) return set;
+  const activation = set.providerBinding === null
+    ? null
+    : currentProviderActivation(set.providerBinding);
+  if (active.status === "stopped") {
+    if (activation !== null) {
+      throw new Error("Stopped Task Role Session cannot retain a live Provider Activation.");
+    }
+    return set;
+  }
+  let updated = updateRoleAgentSessionStatus(
+    set,
+    set.activeAgentId,
+    "stopped",
+    now
+  );
+  if (activation !== null) {
+    updated = updateTaskRoleProviderRuntime(
+      updated,
+      endProviderActivation(updated.providerBinding!, activation.activationId, {
+        status: "ended",
+        endedAt: now.toISOString(),
+        reason: "runtime-physical-exit"
+      }),
+      now
+    );
+  }
+  return updated;
 }
 
 export function markTaskRoleRunPushed(
@@ -755,35 +798,6 @@ export function terminalizeTaskRoleRunSession(
     );
   }
   return updated;
-}
-
-/**
- * Resets the current native generation after its active Run is terminal.
- * The Controller separately owns verified process cleanup.
- */
-export function resetTaskRoleSession(
-  set: TaskRoleSessionSet,
-  now: Date
-): TaskRoleSessionSet {
-  validateRoleSessionSet(set);
-  const timestamp = requireDate(now, "Task Role Session reset timestamp");
-  const current = set.sessions[set.activeAgentId];
-  const sessions = { ...set.sessions };
-  delete sessions[set.activeAgentId];
-  const history = current === undefined
-    ? set.history
-    : [
-        ...(set.history ?? []),
-        { ...current, status: "broken" as const, updatedAt: timestamp }
-      ];
-  return validateRoleSessionSet({
-    ...set,
-    sessions,
-    ...(history === undefined ? {} : { history }),
-    inFlight: null,
-    providerBinding: null,
-    updatedAt: timestamp
-  });
 }
 
 export function settleTaskRoleCompletion(

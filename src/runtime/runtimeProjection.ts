@@ -77,10 +77,9 @@ export type RuntimeProjection = Readonly<{
 
 /**
  * Layered runtime health state shared by the CLI status projection, the Web
- * snapshot, and the scheduler. Short silence is a hint, not a failure: only
- * deterministic dead/broken evidence or the durable semantic stall window
- * (surfaced separately by the scheduler as `stalled-candidate`) authorizes
- * recovery.
+ * snapshot, and the scheduler. Short silence is a hint, not a failure. The
+ * durable semantic window schedules read-only diagnosis; it does not itself
+ * authorize Run recovery or Conversation replacement.
  */
 export type RuntimeHealthLayer =
   | "model-active"
@@ -461,11 +460,9 @@ export function runtimeDisplayStatus(current: RuntimeProjection): RuntimeDisplay
  * Integration checkpoints), so token/tool/CPU activity can never masquerade
  * as business progress.
  *
- * Layers below the durable stall window are advisory: `quiet` and
- * `diagnostic-needed` never authorize a reset. The 30-minute semantic stall is
- * persisted by the scheduler and surfaced as `stalled-candidate` by the
- * caller; this function deliberately stops at `diagnostic-needed` so the
- * Leader's waiting-user/waiting-on-workers classification stays authoritative.
+ * Time-derived layers are advisory: `quiet` and `diagnostic-needed` never
+ * authorize a reset or Session switch. The scheduler owns the separate,
+ * coalesced 30-minute read-only diagnostic window.
  */
 export function classifyRuntimeHealth(input: Readonly<{
   projection: RuntimeProjection;
@@ -527,7 +524,8 @@ function classifyLayer(
   if (current.turn === "waiting") {
     return `waiting-${current.waitingReason ?? "external"}` as RuntimeHealthLayer;
   }
-  // No durable semantic progress past the diagnostic window: read-only look.
+  // No durable semantic progress past fifteen minutes: display only. The
+  // scheduler's coalesced read-only diagnostic remains a separate 30m clock.
   if (semanticIdleMs >= policy.diagnosticAfterMs) return "diagnostic-needed";
   // A live turn with no recent structured activity is quiet, not dead.
   if (runtimeIdleMs >= policy.quietAfterMs) return "quiet";
@@ -558,7 +556,7 @@ function runtimeHealthReason(
       if (current.observer.status === "degraded" || current.observer.status === "unavailable") {
         return `the runtime observer is ${current.observer.status}; read-only diagnostic recommended`;
       }
-      return "no durable semantic progress in the diagnostic window; read-only diagnostic recommended";
+      return "no durable semantic checkpoint in the overdue window; the runtime remains undisturbed";
     case "quiet":
       return "the Agent turn is active but has reported no structured runtime activity recently";
     case "active-quiet":

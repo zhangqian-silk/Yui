@@ -28,6 +28,16 @@ export class ControllerClientError extends Error {
   }
 }
 
+/** The Controller may have committed the request before this client lost its acknowledgement. */
+export function controllerCallMayHaveApplied(error: unknown): boolean {
+  return error instanceof ControllerClientError
+    && [
+      "CONTROLLER_TIMEOUT",
+      "CONTROLLER_UNAVAILABLE",
+      "INVALID_RESPONSE"
+    ].includes(error.code);
+}
+
 export type ControllerCallOptions = Readonly<{
   timeoutMs?: number;
   id?: string;

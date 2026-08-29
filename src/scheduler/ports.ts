@@ -150,6 +150,15 @@ export type RoleRunProgressPersistence = Readonly<{
   now: Date;
 }>;
 
+export type RoleRunDiagnosticPersistence = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  startedAt: string;
+  outcome: "observed" | "observation-error";
+  now: Date;
+}>;
+
 /**
  * Exact persisted session fact used to fence a low-frequency native-host
  * absence observation from a concurrent launch or Hook update.
@@ -251,6 +260,10 @@ export type RoleRunDeliveryFailurePersistence = Readonly<{
   nativeSessionId?: string;
   /** Exact external-process generation prepared for this undelivered Run. */
   launchId?: string;
+  /** Exact terminal explanation when the failure is not retry exhaustion. */
+  summary?: string;
+  /** Whether the failed delivery also requires the local Host to be stopped. */
+  cleanupRequired?: boolean;
   now: Date;
 }>;
 
@@ -371,21 +384,10 @@ export interface SchedulerStorePort {
   getRunProgressFacts?(taskId: string, runId: string): RunProgressFacts | undefined;
   /** Materializes a newly observed related-record fold as one run.progress fact. */
   recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
-  /** Atomically records one new stall episode and routes its responsibility. */
+  /** Closes one coalesced read-only runtime diagnostic window. */
+  recordRoleRunDiagnostic?(input: RoleRunDiagnosticPersistence): "recorded" | "already-recorded" | "state-changed";
+  /** Atomically records one advisory no-progress episode. */
   recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
-  /**
-   * True iff an exact provider-ready fold has been recorded for this generation
-   * (adapter/nativeSession/launch). The scheduler consults it, together with the
-   * adapter's preInputReadiness capability, to gate a fresh first push — never a
-   * sleep, screen scrape, or pane/PID inference. Absent implementation ⇒ no gate.
-   */
-  isRoleGenerationProviderReady?(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    agentId: string;
-    launchId?: string;
-    nativeSessionId?: string;
-  }>): boolean;
   hasInFlightTurn(taskId: string, roleName: string): boolean;
   /** Exact durable Provider writer; human/unknown ownership blocks Controller writes. */
   getProviderAuthorityFence?(input: Readonly<{
@@ -402,25 +404,6 @@ export interface SchedulerStorePort {
     owner: "controller" | "human" | "none" | "unknown";
     holderId?: string;
   }> | null;
-  beginRoleRunProviderTurn?(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    agentId: string;
-    launchId: string;
-    nativeSessionId: string;
-    attemptId: string;
-    now: Date;
-  }>): boolean;
-  resolveRoleRunProviderSubmission?(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    attemptId: string;
-    status: "rejected" | "delivery-unknown";
-    reason: string;
-    now: Date;
-  }>): boolean;
   peekNextAgentRunId(taskId: string): string;
   /** Freeze the exact authoritative context before claiming a new Leader Run. */
   freezeLeaderContextSnapshot?(
@@ -543,7 +526,7 @@ export interface SchedulerStorePort {
   saveRoleRunPrepared(input: RoleRunDeliveryPersistence): void;
   /** Persist successful delivery of a Work AgentRun and its fixed session. */
   saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void;
-  /** Atomically fail one exact prepared Run after bounded delivery exhaustion. */
+  /** Atomically fail one exact prepared Run after conclusive non-delivery. */
   saveRoleRunDeliveryFailure(
     input: RoleRunDeliveryFailurePersistence
   ): "failed" | "state-changed";

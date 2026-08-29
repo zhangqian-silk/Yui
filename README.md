@@ -549,19 +549,18 @@ yui operator new
 yui operator enter
 ```
 
-When a Task Role's current native Session cannot continue, reset it by intent:
+When a Task Role's current Provider Conversation cannot continue, request a
+bounded switch with an audited reason:
 
 ```sh
-yui task role reset <task-id> <role> --reason "<why this generation cannot continue>"
+yui task role session switch <task-id> <role> --reason "<why this conversation cannot continue>"
 ```
 
-Yui derives the current Run, Agent, launch, receipt, and native Session from its
-own records. It fails only that exact active Run (and its execution WorkItem),
-stores the current Session as broken history, and asks the Controller to stop
-only the Role-owned runtime. The command never creates a Candidate, accepts
-work, or completes the Task. While cleanup is pending, `task role status` and
-`task context` block a fresh launch. Existing messages, reviews, and delivery
-history remain durable.
+The command records intent only. It does not fail active work, stop a live
+runtime, or forget the current Conversation. Once the Role has ready work and
+the current writer/Turn is settled, Yui creates and binds the replacement; a
+failure before that bind leaves the old Conversation authoritative. Existing
+messages, reviews, and delivery history remain durable.
 
 Without `--task`, `operator submit` creates a new Draft. Drafts accept planning changes but must be activated before Agent execution.
 Operator resolves every request against the Project catalog and existing Task

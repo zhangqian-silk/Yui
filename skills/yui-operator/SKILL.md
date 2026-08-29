@@ -345,10 +345,10 @@ the workflow without claiming that version was delivered.
   conflicts on the Leader's behalf.
 - Reconcile a disappeared native Session with `task reconcile`; inspect the Run
   before retrying a confirmed failure.
-- If the current Task Role native generation cannot continue, use
-  `yui task role reset <task> <role> --reason "..."`. Let Yui derive the exact
-  Run, Agent, receipt, launch, and Session identities; never reconstruct them
-  from terminal text or ask the user to paste them.
+- If the current Provider Conversation cannot continue, use
+  `yui task role session switch <task> <role> --reason "..."`. The request is
+  audited, and Yui keeps the old Conversation authoritative until the exact
+  replacement bind succeeds; never reconstruct identities from terminal text.
 - Retry only an explicitly failed recovery Job.
 - When a Leader first-progress advisory is reported, inspect its native
   generations and absence of durable progress. It is cost evidence rather than

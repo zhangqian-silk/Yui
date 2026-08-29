@@ -6,7 +6,11 @@ import { dirname, join, resolve } from "node:path";
 import { createConnection, createServer, type Server } from "node:net";
 import { createInterface } from "node:readline";
 
-import { callController, ControllerClientError } from "../core/controllerClient.js";
+import {
+  callController,
+  controllerCallMayHaveApplied,
+  ControllerClientError
+} from "../core/controllerClient.js";
 import { readHomeFilesystemId } from "../core/homeFilesystemIdentity.js";
 import {
   publishStructuredProviderAccepted,
@@ -39,7 +43,8 @@ import {
 } from "./processExitObservation.js";
 import {
   readRuntimeStopReceipt,
-  removeRuntimeStopReceipt
+  removeRuntimeStopReceipt,
+  writeRuntimeStopReceipt
 } from "./runtimeStopReceipt.js";
 import {
   AGENT_HOST_CONTROL_TIMEOUT_MS,
@@ -138,6 +143,7 @@ export async function runAgentHost(input: Readonly<{
   let session: StructuredProviderSession | undefined;
   let sessionPayload: AgentHostLaunchPayload | undefined;
   let activeTurnPayload: AgentHostLaunchPayload | undefined;
+  const switchDetachedSessions = new WeakSet<StructuredProviderSession>();
   let activationId: string | undefined;
   let conversationRecoverability: "unknown" | "recoverable" = "unknown";
   let authority: ProviderAuthorityFence | undefined;
@@ -233,18 +239,20 @@ export async function runAgentHost(input: Readonly<{
       const stopReceipt = readRuntimeStopReceipt(input.home, currentPayload.launchId);
       const observedAt = new Date().toISOString();
       const failures: string[] = [];
-      try {
-        await publishStructuredProviderActivationTerminal({
-          home: input.home,
-          environment: currentPayload.environment,
-          conversationId: providerSession.conversationId,
-          nativeSessionId: providerSession.nativeSessionId,
-          activationId: currentActivationId,
-          status: stopReceipt !== null || hostStopRequested ? "ended" : "failed",
-          observedAt
-        });
-      } catch (error) {
-        failures.push(`activation terminal: ${errorText(error)}`);
+      if (!switchDetachedSessions.has(providerSession)) {
+        try {
+          await publishStructuredProviderActivationTerminal({
+            home: input.home,
+            environment: currentPayload.environment,
+            conversationId: providerSession.conversationId,
+            nativeSessionId: providerSession.nativeSessionId,
+            activationId: currentActivationId,
+            status: stopReceipt !== null || hostStopRequested ? "ended" : "failed",
+            observedAt
+          });
+        } catch (error) {
+          failures.push(`activation terminal: ${errorText(error)}`);
+        }
       }
       let exitPersisted = false;
       try {
@@ -278,7 +286,7 @@ export async function runAgentHost(input: Readonly<{
       if (stopReceipt !== null && exitPersisted) {
         removeRuntimeStopReceipt(input.home, currentPayload.launchId);
       }
-      if (hostStopRequested) return;
+      if (hostStopRequested || !ownsCurrentSession) return;
       updateSnapshot(hostSnapshot(failures.length === 0 ? "exited" : "failed", {
         launchId: currentPayload.launchId,
         adapterId: currentPayload.providerControl?.adapterId,
@@ -311,8 +319,11 @@ export async function runAgentHost(input: Readonly<{
       throw new Error("Agent Host still owns an unsettled Provider Turn.");
     }
     const requestedAuthority = validateProviderAuthorityFence(providerControl.authority);
-    if (authority === undefined) authority = requestedAuthority;
-    else if (!sameProviderAuthorityFence(authority, requestedAuthority)) {
+    const replacesCurrentConversation = session !== undefined && providerControl.kind === "new";
+    if (!replacesCurrentConversation && authority === undefined) authority = requestedAuthority;
+    else if (!replacesCurrentConversation
+      && authority !== undefined
+      && !sameProviderAuthorityFence(authority, requestedAuthority)) {
       throw new Error("Agent Host launch carries a stale Provider authority fence.");
     }
     updateSnapshot(hostSnapshot("starting", {
@@ -333,6 +344,42 @@ export async function runAgentHost(input: Readonly<{
       | Readonly<Record<string, string | number>>
       | undefined;
     try {
+      if (replacesCurrentConversation) {
+        const previousSession = session!;
+        const previousPayload = sessionPayload;
+        const previousActivationId = activationId ?? previousPayload?.launchId;
+        if (previousPayload === undefined || previousActivationId === undefined
+          || authority?.owner !== "controller") {
+          throw new Error("Agent Host cannot detach an inexact Provider Activation.");
+        }
+        await detachDurableProviderForConversationSwitch(input.home, {
+          taskId: requiredEnvironment(next.environment.YUI_TASK_ID, "Task id"),
+          roleName: requiredEnvironment(next.environment.YUI_ROLE, "Role name"),
+          runId: requiredEnvironment(next.environment.YUI_RUN_ID, "Run id"),
+          agentId: requiredEnvironment(next.environment.YUI_AGENT_ID, "Agent id"),
+          launchId: next.launchId,
+          previousConversationId: previousSession.conversationId,
+          previousNativeSessionId: previousSession.nativeSessionId,
+          previousActivationId,
+          nextAuthorityEpoch: requestedAuthority.epoch,
+          nextAuthorityHolderId: requestedAuthority.holderId,
+          observedAt: new Date().toISOString()
+        });
+        switchDetachedSessions.add(previousSession);
+        // The persistent Provider child belongs to the Activation that first
+        // created it, not to the most recent resume Run payload. The exit
+        // observer carries that Activation launch id, so the stop receipt must
+        // use the same identity or the expected switch detach is misclassified
+        // as an abnormal child exit and generic cleanup can kill the Host.
+        writeRuntimeStopReceipt(input.home, previousActivationId, new Date());
+        authority = undefined;
+        await terminateProviderSessionForConversationSwitch(previousSession);
+        if (session === previousSession) session = undefined;
+        sessionPayload = undefined;
+        activationId = undefined;
+        conversationRecoverability = "unknown";
+        authority = requestedAuthority;
+      }
       if (session !== undefined) {
         if (session.adapterId !== providerControl.adapterId
           || providerControl.mode !== "resume"
@@ -636,28 +683,11 @@ export async function runAgentHost(input: Readonly<{
         currentAuthority,
         attemptId
       );
-      try {
-        await beginDurableProviderTurn(input.home, durableTurn);
-      } catch (error) {
-        await callController(input.home, "runtime.provider-turn-submission-resolve", {
-          ...durableTurn,
-          status: "rejected",
-          reason: `Human Turn intent acknowledgement failed before Provider write: ${errorText(error)}`,
-          observedAt: new Date().toISOString()
-        }).catch(() => {});
-        throw error;
-      }
+      await beginDurableProviderTurn(input.home, durableTurn);
       try {
         await submitTurn(turnControl);
       } catch (error) {
-        await callController(input.home, "runtime.provider-turn-submission-resolve", {
-          ...durableTurn,
-          status: error instanceof ProviderDeliveryUnknownError
-            ? "delivery-unknown"
-            : "rejected",
-          reason: errorText(error),
-          observedAt: new Date().toISOString()
-        }).catch(() => {});
+        await resolveProviderTurnSubmission(input.home, durableTurn, error);
         throw error;
       }
       process.stdout.write("Provider accepted the human Turn; waiting for its terminal boundary.\n");
@@ -1124,14 +1154,77 @@ async function beginDurableProviderTurn(
   durableTurn: Readonly<Record<string, string | number>>
 ): Promise<void> {
   try {
-    await callController(home, "runtime.provider-turn-begin", durableTurn);
+    await callControllerIdempotently(home, "runtime.provider-turn-begin", durableTurn);
   } catch (error) {
-    if (!(error instanceof ControllerClientError) || error.code !== "INTERNAL_ERROR") {
+    if (!(error instanceof ControllerAcknowledgementUnknownError)) throw error;
+    await resolveProviderTurnSubmission(
+      home,
+      durableTurn,
+      new Error(`Provider Turn intent acknowledgement failed before Provider write: ${errorText(error)}`)
+    );
+    throw error;
+  }
+}
+
+async function detachDurableProviderForConversationSwitch(
+  home: string,
+  request: Readonly<Record<string, string | number>>
+): Promise<void> {
+  await callControllerIdempotently(home, "runtime.conversation-switch-detach", request);
+}
+
+async function callControllerIdempotently(
+  home: string,
+  method: string,
+  request: Readonly<Record<string, string | number>>
+): Promise<void> {
+  try {
+    await callController(home, method, request);
+  } catch (error) {
+    if (!(error instanceof ControllerClientError)
+      || (error.code !== "INTERNAL_ERROR" && !controllerCallMayHaveApplied(error))) {
       throw error;
     }
-    // The exact attempt is idempotent, so one lost acknowledgement can be
-    // retried without creating a second Provider write.
-    await callController(home, "runtime.provider-turn-begin", durableTurn);
+    const firstCallMayHaveApplied = controllerCallMayHaveApplied(error);
+    // These methods carry exact attempt, launch, and authority fences. A
+    // bounded replay confirms a commit whose acknowledgement may have been lost.
+    try {
+      await callController(home, method, request);
+    } catch (replayError) {
+      if (firstCallMayHaveApplied || controllerCallMayHaveApplied(replayError)) {
+        throw new ControllerAcknowledgementUnknownError(
+          `${method} may have been committed, but its acknowledgement could not be confirmed: ${
+            errorText(replayError)
+          }`
+        );
+      }
+      throw replayError;
+    }
+  }
+}
+
+class ControllerAcknowledgementUnknownError extends Error {
+  readonly name = "ControllerAcknowledgementUnknownError";
+}
+
+async function terminateProviderSessionForConversationSwitch(
+  providerSession: StructuredProviderSession
+): Promise<void> {
+  providerSession.terminate("SIGTERM");
+  const forceKill = setTimeout(() => providerSession.terminate("SIGKILL"), 3_000);
+  forceKill.unref();
+  let hardTimeout: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    hardTimeout = setTimeout(() => reject(new Error(
+      "Old Provider Activation did not exit after its switch authority was revoked."
+    )), 8_000);
+    hardTimeout.unref();
+  });
+  try {
+    await Promise.race([providerSession.waitForExit(), timeout]);
+  } finally {
+    clearTimeout(forceKill);
+    if (hardTimeout !== undefined) clearTimeout(hardTimeout);
   }
 }
 
@@ -1140,14 +1233,32 @@ async function resolveProviderTurnSubmission(
   durableTurn: Readonly<Record<string, string | number>>,
   error: unknown
 ): Promise<void> {
-  await callController(home, "runtime.provider-turn-submission-resolve", {
+  const attemptId = durableTurn.attemptId;
+  if (typeof attemptId !== "string") {
+    throw new Error("Provider Turn resolution has no attempt id.");
+  }
+  const request = {
     ...durableTurn,
     status: error instanceof ProviderDeliveryUnknownError
       ? "delivery-unknown"
       : "rejected",
     reason: errorText(error),
     observedAt: new Date().toISOString()
-  }).catch(() => {});
+  } as const;
+  try {
+    await callControllerIdempotently(
+      home,
+      "runtime.provider-turn-submission-resolve",
+      request
+    );
+  } catch (resolutionError) {
+    throw new ProviderDeliveryUnknownError(
+      `Provider submission outcome could not be durably resolved: ${
+        errorText(resolutionError)
+      }. Original outcome: ${errorText(error)}`,
+      attemptId
+    );
+  }
 }
 
 function requiredEnvironment(value: string | undefined, label: string): string {
