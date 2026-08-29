@@ -339,6 +339,131 @@ export type ExactAgentRunRecoveryResult = Readonly<{
   requiresExplicitFollowup?: boolean;
 }>;
 
+export type ExactAgentRunRetirementInput = Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId?: string;
+  launchId?: string;
+  /** Exact semantic progress fence observed before the retirement request. */
+  expectedProgressAt: string;
+  reason: string;
+}>;
+
+export type ExactAgentRunRetirementResult = Readonly<{
+  disposition: "applied" | "state-changed" | "blocked";
+  run: AgentRun | null;
+  progressAt?: string;
+  reason?: string;
+}>;
+
+/**
+ * Retire one stranded active Run only after its exact Provider Turn is
+ * terminal and every durable execution fence is quiet. The caller owns the
+ * surrounding aggregate transaction so the Run, ReviewRound/Lane, mailbox,
+ * Session, and append-only retirement record commit together.
+ */
+export function retireExactActiveAgentRun(
+  store: TaskStore,
+  input: ExactAgentRunRetirementInput,
+  now: Date
+): ExactAgentRunRetirementResult {
+  const current = store.getAgentRun(input.taskId, input.runId);
+  const stateChanged = (reason: string): ExactAgentRunRetirementResult => ({
+    disposition: "state-changed",
+    run: current,
+    ...(current === null ? {} : { progressAt: latestRunDurableProgressAt(
+      store,
+      input.taskId,
+      input.roleName,
+      input.runId
+    )?.progressAt }),
+    reason
+  });
+  const task = store.getTask(input.taskId);
+  if (task === null) return stateChanged("task-missing");
+  if (task.status !== "active") return stateChanged("task-terminal");
+  if (current === null) return stateChanged("run-missing");
+  if (current.status !== "active") return stateChanged("run-terminal");
+  if (current.taskId !== input.taskId || current.roleName !== input.roleName) {
+    return stateChanged("run-owner-mismatch");
+  }
+  if (current.effective.agentId !== input.agentId
+    || current.effective.adapterId !== input.adapterId) {
+    return stateChanged("run-launch-identity-mismatch");
+  }
+  const active = current.executionGroupId !== undefined && current.executionLaneId !== undefined
+    ? store.getActiveExecutionLaneRun(
+      input.taskId,
+      current.executionGroupId,
+      current.executionLaneId
+    )
+    : store.getActiveAgentRun(input.taskId, input.roleName);
+  if (active?.id !== current.id) return stateChanged("active-run-mismatch");
+  const progress = latestRunDurableProgressAt(
+    store,
+    input.taskId,
+    input.roleName,
+    input.runId
+  );
+  if (progress === null) return stateChanged("progress-unavailable");
+  if (progress.progressAt !== input.expectedProgressAt) {
+    return { ...stateChanged("progress-fence-mismatch"), progressAt: progress.progressAt };
+  }
+  if (!matchesRecoverySessionFence(store, {
+    ...input,
+    action: "terminate",
+    providerAcceptance: current.deliveredAt === undefined ? "rejected" : "accepted",
+    now
+  })) return stateChanged("session-or-launch-fence-mismatch");
+  const blocker = exactRecoveryExecutionBlocker(store, current);
+  if (blocker !== null) {
+    return {
+      disposition: "blocked",
+      run: current,
+      progressAt: progress.progressAt,
+      reason: blocker
+    };
+  }
+  const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+  const session = sessions?.sessions[input.agentId];
+  const providerBinding = sessions?.providerBinding;
+  const providerTurn = providerBinding?.turn;
+  const providerSettled = providerBinding?.runId === current.id
+    && (providerTurn?.status === "completed"
+      || providerTurn?.status === "failed"
+      || providerTurn?.status === "cancelled"
+      || providerTurn?.status === "rejected");
+  if (session?.status !== "stopped" && session?.status !== "broken" && !providerSettled) {
+    return {
+      disposition: "blocked",
+      run: current,
+      progressAt: progress.progressAt,
+      reason: "runtime-not-terminal"
+    };
+  }
+  const terminal = terminalizeExactTaskRun(store, {
+    taskId: input.taskId,
+    roleName: input.roleName,
+    agentId: input.agentId,
+    runId: input.runId,
+    receiptId: agentRunDeliveryReceiptId(current),
+    ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
+    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+    outcome: { status: "failed", summary: input.reason }
+  }, now);
+  if (terminal.disposition !== "applied" || terminal.run === null) {
+    return stateChanged(terminal.reason ?? "terminalization-fence-mismatch");
+  }
+  return {
+    disposition: "applied",
+    run: terminal.run,
+    progressAt: progress.progressAt
+  };
+}
+
 /**
  * Applies one exact application-level terminal fact inside the caller's
  * FileTaskStore transaction. All caller-owned outcome records can therefore

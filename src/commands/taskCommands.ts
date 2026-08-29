@@ -78,6 +78,7 @@ import type {
 import { cancelInputRequest } from "../input/inputRequest.js";
 import {
   recoverExactAgentRun,
+  retireExactActiveAgentRun,
   terminalizeExactTaskRun,
   validateExactRunReviewRound,
   type ExactAgentRunRecoveryAction
@@ -331,7 +332,7 @@ import {
 import { runGrantCommand } from "./grantCommands.js";
 import { runWorkflowCommand } from "./workflowCommands.js";
 import {
-  taskActor as resolveTaskActor,
+  taskLocalActor as resolveTaskLocalActor,
   taskLeaderActionRunId
 } from "./taskActor.js";
 import { enqueueOperatorEvent } from "../scheduler/operatorEvent.js";
@@ -593,7 +594,7 @@ export function preflightTaskCompletion(
   request: Readonly<{ acceptedPublishedTreePublicationId?: string }> = {}
 ): TaskCompletionPreflight {
   const task = requireTask(store, taskId);
-  const actor = taskActor(options, task.id);
+  const actor = taskActor(store, options, task.id);
   if (task.status === "completed") {
     return { task, actor, completed: true, activeTaskReview: false };
   }
@@ -870,7 +871,7 @@ function taskProjectCommand(
   const updated = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
     assertTaskOpen(task);
-    if (task.status === "active" && taskActor(options, task.id) !== "leader") {
+    if (task.status === "active" && taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may add a Project to an active Task.");
     }
     const project = resolveProject(tx.listProjects(), parsed.positionals[1]);
@@ -937,6 +938,7 @@ function updateTaskCommand(
   const result = store.transaction((tx) => {
     const current = requireTask(tx, parsed.positionals[0]);
     if (current.status === "archived") throw usageError(`Task is archived: ${current.id}.`);
+    taskActor(tx, options, current.id);
     const updated = updateTaskMetadata(current, {
       ...(parsed.options.has("--title") ? { title: requiredOption(parsed.options, "--title") } : {}),
       ...(parsed.options.has("--type")
@@ -1552,7 +1554,7 @@ function archiveTaskCommand(
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, request.taskId);
-    const actor = taskActor(options, task.id);
+    const actor = taskActor(tx, options, task.id);
     if (task.status === "archived") return { task, changed: false } as const;
     if (task.status !== "completed"
       && task.status !== "retired") {
@@ -1640,7 +1642,7 @@ function retireTaskCommand(
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, taskId);
-    const actor = taskActor(options, task.id);
+    const actor = taskActor(tx, options, task.id);
     if (task.status === "retired") {
       const same = task.retirementSummary === summary
         && task.replacementTaskId === replacementTaskId;
@@ -1811,7 +1813,7 @@ export function validateTaskArchiveRequest(
 ): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
   const request = parseTaskArchiveArguments(args);
   const task = requireTask(store, request.taskId);
-  const actor = taskActor(options, task.id);
+  const actor = taskActor(store, options, task.id);
   if (actor === "leader") {
     throw usageError("Only the global Operator may archive a Task from a managed Session.");
   }
@@ -1888,7 +1890,7 @@ function taskMessageCommand(
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
-      const actor = taskActor(options, task.id);
+      const actor = taskActor(tx, options, task.id);
       const message = actor === "leader"
         ? appendMessage(
             tx,
@@ -2013,10 +2015,7 @@ function retireMessage(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, reference.taskId);
     assertTaskOpen(task);
-    const actor = taskActor(options, task.id);
-    if (actor === "leader") {
-      throw usageError("Only the user or global Operator may retire a Task Message.");
-    }
+    const actor = taskActor(tx, options, task.id);
     const message = tx.listMessages(task.id).find(({ id }) => id === reference.localId);
     if (message === undefined) {
       throw dataError(`Task Message not found: ${task.id}/${reference.localId}.`);
@@ -2127,7 +2126,7 @@ function switchTaskRoleSession(
       throw usageError(inactiveTaskMessage(task, "switching a Provider Conversation"), usage);
     }
     const role = requireRole(tx, task.id, parsed.positionals[1]);
-    const requestedBy = taskActor(options, task.id);
+    const requestedBy = taskActor(tx, options, task.id);
     const leaderRunId = requestedBy === "leader"
       ? taskLeaderActionRunId(tx, task.id, options.environment, options.yuiHome)
       : undefined;
@@ -2221,6 +2220,7 @@ function addTaskRole(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, taskId);
     assertTaskOpen(task);
+    taskActor(tx, options, task.id);
     assertRoleRuntimeMutationAllowed(tx, {
       scope: "task",
       taskId: task.id,
@@ -2368,6 +2368,7 @@ function updateTaskRole(
   const updated = store.transaction((tx) => {
     const task = requireTask(tx, taskId);
     assertTaskOpen(task);
+    taskActor(tx, options, task.id);
     const role = requireRole(tx, task.id, roleName);
     const changesLaunchContext = hasRoleLaunchContextOptions(parsed) || parsed.has("--profile");
     const changesAgentConfig = hasAgentConfigOptions(parsed);
@@ -2425,6 +2426,7 @@ function removeTaskRole(
   const removed = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
     assertTaskOpen(task);
+    taskActor(tx, options, task.id);
     const role = requireRole(tx, task.id, args[1]);
     if (role.name === LEADER_ROLE) throw usageError("The Task Leader role cannot be removed.");
     assertRoleRuntimeMutationAllowed(tx, {
@@ -2457,6 +2459,7 @@ function bindTaskRole(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
     assertTaskOpen(task);
+    taskActor(tx, options, task.id);
     const role = requireRole(tx, task.id, args[1]);
     assertRoleRuntimeMutationAllowed(tx, {
       scope: "task",
@@ -2521,6 +2524,8 @@ function unbindTaskRole(
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, args[0]);
+    assertTaskOpen(task);
+    taskActor(tx, options, task.id);
     const role = requireRole(tx, task.id, args[1]);
     try {
       const unbound = unbindRoleAgent(
@@ -2583,6 +2588,7 @@ function transferTaskRoleAuthority(
       if (task.status !== "active") {
         throw usageError(inactiveTaskMessage(task, `${action} Provider authority`));
       }
+      taskActor(tx, options, task.id);
       const role = requireRole(tx, task.id, args[1]);
       const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
       const session = sessions?.sessions[role.activeAgentId];
@@ -2697,6 +2703,7 @@ function createWork(
   const item = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
     assertTaskOpen(task);
+    taskActor(tx, options, task.id);
     for (const dependencyId of parsed.after) {
       const dependency = tx.getWorkItem(task.id, dependencyId);
       if (dependency === null) throw usageError(`Work Item dependency not found: ${dependencyId}.`);
@@ -2771,7 +2778,7 @@ function updateWorkScope(
   const updated = store.transaction((tx) => {
     const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may change a Work Item Project scope.");
     }
     if (tx.getActiveAgentRun(task.id, item.assignee ?? "") !== null) {
@@ -2831,7 +2838,7 @@ function updateWork(
     const task = requireTask(tx, current.taskId);
     assertTaskOpen(task);
     if (current.assignee === undefined) {
-      if (taskActor(options, task.id) !== "leader") {
+      if (taskActor(tx, options, task.id) !== "leader") {
         throw usageError(
           `Only the Task Leader may update unassigned Work Item execution: ${current.id}.`
         );
@@ -3044,6 +3051,7 @@ function dispatchWork(
     if (task.status !== "active") {
       throw usageError(inactiveTaskMessage(task, "dispatch"));
     }
+    taskActor(tx, options, task.id);
     const currentGroup = currentWorkItemExecutionGroup(item);
     const existingGroup = currentGroup?.resolution === undefined
       ? currentGroup
@@ -3095,7 +3103,7 @@ function dispatchWork(
         + "then execute it directly or create native subagents in the Leader Session."
       );
     }
-    if (expanding && taskActor(options, task.id) !== "leader") {
+    if (expanding && taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may expand a running ExecutionGroup.");
     }
     assertWorkItemDependenciesCompleted(tx, item);
@@ -3523,7 +3531,7 @@ function resolveWorkExecutionGroup(
     const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "resolving an ExecutionGroup"));
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may resolve an ExecutionGroup.");
     }
     let group = currentWorkItemExecutionGroup(item);
@@ -3809,7 +3817,7 @@ function acceptWork(
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may accept a Work Item.");
     }
     if (item.status !== "awaiting_acceptance") {
@@ -3980,7 +3988,7 @@ function rejectWork(
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may reject a Work Item.");
     }
     if (item.status !== "awaiting_acceptance") {
@@ -4022,7 +4030,7 @@ function retireWork(
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    const actor = taskActor(options, task.id);
+    const actor = taskActor(tx, options, task.id);
     if (replacementWorkItemId !== undefined) {
       const replacement = requireWorkItem(tx, replacementWorkItemId, options);
       if (replacement.taskId !== task.id) {
@@ -4172,7 +4180,7 @@ function reviewWork(
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
     }
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may request a Work Item review.");
     }
     if (item.status !== "awaiting_acceptance") {
@@ -4456,7 +4464,7 @@ function resolveReviewExecutionGroup(
     const round = requireReviewRound(tx, parsed.positionals[0], options);
     const task = requireTask(tx, round.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "resolving a Review ExecutionGroup"));
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may resolve a Reviewer ExecutionGroup.");
     }
     const group = round.executionGroup;
@@ -4614,7 +4622,7 @@ function disposeReviewFindingCommand(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, reference.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "dispositioning a review finding"));
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may disposition a review finding.");
     }
     const command: ReviewFindingDispositionCommand = {
@@ -4656,7 +4664,7 @@ function planReviewRepairWave(
       if (currentTask.status !== "active") {
         throw usageError(inactiveTaskMessage(currentTask, "creating a review repair wave"));
       }
-      if (taskActor(options, currentTask.id) !== "leader") {
+      if (taskActor(tx, options, currentTask.id) !== "leader") {
         throw usageError("Only the Task Leader may create a review repair wave.");
       }
       const openItems = tx.listWorkItems(currentTask.id)
@@ -4791,7 +4799,7 @@ function requestTaskReviewRound(
   const round = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may request a Task-final Review.");
     }
     if (task.projectBindings.length === 0) {
@@ -5079,7 +5087,7 @@ function forceFreshTaskReviewRound(
     }
     const task = requireTask(tx, reference.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may force a fresh Task-final ReviewRound.");
     }
     if ((source.scope ?? "work-item") !== "task") {
@@ -5389,7 +5397,7 @@ function retryFailedTaskReviewRound(
     }
     const task = requireTask(tx, reference.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may retry a failed Task-final ReviewRound.");
     }
     if ((round.scope ?? "work-item") !== "task") {
@@ -5538,8 +5546,16 @@ function retireRun(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task run retire usage: yui task run retire <task>/<run> --reason <text>.";
-  const parsed = parseTail(args, new Set(["--reason"]), usage);
+  const usage = "Task run retire usage: yui task run retire <task>/<run> --reason <text> [--expected-progress-at <timestamp>] [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>].";
+  const parsed = parseTail(args, new Set([
+    "--reason",
+    "--expected-progress-at",
+    "--progress-at",
+    "--agent-id",
+    "--adapter-id",
+    "--native-session-id",
+    "--launch-id"
+  ]), usage);
   exactPositionals(parsed.positionals, 1, usage);
   const reason = requiredOption(parsed.options, "--reason");
   const reference = taskRecordReference(
@@ -5552,10 +5568,7 @@ function retireRun(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, reference.taskId);
     assertTaskOpen(task);
-    const actor = taskActor(options, task.id);
-    if (actor === "leader") {
-      throw usageError("Only the user or global Operator may retire an Agent Run.");
-    }
+    const actor = taskActor(tx, options, task.id);
     let run = tx.getAgentRun(task.id, reference.localId);
     if (run === null) throw dataError(`Agent Run not found: ${task.id}/${reference.localId}.`);
     const events = tx.listEvents(task.id);
@@ -5563,21 +5576,74 @@ function retireRun(
       return { task, run, changed: false } as const;
     }
     if (run.status === "active") {
-      const terminal = terminalizeExactTaskRun(tx, {
+      if (actor === "leader"
+        && taskLeaderActionRunId(tx, task.id, options.environment, options.yuiHome) === run.id) {
+        throw usageError("A Task Leader cannot retire its own current authority Run.", usage);
+      }
+      const expectedProgressAt = requiredOption(
+        parsed.options,
+        parsed.options.has("--expected-progress-at")
+          ? "--expected-progress-at"
+          : "--progress-at"
+      );
+      if (parsed.options.has("--expected-progress-at") && parsed.options.has("--progress-at")) {
+        throw usageError(
+          "--expected-progress-at and --progress-at are mutually exclusive.",
+          usage
+        );
+      }
+      const agentId = requiredOption(parsed.options, "--agent-id");
+      const adapterId = requiredOption(parsed.options, "--adapter-id");
+      const nativeSessionId = parsed.options.get("--native-session-id");
+      const launchId = parsed.options.get("--launch-id");
+      const sessions = tx.getTaskRoleSessionSet(task.id, run.roleName);
+      const session = sessions?.sessions[run.effective.agentId];
+      if (session?.nativeSessionId !== undefined && nativeSessionId === undefined) {
+        throw usageError("--native-session-id is required for this active Run.", usage);
+      }
+      if (session?.nativeSessionId === undefined && launchId === undefined) {
+        throw usageError("--launch-id is required for an opaque active Run.", usage);
+      }
+      const terminal = retireExactActiveAgentRun(tx, {
         taskId: task.id,
         roleName: run.roleName,
-        agentId: run.effective.agentId,
         runId: run.id,
-        receiptId: agentRunDeliveryReceiptId(run),
-        outcome: { status: "failed", summary: `Agent Run retired: ${reason}` }
+        agentId,
+        adapterId,
+        ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
+        ...(launchId === undefined ? {} : { launchId }),
+        expectedProgressAt,
+        reason: `Agent Run retired: ${reason}`
       }, now);
       if (terminal.disposition !== "applied" || terminal.run === null) {
         throw usageError(
-          `Agent Run changed during retirement: ${run.id}/${terminal.reason ?? "obsolete"}.`
+          terminal.disposition === "blocked"
+            ? `Agent Run retirement is blocked: ${run.id}/${terminal.reason ?? "unsafe"}.`
+            : `Agent Run changed during retirement: ${run.id}/${terminal.reason ?? "obsolete"}.`
         );
       }
       run = terminal.run;
     }
+    recordTaskEvent(tx, task.id, "run.retired", {
+      runId: run.id,
+      reason,
+      ...(parsed.options.get("--expected-progress-at") === undefined
+        && parsed.options.get("--progress-at") === undefined
+        ? {}
+        : {
+            expectedProgressAt: parsed.options.get("--expected-progress-at")
+              ?? parsed.options.get("--progress-at")!
+          }),
+      ...(parsed.options.get("--native-session-id") === undefined
+        ? {}
+        : { nativeSessionId: parsed.options.get("--native-session-id")! }),
+      ...(parsed.options.get("--launch-id") === undefined
+        ? {}
+        : { launchId: parsed.options.get("--launch-id")! }),
+      ...(actor === "leader"
+        ? leaderActionEventPayload(tx, task.id, options)
+        : { retiredBy: actor })
+    }, now);
     tx.saveEvent(task.id, createTaskRecordRetirement({
       eventId: tx.nextEventId(task.id),
       taskId: task.id,
@@ -5753,7 +5819,7 @@ function settleStaleFinalReviewRun(
     }
     const task = requireTask(tx, run.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may settle a stale final review Run.");
     }
     const round = tx.getReviewRound(task.id, run.reviewRoundId);
@@ -6672,7 +6738,7 @@ function retryFailedReviewRun(
         + "reconcile it before retrying the Lane."
       );
     }
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may retry a failed final review Run.");
     }
     const round = tx.getReviewRound(task.id, run.reviewRoundId);
@@ -6976,7 +7042,7 @@ function recoverRun(
     const active = requireRun(tx, parsed.positionals[0], options);
     const task = requireTask(tx, active.taskId);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "recovering a run"));
-    if (taskActor(options, task.id) !== "leader") {
+    if (taskActor(tx, options, task.id) !== "leader") {
       throw usageError("Only the Task Leader may control exact Agent Run recovery.");
     }
     const roleName = parsed.options.get("--role") ?? active.roleName;
@@ -8428,6 +8494,8 @@ export function failPendingReviewRound(
 ): ReviewRound {
   const now = clock(options);
   const failed = store.transaction((tx) => {
+    const task = requireTask(tx, taskId);
+    taskActor(tx, options, task.id);
     const round = tx.getReviewRound(taskId, reviewRoundId);
     if (round === null) throw usageError(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
     if (round.status !== "pending") return round;
@@ -8854,8 +8922,15 @@ function assertTaskOpen(task: Task): void {
   if (task.status === "retired") throw usageError(`Task is retired: ${task.id}.`);
 }
 
-function taskActor(options: TaskCommandOptions, taskId: string) {
-  return resolveTaskActor(options.environment, taskId);
+function taskActor(
+  store: Pick<
+    TaskWorkflowStore,
+    "getRole" | "getActiveAgentRun" | "getTaskRoleSessionSet"
+  >,
+  options: TaskCommandOptions,
+  taskId: string
+) {
+  return resolveTaskLocalActor(store, options.environment, taskId, options.yuiHome);
 }
 
 function taskRoleDispatchMode(
@@ -9070,7 +9145,7 @@ function taskBriefCommand(
       const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
       const existing = tx.getTaskBrief(task.id);
-      const updatedBy = taskActor(options, task.id);
+      const updatedBy = taskActor(tx, options, task.id);
       const brief = existing === null
         ? createTaskBrief({
             objective: requiredText(parsed.options.get("--objective"), "--objective"),
@@ -9129,7 +9204,7 @@ function taskDecisionCommand(
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
-      const actor = taskActor(options, task.id);
+      const actor = taskActor(tx, options, task.id);
       const decision = createDecision(tx.nextDecisionId(task.id), task.id, title, rationale, now);
       tx.saveDecision(task.id, decision);
       recordTaskEvent(tx, task.id, "decision.recorded", {
@@ -9203,7 +9278,7 @@ function taskDecisionCommand(
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
-      const actor = taskActor(options, task.id);
+      const actor = taskActor(tx, options, task.id);
       const existing = tx.getDecision(task.id, parsed.positionals[1]);
       if (existing === null) throw dataError(`Decision not found: ${parsed.positionals[1]}.`);
       const decision = supersedeDecision(existing, reason, now);
@@ -9244,7 +9319,7 @@ function taskMilestoneCommand(
     const result = store.transaction((tx) => {
       const task = requireTask(tx, parsed.positionals[0]);
       assertTaskOpen(task);
-      if (taskActor(options, task.id) !== "leader") {
+      if (taskActor(tx, options, task.id) !== "leader") {
         throw usageError("Only the Task Leader can add a Milestone.");
       }
       const milestone = createMilestone(tx.nextMilestoneId(task.id), task.id, title, summary, now);

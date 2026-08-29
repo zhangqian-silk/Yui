@@ -55,6 +55,34 @@ export function taskActor(
 }
 
 /**
+ * Resolve authority for a recoverable Task-local mutation. A managed Leader
+ * does not gain that authority from long-lived process environment alone: the
+ * command must carry the exact current Turn assertion and it must still match
+ * the durable active Run, receipt, Role binding, native Session, and Home.
+ * Plain-user and global-Operator behavior remains unchanged.
+ */
+export function taskLocalActor(
+  store: Pick<
+    TaskStore,
+    "getRole" | "getActiveAgentRun" | "getTaskRoleSessionSet"
+  >,
+  environment: NodeJS.ProcessEnv | undefined,
+  taskId: string,
+  yuiHome?: string
+): TaskCompletedBy {
+  const actor = taskActor(environment, taskId);
+  if (actor !== "leader") return actor;
+  const assertion = leaderActionAssertion(environment ?? {});
+  if (assertion === undefined || assertion === "invalid"
+    || taskLeaderActionRunId(store, taskId, environment, yuiHome) === undefined) {
+    throw usageError(
+      `Task-local Leader authority requires the exact current-Turn assertion: ${taskId}.`
+    );
+  }
+  return actor;
+}
+
+/**
  * Resolve the caller identity for Project-scoped authority. Project Knowledge
  * is an Operator-level authority: a managed Task Session (Leader/Reviewer/
  * Worker) may propose candidates but must not write the authoritative

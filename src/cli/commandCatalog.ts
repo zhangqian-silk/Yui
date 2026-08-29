@@ -871,8 +871,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "retire",
         summary: "Retire an incorrect historical Agent Run without deleting its audit record.",
-        usage: "yui task run retire <task>/<run> --reason <text>",
-        options: ["--reason"]
+        usage: "yui task run retire <task>/<run> --reason <text> [--expected-progress-at <timestamp>] [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>]",
+        options: ["--reason", "--expected-progress-at", "--progress-at", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
       }
     ]
   },
