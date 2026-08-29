@@ -35,8 +35,11 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+import Database from "better-sqlite3";
 
 import {
   describeReport,
@@ -56,6 +59,7 @@ import {
 import { callController } from "../../core/controllerClient.js";
 import { FileTaskStore, STORAGE_STATE_FILE, withStorageWriteLock } from "../taskStore.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
+import { migrateSqliteSchema } from "../sqliteSchema.js";
 import {
   clearUpgradeFence,
   placeUpgradeFence,
@@ -88,6 +92,7 @@ import { createSqliteRecordMigrationTarget } from "./sqliteRecordMigrationTarget
 import { COMMITTED_DATABASE_FILENAME } from "./sqliteStateMigration.js";
 import {
   inspectOfflineUpgradeInventory,
+  inspectSqliteDurableUpgradeInventory,
   type OfflineUpgradeBlocker,
   type OfflineUpgradeInventory
 } from "./offlineUpgradeInventory.js";
@@ -119,6 +124,8 @@ type UpgradeBlocker = Readonly<{
   sceneUnchanged?: true;
   /** True once the atomic Home switch committed; never restore the old Controller. */
   switchCommitted?: true;
+  /** True once an in-place storage transaction committed. */
+  storageCommitted?: true;
   /** The exact backup retained for explicit recovery after a committed switch. */
   backupPath?: string;
   /** Named durable evidence for an ambiguous post-switch boundary. */
@@ -148,6 +155,14 @@ export type UpgradeResult = Readonly<
       classification: HomeClassification;
     }
   | {
+      /** Internal in-place contract with the exact atomic ledger boundary. */
+      outcome: "update-preflight";
+      status: "in-place-migration";
+      stepCount: number;
+      classification: HomeClassification;
+      sqliteMigration: NonNullable<HomeClassification["sqliteMigration"]>;
+    }
+  | {
       outcome: "dry-run";
       classification: HomeClassification;
       report: MigrationReport;
@@ -157,6 +172,7 @@ export type UpgradeResult = Readonly<
       classification: HomeClassification;
       report: MigrationReport;
       backupPath?: string;
+      migrationMode?: "in-place" | "rebuild";
     }
   | (UpgradeBlocker & {
       classification: HomeClassification;
@@ -176,6 +192,12 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
    * is performed from the temporary installation.
    */
   controllerLifecycle?: "owned" | "externally-quiesced";
+  /**
+   * Exact PID of a parent update process that already owns the write-admission
+   * fence across storage migration, binary activation, and health verification.
+   * When absent, this orchestrator owns and releases its local fence.
+   */
+  externalUpgradeFenceOwnerPid?: number;
   now?: () => Date;
   callerPid?: number;
   /** Overrides for the Controller stop/drain client (tests inject fakes). */
@@ -303,6 +325,10 @@ export async function runStorageUpgrade(
       },
       classification
     );
+  }
+
+  if (classification.sqliteMigration !== undefined) {
+    return runSqliteInPlaceUpgrade(options, classification, now, callerPid);
   }
 
   // A pseudo-layout-7 Home (manifest 7, no yui.db, readable state.json) needs
@@ -599,6 +625,406 @@ function offlineInventoryBlocker(
   };
 }
 
+/**
+ * A valid SQLite migration prefix advances the authoritative database in
+ * place. It still uses the offline runtime gate because the old Controller
+ * cannot safely resume after the schema transaction commits, but it never
+ * snapshots, copies, rebuilds, or swaps the database.
+ */
+async function runSqliteInPlaceUpgrade(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  classification: HomeClassification,
+  now: () => Date,
+  callerPid: number
+): Promise<UpgradeResult> {
+  const migration = classification.sqliteMigration!;
+  const inventory = await readOfflineInventory(options, options.home);
+  if (inventory.total > 0) {
+    return withClassification(offlineInventoryBlocker(inventory, true), classification);
+  }
+  if (options.mode === "update-preflight") {
+    return {
+      outcome: "update-preflight",
+      status: "in-place-migration",
+      stepCount: migration.pendingVersions.length,
+      classification,
+      sqliteMigration: migration
+    };
+  }
+  if (options.mode === "dry-run") {
+    return validateSqliteInPlaceDryRun(options, classification, now);
+  }
+  return executeSqliteInPlaceUpgrade(options, classification, now, callerPid);
+}
+
+/**
+ * Exercise every pending SQLite migration against a consistent disposable
+ * snapshot, then open that snapshot through the current production loader.
+ * The authoritative database is opened read-only and is never migrated.
+ */
+async function validateSqliteInPlaceDryRun(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  classification: HomeClassification,
+  now: () => Date
+): Promise<UpgradeResult> {
+  const migration = classification.sqliteMigration!;
+  const stagingRoot = mkdtempSync(join(tmpdir(), "yui-sqlite-upgrade-dry-run-"));
+  const stagedDatabasePath = join(stagingRoot, COMMITTED_DATABASE_FILENAME);
+  let source: Database.Database | undefined;
+  let staged: Database.Database | undefined;
+  let loader: SqliteTaskStore | undefined;
+  try {
+    source = new Database(join(options.home, COMMITTED_DATABASE_FILENAME), {
+      readonly: true,
+      fileMustExist: true
+    });
+    source.pragma("busy_timeout = 5000");
+    await source.backup(stagedDatabasePath);
+    source.close();
+    source = undefined;
+
+    staged = new Database(stagedDatabasePath);
+    staged.pragma("journal_mode = WAL");
+    staged.pragma("synchronous = FULL");
+    staged.pragma("foreign_keys = ON");
+    const applied = migrateSqliteSchema(staged, { mode: "apply" }).applied;
+    if (applied.join(",") !== migration.pendingVersions.join(",")) {
+      throw new Error(
+        `staged SQLite migration applied versions ${applied.join(",") || "none"}; `
+          + `expected ${migration.pendingVersions.join(",")}`
+      );
+    }
+    staged.close();
+    staged = undefined;
+
+    loader = new SqliteTaskStore(stagingRoot);
+    const quickCheck = loader.databaseHandle().pragma("quick_check", { simple: true });
+    if (quickCheck !== "ok") {
+      throw new Error(`staged SQLite quick_check returned ${String(quickCheck)}`);
+    }
+    loader.close();
+    loader = undefined;
+    return {
+      outcome: "dry-run",
+      classification,
+      report: sqliteInPlaceReport(options.latest, migration, "dry-run", now)
+    };
+  } catch (error) {
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: "validate",
+        message: `SQLite dry-run validation failed: ${messageOf(error)}`,
+        action:
+          "The authoritative database was not changed. Resolve the reported migration or loader failure, then retry the dry run."
+      },
+      classification
+    );
+  } finally {
+    try { loader?.close(); } catch { /* best-effort disposable cleanup */ }
+    try { staged?.close(); } catch { /* best-effort disposable cleanup */ }
+    try { source?.close(); } catch { /* best-effort disposable cleanup */ }
+    rmSync(stagingRoot, { recursive: true, force: true });
+  }
+}
+
+/** Acquire a local write fence or prove the exact parent-owned fence exists. */
+function acquireUpgradeAdmission(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  reason: string,
+  now: () => Date,
+  callerPid: number
+): () => void {
+  const externalOwnerPid = options.externalUpgradeFenceOwnerPid;
+  if (externalOwnerPid !== undefined) {
+    const fence = readUpgradeFence(options.home);
+    if (!isPositivePid(externalOwnerPid) || fence?.ownerPid !== externalOwnerPid) {
+      throw new UpgradeFenceError(
+        `expected parent-owned upgrade fence for PID ${String(externalOwnerPid)}`
+      );
+    }
+    return () => {};
+  }
+  return placeUpgradeFence(options.home, {
+    reason,
+    createdAt: now().toISOString(),
+    ownerPid: callerPid
+  });
+}
+
+async function executeSqliteInPlaceUpgrade(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  classification: HomeClassification,
+  now: () => Date,
+  callerPid: number
+): Promise<UpgradeResult> {
+  const { home } = options;
+  const migration = classification.sqliteMigration!;
+  let releaseFence: (() => void) | undefined;
+  try {
+    releaseFence = acquireUpgradeAdmission(
+      options,
+      "SQLite schema migration in progress",
+      now,
+      callerPid
+    );
+  } catch (error) {
+    if (!(error instanceof UpgradeFenceError)) throw error;
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: "coordination",
+        message: `Upgrade coordination could not be acquired: ${error.message}`,
+        action: "Wait for the current maintenance operation to finish, then retry."
+      },
+      classification
+    );
+  }
+
+  const externallyQuiesced = options.controllerLifecycle === "externally-quiesced";
+  let controllerWasRunning = false;
+  let controllerStopConfirmed = false;
+  let controllerIdentity: ControllerLaunchIdentity | undefined;
+  let committed = false;
+  let result: UpgradeResult | undefined;
+  let unexpected: unknown;
+  try {
+    if (!externallyQuiesced) {
+      const controllerStatus = options.controllerStatus
+        ?? ((targetHome: string) => defaultControllerStatus(targetHome, options.controllerOptions));
+      let status: ControllerLifecycleStatus | undefined;
+      try {
+        status = await controllerStatus(home);
+      } catch (error) {
+        result = withClassification(
+          controllerLifecycleBlocker("Controller status could not be verified", error),
+          classification
+        );
+      }
+      if (result === undefined && !isControllerLifecycleStatus(status)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller status was malformed",
+            new Error("expected a boolean running field")
+          ),
+          classification
+        );
+      }
+      if (result === undefined && status!.running && !isControllerLaunchIdentity(status!.identity)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller launch identity could not be authenticated",
+            new Error("executable/argv/version identity is unavailable")
+          ),
+          classification
+        );
+      }
+      if (result === undefined && status!.running && !isPositivePid(status!.pid)) {
+        result = withClassification(
+          controllerLifecycleBlocker(
+            "Controller PID could not be authenticated",
+            new Error("a positive status PID is unavailable for fenced stop")
+          ),
+          classification
+        );
+      }
+      if (result === undefined) {
+        controllerWasRunning = status!.running;
+        controllerIdentity = status!.running ? status!.identity : undefined;
+        controllerStopConfirmed = !controllerWasRunning;
+      }
+      if (result === undefined && controllerWasRunning) {
+        const stopController = options.stopController
+          ?? ((targetHome: string, expectedPid: number) => defaultStopController(
+            targetHome,
+            expectedPid,
+            options.controllerOptions
+          ));
+        try {
+          const expectedPid = status!.pid!;
+          const stopped = await stopController(home, expectedPid);
+          if (!confirmedControllerStopped(stopped, expectedPid)) {
+            result = withClassification(
+              controllerLifecycleBlocker(
+                "Controller stop did not confirm a drained process",
+                new Error(`stop did not confirm captured PID ${expectedPid} with stopped:true`)
+              ),
+              classification
+            );
+          } else {
+            controllerStopConfirmed = true;
+          }
+        } catch (error) {
+          result = withClassification(
+            controllerLifecycleBlocker("Controller stop/drain failed", error),
+            classification
+          );
+        }
+      }
+    } else {
+      controllerStopConfirmed = true;
+    }
+
+    // The first inventory is a cheap/read-only preflight. Re-read after the
+    // Controller has fully drained so a lifecycle request that committed while
+    // the fence was being placed cannot slip through on stale evidence.
+    if (result === undefined) {
+      const finalInventory = await readOfflineInventory(options, home);
+      if (finalInventory.total > 0) {
+        result = withClassification(
+          offlineInventoryBlocker(finalInventory, true),
+          classification
+        );
+      }
+    }
+
+    if (result === undefined) {
+      try {
+        result = withUpgradeCoordinationLock(home, () => {
+          const quiesce = verifyQuiesced(home, callerPid);
+          if (quiesce !== null) return withClassification(quiesce, classification);
+          const db = new Database(join(home, COMMITTED_DATABASE_FILENAME));
+          try {
+            db.pragma("journal_mode = WAL");
+            db.pragma("synchronous = FULL");
+            db.pragma("foreign_keys = ON");
+            db.pragma("busy_timeout = 5000");
+            const apply = db.transaction((): UpgradeResult => {
+              // BEGIN IMMEDIATE waits for every older SQLite writer. With the
+              // upgrade fence still held, the state read here is the final
+              // authoritative durable gate for the same schema transaction.
+              const durableInventory = inspectSqliteDurableUpgradeInventory(home, db);
+              if (durableInventory.total > 0) {
+                return withClassification(
+                  offlineInventoryBlocker(durableInventory, true),
+                  classification
+                );
+              }
+              migrateSqliteSchema(db, { mode: "apply" });
+              return {
+                outcome: "upgraded",
+                classification,
+                migrationMode: "in-place",
+                report: sqliteInPlaceReport(options.latest, migration, "execute", now)
+              };
+            });
+            const applied = apply.immediate();
+            if (applied.outcome === "upgraded") committed = true;
+            return applied;
+          } finally {
+            db.close();
+          }
+        });
+      } catch (error) {
+        unexpected = error;
+      }
+    }
+  } finally {
+    try {
+      releaseFence();
+    } catch (error) {
+      if (unexpected === undefined) unexpected = error;
+    }
+  }
+
+  if (unexpected !== undefined) {
+    if (committed) {
+      return withClassification(
+        {
+          outcome: "blocked",
+          stage: "post-verify",
+          message: `SQLite migration committed but completion failed: ${messageOf(unexpected)}`,
+          action:
+            "Do not restore the old Controller. Re-run this Yui version; the SQLite migration ledger is the commit record.",
+          storageCommitted: true
+        },
+        classification
+      );
+    }
+    if (controllerWasRunning && controllerStopConfirmed) {
+      await restoreController(home, options, unexpected, controllerIdentity);
+    }
+    throw unexpected;
+  }
+  if (result === undefined) throw new Error("SQLite in-place upgrade did not produce a result.");
+
+  if (result.outcome === "upgraded" && !externallyQuiesced && controllerWasRunning) {
+    try {
+      await (options.startController
+        ?? ((targetHome: string) => defaultStartController(targetHome, options.controllerOptions)))(home);
+    } catch (error) {
+      return withClassification(
+        {
+          outcome: "blocked",
+          stage: "post-verify",
+          message: `SQLite migration committed but the replacement Controller did not start: ${messageOf(error)}`,
+          action:
+            "Do not restore the old Controller. Start the current Yui Controller; the SQLite migration ledger already committed.",
+          storageCommitted: true
+        },
+        classification
+      );
+    }
+    return result;
+  }
+
+  if (
+    result.outcome === "blocked"
+    && !committed
+    && !externallyQuiesced
+    && controllerWasRunning
+    && controllerStopConfirmed
+  ) {
+    await restoreController(home, options, new Error(result.message), controllerIdentity);
+  }
+  return result;
+}
+
+function sqliteInPlaceReport(
+  latest: StorageVersionState,
+  migration: NonNullable<HomeClassification["sqliteMigration"]>,
+  mode: "dry-run" | "execute",
+  now: () => Date
+): MigrationReport {
+  const detail = `SQLite schema ${migration.currentVersion}->${migration.targetVersion}; `
+    + `pending versions ${migration.pendingVersions.join(", ")}`;
+  if (mode === "dry-run") {
+    return {
+      outcome: "dry-run",
+      mode,
+      source: latest,
+      target: latest,
+      steps: [],
+      effects: [],
+      derived: { rebuiltEffects: [] },
+      validation: {
+        checks: [{
+          name: "SQLite staged migration and loader gate",
+          outcome: "passed",
+          detail: `${detail}; snapshot migrated and reopened by the current SQLite loader`
+        }]
+      }
+    };
+  }
+  return {
+    outcome: "migrated",
+    mode,
+    source: latest,
+    target: latest,
+    steps: [],
+    effects: [],
+    derived: { rebuiltEffects: [] },
+    validation: {
+      checks: [{ name: "SQLite migration transaction", outcome: "passed", detail }]
+    },
+    switch: {
+      status: "switched",
+      detail: "SQLite schema migrated in place; no database copy or rebuild was created."
+    },
+    completedAt: now().toISOString()
+  };
+}
+
 /** Dry run: validate through the staged gate, then discard; never switch. */
 function dryRun(
   options: RunStorageUpgradeOptions<HomeSnapshot>,
@@ -644,11 +1070,12 @@ async function execute(
   // the other upgrader's fence.
   let releaseFence: (() => void) | undefined;
   try {
-    releaseFence = placeUpgradeFence(home, {
-      reason: "storage upgrade in progress",
-      createdAt: now().toISOString(),
-      ownerPid: callerPid
-    });
+    releaseFence = acquireUpgradeAdmission(
+      options,
+      "storage upgrade in progress",
+      now,
+      callerPid
+    );
   } catch (error) {
     if (!(error instanceof UpgradeFenceError)) throw error;
     return withClassification(
@@ -946,11 +1373,12 @@ async function executePseudoLayout7Repair(
 
   let releaseFence: (() => void) | undefined;
   try {
-    releaseFence = placeUpgradeFence(home, {
-      reason: "storage repair in progress",
-      createdAt: now().toISOString(),
-      ownerPid: callerPid
-    });
+    releaseFence = acquireUpgradeAdmission(
+      options,
+      "storage repair in progress",
+      now,
+      callerPid
+    );
   } catch (error) {
     if (!(error instanceof UpgradeFenceError)) throw error;
     return withClassification(

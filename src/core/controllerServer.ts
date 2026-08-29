@@ -1130,6 +1130,7 @@ function safeApplicationErrorCode(code: string): string | undefined {
     case "METHOD_NOT_FOUND":
     case "NOT_FOUND":
     case "UNAUTHORIZED":
+    case "CONTROLLER_DRAINING":
       return code;
     default:
       return undefined;

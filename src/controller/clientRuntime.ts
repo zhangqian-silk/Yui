@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   callController,
+  ControllerClientError,
   readControllerDiscovery,
   stopOrphanedFileTaskController,
   stopPreviousFileTaskController
@@ -39,6 +40,7 @@ import {
   LIFECYCLE_REQUEST_TIMEOUT_MS
 } from "../runtime/runtimeDeadlines.js";
 import { FileTaskRuntimeIsolation } from "../runtime/taskRuntimeIsolation.js";
+import { isForeignHandoverLockHeld } from "../release/runtimeRelease.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 const POLL_INTERVAL_MS = 50;
@@ -66,6 +68,13 @@ export type FileControllerClientOptions = Readonly<{
   shutdownTimeoutMs?: number;
   pollIntervalMs?: number;
   requestTimeoutMs?: number;
+  /** Maximum time an ordinary caller waits for a Controller handover to finish. */
+  handoverWaitTimeoutMs?: number;
+  /**
+   * PID allowed to own the handover lock without blocking this lifecycle call.
+   * Ordinary callers omit it; update/session maintenance passes its exact owner.
+   */
+  handoverOwnerPid?: number;
   /** Override the expected version for an exact-identity restore handshake. */
   expectedVersion?: string;
   /**
@@ -114,6 +123,7 @@ export async function ensureFileTaskController(
   options: FileControllerClientOptions = {}
 ): Promise<JsonValue> {
   const call = options.call ?? callController;
+  await waitForForeignHandover(home, options);
   try {
     const status = await call(home, "controller.status", {});
     assertCompatibleControllerStatus(status, options.expectedVersion);
@@ -121,6 +131,10 @@ export async function ensureFileTaskController(
   } catch (error) {
     if (!isUnavailable(error)) throw error;
   }
+  // A handover may have started after the first lock check and before the
+  // failed discovery/socket call. Re-check before spawning so a managed
+  // Session can never resurrect the old Controller during an update.
+  await waitForForeignHandover(home, options);
   const timeoutMs = positive(options.startupTimeoutMs, STARTUP_TIMEOUT_MS, "startupTimeoutMs");
   const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
   const spawnController = options.spawnController ?? spawnDetachedFileTaskController;
@@ -461,13 +475,21 @@ export async function callFileTaskController(
         : { stopped: false, alreadyStopped: true };
     }
   }
+  await waitForForeignHandover(home, options);
   try {
     return await call(home, method, params, {
       timeoutMs: options.requestTimeoutMs
     });
   } catch (error) {
-    if (!isUnavailable(error)) throw error;
+    if (!isUnavailable(error)
+      && !(isControllerDraining(error)
+        && isForeignHandoverLockHeld(home, options.handoverOwnerPid ?? process.pid))) {
+      throw error;
+    }
   }
+  // A pre-connect unavailable result is safe to retry. Ambiguous post-send
+  // failures are classified separately by the socket client and surface.
+  await waitForForeignHandover(home, options);
   await ensureFileTaskController(home, options);
   return call(home, method, params, {
     timeoutMs: options.requestTimeoutMs
@@ -848,6 +870,39 @@ function isUnavailable(error: unknown): boolean {
   const code = (error as { code?: unknown }).code;
   return code === "CONTROLLER_NOT_RUNNING"
     || code === "CONTROLLER_UNAVAILABLE";
+}
+
+function isControllerDraining(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error as { code?: unknown }).code === "CONTROLLER_DRAINING";
+}
+
+async function waitForForeignHandover(
+  home: string,
+  options: FileControllerClientOptions
+): Promise<void> {
+  const allowedOwnerPid = options.handoverOwnerPid ?? process.pid;
+  if (!Number.isSafeInteger(allowedOwnerPid) || allowedOwnerPid < 1) {
+    throw new TypeError("handoverOwnerPid must be a positive integer");
+  }
+  if (!isForeignHandoverLockHeld(home, allowedOwnerPid)) return;
+  const timeoutMs = positive(
+    options.handoverWaitTimeoutMs,
+    LIFECYCLE_REQUEST_TIMEOUT_MS,
+    "handoverWaitTimeoutMs"
+  );
+  const pollMs = positive(options.pollIntervalMs, POLL_INTERVAL_MS, "pollIntervalMs");
+  const deadline = Date.now() + timeoutMs;
+  do {
+    await delay(pollMs);
+    if (!isForeignHandoverLockHeld(home, allowedOwnerPid)) return;
+  } while (Date.now() < deadline);
+  throw new ControllerClientError(
+    "CONTROLLER_HANDOVER_TIMEOUT",
+    `Controller handover did not finish within ${timeoutMs} ms.`
+  );
 }
 
 function isDefinitelyNotRunning(error: unknown): boolean {

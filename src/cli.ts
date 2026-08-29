@@ -470,25 +470,49 @@ export async function main(): Promise<void> {
   if (args[0] === "upgrade") {
     // Mirror doctor/controller: needs a Home but self-manages the schema check,
     // because upgrade must run against a non-current Home.
-    const result = await runUpgradeCommand(
-      args.slice(1),
-      home,
-      process.env.YUI_UPDATE_EXTERNALLY_QUIESCED === "1"
-        ? { controllerLifecycle: "externally-quiesced" }
-        : {}
-    );
-    // Public execute upgrades leave the Home operational even when no
-    // Controller existed before the command. Dry-run and the staged updater's
-    // externally-quiesced preflight must remain read-only/lifecycle-neutral.
+    const externallyQuiesced = process.env.YUI_UPDATE_EXTERNALLY_QUIESCED === "1";
+    const ownsHandover = args.length === 1 && !externallyQuiesced;
+    const externalFenceOwner = externallyQuiesced
+      ? process.env.YUI_UPDATE_HANDOVER_OWNER_PID
+      : undefined;
+    const externalUpgradeFenceOwnerPid = externalFenceOwner === undefined
+      ? undefined
+      : Number(externalFenceOwner);
     if (
-      args.length === 1
-      && result.exitCode === 0
-      && process.env.YUI_UPDATE_EXTERNALLY_QUIESCED !== "1"
+      externalUpgradeFenceOwnerPid !== undefined
+      && (!Number.isSafeInteger(externalUpgradeFenceOwnerPid)
+        || externalUpgradeFenceOwnerPid < 1)
     ) {
-      await ensureFileTaskController(home, { environment: process.env });
+      throw runtimeError("Update storage-fence owner PID is invalid.");
     }
-    process.exitCode = result.exitCode;
-    emit(result.output, false, result.data);
+    const handover = ownsHandover ? acquireHandoverLock(home) : undefined;
+    try {
+      const result = await runUpgradeCommand(
+        args.slice(1),
+        home,
+        externallyQuiesced
+          ? {
+              controllerLifecycle: "externally-quiesced",
+              ...(externalUpgradeFenceOwnerPid === undefined
+                ? {}
+                : { externalUpgradeFenceOwnerPid })
+            }
+          : {}
+      );
+      // Public execute upgrades leave the Home operational even when no
+      // Controller existed before the command. Dry-run and the staged updater's
+      // externally-quiesced preflight must remain read-only/lifecycle-neutral.
+      if (ownsHandover && result.exitCode === 0) {
+        await ensureFileTaskController(home, {
+          environment: process.env,
+          handoverOwnerPid: process.pid
+        });
+      }
+      process.exitCode = result.exitCode;
+      emit(result.output, false, result.data);
+    } finally {
+      handover?.release();
+    }
     return;
   }
   if (args[0] === "internal") {
@@ -714,9 +738,23 @@ export async function main(): Promise<void> {
     }
     validateCompatibleFileTaskStore(home);
     const controllerMethod: "stop" | "restart" = method;
+    const updateHandoverOwner = process.env.YUI_UPDATE_HANDOVER_OWNER_PID;
+    const updateHandoverOwnerPid = updateHandoverOwner === undefined
+      ? undefined
+      : Number(updateHandoverOwner);
+    if (
+      updateHandoverOwnerPid !== undefined
+      && (!Number.isSafeInteger(updateHandoverOwnerPid) || updateHandoverOwnerPid < 1)
+    ) {
+      throw runtimeError("Update Controller handover owner PID is invalid.");
+    }
+    const controllerOptions = {
+      environment: process.env,
+      ...(updateHandoverOwnerPid === undefined ? {} : { handoverOwnerPid: updateHandoverOwnerPid })
+    };
     const result = controllerMethod === "restart"
-      ? await restartFileTaskController(home, { environment: process.env })
-      : await stopFileTaskController(home, { environment: process.env });
+      ? await restartFileTaskController(home, controllerOptions)
+      : await stopFileTaskController(home, controllerOptions);
     // The update lifecycle needs the authenticated replacement PID returned by
     // restart/readiness.  Keep stop's long-standing text envelope, while
     // exposing restart's structured result alongside its human output.

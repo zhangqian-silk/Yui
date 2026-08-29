@@ -143,6 +143,7 @@ import {
   type GateArtifactPruneResult
 } from "../verification/gateArtifact.js";
 import {
+  inspectSqliteSchemaMigrations,
   migrateSqliteSchema,
   SqliteSchemaMigrationError,
   SQLITE_AGGREGATE_VERSION,
@@ -282,6 +283,7 @@ export class SqliteTaskStore implements TaskStore {
   readonly #db: Database.Database;
   readonly #rootDir: string;
   readonly #migration: boolean;
+  readonly #openedSchemaHead: Readonly<{ version: number; checksum: string }>;
   #inTransaction = false;
   #dirty = false;
 
@@ -309,6 +311,11 @@ export class SqliteTaskStore implements TaskStore {
       migrateSqliteSchema(this.#db, {
         mode: this.#migration || !databaseExisted ? "apply" : "validate"
       });
+      const schema = inspectSqliteSchemaMigrations(this.#db);
+      this.#openedSchemaHead = {
+        version: schema.currentVersion,
+        checksum: schema.currentChecksum
+      };
       this.#seedHomeMeta();
       this.#seedConfig();
     } catch (error) {
@@ -375,6 +382,20 @@ export class SqliteTaskStore implements TaskStore {
     // per-write admission check. Production stores never set migration mode.
     if (this.#migration) return;
     assertHomeWritable(this.#rootDir);
+    const current = this.#db.prepare(
+      "SELECT version, checksum FROM schema_migrations ORDER BY version DESC LIMIT 1"
+    ).get() as { version?: unknown; checksum?: unknown } | undefined;
+    if (
+      current?.version !== this.#openedSchemaHead.version
+      || current.checksum !== this.#openedSchemaHead.checksum
+    ) {
+      throw new SqliteSchemaMigrationError(
+        `open Store schema head ${this.#openedSchemaHead.version}/${this.#openedSchemaHead.checksum} `
+          + `changed to ${String(current?.version)}/${String(current?.checksum)}; `
+          + "reopen the Store with the active Yui version before writing",
+        "admission"
+      );
+    }
   }
 
   #bumpRevision(): void {
@@ -392,9 +413,12 @@ export class SqliteTaskStore implements TaskStore {
       this.#dirty = true;
       return result;
     }
-    this.#prepareWrite();
     this.#begin();
     try {
+      // Acquire SQLite's write reservation before checking the upgrade fence.
+      // A writer that started first commits before the upgrader's final
+      // transactional inventory; a writer that starts later sees the fence.
+      this.#prepareWrite();
       const result = fn();
       if (!this.#migration) {
         this.#bumpRevision();
@@ -422,9 +446,12 @@ export class SqliteTaskStore implements TaskStore {
     if (this.#inTransaction) return run(this);
     this.#begin();
     try {
+      // Pin the Store's validated schema generation before user code runs.
+      // This prevents a long-lived pre-upgrade Store from executing old SQL
+      // after an in-place migration has committed.
+      this.#prepareWrite();
       const result = run(this);
       if (this.#dirty) {
-        this.#prepareWrite();
         if (options?.requestId !== undefined) {
           this.#insertOutbox(options.requestId, options.outboxCommand ?? null);
         }
@@ -448,9 +475,9 @@ export class SqliteTaskStore implements TaskStore {
    * transactionAsync semantics and preserving the single-writer boundary. */
   async transactionAsync<T>(execute: (store: TaskStore) => Promise<T>): Promise<T> {
     if (this.#inTransaction) return execute(this);
-    this.#prepareWrite();
     this.#begin();
     try {
+      this.#prepareWrite();
       const result = await execute(this);
       if (this.#dirty) this.#bumpRevision();
       this.#commit();

@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, closeSync, fsyncSync, mkdirSync, openSync, rmSync } from "node:fs";
-import { readdir, readFile, rename, unlink } from "node:fs/promises";
+import { chmodSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createConnection, createServer, type Server } from "node:net";
@@ -12,6 +11,8 @@ import {
   ControllerClientError
 } from "../core/controllerClient.js";
 import { readHomeFilesystemId } from "../core/homeFilesystemIdentity.js";
+import { callFileTaskController } from "../controller/clientRuntime.js";
+import { isForeignHandoverLockHeld } from "../release/runtimeRelease.js";
 import {
   publishStructuredProviderAccepted,
   publishStructuredProviderActivationTerminal,
@@ -41,6 +42,10 @@ import {
   validateRuntimeProcessExitObservation,
   type RuntimeProcessExitObservation
 } from "./processExitObservation.js";
+import {
+  persistRuntimeProcessExitObservation,
+  replayRuntimeProcessExitOutbox
+} from "./processExitOutbox.js";
 import {
   readRuntimeStopReceipt,
   removeRuntimeStopReceipt,
@@ -889,48 +894,29 @@ async function redeem(home: string, launchId: string, ticket: string): Promise<A
 }
 
 async function persistAndSubmitExit(home: string, observation: RuntimeProcessExitObservation): Promise<void> {
-  const directory = resolve(join(home, "runtime", "agent-host-outbox"));
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const path = join(directory, `${observation.hostInstanceId}.jsonl`);
-  const descriptor = openSync(path, "a", 0o600);
   try {
-    appendFileSync(descriptor, `${JSON.stringify(observation)}\n`, "utf8");
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
+    await persistRuntimeProcessExitObservation(
+      home,
+      observation,
+      (value) => callController(home, "runtime.process-exit-observe", value).then(() => undefined)
+    );
+  } catch (error) {
+    // The durable outbox is the acknowledgement during a planned Controller
+    // gap. The replacement Controller drains it before accepting new work.
+    if (isForeignHandoverLockHeld(home)) return;
+    throw error;
   }
-  chmodSync(path, 0o600);
-  await callController(home, "runtime.process-exit-observe", observation);
-  rmSync(path, { force: true });
 }
 
 async function replayExitOutbox(home: string): Promise<void> {
-  const directory = resolve(join(home, "runtime", "agent-host-outbox"));
-  let entries: string[];
-  try {
-    entries = await readdir(directory);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
-  }
-  for (const name of entries.filter((value) => value.includes(".jsonl")).sort()) {
-    const path = join(directory, name);
-    const claimed = `${path}.claim-${process.pid}-${randomUUID()}`;
-    try {
-      await rename(path, claimed);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
-    }
-    const lines = (await readFile(claimed, "utf8")).split("\n").filter(Boolean);
-    for (const line of lines) {
-      const observation = validateRuntimeProcessExitObservation(
-        JSON.parse(line) as RuntimeProcessExitObservation
-      );
-      await callController(home, "runtime.process-exit-observe", observation);
-    }
-    await unlink(claimed);
-  }
+  await replayRuntimeProcessExitOutbox(
+    home,
+    (observation) => callController(
+      home,
+      "runtime.process-exit-observe",
+      observation
+    ).then(() => undefined)
+  );
 }
 
 /** Internal socket boundary exported for transport-level verification. */
@@ -1179,7 +1165,7 @@ async function callControllerIdempotently(
   request: Readonly<Record<string, string | number>>
 ): Promise<void> {
   try {
-    await callController(home, method, request);
+    await callAgentController(home, method, request);
   } catch (error) {
     if (!(error instanceof ControllerClientError)
       || (error.code !== "INTERNAL_ERROR" && !controllerCallMayHaveApplied(error))) {
@@ -1189,7 +1175,7 @@ async function callControllerIdempotently(
     // These methods carry exact attempt, launch, and authority fences. A
     // bounded replay confirms a commit whose acknowledgement may have been lost.
     try {
-      await callController(home, method, request);
+      await callAgentController(home, method, request);
     } catch (replayError) {
       if (firstCallMayHaveApplied || controllerCallMayHaveApplied(replayError)) {
         throw new ControllerAcknowledgementUnknownError(
@@ -1259,6 +1245,34 @@ async function resolveProviderTurnSubmission(
       attemptId
     );
   }
+}
+
+/**
+ * Existing in-flight launches keep using the old Controller while it drains.
+ * If the socket is already gone under an explicit handover fence, wait for
+ * the replacement and retry the domain-idempotent Agent Host operation.
+ */
+async function callAgentController(
+  home: string,
+  method: string,
+  params: Readonly<Record<string, string | number>>
+): Promise<void> {
+  try {
+    await callController(home, method, params);
+    return;
+  } catch (error) {
+    if (!isControllerUnavailable(error) || !isForeignHandoverLockHeld(home)) {
+      throw error;
+    }
+  }
+  await callFileTaskController(home, method, params);
+}
+
+function isControllerUnavailable(error: unknown): boolean {
+  return error instanceof ControllerClientError
+    && (error.code === "CONTROLLER_NOT_RUNNING"
+      || error.code === "CONTROLLER_UNAVAILABLE"
+      || error.code === "CONTROLLER_DRAINING");
 }
 
 function requiredEnvironment(value: string | undefined, label: string): string {

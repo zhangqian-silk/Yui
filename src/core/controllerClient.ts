@@ -308,6 +308,7 @@ function exchange(
     const socket = createConnection(socketPath);
     let buffer = Buffer.alloc(0);
     let settled = false;
+    let deliveryStarted = false;
     const timer = setTimeout(() => {
       fail(new ControllerClientError(
         "CONTROLLER_TIMEOUT",
@@ -330,7 +331,13 @@ function exchange(
       reject(error);
     };
 
-    socket.on("connect", () => socket.write(requestLine));
+    socket.on("connect", () => {
+      // Once write begins, a missing response cannot prove that the Controller
+      // did not commit the request. Callers must use their domain identity to
+      // decide whether an explicit retry is safe.
+      deliveryStarted = true;
+      socket.write(requestLine);
+    });
     socket.on("data", (chunk: Buffer) => {
       if (settled) return;
       buffer = Buffer.concat([buffer, chunk]);
@@ -358,10 +365,15 @@ function exchange(
       if (!settled) fail(invalidResponse());
     });
     socket.on("error", () => {
-      fail(new ControllerClientError(
-        "CONTROLLER_UNAVAILABLE",
-        "Controller is unavailable."
-      ));
+      fail(deliveryStarted
+        ? new ControllerClientError(
+          "CONTROLLER_DELIVERY_UNKNOWN",
+          "Controller request delivery is unknown."
+        )
+        : new ControllerClientError(
+          "CONTROLLER_UNAVAILABLE",
+          "Controller is unavailable."
+        ));
     });
   });
 }

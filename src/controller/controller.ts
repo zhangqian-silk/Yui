@@ -2354,7 +2354,7 @@ export async function startFileTaskController(
     dispatcherServiceTime.started();
     try {
       if (stopping) {
-        throw controllerApplicationError("METHOD_NOT_FOUND", "Controller is stopping.");
+        throw controllerApplicationError("CONTROLLER_DRAINING", "Controller is draining.");
       }
       if (method === "scheduler.signal") {
         runtime.signal(signalMailboxKey(params));
@@ -2625,7 +2625,7 @@ function isStartedRuntimeSessionResult(value: JsonValue): boolean {
 }
 
 function controllerApplicationError(
-  code: "INVALID_PARAMS" | "METHOD_NOT_FOUND" | "NOT_FOUND",
+  code: "INVALID_PARAMS" | "METHOD_NOT_FOUND" | "NOT_FOUND" | "CONTROLLER_DRAINING",
   message: string
 ): Error {
   const error = Object.assign(new Error(message), { code });

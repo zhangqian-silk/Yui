@@ -124,6 +124,7 @@ import {
   classifyRuntimeProcessExit,
   validateRuntimeProcessExitObservation
 } from "../runtime/processExitObservation.js";
+import { replayRuntimeProcessExitOutbox } from "../runtime/processExitOutbox.js";
 import { appendGlobalProcessExitObservation } from "../runtime/globalProcessExitStore.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import {
@@ -574,6 +575,12 @@ export async function startFileTaskControllerRuntime(
     launchCoordinator,
     planner
   );
+  // Process-exit observations are persisted by the Agent Host before socket
+  // delivery. Drain them while this Controller is still the only storage
+  // writer and before it begins accepting new work after a handover.
+  await replayRuntimeProcessExitOutbox(home, async (observation) => {
+    await lifecycleDispatcher("runtime.process-exit-observe", observation);
+  });
   // f7/rr5: This same inbox feeds the supervisor's terminal channel and the
   // runtime event processor. When a Job reaches a terminal state, the
   // supervisor enqueues a durable-job-terminal event; the processor drains it
