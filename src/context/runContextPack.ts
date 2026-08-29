@@ -1,4 +1,8 @@
 import type { AgentRun } from "../run/agentRun.js";
+import {
+  rejectedYieldAttemptFromTaskEvent,
+  RUN_YIELD_REJECTED_EVENT
+} from "../run/rejectedYieldAttempt.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
@@ -560,6 +564,21 @@ function collectAuthorizedContext(
     }
     for (const event of publishedTreeAuthorizations.reverse().slice(-16)) {
       result.push(materialize("L4", "task-event", event.id, event));
+    }
+    for (const event of events.filter(({ type }) => (
+      type === RUN_YIELD_REJECTED_EVENT
+    )).slice(-16)) {
+      result.push(materialize("L4", "task-event", event.id, event));
+      const attempt = rejectedYieldAttemptFromTaskEvent(event);
+      if (attempt === null) continue;
+      const rejectedRun = store.getAgentRun(task.id, attempt.runId);
+      if (rejectedRun !== null) {
+        result.push(materialize("L4", "agent-run", rejectedRun.id, rejectedRun));
+      }
+      const rejectedRound = store.getReviewRound(task.id, attempt.reviewRoundId);
+      if (rejectedRound !== null) {
+        result.push(materialize("L3", "review-round", rejectedRound.id, rejectedRound));
+      }
     }
     for (const request of store.listOpenInputRequests([task.id])) {
       result.push(materialize("L4", "input-request", request.id, request));

@@ -31,6 +31,7 @@ import {
   RUN_PROGRESS_EVENT,
   RUN_RECOVERED_EVENT
 } from "../scheduler/roleRunStall.js";
+import { routeRoleEvent } from "../scheduler/operatorEvent.js";
 import { readCommandText } from "./textInput.js";
 import {
   assertTaskCompletionPublishedTreeProof,
@@ -107,6 +108,13 @@ import {
   type RunRecoveryProjection
 } from "../run/recoveryProjection.js";
 import { matchYieldReceipt } from "../run/yieldReceipt.js";
+import {
+  createRejectedYieldAttempt,
+  rejectedYieldAttemptEventPayload,
+  rejectedYieldAttemptFromTaskEvent,
+  RUN_YIELD_REJECTED_EVENT,
+  type RejectedYieldAttempt
+} from "../run/rejectedYieldAttempt.js";
 import {
   createReviewRound,
   createTaskReviewRound,
@@ -7102,14 +7110,31 @@ function showRun(
     const retirement = tx.listEvents(run.taskId)
       .map(taskRecordRetirement)
       .find((entry) => entry?.recordKind === "agent-run" && entry.recordId === run.id) ?? null;
-    return { run, recovery: projectRunRecovery(facts), retirement };
+    const allRejectedYieldAttempts = tx.listEvents(run.taskId)
+      .map(rejectedYieldAttemptFromTaskEvent)
+      .filter((attempt): attempt is RejectedYieldAttempt => (
+        attempt !== null && attempt.runId === run.id
+      ));
+    return {
+      run,
+      recovery: projectRunRecovery(facts),
+      retirement,
+      rejectedYieldAttemptCount: allRejectedYieldAttempts.length,
+      rejectedYieldAttempts: allRejectedYieldAttempts.slice(-16)
+    };
   });
   if (asJson) {
     return { kind: "output" as const, output: `${JSON.stringify(data, null, 2)}\n`, data };
   }
   return {
     kind: "output" as const,
-    output: renderRunShow(data.run, data.recovery, data.retirement),
+    output: renderRunShow(
+      data.run,
+      data.recovery,
+      data.retirement,
+      data.rejectedYieldAttemptCount,
+      data.rejectedYieldAttempts
+    ),
     data
   };
 }
@@ -7117,7 +7142,9 @@ function showRun(
 function renderRunShow(
   run: AgentRun,
   recovery: RunRecoveryProjection,
-  retirement: ReturnType<typeof taskRecordRetirement>
+  retirement: ReturnType<typeof taskRecordRetirement>,
+  rejectedYieldAttemptCount: number,
+  rejectedYieldAttempts: readonly RejectedYieldAttempt[]
 ): string {
   const lines = [
     `Run: ${run.id}`,
@@ -7138,7 +7165,19 @@ function renderRunShow(
       : [`Provider accepted (durable): ${run.deliveredAt}`]),
     ...(run.summary === undefined || run.summary.trim().length === 0
       ? []
-      : [`Summary: ${run.summary}`])
+      : [`Summary: ${run.summary}`]),
+    ...(rejectedYieldAttemptCount === 0
+      ? []
+      : [
+          `Rejected yield attempts: ${rejectedYieldAttempts.length} shown of ${rejectedYieldAttemptCount} (unaccepted diagnostic evidence only)`,
+          ...rejectedYieldAttempts.slice(-5).flatMap((attempt) => [
+            `  ${attempt.attemptedAt}: ${attempt.rejectionReason} (${attempt.attemptDigest.slice(0, 16)})`,
+            `    Reviewer output: ${truncateRunShowText(attempt.summary)}`,
+            `    Checks: ${attempt.checks.length === 0
+              ? "none"
+              : attempt.checks.map(({ name, outcome }) => `${name}:${outcome}`).join(", ")}`
+          ])
+        ])
   ];
   if (recovery.canonicalProgressAt !== null) {
     lines.push(
@@ -7177,6 +7216,11 @@ function renderRunShow(
     lines.push(`Not recoverable: ${recovery.reason ?? "unknown"}`);
   }
   return `${lines.join("\n")}\n`;
+}
+
+function truncateRunShowText(value: string): string {
+  const normalized = value.replaceAll(/\s+/gu, " ").trim();
+  return normalized.length <= 400 ? normalized : `${normalized.slice(0, 399)}…`;
 }
 
 /**
@@ -7291,6 +7335,100 @@ function yieldRunStatus(
   );
 }
 
+function recordRejectedReviewYield(
+  store: TaskWorkflowStore,
+  input: Readonly<{
+    run: AgentRun;
+    activeRun: AgentRun | null;
+    rejectionReason: string;
+    outcome: ReturnType<typeof buildYieldOutcome>;
+    nativeSessionId?: string;
+    launchId?: string;
+    now: Date;
+  }>
+): Readonly<{
+  attempt: RejectedYieldAttempt;
+  event: TaskEvent;
+  created: boolean;
+}> {
+  if (input.run.purpose !== "review" || input.run.reviewRoundId === undefined) {
+    throw new Error(`Only a Review Run can record rejected yield evidence: ${input.run.id}.`);
+  }
+  const receiptId = agentRunDeliveryReceiptId(input.run);
+  const sessions = store.getTaskRoleSessionSet(input.run.taskId, input.run.roleName);
+  const durableSession = sessions?.sessions[input.run.effective.agentId];
+  const attempt = createRejectedYieldAttempt({
+    taskId: input.run.taskId,
+    runId: input.run.id,
+    roleName: input.run.roleName,
+    reviewRoundId: input.run.reviewRoundId,
+    receiptId,
+    rejectionReason: input.rejectionReason,
+    summary: input.outcome.summary,
+    ...(input.outcome.reviewResult === undefined
+      ? {}
+      : { reviewResult: input.outcome.reviewResult }),
+    ...(input.nativeSessionId === undefined
+      ? {}
+      : { nativeSessionId: input.nativeSessionId }),
+    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+    ...(durableSession?.nativeSessionId === undefined
+      ? {}
+      : { durableNativeSessionId: durableSession.nativeSessionId }),
+    ...(durableSession?.launchId === undefined
+      ? {}
+      : { durableLaunchId: durableSession.launchId }),
+    ...(sessions?.inFlight?.runId === undefined
+      ? {}
+      : { inFlightRunId: sessions.inFlight.runId }),
+    ...(sessions?.inFlight?.receiptId === undefined
+      ? {}
+      : { inFlightReceiptId: sessions.inFlight.receiptId }),
+    ...(input.run.assignment.contextSnapshotRef === undefined
+      ? {}
+      : { contextSnapshot: input.run.assignment.contextSnapshotRef }),
+    activeRun: input.activeRun === null
+      ? null
+      : {
+          id: input.activeRun.id,
+          receiptId: agentRunDeliveryReceiptId(input.activeRun),
+          ...(input.activeRun.assignment.contextSnapshotRef === undefined
+            ? {}
+            : { contextSnapshot: input.activeRun.assignment.contextSnapshotRef })
+        },
+    attemptedAt: input.now
+  });
+  const existing = store.listEvents(input.run.taskId).find((event) => (
+    event.type === RUN_YIELD_REJECTED_EVENT
+    && event.payload.runId === input.run.id
+    && event.payload.receiptId === receiptId
+    && event.payload.attemptDigest === attempt.attemptDigest
+  ));
+  if (existing !== undefined) {
+    const persisted = rejectedYieldAttemptFromTaskEvent(existing);
+    if (persisted === null) {
+      throw new Error(`Rejected yield attempt is malformed: ${existing.id}.`);
+    }
+    return { attempt: persisted, event: existing, created: false };
+  }
+  const event = createTaskEvent(
+    store.nextEventId(input.run.taskId),
+    input.run.taskId,
+    RUN_YIELD_REJECTED_EVENT,
+    rejectedYieldAttemptEventPayload(attempt),
+    input.now
+  );
+  store.saveEvent(input.run.taskId, event);
+  routeRoleEvent(
+    store,
+    event,
+    input.run.roleName,
+    "run-yield-rejected",
+    input.now
+  );
+  return { attempt, event, created: true };
+}
+
 function yieldRun(
   args: string[],
   store: TaskWorkflowStore,
@@ -7331,7 +7469,6 @@ function yieldRun(
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "yielding a run"));
     const role = requireRole(tx, task.id, active.roleName);
     const pointer = activeRunPointer(tx, active);
-    if (pointer?.id !== active.id) throw usageError(`Run is not active for ${task.id}/${role.name}: ${active.id}.`);
     const taskFinalContract = active.purpose === "execution"
       && active.workItemId !== undefined
       ? taskFinalReviewContractForMutation(tx, task.id, options)
@@ -7387,6 +7524,27 @@ function yieldRun(
         : { reviewResult: yieldOutcome.reviewResult })
     }, now);
     if (terminalization.disposition !== "applied" || terminalization.run === null) {
+      if (active.purpose === "review" && active.reviewRoundId !== undefined) {
+        const rejected = recordRejectedReviewYield(tx, {
+          run: active,
+          activeRun: pointer,
+          rejectionReason: terminalization.reason ?? "obsolete",
+          outcome: yieldOutcome,
+          ...(options.environment?.YUI_NATIVE_SESSION_ID === undefined
+            ? {}
+            : { nativeSessionId: options.environment.YUI_NATIVE_SESSION_ID }),
+          ...(options.environment?.YUI_LAUNCH_ID === undefined
+            ? {}
+            : { launchId: options.environment.YUI_LAUNCH_ID }),
+          now
+        });
+        return {
+          kind: "rejected" as const,
+          run: active,
+          rejected,
+          notifyLeader: rejected.created
+        };
+      }
       throw usageError(
         `Run ${active.id} no longer matches its exact execution fence: `
         + `${terminalization.reason ?? "obsolete"}.`
@@ -7578,6 +7736,7 @@ function yieldRun(
       if (receipt !== null) {
         tx.saveAgentRun(receipt);
         return {
+          kind: "yielded" as const,
           run: receipt,
           reviewDispatch,
           notifyLeader: leaderHandoff !== null
@@ -7585,11 +7744,23 @@ function yieldRun(
       }
     }
     return {
+      kind: "yielded" as const,
       run: terminal,
       reviewDispatch,
       notifyLeader: leaderHandoff !== null
     };
   });
+  if (yielded.kind === "rejected") {
+    if (yielded.notifyLeader) {
+      notifyMailbox(options.runtime, leaderMailbox(yielded.run.taskId), yielded.run.taskId);
+    }
+    throw usageError(
+      `Run ${yielded.run.id} no longer matches its exact execution fence: `
+      + `${yielded.rejected.attempt.rejectionReason}. `
+      + `Rejected Reviewer output was recorded as ${yielded.rejected.event.id} `
+      + "(unaccepted diagnostic evidence only)."
+    );
+  }
   if (yielded.notifyLeader) {
     notifyMailbox(options.runtime, leaderMailbox(yielded.run.taskId), yielded.run.taskId);
   }
