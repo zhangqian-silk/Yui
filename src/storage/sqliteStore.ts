@@ -761,6 +761,33 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
+  /** Restore one validated historical grant into a disposable migration output. */
+  migrationRestoreCapabilityGrant(taskId: string, grant: CapabilityGrant): void {
+    if (!this.#migration) {
+      throw new StorageRecordError(
+        "Historical capability grants may only be restored into a migration sidecar."
+      );
+    }
+    const stored = storedCapabilityGrant(grant);
+    if (stored.taskId !== taskId) {
+      throw new StorageRecordError(`Capability grant belongs to another Task: ${stored.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const existing = this.#getPayload<CapabilityGrant>(
+        "capability_grants", "task_id = ? AND grant_id = ?", [taskId, stored.id]
+      );
+      if (existing !== null) {
+        throw new StorageRecordError(
+          `Migration cannot overwrite capability grant: ${taskId}/${stored.id}`
+        );
+      }
+      this.#db.prepare(
+        "INSERT INTO capability_grants (task_id, grant_id, payload, updated_at) VALUES (?, ?, ?, ?)"
+      ).run(taskId, stored.id, this.#json(stored), this.#now());
+    });
+  }
+
   // -- generic payload helpers ------------------------------------------------
 
   #getPayload<T>(table: string, where: string, params: readonly unknown[]): T | null {

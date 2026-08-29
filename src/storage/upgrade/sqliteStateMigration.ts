@@ -532,7 +532,7 @@ export function populateSqliteFromState(
         }
         // Capability grants and release workflows (task-15 record families).
         for (const grant of Object.values(stored.capabilityGrants)) {
-          store.saveCapabilityGrant(taskId, grant as unknown as CapabilityGrant);
+          store.migrationRestoreCapabilityGrant(taskId, grant as unknown as CapabilityGrant);
         }
         for (const workflow of Object.values(stored.releaseWorkflows)) {
           store.saveReleaseWorkflow(taskId, workflow as unknown as ReleaseWorkflow);
