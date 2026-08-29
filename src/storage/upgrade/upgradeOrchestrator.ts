@@ -914,7 +914,7 @@ async function executeSqliteInPlaceUpgrade(
           } finally {
             db.close();
           }
-        });
+        }, options.externalUpgradeFenceOwnerPid ?? callerPid);
       } catch (error) {
         unexpected = error;
       }
@@ -1921,7 +1921,7 @@ function executeFenced(
           ? {}
           : { backupPath: report.switch.backupPath })
       };
-    });
+    }, options.externalUpgradeFenceOwnerPid ?? callerPid);
   } catch (error) {
     if (!(error instanceof UpgradeFenceError)) throw error;
     return withClassification(

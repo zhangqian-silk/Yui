@@ -36,6 +36,7 @@ import {
 import { createProductionStorageRegistry } from "../../dist/storage/migration/productionRegistry.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { placeUpgradeFence } from "../../dist/storage/upgradeFence.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { runStorageUpgrade } from "../../dist/storage/upgrade/upgradeOrchestrator.js";
 import { populateSqliteFromState } from "../../dist/storage/upgrade/sqliteStateMigration.js";
@@ -86,14 +87,20 @@ test("the SQLite Task path persists across one in-place schema upgrade", async (
   `);
   db.close();
 
+  const releaseFence = placeUpgradeFence(home, {
+    ownerPid: process.ppid,
+    reason: "parent update storage activation",
+    createdAt: now.toISOString()
+  });
   const upgraded = await runStorageUpgrade({
     home,
     mode: "execute",
     controllerLifecycle: "externally-quiesced",
+    externalUpgradeFenceOwnerPid: process.ppid,
     registry: createProductionStorageRegistry(),
     latest: latestStorageVersionState(),
     inspectOfflineInventory: async () => ({ total: 0, blockers: [] })
-  });
+  }).finally(releaseFence);
   assert.equal(upgraded.outcome, "upgraded", JSON.stringify(upgraded));
   assert.equal(upgraded.migrationMode, "in-place");
   assert.equal(upgraded.backupPath, undefined);
