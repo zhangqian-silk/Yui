@@ -470,15 +470,33 @@ export async function main(): Promise<void> {
   if (args[0] === "upgrade") {
     // Mirror doctor/controller: needs a Home but self-manages the schema check,
     // because upgrade must run against a non-current Home.
-    const ownsHandover = args.length === 1
-      && process.env.YUI_UPDATE_EXTERNALLY_QUIESCED !== "1";
+    const externallyQuiesced = process.env.YUI_UPDATE_EXTERNALLY_QUIESCED === "1";
+    const ownsHandover = args.length === 1 && !externallyQuiesced;
+    const externalFenceOwner = externallyQuiesced
+      ? process.env.YUI_UPDATE_HANDOVER_OWNER_PID
+      : undefined;
+    const externalUpgradeFenceOwnerPid = externalFenceOwner === undefined
+      ? undefined
+      : Number(externalFenceOwner);
+    if (
+      externalUpgradeFenceOwnerPid !== undefined
+      && (!Number.isSafeInteger(externalUpgradeFenceOwnerPid)
+        || externalUpgradeFenceOwnerPid < 1)
+    ) {
+      throw runtimeError("Update storage-fence owner PID is invalid.");
+    }
     const handover = ownsHandover ? acquireHandoverLock(home) : undefined;
     try {
       const result = await runUpgradeCommand(
         args.slice(1),
         home,
-        process.env.YUI_UPDATE_EXTERNALLY_QUIESCED === "1"
-          ? { controllerLifecycle: "externally-quiesced" }
+        externallyQuiesced
+          ? {
+              controllerLifecycle: "externally-quiesced",
+              ...(externalUpgradeFenceOwnerPid === undefined
+                ? {}
+                : { externalUpgradeFenceOwnerPid })
+            }
           : {}
       );
       // Public execute upgrades leave the Home operational even when no

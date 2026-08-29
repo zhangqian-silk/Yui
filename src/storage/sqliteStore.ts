@@ -143,6 +143,7 @@ import {
   type GateArtifactPruneResult
 } from "../verification/gateArtifact.js";
 import {
+  inspectSqliteSchemaMigrations,
   migrateSqliteSchema,
   SqliteSchemaMigrationError,
   SQLITE_AGGREGATE_VERSION,
@@ -282,6 +283,7 @@ export class SqliteTaskStore implements TaskStore {
   readonly #db: Database.Database;
   readonly #rootDir: string;
   readonly #migration: boolean;
+  readonly #openedSchemaHead: Readonly<{ version: number; checksum: string }>;
   #inTransaction = false;
   #dirty = false;
 
@@ -309,6 +311,11 @@ export class SqliteTaskStore implements TaskStore {
       migrateSqliteSchema(this.#db, {
         mode: this.#migration || !databaseExisted ? "apply" : "validate"
       });
+      const schema = inspectSqliteSchemaMigrations(this.#db);
+      this.#openedSchemaHead = {
+        version: schema.currentVersion,
+        checksum: schema.currentChecksum
+      };
       this.#seedHomeMeta();
       this.#seedConfig();
     } catch (error) {
@@ -375,6 +382,20 @@ export class SqliteTaskStore implements TaskStore {
     // per-write admission check. Production stores never set migration mode.
     if (this.#migration) return;
     assertHomeWritable(this.#rootDir);
+    const current = this.#db.prepare(
+      "SELECT version, checksum FROM schema_migrations ORDER BY version DESC LIMIT 1"
+    ).get() as { version?: unknown; checksum?: unknown } | undefined;
+    if (
+      current?.version !== this.#openedSchemaHead.version
+      || current.checksum !== this.#openedSchemaHead.checksum
+    ) {
+      throw new SqliteSchemaMigrationError(
+        `open Store schema head ${this.#openedSchemaHead.version}/${this.#openedSchemaHead.checksum} `
+          + `changed to ${String(current?.version)}/${String(current?.checksum)}; `
+          + "reopen the Store with the active Yui version before writing",
+        "admission"
+      );
+    }
   }
 
   #bumpRevision(): void {
@@ -425,9 +446,12 @@ export class SqliteTaskStore implements TaskStore {
     if (this.#inTransaction) return run(this);
     this.#begin();
     try {
+      // Pin the Store's validated schema generation before user code runs.
+      // This prevents a long-lived pre-upgrade Store from executing old SQL
+      // after an in-place migration has committed.
+      this.#prepareWrite();
       const result = run(this);
       if (this.#dirty) {
-        this.#prepareWrite();
         if (options?.requestId !== undefined) {
           this.#insertOutbox(options.requestId, options.outboxCommand ?? null);
         }

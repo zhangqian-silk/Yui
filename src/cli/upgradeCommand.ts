@@ -42,6 +42,7 @@ export async function runUpgradeCommand(
   options: Readonly<{
     now?: () => Date;
     controllerLifecycle?: "owned" | "externally-quiesced";
+    externalUpgradeFenceOwnerPid?: number;
   }> = {}
 ): Promise<UpgradeCommandResult> {
   const mode = parseUpgradeArgs(args);
@@ -53,6 +54,9 @@ export async function runUpgradeCommand(
     ...(options.controllerLifecycle === undefined
       ? {}
       : { controllerLifecycle: options.controllerLifecycle }),
+    ...(options.externalUpgradeFenceOwnerPid === undefined
+      ? {}
+      : { externalUpgradeFenceOwnerPid: options.externalUpgradeFenceOwnerPid }),
     ...(options.now === undefined ? {} : { now: options.now })
   });
   return {
@@ -98,7 +102,8 @@ export function renderUpgradeResult(
         + "no staged-output loader validation was performed, and storage was not switched.";
     }
     case "dry-run": {
-      const steps = result.report.outcome === "dry-run" ? result.report.steps.length : 0;
+      const steps = result.classification.sqliteMigration?.pendingVersions.length
+        ?? (result.report.outcome === "dry-run" ? result.report.steps.length : 0);
       return `${header}\nDry run: validated ${steps} migration step(s) through the loader gate. `
         + "Staged output discarded; storage was not switched.";
     }

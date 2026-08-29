@@ -35,7 +35,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import Database from "better-sqlite3";
@@ -191,6 +192,12 @@ export type RunStorageUpgradeOptions<Snapshot> = Readonly<{
    * is performed from the temporary installation.
    */
   controllerLifecycle?: "owned" | "externally-quiesced";
+  /**
+   * Exact PID of a parent update process that already owns the write-admission
+   * fence across storage migration, binary activation, and health verification.
+   * When absent, this orchestrator owns and releases its local fence.
+   */
+  externalUpgradeFenceOwnerPid?: number;
   now?: () => Date;
   callerPid?: number;
   /** Overrides for the Controller stop/drain client (tests inject fakes). */
@@ -645,13 +652,104 @@ async function runSqliteInPlaceUpgrade(
     };
   }
   if (options.mode === "dry-run") {
+    return validateSqliteInPlaceDryRun(options, classification, now);
+  }
+  return executeSqliteInPlaceUpgrade(options, classification, now, callerPid);
+}
+
+/**
+ * Exercise every pending SQLite migration against a consistent disposable
+ * snapshot, then open that snapshot through the current production loader.
+ * The authoritative database is opened read-only and is never migrated.
+ */
+async function validateSqliteInPlaceDryRun(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  classification: HomeClassification,
+  now: () => Date
+): Promise<UpgradeResult> {
+  const migration = classification.sqliteMigration!;
+  const stagingRoot = mkdtempSync(join(tmpdir(), "yui-sqlite-upgrade-dry-run-"));
+  const stagedDatabasePath = join(stagingRoot, COMMITTED_DATABASE_FILENAME);
+  let source: Database.Database | undefined;
+  let staged: Database.Database | undefined;
+  let loader: SqliteTaskStore | undefined;
+  try {
+    source = new Database(join(options.home, COMMITTED_DATABASE_FILENAME), {
+      readonly: true,
+      fileMustExist: true
+    });
+    source.pragma("busy_timeout = 5000");
+    await source.backup(stagedDatabasePath);
+    source.close();
+    source = undefined;
+
+    staged = new Database(stagedDatabasePath);
+    staged.pragma("journal_mode = WAL");
+    staged.pragma("synchronous = FULL");
+    staged.pragma("foreign_keys = ON");
+    const applied = migrateSqliteSchema(staged, { mode: "apply" }).applied;
+    if (applied.join(",") !== migration.pendingVersions.join(",")) {
+      throw new Error(
+        `staged SQLite migration applied versions ${applied.join(",") || "none"}; `
+          + `expected ${migration.pendingVersions.join(",")}`
+      );
+    }
+    staged.close();
+    staged = undefined;
+
+    loader = new SqliteTaskStore(stagingRoot);
+    const quickCheck = loader.databaseHandle().pragma("quick_check", { simple: true });
+    if (quickCheck !== "ok") {
+      throw new Error(`staged SQLite quick_check returned ${String(quickCheck)}`);
+    }
+    loader.close();
+    loader = undefined;
     return {
       outcome: "dry-run",
       classification,
       report: sqliteInPlaceReport(options.latest, migration, "dry-run", now)
     };
+  } catch (error) {
+    return withClassification(
+      {
+        outcome: "blocked",
+        stage: "validate",
+        message: `SQLite dry-run validation failed: ${messageOf(error)}`,
+        action:
+          "The authoritative database was not changed. Resolve the reported migration or loader failure, then retry the dry run."
+      },
+      classification
+    );
+  } finally {
+    try { loader?.close(); } catch { /* best-effort disposable cleanup */ }
+    try { staged?.close(); } catch { /* best-effort disposable cleanup */ }
+    try { source?.close(); } catch { /* best-effort disposable cleanup */ }
+    rmSync(stagingRoot, { recursive: true, force: true });
   }
-  return executeSqliteInPlaceUpgrade(options, classification, now, callerPid);
+}
+
+/** Acquire a local write fence or prove the exact parent-owned fence exists. */
+function acquireUpgradeAdmission(
+  options: RunStorageUpgradeOptions<HomeSnapshot>,
+  reason: string,
+  now: () => Date,
+  callerPid: number
+): () => void {
+  const externalOwnerPid = options.externalUpgradeFenceOwnerPid;
+  if (externalOwnerPid !== undefined) {
+    const fence = readUpgradeFence(options.home);
+    if (!isPositivePid(externalOwnerPid) || fence?.ownerPid !== externalOwnerPid) {
+      throw new UpgradeFenceError(
+        `expected parent-owned upgrade fence for PID ${String(externalOwnerPid)}`
+      );
+    }
+    return () => {};
+  }
+  return placeUpgradeFence(options.home, {
+    reason,
+    createdAt: now().toISOString(),
+    ownerPid: callerPid
+  });
 }
 
 async function executeSqliteInPlaceUpgrade(
@@ -664,11 +762,12 @@ async function executeSqliteInPlaceUpgrade(
   const migration = classification.sqliteMigration!;
   let releaseFence: (() => void) | undefined;
   try {
-    releaseFence = placeUpgradeFence(home, {
-      reason: "SQLite schema migration in progress",
-      createdAt: now().toISOString(),
-      ownerPid: callerPid
-    });
+    releaseFence = acquireUpgradeAdmission(
+      options,
+      "SQLite schema migration in progress",
+      now,
+      callerPid
+    );
   } catch (error) {
     if (!(error instanceof UpgradeFenceError)) throw error;
     return withClassification(
@@ -899,7 +998,11 @@ function sqliteInPlaceReport(
       effects: [],
       derived: { rebuiltEffects: [] },
       validation: {
-        checks: [{ name: "SQLite migration ledger", outcome: "passed", detail }]
+        checks: [{
+          name: "SQLite staged migration and loader gate",
+          outcome: "passed",
+          detail: `${detail}; snapshot migrated and reopened by the current SQLite loader`
+        }]
       }
     };
   }
@@ -967,11 +1070,12 @@ async function execute(
   // the other upgrader's fence.
   let releaseFence: (() => void) | undefined;
   try {
-    releaseFence = placeUpgradeFence(home, {
-      reason: "storage upgrade in progress",
-      createdAt: now().toISOString(),
-      ownerPid: callerPid
-    });
+    releaseFence = acquireUpgradeAdmission(
+      options,
+      "storage upgrade in progress",
+      now,
+      callerPid
+    );
   } catch (error) {
     if (!(error instanceof UpgradeFenceError)) throw error;
     return withClassification(
@@ -1269,11 +1373,12 @@ async function executePseudoLayout7Repair(
 
   let releaseFence: (() => void) | undefined;
   try {
-    releaseFence = placeUpgradeFence(home, {
-      reason: "storage repair in progress",
-      createdAt: now().toISOString(),
-      ownerPid: callerPid
-    });
+    releaseFence = acquireUpgradeAdmission(
+      options,
+      "storage repair in progress",
+      now,
+      callerPid
+    );
   } catch (error) {
     if (!(error instanceof UpgradeFenceError)) throw error;
     return withClassification(

@@ -43,6 +43,7 @@ import { isConcreteVersion } from "../domain/validation.js";
 import { STORAGE_DOCTOR_CHECK_NAMES } from "../doctor/doctor.js";
 import { acquireHandoverLock } from "../release/runtimeRelease.js";
 import { inspectStorageSchema } from "../storage/storageSchema.js";
+import { placeUpgradeFence } from "../storage/upgradeFence.js";
 import { correlateUpgradeReceipt } from "../storage/upgrade/upgradeOrchestrator.js";
 import { readSwitchProgress } from "../storage/upgrade/switchProgress.js";
 import type {
@@ -119,12 +120,28 @@ export function createUpdatePorts(
   // deliberately not persisted as a retry or recovery protocol.
   let verifiedActivatedBinary: string | undefined;
   let verifiedActivatedVersion: string | undefined;
+  let storageFenceOwnerPid: number | undefined;
   const stopReplacementController = (home: string, pid: number): UpdateControllerStopResult => (
     stopReplacementControllerForUpdate(home, pid, environment, run)
   );
   return {
     beginControllerHandover(home: string): () => void {
       return acquireHandoverLock(home).release;
+    },
+    beginStorageWriteFence(home: string): () => void {
+      const release = placeUpgradeFence(home, {
+        reason: "update storage activation in progress",
+        createdAt: new Date().toISOString(),
+        ownerPid: process.pid
+      });
+      storageFenceOwnerPid = process.pid;
+      let released = false;
+      return () => {
+        if (released) return;
+        release();
+        released = true;
+        if (storageFenceOwnerPid === process.pid) storageFenceOwnerPid = undefined;
+      };
     },
     stage(version?: string): StagedPackage {
       // A caller that names a version (the release workflow, which freezes the
@@ -199,7 +216,10 @@ export function createUpdatePorts(
           env: {
             ...environment,
             YUI_HOME: home,
-            YUI_UPDATE_EXTERNALLY_QUIESCED: "1"
+            YUI_UPDATE_EXTERNALLY_QUIESCED: "1",
+            ...(storageFenceOwnerPid === undefined
+              ? {}
+              : { YUI_UPDATE_HANDOVER_OWNER_PID: String(storageFenceOwnerPid) })
           },
           shell: false
         }

@@ -214,6 +214,13 @@ export type UpdatePorts = Readonly<{
    */
   beginControllerHandover?: (home: string) => () => void;
   /**
+   * Fence direct storage writers only for a migration path. The returned
+   * release is held across storage activation, binary activation, and loader
+   * verification, then released immediately before the replacement Controller
+   * starts accepting writes.
+   */
+  beginStorageWriteFence?: (home: string) => () => void;
+  /**
    * Optional Controller lifecycle owner for the parent update orchestration.
    * When any lifecycle seam is supplied, all four seams are required so a
    * failed pre-switch update never falls back to a staged/new Controller.
@@ -405,9 +412,46 @@ function runStagedUpdate(
       version: staged.version
     };
   }
+  let releaseStorageWriteFence: (() => void) | undefined;
+  const migrationPath = preflight.status === "in-place-migration"
+    || preflight.status === "migration-required"
+    || preflight.status === "migratable";
+  if (migrationPath && ports.beginControllerHandover !== undefined) {
+    if (ports.beginStorageWriteFence === undefined) {
+      releaseHandover?.();
+      return {
+        outcome: "aborted",
+        phase: "coordination",
+        message: "The update lifecycle does not provide a storage write-admission fence.",
+        action:
+          "Use an updater that holds write admission through storage migration, binary activation, and loader verification; no Controller, binary, or storage change was made.",
+        recoverable: true,
+        version: staged.version
+      };
+    }
+    try {
+      releaseStorageWriteFence = ports.beginStorageWriteFence(home);
+    } catch (error) {
+      releaseHandover?.();
+      return {
+        outcome: "aborted",
+        phase: "coordination",
+        message: `Storage write admission could not be acquired: ${messageOf(error)}`,
+        action:
+          "Another maintenance operation owns this Home. Wait for it to finish, then retry; no Controller, binary, or storage change was made.",
+        recoverable: true,
+        version: staged.version
+      };
+    }
+  }
+  const resumeWrites = (): void => {
+    releaseStorageWriteFence?.();
+    releaseStorageWriteFence = undefined;
+  };
   try {
-    return runPreflightedUpdate(ports, staged, home, preflight);
+    return runPreflightedUpdate(ports, staged, home, preflight, resumeWrites);
   } finally {
+    resumeWrites();
     releaseHandover?.();
   }
 }
@@ -416,7 +460,8 @@ function runPreflightedUpdate(
   ports: UpdatePorts,
   staged: StagedPackage,
   home: string,
-  preflight: Exclude<UpdatePreflight, { status: "blocked" }>
+  preflight: Exclude<UpdatePreflight, { status: "blocked" }>,
+  resumeWrites: () => void
 ): UpdateResult {
 
   // Capture and stop the old Controller exactly once after preflight but
@@ -436,7 +481,8 @@ function runPreflightedUpdate(
       home,
       undefined,
       lifecycle.lifecycle,
-      preflight.status === "compatible" ? "compatible-fast" : "current-fast"
+      preflight.status === "compatible" ? "compatible-fast" : "current-fast",
+      resumeWrites
     );
   }
 
@@ -457,7 +503,8 @@ function runPreflightedUpdate(
       preflight.status === "in-place-migration"
         ? { kind: "in-place", migration: preflight.sqliteMigration }
         : { kind: "switch" },
-      lifecycle.lifecycle
+      lifecycle.lifecycle,
+      resumeWrites
     );
   }
   if (activation.status === "blocked") {
@@ -479,6 +526,7 @@ function runPreflightedUpdate(
     // The child was externally quiesced by this parent. A clean pre-switch
     // refusal therefore restores the exact captured identity; an ambiguous
     // activation is handled separately and never restores blindly.
+    resumeWrites();
     return restoreBeforeSwitchOrReport(
       ports,
       home,
@@ -500,7 +548,8 @@ function runPreflightedUpdate(
       preflight.status === "in-place-migration"
         ? { kind: "in-place", migration: preflight.sqliteMigration }
         : { kind: "switch" },
-      lifecycle.lifecycle
+      lifecycle.lifecycle,
+      resumeWrites
     );
   }
   if (activation.status === "migrated" && !isValidBackupPath(activation.backupPath)) {
@@ -514,7 +563,8 @@ function runPreflightedUpdate(
       home,
       "the activation reported migrated without a non-empty absolute backupPath",
       { kind: "switch" },
-      lifecycle.lifecycle
+      lifecycle.lifecycle,
+      resumeWrites
     );
   }
   const backupPath = activation.status === "migrated" ? activation.backupPath : undefined;
@@ -529,7 +579,8 @@ function runPreflightedUpdate(
     home,
     backupPath,
     lifecycle.lifecycle,
-    path
+    path,
+    resumeWrites
   );
 }
 
@@ -545,7 +596,8 @@ function activateAndVerify(
   home: string,
   storageBackupPath: string | undefined,
   lifecycle: UpdateControllerLifecycle | undefined,
-  path: "current-fast" | "compatible-fast" | "in-place-migration" | "offline-migration"
+  path: "current-fast" | "compatible-fast" | "in-place-migration" | "offline-migration",
+  resumeWrites: () => void
 ): UpdateResult {
   const inPlaceCommitted = path === "in-place-migration";
   try {
@@ -567,6 +619,7 @@ function activateAndVerify(
       version: staged.version,
       ...(storageBackupPath === undefined ? {} : { storageBackupPath })
     };
+    if (!inPlaceCommitted && storageBackupPath === undefined) resumeWrites();
     return restoreBeforeSwitchOrReport(
       ports,
       home,
@@ -593,6 +646,7 @@ function activateAndVerify(
       version: staged.version,
       ...(storageBackupPath === undefined ? {} : { storageBackupPath })
     };
+    if (!inPlaceCommitted && storageBackupPath === undefined) resumeWrites();
     return restoreBeforeSwitchOrReport(
       ports,
       home,
@@ -602,6 +656,11 @@ function activateAndVerify(
       failure
     );
   }
+
+  // The migrated database has now been opened successfully by the activated
+  // binary. Release direct-write admission before starting the replacement
+  // Controller, whose startup scheduler is itself an authoritative writer.
+  resumeWrites();
 
   if (lifecycle?.ensureRunning === true) {
     try {
@@ -908,7 +967,8 @@ function resolveAmbiguousActivation(
     | { kind: "in-place"; migration: UpdateSqliteMigrationBoundary }
     | { kind: "switch" }
   >,
-  lifecycle: UpdateControllerLifecycle | undefined
+  lifecycle: UpdateControllerLifecycle | undefined,
+  resumeWrites: () => void
 ): UpdateResult {
   let probe: StorageStateProbe;
   try {
@@ -973,6 +1033,7 @@ function resolveAmbiguousActivation(
       recoverable: true,
       version: staged.version
     };
+    resumeWrites();
     return restoreBeforeSwitchOrReport(
       ports,
       home,

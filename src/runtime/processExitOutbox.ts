@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import { readdir, readFile, rename, unlink } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readdir, readFile, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { writeTextFileAtomically } from "../storage/durableFile.js";
@@ -73,26 +73,29 @@ export async function replayRuntimeProcessExitOutbox(
   // per observation above, so they never share an append/unlink boundary.
   for (const name of entries.filter(isLegacyOutboxEntry).sort()) {
     const path = join(directory, name);
-    const claimed = `${path}.claim-${process.pid}-${randomUUID()}`;
+    let raw: string;
     try {
-      await rename(path, claimed);
+      raw = await readFile(path, "utf8");
     } catch (error) {
+      // The old writer removes its own append log only after the Controller
+      // acknowledges delivery. If it won that race, there is nothing to replay.
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw error;
     }
-    try {
-      const lines = (await readFile(claimed, "utf8")).split("\n").filter(Boolean);
-      for (const line of lines) {
-        await submit(validateRuntimeProcessExitObservation(
-          JSON.parse(line) as RuntimeProcessExitObservation
-        ));
-      }
-      await unlink(claimed);
-    } catch (error) {
-      // Keep the unique claim file. It remains discoverable by the next replay,
-      // while a concurrent append can safely create/use the ordinary path.
-      throw error;
+    // Only consume newline-terminated records. A legacy writer can be between
+    // append bytes and its trailing newline while this snapshot is read.
+    const completeLength = raw.lastIndexOf("\n") + 1;
+    const lines = raw.slice(0, completeLength).split("\n").filter(Boolean);
+    for (const line of lines) {
+      await submit(validateRuntimeProcessExitObservation(
+        JSON.parse(line) as RuntimeProcessExitObservation
+      ));
     }
+    // Deliberately leave the legacy path in place. A pre-upgrade Agent Host may
+    // already hold an append descriptor for this inode; renaming/unlinking it
+    // would let a later append disappear into an unlinked file. The old writer
+    // removes the path after a successful direct submission. Otherwise the
+    // durable file remains for the next idempotent replay.
   }
 }
 
@@ -101,8 +104,5 @@ function outboxDirectory(home: string): string {
 }
 
 function isLegacyOutboxEntry(name: string): boolean {
-  // A previous process may have stopped after its atomic claim but before
-  // delivery. Re-claiming is safe because the observation boundary dedupes by
-  // observationId.
-  return name.includes(".jsonl");
+  return name.endsWith(".jsonl");
 }
