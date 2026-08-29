@@ -196,7 +196,7 @@ export function buildDeltaRecheckDispatchContext(input: Readonly<{
     "- finding: the diff introduces a material problem; report it as a finding.",
     "- requires-full-review: you cannot prove equivalence (uncertainty, cross-scope,",
     "  semantic change, evidence doubt). This is the safe default.",
-    "Yui verified only the technical delta boundary; the Leader selected this mode.",
+    "Yui verified only the technical delta boundary; a Task-control Agent selected this mode.",
     `Previous accepted ReviewRound: ${previousRound.id}@${record.previousBaseCommit}`,
     `Previous acceptance summary: ${compact(previousRound.summary ?? previousRound.report ?? "")}`,
     ...(round.taskCandidate?.projects.map((project) => {

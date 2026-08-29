@@ -48,7 +48,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
   recordIntegrationCheckJob,
-  requireLeaderDecision,
+  requireResolutionDecision,
   updateIntegrationAttempt,
   type IntegrationAttempt
 } from "./integrationAttempt.js";
@@ -349,7 +349,7 @@ export class GitIntegrationService {
       return this.#terminalResult("committed", committed, workspace);
     } catch (error) {
       if (error instanceof RemoteBaselineConflictError) {
-        const pending = requireLeaderDecision(current, {
+        const pending = requireResolutionDecision(current, {
           affectedPaths: error.affectedPaths,
           summary: error.message
         }, this.now());
@@ -852,7 +852,7 @@ export class GitIntegrationService {
           await git(["-C", candidatePath, "cherry-pick", "--skip"]);
           continue;
         }
-        const pending = requireLeaderDecision(attempt, {
+        const pending = requireResolutionDecision(attempt, {
           affectedPaths,
           summary: `ChangeSet ${changeSetId} conflicts with ${attempt.targetRef}.`
         }, this.now());

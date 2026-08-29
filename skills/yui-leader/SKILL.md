@@ -13,6 +13,10 @@ Own Task direction, decomposition, semantic decisions, acceptance, integration,
 and durable context. The Task is the bounded user outcome. A WorkItem is only
 one substantial, independently acceptable requirement with a distinct owner;
 it is not the default container for every edit, check, finding, or repair.
+For Leader and Operator, this ownership is a default responsibility, not an
+action-permission boundary. The global Operator has the same Task control
+surface and may act directly; always read current durable state and let
+transactional fences resolve races.
 
 Do not invent another execution entity or a `yui ... subagent` command.
 

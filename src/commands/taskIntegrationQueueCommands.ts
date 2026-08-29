@@ -56,7 +56,7 @@ async function enqueue(
   );
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const task = requireActiveTask(store, parsed.positionals[0]);
-  requireLeader(store, options.environment, task.id, home);
+  requireTaskControlActor(store, options.environment, task.id, home);
   const projectRef = parsed.one.get("--project");
   const changeSetId = parsed.one.get("--change-set");
   if (projectRef === undefined || changeSetId === undefined) throw usageError(usage);
@@ -155,7 +155,7 @@ async function process(
   const parsed = parseRepeatable(args, new Set(), new Set(["--project", "--limit"]), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const task = requireActiveTask(store, parsed.positionals[0]);
-  requireLeader(store, options.environment, task.id, home);
+  requireTaskControlActor(store, options.environment, task.id, home);
   const limitValue = parsed.one.get("--limit");
   const limit = limitValue === undefined ? undefined : Number.parseInt(limitValue, 10);
   if (limitValue !== undefined && (!Number.isSafeInteger(limit) || (limit as number) < 1)) {
@@ -194,7 +194,7 @@ function supersede(
   const parsed = parseRepeatable(args, new Set(), new Set(["--reason"]), usage);
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const entry = requireQueueEntry(store, parsed.positionals[0], options.environment);
-  requireLeader(store, options.environment, entry.taskId, home);
+  const actor = requireTaskControlActor(store, options.environment, entry.taskId, home);
   const reason = parsed.one.get("--reason");
   if (reason === undefined) throw usageError(usage);
   const superseded = supersedeIntegrationQueueEntry(
@@ -202,6 +202,7 @@ function supersede(
     entry.taskId,
     entry.id,
     reason,
+    actor,
     options.now ?? (() => new Date())
   );
   return {
@@ -219,11 +220,12 @@ function requeue(
   const usage = "Task Integration queue requeue usage: yui task integration queue requeue <task>/<entry>.";
   if (args.length !== 1) throw usageError(usage);
   const entry = requireQueueEntry(store, args[0], options.environment);
-  requireLeader(store, options.environment, entry.taskId, home);
+  const actor = requireTaskControlActor(store, options.environment, entry.taskId, home);
   const waiting = requeueIntegrationQueueEntry(
     store,
     entry.taskId,
     entry.id,
+    actor,
     options.now ?? (() => new Date())
   );
   return {
@@ -241,7 +243,7 @@ async function reconcile(
   const usage = "Task Integration queue reconcile usage: yui task integration queue reconcile <task>/<entry>.";
   if (args.length !== 1) throw usageError(usage);
   const entry = requireQueueEntry(store, args[0], options.environment);
-  requireLeader(store, options.environment, entry.taskId, home);
+  requireTaskControlActor(store, options.environment, entry.taskId, home);
   const committed = await reconcileIntegrationQueueEntry(
     store,
     entry.taskId,
@@ -294,13 +296,11 @@ function requireQueueEntry(
   return entry;
 }
 
-function requireLeader(
+function requireTaskControlActor(
   store: TaskStore,
   environment: NodeJS.ProcessEnv | undefined,
   taskId: string,
   home?: string
-): void {
-  if (taskLocalActor(store, environment, taskId, home) !== "leader") {
-    throw usageError("Only the Task Leader can change the integration queue.");
-  }
+) {
+  return taskLocalActor(store, environment, taskId, home);
 }

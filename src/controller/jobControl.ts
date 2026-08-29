@@ -24,21 +24,8 @@ import {
   type DurableJobStep
 } from "../job/durableJob.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
-import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
-
-/**
- * rr5/f5: A `job.acknowledge` request must carry an authenticated Leader
- * assertion. The Controller verifies it against the current in-flight Leader
- * Run — a bare flag is never trusted. The runId binds to the active Leader
- * Run; the receiptId binds to the current in-flight Turn, so a stale or
- * replayed assertion from a previous Turn is rejected.
- */
-export type DurableJobLeaderAssertion = Readonly<{
-  runId: string;
-  receiptId: string;
-}>;
+import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
 
 /**
  * rr8: The caller identity a `job.start`/`job.cancel` request is bound to.
@@ -48,26 +35,22 @@ export type DurableJobLeaderAssertion = Readonly<{
  *
  * rr12: The identity is now bound to a durable, Controller-verified record
  * rather than trusted as a literal:
- * - A `task` caller must carry `runId`; the Controller looks up that Run and
- *   requires `run.roleName === role` and `run.status === "active"`. A Leader
- *   caller must additionally carry `receiptId` and pass the same
- *   active-Run + in-flight-receipt + Session check as `job.acknowledge`, so a
- *   borrowed or stale Leader Run is rejected. A Worker caller is constrained
- *   to its own Work Item through `run.workItemId`.
- * - A `user` caller (non-managed) retains full access only when it carries a
- *   `leaderAssertion` the Controller verifies against the active in-flight
- *   Leader Run. The literal `scope: "user"` is never authority on its own — a
- *   managed Session that sheds its identity and declares `user` is rejected.
+ * - A `task` caller must carry `runId`; the Controller looks up that Run,
+ *   requires `run.roleName === role` and `run.status === "active"`, and verifies
+ *   the per-Session caller key. Role does not narrow authority within the Task.
+ * - A `global` caller is verified against the current global Role, Agent,
+ *   launch, and native Session and then has full Task control authority.
+ * - A literal `scope: "user"` is never authority on its own.
  */
 export type DurableJobCaller = Readonly<{
-  scope: "user" | "task";
+  scope: "user" | "global" | "task";
   taskId?: string;
   role?: string;
+  agentId?: string;
+  adapterId?: string;
+  launchId?: string;
+  nativeSessionId?: string;
   runId?: string;
-  /** rr12: task-scope Leader caller — the current in-flight Turn receipt. */
-  receiptId?: string;
-  /** rr12: user-scope caller — the verified Leader authority it acts under. */
-  leaderAssertion?: DurableJobLeaderAssertion;
   /**
    * rr13: task-scope caller — the per-Session job caller key injected at native
    * Session launch as `YUI_JOB_CALLER_KEY`. The Controller verifies its SHA-256
@@ -161,7 +144,7 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
         if (current === null) return null;
         // rr8: Bind the cancel request to the caller's managed identity. The
         // same rules as job.start apply, checked against the job's owner.
-        assertCallerAuthorized(tx, caller, current.owner, taskId);
+        assertCallerAuthorized(tx, caller, taskId);
         const next = requestDurableJobCancel(current, now);
         if (next !== current) tx.saveDurableJob(taskId, next);
         return next;
@@ -171,11 +154,7 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
       return store.transaction((tx) => {
         const current = tx.getDurableJob(taskId, jobId);
         if (current === null) return null;
-        // Acknowledge is a Leader-only recovery decision. Reuse the shared
-        // caller-key, active-Run, receipt, and Session checks, but explicitly
-        // require the Leader role; start/cancel's owner binding intentionally
-        // permits a Worker to operate its own Work Item.
-        assertCallerAuthorized(tx, caller, current.owner, taskId, { leaderOnly: true });
+        assertCallerAuthorized(tx, caller, taskId);
         const next = acknowledgeUnknownDurableJob(current, now);
         if (next !== current) tx.saveDurableJob(taskId, next);
         return next;
@@ -318,9 +297,9 @@ function validateStartParams(store: TaskStore, params: DurableJobStartParams): v
   }
 
   // rr8: Bind the declared owner to the caller's managed identity. A
-  // Reviewer can never start jobs; a Worker can only start jobs owned by
-  // its own Work Item; a Leader or a plain user retains full access.
-  assertCallerAuthorized(store, params.caller, params.owner, params.taskId);
+  // Role is not an authorization boundary. Scope and exact managed Session
+  // identity are verified independently below.
+  assertCallerAuthorized(store, params.caller, params.taskId);
 }
 
 /**
@@ -329,60 +308,83 @@ function validateStartParams(store: TaskStore, params: DurableJobStartParams): v
  * against durable Run/Session state — a self-reported role or scope is never
  * authority on its own. The rules:
  *
- * - `user` (non-managed): full access, but only when the request carries a
- *   `leaderAssertion` the Controller verifies against the active in-flight
- *   Leader Run. A managed Session that sheds its identity and declares
- *   `scope: "user"` without that proof is rejected.
+ * - `user` (non-managed): rejected because it has no managed Session identity.
+ * - `global`: full Task authority after current Role Session verification.
  * - `task` + mismatched taskId: rejected.
  * - `task` + missing `runId`: rejected (a managed caller must bind to a Run).
  * - `task` + Run not found / not active / `roleName !== role`: rejected — the
  *   claimed Role must be the real Role of an active Run.
- * - `task` + Reviewer: always rejected.
- * - `task` + Leader: must carry `receiptId` and pass the same
- *   active-Run + in-flight-receipt + Session check as `job.acknowledge`, so a
- *   borrowed or stale Leader Run cannot authorize the request.
- * - `task` + any other Role (Worker etc.): the owner must be `work-item` and
- *   the caller's Run must be for that same Work Item.
+ * - `task`: full authority inside the matching Task after active Run and
+ *   per-Session caller-key verification; Role does not narrow it.
  */
 /**
  * rr13: `job.start`/`job.cancel` caller authorization at the Controller
  * boundary. Every identity claim the Controller can verify from durable state
- * (role, runId, receiptId, leaderAssertion) is replayable by any client in the
+ * (role and runId) is replayable by any client in the
  * same Home that reads state.json. The channel itself is therefore not
  * authenticated by those claims alone. A non-replayable per-Session caller key
  * closes the gap:
  *
  * - `user` scope: **rejected outright** for start/cancel. A bare shell or a
- *   managed Session that sheds its identity has no channel binding. The human
- *   operator acts through the Leader Session, which carries a caller key.
+ *   managed Session that sheds its identity has no managed Session binding.
+ * - `global` scope: verified against the current global Role Session.
  * - `task` scope: the caller must present `callerKey` — the
  *   `YUI_JOB_CALLER_KEY` injected at its native Session launch. The Controller
  *   hashes it (SHA-256) and compares against the durable `jobCallerKeyHashes`
  *   map for the caller's Role + Agent. No legacy fallback: an absent hash or a
  *   mismatched key is UNAUTHORIZED.
  *
- * The existing Run/role/WorkItem binding checks (rr8/rr12) run after the key
- * check, so a forged identity that also lacks the key is rejected at the
- * channel boundary before any durable-state lookup.
+ * The existing Run binding checks run after the key check, so a forged
+ * identity that also lacks the key is rejected at the channel boundary.
  */
 function assertCallerAuthorized(
   store: Pick<
     TaskStore,
     "getAgentRun" | "getActiveAgentRun" | "getTaskRoleSessionSet" | "getJobCallerKeyHash"
+      | "getGlobalRole" | "getGlobalRoleSessionSet"
   >,
   caller: DurableJobCaller,
-  owner: DurableJobOwner,
-  taskId: string,
-  options: Readonly<{ leaderOnly?: boolean }> = {}
+  taskId: string
 ): void {
   if (caller.scope === "user") {
     // rr13: A user-scope caller has no per-Session channel binding. Every
-    // durable-state claim it could carry (leaderAssertion etc.) is replayable
+    // durable-state claim it could carry is replayable
     // by any client in the same Home. Reject outright (fail-closed).
     throw jobControlError(
       "UNAUTHORIZED",
       "job.start/job.cancel requires a managed Session caller key; user scope is rejected."
     );
+  }
+  if (caller.scope === "global") {
+    const roleName = caller.role;
+    const agentId = caller.agentId;
+    const role = roleName === undefined ? null : store.getGlobalRole(roleName);
+    const binding = role === null || agentId === undefined
+      ? undefined
+      : role.agentBindings[role.activeAgentId];
+    const sessions = roleName === undefined ? null : store.getGlobalRoleSessionSet(roleName);
+    const session = activeLiveRoleAgentSession(sessions);
+    if (role === null
+      || binding === undefined
+      || agentId === undefined
+      || caller.adapterId === undefined
+      || caller.launchId === undefined
+      || sessions === null
+      || sessions.activeAgentId !== role.activeAgentId
+      || session === null
+      || binding.agentId !== agentId
+      || binding.adapterId !== caller.adapterId
+      || session.agentId !== agentId
+      || session.adapterId !== caller.adapterId
+      || session.launchId !== caller.launchId
+      || (caller.nativeSessionId !== undefined
+        && session.nativeSessionId !== caller.nativeSessionId)) {
+      throw jobControlError(
+        "UNAUTHORIZED",
+        "DurableJob control requires the current managed global Agent Session."
+      );
+    }
+    return;
   }
   if (caller.taskId !== taskId) {
     throw jobControlError(
@@ -429,41 +431,6 @@ function assertCallerAuthorized(
     throw jobControlError(
       "UNAUTHORIZED",
       "The managed Session caller key does not match the durable hash."
-    );
-  }
-  if (options.leaderOnly && caller.role !== "leader") {
-    throw jobControlError(
-      "UNAUTHORIZED",
-      "job.acknowledge requires the current Task Leader Session."
-    );
-  }
-  if (caller.role === "reviewer") {
-    throw jobControlError(
-      "UNAUTHORIZED",
-      "A Reviewer may not start or cancel DurableJobs."
-    );
-  }
-  if (caller.role === "leader") {
-    // rr12: Verify the caller is THE current in-flight Task Leader, not a
-    // borrowed or stale Leader Run. This mirrors job.acknowledge.
-    if (caller.receiptId === undefined) {
-      throw jobControlError(
-        "UNAUTHORIZED",
-        "A Leader must carry the current in-flight Turn receipt."
-      );
-    }
-    assertLeaderActionRun(store, taskId, {
-      runId: run.id,
-      receiptId: caller.receiptId
-    });
-    return;
-  }
-  // Worker (or any non-leader, non-reviewer managed role): the owner must be
-  // the caller's own Work Item, verified through the caller's Run.
-  if (owner.kind !== "work-item" || run.workItemId !== owner.workItemId) {
-    throw jobControlError(
-      "UNAUTHORIZED",
-      "A managed Worker may only start or cancel Jobs owned by its own Work Item."
     );
   }
 }
@@ -516,46 +483,6 @@ function readGitHead(path: string): string | null {
 
 function isTerminalWorkItemStatus(status: string): boolean {
   return status === "completed" || status === "failed" || status === "retired";
-}
-
-/**
- * rr5/f5: Verify that the caller is the current in-flight Task Leader. The
- * runId must identify the active Leader Run and the receiptId must match the
- * Run's current in-flight Turn receipt. This binds the assertion to the
- * Leader identity/session the Controller already tracks — a bare flag or a
- * stale Run/receipt pair is rejected.
- */
-function assertLeaderActionRun(
-  store: Pick<TaskStore, "getActiveAgentRun" | "getTaskRoleSessionSet">,
-  taskId: string,
-  assertion: DurableJobLeaderAssertion
-): void {
-  const run = store.getActiveAgentRun(taskId, "leader");
-  if (run === null || run.status !== "active" || run.id !== assertion.runId) {
-    throw jobControlError(
-      "UNAUTHORIZED",
-      "job.acknowledge requires the current active Task Leader Run."
-    );
-  }
-  const expectedReceipt = formatAgentRunReceiptId(taskId, run.id);
-  if (assertion.receiptId !== expectedReceipt) {
-    throw jobControlError(
-      "UNAUTHORIZED",
-      "job.acknowledge Leader receipt does not match the current Run."
-    );
-  }
-  const sessions = store.getTaskRoleSessionSet(taskId, "leader");
-  if (
-    sessions === null
-    || sessions.inFlight === null
-    || sessions.inFlight.runId !== run.id
-    || sessions.inFlight.receiptId !== agentRunDeliveryReceiptId(run)
-  ) {
-    throw jobControlError(
-      "UNAUTHORIZED",
-      "job.acknowledge Leader Run is not in flight."
-    );
-  }
 }
 
 /**
@@ -647,8 +574,7 @@ export function parseDurableJobCancelParams(value: JsonValue): Readonly<{
 
 /**
  * rr26: `job.acknowledge` carries the same managed task caller as
- * job.start/job.cancel.  A replayable leaderAssertion without the ephemeral
- * Session caller key is rejected by assertCallerAuthorized.
+ * job.start/job.cancel.
  */
 export function parseDurableJobAcknowledgeParams(value: JsonValue): Readonly<{
   taskId: string;
@@ -738,9 +664,8 @@ function parseSteps(value: JsonValue | undefined): readonly DurableJobStep[] {
  * boundary (fail-closed). A non-managed caller must explicitly resolve to
  * `{scope: "user"}`; the Controller never defaults a missing identity to
  * user scope. A present caller must carry a valid `scope` and may carry
- * optional `taskId`, `role`, `runId`, `receiptId`, and `leaderAssertion`
- * fields. The identity is verified against durable Run state by
- * `assertCallerAuthorized`; parsing only validates the JSON shape.
+ * optional managed Session identity fields. The identity is verified against
+ * durable state by `assertCallerAuthorized`; parsing only validates the JSON shape.
  */
 function parseCaller(value: JsonValue | undefined): DurableJobCaller {
   if (value === undefined) {
@@ -751,26 +676,30 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
   }
   const record = value as Readonly<Record<string, JsonValue>>;
   const allowed = new Set([
-    "scope", "taskId", "role", "runId", "receiptId", "leaderAssertion", "callerKey"
+    "scope", "taskId", "role", "agentId", "adapterId", "launchId", "nativeSessionId",
+    "runId", "callerKey"
   ]);
   for (const key of Object.keys(record)) {
     if (!allowed.has(key)) {
       throw jobControlError("INVALID_PARAMS", "job caller is invalid.");
     }
   }
-  if (record.scope !== "user" && record.scope !== "task") {
+  if (record.scope !== "user" && record.scope !== "global" && record.scope !== "task") {
     throw jobControlError("INVALID_PARAMS", "job caller scope is invalid.");
   }
-  const optionalId = (key: "taskId" | "role" | "runId" | "receiptId"): string | undefined => {
+  const optionalId = (key: "taskId" | "role" | "agentId" | "adapterId" | "launchId"
+    | "nativeSessionId" | "runId"): string | undefined => {
     const entry = record[key];
     if (entry === undefined) return undefined;
     return requiredId(entry, `job caller ${key}`);
   };
   const taskId = optionalId("taskId");
   const role = optionalId("role");
+  const agentId = optionalId("agentId");
+  const adapterId = optionalId("adapterId");
+  const launchId = optionalId("launchId");
+  const nativeSessionId = optionalId("nativeSessionId");
   const runId = optionalId("runId");
-  const receiptId = optionalId("receiptId");
-  const leaderAssertion = parseLeaderAssertion(record.leaderAssertion);
   const callerKey = record.callerKey === undefined
     ? undefined
     : requiredId(record.callerKey, "job caller callerKey");
@@ -778,35 +707,12 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
     scope: record.scope,
     ...(taskId === undefined ? {} : { taskId }),
     ...(role === undefined ? {} : { role }),
+    ...(agentId === undefined ? {} : { agentId }),
+    ...(adapterId === undefined ? {} : { adapterId }),
+    ...(launchId === undefined ? {} : { launchId }),
+    ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
     ...(runId === undefined ? {} : { runId }),
-    ...(receiptId === undefined ? {} : { receiptId }),
-    ...(leaderAssertion === undefined ? {} : { leaderAssertion }),
     ...(callerKey === undefined ? {} : { callerKey })
-  };
-}
-
-/**
- * rr12: Parse a `leaderAssertion` sub-object (`{runId, receiptId}`) carried by
- * a user-scope caller. Returns undefined when absent; throws on a malformed
- * shape.
- */
-function parseLeaderAssertion(
-  value: JsonValue | undefined
-): DurableJobLeaderAssertion | undefined {
-  if (value === undefined) return undefined;
-  if (
-    typeof value !== "object" || value === null || Array.isArray(value)
-    || Object.keys(value).length !== 2
-  ) {
-    throw jobControlError(
-      "INVALID_PARAMS",
-      "job caller leaderAssertion must have runId and receiptId."
-    );
-  }
-  const record = value as Readonly<Record<string, JsonValue>>;
-  return {
-    runId: requiredId(record.runId, "job caller leaderAssertion runId"),
-    receiptId: requiredId(record.receiptId, "job caller leaderAssertion receiptId")
   };
 }
 

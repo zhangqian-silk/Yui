@@ -1070,7 +1070,7 @@ export async function main(): Promise<void> {
         home,
         {
           environment: process.env,
-          jobPort: createControllerIntegrationJobPort(home, { environment: process.env, store })
+          jobPort: createControllerIntegrationJobPort(home, { environment: process.env })
         }
       );
       emit(result.output, false, result.data);
@@ -1198,12 +1198,7 @@ export async function main(): Promise<void> {
       }
       const reference = cliWorkItemReference(workItemId, process.env);
       const qualified = `${reference.taskId}/${reference.localId}`;
-      const actor = taskActor(process.env, reference.taskId);
-      if (actor === "operator") {
-        throw usageError(
-          "Only the Task Leader may clean a WorkItem from a managed Session."
-        );
-      }
+      taskActor(process.env, reference.taskId);
       if (disposition === "--runtime-only") {
         let runtimeCleanup;
         try {
@@ -1481,7 +1476,7 @@ export async function main(): Promise<void> {
             resolved[2],
             store,
             home,
-            { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env, store }) }
+            { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env }) }
           );
         }
       }

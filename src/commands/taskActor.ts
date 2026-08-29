@@ -12,16 +12,6 @@ const LEADER_ACTION_RECEIPT_ENV = "YUI_LEADER_ACTION_RECEIPT_ID";
 /** rr13: Per-Session DurableJob caller key injected at native Session launch. */
 const JOB_CALLER_KEY_ENV = "YUI_JOB_CALLER_KEY";
 
-/**
- * rr12: The store subset `resolveJobCaller` needs to resolve a user-scope
- * caller's Leader assertion. Kept structural so the Controller client layer
- * does not take a hard dependency on the full TaskStore type.
- */
-export type JobCallerStore = Pick<
-  TaskStore,
-  "getRole" | "getActiveAgentRun" | "getTaskRoleSessionSet"
->;
-
 export function taskActor(
   environment: NodeJS.ProcessEnv | undefined,
   taskId: string
@@ -111,23 +101,20 @@ export function projectActor(environment: NodeJS.ProcessEnv | undefined): Projec
 
 /**
  * rr8: Resolve the caller identity for a `job.start`/`job.cancel` request from
- * the managed Session environment. The Controller binds the declared job owner
- * to this identity — a Reviewer is rejected outright, a Worker can only touch
- * its own Work Item's jobs, and a Leader or plain user retains full access.
+ * the managed Session environment. The Controller verifies the Agent Session
+ * and its scope; Role does not narrow Task control authority.
  *
  * rr12: The identity is now Controller-verified rather than self-reported:
  * - A managed Task Session (`YUI_SESSION_SCOPE=task`) returns `scope: "task"`
- *   with its Role and Run. A Leader additionally carries the current in-flight
- *   Turn receipt (preferring the explicit `YUI_LEADER_ACTION_*` assertion over
- *   a possibly-stale `YUI_RUN_ID`), which the Controller verifies through the
- *   same active-Run + in-flight + Session check as `job.acknowledge`.
+ *   with its Role and Run. For a Leader, the explicit current-Turn Run id is
+ *   preferred over a possibly stale `YUI_RUN_ID`.
  *
  * rr13: A managed Task Session also carries `callerKey` — the
  * `YUI_JOB_CALLER_KEY` injected at its native Session launch. The Controller
  * hashes it and compares against the durable `jobCallerKeyHashes` map, so a
  * client that reads durable state cannot replay the caller. A `user`-scope
- * caller is rejected outright for job.start/job.cancel (fail-closed); the
- * human operator acts through the Leader Session.
+ * caller is rejected outright for job.start/job.cancel (fail-closed); a
+ * managed global Agent carries its own durable Session identity.
  *
  * A managed Task Session may only start jobs for its own Task. An incomplete
  * managed identity (role/agent/run/session vars without a scope) is rejected
@@ -135,8 +122,7 @@ export function projectActor(environment: NodeJS.ProcessEnv | undefined): Projec
  */
 export function resolveJobCaller(
   environment: NodeJS.ProcessEnv | undefined,
-  taskId: string,
-  store?: JobCallerStore
+  taskId: string
 ): DurableJobCaller {
   const env = environment ?? {};
   if (env.YUI_SESSION_SCOPE === "task") {
@@ -151,9 +137,7 @@ export function resolveJobCaller(
     // Controller boundary.
     const callerKey = env[JOB_CALLER_KEY_ENV];
     if (role === LEADER_ROLE) {
-      // Prefer the explicit current-turn Leader assertion over a possibly
-      // stale YUI_RUN_ID/launch. The Controller verifies it against the
-      // active in-flight Leader Run.
+      // Prefer the explicit current-Turn Run over a possibly stale YUI_RUN_ID.
       const assertion = leaderActionAssertion(env);
       if (assertion !== undefined && assertion !== "invalid") {
         return {
@@ -161,7 +145,6 @@ export function resolveJobCaller(
           taskId,
           role,
           runId: assertion.runId,
-          receiptId: assertion.receiptId,
           ...(callerKey === undefined ? {} : { callerKey })
         };
       }
@@ -175,7 +158,14 @@ export function resolveJobCaller(
     };
   }
   if (env.YUI_SESSION_SCOPE === "global") {
-    return userCaller(store, taskId);
+    return {
+      scope: "global",
+      role: env.YUI_ROLE,
+      agentId: env.YUI_AGENT_ID,
+      adapterId: env.YUI_ADAPTER_ID,
+      launchId: env.YUI_LAUNCH_ID,
+      nativeSessionId: env.YUI_NATIVE_SESSION_ID
+    };
   }
   if (
     env.YUI_ROLE !== undefined
@@ -185,63 +175,7 @@ export function resolveJobCaller(
   ) {
     throw usageError("Managed Agent identity is incomplete; refusing to infer user authority.");
   }
-  return userCaller(store, taskId);
-}
-
-/**
- * rr12: Build a `scope: "user"` caller. When a store is available, attach the
- * active in-flight Leader assertion so the Controller can verify the request
- * acts under real Leader authority. Without a store, return the bare
- * `{scope: "user"}` which the Controller rejects (fail-closed).
- */
-function userCaller(
-  store: JobCallerStore | undefined,
-  taskId: string
-): DurableJobCaller {
-  if (store === undefined) return { scope: "user" };
-  const runId = activeLeaderRunId(store, taskId);
-  if (runId === undefined) {
-    throw usageError(
-      "job.start/job.cancel user scope requires an active in-flight Task Leader: "
-      + `${taskId}.`
-    );
-  }
-  return {
-    scope: "user",
-    leaderAssertion: {
-      runId,
-      receiptId: formatAgentRunReceiptId(taskId, runId)
-    }
-  };
-}
-
-/**
- * rr12: Resolve the current in-flight Task Leader Run for a non-managed
- * (operator/bare-shell) caller. Unlike `taskLeaderActionRunId`, this does not
- * require managed Leader environment variables — it verifies the durable
- * state directly: an active Leader Run whose Role Session is currently
- * in-flight with the matching receipt. Returns undefined when no Leader is
- * active or in flight.
- */
-function activeLeaderRunId(
-  store: JobCallerStore,
-  taskId: string
-): string | undefined {
-  const run = store.getActiveAgentRun(taskId, LEADER_ROLE);
-  if (run === null || run.status !== "active" || run.roleName !== LEADER_ROLE) {
-    return undefined;
-  }
-  const sessions = store.getTaskRoleSessionSet(taskId, LEADER_ROLE);
-  const expectedReceipt = agentRunDeliveryReceiptId(run);
-  if (
-    sessions === null
-    || sessions.inFlight === null
-    || sessions.inFlight.runId !== run.id
-    || sessions.inFlight.receiptId !== expectedReceipt
-  ) {
-    return undefined;
-  }
-  return run.id;
+  return { scope: "user" };
 }
 
 /**

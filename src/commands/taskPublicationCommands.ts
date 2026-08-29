@@ -57,13 +57,6 @@ function addPublication(
     throw usageError(`Project is not bound to Task ${task.id}: ${projectReference}.`, usage);
   }
   const actor = taskActor(options.environment, task.id);
-  if (actor === "leader") {
-    throw usageError(
-      "A managed Task Leader cannot record external publication evidence; "
-      + "use a user or global Operator session.",
-      usage
-    );
-  }
   const state = enumOption<PublicationState>(parsed.options, "--state", STATES, usage) ?? "open";
   const verification = parseVerification(parsed, usage);
   const input = {

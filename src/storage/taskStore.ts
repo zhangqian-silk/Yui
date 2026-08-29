@@ -231,13 +231,13 @@ export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 12 as const;
-export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 5 as const;
+export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 6 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 3 as const;
-export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 4 as const;
+export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 5 as const;
 export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_INPUT_REQUEST_SCHEMA_VERSION = 2 as const;
 export const CURRENT_DECISION_SCHEMA_VERSION = 1 as const;
-export const CURRENT_MILESTONE_SCHEMA_VERSION = 1 as const;
+export const CURRENT_MILESTONE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_EVENT_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION = 1 as const;
@@ -3631,8 +3631,10 @@ function storedMilestone(value: unknown): Milestone {
   validateTaskRecordReference({ taskId: milestone.taskId, localId: milestone.id }, "milestone");
   requireNormalizedText(milestone.title, "Milestone title");
   requireNormalizedText(milestone.summary, "Milestone summary");
-  if (milestone.createdBy !== "leader") {
-    throw new StorageRecordError("Milestone createdBy must be leader.");
+  if (milestone.createdBy !== "user"
+    && milestone.createdBy !== "operator"
+    && milestone.createdBy !== "leader") {
+    throw new StorageRecordError("Milestone createdBy is invalid.");
   }
   requireTimestamp(milestone.createdAt, "Milestone createdAt");
   return milestone;
@@ -5090,9 +5092,8 @@ function validReviewRoundTransition(
       candidate.taskFinalReviewContract
     )
     || !compatibleExecutionGroups(existing.executionGroup, candidate.executionGroup)
-    // Issue 06: a Leader retry resets a failed Task-final Round to pending;
-    // the retry is itself a Leader request, so requestedBy may change from
-    // the original policy/contract value to "leader".
+    // Issue 06: an explicit Task-control retry resets a failed Task-final
+    // Round to pending, so requestedBy may change from the original actor.
     || (existing.requestedBy !== candidate.requestedBy
       && !(existing.status === "failed"
         && candidate.status === "pending"

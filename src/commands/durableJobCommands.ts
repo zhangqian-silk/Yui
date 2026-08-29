@@ -21,7 +21,7 @@ export type DurableJobCommandOptions = Readonly<{
   home: string;
   json?: boolean;
   environment?: NodeJS.ProcessEnv;
-  /** Required for `job acknowledge` — the managed caller key is resolved against it. */
+  /** Required for `job acknowledge` to validate Task-local control identity. */
   store?: Pick<TaskStore, "getRole" | "getActiveAgentRun" | "getTaskRoleSessionSet">;
 }>;
 
@@ -58,10 +58,7 @@ async function startJob(
 ): Promise<string> {
   const parsed = parseStartArgs(args);
   await ensureFileTaskController(options.home, { environment: options.environment });
-  // rr8/rr12: Bind the declared owner to the caller's managed identity. The
-  // Controller rejects a Reviewer, constrains a Worker to its own Work Item,
-  // and requires a verified Leader assertion for user scope.
-  const caller = resolveJobCaller(options.environment, parsed.taskId, options.store);
+  const caller = resolveJobCaller(options.environment, parsed.taskId);
   const params: ControllerDurableJobStartParams = {
     taskId: parsed.taskId,
     owner: parsed.owner,
@@ -115,7 +112,7 @@ async function cancelJob(
   const ref = parseRefArgs(args, "cancel");
   await ensureFileTaskController(options.home, { environment: options.environment });
   // rr8/rr12: Bind the cancel request to the caller's managed identity.
-  const caller = resolveJobCaller(options.environment, ref.taskId, options.store);
+  const caller = resolveJobCaller(options.environment, ref.taskId);
   const result = await cancelDurableJob(options.home, ref.taskId, ref.jobId, caller);
   if (options.json === true) return `${JSON.stringify(result, null, 2)}\n`;
   return result.cancelRequested
@@ -128,24 +125,13 @@ async function acknowledgeJob(
   options: DurableJobCommandOptions
 ): Promise<string> {
   const ref = parseRefArgs(args, "acknowledge");
-  // rr5/f5(a): only the Task Leader may acknowledge an
-  // unknown-needs-attention job. A non-Leader (Worker, Operator, or plain
-  // user) is rejected at the CLI boundary.
   if (options.store === undefined) {
     throw usageError(
-      "job acknowledge requires a Task store to resolve the Leader assertion."
+      "job acknowledge requires a Task store to resolve the caller."
     );
   }
-  const actor = taskLocalActor(options.store, options.environment, ref.taskId, options.home);
-  if (actor !== "leader") {
-    throw usageError(
-      "Only the Task Leader may acknowledge a DurableJob: "
-      + `${ref.taskId}.`
-    );
-  }
-  // Carry the full managed task caller, including its ephemeral launch key.
-  // A durable leaderAssertion by itself is intentionally not sufficient.
-  const caller = resolveJobCaller(options.environment, ref.taskId, options.store);
+  taskLocalActor(options.store, options.environment, ref.taskId, options.home);
+  const caller = resolveJobCaller(options.environment, ref.taskId);
   await ensureFileTaskController(options.home, { environment: options.environment });
   const result = await acknowledgeDurableJob(options.home, ref.taskId, ref.jobId, caller);
   if (options.json === true) return `${JSON.stringify(result, null, 2)}\n`;
