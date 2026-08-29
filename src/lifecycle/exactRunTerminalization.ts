@@ -27,6 +27,7 @@ import {
 import { createYieldReceipt } from "../run/yieldReceipt.js";
 import {
   recordExecutionLaneResult,
+  resolveExecutionGroup,
   type ExecutionLaneGitSnapshot
 } from "../execution/executionGroup.js";
 import {
@@ -204,6 +205,8 @@ export function terminalizeExactRunReviewRound(
       deltaDisposition?: DeltaRecheckDisposition;
       deltaReasoning?: string;
     }>;
+    /** Explicit retirement closes a fully terminal failed Group instead of leaving a retry path. */
+    settleFailedExecutionGroup?: boolean;
   }>,
   now: Date
 ): ExactReviewRoundTerminalizationResult {
@@ -212,7 +215,7 @@ export function terminalizeExactRunReviewRound(
     return validation;
   }
   const reviewRound = validation.round;
-  const groupedRound = input.run.executionGroupId !== undefined
+  let groupedRound = input.run.executionGroupId !== undefined
     && input.run.executionLaneId !== undefined
     && reviewRound.executionGroup !== undefined
     ? updateReviewExecutionGroup(
@@ -250,10 +253,30 @@ export function terminalizeExactRunReviewRound(
         )
       )
     : reviewRound;
+  if (input.settleFailedExecutionGroup === true
+    && input.outcome.status === "failed"
+    && groupedRound.executionGroup !== undefined
+    && groupedRound.executionGroup.resolution === undefined
+    && groupedRound.executionGroup.lanes.every((lane) => (
+      lane.status === "yielded"
+      || lane.status === "completed"
+      || lane.status === "failed"
+      || lane.status === "skipped"
+    ))) {
+    groupedRound = updateReviewExecutionGroup(
+      groupedRound,
+      resolveExecutionGroup(groupedRound.executionGroup, {
+        decision: "blocked",
+        summary: input.outcome.summary
+      }, now)
+    );
+  }
   const groupedMultiLane = groupedRound.executionGroup !== undefined
     && (groupedRound.executionGroup.lanes.length > 1
       || groupedRound.executionGroup.strategy.mode === "adaptive");
-  if (groupedMultiLane && groupedRound.executionGroup !== undefined) {
+  if (groupedMultiLane
+    && groupedRound.executionGroup !== undefined
+    && groupedRound.executionGroup.resolution === undefined) {
     // A panel Lane only contributes evidence.  The Leader must see every
     // terminal Lane and explicitly resolve the Group before this ReviewRound
     // can become terminal.
@@ -286,6 +309,8 @@ export type ExactRunTerminalizationInput = Readonly<{
   launchId?: string;
   /** Aggregate retirement owns every queued Role signal, not only this Run. */
   mailboxDisposition?: "exact" | "discard";
+  /** Explicit retirement closes a fully terminal failed Group instead of leaving a retry path. */
+  settleFailedExecutionGroup?: boolean;
   outcome: Readonly<{
     status: "yielded" | "failed";
     summary: string;
@@ -452,10 +477,26 @@ export function retireExactActiveAgentRun(
     receiptId: agentRunDeliveryReceiptId(current),
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
     ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+    settleFailedExecutionGroup: true,
     outcome: { status: "failed", summary: input.reason }
   }, now);
   if (terminal.disposition !== "applied" || terminal.run === null) {
     return stateChanged(terminal.reason ?? "terminalization-fence-mismatch");
+  }
+  if (terminal.run.purpose === "execution" && terminal.run.workItemId !== undefined) {
+    const item = store.getWorkItem(input.taskId, terminal.run.workItemId);
+    if (item !== null
+      && !["completed", "failed", "retired"].includes(item.status)
+      && !workItemOwnsUnresolvedExecutionLane(
+        item,
+        terminal.run.executionGroupId,
+        terminal.run.executionLaneId
+      )) {
+      store.saveWorkItem(
+        input.taskId,
+        updateWorkItemStatus(item, "failed", now, input.reason)
+      );
+    }
   }
   return {
     disposition: "applied",
@@ -562,7 +603,10 @@ export function terminalizeExactTaskRun(
     taskId: input.taskId,
     run,
     outcome: input.outcome,
-    reviewResult: input.reviewResult
+    reviewResult: input.reviewResult,
+    ...(input.settleFailedExecutionGroup === undefined
+      ? {}
+      : { settleFailedExecutionGroup: input.settleFailedExecutionGroup })
   }, now);
   if (reviewRoundTerminalization.disposition !== "applied") {
     return obsolete(run, reviewRoundTerminalization.reason ?? "review-round-mismatch");
@@ -600,7 +644,7 @@ export function terminalizeExactTaskRun(
       ? undefined
       : workItemExecutionGroupById(item, run.executionGroupId);
     if (item !== null && group !== undefined) {
-      const grouped = recordExecutionLaneResult(
+      let grouped = recordExecutionLaneResult(
         group,
         run.executionLaneId,
       {
@@ -615,6 +659,20 @@ export function terminalizeExactTaskRun(
         input.outcome.status === "yielded" ? "completed" : "failed",
         now
       );
+      if (input.settleFailedExecutionGroup === true
+        && input.outcome.status === "failed"
+        && grouped.resolution === undefined
+        && grouped.lanes.every((lane) => (
+          lane.status === "yielded"
+          || lane.status === "completed"
+          || lane.status === "failed"
+          || lane.status === "skipped"
+        ))) {
+        grouped = resolveExecutionGroup(grouped, {
+          decision: "blocked",
+          summary: input.outcome.summary
+        }, now);
+      }
       store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
     }
   }
