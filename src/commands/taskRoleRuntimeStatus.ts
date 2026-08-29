@@ -42,6 +42,11 @@ import {
   resolveSessionTokenIdentity,
   type SessionTokenMetrics
 } from "../runtime/sessionTokenMetrics.js";
+import {
+  freshConversationLaunchBlockers,
+  projectConversationSwitch,
+  type ConversationSwitchStatus
+} from "../runtime/conversationSwitch.js";
 
 export type TaskRoleHealth =
   | "idle"
@@ -71,6 +76,7 @@ export type TaskRoleSessionRecoveryStatus = Readonly<{
   roleName: string;
   runtimeCleanupPending: boolean;
   freshLaunchAllowed: boolean;
+  freshLaunchBlockers: readonly string[];
 }>;
 
 export type TaskRoleRuntimeStatus = Readonly<{
@@ -97,9 +103,11 @@ export type TaskRoleRuntimeStatus = Readonly<{
   nativeSession: RoleAgentSession | null;
   runtimeCleanupPending: boolean;
   freshLaunchAllowed: boolean;
+  freshLaunchBlockers: readonly string[];
   tmux: TaskRoleTmuxStatus;
   workspace: TaskRoleWorkspaceStatus;
   sessionTokens: SessionTokenMetrics;
+  conversationSwitch: ConversationSwitchStatus | null;
   runtime: Readonly<{
     driverId: string;
     status: RuntimeDisplayStatus;
@@ -225,10 +233,15 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
       ? `needs-attention (${status.stall.kind ?? "workflow-not-progressing"}; no workflow progress since ${status.stall.progressAt ?? "unknown"})`
       : "none"}`,
     `  Native session   ${nativeSession}`,
+    `  Session switch   ${status.conversationSwitch === null
+      ? "none"
+      : `${status.conversationSwitch.status} (${status.conversationSwitch.requestId}; ${status.conversationSwitch.reason})`}`,
     `  Agent runtime    ${runtime}`,
     `  Session tokens   ${sessionTokens}`,
     `  Runtime cleanup  ${status.runtimeCleanupPending ? "pending" : "none"}`,
-    `  Fresh launch     ${status.freshLaunchAllowed ? "allowed" : "blocked"}`,
+    `  Fresh launch     ${status.freshLaunchAllowed
+      ? "allowed"
+      : `blocked (${status.freshLaunchBlockers.join(", ")})`}`,
     `  tmux pane        ${tmux}`,
     `  Workspace        ${
       status.workspace.managed ? status.workspace.root : status.workspace.path
@@ -250,7 +263,7 @@ export function taskRoleLastRunLabel(status: TaskRoleRuntimeStatus): string {
 }
 
 export function taskRoleNativeSessionLabel(status: TaskRoleRuntimeStatus): string {
-  if (status.runtimeCleanupPending && status.nativeSession === null) return "reset (cleanup-pending)";
+  if (status.runtimeCleanupPending && status.nativeSession === null) return "unbound (cleanup-pending)";
   return status.nativeSession?.status ?? "unbound";
 }
 
@@ -262,14 +275,23 @@ export function inspectTaskRoleSessionRecovery(
   const sessions = store.getTaskRoleSessionSet(taskId, roleName);
   const target = runtimeLifecycleTarget({ scope: "task", taskId, roleName });
   const runtimeMailbox = store.getWorkMailbox(target);
+  const roleMailbox = store.getWorkMailbox({ kind: "role", taskId, roleName });
+  const switchBlockers = freshConversationLaunchBlockers({
+    sessions,
+    events: store.listEvents(taskId),
+    mailbox: roleMailbox,
+    roleName
+  });
+  const freshLaunchBlockers = [
+    ...switchBlockers,
+    ...(hasRuntimeLifecycleWork(runtimeMailbox) ? ["runtime-lifecycle-busy"] : [])
+  ];
   return {
     taskId,
     roleName,
     runtimeCleanupPending: hasRuntimeCleanupObligation(runtimeMailbox),
-    freshLaunchAllowed: (
-      sessions === null
-      || sessions.sessions[sessions.activeAgentId] === undefined
-    ) && !hasRuntimeLifecycleWork(runtimeMailbox)
+    freshLaunchAllowed: freshLaunchBlockers.length === 0,
+    freshLaunchBlockers
   };
 }
 
@@ -339,6 +361,7 @@ function inspectTaskRoleRuntimeStatus(
     ? { managed: false, path: role.workspace }
     : { ...managedWorkspace, managed: true };
   const events = store.listEvents(taskId);
+  const conversationSwitch = projectConversationSwitch(events, role.name, sessions);
   const sessionTokens = projectSessionTokenMetrics(
     events,
     resolveSessionTokenIdentity(nativeSession === null
@@ -401,6 +424,7 @@ function inspectTaskRoleRuntimeStatus(
     tmux,
     workspace,
     sessionTokens,
+    conversationSwitch,
     runtime,
     stall
   };
@@ -423,7 +447,9 @@ function latestStallKind(
   runId: string
 ): "delivery-stalled" | "workflow-not-progressing" | undefined {
   const event = [...events]
-    .filter((candidate) => candidate.type === "run.stalled" && candidate.payload.runId === runId)
+    .filter((candidate) => candidate.type === "run.stalled"
+      && candidate.payload.runId === runId
+      && candidate.payload.status !== "diagnostic-only")
     .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
   return event?.payload.kind === "delivery-stalled" || event?.payload.kind === "workflow-not-progressing"
     ? event.payload.kind
@@ -444,7 +470,7 @@ function calculateHealth(
   if (runtimeCleanupPending && nativeSession === null) {
     return {
       health: "needs-attention",
-      healthReason: "the native Session was reset; verified runtime cleanup is pending"
+      healthReason: "the native Session is unbound; verified runtime cleanup is pending"
     };
   }
   if (role.status === "failed" || role.status === "exited") {
@@ -508,12 +534,15 @@ function calculateHealth(
         case "broken":
           return { health: "failed", healthReason: runtime.healthReason };
         case "stopped":
-        case "diagnostic-needed":
         case "ready":
         case "awaiting-provider-acceptance":
         case "runtime-unobservable":
         case "starting":
           return { health: "needs-attention", healthReason: runtime.healthReason };
+        case "diagnostic-needed":
+          return runtime.observerStatus === "degraded" || runtime.observerStatus === "unavailable"
+            ? { health: "needs-attention", healthReason: runtime.healthReason }
+            : { health: "running", healthReason: runtime.healthReason };
         case "waiting-user":
           return { health: "blocked-input", healthReason: runtime.healthReason };
         case "waiting-permission":

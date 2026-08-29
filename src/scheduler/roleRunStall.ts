@@ -27,6 +27,7 @@ export const DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS = RUNTIME_DIAGNOSTIC_AFTER_
 export const RUN_PROGRESS_EVENT = "run.progress";
 export const RUN_STALLED_EVENT = "run.stalled";
 export const RUN_RECOVERED_EVENT = "run.recovered";
+export const RUN_DIAGNOSTIC_FINISHED_EVENT = "runtime.diagnostic-finished";
 /** Structured, non-Message recovery evidence written by an explicit Leader. */
 export const RUN_RECOVERY_REQUESTED_EVENT = "run.recovery-requested";
 export const RUN_RECOVERY_APPLIED_EVENT = "run.recovery-applied";
@@ -116,10 +117,7 @@ export function projectRoleRunHealth(input: Readonly<{
   const idleMs = evaluation.idleMs;
   const candidateStart = input.deliveredAt ?? input.createdAt;
   const candidateAge = input.now.getTime() - Date.parse(candidateStart);
-  const candidate = Number.isFinite(candidateAge)
-    && (input.deliveredAt === undefined
-      ? candidateAge >= windowMs
-      : candidateAge >= diagnosticAfterMs);
+  const candidate = Number.isFinite(candidateAge) && candidateAge >= windowMs;
   const providerAcceptance = input.providerAcceptance
     ?? (input.deliveredAt === undefined ? "ambiguous" : "accepted");
   const hostLiveness = input.hostLiveness;
@@ -619,6 +617,7 @@ export function isRoleRunStalled(
   for (const event of events) {
     if (event.payload.runId !== runId) continue;
     if (event.type === RUN_STALLED_EVENT) {
+      if (event.payload.status === "diagnostic-only") continue;
       if (stalled === undefined
         || Date.parse(event.createdAt) > Date.parse(stalled.createdAt)) {
         stalled = event;
@@ -666,8 +665,9 @@ export type RoleRunStallResult = Readonly<{
 /**
  * Low-frequency health pass for active Task Role Runs. An unaccepted Run is
  * watched as delivery-stalled after the reasonable delivery window; an
- * accepted Run enters the workflow-stall candidate scan after ten minutes,
- * while the actual no-progress threshold remains thirty minutes.
+ * accepted Run is displayed as checkpoint-overdue after fifteen minutes, but
+ * this scheduler performs no runtime inspection until the thirty-minute
+ * diagnostic window is due.
  * Leader Runs are only persisted when classification reaches truly-stalled —
  * healthy downstream work, open user input, and recent own progress remain
  * structured waiting/working facts. No branch sends terminal bytes, retries,
@@ -712,20 +712,65 @@ export async function reconcileStalledRoleRuns(
       }];
     })
   ));
-  const stallCandidates = candidates.filter(({ run }) => isStallCandidate(
+  const eventsByTask = new Map<string, readonly TaskEvent[]>();
+  const diagnosticEvents = (taskId: string): readonly TaskEvent[] => {
+    const existing = eventsByTask.get(taskId);
+    if (existing !== undefined) return existing;
+    const events = store.listEvents?.(taskId) ?? [];
+    eventsByTask.set(taskId, events);
+    return events;
+  };
+  const cadenceCandidates = candidates.filter(({ task, run }) => isStallCandidate(
     run,
     now,
     windowMs,
-    diagnosticAfterMs
+    latestRunEventTime(diagnosticEvents(task.id), RUN_DIAGNOSTIC_FINISHED_EVENT, run.id)
   ));
+  const stallCandidates = cadenceCandidates.filter(({ task, role, run }) => {
+    const progressFacts = foldPortPresent
+      ? store.getRunProgressFacts?.(task.id, run.id)
+      : undefined;
+    const progressAt = currentRoleRunProgressAt(
+      store,
+      task.id,
+      role.name,
+      run,
+      foldPortPresent ? undefined : diagnosticEvents(task.id),
+      progressFacts
+    ).progressAt;
+    return isStallCandidate(
+      run,
+      now,
+      windowMs,
+      latestRunEventTime(
+        diagnosticEvents(task.id),
+        RUN_DIAGNOSTIC_FINISHED_EVENT,
+        run.id
+      ),
+      progressAt
+    );
+  });
   if (stallCandidates.length === 0) return [];
+  const diagnosticStartedAt = now.toISOString();
+  const finishDiagnostics = (outcome: "observed" | "observation-error"): void => {
+    for (const { task, role, run } of stallCandidates) {
+      store.recordRoleRunDiagnostic?.({
+        taskId: task.id,
+        roleName: role.name,
+        runId: run.id,
+        startedAt: diagnosticStartedAt,
+        outcome,
+        now
+      });
+    }
+  };
   const stallCandidateKeys = new Set(stallCandidates.map(({ task, role }) => (
     `${task.id}\0${role.name}`
   )));
   const observed = new Map<string, ObservedRun>();
   // Recent active Runs are known healthy enough for Leader classification from
   // their exact acceptance/creation boundary, but are deliberately not read
-  // from tmux or Event history until the 10-minute execution candidate window.
+  // from tmux or Event history until the 30-minute diagnostic window.
   for (const candidate of candidates) {
     const key = `${candidate.task.id}\0${candidate.role.name}`;
     if (stallCandidateKeys.has(key)) continue;
@@ -779,7 +824,9 @@ export async function reconcileStalledRoleRuns(
         )));
     } catch {
       // Health inspection is advisory. Unknown host state must leave the exact
-      // Run/Session fence untouched and let the next full pass retry.
+      // Run/Session fence untouched. Closing this window schedules the next
+      // bounded diagnostic thirty minutes later instead of hot-looping.
+      finishDiagnostics("observation-error");
       return [];
     }
   }
@@ -790,6 +837,7 @@ export async function reconcileStalledRoleRuns(
     } catch {
       // A malformed/partial provider snapshot is not evidence of a stall.
       // Leave all fences untouched and let the next full pass retry.
+      finishDiagnostics("observation-error");
       return [];
     }
   }
@@ -802,8 +850,11 @@ export async function reconcileStalledRoleRuns(
     const key = `${candidate.task.id}\0${candidate.role.name}`;
     let live: "present" | "absent";
     try {
-      if (liveStatuses !== undefined && !liveStatuses.has(key)) return [];
-          live = liveStatuses !== undefined
+      if (liveStatuses !== undefined && !liveStatuses.has(key)) {
+        finishDiagnostics("observation-error");
+        return [];
+      }
+      live = liveStatuses !== undefined
         ? liveStatuses.get(key)!
         : byRole === null
         ? await delivery.inspectRole({
@@ -820,6 +871,7 @@ export async function reconcileStalledRoleRuns(
       // Without a complete live snapshot, especially for downstream Runs,
       // Leader classification would be unsafe. Treat the whole advisory pass
       // as unknown instead of escalating a false stall.
+      finishDiagnostics("observation-error");
       return [];
     }
     // A missing process is handled by the existing fenced liveness pass. This
@@ -1045,6 +1097,7 @@ export async function reconcileStalledRoleRuns(
       });
     }
   }
+  finishDiagnostics("observed");
   return raised;
 }
 
@@ -1052,16 +1105,20 @@ function isStallCandidate(
   run: Readonly<{ createdAt: string; deliveredAt?: string }>,
   now: Date,
   windowMs: number,
-  diagnosticAfterMs: number
+  lastDiagnosticFinishedAt?: string,
+  latestProgressAt?: string
 ): boolean {
   const startAt = run.deliveredAt ?? run.createdAt;
-  const ageMs = now.getTime() - Date.parse(startAt);
+  const baseline = [startAt, lastDiagnosticFinishedAt, latestProgressAt]
+    .filter((value): value is string => (
+      value !== undefined && Number.isFinite(Date.parse(value))
+    ))
+    .reduce((latest, value) => (
+      Date.parse(value) > Date.parse(latest) ? value : latest
+    ));
+  const ageMs = now.getTime() - Date.parse(baseline);
   if (!Number.isFinite(ageMs)) return false;
-  // Undelivered Runs are watched for a delivery stall on the same reasonable
-  // window, but they never enter workflow-stall candidate filtering.
-  return run.deliveredAt === undefined
-    ? ageMs >= windowMs
-    : ageMs >= diagnosticAfterMs;
+  return ageMs >= windowMs;
 }
 
 type ObservedRun = Readonly<{

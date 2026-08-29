@@ -584,7 +584,7 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         const { runtimeHealth: _removed, ...rest } = config;
         return rest;
       });
-      return "Runtime health thresholds reset to quiet 300s / diagnostic 600s / stall 1800s\n";
+      return "Runtime health thresholds reset to quiet 300s / diagnostic 900s / stall 1800s\n";
     }
   },
   {

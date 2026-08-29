@@ -15,6 +15,8 @@ import {
   actionableExecutionLaneRecoveries,
   type ExecutionGroupHealthSummary
 } from "../execution/executionHealth.js";
+import { runOwnsBlockingProviderContinuation } from "../runtime/runtimeContinuationProjection.js";
+import { runHasActiveRuntimeOperations } from "../runtime/runtimeObservation.js";
 
 /**
  * Issue 08: read-only projection of the exact recovery position for one Run.
@@ -30,13 +32,11 @@ import {
 export type RunRecoveryAction =
   | "diagnose"
   | "retry"
-  | "replace-session"
   | "terminate";
 
 export const RUN_RECOVERY_ACTIONS: readonly RunRecoveryAction[] = [
   "diagnose",
   "retry",
-  "replace-session",
   "terminate"
 ];
 
@@ -117,6 +117,9 @@ export type RunRecoveryFacts = Readonly<{
   run: AgentRun;
   task: Pick<Task, "id" | "status"> | null;
   sessionSet: TaskRoleSessionSet | null;
+  inputDeliveryUnsettled: boolean;
+  blockingProviderContinuation: boolean;
+  activeRuntimeOperation: boolean;
   progress: Readonly<{ progressAt: string; evidence?: string }> | null;
   latestProviderObservation: Readonly<{ kind: string; receivedAt: string }> | null;
 }>;
@@ -126,6 +129,11 @@ export type RunRecoveryStore = Readonly<{
   getAgentRun(taskId: string, runId: string): AgentRun | null;
   getTask(taskId: string): Task | null;
   getTaskRoleSessionSet(taskId: string, roleName: string): TaskRoleSessionSet | null;
+  getWorkMailbox?: (target: Readonly<{
+    kind: "role";
+    taskId: string;
+    roleName: string;
+  }>) => Readonly<{ inputDelivery: unknown | null }> | null;
   listEvents(taskId: string): readonly TaskEvent[];
   getWorkItem?: (taskId: string, workItemId: string) => Readonly<{
     updatedAt: string;
@@ -165,6 +173,12 @@ export function readRunRecoveryFacts(
   if (run === null || run.taskId !== taskId) return null;
   const task = store.getTask(taskId);
   const sessionSet = store.getTaskRoleSessionSet(taskId, run.roleName);
+  const events = store.listEvents(taskId);
+  const roleMailbox = store.getWorkMailbox?.({
+    kind: "role",
+    taskId,
+    roleName: run.roleName
+  }) ?? null;
   const progress = latestRunDurableProgressAt(
     store,
     taskId,
@@ -175,9 +189,22 @@ export function readRunRecoveryFacts(
     run,
     task: task === null ? null : { id: task.id, status: task.status },
     sessionSet,
+    inputDeliveryUnsettled: roleMailbox?.inputDelivery != null,
+    blockingProviderContinuation: runOwnsBlockingProviderContinuation(events, {
+      taskId,
+      roleName: run.roleName,
+      runId: run.id,
+      agentId: run.effective.agentId
+    }),
+    activeRuntimeOperation: runHasActiveRuntimeOperations(events, {
+      taskId,
+      roleName: run.roleName,
+      runId: run.id,
+      agentId: run.effective.agentId
+    }),
     progress,
     latestProviderObservation: latestRunProviderObservation(
-      store.listEvents(taskId),
+      events,
       runId
     )
   };
@@ -239,9 +266,14 @@ export function projectRunRecovery(facts: RunRecoveryFacts): RunRecoveryProjecti
     : ["rejected", "ambiguous"] as const;
 
   const blocked = recoveryBlocker(facts, session, canonicalProgressAt);
-  const supportedActions = session?.status === "stopped" || session?.status === "broken"
-    ? RUN_RECOVERY_ACTIONS.filter((action) => action !== "retry")
-    : RUN_RECOVERY_ACTIONS;
+  const sessionTerminal = session?.status === "stopped" || session?.status === "broken";
+  const providerTerminal = sessionSet?.providerBinding?.turn?.status === "failed"
+    || sessionSet?.providerBinding?.turn?.status === "cancelled"
+    || sessionSet?.providerBinding?.turn?.status === "rejected";
+  const supportedActions = RUN_RECOVERY_ACTIONS.filter((action) => (
+    (action !== "retry" || !sessionTerminal)
+    && (action !== "terminate" || sessionTerminal || providerTerminal)
+  ));
   const actions = blocked === null
     ? supportedActions.map((action) => buildActionPlan(facts, action, session!, canonicalProgressAt!))
     : [];
@@ -310,6 +342,20 @@ function recoveryBlocker(
   if (run.status !== "active") return "run-terminal";
   if (canonicalProgressAt === null) return "progress-unavailable";
   if (session === null) return "session-missing";
+  if (facts.inputDeliveryUnsettled) return "provider-input-delivery-unsettled";
+  if (facts.blockingProviderContinuation) return "provider-continuation-writer-owned";
+  if (facts.activeRuntimeOperation) return "provider-operation-active";
+  const binding = facts.sessionSet?.providerBinding;
+  if (run.deliveredAt !== undefined
+    && (binding === null || binding?.turn === null)) return "provider-turn-state-missing";
+  if (binding !== null && binding !== undefined) {
+    if (["submitting", "accepted", "running", "delivery-unknown"].includes(
+      binding.turn?.status ?? ""
+    )) return "provider-turn-unsettled";
+    if (binding.authority.owner === "human" || binding.authority.owner === "unknown") {
+      return "provider-writer-authority-unavailable";
+    }
+  }
   return null;
 }
 
@@ -389,6 +435,5 @@ function actionAcceptance(
 const ACTION_REASONS: Readonly<Record<RunRecoveryAction, string>> = {
   diagnose: "Collect bounded diagnostics before any state-changing recovery.",
   retry: "Request another provider turn on the same native Session when the failure is transient.",
-  "replace-session": "Request a fresh native Session when the current one is unusable.",
   terminate: "Fail the Run explicitly when recovery is not viable."
 };

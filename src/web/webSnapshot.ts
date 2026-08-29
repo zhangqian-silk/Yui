@@ -347,7 +347,9 @@ function latestStallField(
   field: string
 ): string | undefined {
   const stalled = events
-    .filter((event) => event.type === "run.stalled" && event.payload.runId === runId)
+    .filter((event) => event.type === "run.stalled"
+      && event.payload.runId === runId
+      && event.payload.status !== "diagnostic-only")
     .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
   return stalled?.payload[field];
 }

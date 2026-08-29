@@ -65,7 +65,7 @@ export interface RoleLaunchPlanner {
     adapterId: string;
     workspace: string;
   }>): void;
-  /** Persist a task caller key only after a native host was created. */
+  /** Persist a task caller key only after its Provider process was created. */
   commitTaskCallerKey?(input: Readonly<{
     taskId: string;
     roleName: string;

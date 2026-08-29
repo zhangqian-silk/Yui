@@ -39,7 +39,6 @@ import {
 import {
   createRoleSessionSet,
   retireTaskRoleSessionsForWorkspace,
-  roleAgentSessionResumeMode,
   updateTaskRoleProviderRuntime,
   updateRoleAgentSessionStatus,
   type TaskRoleSessionSet
@@ -48,6 +47,13 @@ import {
   currentProviderActivation,
   transferProviderAuthority
 } from "../runtime/providerRuntimeIdentity.js";
+import {
+  CONVERSATION_SWITCH_REQUESTED_EVENT,
+  CONVERSATION_SWITCH_RESOLVED_EVENT,
+  projectConversationSwitch,
+  providerConversationGeneration,
+  roleSessionDispatchModeWithConversationSwitch
+} from "../runtime/conversationSwitch.js";
 import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
 import {
   resolveEffectiveLaunch,
@@ -75,7 +81,6 @@ import {
   validateExactRunReviewRound,
   type ExactAgentRunRecoveryAction
 } from "../lifecycle/exactRunTerminalization.js";
-import { resetTaskRoleSessionGeneration } from "../lifecycle/taskRoleSessionReset.js";
 import {
   activeRoleAgentBinding,
   copyGlobalRoleToTaskRole,
@@ -2077,7 +2082,7 @@ function taskRoleCommand(
   if (command === "remove") return output(removeTaskRole(rest, store, options));
   if (command === "bind") return output(bindTaskRole(rest, store, options));
   if (command === "unbind") return output(unbindTaskRole(rest, store, options));
-  if (command === "reset") return resetTaskRole(rest, store, options);
+  if (command === "session") return taskRoleSessionCommand(rest, store, options);
   if (command === "view") return viewTaskRole(rest, store);
   if (command === "takeover") return transferTaskRoleAuthority(rest, store, options, "takeover");
   if (command === "release") return transferTaskRoleAuthority(rest, store, options, "release");
@@ -2086,43 +2091,102 @@ function taskRoleCommand(
     : `Unknown command: task role ${command}`);
 }
 
-function resetTaskRole(
+function taskRoleSessionCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task role reset usage: yui task role reset <task> <role> --reason <text>.";
+  const [command, ...rest] = args;
+  if (command === "switch") return switchTaskRoleSession(rest, store, options);
+  throw usageError(command === undefined
+    ? "Task role session command is required."
+    : `Unknown command: task role session ${command}`);
+}
+
+function switchTaskRoleSession(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task role session switch usage: yui task role session switch <task> <role> --reason <text>.";
   const parsed = parseTail(args, new Set(["--reason"]), usage);
   exactPositionals(parsed.positionals, 2, usage);
-  const reason = requiredOption(parsed.options, "--reason");
+  const reason = truncateEventNote(requiredOption(parsed.options, "--reason"));
   const now = clock(options);
-  let result;
-  try {
-    result = store.transaction((tx) => resetTaskRoleSessionGeneration(
-      tx,
-      parsed.positionals[0],
-      parsed.positionals[1],
-      reason,
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, parsed.positionals[0]);
+    if (task.status !== "active") {
+      throw usageError(inactiveTaskMessage(task, "switching a Provider Conversation"), usage);
+    }
+    const role = requireRole(tx, task.id, parsed.positionals[1]);
+    const requestedBy = taskActor(options, task.id);
+    const leaderRunId = requestedBy === "leader"
+      ? taskLeaderActionRunId(tx, task.id, options.environment, options.yuiHome)
+      : undefined;
+    if (requestedBy === "leader" && leaderRunId === undefined) {
+      throw usageError(
+        "Leader Conversation switching requires the exact current-Turn assertion.",
+        usage
+      );
+    }
+    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+    const generation = providerConversationGeneration(sessions);
+    if (sessions === null || generation === null) {
+      throw usageError(`Task Role has no current Provider Conversation: ${task.id}/${role.name}.`, usage);
+    }
+    const events = tx.listEvents(task.id);
+    const previous = projectConversationSwitch(events, role.name, sessions);
+    if (previous?.status === "pending"
+      && previous.generation === generation
+      && previous.requestedBy === requestedBy
+      && previous.reason === reason) {
+      return { taskId: task.id, roleName: role.name, request: previous, replayed: true };
+    }
+    if (previous !== null && previous.resolvedAt === undefined) {
+      tx.saveEvent(task.id, createTaskEvent(
+        tx.nextEventId(task.id),
+        task.id,
+        CONVERSATION_SWITCH_RESOLVED_EVENT,
+        {
+          requestId: previous.requestId,
+          roleName: role.name,
+          generation: previous.generation,
+          status: "obsolete"
+        },
+        now
+      ));
+    }
+    const requestId = tx.nextEventId(task.id);
+    const event = createTaskEvent(
+      requestId,
+      task.id,
+      CONVERSATION_SWITCH_REQUESTED_EVENT,
+      {
+        requestId,
+        roleName: role.name,
+        generation,
+        requestedBy,
+        reason,
+        ...(leaderRunId === undefined ? {} : { leaderRunId })
+      },
       now
-    ));
-  } catch (error) {
-    throw usageError(error instanceof Error ? error.message : String(error), usage);
-  }
-  const target = runtimeLifecycleTarget({
-    scope: "task",
+    );
+    tx.saveEvent(task.id, event);
+    return {
+      taskId: task.id,
+      roleName: role.name,
+      request: projectConversationSwitch([...events, event], role.name, sessions)!,
+      replayed: false
+    };
+  });
+  options.runtime?.notifyStateChanged(result.taskId);
+  options.runtime?.notifyMailboxChanged?.({
+    kind: "role",
     taskId: result.taskId,
     roleName: result.roleName
   });
-  options.runtime?.notifyMailboxChanged?.(target);
-  notifyMailbox(
-    options.runtime,
-    result.roleName === LEADER_ROLE
-      ? { kind: "operator" }
-      : leaderMailbox(result.taskId),
-    result.taskId
-  );
   return output(
-    `Reset Task Role Session ${result.taskId}/${result.roleName}; runtime cleanup is pending.\n`,
+    `${result.replayed ? "Reused" : "Recorded"} pending Provider Conversation switch ${result.request.requestId} for ${result.taskId}/${result.roleName}. The current Conversation remains authoritative until safe replacement binding.\n`,
     result
   );
 }
@@ -3231,7 +3295,10 @@ function dispatchWork(
           workItemWriteProjectIds: item.writeProjectIds
         });
       const sessions = tx.getTaskRoleSessionSet(task.id, plan.role.name);
-      const dispatchMode = roleAgentSessionResumeMode(
+      const dispatchMode = taskRoleDispatchMode(
+        tx,
+        task.id,
+        plan.role.name,
         sessions,
         effective.agentId,
         effective
@@ -6062,7 +6129,14 @@ function retryRun(
       runId!,
       task.id,
       role.name,
-      roleAgentSessionResumeMode(sessions, effective.agentId, effective),
+      taskRoleDispatchMode(
+        tx,
+        task.id,
+        role.name,
+        sessions,
+        effective.agentId,
+        effective
+      ),
       assignment,
       now,
       {
@@ -6853,15 +6927,15 @@ function retryFailedReviewRun(
 
 /**
  * Records one explicit Leader recovery decision against an exact live Run.
- * Retry and Session replacement remain requests: the Controller never sends
- * another input or changes a native generation from this command.
+ * Diagnose and retry remain same-Run requests: this command never changes a
+ * native Conversation generation.
  */
 function recoverRun(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task run recover usage: yui task run recover <task>/<run> --action <diagnose|retry|replace-session|terminate> (--expected-progress-at <timestamp>|--from-next-action <fingerprint>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text> [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>].";
+  const usage = "Task run recover usage: yui task run recover <task>/<run> --action <diagnose|retry|terminate> (--expected-progress-at <timestamp>|--from-next-action <fingerprint>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text> [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>].";
   const parsed = parseTail(
     args,
     new Set([
@@ -8097,7 +8171,14 @@ export function dispatchPreparedReviewRound(
         runId,
         taskId,
         laneReviewer.name,
-        roleAgentSessionResumeMode(sessions, effective.agentId, effective),
+        taskRoleDispatchMode(
+          tx,
+          taskId,
+          laneReviewer.name,
+          sessions,
+          effective.agentId,
+          effective
+        ),
         assignment,
         now,
         {
@@ -8606,6 +8687,24 @@ function taskActor(options: TaskCommandOptions, taskId: string) {
   return resolveTaskActor(options.environment, taskId);
 }
 
+function taskRoleDispatchMode(
+  store: TaskWorkflowStore,
+  taskId: string,
+  roleName: string,
+  sessions: TaskRoleSessionSet | null,
+  agentId: string,
+  effective: EffectiveLaunchSnapshot
+): "new" | "resume" {
+  return roleSessionDispatchModeWithConversationSwitch(
+    sessions,
+    store.listEvents(taskId),
+    store.getWorkMailbox({ kind: "role", taskId, roleName }),
+    roleName,
+    agentId,
+    effective
+  );
+}
+
 function inactiveTaskMessage(task: Task, action: string): string {
   if (task.status === "draft") {
     return `Task ${task.id} is a Draft; activate it before ${action}.`;
@@ -8637,10 +8736,9 @@ function parseRecoveryAction(
   if (
     value === "diagnose"
     || value === "retry"
-    || value === "replace-session"
     || value === "terminate"
   ) return value;
-  throw usageError("--action must be diagnose, retry, replace-session, or terminate.", usage);
+  throw usageError("--action must be diagnose, retry, or terminate.", usage);
 }
 
 function parseProviderAcceptance(

@@ -1,11 +1,8 @@
 import { createAgentRun } from "../run/agentRun.js";
 import {
-  createRunAssignment,
-  serializeRunBootstrapEnvelope
+  createRunAssignment
 } from "../context/runContextContract.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
-import { prefixYuiTitleInput } from "../run/runIdentity.js";
-import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
 import {
   effectiveLaunchSnapshotsCompatible,
   effectiveLaunchSnapshotsCompatibleForTaskSession
@@ -28,13 +25,15 @@ import type {
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
+import { roleSessionDispatchModeWithConversationSwitch } from "../runtime/conversationSwitch.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
   runId?: string;
   status: "dispatched" | "skipped" | "failed";
-  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed" | "not-ready" | "writer-attached" | "delivery-uncertain";
+  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed" | "not-ready" | "writer-attached" | "delivery-uncertain" | "provider-rejected";
   error?: string;
+  terminalized?: boolean;
 }>;
 
 export async function processLeaderWakeups(
@@ -110,7 +109,6 @@ export async function processLeaderWakeups(
     let effectiveSession: SchedulerRoleSession | null = existingSession;
     let claimed = false;
     let deliveryAttempted = false;
-    let providerSubmissionBegun = false;
     let run: ReturnType<typeof createAgentRun> | null = null;
     let prepared: PreparedRoleDelivery | undefined;
     let preStartFencePersisted = false;
@@ -172,23 +170,22 @@ export async function processLeaderWakeups(
       const resumableSession = hasNativeSession(existingSession)
         && existingSession.status !== "stopped"
         && existingSession.status !== "broken";
-      // Quick Win (EXE-03): a resume Run that failed before durable Provider
-      // acceptance must not be retried against the same native Session.  The
-      // Session is proven unusable for this delivery; the next launch must be
-      // a fresh Session after exact cleanup/reset.  The guard only applies
-      // while the failed resume Run is the *latest* Run for the Role: once a
-      // newer Run exists (the fresh-Session launch), the historical failure
-      // is stale and must not permanently disable resume for the Role.
-      const latestRoleRun = store.listAgentRuns?.(task.id)
-        ?.filter((run) => run.roleName === role.name)
-        .at(-1);
-      const failedResumeWithoutAcceptance = latestRoleRun !== undefined
-        && latestRoleRun.mode === "resume"
-        && latestRoleRun.status === "failed"
-        && latestRoleRun.deliveredAt === undefined;
-      const mode = resumableSession && compatibleSession && !failedResumeWithoutAcceptance
-        ? "resume"
-        : "new";
+      // A failed or quiet Run is not proof that its Provider Conversation is
+      // unusable. Keep resuming the same identity unless an explicit switch
+      // request (or exact terminal/missing evidence) authorizes a fresh one.
+      const sessionSet = store.getTaskRoleSessionSet?.(task.id, role.name) ?? null;
+      const mode = reopenIdentityDrift
+        ? "new"
+        : sessionSet === null
+          ? resumableSession && compatibleSession ? "resume" : "new"
+          : roleSessionDispatchModeWithConversationSwitch(
+            sessionSet,
+            store.listEvents?.(task.id) ?? [],
+            store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: role.name }),
+            role.name,
+            role.effective.agentId,
+            role.effective
+          );
       const runId = store.peekNextAgentRunId(task.id);
       const wakeEnvelope = resolveLeaderWakeEnvelope(store, task.id);
       const contextSnapshot = store.freezeLeaderContextSnapshot?.(task.id, role.name, now);
@@ -344,19 +341,42 @@ export async function processLeaderWakeups(
         now
       });
       if (ready.prepared.turnRejectedDuringLaunch === true) {
-        delivery.forgetPrepared?.({
+        const persisted = store.saveRoleRunDeliveryFailure({
           taskId: task.id,
           roleName: role.name,
+          agentId: run.effective.agentId,
+          adapterId: run.effective.adapterId,
           runId: run.id,
+          mailboxBatchId: formatAgentRunReceiptId(task.id, run.id),
+          ...(effectiveSession?.nativeSessionId === undefined
+            ? {}
+            : { nativeSessionId: effectiveSession.nativeSessionId }),
           ...(ready.prepared.launchId === undefined
             ? {}
-            : { launchId: ready.prepared.launchId })
+            : { launchId: ready.prepared.launchId }),
+          summary: `Provider conclusively rejected the exact initial Leader Run input: ${run.id}.`,
+          cleanupRequired: false,
+          now
         });
+        if (persisted === "failed") {
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            ...(ready.prepared.launchId === undefined
+              ? {}
+              : { launchId: ready.prepared.launchId })
+          });
+        }
         results.push({
           taskId: task.id,
           runId: run.id,
-          status: "skipped",
-          reason: "not-ready"
+          status: persisted === "failed" ? "failed" : "skipped",
+          reason: "provider-rejected",
+          terminalized: persisted === "failed",
+          ...(persisted === "failed"
+            ? {}
+            : { error: "Run state changed while recording exact Provider rejection." })
         });
         continue;
       }
@@ -412,121 +432,12 @@ export async function processLeaderWakeups(
         results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
         continue;
       }
-      const receiptId = formatAgentRunReceiptId(task.id, run.id);
-      if (effectiveSession === null || effectiveSession.launchId === undefined
-        || !hasNativeSession(effectiveSession)
-        || store.beginRoleRunProviderTurn?.({
-          taskId: task.id,
-          roleName: role.name,
-          runId: run.id,
-          agentId: run.effective.agentId,
-          launchId: effectiveSession.launchId,
-          nativeSessionId: effectiveSession.nativeSessionId,
-          attemptId: receiptId,
-          now
-        }) !== true) {
-        throw new Error("Provider Turn intent could not be durably fenced before delivery.");
-      }
-      providerSubmissionBegun = true;
-      deliveryAttempted = true;
-      const outcome = await delivery.sendOnce({
-        delivery: ready,
-        receiptId,
-        text: prefixYuiTitleInput(
-          serializeRunBootstrapEnvelope(run.bootstrapEnvelope),
-          resolveTaskRoleSessionTitle(effectiveSession.title, task, role.name)
-        )
-      });
-      if (outcome === "busy" || outcome === "unavailable") {
-        store.resolveRoleRunProviderSubmission?.({
-          taskId: task.id,
-          roleName: role.name,
-          runId: run.id,
-          attemptId: receiptId,
-          status: "rejected",
-          reason: outcome === "busy"
-            ? "Agent Host was busy before Provider mutation."
-            : "Agent Host was unavailable before Provider mutation.",
-          now
-        });
-        providerSubmissionBegun = false;
-        results.push({
-          taskId: task.id,
-          runId: run.id,
-          status: "skipped",
-          reason: "not-ready"
-        });
-        continue;
-      }
-      if (outcome === "rejected") {
-        store.resolveRoleRunProviderSubmission?.({
-          taskId: task.id,
-          roleName: role.name,
-          runId: run.id,
-          attemptId: receiptId,
-          status: "rejected",
-          reason: "Provider returned an exact negative acknowledgement.",
-          now
-        });
-        providerSubmissionBegun = false;
-        results.push({ taskId: task.id, runId: run.id, status: "skipped", reason: "not-ready" });
-        continue;
-      }
-      if (outcome === "delivery-unknown") {
-        store.resolveRoleRunProviderSubmission?.({
-          taskId: task.id,
-          roleName: role.name,
-          runId: run.id,
-          attemptId: receiptId,
-          status: "delivery-unknown",
-          reason: "Provider Turn delivery is ambiguous; automatic retry is fenced.",
-          now
-        });
-        providerSubmissionBegun = false;
-        store.saveRoleRunDelivery({
-          task,
-          role,
-          run,
-          session: effectiveSession,
-          ...(ready.prepared.launchId === undefined
-            ? {}
-            : { launchId: ready.prepared.launchId }),
-          now
-        });
-        results.push({
-          taskId: task.id,
-          runId: run.id,
-          status: "skipped",
-          reason: "delivery-uncertain"
-        });
-        continue;
-      }
-
-      store.saveRoleRunDelivery({
-        task,
-        role,
-        run,
-        session: effectiveSession,
-        ...(ready.prepared.launchId === undefined
-          ? {}
-          : { launchId: ready.prepared.launchId }),
-        now
-      });
-      results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
+      throw new Error(
+        "Managed Provider launch completed without an initial Turn outcome."
+      );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       const message = `Leader dispatch failed: ${detail}`;
-      if (providerSubmissionBegun && run !== null) {
-        store.resolveRoleRunProviderSubmission?.({
-          taskId: task.id,
-          roleName: role.name,
-          runId: run.id,
-          attemptId: formatAgentRunReceiptId(task.id, run.id),
-          status: "delivery-unknown",
-          reason: detail,
-          now
-        });
-      }
       if (claimed && run !== null) {
         // Scheduler single-flight backpressure: the Role runtime lifecycle
         // lane was busy when the launch was reserved. The claimed Run stays

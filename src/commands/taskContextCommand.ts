@@ -350,7 +350,9 @@ export function runTaskContextCommand(
               : [`    Runtime source at creation: ${creation.payload.runtimeSource}`]),
             ...(recovery === undefined ? [] : [
               `    Runtime cleanup: ${recovery.runtimeCleanupPending ? "pending" : "none"}`,
-              `    Fresh launch: ${recovery.freshLaunchAllowed ? "allowed" : "blocked"}`
+              `    Fresh launch: ${recovery.freshLaunchAllowed
+                ? "allowed"
+                : `blocked (${recovery.freshLaunchBlockers.join(", ")})`}`
             ])
           ];
         })),
@@ -545,7 +547,9 @@ function renderCoordinationMailbox(
 
 function latestStallKind(events: readonly TaskEvent[], runId: string): string {
   const event = [...events]
-    .filter((candidate) => candidate.type === "run.stalled" && candidate.payload.runId === runId)
+    .filter((candidate) => candidate.type === "run.stalled"
+      && candidate.payload.runId === runId
+      && candidate.payload.status !== "diagnostic-only")
     .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
   return event?.payload.kind ?? "workflow-not-progressing";
 }

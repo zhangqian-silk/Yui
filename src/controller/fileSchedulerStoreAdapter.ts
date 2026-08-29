@@ -12,15 +12,16 @@ import {
   activeLiveRoleAgentSession,
   bindTaskRoleProviderRuntime,
   bindTaskRoleRun,
-  clearTaskRoleProviderRuntimeForCleanup,
   clearTaskRoleRun,
   createRoleSessionSet,
   markTaskRoleRunDelivered,
   markTaskRoleRunPushed,
   prepareTaskRoleRunRedispatch,
   recordRoleAgentSession,
+  replaceTaskRoleAgentSessionForConversationSwitch,
   recordTaskRoleTurnBoundary,
   rememberRoleAgentCompletedTurn,
+  stopTaskRoleRuntimeAfterPhysicalExit,
   updateRoleAgentSessionStatus,
   updateTaskRoleProviderRuntime,
   type AgentSessionStatus,
@@ -37,11 +38,21 @@ import {
   currentProviderConversation,
   markProviderTurnDeliveryUnknown,
   rejectProviderTurn,
+  settleProviderTurnSubmission,
   settleProviderTurn,
   startProviderActivation,
   supersedeProviderConversation,
   updateProviderConversationRecoverability
 } from "../runtime/providerRuntimeIdentity.js";
+import {
+  CONVERSATION_SWITCH_DETACHED_EVENT,
+  CONVERSATION_SWITCH_RESOLVED_EVENT,
+  conversationDetachmentBasis,
+  conversationReplacementBasis,
+  pendingConversationSwitch,
+  roleSessionDispatchModeWithConversationSwitch,
+  type ConversationReplacementBasis
+} from "../runtime/conversationSwitch.js";
 import { decideProviderRecovery } from "../runtime/providerRecoveryDecision.js";
 import {
   hasRecentTurnId
@@ -116,6 +127,7 @@ import type {
   LeaderDispatchPersistence,
   RoleRunDeliveryFailurePersistence,
   RoleRunDeliveryPersistence,
+  RoleRunDiagnosticPersistence,
   RoleRunProgressPersistence,
   RoleRunStallPersistence,
   SchedulerRunProgress,
@@ -141,6 +153,7 @@ import {
   latestStallEvidenceKey,
   isRoleRunStalled,
   RUN_PROGRESS_EVENT,
+  RUN_DIAGNOSTIC_FINISHED_EVENT,
   RUN_RECOVERED_EVENT,
   RUN_STALLED_EVENT
 } from "../scheduler/roleRunStall.js";
@@ -207,6 +220,7 @@ import {
   runtimeObservationFromTaskEvent,
   runtimeObservationRunFenceMatches,
   runtimeObservationTaskEventPayload,
+  runHasActiveRuntimeOperations,
   type RuntimeObservation
 } from "../runtime/runtimeObservation.js";
 import { projectRuntimeTaskEvents } from "../runtime/runtimeProjection.js";
@@ -639,7 +653,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           const message = [
             `Leader native Session became unavailable while Run ${active.id} remains active.`,
             "Yui preserved the Run because Session/host termination is not a workflow outcome.",
-            "Inspect native-child and mailbox facts, then explicitly continue, reset, or request user input."
+            "Inspect native-child and mailbox facts, then explicitly diagnose, recover the Run, request a Conversation switch, or request user input."
           ].join(" ");
           recordLeaderAttentionRequired(store, {
             taskId: input.fence.taskId!,
@@ -1074,6 +1088,40 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return latestRunDurableProgressAt(view, taskId, roleName, runId, projected.runFacts.get(runId) ?? {});
   }
 
+  recordRoleRunDiagnostic(
+    input: RoleRunDiagnosticPersistence
+  ): "recorded" | "already-recorded" | "state-changed" {
+    return this.store.transaction((store) => {
+      const task = store.getTask(input.taskId);
+      const run = store.getActiveAgentRun(input.taskId, input.roleName);
+      if (task === null || task.status !== "active"
+        || run === null || run.id !== input.runId || run.status !== "active") {
+        return "state-changed";
+      }
+      const latest = latestRunEventTime(
+        store.listEvents(input.taskId),
+        RUN_DIAGNOSTIC_FINISHED_EVENT,
+        input.runId
+      );
+      if (latest !== undefined && Date.parse(latest) >= Date.parse(input.startedAt)) {
+        return "already-recorded";
+      }
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        RUN_DIAGNOSTIC_FINISHED_EVENT,
+        {
+          runId: input.runId,
+          roleName: input.roleName,
+          outcome: input.outcome,
+          startedAt: input.startedAt
+        },
+        input.now
+      ));
+      return "recorded";
+    });
+  }
+
   recordRoleRunStall(
     input: RoleRunStallPersistence
   ): "raised" | "already-raised" | "state-changed" {
@@ -1118,16 +1166,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           progressAt: input.progressAt,
           idleMs: String(Math.max(0, Math.floor(input.idleMs))),
           evidenceKey: input.evidenceKey,
-          status: "needs-attention"
+          status: "diagnostic-only"
         },
         input.now
       );
       store.saveEvent(task.id, event);
-      if (role.name === "leader") {
-        enqueueOperatorEvent(store, event, "leader-run-stalled", input.now);
-      } else {
-        queueLeaderWakeup(store, task.id, wakeReason("role-run-stalled"), input.now);
-      }
       return "raised";
     });
   }
@@ -1167,10 +1210,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           )
         )
       ));
-      const stalledAt = latestRunEventTime(events, RUN_STALLED_EVENT, run.id);
-      const recoveredAt = latestRunEventTime(events, RUN_RECOVERED_EVENT, run.id);
-      const recovered = stalledAt !== undefined
-        && (recoveredAt === undefined || Date.parse(recoveredAt) <= Date.parse(stalledAt));
+      // Advisory 30-minute diagnostics are intentionally not lifecycle
+      // episodes and therefore must never synthesize run.recovered.
+      const recovered = isRoleRunStalled(events, run.id);
       if (!existing) {
         store.saveEvent(task.id, createTaskEvent(
           store.nextEventId(task.id),
@@ -1209,6 +1251,111 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return sessions !== null && sessions.inFlight !== null;
   }
 
+  detachAgentHostProviderForConversationSwitch(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+    launchId: string;
+    previousConversationId: string;
+    previousNativeSessionId: string;
+    previousActivationId: string;
+    nextAuthorityEpoch: number;
+    nextAuthorityHolderId: string;
+    now: Date;
+  }>): "detached" | "already-detached" {
+    return this.store.transaction((store) => {
+      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+      const run = store.getAgentRun(input.taskId, input.runId);
+      const mailbox = store.getWorkMailbox({
+        kind: "role",
+        taskId: input.taskId,
+        roleName: input.roleName
+      });
+      const binding = sessions?.providerBinding;
+      const session = sessions?.sessions[input.agentId];
+      const task = store.getTask(input.taskId);
+      const role = store.getRole(input.taskId, input.roleName);
+      const activeRun = store.getActiveAgentRun(input.taskId, input.roleName);
+      if (task === null || task.status !== "active"
+        || role === null || role.activeAgentId !== input.agentId
+        || sessions === null || sessions === undefined
+        || run === null || run.status !== "active" || run.mode !== "new"
+        || activeRun?.id !== run.id
+        || run.effective.agentId !== input.agentId
+        || session?.nativeSessionId !== input.previousNativeSessionId
+        || binding === null || binding === undefined
+        || currentProviderConversation(binding).conversationId !== input.previousConversationId
+        || sessions.inFlight?.runId !== input.runId
+        || mailbox?.processing?.batchId !== sessions.inFlight.receiptId
+        || mailbox.processing.owner !== "controller"
+        || mailbox.processing.executionRef?.type !== "run"
+        || mailbox.processing.executionRef.taskId !== input.taskId
+        || mailbox.processing.executionRef.id !== input.runId
+        || mailbox.inputDelivery !== null
+        || pendingConversationSwitch(
+          store.listEvents(input.taskId),
+          input.roleName,
+          sessions
+        ) === null
+        || !runtimeHookMatchesReservation(
+          store,
+          { scope: "task", taskId: input.taskId, roleName: input.roleName },
+          input.launchId
+        )
+        || input.nextAuthorityHolderId !== input.launchId) {
+        throw new Error("Provider Conversation detachment no longer matches the exact switch Run.");
+      }
+      const target = binding.activations.find((entry) => (
+        entry.activationId === input.previousActivationId
+        && entry.conversationId === input.previousConversationId
+      ));
+      if (target === undefined) {
+        throw new Error("Provider Conversation detachment targets an unknown Activation.");
+      }
+      if (target.status !== "active") {
+        if (binding.authority.owner !== "none"
+          || input.nextAuthorityEpoch !== binding.authority.epoch + 1) {
+          throw new Error("Provider Conversation detachment replay has a stale authority fence.");
+        }
+        return "already-detached";
+      }
+      if (conversationDetachmentBasis({
+        sessions,
+        events: store.listEvents(input.taskId),
+        mailbox,
+        roleName: input.roleName,
+        runId: input.runId,
+        runMode: run.mode
+      }) !== "actor-request"
+        || binding.authority.owner !== "controller"
+        || binding.authority.holderId !== target.activationId
+        || input.nextAuthorityEpoch !== binding.authority.epoch + 2) {
+        throw new Error("Provider Conversation detachment is not authorized at this boundary.");
+      }
+      const detached = endProviderActivation(binding, target.activationId, {
+        status: "ended",
+        endedAt: input.now.toISOString(),
+        reason: "conversation-switch"
+      });
+      store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(sessions, detached, input.now));
+      store.saveEvent(input.taskId, createTaskEvent(
+        store.nextEventId(input.taskId),
+        input.taskId,
+        CONVERSATION_SWITCH_DETACHED_EVENT,
+        {
+          runId: input.runId,
+          roleName: input.roleName,
+          launchId: input.launchId,
+          conversationId: input.previousConversationId,
+          activationId: input.previousActivationId
+        },
+        input.now
+      ));
+      return "detached";
+    });
+  }
+
   beginAgentHostProviderTurn(input: Readonly<{
     taskId: string;
     roleName: string;
@@ -1226,6 +1373,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
       const session = sessions?.sessions[input.agentId];
       const binding = sessions?.providerBinding;
+      const mailbox = store.getWorkMailbox({
+        kind: "role",
+        taskId: input.taskId,
+        roleName: input.roleName
+      });
       if (sessions === null || sessions === undefined
         || binding === null || binding === undefined
         || sessions.inFlight?.runId !== input.runId
@@ -1235,7 +1387,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || currentProviderConversation(binding).conversationId !== input.nativeSessionId
         || binding.authority.owner !== input.authorityOwner
         || binding.authority.epoch !== input.authorityEpoch
-        || binding.authority.holderId !== input.holderId) {
+        || binding.authority.holderId !== input.holderId
+        || !processingOwnsExactInitialDelivery(
+          mailbox,
+          input.taskId,
+          input.runId,
+          input.attemptId
+        )) {
         throw new AgentHostProviderTurnFenceError(
           "Agent Host Provider Turn carries a stale durable writer fence. Release and reacquire Provider authority before retrying input."
         );
@@ -1277,21 +1435,15 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (sessions === null || sessions === undefined
         || binding === null || binding === undefined
         || binding.runId !== input.runId
-        || binding.turn?.attemptId !== input.attemptId
-        || binding.turn.status !== "submitting") {
+        || binding.turn?.attemptId !== input.attemptId) {
         throw new Error("Agent Host Provider Turn submission is no longer current.");
       }
-      const updated = input.status === "delivery-unknown"
-        ? markProviderTurnDeliveryUnknown(binding, {
-            attemptId: input.attemptId,
-            observedAt: input.now.toISOString(),
-            reason: input.reason
-          })
-        : rejectProviderTurn(binding, {
-            attemptId: input.attemptId,
-            rejectedAt: input.now.toISOString(),
-            reason: input.reason
-          });
+      const updated = settleProviderTurnSubmission(binding, {
+        attemptId: input.attemptId,
+        status: input.status,
+        reason: input.reason,
+        resolvedAt: input.now.toISOString()
+      });
       store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(sessions, updated, input.now));
     });
   }
@@ -1325,96 +1477,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       activationId: activation.activationId,
       ...binding.authority
     };
-  }
-
-  beginRoleRunProviderTurn(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    agentId: string;
-    launchId: string;
-    nativeSessionId: string;
-    attemptId: string;
-    now: Date;
-  }>): boolean {
-    return this.store.transaction((store) => {
-      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-      const session = sessions?.sessions[input.agentId];
-      const binding = sessions?.providerBinding;
-      if (sessions === null || sessions === undefined
-        || binding === null || binding === undefined
-        || sessions.inFlight?.runId !== input.runId
-        || binding.runId !== input.runId
-        || session?.launchId !== input.launchId
-        || session.nativeSessionId !== input.nativeSessionId
-        || currentProviderConversation(binding).conversationId !== input.nativeSessionId
-        || binding.authority.owner !== "controller") return false;
-      store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(
-        sessions,
-        beginProviderTurn(binding, {
-          attemptId: input.attemptId,
-          authorityEpoch: binding.authority.epoch,
-          submittedAt: input.now.toISOString()
-        }),
-        input.now
-      ));
-      return true;
-    });
-  }
-
-  resolveRoleRunProviderSubmission(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    runId: string;
-    attemptId: string;
-    status: "rejected" | "delivery-unknown";
-    reason: string;
-    now: Date;
-  }>): boolean {
-    return this.store.transaction((store) => {
-      const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-      const binding = sessions?.providerBinding;
-      if (sessions === null || sessions === undefined
-        || binding === null || binding === undefined
-        || binding.runId !== input.runId
-        || binding.turn?.attemptId !== input.attemptId
-        || binding.turn.status !== "submitting") return false;
-      const updated = input.status === "delivery-unknown"
-        ? markProviderTurnDeliveryUnknown(binding, {
-            attemptId: input.attemptId,
-            observedAt: input.now.toISOString(),
-            reason: input.reason
-          })
-        : rejectProviderTurn(binding, {
-            attemptId: input.attemptId,
-            rejectedAt: input.now.toISOString(),
-            reason: input.reason
-          });
-      store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(sessions, updated, input.now));
-      return true;
-    });
-  }
-
-  isRoleGenerationProviderReady(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    agentId: string;
-    launchId?: string;
-    nativeSessionId?: string;
-  }>): boolean {
-    // A session.ready observation for this exact generation is the durable
-    // pre-input fence. This reads folded Driver truth
-    // only — no liveness, screen, or pane/PID inference. Served from the
-    // revision projection: a stale miss only repeats an idempotent first push.
-    return this.listEvents(input.taskId).some((event) => {
-      const observation = runtimeObservationFromTaskEvent(event);
-      return observation?.kind === "session.ready"
-        && observation.fence.roleName === input.roleName
-        && observation.fence.agentId === input.agentId
-        && (input.launchId === undefined || observation.fence.launchId === input.launchId)
-        && (input.nativeSessionId === undefined
-          || observation.fence.nativeSessionId === input.nativeSessionId);
-    });
   }
 
   peekNextAgentRunId(taskId: string): string {
@@ -1741,14 +1803,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       const owner = runtimeOwnerFromTarget(target);
       markRuntimeOwnerSessionStopped(store, owner, now);
-      if (owner.scope === "task") {
-        const sessions = store.getTaskRoleSessionSet(owner.taskId, owner.roleName);
-        if (sessions !== null && sessions.providerBinding !== null) {
-          store.saveTaskRoleSessionSet(
-            clearTaskRoleProviderRuntimeForCleanup(sessions, now)
-          );
-        }
-      }
       saveRuntimeLifecycleMailbox(store, mailbox);
       return true;
     });
@@ -1931,7 +1985,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now: input.now
         }));
       }
-      if (input.session !== null && input.session.nativeSessionId !== undefined) {
+      if (input.run.mode !== "new"
+        && input.session !== null
+        && input.session.nativeSessionId !== undefined) {
         saveTaskSession(store, role, {
           ...input.session,
           nativeSessionId: input.session.nativeSessionId
@@ -2058,9 +2114,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           store,
           input
         );
-        if (existing?.nativeSessionId !== input.session.nativeSessionId
+        const defersConversationReplacement = active.mode === "new"
+          && existing !== null
+          && existing.nativeSessionId !== input.session.nativeSessionId;
+        if (!defersConversationReplacement
+          && (existing?.nativeSessionId !== input.session.nativeSessionId
           || (input.launchId !== undefined && existing.launchId !== input.launchId)
-          || existing.status !== "running") {
+          || existing.status !== "running")) {
           saveTaskSession(store, role, {
             ...input.session,
             nativeSessionId: input.session.nativeSessionId
@@ -2120,7 +2180,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return "state-changed";
       }
 
-      const summary = `Role delivery retry limit exhausted before exact Run input delivery: ${input.runId}.`;
+      const summary = input.summary
+        ?? `Role delivery retry limit exhausted before exact Run input delivery: ${input.runId}.`;
       const result = terminalizeExactTaskRun(store, {
         taskId: input.taskId,
         roleName: input.roleName,
@@ -2137,17 +2198,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         return "state-changed";
       }
 
-      enqueueWork(
-        store,
-        runtimeLifecycleTarget({
-          scope: "task",
-          taskId: input.taskId,
-          roleName: input.roleName
-        }),
-        RUNTIME_CLEANUP_REQUIRED_REASON,
-        input.now,
-        [{ type: "task", id: input.taskId }]
-      );
+      if (input.cleanupRequired !== false) {
+        enqueueWork(
+          store,
+          runtimeLifecycleTarget({
+            scope: "task",
+            taskId: input.taskId,
+            roleName: input.roleName
+          }),
+          RUNTIME_CLEANUP_REQUIRED_REASON,
+          input.now,
+          [{ type: "task", id: input.taskId }]
+        );
+      }
 
       const terminal = result.run;
       const deliveryFailureEvent = createTaskEvent(
@@ -3465,7 +3528,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   /**
    * Issue 04: reopens each due retry on its original Native Session. A Run
    * whose Session is proven dead terminalizes with an exact replacement
-   * blocker; a live Session is reset for the existing delivery path, which
+   * blocker; a live Session is reopened for the existing delivery path, which
    * re-pushes the exact same input in the same pass.
    */
   resolveDueProviderRetries(
@@ -3510,9 +3573,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           || !providerRetryIsDue(run.providerRetry, now)) {
           return;
         }
-        let sessions = store.getTaskRoleSessionSet(entry.taskId, entry.roleName);
+        const sessions = store.getTaskRoleSessionSet(entry.taskId, entry.roleName);
         const providerBinding = sessions?.providerBinding;
         let recoveryMode: "new" | "resume" = "resume";
+        let replacementRequired = false;
         if (providerBinding === null || providerBinding === undefined) {
           deferUnprovenProviderRecovery(
             store,
@@ -3580,18 +3644,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             );
             return;
           }
-          recoveryMode = "new";
-          const currentSession = sessions?.sessions[run.effective.agentId];
-          if (sessions !== null && currentSession !== undefined
-            && currentSession.status !== "broken") {
-            sessions = updateRoleAgentSessionStatus(
-              sessions,
-              run.effective.agentId,
-              "broken",
-              now
-            );
-            store.saveTaskRoleSessionSet(sessions);
-          }
+          replacementRequired = true;
         }
         const session = sessions?.sessions[run.effective.agentId];
         const identityMatches = session !== undefined
@@ -3644,7 +3697,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           );
           return;
         }
-        if (hasUnsettledRuntimeOperations(store, entry.taskId, run.id)) {
+        if (runHasActiveRuntimeOperations(store.listEvents(entry.taskId), {
+          taskId: entry.taskId,
+          roleName: entry.roleName,
+          runId: run.id,
+          agentId: run.effective.agentId
+        })) {
           const deferred = deferProviderRetry(run.providerRetry, now);
           if (deferred === null) {
             finalizeProviderRetryDeadline(
@@ -3658,6 +3716,39 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           }
           store.saveAgentRun(withProviderRetry(run, deferred));
           return;
+        }
+        if (replacementRequired) {
+          try {
+            recoveryMode = roleSessionDispatchModeWithConversationSwitch(
+              sessions,
+              store.listEvents(entry.taskId),
+              roleMailbox,
+              entry.roleName,
+              run.effective.agentId,
+              run.effective
+            );
+          } catch (error) {
+            deferUnprovenProviderRecovery(
+              store,
+              run,
+              entry.roleName,
+              error instanceof Error
+                ? error.message
+                : "Independent Conversation-switch evaluation failed closed.",
+              now
+            );
+            return;
+          }
+          if (recoveryMode !== "new") {
+            deferUnprovenProviderRecovery(
+              store,
+              run,
+              entry.roleName,
+              "Independent Conversation-switch evaluation kept the current Conversation.",
+              now
+            );
+            return;
+          }
         }
         // Reopen the Run on its original Session: reset transport markers,
         // switch to resume, and mark the projection in-flight. The delivery
@@ -3790,17 +3881,73 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               recordCanonicalObservationObsolete(store, input, "bind-state-missing", now);
               return "obsolete";
             }
-            const bound = recordRoleAgentSession(sessions, {
+            const mailbox = store.getWorkMailbox({
+              kind: "role",
+              taskId,
+              roleName: input.fence.roleName
+            });
+            const existingNativeSessionId = sessions.sessions[input.fence.agentId]
+              ?.nativeSessionId;
+            const replacingNativeSession = existingNativeSessionId !== undefined
+              && existingNativeSessionId !== decision.outcome.nativeSessionId;
+            const replacementBasis = replacingNativeSession
+              ? conversationReplacementBasis({
+                  sessions,
+                  events: store.listEvents(taskId),
+                  mailbox,
+                  roleName: input.fence.roleName,
+                  runId: run.id,
+                  runMode: run.mode
+                })
+              : null;
+            if (replacingNativeSession && replacementBasis === null) {
+              recordCanonicalObservationObsolete(
+                store,
+                input,
+                "conversation-switch-not-authorized",
+                now
+              );
+              return "obsolete";
+            }
+            const sessionInput = {
               agentId: input.fence.agentId,
               adapterId,
               nativeSessionId: decision.outcome.nativeSessionId,
               launchId: input.fence.launchId,
-              policy: "fixed",
-              status: "running",
+              policy: "fixed" as const,
+              status: "running" as const,
               effective: run.effective
-            }, now);
-            const withProvider = bindOrSupersedeProviderRuntime(bound, input, now);
+            };
+            const bound = replacementBasis === null
+              ? recordRoleAgentSession(sessions, sessionInput, now)
+              : replaceTaskRoleAgentSessionForConversationSwitch(
+                  sessions,
+                  sessionInput,
+                  now
+                );
+            const withProvider = bindOrSupersedeProviderRuntime(
+              bound,
+              input,
+              now,
+              replacementBasis ?? undefined
+            );
             store.saveTaskRoleSessionSet(withProvider);
+            if (replacementBasis === "actor-request") {
+              resolveConversationSwitchRequest(
+                store,
+                taskId,
+                input.fence.roleName,
+                sessions,
+                "applied",
+                now,
+                {
+                  conversationId: input.fence.conversationId
+                    ?? decision.outcome.nativeSessionId,
+                  activationId: input.fence.activationId ?? input.fence.launchId,
+                  launchId: input.fence.launchId
+                }
+              );
+            }
             const driver = this.drivers.require(input.fence.driverId);
             if (driver.capabilities.observation.sessionBootstrap === "discovered"
               && run.pushedAt === undefined) {
@@ -4134,7 +4281,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (role === null) return null;
     const sessionSet = store.getTaskRoleSessionSet(fence.taskId, fence.roleName);
     const session = sessionSet?.sessions[fence.agentId] ?? null;
-    const boundNativeSessionId = session?.nativeSessionId;
     if (runId === undefined) {
       return {
         fence,
@@ -4143,7 +4289,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         pushed: false,
         accepted: false,
         terminal: false,
-        ...(boundNativeSessionId === undefined ? {} : { boundNativeSessionId })
+        ...(session?.nativeSessionId === undefined
+          ? {}
+          : { boundNativeSessionId: session.nativeSessionId })
       };
     }
     const run = store.getAgentRun(fence.taskId, runId);
@@ -4154,8 +4302,15 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       || inFlight.runId !== run.id
       || inFlight.agentId !== run.effective.agentId) return null;
     const owner = { scope: "task" as const, taskId: fence.taskId, roleName: fence.roleName };
-    const launchId = session?.launchId
-      ?? (runtimeHookMatchesReservation(store, owner, fence.launchId) ? fence.launchId : undefined);
+    const freshConversationLaunch = run.mode === "new"
+      && runtimeHookMatchesReservation(store, owner, fence.launchId);
+    const boundNativeSessionId = freshConversationLaunch
+      ? undefined
+      : session?.nativeSessionId;
+    const launchId = freshConversationLaunch
+      ? fence.launchId
+      : session?.launchId
+        ?? (runtimeHookMatchesReservation(store, owner, fence.launchId) ? fence.launchId : undefined);
     if (launchId === undefined) return null;
     const expectedFence: CanonicalIdentityFence = {
       taskId: fence.taskId,
@@ -4334,19 +4489,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     }
     return "apply";
   }
-}
-
-function hasUnsettledRuntimeOperations(
-  store: TaskStore,
-  taskId: string,
-  runId: string
-): boolean {
-  return store.listEvents(taskId).some((event) => {
-    const observation = runtimeObservationFromTaskEvent(event);
-    return observation !== null
-      && observation.fence.runId === runId
-      && observation.kind === "operation.started";
-  });
 }
 
 function runtimeTurnFailureSummary(input: TaskRuntimeTurnFailed): string {
@@ -4680,13 +4822,10 @@ function markRuntimeOwnerSessionStopped(
     );
     if (sessions === null) return false;
     const active = sessions.sessions[sessions.activeAgentId];
-    if (active === undefined || active.status === "stopped") return false;
-    store.saveTaskRoleSessionSet(updateRoleAgentSessionStatus(
-      sessions,
-      sessions.activeAgentId,
-      "stopped",
-      now
-    ));
+    if (active === undefined) return false;
+    const stopped = stopTaskRoleRuntimeAfterPhysicalExit(sessions, now);
+    if (stopped === sessions) return false;
+    store.saveTaskRoleSessionSet(stopped);
     return true;
   }
   const sessions = store.getGlobalRoleSessionSet(owner.roleName);
@@ -5363,6 +5502,25 @@ function schedulerRoleSessionsMatch(
     && isDeepStrictEqual(current.effective, expected.effective);
 }
 
+/**
+ * The durable Run/mailbox claim is the pre-Host delivery intent. The Host may
+ * create a ProviderTurn only while that exact reservation still owns the Run;
+ * this closes the gap where a Session could start without any user Turn.
+ */
+function processingOwnsExactInitialDelivery(
+  mailbox: WorkMailbox | null,
+  taskId: string,
+  runId: string,
+  attemptId: string
+): boolean {
+  const processing = mailbox?.processing;
+  return processing?.batchId === attemptId
+    && processing.owner === "controller"
+    && processing.executionRef?.type === "run"
+    && processing.executionRef.taskId === taskId
+    && processing.executionRef.id === runId;
+}
+
 function matchesStallSessionFence(
   current: SchedulerRoleSession | null,
   expected: RoleRunStallPersistence["session"]
@@ -5533,7 +5691,8 @@ function canonicalStructuredProviderTurnId(
 function bindOrSupersedeProviderRuntime(
   sessions: TaskRoleSessionSet,
   input: RuntimeObservation,
-  now: Date
+  now: Date,
+  replacementBasis?: ConversationReplacementBasis
 ): TaskRoleSessionSet {
   if (sessions.inFlight === null) return sessions;
   const conversationId = input.fence.conversationId ?? input.fence.nativeSessionId!;
@@ -5575,10 +5734,45 @@ function bindOrSupersedeProviderRuntime(
       conversationId,
       activationId,
       switchedAt: input.observedAt ?? input.receivedAt,
-      noUnsettledInputDelivery
+      noUnsettledInputDelivery,
+      ...(replacementBasis === undefined ? {} : { basis: replacementBasis })
     }),
     now
   );
+}
+
+function resolveConversationSwitchRequest(
+  store: TaskStore,
+  taskId: string,
+  roleName: string,
+  previousSessions: TaskRoleSessionSet,
+  status: "applied" | "obsolete",
+  now: Date,
+  replacement?: Readonly<{
+    conversationId: string;
+    activationId: string;
+    launchId: string;
+  }>
+): void {
+  const request = pendingConversationSwitch(
+    store.listEvents(taskId),
+    roleName,
+    previousSessions
+  );
+  if (request === null) return;
+  store.saveEvent(taskId, createTaskEvent(
+    store.nextEventId(taskId),
+    taskId,
+    CONVERSATION_SWITCH_RESOLVED_EVENT,
+    {
+      requestId: request.requestId,
+      roleName,
+      generation: request.generation,
+      status,
+      ...(replacement === undefined ? {} : replacement)
+    },
+    now
+  ));
 }
 
 function rejectSubmittingProviderTurn(

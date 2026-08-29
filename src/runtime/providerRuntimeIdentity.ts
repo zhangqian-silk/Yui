@@ -358,6 +358,38 @@ export function rejectProviderTurn(
   });
 }
 
+/** Resolves an Agent Host submission exactly once and accepts an exact acknowledgement replay. */
+export function settleProviderTurnSubmission(
+  raw: ProviderRuntimeBinding,
+  input: Readonly<{
+    attemptId: string;
+    status: "rejected" | "delivery-unknown";
+    reason: string;
+    resolvedAt: string;
+  }>
+): ProviderRuntimeBinding {
+  const binding = validateProviderRuntimeBinding(raw);
+  const attemptId = identity(input.attemptId, "Provider input attempt id");
+  if (binding.turn?.attemptId !== attemptId) {
+    throw new Error("Provider Turn does not match a resolvable delivery state.");
+  }
+  if (binding.turn.status === input.status) return binding;
+  if (binding.turn.status !== "submitting") {
+    throw new Error("Provider Turn does not match a resolvable delivery state.");
+  }
+  return input.status === "delivery-unknown"
+    ? markProviderTurnDeliveryUnknown(binding, {
+        attemptId,
+        observedAt: input.resolvedAt,
+        reason: input.reason
+      })
+    : rejectProviderTurn(binding, {
+        attemptId,
+        rejectedAt: input.resolvedAt,
+        reason: input.reason
+      });
+}
+
 export function settleProviderTurn(
   raw: ProviderRuntimeBinding,
   input: Readonly<{
@@ -409,11 +441,16 @@ export function supersedeProviderConversation(
     activationId: string;
     switchedAt: string;
     noUnsettledInputDelivery: boolean;
+    basis?: "actor-request" | "exact-unrecoverable";
   }>
 ): ProviderRuntimeBinding {
   const binding = validateProviderRuntimeBinding(raw);
   const current = currentProviderConversation(binding);
-  if (current.recoverability !== "unrecoverable") {
+  const basis = input.basis ?? "exact-unrecoverable";
+  if (basis !== "actor-request" && basis !== "exact-unrecoverable") {
+    throw new Error("Provider Conversation switch basis is invalid.");
+  }
+  if (basis === "exact-unrecoverable" && current.recoverability !== "unrecoverable") {
     throw new Error("Current Provider Conversation is not exactly unrecoverable.");
   }
   if (!input.noUnsettledInputDelivery) {

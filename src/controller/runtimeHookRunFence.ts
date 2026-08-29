@@ -19,6 +19,7 @@ import {
 } from "../runtime/exactControlPlane.js";
 import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import { conversationReplacementBasis } from "../runtime/conversationSwitch.js";
 
 export type RuntimeHookRunFence = Readonly<{
   taskId: string;
@@ -163,9 +164,22 @@ export function resolveRuntimeHookRunFence(
   const startupRun = startupRunId === undefined
     ? null
     : store.getAgentRun(taskId, startupRunId);
+  const replacementStartup = options.startupSession !== undefined
+    && session !== undefined
+    && sessions !== null
+    && startupReservation
+    && startupRun?.mode === "new"
+    && conversationReplacementBasis({
+      sessions,
+      events: store.listEvents(taskId),
+      mailbox: roleMailbox,
+      roleName,
+      runId: startupRun.id,
+      runMode: startupRun.mode
+    }) !== null;
   const preallocatedStartup = options.startupSession === "preallocated"
     && expectedNativeSessionId !== undefined
-    && session === undefined
+    && (session === undefined || replacementStartup)
     && startupReservation
     && nativeSessionId === nativeSessionIdForLaunch(
       home,
@@ -175,7 +189,7 @@ export function resolveRuntimeHookRunFence(
     );
   const discoveredStartup = options.startupSession === "discovered"
     && expectedNativeSessionId === undefined
-    && session === undefined
+    && (session === undefined || replacementStartup)
     && startupReservation;
   const terminalRunId = options.terminal === true && acceptedBinding === null
     ? requireIdentity(environment.YUI_RUN_ID ?? runtime?.runId, "Run id")
@@ -226,6 +240,7 @@ export function resolveRuntimeHookRunFence(
     acceptedBinding === null
     && runtime !== undefined
     && session !== undefined
+    && !replacementStartup
     && sessionLaunchId !== undefined
     && typeof runtimeSource === "string"
     && !runtimeSource.trimStart().startsWith("{")
@@ -267,14 +282,14 @@ export function resolveRuntimeHookRunFence(
   if (run.effective.workspace.root !== workspace) {
     throw new Error("Runtime observation Hook workspace does not match the durable Run snapshot.");
   }
-  if (session !== undefined && acceptedBinding === null) {
+  if (session !== undefined && acceptedBinding === null && !replacementStartup) {
     if (session.adapterId !== adapterId
       || session.launchId !== effectiveLaunchId
       || session.nativeSessionId !== nativeSessionId
       || session.effective.workspace.root !== workspace) {
       throw new Error("Runtime observation Hook Session does not match its durable generation.");
     }
-  } else if (session === undefined && acceptedBinding === null) {
+  } else if (acceptedBinding === null && (session === undefined || replacementStartup)) {
     if (!discoveredStartup && !preallocatedStartup) {
       throw new Error("Runtime observation Hook launch is not durably reserved.");
     }

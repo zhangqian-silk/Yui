@@ -800,6 +800,11 @@ export function createRuntimeLifecycleDispatcher(
       }
       return { recorded: true };
     }
+    if (method === "runtime.conversation-switch-detach") {
+      const value = conversationSwitchDetachParams(params);
+      const outcome = schedulerStore.detachAgentHostProviderForConversationSwitch(value);
+      return { recorded: outcome === "detached", outcome };
+    }
     if (method === "runtime.provider-turn-submission-resolve") {
       const value = providerTurnControlParams(params);
       const status = (params as Record<string, unknown>).status;
@@ -905,7 +910,9 @@ export function createRuntimeLifecycleDispatcher(
         || !Number.isSafeInteger(hostPid) || (hostPid as number) <= 0) {
         throw applicationError("INVALID_PARAMS", "Launch redemption identity is invalid.");
       }
-      return launchBrokerForHome(store.rootDirectory()).redeem(launchId, ticket);
+      // The launch payload is validated at reservation time and every member
+      // of its discriminated Provider-control union is JSON serializable.
+      return launchBrokerForHome(store.rootDirectory()).redeem(launchId, ticket) as unknown as JsonValue;
     }
     if (method === "runtime.replace-agent-environment") {
       if (environmentRefresher === undefined) {
@@ -987,6 +994,12 @@ export function createRuntimeLifecycleDispatcher(
     const activeRun = request.scope === "task"
       ? store.getActiveAgentRun(request.taskId, request.roleName)
       : null;
+    if (request.scope === "task" && activeRun === null) {
+      throw applicationError(
+        "INVALID_PARAMS",
+        "Task Role runtime attachment requires an admitted active Run; it cannot create an empty Provider Conversation."
+      );
+    }
     const managedWorkspace = request.scope === "task"
       ? activeRun?.workspace
         ?? currentDesiredManagedWorkspace(store, request.taskId, request.roleName)
@@ -1012,12 +1025,26 @@ export function createRuntimeLifecycleDispatcher(
       );
     }
     validateLifecycleEnvironment(request.environment, agent);
-    const mode = roleAgentSessionResumeMode(
-      sessions,
-      effective.agentId,
-      effective
-    );
     const session = sessions?.sessions[effective.agentId];
+    const managedTurnDispatch = activeRun !== null && (
+      activeRun.pushedAt === undefined
+      || activeRun.providerRetry?.state === "dispatching"
+      || activeRun.controlRequest?.state === "dispatching"
+    );
+    // An ensure call may reattach the already-admitted Run to its existing
+    // Conversation, but it may not manufacture a fresh Conversation without a
+    // pending managed Turn. Fresh replacement remains owned by Run dispatch.
+    const mode = activeRun === null
+      ? roleAgentSessionResumeMode(sessions, effective.agentId, effective)
+      : managedTurnDispatch ? activeRun.mode : "resume";
+    if (request.scope === "task" && mode === "resume"
+      && (session?.nativeSessionId === undefined
+        || session.nativeSessionId.trim().length === 0)) {
+      throw applicationError(
+        "INVALID_PARAMS",
+        "Task Role runtime attachment cannot resume because its Provider Conversation identity is missing."
+      );
+    }
     const owner = request.scope === "task"
       ? { scope: "task" as const, taskId: request.taskId, roleName: request.roleName }
       : { scope: "global" as const, roleName: request.roleName };
@@ -1518,6 +1545,44 @@ function providerTurnControlParams(params: JsonValue): Readonly<{
     authorityEpoch: authorityEpoch as number,
     authorityOwner,
     holderId: requiredParam(value.holderId),
+    now: new Date(observedAt)
+  };
+}
+
+function conversationSwitchDetachParams(params: JsonValue): Readonly<{
+  taskId: string;
+  roleName: string;
+  runId: string;
+  agentId: string;
+  launchId: string;
+  previousConversationId: string;
+  previousNativeSessionId: string;
+  previousActivationId: string;
+  nextAuthorityEpoch: number;
+  nextAuthorityHolderId: string;
+  now: Date;
+}> {
+  if (typeof params !== "object" || params === null || Array.isArray(params)) {
+    throw applicationError("INVALID_PARAMS", "Provider Conversation detachment params are invalid.");
+  }
+  const value = params as Readonly<Record<string, JsonValue>>;
+  const nextAuthorityEpoch = value.nextAuthorityEpoch;
+  const observedAt = requiredParam(value.observedAt);
+  if (!Number.isSafeInteger(nextAuthorityEpoch) || (nextAuthorityEpoch as number) < 1
+    || !Number.isFinite(Date.parse(observedAt))) {
+    throw applicationError("INVALID_PARAMS", "Provider Conversation detachment fence is invalid.");
+  }
+  return {
+    taskId: requiredParam(value.taskId),
+    roleName: requiredParam(value.roleName),
+    runId: requiredParam(value.runId),
+    agentId: requiredParam(value.agentId),
+    launchId: requiredParam(value.launchId),
+    previousConversationId: requiredParam(value.previousConversationId),
+    previousNativeSessionId: requiredParam(value.previousNativeSessionId),
+    previousActivationId: requiredParam(value.previousActivationId),
+    nextAuthorityEpoch: nextAuthorityEpoch as number,
+    nextAuthorityHolderId: requiredParam(value.nextAuthorityHolderId),
     now: new Date(observedAt)
   };
 }

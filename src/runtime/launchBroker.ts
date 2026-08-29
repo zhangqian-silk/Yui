@@ -18,19 +18,45 @@ export type AgentHostLaunchPayload = Readonly<{
   providerControl?: AgentHostProviderControl;
 }>;
 
-export type AgentHostProviderControl = Readonly<{
+type ProviderInitialTurn = Readonly<{
+  attemptId: string;
+  boundedText: string;
+}>;
+
+type AgentHostProviderControlBase = Readonly<{
   schemaVersion: 1;
   adapterId: "codex" | "claude";
   transport: "codex-app-server-stdio" | "claude-stream-json";
-  mode: "new" | "resume";
-  nativeSessionId?: string;
   sessionTitle?: string;
   authority: ProviderAuthorityFence;
-  initialTurn?: Readonly<{
-    attemptId: string;
-    boundedText: string;
-  }>;
 }>;
+
+/**
+ * Managed Provider launches make the first-write contract explicit. A new or
+ * resumed Run can never be serialized without its required first Turn. The
+ * ensure variant only re-establishes the already-running Provider host and is
+ * therefore the sole variant that carries no input.
+ */
+export type AgentHostProviderControl = AgentHostProviderControlBase & (
+  | Readonly<{
+      kind: "new";
+      mode: "new";
+      nativeSessionId?: string;
+      initialTurn: ProviderInitialTurn;
+    }>
+  | Readonly<{
+      kind: "resume";
+      mode: "resume";
+      nativeSessionId: string;
+      initialTurn: ProviderInitialTurn;
+    }>
+  | Readonly<{
+      kind: "ensure";
+      mode: "resume";
+      nativeSessionId: string;
+      initialTurn?: never;
+    }>
+);
 
 type Reservation = Readonly<{
   ticket: string;
@@ -132,6 +158,18 @@ function validateProviderControl(control: AgentHostProviderControl): void {
   }
   if (control.mode !== "new" && control.mode !== "resume") {
     throw new Error("Agent Host Provider control mode is invalid.");
+  }
+  if (control.kind !== "new" && control.kind !== "resume" && control.kind !== "ensure") {
+    throw new Error("Agent Host Provider control kind is invalid.");
+  }
+  if ((control.kind === "new") !== (control.mode === "new")) {
+    throw new Error("Agent Host Provider control kind does not match its transport mode.");
+  }
+  if (control.kind !== "ensure" && control.initialTurn === undefined) {
+    throw new Error("Managed Provider new/resume launch requires its initial Turn.");
+  }
+  if (control.kind === "ensure" && control.initialTurn !== undefined) {
+    throw new Error("Managed Provider ensure launch cannot carry a new Turn.");
   }
   const requiresNativeSessionId = control.mode === "resume" || control.adapterId === "claude";
   if (requiresNativeSessionId !== (control.nativeSessionId !== undefined)) {

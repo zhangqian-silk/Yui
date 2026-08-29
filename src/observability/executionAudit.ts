@@ -95,6 +95,7 @@ export type SessionsAudit = Readonly<{
   stopped: number;
   other: number;
   resets: number;
+  conversationSwitches: number;
   lifecycleEvents: number;
   stopFailures: number;
   /**
@@ -619,6 +620,7 @@ export function runExecutionAudit(
       let stopped = 0;
       let other = 0;
       let resets = 0;
+      let conversationSwitches = 0;
       let lifecycleEvents = 0;
       let stopFailures = 0;
       const terminalByRunRelation = {
@@ -649,6 +651,8 @@ export function runExecutionAudit(
         for (const event of store.listEvents(taskId)) {
           if (!inWindow(event.createdAt, options)) continue;
           if (event.type === "runtime.role-session-reset") resets += 1;
+          else if (event.type === "runtime.conversation-switch-resolved"
+            && event.payload.status === "applied") conversationSwitches += 1;
           else if (runtimeObservationFromTaskEvent(event)?.kind.startsWith("session.")) {
             lifecycleEvents += 1;
           } else if (event.type === "runtime.turn-failed") stopFailures += 1;
@@ -660,6 +664,7 @@ export function runExecutionAudit(
         stopped,
         other,
         resets,
+        conversationSwitches,
         lifecycleEvents,
         stopFailures,
         terminalByRunRelation

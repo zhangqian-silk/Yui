@@ -632,29 +632,27 @@ async function processSelectedRoleRuntimeCleanups(
           const reservedLaunchId = isRuntimeLaunchReservation(mailbox.processing)
             ? mailbox.processing!.batchId
             : undefined;
-          if (
-            reservedLaunchId !== undefined
-            && session?.launchId !== undefined
-            && reservedLaunchId !== session.launchId
-          ) {
-            throw new Error(
-              `Task runtime cleanup launch identity is ambiguous: ${target.taskId}.`
-            );
-          }
-          const launchId = reservedLaunchId ?? session?.launchId;
-          if (
-            launchId !== undefined
-            && lifecycleHost.cleanupTaskLaunch !== undefined
-          ) {
+          // A failed fresh-Conversation launch can leave two exact resource
+          // generations: the detached Session's last committed launch and the
+          // replacement reservation. They are not competing authorities. The
+          // owner-wide stop has already proven physical zero, so clean both
+          // exact launch roots idempotently before settling the mailbox.
+          const launchIds = new Set([
+            reservedLaunchId,
+            session?.launchId
+          ].filter((launchId): launchId is string => launchId !== undefined));
+          if (lifecycleHost.cleanupTaskLaunch !== undefined) {
             const task = store.getTask(target.taskId);
             const reason: TaskRuntimeCleanupReason = task?.status === "completed"
               ? "completion"
               : "interruption";
-            lifecycleHost.cleanupTaskLaunch({
-              taskId: target.taskId,
-              launchId,
-              reason
-            });
+            for (const launchId of launchIds) {
+              lifecycleHost.cleanupTaskLaunch({
+                taskId: target.taskId,
+                launchId,
+                reason
+              });
+            }
           }
         }
         if (
@@ -2119,7 +2117,11 @@ export class FileTaskController {
     }
     for (const wakeup of result.wakeups) {
       const key = `role:${encodeURIComponent(wakeup.taskId)}/leader` as const;
-      if (
+      if (wakeup.terminalized === true) {
+        settled.add(key);
+        resignal.add(key);
+      }
+      else if (
         wakeup.reason === "writer-attached"
       ) {
         writerBlocked.add(key);

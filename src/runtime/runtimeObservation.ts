@@ -366,6 +366,30 @@ export function runtimeObservationFromTaskEvent(
   }
 }
 
+/**
+ * Runtime observation events are compacted by operation identity: a terminal
+ * operation replaces its matching start. Any retained exact start therefore
+ * represents Provider-owned work that is still active for this Run.
+ */
+export function runHasActiveRuntimeOperations(
+  events: readonly TaskEvent[],
+  owner: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    agentId: string;
+  }>
+): boolean {
+  return events.some((event) => {
+    const observation = runtimeObservationFromTaskEvent(event);
+    return observation?.kind === "operation.started"
+      && observation.fence.taskId === owner.taskId
+      && observation.fence.roleName === owner.roleName
+      && observation.fence.runId === owner.runId
+      && observation.fence.agentId === owner.agentId;
+  });
+}
+
 function normalizeFence(input: RuntimeObservationFence): RuntimeObservationFence {
   return Object.freeze({
     ...(input.taskId === undefined ? {} : { taskId: requireIdentity(input.taskId, "Task id") }),
