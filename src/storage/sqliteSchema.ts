@@ -41,6 +41,10 @@ export const TELEMETRY_RUN_CAP = 50_000;
  * `synchronous`/`foreign_keys`/`busy_timeout` are per-connection PRAGMAs set by
  * the store; `journal_mode=WAL` is a persistent database property set on open.
  * The migration itself only contains schema objects.
+ *
+ * This released SQL string, including its comments, is checksummed persistent
+ * history and must remain byte-for-byte unchanged. The `operator-notification`
+ * projection kind it creates is retained only for old layout-7 Homes.
  */
 const MIGRATION_1_SQL = `
 -- Global catalog and coordination (§4.1) -------------------------------------
@@ -331,8 +335,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(task_id, type, occurred_at);
 
--- Per-task scheduler projections. operator-notification is a retired legacy
--- kind retained only so old layout-7 Homes can be read by the upgrade path.
+-- Per-task scheduler projections (leaderFailure, operatorNotification).
 CREATE TABLE IF NOT EXISTS task_projections (
   task_id    TEXT NOT NULL,
   kind       TEXT NOT NULL CHECK (kind IN ('leader-failure','operator-notification')),
