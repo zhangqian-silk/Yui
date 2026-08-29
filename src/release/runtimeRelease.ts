@@ -443,6 +443,31 @@ export function isHandoverLockHeld(home: string): boolean {
   }
 }
 
+/**
+ * True when a live handover is owned by a process other than `allowedOwnerPid`.
+ *
+ * Foreground maintenance commands acquire the lock and still need to call the
+ * Controller they are draining, while every unrelated CLI/managed Session must
+ * wait rather than starting a second Controller during the replacement window.
+ * An unreadable lock remains a foreign live lock so callers fail closed.
+ */
+export function isForeignHandoverLockHeld(
+  home: string,
+  allowedOwnerPid: number = process.pid
+): boolean {
+  const lockPath = join(resolve(home), "runtime", "handover.lock");
+  try {
+    const owner = JSON.parse(readFileSync(lockPath, "utf8")) as {
+      pid?: unknown;
+      processStartIdentity?: unknown;
+    };
+    if (!isHandoverLockLive(owner)) return false;
+    return owner.pid !== allowedOwnerPid;
+  } catch (error) {
+    return !isEnoent(error);
+  }
+}
+
 export function acquireHandoverLock(home: string): HandoverLock {
   const lockPath = join(resolve(home), "runtime", "handover.lock");
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });

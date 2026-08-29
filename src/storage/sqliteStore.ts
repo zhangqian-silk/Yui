@@ -392,9 +392,12 @@ export class SqliteTaskStore implements TaskStore {
       this.#dirty = true;
       return result;
     }
-    this.#prepareWrite();
     this.#begin();
     try {
+      // Acquire SQLite's write reservation before checking the upgrade fence.
+      // A writer that started first commits before the upgrader's final
+      // transactional inventory; a writer that starts later sees the fence.
+      this.#prepareWrite();
       const result = fn();
       if (!this.#migration) {
         this.#bumpRevision();
@@ -448,9 +451,9 @@ export class SqliteTaskStore implements TaskStore {
    * transactionAsync semantics and preserving the single-writer boundary. */
   async transactionAsync<T>(execute: (store: TaskStore) => Promise<T>): Promise<T> {
     if (this.#inTransaction) return execute(this);
-    this.#prepareWrite();
     this.#begin();
     try {
+      this.#prepareWrite();
       const result = await execute(this);
       if (this.#dirty) this.#bumpRevision();
       this.#commit();

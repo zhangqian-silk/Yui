@@ -45,6 +45,8 @@ export function renderUpdateResult(result: UpdateResult): string {
         return result.storageBackupPath === undefined
           ? result.path === "compatible-fast"
             ? `Updated Yui to ${result.version} via the compatible fast path; the Home was not migrated.`
+            : result.path === "in-place-migration"
+              ? `Updated Yui to ${result.version}; SQLite was migrated in place without rebuilding the database.`
             : `Updated Yui to ${result.version}; storage was already current.`
           : `Updated Yui to ${result.version}. Storage was migrated; original Home backed up at `
             + `${result.storageBackupPath}.`;

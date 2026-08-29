@@ -959,6 +959,12 @@ interface Migration {
   sql: string;
 }
 
+/**
+ * The single forward migration history for current SQLite Homes. New durable
+ * layout, aggregate, and record changes belong here and must be expressible as
+ * one atomic in-place transaction. The separate logical migration registry is
+ * only the bridge from valid pre-SQLite Homes and is allowed to rebuild them.
+ */
 const MIGRATIONS: readonly Migration[] = [
   { version: 1, axis: "layout", sql: MIGRATION_1_SQL },
   { version: 2, axis: "record", recordKind: "durableJob+capability-grant+release-workflow", sql: MIGRATION_2_SQL },
@@ -1242,58 +1248,101 @@ export interface MigrationResult {
   readonly version: number;
 }
 
+export type SqliteSchemaMigrationState = Readonly<{
+  /** Highest contiguous migration already committed. */
+  currentVersion: number;
+  /** Checksum of the current ledger head validated by the staged binary. */
+  currentChecksum: string;
+  /** Schema version required by this release. */
+  targetVersion: number;
+  /** Checksum expected at the target ledger head. */
+  targetChecksum: string;
+  /** Ordered versions that an explicit upgrade must apply. */
+  pendingVersions: readonly number[];
+}>;
+
 export type SqliteSchemaMigrationMode = "apply" | "validate";
 
 export type SqliteSchemaMigrationOptions = Readonly<{
   /**
-   * `apply` is reserved for a new database or the disposable staged database
-   * owned by the offline upgrade path. `validate` is the only legal ordinary
-   * open mode for an existing authoritative database.
+   * `apply` is owned by initialization or an explicit upgrade boundary.
+   * `validate` is the only legal ordinary open mode for an existing
+   * authoritative database.
    */
   mode: SqliteSchemaMigrationMode;
 }>;
 
 /**
+ * Inspect a database's checksummed migration prefix without changing it.
+ * Pending versions are a supported upgrade state; malformed, gapped, changed,
+ * or future ledger entries remain explicit integrity failures.
+ */
+export function inspectSqliteSchemaMigrations(
+  db: Database.Database
+): SqliteSchemaMigrationState {
+  const ledgerWasCreated = ensureMigrationLedger(db, "validate");
+  const applied = validateAppliedMigrations(db, ledgerWasCreated);
+  const pendingVersions = MIGRATIONS
+    .filter((migration) => !applied.has(migration.version))
+    .map((migration) => migration.version);
+  if (pendingVersions.length === 0) validateSchemaObjects(db);
+  const current = MIGRATIONS[applied.size - 1];
+  const target = MIGRATIONS.at(-1)!;
+  if (current === undefined) {
+    throw new SqliteSchemaMigrationError("schema_migrations ledger has no current head");
+  }
+  return {
+    currentVersion: applied.size,
+    currentChecksum: checksum(current.sql),
+    targetVersion: SQLITE_SCHEMA_VERSION,
+    targetChecksum: checksum(target.sql),
+    pendingVersions
+  };
+}
+
+/**
  * Apply or validate schema migrations without letting an ordinary open mutate
  * an existing authoritative database.
  *
- * In `apply` mode each migration runs in its own transaction: the DDL and the
- * `schema_migrations` bookkeeping commit atomically, so a crash mid-migration
- * rolls back and the disposable staged database can be rebuilt cleanly.
- * `validate` mode rejects a pending version before executing any migration.
+ * In `apply` mode every pending DDL/data step and every ledger row runs in one
+ * outer transaction. The database therefore advances to the release version
+ * as one commit or remains entirely at its previous version. `validate` mode
+ * rejects a pending version before executing any migration.
  */
 export function migrateSqliteSchema(
   db: Database.Database,
   options: SqliteSchemaMigrationOptions
 ): MigrationResult {
-  const ledgerWasCreated = ensureMigrationLedger(db, options.mode);
-  // Validate the complete ledger before touching any pending migration.  This
-  // prevents a manually altered or partially recorded ledger from silently
-  // skipping the partial-index/projection migrations added after a valid Home.
-  const applied = validateAppliedMigrations(db, ledgerWasCreated);
-  const pending = MIGRATIONS.filter((migration) => !applied.has(migration.version));
-  if (options.mode === "validate" && pending.length > 0) {
-    throw new SqliteSchemaMigrationError(
-      `pending SQLite schema migration ${pending[0]!.version}; `
-        + "run the offline staged upgrade before opening this database",
-      "admission"
-    );
-  }
-  const newlyApplied: number[] = [];
-  for (const migration of MIGRATIONS) {
-    if (applied.has(migration.version)) continue;
-    const apply = db.transaction(() => {
+  const migrate = (): number[] => {
+    const ledgerWasCreated = ensureMigrationLedger(db, options.mode);
+    // Validate the complete ledger before touching any pending migration. This
+    // prevents a manually altered or partially recorded ledger from silently
+    // skipping a later schema/data step.
+    const applied = validateAppliedMigrations(db, ledgerWasCreated);
+    const pending = MIGRATIONS.filter((migration) => !applied.has(migration.version));
+    if (options.mode === "validate" && pending.length > 0) {
+      throw new SqliteSchemaMigrationError(
+        `pending SQLite schema migration ${pending[0]!.version}; `
+          + "run the explicit storage upgrade before opening this database",
+        "admission"
+      );
+    }
+    const newlyApplied: number[] = [];
+    for (const migration of pending) {
       if (migration.version === 13) validatePendingProjectionBackfillSources(db);
       db.exec(migration.sql);
       db.prepare(
         `INSERT INTO schema_migrations (version, axis, record_kind, applied_at, checksum)
          VALUES (?, ?, ?, ?, ?)`
       ).run(migration.version, migration.axis, migration.recordKind ?? null, new Date().toISOString(), checksum(migration.sql));
-    });
-    apply();
-    newlyApplied.push(migration.version);
-  }
-  validateSchemaObjects(db);
+      newlyApplied.push(migration.version);
+    }
+    validateSchemaObjects(db);
+    return newlyApplied;
+  };
+  const newlyApplied = options.mode === "apply" && !db.inTransaction
+    ? db.transaction(migrate)()
+    : migrate();
   return { applied: newlyApplied, version: SQLITE_SCHEMA_VERSION };
 }
 

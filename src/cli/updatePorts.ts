@@ -36,9 +36,12 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import Database from "better-sqlite3";
+
 import { runtimeError } from "../errors/cliError.js";
 import { isConcreteVersion } from "../domain/validation.js";
 import { STORAGE_DOCTOR_CHECK_NAMES } from "../doctor/doctor.js";
+import { acquireHandoverLock } from "../release/runtimeRelease.js";
 import { inspectStorageSchema } from "../storage/storageSchema.js";
 import { correlateUpgradeReceipt } from "../storage/upgrade/upgradeOrchestrator.js";
 import { readSwitchProgress } from "../storage/upgrade/switchProgress.js";
@@ -51,7 +54,9 @@ import type {
   UpdateControllerStopResult,
   UpdateBlockerIdentity,
   UpdatePorts,
-  UpdatePreflight
+  UpdatePreflight,
+  UpdateSqliteLedgerHead,
+  UpdateSqliteMigrationBoundary
 } from "./updateOrchestrator.js";
 
 const PACKAGE_NAME = "@zq-silk/yui";
@@ -118,6 +123,9 @@ export function createUpdatePorts(
     stopReplacementControllerForUpdate(home, pid, environment, run)
   );
   return {
+    beginControllerHandover(home: string): () => void {
+      return acquireHandoverLock(home).release;
+    },
     stage(version?: string): StagedPackage {
       // A caller that names a version (the release workflow, which freezes the
       // exact version in its plan) installs THAT version — never a moving
@@ -282,6 +290,7 @@ export function createUpdatePorts(
       // on-disk schema and report `switched: false` so the caller re-probes the
       // real state instead of giving a recovery instruction from a stale receipt.
       const schema = inspectStorageSchema(home);
+      const sqliteSchemaHead = inspectSqliteSchemaHead(home);
 
       // A crash mid-switch leaves a durable progress marker. A marker of ANY phase
       // — `backing-up`, `promoting`, or `interrupted` — is only actionable as an
@@ -307,6 +316,7 @@ export function createUpdatePorts(
             switched: false,
             interrupted: true,
             schemaCurrent: false,
+            ...(sqliteSchemaHead === undefined ? {} : { sqliteSchemaHead }),
             ...(progress.backupPath === undefined ? {} : { backupPath: progress.backupPath })
           };
         }
@@ -317,12 +327,17 @@ export function createUpdatePorts(
 
       const correlation = correlateUpgradeReceipt(home);
       if (!correlation.corresponds) {
-        return { switched: false, schemaCurrent: schema.status === "current" };
+        return {
+          switched: false,
+          schemaCurrent: schema.status === "current",
+          ...(sqliteSchemaHead === undefined ? {} : { sqliteSchemaHead })
+        };
       }
       const receipt = correlation.receipt;
       return {
         switched: true,
         schemaCurrent: schema.status === "current",
+        ...(sqliteSchemaHead === undefined ? {} : { sqliteSchemaHead }),
         ...(receipt.backupPath === undefined ? {} : { backupPath: receipt.backupPath })
       };
     },
@@ -366,6 +381,39 @@ export function createUpdatePorts(
       restoreControllerIdentity(home, identity, environment, spawn);
     }
   };
+}
+
+/**
+ * Read the generic durable SQLite ledger without asking the old parent binary
+ * to understand the staged release's migration registry. The staged preflight
+ * supplies the validated source and target heads used to interpret this value.
+ */
+function inspectSqliteSchemaHead(home: string): UpdateSqliteLedgerHead | undefined {
+  const path = join(home, "yui.db");
+  if (!existsSync(path)) return undefined;
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    db.pragma("query_only = ON");
+    const rows = db.prepare(
+      "SELECT version, checksum FROM schema_migrations ORDER BY version"
+    ).all() as Array<{ version: unknown; checksum: unknown }>;
+    if (rows.length === 0) throw new Error("SQLite migration ledger is empty.");
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
+      if (row.version !== index + 1
+        || typeof row.checksum !== "string"
+        || row.checksum.length === 0) {
+        throw new Error("SQLite migration ledger is not a contiguous checksummed prefix.");
+      }
+    }
+    const head = rows.at(-1)!;
+    return {
+      version: head.version as number,
+      checksum: head.checksum as string
+    };
+  } finally {
+    db.close();
+  }
 }
 
 const UPDATE_CLI_PATH = fileURLToPath(new URL("../cli.js", import.meta.url));
@@ -803,7 +851,17 @@ function runControllerCommand(
   const result = spawn(
     command,
     args,
-    { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
+    {
+      cwd: process.cwd(),
+      env: {
+        ...environment,
+        YUI_HOME: home,
+        // This exact lifecycle child is part of the update process that owns
+        // the handover lock. Managed Sessions never receive this bypass.
+        YUI_UPDATE_HANDOVER_OWNER_PID: String(process.pid)
+      },
+      shell: false
+    }
   );
   if (result.error !== undefined || result.status !== 0) {
     const error = new Error(`Controller ${method} failed (exit ${result.status ?? "null"}).`);
@@ -1105,12 +1163,15 @@ function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
   };
 }
 
-/** Strictly parse the three green states of the internal update preflight. */
+/** Strictly parse the green states of the internal update preflight. */
 function parseUpdatePreflightResult(data: Record<string, unknown>): UpdatePreflight | null {
   const status = data.status;
   const stepCount = data.stepCount;
   if (
-    (status !== "already-current" && status !== "compatible" && status !== "migration-required")
+    (status !== "already-current"
+      && status !== "compatible"
+      && status !== "in-place-migration"
+      && status !== "migration-required")
     || !Number.isSafeInteger(stepCount)
     || (stepCount as number) < 0
   ) {
@@ -1136,12 +1197,63 @@ function parseUpdatePreflightResult(data: Record<string, unknown>): UpdatePrefli
   if (status === "already-current") return { status };
   const evidence = status === "compatible"
     ? `${stepCount as number} compatible step(s) classified and the compatible source validated in memory`
-    : `${stepCount as number} offline migration step(s) classified and the offline runtime inventory confirmed clear`;
+    : status === "in-place-migration"
+      ? `${stepCount as number} SQLite migration step(s) classified for one in-place transaction and the offline runtime inventory confirmed clear`
+      : `${stepCount as number} offline migration step(s) classified and the offline runtime inventory confirmed clear`;
+  const summary =
+    `${evidence}. `
+    + "No staged Home or staged-output loader validation was performed during update preflight.";
+  if (status === "in-place-migration") {
+    const sqliteMigration = parseSqliteMigrationBoundary(data.sqliteMigration, stepCount as number);
+    if (sqliteMigration === null) return null;
+    return {
+      status,
+      summary,
+      sqliteMigration
+    };
+  }
   return {
     status,
-    summary:
-      `${evidence}. `
-      + "No staged Home or staged-output loader validation was performed during update preflight."
+    summary
+  };
+}
+
+function parseSqliteMigrationBoundary(
+  value: unknown,
+  stepCount: number
+): UpdateSqliteMigrationBoundary | null {
+  if (!isRecord(value)) return null;
+  const currentVersion = value.currentVersion;
+  const currentChecksum = value.currentChecksum;
+  const targetVersion = value.targetVersion;
+  const targetChecksum = value.targetChecksum;
+  const pendingVersions = value.pendingVersions;
+  if (
+    !Number.isSafeInteger(currentVersion)
+    || (currentVersion as number) < 1
+    || typeof currentChecksum !== "string"
+    || currentChecksum.length === 0
+    || !Number.isSafeInteger(targetVersion)
+    || (targetVersion as number) <= (currentVersion as number)
+    || typeof targetChecksum !== "string"
+    || targetChecksum.length === 0
+    || !Array.isArray(pendingVersions)
+    || pendingVersions.length !== stepCount
+    || targetVersion !== (currentVersion as number) + stepCount
+    || pendingVersions.some((version, index) =>
+      !Number.isSafeInteger(version) || version !== (currentVersion as number) + index + 1)
+  ) {
+    return null;
+  }
+  return {
+    current: {
+      version: currentVersion as number,
+      checksum: currentChecksum
+    },
+    target: {
+      version: targetVersion as number,
+      checksum: targetChecksum
+    }
   };
 }
 
@@ -1213,6 +1325,9 @@ function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivatio
   }
   if (outcome === "already-current") return { status: "already-current" };
   if (outcome === "upgraded") {
+    if (data.migrationMode === "in-place" && data.backupPath === undefined) {
+      return { status: "migrated-in-place" };
+    }
     const backupPath = data.backupPath;
     if (
       typeof backupPath !== "string"

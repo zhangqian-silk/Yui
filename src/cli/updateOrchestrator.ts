@@ -63,6 +63,11 @@ export type StagedPackage = Readonly<{
 export type UpdatePreflight = Readonly<
   | { status: "already-current" }
   | { status: "compatible"; summary: string }
+  | {
+      status: "in-place-migration";
+      summary: string;
+      sqliteMigration: UpdateSqliteMigrationBoundary;
+    }
   | { status: "migration-required"; summary: string }
   /** Legacy staged binaries reported this spelling; it remains offline. */
   | { status: "migratable"; summary: string }
@@ -77,6 +82,16 @@ export type UpdatePreflight = Readonly<
     }
 >;
 
+export type UpdateSqliteLedgerHead = Readonly<{
+  version: number;
+  checksum: string;
+}>;
+
+export type UpdateSqliteMigrationBoundary = Readonly<{
+  current: UpdateSqliteLedgerHead;
+  target: UpdateSqliteLedgerHead;
+}>;
+
 /** Exact identity and reason for one offline-upgrade blocker. */
 export type UpdateBlockerIdentity = Readonly<{
   taskId?: string;
@@ -90,6 +105,7 @@ export type UpdateBlockerIdentity = Readonly<{
 /** The result of promoting the staged storage into place (recoverable step). */
 export type StorageActivation = Readonly<
   | { status: "already-current" }
+  | { status: "migrated-in-place" }
   | { status: "migrated"; backupPath?: string }
   | {
       status: "blocked";
@@ -155,6 +171,8 @@ export type StorageStateProbe = Readonly<{
   backupPath?: string;
   /** Whether the on-disk Home is now at the current, loadable schema. */
   schemaCurrent: boolean;
+  /** Generic ledger head; interpreted against the staged preflight boundary. */
+  sqliteSchemaHead?: UpdateSqliteLedgerHead;
 }>;
 
 /**
@@ -190,6 +208,12 @@ export type UpdatePorts = Readonly<{
   /** Best-effort staging cleanup. */
   cleanup: (staged: StagedPackage) => void;
   /**
+   * Publish the Controller handover boundary observed by managed Sessions.
+   * The release callback is invoked only after replacement readiness or a
+   * fully handled abort.
+   */
+  beginControllerHandover?: (home: string) => () => void;
+  /**
    * Optional Controller lifecycle owner for the parent update orchestration.
    * When any lifecycle seam is supplied, all four seams are required so a
    * failed pre-switch update never falls back to a staged/new Controller.
@@ -217,7 +241,7 @@ export type UpdateResult = Readonly<
     | {
         outcome: "updated";
         version: string;
-        path: "current-fast" | "compatible-fast" | "offline-migration";
+        path: "current-fast" | "compatible-fast" | "in-place-migration" | "offline-migration";
         storageBackupPath?: string;
       }
     | {
@@ -367,6 +391,34 @@ function runStagedUpdate(
     };
   }
 
+  let releaseHandover: (() => void) | undefined;
+  try {
+    releaseHandover = ports.beginControllerHandover?.(home);
+  } catch (error) {
+    return {
+      outcome: "aborted",
+      phase: "coordination",
+      message: `Controller handover could not be acquired: ${messageOf(error)}`,
+      action:
+        "Another maintenance operation owns this Home. Wait for it to finish, then retry; no Controller, binary, or storage change was made.",
+      recoverable: true,
+      version: staged.version
+    };
+  }
+  try {
+    return runPreflightedUpdate(ports, staged, home, preflight);
+  } finally {
+    releaseHandover?.();
+  }
+}
+
+function runPreflightedUpdate(
+  ports: UpdatePorts,
+  staged: StagedPackage,
+  home: string,
+  preflight: Exclude<UpdatePreflight, { status: "blocked" }>
+): UpdateResult {
+
   // Capture and stop the old Controller exactly once after preflight but
   // before either storage activation or binary promotion. This parent update
   // process remains the sole lifecycle owner for both binary-only and
@@ -401,7 +453,11 @@ function runStagedUpdate(
       ports,
       staged,
       home,
-      `the activation step threw unexpectedly: ${messageOf(error)}`
+      `the activation step threw unexpectedly: ${messageOf(error)}`,
+      preflight.status === "in-place-migration"
+        ? { kind: "in-place", migration: preflight.sqliteMigration }
+        : { kind: "switch" },
+      lifecycle.lifecycle
     );
   }
   if (activation.status === "blocked") {
@@ -428,6 +484,7 @@ function runStagedUpdate(
       home,
       lifecycle.lifecycle,
       undefined,
+      false,
       failure
     );
   }
@@ -435,7 +492,16 @@ function runStagedUpdate(
     // The activation child left no parseable receipt: the switch may or may not
     // have committed. Resolve the true state from the durable on-disk evidence
     // and report an explicit manual recovery — never a false "recoverable".
-    return resolveAmbiguousActivation(ports, staged, home, activation.detail);
+    return resolveAmbiguousActivation(
+      ports,
+      staged,
+      home,
+      activation.detail,
+      preflight.status === "in-place-migration"
+        ? { kind: "in-place", migration: preflight.sqliteMigration }
+        : { kind: "switch" },
+      lifecycle.lifecycle
+    );
   }
   if (activation.status === "migrated" && !isValidBackupPath(activation.backupPath)) {
     // A migrated/upgraded success without a concrete backup path violates
@@ -446,10 +512,15 @@ function runStagedUpdate(
       ports,
       staged,
       home,
-      "the activation reported migrated without a non-empty absolute backupPath"
+      "the activation reported migrated without a non-empty absolute backupPath",
+      { kind: "switch" },
+      lifecycle.lifecycle
     );
   }
   const backupPath = activation.status === "migrated" ? activation.backupPath : undefined;
+  const path = activation.status === "migrated-in-place"
+    ? "in-place-migration"
+    : "offline-migration";
 
   // 4/5) Promote the binary, then post-verify with the new binary's loader.
   return activateAndVerify(
@@ -458,7 +529,7 @@ function runStagedUpdate(
     home,
     backupPath,
     lifecycle.lifecycle,
-    "offline-migration"
+    path
   );
 }
 
@@ -474,8 +545,9 @@ function activateAndVerify(
   home: string,
   storageBackupPath: string | undefined,
   lifecycle: UpdateControllerLifecycle | undefined,
-  path: "current-fast" | "compatible-fast" | "offline-migration"
+  path: "current-fast" | "compatible-fast" | "in-place-migration" | "offline-migration"
 ): UpdateResult {
+  const inPlaceCommitted = path === "in-place-migration";
   try {
     ports.activateBinary(staged);
   } catch (error) {
@@ -483,9 +555,11 @@ function activateAndVerify(
       outcome: "aborted",
       phase: "activate-binary",
       message: `Failed to activate the new binary: ${messageOf(error)}`,
-      action: storageBackupPath === undefined
-        ? binaryActivationUncertainAction()
-        : postSwitchRecoveryAction(home, storageBackupPath),
+      action: inPlaceCommitted
+        ? inPlaceMigrationRecoveryAction(home)
+        : storageBackupPath === undefined
+          ? binaryActivationUncertainAction()
+          : postSwitchRecoveryAction(home, storageBackupPath),
       // Once binary activation begins, its outcome is not knowable from a
       // failed npm process. Home-not-switched is useful evidence, but it does
       // not prove the current installation remains usable.
@@ -493,7 +567,14 @@ function activateAndVerify(
       version: staged.version,
       ...(storageBackupPath === undefined ? {} : { storageBackupPath })
     };
-    return restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
+    return restoreBeforeSwitchOrReport(
+      ports,
+      home,
+      lifecycle,
+      storageBackupPath,
+      inPlaceCommitted || storageBackupPath !== undefined,
+      failure
+    );
   }
 
   try {
@@ -503,14 +584,23 @@ function activateAndVerify(
       outcome: "aborted",
       phase: "post-verify",
       message: `Post-update health check failed: ${messageOf(error)}`,
-      action: storageBackupPath === undefined
-        ? binaryHealthUncertainAction()
-        : postSwitchRecoveryAction(home, storageBackupPath),
+      action: inPlaceCommitted
+        ? inPlaceMigrationRecoveryAction(home)
+        : storageBackupPath === undefined
+          ? binaryHealthUncertainAction()
+          : postSwitchRecoveryAction(home, storageBackupPath),
       recoverable: false,
       version: staged.version,
       ...(storageBackupPath === undefined ? {} : { storageBackupPath })
     };
-    return restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
+    return restoreBeforeSwitchOrReport(
+      ports,
+      home,
+      lifecycle,
+      storageBackupPath,
+      inPlaceCommitted || storageBackupPath !== undefined,
+      failure
+    );
   }
 
   if (lifecycle?.ensureRunning === true) {
@@ -518,9 +608,11 @@ function activateAndVerify(
       ports.startController!(home);
     } catch (error) {
       const unknownActive = isUnknownActiveControllerFailure(error);
-      const startFailureAction = lifecycle.wasRunning
-        ? "The Home was not migrated. Keep writes quiesced and restore the previously running Controller identity before retrying."
-        : "The Home was not migrated. Keep writes quiesced and start the replacement Controller after verifying the activated binary.";
+      const startFailureAction = inPlaceCommitted
+        ? inPlaceMigrationRecoveryAction(home)
+        : lifecycle.wasRunning
+          ? "The Home was not migrated. Keep writes quiesced and restore the previously running Controller identity before retrying."
+          : "The Home was not migrated. Keep writes quiesced and start the replacement Controller after verifying the activated binary.";
       const failure: UpdateResult = {
         outcome: "aborted",
         phase: "post-verify",
@@ -528,7 +620,7 @@ function activateAndVerify(
           `${unknownActive ? "Replacement Controller ownership could not be authenticated safely" : "The replacement Controller could not start after activation and health verification"}: `
           + `${messageOf(error)}.`,
         action: unknownActive
-          ? unknownActiveControllerAction(home, storageBackupPath)
+          ? unknownActiveControllerAction(home, storageBackupPath, inPlaceCommitted)
           : storageBackupPath === undefined
             ? startFailureAction
             : postSwitchRecoveryAction(home, storageBackupPath),
@@ -550,7 +642,14 @@ function activateAndVerify(
       // and preserve the explicit manual blocker.
       return unknownActive
         ? failure
-        : restoreBeforeSwitchOrReport(ports, home, lifecycle, storageBackupPath, failure);
+        : restoreBeforeSwitchOrReport(
+          ports,
+          home,
+          lifecycle,
+          storageBackupPath,
+          inPlaceCommitted || storageBackupPath !== undefined,
+          failure
+        );
     }
   }
 
@@ -691,11 +790,12 @@ function restoreBeforeSwitchOrReport(
   home: string,
   lifecycle: UpdateControllerLifecycle | undefined,
   storageBackupPath: string | undefined,
+  storageCommitted: boolean,
   failure: Extract<UpdateResult, { outcome: "aborted" }>
 ): UpdateResult {
   // Once storage switched, the old Controller is never safe to restore. Keep
   // the failure structured and point at all durable recovery evidence instead.
-  if (storageBackupPath !== undefined || lifecycle?.wasRunning !== true) return failure;
+  if (storageCommitted || lifecycle?.wasRunning !== true) return failure;
   try {
     ports.restoreController!(home, lifecycle.identity!);
     return failure;
@@ -735,10 +835,21 @@ function binaryHealthUncertainAction(): string {
     + "then retry `yui update` before resuming writes.";
 }
 
-function unknownActiveControllerAction(home: string, backupPath: string | undefined): string {
-  const storageEvidence = backupPath === undefined
-    ? "The Home was not migrated."
-    : `The storage switch is committed (backup at ${backupPath}); do not restore the old Controller. `;
+function inPlaceMigrationRecoveryAction(home: string): string {
+  return `The SQLite migration for ${home} committed in place and has no rollback backup. `
+    + "Do not restore the old Controller; finish installing this or a newer Yui version, run `yui doctor`, then start the Controller.";
+}
+
+function unknownActiveControllerAction(
+  home: string,
+  backupPath: string | undefined,
+  inPlaceCommitted: boolean
+): string {
+  const storageEvidence = inPlaceCommitted
+    ? "The SQLite migration committed in place; do not restore the old Controller. "
+    : backupPath === undefined
+      ? "The Home was not migrated."
+      : `The storage switch is committed (backup at ${backupPath}); do not restore the old Controller. `;
   return `${storageEvidence} A replacement Controller may still be active under unknown ownership. `
     + `Keep writes quiesced and do not claim recovery or resume writes. Inspect the authenticated `
     + `Controller status for ${home}, stop only the PID proven to belong to this update, then `
@@ -792,13 +903,33 @@ function resolveAmbiguousActivation(
   ports: UpdatePorts,
   staged: StagedPackage,
   home: string,
-  detail: string
+  detail: string,
+  expected: Readonly<
+    | { kind: "in-place"; migration: UpdateSqliteMigrationBoundary }
+    | { kind: "switch" }
+  >,
+  lifecycle: UpdateControllerLifecycle | undefined
 ): UpdateResult {
   let probe: StorageStateProbe;
   try {
     probe = ports.probeStorage(home);
   } catch (error) {
     // Even the probe failed: report maximum uncertainty with the raw evidence.
+    if (expected.kind === "in-place") {
+      return {
+        outcome: "ambiguous",
+        phase: "activate-storage",
+        message:
+          `SQLite activation result is unknown (${detail}); reading its migration ledger also failed: ${messageOf(error)}.`,
+        action:
+          `Do not restore the old Controller or assume the migration committed. Inspect the `
+          + `schema_migrations ledger in "${home}/yui.db" with the staged/current Yui version, `
+          + `then re-run "yui update" only after the ledger state is known.`,
+        version: staged.version,
+        schemaCurrent: false,
+        switched: false
+      };
+    }
     return {
       outcome: "ambiguous",
       phase: "activate-storage",
@@ -811,6 +942,63 @@ function resolveAmbiguousActivation(
         + `restore the newest backup with mv before re-running "yui update".`,
       version: staged.version,
       schemaCurrent: false,
+      switched: false
+    };
+  }
+
+  if (expected.kind === "in-place"
+    && sameSqliteLedgerHead(probe.sqliteSchemaHead, expected.migration.target)) {
+    return {
+      outcome: "ambiguous",
+      phase: "activate-storage",
+      message:
+        `The SQLite transaction committed according to its migration ledger, but the activation process did not confirm success (${detail}). The new binary was NOT promoted.`,
+      action:
+        "Do not restore the old Controller. Re-run `yui update` with this or a newer version; the current ledger will make the storage step a no-op, then the binary and Controller handoff can finish.",
+      version: staged.version,
+      schemaCurrent: probe.schemaCurrent,
+      switched: false
+    };
+  }
+
+  if (expected.kind === "in-place"
+    && sameSqliteLedgerHead(probe.sqliteSchemaHead, expected.migration.current)) {
+    const failure: Extract<UpdateResult, { outcome: "aborted" }> = {
+      outcome: "aborted",
+      phase: "activate-storage",
+      message:
+        `The SQLite activation process did not confirm success (${detail}), but the atomic migration ledger proves that no schema transaction committed.`,
+      action:
+        "The database remains at its previous schema. The captured Controller identity was restored when possible; retry the update after diagnosing the activation child.",
+      recoverable: true,
+      version: staged.version
+    };
+    return restoreBeforeSwitchOrReport(
+      ports,
+      home,
+      lifecycle,
+      undefined,
+      false,
+      failure
+    );
+  }
+
+  if (expected.kind === "in-place") {
+    const actual = probe.sqliteSchemaHead === undefined
+      ? "unavailable"
+      : `${probe.sqliteSchemaHead.version}:${probe.sqliteSchemaHead.checksum}`;
+    return {
+      outcome: "ambiguous",
+      phase: "activate-storage",
+      message:
+        `SQLite activation did not confirm a result (${detail}), and its migration ledger head `
+        + `(${actual}) matches neither the validated source nor target boundary.`,
+      action:
+        `Do not restore the old Controller or resume writes. Inspect the schema_migrations ledger `
+        + `in "${home}/yui.db" with the staged/current Yui version and resolve the unexpected `
+        + `ledger state before re-running "yui update".`,
+      version: staged.version,
+      schemaCurrent: probe.schemaCurrent,
       switched: false
     };
   }
@@ -880,6 +1068,13 @@ function resolveAmbiguousActivation(
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sameSqliteLedgerHead(
+  actual: UpdateSqliteLedgerHead | undefined,
+  expected: UpdateSqliteLedgerHead
+): boolean {
+  return actual?.version === expected.version && actual.checksum === expected.checksum;
 }
 
 function isValidBackupPath(value: unknown): value is string {

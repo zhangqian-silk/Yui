@@ -90,7 +90,9 @@ export function renderUpgradeResult(
         ? "four-state classification"
         : result.status === "compatible"
           ? "four-state classification plus compatible-source validation"
-          : "four-state classification plus a clear offline runtime inventory";
+          : result.status === "in-place-migration"
+            ? "SQLite ledger classification plus a clear offline runtime inventory"
+            : "four-state classification plus a clear offline runtime inventory";
       return `${header}\nUpdate preflight: ${result.status} (${result.stepCount} step(s)); `
         + `${evidence}. No staged Home was created, `
         + "no staged-output loader validation was performed, and storage was not switched.";
@@ -101,17 +103,21 @@ export function renderUpgradeResult(
         + "Staged output discarded; storage was not switched.";
     }
     case "upgraded":
-      return `${header}\nUpgraded storage. Original Home backed up at `
-        + `${result.backupPath ?? "(unspecified)"}.`;
+      return result.migrationMode === "in-place"
+        ? `${header}\nUpgraded SQLite in place in one transaction; no database rebuild or backup copy was created.`
+        : `${header}\nUpgraded storage. Original Home backed up at `
+          + `${result.backupPath ?? "(unspecified)"}.`;
     case "blocked": {
       // Most blockers guarantee the source is untouched. A partial switch or a
       // post-switch ambiguity explicitly carries the committed boundary and
       // named recovery evidence; never print a false unchanged claim there.
-      const unchangedNote = result.switchCommitted === true
-        ? "The storage switch committed, but post-switch completion is ambiguous; the old Controller was not restored (see Action and recovery evidence)."
-        : result.stage === "switch-ambiguous"
-          ? "The switch did not complete and could not be rolled back; the authoritative Home is NOT intact (see Action)."
-          : "Storage was not switched; the authoritative Home is unchanged.";
+      const unchangedNote = result.storageCommitted === true
+        ? "The SQLite transaction committed in place; the old Controller was not restored (see Action)."
+        : result.switchCommitted === true
+          ? "The storage switch committed, but post-switch completion is ambiguous; the old Controller was not restored (see Action and recovery evidence)."
+          : result.stage === "switch-ambiguous"
+            ? "The switch did not complete and could not be rolled back; the authoritative Home is NOT intact (see Action)."
+            : "Storage was not switched; the authoritative Home is unchanged.";
       return [
         header,
         `${mode === "dry-run" ? "Dry run" : mode === "update-preflight" ? "Update preflight" : "Upgrade"} blocked at ${result.stage}: ${result.message}`,

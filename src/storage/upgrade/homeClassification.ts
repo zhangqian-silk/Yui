@@ -43,6 +43,10 @@ import {
 import { FileTaskStore, STORAGE_STATE_FILE, StorageRecordError } from "../taskStore.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
 import {
+  inspectSqliteSchemaMigrations,
+  type SqliteSchemaMigrationState
+} from "../sqliteSchema.js";
+import {
   inspectSourceVersionState,
   type HomeSnapshot
 } from "./homeMigrationTarget.js";
@@ -63,6 +67,8 @@ export type HomeClassification = Readonly<{
   incompatibleComponent?: "layout" | "aggregate" | "record";
   /** Set when the Home has never been initialized (`yui setup` needed). */
   uninitialized?: true;
+  /** Pending physical SQLite migrations for an otherwise-current Home. */
+  sqliteMigration?: SqliteSchemaMigrationState;
 }>;
 
 export type ClassifyHomeOptions<Snapshot> = Readonly<{
@@ -157,6 +163,46 @@ export function classifyHome<Snapshot>(
     }
   }
 
+  // Once the logical Home axes are current, the SQLite ledger is the only
+  // remaining upgrade coordinate. A valid applied prefix with pending entries
+  // is upgradeable in place, not corruption and not a reason to rebuild the
+  // database. Ordinary store opens still validate-and-refuse this state; only
+  // the explicit updater is allowed to apply it.
+  if (
+    schema.status === "current"
+    && schema.currentLayoutVersion >= 7
+    && isFullyCurrent(source, latest)
+  ) {
+    let sqliteMigration: SqliteSchemaMigrationState;
+    try {
+      sqliteMigration = inspectLayout7SqliteMigrations(home);
+    } catch (error) {
+      return {
+        ...base,
+        classification: {
+          verdict: "CORRUPTED",
+          status: "unsupported",
+          detail: error instanceof Error ? error.message : String(error)
+        },
+        layoutVersion: schema.currentLayoutVersion,
+        aggregateVersion: schema.currentAggregateSchemaVersion
+      };
+    }
+    if (sqliteMigration.pendingVersions.length > 0) {
+      return {
+        ...base,
+        classification: {
+          verdict: "MIGRATABLE",
+          status: "migration-required",
+          stepCount: sqliteMigration.pendingVersions.length
+        },
+        layoutVersion: schema.currentLayoutVersion,
+        aggregateVersion: schema.currentAggregateSchemaVersion,
+        sqliteMigration
+      };
+    }
+  }
+
   // The reference graph can only be validated by the strict loader, which only
   // understands the current versions. So run it exactly when every axis is
   // already current (the plan would be a no-op); a throw there is genuine
@@ -182,6 +228,19 @@ export function classifyHome<Snapshot>(
       ? {}
       : { incompatibleComponent: incompatibleComponentOf(schema) })
   };
+}
+
+function inspectLayout7SqliteMigrations(home: string): SqliteSchemaMigrationState {
+  const db = new Database(join(home, "yui.db"), {
+    readonly: true,
+    fileMustExist: true
+  });
+  try {
+    db.pragma("query_only = ON");
+    return inspectSqliteSchemaMigrations(db);
+  } finally {
+    db.close();
+  }
 }
 
 /**

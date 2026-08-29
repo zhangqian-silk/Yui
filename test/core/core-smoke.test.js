@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 
 import {
   claimPending,
@@ -32,7 +33,11 @@ import {
   assertRegistryCoversBaselineToCurrent,
   createProductionRegistry
 } from "../../dist/storage/migration/index.js";
+import { createProductionStorageRegistry } from "../../dist/storage/migration/productionRegistry.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
+import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
+import { runStorageUpgrade } from "../../dist/storage/upgrade/upgradeOrchestrator.js";
 import { populateSqliteFromState } from "../../dist/storage/upgrade/sqliteStateMigration.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
@@ -53,10 +58,11 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   }
 });
 
-test("the SQLite Task path persists one normal Task and Message", (t) => {
+test("the SQLite Task path persists across one in-place schema upgrade", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-core-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const now = new Date("2026-08-27T00:00:00.000Z");
+  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   const task = activateTask(createTask(store.nextTaskId(), "Core smoke", now), now);
   store.saveTask(task);
@@ -71,6 +77,26 @@ test("the SQLite Task path persists one normal Task and Message", (t) => {
   );
   store.saveMessage(task.id, message);
   store.close();
+
+  const db = new Database(join(home, "yui.db"));
+  db.exec(`
+    DROP INDEX idx_context_snapshots_scope_sequence;
+    DROP TABLE context_snapshots;
+    DELETE FROM schema_migrations WHERE version = 17;
+  `);
+  db.close();
+
+  const upgraded = await runStorageUpgrade({
+    home,
+    mode: "execute",
+    controllerLifecycle: "externally-quiesced",
+    registry: createProductionStorageRegistry(),
+    latest: latestStorageVersionState(),
+    inspectOfflineInventory: async () => ({ total: 0, blockers: [] })
+  });
+  assert.equal(upgraded.outcome, "upgraded", JSON.stringify(upgraded));
+  assert.equal(upgraded.migrationMode, "in-place");
+  assert.equal(upgraded.backupPath, undefined);
 
   const reopened = new SqliteTaskStore(home);
   assert.equal(reopened.getTask(task.id)?.status, "active");

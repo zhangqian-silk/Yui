@@ -14,6 +14,7 @@ import type {
   StructuredProviderTurnTerminal
 } from "../runtime/structuredProviderHost.js";
 import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
+import { isForeignHandoverLockHeld } from "../release/runtimeRelease.js";
 import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
 import { resolveRuntimeHookRunFence } from "./runtimeHookRunFence.js";
 
@@ -350,10 +351,23 @@ async function persistAndApply(
 ): Promise<void> {
   const inbox = new FileRuntimeEventInbox(home);
   for (const entry of observations) inbox.enqueueObservation(entry);
+  // The immutable inbox is authoritative. During a release/update handover the
+  // old Controller is draining and the replacement is not ready yet; leave the
+  // entries for normal inbox replay instead of turning a healthy Provider Turn
+  // into a transport failure.
+  if (isForeignHandoverLockHeld(home)) return;
   for (const entry of observations) {
-    const result = await callController(home, "runtime.observation-apply", entry, {
-      timeoutMs: 10_000
-    }) as Readonly<{ outcome?: string }>;
+    let result: Readonly<{ outcome?: string }>;
+    try {
+      result = await callController(home, "runtime.observation-apply", entry, {
+        timeoutMs: 10_000
+      }) as Readonly<{ outcome?: string }>;
+    } catch (error) {
+      // Close the race where the handover begins after the first check but
+      // before this socket call. The durable entry remains pending for replay.
+      if (isForeignHandoverLockHeld(home)) return;
+      throw error;
+    }
     // A fast Provider can accept the initial Turn before the scheduler call
     // that launched this Host has returned and committed `run.pushed`. The
     // immutable inbox entry already makes that exact fenced fact durable;
