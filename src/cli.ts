@@ -739,8 +739,12 @@ export async function main(): Promise<void> {
     validateCompatibleFileTaskStore(home);
     const controllerMethod: "stop" | "restart" = method;
     const updateHandoverOwner = process.env.YUI_UPDATE_HANDOVER_OWNER_PID;
+    // A pre-fix updater cannot pass the owner environment variable to the
+    // activated restart child, but it remains that child's direct parent while
+    // holding the exact handover lock. Inherit only that OS-backed relationship;
+    // every unrelated live lock still compares foreign and fails closed.
     const updateHandoverOwnerPid = updateHandoverOwner === undefined
-      ? undefined
+      ? (Number.isSafeInteger(process.ppid) && process.ppid > 0 ? process.ppid : undefined)
       : Number(updateHandoverOwner);
     if (
       updateHandoverOwnerPid !== undefined

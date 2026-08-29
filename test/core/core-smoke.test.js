@@ -29,6 +29,7 @@ import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeO
 import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
+import { acquireHandoverLock } from "../../dist/release/runtimeRelease.js";
 import {
   assertRegistryCoversBaselineToCurrent,
   createProductionRegistry
@@ -57,6 +58,39 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   for (const command of ["setup", "update", "upgrade", "task create", "task list"]) {
     assert.ok(commands.includes(command), `missing core command: ${command}`);
   }
+});
+
+test("a packaged Controller restart inherits its direct parent's handover", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-controller-handover-smoke-"));
+  const environment = { ...bareEnv, YUI_HOME: home };
+  t.after(() => {
+    try {
+      execFileSync(
+        process.execPath,
+        [join(root, "dist", "cli.js"), "controller", "stop"],
+        { cwd: root, encoding: "utf8", env: environment }
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+  ensureStorageSchema(home);
+  new SqliteTaskStore(home).close();
+
+  const handover = acquireHandoverLock(home);
+  let restarted;
+  try {
+    restarted = JSON.parse(execFileSync(
+      process.execPath,
+      [join(root, "dist", "cli.js"), "--json", "controller", "restart"],
+      { cwd: root, encoding: "utf8", env: environment }
+    ));
+  } finally {
+    handover.release();
+  }
+  assert.equal(restarted.ok, true);
+  assert.equal(restarted.data.restarted, true);
+  assert.ok(Number.isInteger(restarted.data.pid) && restarted.data.pid > 0);
 });
 
 test("the SQLite Task path persists across one in-place schema upgrade", async (t) => {
