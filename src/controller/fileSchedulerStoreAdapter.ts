@@ -4472,6 +4472,24 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       );
       store.saveGlobalRoleSessionSet(current);
       completeRuntimeHookReservation(store, owner, input.launchId);
+      if (
+        input.roleName === SYSTEM_OPERATOR_ROLE
+        && input.adapterId === "codex"
+        && completedStatus === "ready"
+      ) {
+        const operatorMailbox = store.getWorkMailbox({ kind: "operator" });
+        // A completed foreground Codex Turn leaves its native TUI attached to
+        // the thread. Stop only that idle Role runtime so Desktop can become
+        // the writer; the durable nativeSessionId remains available to resume.
+        if (operatorMailbox === null || !mailboxHasWork(operatorMailbox)) {
+          enqueueWork(
+            store,
+            runtimeLifecycleTarget(owner),
+            RUNTIME_CLEANUP_REQUIRED_REASON,
+            now
+          );
+        }
+      }
       return current.sessions[input.agentId]!;
     });
   }
