@@ -644,7 +644,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       if (owner.scope !== "task" || input.runId === undefined) {
         args = addCodexSessionNotify(args, launchMode, this.#cliPath);
       }
-      // Managed Codex Runs are ordinary shared-daemon threads. Their Session
+      // Managed Codex Runs use Yui-owned App Server processes. Their Session
       // Manifest points at the Yui Skills; no Yui Hook config is installed.
       if (owner.scope === "task" && input.runId !== undefined) {
         if (managedRun === null || managedRun.status !== "active") {
@@ -755,9 +755,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           ...(managedCompiled!.codexThread === undefined
             ? {}
             : { codexThread: managedCompiled!.codexThread }),
-          ...(managedCompiled!.codexDaemonStartArgs === undefined
-            ? {}
-            : { codexDaemonStartArgs: managedCompiled!.codexDaemonStartArgs }),
           ...(providerOwnedTurn === undefined ? {} : { ownedTurn: providerOwnedTurn }),
           authority: providerAuthority!
         }
@@ -775,9 +772,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
               ...(managedCompiled!.codexThread === undefined
                 ? {}
                 : { codexThread: managedCompiled!.codexThread }),
-              ...(managedCompiled!.codexDaemonStartArgs === undefined
-                ? {}
-                : { codexDaemonStartArgs: managedCompiled!.codexDaemonStartArgs }),
               authority: providerAuthority!,
               initialTurn
             }
@@ -795,9 +789,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
               ...(managedCompiled!.codexThread === undefined
                 ? {}
                 : { codexThread: managedCompiled!.codexThread }),
-              ...(managedCompiled!.codexDaemonStartArgs === undefined
-                ? {}
-                : { codexDaemonStartArgs: managedCompiled!.codexDaemonStartArgs }),
               authority: providerAuthority!,
               initialTurn
             };

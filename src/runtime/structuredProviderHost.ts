@@ -17,8 +17,6 @@ import { PROVIDER_ACCEPT_TIMEOUT_MS } from "./runtimeDeadlines.js";
 import { YUI_VERSION } from "../version.js";
 
 const PROVIDER_MESSAGE_MAX_BYTES = 16 * 1024 * 1024;
-const CODEX_DAEMON_START_TIMEOUT_MS = 10_000;
-const CODEX_DAEMON_OUTPUT_MAX_BYTES = 64 * 1024;
 
 export type StructuredProviderTurnReceipt = Readonly<{
   attemptId: string;
@@ -118,9 +116,6 @@ export async function startStructuredProviderSession(
   if (control === undefined) {
     throw new Error("Managed Agent Host launch requires Provider control metadata.");
   }
-  if (control.adapterId === "codex") {
-    await ensureCodexAppServerDaemon(payload, control);
-  }
   const child = spawn(payload.command, [...payload.args], {
     cwd: payload.cwd,
     env: { ...payload.environment },
@@ -163,59 +158,6 @@ export async function startStructuredProviderSession(
     terminateProcessGroup(child, "SIGTERM");
     throw error;
   }
-}
-
-async function ensureCodexAppServerDaemon(
-  payload: AgentHostLaunchPayload,
-  control: AgentHostProviderControl
-): Promise<void> {
-  if (payload.args.at(-2) !== "app-server" || payload.args.at(-1) !== "proxy") return;
-  if (control.adapterId !== "codex") return;
-  const environment = Object.fromEntries(Object.entries(payload.environment).filter(([key]) => (
-    !key.startsWith("YUI_")
-    && key !== "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"
-    && !["TMPDIR", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"]
-      .includes(key)
-  )));
-  const child = spawn(payload.command, [...control.codexDaemonStartArgs!], {
-    cwd: payload.cwd,
-    env: environment,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  await new Promise<void>((resolvePromise, reject) => {
-    let output = "";
-    let settled = false;
-    let timer: NodeJS.Timeout | undefined;
-    const settle = (error?: Error): void => {
-      if (settled) return;
-      settled = true;
-      if (timer !== undefined) clearTimeout(timer);
-      if (error === undefined) resolvePromise();
-      else reject(error);
-    };
-    const capture = (chunk: Buffer | string): void => {
-      output += String(chunk);
-      if (Buffer.byteLength(output, "utf8") <= CODEX_DAEMON_OUTPUT_MAX_BYTES) return;
-      child.kill("SIGTERM");
-      settle(new Error("Codex App Server daemon start output exceeded its bound."));
-    };
-    child.stdout.on("data", capture);
-    child.stderr.on("data", capture);
-    child.once("error", (error) => settle(error));
-    child.once("close", (code, signal) => {
-      if (code === 0) settle();
-      else settle(new Error(
-        `Codex App Server daemon start failed (${code ?? signal ?? "unknown"})${
-          output.trim().length === 0 ? "" : `: ${output.trim()}`
-        }`
-      ));
-    });
-    timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      settle(new Error("Codex App Server daemon start timed out."));
-    }, CODEX_DAEMON_START_TIMEOUT_MS);
-    timer.unref();
-  });
 }
 
 type JsonObject = Record<string, unknown>;

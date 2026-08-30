@@ -875,13 +875,13 @@ Provider conversations remain ordinary user conversations. Yui adds the Role
 Skill and Session Manifest pointer, then sends Task work through provider-native
 structured requests. Managed prompts are never delivered as terminal bytes.
 
-Codex uses `app-server proxy` to create or resume a normal thread on the shared
-App Server daemon. The thread is visible and directly usable in Desktop; Yui
-does not require takeover or install global Hook/config state. It may
-idempotently start an absent daemon, but never restarts or stops it for a thread
-error. When a user Turn is active, Yui keeps pending Task work and retries
-later. If Yui's proxy disconnects, the Host reattaches without ending the
-logical Activation and reconciles the exact owned Turn from native history.
+Codex uses a direct, Yui-owned `app-server` child to create or resume a normal
+thread. The thread remains visible in Codex, while Yui's view/takeover boundary
+is the supported way to interact with a live managed Role. Task execution stop
+terminates the Agent Host and its Provider process group; start creates a fresh
+owned runtime without depending on the shared Codex daemon. If the child
+disconnects, the Host may start a bounded replacement process and reconcile the
+exact owned Turn from native history.
 Claude Code keeps its independent stream-json process with exact
 user-message replay acknowledgement. A timeout or uncertain write becomes
 `delivery-unknown` and is never automatically retried.
@@ -894,10 +894,9 @@ yui task role takeover <task-id> <role>
 yui task role release <task-id> <role>
 ```
 
-For Codex, open the Role's ordinary thread in Desktop for direct interaction;
-these commands are not required. `view`/`takeover`/`release` remain the explicit
-PTY gateway for providers whose managed conversation uses an independent
-process.
+For a live managed Role, including Codex, these commands are the supported
+human-control boundary. Its ordinary native thread remains inspectable in
+Codex; stop Task execution before resuming it from a different client.
 
 Global Operator and global Role sessions remain native interactive CLIs:
 
@@ -962,7 +961,7 @@ movement cannot conceal a workflow that is not advancing.
 
 Stable Role context never creates a separate bootstrap Turn. Task execution Runs use the generic Leader or Worker Skill, while review Runs use the generic Reviewer Skill based on durable Run purpose rather than a configured Role name. The provider either carries the Skill through a safe additive native context channel or points to it from the ordinary Task delivery. These Yui-owned Role Skills define portable orchestration only. Project Skills remain ordinary versioned files in the Project and are discovered, selected, and loaded by the Agent through its native project mechanism; Yui does not scan, parse, copy, or inject them.
 
-Managed Codex keeps the user's native developer instructions unchanged. The ordinary Task message includes a compact absolute Session Manifest pointer, and the manifest identifies the matching Yui-owned Role Skill for Codex to read on demand. Model, effort, permission, workspace, and shell settings selected for the Role are supplied as thread-scoped `thread/start` or `thread/resume` configuration through the shared App Server daemon. A Codex native config profile cannot be isolated to one shared-daemon thread, so Managed Codex rejects that setting and directs callers to a Yui Agent Profile; ordinary non-Yui and interactive Codex sessions remain unaffected. Unrelated Codex threads keep their existing user, profile, project, and system configuration and the underlying config file is never mutated. App Server notifications are the managed thread's lifecycle authority; Yui installs no managed Codex Hook and does not claim `notify`. Interactive Codex Sessions may still use Yui's structured `notify` callback, and Doctor reports any effective configuration conflict. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Yui-owned Role Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the purpose-specific Role path. Non-Operator global Roles stay neutral and receive no Task orchestration Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker or Reviewer Run assignments remain real mailbox-delivered work messages.
+Managed Codex keeps the user's native developer instructions unchanged. The ordinary Task message includes a compact absolute Session Manifest pointer, and the manifest identifies the matching Yui-owned Role Skill for Codex to read on demand. Its Yui-owned App Server process loads any selected Codex native config profile; model, effort, permission, workspace, and shell settings are supplied to `thread/start` or `thread/resume`, and the underlying Codex config file is never mutated. App Server notifications are the managed thread's lifecycle authority; Yui installs no managed Codex Hook and does not claim `notify`. Interactive Codex Sessions may still use Yui's structured `notify` callback, and Doctor reports any effective configuration conflict. `skills.config` is not misused because it only enables or disables already-discovered Skills. Claude receives the same Yui-owned Role Skill content from a private `0600` managed context file rather than a large or sensitive argv value; retries and resumes reuse the purpose-specific Role path. Non-Operator global Roles stay neutral and receive no Task orchestration Skill. Operator therefore opens at an empty native composer, so the user's text remains its first user message. Leader wakeups and Worker or Reviewer Run assignments remain real mailbox-delivered work messages.
 
 ## Controller and failure handling
 
