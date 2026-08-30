@@ -32,11 +32,10 @@ export type ProviderOwnedTurn = Readonly<{
 type AgentHostProviderControlBase = Readonly<{
   schemaVersion: 1;
   adapterId: "codex" | "claude";
-  transport: "codex-app-server-proxy" | "claude-stream-json";
+  transport: "codex-app-server" | "claude-stream-json";
   sessionTitle?: string;
   authority: ProviderAuthorityFence;
   codexThread?: CodexThreadOptions;
-  codexDaemonStartArgs?: readonly string[];
 }>;
 
 /**
@@ -161,24 +160,14 @@ function validateProviderControl(control: AgentHostProviderControl): void {
   if (control.adapterId !== "codex" && control.adapterId !== "claude") {
     throw new Error("Agent Host Provider control adapter is invalid.");
   }
-  if ((control.adapterId === "codex" && control.transport !== "codex-app-server-proxy")
+  if ((control.adapterId === "codex" && control.transport !== "codex-app-server")
     || (control.adapterId === "claude" && control.transport !== "claude-stream-json")) {
     throw new Error("Agent Host Provider control transport does not match its adapter.");
   }
   if ((control.adapterId === "codex") !== (control.codexThread !== undefined)) {
     throw new Error("Agent Host Provider thread settings do not match its adapter.");
   }
-  if ((control.adapterId === "codex") !== (control.codexDaemonStartArgs !== undefined)) {
-    throw new Error("Agent Host Provider daemon bootstrap does not match its adapter.");
-  }
   if (control.codexThread !== undefined) validateCodexThreadOptions(control.codexThread);
-  if (control.codexDaemonStartArgs !== undefined) {
-    if (!Array.isArray(control.codexDaemonStartArgs)
-      || control.codexDaemonStartArgs.length === 0) {
-      throw new Error("Agent Host Codex daemon bootstrap args are invalid.");
-    }
-    control.codexDaemonStartArgs.forEach((value) => text(value, "Codex daemon argument"));
-  }
   if (control.mode !== "new" && control.mode !== "resume") {
     throw new Error("Agent Host Provider control mode is invalid.");
   }

@@ -2,8 +2,9 @@
 
 Yui treats a provider conversation as the user's conversation. It adds the
 Role's Yui Skill and a pointer to the Session Manifest, then uses provider-native
-requests to deliver durable Task work. Yui does not own the transcript and does
-not require the user to route every interaction through Yui.
+requests to deliver durable Task work. Yui does not own the transcript. Writes
+to a live managed Role go through Yui's control boundary; after Task execution
+stops, the native conversation remains available to its Provider clients.
 
 Task state and conversation state have different responsibilities:
 
@@ -33,15 +34,13 @@ Task/Message -> Yui Run + delivery intent -> ordinary provider Turn
 Yui's internal authority epoch fences only Yui's own submissions and retries.
 It is not a claim that Yui is the only client allowed to use the conversation.
 
-## Codex: ordinary shared-daemon threads
+## Codex: Yui-owned App Server processes
 
-Managed Codex connects through `codex app-server proxy` to the same App Server
-daemon used by normal Codex clients. It never starts a per-Role
-`codex app-server --stdio` writer.
-
-Before opening a proxy, Yui may call the idempotent `app-server daemon start`
-with Task-specific environment removed. It never calls daemon restart/stop in
-response to a thread or Turn error.
+Managed Codex starts one direct `codex app-server` child for a live Role
+runtime. The Agent Host owns that process group, so a Task execution stop ends
+the complete Yui runtime without depending on or changing Codex's shared daemon.
+Starting execution creates a new owned runtime process. Native thread history
+remains in Codex and durable Task state remains in Yui.
 
 For a new Role conversation Yui calls `thread/start` with:
 
@@ -56,27 +55,23 @@ instructions intact. No Yui-specific hook configuration is written to the
 user's global Codex config.
 
 The returned `threadId` is the Role's native Session identity already retained
-by the Task Role Session Set. It is a normal App Server thread, so Desktop may
-list, open, resume, and interact with it directly.
+by the Task Role Session Set. It remains a normal Codex thread and may be listed
+or inspected by Codex clients, but concurrent outside writes to a live
+Yui-managed Role are unsupported. Use Yui's view/takeover boundary or stop Task
+execution before another client resumes the thread.
 
-If Desktop or another client already has an active Turn on that thread, Yui
-classifies its own attempted delivery as `busy`. The Run and mailbox batch stay
-pending and are retried after the native Turn settles. Direct user activity is
-not recorded as a failed Yui Run and never causes Yui to restart the shared
-daemon.
+If an already-running native Turn is observed while Yui resumes a thread, Yui
+classifies its attempted delivery as `busy`. The Run and mailbox batch stay
+pending until that native Turn settles.
 
-Disconnecting or terminating Yui's proxy ends only that client attachment. It
-does not stop the shared daemon or delete/archive the thread.
+If the direct App Server disconnects, the Agent Host may start a bounded
+replacement process and resume the same thread from exact native history.
+Stopping Task execution instead terminates the Host and child process group;
+it does not delete or archive the native thread.
 
-The daemon-sharing boundary is `CODEX_HOME`. Agent bindings that require a
-different account or process-level Codex configuration must use a distinct
-`CODEX_HOME`; Yui does not pretend those settings can be isolated per thread.
-A Yui Agent Profile is thread-compatible because its Skills/instructions are
-referenced by the Task message and its model/effort are copied into Role thread
-settings. A Codex native config profile is process configuration, so Managed
-Codex rejects it instead of silently applying it to the proxy or leaking it to
-other threads. Interactive and non-Yui Codex sessions keep their normal profile
-behavior.
+Because each App Server is process-isolated, a Codex native config profile and
+other process-level Role configuration can be applied without leaking to other
+managed or interactive threads. Yui never mutates the underlying Codex config.
 
 ## Claude Code: independent structured process
 
@@ -85,9 +80,8 @@ Managed Claude continues to use a persistent `--input-format stream-json` and
 preallocates the native Session ID and accepts a submitted Turn only after
 Claude replays the exact user message for that Session.
 
-The tmux view/takeover gateway remains useful for providers whose managed
-conversation is attached to an independent process. Codex users normally open
-the shared thread in Desktop instead; no Yui takeover is required.
+The tmux view/takeover gateway is the supported human-control boundary for a
+live managed Provider process, including Codex and Claude.
 
 ## Delivery outcomes
 
@@ -118,9 +112,9 @@ Conversation recovery uses provider-native evidence:
 | Thread is exactly missing | Require an explicit conversation replacement decision |
 | Availability or delivery is unknown | Preserve identity and require bounded retry/attention |
 
-A missing proxy, dead pane, timeout, or daemon disconnect is not proof that a
-thread is missing. Yui reconnects through the normal proxy path and never uses
-a business-request failure as a reason to restart or stop the shared daemon.
+A dead pane, timeout, or App Server disconnect is not proof that a thread is
+missing. Yui may replace its owned process, but it never replaces a thread
+without exact Provider-native missing evidence.
 
 ## Required invariants
 
@@ -129,6 +123,6 @@ a business-request failure as a reason to restart or stop the shared daemon.
 3. Ambiguous delivery is never automatically duplicated.
 4. A busy ordinary thread keeps Yui work pending instead of failing the Run.
 5. Exact missing evidence is required before replacing a conversation.
-6. Yui Skill/config is thread-scoped and does not mutate global Codex config.
-7. Yui may end its own proxy attachment but never stops or restarts the shared
-   Codex daemon as a response to a thread error.
+6. Yui Skill/config does not mutate global Codex config.
+7. The Agent Host owns every Provider child process used by its Role runtime;
+   Task stop can terminate that runtime without a shared service dependency.

@@ -126,9 +126,8 @@ export type CompiledAgentLaunch = Readonly<{
   sessionStrategy: "runtime-discovery" | "preallocated";
 }>;
 export type CompiledManagedControlLaunch = CompiledAgentLaunch & Readonly<{
-  transport: "codex-app-server-proxy" | "claude-stream-json";
+  transport: "codex-app-server" | "claude-stream-json";
   codexThread?: CodexThreadOptions;
-  codexDaemonStartArgs?: readonly string[];
 }>;
 
 export interface AgentAdapter<TConfig extends RoleAgentConfig = RoleAgentConfig> {
@@ -327,12 +326,6 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
     _nativeSessionId?: string
   ): CompiledManagedControlLaunch {
     const config = this.canonicalizeConfig(input.config);
-    if (config.profile !== undefined) {
-      throw new Error(
-        "Managed Codex does not accept a Codex config profile because it cannot be scoped to one "
-        + "shared-daemon thread. Use a Yui Agent Profile for skills, model, and effort."
-      );
-    }
     const launch = this.compileNew(input);
     // A managed Codex thread is an ordinary user thread. Its Yui guidance is
     // part of the durable Task message, not a developer_instructions override
@@ -350,10 +343,9 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
     }
     return {
       ...launch,
-      argv: [...argv, "app-server", "proxy"],
-      transport: "codex-app-server-proxy",
-      codexThread: codexThreadOptions(input, config),
-      codexDaemonStartArgs: [...input.agent.baseArgs, "app-server", "daemon", "start"]
+      argv: [...argv, "app-server"],
+      transport: "codex-app-server",
+      codexThread: codexThreadOptions(input, config)
     };
   }
 }

@@ -14,6 +14,7 @@ import {
   releaseProcessing
 } from "../../dist/coordination/workMailbox.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
+import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
 import {
   startTaskExecutionCommand,
   stopTaskExecutionCommand
@@ -82,6 +83,40 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   }
   assert.equal(commands.includes("task run recover"), false);
   assert.equal(commands.includes("task role session switch"), false);
+});
+
+test("Managed Codex uses a Yui-owned direct App Server process", () => {
+  const adapter = resolveAgentAdapter("codex");
+  const launch = adapter.compileManagedControl({
+    agent: {
+      schemaVersion: 2,
+      id: "codex",
+      adapterId: "codex",
+      command: "codex",
+      baseArgs: [],
+      environment: [],
+      createdAt: "2026-08-30T00:00:00.000Z",
+      updatedAt: "2026-08-30T00:00:00.000Z",
+      source: "custom"
+    },
+    config: {
+      adapterId: "codex",
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+      permission: { strategy: "bypass" },
+      profile: "operator"
+    },
+    workspace: "/tmp/yui-owned-codex-runtime"
+  }, "new");
+
+  assert.equal(launch.transport, "codex-app-server");
+  assert.deepEqual(launch.argv.slice(-1), ["app-server"]);
+  assert.equal(launch.argv.includes("proxy"), false);
+  assert.equal(launch.argv.includes("daemon"), false);
+  assert.deepEqual(
+    launch.argv.slice(launch.argv.indexOf("--profile"), launch.argv.indexOf("--profile") + 2),
+    ["--profile", "operator"]
+  );
 });
 
 test("Task execution can be fenced without changing semantic progress", () => {

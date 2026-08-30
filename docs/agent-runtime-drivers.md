@@ -128,8 +128,8 @@ replacement, affect scheduling or resource admission, or change Task, Review,
 Integration, and Publication state. Explicit runtime activity identity remains
 a separate observation fact.
 
-Codex shared-daemon threads currently report usage as unavailable because Yui
-does not add a Hook/transcript observer merely for telemetry. Claude Code
+Managed Codex threads currently report usage as unavailable because Yui does
+not add a Hook/transcript observer merely for telemetry. Claude Code
 exposes each de-duplicated assistant message as a request snapshot;
 later streaming records with the same message id replace that request.
 `turn.accepted` persists only the Driver-owned source descriptor. A
