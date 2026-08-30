@@ -84,7 +84,10 @@ import {
   builtinDriverIdForAdapter
 } from "../runtime/builtinAgentDrivers.js";
 import { managedRuntimeAdmission } from "../runtime/agentDriver.js";
-import type { AgentHostProviderControl } from "../runtime/launchBroker.js";
+import type {
+  AgentHostProviderControl,
+  ProviderOwnedTurn
+} from "../runtime/launchBroker.js";
 import { freshConversationLaunchAllowed } from "../runtime/conversationSwitch.js";
 import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
 import { currentProviderActivation } from "../runtime/providerRuntimeIdentity.js";
@@ -470,7 +473,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const adapter = resolveAgentAdapter(binding.adapterId);
     const effectiveWorkspace = effective.workspace.root;
     const agentWorkspace = nativeAgentWorkspace(effective.workspace);
-    if (adapter.id === "codex") {
+    if (adapter.id === "codex" && (owner.scope !== "task" || input.runId === undefined)) {
       const codexConfig = inspectCodexLaunchConfig({
         environment: launchEnvironment,
         workspace: agentWorkspace,
@@ -479,12 +482,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           : undefined,
         trustWorkspace: true
       });
-      assertCodexLaunchOverridesAvailable(
-        codexConfig,
-        owner.scope !== "task" || input.runId === undefined
-          ? ["developerInstructions", "notify"]
-          : ["developerInstructions"]
-      );
+      assertCodexLaunchOverridesAvailable(codexConfig, ["developerInstructions", "notify"]);
     }
     const runtimeIsolation = input.runtimeIsolation === undefined
       ? undefined
@@ -647,24 +645,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     }
     if (binding.adapterId === "codex") {
       // Global/interactive Codex sessions still use notify for presentation.
-      // Managed Runs use the structured Driver Hook as their sole lifecycle
-      // authority, avoiding two terminal channels for the same Turn.
+      // Managed Runs receive lifecycle facts through their ordinary App Server
+      // subscription, avoiding a second Hook channel for the same Turn.
       if (owner.scope !== "task" || input.runId === undefined) {
         args = addCodexSessionNotify(args, launchMode, this.#cliPath);
       }
-      // Managed Codex runs use App Server lifecycle hooks and structured Turn
-      // submission. No Run prompt is placed in argv or written as terminal input.
+      // Managed Codex Runs are ordinary shared-daemon threads. Their Session
+      // Manifest points at the Yui Skills; no Yui Hook config is installed.
       if (owner.scope === "task" && input.runId !== undefined) {
         if (managedRun === null || managedRun.status !== "active") {
           throw new Error(`Managed Codex Run is no longer active: ${input.runId}.`);
         }
-        args = managedControl
-          ? addCodexManagedLifecycleHooks(args, this.#cliPath)
-          : addCodexLifecycleHooks(
-          args,
-          launchMode,
-          this.#cliPath
-        );
       }
       session = launchMode === "resume"
         ? readySession(input.agentId, binding.adapterId, resumeNativeSessionId!, effective)
@@ -736,13 +727,21 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           input.mode
         )
       : undefined;
+    const providerOwnedTurn = managedControl && !carriesInitialTurn
+      ? this.#providerOwnedTurnForLaunch(owner.taskId, role.name, input.runId!)
+      : undefined;
     const providerNativeSessionId = binding.adapterId === "claude"
       ? preallocatedNativeSessionId
       : resumeNativeSessionId;
     const initialTurn = carriesInitialTurn
       ? {
           attemptId: agentRunDeliveryReceiptId(managedRun!),
-          boundedText: managedRunLaunchEnvelope(managedRun!, input.mode, sessionTitle)
+          boundedText: managedRunLaunchEnvelope(
+            managedRun!,
+            input.mode,
+            sessionContext.sessionManifestPath,
+            sessionTitle
+          )
         }
       : undefined;
     const providerControl: AgentHostProviderControl | undefined = !managedControl
@@ -759,6 +758,13 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
             "Managed Provider ensure native session id"
           ),
           ...(sessionTitle === undefined ? {} : { sessionTitle }),
+          ...(managedCompiled!.codexThread === undefined
+            ? {}
+            : { codexThread: managedCompiled!.codexThread }),
+          ...(managedCompiled!.codexDaemonStartArgs === undefined
+            ? {}
+            : { codexDaemonStartArgs: managedCompiled!.codexDaemonStartArgs }),
+          ...(providerOwnedTurn === undefined ? {} : { ownedTurn: providerOwnedTurn }),
           authority: providerAuthority!
         }
         : resumeNativeSessionId === undefined
@@ -772,6 +778,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
                 ? {}
                 : { nativeSessionId: providerNativeSessionId }),
               ...(sessionTitle === undefined ? {} : { sessionTitle }),
+              ...(managedCompiled!.codexThread === undefined
+                ? {}
+                : { codexThread: managedCompiled!.codexThread }),
+              ...(managedCompiled!.codexDaemonStartArgs === undefined
+                ? {}
+                : { codexDaemonStartArgs: managedCompiled!.codexDaemonStartArgs }),
               authority: providerAuthority!,
               initialTurn
             }
@@ -786,6 +798,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
                 "Managed Provider resume native session id"
               ),
               ...(sessionTitle === undefined ? {} : { sessionTitle }),
+              ...(managedCompiled!.codexThread === undefined
+                ? {}
+                : { codexThread: managedCompiled!.codexThread }),
+              ...(managedCompiled!.codexDaemonStartArgs === undefined
+                ? {}
+                : { codexDaemonStartArgs: managedCompiled!.codexDaemonStartArgs }),
               authority: providerAuthority!,
               initialTurn
             };
@@ -841,6 +859,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const scopedLaunch = owner.scope === "task"
       ? this.#applyWorkspaceScope(owner.taskId, role, launch, workspaceOverride)
       : launch;
+    const ordinaryConversationLaunch = withCodexThreadEnvironment(scopedLaunch);
     return {
       role: {
         name: role.name,
@@ -848,7 +867,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...(agentWorkspace === effectiveWorkspace ? {} : { cwd: agentWorkspace }),
         ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
       },
-      launch: scopedLaunch,
+      launch: ordinaryConversationLaunch,
       session,
       ...(sessionTitle === undefined ? {} : { sessionTitle }),
       ...(carriesInitialTurn && input.runId !== undefined
@@ -899,6 +918,21 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       };
     }
     throw new Error(`Provider writer authority is unknown: ${taskId}/${roleName}.`);
+  }
+
+  #providerOwnedTurnForLaunch(
+    taskId: string,
+    roleName: string,
+    runId: string
+  ): ProviderOwnedTurn | undefined {
+    const binding = this.store.getTaskRoleSessionSet(taskId, roleName)?.providerBinding;
+    if (binding === null || binding === undefined || binding.runId !== runId) return undefined;
+    const turn = binding.turn;
+    if (turn === null || !["accepted", "running"].includes(turn.status)) return undefined;
+    if (turn.turnId === undefined) {
+      throw new Error(`Active Provider Turn has no native identity: ${taskId}/${roleName}.`);
+    }
+    return { attemptId: turn.attemptId, turnId: turn.turnId };
   }
 
   #applyWorkspaceScope(
@@ -969,6 +1003,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
 function managedRunLaunchEnvelope(
   run: AgentRun,
   mode: "new" | "resume",
+  sessionManifestPath: string,
   title: string | undefined
 ): string {
   const body = run.providerRetry?.state === "dispatching"
@@ -988,9 +1023,14 @@ function managedRunLaunchEnvelope(
     : mode === "resume" && run.pushedAt !== undefined
       ? serializeRunHostRecoveryEnvelope(run.bootstrapEnvelope)
       : serializeRunBootstrapEnvelope(run.bootstrapEnvelope);
+  const guided = [
+    `Yui Session Manifest: ${sessionManifestPath}`,
+    "Read the manifest and its matching Role Skill before using the yui CLI for this Task.",
+    body
+  ].join("\n");
   return title === undefined
-    ? body
-    : prefixYuiTitleInput(body, title);
+    ? guided
+    : prefixYuiTitleInput(guided, title);
 }
 
 export function nativeAgentWorkspace(
@@ -1262,17 +1302,30 @@ function addCodexLifecycleHooks(
   return [...args.slice(0, -2), ...managed, ...args.slice(-2)];
 }
 
-function addCodexManagedLifecycleHooks(args: readonly string[], cliPath: string): string[] {
-  if (args.length < 2 || args.at(-2) !== "app-server" || args.at(-1) !== "--stdio") {
-    throw new Error("Managed Codex App Server launch shape is invalid.");
-  }
-  return [
-    ...args.slice(0, -2),
-    "--enable", "hooks",
-    "--config", codexLifecycleHooksConfig(cliPath),
-    "--dangerously-bypass-hook-trust",
-    ...args.slice(-2)
-  ];
+function withCodexThreadEnvironment<T extends Readonly<{
+  env: Readonly<Record<string, string>>;
+  providerControl?: AgentHostProviderControl;
+}>>(launch: T): T {
+  const control = launch.providerControl;
+  if (control?.adapterId !== "codex" || control.codexThread === undefined) return launch;
+  const set = Object.fromEntries(Object.entries(launch.env).filter(([key]) => (
+    key.startsWith("YUI_")
+    || ["TMPDIR", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"]
+      .includes(key)
+  )));
+  return {
+    ...launch,
+    providerControl: {
+      ...control,
+      codexThread: {
+        ...control.codexThread,
+        config: {
+          ...(control.codexThread.config ?? {}),
+          shell_environment_policy: { set }
+        }
+      }
+    }
+  };
 }
 
 function readySession(

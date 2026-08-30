@@ -27,7 +27,7 @@ Agent 对话内创建 native subagent，或交给 Task Role AgentRun。Yui
 worker  explorer  implementer  reviewer
 ```
 
-Profile 不绑定 Agent，也不持有 Session 或 workspace。Operator、Leader
+Profile 不绑定 Agent，也不持有 Session 或 workspace。把 Yui Agent Profile 应用到 Task Role 时，会把 instructions、Skills、访问意图以及可选 model/effort 复制到该 Role 的 active Agent binding；显式 Role 参数可以继续覆盖这些值。它与 Codex 通过 `--profile` 选择的原生 config profile 不是一回事。Operator、Leader
 与 Task Role 是运行时 Role。
 
 ## 环境要求
@@ -510,9 +510,9 @@ Task 生命周期的交互选择只展示有效来源状态：activate 只展示
 
 ## Session 与 tmux
 
-受管理的 Task Agent 统一使用混合 Provider Runtime：Controller 与 Agent Host 通过 Provider 原生结构化协议提交和确认输入；tmux/PTY 只负责保持 Host 存活、展示输出，以及在显式人工接管后提供输入网关。受管理输入绝不会作为终端按键、粘贴文本或启动 argv 发送。Codex 使用持久 App Server JSON-RPC 进程；Claude 使用持久 stream-json 进程，并以精确回放的 user message 作为接收确认。
+受管理的 Provider 会话仍然是普通用户会话。Yui 只添加对应的 Role Skill 与 Session Manifest 指针，并通过 Provider 原生结构化协议提交 Task 工作；Yui 不接管完整对话历史。受管理输入绝不会作为终端按键、粘贴文本或启动 argv 发送。Codex 通过 `app-server proxy` 在共享 App Server daemon 上创建或恢复普通 thread；proxy 断开时 Host 会保留逻辑 Activation，重新连接并用原生 thread 历史核对 Yui 已持有的 Turn。Claude 继续使用独立的持久 stream-json 进程，并以精确回放的 user message 作为接收确认。
 
-Run、Conversation、Activation 与 Turn 是四个独立身份。Conversation 可以跨多个 Run 和进程；Activation 只代表一次 Provider 进程存活期；Turn 在写入前先持久化。写入超时或结果不明确会进入 `delivery-unknown`，不会自动重发。Provider 进程退出后结束当前 Activation；恢复同一 Conversation 会创建新 Activation 并推进 authority epoch。
+Run、Conversation、Activation 与 Turn 是四个独立身份。Conversation 可以跨多个 Run 和客户端连接；Activation 只代表 Yui 当前的连接，而不是对 Provider thread 的独占所有权；Turn 在写入前先持久化。写入超时或结果不明确会进入 `delivery-unknown`，不会自动重发。用户在 Desktop 直接发起的 active Turn 只会让 Yui 暂时等待，不会导致 Yui Run 失败。
 
 Task Role 使用以下显式入口：
 
@@ -524,7 +524,7 @@ yui task role takeover <task-id> <role>
 yui task role release <task-id> <role>
 ```
 
-`view` 始终只读。`takeover` 要求存在 active managed Run 且没有未决 Turn；它先以持久 CAS 把唯一 writer authority 转给人工 holder，再把相同 epoch 同步给 Agent Host，最后开放 PTY 输入网关。人工输入仍由 Host 转换为结构化 Provider Turn，而不是直接注入 Provider 终端。detach 会自动归还 authority；`release` 即使没有 active Run 也可执行，用于幂等修复中断或未完全同步的接管。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议。
+Codex Role thread 可以直接在 Desktop 中打开和交互，不需要执行 `takeover`；Yui 不写入全局 Hook/config。Yui 可以幂等启动尚未运行的共享 daemon，但不会因 thread 错误停止或重启它。`view`、`takeover`、`release` 继续作为独立进程型 Provider 的显式 PTY 输入网关。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议。
 
 当新版本需要离线迁移 Home 时，应等待当前 Turn/Run 完成，然后从普通 shell
 执行 `yui session stop --all`，再重新执行 `yui update`。停止命令会先整体预检：
@@ -555,12 +555,12 @@ binding，用于不同账号、模型、profile 或环境来源；这些 binding
 
 Claude 的 session ID 在启动前分配，并由持久 stream-json Provider 进程承载多个 Turn；Codex 使用持久 App Server thread。两者都复用同一套 Conversation、Activation、Turn 与 authority fence，不再向模型对话注入 session-bind prompt。
 
-自动生命周期与投递判断只使用结构化 Hook payload、持久身份、tmux process
+自动生命周期与投递判断只使用 Provider 原生事件或受支持 Hook 的结构化 payload、持久身份、tmux process
 state、receipt 与 pane fence。Yui 不会解析 prompt glyph、进度文本、trust dialog
 或其他 Agent 终端输出来推断 ready 或 success。`captureRole()` 只用于显式的人类
 transcript 查看，不具备生命周期权威。
 
-稳定的 Role 上下文也属于启动元数据，而不是 bootstrap turn。Yui 通过 Agent 原生的 system/developer instruction 通道传入 Role 策略和 `systemPrompt`。Task execution Run 按角色接收通用 Leader 或 Worker Skill，review Run 则按持久 Run purpose 接收通用 Reviewer Skill；这些都只是 Yui 自己拥有的可移植编排规则。Project Skills 始终是 Project 中正常版本化的文件，由 Agent 通过自身项目机制发现、选择并按需加载；Yui 不扫描、不解析、不复制，也不注入 Project Skills。Codex developer instructions 只携带 Yui 自有 Role Skill 的精简绝对路径，并作为本次 invocation 的覆盖值传入；已有的用户、profile、Project 和 system 配置不会使 Session 拒绝启动，Yui 也不会修改原配置文件。优先级高于 invocation 的 managed `developer_instructions` 仍会成为边界明确的启动阻塞，因为 Codex 不允许本次启动参数覆盖它。交互式 Codex Session 的结构化 `notify` 遵循同一规则：Doctor 会把普通覆盖来源作为上下文报告，并拒绝最终生效的 managed 冲突；Managed Run 不占用 `notify`，只使用 Agent Driver Hook。`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 从 Yui 管理的私有 `0600` context 文件读取同一份 Yui Role Skill 内容，不再把大段或敏感文本放进 argv；重试和 resume 会复用按 purpose 区分的稳定路径。非 Operator 的 global Role 保持中性，不会注入 Task 编排 Skill。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake、Worker 和 Reviewer Run assignment 仍是邮箱投递的真实工作消息。不具备原生指令通道的 adapter 必须拒绝这类上下文，不能静默降级为首轮 user prompt。
+稳定的 Role 上下文不会创建额外的 bootstrap Turn。Task execution Run 按角色使用通用 Leader 或 Worker Skill，review Run 则按持久 Run purpose 使用通用 Reviewer Skill；Provider 可以通过安全的追加式原生上下文通道携带 Skill，也可以在普通 Task 投递中指向它。这些都只是 Yui 自己拥有的可移植编排规则。Project Skills 始终是 Project 中正常版本化的文件，由 Agent 通过自身项目机制发现、选择并按需加载；Yui 不扫描、不解析、不复制，也不注入 Project Skills。Managed Codex 保留用户原有的 developer instructions；普通 Task 消息会携带精简的 Session Manifest 绝对路径，Manifest 再指向对应的 Yui Role Skill，供 Codex 按需读取。Role 选择的 model、effort、permission、workspace 与 shell 设置通过共享 App Server daemon，作为线程级 `thread/start` 或 `thread/resume` 配置传入。Codex 原生 config profile 不能隔离到共享 daemon 的单个 thread，因此 Managed Codex 会拒绝这个设置并提示使用 Yui Agent Profile；其他非 Yui 或交互式 Codex 会话不受影响。其他 Codex 线程继续使用原有的用户、profile、Project 和 system 配置，Yui 不修改底层配置文件。App Server 原生通知是 Managed Codex 线程的生命周期权威；Yui 不为它安装 Hook，也不占用 `notify`。交互式 Codex Session 仍可使用 Yui 的结构化 `notify` callback，Doctor 会报告最终生效的配置冲突。`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 从 Yui 管理的私有 `0600` context 文件读取同一份 Yui Role Skill 内容，不再把大段或敏感文本放进 argv；重试和 resume 会复用按 purpose 区分的稳定路径。非 Operator 的 global Role 保持中性，不会注入 Task 编排 Skill。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake、Worker 和 Reviewer Run assignment 仍是邮箱投递的真实工作消息。
 
 ## Controller 与失败处理
 
@@ -579,7 +579,7 @@ Controller；如果之前没有运行，会在完成后启动。只读命令和
 `upgrade --dry-run` 不会启动 Controller。`update` 只有在新二进制健康检查通过后，
 才会替换或启动 Controller。
 
-恢复 reconciliation 默认每 120 秒执行一次。普通持久状态变化只会将 Task、Role 或 Operator key 放入队列并立即返回；固定 100ms 窗口内到达的 key 会合并触发一次不重叠的定向处理。Operator 呈现使用独立 lane，不会被 Task 的 Git/worktree 操作阻塞；周期 Git/worktree 处理只覆盖仍有持久 Task mailbox 工作的 Task，活动 Role 的存活检查合并为一次 tmux inventory。Codex turn-complete Hook 直接写入存储，不启动或等待 Controller，并给合法的 yield、输入请求或完成动作保留 2 秒竞争窗口；到期后才关闭被 Agent 遗忘的活动 Role Run。持久 WorkMailbox 会冻结当前 processing 批次，期间的新事件合并到下一 pending 批次；失败会释放当前批次供恢复。推荐输入与 pending Turn 共用最近 deadline 选择器，不依赖恢复扫描间隔；显式 `task reconcile` 仍会立即请求恢复扫描。保留的闭环为：
+恢复 reconciliation 默认每 120 秒执行一次。普通持久状态变化只会将 Task、Role 或 Operator key 放入队列并立即返回；固定 100ms 窗口内到达的 key 会合并触发一次不重叠的定向处理。Operator 呈现使用独立 lane，不会被 Task 的 Git/worktree 操作阻塞；周期 Git/worktree 处理只覆盖仍有持久 Task mailbox 工作的 Task，活动 Role 的存活检查合并为一次 tmux inventory。来自 Provider 原生事件或受支持 Hook 的结构化 Agent Driver observation，会经过精确 fence 后进入持久 runtime inbox。终态 Turn observation 会给合法的 yield、输入请求或完成动作保留 2 秒竞争窗口；到期后才关闭被 Agent 遗忘的活动 Role Run。持久 WorkMailbox 会冻结当前 processing 批次，期间的新事件合并到下一 pending 批次；失败会释放当前批次供恢复。推荐输入与 pending Turn 共用最近 deadline 选择器，不依赖恢复扫描间隔；显式 `task reconcile` 仍会立即请求恢复扫描。保留的闭环为：
 
 1. 准备 active Project Task 的主 worktree；
 2. 停止 archived Task 的 tmux，并只清理干净 worktree；

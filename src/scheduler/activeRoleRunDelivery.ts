@@ -257,6 +257,26 @@ export async function processActiveRoleRunDeliveries(
             : { launchId: ready.prepared.launchId }),
           now
         });
+        if (ready.prepared.turnBusyDuringLaunch === true) {
+          // An ordinary user Turn is temporary backpressure for this Role,
+          // not a failed Yui Run or a reason to consume its mailbox batch.
+          delivery.forgetPrepared?.({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            ...(ready.prepared.launchId === undefined
+              ? {}
+              : { launchId: ready.prepared.launchId })
+          });
+          results.push({
+            taskId: task.id,
+            roleName: role.name,
+            runId: run.id,
+            status: "skipped",
+            reason: "not-ready"
+          });
+          continue;
+        }
         if (ready.prepared.turnRejectedDuringLaunch === true) {
           const persisted = store.saveRoleRunDeliveryFailure({
             ...roleRunDeliveryFailure(
@@ -725,9 +745,9 @@ async function processActiveRunContinuation(
       };
     }
     store.markInputDeliveryPushed(target, inputDelivery.attemptId, now);
-    // Keep the exact claim until the matching provider turn.accepted Hook
-    // folds it. An interrupted acknowledgement becomes delivery-unknown and
-    // cannot be resubmitted automatically.
+    // Keep the exact claim until the matching structured provider acceptance
+    // observation folds it. An interrupted acknowledgement becomes
+    // delivery-unknown and cannot be resubmitted automatically.
     return {
       taskId: task.id,
       roleName: role.name,
@@ -983,6 +1003,7 @@ function validateLaunchSubmittedRecoverySession(
     session === null
     && (prepared.turnAcceptedDuringLaunch === true
       || prepared.turnDeliveryUnknownDuringLaunch === true
+      || prepared.turnBusyDuringLaunch === true
       || prepared.turnRejectedDuringLaunch === true)
     && prepared.sessionStarted === false
     && existing?.launchId !== undefined

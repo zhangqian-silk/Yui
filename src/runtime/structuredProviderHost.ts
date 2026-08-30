@@ -17,6 +17,8 @@ import { PROVIDER_ACCEPT_TIMEOUT_MS } from "./runtimeDeadlines.js";
 import { YUI_VERSION } from "../version.js";
 
 const PROVIDER_MESSAGE_MAX_BYTES = 16 * 1024 * 1024;
+const CODEX_DAEMON_START_TIMEOUT_MS = 10_000;
+const CODEX_DAEMON_OUTPUT_MAX_BYTES = 64 * 1024;
 
 export type StructuredProviderTurnReceipt = Readonly<{
   attemptId: string;
@@ -34,6 +36,8 @@ export type StructuredProviderTurnTerminal = Readonly<{
   conversationId: string;
   nativeSessionId: string;
   nativeTurnId: string;
+  /** True only when this client received the exact acceptance for the Turn. */
+  clientOwned: boolean;
   status: "completed" | "failed" | "cancelled";
   observedAt: string;
   summary?: string;
@@ -79,6 +83,19 @@ export class ProviderTurnRejectedError extends Error {
   }
 }
 
+/** Another ordinary client currently owns the thread's active Turn. */
+export class ProviderTurnBusyError extends Error {
+  readonly name = "ProviderTurnBusyError";
+
+  constructor(
+    message: string,
+    readonly attemptId: string,
+    readonly activeTurnId?: string
+  ) {
+    super(message);
+  }
+}
+
 export class ProviderConversationMissingError extends Error {
   readonly name = "ProviderConversationMissingError";
 
@@ -95,10 +112,14 @@ export async function startStructuredProviderSession(
   }> = {}
 ): Promise<Readonly<{
   session: StructuredProviderSession;
+  recoveredTerminal?: StructuredProviderTurnTerminal;
 }>> {
   const control = payload.providerControl;
   if (control === undefined) {
     throw new Error("Managed Agent Host launch requires Provider control metadata.");
+  }
+  if (control.adapterId === "codex") {
+    await ensureCodexAppServerDaemon(payload, control);
   }
   const child = spawn(payload.command, [...payload.args], {
     cwd: payload.cwd,
@@ -112,8 +133,8 @@ export async function startStructuredProviderSession(
   child.stderr.on("data", (chunk: string) => mirror("stderr", chunk));
   const exit = childExit(child, processInstanceId);
   try {
-    const session = control.adapterId === "codex"
-      ? await CodexStructuredProviderSession.open(
+    if (control.adapterId === "codex") {
+      const opened = await CodexStructuredProviderSession.open(
           child,
           exit,
           processInstanceId,
@@ -121,8 +142,15 @@ export async function startStructuredProviderSession(
           control,
           input.onTerminal,
           mirror
-        )
-      : await ClaudeStructuredProviderSession.open(
+        );
+      return Object.freeze({
+        session: opened.session,
+        ...(opened.recoveredTerminal === undefined
+          ? {}
+          : { recoveredTerminal: opened.recoveredTerminal })
+      });
+    }
+    const session = await ClaudeStructuredProviderSession.open(
           child,
           exit,
           processInstanceId,
@@ -135,6 +163,59 @@ export async function startStructuredProviderSession(
     terminateProcessGroup(child, "SIGTERM");
     throw error;
   }
+}
+
+async function ensureCodexAppServerDaemon(
+  payload: AgentHostLaunchPayload,
+  control: AgentHostProviderControl
+): Promise<void> {
+  if (payload.args.at(-2) !== "app-server" || payload.args.at(-1) !== "proxy") return;
+  if (control.adapterId !== "codex") return;
+  const environment = Object.fromEntries(Object.entries(payload.environment).filter(([key]) => (
+    !key.startsWith("YUI_")
+    && key !== "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"
+    && !["TMPDIR", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"]
+      .includes(key)
+  )));
+  const child = spawn(payload.command, [...control.codexDaemonStartArgs!], {
+    cwd: payload.cwd,
+    env: environment,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  await new Promise<void>((resolvePromise, reject) => {
+    let output = "";
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      if (error === undefined) resolvePromise();
+      else reject(error);
+    };
+    const capture = (chunk: Buffer | string): void => {
+      output += String(chunk);
+      if (Buffer.byteLength(output, "utf8") <= CODEX_DAEMON_OUTPUT_MAX_BYTES) return;
+      child.kill("SIGTERM");
+      settle(new Error("Codex App Server daemon start output exceeded its bound."));
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
+    child.once("error", (error) => settle(error));
+    child.once("close", (code, signal) => {
+      if (code === 0) settle();
+      else settle(new Error(
+        `Codex App Server daemon start failed (${code ?? signal ?? "unknown"})${
+          output.trim().length === 0 ? "" : `: ${output.trim()}`
+        }`
+      ));
+    });
+    timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      settle(new Error("Codex App Server daemon start timed out."));
+    }, CODEX_DAEMON_START_TIMEOUT_MS);
+    timer.unref();
+  });
 }
 
 type JsonObject = Record<string, unknown>;
@@ -267,13 +348,19 @@ class JsonLineChannel {
 class CodexStructuredProviderSession implements StructuredProviderSession {
   readonly adapterId = "codex" as const;
   #activeTurnId: string | undefined;
+  #clientOwnedTurnId: string | undefined;
+  #submissionPending = false;
+  readonly #bufferedTerminals: Array<Omit<StructuredProviderTurnTerminal, "clientOwned">> = [];
 
   private constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly exit: Promise<StructuredProviderProcessExit>,
     readonly processInstanceId: string,
     readonly conversationId: string,
-    private readonly runtime: CodexAppServerRuntime
+    private readonly runtime: CodexAppServerRuntime,
+    private readonly onTerminal:
+      | ((terminal: StructuredProviderTurnTerminal) => void)
+      | undefined
   ) {}
 
   static async open(
@@ -284,8 +371,13 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
     control: AgentHostProviderControl,
     onTerminal: ((terminal: StructuredProviderTurnTerminal) => void) | undefined,
     mirror: (stream: "stdout" | "stderr", text: string) => void
-  ): Promise<CodexStructuredProviderSession> {
+  ): Promise<Readonly<{
+    session: CodexStructuredProviderSession;
+    recoveredTerminal?: StructuredProviderTurnTerminal;
+  }>> {
     const channel = new JsonLineChannel(child, mirror);
+    const openingMessages: JsonObject[] = [];
+    const stopOpeningBuffer = channel.onMessage((message) => openingMessages.push(message));
     await channel.request("initialize", {
       clientInfo: { name: "yui", title: "Yui", version: YUI_VERSION },
       capabilities: {
@@ -297,13 +389,21 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
     const runtime = new CodexAppServerRuntime(channel);
     let conversationId: string;
     let resumedActiveTurnId: string | undefined;
+    let resumedTurns: import("./codexAppServerRuntime.js").CodexThreadSnapshot["turns"] = [];
     if (control.mode === "new") {
-      conversationId = (await runtime.openConversation({ cwd: payload.cwd })).conversationId;
+      conversationId = (await runtime.openConversation({
+        cwd: payload.cwd,
+        ...control.codexThread!
+      })).conversationId;
     } else {
       try {
-        const resumed = await runtime.resumeConversation(control.nativeSessionId!);
+        const resumed = await runtime.resumeConversation(control.nativeSessionId!, {
+          cwd: payload.cwd,
+          ...control.codexThread!
+        });
         conversationId = resumed.threadId;
         resumedActiveTurnId = resumed.activeTurnId;
+        resumedTurns = resumed.turns;
       } catch (error) {
         if (codexAppServerErrorIsMissing(error)) {
           throw new ProviderConversationMissingError(
@@ -325,36 +425,84 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
       exit,
       processInstanceId,
       conversationId,
-      runtime
+      runtime,
+      onTerminal
     );
     session.#activeTurnId = resumedActiveTurnId;
+    const ownedTurn = control.kind === "ensure" ? control.ownedTurn : undefined;
+    session.#clientOwnedTurnId = ownedTurn?.turnId;
+    stopOpeningBuffer();
+    let recoveredTerminal: StructuredProviderTurnTerminal | undefined;
+    for (const message of openingMessages) {
+      const terminal = session.#observeMessage(message, false);
+      if (terminal?.clientOwned === true) recoveredTerminal = terminal;
+    }
     channel.onMessage((message) => {
+      session.#observeMessage(message, true);
+    });
+    if (ownedTurn !== undefined && recoveredTerminal === undefined
+      && session.#activeTurnId !== ownedTurn.turnId) {
+      const recovered = resumedTurns.find((turn) => turn.turnId === ownedTurn.turnId);
+      if (recovered?.status === "completed"
+        || recovered?.status === "interrupted"
+        || recovered?.status === "failed") {
+        recoveredTerminal = {
+          conversationId,
+          nativeSessionId: conversationId,
+          nativeTurnId: ownedTurn.turnId,
+          clientOwned: true,
+          status: recovered.status === "failed"
+            ? "failed"
+            : recovered.status === "interrupted" ? "cancelled" : "completed",
+          observedAt: new Date().toISOString(),
+          ...(recovered.error === undefined ? {} : { error: recovered.error })
+        };
+        session.#clientOwnedTurnId = undefined;
+      } else {
+        throw new ProviderDeliveryUnknownError(
+          `Codex resume could not recover the persisted Yui Turn ${ownedTurn.turnId}.`,
+          ownedTurn.attemptId
+        );
+      }
+    }
+    return Object.freeze({
+      session,
+      ...(recoveredTerminal === undefined ? {} : { recoveredTerminal })
+    });
+  }
+
+  #observeMessage(
+    message: JsonObject,
+    emit: boolean
+  ): StructuredProviderTurnTerminal | undefined {
       const method = typeof message.method === "string" ? message.method : "";
       const params = object(message.params) ?? {};
-      if (optionalId(params.threadId) !== conversationId) return;
+      if (optionalId(params.threadId) !== this.conversationId) return undefined;
       if (method === "turn/started") {
         const turnId = nestedId(params, "turn") ?? optionalId(params.turnId);
-        if (turnId !== undefined) session.#activeTurnId = turnId;
-        return;
+        if (turnId !== undefined) this.#activeTurnId = turnId;
+        return undefined;
       }
-      if (method !== "turn/completed") return;
+      if (method !== "turn/completed") return undefined;
       const turn = object(params.turn) ?? {};
       const nativeTurnId = optionalId(turn.id) ?? optionalId(params.turnId);
-      if (nativeTurnId === undefined) return;
-      session.#activeTurnId = undefined;
+      if (nativeTurnId === undefined) return undefined;
       const status = turn.status === "failed"
         ? "failed"
         : turn.status === "interrupted" ? "cancelled" : "completed";
-      onTerminal?.({
-        conversationId,
-        nativeSessionId: conversationId,
+      const terminal = {
+        conversationId: this.conversationId,
+        nativeSessionId: this.conversationId,
         nativeTurnId,
         status,
         observedAt: new Date().toISOString(),
         ...(status !== "failed" ? {} : { error: providerErrorText(turn.error) })
-      });
-    });
-    return session;
+      } as const;
+      if (this.#submissionPending && emit) {
+        this.#bufferedTerminals.push(terminal);
+        return undefined;
+      }
+      return this.#completeTerminal(terminal, emit);
   }
 
   get nativeSessionId(): string {
@@ -369,31 +517,63 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
     turn: StructuredProviderTurnInput
   ): Promise<StructuredProviderTurnReceipt> {
     if (this.#activeTurnId !== undefined) {
-      throw new ProviderTurnRejectedError(
+      throw new ProviderTurnBusyError(
         `Provider Conversation already has active Turn ${this.#activeTurnId}.`,
-        turn.attemptId
+        turn.attemptId,
+        this.#activeTurnId
       );
     }
-    const acceptance = await this.runtime.submitTurn({
-      conversationId: this.conversationId,
-      attemptId: turn.attemptId,
-      text: turn.boundedText,
-      expectedNoActiveTurn: true
-    });
-    if (acceptance.status === "unknown") {
-      throw new ProviderDeliveryUnknownError(acceptance.reason, turn.attemptId);
+    this.#submissionPending = true;
+    try {
+      const acceptance = await this.runtime.submitTurn({
+        conversationId: this.conversationId,
+        attemptId: turn.attemptId,
+        text: turn.boundedText,
+        expectedNoActiveTurn: true
+      });
+      if (acceptance.status === "unknown") {
+        throw new ProviderDeliveryUnknownError(acceptance.reason, turn.attemptId);
+      }
+      if (acceptance.status === "busy") {
+        throw new ProviderTurnBusyError(
+          acceptance.reason,
+          turn.attemptId,
+          acceptance.activeTurnId
+        );
+      }
+      if (acceptance.status === "not-accepted") {
+        throw new ProviderTurnRejectedError(acceptance.reason, turn.attemptId);
+      }
+      this.#activeTurnId = acceptance.turnId;
+      this.#clientOwnedTurnId = acceptance.turnId;
+      return Object.freeze({
+        attemptId: turn.attemptId,
+        conversationId: this.conversationId,
+        nativeSessionId: this.conversationId,
+        nativeTurnId: acceptance.turnId,
+        acceptedAt: new Date().toISOString()
+      });
+    } finally {
+      this.#submissionPending = false;
+      const buffered = this.#bufferedTerminals.splice(0);
+      for (const terminal of buffered) this.#emitTerminal(terminal);
     }
-    if (acceptance.status === "not-accepted") {
-      throw new ProviderTurnRejectedError(acceptance.reason, turn.attemptId);
-    }
-    this.#activeTurnId = acceptance.turnId;
-    return Object.freeze({
-      attemptId: turn.attemptId,
-      conversationId: this.conversationId,
-      nativeSessionId: this.conversationId,
-      nativeTurnId: acceptance.turnId,
-      acceptedAt: new Date().toISOString()
-    });
+  }
+
+  #emitTerminal(terminal: Omit<StructuredProviderTurnTerminal, "clientOwned">): void {
+    this.#completeTerminal(terminal, true);
+  }
+
+  #completeTerminal(
+    terminal: Omit<StructuredProviderTurnTerminal, "clientOwned">,
+    emit: boolean
+  ): StructuredProviderTurnTerminal {
+    const clientOwned = terminal.nativeTurnId === this.#clientOwnedTurnId;
+    if (terminal.nativeTurnId === this.#activeTurnId) this.#activeTurnId = undefined;
+    if (clientOwned) this.#clientOwnedTurnId = undefined;
+    const completed = { ...terminal, clientOwned };
+    if (emit) this.onTerminal?.(completed);
+    return completed;
   }
 
   waitForExit(): Promise<StructuredProviderProcessExit> {
@@ -571,6 +751,7 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
       conversationId: this.conversationId,
       nativeSessionId: this.conversationId,
       nativeTurnId,
+      clientOwned: true,
       status: failed ? "failed" : "completed",
       observedAt: new Date().toISOString(),
       ...(typeof message.result === "string" && message.result.length > 0

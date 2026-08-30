@@ -731,6 +731,16 @@ function requireMatchingRuntimeBinding(
     );
   }
   if (
+    binding.initialTurnBusyRunId !== undefined
+    && binding.initialTurnBusyRunId !== request.runId
+  ) {
+    throw new RuntimeBindingContractError(
+      `Session host returned a busy initial structured Turn for another Run: ${
+        request.owner.roleName
+      }.`
+    );
+  }
+  if (
     binding.initialTurnRejectedRunId !== undefined
     && binding.initialTurnRejectedRunId !== request.runId
   ) {

@@ -49,7 +49,8 @@ Session.
 - `WorkerProfile` is a versioned, provider-neutral behavior template containing
   instructions, Skills, a read/write behavior intent, and optional model/effort hints.
 - `TaskRole` is a mutable Worker instance inside one Task. Applying a Profile
-  copies its portable behavior. Its versioned desired launch configuration is
+  copies its portable behavior and the optional model/effort selections into
+  the active Agent binding. Its versioned desired launch configuration is
   next-launch-only. The Role may bind multiple Agents; every binding retains
   independent runtime configuration.
 - `AgentRun` records one managed dispatch and an immutable effective snapshot:
@@ -240,33 +241,38 @@ context.
 
 ## Runtime ownership
 
-tmux owns the persistent Agent Host lifetime and observable output. The
+Provider conversations remain user conversations. Yui adds the matching Role
+Skill and Session Manifest pointer, then uses provider-native requests for
+durable Task delivery; it does not own or mirror the full transcript. The
 Controller owns mailbox delivery, wakeups, Role liveness, recovery decisions,
-and a durable single-writer authority epoch. The Agent Host owns one structured
-Provider child process and mirrors its output to the pane. Managed prompts are
-never terminal bytes: both Controller and human takeover input become fenced
-Provider-native Turn requests.
+and exact receipts. tmux keeps Yui's client attachment observable where the
+provider path needs one.
 
 Run, Conversation, Activation, and Turn identities are independent. A
-Conversation can span Runs and Provider processes; one Activation identifies
-one live process; one Turn identifies one pre-recorded input attempt. A live
-Activation is retained when a later Run reuses the Conversation. Process exit
-ends that Activation, and a resumed process receives a new Activation and a
-higher authority epoch.
+Conversation can span Runs and client attachments; one Activation identifies
+Yui's current attachment, not exclusive ownership of the Provider thread. One
+Turn identifies one provider-native execution. Yui's authority epoch fences
+only Yui's own submissions and retries.
 
-Task observation uses `task role view`. Explicit takeover requires a live
-managed Run, atomically transfers authority to a human holder, synchronizes the
-same fence to the Host, and only then exposes the PTY input gateway. Detach
-releases authority; `task role release` is an idempotent repair path even after
-the Run has ended. Global interactive entry remains a native session-lifecycle
-operation outside this managed Provider contract.
+Codex Task threads can be opened and used directly in Desktop as ordinary
+sessions; no Yui takeover is required. If a direct user Turn is active, Yui
+keeps its pending Run/message and retries after that Turn settles. The explicit
+tmux takeover gateway remains for providers whose managed conversation is
+attached to an independent process. Global interactive entry remains a native
+session-lifecycle operation outside the Task delivery contract.
 
-Codex uses a persistent App Server JSON-RPC transport. Claude uses a persistent
-stream-json transport with exact user-message replay acknowledgement. In both
-cases, Yui records Turn intent before writing, accepts only exact Provider
-evidence, and maps an uncertain write to `delivery-unknown` without automatic
-resubmission. Conversation replacement requires exact missing evidence and no
-unsettled input, Turn, Activation, or writer authority.
+Codex uses `app-server proxy` to create or resume a normal thread on the shared
+App Server daemon. Role model, effort, permission, workspace, and shell settings are passed at
+`thread/start`/`thread/resume`, while the ordinary Task message points to the
+Session Manifest and matching Role Skill. Yui does not write either to global
+Codex config and may only ensure that the daemon is running; it never restarts
+or stops it for a thread error. A Codex native config profile is rejected for
+Managed Codex because the protocol cannot isolate it to one thread; a Yui Agent
+Profile supplies the per-Role behavior, Skills, model, and effort instead.
+Claude uses a persistent stream-json
+transport with exact user-message replay acknowledgement. In both cases, Yui
+records Turn intent before writing, accepts only exact Provider evidence, and
+maps an uncertain write to `delivery-unknown` without automatic resubmission.
 
 Role desired revisions and Run/Session effective snapshots keep configuration
 history explicit. Resume compares the complete effective snapshot and

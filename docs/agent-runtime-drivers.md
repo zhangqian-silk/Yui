@@ -54,7 +54,7 @@ accepted observer source --> Controller sampler --> usage -+--> runtime-observat
 Every Run-scoped observation carries Task, Role, Run, Agent, Driver, launch,
 Session generation, native Session, native Turn, and transport receipt
 identity. `turn.accepted` durably binds the provider's native Turn to that exact
-Run. Every later fact resolves through this binding, so a delayed terminal Hook
+Run. Every later fact resolves through this binding, so a delayed terminal event
 cannot refresh, fail, or complete a successor Run after a reused process has
 advanced.
 
@@ -67,11 +67,13 @@ The stable vocabulary separates:
 - activity: structured provider activity and normalized usage snapshots;
 - host evidence: process/tmux presence, which is diagnostic only.
 
-Native Hook names do not cross the Driver boundary. Managed Codex and Claude
-Code launches both use the hidden `internal runtime-hook` ingress. The core
-selects the registered Driver from the exact launch envelope; a Driver may map
-native payloads, but it cannot choose or forge authority, Driver identity, Run
-fences, ordering, or canonical event IDs.
+Native Hook names do not cross the Driver boundary. Managed Claude uses the
+hidden `internal runtime-hook` ingress. Managed Codex takes exact Session,
+acceptance, and Turn lifecycle facts from its ordinary App Server subscription
+and does not install Yui-specific Hooks. The core selects the registered Driver
+from the exact launch envelope; a Driver may map native payloads, but it cannot
+choose or forge authority, Driver identity, Run fences, ordering, or canonical
+event IDs.
 
 Native identity is also a Driver responsibility. Built-in Drivers resolve
 their native Session field; Claude Code resolves `prompt_id`, Codex resolves
@@ -126,8 +128,9 @@ replacement, affect scheduling or resource admission, or change Task, Review,
 Integration, and Publication state. Explicit runtime activity identity remains
 a separate observation fact.
 
-Codex snapshots preserve every structured rollout `token_count` occurrence.
-Claude Code exposes each de-duplicated assistant message as a request snapshot;
+Codex shared-daemon threads currently report usage as unavailable because Yui
+does not add a Hook/transcript observer merely for telemetry. Claude Code
+exposes each de-duplicated assistant message as a request snapshot;
 later streaming records with the same message id replace that request.
 `turn.accepted` persists only the Driver-owned source descriptor. A
 Controller-owned sampler tails that source independently of Hooks, keeps an
@@ -143,9 +146,8 @@ maximum request input remains unobserved; a request-snapshot source leaves both
 metrics unobserved instead of guessing from partial history.
 
 Claude additionally maps `MessageDisplay` streaming events to explicit model
-activity. Codex currently relies on its incremental transcript source because
-its Hook surface has no equivalent text-stream event. Missing, unreadable,
-truncated, malformed, or lagging sources become explicit `observer.health`
+activity. Missing, unreadable, truncated, malformed, or lagging sources become
+explicit `observer.health`
 evidence (`healthy`, `degraded`, or `unavailable`) without blocking lifecycle
 facts. A future Driver can replace JSONL tailing with an app-server or native
 stream while preserving the same source/sample contract and canonical events.

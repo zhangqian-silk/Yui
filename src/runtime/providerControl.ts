@@ -15,6 +15,7 @@ export type ProviderConversationProbe = Readonly<{
 
 export type ProviderTurnAcceptance =
   | Readonly<{ status: "accepted"; turnId: string }>
+  | Readonly<{ status: "busy"; activeTurnId?: string; reason: string }>
   | Readonly<{ status: "not-accepted"; reason: string }>
   | Readonly<{ status: "unknown"; reason: string }>;
 

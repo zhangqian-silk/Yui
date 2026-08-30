@@ -5,6 +5,7 @@ import {
   type ProviderAuthorityFence
 } from "./providerAuthorityFence.js";
 import { AGENT_HOST_LAUNCH_TICKET_TTL_MS } from "./runtimeDeadlines.js";
+import type { CodexThreadOptions } from "./codexAppServerRuntime.js";
 
 export type AgentHostLaunchPayload = Readonly<{
   schemaVersion: 1;
@@ -23,12 +24,19 @@ type ProviderInitialTurn = Readonly<{
   boundedText: string;
 }>;
 
+export type ProviderOwnedTurn = Readonly<{
+  attemptId: string;
+  turnId: string;
+}>;
+
 type AgentHostProviderControlBase = Readonly<{
   schemaVersion: 1;
   adapterId: "codex" | "claude";
-  transport: "codex-app-server-stdio" | "claude-stream-json";
+  transport: "codex-app-server-proxy" | "claude-stream-json";
   sessionTitle?: string;
   authority: ProviderAuthorityFence;
+  codexThread?: CodexThreadOptions;
+  codexDaemonStartArgs?: readonly string[];
 }>;
 
 /**
@@ -55,6 +63,7 @@ export type AgentHostProviderControl = AgentHostProviderControlBase & (
       mode: "resume";
       nativeSessionId: string;
       initialTurn?: never;
+      ownedTurn?: ProviderOwnedTurn;
     }>
 );
 
@@ -152,9 +161,23 @@ function validateProviderControl(control: AgentHostProviderControl): void {
   if (control.adapterId !== "codex" && control.adapterId !== "claude") {
     throw new Error("Agent Host Provider control adapter is invalid.");
   }
-  if ((control.adapterId === "codex" && control.transport !== "codex-app-server-stdio")
+  if ((control.adapterId === "codex" && control.transport !== "codex-app-server-proxy")
     || (control.adapterId === "claude" && control.transport !== "claude-stream-json")) {
     throw new Error("Agent Host Provider control transport does not match its adapter.");
+  }
+  if ((control.adapterId === "codex") !== (control.codexThread !== undefined)) {
+    throw new Error("Agent Host Provider thread settings do not match its adapter.");
+  }
+  if ((control.adapterId === "codex") !== (control.codexDaemonStartArgs !== undefined)) {
+    throw new Error("Agent Host Provider daemon bootstrap does not match its adapter.");
+  }
+  if (control.codexThread !== undefined) validateCodexThreadOptions(control.codexThread);
+  if (control.codexDaemonStartArgs !== undefined) {
+    if (!Array.isArray(control.codexDaemonStartArgs)
+      || control.codexDaemonStartArgs.length === 0) {
+      throw new Error("Agent Host Codex daemon bootstrap args are invalid.");
+    }
+    control.codexDaemonStartArgs.forEach((value) => text(value, "Codex daemon argument"));
   }
   if (control.mode !== "new" && control.mode !== "resume") {
     throw new Error("Agent Host Provider control mode is invalid.");
@@ -170,6 +193,16 @@ function validateProviderControl(control: AgentHostProviderControl): void {
   }
   if (control.kind === "ensure" && control.initialTurn !== undefined) {
     throw new Error("Managed Provider ensure launch cannot carry a new Turn.");
+  }
+  if (control.kind !== "ensure" && "ownedTurn" in control) {
+    throw new Error("Only a managed Provider ensure launch can recover an owned Turn.");
+  }
+  if (control.kind === "ensure" && control.ownedTurn !== undefined) {
+    if (control.adapterId !== "codex") {
+      throw new Error("Only Managed Codex can recover an owned Turn across client attachment.");
+    }
+    text(control.ownedTurn.attemptId, "owned Provider input attemptId");
+    text(control.ownedTurn.turnId, "owned Provider Turn id");
   }
   const requiresNativeSessionId = control.mode === "resume" || control.adapterId === "claude";
   if (requiresNativeSessionId !== (control.nativeSessionId !== undefined)) {
@@ -194,6 +227,31 @@ function validateProviderControl(control: AgentHostProviderControl): void {
       || Buffer.byteLength(control.initialTurn.boundedText, "utf8") > 32 * 1024) {
       throw new Error("Agent Host Provider input must be bounded bootstrap text.");
     }
+  }
+}
+
+function validateCodexThreadOptions(options: CodexThreadOptions): void {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new Error("Agent Host Codex thread settings are invalid.");
+  }
+  for (const [value, label] of [
+    [options.model, "model"],
+    [options.approvalPolicy, "approval policy"],
+    [options.sandbox, "sandbox"],
+    [options.developerInstructions, "developer instructions"]
+  ] as const) {
+    if (value !== undefined) text(value, `Codex thread ${label}`);
+  }
+  if (options.runtimeWorkspaceRoots !== undefined) {
+    if (!Array.isArray(options.runtimeWorkspaceRoots)) {
+      throw new Error("Agent Host Codex runtime workspace roots are invalid.");
+    }
+    options.runtimeWorkspaceRoots.forEach((root) => text(root, "Codex runtime workspace root"));
+  }
+  if (options.config !== undefined
+    && (options.config === null || typeof options.config !== "object"
+      || Array.isArray(options.config))) {
+    throw new Error("Agent Host Codex thread config is invalid.");
   }
 }
 

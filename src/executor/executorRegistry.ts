@@ -294,6 +294,12 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       ),
       ...(
         input.runId !== undefined
+        && binding?.initialTurnBusyRunId === input.runId
+          ? { turnBusyDuringLaunch: true }
+          : {}
+      ),
+      ...(
+        input.runId !== undefined
         && binding?.initialTurnRejectedRunId === input.runId
           ? { turnRejectedDuringLaunch: true }
           : {}

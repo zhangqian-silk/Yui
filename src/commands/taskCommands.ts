@@ -60,6 +60,7 @@ import {
   resolveEffectiveLaunch,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
+import type { RoleAgentConfig } from "../executor/agentAdapter.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import { renderRoleDetails } from "../output/rolePresentation.js";
@@ -2167,9 +2168,7 @@ function addTaskRole(
     let created = createTaskRole(tx, task, roleName, agentId, now);
     const profileId = parsed.one("--profile");
     if (profileId !== undefined) {
-      created = updateRole(created, workerProfileRolePatch(
-        requireAgentProfile(tx, profileId)
-      ), now);
+      created = applyWorkerAgentProfile(created, requireAgentProfile(tx, profileId), now);
     }
     const profile = roleProfilePatch(parsed);
     if (Object.keys(profile).length > 0) created = updateRole(created, profile, now);
@@ -2315,20 +2314,20 @@ function updateTaskRole(
         roleName: role.name
       }, "desired launch configuration update");
     }
-    let bindings = role.agentBindings;
+    const profileId = parsed.one("--profile");
+    const withProfile = profileId === undefined
+      ? role
+      : applyWorkerAgentProfile(role, requireAgentProfile(tx, profileId), now);
+    let bindings = withProfile.agentBindings;
     if (changesAgentConfig) {
-      const agentId = parsed.one("--agent")?.trim() || role.activeAgentId;
+      const agentId = parsed.one("--agent")?.trim() || withProfile.activeAgentId;
       const agent = requireAgent(tx, agentId);
       const binding = bindings[agentId]
         ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
       bindings = { ...bindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
     }
-    const profileId = parsed.one("--profile");
-    const withProfile = profileId === undefined
-      ? role
-      : updateRole(role, workerProfileRolePatch(requireAgentProfile(tx, profileId)), now);
     const next = updateRole(withProfile, {
-      ...(bindings === role.agentBindings ? {} : { agentBindings: bindings }),
+      ...(bindings === withProfile.agentBindings ? {} : { agentBindings: bindings }),
       ...roleProfilePatch(parsed)
     }, now);
     if (changesLaunchContext) {
@@ -8510,6 +8509,26 @@ function workerProfileRolePatch(profile: AgentProfile) {
       ? ["Do not modify files or external state."]
       : undefined
   };
+}
+
+function applyWorkerAgentProfile(role: Role, profile: AgentProfile, now: Date): Role {
+  const binding = activeRoleAgentBinding(role);
+  const config = structuredClone(binding.config) as unknown as Record<string, unknown>;
+  if (profile.model === undefined) delete config.model;
+  else config.model = profile.model;
+  if (profile.effort === undefined) delete config.effort;
+  else config.effort = profile.effort;
+  const profiledBinding = createRoleAgentBinding({
+    id: binding.agentId,
+    adapterId: binding.adapterId
+  }, config as unknown as RoleAgentConfig);
+  return updateRole(role, {
+    ...workerProfileRolePatch(profile),
+    agentBindings: {
+      ...role.agentBindings,
+      [binding.agentId]: profiledBinding
+    }
+  }, now);
 }
 
 function appendMessage(
