@@ -39,7 +39,9 @@ import {
 } from "./taskCompletionGate.js";
 import {
   createRoleSessionSet,
+  roleAgentSessionResumeMode,
   retireTaskRoleSessionsForWorkspace,
+  terminalizeTaskRoleRunSession,
   updateTaskRoleProviderRuntime,
   updateRoleAgentSessionStatus,
   type TaskRoleSessionSet
@@ -48,13 +50,6 @@ import {
   currentProviderActivation,
   transferProviderAuthority
 } from "../runtime/providerRuntimeIdentity.js";
-import {
-  CONVERSATION_SWITCH_REQUESTED_EVENT,
-  CONVERSATION_SWITCH_RESOLVED_EVENT,
-  projectConversationSwitch,
-  providerConversationGeneration,
-  roleSessionDispatchModeWithConversationSwitch
-} from "../runtime/conversationSwitch.js";
 import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
 import {
   resolveEffectiveLaunch,
@@ -78,11 +73,9 @@ import type {
 } from "../workspace/workItemChangeSetManager.js";
 import { cancelInputRequest } from "../input/inputRequest.js";
 import {
-  recoverExactAgentRun,
   retireExactActiveAgentRun,
   terminalizeExactTaskRun,
-  validateExactRunReviewRound,
-  type ExactAgentRunRecoveryAction
+  validateExactRunReviewRound
 } from "../lifecycle/exactRunTerminalization.js";
 import {
   activeRoleAgentBinding,
@@ -104,11 +97,6 @@ import {
   yieldAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
-import {
-  projectRunRecovery,
-  readRunRecoveryFacts,
-  type RunRecoveryProjection
-} from "../run/recoveryProjection.js";
 import { matchYieldReceipt } from "../run/yieldReceipt.js";
 import {
   createRejectedYieldAttempt,
@@ -178,11 +166,7 @@ import {
   runtimeLifecycleTarget,
   type RuntimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
-import {
-  blockingProviderContinuations,
-  projectProviderContinuations,
-  runOwnsBlockingProviderContinuation
-} from "../runtime/runtimeContinuationProjection.js";
+import { projectProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import {
   activateTask,
@@ -473,7 +457,7 @@ export type TaskCommandExecution =
  */
 export type TaskWorkflowRuntimePort = Readonly<{
   notifyStateChanged(taskId: string): void;
-  notifyMailboxChanged?(target: MailboxTarget): void;
+  notifyMailboxChanged?(target: MailboxTarget): void | Promise<void>;
   reconcileTask(taskId: string): void;
   inspectTaskRolePanes?(taskId: string): readonly TmuxRolePaneState[];
 }>;
@@ -628,21 +612,6 @@ export function preflightTaskCompletion(
   const blockers = readiness.blockers.filter((blocker) => blocker.code !== "active-task-review");
   if (blockers.length > 0) {
     throw usageError(formatCompletionBlockers(task.id, blockers));
-  }
-
-  const roles = store.listRoles(task.id);
-  const activeRuns = roles
-    .map((role) => ({ role, run: store.getActiveAgentRun(task.id, role.name) }))
-    .filter((entry): entry is { role: Role; run: AgentRun } => entry.run !== null);
-
-  const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
-  if (leaderEntry !== undefined) {
-    if (leaderEntry.run.workItemId !== undefined) {
-      throw usageError(`Task ${task.id} has running work: ${leaderEntry.run.workItemId}.`);
-    }
-    if (leaderEntry.run.pushedAt === undefined) {
-      throw usageError(`Task ${task.id} Leader delivery is still pending.`);
-    }
   }
 
   return {
@@ -1289,37 +1258,6 @@ function completeTaskCommand(
         actualTaskCandidate!
       );
     const roles = tx.listRoles(task.id);
-    const activeRuns = roles
-      .map((role) => ({ role, run: tx.getActiveAgentRun(task.id, role.name) }))
-      .filter((entry): entry is { role: Role; run: AgentRun } => entry.run !== null);
-    // The preflight (above, same transaction) already projected the full
-    // readiness via projectCompletionReadiness.  The leader-Run check is
-    // actor-dependent and stays here; every other blocker is re-validated by
-    // the post-Review readiness fence below.
-
-    const leaderEntry = activeRuns.find(({ role }) => role.name === LEADER_ROLE);
-    if (leaderEntry !== undefined) {
-      if (leaderEntry.run.workItemId !== undefined) {
-        throw usageError(`Task ${task.id} has running work: ${leaderEntry.run.workItemId}.`);
-      }
-      if (leaderEntry.run.pushedAt === undefined) {
-        throw usageError(`Task ${task.id} Leader delivery is still pending.`);
-      }
-      const terminal = terminalizeExactTaskRun(tx, {
-        taskId: task.id,
-        roleName: LEADER_ROLE,
-        agentId: leaderEntry.run.effective.agentId,
-        runId: leaderEntry.run.id,
-        receiptId: agentRunDeliveryReceiptId(leaderEntry.run),
-        outcome: { status: "yielded", summary }
-      }, now);
-      if (terminal.disposition !== "applied") {
-        throw usageError(
-          `Task Leader Run changed during completion: ${leaderEntry.run.id}/${terminal.reason}.`
-        );
-      }
-    }
-
     // A final (Task-scoped) review is the Task delivery policy: it reviews the
     // complete frozen Task heads, not a single WorkItem Candidate. If the
     // review config requests a final review, create the Task ReviewRound here
@@ -1340,6 +1278,16 @@ function completeTaskCommand(
         finalReview,
       } as const;
     }
+    // Completion is a semantic boundary. Current Runs and Sessions are
+    // disposable execution attempts; settle them before deriving readiness so
+    // only durable Task results decide whether the Task can complete.
+    const runtimeCleanupTargets = settleTaskExecutionForCompletion(
+      tx,
+      task.id,
+      roles,
+      summary,
+      now
+    );
     // Issue 06: re-validate the full completion readiness inside the
     // transaction (the CAS fence) after final-review preparation.  This is the
     // same pure projection `task next-action` displays, now with the finding
@@ -1389,18 +1337,12 @@ function completeTaskCommand(
     // The durable records remain intact; only the derived mailbox work is
     // discarded at this lifecycle boundary.
     tx.removeWorkMailbox(taskMailbox(task.id));
-    // Role mailboxes are also derived wake state. A Worker result or recovery
+    // Role mailboxes are also derived wake state. A Worker result or runtime
     // signal queued while the final Run was being settled must not survive a
     // completed Task and become actionable after a later explicit reopen.
     for (const role of roles) {
       tx.removeWorkMailbox(roleMailbox(task.id, role.name));
     }
-    const runtimeCleanupTargets = queueCompletedTaskRuntimeCleanups(
-      tx,
-      task.id,
-      roles,
-      now
-    );
     return {
       task: completed,
       changed: true,
@@ -1519,13 +1461,6 @@ function archiveTaskCommand(
     if (activeArchiveJob !== undefined) {
       throw usageError(
         `Task ${task.id} has an active DurableJob: ${activeArchiveJob.id}/${activeArchiveJob.status}.`
-      );
-    }
-    const continuationBlockers = blockingProviderContinuations(tx.listEvents(task.id));
-    if (continuationBlockers.length > 0) {
-      throw usageError(
-        `Task ${task.id} still owns unsettled Provider continuation(s); `
-        + "reconcile or cancel them before archiving."
       );
     }
     if (task.cwd !== undefined || tx.listManagedWorkspaces(task.id).length > 0) {
@@ -2026,113 +1961,12 @@ function taskRoleCommand(
   if (command === "remove") return output(removeTaskRole(rest, store, options));
   if (command === "bind") return output(bindTaskRole(rest, store, options));
   if (command === "unbind") return output(unbindTaskRole(rest, store, options));
-  if (command === "session") return taskRoleSessionCommand(rest, store, options);
   if (command === "view") return viewTaskRole(rest, store);
   if (command === "takeover") return transferTaskRoleAuthority(rest, store, options, "takeover");
   if (command === "release") return transferTaskRoleAuthority(rest, store, options, "release");
   throw usageError(command === undefined
     ? "Task role command is required."
     : `Unknown command: task role ${command}`);
-}
-
-function taskRoleSessionCommand(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const [command, ...rest] = args;
-  if (command === "switch") return switchTaskRoleSession(rest, store, options);
-  throw usageError(command === undefined
-    ? "Task role session command is required."
-    : `Unknown command: task role session ${command}`);
-}
-
-function switchTaskRoleSession(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Task role session switch usage: yui task role session switch <task> <role> --reason <text>.";
-  const parsed = parseTail(args, new Set(["--reason"]), usage);
-  exactPositionals(parsed.positionals, 2, usage);
-  const reason = truncateEventNote(requiredOption(parsed.options, "--reason"));
-  const now = clock(options);
-  const result = store.transaction((tx) => {
-    const task = requireTask(tx, parsed.positionals[0]);
-    if (task.status !== "active") {
-      throw usageError(inactiveTaskMessage(task, "switching a Provider Conversation"), usage);
-    }
-    const role = requireRole(tx, task.id, parsed.positionals[1]);
-    const requestedBy = taskActor(tx, options, task.id);
-    const leaderRunId = requestedBy === "leader"
-      ? taskLeaderActionRunId(tx, task.id, options.environment, options.yuiHome)
-      : undefined;
-    if (requestedBy === "leader" && leaderRunId === undefined) {
-      throw usageError(
-        "Leader Conversation switching requires the exact current-Turn assertion.",
-        usage
-      );
-    }
-    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-    const generation = providerConversationGeneration(sessions);
-    if (sessions === null || generation === null) {
-      throw usageError(`Task Role has no current Provider Conversation: ${task.id}/${role.name}.`, usage);
-    }
-    const events = tx.listEvents(task.id);
-    const previous = projectConversationSwitch(events, role.name, sessions);
-    if (previous?.status === "pending"
-      && previous.generation === generation
-      && previous.requestedBy === requestedBy
-      && previous.reason === reason) {
-      return { taskId: task.id, roleName: role.name, request: previous, replayed: true };
-    }
-    if (previous !== null && previous.resolvedAt === undefined) {
-      tx.saveEvent(task.id, createTaskEvent(
-        tx.nextEventId(task.id),
-        task.id,
-        CONVERSATION_SWITCH_RESOLVED_EVENT,
-        {
-          requestId: previous.requestId,
-          roleName: role.name,
-          generation: previous.generation,
-          status: "obsolete"
-        },
-        now
-      ));
-    }
-    const requestId = tx.nextEventId(task.id);
-    const event = createTaskEvent(
-      requestId,
-      task.id,
-      CONVERSATION_SWITCH_REQUESTED_EVENT,
-      {
-        requestId,
-        roleName: role.name,
-        generation,
-        requestedBy,
-        reason,
-        ...(leaderRunId === undefined ? {} : { leaderRunId })
-      },
-      now
-    );
-    tx.saveEvent(task.id, event);
-    return {
-      taskId: task.id,
-      roleName: role.name,
-      request: projectConversationSwitch([...events, event], role.name, sessions)!,
-      replayed: false
-    };
-  });
-  options.runtime?.notifyStateChanged(result.taskId);
-  options.runtime?.notifyMailboxChanged?.({
-    kind: "role",
-    taskId: result.taskId,
-    roleName: result.roleName
-  });
-  return output(
-    `${result.replayed ? "Reused" : "Recorded"} pending Provider Conversation switch ${result.request.requestId} for ${result.taskId}/${result.roleName}. The current Conversation remains authoritative until safe replacement binding.\n`,
-    result
-  );
 }
 
 function addTaskRole(
@@ -2980,6 +2814,7 @@ function dispatchWork(
     if (task.status !== "active") {
       throw usageError(inactiveTaskMessage(task, "dispatch"));
     }
+    assertTaskExecutionEnabled(task, "dispatching work");
     taskActor(tx, options, task.id);
     const currentGroup = currentWorkItemExecutionGroup(item);
     const existingGroup = currentGroup?.resolution === undefined
@@ -3238,14 +3073,7 @@ function dispatchWork(
           workItemWriteProjectIds: item.writeProjectIds
         });
       const sessions = tx.getTaskRoleSessionSet(task.id, plan.role.name);
-      const dispatchMode = taskRoleDispatchMode(
-        tx,
-        task.id,
-        plan.role.name,
-        sessions,
-        effective.agentId,
-        effective
-      );
+      const dispatchMode = roleAgentSessionResumeMode(sessions, effective.agentId, effective);
       const laneWorkspace = laneManagedWorkspace === undefined
         ? undefined
         : {
@@ -5436,7 +5264,6 @@ function taskRunCommand(
   if (command === "context") return runContextCommand(rest, store, options);
   if (command === "retry") return retryRun(rest, store, options);
   if (command === "settle") return settleStaleFinalReviewRun(rest, store, options);
-  if (command === "recover") return output(recoverRun(rest, store, options));
   if (command === "yield") return yieldRun(rest, store, options);
   if (command === "yield-status") return yieldRunStatus(rest, store, options);
   if (command === "checkpoint") return output(checkpointRun(rest, store, options));
@@ -5892,17 +5719,7 @@ function retryRun(
     }
     const task = requireTask(tx, previous.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (runOwnsBlockingProviderContinuation(tx.listEvents(task.id), {
-      taskId: previous.taskId,
-      roleName: previous.roleName,
-      runId: previous.id,
-      agentId: previous.effective.agentId
-    })) {
-      throw usageError(
-        `Run ${previous.id} still owns an unsettled Provider continuation; `
-        + "reconcile it before retrying the Lane."
-      );
-    }
+    assertTaskExecutionEnabled(task, "retrying a Run");
     const role = requireRole(tx, task.id, previous.roleName);
     if (tx.getActiveAgentRun(task.id, role.name) !== null) {
       throw usageError(`${task.id}/${role.name} already has an active run.`);
@@ -6108,14 +5925,7 @@ function retryRun(
       runId!,
       task.id,
       role.name,
-      taskRoleDispatchMode(
-        tx,
-        task.id,
-        role.name,
-        sessions,
-        effective.agentId,
-        effective
-      ),
+      roleAgentSessionResumeMode(sessions, effective.agentId, effective),
       assignment,
       now,
       {
@@ -6632,17 +6442,6 @@ function retryFailedReviewRun(
     }
     const task = requireTask(tx, run.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    if (runOwnsBlockingProviderContinuation(tx.listEvents(task.id), {
-      taskId: run.taskId,
-      roleName: run.roleName,
-      runId: run.id,
-      agentId: run.effective.agentId
-    })) {
-      throw usageError(
-        `Review Run ${run.id} still owns an unsettled Provider continuation; `
-        + "reconcile it before retrying the Lane."
-      );
-    }
     const requestedBy = taskActor(tx, options, task.id);
     const round = tx.getReviewRound(task.id, run.reviewRoundId);
     if (round === null) {
@@ -6902,165 +6701,7 @@ function retryFailedReviewRun(
   );
 }
 
-/**
- * Records one explicit Leader recovery decision against an exact live Run.
- * Diagnose and retry remain same-Run requests: this command never changes a
- * native Conversation generation.
- */
-function recoverRun(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): string {
-  const usage = "Task run recover usage: yui task run recover <task>/<run> --action <diagnose|retry|terminate> (--expected-progress-at <timestamp>|--from-next-action <fingerprint>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text> [--agent-id <id>] [--adapter-id <id>] [--native-session-id <id>] [--launch-id <id>].";
-  const parsed = parseTail(
-    args,
-    new Set([
-      "--action",
-      "--expected-progress-at",
-      "--progress-at",
-      "--from-next-action",
-      "--provider-acceptance",
-      "--reason",
-      "--role",
-      "--agent-id",
-      "--adapter-id",
-      "--native-session-id",
-      "--launch-id"
-    ]),
-    usage
-  );
-  exactPositionals(parsed.positionals, 1, usage);
-  const now = clock(options);
-  const fingerprint = parsed.options.get("--from-next-action");
-  const explicitFence = parsed.options.get("--expected-progress-at")
-    ?? parsed.options.get("--progress-at");
-  if (fingerprint !== undefined && explicitFence !== undefined) {
-    throw usageError(
-      "--from-next-action and --expected-progress-at/--progress-at are mutually exclusive.",
-      usage
-    );
-  }
-  const input = store.transaction((tx) => {
-    const active = requireRun(tx, parsed.positionals[0], options);
-    const task = requireTask(tx, active.taskId);
-    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "recovering a run"));
-    taskActor(tx, options, task.id);
-    const roleName = parsed.options.get("--role") ?? active.roleName;
-    if (roleName !== active.roleName) {
-      throw usageError(`Recovery Role does not match Run ${active.id}: ${roleName}.`);
-    }
-    const role = requireRole(tx, task.id, roleName);
-    const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-    const session = sessions?.sessions[sessions.activeAgentId];
-    // Issue 08: a fingerprint copied from `task run show` resolves the
-    // canonical fence server-side. The projection is recomputed here, so a
-    // fingerprint from stale observations matches nothing and fails closed.
-    let plan: RunRecoveryProjection["actions"][number] | null = null;
-    if (fingerprint !== undefined) {
-      const facts = readRunRecoveryFacts(tx, task.id, active.id);
-      if (facts === null) throw usageError(`Agent Run not found: ${task.id}/${active.id}.`, usage);
-      const projection = projectRunRecovery(facts);
-      plan = projection.actions.find((entry) => entry.fingerprint === fingerprint) ?? null;
-      if (plan === null) {
-        throw usageError(runRecoveryStaleDiagnosis(
-          task.id,
-          active.id,
-          projection.canonicalProgressAt ?? null,
-          "recovery action fingerprint is stale or unknown"
-        ), usage);
-      }
-    }
-    const action = parseRecoveryAction(
-      parsed.options.get("--action") ?? plan?.action,
-      usage
-    );
-    if (plan !== null && plan.action !== action) {
-      throw usageError(
-        `--action ${action} does not match recovery fingerprint action ${plan.action}.`,
-        usage
-      );
-    }
-    const expectedProgressAt = explicitFence ?? plan?.expectedProgressAt;
-    if (expectedProgressAt === undefined) {
-      throw usageError("--expected-progress-at is required.", usage);
-    }
-    const providerAcceptance = parseProviderAcceptance(
-      parsed.options.get("--provider-acceptance"),
-      usage
-    );
-    const agentId = parsed.options.get("--agent-id")
-      ?? plan?.agentId
-      ?? active.effective.agentId;
-    const adapterId = parsed.options.get("--adapter-id")
-      ?? plan?.adapterId
-      ?? active.effective.adapterId;
-    const nativeSessionId = parsed.options.get("--native-session-id")
-      ?? plan?.nativeSessionId
-      ?? session?.nativeSessionId;
-    const launchId = parsed.options.get("--launch-id")
-      ?? plan?.launchId
-      ?? session?.launchId;
-    return {
-      taskId: task.id,
-      roleName: role.name,
-      runId: active.id,
-      agentId,
-      adapterId,
-      ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
-      ...(launchId === undefined ? {} : { launchId }),
-      expectedProgressAt,
-      providerAcceptance,
-      action,
-      reason: requiredOption(parsed.options, "--reason"),
-      now
-    };
-  });
-  const result = recoverExactAgentRun(store, input);
-  if (result.disposition !== "applied") {
-    throw usageError(
-      runRecoveryStaleDiagnosis(
-        input.taskId,
-        input.runId,
-        result.progressAt ?? null,
-        `exact Run recovery ${result.disposition}: ${result.reason ?? "state changed"}`
-      ),
-      usage
-    );
-  }
-  // The durable recovery request is committed before asking the Controller to
-  // wake the owning Leader; a failed transaction must not leak a signal.
-  if (result.run !== null && result.run.roleName !== LEADER_ROLE) {
-    notifyMailbox(options.runtime, leaderMailbox(result.run.taskId), result.run.taskId);
-  }
-  const followup = result.requiresExplicitFollowup === true
-    ? " Leader follow-up is required; no provider input or Session action was performed."
-    : "";
-  return `Recorded exact ${result.action} recovery for ${result.run?.id ?? "unknown Run"}.${followup}\n`;
-}
-
-/**
- * Issue 08: every recovery rejection carries the current canonical fence and
- * points at the single read-only command that projects it. The caller's
- * side-effecting action is never retried automatically.
- */
-function runRecoveryStaleDiagnosis(
-  taskId: string,
-  runId: string,
-  canonicalProgressAt: string | null,
-  detail: string
-): string {
-  const fence = canonicalProgressAt === null
-    ? "no durable progress timestamp is available for this Run"
-    : `the canonical durable fence is now ${canonicalProgressAt}`;
-  return `${detail}; ${fence}. Re-read the recovery plan: yui task run show ${taskId}/${runId}.`;
-}
-
-/**
- * Issue 08: read-only Run detail with the canonical recovery fence, Provider
- * evidence, and every exact recovery action. Never mutates state and never
- * selects an action or Provider acceptance for the Leader.
- */
+/** Run details are retained audit evidence; continuation uses durable Task state. */
 function showRun(
   args: string[],
   store: TaskWorkflowStore,
@@ -7072,8 +6713,6 @@ function showRun(
   exactPositionals(positionals, 1, usage);
   const data = store.transaction((tx) => {
     const run = requireRun(tx, positionals[0], options);
-    const facts = readRunRecoveryFacts(tx, run.taskId, run.id);
-    if (facts === null) throw usageError(`Agent Run not found: ${run.taskId}/${run.id}.`, usage);
     const retirement = tx.listEvents(run.taskId)
       .map(taskRecordRetirement)
       .find((entry) => entry?.recordKind === "agent-run" && entry.recordId === run.id) ?? null;
@@ -7084,7 +6723,6 @@ function showRun(
       ));
     return {
       run,
-      recovery: projectRunRecovery(facts),
       retirement,
       rejectedYieldAttemptCount: allRejectedYieldAttempts.length,
       rejectedYieldAttempts: allRejectedYieldAttempts.slice(-16)
@@ -7097,7 +6735,6 @@ function showRun(
     kind: "output" as const,
     output: renderRunShow(
       data.run,
-      data.recovery,
       data.retirement,
       data.rejectedYieldAttemptCount,
       data.rejectedYieldAttempts
@@ -7108,7 +6745,6 @@ function showRun(
 
 function renderRunShow(
   run: AgentRun,
-  recovery: RunRecoveryProjection,
   retirement: ReturnType<typeof taskRecordRetirement>,
   rejectedYieldAttemptCount: number,
   rejectedYieldAttempts: readonly RejectedYieldAttempt[]
@@ -7126,6 +6762,7 @@ function renderRunShow(
     ]),
     `Effective: ${run.effective.agentId}/${run.effective.adapterId} r${run.effective.sourceDesiredRevision}`,
     `Created: ${run.createdAt}`,
+    ...(run.endedAt === undefined ? [] : [`Ended: ${run.endedAt}`]),
     ...(run.pushedAt === undefined ? [] : [`Pushed: ${run.pushedAt}`]),
     ...(run.deliveredAt === undefined
       ? []
@@ -7146,42 +6783,6 @@ function renderRunShow(
           ])
         ])
   ];
-  if (recovery.canonicalProgressAt !== null) {
-    lines.push(
-      `Canonical recovery fence (Yui durable CAS): ${recovery.canonicalProgressAt}`,
-      ...(recovery.canonicalProgressEvidence === undefined
-        ? []
-        : [`Fence evidence: ${recovery.canonicalProgressEvidence}`])
-    );
-  }
-  if (recovery.provider.observedAt !== null) {
-    lines.push(
-      `Provider observation (evidence only, not a fence): `
-      + `${recovery.provider.observationKind} at ${recovery.provider.observedAt}`
-    );
-  }
-  if (recovery.session !== null) {
-    const session = recovery.session;
-    lines.push(
-      `Session: ${session.status}`
-      + `${session.nativeSessionId === undefined ? "" : ` ${session.nativeSessionId}`}`
-      + `${session.launchId === undefined ? "" : ` launch ${session.launchId}`}`
-    );
-  }
-  if (recovery.recoverable) {
-    lines.push(
-      `Provider acceptance options: ${recovery.providerAcceptance.options.join(", ")}`,
-      "Recovery actions (copy one; the fence is already canonical):"
-    );
-    for (const plan of recovery.actions) {
-      lines.push(`  [${plan.action}] ${plan.reason}`, `    ${plan.command}`);
-    }
-    if (recovery.judgmentRequired !== undefined) {
-      lines.push(`Judgment: ${recovery.judgmentRequired}`);
-    }
-  } else {
-    lines.push(`Not recoverable: ${recovery.reason ?? "unknown"}`);
-  }
   return `${lines.join("\n")}\n`;
 }
 
@@ -7977,6 +7578,8 @@ export function dispatchPreparedReviewRound(
       }
     }
     const task = requireTask(tx, taskId);
+    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    assertTaskExecutionEnabled(task, "dispatching a Review");
     if ((round.scope ?? "work-item") === "task") {
       let taskFinalContract: TaskFinalReviewContract | undefined;
       try {
@@ -8309,14 +7912,7 @@ export function dispatchPreparedReviewRound(
         runId,
         taskId,
         laneReviewer.name,
-        taskRoleDispatchMode(
-          tx,
-          taskId,
-          laneReviewer.name,
-          sessions,
-          effective.agentId,
-          effective
-        ),
+        roleAgentSessionResumeMode(sessions, effective.agentId, effective),
         assignment,
         now,
         {
@@ -8783,6 +8379,13 @@ function assertTaskOpen(task: Task): void {
   if (task.status === "retired") throw usageError(`Task is retired: ${task.id}.`);
 }
 
+function assertTaskExecutionEnabled(task: Task, action: string): void {
+  if (task.executionGate.state === "enabled") return;
+  throw usageError(
+    `Task execution is stopped: ${task.id}. Run "yui task execution start ${task.id}" before ${action}.`
+  );
+}
+
 function taskActor(
   store: Pick<
     TaskWorkflowStore,
@@ -8792,24 +8395,6 @@ function taskActor(
   taskId: string
 ) {
   return resolveTaskLocalActor(store, options.environment, taskId, options.yuiHome);
-}
-
-function taskRoleDispatchMode(
-  store: TaskWorkflowStore,
-  taskId: string,
-  roleName: string,
-  sessions: TaskRoleSessionSet | null,
-  agentId: string,
-  effective: EffectiveLaunchSnapshot
-): "new" | "resume" {
-  return roleSessionDispatchModeWithConversationSwitch(
-    sessions,
-    store.listEvents(taskId),
-    store.getWorkMailbox({ kind: "role", taskId, roleName }),
-    roleName,
-    agentId,
-    effective
-  );
 }
 
 function inactiveTaskMessage(task: Task, action: string): string {
@@ -8834,26 +8419,6 @@ function parseWorkStatus(value: string): WorkItemStatus {
   if (value === "done") return "completed";
   if (value === "failed") return "failed";
   throw usageError(`Invalid work item status: ${value}.`);
-}
-
-function parseRecoveryAction(
-  value: string | undefined,
-  usage: string
-): ExactAgentRunRecoveryAction {
-  if (
-    value === "diagnose"
-    || value === "retry"
-    || value === "terminate"
-  ) return value;
-  throw usageError("--action must be diagnose, retry, or terminate.", usage);
-}
-
-function parseProviderAcceptance(
-  value: string | undefined,
-  usage: string
-): "accepted" | "rejected" | "ambiguous" {
-  if (value === "accepted" || value === "rejected" || value === "ambiguous") return value;
-  throw usageError("--provider-acceptance must be accepted, rejected, or ambiguous.", usage);
 }
 
 function presentWorkStatus(status: WorkItemStatus): string {
@@ -9748,18 +9313,49 @@ function taskMailbox(taskId: string): MailboxTarget {
   return { kind: "task", taskId };
 }
 
-function queueCompletedTaskRuntimeCleanups(
+function settleTaskExecutionForCompletion(
   store: TaskWorkflowStore,
   taskId: string,
   roles: readonly Role[],
+  summary: string,
   now: Date
 ): RuntimeLifecycleTarget[] {
+  const activeRuns = store.listAgentRuns(taskId).filter((run) => run.status === "active");
+  for (const run of activeRuns) {
+    store.saveAgentRun(run.roleName === LEADER_ROLE && run.pushedAt !== undefined
+      ? yieldAgentRun(run, summary, now)
+      : failAgentRun(run, `Task completed: ${summary}`, now));
+    if (run.executionGroupId !== undefined && run.executionLaneId !== undefined) {
+      store.clearActiveExecutionLaneRun(taskId, run.executionGroupId, run.executionLaneId);
+    }
+  }
+  // Historical pointer projections are execution state, not Task progress.
+  for (const run of store.listAgentRuns(taskId)) {
+    if (run.executionGroupId !== undefined && run.executionLaneId !== undefined) {
+      store.clearActiveExecutionLaneRun(taskId, run.executionGroupId, run.executionLaneId);
+    }
+  }
+
   const targets: RuntimeLifecycleTarget[] = [];
   for (const role of roles) {
-    if (store.getActiveAgentRun(taskId, role.name) !== null) continue;
-    const sessions = store.getTaskRoleSessionSet(taskId, role.name);
-    const active = sessions?.sessions[sessions.activeAgentId];
-    if (!ownedRuntimeSessionRequiresCleanup(active)) continue;
+    store.clearActiveAgentRun(taskId, role.name);
+    let sessions = store.getTaskRoleSessionSet(taskId, role.name);
+    const activeSession = sessions?.sessions[sessions.activeAgentId];
+    const cleanupRequired = ownedRuntimeSessionRequiresCleanup(activeSession);
+    if (sessions !== null) {
+      if (sessions.inFlight !== null) {
+        sessions = terminalizeTaskRoleRunSession(sessions, sessions.inFlight, now);
+      }
+      const current = sessions.sessions[sessions.activeAgentId];
+      if (current !== undefined && current.status !== "stopped" && current.status !== "broken") {
+        sessions = updateRoleAgentSessionStatus(sessions, sessions.activeAgentId, "stopped", now);
+      }
+      store.saveTaskRoleSessionSet(sessions);
+    }
+    if (role.status !== "idle") {
+      store.saveRole(taskId, updateRoleStatus(role, "idle", now));
+    }
+    if (!cleanupRequired) continue;
     const target = runtimeLifecycleTarget({
       scope: "task",
       taskId,

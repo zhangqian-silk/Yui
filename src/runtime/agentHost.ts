@@ -156,7 +156,6 @@ export async function runAgentHost(input: Readonly<{
   let activeNativeTurnId: string | undefined;
   let codexClientAttachedAt: number | undefined;
   let consecutiveCodexDisconnects = 0;
-  const switchDetachedSessions = new WeakSet<StructuredProviderSession>();
   let activationId: string | undefined;
   let conversationRecoverability: "unknown" | "recoverable" = "unknown";
   let authority: ProviderAuthorityFence | undefined;
@@ -356,8 +355,7 @@ export async function runAgentHost(input: Readonly<{
       const reconnectableCodexClient = ownsCurrentSession
         && providerSession.adapterId === "codex"
         && !hostStopRequested
-        && stopReceipt === null
-        && !switchDetachedSessions.has(providerSession);
+        && stopReceipt === null;
       if (reconnectableCodexClient) {
         session = undefined;
         if (codexClientAttachedAt !== undefined
@@ -402,20 +400,18 @@ export async function runAgentHost(input: Readonly<{
       hostSequence += 1;
       const observedAt = new Date().toISOString();
       const failures: string[] = [];
-      if (!switchDetachedSessions.has(providerSession)) {
-        try {
-          await publishStructuredProviderActivationTerminal({
-            home: input.home,
-            environment: currentPayload.environment,
-            conversationId: providerSession.conversationId,
-            nativeSessionId: providerSession.nativeSessionId,
-            activationId: currentActivationId,
-            status: stopReceipt !== null || hostStopRequested ? "ended" : "failed",
-            observedAt
-          });
-        } catch (error) {
-          failures.push(`activation terminal: ${errorText(error)}`);
-        }
+      try {
+        await publishStructuredProviderActivationTerminal({
+          home: input.home,
+          environment: currentPayload.environment,
+          conversationId: providerSession.conversationId,
+          nativeSessionId: providerSession.nativeSessionId,
+          activationId: currentActivationId,
+          status: stopReceipt !== null || hostStopRequested ? "ended" : "failed",
+          observedAt
+        });
+      } catch (error) {
+        failures.push(`activation terminal: ${errorText(error)}`);
       }
       let exitPersisted = false;
       try {
@@ -483,9 +479,13 @@ export async function runAgentHost(input: Readonly<{
     }
     const requestedAuthority = validateProviderAuthorityFence(providerControl.authority);
     const replacesCurrentConversation = session !== undefined && providerControl.kind === "new";
-    if (!replacesCurrentConversation && authority === undefined) authority = requestedAuthority;
-    else if (!replacesCurrentConversation
-      && authority !== undefined
+    if (replacesCurrentConversation) {
+      throw new Error(
+        "Agent Host cannot replace a live Provider Session; stop it before starting a fresh Session."
+      );
+    }
+    if (authority === undefined) authority = requestedAuthority;
+    else if (authority !== undefined
       && !sameProviderAuthorityFence(authority, requestedAuthority)) {
       throw new Error("Agent Host launch carries a stale Provider authority fence.");
     }
@@ -507,42 +507,6 @@ export async function runAgentHost(input: Readonly<{
       | Readonly<Record<string, string | number>>
       | undefined;
     try {
-      if (replacesCurrentConversation) {
-        const previousSession = session!;
-        const previousPayload = sessionPayload;
-        const previousActivationId = activationId ?? previousPayload?.launchId;
-        if (previousPayload === undefined || previousActivationId === undefined
-          || authority?.owner !== "controller") {
-          throw new Error("Agent Host cannot detach an inexact Provider Activation.");
-        }
-        await detachDurableProviderForConversationSwitch(input.home, {
-          taskId: requiredEnvironment(next.environment.YUI_TASK_ID, "Task id"),
-          roleName: requiredEnvironment(next.environment.YUI_ROLE, "Role name"),
-          runId: requiredEnvironment(next.environment.YUI_RUN_ID, "Run id"),
-          agentId: requiredEnvironment(next.environment.YUI_AGENT_ID, "Agent id"),
-          launchId: next.launchId,
-          previousConversationId: previousSession.conversationId,
-          previousNativeSessionId: previousSession.nativeSessionId,
-          previousActivationId,
-          nextAuthorityEpoch: requestedAuthority.epoch,
-          nextAuthorityHolderId: requestedAuthority.holderId,
-          observedAt: new Date().toISOString()
-        });
-        switchDetachedSessions.add(previousSession);
-        // The persistent Provider child belongs to the Activation that first
-        // created it, not to the most recent resume Run payload. The exit
-        // observer carries that Activation launch id, so the stop receipt must
-        // use the same identity or the expected switch detach is misclassified
-        // as an abnormal child exit and generic cleanup can kill the Host.
-        writeRuntimeStopReceipt(input.home, previousActivationId, new Date());
-        authority = undefined;
-        await terminateProviderSessionForConversationSwitch(previousSession);
-        if (session === previousSession) session = undefined;
-        sessionPayload = undefined;
-        activationId = undefined;
-        conversationRecoverability = "unknown";
-        authority = requestedAuthority;
-      }
       if (session !== undefined) {
         if (session.adapterId !== providerControl.adapterId
           || providerControl.mode !== "resume"
@@ -1370,13 +1334,6 @@ async function beginDurableProviderTurn(
   }
 }
 
-async function detachDurableProviderForConversationSwitch(
-  home: string,
-  request: Readonly<Record<string, string | number>>
-): Promise<void> {
-  await callControllerIdempotently(home, "runtime.conversation-switch-detach", request);
-}
-
 async function callControllerIdempotently(
   home: string,
   method: string,
@@ -1409,27 +1366,6 @@ async function callControllerIdempotently(
 
 class ControllerAcknowledgementUnknownError extends Error {
   readonly name = "ControllerAcknowledgementUnknownError";
-}
-
-async function terminateProviderSessionForConversationSwitch(
-  providerSession: StructuredProviderSession
-): Promise<void> {
-  providerSession.terminate("SIGTERM");
-  const forceKill = setTimeout(() => providerSession.terminate("SIGKILL"), 3_000);
-  forceKill.unref();
-  let hardTimeout: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    hardTimeout = setTimeout(() => reject(new Error(
-      "Old Provider Activation did not exit after its switch authority was revoked."
-    )), 8_000);
-    hardTimeout.unref();
-  });
-  try {
-    await Promise.race([providerSession.waitForExit(), timeout]);
-  } finally {
-    clearTimeout(forceKill);
-    if (hardTimeout !== undefined) clearTimeout(hardTimeout);
-  }
 }
 
 async function resolveProviderTurnSubmission(

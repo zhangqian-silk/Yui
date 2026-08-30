@@ -90,6 +90,13 @@ import {
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
+import {
+  parseTaskExecutionStartRequest,
+  parseTaskExecutionStopRequest,
+  finalizeStoppedTaskExecution,
+  startTaskExecutionCommand,
+  stopTaskExecutionCommand
+} from "./commands/taskExecutionCommands.js";
 import { isCurrentGlobalOperator } from "./commands/taskInputCommands.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { runTaskChangeSetCommand } from "./commands/taskChangeSetCommands.js";
@@ -1067,6 +1074,47 @@ export async function main(): Promise<void> {
     return;
   }
   if (resolved[0] === "task") {
+    if (resolved[1] === "execution") {
+      if (resolved[2] === "stop") {
+        const request = parseTaskExecutionStopRequest(resolved.slice(3));
+        const result = stopTaskExecutionCommand(request, store, { environment: process.env });
+        try {
+          await ensureFileTaskController(home, { environment: process.env });
+          await runtime.stopTaskDurableJobs(result.taskId);
+          await runtime.stopTaskRoleSessions(result.taskId, result.roleNames);
+          await runtime.assertTaskPhysicalResourcesReleased(result.taskId);
+          finalizeStoppedTaskExecution(result.taskId, store);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw runtimeError(
+            `Task execution is stopped and durable progress is preserved, but physical runtime cleanup failed: ${message}`
+          );
+        }
+        emit(result.output, false, result);
+        return;
+      }
+      if (resolved[2] === "start") {
+        const taskId = parseTaskExecutionStartRequest(resolved.slice(3));
+        const task = store.getTask(taskId);
+        if (task === null) throw usageError(`Task not found: ${taskId}.`);
+        // Reject managed Task callers before inspecting or starting runtime resources.
+        if (taskActor(process.env, taskId) === "leader") {
+          throw usageError("Task execution stop/start requires the global Operator or a human user.");
+        }
+        if (task.executionGate.state === "stopped") {
+          await runtime.assertTaskPhysicalResourcesReleased(taskId);
+        }
+        await ensureFileTaskController(home, { environment: process.env });
+        const result = startTaskExecutionCommand(taskId, store, { environment: process.env });
+        // Idempotent start is also a reliable kick: if an earlier caller
+        // committed the gate but lost its Controller acknowledgement, retrying
+        // start re-signals the same durable wake without creating another one.
+        await runtime.notifyMailboxChanged?.({ kind: "role", taskId, roleName: "leader" });
+        emit(result.output, false, result);
+        return;
+      }
+      throw usageError("Task execution usage: yui task execution <stop|start> ...");
+    }
     if (resolved[1] === "integration") {
       const result = await runTaskIntegrationCommand(
         resolved.slice(2),

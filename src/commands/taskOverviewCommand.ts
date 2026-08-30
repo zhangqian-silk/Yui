@@ -271,14 +271,21 @@ function buildTaskOverviewEntry(
     now,
     runtimeHealthPolicy
   });
-  const next: TaskOverviewNext | null = execution.action === "recover-execution"
+  const next: TaskOverviewNext | null = execution.status === "stopped"
     ? {
         action: execution.action,
         owner: execution.owner,
         kind: "execution",
         summary: execution.summary
       }
-    : legacyNext;
+    : execution.action === "recover-execution"
+      ? {
+        action: execution.action,
+        owner: execution.owner,
+        kind: "execution",
+        summary: execution.summary
+      }
+      : legacyNext;
   return {
     ...task,
     brief,

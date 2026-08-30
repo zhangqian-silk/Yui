@@ -7,10 +7,9 @@ import {
   effectiveLaunchSnapshotsCompatible,
   effectiveLaunchSnapshotsCompatibleForTaskSession
 } from "../executor/effectiveLaunch.js";
+import { roleAgentSessionResumeMode } from "../executor/agentExecutor.js";
 import {
-  hasRuntimeLifecycleWork,
-  RuntimeLifecycleBusyError,
-  runtimeLifecycleTarget
+  RuntimeLifecycleBusyError
 } from "../runtime/lifecycleReservation.js";
 import { recordLeaderFailure } from "./leaderFailure.js";
 import type {
@@ -25,13 +24,12 @@ import type {
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
-import { roleSessionDispatchModeWithConversationSwitch } from "../runtime/conversationSwitch.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
   runId?: string;
   status: "dispatched" | "skipped" | "failed";
-  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "recovery-blocked" | "state-changed" | "not-ready" | "writer-attached" | "delivery-uncertain" | "provider-rejected";
+  reason?: "busy" | "waiting-input" | "unavailable" | "workspace-not-ready" | "state-changed" | "not-ready" | "writer-attached" | "delivery-uncertain" | "provider-rejected";
   error?: string;
   terminalized?: boolean;
 }>;
@@ -55,17 +53,16 @@ export async function processLeaderWakeups(
   for (const wakeup of wakeups) {
     const task = store.getTask(wakeup.taskId);
     const role = store.getRole(wakeup.taskId, "leader");
-    if (task === null || task.status !== "active" || role === null) {
+    if (task === null
+      || task.status !== "active"
+      || task.executionGate.state !== "enabled"
+      || role === null) {
       results.push({ taskId: wakeup.taskId, status: "skipped", reason: "unavailable" });
       continue;
     }
     const taskWorkspace = store.getTaskWorkspace(task.id);
     if (!isSchedulerTaskWorkspaceReady(task, taskWorkspace)) {
       results.push({ taskId: task.id, status: "skipped", reason: "workspace-not-ready" });
-      continue;
-    }
-    if (store.getLeaderFailure(task.id) !== null) {
-      results.push({ taskId: task.id, status: "skipped", reason: "recovery-blocked" });
       continue;
     }
     if (store.hasOpenInputRequest(task.id)) {
@@ -85,21 +82,6 @@ export async function processLeaderWakeups(
       continue;
     }
 
-    // Single-flight: a Role runtime lifecycle lane that already holds a
-    // launch reservation or cleanup obligation must not be entered by a
-    // second wake. The wake stays durable (pendingWakeup is not consumed) and
-    // is retried after the lane settles; the suppression is recorded for the
-    // audit instead of manufacturing a failed Run.
-    if (hasRuntimeLifecycleWork(store.getWorkMailbox(runtimeLifecycleTarget({
-      scope: "task",
-      taskId: task.id,
-      roleName: role.name
-    })))) {
-      store.recordWakeSuppression?.(task.id, "lifecycle-busy", now);
-      results.push({ taskId: task.id, status: "skipped", reason: "recovery-blocked" });
-      continue;
-    }
-
     const reopening = wakeup.reasons.includes("task-reopened");
     let existingSession = store.getRoleSession(
       task.id,
@@ -113,43 +95,6 @@ export async function processLeaderWakeups(
     let prepared: PreparedRoleDelivery | undefined;
     let preStartFencePersisted = false;
     try {
-      if (existingSession !== null && !hasNativeSession(existingSession)) {
-        const sessionIsTerminal = existingSession.status === "stopped"
-          || existingSession.status === "broken";
-        if (!sessionIsTerminal) {
-          // An opaque live Session has no provider identity that can be safely
-          // rebound. A host absence observation is not a verified stop; keep
-          // the wake durable until an explicit exact cleanup/reset settles it.
-          if (existingSession.launchId !== undefined) {
-            await delivery.inspectRole({
-              taskId: task.id,
-              roleName: role.name,
-              agentId: existingSession.agentId,
-              adapterId: existingSession.adapterId
-            });
-          }
-          results.push({
-            taskId: task.id,
-            status: "skipped",
-            reason: "recovery-blocked"
-          });
-          continue;
-        }
-        if (hasRuntimeLifecycleWork(store.getWorkMailbox(runtimeLifecycleTarget({
-          scope: "task",
-          taskId: task.id,
-          roleName: role.name
-        })))) {
-          // A stopped/broken Session is eligible for a fresh mode only after
-          // its exact runtime cleanup/reservation lane has settled.
-          results.push({
-            taskId: task.id,
-            status: "skipped",
-            reason: "recovery-blocked"
-          });
-          continue;
-        }
-      }
       const compatibleSession = existingSession !== null
         && (reopening
           ? effectiveLaunchSnapshotsCompatible(existingSession.effective, role.effective)
@@ -170,19 +115,15 @@ export async function processLeaderWakeups(
       const resumableSession = hasNativeSession(existingSession)
         && existingSession.status !== "stopped"
         && existingSession.status !== "broken";
-      // A failed or quiet Run is not proof that its Provider Conversation is
-      // unusable. Keep resuming the same identity unless an explicit switch
-      // request (or exact terminal/missing evidence) authorizes a fresh one.
+      // Reuse a healthy Session. A terminal Session is disposable and the next
+      // Run starts fresh without consulting historical recovery records.
       const sessionSet = store.getTaskRoleSessionSet?.(task.id, role.name) ?? null;
       const mode = reopenIdentityDrift
         ? "new"
         : sessionSet === null
           ? resumableSession && compatibleSession ? "resume" : "new"
-          : roleSessionDispatchModeWithConversationSwitch(
+          : roleAgentSessionResumeMode(
             sessionSet,
-            store.listEvents?.(task.id) ?? [],
-            store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: role.name }),
-            role.name,
             role.effective.agentId,
             role.effective
           );
@@ -311,7 +252,9 @@ export async function processLeaderWakeups(
         || ready.prepared.turnAcceptedDuringLaunch === true
         || ready.prepared.turnDeliveryUnknownDuringLaunch === true;
       const latestTask = store.getTask(task.id);
-      if (latestTask === null || latestTask.status !== "active") {
+      if (latestTask === null
+        || latestTask.status !== "active"
+        || latestTask.executionGate.state !== "enabled") {
         delivery.forgetPrepared?.({
           taskId: task.id,
           roleName: role.name,

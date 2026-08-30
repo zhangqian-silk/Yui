@@ -9,7 +9,7 @@ import type { ProviderConversationProbe } from "./providerControl.js";
 export type ProviderRecoveryDecision =
   | Readonly<{ action: "resume"; conversationId: string }>
   | Readonly<{ action: "observe-active-turn"; conversationId: string; turnId: string }>
-  | Readonly<{ action: "replace"; conversationId: string }>
+  | Readonly<{ action: "restart-run"; conversationId: string }>
   | Readonly<{ action: "attention"; conversationId: string; reason: string }>;
 
 /**
@@ -64,7 +64,7 @@ export function decideProviderRecovery(input: Readonly<{
       reason: "Provider Conversation is missing but its Activation writer has not ended."
     };
   }
-  return { action: "replace", conversationId: conversation.conversationId };
+  return { action: "restart-run", conversationId: conversation.conversationId };
 }
 
 function providerTurnIsUnsettled(binding: ProviderRuntimeBinding): boolean {

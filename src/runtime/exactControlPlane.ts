@@ -462,7 +462,9 @@ export function assertExactTaskRuntimeState(
   options: ExactTaskRuntimeStateOptions = {}
 ): void {
   const task = store.getTask(runtime.taskId);
-  if (task === null || task.status !== "active") {
+  if (task === null
+    || task.status !== "active"
+    || task.executionGate.state !== "enabled") {
     throw new Error("Exact Task runtime Task is not current and active.");
   }
   const role = store.getRole(runtime.taskId, runtime.roleName);
@@ -499,18 +501,24 @@ export function assertExactTaskRuntimeState(
     && session?.launchId === runtime.launchId;
   const executionRef = lifecycleMailbox?.processing?.executionRef;
   const preallocated = options.preallocatedDriverSessionReservation;
-  const exactPreallocatedReservation =
-    preallocated !== undefined
-    && runtime.adapterId === preallocated.adapterId
-    && runtime.runId !== undefined
+  const exactRunLaunchReservation =
+    runtime.runId !== undefined
     && runtime.launchId !== undefined
-    && runtime.nativeSessionId !== undefined
-    && session === undefined
     && reservation
     && !hasRuntimeCleanupObligation(lifecycleMailbox)
     && executionRef?.type === "run"
     && executionRef.taskId === runtime.taskId
-    && executionRef.id === runtime.runId
+    && executionRef.id === runtime.runId;
+  const terminalSessionReplacementReservation =
+    exactRunLaunchReservation
+    && session !== undefined
+    && (session.status === "stopped" || session.status === "broken");
+  const exactPreallocatedReservation =
+    preallocated !== undefined
+    && runtime.adapterId === preallocated.adapterId
+    && exactRunLaunchReservation
+    && runtime.nativeSessionId !== undefined
+    && (session === undefined || terminalSessionReplacementReservation)
     && runtime.nativeSessionId === nativeSessionIdForLaunch(
       preallocated.yuiHome,
       runtime.launchId,
@@ -530,10 +538,10 @@ export function assertExactTaskRuntimeState(
     throw new Error("Exact Task runtime launch fence is not current.");
   }
   if (runtime.nativeSessionId === undefined) {
-    if (session !== undefined) {
+    if (session !== undefined && !terminalSessionReplacementReservation) {
       throw new Error("Exact Task runtime native Session fence is missing.");
     }
-  } else if (session === undefined) {
+  } else if (session === undefined || terminalSessionReplacementReservation) {
     if (!exactPreallocatedReservation) {
       throw new Error("Exact Task runtime native Session fence is not current.");
     }

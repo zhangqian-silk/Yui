@@ -29,8 +29,6 @@ export const RUN_STALLED_EVENT = "run.stalled";
 export const RUN_RECOVERED_EVENT = "run.recovered";
 export const RUN_DIAGNOSTIC_FINISHED_EVENT = "runtime.diagnostic-finished";
 /** Structured, non-Message recovery evidence written by an explicit Leader. */
-export const RUN_RECOVERY_REQUESTED_EVENT = "run.recovery-requested";
-export const RUN_RECOVERY_APPLIED_EVENT = "run.recovery-applied";
 
 /** Workflow-semantic events that count for the durable progress clock. */
 const ACTIVITY_EVENT_TYPES = new Set([

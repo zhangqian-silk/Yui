@@ -32,7 +32,6 @@ import {
   executionStageSpendClosed,
   routeExecutionStage
 } from "../execution/resourceBroker.js";
-import type { RunRecoveryProjection } from "../run/recoveryProjection.js";
 import {
   sameTaskFinalReviewContract,
   type TaskFinalReviewContract
@@ -75,9 +74,10 @@ export type NextActionKind =
   | "resolve-execution-stage"
   | "resolve-review-group"
   | "resume-review"
-  | "recover-execution-lane"
+  | "retry-execution-lane"
   | "wait-for-owned-execution"
   | "resolve-input"
+  | "start-task-execution"
   | "complete-task"
   | "repair-protocol-inconsistency";
 
@@ -119,7 +119,7 @@ export type NextAction = Readonly<{
 }>;
 
 export type NextActionFacts = Readonly<{
-  task: Readonly<Pick<Task, "id" | "status" | "projectBindings" | "type">>;
+  task: Readonly<Pick<Task, "id" | "status" | "executionGate" | "projectBindings" | "type">>;
   workItems: readonly WorkItem[];
   changeSets: readonly ChangeSet[];
   integrations: readonly IntegrationAttempt[];
@@ -140,8 +140,6 @@ export type NextActionFacts = Readonly<{
   }>;
   /** Current unresolved Lane health supplied by canonical Task read surfaces. */
   executionGroups?: readonly ExecutionGroupHealthSummary[];
-  /** Exact live-Run recovery plans for Lane actions that use `task run recover`. */
-  runRecoveries?: readonly RunRecoveryProjection[];
   /** CLI-verified physical Task heads; null means no durable candidate is currently available. */
   currentTaskReviewCandidate?: TaskReviewCandidate | null;
 }>;
@@ -158,6 +156,18 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       preconditions: [
         { fact: `Task status is ${task.status}`, satisfied: true, ref: ref("task", task.id) }
       ]
+    });
+  }
+
+  if (task.status === "active" && task.executionGate.state === "stopped") {
+    return buildAction(facts, {
+      kind: "start-task-execution",
+      reason: `Task ${task.id} execution is stopped; durable progress is preserved.`,
+      refs: [ref("task", task.id)],
+      preconditions: [
+        { fact: "Task execution is stopped", satisfied: true, ref: ref("task", task.id) }
+      ],
+      recommendedCommand: `yui task execution start ${task.id}`
     });
   }
 
@@ -781,43 +791,15 @@ function buildExecutionLaneRecoveryAction(
     ref("execution-lane", lane.laneId),
     ref("agent-run", lane.runId)
   ];
-  if (lane.recovery === "retry-new-agent-run") {
-    return buildAction(facts, {
-      kind: "recover-execution-lane",
-      reason: `Execution Lane ${lane.laneId} is durably failed; retry only exact Run ${lane.runId} and retain sibling results.`,
-      refs,
-      preconditions: [
-        { fact: "Execution Lane is failed and unresolved", satisfied: true, ref: refs[1] },
-        { fact: "Exact failed AgentRun is retained", satisfied: true, ref: refs[2] }
-      ],
-      recommendedCommand: `yui task run retry ${facts.task.id}/${lane.runId}`
-    });
-  }
-
-  const action = lane.recovery === "diagnose" ? "diagnose" : "terminate";
-  const recovery = facts.runRecoveries?.find(({ runId }) => runId === lane.runId);
-  const plan = recovery?.actions.find((candidate) => candidate.action === action);
   return buildAction(facts, {
-    kind: "recover-execution-lane",
-    reason: lane.recovery === "diagnose"
-      ? `Execution Lane ${lane.laneId} needs bounded diagnostics for exact Run ${lane.runId}.`
-      : `Execution Lane ${lane.laneId} has confirmed death evidence; terminate exact Run ${lane.runId}.`,
+    kind: "retry-execution-lane",
+    reason: `Execution Lane ${lane.laneId} is durably failed; retry only exact Run ${lane.runId} and retain sibling results.`,
     refs,
     preconditions: [
-      { fact: `Lane recovery is ${lane.recovery}`, satisfied: true, ref: refs[1] },
-      {
-        fact: `Exact Run exposes a current ${action} recovery plan`,
-        satisfied: plan !== undefined,
-        ref: refs[2]
-      }
+      { fact: "Execution Lane is failed and unresolved", satisfied: true, ref: refs[1] },
+      { fact: "Exact failed AgentRun is retained", satisfied: true, ref: refs[2] }
     ],
-    ...(plan === undefined ? {} : { recommendedCommand: plan.command }),
-    ...(plan !== undefined && recovery?.judgmentRequired === undefined
-      ? {}
-      : {
-          judgmentRequired: recovery?.judgmentRequired
-            ?? `Inspect yui task run show ${facts.task.id}/${lane.runId}; its exact recovery fence is unavailable.`
-        })
+    recommendedCommand: `yui task run retry ${facts.task.id}/${lane.runId}`
   });
 }
 

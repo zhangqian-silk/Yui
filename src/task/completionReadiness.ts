@@ -1,5 +1,4 @@
 import type { DurableJob } from "../job/durableJob.js";
-import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import {
@@ -19,8 +18,6 @@ import {
 import { resolveRecordedTaskFinalReviewContract } from "../review/taskFinalReviewContractRebind.js";
 import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { ProviderContinuation } from "../runtime/providerContinuation.js";
-import { blockingProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { WorkItem } from "../workItem/workItem.js";
@@ -49,12 +46,10 @@ export type CompletionBlockerCode =
   | "integration-evidence-missing"
   | "unresolved-integration"
   | "unsettled-integration-queue-entry"
-  | "blocking-provider-continuation"
   | "work-item-workspace-undisposed"
   | "review-workspace-undisposed"
   | "integration-workspace-undisposed"
   | "execution-lane-workspace-undisposed"
-  | "active-run"
   | "open-review-finding"
   | "finding-ledger-unavailable"
   | "delta-recheck-not-accepted";
@@ -97,10 +92,8 @@ export type CompletionReadiness = Readonly<{
  * extra reads on every command.
  */
 export type CompletionReadinessFacts = NextActionFacts & Readonly<{
-  /** Every Run, including terminal owners referenced by historical continuations. */
+  /** Run evidence used to validate semantic Review results. */
   agentRuns: readonly AgentRun[];
-  /** Current Role Session generations used to prove whether a terminal writer is reachable. */
-  roleSessionSets: readonly TaskRoleSessionSet[];
   managedWorkspaces: readonly ManagedWorkspace[];
   durableJobs: readonly DurableJob[];
   integrationQueueEntries: readonly IntegrationQueueEntry[];
@@ -299,19 +292,6 @@ export function projectCompletionReadiness(
     });
   }
 
-  // Provider continuations that may still write the Workspace.
-  for (const continuation of blockingProviderContinuations(facts.events)) {
-    if (!providerContinuationBlocksCompletion(continuation, facts)) continue;
-    const identity = continuation.identity;
-    blockers.push({
-      code: "blocking-provider-continuation",
-      ref: ref("provider-continuation", identity.continuationId),
-      reason: `Provider continuation ${identity.continuationId} (run ${continuation.runId}) `
-        + "may still write the Workspace or has an identity conflict.",
-      fix: `wait for or recover the Provider turn on run ${continuation.runId}`
-    });
-  }
-
   // Terminal child workspaces are cleanup advisories: Task completion is the
   // semantic delivery boundary, while archive remains the fail-closed resource
   // reclamation boundary. Missing/non-terminal ownership stays conservative.
@@ -319,18 +299,6 @@ export function projectCompletionReadiness(
     const disposition = workspaceCompletionDisposition(facts, task.id, workspace);
     if (disposition?.kind === "blocker") blockers.push(disposition.value);
     if (disposition?.kind === "advisory") advisories.push(disposition.value);
-  }
-
-  // Active non-Leader Runs must finish.  The Leader's own Run is terminalized
-  // by the completion transaction itself, so it is not a readiness blocker.
-  for (const run of facts.activeRuns) {
-    if (run.roleName === "leader") continue;
-    blockers.push({
-      code: "active-run",
-      ref: ref("agent-run", run.id),
-      reason: `Role ${run.roleName} has an active Run ${run.id}.`,
-      fix: `wait for Run ${run.id} to yield or fail`
-    });
   }
 
   // Review finding ledger gate (enforce mode only).
@@ -385,58 +353,6 @@ export function projectCompletionReadiness(
     blockers: sorted,
     advisories: sortedAdvisories
   };
-}
-
-/**
- * A terminal Run releases only its completion blocker, never its immutable
- * continuation audit. Missing or inconsistent ownership remains ambiguous and
- * therefore fail-closed. A live exact native Session can still deliver or
- * write for a terminal Run, so it retains the blocker until that Session is
- * stopped, broken, or replaced by another Conversation identity.
- */
-function providerContinuationBlocksCompletion(
-  continuation: ProviderContinuation,
-  facts: Pick<CompletionReadinessFacts, "agentRuns" | "roleSessionSets">
-): boolean {
-  if (continuation.identityConflict) return true;
-
-  const ownerRun = facts.agentRuns.find(({ id }) => id === continuation.runId);
-  if (ownerRun === undefined
-    || ownerRun.taskId !== continuation.taskId
-    || ownerRun.roleName !== continuation.roleName
-    || ownerRun.effective.agentId !== continuation.identity.accountScope) {
-    return true;
-  }
-  if (ownerRun.status !== "failed" && ownerRun.status !== "yielded") return true;
-
-  const sessions = facts.roleSessionSets.find(({ owner }) => (
-    owner.taskId === continuation.taskId && owner.roleName === continuation.roleName
-  ));
-  const session = sessions?.sessions[continuation.identity.accountScope];
-  if (session !== undefined
-    && session.status !== "stopped"
-    && session.status !== "broken"
-    && session.nativeSessionId === continuation.identity.conversationId) {
-    return true;
-  }
-
-  const binding = sessions?.providerBinding;
-  if (binding === undefined || binding === null
-    || binding.providerNamespace !== continuation.identity.providerNamespace
-    || binding.accountScope !== continuation.identity.accountScope) {
-    return false;
-  }
-  const conversationIsCurrent = binding.conversations.some((conversation) => (
-    conversation.conversationId === continuation.identity.conversationId
-    && conversation.epoch === binding.currentConversationEpoch
-    && conversation.status === "current"
-  ));
-  const activationIsLive = binding.activations.some((activation) => (
-    activation.activationId === continuation.identity.activationId
-    && activation.conversationId === continuation.identity.conversationId
-    && activation.status === "active"
-  ));
-  return conversationIsCurrent && activationIsLive;
 }
 
 type WorkspaceCompletionDisposition =

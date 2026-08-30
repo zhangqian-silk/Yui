@@ -42,8 +42,7 @@ export type ExecutionLaneRuntimeHealth =
 
 export type ExecutionLaneRecovery =
   | "none"
-  | "diagnose"
-  | "terminate-exact-run"
+  | "inspect"
   | "retry-new-agent-run"
   | "reuse-result";
 
@@ -82,7 +81,7 @@ export type ActionableExecutionLaneRecovery = Readonly<{
   laneId: string;
   runId?: string;
   runtimeHealth?: ExecutionLaneRuntimeHealth;
-  recovery: "diagnose" | "terminate-exact-run" | "retry-new-agent-run";
+  recovery: "retry-new-agent-run";
 }>;
 
 export type ExecutionHealthRun = Pick<
@@ -193,20 +192,13 @@ export function summarizeExecutionGroupHealth(
 export function actionableExecutionLaneRecoveries(
   groups: readonly ExecutionGroupHealthSummary[]
 ): ActionableExecutionLaneRecovery[] {
-  const priority = {
-    "terminate-exact-run": 0,
-    "retry-new-agent-run": 1,
-    diagnose: 2
-  } as const;
   return groups
     .filter(({ resolution }) => resolution === undefined)
     .flatMap((group) => group.laneSummaries.flatMap((lane): ActionableExecutionLaneRecovery[] => {
       if (lane.recovery === "retry-new-agent-run"
         && group.resources !== undefined
         && executionStageSpendClosed(group.resources)) return [];
-      if (lane.recovery !== "diagnose"
-        && lane.recovery !== "terminate-exact-run"
-        && lane.recovery !== "retry-new-agent-run") return [];
+      if (lane.recovery !== "retry-new-agent-run") return [];
       return [{
         groupId: group.groupId,
         laneId: lane.laneId,
@@ -214,8 +206,7 @@ export function actionableExecutionLaneRecoveries(
         ...(lane.runtimeHealth === undefined ? {} : { runtimeHealth: lane.runtimeHealth }),
         recovery: lane.recovery
       }];
-    }))
-    .sort((left, right) => priority[left.recovery] - priority[right.recovery]);
+    }));
 }
 
 function projectExecutionLaneHealth(
@@ -282,7 +273,7 @@ function projectExecutionLaneHealth(
   if (run === undefined) {
     return projection(lane, {
       runtimeHealth: "suspected-stalled",
-      recovery: "diagnose",
+      recovery: "inspect",
       resultReusable: false,
       reason: "the running Lane has no exact AgentRun record",
       evidence: ["execution-lineage-missing"]
@@ -300,7 +291,7 @@ function projectExecutionLaneHealth(
   if (run.status !== "active") {
     return projection(lane, {
       runtimeHealth: "suspected-stalled",
-      recovery: "diagnose",
+      recovery: "inspect",
       resultReusable: false,
       reason: "the Lane is running but its exact AgentRun is terminal without a Lane result",
       evidence: ["execution-lineage-inconsistent"]
@@ -329,7 +320,7 @@ function projectExecutionLaneHealth(
   )) && !unsettledChildWork) {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
-      recovery: "terminate-exact-run",
+      recovery: "inspect",
       resultReusable: false,
       reason: "the Provider reported an exact run-terminal failure",
       evidence: ["provider-run-terminal"]
@@ -347,7 +338,7 @@ function projectExecutionLaneHealth(
   if (runtimeTerminalEvidence.length > 0 && !unsettledChildWork) {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
-      recovery: "terminate-exact-run",
+      recovery: "inspect",
       resultReusable: false,
       reason: "the exact runtime host or Session is terminal and no unsettled child work remains",
       evidence: runtimeTerminalEvidence
@@ -362,7 +353,7 @@ function projectExecutionLaneHealth(
     && !unsettledChildWork) {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
-      recovery: "terminate-exact-run",
+      recovery: "inspect",
       resultReusable: false,
       reason: "the exact Session and abnormal process exit independently confirm death",
       evidence: ["native-session-terminal", `process-exit:${exit.classification}`]
@@ -372,7 +363,7 @@ function projectExecutionLaneHealth(
   if (isRoleRunStalled(input.events, run.id)) {
     return projection(lane, {
       runtimeHealth: "suspected-stalled",
-      recovery: "diagnose",
+      recovery: "inspect",
       resultReusable: false,
       reason: `the durable progress clock has not advanced since ${
         latestStallProgressAt(input.events, run.id) ?? run.updatedAt

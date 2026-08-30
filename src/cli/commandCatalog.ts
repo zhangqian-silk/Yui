@@ -370,6 +370,24 @@ const taskChildren: readonly NodeInput[] = [
   },
   { name: "activate", summary: "Activate a Draft Task.", usage: "yui task activate <id>" },
   {
+    name: "execution",
+    summary: "Fence or resume all execution for a Task.",
+    sections: [{ id: "manage", title: "Commands", entries: ["stop", "start"] }],
+    children: [
+      {
+        name: "stop",
+        summary: "Stop all Task execution while preserving durable progress.",
+        usage: "yui task execution stop <task> --force --reason <text>",
+        options: ["--force", "--reason"]
+      },
+      {
+        name: "start",
+        summary: "Resume the Leader from durable Task progress.",
+        usage: "yui task execution start <task>"
+      }
+    ]
+  },
+  {
     name: "complete",
     summary: "Complete an active Task and stop automatic wakeups.",
     usage: "yui task complete <id> (--summary <text>|--summary-file <path|->) [--refresh-remote] [--accept-published-tree <publication-id>]",
@@ -627,7 +645,7 @@ const taskChildren: readonly NodeInput[] = [
     name: "role",
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
-      "add", "list", "status", "show", "update", "remove", "bind", "unbind", "session",
+      "add", "list", "status", "show", "update", "remove", "bind", "unbind",
       "view", "takeover", "release"
     ] }],
     children: [
@@ -656,17 +674,6 @@ const taskChildren: readonly NodeInput[] = [
       { name: "remove", summary: "Remove a Task Role.", usage: "yui task role remove <task> <role>" },
       { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "yui task role bind <task> <role> <agent-id>" },
       { name: "unbind", summary: "Unbind a dormant Agent from a Task Role.", usage: "yui task role unbind <task> <role> <agent-id>" },
-      {
-        name: "session",
-        summary: "Manage the Provider Conversation bound to a Task Role.",
-        sections: [{ id: "manage", title: "Commands", entries: ["switch"] }],
-        children: [{
-          name: "switch",
-          summary: "Request a fresh Conversation after the current one reaches a safe boundary.",
-          usage: "yui task role session switch <task> <role> --reason <text>",
-          options: ["--reason"]
-        }]
-      },
       {
         name: "view",
         summary: "Attach read-only to an independent Provider presentation surface.",
@@ -807,12 +814,12 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "run",
     summary: "Inspect and control Task Role Agent Runs.",
-    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "recover", "yield", "context", "checkpoint", "retire"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["list", "show", "retry", "settle", "yield", "context", "checkpoint", "retire"] }],
     children: [
       { name: "list", summary: "List Runs for a work item.", usage: "yui task run list <task>/<work>" },
       {
         name: "show",
-        summary: "Show one Run with its canonical recovery fence and exact recovery actions.",
+        summary: "Show one Run and its retained audit evidence.",
         usage: "yui task run show <task>/<run> [--json]"
       },
       {
@@ -824,12 +831,6 @@ const taskChildren: readonly NodeInput[] = [
         name: "settle",
         summary: "Close an obsolete stranded final Review Run without requesting a retry Round.",
         usage: "yui task run settle <task>/<run>"
-      },
-      {
-        name: "recover",
-        summary: "Record one exact Leader-controlled Run recovery decision.",
-        usage: "yui task run recover <task>/<run> --action <diagnose|retry|terminate> (--expected-progress-at <timestamp>|--from-next-action <fingerprint>) --provider-acceptance <accepted|rejected|ambiguous> --reason <text>",
-        options: ["--action", "--expected-progress-at", "--progress-at", "--from-next-action", "--provider-acceptance", "--reason", "--role", "--agent-id", "--adapter-id", "--native-session-id", "--launch-id"]
       },
       {
         name: "yield",
@@ -1520,7 +1521,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Agent Runs, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile", "upstream"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "execution", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "rebuild", "history", "replace", "reconcile", "upstream"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "continuation", "wake"] }
       ],

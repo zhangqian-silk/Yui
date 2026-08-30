@@ -807,11 +807,6 @@ export function createRuntimeLifecycleDispatcher(
       }
       return { recorded: true };
     }
-    if (method === "runtime.conversation-switch-detach") {
-      const value = conversationSwitchDetachParams(params);
-      const outcome = schedulerStore.detachAgentHostProviderForConversationSwitch(value);
-      return { recorded: outcome === "detached", outcome };
-    }
     if (method === "runtime.provider-turn-submission-resolve") {
       const value = providerTurnControlParams(params);
       const status = (params as Record<string, unknown>).status;
@@ -952,12 +947,13 @@ export function createRuntimeLifecycleDispatcher(
     const task = request.scope === "task"
       ? store.getTask(request.taskId)
       : null;
-    if (request.scope === "task" && task?.status !== "active") {
+    if (request.scope === "task"
+      && (task?.status !== "active" || task.executionGate.state !== "enabled")) {
       throw applicationError(
         "INVALID_PARAMS",
         task === null
           ? `Task not found: ${request.taskId}.`
-          : `Task is not active: ${request.taskId}.`
+          : `Task execution is not enabled: ${request.taskId}.`
       );
     }
     if (request.scope === "task" && task !== null) {
@@ -1132,7 +1128,9 @@ function assertRuntimeLaunchRequestCurrent(
   let activeRun: ReturnType<TaskStore["getActiveAgentRun"]> = null;
   if (request.owner.scope === "task") {
     const task = store.getTask(request.owner.taskId);
-    if (task === null || task.status !== "active") {
+    if (task === null
+      || task.status !== "active"
+      || task.executionGate.state !== "enabled") {
       throw new Error(`Task is no longer active: ${request.owner.taskId}.`);
     }
     activeRun = store.getActiveAgentRun(
@@ -1552,44 +1550,6 @@ function providerTurnControlParams(params: JsonValue): Readonly<{
     authorityEpoch: authorityEpoch as number,
     authorityOwner,
     holderId: requiredParam(value.holderId),
-    now: new Date(observedAt)
-  };
-}
-
-function conversationSwitchDetachParams(params: JsonValue): Readonly<{
-  taskId: string;
-  roleName: string;
-  runId: string;
-  agentId: string;
-  launchId: string;
-  previousConversationId: string;
-  previousNativeSessionId: string;
-  previousActivationId: string;
-  nextAuthorityEpoch: number;
-  nextAuthorityHolderId: string;
-  now: Date;
-}> {
-  if (typeof params !== "object" || params === null || Array.isArray(params)) {
-    throw applicationError("INVALID_PARAMS", "Provider Conversation detachment params are invalid.");
-  }
-  const value = params as Readonly<Record<string, JsonValue>>;
-  const nextAuthorityEpoch = value.nextAuthorityEpoch;
-  const observedAt = requiredParam(value.observedAt);
-  if (!Number.isSafeInteger(nextAuthorityEpoch) || (nextAuthorityEpoch as number) < 1
-    || !Number.isFinite(Date.parse(observedAt))) {
-    throw applicationError("INVALID_PARAMS", "Provider Conversation detachment fence is invalid.");
-  }
-  return {
-    taskId: requiredParam(value.taskId),
-    roleName: requiredParam(value.roleName),
-    runId: requiredParam(value.runId),
-    agentId: requiredParam(value.agentId),
-    launchId: requiredParam(value.launchId),
-    previousConversationId: requiredParam(value.previousConversationId),
-    previousNativeSessionId: requiredParam(value.previousNativeSessionId),
-    previousActivationId: requiredParam(value.previousActivationId),
-    nextAuthorityEpoch: nextAuthorityEpoch as number,
-    nextAuthorityHolderId: requiredParam(value.nextAuthorityHolderId),
     now: new Date(observedAt)
   };
 }

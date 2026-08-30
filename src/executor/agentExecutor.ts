@@ -258,12 +258,8 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
   return updated;
 }
 
-/**
- * Atomically archives the quiescent old native Session and binds the Provider
- * Conversation selected by an already-authorized switch. Authorization is
- * deliberately owned by the Controller caller, not inferred here.
- */
-export function replaceTaskRoleAgentSessionForConversationSwitch(
+/** Atomically archives a disposable old native Session and binds its replacement. */
+export function replaceTaskRoleAgentSession(
   set: TaskRoleSessionSet,
   input: RecordRoleAgentSessionInput,
   now: Date
@@ -490,10 +486,13 @@ export function bindTaskRoleRun(
     throw new Error("Task Role session set already has an in-flight Run.");
   }
   const timestamp = requireDate(preparedAt, "Task Role Run preparedAt");
-  // A fresh Conversation is a two-phase replacement: keep the old binding as
-  // current evidence until the new Provider session is observed and atomically
-  // superseded. Homes with no prior Conversation still start from null.
-  const providerBinding = set.providerBinding !== null
+  // A fresh Session follows physical cleanup and does not inherit execution
+  // fences from the disposable old Conversation. Runtime events retain its
+  // audit evidence; the new Provider binds a fresh control identity when it is
+  // observed. Resume keeps the existing exact Conversation fence.
+  const providerBinding = mode === "new"
+    ? null
+    : set.providerBinding !== null
     ? rebindProviderRuntimeRun(set.providerBinding, normalized.runId)
     : null;
   const updated: TaskRoleSessionSet = {
@@ -938,8 +937,8 @@ export function validateRoleAgentSession(
   if (session.effective.agentId !== agentId || session.effective.adapterId !== session.adapterId) {
     throw new Error(`Role Agent session effective identity is inconsistent: ${agentId}.`);
   }
-  // A restored opaque host may have no provider-native identity; its launch
-  // fence is still durable and exact recovery remains possible.
+  // A restored opaque host may have no provider-native identity; retain its
+  // launch fence so it can be inspected or stopped without inventing identity.
   if (session.nativeSessionId === undefined) {
     if (session.launchId === undefined) {
       throw new Error("Role Agent session requires a native Session or launch id.");

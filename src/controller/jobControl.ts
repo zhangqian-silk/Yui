@@ -179,9 +179,10 @@ function validateStartParams(store: TaskStore, params: DurableJobStartParams): v
   if (task === null) {
     throw jobDomainError(`Task not found: ${params.taskId}.`);
   }
-  if (task.status !== "active") {
+  if (task.status !== "active" || task.executionGate.state !== "enabled") {
     throw jobDomainError(
-      `DurableJob requires an active Task; ${params.taskId} is ${task.status}.`
+      `DurableJob requires enabled Task execution; ${params.taskId} is `
+        + `${task.status}/${task.executionGate.state}.`
     );
   }
 

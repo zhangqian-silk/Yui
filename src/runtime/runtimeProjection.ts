@@ -79,7 +79,7 @@ export type RuntimeProjection = Readonly<{
  * Layered runtime health state shared by the CLI status projection, the Web
  * snapshot, and the scheduler. Short silence is a hint, not a failure. The
  * durable semantic window schedules read-only diagnosis; it does not itself
- * authorize Run recovery or Conversation replacement.
+ * authorize an execution mutation.
  */
 export type RuntimeHealthLayer =
   | "model-active"

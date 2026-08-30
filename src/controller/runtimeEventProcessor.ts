@@ -314,7 +314,9 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     const taskId = event.observation.fence.taskId;
     if (taskId !== undefined) {
       const task = this.observer.getTask(taskId);
-      if (task === null || task.status !== "active") return "obsolete";
+      if (task === null
+        || task.status !== "active"
+        || task.executionGate.state !== "enabled") return "obsolete";
     }
     return this.observer.observeRuntimeObservation?.(event.observation, now) ?? "obsolete";
   }
@@ -403,7 +405,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         summary: event.summary
       };
       if (task === null) return "obsolete";
-      if (task.status !== "active") {
+      if (task.status !== "active" || task.executionGate.state !== "enabled") {
         this.recordObsolete(
           event,
           task.status === "archived" ? "task-archived" : "task-retired",
@@ -914,7 +916,9 @@ export class AsyncRuntimeEventProcessor {
     const taskId = event.observation.fence.taskId;
     if (taskId !== undefined) {
       const task = await this.observer.getTask(taskId);
-      if (task === null || task.status !== "active") return "obsolete";
+      if (task === null
+        || task.status !== "active"
+        || task.executionGate.state !== "enabled") return "obsolete";
     }
     const outcome = (await this.observer.observeRuntimeObservation?.(event.observation, now))
       ?? "obsolete";
@@ -956,7 +960,7 @@ export class AsyncRuntimeEventProcessor {
         summary: event.summary
       };
       if (task === null) return "obsolete";
-      if (task.status !== "active") {
+      if (task.status !== "active" || task.executionGate.state !== "enabled") {
         await this.recordObsolete(
           event,
           task.status === "archived" ? "task-archived" : "task-retired",

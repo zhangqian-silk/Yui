@@ -559,3 +559,42 @@ test("the production migration upgrades Project v4 records to v5 with active sta
   assert.equal(migrated.retirement, undefined);
   assert.equal(snapshot.schemaManifest.recordVersions.project, 5);
 });
+
+test("the production migration enables execution for Task v5 records", () => {
+  const latest = latestStorageVersionState();
+  const source = {
+    layout: latest.layout,
+    aggregate: latest.aggregate,
+    record: { ...latest.record, task: { version: 5, path: latest.record.task.path } }
+  };
+  const current = activateTask(createTask("task-1", "Continue after upgrade", now), now);
+  const { executionGate: _executionGate, ...withoutGate } = current;
+  const v5Task = { ...withoutGate, schemaVersion: 5 };
+  let snapshot = {
+    schemaManifest: { recordVersions: { task: 5 } },
+    state: { tasks: { "task-1": { task: v5Task } } }
+  };
+  let staged = null;
+  const target = {
+    inspectVersions: () => source,
+    detectLiveRuntime: () => ({ active: false }),
+    readSource: () => snapshot,
+    writeFreshOutput: (next) => { staged = next; },
+    rebuildDerivedState: () => ({ rebuiltEffects: [] }),
+    validateCurrentState: () => ({ checks: [] }),
+    discardFreshOutput: () => { staged = null; },
+    atomicSwitchWithBackup: () => { snapshot = staged; staged = null; return { status: "switched" }; }
+  };
+
+  const report = runMigration({
+    registry: createProductionRegistry(),
+    target,
+    latest,
+    mode: "execute"
+  });
+  assert.equal(report.outcome, "migrated");
+  const migrated = snapshot.state.tasks["task-1"].task;
+  assert.equal(migrated.schemaVersion, 6);
+  assert.deepEqual(migrated.executionGate, { state: "enabled" });
+  assert.equal(snapshot.schemaManifest.recordVersions.task, 6);
+});
