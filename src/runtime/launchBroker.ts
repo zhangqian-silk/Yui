@@ -32,7 +32,7 @@ export type ProviderOwnedTurn = Readonly<{
 type AgentHostProviderControlBase = Readonly<{
   schemaVersion: 1;
   adapterId: "codex" | "claude";
-  transport: "codex-app-server" | "claude-stream-json";
+  transport: "codex-app-server-proxy" | "claude-stream-json";
   sessionTitle?: string;
   authority: ProviderAuthorityFence;
   codexThread?: CodexThreadOptions;
@@ -160,7 +160,7 @@ function validateProviderControl(control: AgentHostProviderControl): void {
   if (control.adapterId !== "codex" && control.adapterId !== "claude") {
     throw new Error("Agent Host Provider control adapter is invalid.");
   }
-  if ((control.adapterId === "codex" && control.transport !== "codex-app-server")
+  if ((control.adapterId === "codex" && control.transport !== "codex-app-server-proxy")
     || (control.adapterId === "claude" && control.transport !== "claude-stream-json")) {
     throw new Error("Agent Host Provider control transport does not match its adapter.");
   }

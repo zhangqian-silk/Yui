@@ -510,9 +510,9 @@ Task 生命周期的交互选择只展示有效来源状态：activate 只展示
 
 ## Session 与 tmux
 
-受管理的 Provider 会话仍然是普通用户会话。Yui 只添加对应的 Role Skill 与 Session Manifest 指针，并通过 Provider 原生结构化协议提交 Task 工作；Yui 不接管完整对话历史。受管理输入绝不会作为终端按键、粘贴文本或启动 argv 发送。Codex 由每个存活的 Role Runtime 启动并持有独立的 `app-server` 子进程；Task execution stop 会终止 Agent Host 及其 Provider 进程组，start 会创建新的受控运行时，不再依赖共享 Codex daemon。原生 thread 历史仍由 Codex 保留，Task、WorkItem、代码与持久消息仍由 Yui 保留。Claude 继续使用独立的持久 stream-json 进程，并以精确回放的 user message 作为接收确认。
+受管理的 Provider 会话仍然是普通用户会话。Yui 只添加对应的 Role Skill 与 Session Manifest 指针，并通过 Provider 原生结构化协议提交 Task 工作；Yui 不接管完整对话历史。受管理输入绝不会作为终端按键、粘贴文本或启动 argv 发送。Codex 在只转发字节的 `app-server proxy` 上完成 App Server WebSocket 握手，接入与 Desktop 相同的共享 daemon；原生 thread 可在 Desktop 中直接查看和操作。Task execution stop 只终止 Yui 的 Agent Host、WebSocket 与 proxy，保留共享 daemon、原生 thread、Task、WorkItem、代码与持久消息；start 创建新的 attachment。Claude 继续使用独立的持久 stream-json 进程，并以精确回放的 user message 作为接收确认。
 
-Run、Conversation、Activation 与 Turn 是四个独立身份。Conversation 可以跨多个 Run 和客户端连接；Activation 只代表 Yui 当前的连接，而不是对 Provider thread 的独占所有权；Turn 在写入前先持久化。写入超时或结果不明确会进入 `delivery-unknown`，不会自动重发。已经存在的原生 active Turn 只会让 Yui 暂时等待，不会导致 Yui Run 失败；存活的受管理 Role 应通过 Yui 的 view/takeover 边界进行人工控制，避免其他客户端并发写入。
+Run、Conversation、Activation 与 Turn 是四个独立身份。Conversation 可以跨多个 Run 和客户端连接；Activation 只代表 Yui 当前的连接，而不是对 Provider thread 的独占所有权；Turn 在写入前先持久化。写入超时或结果不明确会进入 `delivery-unknown`，不会自动重发。Codex 已存在的原生 active Turn 只会让 Yui 暂时等待，不会导致 Yui Run 失败；Claude 等独立进程 Provider 继续通过 Yui 的 view/takeover 边界进行人工控制。
 
 Task Role 使用以下显式入口：
 
@@ -524,7 +524,7 @@ yui task role takeover <task-id> <role>
 yui task role release <task-id> <role>
 ```
 
-Codex Role thread 仍可在 Desktop 中查看，但存活的受管理 Role 应通过 `view`、`takeover`、`release` 进行人工控制；若要从其他客户端恢复该 thread，应先停止 Task execution。Yui 不写入全局 Hook/config，也不依赖或控制共享 Codex daemon。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议。
+Codex Role thread 可在 Desktop 中直接查看和操作；Desktop 已有 active Turn 时，Yui 只保留待投递工作并等待，不会失败或重复投递。`view`、`takeover`、`release` 继续作为 Claude 等独立进程 Provider 的人工控制入口。Yui 不写入全局 Hook/config，也不启动、重启或停止共享 daemon；Codex CLI/daemon 故障由 Task 生命周期之外修复。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议。
 
 当新版本需要离线迁移 Home 时，应等待当前 Turn/Run 完成，然后从普通 shell
 执行 `yui session stop --all`，再重新执行 `yui update`。停止命令会先整体预检：
@@ -560,7 +560,7 @@ state、receipt 与 pane fence。Yui 不会解析 prompt glyph、进度文本、
 或其他 Agent 终端输出来推断 ready 或 success。`captureRole()` 只用于显式的人类
 transcript 查看，不具备生命周期权威。
 
-稳定的 Role 上下文不会创建额外的 bootstrap Turn。Task execution Run 按角色使用通用 Leader 或 Worker Skill，review Run 则按持久 Run purpose 使用通用 Reviewer Skill；Provider 可以通过安全的追加式原生上下文通道携带 Skill，也可以在普通 Task 投递中指向它。这些都只是 Yui 自己拥有的可移植编排规则。Project Skills 始终是 Project 中正常版本化的文件，由 Agent 通过自身项目机制发现、选择并按需加载；Yui 不扫描、不解析、不复制，也不注入 Project Skills。Managed Codex 保留用户原有的 developer instructions；普通 Task 消息会携带精简的 Session Manifest 绝对路径，Manifest 再指向对应的 Yui Role Skill，供 Codex 按需读取。每个存活 Role 的 Yui-owned App Server 进程会加载所选 Codex 原生 config profile；model、effort、permission、workspace 与 shell 设置作为线程级 `thread/start` 或 `thread/resume` 配置传入，Yui 不修改底层 Codex 配置文件。App Server 原生通知是 Managed Codex 线程的生命周期权威；Yui 不为它安装 Hook，也不占用 `notify`。交互式 Codex Session 仍可使用 Yui 的结构化 `notify` callback，Doctor 会报告最终生效的配置冲突。`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 从 Yui 管理的私有 `0600` context 文件读取同一份 Yui Role Skill 内容，不再把大段或敏感文本放进 argv；重试和 resume 会复用按 purpose 区分的稳定路径。非 Operator 的 global Role 保持中性，不会注入 Task 编排 Skill。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake、Worker 和 Reviewer Run assignment 仍是邮箱投递的真实工作消息。
+稳定的 Role 上下文不会创建额外的 bootstrap Turn。Task execution Run 按角色使用通用 Leader 或 Worker Skill，review Run 则按持久 Run purpose 使用通用 Reviewer Skill；Provider 可以通过安全的追加式原生上下文通道携带 Skill，也可以在普通 Task 投递中指向它。这些都只是 Yui 自己拥有的可移植编排规则。Project Skills 始终是 Project 中正常版本化的文件，由 Agent 通过自身项目机制发现、选择并按需加载；Yui 不扫描、不解析、不复制，也不注入 Project Skills。Managed Codex 保留用户原有的 developer instructions；普通 Task 消息会携带精简的 Session Manifest 绝对路径，Manifest 再指向对应的 Yui Role Skill，供 Codex 按需读取。model、effort、permission、workspace 与 shell 设置作为共享 daemon 上的线程级 `thread/start` 或 `thread/resume` 配置传入；Codex 原生 config profile 因无法隔离到单条共享 thread 而被拒绝，Yui 不修改底层 Codex 配置文件。App Server 原生通知是 Managed Codex 线程的生命周期权威；Yui 不为它安装 Hook，也不占用 `notify`。交互式 Codex Session 仍可使用 Yui 的结构化 `notify` callback，Doctor 会报告最终生效的配置冲突。`skills.config` 只负责启停已发现 Skill，Yui 不会误用它。Claude 从 Yui 管理的私有 `0600` context 文件读取同一份 Yui Role Skill 内容，不再把大段或敏感文本放进 argv；重试和 resume 会复用按 purpose 区分的稳定路径。非 Operator 的 global Role 保持中性，不会注入 Task 编排 Skill。因此 Operator 会停在空白的原生 composer，用户输入仍是第一条 user message；Leader wake、Worker 和 Reviewer Run assignment 仍是邮箱投递的真实工作消息。
 
 ## Controller 与失败处理
 

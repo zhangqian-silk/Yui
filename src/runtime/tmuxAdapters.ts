@@ -615,7 +615,7 @@ export class TmuxSessionHost implements SessionHostPort {
           : { [YUI_TASK_RUNTIME_DESCRIPTOR]: frozenTaskRuntime })
       }
     };
-    let hostCreated: boolean;
+    let hostCreated = false;
     let providerAcknowledged = false;
     let providerDeliveryUnknown = false;
     let providerBusy = false;
@@ -692,6 +692,18 @@ export class TmuxSessionHost implements SessionHostPort {
       }
     } catch (error) {
       broker.revoke(request.launchId);
+      if (hostCreated && !providerDispatchObserved) {
+        try {
+          await stopExactRole(this.tmux, hostId, request.owner.roleName);
+        } catch (stopError) {
+          throw new Error(
+            `Managed Provider launch failed and its disposable Agent Host could not be stopped: ${
+              stopError instanceof Error ? stopError.message : String(stopError)
+            }`,
+            { cause: stopError }
+          );
+        }
+      }
       throw error;
     }
     if (

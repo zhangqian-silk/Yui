@@ -254,21 +254,20 @@ Yui's current attachment, not exclusive ownership of the Provider thread. One
 Turn identifies one provider-native execution. Yui's authority epoch fences
 only Yui's own submissions and retries.
 
-Codex Task threads remain ordinary native sessions and can be inspected in
-Desktop. While their managed Role runtime is live, writes go through Yui's
-view/takeover boundary; stop Task execution before resuming the thread from a
-different client. If Yui observes a pre-existing active Turn during resume, it
-keeps its pending Run/message until that Turn settles. Global interactive entry
-remains a native session-lifecycle operation outside the Task delivery contract.
+Codex Task threads remain ordinary native sessions and can be opened and used
+directly in Desktop. If a direct user Turn is active, Yui keeps its pending
+Run/message until that Turn settles. Global interactive entry remains a native
+session-lifecycle operation outside the Task delivery contract.
 
-Codex uses a Yui-owned direct `app-server` child to create or resume a normal
-thread. The process loads the selected native config profile; Role model,
-effort, permission, workspace, and shell settings are passed at
+Codex establishes an App Server WebSocket through the byte-forwarding
+`app-server proxy` to create or resume a normal thread on the shared daemon.
+Role model, effort, permission, workspace, and shell settings are passed at
 `thread/start`/`thread/resume`, while the ordinary Task message points to the
 Session Manifest and matching Role Skill. Yui does not write either to global
-Codex config. The Agent Host owns the Provider process group, so Task execution
-stop can end the complete runtime and start can rebuild it without depending on
-the shared Codex daemon.
+Codex config. A native Codex profile is rejected because it cannot be isolated
+to one shared-daemon thread. The Agent Host owns only its proxy and WebSocket:
+Task execution stop discards the Yui attachment without waiting for or changing
+the daemon or native thread, and start creates a new attachment.
 Claude uses a persistent stream-json
 transport with exact user-message replay acknowledgement. In both cases, Yui
 records Turn intent before writing, accepts only exact Provider evidence, and

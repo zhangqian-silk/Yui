@@ -2,9 +2,8 @@
 
 Yui treats a provider conversation as the user's conversation. It adds the
 Role's Yui Skill and a pointer to the Session Manifest, then uses provider-native
-requests to deliver durable Task work. Yui does not own the transcript. Writes
-to a live managed Role go through Yui's control boundary; after Task execution
-stops, the native conversation remains available to its Provider clients.
+requests to deliver durable Task work. Yui does not own the transcript or
+require every user interaction to pass through Yui.
 
 Task state and conversation state have different responsibilities:
 
@@ -34,13 +33,16 @@ Task/Message -> Yui Run + delivery intent -> ordinary provider Turn
 Yui's internal authority epoch fences only Yui's own submissions and retries.
 It is not a claim that Yui is the only client allowed to use the conversation.
 
-## Codex: Yui-owned App Server processes
+## Codex: ordinary shared-daemon threads
 
-Managed Codex starts one direct `codex app-server` child for a live Role
-runtime. The Agent Host owns that process group, so a Task execution stop ends
-the complete Yui runtime without depending on or changing Codex's shared daemon.
-Starting execution creates a new owned runtime process. Native thread history
-remains in Codex and durable Task state remains in Yui.
+Managed Codex establishes the App Server WebSocket protocol through the
+byte-forwarding `codex app-server proxy` and reaches the same native daemon used
+by interactive Codex clients. The daemon owns the thread and its writer state.
+The Agent Host owns only its disposable proxy process and WebSocket attachment.
+
+The shared daemon must already be available through the installed Codex client.
+Yui never starts, restarts, or stops it in response to a Task, thread, or proxy
+error; daemon/CLI repair remains outside Task lifecycle recovery.
 
 For a new Role conversation Yui calls `thread/start` with:
 
@@ -55,23 +57,25 @@ instructions intact. No Yui-specific hook configuration is written to the
 user's global Codex config.
 
 The returned `threadId` is the Role's native Session identity already retained
-by the Task Role Session Set. It remains a normal Codex thread and may be listed
-or inspected by Codex clients, but concurrent outside writes to a live
-Yui-managed Role are unsupported. Use Yui's view/takeover boundary or stop Task
-execution before another client resumes the thread.
+by the Task Role Session Set. It remains an ordinary Codex thread that is
+visible and directly usable in Desktop. Yui does not require a takeover to use
+it from another native Codex client.
 
 If an already-running native Turn is observed while Yui resumes a thread, Yui
 classifies its attempted delivery as `busy`. The Run and mailbox batch stay
 pending until that native Turn settles.
 
-If the direct App Server disconnects, the Agent Host may start a bounded
-replacement process and resume the same thread from exact native history.
-Stopping Task execution instead terminates the Host and child process group;
-it does not delete or archive the native thread.
+If a proxy disconnects, the Agent Host may attach a bounded replacement client
+and resume the same thread from exact native history. Task execution stop
+terminates the Agent Host and proxy, but leaves the shared daemon and native
+thread untouched. Start creates a new proxy attachment. A failed fresh
+attachment is stopped and its launch reservation is released; it cannot leave
+`runtimeCleanupPending` as a prerequisite for the next attempt.
 
-Because each App Server is process-isolated, a Codex native config profile and
-other process-level Role configuration can be applied without leaking to other
-managed or interactive threads. Yui never mutates the underlying Codex config.
+A Codex native config profile is rejected for Managed Codex because it cannot
+be scoped to one shared-daemon thread. Role model, effort, permissions,
+workspace, and shell settings remain thread-scoped. Yui never mutates the
+underlying Codex config.
 
 ## Claude Code: independent structured process
 
@@ -80,8 +84,9 @@ Managed Claude continues to use a persistent `--input-format stream-json` and
 preallocates the native Session ID and accepts a submitted Turn only after
 Claude replays the exact user message for that Session.
 
-The tmux view/takeover gateway is the supported human-control boundary for a
-live managed Provider process, including Codex and Claude.
+The tmux view/takeover gateway remains the human-control boundary for providers
+with an independent managed process, such as Claude. Codex users operate the
+ordinary shared thread directly in Desktop.
 
 ## Delivery outcomes
 
@@ -124,5 +129,5 @@ without exact Provider-native missing evidence.
 4. A busy ordinary thread keeps Yui work pending instead of failing the Run.
 5. Exact missing evidence is required before replacing a conversation.
 6. Yui Skill/config does not mutate global Codex config.
-7. The Agent Host owns every Provider child process used by its Role runtime;
-   Task stop can terminate that runtime without a shared service dependency.
+7. Task stop owns and terminates every Yui Agent Host and proxy without treating
+   the shared Codex daemon or native conversation as Task cleanup.

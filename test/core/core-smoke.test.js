@@ -30,6 +30,7 @@ import {
   startReviewRound
 } from "../../dist/review/reviewRound.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
+import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import { createAsyncRuntimeObserver } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
@@ -85,7 +86,7 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   assert.equal(commands.includes("task role session switch"), false);
 });
 
-test("Managed Codex uses a Yui-owned direct App Server process", () => {
+test("Managed Codex shares the native App Server used by interactive clients", () => {
   const adapter = resolveAgentAdapter("codex");
   const launch = adapter.compileManagedControl({
     agent: {
@@ -103,20 +104,71 @@ test("Managed Codex uses a Yui-owned direct App Server process", () => {
       adapterId: "codex",
       model: "gpt-5.6-sol",
       effort: "xhigh",
+      permission: { strategy: "bypass" }
+    },
+    workspace: "/tmp/yui-shared-codex-runtime"
+  }, "new");
+
+  assert.equal(launch.transport, "codex-app-server-proxy");
+  assert.deepEqual(launch.argv.slice(-2), ["app-server", "proxy"]);
+  assert.throws(() => adapter.compileManagedControl({
+    agent: {
+      schemaVersion: 2,
+      id: "codex",
+      adapterId: "codex",
+      command: "codex",
+      baseArgs: [],
+      environment: [],
+      createdAt: "2026-08-30T00:00:00.000Z",
+      updatedAt: "2026-08-30T00:00:00.000Z",
+      source: "custom"
+    },
+    config: {
+      adapterId: "codex",
       permission: { strategy: "bypass" },
       profile: "operator"
     },
-    workspace: "/tmp/yui-owned-codex-runtime"
-  }, "new");
+    workspace: "/tmp/yui-shared-codex-runtime"
+  }, "new"), /cannot be scoped to one shared-daemon thread/u);
+});
 
-  assert.equal(launch.transport, "codex-app-server");
-  assert.deepEqual(launch.argv.slice(-1), ["app-server"]);
-  assert.equal(launch.argv.includes("proxy"), false);
-  assert.equal(launch.argv.includes("daemon"), false);
-  assert.deepEqual(
-    launch.argv.slice(launch.argv.indexOf("--profile"), launch.argv.indexOf("--profile") + 2),
-    ["--profile", "operator"]
-  );
+test("Managed Codex performs the App Server WebSocket handshake through its proxy", async (t) => {
+  let session;
+  t.after(() => session?.terminate("SIGTERM"));
+  let resolveTerminal;
+  const terminalPromise = new Promise((resolvePromise) => {
+    resolveTerminal = resolvePromise;
+  });
+  const attemptId = "fake-attempt-1";
+  const started = await startStructuredProviderSession({
+    schemaVersion: 1,
+    launchId: "fake-launch-1",
+    command: process.execPath,
+    args: [join(root, "test", "fixtures", "fake-codex-app-server-proxy.mjs")],
+    environment: bareEnv,
+    cwd: root,
+    childLifecycle: "persistent",
+    startMode: "provider",
+    providerControl: {
+      schemaVersion: 1,
+      adapterId: "codex",
+      transport: "codex-app-server-proxy",
+      kind: "new",
+      mode: "new",
+      sessionTitle: "Yui proxy handshake smoke",
+      authority: { epoch: 1, owner: "controller", holderId: "core-smoke" },
+      codexThread: { model: "gpt-5.6-luna", approvalPolicy: "never", sandbox: "read-only" },
+      initialTurn: { attemptId, boundedText: "handshake smoke" }
+    }
+  }, { onTerminal: resolveTerminal, mirrorOutput: () => {} });
+  session = started.session;
+  const receipt = await session.submitTurn({ attemptId, boundedText: "handshake smoke" });
+  const terminal = await terminalPromise;
+
+  assert.equal(receipt.conversationId, "fake-thread-1");
+  assert.equal(receipt.nativeTurnId, "fake-turn-1");
+  assert.equal(terminal.status, "completed");
+  assert.equal(terminal.clientOwned, true);
 });
 
 test("Task execution can be fenced without changing semantic progress", () => {

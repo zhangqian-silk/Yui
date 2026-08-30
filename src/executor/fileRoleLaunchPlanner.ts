@@ -644,8 +644,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       if (owner.scope !== "task" || input.runId === undefined) {
         args = addCodexSessionNotify(args, launchMode, this.#cliPath);
       }
-      // Managed Codex Runs use Yui-owned App Server processes. Their Session
-      // Manifest points at the Yui Skills; no Yui Hook config is installed.
+      // Managed Codex Runs use disposable proxy clients against the shared
+      // native App Server. Their Session Manifest points at the Yui Skills;
+      // no Yui Hook config is installed.
       if (owner.scope === "task" && input.runId !== undefined) {
         if (managedRun === null || managedRun.status !== "active") {
           throw new Error(`Managed Codex Run is no longer active: ${input.runId}.`);

@@ -273,7 +273,7 @@ export async function runAgentHost(input: Readonly<{
       providerControl: {
         schemaVersion: 1,
         adapterId: "codex",
-        transport: "codex-app-server",
+        transport: "codex-app-server-proxy",
         kind: "ensure",
         mode: "resume",
         nativeSessionId: disconnectedSession.nativeSessionId,
@@ -385,7 +385,7 @@ export async function runAgentHost(input: Readonly<{
           ...(activeTurnAttemptId === undefined ? {} : { attemptId: activeTurnAttemptId }),
           ...(activeNativeTurnId === undefined ? {} : { nativeTurnId: activeNativeTurnId }),
           ...exitAuthority,
-          detail: "Codex App Server disconnected; starting a replacement process."
+          detail: "Codex App Server proxy disconnected; attaching a replacement client."
         }));
         await reconnectCodexClient(providerSession, currentPayload);
         return;

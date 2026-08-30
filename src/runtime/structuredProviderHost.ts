@@ -3,6 +3,10 @@ import {
   type ChildProcessWithoutNullStreams
 } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type { Socket } from "node:net";
+import { Duplex } from "node:stream";
+
+import WebSocket, { type RawData } from "ws";
 
 import {
   CodexAppServerRequestError,
@@ -17,6 +21,7 @@ import { PROVIDER_ACCEPT_TIMEOUT_MS } from "./runtimeDeadlines.js";
 import { YUI_VERSION } from "../version.js";
 
 const PROVIDER_MESSAGE_MAX_BYTES = 16 * 1024 * 1024;
+const CODEX_PROXY_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export type StructuredProviderTurnReceipt = Readonly<{
   attemptId: string;
@@ -162,27 +167,62 @@ export async function startStructuredProviderSession(
 
 type JsonObject = Record<string, unknown>;
 
-class JsonLineChannel {
+class CodexProxyWebSocketChannel {
   readonly #pending = new Map<string, Readonly<{
     resolve: (value: JsonObject) => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
   }>>();
   readonly #listeners = new Set<(message: JsonObject) => void>();
-  #buffer = "";
   #nextId = 1;
   #closedError: Error | undefined;
+  #ready = false;
+  readonly #readyPromise: Promise<void>;
+  readonly #resolveReady: () => void;
+  readonly #rejectReady: (error: Error) => void;
+  readonly #webSocket: WebSocket;
 
-  constructor(
+  private constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly mirror: (stream: "stdout" | "stderr", text: string) => void
   ) {
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.#receive(chunk));
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    this.#readyPromise = new Promise<void>((resolvePromise, reject) => {
+      resolveReady = resolvePromise;
+      rejectReady = reject;
+    });
+    this.#resolveReady = resolveReady;
+    this.#rejectReady = rejectReady;
+    const transport = new ChildProcessDuplex(child);
+    this.#webSocket = new WebSocket("ws://localhost/rpc", {
+      createConnection: () => transport as unknown as Socket,
+      handshakeTimeout: CODEX_PROXY_HANDSHAKE_TIMEOUT_MS,
+      maxPayload: PROVIDER_MESSAGE_MAX_BYTES,
+      perMessageDeflate: false
+    });
+    this.#webSocket.once("open", () => {
+      this.#ready = true;
+      this.#resolveReady();
+    });
+    this.#webSocket.on("message", (data, isBinary) => this.#receive(data, isBinary));
+    this.#webSocket.on("error", (error) => this.#close(error));
+    this.#webSocket.once("close", (code, reason) => this.#close(new Error(
+      `Codex App Server proxy WebSocket closed (code=${code}, reason=${reason.toString() || "none"}).`
+    )));
     child.once("error", (error) => this.#close(error));
     child.once("close", (code, signal) => this.#close(new Error(
       `Provider process exited before replying (code=${code ?? "none"}, signal=${signal ?? "none"}).`
     )));
+  }
+
+  static async connect(
+    child: ChildProcessWithoutNullStreams,
+    mirror: (stream: "stdout" | "stderr", text: string) => void
+  ): Promise<CodexProxyWebSocketChannel> {
+    const channel = new CodexProxyWebSocketChannel(child, mirror);
+    await channel.#readyPromise;
+    return channel;
   }
 
   onMessage(listener: (message: JsonObject) => void): () => void {
@@ -191,6 +231,7 @@ class JsonLineChannel {
   }
 
   async request(method: string, params: JsonObject): Promise<JsonObject> {
+    await this.#readyPromise;
     if (this.#closedError !== undefined) throw this.#closedError;
     const id = String(this.#nextId++);
     const response = new Promise<JsonObject>((resolvePromise, reject) => {
@@ -215,6 +256,146 @@ class JsonLineChannel {
 
   async notify(method: string, params?: JsonObject): Promise<void> {
     await this.send({ method, ...(params === undefined ? {} : { params }) });
+  }
+
+  async send(message: JsonObject): Promise<void> {
+    await this.#readyPromise;
+    if (this.#closedError !== undefined) throw this.#closedError;
+    const encoded = JSON.stringify(message);
+    if (Buffer.byteLength(encoded, "utf8") > PROVIDER_MESSAGE_MAX_BYTES) {
+      throw new Error("Provider request exceeds its message bound.");
+    }
+    await new Promise<void>((resolvePromise, reject) => {
+      this.#webSocket.send(encoded, (error) => {
+        if (error === undefined || error === null) resolvePromise();
+        else reject(error);
+      });
+    });
+  }
+
+  #receive(data: RawData, isBinary: boolean): void {
+    const encoded = Buffer.isBuffer(data)
+      ? data
+      : data instanceof ArrayBuffer
+        ? Buffer.from(data)
+        : Buffer.concat(data);
+    if (isBinary || encoded.byteLength > PROVIDER_MESSAGE_MAX_BYTES) {
+      this.#close(new Error(isBinary
+        ? "Provider returned an unsupported binary WebSocket message."
+        : "Provider response message exceeds its bound."));
+      terminateProcessGroup(this.child, "SIGTERM");
+      return;
+    }
+    const text = encoded.toString("utf8");
+    this.mirror("stdout", `${text}\n`);
+    let message: JsonObject;
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return;
+      message = parsed as JsonObject;
+    } catch {
+      return;
+    }
+    const id = requestId(message.id);
+    const pending = id === undefined ? undefined : this.#pending.get(id);
+    if (pending !== undefined) {
+      clearTimeout(pending.timer);
+      this.#pending.delete(id!);
+      const error = object(message.error);
+      if (error !== null) {
+        pending.reject(new CodexAppServerRequestError(
+          typeof error.code === "number" || typeof error.code === "string"
+            ? error.code
+            : "UNKNOWN",
+          typeof error.message === "string" ? error.message : "Provider request failed.",
+          error.data
+        ));
+      } else {
+        pending.resolve(object(message.result) ?? {});
+      }
+      return;
+    }
+    for (const listener of this.#listeners) listener(message);
+  }
+
+  #close(error: Error): void {
+    if (this.#closedError !== undefined) return;
+    this.#closedError = error;
+    if (!this.#ready) this.#rejectReady(error);
+    for (const pending of this.#pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.#pending.clear();
+    if (this.child.exitCode === null && this.child.signalCode === null) {
+      terminateProcessGroup(this.child, "SIGTERM");
+    }
+  }
+}
+
+class ChildProcessDuplex extends Duplex {
+  readonly connecting = false;
+
+  constructor(private readonly child: ChildProcessWithoutNullStreams) {
+    super();
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (!this.push(chunk)) child.stdout.pause();
+    });
+    child.stdout.once("end", () => this.push(null));
+    child.once("error", (error) => this.destroy(error));
+    child.once("close", () => this.destroy());
+  }
+
+  override _read(): void {
+    this.child.stdout.resume();
+  }
+
+  override _write(
+    chunk: Buffer | string,
+    encoding: BufferEncoding,
+    callback: (error?: Error | null) => void
+  ): void {
+    this.child.stdin.write(chunk, encoding, callback);
+  }
+
+  override _final(callback: (error?: Error | null) => void): void {
+    this.child.stdin.end(callback);
+  }
+
+  setNoDelay(): this {
+    return this;
+  }
+
+  setKeepAlive(): this {
+    return this;
+  }
+
+  setTimeout(_timeout: number, callback?: () => void): this {
+    if (callback !== undefined) this.once("timeout", callback);
+    return this;
+  }
+}
+
+class JsonLineChannel {
+  readonly #listeners = new Set<(message: JsonObject) => void>();
+  #buffer = "";
+  #closedError: Error | undefined;
+
+  constructor(
+    private readonly child: ChildProcessWithoutNullStreams,
+    private readonly mirror: (stream: "stdout" | "stderr", text: string) => void
+  ) {
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => this.#receive(chunk));
+    child.once("error", (error) => this.#close(error));
+    child.once("close", (code, signal) => this.#close(new Error(
+      `Provider process exited (code=${code ?? "none"}, signal=${signal ?? "none"}).`
+    )));
+  }
+
+  onMessage(listener: (message: JsonObject) => void): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
   }
 
   async send(message: JsonObject): Promise<void> {
@@ -245,45 +426,18 @@ class JsonLineChannel {
       const line = this.#buffer.slice(0, newline).trim();
       this.#buffer = this.#buffer.slice(newline + 1);
       if (line.length === 0) continue;
-      let message: JsonObject;
       try {
         const parsed: unknown = JSON.parse(line);
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-        message = parsed as JsonObject;
+        for (const listener of this.#listeners) listener(parsed as JsonObject);
       } catch {
         continue;
       }
-      const id = requestId(message.id);
-      const pending = id === undefined ? undefined : this.#pending.get(id);
-      if (pending !== undefined) {
-        clearTimeout(pending.timer);
-        this.#pending.delete(id!);
-        const error = object(message.error);
-        if (error !== null) {
-          pending.reject(new CodexAppServerRequestError(
-            typeof error.code === "number" || typeof error.code === "string"
-              ? error.code
-              : "UNKNOWN",
-            typeof error.message === "string" ? error.message : "Provider request failed.",
-            error.data
-          ));
-        } else {
-          pending.resolve(object(message.result) ?? {});
-        }
-        continue;
-      }
-      for (const listener of this.#listeners) listener(message);
     }
   }
 
   #close(error: Error): void {
-    if (this.#closedError !== undefined) return;
-    this.#closedError = error;
-    for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(error);
-    }
-    this.#pending.clear();
+    if (this.#closedError === undefined) this.#closedError = error;
   }
 }
 
@@ -317,7 +471,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
     session: CodexStructuredProviderSession;
     recoveredTerminal?: StructuredProviderTurnTerminal;
   }>> {
-    const channel = new JsonLineChannel(child, mirror);
+    const channel = await CodexProxyWebSocketChannel.connect(child, mirror);
     const openingMessages: JsonObject[] = [];
     const stopOpeningBuffer = channel.onMessage((message) => openingMessages.push(message));
     await channel.request("initialize", {
