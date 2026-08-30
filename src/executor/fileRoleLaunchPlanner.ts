@@ -88,7 +88,6 @@ import type {
   AgentHostProviderControl,
   ProviderOwnedTurn
 } from "../runtime/launchBroker.js";
-import { freshConversationLaunchAllowed } from "../runtime/conversationSwitch.js";
 import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
 import { currentProviderActivation } from "../runtime/providerRuntimeIdentity.js";
 import {
@@ -217,7 +216,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   }>): void {
     const task = this.store.getTask(input.taskId);
     const role = this.store.getRole(input.taskId, input.roleName);
-    if (task === null || task.status !== "active" || role === null) {
+    if (task === null
+      || task.status !== "active"
+      || task.executionGate.state !== "enabled"
+      || role === null) {
       throw new Error(`Task runtime is not current: ${input.taskId}/${input.roleName}.`);
     }
     const run = this.store.getActiveAgentRun(input.taskId, input.roleName);
@@ -261,7 +263,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
     const task = this.store.getTask(input.taskId);
     if (task === null) throw new Error(`Task not found: ${input.taskId}.`);
-    if (task.status !== "active") throw new Error(`Task is not active: ${input.taskId}.`);
+    if (task.status !== "active" || task.executionGate.state !== "enabled") {
+      throw new Error(`Task execution is not enabled: ${input.taskId}.`);
+    }
     const role = this.store.getRole(input.taskId, input.roleName);
     if (role === null) throw new Error(`Role not found: ${input.taskId}/${input.roleName}.`);
     const activeRun = this.store.getActiveAgentRun(task.id, role.name);
@@ -365,19 +369,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       );
     }
     if (input.mode === "new" && sessionSet !== null
-      && !freshConversationLaunchAllowed({
-        sessions: sessionSet,
-        events: this.store.listEvents(task.id),
-        mailbox: this.store.getWorkMailbox({
-          kind: "role",
-          taskId: task.id,
-          roleName: role.name
-        }),
-        roleName: role.name,
-        ...(input.runId === undefined ? {} : { candidateRunId: input.runId })
-      })) {
+      && activeLiveRoleAgentSession(sessionSet) !== null) {
       throw new Error(
-        `Fresh Provider Conversation is not authorized: ${task.id}/${role.name}.`
+        `Task Role still has a live Session: ${task.id}/${role.name}.`
       );
     }
     return this.#compile(

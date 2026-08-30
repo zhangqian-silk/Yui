@@ -1083,7 +1083,7 @@ async function prepareActiveWorkspaces(
     : [...selection.allRoleTaskIds].flatMap((taskId) => {
         if (selection.blockedTaskIds?.has(taskId)) return [];
         const task = store.getTask(taskId);
-        return task?.status === "active" ? [task] : [];
+        return task?.status === "active" && task.executionGate.state === "enabled" ? [task] : [];
       });
   const failed = new Set<string>();
   const ready = new Set<string>();
@@ -1988,7 +1988,8 @@ export class FileTaskController {
 
   #scheduleTaskPassRetry(scope: DirtyTaskReconcileScope): void {
     if (this.#stopped || this.#pendingFull) return;
-    if (this.store.getTask(scope.taskId)?.status !== "active") {
+    const task = this.store.getTask(scope.taskId);
+    if (task?.status !== "active" || task.executionGate.state !== "enabled") {
       this.#clearTaskPassRetry(scope.taskId);
       return;
     }
@@ -2018,7 +2019,9 @@ export class FileTaskController {
       this.#taskPassRetryTimers.delete(scope.taskId);
       if (this.#stopped || this.#pendingFull) return;
       try {
-        if (this.store.getTask(scope.taskId)?.status !== "active") {
+        const currentTask = this.store.getTask(scope.taskId);
+        if (currentTask?.status !== "active"
+          || currentTask.executionGate.state !== "enabled") {
           this.#clearTaskPassRetry(scope.taskId);
           return;
         }

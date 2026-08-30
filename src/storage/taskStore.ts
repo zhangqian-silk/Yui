@@ -225,7 +225,7 @@ export const CURRENT_PROJECT_SCHEMA_VERSION = 5 as const;
 export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
-export const CURRENT_TASK_SCHEMA_VERSION = 5 as const;
+export const CURRENT_TASK_SCHEMA_VERSION = 6 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
@@ -1051,7 +1051,7 @@ export class FileTaskStore implements TaskStore {
     // The file rollback backend has no catalog index, so it filters the loaded
     // aggregate. Layout-7 Controller hot paths use SQLite's bounded selector.
     return this.listTasks()
-      .filter((task) => task.status === "active")
+      .filter((task) => task.status === "active" && task.executionGate.state === "enabled")
       .map((task) => task.id);
   }
   getStateRevision(): number { return this.#state().revision; }
@@ -1069,6 +1069,7 @@ export class FileTaskStore implements TaskStore {
       task: {
         id: aggregate.task.id,
         status: aggregate.task.status,
+        executionGate: aggregate.task.executionGate,
         projectBindings: aggregate.task.projectBindings,
         type: aggregate.task.type
       },
@@ -1115,7 +1116,6 @@ export class FileTaskStore implements TaskStore {
         values(aggregate.events, "id"),
         "agent-run"
       ),
-      roleSessionSets: this.listRoleSessionSets(taskId),
       managedWorkspaces: values(aggregate.managedWorkspaces, (workspace) => managedWorkspaceKey(workspace.owner)),
       durableJobs: values(aggregate.durableJobs, "id"),
       integrationQueueEntries: values(aggregate.integrationQueue, "id"),
@@ -1877,6 +1877,10 @@ export class FileTaskStore implements TaskStore {
     }
     if (run.status !== "active") throw new StorageRecordError(`Active Agent run must have active status: ${run.id}`);
     this.transaction((store) => {
+      const task = store.getTask(run.taskId);
+      if (task === null || task.status !== "active" || task.executionGate.state !== "enabled") {
+        throw new StorageRecordError(`Task execution is not enabled: ${run.taskId}.`);
+      }
       const current = store.getActiveAgentRun(run.taskId, run.roleName);
       if (current !== null && current.id !== run.id) {
         throw new StorageRecordError(`Role already has an active Agent run: ${run.taskId}/${run.roleName}`);
@@ -1941,6 +1945,10 @@ export class FileTaskStore implements TaskStore {
       throw new StorageRecordError(`Lane active Agent run requires execution lineage: ${run.id}`);
     }
     this.transaction((store) => {
+      const task = store.getTask(run.taskId);
+      if (task === null || task.status !== "active" || task.executionGate.state !== "enabled") {
+        throw new StorageRecordError(`Task execution is not enabled: ${run.taskId}.`);
+      }
       const key = executionLaneActiveRunKey(run.executionGroupId!, run.executionLaneId!);
       const current = store.getActiveExecutionLaneRun(
         run.taskId,

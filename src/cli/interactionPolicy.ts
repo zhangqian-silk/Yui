@@ -410,20 +410,6 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       { argumentIndex: 5, entity: "agent", provider: "configured-agents", actionTarget: false }
     ]
   })),
-  {
-    commandPath: ["task", "role", "session", "switch"],
-    selectors: [
-      { argumentIndex: 4, entity: "task", provider: "tasks", actionTarget: true, statuses: ["active"] },
-      {
-        argumentIndex: 5,
-        entity: "task-role",
-        provider: "task-roles",
-        dependsOn: 4,
-        actionTarget: true
-      }
-    ],
-    trailingOptions: { "--reason": "value" }
-  },
   ...["view", "takeover", "release"].map((command): InteractionPolicy => ({
     commandPath: ["task", "role", command],
     selectors: [

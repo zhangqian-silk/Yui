@@ -549,18 +549,18 @@ yui operator new
 yui operator enter
 ```
 
-When a Task Role's current Provider Conversation cannot continue, request a
-bounded switch with an audited reason:
+If current execution cannot be settled normally, fence the Task and restart
+from its durable progress:
 
 ```sh
-yui task role session switch <task-id> <role> --reason "<why this conversation cannot continue>"
+yui task execution stop <task-id> --force --reason "<why execution must be fenced>"
+yui task execution start <task-id>
 ```
 
-The command records intent only. It does not fail active work, stop a live
-runtime, or forget the current Conversation. Once the Role has ready work and
-the current writer/Turn is settled, Yui creates and binds the replacement; a
-failure before that bind leaves the old Conversation authoritative. Existing
-messages, reviews, and delivery history remain durable.
+`stop` terminates disposable Runs and Sessions while preserving WorkItems,
+repository changes, Messages, reviews, and other Task progress. `start` admits
+one new Leader attempt from those durable records; it does not recover an old
+Agent conversation.
 
 Without `--task`, `operator submit` creates a new Draft. Drafts accept planning changes but must be activated before Agent execution.
 Operator resolves every request against the Project catalog and existing Task

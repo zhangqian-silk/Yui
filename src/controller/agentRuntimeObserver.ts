@@ -298,12 +298,16 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
     // FileTaskStore remains a development/compatibility fallback. The normal
     // Controller store is SQLite and must discover only its indexed hot set.
     const activeTasks = indexedTaskIds === undefined
-      ? this.store.listTasks().filter((task) => task.status === "active")
+      ? this.store.listTasks().filter((task) => (
+          task.status === "active" && task.executionGate.state === "enabled"
+        ))
       : [...new Set(indexedTaskIds)]
         .sort(numericCompare)
         .map((taskId) => this.store.getTask(taskId))
         .filter((task): task is NonNullable<typeof task> => (
-          task !== null && task.status === "active"
+          task !== null
+          && task.status === "active"
+          && task.executionGate.state === "enabled"
         ));
     for (const task of activeTasks) {
       // A Task still incurs one O(E) event projection. Group those observations

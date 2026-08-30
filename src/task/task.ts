@@ -11,6 +11,7 @@ export type TaskStatus =
   | "retired"
   | "archived";
 export type TaskCompletedBy = "user" | "operator" | "leader";
+export type TaskExecutionState = "enabled" | "stopped";
 
 export type TaskProjectBinding = Readonly<{
   projectId: string;
@@ -41,7 +42,7 @@ export type TaskMetadataUpdate = Partial<{
 }>;
 
 export type Task = {
-  schemaVersion: 5;
+  schemaVersion: 6;
   id: string;
   title: string;
   /** Project-defined intent; it describes the request, never its execution topology. */
@@ -61,6 +62,8 @@ export type Task = {
    */
   workspaceIdentity?: TaskWorkspaceIdentity;
   status: TaskStatus;
+  /** Independent execution admission gate; semantic Task progress is preserved while stopped. */
+  executionGate: Readonly<{ state: TaskExecutionState }>;
   completedAt?: string;
   completedBy?: TaskCompletedBy;
   completionSummary?: string;
@@ -79,11 +82,12 @@ export type Task = {
 export function createTask(id: string, title: string, now: Date, metadata: TaskMetadata = {}): Task {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: requireSafeIdentity(id, "Task id"),
     title: requireText(title, "Task title"),
     ...cloneMetadata(metadata),
     status: "draft",
+    executionGate: { state: "enabled" },
     createdAt: timestamp,
     updatedAt: timestamp
   };
@@ -290,13 +294,48 @@ export function isTaskArchived(task: Task): boolean {
   return task.status === "archived";
 }
 
+export function isTaskExecutionEnabled(task: Task): boolean {
+  return task.executionGate.state === "enabled";
+}
+
+export function stopTaskExecution(task: Task, now: Date): Task {
+  validateTask(task);
+  if (task.status !== "active") {
+    throw new Error(`Only an active Task can be stopped: ${task.id}.`);
+  }
+  if (task.executionGate.state === "stopped") return task;
+  return validateTask({
+    ...task,
+    executionGate: { state: "stopped" },
+    updatedAt: now.toISOString()
+  });
+}
+
+export function startTaskExecution(task: Task, now: Date): Task {
+  validateTask(task);
+  if (task.status !== "active") {
+    throw new Error(`Only an active Task can be started: ${task.id}.`);
+  }
+  if (task.executionGate.state === "enabled") return task;
+  return validateTask({
+    ...task,
+    executionGate: { state: "enabled" },
+    updatedAt: now.toISOString()
+  });
+}
+
 export function validateTask(task: Task): Task {
-  if (task.schemaVersion !== 5) throw new Error("Task must use schemaVersion 5.");
+  if (task.schemaVersion !== 6) throw new Error("Task must use schemaVersion 6.");
   requireSafeIdentity(task.id, "Task id");
   requireText(task.title, "Task title");
   if (task.type !== undefined) requireSafeIdentity(task.type, "Task type");
   if (!(["draft", "active", "completed", "retired", "archived"] as const).includes(task.status)) {
     throw new Error(`Task status is invalid: ${String(task.status)}.`);
+  }
+  if (task.executionGate === null
+    || typeof task.executionGate !== "object"
+    || !(["enabled", "stopped"] as const).includes(task.executionGate.state)) {
+    throw new Error(`Task execution state is invalid: ${String(task.executionGate?.state)}.`);
   }
   requireTimestamp(task.createdAt, "Task createdAt");
   requireTimestamp(task.updatedAt, "Task updatedAt");

@@ -24,6 +24,8 @@ export function queueLeaderWakeupAfterYield(
   now: Date
 ): PendingWakeup | null {
   if (run.taskId !== task.id) throw new Error(`AgentRun belongs to another Task: ${run.taskId}.`);
-  if (task.status !== "active" || run.roleName === "leader") return null;
+  if (task.status !== "active" || task.executionGate.state !== "enabled" || run.roleName === "leader") {
+    return null;
+  }
   return queueLeaderWakeup(store, task.id, wakeReason("role-result"), now);
 }

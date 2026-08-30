@@ -47,7 +47,9 @@ export class ProviderContinuationReconciliationService {
 
   async reconcile(now: Date): Promise<readonly string[]> {
     const changedTaskIds = new Set<string>();
-    for (const task of this.store.listTasks().filter((entry) => entry.status === "active")) {
+    for (const task of this.store.listTasks().filter((entry) => (
+      entry.status === "active" && entry.executionGate.state === "enabled"
+    ))) {
       const events = this.store.listEvents(task.id);
       const groups = groupDetachedContinuations(
         projectProviderContinuations(events),

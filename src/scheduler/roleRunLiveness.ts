@@ -282,11 +282,16 @@ function exactBatchInventory(
 }
 
 function isResourceCandidate(
-  task: Readonly<{ status: string }>,
+  task: Readonly<{ status: string; executionGate: { state: "enabled" | "stopped" } }>,
   run: Readonly<{ status: string; deliveredAt?: string }>,
   now: Date
 ): boolean {
-  if (task.status !== "active" || run.status !== "active" || run.deliveredAt === undefined) {
+  if (
+    task.status !== "active"
+    || task.executionGate.state !== "enabled"
+    || run.status !== "active"
+    || run.deliveredAt === undefined
+  ) {
     return false;
   }
   const deliveredAt = Date.parse(run.deliveredAt);

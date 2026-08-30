@@ -27,9 +27,7 @@ import { mailboxHasWork, nextPendingBatch } from "../coordination/workMailbox.js
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import { projectProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import {
-  hasRuntimeLifecycleWork,
-  RuntimeLifecycleBusyError,
-  runtimeLifecycleTarget
+  RuntimeLifecycleBusyError
 } from "../runtime/lifecycleReservation.js";
 
 export type ActiveRoleRunDeliveryResult = Readonly<{
@@ -91,25 +89,6 @@ export async function processActiveRoleRunDeliveries(
           runId: run.id,
           status: "skipped",
           reason: "workspace-not-ready"
-        });
-        continue;
-      }
-
-      // Single-flight: a Role runtime lifecycle lane that already holds a
-      // launch reservation or cleanup obligation must not be entered by a
-      // second delivery. The Run stays active-unpushed and is retried after
-      // the lane settles; the contention is never terminalized as a failure.
-      if (hasRuntimeLifecycleWork(store.getWorkMailbox(runtimeLifecycleTarget({
-        scope: "task",
-        taskId: task.id,
-        roleName: role.name
-      })))) {
-        results.push({
-          taskId: task.id,
-          roleName: role.name,
-          runId: run.id,
-          status: "skipped",
-          reason: "runtime-unavailable"
         });
         continue;
       }

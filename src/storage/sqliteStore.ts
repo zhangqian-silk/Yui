@@ -1075,7 +1075,7 @@ export class SqliteTaskStore implements TaskStore {
         const found = this.#db.prepare("SELECT 1 FROM projects WHERE id = ?").get(binding.projectId);
         if (found === undefined) throw new StorageRecordError(`Task Project not found: ${binding.projectId}`);
       }
-      const isActive = task.status === "active" ? 1 : 0;
+      const isActive = task.status === "active" && task.executionGate.state === "enabled" ? 1 : 0;
       // The catalog projection is inserted first because task_records FKs it.
       this.#db.prepare(
         `INSERT INTO tasks_catalog (task_id, status, lifecycle, is_active, created_at, updated_at)
@@ -1129,6 +1129,7 @@ export class SqliteTaskStore implements TaskStore {
       task: {
         id: task.id,
         status: task.status,
+        executionGate: task.executionGate,
         projectBindings: task.projectBindings,
         type: task.type
       },
@@ -1194,7 +1195,6 @@ export class SqliteTaskStore implements TaskStore {
         this.listEvents(taskId),
         "agent-run"
       ),
-      roleSessionSets: this.listRoleSessionSets(taskId),
       managedWorkspaces: this.#sortById(
         this.#listPayload<ManagedWorkspace>("managed_workspaces", "task_id = ?", [taskId]),
         (workspace) => managedWorkspaceKey(workspace.owner)
@@ -2581,6 +2581,10 @@ export class SqliteTaskStore implements TaskStore {
       return;
     }
     this.transaction((store) => {
+      const task = store.getTask(run.taskId);
+      if (task === null || task.status !== "active" || task.executionGate.state !== "enabled") {
+        throw new StorageRecordError(`Task execution is not enabled: ${run.taskId}.`);
+      }
       this.#assertActiveRunForWrite(run);
       const current = store.getActiveAgentRun(run.taskId, run.roleName);
       if (current !== null && current.id !== run.id) {
@@ -2629,6 +2633,10 @@ export class SqliteTaskStore implements TaskStore {
       throw new StorageRecordError(`Active execution-lane run requires group and lane ids: ${run.id}`);
     }
     this.transaction((store) => {
+      const task = store.getTask(run.taskId);
+      if (task === null || task.status !== "active" || task.executionGate.state !== "enabled") {
+        throw new StorageRecordError(`Task execution is not enabled: ${run.taskId}.`);
+      }
       const key = executionLaneActiveRunKey(run.executionGroupId!, run.executionLaneId!);
       this.#assertActiveRunForWrite(run, {
         executionGroupId: run.executionGroupId!,

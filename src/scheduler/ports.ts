@@ -38,7 +38,7 @@ export type { RuntimeSessionCandidate } from "../runtime/runtimeSessionCandidate
 
 export type SchedulerTask = Readonly<Pick<
   Task,
-  "id" | "title" | "status" | "projectBindings" | "cwd"
+  "id" | "title" | "status" | "executionGate" | "projectBindings" | "cwd"
 >>;
 
 export type SchedulerRole = Readonly<{
@@ -582,20 +582,21 @@ export function selectedActiveSchedulerTasks(
     if (indexedTaskIds === undefined) {
       return store.listTasks().filter((task) => (
         task.status === "active"
+        && task.executionGate.state === "enabled"
         && !selection?.blockedTaskIds?.has(task.id)
       ));
     }
     return [...indexedTaskIds].flatMap((taskId) => {
       if (selection?.blockedTaskIds?.has(taskId)) return [];
       const task = store.getTask(taskId);
-      return task?.status === "active" ? [task] : [];
+      return task?.status === "active" && task.executionGate.state === "enabled" ? [task] : [];
     });
   }
   const taskIds = selection.taskIds;
   return [...taskIds].flatMap((taskId) => {
     if (selection.blockedTaskIds?.has(taskId)) return [];
     const task = store.getTask(taskId);
-    return task?.status === "active" ? [task] : [];
+    return task?.status === "active" && task.executionGate.state === "enabled" ? [task] : [];
   });
 }
 

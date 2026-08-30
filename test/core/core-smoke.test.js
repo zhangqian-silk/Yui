@@ -14,8 +14,14 @@ import {
   releaseProcessing
 } from "../../dist/coordination/workMailbox.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
+import {
+  startTaskExecutionCommand,
+  stopTaskExecutionCommand
+} from "../../dist/commands/taskExecutionCommands.js";
+import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { createTaskMessage } from "../../dist/message/message.js";
 import { createProject } from "../../dist/repository/project.js";
+import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import {
   attachReviewRoundWorkspace,
   createTaskReviewRound,
@@ -28,6 +34,8 @@ import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.j
 import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
 import { createAgentRun, yieldAgentRun } from "../../dist/run/agentRun.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
+import { buildTaskExecutionProjection } from "../../dist/scheduler/taskExecutionProjection.js";
+import { projectNextAction } from "../../dist/task/nextAction.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { acquireHandoverLock } from "../../dist/release/runtimeRelease.js";
 import {
@@ -41,7 +49,13 @@ import { placeUpgradeFence } from "../../dist/storage/upgradeFence.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { runStorageUpgrade } from "../../dist/storage/upgrade/upgradeOrchestrator.js";
 import { populateSqliteFromState } from "../../dist/storage/upgrade/sqliteStateMigration.js";
-import { activateTask, createTask } from "../../dist/task/task.js";
+import {
+  activateTask,
+  createTask,
+  startTaskExecution,
+  stopTaskExecution
+} from "../../dist/task/task.js";
+import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
@@ -55,9 +69,139 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   });
   assert.match(help, /Yui/u);
   const commands = listPublicCommandPaths();
-  for (const command of ["setup", "update", "upgrade", "task create", "task list"]) {
+  for (const command of [
+    "setup",
+    "update",
+    "upgrade",
+    "task create",
+    "task list",
+    "task execution stop",
+    "task execution start"
+  ]) {
     assert.ok(commands.includes(command), `missing core command: ${command}`);
   }
+  assert.equal(commands.includes("task run recover"), false);
+  assert.equal(commands.includes("task role session switch"), false);
+});
+
+test("Task execution can be fenced without changing semantic progress", () => {
+  const now = new Date("2026-08-30T00:00:00.000Z");
+  const active = activateTask(createTask("task-1", "Continue safely", now), now);
+  const stopped = stopTaskExecution(active, new Date("2026-08-30T00:01:00.000Z"));
+  assert.equal(stopped.status, "active");
+  assert.equal(stopped.executionGate.state, "stopped");
+  const restarted = startTaskExecution(stopped, new Date("2026-08-30T00:02:00.000Z"));
+  assert.equal(restarted.status, "active");
+  assert.equal(restarted.executionGate.state, "enabled");
+});
+
+test("Task execution stop/start atomically controls scheduler admission", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-execution-gate-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-08-30T00:00:00.000Z");
+  const task = activateTask(createTask("task-1", "Preserve progress", now), now);
+  store.saveTask(task);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const leader = createRole(
+    task.id,
+    "leader",
+    [binding],
+    binding.agentId,
+    "/tmp/yui-execution-gate-smoke",
+    now
+  );
+  store.saveRole(task.id, leader);
+  const item = updateWorkItemStatus(
+    createWorkItem("work-item-1", task.id, { title: "Keep completed edits" }, now),
+    "running",
+    now
+  );
+  store.saveWorkItem(task.id, item);
+  const activeRun = createAgentRun(
+    "agent-run-1",
+    task.id,
+    leader.name,
+    "new",
+    "Continue the Task.",
+    now,
+    {
+      effective: {
+        schemaVersion: 2,
+        sourceDesiredRevision: leader.launchRevision,
+        agentId: binding.agentId,
+        adapterId: "codex",
+        profileAccess: "write",
+        search: false,
+        permission: { strategy: "default" },
+        writeProjectIds: [],
+        workspace: { root: leader.workspace, entries: [] },
+        context: {}
+      }
+    }
+  );
+  store.saveActiveAgentRun(activeRun);
+
+  const stopped = stopTaskExecutionCommand(
+    { taskId: task.id, reason: "Operator safety fence" },
+    store,
+    { now: () => new Date("2026-08-30T00:01:00.000Z"), environment: bareEnv }
+  );
+  assert.equal(stopped.changed, true);
+  assert.equal(store.getTask(task.id).status, "active");
+  assert.equal(store.getTask(task.id).executionGate.state, "stopped");
+  assert.deepEqual(store.listActiveTaskIds(), []);
+  assert.equal(buildTaskExecutionProjection(store, task.id).status, "stopped");
+  assert.equal(
+    projectNextAction(store.readNextActionFacts(task.id)).recommendedCommand,
+    `yui task execution start ${task.id}`
+  );
+  assert.equal(store.getAgentRun(task.id, activeRun.id).status, "failed");
+  assert.equal(store.getActiveAgentRun(task.id, leader.name), null);
+  assert.equal(store.getWorkItem(task.id, item.id).status, "running");
+  assert.throws(() => runTaskCommand(
+    ["run", "retry", `${task.id}/${activeRun.id}`],
+    store,
+    { now: () => new Date("2026-08-30T00:01:30.000Z"), environment: bareEnv }
+  ), /Task execution is stopped/);
+  assert.equal(store.getActiveAgentRun(task.id, leader.name), null);
+
+  const started = startTaskExecutionCommand(task.id, store, {
+    now: () => new Date("2026-08-30T00:02:00.000Z"),
+    environment: bareEnv
+  });
+  assert.equal(started.changed, true);
+  assert.equal(store.getTask(task.id).executionGate.state, "enabled");
+  assert.deepEqual(store.listActiveTaskIds(), [task.id]);
+  assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["execution-started"]);
+
+  const completedItem = updateWorkItemStatus(
+    store.getWorkItem(task.id, item.id),
+    "completed",
+    new Date("2026-08-30T00:03:00.000Z"),
+    "Edits retained."
+  );
+  store.saveWorkItem(task.id, completedItem);
+  const disposableRun = createAgentRun(
+    "agent-run-2",
+    task.id,
+    leader.name,
+    "new",
+    "Finish the Task.",
+    new Date("2026-08-30T00:03:00.000Z"),
+    { effective: activeRun.effective }
+  );
+  store.saveActiveAgentRun(disposableRun);
+  runTaskCommand(
+    ["complete", task.id, "--summary", "Delivery complete."],
+    store,
+    { now: () => new Date("2026-08-30T00:04:00.000Z"), environment: bareEnv }
+  );
+  assert.equal(store.getTask(task.id).status, "completed");
+  assert.equal(store.getAgentRun(task.id, disposableRun.id).status, "failed");
+  assert.equal(store.getWorkItem(task.id, completedItem.id).status, "completed");
 });
 
 test("a packaged Controller restart inherits its direct parent's handover", (t) => {

@@ -19,7 +19,6 @@ import {
 } from "../runtime/exactControlPlane.js";
 import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import { conversationReplacementBasis } from "../runtime/conversationSwitch.js";
 
 export type RuntimeHookRunFence = Readonly<{
   taskId: string;
@@ -91,7 +90,9 @@ export function resolveRuntimeHookRunFence(
 
   const store = openCompatibleFileTaskStore(home);
   const task = store.getTask(taskId);
-  if (task === null || task.status !== "active") {
+  if (task === null
+    || task.status !== "active"
+    || task.executionGate.state !== "enabled") {
     throw new Error("Runtime observation Hook Task is not current and active.");
   }
   const role = store.getRole(taskId, roleName);
@@ -169,14 +170,7 @@ export function resolveRuntimeHookRunFence(
     && sessions !== null
     && startupReservation
     && startupRun?.mode === "new"
-    && conversationReplacementBasis({
-      sessions,
-      events: store.listEvents(taskId),
-      mailbox: roleMailbox,
-      roleName,
-      runId: startupRun.id,
-      runMode: startupRun.mode
-    }) !== null;
+    && (session.status === "stopped" || session.status === "broken");
   const preallocatedStartup = options.startupSession === "preallocated"
     && expectedNativeSessionId !== undefined
     && (session === undefined || replacementStartup)

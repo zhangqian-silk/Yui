@@ -596,16 +596,18 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   ) {}
 
   notifyStateChanged(taskId: string): void {
-    this.notifyMailboxChanged({ kind: "task", taskId });
+    void this.notifyMailboxChanged({ kind: "task", taskId });
   }
 
-  notifyMailboxChanged(target: MailboxTarget): void {
-    void callFileTaskController(
+  notifyMailboxChanged(target: MailboxTarget): Promise<void> {
+    const pending = callFileTaskController(
       this.home,
       "scheduler.signal",
       { key: controllerMailboxKey(target) },
       this.clientOptions
-    ).catch(this.clientOptions.onError ?? (() => {}));
+    ).then(() => {});
+    void pending.catch(this.clientOptions.onError ?? (() => {}));
+    return pending;
   }
 
   reconcileTask(taskId: string): void {
@@ -651,12 +653,70 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     }
   }
 
+  /** Wait until every cancellation requested by Task execution stop is physically settled. */
+  async stopTaskDurableJobs(taskId: string): Promise<void> {
+    const deadline = Date.now() + LIFECYCLE_REQUEST_TIMEOUT_MS;
+    for (;;) {
+      const active = this.store.listActiveDurableJobs()
+        .filter((job) => job.taskId === taskId);
+      if (active.length === 0) return;
+      await callFileTaskController(this.home, "scheduler.scan", {}, {
+        ...this.clientOptions,
+        requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
+      });
+      const remaining = this.store.listActiveDurableJobs()
+        .filter((job) => job.taskId === taskId);
+      if (remaining.length === 0) return;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `DurableJobs did not stop: ${remaining.map(({ id }) => `${taskId}/${id}`).join(", ")}.`
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
   /**
    * Issue 03 archive postcondition. Re-verifies physical absence after the
    * runtime stop and blocks archive while any owned Provider root is still
    * live, preserving the owner records for Operator recovery.
    */
   async assertTaskPhysicalResourcesReleased(taskId: string): Promise<void> {
+    const activeJobs = this.store.listActiveDurableJobs()
+      .filter((job) => job.taskId === taskId);
+    if (activeJobs.length > 0) {
+      throw new WorkspaceCleanupBlockedError(
+        "physical-resource-live",
+        `task:${taskId}`,
+        true,
+        `Task physical resources are not released: ${activeJobs.length} DurableJob(s) are still active: `
+          + activeJobs.map(({ id }) => id).join(", ")
+      );
+    }
+    const liveSessions = this.store.listRoleSessionSets(taskId).flatMap((sessions) => (
+      Object.values(sessions.sessions)
+        .filter((session) => session.status !== "stopped" && session.status !== "broken")
+        .map((session) => `${sessions.owner.roleName}/${session.agentId}/${session.status}`)
+    ));
+    if (liveSessions.length > 0) {
+      throw new WorkspaceCleanupBlockedError(
+        "physical-resource-live",
+        `task:${taskId}`,
+        true,
+        `Task physical resources are not released: current Role Session state is still live: `
+          + liveSessions.join(", ")
+      );
+    }
+    const livePanes = this.tmux.inspectTaskRolePanes(taskId).filter((pane) => !pane.dead);
+    if (livePanes.length > 0) {
+      throw new WorkspaceCleanupBlockedError(
+        "physical-resource-live",
+        `task:${taskId}`,
+        true,
+        `Task physical resources are not released: ${livePanes.length} tmux Role pane(s) are still live: `
+          + livePanes.map(({ roleName, pid }) => `${roleName} (pid ${pid ?? "?"})`).join(", ")
+      );
+    }
     const reconciliation = new SessionOwnerReconciliation({
       home: this.home,
       store: this.store,
@@ -813,6 +873,7 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     if (
       task !== null
       && task.status === "active"
+      && task.executionGate.state === "enabled"
       && this.workspacePreparer !== undefined
     ) {
       await this.workspacePreparer.prepareTaskWorkspace(taskId);

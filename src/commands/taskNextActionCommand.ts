@@ -24,7 +24,6 @@ import {
   type TaskExecutionProjection,
   type TaskExecutionRun
 } from "../scheduler/taskExecutionProjection.js";
-import { projectExecutionLaneRunRecoveries } from "../run/recoveryProjection.js";
 import {
   projectReviewDecision,
   type ReviewDecisionProjection
@@ -73,12 +72,7 @@ export function runTaskNextActionCommand(
     const actionFacts: NextActionFacts = {
       ...facts,
       currentTaskReviewCandidate,
-      executionGroups: execution.executionGroups,
-      runRecoveries: projectExecutionLaneRunRecoveries(
-        reader,
-        taskId,
-        execution.executionGroups
-      )
+      executionGroups: execution.executionGroups
     };
     const action = projectNextAction(actionFacts);
     const repairWave = repairWaveFor(action, actionFacts);

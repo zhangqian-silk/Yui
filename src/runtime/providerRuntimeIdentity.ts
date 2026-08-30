@@ -440,27 +440,35 @@ export function supersedeProviderConversation(
     conversationId: string;
     activationId: string;
     switchedAt: string;
-    noUnsettledInputDelivery: boolean;
-    basis?: "actor-request" | "exact-unrecoverable";
+    basis: "terminal-session";
   }>
 ): ProviderRuntimeBinding {
   const binding = validateProviderRuntimeBinding(raw);
   const current = currentProviderConversation(binding);
-  const basis = input.basis ?? "exact-unrecoverable";
-  if (basis !== "actor-request" && basis !== "exact-unrecoverable") {
-    throw new Error("Provider Conversation switch basis is invalid.");
+  const basis = input.basis;
+  if (basis !== "terminal-session") {
+    throw new Error("Provider Conversation replacement basis is invalid.");
   }
-  if (basis === "exact-unrecoverable" && current.recoverability !== "unrecoverable") {
-    throw new Error("Current Provider Conversation is not exactly unrecoverable.");
-  }
-  if (!input.noUnsettledInputDelivery) {
-    throw new Error("Cannot replace a Provider Conversation with unsettled input delivery.");
-  }
-  if (binding.authority.owner !== "none" || currentProviderActivation(binding) !== null) {
-    throw new Error("Cannot replace a Provider Conversation while its writer umbrella is owned.");
-  }
-  const switchedAt = timestamp(input.switchedAt, "Provider Conversation switch timestamp");
+  const switchedAt = timestamp(input.switchedAt, "Provider Conversation replacement timestamp");
   const epoch = current.epoch + 1;
+  const terminalReason = "terminal-session-replaced";
+  const activations = binding.activations.map((entry) => entry.status === "active"
+      ? {
+          ...entry,
+          status: "failed" as const,
+          endedAt: switchedAt,
+          terminalReason
+        }
+      : entry);
+  const turn = binding.turn !== null
+    && ["submitting", "accepted", "running", "delivery-unknown"].includes(binding.turn.status)
+    ? {
+        ...binding.turn,
+        status: binding.turn.turnId === undefined ? "rejected" as const : "failed" as const,
+        updatedAt: switchedAt,
+        terminalReason
+      }
+    : binding.turn;
   return validateProviderRuntimeBinding({
     ...binding,
     currentConversationEpoch: epoch,
@@ -476,7 +484,7 @@ export function supersedeProviderConversation(
         createdAt: switchedAt
       }
     ],
-    activations: [...binding.activations, {
+    activations: [...activations, {
       activationId: identity(input.activationId, "Provider Activation id"),
       conversationId: input.conversationId,
       generation: 1,
@@ -488,7 +496,8 @@ export function supersedeProviderConversation(
       owner: "controller",
       holderId: input.activationId,
       changedAt: switchedAt
-    }
+    },
+    turn
   });
 }
 

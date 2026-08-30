@@ -27,6 +27,8 @@ const TASK_FROM_VERSION = 3;
 const TASK_TO_VERSION = 4;
 const TASK_INTENT_FROM_VERSION = 4;
 const TASK_INTENT_TO_VERSION = 5;
+const TASK_EXECUTION_GATE_FROM_VERSION = 5;
+const TASK_EXECUTION_GATE_TO_VERSION = 6;
 const WORK_ITEM_FROM_VERSION = 6;
 const WORK_ITEM_TO_VERSION = 7;
 const WORK_ITEM_GIT_SNAPSHOT_FROM_VERSION = 7;
@@ -165,6 +167,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerCompatible(projectLifecycleStep())
     .registerOfflineMigration(taskWorkspaceIdentityStep())
     .registerOfflineMigration(taskIntentStep())
+    .registerOfflineMigration(taskExecutionGateStep())
     .registerOfflineMigration(recordFamilyStep(
       "workItem",
       WORK_ITEM_FROM_VERSION,
@@ -3979,6 +3982,76 @@ function migrateTaskV4ToV5(snapshot: HomeSnapshot): HomeSnapshot {
         ...retained,
         schemaVersion: TASK_INTENT_TO_VERSION,
         ...(legacyDeliveryPath === undefined ? {} : { legacyDeliveryPath })
+      }
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, tasks: nextTasks }
+  };
+}
+
+/** Task v6 separates semantic lifecycle from the current execution admission gate. */
+function taskExecutionGateStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "task",
+    fromVersion: TASK_EXECUTION_GATE_FROM_VERSION,
+    toVersion: TASK_EXECUTION_GATE_TO_VERSION,
+    preconditions: requireTaskV5Family,
+    transform: migrateTaskV5ToV6,
+    declaredEffects: []
+  };
+}
+
+function requireTaskV5Family(snapshot: HomeSnapshot): void {
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  if (manifestVersions.task !== TASK_EXECUTION_GATE_FROM_VERSION) {
+    throw new Error(
+      `Record task migration requires manifest version ${TASK_EXECUTION_GATE_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const aggregate = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (aggregate.task === undefined) continue;
+    const record = asObject(aggregate.task, `Task ${taskId}`);
+    if (record.schemaVersion !== TASK_EXECUTION_GATE_FROM_VERSION) {
+      throw new Error(`Task ${taskId} must use schemaVersion ${TASK_EXECUTION_GATE_FROM_VERSION}.`);
+    }
+  }
+}
+
+function migrateTaskV5ToV6(snapshot: HomeSnapshot): HomeSnapshot {
+  requireTaskV5Family(snapshot);
+  const manifestVersions = asObject(
+    snapshot.schemaManifest.recordVersions,
+    "schema manifest recordVersions"
+  );
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...manifestVersions, task: TASK_EXECUTION_GATE_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const aggregate = asObject(rawTask, `Task aggregate ${taskId}`);
+    if (aggregate.task === undefined) {
+      nextTasks[taskId] = { ...aggregate };
+      continue;
+    }
+    const task = asObject(aggregate.task, `Task ${taskId}`);
+    nextTasks[taskId] = {
+      ...aggregate,
+      task: {
+        ...task,
+        schemaVersion: TASK_EXECUTION_GATE_TO_VERSION,
+        executionGate: { state: "enabled" }
       }
     };
   }

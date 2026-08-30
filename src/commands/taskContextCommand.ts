@@ -8,7 +8,6 @@ import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunSta
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import type { WorkItemObservabilityProjection } from "../scheduler/taskObservabilityProjection.js";
 import { projectNextAction } from "../task/nextAction.js";
-import { inspectTaskRoleSessionRecovery } from "./taskRoleRuntimeStatus.js";
 import {
   summarizeExecutionGroup,
   type ExecutionGroup,
@@ -17,7 +16,6 @@ import {
 import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
 import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
-import { projectExecutionLaneRunRecoveries } from "../run/recoveryProjection.js";
 import { projectReviewDecision } from "../review/reviewDecision.js";
 import type { TaskReviewCandidate } from "../review/reviewRound.js";
 
@@ -95,9 +93,6 @@ export function runTaskContextCommand(
       managedWorkspaces: reader.listManagedWorkspaces(task.id),
       roleSessionSets,
       coordinationMailboxes,
-      roleSessionRecoveries: roles.map((role) => (
-        inspectTaskRoleSessionRecovery(task.id, role.name, reader)
-      )),
       workItems,
       agentRuns,
       reviewRounds,
@@ -111,12 +106,7 @@ export function runTaskContextCommand(
       nextAction: projectNextAction({
         ...nextActionFacts,
         currentTaskReviewCandidate,
-        executionGroups: execution.executionGroups,
-        runRecoveries: projectExecutionLaneRunRecoveries(
-          reader,
-          task.id,
-          execution.executionGroups
-        )
+        executionGroups: execution.executionGroups
       })
     };
   });
@@ -132,7 +122,6 @@ export function runTaskContextCommand(
     managedWorkspaces,
     roleSessionSets,
     coordinationMailboxes,
-    roleSessionRecoveries,
     workItems,
     agentRuns,
     reviewRounds,
@@ -330,7 +319,6 @@ export function runTaskContextCommand(
           const activeSession = sessions?.sessions[sessions.activeAgentId];
           const effective = activeRun?.effective ?? activeSession?.effective;
           const effectiveSource = activeRun === undefined ? "Session" : "Run";
-          const recovery = roleSessionRecoveries.find((entry) => entry.roleName === role.name);
           const creation = [...events].reverse().find((event) => (
             event.type === "role.added" && event.payload.role === role.name
           ));
@@ -347,13 +335,7 @@ export function runTaskContextCommand(
                 : "pending next launch"}`,
             ...(creation?.payload.runtimeSource === undefined
               ? []
-              : [`    Runtime source at creation: ${creation.payload.runtimeSource}`]),
-            ...(recovery === undefined ? [] : [
-              `    Runtime cleanup: ${recovery.runtimeCleanupPending ? "pending" : "none"}`,
-              `    Fresh launch: ${recovery.freshLaunchAllowed
-                ? "allowed"
-                : `blocked (${recovery.freshLaunchBlockers.join(", ")})`}`
-            ])
+              : [`    Runtime source at creation: ${creation.payload.runtimeSource}`])
           ];
         })),
     "",

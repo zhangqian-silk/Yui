@@ -39,6 +39,7 @@ import {
  * aggregate and its existing execution records.
  */
 export type TaskExecutionStatus =
+  | "stopped"
   | "needs-leader-action"
   | "waiting-on-agents"
   | "waiting-user"
@@ -68,6 +69,7 @@ export type TaskExecutionAction =
   | "inspect-attention"
   | "recover-leader"
   | "resolve-blocker"
+  | "start-execution"
   | "complete-task"
   | "none";
 
@@ -162,7 +164,7 @@ export type TaskExecutionReadStore = Readonly<{
 
 type TaskExecutionTask = Readonly<Pick<
   Task,
-  "id" | "title" | "status" | "projectBindings" | "cwd"
+  "id" | "title" | "status" | "executionGate" | "projectBindings" | "cwd"
 >>;
 
 export type TaskExecutionFacts = Readonly<{
@@ -358,12 +360,29 @@ export function projectTaskExecution(
     ...(run.executionGroupId === undefined ? {} : { executionGroupId: run.executionGroupId }),
     ...(run.executionLaneId === undefined ? {} : { executionLaneId: run.executionLaneId })
   }));
-  const monitoring = task.status === "completed"
+  const monitoring = task.executionGate.state === "stopped"
+    || task.status === "completed"
     || task.status === "retired"
     || task.status === "archived"
     ? "stopped"
     : "active";
   if (monitoring === "stopped") {
+    if (task.executionGate.state === "stopped" && task.status === "active") {
+      return render({
+        task,
+        status: "stopped",
+        owner: "operator",
+        action: "start-execution",
+        summary: `Task ${task.id} execution is stopped; durable progress is preserved.`,
+        reason: "execution-stopped",
+        monitoring,
+        failClosed: false,
+        activeRuns: activeRunViews,
+        attention: [],
+        blockers: [],
+        pendingWakeup
+      });
+    }
     const stoppedStatus = task.status as Extract<TaskStatus, "completed" | "retired" | "archived">;
     return render({
       task,

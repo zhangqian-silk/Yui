@@ -35,19 +35,14 @@ import {
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import { runOwnsBlockingProviderContinuation } from "../runtime/runtimeContinuationProjection.js";
-import { runHasActiveRuntimeOperations } from "../runtime/runtimeObservation.js";
 import {
-  latestRunDurableProgressAt,
-  RUN_RECOVERY_APPLIED_EVENT,
-  RUN_RECOVERY_REQUESTED_EVENT
+  latestRunDurableProgressAt
 } from "../scheduler/roleRunStall.js";
 import { markTaskWakeConsumed } from "../scheduler/taskWake.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   workItemExecutionGroupById,
-  workItemOwnsUnresolvedExecutionLane,
-  updateWorkItemExecutionGroup,
-  updateWorkItemStatus
+  updateWorkItemExecutionGroup
 } from "../workItem/workItem.js";
 export type ExactReviewRoundTerminalizationResult = Readonly<{
   disposition: "applied" | "obsolete";
@@ -333,37 +328,6 @@ export type ExactRunTerminalizationResult = Readonly<{
   reason?: string;
 }>;
 
-export type ExactAgentRunRecoveryAction =
-  | "diagnose"
-  | "retry"
-  | "terminate";
-
-export type ExactAgentRunRecoveryInput = Readonly<{
-  taskId: string;
-  roleName: string;
-  runId: string;
-  agentId: string;
-  adapterId: string;
-  nativeSessionId?: string;
-  launchId?: string;
-  /** Exact semantic progress fence read by the Leader before acting. */
-  expectedProgressAt: string;
-  providerAcceptance: "accepted" | "rejected" | "ambiguous";
-  action: ExactAgentRunRecoveryAction;
-  reason: string;
-  now: Date;
-}>;
-
-export type ExactAgentRunRecoveryResult = Readonly<{
-  disposition: "applied" | "state-changed" | "blocked";
-  action: ExactAgentRunRecoveryAction;
-  run: AgentRun | null;
-  progressAt?: string;
-  reason?: string;
-  /** Diagnose/retry are requests only; the Leader must perform the next exact action. */
-  requiresExplicitFollowup?: boolean;
-}>;
-
 export type ExactAgentRunRetirementInput = Readonly<{
   taskId: string;
   roleName: string;
@@ -437,22 +401,22 @@ export function retireExactActiveAgentRun(
   if (progress.progressAt !== input.expectedProgressAt) {
     return { ...stateChanged("progress-fence-mismatch"), progressAt: progress.progressAt };
   }
-  if (!matchesRecoverySessionFence(store, {
-    ...input,
-    action: "terminate",
-    providerAcceptance: current.deliveredAt === undefined ? "rejected" : "accepted",
-    now
-  })) return stateChanged("session-or-launch-fence-mismatch");
-  const blocker = exactRecoveryExecutionBlocker(store, current);
-  if (blocker !== null) {
-    return {
-      disposition: "blocked",
-      run: current,
-      progressAt: progress.progressAt,
-      reason: blocker
-    };
-  }
   const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
+  const terminalInput: ExactRunTerminalizationInput = {
+    taskId: input.taskId,
+    roleName: input.roleName,
+    agentId: input.agentId,
+    runId: input.runId,
+    receiptId: agentRunDeliveryReceiptId(current),
+    ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
+    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+    settleFailedExecutionGroup: true,
+    outcome: { status: "failed", summary: input.reason }
+  };
+  if (!matchesSessionFence(sessions, terminalInput)
+    || !matchesLaunchFence(store, sessions, terminalInput)) {
+    return stateChanged("session-or-launch-fence-mismatch");
+  }
   const session = sessions?.sessions[input.agentId];
   const providerBinding = sessions?.providerBinding;
   const providerTurn = providerBinding?.turn;
@@ -469,34 +433,9 @@ export function retireExactActiveAgentRun(
       reason: "runtime-not-terminal"
     };
   }
-  const terminal = terminalizeExactTaskRun(store, {
-    taskId: input.taskId,
-    roleName: input.roleName,
-    agentId: input.agentId,
-    runId: input.runId,
-    receiptId: agentRunDeliveryReceiptId(current),
-    ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
-    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-    settleFailedExecutionGroup: true,
-    outcome: { status: "failed", summary: input.reason }
-  }, now);
+  const terminal = terminalizeExactTaskRun(store, terminalInput, now);
   if (terminal.disposition !== "applied" || terminal.run === null) {
     return stateChanged(terminal.reason ?? "terminalization-fence-mismatch");
-  }
-  if (terminal.run.purpose === "execution" && terminal.run.workItemId !== undefined) {
-    const item = store.getWorkItem(input.taskId, terminal.run.workItemId);
-    if (item !== null
-      && !["completed", "failed", "retired"].includes(item.status)
-      && !workItemOwnsUnresolvedExecutionLane(
-        item,
-        terminal.run.executionGroupId,
-        terminal.run.executionLaneId
-      )) {
-      store.saveWorkItem(
-        input.taskId,
-        updateWorkItemStatus(item, "failed", now, input.reason)
-      );
-    }
   }
   return {
     disposition: "applied",
@@ -542,7 +481,8 @@ export function terminalizeExactTaskRun(
   if (!matchesLaunchFence(store, sessions, input)) {
     return obsolete(run, "launch-fence-mismatch");
   }
-  if (runOwnsBlockingProviderContinuation(store.listEvents(input.taskId), {
+  if (input.settleFailedExecutionGroup !== true
+    && runOwnsBlockingProviderContinuation(store.listEvents(input.taskId), {
     taskId: run.taskId,
     roleName: run.roleName,
     runId: run.id,
@@ -703,340 +643,6 @@ export function terminalizeExactTaskRun(
   }
   settleLaunchReservation(store, sessions, input);
   return { disposition: "applied", run: terminal };
-}
-
-/**
- * Leader-controlled recovery boundary for one active AgentRun. This primitive
- * validates every durable fence in one transaction and records only a
- * structured request for same-Run diagnosis/retry. It never writes terminal
- * bytes, retries a provider input, kills a host, or silently rebinds a native
- * generation. Explicit termination is the sole action that changes Run state.
- */
-export function recoverExactAgentRun(
-  store: TaskStore,
-  input: ExactAgentRunRecoveryInput
-): ExactAgentRunRecoveryResult {
-  return store.transaction((tx) => recoverExactAgentRunInTransaction(tx, input));
-}
-
-/** Alias named after the existing exact terminalization primitive. */
-export const recoverExactTaskRun = recoverExactAgentRun;
-
-function recoverExactAgentRunInTransaction(
-  store: TaskStore,
-  input: ExactAgentRunRecoveryInput
-): ExactAgentRunRecoveryResult {
-  const current = store.getAgentRun(input.taskId, input.runId);
-  const stateChanged = (reason: string): ExactAgentRunRecoveryResult => ({
-    disposition: "state-changed",
-    action: input.action,
-    run: current,
-    ...(current === null ? {} : { progressAt: latestRunDurableProgressAt(
-      store,
-      input.taskId,
-      input.roleName,
-      input.runId
-    )?.progressAt }),
-    reason
-  });
-  const task = store.getTask(input.taskId);
-  if (task === null) return stateChanged("task-missing");
-  if (task.status !== "active") return stateChanged("task-terminal");
-  if (current === null) return stateChanged("run-missing");
-  if (current.status !== "active") return stateChanged("run-terminal");
-  if (current.taskId !== input.taskId || current.roleName !== input.roleName) {
-    return stateChanged("run-owner-mismatch");
-  }
-  if (
-    current.effective.agentId !== input.agentId
-    || current.effective.adapterId !== input.adapterId
-  ) {
-    return stateChanged("run-launch-identity-mismatch");
-  }
-  const role = store.getRole(input.taskId, input.roleName);
-  if (role === null) return stateChanged("role-missing");
-  const active = current.executionGroupId !== undefined && current.executionLaneId !== undefined
-    ? store.getActiveExecutionLaneRun(
-      input.taskId,
-      current.executionGroupId,
-      current.executionLaneId
-    )
-    : store.getActiveAgentRun(input.taskId, input.roleName);
-  if (active?.id !== current.id) {
-    return stateChanged("active-run-mismatch");
-  }
-  const progress = latestRunDurableProgressAt(
-    store,
-    input.taskId,
-    input.roleName,
-    input.runId
-  );
-  if (progress === null) return stateChanged("progress-unavailable");
-  if (progress.progressAt !== input.expectedProgressAt) {
-    return {
-      ...stateChanged("progress-fence-mismatch"),
-      progressAt: progress.progressAt
-    };
-  }
-  // Acceptance is a durable delivery boundary, not a Leader assertion. An
-  // accepted request must match the Run's persisted receipt; an already
-  // delivered Run cannot be reclassified as provider-rejected.
-  if (
-    (input.providerAcceptance === "accepted" && current.deliveredAt === undefined)
-    || (input.providerAcceptance === "rejected" && current.deliveredAt !== undefined)
-  ) {
-    return {
-      disposition: "blocked",
-      action: input.action,
-      run: current,
-      progressAt: progress.progressAt,
-      reason: "provider-acceptance-mismatch"
-    };
-  }
-  if (!matchesRecoverySessionFence(store, input)) {
-    return stateChanged("session-or-launch-fence-mismatch");
-  }
-  const recoveryBlocker = exactRecoveryExecutionBlocker(store, current);
-  if (recoveryBlocker !== null) {
-    return {
-      disposition: "blocked",
-      action: input.action,
-      run: current,
-      progressAt: progress.progressAt,
-      reason: recoveryBlocker
-    };
-  }
-  if (input.action === "terminate") {
-    const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-    const session = sessions?.sessions[input.agentId];
-    const providerTurn = sessions?.providerBinding?.turn;
-    const exactTerminalEvidence = session?.status === "stopped"
-      || session?.status === "broken"
-      || providerTurn?.status === "failed"
-      || providerTurn?.status === "cancelled"
-      || providerTurn?.status === "rejected";
-    if (!exactTerminalEvidence) {
-      return {
-        disposition: "blocked",
-        action: input.action,
-        run: current,
-        progressAt: progress.progressAt,
-        reason: "runtime-not-terminal"
-      };
-    }
-  }
-  if (
-    input.providerAcceptance === "ambiguous"
-    && input.action !== "diagnose"
-  ) {
-    return {
-      disposition: "blocked",
-      action: input.action,
-      run: current,
-      progressAt: progress.progressAt,
-      reason: "provider-acceptance-ambiguous"
-    };
-  }
-  if (!hasRecoveryReason(input.reason)) {
-    return {
-      disposition: "blocked",
-      action: input.action,
-      run: current,
-      progressAt: progress.progressAt,
-      reason: "recovery-reason-required"
-    };
-  }
-
-  const eventPayload = {
-    runId: current.id,
-    roleName: current.roleName,
-    action: input.action,
-    providerAcceptance: input.providerAcceptance,
-    progressAt: progress.progressAt,
-    ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
-    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-    reason: input.reason
-  };
-  const events = store.listEvents(input.taskId);
-  const alreadyRequested = events.some((event) => (
-    event.type === RUN_RECOVERY_REQUESTED_EVENT
-    && event.payload.runId === current.id
-    && event.payload.action === input.action
-    && event.payload.progressAt === progress.progressAt
-    && event.payload.nativeSessionId === input.nativeSessionId
-    && event.payload.launchId === input.launchId
-  ));
-
-  if (input.action !== "terminate") {
-    if (!alreadyRequested) {
-      store.saveEvent(input.taskId, createTaskEvent(
-        store.nextEventId(input.taskId),
-        input.taskId,
-        RUN_RECOVERY_REQUESTED_EVENT,
-        eventPayload,
-        input.now
-      ));
-      // A non-Leader request is surfaced through the existing Leader mailbox;
-      // it is not a Task Message and is coalesced by the mailbox reason.
-      if (input.roleName !== "leader") {
-        enqueueWork(
-          store,
-          { kind: "role", taskId: input.taskId, roleName: "leader" },
-          "run-recovery-requested",
-          input.now,
-          [{ type: "run", taskId: input.taskId, id: current.id }]
-        );
-      }
-    }
-    return {
-      disposition: "applied",
-      action: input.action,
-      run: current,
-      progressAt: progress.progressAt,
-      requiresExplicitFollowup: true
-    };
-  }
-
-  const terminalization = terminalizeExactTaskRun(store, {
-    taskId: input.taskId,
-    roleName: input.roleName,
-    agentId: input.agentId,
-    runId: input.runId,
-    receiptId: agentRunDeliveryReceiptId(current),
-    ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
-    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-    outcome: { status: "failed", summary: input.reason }
-  }, input.now);
-  if (terminalization.disposition !== "applied" || terminalization.run === null) {
-    return stateChanged(terminalization.reason ?? "terminalization-fence-mismatch");
-  }
-  const terminal = terminalization.run;
-  if (terminal.purpose === "execution" && terminal.workItemId !== undefined) {
-    const item = store.getWorkItem(input.taskId, terminal.workItemId);
-    if (item !== null
-      && !["completed", "failed", "retired"].includes(item.status)
-      && !workItemOwnsUnresolvedExecutionLane(
-        item,
-        terminal.executionGroupId,
-        terminal.executionLaneId
-      )) {
-      store.saveWorkItem(input.taskId, updateWorkItemStatus(item, "failed", input.now, input.reason));
-    }
-  }
-  store.saveEvent(input.taskId, createTaskEvent(
-    store.nextEventId(input.taskId),
-    input.taskId,
-    RUN_RECOVERY_APPLIED_EVENT,
-    { ...eventPayload, status: "terminated" },
-    input.now
-  ));
-  if (input.roleName !== "leader") {
-    enqueueWork(
-      store,
-      { kind: "role", taskId: input.taskId, roleName: "leader" },
-      "run-recovery-terminated",
-      input.now,
-      [{ type: "run", taskId: input.taskId, id: input.runId }]
-    );
-  }
-  return {
-    disposition: "applied",
-    action: input.action,
-    run: terminal,
-    progressAt: progress.progressAt
-  };
-}
-
-function exactRecoveryExecutionBlocker(
-  store: TaskStore,
-  run: AgentRun
-): string | null {
-  const sessions = store.getTaskRoleSessionSet(run.taskId, run.roleName);
-  const binding = sessions?.providerBinding;
-  const mailbox = store.getWorkMailbox({
-    kind: "role",
-    taskId: run.taskId,
-    roleName: run.roleName
-  });
-  if (mailbox?.inputDelivery != null) return "provider-input-delivery-unsettled";
-  if (runOwnsBlockingProviderContinuation(store.listEvents(run.taskId), {
-    taskId: run.taskId,
-    roleName: run.roleName,
-    runId: run.id,
-    agentId: run.effective.agentId
-  })) return "provider-continuation-writer-owned";
-  if (runHasActiveRuntimeOperations(store.listEvents(run.taskId), {
-    taskId: run.taskId,
-    roleName: run.roleName,
-    runId: run.id,
-    agentId: run.effective.agentId
-  })) return "provider-operation-active";
-  if (run.deliveredAt !== undefined
-    && (binding === null || binding?.turn === null)) return "provider-turn-state-missing";
-  if (binding === null || binding === undefined) return null;
-  if (["submitting", "accepted", "running", "delivery-unknown"].includes(
-    binding.turn?.status ?? ""
-  )) return "provider-turn-unsettled";
-  if (binding.authority.owner === "human" || binding.authority.owner === "unknown") {
-    return "provider-writer-authority-unavailable";
-  }
-  return null;
-}
-
-function matchesRecoverySessionFence(
-  store: TaskStore,
-  input: ExactAgentRunRecoveryInput
-): boolean {
-  const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-  // Recovery must never proceed without a durable Session fence.  A missing
-  // nativeSessionId is supported for an opaque host, but its exact launchId
-  // is then the only identity that can fence the action.
-  if (sessions === null) return false;
-  if (sessions.activeAgentId !== input.agentId) return false;
-  const session = sessions.sessions[input.agentId];
-  if (session === undefined) return false;
-  if (session.agentId !== input.agentId || session.adapterId !== input.adapterId) return false;
-  // Preserve a dead Session's exact identity as the CAS fence; only same-Session
-  // retry is invalid once the native process is stopped or broken.
-  if ((session.status === "stopped" || session.status === "broken")
-    && input.action === "retry") return false;
-
-  const sessionNativeSessionId = session.nativeSessionId;
-  if (sessionNativeSessionId === undefined) {
-    if (input.nativeSessionId !== undefined) return false;
-  } else if (input.nativeSessionId !== sessionNativeSessionId) {
-    return false;
-  }
-
-  let launchMatches = false;
-  if (input.launchId !== undefined && session.launchId === input.launchId) {
-    launchMatches = true;
-  }
-  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
-    scope: "task",
-    taskId: input.taskId,
-    roleName: input.roleName
-  }));
-  if (
-    !launchMatches
-    && input.launchId !== undefined
-    && isRuntimeLaunchReservation(mailbox?.processing, input.launchId)
-  ) {
-    launchMatches = true;
-  }
-
-  // An opaque Session has no native identity to compare, so an exact launch
-  // identity is mandatory.  Native Sessions may retain the older no-launch
-  // shape; their exact native identity remains a valid fence.
-  if (sessionNativeSessionId === undefined) return launchMatches;
-  if (input.nativeSessionId === undefined) return launchMatches;
-  return session.launchId === undefined
-    ? input.launchId === undefined || launchMatches
-    : launchMatches;
-}
-
-function hasRecoveryReason(value: string): boolean {
-  return typeof value === "string" && value.includes("\0") === false && value.trim().length > 0;
 }
 
 function matchesSessionFence(
