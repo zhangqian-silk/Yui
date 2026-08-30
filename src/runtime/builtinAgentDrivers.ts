@@ -148,7 +148,8 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
       }),
       observation: Object.freeze({
         ...STRUCTURED_CLI_CAPABILITIES.observation,
-        // Managed Codex uses its Yui-owned App Server event stream.
+        // Managed Codex uses its Yui-owned proxy subscription to the shared
+        // App Server event stream.
         // Turn lifecycle is exact; Yui does not install per-thread Hooks merely
         // to manufacture tool/wait/usage observations.
         operations: Object.freeze([] as const),
