@@ -10,6 +10,16 @@ import type {
 
 export type JsonRpcObject = Readonly<Record<string, unknown>>;
 
+/** Per-thread settings for a Yui-guided ordinary Codex conversation. */
+export type CodexThreadOptions = Readonly<{
+  model?: string;
+  approvalPolicy?: string;
+  sandbox?: string;
+  developerInstructions?: string;
+  runtimeWorkspaceRoots?: readonly string[];
+  config?: JsonRpcObject;
+}>;
+
 export interface CodexAppServerTransport {
   request(method: string, params: JsonRpcObject): Promise<JsonRpcObject>;
 }
@@ -32,13 +42,21 @@ export type CodexThreadSnapshot = Readonly<{
   activeTurnId?: string;
   status: "active" | "idle" | "systemError" | "notLoaded" | "unknown";
   latestTurnStatus?: "completed" | "interrupted" | "failed" | "inProgress";
+  turns: readonly CodexThreadTurnSnapshot[];
   parentThreadId?: string;
   ancestorThreadIds: readonly string[];
   raw: JsonRpcObject;
 }>;
 
+export type CodexThreadTurnSnapshot = Readonly<{
+  turnId: string;
+  status?: "completed" | "interrupted" | "failed" | "inProgress";
+  error?: string;
+}>;
+
 export type CodexTurnAcceptance =
   | Readonly<{ status: "accepted"; turnId: string }>
+  | Readonly<{ status: "busy"; activeTurnId?: string; reason: string }>
   | Readonly<{ status: "not-accepted"; reason: string }>
   | Readonly<{ status: "unknown"; reason: string }>;
 
@@ -54,32 +72,26 @@ export class CodexAppServerRuntime implements
 
   constructor(private readonly transport: CodexAppServerTransport) {}
 
-  async openConversation(input: Readonly<{
+  async openConversation(input: CodexThreadOptions & Readonly<{
     cwd: string;
-    model?: string;
-    approvalPolicy?: string;
-    sandbox?: string;
-    developerInstructions?: string;
-    runtimeWorkspaceRoots?: readonly string[];
   }>): Promise<Readonly<{ conversationId: string }>> {
     const result = await this.transport.request("thread/start", {
       cwd: text(input.cwd, "Codex thread cwd"),
-      ...(input.model === undefined ? {} : { model: input.model }),
-      ...(input.approvalPolicy === undefined ? {} : { approvalPolicy: input.approvalPolicy }),
-      ...(input.sandbox === undefined ? {} : { sandbox: input.sandbox }),
-      ...(input.developerInstructions === undefined
-        ? {}
-        : { developerInstructions: input.developerInstructions }),
-      ...(input.runtimeWorkspaceRoots === undefined
-        ? {}
-        : { runtimeWorkspaceRoots: [...input.runtimeWorkspaceRoots] })
+      ...threadOptions(input)
     });
     return { conversationId: threadId(result) };
   }
 
-  async resumeConversation(conversationId: string): Promise<CodexThreadSnapshot> {
+  async resumeConversation(
+    conversationId: string,
+    options: CodexThreadOptions & Readonly<{ cwd?: string }> = {}
+  ): Promise<CodexThreadSnapshot> {
     const id = text(conversationId, "Codex thread id");
-    const result = await this.transport.request("thread/resume", { threadId: id });
+    const result = await this.transport.request("thread/resume", {
+      threadId: id,
+      ...(options.cwd === undefined ? {} : { cwd: text(options.cwd, "Codex thread cwd") }),
+      ...threadOptions(options)
+    });
     return parseThreadSnapshot(result, id, true);
   }
 
@@ -145,7 +157,11 @@ export class CodexAppServerRuntime implements
       const snapshot = await this.readConversation(requestedThreadId);
       threadId = snapshot.threadId;
       if (input.expectedNoActiveTurn && snapshot.activeTurnId !== undefined) {
-        return { status: "not-accepted", reason: `active-turn:${snapshot.activeTurnId}` };
+        return {
+          status: "busy",
+          activeTurnId: snapshot.activeTurnId,
+          reason: `active-turn:${snapshot.activeTurnId}`
+        };
       }
     } catch (error) {
       // A new App Server thread has no materialized Turn history yet. This
@@ -341,12 +357,24 @@ function parseThreadSnapshot(
     ["inProgress", "in_progress", "running", "active"].includes(String(turn.status))
   ));
   const latestStatus = optionalTurnStatus(turns.at(-1)?.status);
+  const turnSnapshots = turns.flatMap((turn): CodexThreadTurnSnapshot[] => {
+    const turnId = optionalId(turn.id);
+    if (turnId === undefined) return [];
+    const status = optionalTurnStatus(turn.status);
+    const error = providerError(turn.error);
+    return [{
+      turnId,
+      ...(status === undefined ? {} : { status }),
+      ...(error === undefined ? {} : { error })
+    }];
+  });
   return {
     threadId: id,
     loaded,
     status: threadStatus(thread.status),
     ...(optionalId(active?.id) === undefined ? {} : { activeTurnId: optionalId(active?.id) }),
     ...(latestStatus === undefined ? {} : { latestTurnStatus: latestStatus }),
+    turns: Object.freeze(turnSnapshots),
     ...(optionalId(thread.parentThreadId) === undefined
       ? {}
       : { parentThreadId: optionalId(thread.parentThreadId) }),
@@ -355,6 +383,16 @@ function parseThreadSnapshot(
     ))),
     raw: result
   };
+}
+
+function providerError(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  const record = object(value);
+  if (record === null) return undefined;
+  if (typeof record.message === "string" && record.message.trim().length > 0) {
+    return record.message.trim();
+  }
+  return JSON.stringify(record);
 }
 
 function codexContinuationState(
@@ -419,11 +457,19 @@ function optionalTurnStatus(
 
 function classifyMutationError(error: unknown): CodexTurnAcceptance {
   if (error instanceof CodexAppServerRequestError) {
+    if (codexAppServerErrorIsBusy(error)) {
+      return { status: "busy", reason: error.message };
+    }
     if (["INVALID_PARAMS", "NOT_FOUND", "TURN_NOT_ACTIVE", -32602].includes(error.code)) {
       return { status: "not-accepted", reason: error.message };
     }
   }
   return { status: "unknown", reason: error instanceof Error ? error.message : String(error) };
+}
+
+function codexAppServerErrorIsBusy(error: CodexAppServerRequestError): boolean {
+  return /\b(active turn|turn (?:is )?(?:already )?(?:active|in progress|running)|already has an active)\b/iu
+    .test(error.message);
 }
 
 function isNotLoaded(error: unknown): boolean {
@@ -479,4 +525,30 @@ function text(value: unknown, label: string): string {
     throw new Error(`${label} is invalid.`);
   }
   return value.trim();
+}
+
+function threadOptions(input: CodexThreadOptions): JsonRpcObject {
+  return {
+    ...(input.model === undefined ? {} : { model: text(input.model, "Codex model") }),
+    ...(input.approvalPolicy === undefined
+      ? {}
+      : { approvalPolicy: text(input.approvalPolicy, "Codex approval policy") }),
+    ...(input.sandbox === undefined ? {} : { sandbox: text(input.sandbox, "Codex sandbox") }),
+    ...(input.developerInstructions === undefined
+      ? {}
+      : {
+          developerInstructions: text(
+            input.developerInstructions,
+            "Codex developer instructions"
+          )
+        }),
+    ...(input.runtimeWorkspaceRoots === undefined
+      ? {}
+      : {
+          runtimeWorkspaceRoots: input.runtimeWorkspaceRoots.map((root) => (
+            text(root, "Codex runtime workspace root")
+          ))
+        }),
+    ...(input.config === undefined ? {} : { config: { ...input.config } })
+  };
 }

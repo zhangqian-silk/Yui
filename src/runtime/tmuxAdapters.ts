@@ -618,6 +618,7 @@ export class TmuxSessionHost implements SessionHostPort {
     let hostCreated: boolean;
     let providerAcknowledged = false;
     let providerDeliveryUnknown = false;
+    let providerBusy = false;
     let providerRejected = false;
     let providerDispatchObserved = false;
     let providerSnapshot: AgentHostSnapshot | undefined;
@@ -633,9 +634,11 @@ export class TmuxSessionHost implements SessionHostPort {
           requireTurnAck: planned.initialTurnRunId !== undefined
         });
         providerDeliveryUnknown = providerSnapshot.state === "delivery-unknown";
+        providerBusy = planned.initialTurnRunId !== undefined
+          && providerSnapshot.state === "busy";
         providerRejected = planned.initialTurnRunId !== undefined
           && providerSnapshot.state === "rejected";
-        providerAcknowledged = !providerDeliveryUnknown && !providerRejected;
+        providerAcknowledged = !providerDeliveryUnknown && !providerBusy && !providerRejected;
         if (providerSnapshot.state === "rejected" && !providerRejected) {
           throw new Error("Agent Host rejected a launch without an initial Provider Turn.");
         }
@@ -669,9 +672,11 @@ export class TmuxSessionHost implements SessionHostPort {
             && controlResult.snapshot.state === "idle");
         const deliveryUnknownState = planned.initialTurnRunId !== undefined
           && controlResult.snapshot.state === "delivery-unknown";
+        const busyState = planned.initialTurnRunId !== undefined
+          && controlResult.snapshot.state === "busy";
         const rejectedState = planned.initialTurnRunId !== undefined
           && controlResult.snapshot.state === "rejected";
-        if ((!acceptableState && !deliveryUnknownState && !rejectedState)
+        if ((!acceptableState && !deliveryUnknownState && !busyState && !rejectedState)
           || controlResult.snapshot.launchId !== reservation.launchId) {
           broker.revoke(request.launchId);
           throw new Error(
@@ -681,6 +686,7 @@ export class TmuxSessionHost implements SessionHostPort {
         providerSnapshot = controlResult.snapshot;
         providerAcknowledged = acceptableState;
         providerDeliveryUnknown = deliveryUnknownState;
+        providerBusy = busyState;
         providerRejected = rejectedState;
         providerDispatchObserved = true;
       }
@@ -722,6 +728,9 @@ export class TmuxSessionHost implements SessionHostPort {
         : {}),
       ...(providerDeliveryUnknown && planned.initialTurnRunId !== undefined
         ? { initialTurnDeliveryUnknownRunId: planned.initialTurnRunId }
+        : {}),
+      ...(providerBusy && planned.initialTurnRunId !== undefined
+        ? { initialTurnBusyRunId: planned.initialTurnRunId }
         : {}),
       ...(providerRejected && planned.initialTurnRunId !== undefined
         ? { initialTurnRejectedRunId: planned.initialTurnRunId }
@@ -863,6 +872,7 @@ export class AgentHostPromptPushAdapter implements ActivePromptPushPort {
         }
       });
       if (result.snapshot.state === "delivery-unknown") return "delivery-unknown";
+      if (result.snapshot.state === "busy") return "busy";
       if (result.outcome === "rejected") return "rejected";
       if (result.snapshot.attemptId !== request.envelope.id) {
         return result.snapshot.state === "starting" || result.snapshot.state === "settling"

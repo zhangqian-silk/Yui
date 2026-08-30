@@ -340,6 +340,26 @@ export async function processLeaderWakeups(
           : { launchId: ready.prepared.launchId }),
         now
       });
+      if (ready.prepared.turnBusyDuringLaunch === true) {
+        // A direct Desktop/user Turn is ordinary thread activity. Keep the
+        // claimed Run and wake batch intact; active-Run delivery retries after
+        // that Turn reaches its native terminal boundary.
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId })
+        });
+        results.push({
+          taskId: task.id,
+          runId: run.id,
+          status: "skipped",
+          reason: "busy"
+        });
+        continue;
+      }
       if (ready.prepared.turnRejectedDuringLaunch === true) {
         const persisted = store.saveRoleRunDeliveryFailure({
           taskId: task.id,

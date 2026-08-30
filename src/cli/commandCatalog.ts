@@ -669,17 +669,17 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "view",
-        summary: "Attach read-only to a managed Provider presentation surface.",
+        summary: "Attach read-only to an independent Provider presentation surface.",
         usage: "yui task role view <task> <role>"
       },
       {
         name: "takeover",
-        summary: "Acquire Provider writer authority and enter the PTY input gateway.",
+        summary: "Enter the PTY input gateway for an independent Provider process.",
         usage: "yui task role takeover <task> <role>"
       },
       {
         name: "release",
-        summary: "Return stranded human Provider authority to the Controller.",
+        summary: "Release an independent Provider PTY input gateway.",
         usage: "yui task role release <task> <role>"
       }
     ]

@@ -647,6 +647,8 @@ export type PreparedRoleDelivery = Readonly<{
   turnAcceptedDuringLaunch?: boolean;
   /** Provider launch lost the exact acknowledgement for this Run's first Turn. */
   turnDeliveryUnknownDuringLaunch?: boolean;
+  /** Another ordinary client has an active Turn; retry this Run later. */
+  turnBusyDuringLaunch?: boolean;
   /** Provider definitively rejected this Run's first Turn during launch. */
   turnRejectedDuringLaunch?: boolean;
 }>;

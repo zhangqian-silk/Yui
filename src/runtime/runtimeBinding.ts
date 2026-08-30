@@ -19,6 +19,8 @@ export type RuntimeBinding = Readonly<{
   initialTurnRunId?: string;
   /** Exact Task Run whose first structured Turn may have reached the Provider. */
   initialTurnDeliveryUnknownRunId?: string;
+  /** Exact Task Run deferred because another ordinary client has an active Turn. */
+  initialTurnBusyRunId?: string;
   /** Exact Task Run whose first structured Turn received a definitive negative acknowledgement. */
   initialTurnRejectedRunId?: string;
   nativeSessionId?: string;
@@ -42,7 +44,15 @@ export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
   const initialTurnRejectedRunId = input.initialTurnRejectedRunId === undefined
     ? undefined
     : requireSafeIdentity(input.initialTurnRejectedRunId, "Rejected initial Turn Run id");
-  if ([initialTurnRunId, initialTurnDeliveryUnknownRunId, initialTurnRejectedRunId]
+  const initialTurnBusyRunId = input.initialTurnBusyRunId === undefined
+    ? undefined
+    : requireSafeIdentity(input.initialTurnBusyRunId, "Busy initial Turn Run id");
+  if ([
+    initialTurnRunId,
+    initialTurnDeliveryUnknownRunId,
+    initialTurnBusyRunId,
+    initialTurnRejectedRunId
+  ]
     .filter((value) => value !== undefined).length > 1) {
     throw new TypeError("Runtime binding must report at most one initial Turn outcome.");
   }
@@ -58,6 +68,7 @@ export function createRuntimeBinding(input: RuntimeBinding): RuntimeBinding {
     ...(initialTurnDeliveryUnknownRunId === undefined
       ? {}
       : { initialTurnDeliveryUnknownRunId }),
+    ...(initialTurnBusyRunId === undefined ? {} : { initialTurnBusyRunId }),
     ...(initialTurnRejectedRunId === undefined ? {} : { initialTurnRejectedRunId }),
     ...(input.nativeSessionId === undefined
       ? {}

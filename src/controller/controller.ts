@@ -2128,6 +2128,7 @@ export class FileTaskController {
       }
       else if (
         wakeup.reason === "not-ready"
+        || (wakeup.reason === "busy" && wakeup.runId !== undefined)
       ) {
         retry.set(key, { identity: wakeup.runId ?? key });
       }

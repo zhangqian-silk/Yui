@@ -5234,7 +5234,7 @@ function globalCompletionNativeSessionId(
     nativeSessionId: string;
   }>
 ): string {
-  // Codex app-server and its notify Hook expose different native IDs for the
+  // Codex structured event sources can expose different native IDs for the
   // same launch. The launch generation remains the authoritative fence.
   return input.adapterId === "codex"
     && input.launchId !== undefined

@@ -27,6 +27,7 @@ import {
 import {
   ProviderDeliveryUnknownError,
   ProviderConversationMissingError,
+  ProviderTurnBusyError,
   ProviderTurnRejectedError,
   startStructuredProviderSession,
   type StructuredProviderSession,
@@ -58,6 +59,8 @@ import {
 
 export const AGENT_HOST_CONTROL_PROTOCOL = "yui-agent-host/v2" as const;
 const HOST_CONTROL_MAX_BYTES = 32 * 1024;
+const CODEX_CLIENT_STABLE_MS = 5_000;
+const MAX_CONSECUTIVE_CODEX_DISCONNECTS = 3;
 
 export type AgentHostLaunchControl = Readonly<{
   protocol: typeof AGENT_HOST_CONTROL_PROTOCOL;
@@ -99,6 +102,7 @@ export type AgentHostProviderState =
   | "ready"
   | "settling"
   | "delivery-unknown"
+  | "busy"
   | "rejected"
   | "failed"
   | "exited";
@@ -148,6 +152,10 @@ export async function runAgentHost(input: Readonly<{
   let session: StructuredProviderSession | undefined;
   let sessionPayload: AgentHostLaunchPayload | undefined;
   let activeTurnPayload: AgentHostLaunchPayload | undefined;
+  let activeTurnAttemptId: string | undefined;
+  let activeNativeTurnId: string | undefined;
+  let codexClientAttachedAt: number | undefined;
+  let consecutiveCodexDisconnects = 0;
   const switchDetachedSessions = new WeakSet<StructuredProviderSession>();
   let activationId: string | undefined;
   let conversationRecoverability: "unknown" | "recoverable" = "unknown";
@@ -172,6 +180,28 @@ export async function runAgentHost(input: Readonly<{
   };
 
   const handleTerminal = (terminal: StructuredProviderTurnTerminal): void => {
+    if (!terminal.clientOwned) {
+      const busyPayload = sessionPayload;
+      if (
+        busyPayload === undefined
+        || session === undefined
+        || terminal.conversationId !== session.conversationId
+      ) return;
+      // Another ordinary client completed a Turn. It never enters Yui's Run
+      // observation path; it only removes backpressure from retained work.
+      if (snapshot.state === "busy") {
+        updateSnapshot(hostSnapshot("idle", {
+          launchId: busyPayload.launchId,
+          adapterId: session.adapterId,
+          processInstanceId: session.processInstanceId,
+          nativeSessionId: session.nativeSessionId,
+          conversationId: session.conversationId,
+          ...authorityFields()
+        }));
+      }
+      signalRoleMailbox(input.home, busyPayload);
+      return;
+    }
     const terminalPayload = activeTurnPayload;
     if (terminalPayload === undefined) return;
     const terminalActivationId = activationId ?? terminalPayload.launchId;
@@ -197,9 +227,11 @@ export async function runAgentHost(input: Readonly<{
         });
         if (activeTurnPayload !== terminalPayload) return;
         activeTurnPayload = undefined;
+        activeTurnAttemptId = undefined;
+        activeNativeTurnId = undefined;
         if (session === undefined) return;
         const currentPayload = sessionPayload ?? terminalPayload;
-        updateSnapshot(hostSnapshot("idle", {
+        updateSnapshot(hostSnapshot(session.activeTurnId === undefined ? "idle" : "busy", {
           launchId: currentPayload.launchId,
           adapterId: currentPayload.providerControl!.adapterId,
           processInstanceId: session.processInstanceId,
@@ -223,6 +255,92 @@ export async function runAgentHost(input: Readonly<{
     }).catch(() => {});
   };
 
+  const reconnectCodexClient = async (
+    disconnectedSession: StructuredProviderSession,
+    currentPayload: AgentHostLaunchPayload
+  ): Promise<void> => {
+    const previousControl = currentPayload.providerControl;
+    if (previousControl?.adapterId !== "codex" || authority === undefined) {
+      throw new Error("Codex client reconnect lost its Provider control identity.");
+    }
+    const ownedTurn = activeTurnPayload === undefined
+      || activeTurnAttemptId === undefined
+      || activeNativeTurnId === undefined
+      ? undefined
+      : { attemptId: activeTurnAttemptId, turnId: activeNativeTurnId };
+    const reconnectPayload: AgentHostLaunchPayload = {
+      ...currentPayload,
+      environment: activeTurnPayload?.environment ?? currentPayload.environment,
+      providerControl: {
+        schemaVersion: 1,
+        adapterId: "codex",
+        transport: "codex-app-server-proxy",
+        kind: "ensure",
+        mode: "resume",
+        nativeSessionId: disconnectedSession.nativeSessionId,
+        ...(previousControl.sessionTitle === undefined
+          ? {}
+          : { sessionTitle: previousControl.sessionTitle }),
+        codexThread: previousControl.codexThread!,
+        codexDaemonStartArgs: previousControl.codexDaemonStartArgs!,
+        ...(ownedTurn === undefined ? {} : { ownedTurn }),
+        authority
+      }
+    };
+    const delays = [0, 250, 1_000] as const;
+    let lastError: unknown;
+    for (const delayMs of delays) {
+      if (hostStopRequested) return;
+      if (delayMs !== 0) await delay(delayMs);
+      if (hostStopRequested) return;
+      try {
+        const started = await startStructuredProviderSession(reconnectPayload, {
+          onTerminal: handleTerminal
+        });
+        session = started.session;
+        sessionPayload = currentPayload;
+        conversationRecoverability = "recoverable";
+        codexClientAttachedAt = Date.now();
+        observeExit(started.session, currentPayload);
+        const reconnectState = activeTurnPayload !== undefined
+          ? ownedTurn === undefined ? "delivery-unknown" : "ready"
+          : started.session.activeTurnId === undefined ? "idle" : "busy";
+        updateSnapshot(hostSnapshot(reconnectState, {
+          launchId: currentPayload.launchId,
+          adapterId: "codex",
+          processInstanceId: started.session.processInstanceId,
+          nativeSessionId: started.session.nativeSessionId,
+          conversationId: started.session.conversationId,
+          ...(activeTurnAttemptId === undefined ? {} : { attemptId: activeTurnAttemptId }),
+          ...(activeNativeTurnId === undefined ? {} : { nativeTurnId: activeNativeTurnId }),
+          ...authorityFields(),
+          ...(ownedTurn !== undefined || activeTurnPayload === undefined
+            ? {}
+            : {
+                detail: "Codex client reattached, but the in-flight Turn has no exact native identity."
+              })
+        }));
+        if (started.recoveredTerminal !== undefined) {
+          handleTerminal(started.recoveredTerminal);
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    updateSnapshot(hostSnapshot("failed", {
+      launchId: currentPayload.launchId,
+      adapterId: "codex",
+      processInstanceId: disconnectedSession.processInstanceId,
+      nativeSessionId: disconnectedSession.nativeSessionId,
+      conversationId: disconnectedSession.conversationId,
+      ...(activeTurnAttemptId === undefined ? {} : { attemptId: activeTurnAttemptId }),
+      ...(activeNativeTurnId === undefined ? {} : { nativeTurnId: activeNativeTurnId }),
+      ...authorityFields(),
+      detail: `Codex client could not reattach after bounded retries: ${errorText(lastError)}`
+    }));
+  };
+
   const observeExit = (
     providerSession: StructuredProviderSession,
     launched: AgentHostLaunchPayload
@@ -234,6 +352,47 @@ export async function runAgentHost(input: Readonly<{
         ? activationId ?? launched.launchId
         : launched.launchId;
       const exitAuthority = authorityFields();
+      const stopReceipt = readRuntimeStopReceipt(input.home, currentPayload.launchId);
+      const reconnectableCodexClient = ownsCurrentSession
+        && providerSession.adapterId === "codex"
+        && !hostStopRequested
+        && stopReceipt === null
+        && !switchDetachedSessions.has(providerSession);
+      if (reconnectableCodexClient) {
+        session = undefined;
+        if (codexClientAttachedAt !== undefined
+          && Date.now() - codexClientAttachedAt >= CODEX_CLIENT_STABLE_MS) {
+          consecutiveCodexDisconnects = 0;
+        }
+        consecutiveCodexDisconnects += 1;
+        if (consecutiveCodexDisconnects > MAX_CONSECUTIVE_CODEX_DISCONNECTS) {
+          updateSnapshot(hostSnapshot("failed", {
+            launchId: currentPayload.launchId,
+            adapterId: "codex",
+            processInstanceId: result.processInstanceId,
+            nativeSessionId: providerSession.nativeSessionId,
+            conversationId: providerSession.conversationId,
+            ...(activeTurnAttemptId === undefined ? {} : { attemptId: activeTurnAttemptId }),
+            ...(activeNativeTurnId === undefined ? {} : { nativeTurnId: activeNativeTurnId }),
+            ...exitAuthority,
+            detail: "Codex client repeatedly disconnected before reaching a stable attachment."
+          }));
+          return;
+        }
+        updateSnapshot(hostSnapshot("starting", {
+          launchId: currentPayload.launchId,
+          adapterId: "codex",
+          processInstanceId: result.processInstanceId,
+          nativeSessionId: providerSession.nativeSessionId,
+          conversationId: providerSession.conversationId,
+          ...(activeTurnAttemptId === undefined ? {} : { attemptId: activeTurnAttemptId }),
+          ...(activeNativeTurnId === undefined ? {} : { nativeTurnId: activeNativeTurnId }),
+          ...exitAuthority,
+          detail: "Codex client disconnected; reattaching to the shared daemon."
+        }));
+        await reconnectCodexClient(providerSession, currentPayload);
+        return;
+      }
       if (ownsCurrentSession) {
         session = undefined;
         activationId = undefined;
@@ -241,7 +400,6 @@ export async function runAgentHost(input: Readonly<{
         authority = undefined;
       }
       hostSequence += 1;
-      const stopReceipt = readRuntimeStopReceipt(input.home, currentPayload.launchId);
       const observedAt = new Date().toISOString();
       const failures: string[] = [];
       if (!switchDetachedSessions.has(providerSession)) {
@@ -397,10 +555,22 @@ export async function runAgentHost(input: Readonly<{
         conversationRecoverability = providerControl.adapterId === "codex"
           ? "recoverable"
           : "unknown";
+        if (providerControl.kind === "ensure" && providerControl.ownedTurn !== undefined) {
+          activeTurnPayload = next;
+          activeTurnAttemptId = providerControl.ownedTurn.attemptId;
+          activeNativeTurnId = providerControl.ownedTurn.turnId;
+        }
         const started = await startStructuredProviderSession(next, { onTerminal: handleTerminal });
         session = started.session;
         sessionPayload = next;
+        if (started.session.adapterId === "codex") {
+          codexClientAttachedAt = Date.now();
+          consecutiveCodexDisconnects = 0;
+        }
         observeExit(started.session, next);
+        if (started.recoveredTerminal !== undefined) {
+          handleTerminal(started.recoveredTerminal);
+        }
       }
       await publishStructuredProviderOpened({
         home: input.home,
@@ -421,9 +591,12 @@ export async function runAgentHost(input: Readonly<{
         );
         await beginDurableProviderTurn(input.home, durableInitialTurn);
         activeTurnPayload = next;
+        activeTurnAttemptId = providerControl.initialTurn.attemptId;
+        activeNativeTurnId = undefined;
         try {
           receipt = await session.submitTurn(providerControl.initialTurn);
           providerAcceptedAttemptId = receipt.attemptId;
+          activeNativeTurnId = receipt.nativeTurnId;
         } catch (error) {
           await resolveProviderTurnSubmission(input.home, durableInitialTurn, error);
           throw error;
@@ -452,16 +625,26 @@ export async function runAgentHost(input: Readonly<{
           throw error;
         }
       }
-      updateSnapshot(hostSnapshot(receipt === undefined ? "idle" : "ready", {
+      const ensuredOwnedTurn = providerControl.kind === "ensure"
+        ? providerControl.ownedTurn
+        : undefined;
+      const providerState = receipt !== undefined || ensuredOwnedTurn !== undefined
+        ? "ready"
+        : session.activeTurnId === undefined ? "idle" : "busy";
+      updateSnapshot(hostSnapshot(providerState, {
         launchId: next.launchId,
         adapterId: providerControl.adapterId,
         processInstanceId: session.processInstanceId,
         nativeSessionId: receipt?.nativeSessionId ?? session.nativeSessionId,
         conversationId: receipt?.conversationId ?? session.conversationId,
-        ...(receipt === undefined ? {} : {
-          attemptId: receipt.attemptId,
-          nativeTurnId: receipt.nativeTurnId
-        }),
+        ...(receipt !== undefined
+          ? { attemptId: receipt.attemptId, nativeTurnId: receipt.nativeTurnId }
+          : ensuredOwnedTurn === undefined
+            ? {}
+            : {
+                attemptId: ensuredOwnedTurn.attemptId,
+                nativeTurnId: ensuredOwnedTurn.turnId
+              }),
         ...authorityFields()
       }));
       return snapshot;
@@ -485,7 +668,9 @@ export async function runAgentHost(input: Readonly<{
         || providerAcceptedAttemptId !== undefined;
       const state = deliveryUnknown
         ? "delivery-unknown"
-        : error instanceof ProviderTurnRejectedError ? "rejected" : "failed";
+        : error instanceof ProviderTurnBusyError
+          ? "busy"
+          : error instanceof ProviderTurnRejectedError ? "rejected" : "failed";
       updateSnapshot(hostSnapshot(state, {
         launchId: next.launchId,
         adapterId: providerControl.adapterId,
@@ -498,7 +683,11 @@ export async function runAgentHost(input: Readonly<{
         ...authorityFields(),
         detail: errorText(error)
       }));
-      if (state !== "delivery-unknown") activeTurnPayload = undefined;
+      if (state !== "delivery-unknown") {
+        activeTurnPayload = undefined;
+        activeTurnAttemptId = undefined;
+        activeNativeTurnId = undefined;
+      }
       if (deliveryUnknown && !(error instanceof ProviderDeliveryUnknownError)) {
         throw new ProviderDeliveryUnknownError(
           `Provider accepted input but its durable acknowledgement could not be confirmed: ${
@@ -535,6 +724,8 @@ export async function runAgentHost(input: Readonly<{
       throw new Error("Agent Host still owns an unsettled Provider Turn.");
     }
     activeTurnPayload = sessionPayload;
+    activeTurnAttemptId = request.turn.attemptId;
+    activeNativeTurnId = undefined;
     updateSnapshot(hostSnapshot("starting", {
       launchId: request.launchId,
       adapterId: session.adapterId,
@@ -548,6 +739,7 @@ export async function runAgentHost(input: Readonly<{
     try {
       const receipt = await session.submitTurn(request.turn);
       providerAccepted = true;
+      activeNativeTurnId = receipt.nativeTurnId;
       await publishStructuredProviderAccepted({
         home: input.home,
         environment: sessionPayload.environment,
@@ -569,7 +761,9 @@ export async function runAgentHost(input: Readonly<{
       const deliveryUnknown = error instanceof ProviderDeliveryUnknownError || providerAccepted;
       const state = deliveryUnknown
         ? "delivery-unknown"
-        : error instanceof ProviderTurnRejectedError ? "rejected" : "failed";
+        : error instanceof ProviderTurnBusyError
+          ? "busy"
+          : error instanceof ProviderTurnRejectedError ? "rejected" : "failed";
       updateSnapshot(hostSnapshot(state, {
         launchId: request.launchId,
         adapterId: session.adapterId,
@@ -580,7 +774,11 @@ export async function runAgentHost(input: Readonly<{
         ...authorityFields(),
         detail: errorText(error)
       }));
-      if (state !== "delivery-unknown") activeTurnPayload = undefined;
+      if (state !== "delivery-unknown") {
+        activeTurnPayload = undefined;
+        activeTurnAttemptId = undefined;
+        activeNativeTurnId = undefined;
+      }
       if (deliveryUnknown && !(error instanceof ProviderDeliveryUnknownError)) {
         throw new ProviderDeliveryUnknownError(
           `Provider accepted input but its durable acknowledgement could not be confirmed: ${
@@ -822,7 +1020,9 @@ export async function waitForAgentHostLaunchAck(input: Readonly<{
       if (snapshot.launchId === input.launchId) {
         if (snapshot.state === "ready"
           || (input.requireTurnAck !== true && snapshot.state === "idle")) return snapshot;
-        if (snapshot.state === "delivery-unknown" || snapshot.state === "rejected") {
+        if (snapshot.state === "delivery-unknown"
+          || snapshot.state === "busy"
+          || snapshot.state === "rejected") {
           return snapshot;
         }
         if (snapshot.state === "failed" || snapshot.state === "exited") {
@@ -1059,7 +1259,7 @@ function validateControlResult(result: AgentHostControlResult): AgentHostControl
 
 function validateSnapshot(snapshot: AgentHostSnapshot): AgentHostSnapshot {
   if (snapshot.schemaVersion !== 1
-    || !["idle", "starting", "ready", "settling", "delivery-unknown", "rejected", "failed", "exited"]
+    || !["idle", "starting", "ready", "settling", "delivery-unknown", "busy", "rejected", "failed", "exited"]
       .includes(snapshot.state)) {
     throw new Error("Agent Host snapshot is invalid.");
   }
@@ -1111,6 +1311,24 @@ function definedFields<T extends object>(value: T): Partial<T> {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error ?? "unknown error");
+}
+
+function signalRoleMailbox(home: string, payload: AgentHostLaunchPayload): void {
+  const taskId = payload.environment.YUI_TASK_ID;
+  const roleName = payload.environment.YUI_ROLE;
+  if (taskId === undefined || roleName === undefined) return;
+  const key = `role:${encodeURIComponent(taskId)}/${encodeURIComponent(roleName)}`;
+  void callController(home, "scheduler.signal", { key }).catch(() => {
+    // This is a low-latency hint. Durable mailbox state and periodic
+    // reconciliation remain the recovery path across a Controller handover.
+  });
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolvePromise) => {
+    const timer = setTimeout(resolvePromise, milliseconds);
+    timer.unref();
+  });
 }
 
 function hostTurnControlParams(

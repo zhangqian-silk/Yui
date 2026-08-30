@@ -19,6 +19,7 @@ import {
 } from "./agentConfigurationProbe.js";
 import type { PreInputReadinessCapability } from "../lifecycle/canonicalLifecycleEvent.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
+import type { CodexThreadOptions } from "../runtime/codexAppServerRuntime.js";
 
 export type AdvancedAgentConfig = Readonly<{ rawArgs?: readonly string[] }>;
 export type PermissionStrategy = "default" | "bypass" | "configured";
@@ -125,7 +126,9 @@ export type CompiledAgentLaunch = Readonly<{
   sessionStrategy: "runtime-discovery" | "preallocated";
 }>;
 export type CompiledManagedControlLaunch = CompiledAgentLaunch & Readonly<{
-  transport: "codex-app-server-stdio" | "claude-stream-json";
+  transport: "codex-app-server-proxy" | "claude-stream-json";
+  codexThread?: CodexThreadOptions;
+  codexDaemonStartArgs?: readonly string[];
 }>;
 
 export interface AgentAdapter<TConfig extends RoleAgentConfig = RoleAgentConfig> {
@@ -155,7 +158,7 @@ const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"] as cons
 const APPROVALS = ["untrusted", "on-request", "never"] as const;
 const PROBE_TIMEOUT_MS = 2_000;
 const PROBE_MAX_BYTES = 1024 * 1024;
-const CODEX_TESTED_THROUGH_VERSION = "0.145.0";
+const CODEX_TESTED_THROUGH_VERSION = "0.150.1";
 
 abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdapter<TConfig> {
   abstract readonly id: AgentAdapterId;
@@ -218,7 +221,7 @@ abstract class BaseAdapter<TConfig extends RoleAgentConfig> implements AgentAdap
 class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
   readonly id = "codex" as const;
   readonly label = "Codex";
-  readonly supportedVersion = "0.144.1";
+  readonly supportedVersion = "0.150.1";
   readonly capabilities = {
     recover: true,
     interrupt: true,
@@ -323,22 +326,34 @@ class CodexAdapter extends BaseAdapter<CodexAgentConfig> {
     _mode: "new" | "resume",
     _nativeSessionId?: string
   ): CompiledManagedControlLaunch {
+    const config = this.canonicalizeConfig(input.config);
+    if (config.profile !== undefined) {
+      throw new Error(
+        "Managed Codex does not accept a Codex config profile because it cannot be scoped to one "
+        + "shared-daemon thread. Use a Yui Agent Profile for skills, model, and effort."
+      );
+    }
     const launch = this.compileNew(input);
-    const argv = [...launch.argv];
-    if (input.config.model !== undefined) {
+    // A managed Codex thread is an ordinary user thread. Its Yui guidance is
+    // part of the durable Task message, not a developer_instructions override
+    // that would shadow the user's native project/developer configuration.
+    const argv = withoutCodexConfigOverride(launch.argv, "developer_instructions");
+    if (config.model !== undefined) {
       const modelFlag = argv.findIndex((value, index) => (
-        value === "--model" && argv[index + 1] === input.config.model
+        value === "--model" && argv[index + 1] === config.model
       ));
       if (modelFlag < 0) throw new Error("Managed Codex launch lost its selected model.");
       argv.splice(modelFlag, 2);
       // App Server thread/start reads the model from resolved configuration;
       // the interactive --model shortcut is not inherited by new threads.
-      argv.push("--config", `model=${tomlString(input.config.model)}`);
+      argv.push("--config", `model=${tomlString(config.model)}`);
     }
     return {
       ...launch,
-      argv: [...argv, "app-server", "--stdio"],
-      transport: "codex-app-server-stdio"
+      argv: [...argv, "app-server", "proxy"],
+      transport: "codex-app-server-proxy",
+      codexThread: codexThreadOptions(input, config),
+      codexDaemonStartArgs: [...input.agent.baseArgs, "app-server", "daemon", "start"]
     };
   }
 }
@@ -499,6 +514,57 @@ const ADAPTERS: Readonly<Record<AgentAdapterId, AgentAdapter<any>>> = {
 function tomlString(value: string): string {
   if (value.includes("\0")) throw new Error("Agent launch context cannot contain NUL bytes.");
   return JSON.stringify(value);
+}
+
+function codexThreadOptions(
+  input: CompileInput<CodexAgentConfig>,
+  config: CodexAgentConfig
+): CodexThreadOptions {
+  const roots = [...new Set([
+    resolve(input.workspace),
+    ...(config.additionalDirectories ?? []).map((path) => resolve(path))
+  ])];
+  const threadConfig = {
+    // Yui has already scoped and authorized this exact managed workspace.
+    // Keep the trust override on this thread instead of mutating global config.
+    projects: { [resolve(input.workspace)]: { trust_level: "trusted" } },
+    ...(config.effort === undefined ? {} : { model_reasoning_effort: config.effort }),
+    ...(config.search === true ? { web_search: "live" } : {})
+  };
+  const permission = config.permission.strategy === "bypass"
+    ? { approvalPolicy: "never", sandbox: "danger-full-access" }
+    : config.permission.strategy === "configured"
+      ? {
+          ...(config.permission.approval === undefined
+            ? {}
+            : { approvalPolicy: config.permission.approval }),
+          ...(config.permission.sandbox === undefined
+            ? {}
+            : { sandbox: config.permission.sandbox })
+        }
+      : {};
+  return {
+    ...(config.model === undefined ? {} : { model: config.model }),
+    ...permission,
+    runtimeWorkspaceRoots: roots,
+    ...(Object.keys(threadConfig).length === 0 ? {} : { config: threadConfig })
+  };
+}
+
+function withoutCodexConfigOverride(argv: readonly string[], key: string): string[] {
+  const filtered: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (
+      (argument === "--config" || argument === "-c")
+      && argv[index + 1]?.startsWith(`${key}=`) === true
+    ) {
+      index += 1;
+      continue;
+    }
+    filtered.push(argument);
+  }
+  return filtered;
 }
 
 function sessionTitle(value: string): string {
