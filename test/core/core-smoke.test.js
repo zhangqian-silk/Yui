@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -454,6 +454,47 @@ test("the SQLite Task path persists across one in-place schema upgrade", async (
   const reopened = new SqliteTaskStore(home);
   assert.equal(reopened.getTask(task.id)?.status, "active");
   assert.deepEqual(reopened.listMessages(task.id), [message]);
+  reopened.close();
+});
+
+test("the SQLite record migration preserves WorkMailbox content across its version step", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-mailbox-migration-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const now = new Date("2026-08-31T00:00:00.000Z");
+  ensureStorageSchema(home, now);
+  const store = new SqliteTaskStore(home);
+  const target = { kind: "operator" };
+  const mailbox = enqueueSignal(createWorkMailbox(target), {
+    reason: "migration-smoke",
+    refs: [{ type: "task", id: "task-1" }],
+    occurredAt: now.toISOString()
+  });
+  store.saveWorkMailbox(mailbox);
+  store.close();
+
+  const schemaPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(schemaPath, "utf8"));
+  manifest.recordVersions.workMailbox = 2;
+  writeFileSync(schemaPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const releaseFence = placeUpgradeFence(home, {
+    ownerPid: process.ppid,
+    reason: "parent update storage activation",
+    createdAt: now.toISOString()
+  });
+  const upgraded = await runStorageUpgrade({
+    home,
+    mode: "execute",
+    controllerLifecycle: "externally-quiesced",
+    externalUpgradeFenceOwnerPid: process.ppid,
+    registry: createProductionStorageRegistry(),
+    latest: latestStorageVersionState(),
+    inspectOfflineInventory: async () => ({ total: 0, blockers: [] })
+  }).finally(releaseFence);
+  assert.equal(upgraded.outcome, "upgraded", JSON.stringify(upgraded));
+
+  const reopened = new SqliteTaskStore(home);
+  assert.deepEqual(reopened.getWorkMailbox(target), mailbox);
   reopened.close();
 });
 

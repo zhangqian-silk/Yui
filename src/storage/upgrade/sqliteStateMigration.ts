@@ -61,7 +61,11 @@ import type { WorkItem } from "../../workItem/workItem.js";
 import type { ManagedWorkspace } from "../../worktree/managedWorkspace.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
 import { readStorageSchemaManifest } from "../storageSchema.js";
-import { CURRENT_STORED_TASK_SCHEMA_VERSION, type YuiConfig } from "../taskStore.js";
+import {
+  CURRENT_STORED_TASK_SCHEMA_VERSION,
+  CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
+  type YuiConfig
+} from "../taskStore.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,7 +115,11 @@ export function readMigrationSourceStateFromSqlite(home: string): Record<string,
     // Physical migration 14 rewrites the WorkMailbox family while adding its
     // current columns. Preserve the source rows before applying it so the
     // logical record migration still sees and transforms v1 exactly once.
-    const sourceMailboxes = readWorkMailboxesFromSqlite(snapshotPath);
+    const sourceManifest = readStorageSchemaManifest(home);
+    const sourceMailboxes = readWorkMailboxesFromSqlite(
+      snapshotPath,
+      requireWorkMailboxSchemaVersion(sourceManifest.recordVersions?.workMailbox)
+    );
     const stagedStore = new SqliteTaskStore(home, {
       databaseFilename: MIGRATION_SOURCE_DATABASE_FILENAME,
       migration: true
@@ -776,7 +784,10 @@ type WorkMailboxRow = Readonly<{
   input_delivery?: string | null;
 }>;
 
-export function rowToMailbox(row: WorkMailboxRow): Record<string, unknown> {
+export function rowToMailbox(
+  row: WorkMailboxRow,
+  schemaVersion: 1 | 2 | 3
+): Record<string, unknown> {
   let target: Record<string, unknown>;
   switch (row.target_kind) {
     case "operator":
@@ -803,15 +814,22 @@ export function rowToMailbox(row: WorkMailboxRow): Record<string, unknown> {
     processing: row.processing === null ? null : JSON.parse(row.processing) as unknown,
     pending: row.pending === null ? null : JSON.parse(row.pending) as unknown
   };
-  return Object.hasOwn(row, "input_delivery")
+  return schemaVersion > 1
     ? {
-        schemaVersion: 2,
+        schemaVersion,
         ...common,
         inputDelivery: row.input_delivery === null
           ? null
           : JSON.parse(row.input_delivery!) as unknown
       }
     : { schemaVersion: 1, ...common };
+}
+
+function requireWorkMailboxSchemaVersion(value: unknown): 1 | 2 | 3 {
+  if (value !== 1 && value !== 2 && value !== 3) {
+    throw new Error(`WorkMailbox manifest version is invalid: ${String(value)}.`);
+  }
+  return value;
 }
 
 function readWorkMailboxRows(db: Database.Database): WorkMailboxRow[] {
@@ -825,12 +843,15 @@ function readWorkMailboxRows(db: Database.Database): WorkMailboxRow[] {
   ).all() as WorkMailboxRow[];
 }
 
-function readWorkMailboxesFromSqlite(dbPath: string): Record<string, unknown> {
+function readWorkMailboxesFromSqlite(
+  dbPath: string,
+  schemaVersion: 1 | 2 | 3
+): Record<string, unknown> {
   const db = new Database(dbPath, { readonly: true });
   try {
     const mailboxes: Record<string, unknown> = {};
     for (const row of readWorkMailboxRows(db)) {
-      const mailbox = rowToMailbox(row);
+      const mailbox = rowToMailbox(row, schemaVersion);
       mailboxes[mailboxTargetKey(mailbox.target as MailboxTarget)] = mailbox;
     }
     return mailboxes;
@@ -924,7 +945,10 @@ export function computeDbFamilyChecksums(
 
     // Mailboxes are reconstructed from typed columns (no payload column).
     const mailboxRows = readWorkMailboxRows(db);
-    checksums.workMailbox = hashRecords(mailboxRows.map(rowToMailbox));
+    checksums.workMailbox = hashRecords(mailboxRows.map((row) => rowToMailbox(
+      row,
+      CURRENT_WORK_MAILBOX_SCHEMA_VERSION
+    )));
 
     return checksums;
   } finally {
@@ -996,6 +1020,9 @@ export function readStateFromSqlite(
     const storedTaskVersion = typeof manifest.recordVersions?.storedTask === "number"
       ? manifest.recordVersions.storedTask
       : CURRENT_STORED_TASK_SCHEMA_VERSION;
+    const storedWorkMailboxVersion = requireWorkMailboxSchemaVersion(
+      manifest.recordVersions?.workMailbox
+    );
 
     // Home identity + revision continuity.
     const meta = db.prepare(
@@ -1197,7 +1224,7 @@ export function readStateFromSqlite(
     const mailboxRows = readWorkMailboxRows(db);
     const mailboxes = state.mailboxes as Record<string, unknown>;
     for (const row of mailboxRows) {
-      const mailbox = rowToMailbox(row);
+      const mailbox = rowToMailbox(row, storedWorkMailboxVersion);
       mailboxes[mailboxTargetKey(mailbox.target as MailboxTarget)] = mailbox;
     }
 
