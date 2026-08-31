@@ -44,6 +44,8 @@ export type ProviderAuthority = Readonly<{
 }>;
 
 export type ProviderTurn = Readonly<{
+  /** Correlation only: workflow ownership remains in AgentRun. */
+  runId: string;
   attemptId: string;
   authorityEpoch: number;
   status: ProviderTurnStatus;
@@ -54,10 +56,9 @@ export type ProviderTurn = Readonly<{
 }>;
 
 export type ProviderRuntimeBinding = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   providerNamespace: string;
   accountScope: string;
-  runId: string;
   currentConversationEpoch: number;
   conversations: readonly ProviderConversation[];
   activations: readonly ProviderActivation[];
@@ -68,17 +69,15 @@ export type ProviderRuntimeBinding = Readonly<{
 export function createProviderRuntimeBinding(input: Readonly<{
   providerNamespace: string;
   accountScope: string;
-  runId: string;
   conversationId: string;
   activationId: string;
   startedAt: string;
 }>): ProviderRuntimeBinding {
   const startedAt = timestamp(input.startedAt, "Provider Activation startedAt");
   return validateProviderRuntimeBinding({
-    schemaVersion: 2,
+    schemaVersion: 3,
     providerNamespace: identity(input.providerNamespace, "Provider namespace"),
     accountScope: identity(input.accountScope, "Provider account scope"),
-    runId: identity(input.runId, "Run id"),
     currentConversationEpoch: 1,
     conversations: [{
       conversationId: identity(input.conversationId, "Provider Conversation id"),
@@ -124,21 +123,6 @@ export function currentProviderActivation(
   return [...binding.activations].reverse().find((entry) => (
     entry.conversationId === conversation.conversationId && entry.status === "active"
   )) ?? null;
-}
-
-/** Rebinds the live Conversation state to the next Yui Run without resetting authority. */
-export function rebindProviderRuntimeRun(
-  raw: ProviderRuntimeBinding,
-  runId: string
-): ProviderRuntimeBinding {
-  const binding = validateProviderRuntimeBinding(raw);
-  if (providerTurnIsActive(binding.turn)) {
-    throw new Error("Provider Runtime cannot bind another Run while a Turn is unsettled.");
-  }
-  return validateProviderRuntimeBinding({
-    ...binding,
-    runId: identity(runId, "Run id")
-  });
 }
 
 export function startProviderActivation(
@@ -264,11 +248,18 @@ export function transferProviderAuthority(
 
 export function beginProviderTurn(
   raw: ProviderRuntimeBinding,
-  input: Readonly<{ attemptId: string; authorityEpoch: number; submittedAt: string }>
+  input: Readonly<{
+    runId: string;
+    attemptId: string;
+    authorityEpoch: number;
+    submittedAt: string;
+  }>
 ): ProviderRuntimeBinding {
   const binding = validateProviderRuntimeBinding(raw);
+  const runId = identity(input.runId, "Run id");
   const attemptId = identity(input.attemptId, "Provider input attempt id");
-  if (binding.turn?.attemptId === attemptId
+  if (binding.turn?.runId === runId
+    && binding.turn.attemptId === attemptId
     && binding.turn.authorityEpoch === input.authorityEpoch
     && binding.turn.status === "submitting") {
     return binding;
@@ -285,6 +276,7 @@ export function beginProviderTurn(
   return validateProviderRuntimeBinding({
     ...binding,
     turn: {
+      runId,
       attemptId,
       authorityEpoch: input.authorityEpoch,
       status: "submitting",
@@ -502,10 +494,9 @@ export function supersedeProviderConversation(
 }
 
 export function validateProviderRuntimeBinding(value: ProviderRuntimeBinding): ProviderRuntimeBinding {
-  if (value.schemaVersion !== 2) throw new Error("Provider Runtime Binding schemaVersion must be 2.");
+  if (value.schemaVersion !== 3) throw new Error("Provider Runtime Binding schemaVersion must be 3.");
   identity(value.providerNamespace, "Provider namespace");
   identity(value.accountScope, "Provider account scope");
-  identity(value.runId, "Run id");
   integer(value.currentConversationEpoch, 1, "Current Provider Conversation epoch");
   if (!Array.isArray(value.conversations) || value.conversations.length === 0) {
     throw new Error("Provider Runtime Binding requires a Conversation.");
@@ -602,6 +593,7 @@ export function validateProviderRuntimeBinding(value: ProviderRuntimeBinding): P
 }
 
 function validateProviderTurn(turn: ProviderTurn, currentAuthorityEpoch: number): void {
+  identity(turn.runId, "Run id");
   identity(turn.attemptId, "Provider input attempt id");
   integer(turn.authorityEpoch, 1, "Provider Turn authority epoch");
   if (turn.authorityEpoch > currentAuthorityEpoch) {

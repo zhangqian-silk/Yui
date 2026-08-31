@@ -7,7 +7,6 @@ import { recordExecutionLaneResult } from "../execution/executionGroup.js";
 import { usageError } from "../errors/cliError.js";
 import { requestDurableJobCancel } from "../job/durableJob.js";
 import { finishReviewRound, updateReviewExecutionGroup } from "../review/reviewRound.js";
-import { updateRoleStatus } from "../role/role.js";
 import { failAgentRun, type AgentRun } from "../run/agentRun.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import type { TaskStore } from "../storage/taskStore.js";
@@ -121,10 +120,6 @@ export function stopTaskExecutionCommand(
       const sessions = tx.getTaskRoleSessionSet(task.id, roleName);
       if (sessions !== null && sessions.inFlight !== null) {
         tx.saveTaskRoleSessionSet(terminalizeCurrentRun(sessions, now));
-      }
-      const role = tx.getRole(task.id, roleName);
-      if (role !== null && role.status !== "idle") {
-        tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
       }
     }
     // A stop is allowed to discard stale pointer projections even when their

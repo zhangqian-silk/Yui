@@ -323,7 +323,7 @@ export function runTaskContextCommand(
             event.type === "role.added" && event.payload.role === role.name
           ));
           return [
-            `  ${role.name} [${role.status}]: ${role.activeAgentId}/${binding.adapterId}`,
+            `  ${role.name} [${activeRun === undefined ? "idle" : "running"}]: ${role.activeAgentId}/${binding.adapterId}`,
             `    Desired: r${role.launchRevision}; Profile intent: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; permission: ${binding.config.permission.strategy}`,
             `    Effective: ${effective === undefined
               ? "not started"

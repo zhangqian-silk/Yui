@@ -371,10 +371,6 @@ export async function runControllerSchedulerPass(
     const newlyIdleBusyTaskIds = new Set(initialWakeupResults.flatMap((result) => (
       result.reason === "busy"
         && store.getActiveAgentRun(result.taskId, "leader") === null
-        && (
-          typeof store.hasInFlightTurn !== "function"
-          || !store.hasInFlightTurn(result.taskId, "leader")
-        )
         ? [result.taskId]
         : []
     )));

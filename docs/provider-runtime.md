@@ -8,10 +8,14 @@ require every user interaction to pass through Yui.
 Task state and conversation state have different responsibilities:
 
 - Codex or Claude owns messages, turns, tool activity, and native history.
-- Yui owns Tasks, WorkItems, Runs, workspaces, durable messages, and delivery
-  receipts.
+- Yui owns Tasks, WorkItems, AgentRuns, workspaces, durable messages, and
+  delivery receipts. The active AgentRun is the only durable answer to whether
+  a Role has workflow work in progress.
+- A Provider binding owns Conversation, Activation, authority, and Turn facts.
+  A Turn carries its Run id only as correlation evidence; the Conversation does
+  not expose or maintain a second "current Run" state.
 - The Role Skill tells the Agent when and how to read or update Yui through the
-  ordinary `yui` CLI.
+  Session Manifest's exact `YUI_SESSION_CLI` entry point.
 
 ## Components
 
@@ -64,6 +68,13 @@ it from another native Codex client.
 If an already-running native Turn is observed while Yui resumes a thread, Yui
 classifies its attempted delivery as `busy`. The Run and mailbox batch stay
 pending until that native Turn settles.
+
+An Agent may declare a Yui Run outcome before the native Provider reports its
+Turn terminal. Yui accepts that semantic outcome immediately and may claim the
+next mailbox batch as a new AgentRun. Agent Host still serializes Provider
+input: it waits for the old native Turn, folds that terminal against the old
+Turn correlation, then submits the retained new Run. No Provider state is
+rebound while the old Turn is active, and no mailbox intent is rolled back.
 
 If a proxy disconnects, the Agent Host may attach a bounded replacement client
 and resume the same thread from exact native history. Task execution stop
@@ -131,3 +142,6 @@ without exact Provider-native missing evidence.
 6. Yui Skill/config does not mutate global Codex config.
 7. Task stop owns and terminates every Yui Agent Host and proxy without treating
    the shared Codex daemon or native conversation as Task cleanup.
+8. Provider runtime state never decides whether a Role may own an AgentRun.
+9. TaskRole carries desired configuration only; displayed activity is derived
+   from AgentRun and cannot become another writable scheduling state.

@@ -285,10 +285,10 @@ export function createUpdatePorts(
             + "different build than the one that passed preflight."
         );
       }
-      // Existing managed Sessions may have been created by a release that
-      // embedded an exact CLI path/version in its wrapper. Convert those
-      // authenticated, Manifest-referenced wrappers before the replacement
-      // Controller starts so the update cannot strand a live Session.
+      // Existing managed Sessions may have been created by an earlier release.
+      // Retarget those authenticated, Manifest-referenced wrappers to the
+      // activated control plane before the replacement Controller starts so
+      // the update cannot strand a live Session.
       const sessionCliRefresh = run(
         activeBinary,
         ["--json", "internal", "session-cli-refresh"],

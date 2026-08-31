@@ -85,7 +85,6 @@ import {
   switchActiveRoleAgent,
   unbindRoleAgent,
   updateRole,
-  updateRoleStatus,
   type GlobalRole,
   type Role
 } from "../role/role.js";
@@ -1594,11 +1593,6 @@ function retireTaskCommand(
           task.id,
           cancelInputRequest(request, `Task retired: ${summary}`, now)
         );
-      }
-    }
-    for (const role of tx.listRoles(task.id)) {
-      if (role.status !== "idle") {
-        tx.saveRole(task.id, updateRoleStatus(role, "idle", now));
       }
     }
     for (const mailbox of tx.listWorkMailboxes()) {
@@ -3238,7 +3232,6 @@ function dispatchWork(
       const role = requireRole(tx, task.id, unboundRun.roleName);
       tx.saveAgentRun(runWithLineage);
       tx.saveActiveAgentRun(runWithLineage);
-      tx.saveRole(task.id, updateRoleStatus(role, "running", now));
       enqueueWork(tx, roleMailbox(task.id, role.name), "run-dispatched", now, [
         runRef(task.id, runWithLineage.id),
         workItemRef(task.id, item.id)
@@ -5940,7 +5933,6 @@ function retryRun(
     );
     tx.saveAgentRun(created);
     tx.saveActiveAgentRun(created);
-    tx.saveRole(task.id, updateRoleStatus(role, "running", now));
     if (previous.workItemId !== undefined && retriedItemWithGroup !== null) {
       const item = retriedItemWithGroup;
       const workspace = tx.getWorkItemWorkspace(task.id, item.id);
@@ -7967,7 +7959,6 @@ export function dispatchPreparedReviewRound(
       const laneReviewer = requireRole(tx, taskId, unboundRun.roleName);
       tx.saveAgentRun(created);
       tx.saveActiveAgentRun(created);
-      tx.saveRole(taskId, updateRoleStatus(laneReviewer, "running", now));
       enqueueWork(tx, roleMailbox(taskId, laneReviewer.name), "review-requested", now, [
         runRef(taskId, created.id),
         ...(item === undefined ? [] : [workItemRef(taskId, item.id)])
@@ -9351,9 +9342,6 @@ function settleTaskExecutionForCompletion(
         sessions = updateRoleAgentSessionStatus(sessions, sessions.activeAgentId, "stopped", now);
       }
       store.saveTaskRoleSessionSet(sessions);
-    }
-    if (role.status !== "idle") {
-      store.saveRole(taskId, updateRoleStatus(role, "idle", now));
     }
     if (!cleanupRequired) continue;
     const target = runtimeLifecycleTarget({

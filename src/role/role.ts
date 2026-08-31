@@ -23,8 +23,6 @@ export type {
   RoleAgentConfig
 } from "../executor/agentAdapter.js";
 
-export type RoleStatus = "idle" | "running" | "detached" | "exited" | "failed";
-
 export type RoleProfile = {
   description?: string;
   responsibilities?: string[];
@@ -41,7 +39,6 @@ export type RoleAgentBinding = {
 };
 
 type RoleAgentOwner = RoleProfile & {
-  schemaVersion: 3;
   /** Monotonic desired configuration revision. It only affects the next launch. */
   launchRevision: number;
   /** Provider-neutral read/write behavior intent copied from the Profile. */
@@ -54,10 +51,12 @@ type RoleAgentOwner = RoleProfile & {
   updatedAt: string;
 };
 
-export type GlobalRole = RoleAgentOwner;
+export type GlobalRole = RoleAgentOwner & {
+  schemaVersion: 3;
+};
 export type TaskRole = RoleAgentOwner & {
+  schemaVersion: 4;
   taskId: string;
-  status: RoleStatus;
 };
 export type Role = TaskRole;
 
@@ -106,8 +105,8 @@ export function createRole(
   const owner = createRoleOwner(name, bindings, activeAgentId, workspace, now, profile, defaultAccess);
   return validateTaskRole({
     ...owner,
-    taskId: requireSafeIdentity(taskId, "Task id"),
-    status: "idle"
+    schemaVersion: 4,
+    taskId: requireSafeIdentity(taskId, "Task id")
   });
 }
 
@@ -120,7 +119,10 @@ export function createGlobalRole(
   profile: RoleProfile = {},
   defaultAccess: WorkerAccess = "write"
 ): GlobalRole {
-  return createRoleOwner(name, bindings, activeAgentId, workspace, now, profile, defaultAccess);
+  return validateGlobalRole({
+    ...createRoleOwner(name, bindings, activeAgentId, workspace, now, profile, defaultAccess),
+    schemaVersion: 3
+  });
 }
 
 export function copyGlobalRoleToTaskRole(
@@ -133,7 +135,7 @@ export function copyGlobalRoleToTaskRole(
   const timestamp = now.toISOString();
   return validateTaskRole({
     ...cloneProfile(globalRole),
-    schemaVersion: 3,
+    schemaVersion: 4,
     launchRevision: 1,
     defaultAccess: globalRole.defaultAccess,
     taskId: requireSafeIdentity(taskId, "Task id"),
@@ -141,7 +143,6 @@ export function copyGlobalRoleToTaskRole(
     activeAgentId: globalRole.activeAgentId,
     agentBindings: cloneBindings(globalRole.agentBindings),
     workspace: globalRole.workspace,
-    status: "idle",
     createdAt: timestamp,
     updatedAt: timestamp
   });
@@ -190,12 +191,6 @@ export function updateRole(
     ? role.launchRevision
     : role.launchRevision + 1;
   return validateTaskRole(updated);
-}
-
-export function updateRoleStatus(role: Role, status: RoleStatus, now: Date): Role {
-  validateTaskRole(role);
-  if (!isRoleStatus(status)) throw new Error(`Role status is invalid: ${status}.`);
-  return { ...role, status, updatedAt: now.toISOString() };
 }
 
 export function switchActiveRoleAgent(
@@ -363,7 +358,6 @@ export function validateGlobalRole(role: GlobalRole): GlobalRole {
 
 export function validateTaskRole(role: TaskRole): TaskRole {
   requireSafeIdentity(role.taskId, "Task id");
-  if (!isRoleStatus(role.status)) throw new Error(`Role status is invalid: ${role.status}.`);
   return validateRoleOwner(role);
 }
 
@@ -375,7 +369,7 @@ function createRoleOwner(
   now: Date,
   profile: RoleProfile,
   defaultAccess: WorkerAccess
-): GlobalRole {
+): RoleAgentOwner {
   const mappedBindings: Record<string, RoleAgentBinding> = {};
   for (const sourceBinding of bindings) {
     const binding = validateRoleAgentBinding(cloneBinding(sourceBinding));
@@ -385,9 +379,8 @@ function createRoleOwner(
     mappedBindings[binding.agentId] = binding;
   }
   const timestamp = now.toISOString();
-  return validateGlobalRole({
+  return {
     ...cloneProfile(profile),
-    schemaVersion: 3,
     launchRevision: 1,
     defaultAccess,
     name: requireSafeIdentity(name, "Role name"),
@@ -396,11 +389,14 @@ function createRoleOwner(
     workspace: requireText(workspace, "Role workspace"),
     createdAt: timestamp,
     updatedAt: timestamp
-  });
+  };
 }
 
-function validateRoleOwner<T extends GlobalRole>(role: T): T {
-  if (role.schemaVersion !== 3) throw new Error("Role schema version is invalid.");
+function validateRoleOwner<T extends GlobalRole | TaskRole>(role: T): T {
+  const expectedSchemaVersion = "taskId" in role ? 4 : 3;
+  if (role.schemaVersion !== expectedSchemaVersion) {
+    throw new Error("Role schema version is invalid.");
+  }
   if (!Number.isSafeInteger(role.launchRevision) || role.launchRevision < 1) {
     throw new Error("Role launch revision must be a positive integer.");
   }
@@ -465,7 +461,7 @@ function cloneRolePatch(
   };
 }
 
-function desiredLaunchProjection(role: GlobalRole): unknown {
+function desiredLaunchProjection(role: GlobalRole | TaskRole): unknown {
   return {
     name: role.name,
     activeAgentId: role.activeAgentId,
@@ -540,8 +536,4 @@ function requireText(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new Error(`${label} is required.`);
   return normalized;
-}
-
-function isRoleStatus(value: string): value is RoleStatus {
-  return ["idle", "running", "detached", "exited", "failed"].includes(value);
 }

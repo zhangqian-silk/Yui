@@ -51,7 +51,6 @@ export type SchedulerRole = Readonly<{
   effective: EffectiveLaunchSnapshot;
   workspace: string;
   managedWorkspace?: ManagedWorkspace;
-  status: "idle" | "running" | "detached" | "exited" | "failed";
 }>;
 
 export type SchedulerAgentRun = AgentRun;
@@ -390,7 +389,6 @@ export interface SchedulerStorePort {
   recordRoleRunDiagnostic?(input: RoleRunDiagnosticPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Atomically records one advisory no-progress episode. */
   recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
-  hasInFlightTurn(taskId: string, roleName: string): boolean;
   /** Exact durable Provider writer; human/unknown ownership blocks Controller writes. */
   getProviderAuthorityFence?(input: Readonly<{
     taskId: string;

@@ -850,8 +850,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       role: {
         name: role.name,
         workspace: effectiveWorkspace,
-        ...(agentWorkspace === effectiveWorkspace ? {} : { cwd: agentWorkspace }),
-        ...(owner.scope === "task" ? { status: (role as TaskRole).status } : {})
+        ...(agentWorkspace === effectiveWorkspace ? {} : { cwd: agentWorkspace })
       },
       launch: ordinaryConversationLaunch,
       session,
@@ -912,7 +911,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     runId: string
   ): ProviderOwnedTurn | undefined {
     const binding = this.store.getTaskRoleSessionSet(taskId, roleName)?.providerBinding;
-    if (binding === null || binding === undefined || binding.runId !== runId) return undefined;
+    if (binding === null || binding === undefined || binding.turn?.runId !== runId) return undefined;
     const turn = binding.turn;
     if (turn === null || !["accepted", "running"].includes(turn.status)) return undefined;
     if (turn.turnId === undefined) {

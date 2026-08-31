@@ -1034,7 +1034,7 @@ export async function reconcileStalledRoleRuns(
     if (classification !== "truly-stalled") continue;
     const evidenceKey = [
       kind,
-      stallEvidenceKey(candidate.role.status, candidate.session?.status),
+      stallEvidenceKey(candidate.session?.status),
       classification,
       ...(candidate.role.name === "leader"
         ? [leaderStallEvidence(store, candidate.task.id, observed, now, windowMs)]
@@ -1124,7 +1124,6 @@ type ObservedRun = Readonly<{
     task: Readonly<{ id: string }>;
     role: Readonly<{
       name: string;
-      status: string;
       activeAgentId: string;
       adapterId: string;
     }>;
@@ -1338,8 +1337,8 @@ function leaderStallEvidence(
   return `downstream=active:${active},healthy:${healthy},stalled:${stalled}:leader-mailbox=${pendingAge},leader-processing=${processingAge}`;
 }
 
-function stallEvidenceKey(roleStatus: string, sessionStatus: string | undefined): string {
-  return `live-pane-no-progress:role=${roleStatus}:session=${sessionStatus ?? "unknown"}`;
+function stallEvidenceKey(sessionStatus: string | undefined): string {
+  return `live-pane-no-progress:session=${sessionStatus ?? "unknown"}`;
 }
 
 function exactLiveStatuses(

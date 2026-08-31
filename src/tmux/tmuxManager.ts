@@ -24,7 +24,6 @@ export type TmuxRole = Readonly<{
   workspace: string;
   /** Native process cwd; workspace remains the durable Yui scope root. */
   cwd?: string;
-  status?: string;
 }>;
 
 export type TmuxLaunchPlan = Readonly<{

@@ -2,9 +2,15 @@
 
 # Yui
 
-Yui 是面向持久 Codex/Claude 工作的本地控制平面。用户只需和 Operator
-对话；Operator 将不同 Project 的需求、Bug、审查和问题咨询路由到对应
-Task，Leader 再负责拆解、执行选择、验收和安全集成。
+Yui 是面向智能 Codex/Claude Agent 的本地控制平面。它持久保存用户意图、
+Project Knowledge、Task、交接和结果，并提供上下文、消息、委派、工作区、
+Session、审查和集成等小而原子的能力。Agent 组合这些能力，自主决定规划、
+顺序、委派、重试和恢复。
+
+Yui 不把 Agent 的判断固化成确定性的工作流引擎。核心只负责持久身份、用户
+授权、工作区隔离和原子状态变更；Provider Session 与运行时观测用于执行和
+连续性，但不是 Task 事实的另一套来源。用户只需和 Operator 对话，Operator
+负责路由，Leader 负责目标拆解、执行选择、验收和集成。
 
 当前实现保留实用的 Role/Agent/session 与 CLI 框架，不恢复后期膨胀的数据维护、租约、定时调度和恢复账本体系。
 
@@ -513,6 +519,8 @@ Task 生命周期的交互选择只展示有效来源状态：activate 只展示
 受管理的 Provider 会话仍然是普通用户会话。Yui 只添加对应的 Role Skill 与 Session Manifest 指针，并通过 Provider 原生结构化协议提交 Task 工作；Yui 不接管完整对话历史。受管理输入绝不会作为终端按键、粘贴文本或启动 argv 发送。Codex 在只转发字节的 `app-server proxy` 上完成 App Server WebSocket 握手，接入与 Desktop 相同的共享 daemon；原生 thread 可在 Desktop 中直接查看和操作。Task execution stop 只终止 Yui 的 Agent Host、WebSocket 与 proxy，保留共享 daemon、原生 thread、Task、WorkItem、代码与持久消息；start 创建新的 attachment。Claude 继续使用独立的持久 stream-json 进程，并以精确回放的 user message 作为接收确认。
 
 Run、Conversation、Activation 与 Turn 是四个独立身份。Conversation 可以跨多个 Run 和客户端连接；Activation 只代表 Yui 当前的连接，而不是对 Provider thread 的独占所有权；Turn 在写入前先持久化。写入超时或结果不明确会进入 `delivery-unknown`，不会自动重发。Codex 已存在的原生 active Turn 只会让 Yui 暂时等待，不会导致 Yui Run 失败；Claude 等独立进程 Provider 继续通过 Yui 的 view/takeover 边界进行人工控制。
+
+AgentRun 是 Role 是否有工作正在执行的唯一持久调度状态。Conversation 不再维护另一份 current Run；Provider Turn 中的 Run id 只用于关联接收回执和终态事件。TaskRole 本身只保存身份和期望启动配置，不再保存可写的运行状态；CLI/Web 展示的 Role 状态由活动 AgentRun 派生，并叠加 Session/Driver 生命周期事实用于诊断。Agent 可以在 Provider 终态到达前声明旧 Run 的语义结果，下一批 mailbox 工作也可以先形成新的 AgentRun；Agent Host 仍会串行等待旧 Turn 结束，再投递被保留的新输入，不回滚事件，也不把旧 Conversation 强行换绑到新 Run。
 
 Task Role 使用以下显式入口：
 

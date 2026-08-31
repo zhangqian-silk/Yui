@@ -228,7 +228,7 @@ export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
 export const CURRENT_TASK_SCHEMA_VERSION = 6 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
-export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 3 as const;
+export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 4 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 12 as const;
 export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 6 as const;
@@ -386,7 +386,7 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 18 as const;
  * Keep these named at the storage boundary so the upgrade record-axis map can
  * assert it is classifying the same bytes the store reads and writes.
  */
-export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 6 as const;
+export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 7 as const;
 /**
  * v7 combines optional Issue 04 retry/receipt fields and Issue 05 Leader
  * actionability fields. All are optional, so the v6→v7 migration is a

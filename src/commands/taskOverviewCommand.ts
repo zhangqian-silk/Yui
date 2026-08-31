@@ -8,7 +8,7 @@ import {
   latestStallProgressAt
 } from "../scheduler/roleRunStall.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { Role } from "../role/role.js";
+import type { RoleAgentSession } from "../executor/agentExecutor.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { Task } from "../task/task.js";
 import { pendingWakeupProjection, type TaskStore } from "../storage/taskStore.js";
@@ -32,7 +32,8 @@ export type TaskOverviewWorkCounts = Readonly<Record<WorkItemStatus, number> & {
 
 export type TaskOverviewLeader = Readonly<{
   role: "leader";
-  roleStatus: Role["status"] | "missing";
+  /** Derived workflow/lifecycle presentation; never persisted on TaskRole. */
+  roleStatus: RoleAgentSession["status"] | "idle" | "missing";
   summary: string | null;
   currentFocus: string | null;
   updatedAt: string | null;
@@ -226,7 +227,11 @@ function buildTaskOverviewEntry(
   );
   const leader: TaskOverviewLeader = {
     role: "leader",
-    roleStatus: leaderRole?.status ?? "missing",
+    roleStatus: leaderRole === null
+      ? "missing"
+      : agentRuns.some((run) => run.roleName === "leader" && run.status === "active")
+        ? "running"
+        : roleSessions.find((session) => session.roleName === "leader")?.status ?? "idle",
     summary: brief?.leaderSummary ?? null,
     currentFocus: brief?.currentFocus ?? null,
     updatedAt: brief?.updatedAt ?? null,

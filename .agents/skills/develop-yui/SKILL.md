@@ -12,6 +12,28 @@ These constraints apply whenever Yui is the Project being changed, regardless
 of whether the work is performed manually, by a direct Agent, through Yui
 orchestration, in CI, or by another development tool.
 
+## Develop an Agent-first control plane
+
+Yui serves intelligent Agents. Its core should expose durable context and small
+atomic capabilities, while the Agent decides planning, sequencing, delegation,
+retry, and recovery. Build a policy engine only when the product itself, rather
+than an Agent using current context, must make the decision.
+
+- Prefer one CLI read model and one explicit atomic mutation over a prescribed
+  multi-step workflow. Preserve pending intent when a mutation cannot proceed,
+  and return an observable result that lets the Agent choose what to do next.
+- Keep semantic judgment in Project Skills, Knowledge, Task context, and Agent
+  instructions. Core owns identity, authorization, workspace isolation,
+  persistent integrity, and atomic effects; it does not need to model every
+  sensible Agent decision or provider edge case.
+- Treat Provider Sessions and runtime continuity as execution aids. Durable
+  Task context, results, and managed workspaces must be sufficient for an Agent
+  to resume or redo bounded work when a runtime cannot continue cleanly.
+- Trust enforced internal contracts and valid Agent declarations. Add a state,
+  fence, retry, recovery path, or permanent validation only for a normal
+  product path, a hard authority or data-integrity boundary, or an observed
+  failure whose cost justifies the added protocol.
+
 ## Keep Yui validation lean
 
 Use [`docs/testing/verification-levels.md`](../../../docs/testing/verification-levels.md)
@@ -39,6 +61,11 @@ Agent Driver registration.
   and effect boundary in the current request.
 
 ## Let the Leader choose the smallest useful topology
+
+Execution topology is a Leader judgment made from current Task context, not a
+core scheduling policy. Yui should provide the same composable operations for
+direct work, native children, and managed Runs without trying to infer an
+optimal decomposition from file count, risk labels, or workflow phase.
 
 Classify Yui software work as `bugfix` or `feature`. A reproducible bugfix is
 Leader-owned: implement it on clean committed Task main, run the smallest
