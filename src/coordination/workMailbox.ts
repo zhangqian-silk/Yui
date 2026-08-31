@@ -100,7 +100,7 @@ export type PendingLanes = Readonly<{
 const RECENT_DEDUPE_KEY_LIMIT = 256;
 
 export type WorkMailbox = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   target: MailboxTarget;
   nextSequence: number;
   /** Internal controller claims; model input uses inputDelivery exclusively. */
@@ -304,7 +304,7 @@ function requireProcessing(mailbox: WorkMailbox, batchId: string): ProcessingBat
 
 export function createWorkMailbox(target: MailboxTarget): WorkMailbox {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     target: copyTarget(target),
     nextSequence: 1,
     processing: null,
@@ -325,7 +325,7 @@ export function validateWorkMailbox(value: unknown): WorkMailbox {
     ["schemaVersion", "target", "nextSequence", "processing", "pending", "inputDelivery"],
     "WorkMailbox"
   );
-  if (mailbox.schemaVersion !== 2) throw new Error("WorkMailbox must use schemaVersion 2");
+  if (mailbox.schemaVersion !== 3) throw new Error("WorkMailbox must use schemaVersion 3");
   const target = parseTarget(mailbox.target);
   const nextSequence = requireInteger(mailbox.nextSequence, 1, "WorkMailbox nextSequence");
   const processing = mailbox.processing === null ? null : parseProcessing(mailbox.processing);
@@ -368,7 +368,7 @@ export function validateWorkMailbox(value: unknown): WorkMailbox {
   if (inputDelivery !== null && target.kind !== "role" && target.kind !== "operator") {
     throw new Error("WorkMailbox inputDelivery requires a Role or Operator target");
   }
-  return { schemaVersion: 2, target, nextSequence, processing, pending, inputDelivery };
+  return { schemaVersion: 3, target, nextSequence, processing, pending, inputDelivery };
 }
 
 function parsePendingLanes(value: unknown): PendingLanes {

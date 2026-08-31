@@ -54,6 +54,8 @@ const AGENT_RUN_CONTEXT_PROTOCOL_FROM_VERSION = 7;
 const AGENT_RUN_CONTEXT_PROTOCOL_TO_VERSION = 8;
 const AGENT_RUN_RETRY_EPISODE_FROM_VERSION = 8;
 const AGENT_RUN_RETRY_EPISODE_TO_VERSION = 9;
+const AGENT_RUN_ERROR_FACTS_FROM_VERSION = 9;
+const AGENT_RUN_ERROR_FACTS_TO_VERSION = 10;
 const MESSAGE_WAKE_POLICY_FROM_VERSION = 2;
 const MESSAGE_WAKE_POLICY_TO_VERSION = 3;
 const REVIEW_ROUND_FROM_VERSION = 2;
@@ -102,6 +104,8 @@ const RELEASE_WORKFLOW_FROM_VERSION = 0;
 const RELEASE_WORKFLOW_TO_VERSION = 1;
 const WORK_MAILBOX_FROM_VERSION = 1;
 const WORK_MAILBOX_TO_VERSION = 2;
+const HOST_OWNED_WORK_MAILBOX_FROM_VERSION = 2;
+const HOST_OWNED_WORK_MAILBOX_TO_VERSION = 3;
 const TASK_ROLE_FROM_VERSION = 3;
 const TASK_ROLE_TO_VERSION = 4;
 const TASK_ROLE_SESSION_SET_FROM_VERSION = 4;
@@ -110,12 +114,18 @@ const STRUCTURED_PROVIDER_SESSION_SET_FROM_VERSION = 5;
 const STRUCTURED_PROVIDER_SESSION_SET_TO_VERSION = 6;
 const AGENT_FIRST_SESSION_SET_FROM_VERSION = 6;
 const AGENT_FIRST_SESSION_SET_TO_VERSION = 7;
+const UNIFIED_TASK_SESSION_SET_FROM_VERSION = 7;
+const UNIFIED_TASK_SESSION_SET_TO_VERSION = 8;
+const UNIFIED_GLOBAL_SESSION_SET_FROM_VERSION = 3;
+const UNIFIED_GLOBAL_SESSION_SET_TO_VERSION = 4;
 const PUBLICATION_REFERENCE_FROM_VERSION = 0;
 const PUBLICATION_REFERENCE_TO_VERSION = 1;
 const CONFIG_FROM_VERSION = 1;
 const CONFIG_TO_VERSION = 2;
 const CONFIG_REVIEW_CONTROLS_FROM_VERSION = 2;
 const CONFIG_REVIEW_CONTROLS_TO_VERSION = 3;
+const CONFIG_AGENT_RECOVERY_FROM_VERSION = 3;
+const CONFIG_AGENT_RECOVERY_TO_VERSION = 4;
 
 /**
  * Build the authoritative production graph. Transition intent and executable
@@ -167,6 +177,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(projectOwnershipStep())
     .registerOfflineMigration(configV2Step())
     .registerOfflineMigration(configReviewControlsRemovalStep())
+    .registerOfflineMigration(configAgentRecoveryStep())
     .registerCompatible(projectKnowledgeProposalsStep())
     .registerCompatible(projectLifecycleStep())
     .registerOfflineMigration(taskWorkspaceIdentityStep())
@@ -222,6 +233,7 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     ))
     .registerOfflineMigration(agentRunContextProtocolStep())
     .registerOfflineMigration(agentRunRetryEpisodeStep())
+    .registerOfflineMigration(agentRunErrorFactsStep())
     .registerOfflineMigration(messageWakePolicyStep())
     .registerOfflineMigration(recordFamilyStep(
       "reviewRound",
@@ -281,10 +293,13 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(capabilityGrantIntroductionStep())
     .registerOfflineMigration(releaseWorkflowIntroductionStep())
     .registerOfflineMigration(workMailboxV2Step())
+    .registerOfflineMigration(hostOwnedWorkMailboxStep())
     .registerOfflineMigration(agentRunOwnedTaskRoleStep())
     .registerOfflineMigration(taskRoleSessionSetV5Step())
     .registerOfflineMigration(structuredProviderSessionSetV6Step())
     .registerOfflineMigration(agentFirstSessionSetV7Step())
+    .registerOfflineMigration(unifiedTaskSessionSetStep())
+    .registerOfflineMigration(unifiedGlobalSessionSetStep())
     .registerOfflineMigration(publicationReferenceIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
@@ -484,6 +499,64 @@ function migrateConfigV2ToV3(snapshot: HomeSnapshot): HomeSnapshot {
         schemaVersion: CONFIG_REVIEW_CONTROLS_TO_VERSION,
         ...(migratedReview === undefined ? {} : { review: migratedReview })
       }
+    }
+  };
+}
+
+/** Removes Core-owned Provider retry policy; recovery is chosen from AgentError facts. */
+function configAgentRecoveryStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "config",
+    fromVersion: CONFIG_AGENT_RECOVERY_FROM_VERSION,
+    toVersion: CONFIG_AGENT_RECOVERY_TO_VERSION,
+    preconditions: requireConfigV3,
+    transform: migrateConfigV3ToV4,
+    declaredEffects: []
+  };
+}
+
+function requireConfigV3(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.config !== CONFIG_AGENT_RECOVERY_FROM_VERSION) {
+    throw new Error(
+      `Record config migration requires manifest version ${CONFIG_AGENT_RECOVERY_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const config = asObject(snapshot.state.config, "Yui config");
+  if (config.schemaVersion !== CONFIG_AGENT_RECOVERY_FROM_VERSION) {
+    throw new Error(
+      `Yui config must use schemaVersion ${CONFIG_AGENT_RECOVERY_FROM_VERSION} before migration.`
+    );
+  }
+}
+
+function migrateConfigV3ToV4(snapshot: HomeSnapshot): HomeSnapshot {
+  requireConfigV3(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...versions, config: CONFIG_AGENT_RECOVERY_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const config = asObject(snapshot.state.config, "Yui config");
+  const {
+    providerRetryMode: _mode,
+    providerRetryAdapters: _adapters,
+    providerRetryDelaysSeconds: _delays,
+    providerRetryMaxWindowSeconds: _window,
+    ...retained
+  } = config;
+  void _mode;
+  void _adapters;
+  void _delays;
+  void _window;
+  return {
+    schemaManifest,
+    state: {
+      ...snapshot.state,
+      config: { ...retained, schemaVersion: CONFIG_AGENT_RECOVERY_TO_VERSION }
     }
   };
 }
@@ -2694,6 +2767,57 @@ function migrateAgentRunsToRetryEpisodes(snapshot: HomeSnapshot): HomeSnapshot {
   return { schemaManifest, state: { ...snapshot.state, tasks: nextTasks } };
 }
 
+/** Deletes the retired retry episode; an AgentRun now records scheduling only. */
+function agentRunErrorFactsStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "agentRun",
+    fromVersion: AGENT_RUN_ERROR_FACTS_FROM_VERSION,
+    toVersion: AGENT_RUN_ERROR_FACTS_TO_VERSION,
+    preconditions: (snapshot) => requireRecordFamilyVersion(
+      snapshot,
+      "agentRun",
+      AGENT_RUN_ERROR_FACTS_FROM_VERSION,
+      "agentRuns"
+    ),
+    transform: migrateAgentRunsToErrorFacts,
+    declaredEffects: []
+  };
+}
+
+function migrateAgentRunsToErrorFacts(snapshot: HomeSnapshot): HomeSnapshot {
+  requireRecordFamilyVersion(
+    snapshot,
+    "agentRun",
+    AGENT_RUN_ERROR_FACTS_FROM_VERSION,
+    "agentRuns"
+  );
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...versions, agentRun: AGENT_RUN_ERROR_FACTS_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawTask] of Object.entries(tasks)) {
+    const task = asObject(rawTask, `Task aggregate ${taskId}`);
+    const records = asObject(task.agentRuns ?? {}, `agentRun map ${taskId}`);
+    const nextRecords: Record<string, unknown> = {};
+    for (const [runId, rawRecord] of Object.entries(records)) {
+      const record = asObject(rawRecord, `agentRun ${taskId}/${runId}`);
+      const { providerRetry: _retry, ...retained } = record;
+      void _retry;
+      nextRecords[runId] = {
+        ...retained,
+        schemaVersion: AGENT_RUN_ERROR_FACTS_TO_VERSION
+      };
+    }
+    nextTasks[taskId] = { ...task, agentRuns: nextRecords };
+  }
+  return { schemaManifest, state: { ...snapshot.state, tasks: nextTasks } };
+}
+
 function requiredMigrationPositiveInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 1) {
     throw new Error(`${label} must be a positive integer.`);
@@ -3198,6 +3322,82 @@ function migrateWorkMailboxV1ToV2(snapshot: HomeSnapshot): HomeSnapshot {
   };
 }
 
+/** A Host launch reservation belongs to the Role owner and launchId, never a Run. */
+function hostOwnedWorkMailboxStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "workMailbox",
+    fromVersion: HOST_OWNED_WORK_MAILBOX_FROM_VERSION,
+    toVersion: HOST_OWNED_WORK_MAILBOX_TO_VERSION,
+    preconditions: requireWorkMailboxV2Family,
+    transform: migrateWorkMailboxV2ToV3,
+    declaredEffects: []
+  };
+}
+
+function requireWorkMailboxV2Family(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.workMailbox !== HOST_OWNED_WORK_MAILBOX_FROM_VERSION) {
+    throw new Error(
+      `Record workMailbox migration requires manifest version ${HOST_OWNED_WORK_MAILBOX_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const mailboxes = asObject(snapshot.state.mailboxes, "state mailboxes");
+  for (const [key, rawMailbox] of Object.entries(mailboxes)) {
+    const mailbox = asObject(rawMailbox, `WorkMailbox ${key}`);
+    if (mailbox.schemaVersion !== HOST_OWNED_WORK_MAILBOX_FROM_VERSION) {
+      throw new Error(
+        `WorkMailbox ${key} must use schemaVersion ${HOST_OWNED_WORK_MAILBOX_FROM_VERSION}.`
+      );
+    }
+  }
+}
+
+function migrateWorkMailboxV2ToV3(snapshot: HomeSnapshot): HomeSnapshot {
+  requireWorkMailboxV2Family(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...versions, workMailbox: HOST_OWNED_WORK_MAILBOX_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const mailboxes = asObject(snapshot.state.mailboxes, "state mailboxes");
+  const nextMailboxes: Record<string, unknown> = {};
+  for (const [key, rawMailbox] of Object.entries(mailboxes)) {
+    const mailbox = asObject(rawMailbox, `WorkMailbox ${key}`);
+    const target = asObject(mailbox.target, `WorkMailbox ${key} target`);
+    const processing = mailbox.processing === null
+      ? null
+      : asObject(mailbox.processing, `WorkMailbox ${key} processing`);
+    const batch = processing === null
+      ? null
+      : asObject(processing.batch, `WorkMailbox ${key} processing batch`);
+    const lifecycleReservation = (target.kind === "role-runtime"
+        || target.kind === "global-role-runtime")
+      && Array.isArray(batch?.reasons)
+      && batch.reasons.includes("runtime-launch-reserved");
+    const nextProcessing = processing === null
+      ? null
+      : lifecycleReservation
+        ? (() => {
+            const { executionRef: _run, ...retained } = processing;
+            void _run;
+            return retained;
+          })()
+        : processing;
+    nextMailboxes[key] = {
+      ...mailbox,
+      schemaVersion: HOST_OWNED_WORK_MAILBOX_TO_VERSION,
+      processing: nextProcessing
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, mailboxes: nextMailboxes }
+  };
+}
+
 /**
  * v1 used `processing` for both internal/initial dispatch ownership and later
  * model input.  A crashed later input may already have reached the provider;
@@ -3404,6 +3604,189 @@ function migrateTaskRoleSessionSetV6ToV7(snapshot: HomeSnapshot): HomeSnapshot {
     nextTasks[taskId] = { ...aggregate, roleSessionSets: nextSets };
   }
   return { schemaManifest, state: { ...snapshot.state, tasks: nextTasks } };
+}
+
+/** Session stores existence only; Host readiness and Turn activity are runtime facts. */
+function unifiedTaskSessionSetStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "taskRoleSessionSet",
+    fromVersion: UNIFIED_TASK_SESSION_SET_FROM_VERSION,
+    toVersion: UNIFIED_TASK_SESSION_SET_TO_VERSION,
+    preconditions: requireTaskRoleSessionSetV7Family,
+    transform: migrateTaskRoleSessionSetV7ToV8,
+    declaredEffects: []
+  };
+}
+
+function requireTaskRoleSessionSetV7Family(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.taskRoleSessionSet !== UNIFIED_TASK_SESSION_SET_FROM_VERSION) {
+    throw new Error(
+      `Record taskRoleSessionSet migration requires manifest version ${UNIFIED_TASK_SESSION_SET_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const sets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+    for (const [roleName, rawSet] of Object.entries(sets)) {
+      const set = asObject(rawSet, `Task Role session set ${taskId}/${roleName}`);
+      if (set.schemaVersion !== UNIFIED_TASK_SESSION_SET_FROM_VERSION) {
+        throw new Error(
+          `Task Role session set ${taskId}/${roleName} must use schemaVersion ${UNIFIED_TASK_SESSION_SET_FROM_VERSION}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateTaskRoleSessionSetV7ToV8(snapshot: HomeSnapshot): HomeSnapshot {
+  requireTaskRoleSessionSetV7Family(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...versions,
+      taskRoleSessionSet: UNIFIED_TASK_SESSION_SET_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const sets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+    const nextSets: Record<string, unknown> = {};
+    for (const [roleName, rawSet] of Object.entries(sets)) {
+      const set = asObject(rawSet, `Task Role session set ${taskId}/${roleName}`);
+      const sessions = migrateRoleAgentSessionMap(
+        set.sessions,
+        `Task Role sessions ${taskId}/${roleName}`
+      );
+      const history = set.history === undefined
+        ? undefined
+        : migrateRoleAgentSessionArray(
+            set.history,
+            `Task Role session history ${taskId}/${roleName}`
+          );
+      nextSets[roleName] = {
+        ...set,
+        schemaVersion: UNIFIED_TASK_SESSION_SET_TO_VERSION,
+        sessions,
+        ...(history === undefined ? {} : { history })
+      };
+    }
+    nextTasks[taskId] = { ...aggregate, roleSessionSets: nextSets };
+  }
+  return { schemaManifest, state: { ...snapshot.state, tasks: nextTasks } };
+}
+
+function unifiedGlobalSessionSetStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "globalRoleSessionSet",
+    fromVersion: UNIFIED_GLOBAL_SESSION_SET_FROM_VERSION,
+    toVersion: UNIFIED_GLOBAL_SESSION_SET_TO_VERSION,
+    preconditions: requireGlobalRoleSessionSetV3Family,
+    transform: migrateGlobalRoleSessionSetV3ToV4,
+    declaredEffects: []
+  };
+}
+
+function requireGlobalRoleSessionSetV3Family(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.globalRoleSessionSet !== UNIFIED_GLOBAL_SESSION_SET_FROM_VERSION) {
+    throw new Error(
+      `Record globalRoleSessionSet migration requires manifest version ${UNIFIED_GLOBAL_SESSION_SET_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const sets = asObject(snapshot.state.globalRoleSessionSets, "Global Role session sets");
+  for (const [roleName, rawSet] of Object.entries(sets)) {
+    const set = asObject(rawSet, `Global Role session set ${roleName}`);
+    if (set.schemaVersion !== UNIFIED_GLOBAL_SESSION_SET_FROM_VERSION) {
+      throw new Error(
+        `Global Role session set ${roleName} must use schemaVersion ${UNIFIED_GLOBAL_SESSION_SET_FROM_VERSION}.`
+      );
+    }
+  }
+}
+
+function migrateGlobalRoleSessionSetV3ToV4(snapshot: HomeSnapshot): HomeSnapshot {
+  requireGlobalRoleSessionSetV3Family(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...versions,
+      globalRoleSessionSet: UNIFIED_GLOBAL_SESSION_SET_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const sets = asObject(snapshot.state.globalRoleSessionSets, "Global Role session sets");
+  const nextSets: Record<string, unknown> = {};
+  for (const [roleName, rawSet] of Object.entries(sets)) {
+    const set = asObject(rawSet, `Global Role session set ${roleName}`);
+    const history = set.history === undefined
+      ? undefined
+      : migrateRoleAgentSessionMap(
+          set.history,
+          `Global Role session history ${roleName}`
+        );
+    nextSets[roleName] = {
+      ...set,
+      schemaVersion: UNIFIED_GLOBAL_SESSION_SET_TO_VERSION,
+      sessions: migrateRoleAgentSessionMap(set.sessions, `Global Role sessions ${roleName}`),
+      ...(history === undefined ? {} : { history })
+    };
+  }
+  return {
+    schemaManifest,
+    state: { ...snapshot.state, globalRoleSessionSets: nextSets }
+  };
+}
+
+function migrateRoleAgentSessionMap(value: unknown, label: string): Record<string, unknown> {
+  const sessions = asObject(value, label);
+  return Object.fromEntries(Object.entries(sessions).map(([key, session]) => [
+    key,
+    migrateRoleAgentSessionV3(session, `${label}/${key}`)
+  ]));
+}
+
+function migrateRoleAgentSessionArray(value: unknown, label: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array.`);
+  return value.map((session, index) => migrateRoleAgentSessionV3(
+    session,
+    `${label}/${String(index)}`
+  ));
+}
+
+function migrateRoleAgentSessionV3(value: unknown, label: string): Record<string, unknown> {
+  const session = asObject(value, label);
+  if (session.schemaVersion !== 3) {
+    throw new Error(`${label} must use schemaVersion 3.`);
+  }
+  const status = session.status;
+  if (status !== "reserved"
+    && status !== "ready"
+    && status !== "running"
+    && status !== "stopped"
+    && status !== "broken") {
+    throw new Error(`${label} has an invalid Session status.`);
+  }
+  const { status: _status, ...retained } = session;
+  void _status;
+  return {
+    ...retained,
+    schemaVersion: 4,
+    status: status === "stopped" || status === "broken" ? "ended" : "active",
+    ...(status === "stopped"
+      ? { endReason: "stopped" }
+      : status === "broken" ? { endReason: "failed" } : {})
+  };
 }
 
 function requireTaskRoleSessionSetV5Family(snapshot: HomeSnapshot): void {

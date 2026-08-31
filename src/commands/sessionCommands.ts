@@ -34,7 +34,7 @@ export type SessionStopResult = Readonly<{
     stopped: readonly RuntimeSessionCandidate[];
     blocked: readonly Readonly<{
       session: RuntimeSessionCandidate;
-      reason: "running" | "runtime-work-pending";
+      reason: "runtime-work-pending";
     }>[];
   }>;
   exitCode: number;
@@ -119,9 +119,7 @@ function blockedSessions(input: Readonly<{
     if (idle) return [];
     return [{
       session,
-      reason: session.status === "running"
-        ? "running" as const
-        : "runtime-work-pending" as const
+      reason: "runtime-work-pending" as const
     }];
   });
 }
@@ -129,10 +127,8 @@ function blockedSessions(input: Readonly<{
 function blockedStopResult(
   blocked: SessionStopResult["data"]["blocked"]
 ): SessionStopResult {
-  const details = blocked.map(({ session, reason }) => (
-    `- ${renderSessionOwner(session)} (${reason === "running"
-      ? "a Turn or Run is still running"
-      : "an active Run or lifecycle operation is still pending"})`
+  const details = blocked.map(({ session }) => (
+    `- ${renderSessionOwner(session)} (an active Run or lifecycle operation is still pending)`
   ));
   return {
     output: [

@@ -146,22 +146,16 @@ export function resolveRuntimeHookRunFence(
   }));
   const exactReservation = isRuntimeLaunchReservation(mailbox?.processing, launchId)
     && !hasRuntimeCleanupObligation(mailbox);
-  const executionRef = mailbox?.processing?.executionRef;
   const startupRunId = options.startupSession === undefined
     ? undefined
     : requireIdentity(
         runtime?.runId
-          ?? environment.YUI_RUN_ID
-          ?? (executionRef?.type === "run" && executionRef.taskId === taskId
-            ? executionRef.id
-            : undefined),
+          ?? environment.YUI_RUN_ID,
         "Run id"
       );
   const startupReservation = startupRunId !== undefined
     && exactReservation
-    && executionRef?.type === "run"
-    && executionRef.taskId === taskId
-    && executionRef.id === startupRunId;
+    && !hasRuntimeCleanupObligation(mailbox);
   const startupRun = startupRunId === undefined
     ? null
     : store.getAgentRun(taskId, startupRunId);
@@ -170,7 +164,7 @@ export function resolveRuntimeHookRunFence(
     && sessions !== null
     && startupReservation
     && startupRun?.mode === "new"
-    && (session.status === "stopped" || session.status === "broken");
+    && session.status === "ended";
   const preallocatedStartup = options.startupSession === "preallocated"
     && expectedNativeSessionId !== undefined
     && (session === undefined || replacementStartup)

@@ -349,12 +349,20 @@ the workflow without claiming that version was delivered.
   treat it as a permission boundary. The Operator may make code, semantic,
   requirement, acceptance, recovery, and integration decisions and must leave
   the real actor and rationale in durable Task state.
-- Reconcile a disappeared native Session with `task reconcile`; inspect the Run
-  before retrying a confirmed failure.
-- If the current Provider Conversation cannot continue, use
-  `yui task role session switch <task> <role> --reason "..."`. The request is
-  audited, and Yui keeps the old Conversation authoritative until the exact
-  replacement bind succeeds; never reconstruct identities from terminal text.
+- Inspect `runtime.agent-error` and `yui task role session inspect` before a
+  recovery. When a Provider-accepted Turn fails with availability, `429`,
+  capacity, or a recoverable transport error and the Session remains usable,
+  add a new Turn to that Session. A Session preparation failure or Driver
+  rejection before input acceptance fails the exact Run once; explicitly retry
+  that failed Run when another attempt is useful. Core does not redispatch it
+  on a scheduler tick. If the Driver proves the Session cannot continue, settle
+  or retire its exact Run, stop that one idle Session with `yui task role
+  session stop <task> <role> --reason "..."`, then retry the failed Run. The
+  replacement Run receives the old Agent, adapter, Run, Host, Session, Turn,
+  and complete raw-error facts through Task context.
+- Inspect recent errors before creating another fresh Session. After repeated
+  fresh-Session failures, summarize the evidence and bounded options to the
+  user; do not hide them behind an automatic replacement counter or loop.
 - Retry only an explicitly failed recovery Job.
 - When a Leader first-progress advisory is reported, inspect its native
   generations and absence of durable progress. It is cost evidence rather than

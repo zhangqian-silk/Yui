@@ -346,7 +346,7 @@ function projectExecutionLaneHealth(
   }
 
   const exit = latestExactProcessExit(input.events, run, session);
-  const sessionDead = session?.status === "stopped" || session?.status === "broken";
+  const sessionDead = session?.status === "ended";
   if (sessionDead
     && exit !== null
     && isAbnormalExit(exit.classification)

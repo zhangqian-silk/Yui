@@ -259,8 +259,7 @@ export function taskLeaderActionRunId(
     session === undefined
     || identity(session.nativeSessionId) === undefined
     || identity(session.launchId) === undefined
-    || session.status === "stopped"
-    || session.status === "broken"
+    || session.status === "ended"
     || session.adapterId !== adapterId
     || (explicitAssertion === undefined && session.launchId !== launchId)
   ) return undefined;

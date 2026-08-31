@@ -122,8 +122,8 @@ or yield merely to preserve that native wait.
 Before the first durable Leader action, Yui observes fresh native generations
 that produce no WorkItem, Review, Integration, or Leader-attributed durable
 event. Two such generations create a non-blocking orchestration advisory for
-Leader and Operator judgment; they do not fail the Role, reduce the configured
-Provider retry policy, or prevent another useful generation. Read the evidence
+Leader and Operator judgment; they do not fail the Role or prevent another
+useful generation. Read the evidence
 before retrying, then choose whether to continue, change the configured Leader,
 or perform direct maintenance without manufacturing protocol records merely to
 silence the advisory.
@@ -703,12 +703,34 @@ newer WorkItem. If the original execution Session cannot be resumed, surface
 the recovery decision to the user; do not silently discard its context by
 creating a replacement.
 
-If a native Role Session disappears, run `yui task reconcile <task-id>`,
-inspect the Run and partial work, then retry only a confirmed failed Run:
+For a Role runtime failure, inspect the exact error and runtime identities first:
 
 ```sh
-yui task run retry <run-id>
+yui task event show <task> <agent-error-event>
+yui task role session inspect <task> <role>
 ```
+
+When a Provider-accepted Turn fails with availability, `429`, capacity, or a
+recoverable transport error and the Session remains usable, retain the Run and
+Session; a recovery action adds a new Turn on that same native Session. A
+Session preparation failure or Driver rejection before input acceptance fails
+the exact Run once; inspect its error and explicitly retry that failed Run when
+another attempt is useful. Core will not redispatch it on a scheduler tick.
+
+If the Driver proves that the Session cannot continue, settle or retire the
+exact active Run, stop only that Role Session, then retry the failed Run so the
+next dispatch starts a new Session:
+
+```sh
+yui task role session stop <task> <role> --reason "<error decision>"
+yui task run retry <task>/<failed-run>
+```
+
+The new Run context contains the prior Agent, adapter, Run, Host activation,
+native Session/Turn identities, and complete raw error through the referenced
+Task event. Inspect recent `runtime.agent-error` events before another fresh
+Session; after repeated fresh-Session failures, report the evidence and bounded
+options to the user instead of inventing another automatic loop.
 
 ## Request a decision
 
@@ -789,8 +811,8 @@ yui task complete <task-id> --summary "<outcome, validation, and remaining risks
 
 Retire obsolete WorkItems with `yui task work retire <task>/<work> --summary
 "..."`, optionally using `--replacement`. If the current Provider Conversation
-cannot continue, request a bounded switch with
-`yui task role session switch <task> <role> --reason "..."`; the current
-Conversation remains authoritative until Yui safely binds the replacement. Archiving is a
+cannot continue, settle its Run and stop the exact idle Session with
+`yui task role session stop`; the next explicit Run dispatch creates the
+replacement. Archiving is a
 separate global Operator lifecycle action. It performs the final Task-owned
 runtime and clean-worktree teardown, including this Leader.

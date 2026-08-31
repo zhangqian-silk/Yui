@@ -52,7 +52,7 @@ export function createPendingTurnCompletion(
     roleName: requireSafeIdentity(input.roleName, "Role name"),
     agentId: requireSafeIdentity(input.agentId, "Agent id"),
     nativeSessionId: requireText(input.nativeSessionId, "Native session id"),
-    turnId: requireSafeIdentity(input.turnId, "Turn id"),
+    turnId: requireText(input.turnId, "Turn id"),
     runId: requireSafeIdentity(input.runId, "Run id"),
     summary: requireText(input.summary, "Turn summary"),
     observedAt,
@@ -81,7 +81,7 @@ export function validatePendingTurnCompletion(value: unknown): PendingTurnComple
     roleName: requireSafeIdentityValue(input.roleName, "Role name"),
     agentId: requireSafeIdentityValue(input.agentId, "Agent id"),
     nativeSessionId: requireTextValue(input.nativeSessionId, "Native session id"),
-    turnId: requireSafeIdentityValue(input.turnId, "Turn id"),
+    turnId: requireTextValue(input.turnId, "Turn id"),
     runId: requireSafeIdentityValue(input.runId, "Run id"),
     summary: requireTextValue(input.summary, "Turn summary"),
     observedAt,
@@ -99,7 +99,7 @@ export function validateRecentTurnIds(
     throw new Error(`Recent Turn ids must not contain more than ${normalizedLimit} entries.`);
   }
   const result = value.map(
-    (turnId) => requireSafeIdentityValue(turnId, "Recent Turn id")
+    (turnId) => requireTextValue(turnId, "Recent Turn id")
   );
   if (new Set(result).size !== result.length) {
     throw new Error("Recent Turn ids must not contain duplicates.");
@@ -114,7 +114,7 @@ export function rememberRecentTurnId(
 ): readonly string[] {
   const normalizedLimit = requireLimit(limit);
   const existing = validateRecentTurnIds(recentTurnIds, normalizedLimit);
-  const normalizedTurnId = requireSafeIdentity(turnId, "Recent Turn id");
+  const normalizedTurnId = requireText(turnId, "Recent Turn id");
   return [
     ...existing.filter((candidate) => candidate !== normalizedTurnId),
     normalizedTurnId
@@ -126,7 +126,7 @@ export function hasRecentTurnId(
   turnId: string
 ): boolean {
   const existing = validateRecentTurnIds(recentTurnIds);
-  return existing.includes(requireSafeIdentity(turnId, "Recent Turn id"));
+  return existing.includes(requireText(turnId, "Recent Turn id"));
 }
 
 function requireOrderedTimestamps(observedAt: string, dueAt: string): void {

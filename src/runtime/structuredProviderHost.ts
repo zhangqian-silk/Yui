@@ -17,6 +17,7 @@ import type {
   AgentHostLaunchPayload,
   AgentHostProviderControl
 } from "./launchBroker.js";
+import { serializeAgentErrorRaw } from "./agentError.js";
 import { PROVIDER_ACCEPT_TIMEOUT_MS } from "./runtimeDeadlines.js";
 import { YUI_VERSION } from "../version.js";
 
@@ -31,9 +32,10 @@ export type StructuredProviderTurnReceipt = Readonly<{
   acceptedAt: string;
 }>;
 
-export type StructuredProviderTurnInput = NonNullable<
-  AgentHostProviderControl["initialTurn"]
->;
+export type StructuredProviderTurnInput = Readonly<{
+  attemptId: string;
+  boundedText: string;
+}>;
 
 export type StructuredProviderTurnTerminal = Readonly<{
   conversationId: string;
@@ -44,7 +46,10 @@ export type StructuredProviderTurnTerminal = Readonly<{
   status: "completed" | "failed" | "cancelled";
   observedAt: string;
   summary?: string;
+  /** Human-readable Provider error message. */
   error?: string;
+  /** Complete serialized Provider exception as received by this Driver. */
+  rawError?: string;
 }>;
 
 export type StructuredProviderProcessExit = Readonly<{
@@ -525,7 +530,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
       onTerminal
     );
     session.#activeTurnId = resumedActiveTurnId;
-    const ownedTurn = control.kind === "ensure" ? control.ownedTurn : undefined;
+    const ownedTurn = control.kind === "restore" ? control.ownedTurn : undefined;
     session.#clientOwnedTurnId = ownedTurn?.turnId;
     stopOpeningBuffer();
     let recoveredTerminal: StructuredProviderTurnTerminal | undefined;
@@ -551,7 +556,12 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
             ? "failed"
             : recovered.status === "interrupted" ? "cancelled" : "completed",
           observedAt: new Date().toISOString(),
-          ...(recovered.error === undefined ? {} : { error: recovered.error })
+          ...(recovered.status !== "failed"
+            ? {}
+            : {
+                error: recovered.error ?? "Provider Turn failed.",
+                rawError: serializeAgentErrorRaw(recovered)
+              })
         };
         session.#clientOwnedTurnId = undefined;
       } else {
@@ -586,13 +596,16 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
       const status = turn.status === "failed"
         ? "failed"
         : turn.status === "interrupted" ? "cancelled" : "completed";
+      const failure = status === "failed"
+        ? providerErrorEvidence(turn.error)
+        : undefined;
       const terminal = {
         conversationId: this.conversationId,
         nativeSessionId: this.conversationId,
         nativeTurnId,
         status,
         observedAt: new Date().toISOString(),
-        ...(status !== "failed" ? {} : { error: providerErrorText(turn.error) })
+        ...(failure === undefined ? {} : failure)
       } as const;
       if (this.#submissionPending && emit) {
         this.#bufferedTerminals.push(terminal);
@@ -681,18 +694,9 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
   }
 }
 
-type ClaudeWaiter = Readonly<{
-  attemptId: string;
-  text: string;
-  resolve: (receipt: StructuredProviderTurnReceipt) => void;
-  reject: (error: Error) => void;
-  timer: NodeJS.Timeout;
-}>;
-
 class ClaudeStructuredProviderSession implements StructuredProviderSession {
   readonly adapterId = "claude" as const;
   #activeTurnId: string | undefined;
-  #waiter: ClaudeWaiter | undefined;
 
   private constructor(
     private readonly child: ChildProcessWithoutNullStreams,
@@ -723,16 +727,6 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
       channel
     );
     channel.onMessage((message) => session.#receive(message, onTerminal));
-    exit.then(() => {
-      const waiter = session.#waiter;
-      if (waiter === undefined) return;
-      clearTimeout(waiter.timer);
-      session.#waiter = undefined;
-      waiter.reject(new ProviderDeliveryUnknownError(
-        "Claude process exited before replaying the submitted user message.",
-        waiter.attemptId
-      ));
-    }).catch(() => {});
     return session;
   }
 
@@ -747,29 +741,12 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
   async submitTurn(
     turn: StructuredProviderTurnInput
   ): Promise<StructuredProviderTurnReceipt> {
-    if (this.#activeTurnId !== undefined || this.#waiter !== undefined) {
+    if (this.#activeTurnId !== undefined) {
       throw new ProviderTurnRejectedError(
         "Provider Conversation already has an unsettled Turn.",
         turn.attemptId
       );
     }
-    let deliveryTimer: NodeJS.Timeout | undefined;
-    const receipt = new Promise<StructuredProviderTurnReceipt>((resolvePromise, reject) => {
-      deliveryTimer = setTimeout(() => {
-        if (this.#waiter?.attemptId === turn.attemptId) this.#waiter = undefined;
-        reject(new ProviderDeliveryUnknownError(
-          "Claude did not replay the submitted user message before the acknowledgement deadline.",
-          turn.attemptId
-        ));
-      }, PROVIDER_ACCEPT_TIMEOUT_MS);
-      this.#waiter = {
-        attemptId: turn.attemptId,
-        text: turn.boundedText,
-        resolve: resolvePromise,
-        reject,
-        timer: deliveryTimer!
-      };
-    });
     try {
       await this.channel.send({
         type: "user",
@@ -779,16 +756,27 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
         }
       });
     } catch (error) {
-      if (deliveryTimer !== undefined) clearTimeout(deliveryTimer);
-      this.#waiter = undefined;
       throw new ProviderDeliveryUnknownError(
-        `Claude input write did not produce an exact replay acknowledgement: ${
+        `Claude input write did not complete: ${
           error instanceof Error ? error.message : String(error)
         }`,
         turn.attemptId
       );
     }
-    return await receipt;
+    // AgentHost is the sole writer to this dedicated stream-json process.
+    // A completed pipe write is the smallest reliable acceptance boundary;
+    // Claude's later `result` is the matching terminal for this serialized
+    // Turn. Requiring an echoed user-message creates a second, brittle
+    // protocol without improving delivery safety.
+    const nativeTurnId = `claude-stream:${turn.attemptId}`;
+    this.#activeTurnId = nativeTurnId;
+    return Object.freeze({
+      attemptId: turn.attemptId,
+      conversationId: this.conversationId,
+      nativeSessionId: this.conversationId,
+      nativeTurnId,
+      acceptedAt: new Date().toISOString()
+    });
   }
 
   waitForExit(): Promise<StructuredProviderProcessExit> {
@@ -803,46 +791,15 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
     message: JsonObject,
     onTerminal: ((terminal: StructuredProviderTurnTerminal) => void) | undefined
   ): void {
-    if (message.type === "user") {
-      const waiter = this.#waiter;
-      if (waiter === undefined || claudeUserText(message) !== waiter.text) return;
-      const observedSessionId = optionalId(message.session_id);
-      if (observedSessionId !== this.conversationId) {
-        clearTimeout(waiter.timer);
-        this.#waiter = undefined;
-        waiter.reject(new ProviderDeliveryUnknownError(
-          "Claude replayed input for a different native Session.",
-          waiter.attemptId
-        ));
-        return;
-      }
-      const nativeTurnId = optionalId(message.uuid);
-      if (nativeTurnId === undefined) {
-        clearTimeout(waiter.timer);
-        this.#waiter = undefined;
-        waiter.reject(new ProviderDeliveryUnknownError(
-          "Claude replayed input without a native message identity.",
-          waiter.attemptId
-        ));
-        return;
-      }
-      this.#activeTurnId = nativeTurnId;
-      clearTimeout(waiter.timer);
-      this.#waiter = undefined;
-      waiter.resolve(Object.freeze({
-        attemptId: waiter.attemptId,
-        conversationId: this.conversationId,
-        nativeSessionId: this.conversationId,
-        nativeTurnId,
-        acceptedAt: new Date().toISOString()
-      }));
-      return;
-    }
+    if (message.type === "user") return;
     if (message.type !== "result" || this.#activeTurnId === undefined
       || optionalId(message.session_id) !== this.conversationId) return;
     const nativeTurnId = this.#activeTurnId;
     this.#activeTurnId = undefined;
     const failed = message.is_error === true || message.subtype === "error_during_execution";
+    const result = typeof message.result === "string" && message.result.length > 0
+      ? message.result
+      : "Provider Turn failed.";
     onTerminal?.({
       conversationId: this.conversationId,
       nativeSessionId: this.conversationId,
@@ -850,9 +807,11 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
       clientOwned: true,
       status: failed ? "failed" : "completed",
       observedAt: new Date().toISOString(),
-      ...(typeof message.result === "string" && message.result.length > 0
-        ? failed ? { error: message.result } : { summary: message.result }
-        : {})
+      ...(failed
+        ? { error: result, rawError: providerErrorEvidence(message).rawError }
+        : typeof message.result === "string" && message.result.length > 0
+          ? { summary: message.result }
+          : {})
     });
   }
 }
@@ -909,18 +868,15 @@ function nestedId(value: JsonObject, key: string): string | undefined {
   return optionalId(object(value[key])?.id);
 }
 
-function providerErrorText(value: unknown): string {
+function providerErrorEvidence(value: unknown): Readonly<{
+  error: string;
+  rawError: string;
+}> {
   const error = object(value);
-  if (typeof error?.message === "string" && error.message.length > 0) return error.message;
-  return "Provider Turn failed.";
-}
-
-function claudeUserText(message: JsonObject): string | undefined {
-  const content = object(message.message)?.content;
-  if (!Array.isArray(content)) return undefined;
-  const text = content.flatMap((entry) => {
-    const block = object(entry);
-    return block?.type === "text" && typeof block.text === "string" ? [block.text] : [];
-  });
-  return text.length === 1 ? text[0] : text.join("");
+  const message = typeof error?.message === "string" && error.message.length > 0
+    ? error.message
+    : typeof value === "string" && value.length > 0
+      ? value
+      : "Provider Turn failed.";
+  return { error: message, rawError: serializeAgentErrorRaw(value) };
 }

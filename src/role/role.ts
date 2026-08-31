@@ -304,7 +304,7 @@ export function unbindRoleAgent(
       throw new Error(`Cannot unbind Role Agent with an active Run: ${normalizedAgentId}.`);
     }
     const targetSession = sessions.sessions[normalizedAgentId];
-    if (targetSession !== undefined && targetSession.status !== "stopped") {
+    if (targetSession !== undefined && targetSession.status === "active") {
       throw new Error(
         `Cannot unbind Role Agent while its native session is ${targetSession.status}: `
         + `${normalizedAgentId}.`

@@ -38,8 +38,6 @@ export type PlannedRoleSession = Readonly<{
   launch: TmuxLaunchPlan;
   session: SchedulerRoleSession | null;
   sessionTitle?: string;
-  /** Exact Run whose first structured Provider Turn is handled by this launch workflow. */
-  initialTurnRunId?: string;
 }>;
 
 export interface RoleLaunchPlanner {
@@ -175,6 +173,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;
+    hostActivationId?: string;
     beforeHostStart?: RuntimeLaunchPreStart;
   }>): Promise<PreparedRoleDelivery> {
     if (input.mode === "resume" && !hasText(input.nativeSessionId)) {
@@ -237,7 +236,10 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
             : {
                 ...common,
                 mode: "resume",
-                nativeSessionId: input.nativeSessionId!
+                nativeSessionId: input.nativeSessionId!,
+                ...(input.hostActivationId === undefined
+                  ? {}
+                  : { hostActivationId: input.hostActivationId })
               },
           "deferred",
           undefined,
@@ -258,7 +260,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
             });
         binding = request.mode === "new"
           ? await this.runtimePorts.sessionHost.start(request, input.beforeHostStart)
-          : await this.runtimePorts.sessionHost.resume(request, input.beforeHostStart);
+          : await this.runtimePorts.sessionHost.restore(request, input.beforeHostStart);
       }
       sessionStarted = binding.hostCreated === true;
       session = binding.nativeSessionId === undefined
@@ -267,7 +269,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
             agentId: binding.agentId,
             adapterId: binding.adapterId,
             nativeSessionId: binding.nativeSessionId,
-            status: "ready",
+            status: "active",
             effective: input.effective
           };
     }
@@ -276,34 +278,6 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       ...(binding === undefined ? {} : { launchId: binding.launchId }),
       sessionStarted,
       session,
-      ...(
-        input.runId !== undefined
-        && (
-          (
-            binding?.initialTurnRunId === input.runId
-          )
-        )
-          ? { turnAcceptedDuringLaunch: true }
-          : {}
-      ),
-      ...(
-        input.runId !== undefined
-        && binding?.initialTurnDeliveryUnknownRunId === input.runId
-          ? { turnDeliveryUnknownDuringLaunch: true }
-          : {}
-      ),
-      ...(
-        input.runId !== undefined
-        && binding?.initialTurnBusyRunId === input.runId
-          ? { turnBusyDuringLaunch: true }
-          : {}
-      ),
-      ...(
-        input.runId !== undefined
-        && binding?.initialTurnRejectedRunId === input.runId
-          ? { turnRejectedDuringLaunch: true }
-          : {}
-      )
     };
     this.#prepared.set(delivery.deliveryId, {
       delivery,
@@ -616,6 +590,7 @@ function preparedDeliveryId(input: Readonly<{
     mode: RoleSessionLaunchMode;
   runId?: string;
   nativeSessionId?: string;
+  hostActivationId?: string;
 }>): string {
   return createHash("sha256").update(JSON.stringify([
     input.taskId,
@@ -625,7 +600,8 @@ function preparedDeliveryId(input: Readonly<{
     input.effective,
     input.mode,
     input.runId ?? null,
-    input.nativeSessionId ?? null
+    input.nativeSessionId ?? null,
+    input.hostActivationId ?? null
   ])).digest("hex");
 }
 

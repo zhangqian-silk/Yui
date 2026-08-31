@@ -3,6 +3,10 @@ import type {
   RuntimeObservationPayload,
   RuntimeUsageSnapshot
 } from "./runtimeObservation.js";
+import type {
+  AgentDriverErrorInput,
+  AgentErrorClassification
+} from "./agentError.js";
 
 export type AgentDriverSurface = "managed-protocol" | "interactive-cli";
 export type AgentRuntimeOperation = "model" | "tool" | "subagent";
@@ -190,6 +194,8 @@ export type AgentDriver = AgentDriverDescriptor & Readonly<{
     nativeSessionId(input: AgentDriverNativeHook): string | undefined;
     /** Resolve the provider's stable Turn identity without leaking its field names into core. */
     nativeTurnId(input: AgentDriverNativeHook): string | undefined;
+    /** Recognize one complete Provider exception as policy-free failure facts. */
+    mapError(input: AgentDriverErrorInput): AgentErrorClassification;
     mapHook(input: AgentDriverNativeHook): AgentDriverMappedHook | readonly AgentDriverMappedHook[];
     classifyHook(input: AgentDriverNativeHook): AgentDriverHookClassification;
     /** Optional independent observation source, sampled outside the Hook path. */
@@ -459,6 +465,7 @@ export class AgentDriverRegistry {
     }
     if (typeof input.runtime.nativeSessionId !== "function"
       || typeof input.runtime.nativeTurnId !== "function"
+      || typeof input.runtime.mapError !== "function"
       || typeof input.runtime.mapHook !== "function"
       || typeof input.runtime.classifyHook !== "function"
       || (input.runtime.observer !== undefined
@@ -475,6 +482,7 @@ export class AgentDriverRegistry {
       runtime: Object.freeze({
         nativeSessionId: input.runtime.nativeSessionId,
         nativeTurnId: input.runtime.nativeTurnId,
+        mapError: input.runtime.mapError,
         mapHook: input.runtime.mapHook,
         classifyHook: input.runtime.classifyHook,
         ...(input.runtime.observer === undefined

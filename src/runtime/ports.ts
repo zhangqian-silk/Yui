@@ -62,6 +62,8 @@ export type RuntimeLaunchPreparationRequest = Readonly<{
   environment?: Readonly<Record<string, string>>;
   mode: "new" | "resume";
   nativeSessionId?: string;
+  /** Current Host activation for exact same-Session restore, when known. */
+  hostActivationId?: string;
   runId?: string;
 }>;
 
@@ -80,7 +82,6 @@ export type RuntimeLaunchPreflight = Readonly<{
   effective: EffectiveLaunchSnapshot;
   sessionTitle?: string;
   nativeSessionId?: string;
-  initialTurnRunId?: string;
 }>;
 
 export type RuntimeLaunchPreStart = (preflight: RuntimeLaunchPreflight) => void;
@@ -117,7 +118,8 @@ export interface SessionHostPort {
     request: NewSessionLaunchRequest,
     beforeHostStart?: RuntimeLaunchPreStart
   ): Promise<RuntimeBinding>;
-  resume(
+  /** Reattach exactly the requested native Session; never creates a replacement Session. */
+  restore(
     request: ResumeSessionLaunchRequest,
     beforeHostStart?: RuntimeLaunchPreStart
   ): Promise<RuntimeBinding>;

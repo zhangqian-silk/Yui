@@ -1,6 +1,7 @@
 import { createAgentRun } from "../run/agentRun.js";
 import {
-  createRunAssignment
+  createRunAssignment,
+  serializeRunBootstrapEnvelope
 } from "../context/runContextContract.js";
 import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
 import {
@@ -11,7 +12,6 @@ import { roleAgentSessionResumeMode } from "../executor/agentExecutor.js";
 import {
   RuntimeLifecycleBusyError
 } from "../runtime/lifecycleReservation.js";
-import { recordLeaderFailure } from "./leaderFailure.js";
 import type {
   PreparedRoleDelivery,
   SchedulerRole,
@@ -24,6 +24,7 @@ import type {
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import type { RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { RuntimeLaunchError } from "../runtime/ports.js";
+import { serializeAgentErrorRaw } from "../runtime/agentError.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
@@ -76,6 +77,13 @@ export async function processLeaderWakeups(
       results.push({ taskId: task.id, status: "skipped", reason: "busy" });
       continue;
     }
+    // A durable wake is already the complete next intent. Do not materialize
+    // another Run while the Provider still owns the previous Turn: doing so
+    // would make its late terminal compete with a newer Run generation.
+    if (providerTurnIsUnsettled(store, task.id, role.name)) {
+      results.push({ taskId: task.id, status: "skipped", reason: "busy" });
+      continue;
+    }
     const reopening = wakeup.reasons.includes("task-reopened");
     let existingSession = store.getRoleSession(
       task.id,
@@ -88,6 +96,7 @@ export async function processLeaderWakeups(
     let run: ReturnType<typeof createAgentRun> | null = null;
     let prepared: PreparedRoleDelivery | undefined;
     let preStartFencePersisted = false;
+    let mode: "new" | "resume" = "new";
     try {
       const compatibleSession = existingSession !== null
         && (reopening
@@ -101,18 +110,17 @@ export async function processLeaderWakeups(
         && !compatibleSession;
       if (hasNativeSession(existingSession) && !compatibleSession
         && !reopenIdentityDrift
-        && existingSession.status !== "stopped" && existingSession.status !== "broken") {
+        && existingSession.status === "active") {
         throw new Error(
           `Leader Session is incompatible with desired effective launch: ${task.id}/${role.name}.`
         );
       }
       const resumableSession = hasNativeSession(existingSession)
-        && existingSession.status !== "stopped"
-        && existingSession.status !== "broken";
+        && existingSession.status === "active";
       // Reuse a healthy Session. A terminal Session is disposable and the next
       // Run starts fresh without consulting historical recovery records.
       const sessionSet = store.getTaskRoleSessionSet?.(task.id, role.name) ?? null;
-      const mode = reopenIdentityDrift
+      mode = reopenIdentityDrift
         ? "new"
         : sessionSet === null
           ? resumableSession && compatibleSession ? "resume" : "new"
@@ -187,6 +195,9 @@ export async function processLeaderWakeups(
         mode,
         runId: run.id,
         ...(mode === "resume" ? { nativeSessionId: existingSession!.nativeSessionId } : {}),
+        ...(mode !== "resume" || existingSession?.launchId === undefined
+          ? {}
+          : { hostActivationId: existingSession.launchId }),
         beforeHostStart: (preflight) => {
           persistPreStartFence(
             store,
@@ -208,19 +219,8 @@ export async function processLeaderWakeups(
           preStartFencePersisted = true;
         }
       });
-      // A managed Host may have submitted the exact Run Turn after its
-      // two-phase launch handshake. Once preparation returns that transport
-      // fact, any
-      // later readiness or aggregate-write failure is delivery uncertainty,
-      // not a launch failure: preserve the Run and its reservation for the
-      // matching provider Hook instead of terminalizing it.
-      deliveryAttempted = prepared.turnAcceptedDuringLaunch === true
-        || prepared.turnDeliveryUnknownDuringLaunch === true;
-      // Persist the exact preparation fence before waiting on provider
-      // readiness. A pre-input lifecycle Hook may fire during that wait; it
-      // must be able to resolve this Run/Session/launch generation from durable
-      // state rather than an in-memory delivery object. Fresh providers that
-      // discover their native Session later intentionally persist `null`.
+      // Persist the Session identity before submitting the Leader Turn.
+      // Starting/restoring a Session is independent from sending Run input.
       if (!preStartFencePersisted) {
         const preparedFenceSession = prepared.session === undefined
           ? existingSession
@@ -242,9 +242,6 @@ export async function processLeaderWakeups(
         });
       }
       const ready = await delivery.waitUntilReady(prepared);
-      deliveryAttempted = deliveryAttempted
-        || ready.prepared.turnAcceptedDuringLaunch === true
-        || ready.prepared.turnDeliveryUnknownDuringLaunch === true;
       const latestTask = store.getTask(task.id);
       if (latestTask === null
         || latestTask.status !== "active"
@@ -277,10 +274,13 @@ export async function processLeaderWakeups(
           : { launchId: ready.prepared.launchId }),
         now
       });
-      if (ready.prepared.turnBusyDuringLaunch === true) {
-        // A direct Desktop/user Turn is ordinary thread activity. Keep the
-        // claimed Run and wake batch intact; active-Run delivery retries after
-        // that Turn reaches its native terminal boundary.
+      deliveryAttempted = true;
+      const outcome = await delivery.sendOnce({
+        delivery: ready,
+        receiptId: formatAgentRunReceiptId(task.id, run.id),
+        text: serializeRunBootstrapEnvelope(run.bootstrapEnvelope)
+      });
+      if (outcome === "busy" || outcome === "unavailable") {
         delivery.forgetPrepared?.({
           taskId: task.id,
           roleName: role.name,
@@ -293,12 +293,12 @@ export async function processLeaderWakeups(
           taskId: task.id,
           runId: run.id,
           status: "skipped",
-          reason: "busy"
+          reason: outcome === "busy" ? "busy" : "not-ready"
         });
         continue;
       }
-      if (ready.prepared.turnRejectedDuringLaunch === true) {
-        const persisted = store.saveRoleRunDeliveryFailure({
+      if (outcome === "rejected") {
+        const terminal = store.saveRoleRunDeliveryFailure({
           taskId: task.id,
           roleName: role.name,
           agentId: run.effective.agentId,
@@ -311,33 +311,28 @@ export async function processLeaderWakeups(
           ...(ready.prepared.launchId === undefined
             ? {}
             : { launchId: ready.prepared.launchId }),
-          summary: `Provider conclusively rejected the exact initial Leader Run input: ${run.id}.`,
+          summary: "Provider rejected the Leader Turn before acceptance; Operator recovery is required.",
           cleanupRequired: false,
           now
         });
-        if (persisted === "failed") {
-          delivery.forgetPrepared?.({
-            taskId: task.id,
-            roleName: role.name,
-            runId: run.id,
-            ...(ready.prepared.launchId === undefined
-              ? {}
-              : { launchId: ready.prepared.launchId })
-          });
-        }
+        delivery.forgetPrepared?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          ...(ready.prepared.launchId === undefined
+            ? {}
+            : { launchId: ready.prepared.launchId })
+        });
         results.push({
           taskId: task.id,
           runId: run.id,
-          status: persisted === "failed" ? "failed" : "skipped",
+          status: terminal === "failed" ? "failed" : "skipped",
           reason: "provider-rejected",
-          terminalized: persisted === "failed",
-          ...(persisted === "failed"
-            ? {}
-            : { error: "Run state changed while recording exact Provider rejection." })
+          ...(terminal === "failed" ? { terminalized: true } : {})
         });
         continue;
       }
-      if (ready.prepared.turnDeliveryUnknownDuringLaunch === true) {
+      if (outcome === "delivery-unknown") {
         store.saveRoleRunDelivery({
           task,
           role,
@@ -364,34 +359,26 @@ export async function processLeaderWakeups(
         });
         continue;
       }
-      if (ready.prepared.turnAcceptedDuringLaunch === true) {
-        // The Agent Host submitted the exact first Turn through structured
-        // Provider control. Persist the transport fence without a second write;
-        // the matching structured acknowledgement owns Run acceptance.
-        store.saveRoleRunDelivery({
-          task,
-          role,
-          run,
-          session: effectiveSession,
-          ...(ready.prepared.launchId === undefined
-            ? {}
-            : { launchId: ready.prepared.launchId }),
-          now
-        });
-        delivery.forgetPrepared?.({
-          taskId: task.id,
-          roleName: role.name,
-          runId: run.id,
-          ...(ready.prepared.launchId === undefined
-            ? {}
-            : { launchId: ready.prepared.launchId })
-        });
-        results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
-        continue;
-      }
-      throw new Error(
-        "Managed Provider launch completed without an initial Turn outcome."
-      );
+      store.saveRoleRunDelivery({
+        task,
+        role,
+        run,
+        session: effectiveSession,
+        ...(ready.prepared.launchId === undefined
+          ? {}
+          : { launchId: ready.prepared.launchId }),
+        now
+      });
+      delivery.forgetPrepared?.({
+        taskId: task.id,
+        roleName: role.name,
+        runId: run.id,
+        ...(ready.prepared.launchId === undefined
+          ? {}
+          : { launchId: ready.prepared.launchId })
+      });
+      results.push({ taskId: task.id, runId: run.id, status: "dispatched" });
+      continue;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       const message = `Leader dispatch failed: ${detail}`;
@@ -415,6 +402,61 @@ export async function processLeaderWakeups(
             error: message
           });
           continue;
+        }
+        store.recordAgentError?.({
+          taskId: task.id,
+          roleName: role.name,
+          runId: run.id,
+          source: error instanceof RuntimeLaunchError ? "host" : "yui",
+          phase: deliveryAttempted
+            ? "turn-submit"
+            : mode === "new" ? "session-start" : "session-restore",
+          message: detail,
+          raw: serializeAgentErrorRaw(error),
+          inputDisposition: deliveryAttempted ? "unknown" : "not-accepted"
+        }, now);
+        if (!deliveryAttempted) {
+          const failedSession = store.getRoleSession(
+            task.id,
+            role.name,
+            run.effective.agentId
+          );
+          const terminal = store.saveRoleRunDeliveryFailure({
+            taskId: task.id,
+            roleName: role.name,
+            agentId: run.effective.agentId,
+            adapterId: run.effective.adapterId,
+            runId: run.id,
+            mailboxBatchId: formatAgentRunReceiptId(task.id, run.id),
+            ...(failedSession?.nativeSessionId === undefined
+              ? {}
+              : { nativeSessionId: failedSession.nativeSessionId }),
+            ...(prepared?.launchId === undefined && failedSession?.launchId === undefined
+              ? {}
+              : { launchId: prepared?.launchId ?? failedSession!.launchId }),
+            summary: `Leader Session preparation failed before Turn acceptance: ${message}`,
+            cleanupRequired: false,
+            now
+          });
+          if (terminal === "failed") {
+            delivery.forgetPrepared?.({
+              taskId: task.id,
+              roleName: role.name,
+              runId: run.id,
+              ...(prepared?.launchId === undefined
+                ? {}
+                : { launchId: prepared.launchId })
+            });
+            results.push({
+              taskId: task.id,
+              runId: run.id,
+              status: "failed",
+              reason: "unavailable",
+              error: message,
+              terminalized: true
+            });
+            continue;
+          }
         }
         // A managed Provider lifecycle operation may still be settling. Keep
         // this newly-claimed Run as the sole mailbox owner; active-Run delivery
@@ -452,25 +494,13 @@ export async function processLeaderWakeups(
             ? {}
             : { launchId: prepared.launchId })
         });
-        const failureResult = store.saveLeaderDispatchFailure({
-          task,
-          role,
-          session: effectiveSession,
-          claimed: { run, wakeup },
-          failure: recordLeaderFailure(
-            task.id,
-            effectiveSession?.nativeSessionId ?? "(unregistered)",
-            message,
-            now,
-            store.getLeaderFailure(task.id)
-          ),
-          now
+        results.push({
+          taskId: task.id,
+          runId: run.id,
+          status: "skipped",
+          reason: "not-ready",
+          error: message
         });
-        if (failureResult === "state-changed") {
-          results.push({ taskId: task.id, status: "skipped", reason: "state-changed" });
-        } else {
-          results.push({ taskId: task.id, runId: run.id, status: "failed", error: message });
-        }
         continue;
       }
       results.push({
@@ -483,6 +513,18 @@ export async function processLeaderWakeups(
     }
   }
   return results;
+}
+
+function providerTurnIsUnsettled(
+  store: SchedulerStorePort,
+  taskId: string,
+  roleName: string
+): boolean {
+  if (store.getRoleSession(taskId, roleName)?.status !== "active") return false;
+  const status = store.getTaskRoleSessionSet?.(taskId, roleName)
+    ?.providerBinding?.turn?.status;
+  return status !== undefined
+    && ["submitting", "accepted", "running", "delivery-unknown"].includes(status);
 }
 
 function validateReadySession(
@@ -514,7 +556,7 @@ function validateReadySession(
   }
   return {
     ...session,
-    status: "running",
+    status: "active",
     ...(mode === "resume" && existing !== null
       ? { effective: existing.effective }
       : {})
@@ -566,7 +608,7 @@ function preflightSession(
         nativeSessionId: preflight.nativeSessionId,
         launchId: preflight.launchId,
         ...(preflight.sessionTitle === undefined ? {} : { title: preflight.sessionTitle }),
-        status: "ready" as const,
+        status: "active" as const,
         effective: preflight.effective
       };
   return validateReadySession(role, effective, existing, mode, session);

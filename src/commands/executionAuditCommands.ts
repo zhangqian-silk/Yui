@@ -268,38 +268,39 @@ export function renderExecutionAudit(
     lines.push("", ...sectionError("events", report));
   }
 
-  if (report.providerRetries.status === "ok" && report.providerRetries.data !== undefined) {
-    const retries = report.providerRetries.data;
-    if (retries.total > 0) {
+  if (report.agentErrors.status === "ok" && report.agentErrors.data !== undefined) {
+    const errors = report.agentErrors.data;
+    if (errors.total > 0) {
       lines.push(
         "",
-        `Provider retries: ${retries.total} run(s) retried in place · ${retries.terminal} terminal`
+        `Agent errors: ${errors.total} · ${Object.entries(errors.byCategory)
+          .map(([category, count]) => `${category}:${count}`).join(", ")}`
       );
       lines.push(
         renderTable(
-          "Provider retry lineages",
+          "Agent errors",
           [
             { header: "Task", minWidth: 8, maxWidth: 14 },
             { header: "Run", minWidth: 14, maxWidth: 24 },
             { header: "Role", minWidth: 8, maxWidth: 12 },
-            { header: "Attempts", minWidth: 8, maxWidth: 10 },
-            { header: "Error class", minWidth: 14, maxWidth: 24 },
-            { header: "Decision", minWidth: 14, maxWidth: 26 }
+            { header: "Category", minWidth: 12, maxWidth: 20 },
+            { header: "Code", minWidth: 16, maxWidth: 32 },
+            { header: "Session", minWidth: 12, maxWidth: 16 }
           ],
-          retries.entries.map((entry) => [
+          errors.entries.map((entry) => [
             entry.taskId,
             entry.runId,
             entry.roleName,
-            String(entry.attempts),
-            entry.errorClass,
-            entry.decision
+            entry.category,
+            entry.code,
+            entry.sessionDisposition
           ]),
           width
         )
       );
     }
   } else {
-    lines.push("", ...sectionError("providerRetries", report));
+    lines.push("", ...sectionError("agentErrors", report));
   }
 
   if (report.workItems.status === "ok" && report.workItems.data !== undefined) {
@@ -366,8 +367,8 @@ export function renderExecutionAudit(
     const versions = Object.entries(runtime.contextProtocolVersions)
       .map(([version, count]) => `${version}:${count}`)
       .join(", ") || "none";
-    const retryStates = Object.entries(runtime.activeRetryStates)
-      .map(([state, count]) => `${state}:${count}`)
+    const errorCategories = Object.entries(runtime.agentErrorCategories)
+      .map(([category, count]) => `${category}:${count}`)
       .join(", ") || "none";
     const exits = Object.entries(runtime.processExitClassifications)
       .map(([classification, count]) => `${classification}:${count}`)
@@ -378,8 +379,7 @@ export function renderExecutionAudit(
     lines.push(
       "",
       `Runtime protocol: context versions ${versions} · manifest compatibility identities ${runtime.manifestCompatibilityDigests}`,
-      `Active retry: ${runtime.activeRetryEpisodes} episode(s) [${retryStates}] · failures ${runtime.activeConsecutiveFailures} · dispatched ${runtime.activeDispatchedRetries}`,
-      `Retry audit: ${runtime.retryClassifiedEvents} classified · ${runtime.retryDispatchedEvents} dispatched · ${runtime.retryRecoveredEvents} recovered · ${runtime.retryExhaustedEvents} exhausted`,
+      `Agent errors: ${runtime.agentErrors} [${errorCategories}]`,
       `Process exits: ${runtime.processExitObservations} [${exits}] · capacity failures ${runtime.contextCapacityFailures}`,
       `Context telemetry: usage [${usage}] · native compaction events ${runtime.compactionEvents}`
     );

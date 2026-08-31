@@ -16,12 +16,16 @@ import {
 import {
   currentProviderActivation,
   endProviderActivation,
+  settleProviderTurn,
+  settleProviderTurnSubmission,
   validateProviderRuntimeBinding,
   type ProviderRuntimeBinding
 } from "../runtime/providerRuntimeIdentity.js";
 import { builtinDriverIdForAdapter } from "../runtime/builtinAgentDrivers.js";
 
-export type AgentSessionStatus = "reserved" | "ready" | "running" | "stopped" | "broken";
+/** Session existence only. Readiness and activity belong to Host/Turn facts. */
+export type AgentSessionStatus = "active" | "ended";
+export type AgentSessionEndReason = "stopped" | "failed";
 
 export type GlobalRoleSessionOwner = {
   scope: "global";
@@ -38,7 +42,7 @@ export type RoleSessionOwner = GlobalRoleSessionOwner | TaskRoleSessionOwner;
 
 /** One independently resumable native session for one Agent binding on a Role. */
 export type RoleAgentSession = {
-  schemaVersion: 3;
+  schemaVersion: 4;
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
@@ -50,6 +54,7 @@ export type RoleAgentSession = {
   /** Immutable actual configuration for this native session. */
   effective: EffectiveLaunchSnapshot;
   status: AgentSessionStatus;
+  endReason?: AgentSessionEndReason;
   recentCompletedTurnIds: readonly string[];
   createdAt: string;
   updatedAt: string;
@@ -74,13 +79,13 @@ export type TaskRoleInFlight = Readonly<{
 }>;
 
 export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & {
-  schemaVersion: 3;
+  schemaVersion: 4;
   /** Immutable terminal native Sessions keyed by an opaque Yui reference. */
   history?: Record<string, RoleAgentSession>;
 };
 
 export type TaskRoleSessionSet = RoleSessionSetBase<TaskRoleSessionOwner> & {
-  schemaVersion: 7;
+  schemaVersion: 8;
   /** Immutable terminal native Sessions superseded by a fresh effective launch. */
   history?: readonly RoleAgentSession[];
   /** Exact delivery-receipt projection; never a Role scheduling/busy authority. */
@@ -104,6 +109,7 @@ export type RecordRoleAgentSessionInput = {
   preview?: string;
   policy: RoleAgentSession["policy"];
   status: AgentSessionStatus;
+  endReason?: AgentSessionEndReason;
   effective: EffectiveLaunchSnapshot;
 };
 
@@ -135,10 +141,10 @@ export function createRoleSessionSet(
     updatedAt: now.toISOString()
   };
   return owner.scope === "global"
-    ? { ...base, schemaVersion: 3 } as GlobalRoleSessionSet
+    ? { ...base, schemaVersion: 4 } as GlobalRoleSessionSet
     : {
         ...base,
-        schemaVersion: 7,
+        schemaVersion: 8,
         inFlight: null,
         providerBinding: null
       } as TaskRoleSessionSet;
@@ -153,7 +159,7 @@ export function activeRoleAgentSession(set: RoleSessionSet | null): RoleAgentSes
 /** The immutable snapshot that remains actual until its native process terminates. */
 export function activeLiveRoleAgentSession(set: RoleSessionSet | null): RoleAgentSession | null {
   const session = activeRoleAgentSession(set);
-  return session === null || session.status === "stopped" || session.status === "broken"
+  return session === null || session.status === "ended"
     ? null
     : session;
 }
@@ -210,13 +216,13 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
     throw new Error(`Role Agent session effective launch cannot change: ${agentId}.`);
   }
   if (existing !== undefined && existing.nativeSessionId !== nativeSessionId
-    && existing.status !== "stopped" && existing.status !== "broken") {
+    && existing.status === "active") {
     throw new Error(`Live Role Agent native session cannot be replaced: ${agentId}.`);
   }
   const timestamp = now.toISOString();
   const continuing = existing?.nativeSessionId === nativeSessionId ? existing : undefined;
   const session: RoleAgentSession = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     agentId,
     adapterId,
     nativeSessionId,
@@ -228,6 +234,9 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
     policy: input.policy,
     effective: continuing?.effective ?? effective,
     status: input.status,
+    ...(input.status === "ended"
+      ? { endReason: input.endReason ?? continuing?.endReason ?? "stopped" }
+      : {}),
     recentCompletedTurnIds: continuing?.recentCompletedTurnIds ?? [],
     createdAt: continuing?.createdAt ?? timestamp,
     updatedAt: timestamp
@@ -269,7 +278,13 @@ export function replaceTaskRoleAgentSession(
   if (existing === undefined || existing.nativeSessionId === input.nativeSessionId) {
     return recordRoleAgentSession(set, input, now);
   }
-  const terminalized = updateRoleAgentSessionStatus(set, input.agentId, "stopped", now);
+  const terminalized = updateRoleAgentSessionStatus(
+    set,
+    input.agentId,
+    "ended",
+    now,
+    "stopped"
+  );
   return recordRoleAgentSession(terminalized, input, now);
 }
 
@@ -303,7 +318,8 @@ export function updateRoleAgentSessionStatus<TSet extends RoleSessionSet>(
   set: TSet,
   agentId: string,
   status: AgentSessionStatus,
-  now: Date
+  now: Date,
+  endReason?: AgentSessionEndReason
 ): TSet {
   validateRoleSessionSet(set);
   const normalizedAgentId = requireSafeIdentity(agentId, "Agent id");
@@ -319,7 +335,12 @@ export function updateRoleAgentSessionStatus<TSet extends RoleSessionSet>(
     ...set,
     sessions: {
       ...set.sessions,
-      [normalizedAgentId]: { ...existing, status, updatedAt: timestamp }
+      [normalizedAgentId]: {
+        ...existing,
+        status,
+        ...(status === "ended" ? { endReason: endReason ?? "stopped" } : { endReason: undefined }),
+        updatedAt: timestamp
+      }
     },
     updatedAt: timestamp
   } as TSet;
@@ -336,7 +357,7 @@ export function retireTaskRoleSessionsForWorkspace(
     throw new Error("Cannot retire a Task Role session with unsettled Run state.");
   }
   const live = Object.values(set.sessions).find(
-    ({ status }) => status !== "stopped" && status !== "broken"
+    ({ status }) => status === "active"
   );
   if (live !== undefined) {
     throw new Error(
@@ -374,12 +395,17 @@ export function retireConfirmedAbsentInactiveTaskRolePlaceholders(
   const sessions = Object.fromEntries(Object.entries(set.sessions).map(([agentId, session]) => {
     const isNeverStartedInactiveClaude = agentId !== set.activeAgentId
       && session.adapterId === "claude"
-      && (session.status === "reserved" || session.status === "ready")
+      && session.status === "active"
       && session.launchId === undefined
       && session.recentCompletedTurnIds.length === 0;
     if (!isNeverStartedInactiveClaude) return [agentId, session];
     changed = true;
-    return [agentId, { ...session, status: "broken" as const, updatedAt: timestamp }];
+    return [agentId, {
+      ...session,
+      status: "ended" as const,
+      endReason: "failed" as const,
+      updatedAt: timestamp
+    }];
   }));
   if (!changed) return set;
   return validateRoleSessionSet({
@@ -405,7 +431,7 @@ export function rememberRoleAgentCompletedTurn<TSet extends RoleSessionSet>(
   if (session.nativeSessionId !== requireText(nativeSessionId, "Native session id")) {
     throw new Error("Completed Turn native session does not match the Role Agent session.");
   }
-  const normalizedTurnId = requireSafeIdentity(turnId, "Turn id");
+  const normalizedTurnId = requireText(turnId, "Turn id");
   if (hasRecentTurnId(session.recentCompletedTurnIds, normalizedTurnId)) return set;
   const recentCompletedTurnIds = rememberRecentTurnId(
     session.recentCompletedTurnIds,
@@ -419,9 +445,6 @@ export function rememberRoleAgentCompletedTurn<TSet extends RoleSessionSet>(
       ...set.sessions,
       [normalizedAgentId]: {
         ...session,
-        status: session.status === "stopped" || session.status === "broken"
-          ? session.status
-          : "ready" as const,
         recentCompletedTurnIds,
         updatedAt: timestamp
       }
@@ -448,7 +471,7 @@ export function roleAgentSessionResumeMode(
     typeof session.nativeSessionId !== "string"
     || session.nativeSessionId.trim().length === 0
   ) {
-    if (session.status !== "stopped" && session.status !== "broken") {
+    if (session.status === "active") {
       throw new Error(
         `Role Agent session has no native Session identity: ${agentId}. `
         + "Restore the exact native Session or explicitly stop it before starting a fresh Session."
@@ -456,7 +479,7 @@ export function roleAgentSessionResumeMode(
     }
     return "new";
   }
-  if (session.status === "stopped" || session.status === "broken") {
+  if (session.status === "ended") {
     return "new";
   }
   const compatible = set.owner.scope === "task"
@@ -503,33 +526,6 @@ export function bindTaskRoleRun(
   return validateRoleSessionSet(updated);
 }
 
-/** Re-fences the same active Run for an exact Provider retry without losing its Conversation. */
-export function prepareTaskRoleRunRedispatch(
-  set: TaskRoleSessionSet,
-  fence: TaskRoleRunFence,
-  preparedAt: Date
-): TaskRoleSessionSet {
-  validateRoleSessionSet(set);
-  const normalized = normalizeTaskRoleRunFence(fence);
-  if (set.inFlight === null
-    || set.inFlight.agentId !== normalized.agentId
-    || set.inFlight.runId !== normalized.runId) {
-    throw new Error("Provider retry does not match the in-flight Task Run.");
-  }
-  if (set.providerBinding !== null
-    && set.providerBinding.turn !== null
-    && ["submitting", "accepted", "running", "delivery-unknown"]
-      .includes(set.providerBinding.turn.status)) {
-    throw new Error("Provider retry cannot redispatch an unsettled Turn.");
-  }
-  const timestamp = requireDate(preparedAt, "Task Role retry preparedAt");
-  return validateRoleSessionSet({
-    ...set,
-    inFlight: { ...normalized, preparedAt: timestamp },
-    updatedAt: timestamp
-  });
-}
-
 export function bindTaskRoleProviderRuntime(
   set: TaskRoleSessionSet,
   binding: ProviderRuntimeBinding,
@@ -568,36 +564,61 @@ export function updateTaskRoleProviderRuntime(
 }
 
 /**
- * Records an exact local Host exit without forgetting the Provider
- * Conversation. The ended Activation releases writer authority, while the
- * current Conversation and any unsettled Turn remain durable recovery fences.
+ * Detaches a confirmed-dead local Host without ending its resumable native
+ * Session. The Host launch and Provider Activation are disposable execution
+ * facts; the native Session remains the durable continuation identity.
  */
-export function stopTaskRoleRuntimeAfterPhysicalExit(
-  set: TaskRoleSessionSet,
+export function detachRoleAgentSessionHost<TSet extends RoleSessionSet>(
+  set: TSet,
   now: Date
-): TaskRoleSessionSet {
+): TSet {
   validateRoleSessionSet(set);
   const active = set.sessions[set.activeAgentId];
-  if (active === undefined) return set;
-  const activation = set.providerBinding === null
-    ? null
-    : currentProviderActivation(set.providerBinding);
-  if (active.status === "stopped") {
-    if (activation !== null) {
-      throw new Error("Stopped Task Role Session cannot retain a live Provider Activation.");
-    }
-    return set;
+  if (active === undefined || active.status === "ended") return set;
+  const timestamp = requireDate(now, "Role Host detach timestamp");
+  const { launchId: _launchId, endReason: _endReason, ...session } = active;
+  let updated = validateRoleSessionSet({
+    ...set,
+    sessions: {
+      ...set.sessions,
+      [set.activeAgentId]: {
+        ...session,
+        status: "active",
+        updatedAt: timestamp
+      }
+    },
+    updatedAt: timestamp
+  }) as TSet;
+  if (updated.owner.scope !== "task") return updated;
+  let taskSet = updated as TaskRoleSessionSet;
+  let binding = taskSet.providerBinding;
+  const turn = binding?.turn;
+  if (binding !== null && binding !== undefined && turn !== null && turn !== undefined
+    && ["accepted", "running"].includes(turn.status)) {
+    binding = settleProviderTurn(binding, {
+      turnId: turn.turnId!,
+      status: "cancelled",
+      settledAt: timestamp,
+      reason: "runtime-physical-exit"
+    });
+    taskSet = updateTaskRoleProviderRuntime(taskSet, binding, now);
+  } else if (binding !== null && binding !== undefined && turn !== null && turn !== undefined
+    && ["submitting", "delivery-unknown"].includes(turn.status)) {
+    binding = settleProviderTurnSubmission(binding, {
+      attemptId: turn.attemptId,
+      status: "rejected",
+      resolvedAt: timestamp,
+      reason: "runtime-physical-exit"
+    });
+    taskSet = updateTaskRoleProviderRuntime(taskSet, binding, now);
   }
-  let updated = updateRoleAgentSessionStatus(
-    set,
-    set.activeAgentId,
-    "stopped",
-    now
-  );
+  const activation = binding === null
+    ? null
+    : currentProviderActivation(binding);
   if (activation !== null) {
-    updated = updateTaskRoleProviderRuntime(
-      updated,
-      endProviderActivation(updated.providerBinding!, activation.activationId, {
+    taskSet = updateTaskRoleProviderRuntime(
+      taskSet,
+      endProviderActivation(binding!, activation.activationId, {
         status: "ended",
         endedAt: now.toISOString(),
         reason: "runtime-physical-exit"
@@ -605,7 +626,7 @@ export function stopTaskRoleRuntimeAfterPhysicalExit(
       now
     );
   }
-  return updated;
+  return taskSet as TSet;
 }
 
 export function markTaskRoleRunPushed(
@@ -676,7 +697,7 @@ export function recordTaskRoleTurnBoundary(
   assertTaskRoleSessionSet(set);
   const agentId = requireSafeIdentity(input.agentId, "Agent id");
   const nativeSessionId = requireText(input.nativeSessionId, "Native session id");
-  const turnId = requireSafeIdentity(input.turnId, "Turn id");
+  const turnId = requireText(input.turnId, "Turn id");
   const session = set.sessions[agentId];
   if (session === undefined || session.nativeSessionId !== nativeSessionId) {
     throw new Error("Completed Turn has no matching Role Agent native session.");
@@ -686,16 +707,12 @@ export function recordTaskRoleTurnBoundary(
     throw new Error("Completed Turn Agent does not match the in-flight Run.");
   }
   const timestamp = requireDate(completedAt, "Turn completedAt");
-  const status = session.status === "stopped" || session.status === "broken"
-    ? session.status
-    : "ready";
   return validateRoleSessionSet({
     ...set,
     sessions: {
       ...set.sessions,
       [agentId]: {
         ...session,
-        status,
         recentCompletedTurnIds: rememberRecentTurnId(
           session.recentCompletedTurnIds,
           turnId
@@ -792,7 +809,7 @@ export function settleTaskRoleCompletion(
   assertTaskRoleSessionSet(set);
   const agentId = requireSafeIdentity(expected.agentId, "Agent id");
   const runId = requireSafeIdentity(expected.runId, "Run id");
-  const turnId = requireSafeIdentity(expected.turnId, "Turn id");
+  const turnId = requireText(expected.turnId, "Turn id");
   const inFlight = set.inFlight;
   if (inFlight === null || inFlight.agentId !== agentId || inFlight.runId !== runId) {
     throw new Error("Pending Turn completion does not match the in-flight Run.");
@@ -825,7 +842,7 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
     validateRoleAgentSession(session, agentId);
   }
   if (set.owner.scope === "global") {
-    if (set.schemaVersion !== 3) {
+    if (set.schemaVersion !== 4) {
       throw new Error("Global Role session set schema version is invalid.");
     }
     if (
@@ -841,13 +858,13 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       for (const [ref, session] of Object.entries(history)) {
         requireSafeIdentity(ref, "Operator session ref");
         validateRoleAgentSession(session);
-        if (session.status !== "stopped" && session.status !== "broken") {
+        if (session.status !== "ended") {
           throw new Error(`Operator history session must be stopped: ${ref}.`);
         }
       }
     }
   } else {
-    if (set.schemaVersion !== 7) {
+    if (set.schemaVersion !== 8) {
       throw new Error("Task Role session set schema version is invalid.");
     }
     if (
@@ -864,7 +881,7 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       const identities = new Set<string>();
       for (const session of taskSet.history) {
         validateRoleAgentSession(session);
-        if (session.status !== "stopped" && session.status !== "broken") {
+        if (session.status !== "ended") {
           throw new Error("Task Role session history must be terminal.");
         }
         const key = taskRoleSessionIdentity(session);
@@ -906,7 +923,7 @@ export function validateRoleAgentSession(
   session: RoleAgentSession,
   expectedAgentId = session.agentId
 ): RoleAgentSession {
-  if (session.schemaVersion !== 3) {
+  if (session.schemaVersion !== 4) {
     throw new Error(`Role Agent session schema version is invalid: ${expectedAgentId}.`);
   }
   const agentId = requireSafeIdentity(session.agentId, "Agent id");
@@ -945,6 +962,14 @@ export function validateRoleAgentSession(
   }
   if (!isAgentSessionStatus(session.status)) {
     throw new Error(`Role Agent session status is invalid: ${agentId}.`);
+  }
+  if (session.status === "active" && session.endReason !== undefined) {
+    throw new Error(`Active Role Agent session cannot have an end reason: ${agentId}.`);
+  }
+  if (session.status === "ended"
+    && session.endReason !== "stopped"
+    && session.endReason !== "failed") {
+    throw new Error(`Ended Role Agent session requires an end reason: ${agentId}.`);
   }
   validateRecentTurnIds(session.recentCompletedTurnIds);
   requireText(session.createdAt, "Role Agent session creation timestamp");
@@ -1108,7 +1133,7 @@ function normalizeOwner(owner: RoleSessionOwner): RoleSessionOwner {
 }
 
 function isAgentSessionStatus(value: string): value is AgentSessionStatus {
-  return ["reserved", "ready", "running", "stopped", "broken"].includes(value);
+  return value === "active" || value === "ended";
 }
 
 function requireSafeIdentity(value: string, label: string): string {

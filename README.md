@@ -48,7 +48,7 @@ behavior, then apply only changes the user confirms.
 
 Durable settings are grouped by responsibility: `config system` for Home
 defaults and presentation, `config runtime` for Controller health, concurrency,
-launch, delivery, and Provider retry, `config workflow` for Leader/context/review
+launch, and delivery mechanics, `config workflow` for Leader/context/review
 policy, `config resources` for quarantine and GC, and `config tools` for tmux
 and diagnostic telemetry. Configured Agents, global Roles, Profiles, and shell
 completion remain the sibling `config agent|role|profile|completion` domains.
@@ -892,8 +892,9 @@ creates a fresh proxy attachment.
 If the proxy disconnects, the Host may attach a bounded replacement client and
 reconcile the exact owned Turn from native history. A failed fresh attachment
 is released instead of becoming a cleanup prerequisite for later Runs.
-Claude Code keeps its independent stream-json process with exact
-user-message replay acknowledgement. A timeout or uncertain write becomes
+Claude Code keeps its independent stream-json process. Agent Host is the sole
+writer to that process, so a completed stream write accepts the Turn; the
+later provider `result` event settles it. An uncertain write becomes
 `delivery-unknown` and is never automatically retried.
 
 Task Role observation and takeover are explicit:
@@ -912,11 +913,11 @@ backpressure for Yui rather than a failed Run.
 AgentRun is the only durable Role scheduling state. Conversation state does not
 carry a second current-Run pointer; each Provider Turn records a Run id only to
 correlate its receipt and terminal event. If an Agent finishes a Yui Run before
-the native Turn terminal arrives, the next mailbox batch may already become a
-new AgentRun, but Agent Host keeps its input pending and submits it only after
-the old Turn settles. TaskRole itself stores identity and desired launch
-configuration, not runtime status; Role status shown by CLI/Web is derived from
-the active AgentRun plus Session/Driver lifecycle facts.
+the native Turn terminal arrives, the next mailbox intent remains pending until
+that Turn settles. Yui then claims the new AgentRun and submits it through the
+same Session. TaskRole itself stores identity and desired launch configuration,
+not runtime status; Role status shown by CLI/Web is derived from the active
+AgentRun plus Session/Driver lifecycle facts.
 
 Global Operator and global Role sessions remain native interactive CLIs:
 

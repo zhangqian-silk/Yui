@@ -52,7 +52,6 @@ export function createSessionLaunchRequest(
     || runtimeIsolation.taskId !== input.owner.taskId
     || runtimeIsolation.workspace.root !== workspace
     || runtimeIsolation.generation.launchId !== input.launchId
-    || runtimeIsolation.generation.runId !== input.runId
   )) {
     throw new TypeError(
       "Session launch request does not match its Task runtime isolation descriptor."

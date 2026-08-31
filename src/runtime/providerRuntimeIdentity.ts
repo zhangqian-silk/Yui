@@ -350,7 +350,7 @@ export function rejectProviderTurn(
   });
 }
 
-/** Resolves an Agent Host submission exactly once and accepts an exact acknowledgement replay. */
+/** Resolves an Agent Host submission; an unknown delivery may later gain exact negative evidence. */
 export function settleProviderTurnSubmission(
   raw: ProviderRuntimeBinding,
   input: Readonly<{
@@ -366,7 +366,10 @@ export function settleProviderTurnSubmission(
     throw new Error("Provider Turn does not match a resolvable delivery state.");
   }
   if (binding.turn.status === input.status) return binding;
-  if (binding.turn.status !== "submitting") {
+  if (
+    binding.turn.status !== "submitting"
+    && !(binding.turn.status === "delivery-unknown" && input.status === "rejected")
+  ) {
     throw new Error("Provider Turn does not match a resolvable delivery state.");
   }
   return input.status === "delivery-unknown"

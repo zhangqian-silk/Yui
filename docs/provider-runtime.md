@@ -34,7 +34,7 @@ Task/Message -> Yui Run + delivery intent -> ordinary provider Turn
                                              +-> exact native Turn receipt
 ```
 
-Yui's internal authority epoch fences only Yui's own submissions and retries.
+Yui's internal authority epoch fences only Yui's own submissions.
 It is not a claim that Yui is the only client allowed to use the conversation.
 
 ## Codex: ordinary shared-daemon threads
@@ -70,10 +70,9 @@ classifies its attempted delivery as `busy`. The Run and mailbox batch stay
 pending until that native Turn settles.
 
 An Agent may declare a Yui Run outcome before the native Provider reports its
-Turn terminal. Yui accepts that semantic outcome immediately and may claim the
-next mailbox batch as a new AgentRun. Agent Host still serializes Provider
-input: it waits for the old native Turn, folds that terminal against the old
-Turn correlation, then submits the retained new Run. No Provider state is
+Turn terminal. Yui accepts that semantic outcome immediately, but keeps the
+next mailbox intent pending until the old native Turn settles. It then claims
+the next AgentRun and submits it through the same Session. No Provider state is
 rebound while the old Turn is active, and no mailbox intent is rolled back.
 
 If a proxy disconnects, the Agent Host may attach a bounded replacement client
@@ -91,9 +90,10 @@ underlying Codex config.
 ## Claude Code: independent structured process
 
 Managed Claude continues to use a persistent `--input-format stream-json` and
-`--output-format stream-json` process with replayed user messages. Yui
-preallocates the native Session ID and accepts a submitted Turn only after
-Claude replays the exact user message for that Session.
+`--output-format stream-json` process. Yui preallocates the native Session ID,
+and Agent Host is that process's sole input writer. A completed pipe write
+accepts the Turn; the later Claude `result` event settles it. Provider Turn IDs
+are opaque correlation values rather than path-safe Yui identities.
 
 The tmux view/takeover gateway remains the human-control boundary for providers
 with an independent managed process, such as Claude. Codex users operate the
@@ -119,18 +119,20 @@ because the provider proved that Yui's requested Turn was not created.
 
 Conversation recovery uses provider-native evidence:
 
-| Observation | Decision |
+| Observation | Available Agent choice |
 | --- | --- |
 | Thread has Yui's exact persisted active Turn | Reattach and continue observing it |
 | Thread has another client's active Turn | Wait; retain pending Yui work |
 | Yui's persisted Turn is terminal in native history | Fold the recovered terminal exactly once |
 | Thread exists and is idle | Resume and deliver the pending input |
-| Thread is exactly missing | Require an explicit conversation replacement decision |
-| Availability or delivery is unknown | Preserve identity and require bounded retry/attention |
+| Driver proves the thread is missing, ended, expired, or out of context | Settle the current Run, explicitly stop the exact Session/Host, then dispatch a new Run on a new Session; the complete prior error and identities remain readable |
+| Availability, capacity, or `429`; input was accepted and Session is recoverable | Submit a new Turn in the same Session when useful |
+| Delivery is unknown | Inspect native history and preserve identity; do not blindly duplicate the input |
 
-A dead pane, timeout, or App Server disconnect is not proof that a thread is
-missing. Yui may replace its owned process, but it never replaces a thread
-without exact Provider-native missing evidence.
+A dead pane, process exit, timeout, or App Server disconnect is not proof that
+a thread is missing. Yui may replace its owned process, but it replaces a
+thread only after exact Driver evidence that the native conversation is dead
+or cannot continue because its context is exhausted.
 
 ## Required invariants
 
@@ -138,7 +140,8 @@ without exact Provider-native missing evidence.
 2. Provider acceptance carries an exact native Turn identity.
 3. Ambiguous delivery is never automatically duplicated.
 4. A busy ordinary thread keeps Yui work pending instead of failing the Run.
-5. Exact missing evidence is required before replacing a conversation.
+5. A replacement conversation is created only after the responsible Agent
+   explicitly ends the old Session; Core never replaces it as error policy.
 6. Yui Skill/config does not mutate global Codex config.
 7. Task stop owns and terminates every Yui Agent Host and proxy without treating
    the shared Codex daemon or native conversation as Task cleanup.

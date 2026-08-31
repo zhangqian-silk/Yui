@@ -61,7 +61,9 @@ supported checkpoint/yield command as the final control-plane action, then stop
 immediately. If that direct command is denied or stale, report the blocker once
 and stop; do not wrap, retry, broaden permissions, or target another Run.
 
-For a transient Provider retry Envelope, continue the failed Turn in the same
-native Session. Do not replay the original Assignment or reload unrelated Task
-content. Process/child replacement does not by itself authorize a new Yui
-generation or native conversation.
+After a failed Provider Turn, read the referenced `runtime.agent-error` fact.
+The failed Turn is immutable; a recovery is always a new Turn. Continue on the
+same native Session when it remains recoverable, and load only the current Run
+delta instead of replaying its original Assignment. A new Host process does not
+imply a new Session, and a new Session must never be substituted silently for
+the persisted native Session id.

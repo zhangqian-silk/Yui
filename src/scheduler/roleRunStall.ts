@@ -91,6 +91,7 @@ export function projectRoleRunHealth(input: Readonly<{
   hostLiveness: "present" | "absent" | "unknown";
   nativeSession?: Readonly<{
     status: string;
+    endReason?: string;
     nativeSessionId?: string;
     launchId?: string;
   }> | null;
@@ -122,13 +123,9 @@ export function projectRoleRunHealth(input: Readonly<{
   const session = input.nativeSession;
   const nativeSession = session === null || session === undefined
     ? "missing"
-    : session.status === "stopped"
-      ? "stopped"
-      : session.status === "broken"
-        ? "broken"
-        : session.status !== "ready" && session.status !== "running"
-          ? "unknown"
-          : !hasResourceIdentityText(session.nativeSessionId)
+    : session.status === "ended"
+      ? session.endReason === "failed" ? "broken" : "stopped"
+      : !hasResourceIdentityText(session.nativeSessionId)
             && !hasResourceIdentityText(session.launchId)
             ? "unknown"
             : "matching";
@@ -927,7 +924,7 @@ export async function reconcileStalledRoleRuns(
         && candidate.session.adapterId === runAdapterId
       );
     const sessionUsable = candidate.session === null
-      || (candidate.session.status !== "stopped" && candidate.session.status !== "broken");
+      || candidate.session.status === "active";
     const expectedResourceIdentity = candidate.session === null
       ? undefined
       : {

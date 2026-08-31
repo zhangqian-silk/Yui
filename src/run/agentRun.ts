@@ -11,11 +11,6 @@ import type {
   LeaderWaitReason
 } from "../scheduler/actionability.js";
 import {
-  prepareProviderRetryDispatch,
-  validateAgentRunProviderRetry,
-  type AgentRunProviderRetry
-} from "./providerRetry.js";
-import {
   validateYieldReceipt,
   type YieldReceipt
 } from "./yieldReceipt.js";
@@ -46,7 +41,7 @@ export type AgentRun = {
    * v8 replaces unbounded launch input with a durable Assignment and a bounded
    * transport Envelope. Task content is loaded through the exact Context API.
    */
-  schemaVersion: 9;
+  schemaVersion: 10;
   id: string;
   taskId: string;
   roleName: string;
@@ -76,19 +71,9 @@ export type AgentRun = {
    * gate every consumer reads; transport alone never sets it.
    */
   deliveredAt?: string;
-  /**
-   * Receipt of the most recently dispatched input for this Run. It survives
-   * retry-episode recovery so later lifecycle observations remain fenced to
-   * the accepted continuation even after active retry counters are cleared.
-   */
+  /** Receipt of the most recently dispatched input for this Run. */
   deliveryReceiptId?: string;
   summary?: string;
-  /**
-   * Issue 04 durable in-place retry projection. Present only while an active
-   * Run is being retried on its original Native Session; cleared at
-   * terminalization.
-   */
-  providerRetry?: AgentRunProviderRetry;
   /** Bounded same-Session control input; never contains the Run Assignment. */
   controlRequest?: AgentRunControlRequest;
   /**
@@ -156,7 +141,7 @@ export function createAgentRun(
       })
     : validateRunAssignment(assignment);
   return {
-    schemaVersion: 9,
+    schemaVersion: 10,
     id: requireSafeIdentity(id, "Agent run id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -237,7 +222,7 @@ export function markAgentRunDelivered(run: AgentRun, now: Date): AgentRun {
 }
 
 export function validateAgentRun(run: AgentRun): AgentRun {
-  if (run.schemaVersion !== 9) throw new Error("Agent run must use schemaVersion 9.");
+  if (run.schemaVersion !== 10) throw new Error("Agent run must use schemaVersion 10.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "agentRun");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {
@@ -400,12 +385,6 @@ export function validateAgentRun(run: AgentRun): AgentRun {
       }
     }
   }
-  if (run.providerRetry !== undefined) {
-    validateAgentRunProviderRetry(run.providerRetry);
-    if (run.status !== "active") {
-      throw new Error("A terminal Agent run cannot carry a providerRetry projection.");
-    }
-  }
   if (run.controlRequest !== undefined) {
     validateAgentRunControlRequest(run.controlRequest);
     if (run.status !== "active") {
@@ -446,69 +425,13 @@ function finishAgentRun(
     updatedAt: timestamp,
     endedAt: timestamp
   } as AgentRun;
-  // A terminal Run no longer waits for a retry; the projection is cleared so
-  // old and new readers agree the Run is settled.
-  if (terminal.providerRetry !== undefined) {
-    delete terminal.providerRetry;
-  }
   if (terminal.controlRequest !== undefined) delete terminal.controlRequest;
   return terminal;
-}
-
-/**
- * Attaches (or advances) the Issue 04 in-place retry projection on an active
- * Run. The Run stays `active`; only the projection changes.
- */
-export function withProviderRetry(
-  run: AgentRun,
-  retry: AgentRunProviderRetry
-): AgentRun {
-  if (run.status !== "active") {
-    throw new Error(`Cannot schedule provider retry on a terminal Agent run: ${run.id}.`);
-  }
-  return validateAgentRun({ ...run, providerRetry: retry });
-}
-
-/**
- * Reopens an active retry-waiting Run for another in-place attempt on its
- * original Native Session. The original Run transport/acceptance timestamps
- * remain historical facts; the new delivery receipt and `dispatching` retry
- * state make the delivery path send only the short continuation envelope.
- */
-export function reopenRunForProviderRetry(
-  run: AgentRun,
-  receiptId: string,
-  now: Date,
-  mode: "new" | "resume" = "resume"
-): AgentRun {
-  if (run.status !== "active" || run.providerRetry === undefined) {
-    throw new Error(`Agent run is not waiting for a provider retry: ${run.id}.`);
-  }
-  const timestamp = now.toISOString();
-  const {
-    providerRetry,
-    ...rest
-  } = run;
-  return validateAgentRun({
-    ...rest,
-    mode,
-    deliveryReceiptId: receiptId,
-    updatedAt: timestamp,
-    providerRetry: prepareProviderRetryDispatch(providerRetry, receiptId, now)
-  });
-}
-
-/** Any exact correlated provider progress ends the active consecutive-failure episode. */
-export function clearProviderRetryOnProgress(run: AgentRun): AgentRun {
-  if (run.providerRetry === undefined) return run;
-  const { providerRetry: _providerRetry, ...rest } = run;
-  return validateAgentRun(rest as AgentRun);
 }
 
 export function agentRunDeliveryReceiptId(run: AgentRun): string {
   return run.deliveryReceiptId
     ?? run.controlRequest?.receiptId
-    ?? run.providerRetry?.lastRetryReceiptId
     ?? formatAgentRunReceiptId(run.taskId, run.id);
 }
 
@@ -517,7 +440,7 @@ export function withAgentRunControlRequest(
   request: AgentRunControlRequest,
   now: Date
 ): AgentRun {
-  if (run.status !== "active" || run.providerRetry !== undefined) {
+  if (run.status !== "active") {
     throw new Error(`Agent run cannot accept a control request: ${run.id}.`);
   }
   return validateAgentRun({

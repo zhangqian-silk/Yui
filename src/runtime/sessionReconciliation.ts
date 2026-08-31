@@ -9,7 +9,7 @@ export type DurableSessionFact = Readonly<{
   adapterId: string;
   launchId?: string;
   nativeSessionId?: string;
-  status: "reserved" | "ready" | "running" | "stopped" | "broken";
+  status: "active" | "ended";
   inHistory: boolean;
 }>;
 
@@ -36,7 +36,7 @@ export type SessionReconciliationEntry = Readonly<{
   launchId: string;
   nativeSessionId?: string;
   taskStatus?: "draft" | "active" | "completed" | "retired" | "archived";
-  durableStatus: "reserved" | "ready" | "running" | "stopped" | "broken" | "absent";
+  durableStatus: "active" | "ended" | "absent";
   tmuxPane?: Readonly<{ target: string; dead: boolean }>;
   physical?: SessionPhysicalObservation;
   lastStopOutcome?: string;
@@ -131,12 +131,12 @@ function reconcileOne(
   if (physical?.identityConflict === true) {
     mismatch = "identity-conflict";
   } else if (physical?.alive === true) {
-    if (durable === undefined || durable.status === "stopped" || durable.status === "broken") {
+    if (durable === undefined || durable.status === "ended") {
       mismatch = "durable-terminal-physical-live";
     }
   } else if (physical === undefined) {
     verificationGap = "/proc identity unavailable";
-  } else if (durable !== undefined && durable.status === "running") {
+  } else if (durable !== undefined && durable.status === "active") {
     mismatch = "durable-live-physical-absent";
   }
 

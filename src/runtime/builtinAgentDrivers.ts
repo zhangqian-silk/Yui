@@ -14,7 +14,11 @@ import {
   codexTranscriptObserver,
   transcriptObserverSource
 } from "./builtinTranscriptObserver.js";
-import { parseClaudeError } from "./providerErrorCodes.js";
+import {
+  mapClaudeAgentError,
+  mapCodexAgentError
+} from "./builtinAgentErrorMappers.js";
+import { serializeAgentErrorRaw, standardAgentError } from "./agentError.js";
 
 export const CODEX_DRIVER_ID = "openai/codex";
 export const CLAUDE_CODE_DRIVER_ID = "anthropic/claude-code";
@@ -99,6 +103,7 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
       nativeTurnId: ({ payload }: AgentDriverNativeHook) => (
         optionalIdentityFrom(payload, ["prompt_id", "turn_id"])
       ),
+      mapError: mapClaudeAgentError,
       mapHook: ({ hookEventName, payload, occurrenceId }: AgentDriverNativeHook) => (
         mapClaudeHook(hookEventName, payload, occurrenceId)
       ),
@@ -164,6 +169,7 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
       nativeTurnId: ({ payload }: AgentDriverNativeHook) => (
         optionalIdentityFrom(payload, ["turn_id", "prompt_id"])
       ),
+      mapError: mapCodexAgentError,
       mapHook: ({ hookEventName, payload, occurrenceId }: AgentDriverNativeHook) => (
         mapCodexHook(hookEventName, payload, occurrenceId)
       ),
@@ -280,7 +286,10 @@ function mapClaudeHook(
     case "StopFailure":
       return mapped("turn.failed", claudeFailure(payload));
     case "SessionEnd":
-      return [mapped("session.ended"), mapped("activation.ended")];
+      // Native CLI exit ends this local Provider attachment, not the
+      // resumable Conversation. Durable Session end is an explicit Yui
+      // mutation or a Provider fact that the Conversation is unrecoverable.
+      return mapped("activation.ended");
     default:
       throw new Error(`Claude Code Driver does not support Hook event: ${name}.`);
   }
@@ -339,7 +348,7 @@ function mapCodexHook(
     case "Stop":
       return mapped("turn.completed", optionalSummary(payload));
     case "SessionEnd":
-      return [mapped("session.ended"), mapped("activation.ended")];
+      return mapped("activation.ended");
     default:
       throw new Error(`Codex Driver does not support Hook event: ${name}.`);
   }
@@ -463,7 +472,8 @@ function claudeFailure(
   const code = firstIdentity(payload, ["error"], "Claude StopFailure error");
   const details = optionalText(payload.error_details);
   const lastOutput = optionalText(payload.last_assistant_message);
-  const parsed = parseClaudeError(code, details);
+  const raw = serializeAgentErrorRaw(payload);
+  const classification = mapClaudeAgentError({ message: code, raw });
   const retryAfterMs = typeof payload.retry_after_ms === "number"
     && Number.isSafeInteger(payload.retry_after_ms)
     && payload.retry_after_ms > 0
@@ -471,14 +481,19 @@ function claudeFailure(
     : undefined;
   return {
     failure: {
-      ...(parsed.code !== "unknown" ? { errorCode: parsed.code } : {}),
-      code,
-      ...(details === undefined ? {} : { details }),
+      error: standardAgentError({
+        source: "provider",
+        phase: "turn-execute",
+        classification,
+        message: code,
+        raw,
+        inputDisposition: "accepted",
+        ...(retryAfterMs === undefined ? {} : { retryAfterMs })
+      }),
       ...(lastOutput === undefined ? {} : { lastOutput }),
       ...(payload.run_terminal === true || payload.unrecoverable === true
         ? { runTerminal: true }
-        : {}),
-      ...(retryAfterMs === undefined ? {} : { retryAfterMs })
+        : {})
     },
     summary: [
       "Agent turn failed.",

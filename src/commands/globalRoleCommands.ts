@@ -343,7 +343,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
         {
           activeRun: false,
           nativeProcessRunning: activeSession !== undefined
-            && activeSession.status !== "stopped"
+            && activeSession.status === "active"
         },
         now
       );
@@ -368,7 +368,7 @@ function removeRole(args: string[], store: GlobalRoleStore): string {
       roleName: role.name
     }, "removal");
     const sessions = tx.getGlobalRoleSessionSet(name);
-    if (Object.values(sessions?.sessions ?? {}).some(({ status }) => status !== "stopped")) {
+    if (Object.values(sessions?.sessions ?? {}).some(({ status }) => status === "active")) {
       throw usageError(`GlobalRole is active and cannot be removed: ${name}.`);
     }
     if (!tx.removeGlobalRole(name)) throw roleNotFound(name);
@@ -446,7 +446,7 @@ function roleSession(
       adapterId: binding.adapterId,
       nativeSessionId,
       policy: "fixed" as const,
-      status: environment.YUI_ROLE === name ? "running" as const : "ready" as const,
+      status: "active" as const,
       effective: resolveEffectiveLaunch({ role, purpose: "execution" })
     };
     if (command === "record") {
@@ -459,7 +459,7 @@ function roleSession(
     if (existing === null) {
       throw usageError("Native session replacement requires an existing native session.");
     }
-    if (existing.status !== "stopped") {
+    if (existing.status !== "ended") {
       throw usageError("Native session replacement is blocked while the native Agent process is running.");
     }
     if (existing.nativeSessionId === nativeSessionId) {

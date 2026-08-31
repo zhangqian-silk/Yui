@@ -1,16 +1,16 @@
 import {
   activeRoleAgentSession,
-  type AgentSessionStatus,
   type RoleSessionSet
 } from "../executor/agentExecutor.js";
 import type { RuntimeOwner } from "./runtimeOwner.js";
 
 /**
- * Bounded projection of a RoleSessionSet's current non-stopped Session.
+ * Bounded projection of a RoleSessionSet's current active Session.
  *
- * Historical Session rows never enter this shape. SQLite persists the shape in
- * a dedicated hot table in the same transaction as the authoritative
- * RoleSessionSet; the file rollback backend derives it from its aggregate.
+ * Presence in this projection means active; it deliberately carries no second
+ * lifecycle status. Historical and ended Sessions never enter this shape.
+ * SQLite persists it in the same transaction as the authoritative
+ * RoleSessionSet; the file rollback backend derives it from that aggregate.
  */
 export type RuntimeSessionCandidate = Readonly<{
   owner: RuntimeOwner;
@@ -18,7 +18,6 @@ export type RuntimeSessionCandidate = Readonly<{
   adapterId: string;
   nativeSessionId: string;
   launchId?: string;
-  status: Exclude<AgentSessionStatus, "stopped">;
   sessionUpdatedAt: string;
   cleanupRequired: boolean;
 }>;
@@ -35,21 +34,12 @@ export type RuntimeSessionCandidateQuery = Readonly<{
   taskIds?: readonly string[];
 }>;
 
-/** Exact completed-Task cleanup contract shared by projection writers/readers. */
-export function runtimeSessionRequiresCleanup(input: Readonly<{
-  status: AgentSessionStatus;
-  launchId?: string;
-}>): boolean {
-  if (input.status === "stopped" || input.status === "broken") return false;
-  return input.status === "running" || input.launchId !== undefined;
-}
-
-/** Projects only the current active Agent Session; stopped history disappears. */
+/** Projects only the current active Agent Session; ended history disappears. */
 export function projectRuntimeSessionCandidate(
   sessions: RoleSessionSet
 ): RuntimeSessionCandidate | null {
   const active = activeRoleAgentSession(sessions);
-  if (active === null || active.status === "stopped") return null;
+  if (active === null || active.status === "ended") return null;
   return {
     owner: sessions.owner.scope === "task"
       ? {
@@ -62,9 +52,8 @@ export function projectRuntimeSessionCandidate(
     adapterId: active.adapterId,
     nativeSessionId: active.nativeSessionId,
     ...(active.launchId === undefined ? {} : { launchId: active.launchId }),
-    status: active.status,
     sessionUpdatedAt: active.updatedAt,
-    cleanupRequired: runtimeSessionRequiresCleanup(active)
+    cleanupRequired: active.launchId !== undefined
   };
 }
 

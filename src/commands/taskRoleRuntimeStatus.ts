@@ -439,7 +439,7 @@ function calculateHealth(
       healthReason: "the native Session is unbound; verified runtime cleanup is pending"
     };
   }
-  if (nativeSession?.status === "broken") {
+  if (nativeSession?.status === "ended" && nativeSession.endReason === "failed") {
     // Issue 09: a broken Session only fails a live Run. When the last Run
     // already yielded, the Session death is a lifecycle event, not a Run
     // failure — surface it as attention with the persisted Run outcome.
@@ -517,10 +517,10 @@ function calculateHealth(
       }
     }
   }
-  if (nativeSession?.status === "running" && tmux.state !== "running") {
+  if (nativeSession?.status === "active" && tmux.state !== "running") {
     return { health: "needs-attention", healthReason: "the native session is running without a live tmux pane" };
   }
-  if (nativeSession?.status === "stopped" && tmux.state === "running") {
+  if (nativeSession?.status === "ended" && tmux.state === "running") {
     return { health: "needs-attention", healthReason: "a stopped native session has a live tmux pane" };
   }
   if (role.name === "leader" && openInputRequestCount > 0) {

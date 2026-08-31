@@ -60,7 +60,8 @@ advanced.
 
 The stable vocabulary separates:
 
-- Session state: started, ready, ended, failed;
+- durable Session lifecycle: active or ended, with stopped/failed as the end reason;
+- Host and current Turn observations: starting, idle, busy, settling, failed, or unavailable;
 - Turn state: accepted, waiting, completed, failed, cancelled; each waiting
   episode has its own `waitId` and positive operation/model evidence resumes it;
 - operations: model, tool, and subagent start/completion/failure;
@@ -81,6 +82,26 @@ their native Session field; Claude Code resolves `prompt_id`, Codex resolves
 core branch. Core validates the resolved identities and derives content-stable
 canonical event IDs, so retrying the same native Hook does not create a second
 fact.
+
+## Standard Agent errors
+
+Every Driver also maps its provider-native exception into Yui's small,
+provider-neutral Agent error taxonomy. The normalized fact contains source,
+phase, category, stable code, input disposition, Session disposition, optional
+retry-after evidence, a human-readable message, and the complete serialized
+native error. `unknown` is the required fallback.
+
+The taxonomy contains `availability`, `rate-limit`, `transport`, `access`,
+`invalid-request`, `context`, `session`, `runtime`, `conflict`, `cancelled`, and
+`unknown`. These are observations, not recommended actions. A Driver recognizes
+its own native error shapes; it does not start a replacement Session, count
+attempts, or impose backoff. The Leader or Operator reads the fact with current
+Run, Host, Session, and Turn state and chooses the next atomic operation.
+
+The taxonomy describes evidence; it is not a second lifecycle state machine.
+Drivers recognize native shapes, Core records the standardized fact, and the
+Leader or Operator remains free to choose a better recovery from current Task
+context.
 
 ## Runtime activity is not workflow progress
 
@@ -218,7 +239,9 @@ view. The Driver must:
 3. expose an independently sampled, incremental observer when structured usage
    or activity is available, including explicit health;
 4. provide the full exact identity fence for every Run-scoped fact;
-5. prove stale-generation rejection, replay idempotency, out-of-order replay,
+5. map every native failure to a standard Agent error code and preserve the
+   complete native error, using `unknown` when no mapping is justified;
+6. prove stale-generation rejection, replay idempotency, out-of-order replay,
    zero-token-delta behavior, operation/waiting projection, and terminal
    behavior with deterministic tests.
 

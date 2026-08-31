@@ -27,14 +27,7 @@ import {
   roleSessionKind
 } from "../context/roleSessionContext.js";
 import { materializeSessionBootstrap } from "../context/sessionBootstrapManifest.js";
-import {
-  serializeRunBootstrapEnvelope,
-  serializeRunHostRecoveryEnvelope
-} from "../context/runContextContract.js";
-import { serializeProviderRetryEnvelope } from "../run/providerRetry.js";
-import { serializeWorkflowOutcomeRequestEnvelope } from "../run/runControlRequest.js";
 import { prefixYuiTitleInput } from "../run/runIdentity.js";
-import { agentRunDeliveryReceiptId, type AgentRun } from "../run/agentRun.js";
 import { resolveAgentAdapter } from "./agentAdapter.js";
 import type { ClaudeAgentConfig, RoleAgentConfig } from "./agentAdapter.js";
 import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
@@ -485,7 +478,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       owner.scope !== "task"
       || runtimeIsolation.taskId !== owner.taskId
       || runtimeIsolation.workspace.root !== effectiveWorkspace
-      || runtimeIsolation.generation.runId !== input.runId
       || runtimeIsolation.generation.launchId !== input.launchId
     )) {
       throw new Error("Role launch does not match its Task runtime isolation descriptor.");
@@ -702,18 +694,12 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     if (owner.scope === "task" && (input.mode === "new" || input.mode === "resume")) {
       jobCallerKey = randomBytes(32).toString("hex");
     }
-    // Every managed launch for an unpushed Run owns that Run's first Provider
-    // write, whether it creates or resumes the native Conversation. Keeping
-    // resume on the same launch handshake prevents a durable AgentRun from
-    // existing without a corresponding Provider Turn.
+    // Session lifecycle and Turn submission are separate atomic operations.
+    // Planning only starts or restores the exact native Session; delivery
+    // submits the Run input after that Session fact is durable.
     if (managedControl && (managedRun === null || managedRun.status !== "active")) {
       throw new Error(`Managed Run is no longer active: ${input.runId}.`);
     }
-    const carriesInitialTurn = managedControl && (
-      managedRun!.pushedAt === undefined
-      || managedRun!.providerRetry?.state === "dispatching"
-      || managedRun!.controlRequest?.state === "dispatching"
-    );
     const providerAuthority = managedControl
       ? this.#providerAuthorityForLaunch(
           owner.taskId,
@@ -722,84 +708,50 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
           input.mode
         )
       : undefined;
-    const providerOwnedTurn = managedControl && !carriesInitialTurn
+    const providerOwnedTurn = managedControl && input.mode === "resume"
       ? this.#providerOwnedTurnForLaunch(owner.taskId, role.name, input.runId!)
       : undefined;
     const providerNativeSessionId = binding.adapterId === "claude"
       ? preallocatedNativeSessionId
       : resumeNativeSessionId;
-    const initialTurn = carriesInitialTurn
-      ? {
-          attemptId: agentRunDeliveryReceiptId(managedRun!),
-          boundedText: managedRunLaunchEnvelope(
-            managedRun!,
-            input.mode,
-            sessionContext.sessionManifestPath,
-            sessionTitle
-          )
-        }
-      : undefined;
     const providerControl: AgentHostProviderControl | undefined = !managedControl
       ? undefined
-      : initialTurn === undefined
+      : input.mode === "resume"
         ? {
-          schemaVersion: 1,
-          adapterId: binding.adapterId,
-          transport: managedCompiled!.transport,
-          kind: "ensure",
-          mode: "resume",
-          nativeSessionId: requireText(
-            providerNativeSessionId,
-            "Managed Provider ensure native session id"
-          ),
-          ...(sessionTitle === undefined ? {} : { sessionTitle }),
-          ...(managedCompiled!.codexThread === undefined
-            ? {}
-            : { codexThread: managedCompiled!.codexThread }),
-          ...(providerOwnedTurn === undefined ? {} : { ownedTurn: providerOwnedTurn }),
-          authority: providerAuthority!
-        }
-        : resumeNativeSessionId === undefined
-          ? {
-              schemaVersion: 1,
-              adapterId: binding.adapterId,
-              transport: managedCompiled!.transport,
-              kind: "new",
-              mode: "new",
-              ...(providerNativeSessionId === undefined
-                ? {}
-                : { nativeSessionId: providerNativeSessionId }),
-              ...(sessionTitle === undefined ? {} : { sessionTitle }),
-              ...(managedCompiled!.codexThread === undefined
-                ? {}
-                : { codexThread: managedCompiled!.codexThread }),
-              authority: providerAuthority!,
-              initialTurn
-            }
-          : {
-              schemaVersion: 1,
-              adapterId: binding.adapterId,
-              transport: managedCompiled!.transport,
-              kind: "resume",
-              mode: "resume",
-              nativeSessionId: requireText(
-                providerNativeSessionId,
-                "Managed Provider resume native session id"
-              ),
-              ...(sessionTitle === undefined ? {} : { sessionTitle }),
-              ...(managedCompiled!.codexThread === undefined
-                ? {}
-                : { codexThread: managedCompiled!.codexThread }),
-              authority: providerAuthority!,
-              initialTurn
-            };
+            schemaVersion: 1,
+            adapterId: binding.adapterId,
+            transport: managedCompiled!.transport,
+            kind: "restore",
+            mode: "resume",
+            nativeSessionId: requireText(
+              providerNativeSessionId,
+              "Managed Provider restore native session id"
+            ),
+            ...(sessionTitle === undefined ? {} : { sessionTitle }),
+            ...(managedCompiled!.codexThread === undefined
+              ? {}
+              : { codexThread: managedCompiled!.codexThread }),
+            ...(providerOwnedTurn === undefined ? {} : { ownedTurn: providerOwnedTurn }),
+            authority: providerAuthority!
+          }
+        : {
+            schemaVersion: 1,
+            adapterId: binding.adapterId,
+            transport: managedCompiled!.transport,
+            kind: "start",
+            mode: "new",
+            ...(providerNativeSessionId === undefined
+              ? {}
+              : { nativeSessionId: providerNativeSessionId }),
+            ...(sessionTitle === undefined ? {} : { sessionTitle }),
+            ...(managedCompiled!.codexThread === undefined
+              ? {}
+              : { codexThread: managedCompiled!.codexThread }),
+            authority: providerAuthority!
+          };
     const launch = {
       command,
       args,
-      ...(managedRun?.providerRetry !== undefined
-        && managedRun.providerRetry.state !== "dispatching"
-        ? { deferProviderStart: true }
-        : {}),
       ...(providerControl === undefined ? {} : { providerControl }),
       env: {
         ...launchEnvironment,
@@ -854,10 +806,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       },
       launch: ordinaryConversationLaunch,
       session,
-      ...(sessionTitle === undefined ? {} : { sessionTitle }),
-      ...(carriesInitialTurn && input.runId !== undefined
-        ? { initialTurnRunId: input.runId }
-        : {})
+      ...(sessionTitle === undefined ? {} : { sessionTitle })
     };
   }
 
@@ -983,39 +932,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     )));
     return selectEnvironment(source, names);
   }
-}
-
-function managedRunLaunchEnvelope(
-  run: AgentRun,
-  mode: "new" | "resume",
-  sessionManifestPath: string,
-  title: string | undefined
-): string {
-  const body = run.providerRetry?.state === "dispatching"
-    ? serializeProviderRetryEnvelope({
-        taskId: run.taskId,
-        runId: run.id,
-        roleName: run.roleName,
-        retry: run.providerRetry
-      })
-    : run.controlRequest?.state === "dispatching"
-      ? serializeWorkflowOutcomeRequestEnvelope({
-          taskId: run.taskId,
-          runId: run.id,
-          roleName: run.roleName,
-          request: run.controlRequest
-        })
-    : mode === "resume" && run.pushedAt !== undefined
-      ? serializeRunHostRecoveryEnvelope(run.bootstrapEnvelope)
-      : serializeRunBootstrapEnvelope(run.bootstrapEnvelope);
-  const guided = [
-    `Yui Session Manifest: ${sessionManifestPath}`,
-    "Read the manifest and its matching Role Skill before using the yui CLI for this Task.",
-    body
-  ].join("\n");
-  return title === undefined
-    ? guided
-    : prefixYuiTitleInput(guided, title);
 }
 
 export function nativeAgentWorkspace(
@@ -1323,7 +1239,7 @@ function readySession(
     agentId,
     adapterId,
     nativeSessionId: requireText(nativeSessionId, "Native session id"),
-    status: "ready",
+    status: "active",
     effective
   };
 }

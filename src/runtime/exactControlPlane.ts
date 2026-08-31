@@ -499,24 +499,19 @@ export function assertExactTaskRuntimeState(
     && isRuntimeLaunchReservation(lifecycleMailbox?.processing, runtime.launchId);
   const sessionLaunch = runtime.launchId !== undefined
     && session?.launchId === runtime.launchId;
-  const executionRef = lifecycleMailbox?.processing?.executionRef;
   const preallocated = options.preallocatedDriverSessionReservation;
-  const exactRunLaunchReservation =
-    runtime.runId !== undefined
-    && runtime.launchId !== undefined
+  const exactHostLaunchReservation =
+    runtime.launchId !== undefined
     && reservation
-    && !hasRuntimeCleanupObligation(lifecycleMailbox)
-    && executionRef?.type === "run"
-    && executionRef.taskId === runtime.taskId
-    && executionRef.id === runtime.runId;
+    && !hasRuntimeCleanupObligation(lifecycleMailbox);
   const terminalSessionReplacementReservation =
-    exactRunLaunchReservation
+    exactHostLaunchReservation
     && session !== undefined
-    && (session.status === "stopped" || session.status === "broken");
+    && session.status === "ended";
   const exactPreallocatedReservation =
     preallocated !== undefined
     && runtime.adapterId === preallocated.adapterId
-    && exactRunLaunchReservation
+    && exactHostLaunchReservation
     && runtime.nativeSessionId !== undefined
     && (session === undefined || terminalSessionReplacementReservation)
     && runtime.nativeSessionId === nativeSessionIdForLaunch(
@@ -550,8 +545,7 @@ export function assertExactTaskRuntimeState(
     || session.adapterId !== runtime.adapterId
     || session.nativeSessionId !== runtime.nativeSessionId
     || session.launchId !== runtime.launchId
-    || session.status === "stopped"
-    || session.status === "broken"
+    || session.status === "ended"
     || session.effective.agentId !== runtime.agentId
     || session.effective.adapterId !== runtime.adapterId
     || canonicalPath(session.effective.workspace.root) !== runtime.workspace
