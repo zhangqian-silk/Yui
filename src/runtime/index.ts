@@ -197,10 +197,6 @@ export {
   type ProviderAuthorityFence
 } from "./providerAuthorityFence.js";
 export {
-  decideProviderRecovery,
-  type ProviderRecoveryDecision
-} from "./providerRecoveryDecision.js";
-export {
   reconcileSessionOwners,
   type DurableSessionFact,
   type SessionPhysicalObservation,

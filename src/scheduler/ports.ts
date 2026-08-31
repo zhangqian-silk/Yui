@@ -5,7 +5,6 @@ import type { Milestone } from "../milestone/milestone.js";
 import type { LeaderFailure } from "./leaderFailure.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { PendingProviderRetry } from "../run/providerRetry.js";
 import type {
   MailboxEntityRef,
   MailboxTarget,
@@ -23,7 +22,14 @@ import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import type { Task } from "../task/task.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import type { AgentSessionStatus } from "../executor/agentExecutor.js";
 import type { RuntimeLaunchPreStart } from "../runtime/ports.js";
+import type {
+  AgentErrorInputDisposition,
+  AgentErrorPhase,
+  AgentErrorSessionDisposition,
+  AgentErrorSource
+} from "../runtime/agentError.js";
 import {
   isTaskOwnedWorkspace,
   type ManagedWorkspace
@@ -62,7 +68,8 @@ export type SchedulerRoleSession = Readonly<{
   /** Exact external-process generation, when runtime coordination recorded it. */
   launchId?: string;
   title?: string;
-  status: "reserved" | "ready" | "running" | "stopped" | "broken";
+  status: AgentSessionStatus;
+  endReason?: "stopped" | "failed";
   effective: EffectiveLaunchSnapshot;
   /** Last durable session transition, when the adapter can expose it. */
   updatedAt?: string;
@@ -237,6 +244,7 @@ export type SchedulerInputDeliveryClaimInput = Readonly<{
 
 export type SchedulerInputDeliveryClaimResult =
   | Readonly<{ status: "claimed" | "delivery"; delivery: InputDelivery }>
+  | Readonly<{ status: "busy" }>
   | Readonly<{ status: "empty" }>;
 
 export type RoleRunDeliveryPersistence = Readonly<{
@@ -259,30 +267,10 @@ export type RoleRunDeliveryFailurePersistence = Readonly<{
   nativeSessionId?: string;
   /** Exact external-process generation prepared for this undelivered Run. */
   launchId?: string;
-  /** Exact terminal explanation when the failure is not retry exhaustion. */
+  /** Exact terminal explanation for this conclusively unaccepted delivery. */
   summary?: string;
   /** Whether the failed delivery also requires the local Host to be stopped. */
   cleanupRequired?: boolean;
-  now: Date;
-}>;
-
-export type ExitedRoleRunPersistence = Readonly<{
-  task: SchedulerTask;
-  role: SchedulerRole;
-  run: SchedulerAgentRun;
-  session: SchedulerRoleSession | null;
-  summary: string;
-  /** Static pre-accept failures fail closed instead of creating another Leader generation. */
-  leaderRecovery: "automatic" | "blocked";
-  now: Date;
-}>;
-
-export type LeaderDispatchFailurePersistence = Readonly<{
-  task: SchedulerTask;
-  role: SchedulerRole;
-  session: SchedulerRoleSession | null;
-  claimed: Readonly<{ run: SchedulerAgentRun; wakeup: PendingWakeup }>;
-  failure: LeaderFailure;
   now: Date;
 }>;
 
@@ -326,21 +314,6 @@ export interface SchedulerStorePort {
     now: Date,
     taskIds?: ReadonlySet<string>
   ): readonly AutoResolvedInput[];
-  /**
-   * Issue 04 durable in-place retry timer. Lists active Runs whose Provider
-   * retry is due; the Controller arms its deadline timer from this projection.
-   * Optional so adapters without the feature keep the old behavior.
-   */
-  listPendingProviderRetries?(taskIds?: readonly string[]): ReadonlyArray<PendingProviderRetry>;
-  /**
-   * Issue 04: reopens each due retry on its original Native Session, or
-   * terminalizes a Run whose Session is proven dead. Returns the reopened Run
-   * references. Optional so adapters without the feature keep the old behavior.
-   */
-  resolveDueProviderRetries?(
-    now: Date,
-    taskIds?: ReadonlySet<string>
-  ): readonly string[];
   /** Persist exact tmux remain-on-exit evidence before rebuilding an Agent Host. */
   saveRoleHostExitObservation?(input: Readonly<{
     taskId: string;
@@ -454,6 +427,12 @@ export interface SchedulerStorePort {
     now?: Date,
     expectedDormantCandidate?: DormantRuntimeOwnerCandidate
   ): RuntimeLifecycleTarget | null;
+  /** Queues physical Host cleanup while preserving its resumable Session. */
+  enqueueRuntimeHostDetach?(
+    owner: RuntimeRoleOwner,
+    now?: Date,
+    expectedDormantCandidate?: DormantRuntimeOwnerCandidate
+  ): RuntimeLifecycleTarget | null;
   /** Atomically clears one confirmed-absent reservation and stops its session fact. */
   completeStoppedRuntimeReservation?(
     target: Extract<
@@ -472,14 +451,18 @@ export interface SchedulerStorePort {
   listRuntimeSessionCandidates?(
     query?: RuntimeSessionCandidateQuery
   ): readonly RuntimeSessionCandidate[];
-  /**
-   * Persists a confirmed absent dormant owner only while its exact session
-   * fact is still current and no launch, cleanup, or Task Run has appeared.
-   */
-  markRuntimeOwnerStopped?(
-    candidate: DormantRuntimeOwnerCandidate,
-    now: Date
-  ): boolean;
+  /** Persists one provider-neutral failure fact and wakes the responsible Agent. */
+  recordAgentError?(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    runId: string;
+    source: AgentErrorSource;
+    phase: AgentErrorPhase;
+    message: string;
+    raw: string;
+    inputDisposition?: AgentErrorInputDisposition;
+    sessionDisposition?: AgentErrorSessionDisposition;
+  }>, now: Date): string;
   queueTaskProgress(taskId: string, reason: string, now: Date): void;
 
   getPendingWakeup(taskId: string): PendingWakeup | null;
@@ -530,10 +513,6 @@ export interface SchedulerStorePort {
   saveRoleRunDeliveryFailure(
     input: RoleRunDeliveryFailurePersistence
   ): "failed" | "state-changed";
-  /** Persist LeaderFailure, its semantic attention event, and failed/broken runtime state. */
-  saveLeaderDispatchFailure(input: LeaderDispatchFailurePersistence): "failed" | "state-changed";
-  /** Fail the exact Run and its WorkItem or ReviewRound, clear active-run, and stop the Role session. */
-  saveExitedRoleRun(input: ExitedRoleRunPersistence): "failed" | "state-changed";
 }
 
 export function isSchedulerTaskWorkspaceReady(
@@ -642,14 +621,6 @@ export type PreparedRoleDelivery = Readonly<{
    * that do not expose a pre-readiness Session fact.
    */
   session?: SchedulerRoleSession | null;
-  /** The launch workflow durably fenced and accepted this Run's first structured Turn. */
-  turnAcceptedDuringLaunch?: boolean;
-  /** Provider launch lost the exact acknowledgement for this Run's first Turn. */
-  turnDeliveryUnknownDuringLaunch?: boolean;
-  /** Another ordinary client has an active Turn; retry this Run later. */
-  turnBusyDuringLaunch?: boolean;
-  /** Provider definitively rejected this Run's first Turn during launch. */
-  turnRejectedDuringLaunch?: boolean;
 }>;
 
 export type ReadyRoleDelivery = Readonly<{
@@ -676,6 +647,8 @@ export interface TmuxDeliveryPort {
     mode: RoleSessionLaunchMode;
     runId?: string;
     nativeSessionId?: string;
+    /** Current Host activation that may be reused for this exact Session. */
+    hostActivationId?: string;
     beforeHostStart?: RuntimeLaunchPreStart;
   }>): Promise<PreparedRoleDelivery>;
   waitUntilReady(delivery: PreparedRoleDelivery): Promise<ReadyRoleDelivery>;

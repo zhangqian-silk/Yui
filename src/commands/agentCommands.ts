@@ -366,7 +366,7 @@ function sessionReference(
   reference: RoleReference
 ): SessionReference | null {
   const session = set.sessions[agentId];
-  if (session === undefined || session.status === "stopped") return null;
+  if (session === undefined || session.status === "ended") return null;
   return { ...reference, status: session.status };
 }
 

@@ -165,28 +165,26 @@ export type EventsAudit = Readonly<{
   progressShare: number;
 }>;
 
-export type ProviderRetryAuditEntry = Readonly<{
+export type AgentErrorAuditEntry = Readonly<{
   taskId: string;
+  eventId: string;
   runId: string;
   roleName: string;
-  /** Highest retry attempt recorded on this lineage. */
-  attempts: number;
-  /** Last classified Provider error code. */
-  errorClass: string;
-  firstFailureAt: string;
-  lastFailureAt: string;
-  /** Last scheduled backoff deadline, when recorded. */
-  lastBackoffAt?: string;
-  /** Last recorded decision (retrying, waiting, resume, session-dead, …). */
-  decision: string;
+  source: string;
+  phase: string;
+  category: string;
+  code: string;
+  message: string;
+  raw: string;
+  inputDisposition: string;
+  sessionDisposition: string;
+  createdAt: string;
 }>;
 
-export type ProviderRetriesAudit = Readonly<{
-  /** Runs that entered in-place Provider retry at least once. */
+export type AgentErrorsAudit = Readonly<{
   total: number;
-  /** Runs whose retry lineage ended in a terminal decision. */
-  terminal: number;
-  entries: readonly ProviderRetryAuditEntry[];
+  byCategory: Readonly<Record<string, number>>;
+  entries: readonly AgentErrorAuditEntry[];
 }>;
 
 export type StorageAudit = Readonly<{
@@ -201,14 +199,8 @@ export type StorageAudit = Readonly<{
 export type RuntimeProtocolAudit = Readonly<{
   contextProtocolVersions: Readonly<Record<string, number>>;
   manifestCompatibilityDigests: number;
-  activeRetryEpisodes: number;
-  activeRetryStates: Readonly<Record<string, number>>;
-  activeConsecutiveFailures: number;
-  activeDispatchedRetries: number;
-  retryClassifiedEvents: number;
-  retryDispatchedEvents: number;
-  retryRecoveredEvents: number;
-  retryExhaustedEvents: number;
+  agentErrors: number;
+  agentErrorCategories: Readonly<Record<string, number>>;
   contextCapacityFailures: number;
   processExitObservations: number;
   processExitClassifications: Readonly<Record<string, number>>;
@@ -238,7 +230,7 @@ export type ExecutionAuditReport = Readonly<{
   integrations: AuditSection<IntegrationsAudit>;
   publications: AuditSection<PublicationsAudit>;
   events: AuditSection<EventsAudit>;
-  providerRetries: AuditSection<ProviderRetriesAudit>;
+  agentErrors: AuditSection<AgentErrorsAudit>;
   workItems: AuditSection<Readonly<{
     total: number;
     completed: number;
@@ -318,19 +310,6 @@ function roleBucket(roleName: string): keyof RunsAudit["byRole"] {
     return "implementer";
   }
   return "other";
-}
-
-/** Maps a provider-retry lifecycle event to its last recorded decision. */
-function providerRetryDecision(event: { type: string; payload: Readonly<Record<string, string>> }): string {
-  if (event.type === "runtime.provider-retry-waiting") return "waiting";
-  if (event.type === "runtime.provider-retry-resume") return "resume";
-  if (event.type === "runtime.provider-retry-session-dead") return "session-dead";
-  if (event.type === "runtime.provider-retry-budget-exhausted") return "budget-exhausted";
-  if (event.payload.note === "native-turn-completion-durable") return "suppressed:completion-durable";
-  if (event.payload.note === "retry-budget-exhausted") return "budget-exhausted";
-  if (event.payload.wouldRetry === "true") return "retrying";
-  if (event.payload.shadow === "true") return "shadow";
-  return "not-retried";
 }
 
 function durationMs(run: AgentRun): number {
@@ -465,7 +444,7 @@ export function runExecutionAudit(
       integrations: section,
       publications: section,
       events: section,
-      providerRetries: section,
+      agentErrors: section,
       workItems: section,
       orchestration: section,
       storage: section,
@@ -635,10 +614,10 @@ export function runExecutionAudit(
           const history = Array.isArray(set.history) ? set.history : [];
           for (const session of [...history, ...Object.values(set.sessions)]) {
             generations += 1;
-            if (session.status === "broken") broken += 1;
-            else if (session.status === "stopped") stopped += 1;
+            if (session.status === "ended" && session.endReason === "failed") broken += 1;
+            else if (session.status === "ended") stopped += 1;
             else other += 1;
-            if (session.status === "broken" || session.status === "stopped") {
+            if (session.status === "ended") {
               classifyTerminalSessionRunRelation(
                 runs,
                 set.owner.roleName,
@@ -838,51 +817,41 @@ export function runExecutionAudit(
     }
   })();
 
-  const providerRetries = ((): AuditSection<ProviderRetriesAudit> => {
+  const agentErrors = ((): AuditSection<AgentErrorsAudit> => {
     try {
-      const entries = new Map<string, ProviderRetryAuditEntry & { terminal: boolean }>();
+      const entries: AgentErrorAuditEntry[] = [];
+      const categories = new Map<string, number>();
       for (const taskId of taskIds) {
         for (const event of store.listEvents(taskId)) {
-          if (!inWindow(event.createdAt, options)) continue;
-          if (!event.type.startsWith("runtime.provider-retry-")) continue;
-          const runId = event.payload.runId;
-          if (typeof runId !== "string") continue;
-          const key = `${taskId}/${runId}`;
-          const previous = entries.get(key);
-          const attempt = Number(event.payload.attempt ?? "0");
-          const decision = providerRetryDecision(event);
-          const terminal = decision === "session-dead" || decision === "budget-exhausted";
-          const next = {
+          if (!inWindow(event.createdAt, options) || event.type !== "runtime.agent-error") {
+            continue;
+          }
+          const category = event.payload.category ?? "unknown";
+          categories.set(category, (categories.get(category) ?? 0) + 1);
+          entries.push({
             taskId,
-            runId,
-            roleName: typeof event.payload.roleName === "string"
-              ? event.payload.roleName
-              : previous?.roleName ?? "",
-            attempts: Number.isFinite(attempt) ? Math.max(previous?.attempts ?? 0, attempt) : (previous?.attempts ?? 0),
-            errorClass: typeof event.payload.errorClass === "string"
-              ? event.payload.errorClass
-              : previous?.errorClass ?? "",
-            firstFailureAt: previous?.firstFailureAt ?? event.createdAt,
-            lastFailureAt: event.createdAt,
-            ...(typeof event.payload.nextAttemptAt === "string"
-              ? { lastBackoffAt: event.payload.nextAttemptAt }
-              : previous?.lastBackoffAt !== undefined
-                ? { lastBackoffAt: previous.lastBackoffAt }
-                : {}),
-            decision,
-            terminal: (previous?.terminal ?? false) || terminal
-          };
-          entries.set(key, next);
+            eventId: event.id,
+            runId: event.payload.runId ?? "",
+            roleName: event.payload.roleName ?? "",
+            source: event.payload.source ?? "unknown",
+            phase: event.payload.phase ?? "unknown",
+            category,
+            code: event.payload.code ?? "unknown",
+            message: event.payload.message ?? "",
+            raw: event.payload.raw ?? "",
+            inputDisposition: event.payload.inputDisposition ?? "unknown",
+            sessionDisposition: event.payload.sessionDisposition ?? "unknown",
+            createdAt: event.createdAt
+          });
         }
       }
-      const list = [...entries.values()];
       return ok({
-        total: list.length,
-        terminal: list.filter((entry) => entry.terminal).length,
-        entries: list.map(({ terminal: _terminal, ...entry }) => entry)
+        total: entries.length,
+        byCategory: Object.fromEntries(categories),
+        entries
       });
     } catch (error) {
-      return failed<ProviderRetriesAudit>(error);
+      return failed<AgentErrorsAudit>(error);
     }
   })();
 
@@ -970,16 +939,10 @@ export function runExecutionAudit(
     try {
       const protocolVersions = new Map<string, number>();
       const manifestDigests = new Set<string>();
-      const retryStates = new Map<string, number>();
+      const agentErrorCategories = new Map<string, number>();
       const exitClassifications = new Map<string, number>();
       const usageSemantics = new Map<string, number>();
-      let activeRetryEpisodes = 0;
-      let activeConsecutiveFailures = 0;
-      let activeDispatchedRetries = 0;
-      let retryClassifiedEvents = 0;
-      let retryDispatchedEvents = 0;
-      let retryRecoveredEvents = 0;
-      let retryExhaustedEvents = 0;
+      let agentErrors = 0;
       let contextCapacityFailures = 0;
       let processExitObservations = 0;
       let compactionEvents = 0;
@@ -991,23 +954,18 @@ export function runExecutionAudit(
           if (run.effective.sessionManifestCompatibilityDigest !== undefined) {
             manifestDigests.add(run.effective.sessionManifestCompatibilityDigest);
           }
-          if (run.providerRetry !== undefined) {
-            activeRetryEpisodes += 1;
-            retryStates.set(
-              run.providerRetry.state,
-              (retryStates.get(run.providerRetry.state) ?? 0) + 1
-            );
-            activeConsecutiveFailures += run.providerRetry.consecutiveFailures;
-            activeDispatchedRetries += run.providerRetry.dispatchedRetries;
-          }
         }
         for (const event of store.listEvents(taskId)) {
           if (!inWindow(event.createdAt, options)) continue;
-          if (event.type === "runtime.provider-retry-classified") retryClassifiedEvents += 1;
-          else if (event.type === "runtime.provider-retry-dispatched") retryDispatchedEvents += 1;
-          else if (event.type === "runtime.provider-retry-recovered") retryRecoveredEvents += 1;
-          else if (event.type === "runtime.provider-retry-exhausted") retryExhaustedEvents += 1;
-          else if (event.type === "runtime.context-capacity-failure") contextCapacityFailures += 1;
+          if (event.type === "runtime.agent-error") {
+            agentErrors += 1;
+            const category = event.payload.category ?? "unknown";
+            agentErrorCategories.set(
+              category,
+              (agentErrorCategories.get(category) ?? 0) + 1
+            );
+            if (category === "context") contextCapacityFailures += 1;
+          }
           else if (event.type === "runtime.process-exit-observed") {
             processExitObservations += 1;
             const classification = event.payload.classification ?? "unknown";
@@ -1028,14 +986,8 @@ export function runExecutionAudit(
       return ok({
         contextProtocolVersions: Object.fromEntries(protocolVersions),
         manifestCompatibilityDigests: manifestDigests.size,
-        activeRetryEpisodes,
-        activeRetryStates: Object.fromEntries(retryStates),
-        activeConsecutiveFailures,
-        activeDispatchedRetries,
-        retryClassifiedEvents,
-        retryDispatchedEvents,
-        retryRecoveredEvents,
-        retryExhaustedEvents,
+        agentErrors,
+        agentErrorCategories: Object.fromEntries(agentErrorCategories),
         contextCapacityFailures,
         processExitObservations,
         processExitClassifications: Object.fromEntries(exitClassifications),
@@ -1090,7 +1042,7 @@ export function runExecutionAudit(
     integrations,
     publications,
     events,
-    providerRetries,
+    agentErrors,
     workItems,
     orchestration,
     storage,

@@ -56,8 +56,9 @@ import {
   AGENT_HOST_CONTROL_TIMEOUT_MS,
   AGENT_HOST_READY_TIMEOUT_MS
 } from "./runtimeDeadlines.js";
+import { serializeAgentErrorRaw } from "./agentError.js";
 
-export const AGENT_HOST_CONTROL_PROTOCOL = "yui-agent-host/v2" as const;
+export const AGENT_HOST_CONTROL_PROTOCOL = "yui-agent-host/v3" as const;
 const HOST_CONTROL_MAX_BYTES = 32 * 1024;
 const CODEX_CLIENT_STABLE_MS = 5_000;
 const MAX_CONSECUTIVE_CODEX_DISCONNECTS = 3;
@@ -79,6 +80,8 @@ export type AgentHostSubmitTurnControl = Readonly<{
   type: "submit-turn";
   launchId: string;
   nativeSessionId: string;
+  /** Current durable Run; a reused Host must not inherit its launch-time Run. */
+  runId: string;
   authority: ProviderAuthorityFence;
   turn: StructuredProviderTurnInput;
 }>;
@@ -274,7 +277,7 @@ export async function runAgentHost(input: Readonly<{
         schemaVersion: 1,
         adapterId: "codex",
         transport: "codex-app-server-proxy",
-        kind: "ensure",
+        kind: "restore",
         mode: "resume",
         nativeSessionId: disconnectedSession.nativeSessionId,
         ...(previousControl.sessionTitle === undefined
@@ -477,7 +480,7 @@ export async function runAgentHost(input: Readonly<{
       throw new Error("Agent Host still owns an unsettled Provider Turn.");
     }
     const requestedAuthority = validateProviderAuthorityFence(providerControl.authority);
-    const replacesCurrentConversation = session !== undefined && providerControl.kind === "new";
+    const replacesCurrentConversation = session !== undefined && providerControl.kind === "start";
     if (replacesCurrentConversation) {
       throw new Error(
         "Agent Host cannot replace a live Provider Session; stop it before starting a fresh Session."
@@ -491,9 +494,6 @@ export async function runAgentHost(input: Readonly<{
     updateSnapshot(hostSnapshot("starting", {
       launchId: next.launchId,
       adapterId: providerControl.adapterId,
-      ...(providerControl.initialTurn === undefined
-        ? {}
-        : { attemptId: providerControl.initialTurn.attemptId }),
       ...(session === undefined ? {} : {
         processInstanceId: session.processInstanceId,
         nativeSessionId: session.nativeSessionId,
@@ -501,10 +501,6 @@ export async function runAgentHost(input: Readonly<{
       }),
       ...authorityFields()
     }));
-    let providerAcceptedAttemptId: string | undefined;
-    let durableInitialTurn:
-      | Readonly<Record<string, string | number>>
-      | undefined;
     try {
       if (session !== undefined) {
         if (session.adapterId !== providerControl.adapterId
@@ -518,7 +514,7 @@ export async function runAgentHost(input: Readonly<{
         conversationRecoverability = providerControl.adapterId === "codex"
           ? "recoverable"
           : "unknown";
-        if (providerControl.kind === "ensure" && providerControl.ownedTurn !== undefined) {
+        if (providerControl.kind === "restore" && providerControl.ownedTurn !== undefined) {
           activeTurnPayload = next;
           activeTurnAttemptId = providerControl.ownedTurn.attemptId;
           activeNativeTurnId = providerControl.ownedTurn.turnId;
@@ -544,70 +540,24 @@ export async function runAgentHost(input: Readonly<{
         recoverability: conversationRecoverability,
         observedAt: new Date().toISOString()
       });
-      let receipt;
-      if (providerControl.initialTurn !== undefined) {
-        durableInitialTurn = hostTurnControlParams(
-          next,
-          session.nativeSessionId,
-          requestedAuthority,
-          providerControl.initialTurn.attemptId
-        );
-        await beginDurableProviderTurn(input.home, durableInitialTurn);
-        activeTurnPayload = next;
-        activeTurnAttemptId = providerControl.initialTurn.attemptId;
-        activeNativeTurnId = undefined;
-        try {
-          receipt = await session.submitTurn(providerControl.initialTurn);
-          providerAcceptedAttemptId = receipt.attemptId;
-          activeNativeTurnId = receipt.nativeTurnId;
-        } catch (error) {
-          await resolveProviderTurnSubmission(input.home, durableInitialTurn, error);
-          throw error;
-        }
-      }
-      if (receipt !== undefined) {
-        conversationRecoverability = "recoverable";
-        try {
-          await publishStructuredProviderAccepted({
-            home: input.home,
-            environment: next.environment,
-            activationId: activationId ?? next.launchId,
-            receipt
-          });
-        } catch (error) {
-          await resolveProviderTurnSubmission(
-            input.home,
-            durableInitialTurn!,
-            new ProviderDeliveryUnknownError(
-              `Provider accepted input but its durable acknowledgement could not be confirmed: ${
-                errorText(error)
-              }`,
-              receipt.attemptId
-            )
-          );
-          throw error;
-        }
-      }
-      const ensuredOwnedTurn = providerControl.kind === "ensure"
+      const restoredOwnedTurn = providerControl.kind === "restore"
         ? providerControl.ownedTurn
         : undefined;
-      const providerState = receipt !== undefined || ensuredOwnedTurn !== undefined
+      const providerState = restoredOwnedTurn !== undefined
         ? "ready"
         : session.activeTurnId === undefined ? "idle" : "busy";
       updateSnapshot(hostSnapshot(providerState, {
         launchId: next.launchId,
         adapterId: providerControl.adapterId,
         processInstanceId: session.processInstanceId,
-        nativeSessionId: receipt?.nativeSessionId ?? session.nativeSessionId,
-        conversationId: receipt?.conversationId ?? session.conversationId,
-        ...(receipt !== undefined
-          ? { attemptId: receipt.attemptId, nativeTurnId: receipt.nativeTurnId }
-          : ensuredOwnedTurn === undefined
-            ? {}
-            : {
-                attemptId: ensuredOwnedTurn.attemptId,
-                nativeTurnId: ensuredOwnedTurn.turnId
-              }),
+        nativeSessionId: session.nativeSessionId,
+        conversationId: session.conversationId,
+        ...(restoredOwnedTurn === undefined
+          ? {}
+          : {
+              attemptId: restoredOwnedTurn.attemptId,
+              nativeTurnId: restoredOwnedTurn.turnId
+            }),
         ...authorityFields()
       }));
       return snapshot;
@@ -627,11 +577,7 @@ export async function runAgentHost(input: Readonly<{
         conversationRecoverability = "unknown";
         authority = undefined;
       }
-      const deliveryUnknown = error instanceof ProviderDeliveryUnknownError
-        || providerAcceptedAttemptId !== undefined;
-      const state = deliveryUnknown
-        ? "delivery-unknown"
-        : error instanceof ProviderTurnBusyError
+      const state = error instanceof ProviderTurnBusyError
           ? "busy"
           : error instanceof ProviderTurnRejectedError ? "rejected" : "failed";
       updateSnapshot(hostSnapshot(state, {
@@ -640,25 +586,12 @@ export async function runAgentHost(input: Readonly<{
         processInstanceId: session?.processInstanceId,
         nativeSessionId: session?.nativeSessionId ?? providerControl.nativeSessionId,
         conversationId: session?.conversationId ?? providerControl.nativeSessionId,
-        ...(providerControl.initialTurn === undefined
-          ? {}
-          : { attemptId: providerControl.initialTurn.attemptId }),
         ...authorityFields(),
         detail: errorText(error)
       }));
-      if (state !== "delivery-unknown") {
-        activeTurnPayload = undefined;
-        activeTurnAttemptId = undefined;
-        activeNativeTurnId = undefined;
-      }
-      if (deliveryUnknown && !(error instanceof ProviderDeliveryUnknownError)) {
-        throw new ProviderDeliveryUnknownError(
-          `Provider accepted input but its durable acknowledgement could not be confirmed: ${
-            errorText(error)
-          }`,
-          providerAcceptedAttemptId!
-        );
-      }
+      activeTurnPayload = undefined;
+      activeTurnAttemptId = undefined;
+      activeNativeTurnId = undefined;
       throw error;
     }
   };
@@ -684,9 +617,19 @@ export async function runAgentHost(input: Readonly<{
       throw new Error("Agent Host rejected a stale Provider writer fence.");
     }
     if (activeTurnPayload !== undefined || snapshot.state === "settling") {
-      throw new Error("Agent Host still owns an unsettled Provider Turn.");
+      throw new ProviderTurnBusyError(
+        "Agent Host still owns an unsettled Provider Turn.",
+        request.turn.attemptId,
+        activeNativeTurnId
+      );
     }
-    activeTurnPayload = sessionPayload;
+    activeTurnPayload = {
+      ...sessionPayload,
+      environment: {
+        ...sessionPayload.environment,
+        YUI_RUN_ID: request.runId
+      }
+    };
     activeTurnAttemptId = request.turn.attemptId;
     activeNativeTurnId = undefined;
     updateSnapshot(hostSnapshot("starting", {
@@ -698,17 +641,36 @@ export async function runAgentHost(input: Readonly<{
       attemptId: request.turn.attemptId,
       ...authorityFields()
     }));
+    const durableTurn = hostTurnControlParams(
+      sessionPayload,
+      session.nativeSessionId,
+      request.authority,
+      request.turn.attemptId,
+      request.runId
+    );
+    await beginDurableProviderTurn(input.home, durableTurn);
     let providerAccepted = false;
     try {
       const receipt = await session.submitTurn(request.turn);
       providerAccepted = true;
       activeNativeTurnId = receipt.nativeTurnId;
-      await publishStructuredProviderAccepted({
-        home: input.home,
-        environment: sessionPayload.environment,
-        activationId: activationId ?? sessionPayload.launchId,
-        receipt
-      });
+      try {
+        await publishStructuredProviderAccepted({
+          home: input.home,
+          environment: sessionPayload.environment,
+          activationId: activationId ?? sessionPayload.launchId,
+          receipt
+        });
+      } catch (error) {
+        const unknown = new ProviderDeliveryUnknownError(
+          `Provider accepted input but its durable acknowledgement could not be confirmed: ${
+            errorText(error)
+          }`,
+          request.turn.attemptId
+        );
+        await resolveProviderTurnSubmission(input.home, durableTurn, unknown);
+        throw unknown;
+      }
       updateSnapshot(hostSnapshot("ready", {
         launchId: request.launchId,
         adapterId: session.adapterId,
@@ -721,6 +683,9 @@ export async function runAgentHost(input: Readonly<{
       }));
       return snapshot;
     } catch (error) {
+      if (!providerAccepted) {
+        await resolveProviderTurnSubmission(input.home, durableTurn, error);
+      }
       const deliveryUnknown = error instanceof ProviderDeliveryUnknownError || providerAccepted;
       const state = deliveryUnknown
         ? "delivery-unknown"
@@ -837,6 +802,7 @@ export async function runAgentHost(input: Readonly<{
         type: "submit-turn" as const,
         launchId: currentPayload.launchId,
         nativeSessionId: currentSession.nativeSessionId,
+        runId: requiredEnvironment(currentPayload.environment.YUI_RUN_ID, "Run id"),
         authority: currentAuthority,
         turn: {
           attemptId,
@@ -1122,8 +1088,10 @@ export async function openAgentHostControl(
           socket.end(`${JSON.stringify(await dispatch(request))}\n`);
         } catch (error) {
           const current = snapshot();
-          socket.end(`${JSON.stringify(controlResult("rejected", validateSnapshot({
+          const busy = error instanceof ProviderTurnBusyError;
+          socket.end(`${JSON.stringify(controlResult(busy ? "accepted" : "rejected", validateSnapshot({
             ...current,
+            ...(busy ? { state: "busy" as const } : {}),
             detail: errorText(error),
             updatedAt: new Date().toISOString()
           })))}\n`);
@@ -1170,6 +1138,7 @@ function validateControl(control: AgentHostControl): AgentHostControl {
   if (control.type === "submit-turn") {
     validateLaunchId(control.launchId);
     validateIdentity(control.nativeSessionId, "native Session id");
+    validateIdentity(control.runId, "Run id");
     validateProviderAuthorityFence(control.authority);
     validateIdentity(control.turn.attemptId, "Provider input attempt id");
     if (typeof control.turn.boundedText !== "string"
@@ -1298,13 +1267,14 @@ function hostTurnControlParams(
   payload: AgentHostLaunchPayload,
   nativeSessionId: string,
   authority: ProviderAuthorityFence,
-  attemptId: string
+  attemptId: string,
+  runId = requiredEnvironment(payload.environment.YUI_RUN_ID, "Run id")
 ): Readonly<Record<string, string | number>> {
   const environment = payload.environment;
   return Object.freeze({
     taskId: requiredEnvironment(environment.YUI_TASK_ID, "Task id"),
     roleName: requiredEnvironment(environment.YUI_ROLE, "Role name"),
-    runId: requiredEnvironment(environment.YUI_RUN_ID, "Run id"),
+    runId: requiredEnvironment(runId, "Run id"),
     agentId: requiredEnvironment(environment.YUI_AGENT_ID, "Agent id"),
     launchId: payload.launchId,
     nativeSessionId: requiredEnvironment(nativeSessionId, "native Session id"),
@@ -1382,6 +1352,7 @@ async function resolveProviderTurnSubmission(
       ? "delivery-unknown"
       : "rejected",
     reason: errorText(error),
+    raw: serializeAgentErrorRaw(error),
     observedAt: new Date().toISOString()
   } as const;
   try {

@@ -16,6 +16,11 @@ import {
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
 import {
+  createRoleSessionSet,
+  recordRoleAgentSession
+} from "../../dist/executor/agentExecutor.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
+import {
   startTaskExecutionCommand,
   stopTaskExecutionCommand
 } from "../../dist/commands/taskExecutionCommands.js";
@@ -30,6 +35,7 @@ import {
   startReviewRound
 } from "../../dist/review/reviewRound.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
+import { serializeAgentErrorRaw, standardAgentError } from "../../dist/runtime/agentError.js";
 import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import { createAsyncRuntimeObserver } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
@@ -78,7 +84,9 @@ test("the packaged CLI starts and exposes the core workflow", () => {
     "task create",
     "task list",
     "task execution stop",
-    "task execution start"
+    "task execution start",
+    "task role session inspect",
+    "task role session stop"
   ]) {
     assert.ok(commands.includes(command), `missing core command: ${command}`);
   }
@@ -158,7 +166,6 @@ test("Managed Codex performs the App Server WebSocket handshake through its prox
       sessionTitle: "Yui proxy handshake smoke",
       authority: { epoch: 1, owner: "controller", holderId: "core-smoke" },
       codexThread: { model: "gpt-5.6-luna", approvalPolicy: "never", sandbox: "read-only" },
-      initialTurn: { attemptId, boundedText: "handshake smoke" }
     }
   }, { onTerminal: resolveTerminal, mirrorOutput: () => {} });
   session = started.session;
@@ -180,6 +187,52 @@ test("Task execution can be fenced without changing semantic progress", () => {
   const restarted = startTaskExecution(stopped, new Date("2026-08-30T00:02:00.000Z"));
   assert.equal(restarted.status, "active");
   assert.equal(restarted.executionGate.state, "enabled");
+});
+
+test("SQLite projects an active native Session and its Host activation", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-active-session-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-08-31T00:00:00.000Z");
+  const task = activateTask(createTask("task-1", "Bind the native Session", now), now);
+  store.saveTask(task);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const leader = createRole(
+    task.id,
+    "leader",
+    [binding],
+    binding.agentId,
+    "/tmp/yui-active-session-smoke",
+    now
+  );
+  store.saveRole(task.id, leader);
+  const empty = createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: leader.name },
+    binding.agentId,
+    now
+  );
+  const sessions = recordRoleAgentSession(empty, {
+    agentId: binding.agentId,
+    adapterId: binding.adapterId,
+    nativeSessionId: "native-session-1",
+    launchId: "launch-1",
+    policy: "fixed",
+    status: "active",
+    effective: resolveEffectiveLaunch({ role: leader, purpose: "execution" })
+  }, now);
+
+  assert.doesNotThrow(() => store.saveRoleSessionSet(sessions));
+  assert.deepEqual(store.listRuntimeSessionCandidates({ taskIds: [task.id] }), [{
+    owner: { scope: "task", taskId: task.id, roleName: leader.name },
+    agentId: binding.agentId,
+    adapterId: binding.adapterId,
+    nativeSessionId: "native-session-1",
+    launchId: "launch-1",
+    sessionUpdatedAt: now.toISOString(),
+    cleanupRequired: true
+  }]);
 });
 
 test("Task execution stop/start atomically controls scheduler admission", (t) => {
@@ -346,9 +399,37 @@ test("the SQLite Task path persists across one in-place schema upgrade", async (
 
   const db = new Database(join(home, "yui.db"));
   db.exec(`
-    DROP INDEX idx_context_snapshots_scope_sequence;
-    DROP TABLE context_snapshots;
-    DELETE FROM schema_migrations WHERE version = 17;
+    DROP INDEX idx_runtime_session_cleanup_required;
+    ALTER TABLE runtime_session_candidates RENAME TO runtime_session_candidates_v18;
+    CREATE TABLE runtime_session_candidates (
+      scope TEXT NOT NULL CHECK (scope IN ('task','global')),
+      task_id TEXT NOT NULL,
+      role_name TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      adapter_id TEXT NOT NULL,
+      native_session_id TEXT NOT NULL,
+      launch_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('reserved','ready','running','broken')),
+      session_updated_at TEXT NOT NULL,
+      cleanup_required INTEGER NOT NULL CHECK (cleanup_required IN (0,1)),
+      PRIMARY KEY (scope, task_id, role_name),
+      CHECK (
+        (scope = 'task' AND length(task_id) > 0)
+        OR (scope = 'global' AND task_id = '')
+      ),
+      CHECK (
+        cleanup_required = CASE
+          WHEN status NOT IN ('stopped','broken')
+            AND (status = 'running' OR launch_id IS NOT NULL)
+          THEN 1 ELSE 0
+        END
+      )
+    );
+    DROP TABLE runtime_session_candidates_v18;
+    CREATE INDEX idx_runtime_session_cleanup_required
+      ON runtime_session_candidates(scope, task_id, role_name)
+      WHERE cleanup_required = 1;
+    DELETE FROM schema_migrations WHERE version = 18;
   `);
   db.close();
 
@@ -534,6 +615,66 @@ test("the built-in Agent Drivers are available through the shared registry", () 
   const drivers = builtinAgentDriverRegistry();
   assert.equal(drivers.requireByAdapterId("codex").id, "openai/codex");
   assert.equal(drivers.requireByAdapterId("claude").id, "anthropic/claude-code");
+  for (const adapterId of ["codex", "claude"]) {
+    const mapped = drivers.requireByAdapterId(adapterId).runtime.mapHook({
+      hookEventName: "SessionEnd",
+      payload: {},
+      occurrenceId: "hook-1"
+    });
+    const observations = Array.isArray(mapped) ? mapped : [mapped];
+    assert.deepEqual(observations.map(({ kind }) => kind), ["activation.ended"]);
+  }
+});
+
+test("Agent errors preserve provider classification and the complete native Error", () => {
+  const drivers = builtinAgentDriverRegistry();
+  const native = Object.assign(new Error("Selected model is at capacity"), {
+    code: "model_capacity",
+    requestId: "request-1"
+  });
+  native.cause = native;
+  const raw = serializeAgentErrorRaw(native);
+  const classification = drivers.requireByAdapterId("codex").runtime.mapError({
+    message: native.message,
+    raw
+  });
+  const error = standardAgentError({
+    source: "provider",
+    phase: "turn-execute",
+    classification,
+    message: native.message,
+    raw,
+    inputDisposition: "accepted"
+  });
+
+  assert.equal(error.category, "availability");
+  assert.equal(error.code, "provider.model-capacity");
+  assert.equal(error.sessionDisposition, "recoverable");
+  assert.equal(error.inputDisposition, "accepted");
+  assert.match(error.raw, /model_capacity/u);
+  assert.match(error.raw, /request-1/u);
+  assert.match(error.raw, /stack/u);
+  assert.match(error.raw, /\[Circular\]/u);
+
+  for (const adapterId of ["codex", "claude"]) {
+    const transport = drivers.requireByAdapterId(adapterId).runtime.mapError({
+      message: "connect ECONNREFUSED /tmp/yui/agent-host.sock",
+      raw: '{"code":"ECONNREFUSED","syscall":"connect"}'
+    });
+    assert.equal(transport.category, "transport");
+    assert.equal(transport.code, "transport.connection-refused");
+    assert.equal(transport.sessionDisposition, "recoverable");
+  }
+
+  const unknown = standardAgentError({
+    source: "driver",
+    phase: "session-restore",
+    message: "new native failure",
+    raw: '{"shape":"unrecognized"}'
+  });
+  assert.equal(unknown.category, "unknown");
+  assert.equal(unknown.code, "unknown");
+  assert.equal(unknown.raw, '{"shape":"unrecognized"}');
 });
 
 test("Operator batches durable refs and defers the whole batch while busy", async () => {

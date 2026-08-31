@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { callController } from "../core/controllerClient.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
+import { standardAgentError } from "../runtime/agentError.js";
 import {
   createRuntimeObservation,
   runtimeObservationSemanticKey,
@@ -219,11 +220,23 @@ export async function publishStructuredProviderTerminal(input: Readonly<{
     : kind === "turn.failed"
       ? {
           failure: {
-            code: "provider-structured-failure",
-            ...(input.terminal.error === undefined
-              ? {}
-              : { details: input.terminal.error })
-          }
+            error: standardAgentError({
+              source: "provider",
+              phase: "turn-execute",
+              classification: driver.runtime.mapError({
+                message: input.terminal.error ?? "Provider Turn failed.",
+                raw: input.terminal.rawError
+                  ?? input.terminal.error
+                  ?? "Provider Turn failed without an error payload."
+              }),
+              message: input.terminal.error ?? "Provider Turn failed.",
+              raw: input.terminal.rawError
+                ?? input.terminal.error
+                ?? "Provider Turn failed without an error payload.",
+              inputDisposition: "accepted"
+            })
+          },
+          summary: input.terminal.error ?? "Provider Turn failed."
         }
       : {};
   const terminalObservation = observation({

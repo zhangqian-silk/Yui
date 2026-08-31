@@ -184,8 +184,8 @@ advisories cover direct-path protocol overhead, initial integrated WorkItem
 fan-out, unexplained review-repair fan-out, repeated exact Integration checks,
 same-Reviewer/same-candidate full Review repetition without new findings, and
 the two-generation first-progress advisory threshold. No Review advisory is a
-budget or blocks a legal action; the first-progress threshold never changes
-Provider retry policy.
+budget or blocks a legal action; the first-progress threshold never chooses
+Agent recovery.
 
 ## Rollout
 

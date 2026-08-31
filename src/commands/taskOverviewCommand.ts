@@ -33,7 +33,7 @@ export type TaskOverviewWorkCounts = Readonly<Record<WorkItemStatus, number> & {
 export type TaskOverviewLeader = Readonly<{
   role: "leader";
   /** Derived workflow/lifecycle presentation; never persisted on TaskRole. */
-  roleStatus: RoleAgentSession["status"] | "idle" | "missing";
+  roleStatus: RoleAgentSession["status"] | "running" | "idle" | "missing";
   summary: string | null;
   currentFocus: string | null;
   updatedAt: string | null;

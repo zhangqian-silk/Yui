@@ -62,7 +62,7 @@ export function projectOperatorStatus(
   }
   return Object.freeze({
     writer: {
-      state: matchingActive.status === "stopped" || matchingActive.status === "broken" ? "inactive" : "active",
+      state: matchingActive.status === "ended" ? "inactive" : "active",
       agentId: matchingActive.agentId,
       adapterId: matchingActive.adapterId,
       sessionRef: activeRef,
@@ -89,7 +89,7 @@ export function listOperatorSessions(
   if (sessions === null) return [];
   validateRoleSessionSet(sessions);
   const current = Object.values(sessions.sessions).map((session) => (
-    listItem(session, session.status === "stopped" || session.status === "broken"
+    listItem(session, session.status === "ended"
       ? "current"
       : "running")
   ));
@@ -157,7 +157,8 @@ export function prepareOperatorResumeSession(
   delete history[normalizedRef];
   nextSessions[selected.agentId] = {
     ...selected,
-    status: "stopped",
+    status: "ended",
+    endReason: "stopped",
     updatedAt: requireDate(now)
   };
   return validateRoleSessionSet({
@@ -173,14 +174,15 @@ function archiveCurrent(
   history: Record<string, RoleAgentSession>,
   session: RoleAgentSession
 ): Record<string, RoleAgentSession> {
-  if (session.status !== "stopped" && session.status !== "broken") {
+  if (session.status !== "ended") {
     throw new Error(
       `Cannot replace Operator session while its native process is ${session.status}.`
     );
   }
   const archived = {
     ...session,
-    status: "stopped" as const
+    status: "ended" as const,
+    endReason: session.endReason ?? "stopped" as const
   };
   return {
     ...history,

@@ -8,6 +8,7 @@ import {
 export const RUNTIME_LIFECYCLE_OWNER = "runtime-lifecycle";
 export const RUNTIME_LAUNCH_RESERVED_REASON = "runtime-launch-reserved";
 export const RUNTIME_CLEANUP_REQUIRED_REASON = "runtime-cleanup-required";
+export const RUNTIME_HOST_DETACH_REQUIRED_REASON = "runtime-host-detach-required";
 
 /**
  * A Role runtime lifecycle lane already holds an in-flight operation (a
@@ -80,12 +81,27 @@ export function hasRuntimeLaunchReservation(
 export function hasRuntimeCleanupObligation(
   mailbox: WorkMailbox | null
 ): boolean {
-  const pending = mailbox?.pending.normal;
-  return pending?.reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON) === true
-    || (
-      !isRuntimeLaunchReservation(mailbox?.processing)
-      && mailbox?.processing?.batch.reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON) === true
-    );
+  return runtimeCleanupDisposition(mailbox) !== null;
+}
+
+/** Explicit Session end dominates a coalesced physical Host detach request. */
+export function runtimeCleanupDisposition(
+  mailbox: WorkMailbox | null
+): "end-session" | "detach-host" | null {
+  const reasons = [
+    ...(mailbox?.pending.normal?.reasons ?? []),
+    ...(!isRuntimeLaunchReservation(mailbox?.processing)
+      ? mailbox?.processing?.batch.reasons ?? []
+      : [])
+  ];
+  if (reasons.includes(RUNTIME_CLEANUP_REQUIRED_REASON)) return "end-session";
+  if (reasons.includes(RUNTIME_HOST_DETACH_REQUIRED_REASON)) return "detach-host";
+  return null;
+}
+
+export function isRuntimeCleanupReason(reason: string): boolean {
+  return reason === RUNTIME_CLEANUP_REQUIRED_REASON
+    || reason === RUNTIME_HOST_DETACH_REQUIRED_REASON;
 }
 
 export function hasRuntimeLifecycleWork(

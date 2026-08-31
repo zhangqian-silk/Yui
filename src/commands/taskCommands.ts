@@ -433,6 +433,18 @@ function taskFinalReviewContractForMutation(
 export type TaskCommandExecution =
   | Readonly<{ kind: "output"; output: string; data?: unknown }>
   | Readonly<{
+      kind: "session-stop";
+      taskId: string;
+      roleName: string;
+      agentId: string;
+      adapterId: string;
+      nativeSessionId: string;
+      launchId?: string;
+      sessionUpdatedAt: string;
+      reason: string;
+      output: string;
+    }>
+  | Readonly<{
       kind: "view";
       taskId: string;
       roleName: string;
@@ -1955,12 +1967,111 @@ function taskRoleCommand(
   if (command === "remove") return output(removeTaskRole(rest, store, options));
   if (command === "bind") return output(bindTaskRole(rest, store, options));
   if (command === "unbind") return output(unbindTaskRole(rest, store, options));
+  if (command === "session") return taskRoleSessionCommand(rest, store, options);
   if (command === "view") return viewTaskRole(rest, store);
   if (command === "takeover") return transferTaskRoleAuthority(rest, store, options, "takeover");
   if (command === "release") return transferTaskRoleAuthority(rest, store, options, "release");
   throw usageError(command === undefined
     ? "Task role command is required."
     : `Unknown command: task role ${command}`);
+}
+
+function taskRoleSessionCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const [command, ...rest] = args;
+  if (command === "inspect") {
+    exactPositionals(
+      rest,
+      2,
+      "Task Role Session inspect usage: yui task role session inspect <task> <role>."
+    );
+    const task = requireTask(store, rest[0]);
+    const role = requireRole(store, task.id, rest[1]);
+    taskActor(store, options, task.id);
+    const sessions = store.getTaskRoleSessionSet(task.id, role.name);
+    const active = sessions?.sessions[sessions.activeAgentId] ?? null;
+    const binding = sessions?.providerBinding ?? null;
+    return output(
+      active === null
+        ? `No Session exists for ${task.id}/${role.name}.\n`
+        : [
+            `Session ${task.id}/${role.name}`,
+            `Agent: ${active.agentId}/${active.adapterId}`,
+            `Native id: ${active.nativeSessionId}`,
+            `Host activation: ${active.launchId ?? "none"}`,
+            `Session: ${active.status}${active.endReason === undefined ? "" : `/${active.endReason}`}`,
+            `Turn: ${binding?.turn?.status ?? "none"}`
+          ].join("\n") + "\n",
+      { task, role, session: active, providerBinding: binding }
+    );
+  }
+  if (command === "stop") {
+    const usage = "Task Role Session stop usage: yui task role session stop <task> <role> --reason <text>.";
+    const parsed = parseTail(rest, new Set(["--reason"]), usage);
+    exactPositionals(parsed.positionals, 2, usage);
+    const reason = requiredOption(parsed.options, "--reason");
+    const now = clock(options);
+    const request = store.transaction((tx) => {
+      const task = requireTask(tx, parsed.positionals[0]);
+      assertTaskOpen(task);
+      const actor = taskActor(tx, options, task.id);
+      const role = requireRole(tx, task.id, parsed.positionals[1]);
+      if (actor === "leader" && role.name === LEADER_ROLE) {
+        throw usageError("A Leader cannot stop the Session executing its own current command.", usage);
+      }
+      if (tx.getActiveAgentRun(task.id, role.name) !== null) {
+        throw usageError(
+          `Task Role has an active Run; settle or retire it before stopping the Session: ${task.id}/${role.name}.`,
+          usage
+        );
+      }
+      const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+      const session = sessions?.sessions[sessions.activeAgentId];
+      if (session === undefined || session.status === "ended") {
+        throw usageError(`Task Role has no active Session: ${task.id}/${role.name}.`, usage);
+      }
+      const lifecycle = tx.getWorkMailbox(runtimeLifecycleTarget({
+        scope: "task",
+        taskId: task.id,
+        roleName: role.name
+      }));
+      if (lifecycle !== null && workMailboxHasWork(lifecycle)) {
+        throw usageError(`Task Role Session lifecycle is busy: ${task.id}/${role.name}.`, usage);
+      }
+      recordTaskEvent(tx, task.id, "runtime.session-stop-requested", {
+        roleName: role.name,
+        agentId: session.agentId,
+        adapterId: session.adapterId,
+        nativeSessionId: session.nativeSessionId,
+        launchId: session.launchId ?? "",
+        reason,
+        requestedBy: actor
+      }, now);
+      return {
+        taskId: task.id,
+        roleName: role.name,
+        agentId: session.agentId,
+        adapterId: session.adapterId,
+        nativeSessionId: session.nativeSessionId,
+        ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
+        sessionUpdatedAt: session.updatedAt
+      };
+    });
+    return {
+      kind: "session-stop",
+      ...request,
+      reason,
+      output: `Stopped Session ${request.taskId}/${request.roleName}: ${reason}\n`
+    };
+  }
+  throw usageError(
+    command === undefined
+      ? "Task Role Session command is required."
+      : `Unknown command: task role session ${command}`
+  );
 }
 
 function addTaskRole(
@@ -2201,7 +2312,7 @@ function removeTaskRole(
       throw usageError(`Task Role has an active Run and cannot be removed: ${task.id}/${role.name}.`);
     }
     const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
-    if (Object.values(sessions?.sessions ?? {}).some(({ status }) => status !== "stopped")) {
+    if (Object.values(sessions?.sessions ?? {}).some(({ status }) => status === "active")) {
       throw usageError(`Task Role has a running native Agent and cannot be removed: ${task.id}/${role.name}.`);
     }
     if (!tx.removeTaskRole(task.id, role.name)) throw roleNotFound(role.name);
@@ -2256,7 +2367,7 @@ function bindTaskRole(
         return switchActiveRoleAgent(bound, existing, agent.id, {
           activeRun: tx.getActiveAgentRun(task.id, role.name) !== null,
           nativeProcessRunning: currentSession !== undefined
-            && currentSession.status !== "stopped"
+            && currentSession.status === "active"
         }, now);
       } catch (error) {
         throw usageError(messageOf(error));
@@ -2324,7 +2435,7 @@ function viewTaskRole(
   }
   const role = requireRole(store, task.id, args[1]);
   const session = store.getRoleSession(task.id, role.name);
-  if (session === null || session.status === "stopped" || session.status === "broken") {
+  if (session === null || session.status === "ended") {
     throw usageError(`Task Role has no live Provider view: ${task.id}/${role.name}.`);
   }
   return {
@@ -2359,7 +2470,7 @@ function transferTaskRoleAuthority(
       if (sessions === null || sessions === undefined || session === undefined
         || binding === null || binding === undefined
         || session.launchId === undefined
-        || session.status === "stopped" || session.status === "broken") {
+        || session.status === "ended") {
         throw new Error(`Task Role has no live managed Provider: ${task.id}/${role.name}.`);
       }
       const activation = currentProviderActivation(binding);
@@ -4130,7 +4241,7 @@ function rebindTaskFinalReviewContract(
         );
       }
       const liveLeaderSession = Object.values(leaderSessions.sessions).find(
-        ({ status }) => status !== "stopped" && status !== "broken"
+        ({ status }) => status === "active"
       );
       if (liveLeaderSession !== undefined) {
         throw usageError(
@@ -9338,8 +9449,14 @@ function settleTaskExecutionForCompletion(
         sessions = terminalizeTaskRoleRunSession(sessions, sessions.inFlight, now);
       }
       const current = sessions.sessions[sessions.activeAgentId];
-      if (current !== undefined && current.status !== "stopped" && current.status !== "broken") {
-        sessions = updateRoleAgentSessionStatus(sessions, sessions.activeAgentId, "stopped", now);
+      if (current !== undefined && current.status === "active") {
+        sessions = updateRoleAgentSessionStatus(
+          sessions,
+          sessions.activeAgentId,
+          "ended",
+          now,
+          "stopped"
+        );
       }
       store.saveTaskRoleSessionSet(sessions);
     }
@@ -9364,14 +9481,14 @@ function settleTaskExecutionForCompletion(
 function ownedRuntimeSessionRequiresCleanup(
   session: TaskRoleSessionSet["sessions"][string] | undefined
 ): boolean {
-  if (session === undefined || session.status === "stopped" || session.status === "broken") {
+  if (session === undefined || session.status === "ended") {
     return false;
   }
   // Older synthetic session fixtures can represent a ready native session
   // without a lifecycle generation. Do not manufacture a cleanup obligation
   // for those records; coordinated launches always carry launchId, while a
   // running session remains actionable even when an older record lacks it.
-  return session.status === "running" || session.launchId !== undefined;
+  return session.launchId !== undefined;
 }
 
 function roleMailbox(taskId: string, roleName: string): MailboxTarget {

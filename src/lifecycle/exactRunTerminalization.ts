@@ -424,7 +424,7 @@ export function retireExactActiveAgentRun(
       || providerTurn?.status === "failed"
       || providerTurn?.status === "cancelled"
       || providerTurn?.status === "rejected");
-  if (session?.status !== "stopped" && session?.status !== "broken" && !providerSettled) {
+  if (session?.status === "active" && !providerSettled) {
     return {
       disposition: "blocked",
       run: current,

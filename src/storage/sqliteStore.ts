@@ -59,7 +59,6 @@ import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from 
 import type { TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { AgentRun } from "../run/agentRun.js";
-import type { PendingProviderRetry } from "../run/providerRetry.js";
 import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
 import {
   compareRuntimeSessionCandidates,
@@ -1693,7 +1692,7 @@ export class SqliteTaskStore implements TaskStore {
       : ` WHERE ${predicates.join(" AND ")}`;
     const rows = this.#db.prepare(
       `SELECT scope, task_id, role_name, agent_id, adapter_id,
-              native_session_id, launch_id, status, session_updated_at,
+              native_session_id, launch_id, session_updated_at,
               cleanup_required
        FROM runtime_session_candidates${where}`
     ).all(...parameters) as Array<{
@@ -1704,7 +1703,6 @@ export class SqliteTaskStore implements TaskStore {
       adapter_id: string;
       native_session_id: string;
       launch_id: string | null;
-      status: RuntimeSessionCandidate["status"];
       session_updated_at: string;
       cleanup_required: 0 | 1;
     }>;
@@ -1716,7 +1714,6 @@ export class SqliteTaskStore implements TaskStore {
       adapterId: row.adapter_id,
       nativeSessionId: row.native_session_id,
       ...(row.launch_id === null ? {} : { launchId: row.launch_id }),
-      status: row.status,
       sessionUpdatedAt: row.session_updated_at,
       cleanupRequired: row.cleanup_required === 1
     })).sort(compareRuntimeSessionCandidates);
@@ -1761,7 +1758,7 @@ export class SqliteTaskStore implements TaskStore {
       adapter_id: string | null;
       native_session_id: string | null;
       launch_id: string | null;
-      status: RuntimeSessionCandidate["status"] | null;
+      is_active: 0 | 1 | null;
       session_updated_at: string | null;
       cleanup_required: 0 | 1 | null;
     };
@@ -1791,14 +1788,14 @@ export class SqliteTaskStore implements TaskStore {
            json_extract(active_session, '$.adapterId') AS adapter_id,
            json_extract(active_session, '$.nativeSessionId') AS native_session_id,
            json_extract(active_session, '$.launchId') AS launch_id,
-           json_extract(active_session, '$.status') AS status,
+           CASE
+             WHEN json_extract(active_session, '$.status') = 'active'
+             THEN 1 ELSE 0
+           END AS is_active,
            json_extract(active_session, '$.updatedAt') AS session_updated_at,
            CASE
-             WHEN json_extract(active_session, '$.status') NOT IN ('stopped','broken')
-               AND (
-                 json_extract(active_session, '$.status') = 'running'
-                 OR json_type(active_session, '$.launchId') = 'text'
-               )
+             WHEN json_extract(active_session, '$.status') = 'active'
+               AND json_type(active_session, '$.launchId') = 'text'
              THEN 1 ELSE 0
            END AS cleanup_required
          FROM active`
@@ -1824,7 +1821,7 @@ export class SqliteTaskStore implements TaskStore {
       && row.adapter_id === candidate.adapterId
       && row.native_session_id === candidate.nativeSessionId
       && (row.launch_id ?? undefined) === candidate.launchId
-      && row.status === candidate.status
+      && row.is_active === 1
       && row.session_updated_at === candidate.sessionUpdatedAt
       && row.cleanup_required === (candidate.cleanupRequired ? 1 : 0);
   }
@@ -1865,14 +1862,13 @@ export class SqliteTaskStore implements TaskStore {
     this.#db.prepare(
       `INSERT INTO runtime_session_candidates (
          scope, task_id, role_name, agent_id, adapter_id, native_session_id,
-         launch_id, status, session_updated_at, cleanup_required
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         launch_id, session_updated_at, cleanup_required
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(scope, task_id, role_name) DO UPDATE SET
          agent_id = excluded.agent_id,
          adapter_id = excluded.adapter_id,
          native_session_id = excluded.native_session_id,
          launch_id = excluded.launch_id,
-         status = excluded.status,
          session_updated_at = excluded.session_updated_at,
          cleanup_required = excluded.cleanup_required`
     ).run(
@@ -1883,7 +1879,6 @@ export class SqliteTaskStore implements TaskStore {
       candidate.adapterId,
       candidate.nativeSessionId,
       candidate.launchId ?? null,
-      candidate.status,
       candidate.sessionUpdatedAt,
       candidate.cleanupRequired ? 1 : 0
     );
@@ -2364,47 +2359,6 @@ export class SqliteTaskStore implements TaskStore {
            payload = excluded.payload, updated_at = excluded.updated_at`
       ).run(run.taskId, run.id, run.roleName, run.status, this.#json(run), this.#now());
     });
-  }
-
-  /**
-   * Issue 04: SQLite-native pending retry query.  A single indexed scan
-   * replaces the adapter's per-Task in-memory sweep, so Controller deadline
-   * arming no longer materializes every Task and Run in JavaScript.
-   */
-  listPendingProviderRetries(taskIds?: readonly string[]): ReadonlyArray<PendingProviderRetry> {
-    const selectedTaskIds = taskIds === undefined
-      ? undefined
-      : [...new Set(taskIds)].sort(numericCompare);
-    if (selectedTaskIds?.length === 0) return [];
-    const taskPredicate = selectedTaskIds === undefined
-      ? ""
-      : ` AND tc.task_id IN (${selectedTaskIds.map(() => "?").join(", ")})`;
-    const rows = this.#db.prepare(
-      `SELECT DISTINCT ar.task_id AS taskId, ar.run_id AS runId, ar.role_name AS roleName,
-              json_extract(ar.payload, '$.providerRetry.state') AS state,
-              CASE json_extract(ar.payload, '$.providerRetry.state')
-                WHEN 'scheduled' THEN json_extract(ar.payload, '$.providerRetry.nextAttemptAt')
-                ELSE json_extract(ar.payload, '$.providerRetry.episodeDeadlineAt')
-              END AS dueAt
-       FROM tasks_catalog tc INDEXED BY idx_tasks_active
-       JOIN active_runs ap ON ap.task_id = tc.task_id
-       JOIN agent_runs ar ON ar.task_id = ap.task_id AND ar.run_id = ap.run_id
-       WHERE tc.is_active = 1
-         AND ar.status = 'active'
-         AND json_extract(ar.payload, '$.providerRetry.state') IN
-           ('scheduled', 'dispatching', 'awaiting-progress')${taskPredicate}`
-    ).all(...(selectedTaskIds ?? [])) as Array<{
-      taskId: string;
-      runId: string;
-      roleName: string;
-      state: PendingProviderRetry["state"];
-      dueAt: string;
-    }>;
-    return rows.sort((left, right) => (
-      numericCompare(left.taskId, right.taskId)
-      || numericCompare(left.roleName, right.roleName)
-      || numericCompare(left.runId, right.runId)
-    ));
   }
 
   // -- review rounds ----------------------------------------------------------

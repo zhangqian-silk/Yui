@@ -37,10 +37,6 @@ import {
   resolveDeliveryTimeoutSeconds,
   resolveLeaderNextActionMode,
   resolveLeaderSemanticBudgetTurns,
-  resolveProviderRetryAdapters,
-  resolveProviderRetryDelaysSeconds,
-  resolveProviderRetryMaxWindowSeconds,
-  resolveProviderRetryMode,
   resolveResourcesGcAutoQuarantine,
   resolveResourcesGcMode,
   resolveResourcesQuarantineTtlHours,
@@ -87,10 +83,6 @@ import {
   validateAgentRun,
   type AgentRun
 } from "../run/agentRun.js";
-import {
-  providerRetryWakeAt,
-  type PendingProviderRetry
-} from "../run/providerRetry.js";
 import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
 import {
   compareRuntimeSessionCandidates,
@@ -209,7 +201,7 @@ import {
 export const STORAGE_STATE_FILE = "state.json";
 /** The root StorageState schema is the persisted aggregate document version. */
 export const CURRENT_STORAGE_STATE_SCHEMA_VERSION = CURRENT_AGGREGATE_SCHEMA_VERSION;
-export const CURRENT_CONFIG_SCHEMA_VERSION = 3 as const;
+export const CURRENT_CONFIG_SCHEMA_VERSION = 4 as const;
 export const CURRENT_HOME_IDENTITY_SCHEMA_VERSION = 1 as const;
 export const CURRENT_ACTIVE_RUN_POINTER_SCHEMA_VERSION = 3 as const;
 /**
@@ -224,7 +216,7 @@ export const CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION = 2 as const;
 export const CURRENT_PROJECT_SCHEMA_VERSION = 5 as const;
 export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
-export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 3 as const;
+export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
 export const CURRENT_TASK_SCHEMA_VERSION = 6 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
@@ -241,9 +233,9 @@ export const CURRENT_MILESTONE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_EVENT_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CAPABILITY_GRANT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_RELEASE_WORKFLOW_SCHEMA_VERSION = 1 as const;
-export const CURRENT_WORK_MAILBOX_SCHEMA_VERSION = 2 as const;
+export const CURRENT_WORK_MAILBOX_SCHEMA_VERSION = 3 as const;
 export const CURRENT_PUBLICATION_REFERENCE_SCHEMA_VERSION = 1 as const;
-export const CURRENT_ROLE_AGENT_SESSION_SCHEMA_VERSION = 3 as const;
+export const CURRENT_ROLE_AGENT_SESSION_SCHEMA_VERSION = 4 as const;
 export const CURRENT_PENDING_WAKEUP_SCHEMA_VERSION = 1 as const;
 const STORAGE_LOCK_DIRECTORY = ".state.lock";
 const LOCK_TIMEOUT_MS = 5_000;
@@ -297,22 +289,6 @@ export type YuiConfig = Readonly<{
   leaderNextActionMode?: "display" | "warn" | "enforce";
   /** Compatibility-only retired context-budget values; never behavioral. */
   contextBudget?: import("../config/yuiConfig.js").ContextBudgetConfig;
-  /**
-   * Issue 01 in-place Provider retry mode. `enforce` (default) keeps the
-   * original AgentRun and native Session on retryable Provider failures;
-   * `shadow` only records classification; `off` disables the feature.
-   * Optional additive field; Homes without it default to `enforce`.
-   */
-  providerRetryMode?: "off" | "shadow" | "enforce";
-  /**
-   * Adapters with in-place retry enabled. `["all"]` means every supported
-   * adapter; an empty array disables the feature. Defaults to all supported.
-   */
-  providerRetryAdapters?: string[];
-  /** Delay schedule for continuation attempts, in seconds. */
-  providerRetryDelaysSeconds?: number[];
-  /** Total retry budget per Run lineage, in seconds. */
-  providerRetryMaxWindowSeconds?: number;
   runtimeHealth?: import("../config/yuiConfig.js").RuntimeHealthConfig;
   controllerTaskConcurrency?: number;
   agentLaunchInactivityTimeoutSeconds?: number;
@@ -386,13 +362,13 @@ export const CURRENT_STORED_TASK_SCHEMA_VERSION = 18 as const;
  * Keep these named at the storage boundary so the upgrade record-axis map can
  * assert it is classifying the same bytes the store reads and writes.
  */
-export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 7 as const;
+export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 8 as const;
 /**
  * v7 combines optional Issue 04 retry/receipt fields and Issue 05 Leader
  * actionability fields. All are optional, so the v6→v7 migration is a
  * version-only rewrite.
  */
-export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 9 as const;
+export const CURRENT_AGENT_RUN_SCHEMA_VERSION = 10 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 
 type StoredTask = {
@@ -595,12 +571,6 @@ export type TaskStore = {
   getAgentRun(taskId: string, runId: string): AgentRun | null;
   listAgentRuns(taskId: string): AgentRun[];
   saveAgentRun(run: AgentRun): void;
-  /**
-   * Issue 04: pending Provider retry scan. Layout 7's authoritative SQLite
-   * store answers this with one indexed query; the legacy File store fails
-   * closed because in-place retry is a db-only control-plane capability.
-   */
-  listPendingProviderRetries(taskIds?: readonly string[]): ReadonlyArray<PendingProviderRetry>;
   nextReviewRoundId(taskId: string): string;
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
@@ -1727,30 +1697,6 @@ export class FileTaskStore implements TaskStore {
   }
   getAgentRun(taskId: string, id: string): AgentRun | null { return optional(this.#state().tasks[taskId]?.agentRuns[id]); }
   listAgentRuns(taskId: string): AgentRun[] { return values(this.#requireTask(taskId).agentRuns, "id"); }
-  listPendingProviderRetries(taskIds?: readonly string[]): ReadonlyArray<PendingProviderRetry> {
-    // The legacy File store can answer the empty case without a scan fallback.
-    // If durable retry state exists, the db-only capability must fail closed
-    // instead of silently losing the Controller's wake deadline.
-    const tasks = taskIds === undefined
-      ? this.listTasks()
-      : [...new Set(taskIds)].sort(numericCompare).flatMap((taskId) => {
-          const task = this.getTask(taskId);
-          return task === null ? [] : [task];
-        });
-    for (const task of tasks) {
-      if (task.status !== "active") continue;
-      for (const run of this.listAgentRuns(task.id)) {
-        if (run.status === "active"
-          && run.providerRetry !== undefined
-          && providerRetryWakeAt(run.providerRetry) !== null) {
-          throw new StorageRecordError(
-            "Provider retry in place requires the SQLite backend; run `yui update` to migrate this Home."
-          );
-        }
-      }
-    }
-    return [];
-  }
   saveAgentRun(run: AgentRun): void {
     const stored = identified<AgentRun>(
       run,
@@ -3458,10 +3404,6 @@ export function validateYuiConfig(config: YuiConfig): void {
     resolveResourcesGcMode(config.resourcesGcMode);
     resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine);
     resolveResourcesQuarantineTtlHours(config.resourcesQuarantineTtlHours);
-    resolveProviderRetryMode(config.providerRetryMode);
-    resolveProviderRetryAdapters(config.providerRetryAdapters);
-    resolveProviderRetryDelaysSeconds(config.providerRetryDelaysSeconds);
-    resolveProviderRetryMaxWindowSeconds(config.providerRetryMaxWindowSeconds);
     resolveRuntimeHealth(config.runtimeHealth);
     resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
     resolveAgentLaunchInactivityTimeoutSeconds(config.agentLaunchInactivityTimeoutSeconds);

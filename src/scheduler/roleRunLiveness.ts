@@ -167,7 +167,10 @@ export async function reconcileExitedRoleRuns(
           ...(run.workspace === undefined ? {} : { managedWorkspace: run.workspace }),
           mode: "resume",
           runId: run.id,
-          nativeSessionId: session.nativeSessionId
+          nativeSessionId: session.nativeSessionId,
+          ...(session.launchId === undefined
+            ? {}
+            : { hostActivationId: session.launchId })
         });
         store.saveRoleRunPrepared({
           task,

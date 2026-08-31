@@ -7,7 +7,10 @@ import type {
 } from "./agentDriver.js";
 import { requireDriverId } from "./agentDriver.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { ProviderErrorCode } from "./providerErrorCodes.js";
+import {
+  isStandardAgentError,
+  type StandardAgentError
+} from "./agentError.js";
 
 export const RUNTIME_OBSERVATION_TASK_EVENT = "runtime.observation";
 
@@ -75,15 +78,11 @@ export type RuntimeUsageSnapshot = Readonly<{
 }>;
 
 export type RuntimeTurnFailure = Readonly<{
-  /** Structured Provider-neutral error code, when the driver could extract one. */
-  errorCode?: ProviderErrorCode;
-  code: string;
-  details?: string;
+  /** Complete standardized fact; never a recovery decision. */
+  error: StandardAgentError;
   lastOutput?: string;
   /** Exact Provider evidence that this error irrecoverably covers the Yui Run. */
   runTerminal?: boolean;
-  /** Trusted structured Provider backoff hint; free-form text is never parsed. */
-  retryAfterMs?: number;
 }>;
 
 export type RuntimeObservationPayload = Readonly<{
@@ -608,7 +607,7 @@ export function runtimeObservationSemanticKey(input: Readonly<{
       ...continuationIdentity,
       fence.continuationId ?? fence.nativeTurnId ?? "none",
       input.kind,
-      input.payload?.outcome ?? input.payload?.failure?.code ?? "terminal",
+      input.payload?.outcome ?? input.payload?.failure?.error.code ?? "terminal",
       input.kind === "continuation.settled" ? input.payload?.resultRef ?? "none" : "none",
       input.kind === "turn.failed" && input.payload?.failure?.runTerminal === true
         ? "run-terminal"
@@ -669,33 +668,22 @@ function normalizeFailure(input: RuntimeTurnFailure): RuntimeTurnFailure {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new Error("Runtime failure evidence must be an object.");
   }
+  if (!isStandardAgentError(input.error)) {
+    throw new Error("Runtime failure requires a standard Agent error.");
+  }
   return Object.freeze({
-    ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
-    code: requireText(input.code, "Runtime failure code"),
-    ...(input.details === undefined
-      ? {}
-      : { details: requireText(input.details, "Runtime failure details") }),
+    error: Object.freeze({ ...input.error }),
     ...(input.lastOutput === undefined
       ? {}
       : { lastOutput: requireText(input.lastOutput, "Runtime failure last output") }),
     ...(input.runTerminal === undefined
       ? {}
-      : { runTerminal: requireBoolean(input.runTerminal, "Runtime failure runTerminal") }),
-    ...(input.retryAfterMs === undefined
-      ? {}
-      : { retryAfterMs: requirePositiveMilliseconds(input.retryAfterMs) })
+      : { runTerminal: requireBoolean(input.runTerminal, "Runtime failure runTerminal") })
   });
 }
 
 function requireBoolean(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") throw new Error(`${label} must be boolean.`);
-  return value;
-}
-
-function requirePositiveMilliseconds(value: number): number {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error("Runtime failure retryAfterMs must be a positive safe integer.");
-  }
   return value;
 }
 

@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 7;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 1;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 17;
+export const SQLITE_SCHEMA_VERSION = 18;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -955,6 +955,58 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_context_snapshots_scope_sequence
   ON context_snapshots(task_id, scope, COALESCE(scope_ref, ''), sequence);
 `;
 
+/**
+ * Migration 18: align the current-Session hot projection with Session v4.
+ *
+ * Session existence now has one lifecycle: active or ended. Ended Sessions do
+ * not belong in this bounded projection, so row presence itself means active;
+ * the projection carries no independently writable lifecycle status. Host
+ * cleanup is derived solely from whether the Session still names a Host
+ * activation. Valid earlier live rows are projected into that contract;
+ * terminal broken rows disappear with the rest of ended Session history.
+ */
+const MIGRATION_18_SQL = `
+DROP INDEX idx_runtime_session_cleanup_required;
+ALTER TABLE runtime_session_candidates RENAME TO runtime_session_candidates_v11;
+
+CREATE TABLE runtime_session_candidates (
+  scope               TEXT NOT NULL CHECK (scope IN ('task','global')),
+  task_id             TEXT NOT NULL,
+  role_name           TEXT NOT NULL,
+  agent_id            TEXT NOT NULL,
+  adapter_id          TEXT NOT NULL,
+  native_session_id   TEXT NOT NULL,
+  launch_id           TEXT,
+  session_updated_at  TEXT NOT NULL,
+  cleanup_required    INTEGER NOT NULL CHECK (cleanup_required IN (0,1)),
+  PRIMARY KEY (scope, task_id, role_name),
+  CHECK (
+    (scope = 'task' AND length(task_id) > 0)
+    OR (scope = 'global' AND task_id = '')
+  ),
+  CHECK (
+    cleanup_required = CASE WHEN launch_id IS NOT NULL THEN 1 ELSE 0 END
+  )
+);
+
+INSERT INTO runtime_session_candidates (
+  scope, task_id, role_name, agent_id, adapter_id, native_session_id,
+  launch_id, session_updated_at, cleanup_required
+)
+SELECT
+  scope, task_id, role_name, agent_id, adapter_id, native_session_id,
+  launch_id, session_updated_at,
+  CASE WHEN launch_id IS NOT NULL THEN 1 ELSE 0 END
+FROM runtime_session_candidates_v11
+WHERE status IN ('reserved','ready','running');
+
+DROP TABLE runtime_session_candidates_v11;
+
+CREATE INDEX idx_runtime_session_cleanup_required
+  ON runtime_session_candidates(scope, task_id, role_name)
+  WHERE cleanup_required = 1;
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -985,7 +1037,8 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 14, axis: "record", recordKind: "workMailbox", sql: MIGRATION_14_SQL },
   { version: 15, axis: "record", recordKind: "publicationReference", sql: MIGRATION_15_SQL },
   { version: 16, axis: "record", recordKind: "taskWake", sql: MIGRATION_16_SQL },
-  { version: 17, axis: "record", recordKind: "contextSnapshot", sql: MIGRATION_17_SQL }
+  { version: 17, axis: "record", recordKind: "contextSnapshot", sql: MIGRATION_17_SQL },
+  { version: 18, axis: "layout", sql: MIGRATION_18_SQL }
 ];
 
 /** Current hot-path indexes whose absence would invalidate a current Home. */

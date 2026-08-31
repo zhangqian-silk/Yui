@@ -67,8 +67,6 @@ export type RuntimePlannedSession = Readonly<{
   role: RuntimeTmuxRole;
   launch: RuntimeTmuxLaunchPlan;
   session: Readonly<{ nativeSessionId?: string }> | null;
-  /** Exact Run whose first structured Turn is handled by this launch workflow. */
-  initialTurnRunId?: string;
 }>;
 
 /** Narrow structural boundary implemented by FileRoleLaunchPlanner. */
@@ -264,7 +262,7 @@ export class TmuxSessionHost implements SessionHostPort {
     return this.#launch(request, beforeHostStart);
   }
 
-  async resume(
+  async restore(
     request: ResumeSessionLaunchRequest,
     beforeHostStart?: RuntimeLaunchPreStart
   ): Promise<RuntimeBinding> {
@@ -484,10 +482,7 @@ export class TmuxSessionHost implements SessionHostPort {
       ...(planned.launch.env.YUI_SESSION_TITLE === undefined
         ? {}
         : { sessionTitle: planned.launch.env.YUI_SESSION_TITLE }),
-      ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
-      ...(planned.initialTurnRunId === undefined
-        ? {}
-        : { initialTurnRunId: planned.initialTurnRunId })
+      ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     });
     const yuiHome = planned.launch.env.YUI_HOME;
     const childLifecycle = planned.launch.childLifecycle;
@@ -521,9 +516,6 @@ export class TmuxSessionHost implements SessionHostPort {
           roleName: request.owner.roleName
         }),
         hostCreated,
-        ...(hostCreated && planned.initialTurnRunId !== undefined
-          ? { initialTurnRunId: planned.initialTurnRunId }
-          : {}),
         ...(nativeSessionId === undefined ? {} : { nativeSessionId })
       });
       if (hostCreated) {
@@ -540,7 +532,6 @@ export class TmuxSessionHost implements SessionHostPort {
         if (request.mode === "new"
           && request.owner.scope === "task"
           && request.runId !== undefined
-          && planned.initialTurnRunId === request.runId
           && this.#waitForNativeSession !== undefined) {
           binding = createRuntimeBinding({
             ...binding,
@@ -616,10 +607,6 @@ export class TmuxSessionHost implements SessionHostPort {
       }
     };
     let hostCreated = false;
-    let providerAcknowledged = false;
-    let providerDeliveryUnknown = false;
-    let providerBusy = false;
-    let providerRejected = false;
     let providerDispatchObserved = false;
     let providerSnapshot: AgentHostSnapshot | undefined;
     try {
@@ -631,17 +618,8 @@ export class TmuxSessionHost implements SessionHostPort {
           ...(request.owner.scope === "task" ? { taskId: request.owner.taskId } : {}),
           roleName: request.owner.roleName,
           launchId: reservation.launchId,
-          requireTurnAck: planned.initialTurnRunId !== undefined
+          requireTurnAck: false
         });
-        providerDeliveryUnknown = providerSnapshot.state === "delivery-unknown";
-        providerBusy = planned.initialTurnRunId !== undefined
-          && providerSnapshot.state === "busy";
-        providerRejected = planned.initialTurnRunId !== undefined
-          && providerSnapshot.state === "rejected";
-        providerAcknowledged = !providerDeliveryUnknown && !providerBusy && !providerRejected;
-        if (providerSnapshot.state === "rejected" && !providerRejected) {
-          throw new Error("Agent Host rejected a launch without an initial Provider Turn.");
-        }
         providerDispatchObserved = true;
       }
       if (!hostCreated) {
@@ -667,16 +645,10 @@ export class TmuxSessionHost implements SessionHostPort {
         if (controlResult.outcome === "active-same-launch") {
           broker.revoke(request.launchId);
         }
-        const acceptableState = controlResult.snapshot.state === "ready"
-          || (planned.initialTurnRunId === undefined
-            && controlResult.snapshot.state === "idle");
-        const deliveryUnknownState = planned.initialTurnRunId !== undefined
-          && controlResult.snapshot.state === "delivery-unknown";
-        const busyState = planned.initialTurnRunId !== undefined
-          && controlResult.snapshot.state === "busy";
-        const rejectedState = planned.initialTurnRunId !== undefined
-          && controlResult.snapshot.state === "rejected";
-        if ((!acceptableState && !deliveryUnknownState && !busyState && !rejectedState)
+        const acceptableState = ["idle", "ready", "busy"].includes(
+          controlResult.snapshot.state
+        );
+        if (!acceptableState
           || controlResult.snapshot.launchId !== reservation.launchId) {
           broker.revoke(request.launchId);
           throw new Error(
@@ -684,10 +656,6 @@ export class TmuxSessionHost implements SessionHostPort {
           );
         }
         providerSnapshot = controlResult.snapshot;
-        providerAcknowledged = acceptableState;
-        providerDeliveryUnknown = deliveryUnknownState;
-        providerBusy = busyState;
-        providerRejected = rejectedState;
         providerDispatchObserved = true;
       }
     } catch (error) {
@@ -735,18 +703,6 @@ export class TmuxSessionHost implements SessionHostPort {
         roleName: request.owner.roleName
       }),
       hostCreated,
-      ...(providerAcknowledged && planned.initialTurnRunId !== undefined
-        ? { initialTurnRunId: planned.initialTurnRunId }
-        : {}),
-      ...(providerDeliveryUnknown && planned.initialTurnRunId !== undefined
-        ? { initialTurnDeliveryUnknownRunId: planned.initialTurnRunId }
-        : {}),
-      ...(providerBusy && planned.initialTurnRunId !== undefined
-        ? { initialTurnBusyRunId: planned.initialTurnRunId }
-        : {}),
-      ...(providerRejected && planned.initialTurnRunId !== undefined
-        ? { initialTurnRejectedRunId: planned.initialTurnRunId }
-        : {}),
       ...((providerSnapshot?.nativeSessionId ?? nativeSessionId) === undefined
         ? {}
         : { nativeSessionId: providerSnapshot?.nativeSessionId ?? nativeSessionId }),
@@ -876,6 +832,7 @@ export class AgentHostPromptPushAdapter implements ActivePromptPushPort {
           type: "submit-turn",
           launchId: request.binding.launchId,
           nativeSessionId: request.binding.nativeSessionId,
+          runId: request.envelope.source.localId,
           authority: request.binding.providerAuthority,
           turn: {
             attemptId: request.envelope.id,

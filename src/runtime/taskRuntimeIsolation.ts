@@ -60,7 +60,6 @@ export type TaskRuntimeIsolationDescriptor = Readonly<{
     requested: readonly string[];
   }>;
   generation: Readonly<{
-    runId?: string;
     launchId: string;
     generationId: string;
   }>;
@@ -96,7 +95,6 @@ export type TaskRuntimeIsolationPreparation = Readonly<{
 
 export type TaskRuntimeIsolationPreflightInput = Readonly<{
   workspace: ManagedWorkspace;
-  runId?: string;
   launchId: string;
   generationId: string;
   policy?: TaskRuntimeLaunchPolicy;
@@ -366,7 +364,6 @@ export class FileTaskRuntimeIsolation implements
 
 export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
   workspace: ManagedWorkspace;
-  runId?: string;
   launchId: string;
   generationId: string;
   runtimeRoot: string;
@@ -376,9 +373,6 @@ export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
   const workspace = validateManagedWorkspace(input.workspace);
   const owner = taskRuntimeWorkspaceOwner(workspace.owner);
   const taskId = requireIdentity(owner.taskId, "Task id");
-  const runId = input.runId === undefined
-    ? undefined
-    : requireIdentity(input.runId, "Run id");
   const launchId = requireIdentity(input.launchId, "Launch id");
   const generationId = requireIdentity(input.generationId, "Generation id");
   const runtimeRoot = canonicalPath(input.runtimeRoot, "Task runtime root");
@@ -421,7 +415,6 @@ export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
     portAllocations,
     externalCapabilities: Object.freeze({ declared, requested }),
     generation: Object.freeze({
-      ...(runId === undefined ? {} : { runId }),
       launchId,
       generationId
     })
@@ -479,9 +472,6 @@ export function parseTaskRuntimeIsolationDescriptor(
       requested: capabilities(external.requested, "Requested external capability")
     },
     generation: {
-      ...(generation.runId === undefined
-        ? {}
-        : { runId: requireIdentity(generation.runId, "Run id") }),
       launchId: requireIdentity(generation.launchId, "Launch id"),
       generationId: requireIdentity(generation.generationId, "Generation id")
     }

@@ -555,7 +555,15 @@ export async function main(): Promise<void> {
       return;
     }
     if (args[1] === "runtime-hook" && args.length === 2) {
-      await runRuntimeObservationHookCommand(readFileSync(0, "utf8"), process.env);
+      // Provider lifecycle Hooks are observation channels, never execution
+      // gates. A late/stale Hook must not make Claude reject an otherwise
+      // valid Session or Turn; its exact fence is revalidated before any
+      // inbox fact is written, so dropping an invalid observation is safe.
+      try {
+        await runRuntimeObservationHookCommand(readFileSync(0, "utf8"), process.env);
+      } catch {
+        return;
+      }
       return;
     }
     throw usageError("Internal lifecycle callback usage is invalid.");
@@ -1863,6 +1871,33 @@ export async function main(): Promise<void> {
       if (jsonOutput) {
         throw usageError("Task Role view/takeover requires an interactive terminal.");
       }
+      if (result.kind === "session-stop") {
+        await ensureFileTaskController(home, { environment: process.env });
+        try {
+          await runtime.stopExactTaskRoleSession({
+            taskId: result.taskId,
+            roleName: result.roleName,
+            agentId: result.agentId,
+            adapterId: result.adapterId,
+            nativeSessionId: result.nativeSessionId,
+            ...(result.launchId === undefined ? {} : { launchId: result.launchId }),
+            sessionUpdatedAt: result.sessionUpdatedAt
+          });
+        } catch (error) {
+          throw runtimeError(
+            `Session stop was requested but physical Host cleanup did not complete: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+        emit(result.output, false, {
+          taskId: result.taskId,
+          roleName: result.roleName,
+          stopped: true,
+          reason: result.reason
+        });
+        return;
+      }
       if (result.kind === "view") {
         if (result.output !== undefined) emit(result.output);
         tmux.attachRole(result.taskId, result.roleName, "read-only");
@@ -2108,21 +2143,14 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     && process.env.YUI_DRIVER_ID !== undefined
     ? builtinAgentDriverRegistry().require(process.env.YUI_DRIVER_ID)
     : undefined;
-  const preallocatedDriverCallback = runtimeDriverCallback
-    ?.capabilities.observation.sessionBootstrap === "preallocated";
   const verifiedStore = openCompatibleFileTaskStore(control.yuiHome);
-  assertExactTaskRuntimeState(
-    runtime,
-    verifiedStore,
-    preallocatedDriverCallback
-      ? {
-          preallocatedDriverSessionReservation: {
-            yuiHome: control.yuiHome,
-            adapterId: runtimeDriverCallback.adapterId
-          }
-        }
-      : {}
-  );
+  // Runtime Hooks have their own event-aware fence, including the valid case
+  // where a Provider terminal arrives after its Yui Run has yielded and a
+  // later wake is pending. Ordinary managed commands still require the exact
+  // current mutable runtime before routing.
+  if (runtimeDriverCallback === undefined) {
+    assertExactTaskRuntimeState(runtime, verifiedStore);
+  }
   const request = taskFinalReviewInvocation.request;
   if (request === undefined) {
     return {
@@ -2988,8 +3016,7 @@ async function executeOperatorSessionControl(
     paneRunning
     || (
       active !== undefined
-      && active.status !== "stopped"
-      && active.status !== "broken"
+      && active.status === "active"
     )
   ) {
     await runtime.stopGlobalRoleSession(role.name);

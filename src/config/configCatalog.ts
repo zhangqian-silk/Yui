@@ -1,9 +1,7 @@
-import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 import { MAX_RUN_CAP } from "../telemetry/telemetryConfig.js";
 import {
   MAX_CONTEXT_BUDGET_TOKENS,
-  MAX_PROVIDER_RETRY_ATTEMPTS,
   MIN_CONTEXT_BUDGET_TOKENS
 } from "./yuiConfig.js";
 
@@ -34,11 +32,6 @@ export const CONFIG_DEFINITIONS = Object.freeze([
   { key: "runtime-health", domain: "runtime", property: "runtimeHealth", label: "Runtime health thresholds", summary: "Quiet, checkpoint-overdue, and read-only diagnostic thresholds in seconds; values must be strictly increasing (defaults: 300/900/1800).", takesEffect: "CLI and Web projections immediately; scheduler diagnostics after the Controller restarts." },
   { key: "agent-launch-inactivity-timeout-seconds", domain: "runtime", property: "agentLaunchInactivityTimeoutSeconds", label: "Agent launch inactivity timeout", summary: "Maximum launch silence before startup fails, 15-3600 seconds (default: 300).", takesEffect: "After the Controller restarts." },
   { key: "delivery-timeout-seconds", domain: "runtime", property: "deliveryTimeoutSeconds", label: "Delivery timeout", summary: "Total control-plane delivery retry budget, 5-600 seconds (default: 120).", takesEffect: "After the Controller restarts; internal retry cadence remains automatic." },
-  { key: "provider-retry-mode", domain: "runtime", property: "providerRetryMode", label: "Provider retry mode", summary: "Provider retry mode: off, shadow, or enforce (default: enforce).", takesEffect: "The next eligible provider-failure decision." },
-  { key: "provider-retry-adapters", domain: "runtime", property: "providerRetryAdapters", label: "Provider retry adapters", summary: `Adapters with in-place retry: all, off, or a comma-separated subset of ${supportedAgentAdapterIds().join(", ")} (default: all).`, takesEffect: "The next eligible provider-failure decision." },
-  { key: "provider-retry-delays-seconds", domain: "runtime", property: "providerRetryDelaysSeconds", label: "Provider retry delays", summary: `Ordered comma-separated retry delays of 1-600 seconds, with 1-${MAX_PROVIDER_RETRY_ATTEMPTS} attempts (default: 2,5,15).`, takesEffect: "The next eligible provider-failure decision; attempt count is the list length." },
-  { key: "provider-retry-max-window-seconds", domain: "runtime", property: "providerRetryMaxWindowSeconds", label: "Provider retry max window", summary: "Positive-integer total retry budget per Run lineage in seconds (default: 600).", takesEffect: "The next retry episode; an active episode keeps its existing deadline." },
-
   { key: "leader-next-action", domain: "workflow", property: "leaderNextActionMode", label: "Leader next-action mode", summary: "Leader next-action mode: display, warn, or enforce (default: display).", takesEffect: "The next Leader next-action projection or gate." },
   { key: "leader-semantic-budget-turns", domain: "workflow", property: "leaderSemanticBudgetTurns", label: "Leader semantic budget", summary: "Consecutive yielded Leader turns without durable delivery progress before warning, 1-20 (default: 3).", takesEffect: "The next Leader delivery guard evaluation." },
   { key: "context-budget", domain: "workflow", property: "contextBudget", label: "Legacy context budget (inactive)", summary: `Compatibility-only soft and hard values in ${MIN_CONTEXT_BUDGET_TOKENS}-${MAX_CONTEXT_BUDGET_TOKENS}; they are parsed but never control Session or workflow behavior.`, takesEffect: "No runtime effect; Session Token metrics are read-only observations." },

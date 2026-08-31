@@ -19,11 +19,6 @@ export type AgentHostLaunchPayload = Readonly<{
   providerControl?: AgentHostProviderControl;
 }>;
 
-type ProviderInitialTurn = Readonly<{
-  attemptId: string;
-  boundedText: string;
-}>;
-
 export type ProviderOwnedTurn = Readonly<{
   attemptId: string;
   turnId: string;
@@ -39,29 +34,20 @@ type AgentHostProviderControlBase = Readonly<{
 }>;
 
 /**
- * Managed Provider launches make the first-write contract explicit. A new or
- * resumed Run can never be serialized without its required first Turn. The
- * ensure variant only re-establishes the already-running Provider host and is
- * therefore the sole variant that carries no input.
+ * Session lifecycle is independent from Turn submission. `start` creates one
+ * new native Session; `restore` reattaches exactly the named Session and never
+ * falls back to creating another one.
  */
 export type AgentHostProviderControl = AgentHostProviderControlBase & (
   | Readonly<{
-      kind: "new";
+      kind: "start";
       mode: "new";
       nativeSessionId?: string;
-      initialTurn: ProviderInitialTurn;
     }>
   | Readonly<{
-      kind: "resume";
+      kind: "restore";
       mode: "resume";
       nativeSessionId: string;
-      initialTurn: ProviderInitialTurn;
-    }>
-  | Readonly<{
-      kind: "ensure";
-      mode: "resume";
-      nativeSessionId: string;
-      initialTurn?: never;
       ownedTurn?: ProviderOwnedTurn;
     }>
 );
@@ -171,22 +157,16 @@ function validateProviderControl(control: AgentHostProviderControl): void {
   if (control.mode !== "new" && control.mode !== "resume") {
     throw new Error("Agent Host Provider control mode is invalid.");
   }
-  if (control.kind !== "new" && control.kind !== "resume" && control.kind !== "ensure") {
+  if (control.kind !== "start" && control.kind !== "restore") {
     throw new Error("Agent Host Provider control kind is invalid.");
   }
-  if ((control.kind === "new") !== (control.mode === "new")) {
+  if ((control.kind === "start") !== (control.mode === "new")) {
     throw new Error("Agent Host Provider control kind does not match its transport mode.");
   }
-  if (control.kind !== "ensure" && control.initialTurn === undefined) {
-    throw new Error("Managed Provider new/resume launch requires its initial Turn.");
+  if (control.kind !== "restore" && "ownedTurn" in control) {
+    throw new Error("Only Session restore can reconcile an owned Turn.");
   }
-  if (control.kind === "ensure" && control.initialTurn !== undefined) {
-    throw new Error("Managed Provider ensure launch cannot carry a new Turn.");
-  }
-  if (control.kind !== "ensure" && "ownedTurn" in control) {
-    throw new Error("Only a managed Provider ensure launch can recover an owned Turn.");
-  }
-  if (control.kind === "ensure" && control.ownedTurn !== undefined) {
+  if (control.kind === "restore" && control.ownedTurn !== undefined) {
     if (control.adapterId !== "codex") {
       throw new Error("Only Managed Codex can recover an owned Turn across client attachment.");
     }
@@ -209,14 +189,6 @@ function validateProviderControl(control: AgentHostProviderControl): void {
     }
   }
   validateProviderAuthorityFence(control.authority);
-  if (control.initialTurn !== undefined) {
-    text(control.initialTurn.attemptId, "Provider input attemptId");
-    if (typeof control.initialTurn.boundedText !== "string"
-      || control.initialTurn.boundedText.includes("\0")
-      || Buffer.byteLength(control.initialTurn.boundedText, "utf8") > 32 * 1024) {
-      throw new Error("Agent Host Provider input must be bounded bootstrap text.");
-    }
-  }
 }
 
 function validateCodexThreadOptions(options: CodexThreadOptions): void {

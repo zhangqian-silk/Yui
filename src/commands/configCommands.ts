@@ -7,15 +7,11 @@ import {
   DEFAULT_DELIVERY_TIMEOUT_SECONDS,
   DEFAULT_LEADER_NEXT_ACTION_MODE,
   DEFAULT_LEADER_SEMANTIC_BUDGET_TURNS,
-  DEFAULT_PROVIDER_RETRY_DELAYS_SECONDS,
-  DEFAULT_PROVIDER_RETRY_MAX_WINDOW_SECONDS,
-  DEFAULT_PROVIDER_RETRY_MODE,
   DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
   DEFAULT_RESOURCES_GC_MODE,
   DEFAULT_RESOURCES_QUARANTINE_TTL_HOURS,
   DEFAULT_TMUX_HISTORY_LIMIT,
   LEADER_NEXT_ACTION_MODES,
-  PROVIDER_RETRY_MODES,
   reconciliationIntervalMilliseconds,
   resolveAgentLaunchInactivityTimeoutSeconds,
   resolveControllerTaskConcurrency,
@@ -23,10 +19,6 @@ import {
   resolveDeliveryTimeoutSeconds,
   resolveLeaderNextActionMode,
   resolveLeaderSemanticBudgetTurns,
-  resolveProviderRetryAdapters,
-  resolveProviderRetryDelaysSeconds,
-  resolveProviderRetryMaxWindowSeconds,
-  resolveProviderRetryMode,
   resolveResourcesGcAutoQuarantine,
   resolveResourcesGcMode,
   resolveResourcesQuarantineTtlHours,
@@ -37,8 +29,7 @@ import {
   resolveTmuxBin,
   resolveTmuxHistoryLimit,
   type ContextBudgetConfig,
-  type LeaderNextActionMode,
-  type ProviderRetryMode
+  type LeaderNextActionMode
 } from "../config/yuiConfig.js";
 import {
   CONFIG_DEFINITIONS,
@@ -170,10 +161,6 @@ export function effectiveConfigData(
     resourcesGcMode: resolveResourcesGcMode(config.resourcesGcMode),
     resourcesGcAutoQuarantine: resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine),
     resourcesQuarantineTtlHours: resolveResourcesQuarantineTtlHours(config.resourcesQuarantineTtlHours),
-    providerRetryMode: resolveProviderRetryMode(config.providerRetryMode),
-    providerRetryAdapters: resolveProviderRetryAdapters(config.providerRetryAdapters),
-    providerRetryDelaysSeconds: resolveProviderRetryDelaysSeconds(config.providerRetryDelaysSeconds),
-    providerRetryMaxWindowSeconds: resolveProviderRetryMaxWindowSeconds(config.providerRetryMaxWindowSeconds),
     runtimeHealth: {
       quietAfterSeconds: health.quietAfterMs / 1_000,
       diagnosticAfterSeconds: health.diagnosticAfterMs / 1_000,
@@ -629,95 +616,6 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         return rest;
       });
       return `Delivery timeout reset to ${DEFAULT_DELIVERY_TIMEOUT_SECONDS} seconds\n`;
-    }
-  },
-  {
-    key: "provider-retry-mode",
-    showLabel: "Provider retry mode",
-    showValue: (config) => resolveProviderRetryMode(config.providerRetryMode),
-    set(args, store) {
-      if (args.length !== 1) throw usageError(`Runtime config set usage: yui config runtime set provider-retry-mode <${PROVIDER_RETRY_MODES.join("|")}>.`);
-      const mode = validatedConfigValue(
-        () => resolveProviderRetryMode(args[0]),
-        `Runtime config set usage: yui config runtime set provider-retry-mode <${PROVIDER_RETRY_MODES.join("|")}>.`
-      );
-      saveConfigKey(store, (config) => ({ ...config, providerRetryMode: mode }));
-      return `Provider retry mode set to ${mode}\n`;
-    },
-    clear(store) {
-      saveConfigKey(store, (config) => {
-        const { providerRetryMode: _removed, ...rest } = config;
-        return rest;
-      });
-      return `Provider retry mode reset to ${DEFAULT_PROVIDER_RETRY_MODE}\n`;
-    }
-  },
-  {
-    key: "provider-retry-adapters",
-    showLabel: "Provider retry adapters",
-    showValue: (config) => resolveProviderRetryAdapters(config.providerRetryAdapters).join(", ") || "none",
-    set(args, store) {
-      if (args.length !== 1) throw usageError("Runtime config set usage: yui config runtime set provider-retry-adapters <all|claude,codex|off>.");
-      const raw = args[0].trim().toLowerCase();
-      const adapters = raw === "off" || raw === "" || raw === "0"
-        ? []
-        : validatedConfigValue(
-          () => resolveProviderRetryAdapters(raw.split(",")),
-          "Runtime config set usage: yui config runtime set provider-retry-adapters <all|claude,codex|off>."
-        );
-      saveConfigKey(store, (config) => ({ ...config, providerRetryAdapters: adapters }));
-      return `Provider retry adapters set to ${adapters.join(", ") || "none"}\n`;
-    },
-    clear(store) {
-      saveConfigKey(store, (config) => {
-        const { providerRetryAdapters: _removed, ...rest } = config;
-        return rest;
-      });
-      return "Provider retry adapters reset to all supported\n";
-    }
-  },
-  {
-    key: "provider-retry-delays-seconds",
-    showLabel: "Provider retry delays",
-    showValue: (config) => `${resolveProviderRetryDelaysSeconds(config.providerRetryDelaysSeconds).join(", ")} seconds`,
-    set(args, store) {
-      const usage = "Runtime config set usage: yui config runtime set provider-retry-delays-seconds <comma-separated-seconds>.";
-      if (args.length !== 1) throw usageError(usage);
-      const providerRetryDelaysSeconds = validatedConfigValue(
-        () => resolveProviderRetryDelaysSeconds(args[0].split(",").map(Number)),
-        usage
-      );
-      saveConfigKey(store, (config) => ({ ...config, providerRetryDelaysSeconds }));
-      return `Provider retry delays set to ${providerRetryDelaysSeconds.join(", ")} seconds\n`;
-    },
-    clear(store) {
-      saveConfigKey(store, (config) => {
-        const { providerRetryDelaysSeconds: _removed, ...rest } = config;
-        return rest;
-      });
-      return `Provider retry delays reset to ${DEFAULT_PROVIDER_RETRY_DELAYS_SECONDS.join(", ")} seconds\n`;
-    }
-  },
-  {
-    key: "provider-retry-max-window-seconds",
-    showLabel: "Provider retry max window",
-    showValue: (config) => `${resolveProviderRetryMaxWindowSeconds(config.providerRetryMaxWindowSeconds)} seconds`,
-    set(args, store) {
-      const usage = "Runtime config set usage: yui config runtime set provider-retry-max-window-seconds <positive-seconds>.";
-      if (args.length !== 1) throw usageError(usage);
-      const providerRetryMaxWindowSeconds = validatedConfigValue(
-        () => resolveProviderRetryMaxWindowSeconds(Number(args[0])),
-        usage
-      );
-      saveConfigKey(store, (config) => ({ ...config, providerRetryMaxWindowSeconds }));
-      return `Provider retry max window set to ${providerRetryMaxWindowSeconds} seconds\n`;
-    },
-    clear(store) {
-      saveConfigKey(store, (config) => {
-        const { providerRetryMaxWindowSeconds: _removed, ...rest } = config;
-        return rest;
-      });
-      return `Provider retry max window reset to ${DEFAULT_PROVIDER_RETRY_MAX_WINDOW_SECONDS} seconds\n`;
     }
   },
   {

@@ -776,12 +776,19 @@ export function createRuntimeLifecycleDispatcher(
   const lifecycleTails = new Map<string, Promise<void>>();
   return async (method, params) => {
     if (method === "runtime.observation-apply") {
-      return {
-        outcome: schedulerStore.observeRuntimeObservation(
-          createRuntimeObservation(params as never),
-          new Date()
-        )
-      };
+      try {
+        return {
+          outcome: schedulerStore.observeRuntimeObservation(
+            createRuntimeObservation(params as never),
+            new Date()
+          )
+        };
+      } catch (error) {
+        throw applicationError(
+          "INVALID_PARAMS",
+          error instanceof Error ? error.message : String(error)
+        );
+      }
     }
     if (method === "runtime.provider-turn-begin") {
       const value = providerTurnControlParams(params);
@@ -811,8 +818,10 @@ export function createRuntimeLifecycleDispatcher(
       const value = providerTurnControlParams(params);
       const status = (params as Record<string, unknown>).status;
       const reason = (params as Record<string, unknown>).reason;
+      const raw = (params as Record<string, unknown>).raw;
       if ((status !== "rejected" && status !== "delivery-unknown")
-        || typeof reason !== "string" || reason.trim().length === 0) {
+        || typeof reason !== "string" || reason.trim().length === 0
+        || typeof raw !== "string" || raw.trim().length === 0) {
         throw applicationError("INVALID_PARAMS", "Provider Turn resolution is invalid.");
       }
       schedulerStore.resolveAgentHostProviderTurnSubmission({
@@ -822,6 +831,7 @@ export function createRuntimeLifecycleDispatcher(
         attemptId: value.attemptId,
         status,
         reason,
+        raw,
         now: value.now
       });
       return { recorded: true };
@@ -1031,7 +1041,6 @@ export function createRuntimeLifecycleDispatcher(
     const session = sessions?.sessions[effective.agentId];
     const managedTurnDispatch = activeRun !== null && (
       activeRun.pushedAt === undefined
-      || activeRun.providerRetry?.state === "dispatching"
       || activeRun.controlRequest?.state === "dispatching"
     );
     // An ensure call may reattach the already-admitted Run to its existing

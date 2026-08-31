@@ -1,4 +1,3 @@
-import { supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
 import {
   DEFAULT_RUN_CAP,
   DEFAULT_TERMINAL_KEEP,
@@ -95,94 +94,6 @@ export function resolveLeaderNextActionMode(value?: unknown): LeaderNextActionMo
     throw new TypeError("leaderNextActionMode must be display, warn, or enforce.");
   }
   return normalized as LeaderNextActionMode;
-}
-
-// ── Issue 01: Provider retry ──────────────────────────────────────────────
-
-export const PROVIDER_RETRY_MODES = ["off", "shadow", "enforce"] as const;
-export type ProviderRetryMode = (typeof PROVIDER_RETRY_MODES)[number];
-export const DEFAULT_PROVIDER_RETRY_MODE: ProviderRetryMode = "enforce";
-export const DEFAULT_PROVIDER_RETRY_DELAYS_SECONDS = Object.freeze([2, 5, 15] as const);
-export const DEFAULT_PROVIDER_RETRY_MAX_WINDOW_SECONDS = 600;
-export const MAX_PROVIDER_RETRY_ATTEMPTS = 10;
-
-export function resolveProviderRetryMode(value?: unknown): ProviderRetryMode {
-  if (value === undefined || value === null) return DEFAULT_PROVIDER_RETRY_MODE;
-  if (typeof value !== "string") {
-    throw new TypeError("providerRetryMode must be off, shadow, or enforce.");
-  }
-  const normalized = value.trim().toLowerCase();
-  if (normalized.length === 0) return DEFAULT_PROVIDER_RETRY_MODE;
-  if (!(PROVIDER_RETRY_MODES as readonly string[]).includes(normalized)) {
-    throw new TypeError("providerRetryMode must be off, shadow, or enforce.");
-  }
-  return normalized as ProviderRetryMode;
-}
-
-/**
- * Resolves the adapter list. `["all"]` or undefined means every supported
- * adapter; an empty array disables in-place retry.
- */
-export function resolveProviderRetryAdapters(value?: unknown): string[] {
-  if (value === undefined || value === null) {
-    return [...supportedAgentAdapterIds()];
-  }
-  if (!Array.isArray(value)) {
-    throw new TypeError("providerRetryAdapters must be an array of adapter ids.");
-  }
-  const supported = new Set<string>(supportedAgentAdapterIds());
-  const adapters: string[] = [];
-  for (const raw of value) {
-    if (typeof raw !== "string") {
-      throw new TypeError("providerRetryAdapters entries must be strings.");
-    }
-    const token = raw.trim().toLowerCase();
-    if (token === "all") {
-      for (const adapter of supportedAgentAdapterIds()) {
-        if (!adapters.includes(adapter)) adapters.push(adapter);
-      }
-      continue;
-    }
-    if (!/^[a-z0-9][a-z0-9._-]*$/u.test(token)) {
-      throw new TypeError(`Invalid Provider retry adapter: ${token}.`);
-    }
-    if (!supported.has(token)) {
-      throw new TypeError(`Unknown Provider retry adapter: ${token}.`);
-    }
-    if (!adapters.includes(token)) adapters.push(token);
-  }
-  return adapters;
-}
-
-export function resolveProviderRetryDelaysSeconds(value?: unknown): number[] {
-  if (value === undefined || value === null) return [...DEFAULT_PROVIDER_RETRY_DELAYS_SECONDS];
-  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_PROVIDER_RETRY_ATTEMPTS) {
-    throw new TypeError(
-      `providerRetryDelaysSeconds must contain 1-${MAX_PROVIDER_RETRY_ATTEMPTS} positive integers.`
-    );
-  }
-  const delays = value.map((entry) => {
-    if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 1 || entry > 600) {
-      throw new TypeError("providerRetryDelaysSeconds entries must be integers from 1 to 600.");
-    }
-    return entry;
-  });
-  for (let index = 1; index < delays.length; index += 1) {
-    if (delays[index]! < delays[index - 1]!) {
-      throw new TypeError("providerRetryDelaysSeconds must be ordered from shortest to longest.");
-    }
-  }
-  return delays;
-}
-
-export function resolveProviderRetryMaxWindowSeconds(value?: unknown): number {
-  return resolveBoundedPositiveInteger(
-    value,
-    DEFAULT_PROVIDER_RETRY_MAX_WINDOW_SECONDS,
-    1,
-    Number.MAX_SAFE_INTEGER,
-    "providerRetryMaxWindowSeconds"
-  );
 }
 
 // ── Executable paths ──────────────────────────────────────────────────────

@@ -299,6 +299,18 @@ export async function runControllerSchedulerPass(
   // event-loop turn. Give already-written requests a poll boundary before the
   // next durable phase; later phases retain their existing CAS fences.
   await controlEventLoopTurn();
+  // A dormant Session may still name a Host that disappeared after its last
+  // Provider Turn. Detach that disposable Host before claiming the next Run,
+  // so retained Agent intent restores the same Session instead of first
+  // connecting to a known-dead control socket.
+  await reconcileDormantRuntimeOwners(
+    store,
+    delivery,
+    lifecycleHost,
+    scope,
+    now,
+    blockedTaskIds
+  );
   const failedCleanupRoles = await processSelectedRoleRuntimeCleanups(
     store,
     delivery,
@@ -349,7 +361,6 @@ export async function runControllerSchedulerPass(
     // Issue 04: reopen due in-place Provider retries on their original
     // Sessions before delivery, so the existing delivery path re-pushes the
     // exact same input in this same pass.
-    resolveDueProviderRetries(store, roleSelection, now);
     const activeRunDeliveries = await processActiveRoleRunDeliveries(
       store, delivery, now, roleSelection, inputDeliveryRecoveryCutoff
     );
@@ -591,10 +602,10 @@ function queueSelectedCompletedTaskRuntimeCleanups(
 function schedulerSessionRequiresRuntimeCleanup(
   session: SchedulerRoleSession | null
 ): boolean {
-  if (session === null || session.status === "stopped" || session.status === "broken") {
+  if (session === null || session.status === "ended") {
     return false;
   }
-  return session.status === "running" || session.launchId !== undefined;
+  return session.launchId !== undefined;
 }
 
 async function processSelectedRoleRuntimeCleanups(
@@ -720,16 +731,20 @@ async function reconcileDormantRuntimeOwners(
   blockedTaskIds: ReadonlySet<string> = new Set()
 ): Promise<void> {
   if (
-    scope.kind !== "full"
-    || lifecycleHost === undefined
+    lifecycleHost === undefined
     || store.listDormantRuntimeOwners === undefined
-    || store.markRuntimeOwnerStopped === undefined
   ) {
     return;
   }
+  const selectedOwners = scope.kind === "full"
+    ? undefined
+    : new Set(selectedRuntimeLifecycleTargets(store, scope, blockedTaskIds)
+      .map((target) => runtimeOwnerIdentity(runtimeOwner(target))));
   const candidates = store.listDormantRuntimeOwners().filter((candidate) => (
-    candidate.owner.scope !== "task"
-    || !blockedTaskIds.has(candidate.owner.taskId)
+    (candidate.owner.scope !== "task"
+      || !blockedTaskIds.has(candidate.owner.taskId))
+    && (selectedOwners === undefined
+      || selectedOwners.has(runtimeOwnerIdentity(candidate.owner)))
   ));
   if (candidates.length === 0) return;
   const owners = candidates.map((candidate) => candidate.owner);
@@ -767,19 +782,12 @@ async function reconcileDormantRuntimeOwners(
       byOwner.get(runtimeOwnerIdentity(candidate.owner))?.state
       === "stopped"
     ) {
-      if (
-        candidate.owner.scope === "task"
-        && candidate.launchId !== undefined
-      ) {
+      if (candidate.launchId !== undefined) {
         // The exact launch-owned resources must settle through the durable
-        // cleanup lane before its Session fact becomes stopped. The candidate
-        // is passed back as the CAS fence so a concurrent Hook/launch cannot
-        // redirect cleanup to a newer generation.
-        store.enqueueRuntimeCleanup?.(candidate.owner, now, candidate);
-        continue;
-      }
-      if (store.markRuntimeOwnerStopped(candidate, now)) {
-        forgetPreparedRuntimeOwner(delivery, candidate.owner);
+        // cleanup lane before its Host fact is detached. The resumable Session
+        // remains active; the candidate is the CAS fence against a concurrent
+        // Hook or replacement launch.
+        store.enqueueRuntimeHostDetach?.(candidate.owner, now, candidate);
       }
     }
   }
@@ -800,23 +808,6 @@ function runtimeOwnerIdentity(owner: RuntimeRoleOwner): string {
   return owner.scope === "task"
     ? `task\0${owner.taskId}\0${owner.roleName}`
     : `global\0${owner.roleName}`;
-}
-
-/**
- * Issue 04: reopens due in-place Provider retries on their original Native
- * Sessions before the active-run delivery pass, so the existing delivery
- * path re-pushes the exact same input in the same pass. A Run whose Session
- * is proven dead terminalizes with a replacement blocker instead.
- */
-function resolveDueProviderRetries(
-  store: SchedulerStorePort,
-  selection: ReconcileSelection,
-  now: Date
-): void {
-  if (typeof store.resolveDueProviderRetries !== "function") return;
-  const selectedTaskIds = selectedTaskIdsForBoundedPass(store, selection);
-  if (selectedTaskIds?.size === 0) return;
-  store.resolveDueProviderRetries(now, selectedTaskIds);
 }
 
 function selectedTaskIdsForBoundedPass(
@@ -2050,25 +2041,13 @@ export class FileTaskController {
       this.#deadlineTimer = undefined;
     }
     if (this.#stopped) return;
-    const deadlines = [
-      ...this.store.listOpenInputRequests()
+    const deadlines = this.store.listOpenInputRequests()
       .flatMap((request) => request.policy.kind === "recommended"
         ? [{
             key: `task:${encodeURIComponent(request.taskId)}` as MailboxKey,
             at: Date.parse(request.policy.timeoutAt)
           }]
-        : []),
-      // Issue 04 durable in-place retry timer: arm the Controller wake at the
-      // earliest dispatch/deadline wake. Scheduled retries re-push on their
-      // original Session; in-flight retries only wake at the episode deadline.
-      // The projection is durable, so a restart resumes the lineage.
-      ...(typeof this.store.listPendingProviderRetries === "function"
-        ? this.store.listPendingProviderRetries()
-        : []).map((retry) => ({
-        key: `role:${encodeURIComponent(retry.taskId)}/${encodeURIComponent(retry.roleName)}` as MailboxKey,
-        at: Date.parse(retry.dueAt)
-      }))
-    ];
+        : []);
     const nearest = nearestDeadlineBatch(deadlines);
     if (nearest === null) return;
     const now = this.#now().getTime();

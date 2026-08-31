@@ -645,11 +645,65 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
         );
       }
       const session = this.store.getRoleSession(target.taskId, target.roleName);
-      if (session !== null && session.status !== "stopped") {
+      if (session !== null && session.status !== "ended") {
         throw new Error(
           `Role runtime session is still active: ${target.taskId}/${target.roleName}.`
         );
       }
+    }
+  }
+
+  /** Stops only the exact idle Session observed by an Agent command. */
+  async stopExactTaskRoleSession(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    nativeSessionId: string;
+    launchId?: string;
+    sessionUpdatedAt: string;
+  }>): Promise<void> {
+    if (this.store.getActiveAgentRun(input.taskId, input.roleName) !== null) {
+      throw new Error(`Role has an active Run: ${input.taskId}/${input.roleName}.`);
+    }
+    const owner = {
+      scope: "task" as const,
+      taskId: input.taskId,
+      roleName: input.roleName
+    };
+    const target = this.schedulerStore.enqueueRuntimeCleanup(
+      owner,
+      new Date(),
+      {
+        owner,
+        agentId: input.agentId,
+        adapterId: input.adapterId,
+        nativeSessionId: input.nativeSessionId,
+        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        sessionUpdatedAt: input.sessionUpdatedAt
+      }
+    );
+    if (target === null) {
+      throw new Error(
+        `Role Session changed before its exact stop was reserved: ${input.taskId}/${input.roleName}.`
+      );
+    }
+    await callFileTaskController(this.home, "scheduler.scan", {}, {
+      ...this.clientOptions,
+      requestTimeoutMs: LIFECYCLE_REQUEST_TIMEOUT_MS
+    });
+    if (hasRuntimeLifecycleWork(this.store.getWorkMailbox(target))) {
+      throw new Error(`Role runtime did not stop: ${input.taskId}/${input.roleName}.`);
+    }
+    const session = this.store.getRoleSession(input.taskId, input.roleName);
+    if (
+      session !== null
+      && session.status !== "ended"
+      && session.agentId === input.agentId
+      && session.adapterId === input.adapterId
+      && session.nativeSessionId === input.nativeSessionId
+    ) {
+      throw new Error(`Role runtime session is still active: ${input.taskId}/${input.roleName}.`);
     }
   }
 
@@ -695,7 +749,7 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     }
     const liveSessions = this.store.listRoleSessionSets(taskId).flatMap((sessions) => (
       Object.values(sessions.sessions)
-        .filter((session) => session.status !== "stopped" && session.status !== "broken")
+        .filter((session) => session.status === "active")
         .map((session) => `${sessions.owner.roleName}/${session.agentId}/${session.status}`)
     ));
     if (liveSessions.length > 0) {
@@ -766,7 +820,7 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     }
     const sessions = this.store.getGlobalRoleSessionSet(roleName);
     const active = sessions?.sessions[sessions.activeAgentId];
-    if (active !== undefined && active.status !== "stopped") {
+    if (active !== undefined && active.status !== "ended") {
       throw new Error(`Global Role runtime session is still active: ${roleName}.`);
     }
   }

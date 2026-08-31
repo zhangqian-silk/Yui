@@ -127,7 +127,7 @@ const CONFIG_KEY_VALUES: readonly CommandValue[] = CONFIG_DEFINITIONS.map((defin
 
 const CONFIG_DOMAIN_SUMMARIES: Readonly<Record<ConfigDomain, string>> = {
   system: "Configure Home-wide defaults and human-facing presentation.",
-  runtime: "Configure Controller recovery, concurrency, health, launch, delivery, and Provider retry policy.",
+  runtime: "Configure Controller recovery, concurrency, health, launch, and delivery mechanics.",
   workflow: "Configure Leader convergence, context, and optional review policy.",
   resources: "Configure resource garbage collection and quarantine policy.",
   tools: "Configure tmux and optional diagnostic telemetry."
@@ -646,7 +646,7 @@ const taskChildren: readonly NodeInput[] = [
     summary: "Manage Roles within a Task.",
     sections: [{ id: "manage", title: "Commands", entries: [
       "add", "list", "status", "show", "update", "remove", "bind", "unbind",
-      "view", "takeover", "release"
+      "session", "view", "takeover", "release"
     ] }],
     children: [
       {
@@ -674,6 +674,25 @@ const taskChildren: readonly NodeInput[] = [
       { name: "remove", summary: "Remove a Task Role.", usage: "yui task role remove <task> <role>" },
       { name: "bind", summary: "Bind and activate an Agent for a Task Role.", usage: "yui task role bind <task> <role> <agent-id>" },
       { name: "unbind", summary: "Unbind a dormant Agent from a Task Role.", usage: "yui task role unbind <task> <role> <agent-id>" },
+      {
+        name: "session",
+        summary: "Inspect or stop one Task Role's native Session.",
+        executable: true,
+        sections: [{ id: "manage", title: "Commands", entries: ["inspect", "stop"] }],
+        children: [
+          {
+            name: "inspect",
+            summary: "Read the current Session, Host activation, and Turn facts.",
+            usage: "yui task role session inspect <task> <role>"
+          },
+          {
+            name: "stop",
+            summary: "Stop one idle Session and its exact Host activation.",
+            usage: "yui task role session stop <task> <role> --reason <text>",
+            options: ["--reason"]
+          }
+        ]
+      },
       {
         name: "view",
         summary: "Attach read-only to an independent Provider presentation surface.",
