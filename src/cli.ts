@@ -530,7 +530,10 @@ export async function main(): Promise<void> {
           "Managed Session CLI refresh may be run only by the user or global Operator."
         );
       }
-      const result = refreshManagedSessionCliWrappers(home);
+      const result = refreshManagedSessionCliWrappers(
+        home,
+        currentInvocationControlPlane(home)
+      );
       emit(
         `Refreshed ${result.refreshed} legacy Session CLI wrapper(s); `
           + `${result.current} already current, ${result.skipped} skipped.`,

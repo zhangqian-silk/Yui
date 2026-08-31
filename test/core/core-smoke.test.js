@@ -480,6 +480,56 @@ test("the production migration preserves ReviewRound-backed Agent Runs", (t) => 
   migrated.close();
 });
 
+test("the production migrations remove duplicate Role and Provider Run state", () => {
+  const registry = createProductionRegistry();
+  const roleStep = registry.lookup("record", "taskRole", 3);
+  const sessionStep = registry.lookup("record", "taskRoleSessionSet", 6);
+  assert.ok(roleStep);
+  assert.ok(sessionStep);
+
+  const source = {
+    schemaManifest: {
+      recordVersions: { taskRole: 3, taskRoleSessionSet: 6 }
+    },
+    state: {
+      tasks: {
+        "task-1": {
+          roles: {
+            leader: { schemaVersion: 3, name: "leader", status: "running" }
+          },
+          roleSessionSets: {
+            leader: {
+              schemaVersion: 6,
+              providerBinding: {
+                schemaVersion: 2,
+                providerNamespace: "anthropic/claude-code",
+                runId: "agent-run-1",
+                turn: { attemptId: "receipt-1", status: "completed" }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  roleStep.preconditions(source);
+  const roleMigrated = roleStep.transform(source);
+  sessionStep.preconditions(roleMigrated);
+  const migrated = sessionStep.transform(roleMigrated);
+  const aggregate = migrated.state.tasks["task-1"];
+  const role = aggregate.roles.leader;
+  const binding = aggregate.roleSessionSets.leader.providerBinding;
+
+  assert.equal(migrated.schemaManifest.recordVersions.taskRole, 4);
+  assert.equal(migrated.schemaManifest.recordVersions.taskRoleSessionSet, 7);
+  assert.equal(role.schemaVersion, 4);
+  assert.equal(Object.hasOwn(role, "status"), false);
+  assert.equal(binding.schemaVersion, 3);
+  assert.equal(Object.hasOwn(binding, "runId"), false);
+  assert.equal(binding.turn.runId, "agent-run-1");
+});
+
 test("the built-in Agent Drivers are available through the shared registry", () => {
   const drivers = builtinAgentDriverRegistry();
   assert.equal(drivers.requireByAdapterId("codex").id, "openai/codex");

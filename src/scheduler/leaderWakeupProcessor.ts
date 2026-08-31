@@ -76,12 +76,6 @@ export async function processLeaderWakeups(
       results.push({ taskId: task.id, status: "skipped", reason: "busy" });
       continue;
     }
-    if (typeof store.hasInFlightTurn === "function"
-      && store.hasInFlightTurn(task.id, role.name)) {
-      results.push({ taskId: task.id, status: "skipped", reason: "busy" });
-      continue;
-    }
-
     const reopening = wakeup.reasons.includes("task-reopened");
     let existingSession = store.getRoleSession(
       task.id,

@@ -165,7 +165,6 @@ export {
   currentProviderConversation,
   endProviderActivation,
   markProviderTurnDeliveryUnknown,
-  rebindProviderRuntimeRun,
   rejectProviderTurn,
   settleProviderTurnSubmission,
   settleProviderTurn,

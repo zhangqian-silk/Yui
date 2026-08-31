@@ -7,7 +7,6 @@ import {
   terminalizeTaskRoleRunSession,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
-import { updateRoleStatus } from "../role/role.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import {
   finishReviewRound,
@@ -420,7 +419,7 @@ export function retireExactActiveAgentRun(
   const session = sessions?.sessions[input.agentId];
   const providerBinding = sessions?.providerBinding;
   const providerTurn = providerBinding?.turn;
-  const providerSettled = providerBinding?.runId === current.id
+  const providerSettled = providerTurn?.runId === current.id
     && (providerTurn?.status === "completed"
       || providerTurn?.status === "failed"
       || providerTurn?.status === "cancelled"
@@ -633,7 +632,6 @@ export function terminalizeExactTaskRun(
   } else {
     store.clearActiveAgentRun(input.taskId, input.roleName);
   }
-  store.saveRole(input.taskId, updateRoleStatus(role, "idle", now));
   if (sessions !== null) {
     store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
       agentId: input.agentId,

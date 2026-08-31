@@ -1,9 +1,33 @@
 # Yui Architecture
 
-Yui is a local control plane for durable work across Projects and native Agent
-runtimes. The user talks to one Operator. The Operator routes each request to
-the right Project and Task; that Task's Leader owns decomposition, execution
-choice, review, integration, and completion.
+Yui is a local control plane for intelligent Agents doing durable work across
+Projects and native runtimes. The user talks to one Operator. The Operator
+routes each request to the right Project and Task; that Task's Leader owns
+decomposition, execution choice, review, integration, and completion.
+
+## Design principles
+
+- **Agents own judgment.** Yui exposes current durable context and atomic
+  capabilities; the Operator, Leader, and Workers choose plans, execution
+  topology, sequencing, retry, and recovery from that context.
+- **Core provides primitives, not a prescribed workflow.** Reads, messages,
+  bounded record transitions, workspace ownership, Session lifecycle, and
+  acceptance are composable operations. Project Skills and Knowledge provide
+  project-specific policy without adding core branches.
+- **Durable intent outranks runtime continuity.** Tasks, WorkItems, Messages,
+  Decisions, results, Project Knowledge, and managed workspaces are authority.
+  Provider Sessions, transcripts, processes, and observations are execution
+  aids that may be resumed or replaced.
+- **Trust explicit Agent actions.** Once identity, authority, and scope are
+  established, a valid Agent command is a semantic declaration. Core should not
+  reconstruct the same judgment through another status protocol.
+- **Fail visibly and let the Agent adapt.** Preserve pending intent and return
+  actionable state. Add automated retry, recovery, leases, or fallback only for
+  a normal product path, a hard safety or data-integrity boundary, or a proven
+  failure whose cost justifies the machinery.
+- **One question has one authority.** Projections and indexes may summarize
+  state, but scheduling and lifecycle decisions must not depend on independently
+  writable copies of the same fact.
 
 ## One outcome, Leader-chosen execution topology
 
@@ -253,6 +277,18 @@ Conversation can span Runs and client attachments; one Activation identifies
 Yui's current attachment, not exclusive ownership of the Provider thread. One
 Turn identifies one provider-native execution. Yui's authority epoch fences
 only Yui's own submissions and retries.
+
+`AgentRun` is the single durable scheduling authority for a Role. Provider
+runtime persistence has no independently writable current-Run field; a Turn's
+Run id is correlation evidence for receipts and terminal observations only.
+`TaskRole` likewise stores configuration and identity, not a writable runtime
+status. CLI and Web status views derive activity from the active AgentRun and
+add Session/Driver facts only as lifecycle and diagnostic detail.
+`AgentHost` is the serialized consumer: while a native Turn is active, the next
+AgentRun and mailbox batch remain durable and unsubmitted. When that Turn ends,
+the Host makes the Conversation ready and the retained delivery continues.
+This remains true when the Agent declared the old Run's semantic outcome before
+the Provider emitted its terminal event.
 
 Codex Task threads remain ordinary native sessions and can be opened and used
 directly in Desktop. If a direct user Turn is active, Yui keeps its pending

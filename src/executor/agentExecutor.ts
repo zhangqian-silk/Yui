@@ -16,7 +16,6 @@ import {
 import {
   currentProviderActivation,
   endProviderActivation,
-  rebindProviderRuntimeRun,
   validateProviderRuntimeBinding,
   type ProviderRuntimeBinding
 } from "../runtime/providerRuntimeIdentity.js";
@@ -81,9 +80,10 @@ export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & 
 };
 
 export type TaskRoleSessionSet = RoleSessionSetBase<TaskRoleSessionOwner> & {
-  schemaVersion: 6;
+  schemaVersion: 7;
   /** Immutable terminal native Sessions superseded by a fresh effective launch. */
   history?: readonly RoleAgentSession[];
+  /** Exact delivery-receipt projection; never a Role scheduling/busy authority. */
   inFlight: TaskRoleInFlight | null;
   providerBinding: ProviderRuntimeBinding | null;
 };
@@ -138,7 +138,7 @@ export function createRoleSessionSet(
     ? { ...base, schemaVersion: 3 } as GlobalRoleSessionSet
     : {
         ...base,
-        schemaVersion: 6,
+        schemaVersion: 7,
         inFlight: null,
         providerBinding: null
       } as TaskRoleSessionSet;
@@ -486,15 +486,14 @@ export function bindTaskRoleRun(
     throw new Error("Task Role session set already has an in-flight Run.");
   }
   const timestamp = requireDate(preparedAt, "Task Role Run preparedAt");
-  // A fresh Session follows physical cleanup and does not inherit execution
-  // fences from the disposable old Conversation. Runtime events retain its
-  // audit evidence; the new Provider binds a fresh control identity when it is
-  // observed. Resume keeps the existing exact Conversation fence.
+  // A fresh Session follows physical cleanup and does not inherit runtime
+  // evidence from the disposable old Conversation. A resumed Session keeps
+  // that evidence unchanged here: claiming a durable Run is a workflow
+  // mutation, not a Provider operation. AgentHost binds the Conversation to
+  // this Run only when it can actually submit the next serialized Turn.
   const providerBinding = mode === "new"
     ? null
-    : set.providerBinding !== null
-    ? rebindProviderRuntimeRun(set.providerBinding, normalized.runId)
-    : null;
+    : set.providerBinding;
   const updated: TaskRoleSessionSet = {
     ...set,
     inFlight: { ...normalized, preparedAt: timestamp },
@@ -538,9 +537,6 @@ export function bindTaskRoleProviderRuntime(
 ): TaskRoleSessionSet {
   validateRoleSessionSet(set);
   const normalized = validateProviderRuntimeBinding(binding);
-  if (set.inFlight === null || set.inFlight.runId !== normalized.runId) {
-    throw new Error("Provider Runtime Binding does not match the in-flight Run.");
-  }
   if (set.providerBinding !== null) {
     if (JSON.stringify(set.providerBinding) === JSON.stringify(normalized)) return set;
     throw new Error("Task Role already has a Provider Runtime Binding.");
@@ -560,7 +556,6 @@ export function updateTaskRoleProviderRuntime(
   validateRoleSessionSet(set);
   const normalized = validateProviderRuntimeBinding(binding);
   if (set.providerBinding === null
-    || normalized.runId !== set.providerBinding.runId
     || normalized.providerNamespace !== set.providerBinding.providerNamespace
     || normalized.accountScope !== set.providerBinding.accountScope) {
     throw new Error("Provider Runtime Binding identity cannot change in place.");
@@ -773,9 +768,10 @@ export function clearTaskRoleRun(
 }
 
 /**
- * Applies an authoritative application-level Run terminal fact to the native
- * session fence. A later native Hook is only advisory and must not be required
- * to make the next Run dispatchable.
+ * Applies an authoritative application-level Run terminal fact to its exact
+ * delivery receipt. Provider lifecycle remains independent: only the matching
+ * native Turn boundary may move the Session from running to ready. AgentHost
+ * serializes a retained next delivery while that Turn is still active.
  */
 export function terminalizeTaskRoleRunSession(
   set: TaskRoleSessionSet,
@@ -784,19 +780,7 @@ export function terminalizeTaskRoleRunSession(
 ): TaskRoleSessionSet {
   validateRoleSessionSet(set);
   const inFlight = set.inFlight;
-  let updated = inFlight === null
-      ? set
-      : clearTaskRoleRun(set, fence, terminalAt);
-  const session = updated.sessions[updated.activeAgentId];
-  if (session?.status === "running") {
-    updated = updateRoleAgentSessionStatus(
-      updated,
-      updated.activeAgentId,
-      "ready",
-      terminalAt
-    );
-  }
-  return updated;
+  return inFlight === null ? set : clearTaskRoleRun(set, fence, terminalAt);
 }
 
 export function settleTaskRoleCompletion(
@@ -863,7 +847,7 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       }
     }
   } else {
-    if (set.schemaVersion !== 6) {
+    if (set.schemaVersion !== 7) {
       throw new Error("Task Role session set schema version is invalid.");
     }
     if (
@@ -905,9 +889,6 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       throw new Error("Task Role in-flight Run Agent must be active.");
     }
     if (providerBinding !== null) {
-      if (inFlight !== null && providerBinding.runId !== inFlight.runId) {
-        throw new Error("Provider Runtime Binding must match the in-flight Run.");
-      }
       const session = taskSet.sessions[inFlight?.agentId ?? set.activeAgentId];
       if (session === undefined) {
         throw new Error("Provider Runtime Binding has no active Role Agent session.");

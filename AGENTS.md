@@ -1,5 +1,14 @@
 # Yui Repository Guidance
 
+## Build for intelligent Agents
+
+- Yui is a local control plane and context API for intelligent Agents, not a deterministic workflow engine. Preserve durable intent, expose current facts, and provide small atomic operations; let the Agent choose the plan, order, execution topology, retry, and recovery from those primitives.
+- Put semantic judgment in Agent instructions, Project Skills and Knowledge, and current Task context. Do not encode decisions an Agent can make from observable state as new workflow states, policy engines, approval gates, or background protocols.
+- Make each capability narrow, composable, and explicit about its effect. Prefer `read current state -> one atomic mutation -> observable result`. When an operation cannot proceed, preserve the intent and return enough context for the Agent to decide the next action.
+- Treat Tasks, WorkItems, Messages, Decisions, results, Project Knowledge, and managed workspaces as durable authority. Provider Sessions, transcripts, processes, caches, and runtime observations support execution and diagnostics; they are not competing sources of Task truth.
+- Trust a valid Agent action at an enforced boundary. Add code-level guards only for user authority, scope and workspace isolation, persistent data integrity, irreversible external effects, or a common observed failure. Prefer a clear error and Agent-directed retry or recovery over leases, repair workers, fallbacks, and edge-case state machines.
+- Give each product question one authority. Derived statuses and indexes may improve presentation or lookup, but they must not become independently writable state or a second scheduling protocol.
+
 ## Communicate at the user's level
 
 - Lead with the product decision, observable behavior, and user impact.
@@ -12,7 +21,7 @@
 ## Separate human and Agent deliverables
 
 - Human-facing communication should be concise: outcome, architecture, behavior change, material tradeoffs, unresolved decision, and next action.
-- Agent-facing WorkItems and handoffs should be executable: relevant components, constraints and contracts, ordered implementation path, failure cases, acceptance criteria, test cases, and expected evidence.
+- Agent-facing WorkItems and handoffs should be decision-complete: objective, relevant context, hard boundaries, acceptance criteria, known risks, and expected evidence. Let the receiving Agent choose the implementation plan and tools unless ordering is itself part of the contract.
 - Do not paste a detailed Agent execution brief into a user-facing response. Synthesize it into the product-level result.
 - Do not make Agent instructions vague merely to keep the user-facing explanation short. Maintain separate views for the two audiences.
 
@@ -20,7 +29,7 @@
 
 - Treat Yui CLI reads as the context API. Launch and wake messages should guide an Agent to the relevant Project, Task, WorkItem, message, or input records instead of embedding the full source content.
 - Persist Project Knowledge in YUI_HOME. Repository files may be evidence or reading material, but they are not the authority for Yui's maintained knowledge.
-- Keep Yui CLI behavior project-neutral: its Task, Role, review, recovery, and resource-authorization rules must work for any Project. Put Yui-repository build, test, CI, release, and validation policy in this repository's guidance and Project Skill instead of generic CLI Roles.
+- Keep Yui CLI primitives project-neutral. Put project-specific planning, build, test, migration, release, review, and recovery judgment in Project Skills, Knowledge, and Task context instead of generic CLI Roles or core branches.
 - Treat stable Project checkouts as read-only reference workspaces. Perform Task and WorkItem changes in managed worktrees.
 - A Project-backed Task receives its main worktree when it is created. During execution, the Leader may create an isolated WorkItem worktree directly when concurrent work warrants it; do not introduce an approval workflow.
 - Archive only after active work is settled, results are integrated or deliberately abandoned, and managed worktrees are clean and removable. Worktree cleanup must not delete the Task record.
@@ -35,8 +44,8 @@
 ## Keep the main path lean
 
 - Provide migration code only for valid earlier versions of persistent Yui data. Any change to a persistent layout, aggregate, record, or configuration schema must declare its version transition and use the centralized migration mechanism.
-- For every other change, implement the current contract directly. Do not add transitional adapters, dual behavior, legacy fallbacks, or automatic repair for malformed, partially written, manually modified, or historically leaked Homes, Sessions, worktrees, configuration, or runtime artifacts. Such anomalous active state must fail closed with a bounded diagnosis or cleanup recommendation. An explicitly retired Task is the isolation boundary: migrations preserve its stored information, including anomalous runtime references, without letting those references block healthy Tasks; they do not rewrite or repair that history.
-- Prefer the smallest workflow that satisfies the current product commitment. Avoid speculative states, background protocols, and duplicate sources of truth.
+- For every other change, implement the current contract directly. Do not add transitional adapters, dual behavior, legacy fallbacks, or automatic repair for malformed or manually modified runtime state. Return a bounded diagnosis and let the Agent or Operator choose cleanup or retry. Migrations preserve valid stored history; they do not repair it heuristically.
+- Before adding persistent state, a retry or recovery worker, a lease, an acknowledgement, or another protocol phase, identify the normal product path or hard boundary it protects. If a visible failure plus Agent retry is sufficient, do not add the mechanism.
 - Keep permanent tests to the seconds-scale core happy path. Change-specific TDD and abnormal, deletion, retirement, retry, or historical-regression fixtures are temporary development evidence and must be removed when the change is complete unless they replace a missing primary product smoke.
 
 ## Keep Yui-specific workflow in its Project Skill

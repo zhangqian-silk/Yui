@@ -39,7 +39,6 @@ export function renderRoleDetails(
   const overview = [
     `  Kind             ${input.kind}`,
     `  Active Agent     ${role.activeAgentId}`,
-    ...("status" in role ? [`  Status           ${role.status}`] : []),
     `  Workspace        ${role.workspace}`,
     `  Desired launch   r${role.launchRevision}; Profile intent=${role.defaultAccess}`,
     `  Effective launch ${effective === undefined

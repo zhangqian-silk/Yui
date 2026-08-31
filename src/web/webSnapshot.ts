@@ -183,6 +183,9 @@ export function buildWebTaskDetail(
       const effectiveLaunch = activeRun?.effective ?? activeSession?.effective ?? null;
       return {
         ...role,
+        // Presentation only: workflow activity is derived from AgentRun; the
+        // native Session contributes lifecycle detail when no Run is active.
+        status: activeRun === undefined ? activeSession?.status ?? "idle" : "running",
         sessionTokens: projectSessionTokenMetrics(
           events,
           resolveSessionTokenIdentity(activeSession === undefined

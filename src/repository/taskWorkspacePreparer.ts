@@ -3356,7 +3356,6 @@ function canCorrectActiveWorkItemRoleWorkspaceHint(
 ): boolean {
   if (
     role.taskId !== taskId
-    || role.status !== "running"
     || item.taskId !== taskId
     || item.assignee !== role.name
     || ["completed", "failed", "retired"].includes(item.status)

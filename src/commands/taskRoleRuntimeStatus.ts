@@ -214,7 +214,6 @@ export function renderTaskRoleRuntimeStatus(status: TaskRoleRuntimeStatus): stri
       ? "-"
       : status.launchDrift ? "pending next launch" : "none"}`,
     `  Run/session      ${status.runSessionDrift ? "snapshot mismatch" : "snapshot consistent"}`,
-    `  Role state       ${status.role.status}`,
     `  Active work      ${activeWork}`,
     `  Active run       ${activeRun}`,
     ...(lastRun === undefined ? [] : [`  Last run         ${lastRun}`]),
@@ -440,9 +439,6 @@ function calculateHealth(
       healthReason: "the native Session is unbound; verified runtime cleanup is pending"
     };
   }
-  if (role.status === "failed" || role.status === "exited") {
-    return { health: "failed", healthReason: `persisted Role state is ${role.status}` };
-  }
   if (nativeSession?.status === "broken") {
     // Issue 09: a broken Session only fails a live Run. When the last Run
     // already yielded, the Session death is a lifecycle event, not a Run
@@ -475,12 +471,6 @@ function calculateHealth(
     };
   }
   if (activeRun !== null) {
-    if (role.status !== "running") {
-      return {
-        health: "needs-attention",
-        healthReason: `the active Run conflicts with persisted Role state ${role.status}`
-      };
-    }
     if (activeRun.deliveredAt !== undefined && tmux.state !== "running") {
       return { health: "needs-attention", healthReason: "the delivered active Run has no live tmux pane" };
     }
@@ -526,9 +516,6 @@ function calculateHealth(
           return { health: "running", healthReason: runtime.healthReason };
       }
     }
-  }
-  if (activeRun === null && role.status === "running") {
-    return { health: "needs-attention", healthReason: "the Role is running without an active Run" };
   }
   if (nativeSession?.status === "running" && tmux.state !== "running") {
     return { health: "needs-attention", healthReason: "the native session is running without a live tmux pane" };

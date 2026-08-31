@@ -40,8 +40,6 @@ export function repairOrphanedActiveTasks(
       const run = store.getActiveAgentRun(task.id, role.name);
       return run === null ? [] : [run];
     });
-    const hasInFlightTurn = roles.some((role) => store.hasInFlightTurn(task.id, role.name));
-    const hasLeaderInFlightTurn = store.hasInFlightTurn(task.id, "leader");
     const leaderTarget = { kind: "role", taskId: task.id, roleName: "leader" } as const;
     const leaderMailbox = store.getWorkMailbox(leaderTarget);
     const projection = projectTaskExecution({
@@ -57,8 +55,7 @@ export function repairOrphanedActiveTasks(
       && activeRuns.some(({ roleName }) => roleName !== "leader")
       && projection.status === "waiting-on-agents";
     if (
-      (queuedAlongsideActiveSibling ? hasLeaderInFlightTurn : hasInFlightTurn)
-      || store.hasOpenInputRequest(task.id)
+      store.hasOpenInputRequest(task.id)
       || store.getLeaderFailure(task.id) !== null
       || (projection.status !== "needs-leader-action" && !queuedAlongsideActiveSibling)
       || hasUnclaimedLeaderWork(store, task.id, leaderMailbox)

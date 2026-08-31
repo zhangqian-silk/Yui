@@ -12,10 +12,11 @@ workspace layout, native transcript, or an earlier Run.
 For every managed Task Run:
 
 1. Read the exact Run identity from the newest Bootstrap Envelope.
-2. Before acting, load its authorized pack with the ordinary Yui CLI command:
+2. Before acting, load its authorized pack with the Session CLI named by the
+   current Session Manifest:
 
    ```sh
-   yui task run context "$YUI_TASK_ID/<run-id>" --json
+   "$YUI_SESSION_CLI" task run context "$YUI_TASK_ID/<run-id>" --json
    ```
 
 3. Verify that the returned Task, Run, Role, purpose, Snapshot digest, workspace,
@@ -27,7 +28,7 @@ For every managed Task Run:
    `refId`:
 
    ```sh
-   yui task run context expand "$YUI_TASK_ID/<run-id>" <ref-id> --store <store> --mode full --json
+   "$YUI_SESSION_CLI" task run context expand "$YUI_TASK_ID/<run-id>" <ref-id> --store <store> --mode full --json
    ```
 
    A bare `<ref-id>` remains supported only when it identifies exactly one
@@ -46,7 +47,7 @@ For a global Operator or custom GlobalRole Session, load the stable authorized v
 before routing or acting:
 
 ```sh
-yui session context "$YUI_ROLE" --json
+"$YUI_SESSION_CLI" session context "$YUI_ROLE" --json
 ```
 
 Global context grants no Task implementation workspace. Read a Task only after

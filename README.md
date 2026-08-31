@@ -2,7 +2,16 @@
 
 # Yui
 
-Yui is a local control plane for durable Codex and Claude work. It keeps control state and Project knowledge in inspectable JSON, lets tmux own native Agent terminals, and combines reusable Worker Profiles, Leader-owned delegation, explicit acceptance, and isolated Git worktrees for Project-backed Tasks.
+Yui is a local control plane for intelligent Codex and Claude Agents. It keeps
+user intent, Project knowledge, Tasks, handoffs, and results durable and
+inspectable, while exposing small atomic capabilities for context, messaging,
+delegation, workspaces, Sessions, review, and integration. Agents compose those
+capabilities and decide how to plan, sequence, delegate, retry, and recover.
+
+Yui deliberately does not turn Agent judgment into a deterministic workflow
+engine. Its core owns durable identity, user authority, workspace isolation,
+and atomic state changes. Provider Sessions and runtime observations support
+execution and continuity, but they are not competing sources of Task truth.
 
 The current implementation restores the useful Role/Agent/session and CLI framework without restoring the later data-maintenance, lease, schedule, and recovery-ledger systems.
 
@@ -899,6 +908,15 @@ For an independently hosted Provider such as Claude, these commands are the
 supported human-control boundary. A Codex Role uses an ordinary shared thread
 and may be operated directly in Desktop; an active Desktop Turn creates bounded
 backpressure for Yui rather than a failed Run.
+
+AgentRun is the only durable Role scheduling state. Conversation state does not
+carry a second current-Run pointer; each Provider Turn records a Run id only to
+correlate its receipt and terminal event. If an Agent finishes a Yui Run before
+the native Turn terminal arrives, the next mailbox batch may already become a
+new AgentRun, but Agent Host keeps its input pending and submits it only after
+the old Turn settles. TaskRole itself stores identity and desired launch
+configuration, not runtime status; Role status shown by CLI/Web is derived from
+the active AgentRun plus Session/Driver lifecycle facts.
 
 Global Operator and global Role sessions remain native interactive CLIs:
 

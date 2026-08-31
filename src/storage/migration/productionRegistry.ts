@@ -102,10 +102,14 @@ const RELEASE_WORKFLOW_FROM_VERSION = 0;
 const RELEASE_WORKFLOW_TO_VERSION = 1;
 const WORK_MAILBOX_FROM_VERSION = 1;
 const WORK_MAILBOX_TO_VERSION = 2;
+const TASK_ROLE_FROM_VERSION = 3;
+const TASK_ROLE_TO_VERSION = 4;
 const TASK_ROLE_SESSION_SET_FROM_VERSION = 4;
 const TASK_ROLE_SESSION_SET_TO_VERSION = 5;
 const STRUCTURED_PROVIDER_SESSION_SET_FROM_VERSION = 5;
 const STRUCTURED_PROVIDER_SESSION_SET_TO_VERSION = 6;
+const AGENT_FIRST_SESSION_SET_FROM_VERSION = 6;
+const AGENT_FIRST_SESSION_SET_TO_VERSION = 7;
 const PUBLICATION_REFERENCE_FROM_VERSION = 0;
 const PUBLICATION_REFERENCE_TO_VERSION = 1;
 const CONFIG_FROM_VERSION = 1;
@@ -277,12 +281,71 @@ export function createProductionStorageRegistry(): MigrationRegistry<HomeSnapsho
     .registerOfflineMigration(capabilityGrantIntroductionStep())
     .registerOfflineMigration(releaseWorkflowIntroductionStep())
     .registerOfflineMigration(workMailboxV2Step())
+    .registerOfflineMigration(agentRunOwnedTaskRoleStep())
     .registerOfflineMigration(taskRoleSessionSetV5Step())
     .registerOfflineMigration(structuredProviderSessionSetV6Step())
+    .registerOfflineMigration(agentFirstSessionSetV7Step())
     .registerOfflineMigration(publicationReferenceIntroductionStep());
 
   assertRegistryCoversBaselineToCurrent(registry);
   return registry;
+}
+
+/** Removes the independently writable Role runtime projection; AgentRun owns workflow activity. */
+function agentRunOwnedTaskRoleStep(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "taskRole",
+    fromVersion: TASK_ROLE_FROM_VERSION,
+    toVersion: TASK_ROLE_TO_VERSION,
+    preconditions: requireTaskRoleV3Family,
+    transform: migrateTaskRoleV3ToV4,
+    declaredEffects: []
+  };
+}
+
+function requireTaskRoleV3Family(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.taskRole !== TASK_ROLE_FROM_VERSION) {
+    throw new Error(`Record taskRole migration requires manifest version ${TASK_ROLE_FROM_VERSION}.`);
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const roles = asObject(aggregate.roles, `Task Roles ${taskId}`);
+    for (const [roleName, rawRole] of Object.entries(roles)) {
+      const role = asObject(rawRole, `Task Role ${taskId}/${roleName}`);
+      if (role.schemaVersion !== TASK_ROLE_FROM_VERSION) {
+        throw new Error(
+          `Task Role ${taskId}/${roleName} must use schemaVersion ${TASK_ROLE_FROM_VERSION}.`
+        );
+      }
+    }
+  }
+}
+
+function migrateTaskRoleV3ToV4(snapshot: HomeSnapshot): HomeSnapshot {
+  requireTaskRoleV3Family(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: { ...versions, taskRole: TASK_ROLE_TO_VERSION }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks = Object.fromEntries(Object.entries(tasks).map(([taskId, rawAggregate]) => {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const roles = asObject(aggregate.roles, `Task Roles ${taskId}`);
+    const nextRoles = Object.fromEntries(Object.entries(roles).map(([roleName, rawRole]) => {
+      const role = asObject(rawRole, `Task Role ${taskId}/${roleName}`);
+      const { status: _status, ...retained } = role;
+      void _status;
+      return [roleName, { ...retained, schemaVersion: TASK_ROLE_TO_VERSION }];
+    }));
+    return [taskId, { ...aggregate, roles: nextRoles }];
+  }));
+  return { schemaManifest, state: { ...snapshot.state, tasks: nextTasks } };
 }
 
 function configV2Step(): MigrationStep<HomeSnapshot> {
@@ -3253,6 +3316,94 @@ function structuredProviderSessionSetV6Step(): MigrationStep<HomeSnapshot> {
     transform: migrateTaskRoleSessionSetV5ToV6,
     declaredEffects: []
   };
+}
+
+/**
+ * A Provider binding describes one reusable Conversation. Run correlation now
+ * belongs to the concrete Provider Turn instead of making the Conversation a
+ * second writable projection of the current AgentRun.
+ */
+function agentFirstSessionSetV7Step(): MigrationStep<HomeSnapshot> {
+  return {
+    axis: "record",
+    recordKind: "taskRoleSessionSet",
+    fromVersion: AGENT_FIRST_SESSION_SET_FROM_VERSION,
+    toVersion: AGENT_FIRST_SESSION_SET_TO_VERSION,
+    preconditions: requireTaskRoleSessionSetV6Family,
+    transform: migrateTaskRoleSessionSetV6ToV7,
+    declaredEffects: []
+  };
+}
+
+function requireTaskRoleSessionSetV6Family(snapshot: HomeSnapshot): void {
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  if (versions.taskRoleSessionSet !== AGENT_FIRST_SESSION_SET_FROM_VERSION) {
+    throw new Error(
+      `Record taskRoleSessionSet migration requires manifest version ${AGENT_FIRST_SESSION_SET_FROM_VERSION}.`
+    );
+  }
+  if (snapshot.state === null) return;
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const sets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+    for (const [roleName, rawSet] of Object.entries(sets)) {
+      const set = asObject(rawSet, `Task Role session set ${taskId}/${roleName}`);
+      if (set.schemaVersion !== AGENT_FIRST_SESSION_SET_FROM_VERSION) {
+        throw new Error(
+          `Task Role session set ${taskId}/${roleName} must use schemaVersion ${AGENT_FIRST_SESSION_SET_FROM_VERSION}.`
+        );
+      }
+      if (set.providerBinding !== null) {
+        const binding = asObject(set.providerBinding, `Provider Binding ${taskId}/${roleName}`);
+        if (binding.schemaVersion !== 2 || typeof binding.runId !== "string") {
+          throw new Error(`Provider Binding ${taskId}/${roleName} must use schemaVersion 2.`);
+        }
+      }
+    }
+  }
+}
+
+function migrateTaskRoleSessionSetV6ToV7(snapshot: HomeSnapshot): HomeSnapshot {
+  requireTaskRoleSessionSetV6Family(snapshot);
+  const versions = asObject(snapshot.schemaManifest.recordVersions, "schema manifest recordVersions");
+  const schemaManifest = {
+    ...snapshot.schemaManifest,
+    recordVersions: {
+      ...versions,
+      taskRoleSessionSet: AGENT_FIRST_SESSION_SET_TO_VERSION
+    }
+  };
+  if (snapshot.state === null) return { schemaManifest, state: null };
+  const tasks = asObject(snapshot.state.tasks, "state tasks");
+  const nextTasks: Record<string, unknown> = {};
+  for (const [taskId, rawAggregate] of Object.entries(tasks)) {
+    const aggregate = asObject(rawAggregate, `Task aggregate ${taskId}`);
+    const rawSets = asObject(aggregate.roleSessionSets, `Task Role session sets ${taskId}`);
+    const nextSets: Record<string, unknown> = {};
+    for (const [roleName, rawSet] of Object.entries(rawSets)) {
+      const set = asObject(rawSet, `Task Role session set ${taskId}/${roleName}`);
+      let providerBinding: unknown = null;
+      if (set.providerBinding !== null) {
+        const binding = asObject(set.providerBinding, `Provider Binding ${taskId}/${roleName}`);
+        const { runId, ...conversation } = binding;
+        providerBinding = {
+          ...conversation,
+          schemaVersion: 3,
+          turn: binding.turn === null
+            ? null
+            : { ...asObject(binding.turn, `Provider Turn ${taskId}/${roleName}`), runId }
+        };
+      }
+      nextSets[roleName] = {
+        ...set,
+        schemaVersion: AGENT_FIRST_SESSION_SET_TO_VERSION,
+        providerBinding
+      };
+    }
+    nextTasks[taskId] = { ...aggregate, roleSessionSets: nextSets };
+  }
+  return { schemaManifest, state: { ...snapshot.state, tasks: nextTasks } };
 }
 
 function requireTaskRoleSessionSetV5Family(snapshot: HomeSnapshot): void {

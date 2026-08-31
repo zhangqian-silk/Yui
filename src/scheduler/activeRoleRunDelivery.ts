@@ -609,17 +609,9 @@ async function processActiveRunContinuation(
     };
   }
   // Managed input has one write path: a new structured Turn at a settled
-  // boundary. Corrections retain their priority while the current Turn runs.
+  // boundary. AgentHost owns Provider serialization; a busy send releases the
+  // claim and leaves the durable correction pending for the next pass.
   const mode = "followup" as const;
-  if (session.status === "running") {
-    return {
-      taskId: task.id,
-      roleName: role.name,
-      runId: run.id,
-      status: "skipped",
-      reason: "not-ready"
-    };
-  }
   if (writer === null) {
     return {
       taskId: task.id,

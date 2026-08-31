@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 
 import type { ExactControlPlaneDescriptor } from "../runtime/exactControlPlane.js";
 import {
+  exactControlPlaneCommandPrefix,
   exactControlPlaneDigest,
   serializeExactDescriptor
 } from "../runtime/exactControlPlane.js";
@@ -58,11 +59,15 @@ export type SessionCliRefreshResult = Readonly<{
   skipped: number;
 }>;
 
-const ORDINARY_SESSION_CLI = [
-  "#!/bin/sh",
-  "exec yui \"$@\"",
-  ""
-].join("\n");
+const ordinarySessionCli = ["#!/bin/sh", "exec yui \"$@\"", ""].join("\n");
+
+function renderSessionCli(controlPlane: ExactControlPlaneDescriptor): string {
+  return [
+    "#!/bin/sh",
+    `exec ${exactControlPlaneCommandPrefix(controlPlane)} \"$@\"`,
+    ""
+  ].join("\n");
+}
 
 /** Read back one immutable Session Manifest and verify its content digest. */
 export function readSessionBootstrapManifest(path: string): SessionBootstrapManifest {
@@ -146,10 +151,11 @@ export function materializeSessionBootstrap(input: Readonly<{
   const descriptorPath = resolve(join(home, "runtime", "control-plane", `${controlDigest}.json`));
   writeImmutableText(descriptorPath, `${serializeExactDescriptor(input.controlPlane)}\n`);
 
-  // Session identity is carried by the immutable Manifest and durable Role/
-  // Run fences. Resolve the ordinary CLI on every invocation so package or
-  // release upgrades do not invalidate a still-current native Session.
-  const sessionCliContent = ORDINARY_SESSION_CLI;
+  // Provider command runners may rebuild PATH independently of the managed
+  // process environment. Keep the Session entry point deterministic; the
+  // existing continuity preflight accepts compatible package replacement at
+  // this path without treating package version as Session identity.
+  const sessionCliContent = renderSessionCli(input.controlPlane);
   const sessionCliDigest = digest(sessionCliContent);
   const sessionCliPath = resolve(join(home, "runtime", "session-cli", `yui-${sessionCliDigest}.sh`));
   writeImmutableText(sessionCliPath, sessionCliContent);
@@ -199,11 +205,11 @@ export function materializeSessionBootstrap(input: Readonly<{
     roleProfileRef: { digest: profileDigest, path: roleProfilePath },
     contextProtocol: input.owner.scope === "global"
       ? {
-          loadCommand: "yui session context \"$YUI_ROLE\" --json"
+          loadCommand: "\"$YUI_SESSION_CLI\" session context \"$YUI_ROLE\" --json"
         }
       : {
-          loadCommand: "yui task run context \"$YUI_TASK_ID/<run-id>\" --json",
-          expandCommand: "yui task run context expand \"$YUI_TASK_ID/<run-id>\" <ref-id> --store <store> --mode full --json"
+          loadCommand: "\"$YUI_SESSION_CLI\" task run context \"$YUI_TASK_ID/<run-id>\" --json",
+          expandCommand: "\"$YUI_SESSION_CLI\" task run context expand \"$YUI_TASK_ID/<run-id>\" <ref-id> --store <store> --mode full --json"
         }
   };
   const manifest = Object.freeze({ ...body, digest: digest(body) });
@@ -224,14 +230,16 @@ export function materializeSessionBootstrap(input: Readonly<{
 }
 
 /**
- * Converts wrappers produced before the protocol-compatible Session CLI to an
- * ordinary `yui` invocation. Only a valid Session Manifest may nominate a
- * wrapper, and only the exact legacy two-line wrapper shape is changed. The
- * Manifest and its frozen descriptor stay immutable and continue to
- * authenticate the Session; repeated refreshes are no-ops.
+ * Retargets known managed wrappers to the current resolved control plane after
+ * a compatible update. Only a valid Session Manifest may nominate a wrapper,
+ * and only Yui's ordinary or exact two-line wrapper shapes are changed.
  */
-export function refreshManagedSessionCliWrappers(homeInput: string): SessionCliRefreshResult {
+export function refreshManagedSessionCliWrappers(
+  homeInput: string,
+  controlPlane: ExactControlPlaneDescriptor
+): SessionCliRefreshResult {
   const home = resolve(homeInput);
+  const currentSessionCli = renderSessionCli(controlPlane);
   const manifestDirectory = resolve(join(home, "runtime", "session-manifests"));
   const sessionCliDirectory = resolve(join(home, "runtime", "session-cli"));
   if (!existsSync(manifestDirectory)) {
@@ -269,22 +277,22 @@ export function refreshManagedSessionCliWrappers(homeInput: string): SessionCliR
       continue;
     }
     const content = readFileSync(wrapperPath, "utf8");
-    if (content === ORDINARY_SESSION_CLI) {
+    if (content === currentSessionCli) {
       current += 1;
       continue;
     }
-    if (!isLegacyExactSessionCli(content)) {
+    if (content !== ordinarySessionCli && !isExactSessionCli(content)) {
       skipped += 1;
       continue;
     }
-    writeTextFileAtomically(wrapperPath, ORDINARY_SESSION_CLI);
+    writeTextFileAtomically(wrapperPath, currentSessionCli);
     chmodSync(wrapperPath, 0o700);
     refreshed += 1;
   }
   return Object.freeze({ refreshed, current, skipped });
 }
 
-function isLegacyExactSessionCli(content: string): boolean {
+function isExactSessionCli(content: string): boolean {
   return /^#!\/bin\/sh\nexec [^\n]+ '--yui-control' '[a-f0-9]{64}' "\$@"\n$/u.test(content);
 }
 
