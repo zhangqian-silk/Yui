@@ -33,8 +33,9 @@ decomposition, execution choice, review, integration, and completion.
 
 `Task` is the bounded user outcome. Its optional `type` describes intent, not
 execution topology; software Projects normally use `feature` or `bugfix`, while
-other Projects may define their own types. Yui does not store a direct versus
-integrated delivery mode.
+other Projects may define their own types. Yui does not store a Task-level
+direct versus integrated delivery mode. The `direct` and `replicated` labels
+below describe only the execution shape of one WorkItem.
 
 A software bugfix is Leader-owned: the Leader implements and verifies it in the
 managed Task main without manufacturing a WorkItem. If the scope proves to need
@@ -60,11 +61,29 @@ implementation steps, test runs, review findings, and local fixes remain Turn,
 Event, report, or commit evidence under the existing Task or WorkItem; they are
 not new WorkItems.
 
-Each WorkItem may use a native subagent inside the Leader conversation or a
-Task Role Turn backed by a durable Worker Session. There is no Yui
-subagent launcher or child-session record. Turn is an execution attempt,
-not a requirement, and repeated Turns may continue the same compatible Role
-Session.
+Native subagents may help an Agent investigate or critique inside its current
+conversation, but they are not a second Yui WorkItem execution model and do
+not create child-session records. A Yui-managed WorkItem dispatch has one
+logical main executor: the current Session for `WorkItem.assignee`. A Turn is
+an execution attempt, not a requirement, and repeated Turns may continue the
+same compatible Role Session.
+
+Without `--lane-role`, dispatch is `direct`: Yui creates only the main Turn and
+does not persist an ExecutionGroup or Lane. With at least two distinct
+non-assignee roles, dispatch is `replicated`: one ExecutionGroup freezes a
+canonical Assignment and every Lane independently executes that exact same
+Assignment. One Lane role is invalid, and Lane roles cannot introduce their
+own objective, directive, acceptance criteria, context, or write scope.
+
+A Lane is a recoverable logical slot whose durable disposition is `open`,
+`succeeded`, or `failed`. Failed Turns leave the Lane open for an exact
+`task turn retry`; `task turn settle` records the Leader's decision to stop
+recovering that Lane. Yui waits until every Lane is settled. At least two
+successful Lanes make synthesis eligible and create or wake one idempotent
+main Turn with every successful Producer result in stable Lane order. Fewer
+than two successes fail that Group attempt without degrading to a single
+result. Retrying the main Turn keeps the same Group and does not rerun a
+successful Lane.
 
 ## Profiles, Roles, and Agents
 
@@ -83,8 +102,11 @@ Session.
   context, and source desired revision. A native Role Session stores the same snapshot; running processes
   are never hot-mutated by later Role edits.
 - A `WorkItemCandidate` is the explicit result currently awaiting Leader
-  acceptance. It snapshots the WorkItem revision, summary, and either a
-  completed execution Turn or a Leader-managed direct source.
+  acceptance. A dispatched WorkItem Candidate can reference only a successful
+  main Turn; the complete replicated provenance is derived through Main Turn
+  -> ExecutionGroup -> Lane -> successful Producer Turn. A roleless delivery
+  unit managed directly by the Leader may instead use the existing direct
+  source. Lanes never become Candidates or enter Review or Integration.
 - `ReviewRound` records one semantic judgment. A WorkItem Review references
   that WorkItem's immutable Candidate. A Task-final Review references the
   frozen Task heads directly and has no synthetic WorkItem/Candidate anchor.
@@ -97,26 +119,27 @@ For a native subagent, the Leader must choose and read an explicit
 WorkerProfile, using `worker` when no specialist fits. The Leader includes the
 Profile instructions, Skills, behavior intent, workspace boundary, validation expectations, and
 supported model/effort hints in the child brief. Task Role Agent bindings are
-ignored because the child inherits the Leader Agent. The reviewed WorkItem
-summary records the actual Profile revision, inherited or confirmed model and
-effort, round, result, and checks.
+ignored because the child inherits the Leader Agent. Its output remains
+session-local collaboration evidence: it does not create a Yui Lane, Candidate,
+ReviewRound, or Integration source. When that evidence affects delivery, the
+main executor incorporates it into the WorkItem's authoritative result.
 
 ## Lifecycle and acceptance
 
-Native-subagent WorkItem execution follows:
+WorkItem delivery has one Leader-owned acceptance path regardless of execution
+shape:
 
 ```text
-todo -> running -> done | failed
-                -> awaiting Leader decision  (when review is configured)
-```
-
-Task Role work follows:
-
-```text
-todo -> running -> awaiting Leader review
-                      | accept -> done
+todo -> running -> awaiting_acceptance
+                      | accept -> completed
                       | reject -> failed -> redispatch -> running
 ```
+
+For `direct`, the assignee's successful main Turn supplies the result. For
+`replicated`, Lane Turns supply immutable Producer results and only the
+successful synthesis main Turn supplies the Candidate. Roleless WorkItems are
+advanced directly by the Leader but enter the same Candidate, ChangeSet,
+Integration, and acceptance boundary.
 
 The Provider's native Turn terminal ends its associated Turn and stores the
 final response as immutable Turn evidence. It never accepts the WorkItem. The
@@ -127,8 +150,9 @@ WorkItem keeps its workspace so the next Turn can repair the same result.
 An optional global review rule names one existing Global Role and chooses
 `always`, `leader`, or `final`. Candidate rules remain live defaults; each
 WorkItem Candidate snapshots the effective review rule when submitted.
-Every result is stored first on its exact Turn/Lane. A Candidate is created only
-when the Leader resolves the execution output for acceptance.
+Every managed execution result is stored first on its exact Turn. A Candidate
+is created only from the main result when the Leader resolves the execution
+output for acceptance.
 `always` dispatches a review Turn for every candidate, whether it comes
 from a completed execution Turn or a Leader-managed direct result; `leader`
 leaves every candidate for the Leader to accept directly or review explicitly.
