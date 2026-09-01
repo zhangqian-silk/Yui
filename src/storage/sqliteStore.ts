@@ -2522,6 +2522,21 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
+  updateMessage(taskId: string, message: TaskMessage): void {
+    if (message.taskId !== taskId) {
+      throw new StorageRecordError(`Message belongs to another Task: ${message.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const result = this.#db.prepare(
+        `UPDATE messages SET payload = ? WHERE task_id = ? AND message_id = ?`
+      ).run(this.#json(message), taskId, message.id);
+      if (result.changes !== 1) {
+        throw new StorageRecordError(`Message does not exist: ${taskId}/${message.id}`);
+      }
+    });
+  }
+
   listMessages(taskId: string): TaskMessage[] {
     return this.#sortById(
       this.#listPayload<TaskMessage>("messages", "task_id = ?", [taskId]),
