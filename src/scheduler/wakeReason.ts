@@ -8,27 +8,23 @@
  * queue — the wake layer owns the meaning of its tags.
  *
  * Tag wire format: `<kind>` or `<kind>:<ref>`. The ref is an exact record
- * identifier (InputRequest id, AgentRun id, ...) or, for `force-wake`, the
+ * identifier (InputRequest id, Turn id, ...) or, for `force-wake`, the
  * operator-supplied text. Unknown kinds parse losslessly so a newer producer
  * can never wedge an older reader.
  */
 
 export const WAKE_REASON_KINDS = Object.freeze([
   "role-result",
-  "task-orphaned",
   "input-timeout",
-  "role-run-stalled",
+  "role-turn-stalled",
   "agent-error",
   "agent-session-recovery",
   "review-failed",
   "task-reopened",
-  "agent-error",
-  "agent-session-recovery",
-  "leader-run-failed",
-  "role-run-failed",
+  "leader-turn-failed",
+  "role-turn-failed",
   "job-finished",
   "published-tree-authorized",
-  "review-contract-rebound",
   "force-wake"
 ] as const);
 
@@ -44,8 +40,8 @@ export type WakeReason = Readonly<{
 
 const IMMEDIATE_KINDS: ReadonlySet<string> = new Set([
   "task-reopened",
-  "leader-run-failed",
-  "role-run-failed"
+  "leader-turn-failed",
+  "role-turn-failed"
 ]);
 
 export function wakeReason(kind: WakeReasonKind, ref?: string): string {

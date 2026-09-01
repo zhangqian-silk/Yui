@@ -6,7 +6,7 @@ import {
 } from "../domain/validation.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 
-export const CAPABILITY_GRANT_SCHEMA_VERSION = 1 as const;
+export const CAPABILITY_GRANT_SCHEMA_VERSION = 2 as const;
 
 export type CapabilityGrantIrreversibilityCeiling = "none" | "reversible" | "irreversible";
 export type CapabilityGrantIrreversibility = CapabilityGrantIrreversibilityCeiling;
@@ -57,10 +57,8 @@ export type CapabilityGrant = Readonly<{
    * Durable attempt identities for which a use was recorded. Each release
    * workflow submission appends one key (`<workflow>/<step>#<attempt>`) so a
    * resume can recognize an already-committed use instead of charging again.
-   * A grant that predates reservations has no field; its `usesUsed` is the
-   * only signal. Only present when a use was recorded with a key.
    */
-  useReservations?: readonly string[];
+  useReservations: readonly string[];
   irreversibilityCeiling: CapabilityGrantIrreversibilityCeiling;
   revokedAt?: string;
   revokedBy?: string;
@@ -104,6 +102,7 @@ export function createCapabilityGrant(
     ...(input.expiresAt === undefined ? {} : { expiresAt: requireTimestamp(input.expiresAt, "Capability grant expiresAt") }),
     ...(input.maxUses === undefined ? {} : { maxUses: requirePositiveInteger(input.maxUses, "Capability grant maxUses") }),
     usesUsed: 0,
+    useReservations: Object.freeze([]),
     irreversibilityCeiling: normalizeCeiling(input.irreversibilityCeiling),
     createdAt: timestamp,
     updatedAt: timestamp
@@ -153,22 +152,20 @@ export function checkGrant(
   return { allowed: true };
 }
 
-/** The reservation keys recorded on a grant, or an empty list for legacy grants. */
+/** The reservation keys recorded on a grant. */
 export function grantUseReservations(grant: CapabilityGrant): readonly string[] {
-  return grant.useReservations ?? [];
+  return grant.useReservations;
 }
 
 /**
  * Record one use against the grant, failing closed once the limit is reached.
- * When `reservationKey` is supplied it is appended to the grant's durable
- * reservations so a later resume can recognize this exact attempt and avoid a
- * double charge. A use recorded without a key (legacy callers) leaves the
- * reservation list untouched.
+ * The reservation key is appended to the grant's durable reservations so a
+ * later resume recognizes this exact attempt and avoids a double charge.
  */
 export function recordGrantUse(
   grant: CapabilityGrant,
   now: Date,
-  reservationKey?: string
+  reservationKey: string
 ): CapabilityGrant {
   validateCapabilityGrant(grant);
   if (grant.maxUses !== undefined && grant.usesUsed >= grant.maxUses) {
@@ -177,9 +174,7 @@ export function recordGrantUse(
   return validateCapabilityGrant({
     ...grant,
     usesUsed: grant.usesUsed + 1,
-    ...(reservationKey === undefined
-      ? {}
-      : { useReservations: Object.freeze([...grantUseReservations(grant), reservationKey]) }),
+    useReservations: Object.freeze([...grantUseReservations(grant), reservationKey]),
     updatedAt: now.toISOString()
   });
 }
@@ -207,7 +202,7 @@ export function revokeGrant(
 
 export function validateCapabilityGrant(grant: CapabilityGrant): CapabilityGrant {
   if (grant.schemaVersion !== CAPABILITY_GRANT_SCHEMA_VERSION) {
-    throw new Error("Capability grant must use schemaVersion 1.");
+    throw new Error("Capability grant must use schemaVersion 2.");
   }
   validateTaskRecordReference({ taskId: grant.taskId, localId: grant.id }, "capabilityGrant");
   requireIdentity(grant.taskId, "Task id");
@@ -227,21 +222,19 @@ export function validateCapabilityGrant(grant: CapabilityGrant): CapabilityGrant
   if (grant.maxUses !== undefined && grant.usesUsed > grant.maxUses) {
     throw new Error("Capability grant usesUsed cannot exceed maxUses.");
   }
-  if (grant.useReservations !== undefined) {
-    if (!Array.isArray(grant.useReservations)) {
-      throw new Error("Capability grant useReservations must be an array.");
+  if (!Array.isArray(grant.useReservations)) {
+    throw new Error("Capability grant useReservations must be an array.");
+  }
+  for (const key of grant.useReservations) {
+    if (typeof key !== "string" || key.length === 0) {
+      throw new Error("Capability grant useReservations must be non-empty strings.");
     }
-    for (const key of grant.useReservations) {
-      if (typeof key !== "string" || key.length === 0) {
-        throw new Error("Capability grant useReservations must be non-empty strings.");
-      }
-    }
-    if (new Set(grant.useReservations).size !== grant.useReservations.length) {
-      throw new Error("Capability grant useReservations must be unique.");
-    }
-    if (grant.useReservations.length > grant.usesUsed) {
-      throw new Error("Capability grant useReservations cannot outnumber usesUsed.");
-    }
+  }
+  if (new Set(grant.useReservations).size !== grant.useReservations.length) {
+    throw new Error("Capability grant useReservations must be unique.");
+  }
+  if (grant.useReservations.length > grant.usesUsed) {
+    throw new Error("Capability grant useReservations cannot outnumber usesUsed.");
   }
   normalizeCeiling(grant.irreversibilityCeiling);
   if ((grant.revokedAt === undefined) !== (grant.revokedBy === undefined)) {

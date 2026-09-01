@@ -8,13 +8,9 @@ export type { UpdateSpawner } from "./updatePorts.js";
  * Run `yui update` as a side-by-side, recoverable orchestration.
  *
  * The new package is staged beside the live install and used to run a read-only
- * preflight against the target Home. Current/compatible-old storage promotes the
- * binary through the exact Controller handoff without a Home switch; only a
- * migration-required verdict enters the offline backup/switch path. On failure
- * it reports the precise phase and recovery boundary. See
- * {@link runUpdate} for the exact, narrowed rollback boundary (this release does
- * not introduce a versioned binary pointer, so it does not claim binary+Home
- * dual-resource atomicity).
+ * preflight against the target Home. Only the exact current storage contract is
+ * accepted; the exact Controller handoff then promotes and verifies the binary
+ * without changing the Home. Older Homes remain untouched.
  *
  * Returns a process exit code: 0 on success or already-current, 5 on abort.
  */
@@ -28,10 +24,7 @@ export function runUpdateCommand(
   const resolvedPorts = ports ?? createUpdatePorts(environment, spawn);
   const result = runUpdate(resolvedPorts, { home });
   write(`${renderUpdateResult(result)}\n`);
-  // Both an abort and an ambiguous result are non-success exits; ambiguous is
-  // distinct (manual verification required), so it gets its own exit code.
   if (result.outcome === "aborted") return 5;
-  if (result.outcome === "ambiguous") return 6;
   return 0;
 }
 
@@ -42,28 +35,15 @@ export function renderUpdateResult(result: UpdateResult): string {
       case "already-current":
         return "Yui is already up to date; nothing to install.";
       case "updated":
-        return result.storageBackupPath === undefined
-          ? result.path === "compatible-fast"
-            ? `Updated Yui to ${result.version} via the compatible fast path; the Home was not migrated.`
-            : result.path === "in-place-migration"
-              ? `Updated Yui to ${result.version}; SQLite was migrated in place without rebuilding the database.`
-            : `Updated Yui to ${result.version}; storage was already current.`
-          : `Updated Yui to ${result.version}. Storage was migrated; original Home backed up at `
-            + `${result.storageBackupPath}.`;
+        return `Updated Yui to ${result.version}; the current Home was not modified.`;
       case "aborted":
         return [
           `Update aborted during ${result.phase}: ${result.message}`,
           result.recoverable
             ? "The current install and Home remain usable."
-            : result.phase === "activate-binary" && result.storageBackupPath === undefined
-              ? "The Home was not migrated, but binary health is unknown; do not assume the current install is usable."
+            : result.phase === "activate-binary"
+              ? "The Home was unchanged, but binary health is unknown; do not assume the current install is usable."
               : "Manual recovery is required (see below).",
-          `Action: ${result.action}`
-        ].join("\n");
-      case "ambiguous":
-        return [
-          `Update result is UNKNOWN after ${result.phase}: ${result.message}`,
-          "Manual verification is required — do NOT assume the update succeeded or was a no-op.",
           `Action: ${result.action}`
         ].join("\n");
     }

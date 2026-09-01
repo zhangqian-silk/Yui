@@ -21,10 +21,10 @@ and observed input peaks. Provider compression and marginal-value observations
 remain explicitly unavailable until the runtime records those facts, so the UI
 never fabricates them.
 
-## Agent runtime status
+## AgentRuntime status
 
 `yui task role status <task> <role>` projects the provider-independent Agent
-Driver observations documented in [Agent Runtime Drivers](../agent-runtime-drivers.md).
+Driver observations documented in [AgentRuntime Drivers](../agentRuntime-drivers.md).
 It reports the Driver, current Session/Turn/operation state, recent activity,
 waiting reason, and normalized usage. Host presence remains a separate tmux
 field: a live pane is not proof that the Agent is actively working.
@@ -59,20 +59,17 @@ When enabled, `yui controller status` adds a read-only identity section:
 | `storage.manifestStatus` | `schema.json` | `current`/`uninitialized`/`invalid`/`unsupported` |
 | `storage.logicalLayout` | `schema.json.storageVersion` | |
 | `storage.aggregateSchemaVersion` | `schema.json.aggregateSchemaVersion` | |
-| `storage.configuredBackend` | Home-aware resolver (manifest + `YUI_STORE_BACKEND`) | `file` or `sqlite` |
-| `storage.workerEnabled` | Home-aware worker resolver (manifest + `YUI_STORE_WORKER`) | |
-| `storage.physicalStateJson` | `state.json` existence/size | |
+| `storage.configuredBackend` | Current product contract | Always `sqlite` |
+| `storage.workerEnabled` | `YUI_STORE_WORKER` override over the current SQLite default | |
+| `storage.physicalStateJson` | Old `state.json` existence/size | Evidence only; never authoritative |
 | `storage.physicalDatabase` | `yui.db` existence/size/WAL/SHM + `PRAGMA quick_check` | health: `ok`/`corrupt`/`unopenable`/`unsupported` |
-| `storage.hasMigrationReceipt` | `migration-receipt.json` | certifies the file→db switch |
-| `storage.findings[]` | manifest vs physical evidence | contradictions + needs-repair + warnings |
+| `storage.findings[]` | Exact-contract and physical evidence | contradictions + warnings |
 | `storage.healthy` | derived | `true` only when health status is `ok` |
 | `runtime.uptimeMs` | Controller process | |
 | `runtime.rssBytes` | `process.resourceUsage` | |
 | `runtime.droppedInboxEvents` | runtime/inbox-invalid | Count of dropped inbox events |
 
-Backend and worker selection use the same Home-aware resolvers as startup
-(`resolveTaskStoreBackendForHome` / `resolveStoreWorkerEnabledForHome`), so
-status reports exactly what ordinary startup would open.
+Startup and status both select the current SQLite Store.
 
 ### Storage health classification
 
@@ -81,35 +78,27 @@ Findings have three severities, rolled up into a health status:
 | Status | Meaning | Exit code |
 | --- | --- | --- |
 | `ok` | no findings | 0 |
-| `degraded` | needs-repair findings only | 0 |
 | `fail` | one or more contradictions | 5 |
 
 #### Contradictions (fail-closed)
 
 | Code | Meaning |
 | --- | --- |
-| `no-authoritative-backend` | Layout 7 with neither `yui.db` nor a readable `state.json` — no authoritative data source |
+| `current-database-missing` | The current manifest exists but `yui.db` is missing |
 | `database-unhealthy` | `yui.db` exists but `PRAGMA quick_check` fails (corrupt or unopenable) |
-| `dual-copy-conflict` | Both `state.json` and `yui.db` exist without a `migration-receipt.json` — ambiguous authority |
-| `backend-sqlite-without-database` | `YUI_STORE_BACKEND=sqlite` forced but no `yui.db` |
-| `file-store-missing-state` | File backend (layout < 7) selected but `state.json` missing |
-
-#### Needs-repair (degraded)
-
-| Code | Meaning | Remediation |
-| --- | --- | --- |
-| `pseudo-layout-7` | Layout 7 without `yui.db` but with a readable `state.json` — the legacy file store is the rebuild source | Run `yui upgrade` to rebuild `yui.db` |
+| `unsupported-storage-contract` | The manifest does not exactly match this release |
+| `invalid-storage-manifest` | `schema.json` is invalid |
 
 #### Warnings
 
 | Code | Meaning |
 | --- | --- |
-| `database-present-but-file-backend` | `yui.db` exists but backend is `file` |
-| `worker-flag-without-sqlite` | `YUI_STORE_WORKER` set but backend is not `sqlite` |
+| `ignored-historical-store` | `state.json` is present but ignored by the current Store |
+| `invalid-worker-flag` | `YUI_STORE_WORKER` is not a recognized boolean |
 
-Only `fail` (contradictions) exits 5; `degraded` Homes stay operational and
-exit 0 while pointing at the exact repair command. Every finding prints with a
-precise remediation action.
+Only `fail` (contradictions) exits 5. Every finding prints with a precise action;
+unsupported Homes are preserved and must be inspected with their original Yui
+version or replaced by a new Home.
 
 ## Fault classification taxonomy
 
@@ -120,9 +109,8 @@ Stable taxonomy for execution failures (`src/observability/faultClassification.t
 | `provider-transient` | text-historical | StopFailure 500/504, connection lost, rate limit |
 | `policy-denied` | text-historical | policy, permission denied, 403 |
 | `session-dead` | text-historical | tmux session exited, pane dead |
-| `delivery-yield-uncertain` | text-historical | yield/delivery uncertain |
+| `delivery-uncertain` | text-historical | delivery uncertain |
 | `storage-backend-lock` | text-historical | SQLITE_BUSY, lock timeout |
-| `scheduler-duplicate-suppressed-wake` | structured | orphan wake reasons |
 | `review-infra` | structured | ReviewRound failed to execute |
 | `review-semantic-negative` | structured | ReviewRound completed with failed checks |
 | `integration-environment` | text-historical | tsc: not found, ENOENT |
@@ -146,14 +134,14 @@ yui execution audit [--task <task-id>] [--since <iso>] [--until <iso>] [--json]
 Sections:
 
 - **tasks** — total/archived/active counts.
-- **runs** — total/active/yielded/failed, failure rate, cumulative duration,
+- **runs** — total/active/completed/failed, failure rate, cumulative duration,
   by-role and by-purpose distribution, fault class counts, and structured
   launch-failure phase/kind counts parsed from launch diagnostics.
-- **wakes** — leader runs with wake reasons, orphan wakes, orphan yield-only.
+- **wakes** — Leader Turns and their durable wake reasons.
   `suppressedWakes` counts durable `wake.suppressed` task events: Leader wakes
   coalesced by scheduler single-flight because the Role runtime lifecycle lane
   was busy (Issue 05). The wake stays durable and is retried after the lane
-  settles, so a suppression is scheduler backpressure, never a failed Run.
+  settles, so a suppression is scheduler backpressure, never a failed Turn.
 - **sessions** — generations, broken/stopped, resets, lifecycle events, stop
   failures.
 - **reviews** — total/completed/failed, non-semantic infrastructure vs
@@ -163,20 +151,20 @@ Sections:
   PR/MR references.
 - **events** — total, progress vs semantic, obsolete, message count.
 - **workItems** — total/completed/retired.
-- **orchestration** — per-Task intent type, Run/WorkItem counts, full/delta/
-  non-semantic Reviews, finding yield, Integration attempts/failures/repeated
+- **orchestration** — per-Task intent type, Turn/WorkItem counts, full/delta/
+  non-semantic Reviews, finding results, Integration attempts/failures/repeated
   identities/evidence reuse, generations before first durable progress,
   publication-to-completion latency, terminal workspaces, and non-blocking
   cost advisories. `--since`/`--until` filters every underlying record family.
 - **storage** — state.json/runtime/deployments byte sizes.
-- **topLongRunning** — longest-running active/yielded runs with exact refs.
+- **topLongRunning** — longest-running active/completed Turns with exact refs.
 
 Each section degrades independently: a read failure produces an `error` section
 with the error location, without blocking completed sections.
 
 `yui task next-action <task>` shows the same Task-scoped orchestration
 advisories alongside its protocol recommendation. It also shows the canonical
-active AgentRun projection with each Run's purpose and WorkItem/ReviewRound
+active Turn projection with each Turn's purpose and WorkItem/ReviewRound
 binding, so Review activity is never presented as delegated implementation.
 Advisories are derived from existing records and never write state or block a
 legal action. Current

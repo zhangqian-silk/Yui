@@ -3,11 +3,11 @@
  *
  * Classification comes from structured outcomes wherever the current build
  * exposes them. Free-text regex matching exists ONLY for importing historical
- * records (AgentRun summaries written before this taxonomy existed) and is
+ * records (Turn summaries written before this taxonomy existed) and is
  * never the basis of a new state machine: every text-derived result carries
  * `basis: "text-historical"` so consumers can tell the two apart.
  */
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import {
@@ -19,9 +19,8 @@ export const FAULT_CLASSES = [
   "provider-transient",
   "policy-denied",
   "session-dead",
-  "delivery-yield-uncertain",
+  "delivery-uncertain",
   "storage-backend-lock",
-  "scheduler-duplicate-suppressed-wake",
   "review-infra",
   "review-semantic-negative",
   "integration-environment",
@@ -61,7 +60,7 @@ const SESSION_DEAD_PATTERN =
 const STORAGE_LOCK_PATTERN =
   /storage lock|database is locked|SQLITE_BUSY|lock timeout|COMMAND_TIMED_OUT|storage conflict|timed out waiting/iu;
 const DELIVERY_UNCERTAIN_PATTERN =
-  /delivery[^\n]*(uncertain|unknown)|yield[^\n]*(uncertain|unknown)|uncertain[^\n]*(yield|delivery)|push[^\n]*uncertain/iu;
+  /delivery[^\n]*(uncertain|unknown)|uncertain[^\n]*delivery|push[^\n]*uncertain/iu;
 const STALE_BASE_PATTERN =
   /stale (role|agent|base|target|state)|expected head|base[^\n]*(changed|moved)|conflict|CAS/iu;
 
@@ -74,12 +73,12 @@ function excerpt(text: string, max = 160): string {
 }
 
 /**
- * Classify a failed AgentRun. A structured hint (from a future capability
+ * Classify a failed Turn. A structured hint (from a future capability
  * provider) always wins; otherwise the summary is matched as historical
- * import text. Active/yielded runs return {@link NO_FAULT}.
+ * import text. Non-failed Turns return {@link NO_FAULT}.
  */
-export function classifyAgentRunFailure(
-  run: Pick<AgentRun, "status" | "summary">,
+export function classifyTurnFailure(
+  run: Pick<Turn, "status" | "result">,
   structured?: StructuredFaultHint
 ): FaultClassification {
   if (run.status !== "failed") return NO_FAULT;
@@ -90,7 +89,7 @@ export function classifyAgentRunFailure(
       evidence: structured.evidence
     };
   }
-  const summary = run.summary ?? "";
+  const summary = run.result?.output ?? "";
   if (summary.length === 0) {
     return { faultClass: "other", basis: "text-historical", evidence: "" };
   }
@@ -105,7 +104,7 @@ export function classifyAgentRunFailure(
     return { faultClass: "storage-backend-lock", basis: "text-historical", evidence: text };
   }
   if (DELIVERY_UNCERTAIN_PATTERN.test(summary)) {
-    return { faultClass: "delivery-yield-uncertain", basis: "text-historical", evidence: text };
+    return { faultClass: "delivery-uncertain", basis: "text-historical", evidence: text };
   }
   if (STALE_BASE_PATTERN.test(summary)) {
     return { faultClass: "stale-base-target-cas", basis: "text-historical", evidence: text };
@@ -184,23 +183,6 @@ export function classifyIntegrationAttempt(
     basis: "structured",
     evidence: "failed without checks or conflict"
   };
-}
-
-/**
- * Wake reason classification. An orphan wake (the scheduler re-woke a Leader
- * with no new fact) is the duplicate/suppressed-wake class. Quiescence
- * suppression counters are owned by the scheduler Issue; when absent the
- * audit reports `unsupported` instead of guessing.
- */
-export function classifyWakeReasons(reasons: readonly string[]): FaultClassification {
-  if (reasons.some((reason) => reason === "task-orphaned")) {
-    return {
-      faultClass: "scheduler-duplicate-suppressed-wake",
-      basis: "structured",
-      evidence: reasons.join(",")
-    };
-  }
-  return NO_FAULT;
 }
 
 export type FaultClassCounts = Readonly<Record<FaultClass, number>>;

@@ -2,7 +2,7 @@
  * Standalone durable-job runner.
  *
  * Receives exactly one argument: the absolute path to a `spec.json` written
- * atomically by the Controller. The runner MUST NOT open state.json or any
+ * atomically by the Controller. The runner MUST NOT open yui.db or any
  * other control-plane file; its entire contract is the spec + the artifact
  * directory. The Controller supervises the runner through the artifact files
  * (heartbeat, checkpoint.json, exit.json) and the process identity.

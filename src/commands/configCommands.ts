@@ -15,7 +15,6 @@ import {
   reconciliationIntervalMilliseconds,
   resolveAgentLaunchInactivityTimeoutSeconds,
   resolveControllerTaskConcurrency,
-  resolveContextBudget,
   resolveDeliveryTimeoutSeconds,
   resolveLeaderNextActionMode,
   resolveLeaderSemanticBudgetTurns,
@@ -24,11 +23,10 @@ import {
   resolveResourcesQuarantineTtlHours,
   resolveRuntimeHealth,
   resolveTelemetryEnabled,
-  resolveTelemetryRunCap,
+  resolveTelemetryTurnCap,
   resolveTelemetryTerminalKeep,
   resolveTmuxBin,
   resolveTmuxHistoryLimit,
-  type ContextBudgetConfig,
   type LeaderNextActionMode
 } from "../config/yuiConfig.js";
 import {
@@ -86,7 +84,6 @@ const RECONCILIATION_SET_USAGE = "Runtime config set usage: yui config runtime s
 const RESOURCES_GC_MODE_SET_USAGE = "Resources config set usage: yui config resources set resources-gc-mode <report|quarantine>.";
 const RESOURCES_GC_AUTO_QUARANTINE_SET_USAGE = "Resources config set usage: yui config resources set resources-gc-auto-quarantine <true|false>.";
 const LEADER_NEXT_ACTION_SET_USAGE = `Workflow config set usage: yui config workflow set leader-next-action <${LEADER_NEXT_ACTION_MODES.join("|")}>.`;
-const CONTEXT_BUDGET_SET_USAGE = "Workflow config set usage: yui config workflow set context-budget [--soft-tokens <n>] [--hard-tokens <n>].";
 const REVIEW_SET_USAGE = "Workflow config set usage: yui config workflow set review --role <global-role> --trigger <always|leader|final> "
   + "[--finding-ledger <shadow|enforce>].";
 
@@ -145,7 +142,6 @@ export function effectiveConfigData(
   config: YuiConfig,
   domain: ConfigDomain
 ): Record<string, unknown> {
-  const budget = resolveContextBudget(config.contextBudget);
   const health = resolveRuntimeHealth(config.runtimeHealth);
   const all: Record<keyof YuiConfig, unknown> = {
     schemaVersion: config.schemaVersion,
@@ -157,7 +153,6 @@ export function effectiveConfigData(
     reconciliationIntervalSeconds: config.reconciliationIntervalSeconds
       ?? DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     leaderNextActionMode: resolveLeaderNextActionMode(config.leaderNextActionMode),
-    contextBudget: { softTokens: budget.softTokens, hardTokens: budget.hardTokens },
     resourcesGcMode: resolveResourcesGcMode(config.resourcesGcMode),
     resourcesGcAutoQuarantine: resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine),
     resourcesQuarantineTtlHours: resolveResourcesQuarantineTtlHours(config.resourcesQuarantineTtlHours),
@@ -176,7 +171,7 @@ export function effectiveConfigData(
     tmuxHistoryLimit: resolveTmuxHistoryLimit(config.tmuxHistoryLimit),
     telemetryEnabled: resolveTelemetryEnabled(config.telemetryEnabled),
     telemetryTerminalKeep: resolveTelemetryTerminalKeep(config.telemetryTerminalKeep),
-    telemetryRunCap: resolveTelemetryRunCap(config.telemetryRunCap),
+    telemetryTurnCap: resolveTelemetryTurnCap(config.telemetryTurnCap),
     review: config.review === undefined
       ? null
       : {
@@ -254,13 +249,6 @@ function validatedConfigValue<T>(validate: () => T, usage: string): T {
     }
     throw error;
   }
-}
-
-function parseBudgetToken(value: string, label: string): number {
-  if (!/^\d+$/.test(value)) {
-    throw usageError(`${label} must be a positive integer.`);
-  }
-  return Number(value);
 }
 
 function parseReconciliationIntervalSeconds(value: string): number {
@@ -405,47 +393,6 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         return rest;
       });
       return `Leader semantic budget reset to ${DEFAULT_LEADER_SEMANTIC_BUDGET_TURNS} turns\n`;
-    }
-  },
-  {
-    key: "context-budget",
-    showLabel: "Legacy context budget (inactive)",
-    showValue: (config) => {
-      const budget = resolveContextBudget(config.contextBudget);
-      return `inactive; legacy soft ${budget.softTokens} / hard ${budget.hardTokens} tokens`;
-    },
-    set(args, store) {
-      if (args.length !== 2 && args.length !== 4) throw usageError(CONTEXT_BUDGET_SET_USAGE);
-      const options = new Map<string, string>();
-      for (let index = 0; index < args.length; index += 2) {
-        const name = args[index];
-        const value = args[index + 1];
-        if (!["--soft-tokens", "--hard-tokens"].includes(name)
-          || value === undefined
-          || options.has(name)) {
-          throw usageError(CONTEXT_BUDGET_SET_USAGE);
-        }
-        options.set(name, value);
-      }
-      const current = resolveContextBudget(store.getConfig().contextBudget);
-      const next: ContextBudgetConfig = {
-        ...(options.get("--soft-tokens") === undefined
-          ? {}
-          : { softTokens: parseBudgetToken(options.get("--soft-tokens")!, "--soft-tokens") }),
-        ...(options.get("--hard-tokens") === undefined
-          ? {}
-          : { hardTokens: parseBudgetToken(options.get("--hard-tokens")!, "--hard-tokens") })
-      };
-      const resolved = resolveContextBudget({ ...current, ...next });
-      saveConfigKey(store, (config) => ({ ...config, contextBudget: resolved }));
-      return `Legacy context budget stored as soft ${resolved.softTokens} / hard ${resolved.hardTokens} tokens (inactive)\n`;
-    },
-    clear(store) {
-      saveConfigKey(store, (config) => {
-        const { contextBudget: _removed, ...rest } = config;
-        return rest;
-      });
-      return "Legacy context budget cleared; Session Token metrics remain read-only\n";
     }
   },
   {
@@ -705,24 +652,24 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
     }
   },
   {
-    key: "telemetry-run-cap",
-    showLabel: "Telemetry run cap",
-    showValue: (config) => String(resolveTelemetryRunCap(config.telemetryRunCap)),
+    key: "telemetry-turn-cap",
+    showLabel: "Telemetry Turn cap",
+    showValue: (config) => String(resolveTelemetryTurnCap(config.telemetryTurnCap)),
     set(args, store) {
-      if (args.length !== 1) throw usageError("Tools config set usage: yui config tools set telemetry-run-cap <n>.");
-      const telemetryRunCap = validatedConfigValue(
-        () => resolveTelemetryRunCap(Number(args[0])),
-        "Tools config set usage: yui config tools set telemetry-run-cap <n>."
+      if (args.length !== 1) throw usageError("Tools config set usage: yui config tools set telemetry-turn-cap <n>.");
+      const telemetryTurnCap = validatedConfigValue(
+        () => resolveTelemetryTurnCap(Number(args[0])),
+        "Tools config set usage: yui config tools set telemetry-turn-cap <n>."
       );
-      saveConfigKey(store, (config) => ({ ...config, telemetryRunCap }));
-      return `Telemetry run cap set to ${telemetryRunCap}\n`;
+      saveConfigKey(store, (config) => ({ ...config, telemetryTurnCap }));
+      return `Telemetry Turn cap set to ${telemetryTurnCap}\n`;
     },
     clear(store) {
       saveConfigKey(store, (config) => {
-        const { telemetryRunCap: _removed, ...rest } = config;
+        const { telemetryTurnCap: _removed, ...rest } = config;
         return rest;
       });
-      return "Telemetry run cap reset to default\n";
+      return "Telemetry Turn cap reset to default\n";
     }
   },
   {

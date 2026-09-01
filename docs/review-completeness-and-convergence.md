@@ -4,7 +4,7 @@ Status: implemented contract
 
 This document defines the minimal change needed to prevent
 one-finding-per-round Review behavior. It is deliberately separate from
-[Managed Run Delivery and Session Recovery](managed-run-delivery-and-session-recovery.md),
+[Managed Turn and Session Runtime](managed-turn-and-session-runtime.md),
 which owns Turn delivery, native Session continuity, monitoring, and recovery.
 
 ## Product decision
@@ -22,7 +22,7 @@ possible defect. A later Review may still find something new.
 
 ## Why task-58 produced repeated findings
 
-The existing `ReviewYieldReport` can already contain multiple findings. The
+The existing `ReviewResultReport` can already contain multiple findings. The
 finding ledger can already preserve each finding across repair rounds. The
 problem was not a one-finding schema limit.
 
@@ -32,8 +32,8 @@ then fixed that one reported issue, requested another Review, and the next Round
 found another issue. Infrastructure failures and unnecessary Session churn made
 the trajectory longer, but they were separate runtime problems.
 
-The smallest correction is to move the semantic yield boundary to the end of
-the Reviewer's own review process.
+The smallest correction is to require the Reviewer to finish inspection before
+ending its Provider Turn.
 
 ## Goals
 
@@ -66,18 +66,18 @@ The candidate remains immutable for that Round. If the candidate identity is
 wrong or changes during inspection, the Reviewer cannot produce a trustworthy
 semantic result for that Round.
 
-### 2. Accumulate instead of yielding early
+### 2. Accumulate before ending the Turn
 
 While reviewing, the Reviewer keeps discovered findings in its working context.
-Finding one valid defect does not end the review and does not trigger `yield`.
+Finding one valid defect does not end the review or its Provider Turn.
 
 The Reviewer decides how much inspection is appropriate and when the review is
 complete. Yui does not prescribe an internal checklist or additional sweep.
 
 ### 3. Submit one completed result
 
-After the Reviewer judges the review complete, it yields one
-`ReviewYieldReport` containing:
+After the Reviewer judges the review complete, it returns one
+`ReviewResultReport` containing:
 
 - the overall verdict and summary;
 - every material finding accumulated during the review;
@@ -136,13 +136,13 @@ Review orchestration follows these shared rules:
 
 1. A completed Review writes its ReviewRound, finding-ledger changes, and
    durable mailbox references.
-2. It does not pre-create a future Leader Run.
+2. It does not pre-create a future Leader Turn.
 3. If the Leader is active, the Review result remains pending until a natural
    Turn boundary; Yui does not interrupt the Leader.
-4. If a new Leader Run is needed, its Run and initial delivery intent are
+4. If a new Leader Turn is needed, its initial delivery intent is
    admitted atomically; the Provider Turn begins only after the Host binds the
    exact Conversation and Activation.
-5. Leader and Reviewer Conversations survive ordinary Run and ReviewRound
+5. Leader and Reviewer Sessions survive ordinary Turn and ReviewRound
    boundaries.
 6. Review duration, finding count, verdict, and round count are not Session
    replacement evidence.
@@ -153,9 +153,9 @@ Review orchestration follows these shared rules:
 
 Add one direct instruction to `skills/yui-reviewer/SKILL.md`:
 
-> Complete the review before yielding. Do not yield when you discover the first
-> finding. Accumulate all findings discovered during the review and submit them
-> together in one final Review result.
+> Complete the review before ending the Provider Turn. Do not stop when you
+> discover the first finding. Accumulate all findings discovered during the
+> review and return them together in one final Review result.
 
 Existing guidance for candidate identity, evidence, delta review, and
 infra-versus-semantic failure remains unchanged.
@@ -173,14 +173,14 @@ scheduler gate.
 
 No Review-domain schema or migration is expected.
 
-- `ReviewYieldReport.findings` already carries multiple findings.
+- `ReviewResultReport.findings` already carries multiple findings.
 - Review terminalization and the finding ledger retain their existing identity
   and atomicity rules.
 - No canonical `ReviewCheck` values are added.
 - No semantic-completeness validator is added.
 - No Review-count or finding-family admission rule is added.
 
-Production-code changes for Run delivery and Session continuity belong to the
+Production-code changes for Turn delivery and Session continuity belong to the
 companion runtime design. If implementation inspection confirms that one
 Review result already reconciles multiple findings correctly, the semantic
 Review change is limited to the two Skills.
@@ -190,13 +190,13 @@ Review change is limited to the two Skills.
 Verification follows [Yui's verification policy](testing/verification-levels.md).
 No real Provider or shared Home is required.
 
-- Inspect the final Reviewer Skill to confirm that the yield boundary is after
+- Inspect the final Reviewer Skill to confirm that the Provider Turn ends after
   review completion, not after the first finding.
 - Inspect the final Leader Skill to confirm that it consumes the complete
   submitted result before planning repairs.
 - Use a small deterministic report/ledger check only if current evidence does
   not already prove that one result can carry multiple findings.
-- Validate Session continuity and no-precreated-Leader-Run behavior under the
+- Validate Session continuity and no-precreated-Leader-Turn behavior under the
   companion runtime implementation, not through a semantic completeness test.
 
 No permanent combinatorial Review fixture is required for a Skill-only behavior
@@ -206,15 +206,15 @@ change.
 
 The design is implemented when:
 
-- Reviewer guidance says to finish reviewing before yielding.
+- Reviewer guidance says to finish reviewing before ending the Turn.
 - Discovering the first finding does not instruct the Reviewer to end the
   Review.
 - All findings collected before completion are submitted in one existing
-  `ReviewYieldReport`.
+  `ReviewResultReport`.
 - Leader guidance consumes the complete submitted batch before repair planning.
 - No checklist, final sweep, completion validator, Review budget, or new
   persistent state is introduced.
 - Ordinary re-review reuses the Reviewer Conversation.
-- Review completion does not pre-create or interrupt a Leader Run.
+- Review completion does not pre-create or interrupt a Leader Turn.
 - Infrastructure failure before semantic inspection remains non-semantic;
   mixed infrastructure and semantic evidence remains ambiguous.

@@ -51,6 +51,7 @@ export type CodexThreadSnapshot = Readonly<{
 export type CodexThreadTurnSnapshot = Readonly<{
   turnId: string;
   status?: "completed" | "interrupted" | "failed" | "inProgress";
+  summary?: string;
   error?: string;
 }>;
 
@@ -59,6 +60,14 @@ export type CodexTurnAcceptance =
   | Readonly<{ status: "busy"; activeTurnId?: string; reason: string }>
   | Readonly<{ status: "not-accepted"; reason: string }>
   | Readonly<{ status: "unknown"; reason: string }>;
+
+export type CodexThreadGoal = Readonly<{
+  conversationId: string;
+  status: "active" | "paused" | "blocked" | "usage-limited" | "budget-limited" | "complete";
+  objective: string;
+  updatedAt: string;
+  tokenBudget?: number;
+}>;
 
 /**
  * Continuable Codex integration over App Server. A transport connection is
@@ -112,6 +121,13 @@ export class CodexAppServerRuntime implements
       includeTurns: true
     });
     return parseThreadSnapshot(result, id, "unknown");
+  }
+
+  async readGoal(conversationId: string): Promise<CodexThreadGoal | null> {
+    const id = text(conversationId, "Codex thread id");
+    const result = await this.transport.request("thread/goal/get", { threadId: id });
+    const goal = objectMember(result, "goal");
+    return goal === null ? null : codexThreadGoal(goal, id);
   }
 
   async inspectConversation(conversationId: string): Promise<ProviderConversationProbe> {
@@ -328,7 +344,7 @@ export function codexNotificationBoundary(input: Readonly<{
   method: string;
   params: JsonRpcObject;
 }>): Readonly<{
-  kind: "activation-ended" | "turn-started" | "turn-completed" | "other";
+  kind: "activation-ended" | "goal-updated" | "goal-cleared" | "turn-started" | "turn-completed" | "other";
   conversationId?: string;
   turnId?: string;
 }> {
@@ -337,9 +353,24 @@ export function codexNotificationBoundary(input: Readonly<{
   const turnId = optionalId(input.params.turnId)
     ?? optionalId(objectMember(input.params, "turn")?.id);
   if (input.method === "thread/closed") return { kind: "activation-ended", conversationId };
+  if (input.method === "thread/goal/updated") return { kind: "goal-updated", conversationId, turnId };
+  if (input.method === "thread/goal/cleared") return { kind: "goal-cleared", conversationId };
   if (input.method === "turn/started") return { kind: "turn-started", conversationId, turnId };
   if (input.method === "turn/completed") return { kind: "turn-completed", conversationId, turnId };
   return { kind: "other", conversationId, turnId };
+}
+
+export function codexGoalNotification(input: Readonly<{
+  method: string;
+  params: JsonRpcObject;
+}>): CodexThreadGoal | null | undefined {
+  const conversationId = optionalId(input.params.threadId);
+  if (conversationId === undefined) return undefined;
+  if (input.method === "thread/goal/cleared") return null;
+  if (input.method !== "thread/goal/updated") return undefined;
+  const goal = objectMember(input.params, "goal");
+  if (goal === null) return undefined;
+  return codexThreadGoal(goal, conversationId);
 }
 
 function parseThreadSnapshot(
@@ -361,10 +392,12 @@ function parseThreadSnapshot(
     const turnId = optionalId(turn.id);
     if (turnId === undefined) return [];
     const status = optionalTurnStatus(turn.status);
+    const summary = codexTurnSummary(turn);
     const error = providerError(turn.error);
     return [{
       turnId,
       ...(status === undefined ? {} : { status }),
+      ...(summary === undefined ? {} : { summary }),
       ...(error === undefined ? {} : { error })
     }];
   });
@@ -385,6 +418,55 @@ function parseThreadSnapshot(
   };
 }
 
+/** Extract the last assistant message from one native Codex Turn. */
+export function codexTurnSummary(turn: JsonRpcObject): string | undefined {
+  for (const value of [...arrayMember(turn, "items")].reverse()) {
+    const item = object(value);
+    if (item === null) continue;
+    const type = item.type;
+    const message = object(item.message);
+    const agentMessage = type === "agentMessage"
+      || type === "agent_message"
+      || (type === "message" && (item.role === "assistant" || message?.role === "assistant"));
+    if (!agentMessage) continue;
+    const text = messageText(item) ?? (message === null ? undefined : messageText(message));
+    if (text !== undefined) return text;
+  }
+  return undefined;
+}
+
+/** Extract the provider-visible human input without copying tool or reasoning items. */
+export function codexTurnInput(turn: JsonRpcObject): string | undefined {
+  for (const value of arrayMember(turn, "items")) {
+    const item = object(value);
+    if (item === null) continue;
+    const type = item.type;
+    const message = object(item.message);
+    const userMessage = type === "userMessage"
+      || type === "user_message"
+      || (type === "message" && (item.role === "user" || message?.role === "user"));
+    if (!userMessage) continue;
+    const text = messageText(item) ?? (message === null ? undefined : messageText(message));
+    if (text !== undefined) return text;
+  }
+  return undefined;
+}
+
+function messageText(message: JsonRpcObject): string | undefined {
+  for (const value of [message.text, message.content]) {
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    if (!Array.isArray(value)) continue;
+    const parts = value.flatMap((part) => {
+      if (typeof part === "string" && part.trim().length > 0) return [part];
+      const record = object(part);
+      const text = record?.text ?? record?.content;
+      return typeof text === "string" && text.trim().length > 0 ? [text] : [];
+    });
+    if (parts.length > 0) return parts.join("\n").trim();
+  }
+  return undefined;
+}
+
 function providerError(value: unknown): string | undefined {
   if (typeof value === "string" && value.trim().length > 0) return value.trim();
   const record = object(value);
@@ -393,6 +475,50 @@ function providerError(value: unknown): string | undefined {
     return record.message.trim();
   }
   return JSON.stringify(record);
+}
+
+function codexThreadGoal(goal: JsonRpcObject, expectedThreadId: string): CodexThreadGoal {
+  const conversationId = text(goal.threadId, "Codex Goal thread id");
+  if (conversationId !== expectedThreadId) {
+    throw new Error("Codex Goal belongs to a different thread.");
+  }
+  const status = codexGoalStatus(goal.status);
+  const tokenBudget = goal.tokenBudget;
+  return Object.freeze({
+    conversationId,
+    status,
+    objective: text(goal.objective, "Codex Goal objective"),
+    updatedAt: codexEpochTimestamp(goal.updatedAt),
+    ...(tokenBudget === null || tokenBudget === undefined
+      ? {}
+      : { tokenBudget: positiveInteger(tokenBudget, "Codex Goal token budget") })
+  });
+}
+
+function codexGoalStatus(value: unknown): CodexThreadGoal["status"] {
+  switch (value) {
+    case "active":
+    case "paused":
+    case "blocked":
+    case "complete":
+      return value;
+    case "usageLimited": return "usage-limited";
+    case "budgetLimited": return "budget-limited";
+    default: throw new Error("Codex Goal status is invalid.");
+  }
+}
+
+function codexEpochTimestamp(value: unknown): string {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error("Codex Goal updatedAt is invalid.");
+  }
+  const epoch = value as number;
+  return new Date(epoch < 1_000_000_000_000 ? epoch * 1_000 : epoch).toISOString();
+}
+
+function positiveInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error(`${label} is invalid.`);
+  return value as number;
 }
 
 function codexContinuationState(

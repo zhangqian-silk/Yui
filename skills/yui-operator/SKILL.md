@@ -5,7 +5,7 @@ description: Route multi-project user requests into Yui Tasks, configure Yui thr
 
 # Yui Operator
 
-Follow `yui-runtime` for every routed managed Run. Load only the exact
+Follow `yui-runtime` for every routed managed Turn. Load only the exact
 authorized Context Pack; do not infer Task authority from a prompt, process, or
 workspace.
 
@@ -41,7 +41,7 @@ that resource, effect, and isolation boundary; never broaden the authorization.
 Task Messages and Operator notices should preserve only information that
 changes the user's understanding, authorization, or next action. Summarize a
 stage result, cross-Task consequence, material risk, or explicit decision and
-refer to the exact Task/Run/WorkItem/Input/Job record for evidence. Do not
+refer to the exact Task/Turn/WorkItem/Input/Job record for evidence. Do not
 forward scheduler dispatch, attach, heartbeat, sampling, waiting, or repeated
 no-change recovery as narrative. Keep the recipient's abstraction level in
 mind and avoid imposing a fixed heading, field, section, or character
@@ -249,10 +249,10 @@ Task; use current durable state and the command's consistency fences to avoid
 duplicate or conflicting decisions.
 
 The Leader chooses among direct execution, native subagents, and a Task Role
-AgentRun. Native subagents are created inside the Leader Session, inherit the
+Turn. Native subagents are created inside the Leader Session, inherit the
 Leader Agent, ignore Task Role Agent bindings, and have no Yui launch command.
 Their structured lifecycle and completion notifications may span provider
-Turns inside the same Yui AgentRun. A Task Role is required when the user
+Turns inside the same Yui Turn. A Task Role is required when the user
 requests a different provider, credentials, interactive Session, or durable
 independent lifecycle.
 
@@ -290,7 +290,7 @@ affected Session and stop rather than partially updating the configuration or
 telling the Leader to reconstruct it.
 
 Provider transcripts remain native to the Agent. Yui stores durable Task
-context, WorkItems, AgentRuns, compact results, and Git integration evidence.
+context, WorkItems, Turns, compact results, and Git integration evidence.
 
 ## Present progress
 
@@ -299,13 +299,13 @@ terminal text. For progress, report:
 
 - Task ID, Project bindings and base refs, and lifecycle;
 - current WorkItems, dependencies, and assigned Task Roles;
-- current and recent AgentRuns, actual Agent/model when recorded, and yielded
+- current and recent Turns, actual Agent/model when recorded, and stored
   result;
 - Leader acceptance or rejection and requested repair;
 - latest ChangeSet/integration state;
 - current Brief focus, latest Milestone, blockers, and open InputRequests.
 
-Worker yield is not completion. Describe a result as awaiting Leader review
+Worker Turn completion is not WorkItem completion. Describe a result as awaiting Leader review
 until it is accepted. Report code as delivered only when the governing
 Candidate's current ChangeSet is committed; a superseded disposition settles
 the workflow without claiming that version was delivered.
@@ -327,7 +327,7 @@ the workflow without claiming that version was delivered.
 - When a proven incorrect historical record is affecting current projections,
   preserve it as audit evidence and append a reasoned retirement with
   `yui task message retire <task>/<message> --reason "..."`,
-  `yui task run retire <task>/<run> --reason "..."`, or
+  `yui task turn retire <task>/<turn> --reason "..."`, or
   `yui task work retire <task>/<work> --summary "..."`. Inspect the exact
   record first; retirement is not a substitute for normal failure recovery or
   for resolving a still-valid result.
@@ -342,7 +342,7 @@ the workflow without claiming that version was delivered.
   the reason: `yui task input cancel <task> <input> --reason "..."`.
 - Raise an InputRequest only for a real user choice, authorization, an external
   fact Yui cannot derive, or a safety boundary. For Yui-observable conditions
-  such as a Run's terminal state, a committed Integration, or a runtime version,
+  such as a Turn's terminal state, a committed Integration, or a runtime version,
   read the state and report it; never ask the user to confirm "continue" as a
   scheduler for machine-observable progress.
 - Prefer the current Leader's coherent plan when it remains valid, but do not
@@ -353,12 +353,12 @@ the workflow without claiming that version was delivered.
   recovery. When a Provider-accepted Turn fails with availability, `429`,
   capacity, or a recoverable transport error and the Session remains usable,
   add a new Turn to that Session. A Session preparation failure or Driver
-  rejection before input acceptance fails the exact Run once; explicitly retry
-  that failed Run when another attempt is useful. Core does not redispatch it
+  rejection before input acceptance fails the exact Turn once; explicitly retry
+  that failed Turn when another attempt is useful. Core does not redispatch it
   on a scheduler tick. If the Driver proves the Session cannot continue, settle
-  or retire its exact Run, stop that one idle Session with `yui task role
-  session stop <task> <role> --reason "..."`, then retry the failed Run. The
-  replacement Run receives the old Agent, adapter, Run, Host, Session, Turn,
+  or retire its exact Turn, stop that one idle Session with `yui task role
+  session stop <task> <role> --reason "..."`, then retry the failed Turn. The
+  replacement Turn receives the old Agent, adapter, Turn, Host, Session,
   and complete raw-error facts through Task context.
 - Inspect recent errors before creating another fresh Session. After repeated
   fresh-Session failures, summarize the evidence and bounded options to the
@@ -388,8 +388,8 @@ is settled, results are integrated or deliberately abandoned, and managed
 worktrees are clean and removable, perform it yourself with `yui task archive
 <task-id> --integrated` or `--abandon`. Archive stops every Task Role runtime,
 including the Leader, removes clean retained WorkItem, ReviewRound, and Task
-worktrees, and retains Task, WorkItem, Run, Candidate, Integration, and native
-Session history. Dirty worktrees, active Runs, and unresolved Integration
+worktrees, and retains Task, WorkItem, Turn, Candidate, Integration, and native
+Session history. Dirty worktrees, active Turns, and unresolved Integration
 evidence are blockers: report the exact command reason and route it to the
 Leader instead of forcing cleanup or editing Yui state. Integration worktrees
 use their explicit cleanup command.

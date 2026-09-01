@@ -50,7 +50,7 @@ function eventLabel(event: TaskEvent): string {
     case "task.completed": return "Task completed";
     case "task.retired": return "Task retired";
     case "leader.attention-required": return "Task Leader needs attention";
-    case "run.stalled": return "Task Leader stalled";
+    case "turn.stalled": return "Task Leader stalled";
     default: return `Task event ${event.type}`;
   }
 }

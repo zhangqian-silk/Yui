@@ -294,7 +294,7 @@ export function createReleaseWorkflowPorts(
               logs: [`cli-update: ${result.outcome} (${result.version})`]
             };
           }
-          if (result.outcome === "ambiguous" || (result.outcome === "aborted" && !result.recoverable)) {
+          if (result.outcome === "aborted" && !result.recoverable) {
             // P1-2 (rr20): An aborted activation with recoverable=false means
             // npm activation began but its outcome is unknowable — the global
             // install may or may not have landed. Treat it as ambiguous:
@@ -311,7 +311,7 @@ export function createReleaseWorkflowPorts(
             // externalIdentity so the engine marks the step as `unknown`
             // and stops — resume must not continue until the expected
             // Controller lifecycle/identity handoff is proven complete.
-            if (result.outcome === "aborted" && result.controllerOwnershipUnknown === true) {
+            if (result.controllerOwnershipUnknown === true) {
               return {
                 outcome: "timeout",
                 logs: [`cli-update Controller ownership unknown at phase ${result.phase}: ${result.message}`]

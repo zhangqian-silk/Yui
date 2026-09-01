@@ -60,42 +60,16 @@ Additional rules:
   `yui task workflow resume <task> <workflow> --grant <new-grant>`; the plan,
   source, and all confirmed step evidence are immutable across the rebind.
 
-## Rebinding a legacy Task-final Review contract
+## Stable Task-final Review contract
 
 Compatible CLI package updates and Controller replacements do not change an
 active Task's final-review capability. Managed Sessions use the ordinary
 `yui` command, compatibility is checked by protocol and storage identity, and
 a replacement Leader presents the contract already established by durable Task
 evidence. No version-aware Operator action is required.
-
-Historical Tasks may already contain `task review rebind` evidence from an
-older immutable-release handover. That chain remains readable audit history,
-but ordinary Task mutation and completion now reuse the stored Reviewer policy
-through any protocol/storage-compatible CLI; a control-plane digest rebind is
-not required for continuity. The recovery command remains available only to
-repair a genuinely inconsistent historical chain:
-
-```sh
-yui task review rebind <task> \
-  --from-control <old-digest> --to-control <current-digest> \
-  --from-release <old-release-id> --to-release <current-release-id>
-```
-
-The legacy recovery verifies the current global Session Manifest, both installed
-immutable releases, the active release pointer, and the completed target
-activation receipt while holding the release handover lock. The source may be
-the immediately previous release or an older installed immutable release when
-the Task skipped one or more handovers. The Task transaction then requires the
-stored contract, Task identity, Reviewer identity and policy. Pre-feature
-contract observations may form one forward-only legacy sequence with the same
-Task and Reviewer; after the first explicit rebind, every transition must be
-event-backed. Success appends one `review.task-final-contract-rebound` event with the
-old/new contract and control digests, release identities, handover id, and
-Operator identity. Historical Candidate and Review records are never
-rewritten; later Candidates use the chain's effective contract. Repeating the
-same proof is idempotent, and the first authorization wakes the Task Leader
-with the exact event reference so blocked delivery can resume. A different release path, active ReviewRound,
-unknown release, identity mismatch, or concurrent drift fails closed.
+Candidate and Task-final ReviewRound records must all carry that one contract.
+Conflicting records fail closed; there is no rebind event, recovery command, or
+second contract state machine.
 
 ## CLI and Controller release boundary
 
@@ -149,7 +123,7 @@ unconfirmed step fails the run rather than guessing.
 
 A run always starts from the **resume cursor**: the first plan step whose
 status is not terminal (`succeeded` or `skipped`). There is no "start over" —
-confirmed steps are never re-run.
+confirmed steps are never re-turn.
 
 Because every state transition is persisted before the next external call, a
 process exit at any point is recoverable: re-invoke `run` (or `resume`) and
@@ -183,7 +157,7 @@ blind re-submission:
 Run outcomes: `succeeded`, `failed`, `unknown`, `unauthorized`,
 `unconfirmed`, `budget-exhausted`. Each carries a machine-readable
 `stopReason` (for example `unknown:publish`, `unauthorized:grant-revoked`,
-`budget-exhausted:verify`) and the list of step ids attempted that run.
+`budget-exhausted:verify`) and the list of step ids attempted that turn.
 
 ## Idempotency key contract
 

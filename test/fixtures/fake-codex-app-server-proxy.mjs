@@ -90,6 +90,9 @@ function handleMessage(message) {
         }
       });
       break;
+    case "thread/goal/get":
+      respond({ goal: null });
+      break;
     case "turn/start":
       respond({ turn: { id: "fake-turn-1" } });
       setImmediate(() => {
@@ -101,7 +104,11 @@ function handleMessage(message) {
           method: "turn/completed",
           params: {
             threadId: "fake-thread-1",
-            turn: { id: "fake-turn-1", status: "completed" }
+            turn: {
+              id: "fake-turn-1",
+              status: "completed",
+              items: [{ id: "item-1", type: "agentMessage", text: "Native Codex result." }]
+            }
           }
         });
       });

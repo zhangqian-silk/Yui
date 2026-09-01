@@ -87,7 +87,7 @@ function urlTaskId() {
   return readQuery().get("task") || null;
 }
 
-// The visible detail section is part of the URL (?task=X&section=runs) so a
+// The visible detail section is part of the URL (?task=X&section=exec) so a
 // refresh or a shared link lands on the same section. Writes always replace —
 // section moves are not history entries.
 function setSectionParam(targetId) {

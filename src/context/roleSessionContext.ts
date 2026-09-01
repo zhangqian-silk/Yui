@@ -44,7 +44,7 @@ const BUILTIN_YUI_SKILLS = new Set([
 
 /**
  * Compiles stable Role policy for an Agent-native instruction channel.
- * Dynamic wakeups and Run assignments deliberately remain outside this value.
+ * Dynamic wakeups and Turn assignments deliberately remain outside this value.
  */
 export function compileRoleSessionContext(
   yuiHome: string | undefined,
@@ -123,7 +123,7 @@ function renderRoleCore(
     case "reviewer":
       return [
         `You are Yui review Role ${role.name} for Task ${owner.scope === "task" ? owner.taskId : role.name}.`,
-        "Review only the exact frozen ReviewRound scope assigned to this Run.",
+        "Review only the exact frozen ReviewRound scope assigned to this Turn.",
         "Follow the injected yui-reviewer Skill while reviewing Yui work."
       ];
     case "worker":

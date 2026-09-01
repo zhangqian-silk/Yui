@@ -1270,7 +1270,7 @@ function integrationRuntimeLaunchId(home: string, integrationId: string): string
 
 /**
  * Reuse is enabled only for an immutable installed release. Development
- * checkouts have no content-addressed release identity, so they rerun.
+ * checkouts have no content-addressed release identity, so they return.
  */
 function integrationRuntimeReleaseIdentity(home: string): string | null {
   try {
@@ -1395,7 +1395,7 @@ async function resolveRef(repositoryPath: string, ref: string): Promise<string> 
 /**
  * Static preflight before the (potentially expensive) checks: the target ref
  * must still equal the expected head and a checked-out target worktree must be
- * clean.  A failure here means the check commands must not run.  The post-check
+ * clean.  A failure here means the check commands must not turn.  The post-check
  * {@link advanceTargetRef} re-verifies both before the CAS, so a target that
  * moves during the gate is still fenced.
  */

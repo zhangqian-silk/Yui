@@ -76,7 +76,7 @@ export type ReviewCheck = Readonly<{
   details?: string;
 }>;
 
-export type ReviewYieldReport = Readonly<{
+export type ReviewResultReport = Readonly<{
   summary: string;
   report: string;
   checks: readonly ReviewCheck[];
@@ -96,12 +96,10 @@ export type ReviewRound = {
   taskId: string;
   workItemId?: string;
   candidateId?: string;
-  /** Historical v4 Task-final anchor retained only as migrated audit context. */
-  legacyAnchor?: Readonly<{ workItemId: string; candidateId: string }>;
   reviewerRoleName: string;
-  reviewerRunId?: string;
+  reviewerTurnId?: string;
   reviewBaseCommit: string;
-  /** Omitted on legacy records, which are equivalent to `work-item`. */
+  /** WorkItem review by default; `task` reviews the complete frozen Task. */
   scope?: ReviewScope;
   /** Present only when this round reviews the complete frozen Task. */
   taskCandidate?: TaskReviewCandidate;
@@ -239,7 +237,7 @@ export function attachReviewRoundWorkspace(
 
 export function startReviewRound(
   round: ReviewRound,
-  reviewerRunId: string
+  reviewerTurnId: string
 ): ReviewRound {
   validateReviewRound(round);
   if (round.status !== "pending") {
@@ -250,7 +248,7 @@ export function startReviewRound(
   }
   return validateReviewRound({
     ...round,
-    reviewerRunId: requireIdentity(reviewerRunId, "Reviewer Run id"),
+    reviewerTurnId: requireIdentity(reviewerTurnId, "Reviewer Turn id"),
     status: "running"
   });
 }
@@ -312,7 +310,7 @@ export function finishReviewRound(
 
 /**
  * Issue 06: retry a failed Task-final execution attempt under the same semantic
- * Round identity. AgentRun history remains the attempt trail; the Round itself
+ * Round identity. Turn history remains the attempt trail; the Round itself
  * returns to pending so infrastructure retries do not manufacture a new
  * semantic ReviewRound or duplicate findings.
  */
@@ -335,7 +333,6 @@ export function retryTaskReviewRound(
     schemaVersion: round.schemaVersion,
     id: round.id,
     taskId: round.taskId,
-    ...(round.legacyAnchor === undefined ? {} : { legacyAnchor: round.legacyAnchor }),
     reviewerRoleName: round.reviewerRoleName,
     reviewBaseCommit: round.reviewBaseCommit,
     scope: "task",
@@ -359,7 +356,7 @@ export function retryTaskReviewRound(
             deletedLines: round.deltaRecheck.deletedLines
           })
         }),
-    // Keep the historical attempt Group and Lane addressable from AgentRun
+    // Keep the historical attempt Group and Lane addressable from Turn
     // history while resetting the Lane for another dispatch attempt.
     ...(retryExecutionGroup === undefined ? {} : { executionGroup: retryExecutionGroup }),
     requestedBy: validateReviewRequestSource(requestedBy),
@@ -373,7 +370,7 @@ export function retryTaskReviewRound(
 export function retryRunningReviewExecutionLane(
   round: ReviewRound,
   executionLaneId: string,
-  runId: string,
+  turnId: string,
   now: Date
 ): ReviewRound {
   validateReviewRound(round);
@@ -381,10 +378,10 @@ export function retryRunningReviewExecutionLane(
     throw new Error(`ReviewRound ${round.id} has no running ExecutionGroup.`);
   }
   const lane = round.executionGroup.lanes.find(({ id }) => id === executionLaneId);
-  if (lane === undefined || lane.status !== "failed" || lane.runId !== runId) {
+  if (lane === undefined || lane.status !== "failed" || lane.turnId !== turnId) {
     throw new Error(
       `Review retry does not target the current failed Lane attempt: `
-      + `${round.executionGroup.id}/${executionLaneId}/${runId}.`
+      + `${round.executionGroup.id}/${executionLaneId}/${turnId}.`
     );
   }
   return updateReviewExecutionGroup(
@@ -422,7 +419,7 @@ function retryReviewExecutionGroup(
 }
 
 /** Accepts the Reviewer's complete report and extracts only optional known evidence. */
-export function parseReviewYieldReport(value: string): ReviewYieldReport {
+export function parseReviewResultReport(value: string): ReviewResultReport {
   const report = requireText(value, "Review report");
   let parsed: unknown;
   try {
@@ -591,15 +588,6 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     if (round.workItemId !== undefined || round.candidateId !== undefined) {
       throw new Error(`Task ReviewRound cannot use a WorkItem Candidate anchor: ${round.id}.`);
     }
-    if (round.legacyAnchor !== undefined) {
-      validateTaskRecordReference({
-        taskId: round.taskId,
-        localId: round.legacyAnchor.workItemId
-      }, "workItem");
-      if (!/^candidate-[1-9]\d*$/.test(round.legacyAnchor.candidateId)) {
-        throw new Error(`Legacy Candidate local id is invalid: ${round.legacyAnchor.candidateId}.`);
-      }
-    }
     if (round.taskCandidate === undefined) {
       throw new Error(`Task ReviewRound requires a frozen Task candidate: ${round.id}.`);
     }
@@ -625,8 +613,7 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
       throw new Error(`Candidate local id is invalid: ${round.candidateId}.`);
     }
     if (round.taskCandidate !== undefined
-      || round.taskFinalReviewContract !== undefined
-      || round.legacyAnchor !== undefined) {
+      || round.taskFinalReviewContract !== undefined) {
       throw new Error(`WorkItem ReviewRound cannot carry Task-final metadata: ${round.id}.`);
     }
   }
@@ -641,11 +628,11 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     }
     validateDeltaRecheckRecord(round.deltaRecheck);
   }
-  if (round.reviewerRunId !== undefined) {
+  if (round.reviewerTurnId !== undefined) {
     validateTaskRecordReference({
       taskId: round.taskId,
-      localId: round.reviewerRunId
-    }, "agentRun");
+      localId: round.reviewerTurnId
+    }, "turn");
   }
   if (round.workspace !== undefined) validateReviewWorkspace(round, round.workspace);
   requireTimestamp(round.createdAt, "ReviewRound createdAt");
@@ -671,8 +658,8 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     throw new Error("An active ReviewRound cannot have terminal metadata.");
   }
   if (round.status === "running"
-    && (round.reviewerRunId === undefined || round.workspace === undefined)) {
-    throw new Error("A running ReviewRound requires a Reviewer Run and workspace.");
+    && (round.reviewerTurnId === undefined || round.workspace === undefined)) {
+    throw new Error("A running ReviewRound requires a Reviewer Turn and workspace.");
   }
   if (round.workspaceDisposition !== undefined) {
     if (!terminal || round.workspace === undefined) {

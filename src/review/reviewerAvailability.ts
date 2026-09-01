@@ -4,15 +4,15 @@ import {
   type MailboxTarget,
   type WorkMailbox
 } from "../coordination/workMailbox.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import { runtimeLifecycleTarget } from "../runtime/lifecycleReservation.js";
 import type { ReviewRound } from "./reviewRound.js";
 
 export type ReviewerBusy = Readonly<{
   kind: "busy";
   reviewerRoleName: string;
-  phase: "review-slot" | "active-run" | "mailbox" | "runtime-lifecycle";
-  activeRunId?: string;
+  phase: "review-slot" | "active-turn" | "mailbox" | "runtime-lifecycle";
+  activeTurnId?: string;
   activeReviewRoundId?: string;
   startedAt?: string;
   retryable: true;
@@ -28,8 +28,8 @@ export type ReviewerAvailable = Readonly<{
 export type ReviewerAvailability = ReviewerBusy | ReviewerAvailable;
 
 export type ReviewerAvailabilityStore = Readonly<{
-  getActiveAgentRun(taskId: string, roleName: string): AgentRun | null;
-  listAgentRuns(taskId: string): readonly AgentRun[];
+  getActiveTurn(taskId: string, roleName: string): Turn | null;
+  listTurns(taskId: string): readonly Turn[];
   listReviewRounds(taskId: string): readonly ReviewRound[];
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
 }>;
@@ -40,16 +40,16 @@ export function projectReviewerAvailability(
   taskId: string,
   reviewerRoleName: string
 ): ReviewerAvailability {
-  const active = store.getActiveAgentRun(taskId, reviewerRoleName)
-    ?? store.listAgentRuns(taskId).find((run) => (
+  const active = store.getActiveTurn(taskId, reviewerRoleName)
+    ?? store.listTurns(taskId).find((run) => (
       run.roleName === reviewerRoleName && run.status === "active"
     ));
   if (active !== null && active !== undefined) {
     return {
       kind: "busy",
       reviewerRoleName,
-      phase: "active-run",
-      activeRunId: active.id,
+      phase: "active-turn",
+      activeTurnId: active.id,
       ...(active.reviewRoundId === undefined
         ? {}
         : { activeReviewRoundId: active.reviewRoundId }),

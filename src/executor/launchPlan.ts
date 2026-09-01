@@ -13,16 +13,16 @@ export type YuiLaunchRole = Readonly<{
   agent?: string;
 }>;
 
-export type YuiLaunchRun = Readonly<{
+export type YuiLaunchTurn = Readonly<{
   id: string;
   taskId: string;
 }>;
 
-export function withYuiRunEnvironment(
+export function withYuiTurnEnvironment(
   launch: AgentLaunchPlan,
   yuiHome: string,
   role: YuiLaunchRole,
-  run: YuiLaunchRun,
+  turn: YuiLaunchTurn,
   nativeSessionId?: string,
   nativeSessionRoot?: string
 ): AgentLaunchPlan {
@@ -31,10 +31,10 @@ export function withYuiRunEnvironment(
     env: {
       ...launch.env,
       YUI_HOME: yuiHome,
-      YUI_TASK_ID: run.taskId,
+      YUI_TASK_ID: turn.taskId,
       YUI_ROLE: role.name,
       YUI_AGENT_ID: role.activeAgentId ?? role.agent ?? "",
-      YUI_RUN_ID: run.id,
+      YUI_TURN_ID: turn.id,
       YUI_WORKSPACE: role.workspace,
       ...(nativeSessionRoot === undefined ? {} : { YUI_NATIVE_SESSION_ROOT: nativeSessionRoot }),
       ...(nativeSessionId === undefined ? {} : { YUI_NATIVE_SESSION_ID: nativeSessionId })

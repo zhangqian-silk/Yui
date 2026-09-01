@@ -22,7 +22,7 @@ export type DurableJobCommandOptions = Readonly<{
   json?: boolean;
   environment?: NodeJS.ProcessEnv;
   /** Required for `job acknowledge` to validate Task-local control identity. */
-  store?: Pick<TaskStore, "getRole" | "getActiveAgentRun" | "getTaskRoleSessionSet">;
+  store?: Pick<TaskStore, "getRole" | "getActiveTurn" | "getTaskRoleSessionSet">;
 }>;
 
 /**

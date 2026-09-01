@@ -5,12 +5,28 @@ export type ProviderAuthorityOwner = "controller" | "human" | "none" | "unknown"
 export type ProviderTurnStatus =
   | "submitting"
   | "accepted"
-  | "running"
   | "completed"
   | "failed"
   | "cancelled"
   | "rejected"
   | "delivery-unknown";
+
+export type ProviderGoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "usage-limited"
+  | "budget-limited"
+  | "complete";
+
+/** Provider-native Session intent. It is independent from Turn and Task completion. */
+export type ProviderGoal = Readonly<{
+  status: ProviderGoalStatus;
+  objective: string;
+  updatedAt: string;
+  nativeTurnId?: string;
+  tokenBudget?: number;
+}>;
 
 export type ProviderConversation = Readonly<{
   conversationId: string;
@@ -44,19 +60,19 @@ export type ProviderAuthority = Readonly<{
 }>;
 
 export type ProviderTurn = Readonly<{
-  /** Correlation only: workflow ownership remains in AgentRun. */
-  runId: string;
+  /** Optional correlation for the durable Yui Turn record. */
+  turnId?: string;
   attemptId: string;
   authorityEpoch: number;
   status: ProviderTurnStatus;
   submittedAt: string;
   updatedAt: string;
-  turnId?: string;
+  nativeTurnId?: string;
   terminalReason?: string;
 }>;
 
 export type ProviderRuntimeBinding = Readonly<{
-  schemaVersion: 3;
+  schemaVersion: 5;
   providerNamespace: string;
   accountScope: string;
   currentConversationEpoch: number;
@@ -64,6 +80,7 @@ export type ProviderRuntimeBinding = Readonly<{
   activations: readonly ProviderActivation[];
   authority: ProviderAuthority;
   turn: ProviderTurn | null;
+  goal: ProviderGoal | null;
 }>;
 
 export function createProviderRuntimeBinding(input: Readonly<{
@@ -75,7 +92,7 @@ export function createProviderRuntimeBinding(input: Readonly<{
 }>): ProviderRuntimeBinding {
   const startedAt = timestamp(input.startedAt, "Provider Activation startedAt");
   return validateProviderRuntimeBinding({
-    schemaVersion: 3,
+    schemaVersion: 5,
     providerNamespace: identity(input.providerNamespace, "Provider namespace"),
     accountScope: identity(input.accountScope, "Provider account scope"),
     currentConversationEpoch: 1,
@@ -99,8 +116,32 @@ export function createProviderRuntimeBinding(input: Readonly<{
       holderId: input.activationId,
       changedAt: startedAt
     },
-    turn: null
+    turn: null,
+    goal: null
   });
+}
+
+export function updateProviderGoal(
+  raw: ProviderRuntimeBinding,
+  goal: ProviderGoal
+): ProviderRuntimeBinding {
+  const binding = validateProviderRuntimeBinding(raw);
+  const normalized = validateProviderGoal(goal);
+  return validateProviderRuntimeBinding({ ...binding, goal: normalized });
+}
+
+export function clearProviderGoal(
+  raw: ProviderRuntimeBinding
+): ProviderRuntimeBinding {
+  const binding = validateProviderRuntimeBinding(raw);
+  return binding.goal === null
+    ? binding
+    : validateProviderRuntimeBinding({ ...binding, goal: null });
+}
+
+/** Only active means the Provider is expected to continue autonomously. */
+export function providerGoalContinues(goal: ProviderGoal | null | undefined): boolean {
+  return goal?.status === "active";
 }
 
 export function currentProviderAuthority(binding: ProviderRuntimeBinding): ProviderAuthority {
@@ -249,19 +290,21 @@ export function transferProviderAuthority(
 export function beginProviderTurn(
   raw: ProviderRuntimeBinding,
   input: Readonly<{
-    runId: string;
+    turnId?: string;
     attemptId: string;
     authorityEpoch: number;
     submittedAt: string;
   }>
 ): ProviderRuntimeBinding {
   const binding = validateProviderRuntimeBinding(raw);
-  const runId = identity(input.runId, "Run id");
   const attemptId = identity(input.attemptId, "Provider input attempt id");
-  if (binding.turn?.runId === runId
-    && binding.turn.attemptId === attemptId
-    && binding.turn.authorityEpoch === input.authorityEpoch
-    && binding.turn.status === "submitting") {
+  const turnId = input.turnId === undefined ? undefined : identity(input.turnId, "Turn id");
+  const currentTurn = binding.turn;
+  if (currentTurn !== null
+    && currentTurn.turnId === turnId
+    && currentTurn.attemptId === attemptId
+    && currentTurn.authorityEpoch === input.authorityEpoch
+    && currentTurn.status === "submitting") {
     return binding;
   }
   if (binding.authority.epoch !== input.authorityEpoch
@@ -276,7 +319,7 @@ export function beginProviderTurn(
   return validateProviderRuntimeBinding({
     ...binding,
     turn: {
-      runId,
+      ...(turnId === undefined ? {} : { turnId }),
       attemptId,
       authorityEpoch: input.authorityEpoch,
       status: "submitting",
@@ -288,7 +331,7 @@ export function beginProviderTurn(
 
 export function acceptProviderTurn(
   raw: ProviderRuntimeBinding,
-  input: Readonly<{ attemptId: string; turnId: string; acceptedAt: string }>
+  input: Readonly<{ attemptId: string; nativeTurnId: string; acceptedAt: string }>
 ): ProviderRuntimeBinding {
   const binding = validateProviderRuntimeBinding(raw);
   const attemptId = identity(input.attemptId, "Provider input attempt id");
@@ -303,7 +346,7 @@ export function acceptProviderTurn(
     turn: {
       ...turn,
       status: "accepted",
-      turnId: identity(input.turnId, "Provider Turn id"),
+      nativeTurnId: identity(input.nativeTurnId, "Provider native Turn id"),
       updatedAt: acceptedAt
     }
   });
@@ -388,7 +431,7 @@ export function settleProviderTurnSubmission(
 export function settleProviderTurn(
   raw: ProviderRuntimeBinding,
   input: Readonly<{
-    turnId: string;
+    nativeTurnId: string;
     status: "completed" | "failed" | "cancelled";
     settledAt: string;
     reason?: string;
@@ -396,9 +439,9 @@ export function settleProviderTurn(
 ): ProviderRuntimeBinding {
   const binding = validateProviderRuntimeBinding(raw);
   const turn = binding.turn;
-  const turnId = identity(input.turnId, "Provider Turn id");
-  if (turn === null || turn.turnId !== turnId
-    || (turn.status !== "accepted" && turn.status !== "running")) {
+  const nativeTurnId = identity(input.nativeTurnId, "Provider native Turn id");
+  if (turn === null || turn.nativeTurnId !== nativeTurnId
+    || turn.status !== "accepted") {
     throw new Error("Provider Turn settlement does not match the current Turn.");
   }
   const settledAt = orderedTurnTimestamp(turn, input.settledAt, "Provider Turn settledAt");
@@ -456,10 +499,10 @@ export function supersedeProviderConversation(
         }
       : entry);
   const turn = binding.turn !== null
-    && ["submitting", "accepted", "running", "delivery-unknown"].includes(binding.turn.status)
+    && ["submitting", "accepted", "delivery-unknown"].includes(binding.turn.status)
     ? {
         ...binding.turn,
-        status: binding.turn.turnId === undefined ? "rejected" as const : "failed" as const,
+        status: binding.turn.nativeTurnId === undefined ? "rejected" as const : "failed" as const,
         updatedAt: switchedAt,
         terminalReason
       }
@@ -492,12 +535,13 @@ export function supersedeProviderConversation(
       holderId: input.activationId,
       changedAt: switchedAt
     },
-    turn
+    turn,
+    goal: null
   });
 }
 
 export function validateProviderRuntimeBinding(value: ProviderRuntimeBinding): ProviderRuntimeBinding {
-  if (value.schemaVersion !== 3) throw new Error("Provider Runtime Binding schemaVersion must be 3.");
+  if (value.schemaVersion !== 5) throw new Error("Provider Runtime Binding schemaVersion must be 5.");
   identity(value.providerNamespace, "Provider namespace");
   identity(value.accountScope, "Provider account scope");
   integer(value.currentConversationEpoch, 1, "Current Provider Conversation epoch");
@@ -592,17 +636,44 @@ export function validateProviderRuntimeBinding(value: ProviderRuntimeBinding): P
   }
   if (!Object.hasOwn(value, "turn")) throw new Error("Provider Runtime Binding requires Turn state.");
   if (value.turn !== null) validateProviderTurn(value.turn, value.authority.epoch);
+  if (!Object.hasOwn(value, "goal")) throw new Error("Provider Runtime Binding requires Goal state.");
+  if (value.goal !== null) validateProviderGoal(value.goal);
   return value;
 }
 
+function validateProviderGoal(goal: ProviderGoal): ProviderGoal {
+  if (![
+    "active",
+    "paused",
+    "blocked",
+    "usage-limited",
+    "budget-limited",
+    "complete"
+  ].includes(goal.status)) {
+    throw new Error("Provider Goal status is invalid.");
+  }
+  const normalized: ProviderGoal = {
+    status: goal.status,
+    objective: identity(goal.objective, "Provider Goal objective"),
+    updatedAt: timestamp(goal.updatedAt, "Provider Goal updatedAt"),
+    ...(goal.nativeTurnId === undefined
+      ? {}
+      : { nativeTurnId: identity(goal.nativeTurnId, "Provider Goal native Turn id") }),
+    ...(goal.tokenBudget === undefined
+      ? {}
+      : { tokenBudget: integer(goal.tokenBudget, 1, "Provider Goal token budget") })
+  };
+  return Object.freeze(normalized);
+}
+
 function validateProviderTurn(turn: ProviderTurn, currentAuthorityEpoch: number): void {
-  identity(turn.runId, "Run id");
+  if (turn.turnId !== undefined) identity(turn.turnId, "Turn id");
   identity(turn.attemptId, "Provider input attempt id");
   integer(turn.authorityEpoch, 1, "Provider Turn authority epoch");
   if (turn.authorityEpoch > currentAuthorityEpoch) {
     throw new Error("Provider Turn authority epoch is ahead of current authority.");
   }
-  if (!["submitting", "accepted", "running", "completed", "failed", "cancelled", "rejected", "delivery-unknown"]
+  if (!["submitting", "accepted", "completed", "failed", "cancelled", "rejected", "delivery-unknown"]
     .includes(turn.status)) {
     throw new Error("Provider Turn status is invalid.");
   }
@@ -611,10 +682,16 @@ function validateProviderTurn(turn: ProviderTurn, currentAuthorityEpoch: number)
   if (Date.parse(turn.updatedAt) < Date.parse(turn.submittedAt)) {
     throw new Error("Provider Turn updatedAt is earlier than submittedAt.");
   }
-  const hasAcceptedIdentity = turn.status === "accepted" || turn.status === "running"
+  const hasAcceptedIdentity = turn.status === "accepted"
     || turn.status === "completed" || turn.status === "failed" || turn.status === "cancelled";
-  if (hasAcceptedIdentity) identity(turn.turnId!, "Provider Turn id");
-  else if (turn.turnId !== undefined) throw new Error("Unaccepted Provider Turn cannot have a Turn id.");
+  if (hasAcceptedIdentity) identity(turn.nativeTurnId!, "Provider native Turn id");
+  else if (turn.nativeTurnId !== undefined) {
+    throw new Error("Unaccepted Provider Turn cannot have a native Turn id.");
+  }
+}
+
+export function managedProviderTurnId(turn: ProviderTurn | null | undefined): string | null {
+  return turn?.turnId ?? null;
 }
 
 function requireProviderTurn(
@@ -638,7 +715,7 @@ function orderedTurnTimestamp(turn: ProviderTurn, value: string, label: string):
 }
 
 function providerTurnIsActive(turn: ProviderTurn | null): boolean {
-  return turn !== null && ["submitting", "accepted", "running", "delivery-unknown"]
+  return turn !== null && ["submitting", "accepted", "delivery-unknown"]
     .includes(turn.status);
 }
 

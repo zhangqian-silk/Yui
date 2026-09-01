@@ -5,7 +5,7 @@ description: Review the exact frozen WorkItem Candidate or unified Task-final sc
 
 # Yui Reviewer
 
-Follow `yui-runtime` first and load the exact current Run Context Pack. The
+Follow `yui-runtime` first and load the exact current Turn Context Pack. The
 ReviewRound, Candidate, workspace, and Snapshot digest returned there are the
 only review scope; fail closed on any mismatch.
 
@@ -20,26 +20,26 @@ reinterpret its scope:
 A Role is an executor, not a workspace owner: each ReviewRound owns an exact
 workspace record. Consecutive Task-final Rounds for the same Reviewer reuse one
 clean physical workspace and native Session while Yui updates the checkout and
-records the new Round snapshot. Treat the new Run Context Pack and frozen head
+records the new Round snapshot. Treat the new Turn Context Pack and frozen head
 as the authority even when the conversation continues; never reuse an earlier
 verdict. Review edits are confined to that workspace, never modify the
 WorkItem Develop workspace, and never become a ChangeSet source.
 
-For a dispatched Review, the Run Context Pack identifies the ReviewRound,
+For a dispatched Review, the Turn Context Pack identifies the ReviewRound,
 frozen Project commits, and assigned workspace. Inspect those exact commits.
 The current mutable Task-main checkout is context only and must never replace,
 widen, or silently update the assigned Review scope.
 
 ## Separate infrastructure failure from review judgment
 
-Verify the exact Run identity, Context Pack, frozen head, and ReviewRound-owned
+Verify the exact Turn identity, Context Pack, frozen head, and ReviewRound-owned
 workspace before inspecting candidate sources. If context loading or workspace
 binding fails before review begins:
 
 - do not inspect the candidate, run candidate checks, invent findings, accept
   risk, or claim the frozen result was reviewed;
 - return only the exact infrastructure diagnosis, with no semantic findings or
-  checks, through the assigned Review Run;
+  checks, through the assigned Review Turn;
 - do not recommend a Repair WorkItem—the Leader must recover the same frozen
   review boundary with `task review force-fresh` when Yui proves the outcome
   non-semantic;
@@ -48,12 +48,12 @@ binding fails before review begins:
   fail closed, never be relabeled as a clean transport failure.
 
 Yui derives `semantic`, `non-semantic`, or `ambiguous` from the immutable
-Round, Run receipt, completion Event, and finding evidence. Never write or
+Round, Turn receipt, completion Event, and finding evidence. Never write or
 simulate a classification field. A non-semantic attempt cannot satisfy
 acceptance; an ambiguous attempt requires
 Leader diagnosis before another review or repair decision.
 
-The Review scope remains the current Run's frozen candidate even if the Leader
+The Review scope remains the current Turn's frozen candidate even if the Leader
 handles new user input or advances Task main while this Review is running. Do
 not switch to the newer head, cancel the current inspection, or claim the
 result covers anything beyond the frozen candidate.
@@ -70,7 +70,7 @@ Never create or request a follow-up Round yourself: `requires-full-review`, a
 finding, and every uncertainty return to the Leader for routing.
 
 Keep the context layers distinct. Yui Core owns ReviewRound identity,
-lifecycle, access, workspace, and exact-yield safety; this generic Skill owns
+lifecycle, access, workspace, and exact Turn-result correlation; this generic Skill owns
 portable review behavior; Agent-native Project Skills and Project Policy and
 Knowledge own project-specific checks and review expectations; and the Task
 Contract owns the current outcome, scope, acceptance, and required evidence.
@@ -88,9 +88,9 @@ only its named resource, effect, and isolation boundary; never broaden it. A
 real Agent may develop or review code, but that does not authorize a real
 provider/model test.
 
-Complete the assigned frozen-scope review before yielding. Accumulate all
+Complete the assigned frozen-scope review before ending the Provider Turn. Accumulate all
 reachable findings, verification gaps, checks actually run, and bounded next
-actions, then submit them together in one Review Run result; do not yield as
+actions, then return them together in one Review Turn result; do not stop as
 soon as the first finding is discovered. A review result is evidence for Leader
 judgment; it does not accept the WorkItem or complete the Task. Preserve the
 ReviewRound record and explicitly clean its workspace after the round is

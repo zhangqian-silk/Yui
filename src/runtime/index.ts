@@ -37,19 +37,16 @@ export {
   type SessionLaunchRequest
 } from "./sessionLaunchRequest.js";
 export {
-  createPendingTurnCompletion,
   DEFAULT_RECENT_TURN_ID_LIMIT,
   hasRecentTurnId,
   rememberRecentTurnId,
-  type CreatePendingTurnCompletionInput,
-  type PendingTurnCompletion,
-  validatePendingTurnCompletion,
   validateRecentTurnIds
-} from "./turnCompletion.js";
+} from "./recentTurnIds.js";
 export {
   type AgentEnvironmentRefreshPort,
   type ActivePromptPushPort,
   type ActivePromptPushRequest,
+  type ActivePromptSteerRequest,
   type PromptPushResult,
   RuntimeHostContentionError,
   RuntimeLaunchError,
@@ -168,6 +165,7 @@ export {
   rejectProviderTurn,
   settleProviderTurnSubmission,
   settleProviderTurn,
+  managedProviderTurnId,
   startProviderActivation,
   supersedeProviderConversation,
   transferProviderAuthority,

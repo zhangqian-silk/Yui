@@ -20,6 +20,7 @@ import {
   RuntimeLaunchError,
   type ActivePromptPushPort,
   type ActivePromptPushRequest,
+  type ActivePromptSteerRequest,
   type PromptPushResult,
   type RuntimeLaunchPreStart,
   type SessionHostPort,
@@ -43,6 +44,7 @@ import {
   AGENT_HOST_CONTROL_PROTOCOL,
   sendAgentHostLaunchControl,
   sendAgentHostTurnControl,
+  sendAgentHostSteerControl,
   waitForAgentHostLaunchAck,
   type AgentHostSnapshot
 } from "./agentHost.js";
@@ -78,7 +80,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     adapterId: string;
     effective: EffectiveLaunchSnapshot;
     mode: "new" | "resume";
-    runId?: string;
+    turnId?: string;
     nativeSessionId?: string;
     launchId?: string;
     runtimeIsolation?: TaskRuntimeIsolationDescriptor;
@@ -409,7 +411,7 @@ export class TmuxSessionHost implements SessionHostPort {
     // Validate generated identity before starting an external process.
     const bindingId = requireSafeIdentity(this.#createBindingId(), "Runtime binding id");
     const writableHumanAttached = request.owner.scope === "task"
-      && request.runId !== undefined
+      && request.turnId !== undefined
       && (this.tmux.hasWritableClientAsync !== undefined
         ? await this.tmux.hasWritableClientAsync(hostId, request.owner.roleName)
         : this.tmux.hasWritableClient?.(hostId, request.owner.roleName) === true);
@@ -428,7 +430,7 @@ export class TmuxSessionHost implements SessionHostPort {
       effective: request.effective,
       launchId: request.launchId,
       mode: request.mode,
-      ...(request.runId === undefined ? {} : { runId: request.runId }),
+      ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
       ...(request.runtimeIsolation === undefined
         ? {}
         : { runtimeIsolation: request.runtimeIsolation }),
@@ -475,7 +477,7 @@ export class TmuxSessionHost implements SessionHostPort {
     beforeHostStart?.({
       owner: request.owner,
       launchId: request.launchId,
-      ...(request.runId === undefined ? {} : { runId: request.runId }),
+      ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
       agentId: request.agentId,
       adapterId: request.adapterId,
       effective: request.effective,
@@ -489,14 +491,14 @@ export class TmuxSessionHost implements SessionHostPort {
     // Interactive/global Roles remain native TUIs even when their Driver
     // advertises a persistent child lifecycle. Provider control metadata is
     // the discriminator for the structured Agent Host path. A managed Task
-    // Run has no terminal-write fallback and must expose that contract.
+    // Turn has no terminal-write fallback and must expose that contract.
     if (
       yuiHome === undefined
       || childLifecycle === undefined
       || planned.launch.providerControl === undefined
     ) {
-      if (request.owner.scope === "task" && request.runId !== undefined) {
-        throw new Error("Managed Task Run is missing its structured Agent Host contract.");
+      if (request.owner.scope === "task" && request.turnId !== undefined) {
+        throw new Error("Managed Task Turn is missing its structured Agent Host contract.");
       }
       let hostCreated: boolean;
       try {
@@ -531,7 +533,7 @@ export class TmuxSessionHost implements SessionHostPort {
         }
         if (request.mode === "new"
           && request.owner.scope === "task"
-          && request.runId !== undefined
+          && request.turnId !== undefined
           && this.#waitForNativeSession !== undefined) {
           binding = createRuntimeBinding({
             ...binding,
@@ -550,7 +552,7 @@ export class TmuxSessionHost implements SessionHostPort {
     const sessionManifest = planned.launch.env.YUI_SESSION_MANIFEST;
     const frozenControlPlane = planned.launch.env[YUI_CONTROL_PLANE_DESCRIPTOR];
     const frozenTaskRuntime = planned.launch.env[YUI_TASK_RUNTIME_DESCRIPTOR];
-    if (request.owner.scope === "task" && request.runId !== undefined
+    if (request.owner.scope === "task" && request.turnId !== undefined
       && (sessionManifest === undefined
         || frozenControlPlane === undefined
         || frozenTaskRuntime === undefined)) {
@@ -810,7 +812,7 @@ async function deadHostLaunchFailure(
   );
 }
 
-/** Structured managed-Run input; tmux remains presentation/liveness only. */
+/** Structured managed-Turn input; tmux remains presentation/liveness only. */
 export class AgentHostPromptPushAdapter implements ActivePromptPushPort {
   constructor(private readonly home: string) {}
 
@@ -832,7 +834,7 @@ export class AgentHostPromptPushAdapter implements ActivePromptPushPort {
           type: "submit-turn",
           launchId: request.binding.launchId,
           nativeSessionId: request.binding.nativeSessionId,
-          runId: request.envelope.source.localId,
+          turnId: request.envelope.source.localId,
           authority: request.binding.providerAuthority,
           turn: {
             attemptId: request.envelope.id,
@@ -852,6 +854,38 @@ export class AgentHostPromptPushAdapter implements ActivePromptPushPort {
       return result.snapshot.state === "starting" || result.snapshot.state === "settling"
         ? "busy"
         : "unavailable";
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return code === "ENOENT" || code === "ECONNREFUSED"
+        ? "unavailable"
+        : "delivery-unknown";
+    }
+  }
+
+  async trySteer(request: ActivePromptSteerRequest): Promise<PromptPushResult> {
+    try {
+      const result = await sendAgentHostSteerControl({
+        home: this.home,
+        scope: "task",
+        taskId: request.owner.taskId,
+        roleName: request.owner.roleName,
+        control: {
+          protocol: AGENT_HOST_CONTROL_PROTOCOL,
+          type: "steer-turn",
+          launchId: request.launchId,
+          nativeSessionId: request.nativeSessionId,
+          nativeTurnId: request.nativeTurnId,
+          authority: request.providerAuthority,
+          turn: {
+            attemptId: request.envelope.id,
+            boundedText: request.envelope.text
+          }
+        }
+      });
+      if (result.outcome === "accepted") return "delivered";
+      if (result.snapshot.state === "delivery-unknown") return "delivery-unknown";
+      if (result.snapshot.state === "busy") return "busy";
+      return result.outcome === "rejected" ? "rejected" : "unavailable";
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       return code === "ENOENT" || code === "ECONNREFUSED"

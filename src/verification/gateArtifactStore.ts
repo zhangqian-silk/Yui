@@ -16,8 +16,8 @@ import {
 /**
  * Issue 08: the GateArtifact store adapter.
  *
- * Every function delegates to a {@link GateArtifactStorePort} (satisfied by
- * both SqliteTaskStore and FileTaskStore).  The artifact record and its step
+ * Every function delegates to a {@link GateArtifactStorePort}. The artifact
+ * record and its step
  * logs are persisted atomically by the store implementation; this module
  * owns the domain logic (key computation, log hashing, reuse lookup,
  * retention) but no filesystem paths.

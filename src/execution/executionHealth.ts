@@ -1,9 +1,9 @@
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import {
-  isRoleRunStalled,
+  isRoleTurnStalled,
   latestStallProgressAt
-} from "../scheduler/roleRunStall.js";
+} from "../scheduler/roleTurnStall.js";
 import {
   validateRuntimeProcessExitObservation,
   type RuntimeProcessExitObservation
@@ -43,7 +43,7 @@ export type ExecutionLaneRuntimeHealth =
 export type ExecutionLaneRecovery =
   | "none"
   | "inspect"
-  | "retry-new-agent-run"
+  | "retry-new-turn"
   | "reuse-result";
 
 export type ExecutionLaneHealthProjection = Readonly<{
@@ -79,13 +79,13 @@ export type ExecutionGroupHealthSummary = Readonly<
 export type ActionableExecutionLaneRecovery = Readonly<{
   groupId: string;
   laneId: string;
-  runId?: string;
+  turnId?: string;
   runtimeHealth?: ExecutionLaneRuntimeHealth;
-  recovery: "retry-new-agent-run";
+  recovery: "retry-new-turn";
 }>;
 
-export type ExecutionHealthRun = Pick<
-  AgentRun,
+export type ExecutionHealthTurn = Pick<
+  Turn,
   | "id"
   | "taskId"
   | "roleName"
@@ -93,8 +93,6 @@ export type ExecutionHealthRun = Pick<
   | "status"
   | "createdAt"
   | "updatedAt"
-  | "pushedAt"
-  | "deliveredAt"
   | "workItemId"
   | "executionGroupId"
   | "executionLaneId"
@@ -115,7 +113,7 @@ export type ExecutionGroupHealthInput = Readonly<{
   group: ExecutionGroup;
   /** WorkItem history used to aggregate retry spend for an exploration stage. */
   stageGroups?: readonly ExecutionGroup[];
-  runs: readonly ExecutionHealthRun[];
+  turns: readonly ExecutionHealthTurn[];
   sessions: readonly ExecutionHealthSession[];
   events: readonly TaskEvent[];
   now: Date;
@@ -123,9 +121,9 @@ export type ExecutionGroupHealthInput = Readonly<{
 }>;
 
 /**
- * Fold existing Run, runtime, Session, process-exit, and stall facts into the
+ * Fold existing Turn, runtime, Session, process-exit, and stall facts into the
  * four Lane health states. This is a read model only: it never advances a
- * Lane, terminalizes a Run, or guesses that silence means death.
+ * Lane, terminalizes a Turn, or guesses that silence means death.
  */
 export function projectExecutionGroupHealth(
   input: ExecutionGroupHealthInput
@@ -145,7 +143,7 @@ export function projectExecutionGroupHealth(
     confirmedDeadLaneCount: countHealth(lanes, "confirmed-dead"),
     reusableLaneIds: lanes.filter(({ resultReusable }) => resultReusable)
       .map(({ laneId }) => laneId),
-    retryableLaneIds: lanes.filter(({ recovery }) => recovery === "retry-new-agent-run")
+    retryableLaneIds: lanes.filter(({ recovery }) => recovery === "retry-new-turn")
       .map(({ laneId }) => laneId)
   });
 }
@@ -164,7 +162,7 @@ export function summarizeExecutionGroupHealth(
         usage: observedExecutionResourceUsage({
           group: input.group,
           ...(input.stageGroups === undefined ? {} : { stageGroups: input.stageGroups }),
-          runs: input.runs,
+          turns: input.turns,
           events: input.events
         }),
         now: input.now
@@ -195,14 +193,14 @@ export function actionableExecutionLaneRecoveries(
   return groups
     .filter(({ resolution }) => resolution === undefined)
     .flatMap((group) => group.laneSummaries.flatMap((lane): ActionableExecutionLaneRecovery[] => {
-      if (lane.recovery === "retry-new-agent-run"
+      if (lane.recovery === "retry-new-turn"
         && group.resources !== undefined
         && executionStageSpendClosed(group.resources)) return [];
-      if (lane.recovery !== "retry-new-agent-run") return [];
+      if (lane.recovery !== "retry-new-turn") return [];
       return [{
         groupId: group.groupId,
         laneId: lane.laneId,
-        ...(lane.runId === undefined ? {} : { runId: lane.runId }),
+        ...(lane.turnId === undefined ? {} : { turnId: lane.turnId }),
         ...(lane.runtimeHealth === undefined ? {} : { runtimeHealth: lane.runtimeHealth }),
         recovery: lane.recovery
       }];
@@ -214,29 +212,28 @@ function projectExecutionLaneHealth(
   input: ExecutionGroupHealthInput,
   policy: RuntimeHealthPolicy
 ): ExecutionLaneHealthProjection {
-  const run = lane.runId === undefined
+  const run = lane.turnId === undefined
     ? undefined
-    : input.runs.find((candidate) => exactLaneRun(candidate, input.group, lane));
+    : input.turns.find((candidate) => exactLaneTurn(candidate, input.group, lane));
   const continuationAgentId = run?.effective.agentId ?? lane.effective?.agentId;
   if (lane.status !== "completed"
-    && lane.status !== "yielded"
-    && lane.runId !== undefined
+    && lane.turnId !== undefined
     && continuationAgentId !== undefined
     && runOwnsBlockingProviderContinuation(input.events, {
       taskId: input.group.taskId,
       roleName: lane.roleName,
-      runId: lane.runId,
+      turnId: lane.turnId,
       agentId: continuationAgentId
     })) {
     return projection(lane, {
       runtimeHealth: "active",
       recovery: "none",
       resultReusable: false,
-      reason: "the exact Run still owns an unsettled Provider continuation writer",
+      reason: "the exact Turn still owns an unsettled Provider continuation writer",
       evidence: ["runtime-continuation-writer-owned"]
     });
   }
-  if (lane.status === "completed" || lane.status === "yielded") {
+  if (lane.status === "completed") {
     return projection(lane, {
       recovery: "reuse-result",
       resultReusable: true,
@@ -247,9 +244,9 @@ function projectExecutionLaneHealth(
   if (lane.status === "failed") {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
-      recovery: "retry-new-agent-run",
+      recovery: "retry-new-turn",
       resultReusable: false,
-      reason: "the exact Lane attempt is durably failed; a retry must create a new AgentRun",
+      reason: "the exact Lane attempt is durably failed; a retry must create a new Turn",
       evidence: ["execution-lane-terminal-failure"]
     });
   }
@@ -275,17 +272,17 @@ function projectExecutionLaneHealth(
       runtimeHealth: "suspected-stalled",
       recovery: "inspect",
       resultReusable: false,
-      reason: "the running Lane has no exact AgentRun record",
+      reason: "the running Lane has no exact Turn record",
       evidence: ["execution-lineage-missing"]
     });
   }
   if (run.status === "failed") {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
-      recovery: "retry-new-agent-run",
+      recovery: "retry-new-turn",
       resultReusable: false,
-      reason: "the exact AgentRun is durably failed",
-      evidence: ["agent-run-terminal-failure"]
+      reason: "the exact Turn is durably failed",
+      evidence: ["turn-terminal-failure"]
     });
   }
   if (run.status !== "active") {
@@ -293,7 +290,7 @@ function projectExecutionLaneHealth(
       runtimeHealth: "suspected-stalled",
       recovery: "inspect",
       resultReusable: false,
-      reason: "the Lane is running but its exact AgentRun is terminal without a Lane result",
+      reason: "the Lane is running but its exact Turn is terminal without a Lane result",
       evidence: ["execution-lineage-inconsistent"]
     });
   }
@@ -303,7 +300,7 @@ function projectExecutionLaneHealth(
     && candidate.agentId === run.effective.agentId
     && candidate.adapterId === run.effective.adapterId
   ));
-  const observations = exactRunObservations(input.events, run, session);
+  const observations = exactTurnObservations(input.events, run, session);
   const runtime = runtimeProjection(observations, input.events, run);
   const unsettledContinuation = runtime !== null
     && Object.values(runtime.continuations).some((continuation) => (
@@ -316,14 +313,14 @@ function projectExecutionLaneHealth(
       || unsettledContinuation);
   if (observations.some((observation) => (
     observation.kind === "turn.failed"
-    && observation.payload.failure?.runTerminal === true
+    && observation.payload.failure?.turnTerminal === true
   )) && !unsettledChildWork) {
     return projection(lane, {
       runtimeHealth: "confirmed-dead",
       recovery: "inspect",
       resultReusable: false,
-      reason: "the Provider reported an exact run-terminal failure",
-      evidence: ["provider-run-terminal"]
+      reason: "the Provider reported an exact Turn-terminal failure",
+      evidence: ["provider-turn-terminal"]
     });
   }
 
@@ -360,7 +357,7 @@ function projectExecutionLaneHealth(
     });
   }
 
-  if (isRoleRunStalled(input.events, run.id)) {
+  if (isRoleTurnStalled(input.events, run.id)) {
     return projection(lane, {
       runtimeHealth: "suspected-stalled",
       recovery: "inspect",
@@ -368,15 +365,14 @@ function projectExecutionLaneHealth(
       reason: `the durable progress clock has not advanced since ${
         latestStallProgressAt(input.events, run.id) ?? run.updatedAt
       }; no death proof exists`,
-      evidence: ["run-stalled"]
+      evidence: ["turn-stalled"]
     });
   }
 
   const activeOperation = runtime !== null
     && (Object.keys(runtime.operations).length > 0 || unsettledContinuation);
   const lastActivityAt = runtime?.lastRuntimeActivityAt
-    ?? run.deliveredAt
-    ?? run.pushedAt
+    ?? run.updatedAt
     ?? run.createdAt;
   const recentActivity = input.now.getTime() - Date.parse(lastActivityAt) < policy.quietAfterMs;
   if (activeOperation || recentActivity) {
@@ -388,7 +384,7 @@ function projectExecutionLaneHealth(
         ? "the exact runtime reports unsettled continuation work"
         : activeOperation
           ? "the exact runtime reports an active operation"
-        : "the exact Run has recent structured runtime activity",
+        : "the exact Turn has recent structured runtime activity",
       evidence: unsettledContinuation
         ? ["runtime-continuation-unsettled"]
         : activeOperation ? ["runtime-operation-active"] : ["runtime-activity-recent"]
@@ -398,8 +394,8 @@ function projectExecutionLaneHealth(
     runtimeHealth: "silent",
     recovery: "none",
     resultReusable: false,
-    reason: "the exact Run remains active without recent structured activity; silence alone is not death",
-    evidence: ["agent-run-active"]
+    reason: "the exact Turn remains active without recent structured activity; silence alone is not death",
+    evidence: ["turn-active"]
   });
 }
 
@@ -410,28 +406,28 @@ function projection(
   return Object.freeze({ laneId: lane.id, ...value });
 }
 
-function exactLaneRun(
-  run: ExecutionHealthRun,
+function exactLaneTurn(
+  run: ExecutionHealthTurn,
   group: ExecutionGroup,
   lane: ExecutionLane
 ): boolean {
-  return run.id === lane.runId
+  return run.id === lane.turnId
     && run.taskId === group.taskId
     && run.roleName === lane.roleName
     && run.executionGroupId === group.id
     && run.executionLaneId === lane.id;
 }
 
-function exactRunObservations(
+function exactTurnObservations(
   events: readonly TaskEvent[],
-  run: ExecutionHealthRun,
+  run: ExecutionHealthTurn,
   session: ExecutionHealthSession | undefined
 ): RuntimeObservation[] {
   return events.map(runtimeObservationFromTaskEvent)
     .filter((observation): observation is RuntimeObservation => (
       observation !== null
       && observation.fence.taskId === run.taskId
-      && observation.fence.runId === run.id
+      && observation.fence.turnId === run.id
       && observation.fence.roleName === run.roleName
       && observation.fence.agentId === run.effective.agentId
       && (session?.launchId === undefined || observation.fence.launchId === session.launchId)
@@ -443,7 +439,7 @@ function exactRunObservations(
 function runtimeProjection(
   observations: readonly RuntimeObservation[],
   events: readonly TaskEvent[],
-  run: ExecutionHealthRun
+  run: ExecutionHealthTurn
 ): RuntimeProjection | null {
   const first = observations[0];
   return first === undefined
@@ -458,7 +454,7 @@ type ExactProcessExit = Readonly<{
 
 function latestExactProcessExit(
   events: readonly TaskEvent[],
-  run: ExecutionHealthRun,
+  run: ExecutionHealthTurn,
   session: ExecutionHealthSession | undefined
 ): ExactProcessExit | null {
   const matching = events.flatMap((event): ExactProcessExit[] => {
@@ -468,7 +464,7 @@ function latestExactProcessExit(
         JSON.parse(event.payload.observation ?? "") as RuntimeProcessExitObservation
       );
       if (observation.taskId !== run.taskId
-        || observation.runId !== run.id
+        || observation.turnId !== run.id
         || observation.roleName !== run.roleName
         || (session?.launchId !== undefined && observation.launchId !== session.launchId)
         || (session?.nativeSessionId !== undefined

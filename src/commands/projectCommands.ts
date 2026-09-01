@@ -724,7 +724,7 @@ function assertNoActiveTaskBinding(
   if (references.activeTaskIds.length > 0) {
     const delivery = [
       ...references.unresolvedWorkItemRefs,
-      ...references.activeRunRefs,
+      ...references.activeTurnRefs,
       ...references.unresolvedIntegrationRefs
     ];
     throw usageError(
@@ -1045,7 +1045,7 @@ async function replaceProject(
 
 /**
  * Auditable soft deprecation. The catalog record, checkout, and every
- * historical Task/Run/Review/Integration/Publication reference are retained;
+ * historical Task/Turn/Review/Integration/Publication reference are retained;
  * the Project can no longer be bound to new work or maintained. Hard removal
  * is a separate `project delete` decision.
  */
@@ -1074,7 +1074,7 @@ function retireProjectCommand(
     `Retired project ${retired.project.id} (${retired.project.name})`,
     `Reason: ${parsed.reason}`,
     `Retired by: ${retiredBy} at ${retired.project.retirement?.retiredAt ?? "?"}`,
-    "The catalog record, checkout, and historical Task/Run/Review/Integration/Publication evidence are retained.",
+    "The catalog record, checkout, and historical Task/Turn/Review/Integration/Publication evidence are retained.",
     ...(retired.references.boundTaskIds.length === 0
       ? []
       : [`Historical Task bindings retained: ${retired.references.boundTaskIds.join(", ")}.`]),
@@ -1137,7 +1137,7 @@ async function deleteProjectCommand(
   const tombstone = join(store.rootDirectory(), "projects", `.delete-${project.id}`);
   const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
   try {
-    // Heal a crashed earlier attempt before the prechecks run.
+    // Heal a crashed earlier attempt before the prechecks turn.
     await healCheckoutSwap({ currentPath: project.path, backupPath: tombstone });
     if (existsSync(project.path)) {
       const git = options.git ?? new NodeGitWorkspace();
@@ -1216,7 +1216,7 @@ function removeRetiredProjectRecord(store: ProjectCommandStore, projectId: strin
       throw usageError(
         `Project cannot be deleted while Task records reference it: ${latest.id}. `
         + `Bound Tasks: ${references.boundTaskIds.join(", ")}. `
-        + "Historical Task/Run/Review/Integration/Publication evidence must stay resolvable; keep the Project retired instead."
+        + "Historical Task/Turn/Review/Integration/Publication evidence must stay resolvable; keep the Project retired instead."
       );
     }
     if (!tx.removeProject(latest.id)) {

@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import { requireIdentity, requireText, requireTimestamp } from "../domain/validation.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import {
   validateExecutionGroup,
@@ -460,9 +460,9 @@ export function observedExecutionResourceUsage(input: Readonly<{
   group: ExecutionGroup;
   /** All WorkItem Groups; only this stage's retry lineage is counted. */
   stageGroups?: readonly ExecutionGroup[];
-  /** Immutable Run history keeps failed Lane attempts inside the budget. */
-  runs?: readonly Pick<
-    AgentRun,
+  /** Immutable Turn history keeps failed Lane attempts inside the budget. */
+  turns?: readonly Pick<
+    Turn,
     "id" | "taskId" | "purpose" | "executionGroupId"
   >[];
   events: readonly TaskEvent[];
@@ -470,28 +470,28 @@ export function observedExecutionResourceUsage(input: Readonly<{
   const group = validateExecutionGroup(input.group);
   const stageGroups = executionStageRetryLineage(group, input.stageGroups);
   const groupIds = new Set(stageGroups.map(({ id }) => id));
-  const runIds = new Set([
+  const turnIds = new Set([
     ...stageGroups.flatMap((candidate) => candidate.lanes
-      .flatMap(({ runId }) => runId === undefined ? [] : [runId])),
-    ...(input.runs ?? []).filter((run) => (
-      run.taskId === group.taskId
-      && run.purpose === "execution"
-      && run.executionGroupId !== undefined
-      && groupIds.has(run.executionGroupId)
+      .flatMap(({ turnId }) => turnId === undefined ? [] : [turnId])),
+    ...(input.turns ?? []).filter((turn) => (
+      turn.taskId === group.taskId
+      && turn.purpose === "execution"
+      && turn.executionGroupId !== undefined
+      && groupIds.has(turn.executionGroupId)
     )).map(({ id }) => id)
   ]);
   const observations = input.events.map(runtimeObservationFromTaskEvent)
     .filter((value): value is NonNullable<typeof value> => (
       value !== null
       && value.fence.taskId === group.taskId
-      && value.fence.runId !== undefined
-      && runIds.has(value.fence.runId)
+      && value.fence.turnId !== undefined
+      && turnIds.has(value.fence.turnId)
     ));
   let tokens = 0;
   let tokensObservable = true;
-  for (const runId of runIds) {
+  for (const turnId of turnIds) {
     const usage = observations.filter(({ fence, payload }) => (
-      fence.runId === runId && payload.usage !== undefined
+      fence.turnId === turnId && payload.usage !== undefined
     )).sort((left, right) => (
       left.receivedAt.localeCompare(right.receivedAt)
       || (left.sequence ?? 0) - (right.sequence ?? 0)
@@ -525,7 +525,7 @@ export function observedExecutionResourceUsage(input: Readonly<{
   }
   const toolOperationIds = new Set(observations.flatMap((observation) => (
     observation.kind === "operation.started" && observation.payload.operation === "tool"
-      ? [`${observation.fence.runId}\0${observation.payload.operationId ?? observation.semanticKey}`]
+      ? [`${observation.fence.turnId}\0${observation.payload.operationId ?? observation.semanticKey}`]
       : []
   )));
   const toolCallsObservable = observations.some(({ kind, payload }) => (
@@ -621,5 +621,5 @@ function percentage(value: number, label: string): number {
 }
 
 function isUsable(status: ExecutionLaneStatus): boolean {
-  return status === "yielded" || status === "completed";
+  return status === "completed";
 }

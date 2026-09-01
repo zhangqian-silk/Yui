@@ -8,7 +8,7 @@
  *
  * The registry is GC's own state: it is not part of the aggregate and never
  * participates in aggregate versioning.  The `resource_registry` table is
- * created by schema migration 8.
+ * created by the current SQLite baseline.
  */
 
 import { existsSync, mkdirSync } from "node:fs";

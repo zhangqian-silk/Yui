@@ -139,7 +139,7 @@ async function handleTransaction(
   if (writer === undefined) {
     throw new Error("Worker not initialized.");
   }
-  // Idempotent replay: a batch that committed before a crash is not re-run.
+  // Idempotent replay: a batch that committed before a crash is not re-turn.
   if (writer.hasOutboxEntry(requestId)) {
     return ALREADY_APPLIED;
   }

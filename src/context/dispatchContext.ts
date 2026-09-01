@@ -1,7 +1,5 @@
 import type { Role } from "../role/role.js";
 
-export type DispatchContextStore = Readonly<Record<string, never>>;
-
 /** Stable Project references that tell an Agent where Project Policy lives.
  *
  * Policy remains a Yui-maintained Project record (or a configured Project
@@ -32,17 +30,6 @@ export type BuildRoleContextInput = Readonly<{
   projectPolicy?: readonly ProjectPolicyReference[];
 }>;
 
-/** Compatibility entry point used by the restored Task workflow. */
-export function compileDispatchInput(
-  _store: DispatchContextStore,
-  taskId: string,
-  role: Role,
-  input: string,
-  workContext: Pick<BuildRoleContextInput, "workItem" | "workspace" | "projectPolicy"> = {}
-): string {
-  return buildRoleContext({ taskId, role, input, ...workContext });
-}
-
 export function buildRoleContext(context: BuildRoleContextInput): string {
   return context.role.name === "leader"
     ? buildLeaderContext(context)
@@ -57,43 +44,31 @@ export function buildWorkerContext(context: BuildRoleContextInput): string {
   return renderDispatchContext("worker", context);
 }
 
-const WORKER_RUN_COMPLETION_MARKER = "Yui Role Run completion requirement:";
-const WORKER_RUN_COMPLETION_REQUIREMENT = [
-  WORKER_RUN_COMPLETION_MARKER,
-  "Before ending, read the exact current Run ID from the managed first line and execute "
-    + "`yui task run yield <current-run-id> --summary-file - <<'YUI_SUMMARY'` "
-    + "followed by the outcome, evidence, and a closing `YUI_SUMMARY` line, "
-    + "replacing the placeholder with that ID.",
+const WORKER_TURN_COMPLETION_MARKER = "Yui Role Turn result requirement:";
+const WORKER_TURN_COMPLETION_REQUIREMENT = [
+  WORKER_TURN_COMPLETION_MARKER,
+  "End the Provider turn with a truthful final report. Yui records that native turn result "
+    + "for the current Turn automatically; no completion command is required.",
   "If you cannot finally determine success, failure, completeness, or the correct "
     + "disposition, do not guess, silently stop, or hide uncertainty behind a success "
-    + "summary. Use this exact yield path and label the handoff uncertain, incomplete, "
+    + "summary. Label the final report uncertain, incomplete, "
     + "blocked, or requiring Leader judgment.",
-  "Report the most complete truthful evidence available and, when applicable: exact Run, "
+  "Report the most complete truthful evidence available and, when applicable: exact Turn, "
     + "WorkItem, and native Session identity; actions actually performed; changed paths "
     + "and commit/worktree state; checks actually run and their outcomes; provider, runtime, "
     + "or permission errors; the last confirmed lifecycle boundary; work not performed; "
     + "unresolved assumptions or decisions; residual risks; confidence; and bounded next options.",
-  "Yield submits immutable Run evidence and a Candidate, or Review evidence only. It never "
-    + "implies Leader acceptance, WorkItem completion, ChangeSet capture, Integration, or "
-    + "Task completion. Review Runs report findings, verification gaps, and limits; the "
-    + "Leader decides disposition.",
-  "This exact control-plane permission does not grant repository writes, broad Bash, "
-    + "external effects, or cross-Run control.",
-  "If the exact yield is denied, do not retry, broaden permissions, use a wrapper, mutate "
-    + "Yui state, or invent delivery evidence. Truthfully surface the blocker through the "
-    + "supported provider failure boundary; there is no fallback protocol.",
-  "Yielding closes the Run and hands the WorkItem to the Leader for acceptance; "
-    + "a final response alone does neither.",
-  "The yield command must be your final tool action. After it succeeds, stop immediately: "
-    + "do not inspect, poll, accept, or perform any further work in the same native turn."
+  "The Provider turn ending closes only this Turn. It does not imply Leader acceptance, "
+    + "WorkItem completion, ChangeSet capture, Integration, or Task completion. Review Turns "
+    + "report findings, verification gaps, and limits; the Leader decides disposition."
 ].join("\n");
 
-export function ensureWorkerRunCompletionRequirement(
+export function ensureWorkerTurnCompletionRequirement(
   input: string
 ): string {
-  return input.endsWith(`\n\n${WORKER_RUN_COMPLETION_REQUIREMENT}`)
+  return input.endsWith(`\n\n${WORKER_TURN_COMPLETION_REQUIREMENT}`)
     ? input
-    : `${input}\n\n${WORKER_RUN_COMPLETION_REQUIREMENT}`;
+    : `${input}\n\n${WORKER_TURN_COMPLETION_REQUIREMENT}`;
 }
 
 function renderDispatchContext(
@@ -125,7 +100,7 @@ function renderDispatchContext(
   ].filter((section): section is string => section !== null && section.length > 0)
     .join("\n\n");
   return kind === "worker"
-    ? ensureWorkerRunCompletionRequirement(rendered)
+    ? ensureWorkerTurnCompletionRequirement(rendered)
     : rendered;
 }
 

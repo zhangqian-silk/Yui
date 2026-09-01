@@ -328,7 +328,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             ...(runtimeIsolation === undefined
               ? {}
               : { runtimeIsolation: runtimeIsolation.descriptor }),
-            ...(request.runId === undefined ? {} : { runId: request.runId }),
+            ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment })
@@ -344,7 +344,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
             ...(runtimeIsolation === undefined
               ? {}
               : { runtimeIsolation: runtimeIsolation.descriptor }),
-            ...(request.runId === undefined ? {} : { runId: request.runId }),
+            ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
             ...(request.environment === undefined
               ? {}
               : { environment: request.environment }),
@@ -643,7 +643,7 @@ function validateRuntimeLaunchPreflight(
   if (
     preflight.launchId !== launchId
     || !ownerMatches
-    || preflight.runId !== request.runId
+    || preflight.turnId !== request.turnId
     || preflight.agentId !== request.agentId
     || preflight.adapterId !== request.adapterId
     || !effectiveLaunchSnapshotsCompatible(preflight.effective, request.effective)

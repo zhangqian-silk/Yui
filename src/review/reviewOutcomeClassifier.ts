@@ -1,6 +1,5 @@
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { AgentRun } from "../run/agentRun.js";
-import { matchYieldReceipt } from "../run/yieldReceipt.js";
+import type { Turn } from "../turn/turn.js";
 import type { ReviewFinding } from "./reviewFinding.js";
 import type { ReviewRound } from "./reviewRound.js";
 import {
@@ -10,19 +9,16 @@ import {
 
 /**
  * Review outcome classification is a read-only projection over existing
- * Round/Run/Event/Finding evidence.  It deliberately adds no mutable Review
- * status: old Homes can be classified more precisely as their corroborating
- * records become available, while ambiguous evidence continues to fail
- * closed.
+ * Round/Turn/Event/Finding evidence. It deliberately adds no mutable Review
+ * status; ambiguous evidence continues to fail closed.
  */
 
 export type ReviewInfraFailureKind =
   | "session-not-stopped"
-  | "run-start"
+  | "turn-start"
   | "storage-lock"
   | "tmux-exit"
-  | "yield-timeout"
-  | "run-identity"
+  | "turn-identity"
   | "policy"
   | "baseline-contamination"
   | "context-load"
@@ -36,7 +32,7 @@ export type ReviewOutcomeClassification = Readonly<{
 }>;
 
 export type ReviewOutcomeEvidenceStore = Readonly<{
-  listAgentRuns(taskId: string): readonly AgentRun[];
+  listTurns(taskId: string): readonly Turn[];
   listReviewFindings(taskId: string): readonly ReviewFinding[];
   listEvents(taskId: string): readonly TaskEvent[];
 }>;
@@ -46,14 +42,13 @@ const INFRA_SIGNATURES: readonly Readonly<{
   pattern: RegExp;
 }>[] = [
   { kind: "session-not-stopped", pattern: /session must be stopped before workspace migration/iu },
-  { kind: "run-start", pattern: /role run could not start|could not start (?:the )?(?:reviewer|role) run/iu },
+  { kind: "turn-start", pattern: /role turn could not start|could not start (?:the )?(?:reviewer|role) turn/iu },
   { kind: "storage-lock", pattern: /\.state\.lock|state lock|lock timeout|storage lock/iu },
   { kind: "tmux-exit", pattern: /tmux[^\n]{0,80}(?:exited|exit|died|vanished)|pane (?:exited|died)/iu },
-  { kind: "yield-timeout", pattern: /yield timeout|controller yield timeout|yield timed out/iu },
-  { kind: "run-identity", pattern: /wrong run id|unknown run id|run id (?:is )?(?:invalid|unknown|mismatch)/iu },
+  { kind: "turn-identity", pattern: /wrong turn id|unknown turn id|turn id (?:is )?(?:invalid|unknown|mismatch)/iu },
   { kind: "policy", pattern: /cyber_?policy|policy denial|permission denied by policy/iu },
   { kind: "baseline-contamination", pattern: /cross[-\s]?baseline|baseline pollution|contaminated baseline|wrong base sha/iu },
-  { kind: "context-load", pattern: /(?:run )?(?:context|context pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)/iu },
+  { kind: "context-load", pattern: /(?:turn )?(?:context|context pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)/iu },
   { kind: "workspace-binding", pattern: /workspace is not the durable owner|workspace-binding failure/iu }
 ];
 
@@ -64,16 +59,16 @@ export function classifyReviewRoundOutcome(
 ): ReviewOutcomeClassification | null {
   if (round.status !== "completed" && round.status !== "failed") return null;
 
-  if (evidence !== undefined && round.reviewerRunId !== undefined
+  if (evidence !== undefined && round.reviewerTurnId !== undefined
     && isTaskRecordRetired(
       evidence.listEvents(round.taskId),
-      "agent-run",
-      round.reviewerRunId
+      "turn",
+      round.reviewerTurnId
     )) {
     return {
       kind: "non-semantic",
-      infraKind: "run-identity",
-      reason: `Reviewer Run ${round.reviewerRunId} was retired from operational evidence.`
+      infraKind: "turn-identity",
+      reason: `Reviewer Turn ${round.reviewerTurnId} was retired from operational evidence.`
     };
   }
 
@@ -100,7 +95,7 @@ export function classifyReviewRoundOutcome(
     return {
       kind: "ambiguous",
       infraKind,
-      reason: "Completed Round claims an infrastructure failure but corroborating Run/Event evidence was not supplied."
+      reason: "Completed Round claims an infrastructure failure but corroborating Turn/Event evidence was not supplied."
     };
   }
   const corroborationFailure = completedInfrastructureCorroborationFailure(round, evidence);
@@ -108,7 +103,7 @@ export function classifyReviewRoundOutcome(
     ? {
         kind: "non-semantic",
         infraKind,
-        reason: "Completed Round and yielded Run agree on an explicit pre-review infrastructure failure."
+        reason: "Completed Round and Turn agree on an explicit pre-review infrastructure failure."
       }
     : {
         kind: "ambiguous",
@@ -151,22 +146,22 @@ function failedRoundSemanticEvidence(
     || (lane.result?.evidence ?? []).length > 0
     || lane.result?.evidenceCommit !== undefined
     || lane.result?.gitSnapshot !== undefined
-    || lane.status === "yielded"
     || lane.status === "completed"
   ));
   if (semanticLane !== undefined) return `Reviewer Lane ${semanticLane.id} delivered semantic evidence.`;
   if (evidence !== undefined) {
     const events = evidence.listEvents(round.taskId);
     const reviewRun = operationalTaskRecords(
-      evidence.listAgentRuns(round.taskId),
+      evidence.listTurns(round.taskId),
       events,
-      "agent-run"
+      "turn"
     ).find((run) => (
       run.purpose === "review"
       && run.reviewRoundId === round.id
-      && (run.status === "yielded" || runtimeFailureSummaryHasReviewerOutput(run.summary ?? ""))
+      && (run.status === "completed"
+        || runtimeFailureSummaryHasReviewerOutput(run.result?.output ?? ""))
     ));
-    if (reviewRun !== undefined) return `Reviewer Run ${reviewRun.id} records Reviewer output.`;
+    if (reviewRun !== undefined) return `Reviewer Turn ${reviewRun.id} records Reviewer output.`;
     const finding = evidence.listReviewFindings(round.taskId).find((entry) => (
       entry.firstReviewRoundId === round.id || entry.lastReviewRoundId === round.id
     ));
@@ -212,7 +207,7 @@ function completedInfrastructureCorroborationFailure(
       || lane.result?.gitSnapshot !== undefined) {
       return `Reviewer Lane ${lane.id} delivered semantic evidence.`;
     }
-    if (lane.status === "yielded" || lane.status === "completed") {
+    if (lane.status === "completed") {
       if (lane.result === undefined
         || lane.result.summary !== round.summary
         || lane.result.report !== round.report
@@ -226,41 +221,28 @@ function completedInfrastructureCorroborationFailure(
 
   const allEvents = store.listEvents(round.taskId);
   const runs = operationalTaskRecords(
-    store.listAgentRuns(round.taskId),
+    store.listTurns(round.taskId),
     allEvents,
-    "agent-run"
+    "turn"
   ).filter((run) => (
     run.purpose === "review" && run.reviewRoundId === round.id
   ));
   const active = runs.find(({ status }) => status === "active");
-  if (active !== undefined) return `Reviewer Run ${active.id} is still active.`;
+  if (active !== undefined) return `Reviewer Turn ${active.id} is still active.`;
   const output = runs.find((run) => (
-    run.status === "failed" && runtimeFailureSummaryHasReviewerOutput(run.summary ?? "")
+    run.status === "failed" && runtimeFailureSummaryHasReviewerOutput(run.result?.output ?? "")
   ));
-  if (output !== undefined) return `Reviewer Run ${output.id} records Reviewer output.`;
-  const yielded = runs.filter(({ status }) => status === "yielded");
-  if (round.reviewerRunId === undefined
-    || yielded.length !== 1
-    || yielded[0]!.id !== round.reviewerRunId) {
-    return "Completed Round lacks one exact yielded Reviewer Run.";
+  if (output !== undefined) return `Reviewer Turn ${output.id} records Reviewer output.`;
+  const completed = runs.filter(({ status }) => status === "completed");
+  if (round.reviewerTurnId === undefined
+    || completed.length !== 1
+    || completed[0]!.id !== round.reviewerTurnId) {
+    return "Completed Round lacks one exact completed Reviewer Turn.";
   }
-  const run = yielded[0]!;
+  const run = completed[0]!;
   if (run.roleName !== round.reviewerRoleName
-    || run.summary !== round.summary
-    || run.yieldReceipt === undefined) {
-    return `Reviewer Run ${run.id} does not match the non-semantic Round receipt.`;
-  }
-  const receiptMatch = matchYieldReceipt(run.yieldReceipt, {
-    status: "yielded",
-    summary: round.summary ?? "",
-    reviewResult: {
-      report: round.report ?? "",
-      checks: round.checks ?? [],
-      evidenceCommit: round.reviewBaseCommit
-    }
-  });
-  if (receiptMatch?.kind !== "replayed") {
-    return `Reviewer Run ${run.id} yield receipt does not cover the Round outcome.`;
+    || run.result?.output !== round.summary) {
+    return `Reviewer Turn ${run.id} does not match the non-semantic Round result.`;
   }
 
   const finding = store.listReviewFindings(round.taskId).find((entry) => (
@@ -285,12 +267,12 @@ function completedInfrastructureCorroborationFailure(
 function explicitCompletedReviewInfrastructureFailure(summary: string, round: ReviewRound): boolean {
   if (exactCompletedReviewInfrastructureFailureReport(summary)) return true;
   const report = summary.trim();
-  if (report === `Role Run workspace is not the durable owner: ${round.taskId}/${round.reviewerRoleName}.`
-    || (round.reviewerRunId !== undefined
-      && report === `Review Run workspace is not the durable owner: ${round.reviewerRunId}.`)) {
+  if (report === `Role Turn workspace is not the durable owner: ${round.taskId}/${round.reviewerRoleName}.`
+    || (round.reviewerTurnId !== undefined
+      && report === `Review Turn workspace is not the durable owner: ${round.reviewerTurnId}.`)) {
     return true;
   }
-  return /^(?:Run )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)(?:: (?:failure|mismatch|unavailable|unauthorized|stale|mismatched|malformed))?\.?$/iu
+  return /^(?:Turn )?(?:Context|Context Pack) load (?:failed|unavailable|unauthorized|stale|mismatched|malformed)(?:: (?:failure|mismatch|unavailable|unauthorized|stale|mismatched|malformed))?\.?$/iu
     .test(report);
 }
 
@@ -299,9 +281,9 @@ function exactCompletedReviewInfrastructureFailureReport(summary: string): boole
   const envelope: readonly RegExp[] = [
     /^# Review result: (?:context-load|workspace-binding) failure$/u,
     /^$/u,
-    /^The assigned Run context could not be safely matched to this native session, so no candidate review was performed\.$/u,
+    /^The assigned Turn context could not be safely matched to this native session, so no candidate review was performed\.$/u,
     /^$/u,
-    /^- Run: `[^`\r\n]+`$/u,
+    /^- Turn: `[^`\r\n]+`$/u,
     /^- ReviewRound: `[^`\r\n]+`$/u,
     /^- Review base commit: `[0-9a-f]{40}`$/u,
     /^- Frozen target: `[^`\r\n]+`$/u,
@@ -318,14 +300,14 @@ function exactCompletedReviewInfrastructureFailureReport(summary: string): boole
     /^$/u,
     /^## Checks actually run$/u,
     /^$/u,
-    /^- Exact Context API load: passed for Task\/Run\/Role\/purpose\/subject\/snapshot\/adapter\.$/u,
+    /^- Exact Context API load: passed for Task\/Turn\/Role\/purpose\/subject\/snapshot\/adapter\.$/u,
     /^- Workspace binding verification: failed\.$/u,
     /^- Candidate build\/tests\/package checks: not run\.$/u,
     /^- Real-provider E2E: not run and not authorized\.$/u,
     /^$/u,
     /^## Required next action$/u,
     /^$/u,
-    /^Attach the native Reviewer session to the exact workspace recorded by the Context Pack, or issue a fresh internally consistent Review Run\/Context Pack\. Then perform the complete bounded Task-final review at the frozen head\.$/u
+    /^Attach the native Reviewer session to the exact workspace recorded by the Context Pack, or issue a fresh internally consistent Review Turn\/Context Pack\. Then perform the complete bounded Task-final review at the frozen head\.$/u
   ];
   return lines.length === envelope.length
     && envelope.every((pattern, index) => pattern.test(lines[index]!));

@@ -93,22 +93,21 @@ export function taskWorkspaceRefSegmentFromIdentity(
 }
 
 /**
- * The durable ref segment for a Task. A Task with a persisted workspace
- * identity always uses its token-bearing segment; a pre-identity record (a
- * valid v4 Task that never had a managed Git workspace, or one awaiting the
- * controlled rebuild) keeps its bare Task id so its existing worktrees remain
- * addressable until they are rebuilt.
+ * The durable ref segment for a Task. Every managed Git workspace uses the
+ * token-bearing identity minted before its first adoption.
  */
 export function taskWorkspaceRefSegment(
   task: Readonly<{ id: string; workspaceIdentity?: TaskWorkspaceIdentity }>
 ): string {
-  if (task.workspaceIdentity === undefined) return task.id;
+  if (task.workspaceIdentity === undefined) {
+    throw new Error(`Task workspace identity is required: ${task.id}.`);
+  }
   return taskWorkspaceRefSegmentFromIdentity(task.workspaceIdentity);
 }
 
 /**
  * The strict main-branch ref for a Task workspace. The main branch is always
- * `yui/task-N-<8hex>/main`; any other shape is a foreign or legacy ref.
+ * `yui/task-N-<8hex>/main`; any other shape is foreign to the current contract.
  */
 export function taskMainBranch(refSegment: string): string {
   if (!TASK_WORKSPACE_REF_SEGMENT_PATTERN.test(refSegment)) {
@@ -141,11 +140,9 @@ export function taskIntegrationBranch(refSegment: string, integrationId: string)
 }
 
 /**
- * The non-colliding, auditable archive ref for a legacy Task ref. The Home id
- * in the path keeps two Homes' archives apart even when they share a Project
+ * The non-colliding, auditable archive ref for a current managed Task ref.
+ * The Home id keeps two Homes' archives apart when they share a Project
  * repository; the full original ref name is preserved verbatim.
- * Legacy refs live at `refs/heads/yui/task-N/...`; archives at
- * `refs/yui/archive/<homeId>/heads/yui/task-N/...`.
  */
 export function taskArchiveRef(homeId: string, sourceRef: string): string {
   const id = requireIdentityPart(homeId, "Home id");
@@ -156,16 +153,6 @@ export function taskArchiveRef(homeId: string, sourceRef: string): string {
     throw new Error(`Archive source ref is invalid: ${sourceRef}.`);
   }
   return `refs/yui/archive/${id}/${ref.slice("refs/".length)}`;
-}
-
-/**
- * Whether a managed branch belongs to the legacy (pre-identity) layout:
- * `yui/task-N/...` with a bare Task id segment. Identity-bearing branches
- * (`yui/task-N-<8hex>/...`) are never legacy.
- */
-export function isLegacyTaskRef(refName: string): boolean {
-  const match = /^refs\/heads\/(yui\/(task-[0-9]+)\/.+)$/.exec(refName);
-  return match !== null && !TASK_WORKSPACE_REF_SEGMENT_PATTERN.test(match[2]!);
 }
 
 export function validateTaskWorkspaceIdentity(

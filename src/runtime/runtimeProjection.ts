@@ -2,13 +2,12 @@ import type { AgentRuntimeOperation, AgentRuntimeWaitReason } from "./agentDrive
 import {
   createRuntimeObservation,
   runtimeObservationFromTaskEvent,
-  runtimeObservationRunFenceMatches,
+  runtimeObservationTurnFenceMatches,
   type RuntimeObservation,
   type RuntimeObservationFence,
   type RuntimeUsageSnapshot
 } from "./runtimeObservation.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { WorkMailbox } from "../coordination/workMailbox.js";
 import {
   DEFAULT_RUNTIME_HEALTH_POLICY,
   type RuntimeHealthPolicy
@@ -33,9 +32,10 @@ export type RuntimeProjection = Readonly<{
   fence: RuntimeObservationFence;
   host: "unknown" | "alive" | "exited";
   session: "unknown" | "started" | "ready" | "active" | "waiting" | "ended" | "failed";
-  turn: "none" | "accepted" | "waiting" | "completed" | "failed" | "cancelled";
+  turn: "none" | "accepted" | "waiting" | "completed" | "failed" | "cancelled" | "delivery-unknown";
   conversation: "unknown" | "recoverable" | "unrecoverable";
   activation: "none" | "active" | "ended" | "failed";
+  goal: "none" | "active" | "paused" | "blocked" | "usage-limited" | "budget-limited" | "complete";
   continuations: Readonly<Record<string, Readonly<{
     execution: "active" | "quiescent" | "unknown";
     outcome: "pending" | "succeeded" | "failed" | "cancelled" | "unknown";
@@ -45,7 +45,6 @@ export type RuntimeProjection = Readonly<{
     identityConflict: boolean;
     resultRef?: string;
   }>>>;
-  inputDelivery: "none" | "dispatching" | "delivery-unknown";
   runActivity: "starting" | "running" | "waiting" | "parked";
   health: "healthy" | "reconciling" | "unobservable";
   waitingOn: readonly string[];
@@ -122,8 +121,8 @@ export function createRuntimeProjection(
     turn: "none",
     conversation: "unknown",
     activation: "none",
+    goal: "none",
     continuations: Object.freeze({}),
-    inputDelivery: "none",
     runActivity: "starting",
     health: "reconciling",
     waitingOn: Object.freeze([]),
@@ -148,7 +147,7 @@ export function projectRuntimeTaskEvents(
   const observations = events
     .map(runtimeObservationFromTaskEvent)
     .filter((event): event is RuntimeObservation => (
-      event !== null && runtimeObservationRunFenceMatches(fence, event.fence)
+      event !== null && runtimeObservationTurnFenceMatches(fence, event.fence)
     ))
     .sort((left, right) => (
       left.receivedAt.localeCompare(right.receivedAt)
@@ -164,7 +163,7 @@ export function projectRuntimeObservation(
   raw: RuntimeObservation
 ): RuntimeProjection {
   const event = createRuntimeObservation(raw);
-  if (!runtimeObservationRunFenceMatches(current.fence, event.fence)) {
+  if (!runtimeObservationTurnFenceMatches(current.fence, event.fence)) {
     throw new Error("Runtime observation fence does not match the projection.");
   }
   const at = event.receivedAt;
@@ -189,9 +188,9 @@ export function projectRuntimeObservation(
         activation: "ended",
         turn: terminalTurn(current.turn),
         // A parent provider Session ending is independent from native child
-        // operations already observed under the Run. Keep those children
+        // operations already observed under the Turn. Keep those children
         // visible until their own terminal facts arrive; host/session loss is
-        // health evidence, not proof that child work or the Yui Run ended.
+        // health evidence, not proof that child work or the Yui Turn ended.
         operations: activeSubagentOperations(current.operations),
         stateSince: at
       });
@@ -228,7 +227,7 @@ export function projectRuntimeObservation(
         waitId: undefined,
         // Tool operations belong to the completed native Turn. Provider-owned
         // background subagents may legitimately outlive it and wake later
-        // native Turns inside the same durable Yui Run.
+        // native Provider activity inside the same durable Yui Turn.
         operations: activeSubagentOperations(current.operations),
         stateSince: at
       }), "provider", at);
@@ -323,6 +322,10 @@ export function projectRuntimeObservation(
       return next(current, { activation: "ended", stateSince: at });
     case "activation.failed":
       return next(current, { activation: "failed", stateSince: at });
+    case "goal.updated":
+      return next(current, { goal: event.payload.goalStatus!, stateSince: at });
+    case "goal.cleared":
+      return next(current, { goal: "none", stateSince: at });
     case "continuation.started":
     case "continuation.reported":
     case "continuation.settled": {
@@ -386,7 +389,7 @@ export function projectRuntimeObservation(
       });
     }
     case "input.delivery-unknown":
-      return next(current, { inputDelivery: "delivery-unknown", stateSince: at });
+      return next(current, { turn: "delivery-unknown", stateSince: at });
     case "native-work.snapshot":
       return next(current, {});
     default:
@@ -419,20 +422,6 @@ export function completeRuntimeWorkflow(
   });
 }
 
-export function projectRuntimeMailbox(
-  current: RuntimeProjection,
-  mailbox: WorkMailbox | null
-): RuntimeProjection {
-  if (mailbox?.inputDelivery === undefined || mailbox.inputDelivery === null) {
-    return next(current, { inputDelivery: "none" });
-  }
-  return next(current, {
-    inputDelivery: mailbox.inputDelivery.status === "delivery-unknown"
-      ? "delivery-unknown"
-      : "dispatching"
-  });
-}
-
 export function runtimeDisplayStatus(current: RuntimeProjection): RuntimeDisplayStatus {
   if (current.session === "failed") return "broken";
   const operation = dominantOperation(current.operations);
@@ -456,7 +445,7 @@ export function runtimeDisplayStatus(current: RuntimeProjection): RuntimeDisplay
 /**
  * Classify one RuntimeProjection into the layered health state shared by CLI,
  * Web, and scheduler. The semantic progress timestamp is the same durable
- * fence the scheduler stall pass consumes (deliveredAt plus Work/Review/
+ * fence the scheduler stall pass consumes (Turn creation plus Work/Review/
  * Integration checkpoints), so token/tool/CPU activity can never masquerade
  * as business progress.
  *
@@ -547,7 +536,7 @@ function runtimeHealthReason(
     case "broken":
       return "the Agent Driver runtime is broken";
     case "stopped":
-      return "the Provider Activation ended while the Yui Run remains active";
+      return "the Provider Activation ended while the Yui Turn remains active";
     case "subagent-active":
     case "tool-active":
     case "model-active":
@@ -566,9 +555,9 @@ function runtimeHealthReason(
     case "waiting-external":
       return `the Agent Driver is ${layer.replaceAll("-", " ")}`;
     case "ready":
-      return "the Agent turn ended while the workflow Run is still active";
+      return "the Provider turn ended while the Yui Turn is still active";
     case "awaiting-provider-acceptance":
-      return "the pushed active Run is awaiting provider acceptance";
+      return "the submitted active Turn is awaiting Provider acceptance";
     case "runtime-unobservable":
       return "the host is present but the Agent Driver exposes no current runtime state";
     case "starting":
@@ -612,7 +601,7 @@ function next(
     ...activeNativeOperations.map(([id]) => `native-operation:${id}`)
   ];
   const attention = [
-    ...(copy.inputDelivery === "delivery-unknown" ? ["delivery-unknown"] : []),
+    ...(copy.turn === "delivery-unknown" ? ["delivery-unknown"] : []),
     ...continuations.flatMap(([id, continuation]) => (
       continuation.identityConflict ? [`identity-conflict:${id}`]
         : continuation.observation === "unavailable" ? [`continuation-unresolved:${id}`]
@@ -629,12 +618,10 @@ function next(
       || copy.session === "ended"
       || copy.session === "failed"
     ? "unobservable"
-    : copy.inputDelivery === "dispatching"
-      || (copy.activation !== "active" && waitingNative.length > 0)
+    : (copy.activation !== "active" && waitingNative.length > 0)
       ? "reconciling"
       : "healthy";
-  const runActivity: RuntimeProjection["runActivity"] = copy.inputDelivery === "dispatching"
-      || copy.turn === "accepted"
+  const runActivity: RuntimeProjection["runActivity"] = copy.turn === "accepted"
       || copy.session === "active"
     ? "running"
     : waitingNative.length > 0 || activeNativeOperations.length > 0 ? "waiting"

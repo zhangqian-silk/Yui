@@ -15,9 +15,9 @@ import {
   REVIEW_FINDINGS_RECONCILE_FAILED_EVENT,
   reviewFindingLedgerWriteFailedFromEvents
 } from "../review/reviewFindingLedger.js";
-import { resolveRecordedTaskFinalReviewContract } from "../review/taskFinalReviewContractRebind.js";
+import { resolveRecordedTaskFinalReviewContract } from "../review/taskFinalReviewContractResolution.js";
 import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { WorkItem } from "../workItem/workItem.js";
@@ -92,8 +92,8 @@ export type CompletionReadiness = Readonly<{
  * extra reads on every command.
  */
 export type CompletionReadinessFacts = NextActionFacts & Readonly<{
-  /** Run evidence used to validate semantic Review results. */
-  agentRuns: readonly AgentRun[];
+  /** Turn evidence used to validate semantic Review results. */
+  turns: readonly Turn[];
   managedWorkspaces: readonly ManagedWorkspace[];
   durableJobs: readonly DurableJob[];
   integrationQueueEntries: readonly IntegrationQueueEntry[];
@@ -115,7 +115,7 @@ const UNRESOLVED_INTEGRATION_STATUSES = new Set([
 ]);
 
 const TERMINAL_REVIEW_STATUSES = new Set(["completed", "failed"]);
-const TERMINAL_LANE_STATUSES = new Set(["completed", "failed", "yielded", "skipped"]);
+const TERMINAL_LANE_STATUSES = new Set(["completed", "failed", "skipped"]);
 
 export type CompletionReadinessOptions = Readonly<{
   /**
@@ -140,8 +140,7 @@ export function projectCompletionReadiness(
   const taskFinalReviewContract = resolveRecordedTaskFinalReviewContract(
     task.id,
     facts.workItems,
-    facts.reviewRounds,
-    facts.taskFinalReviewContractEvents
+    facts.reviewRounds
   )?.effective;
   const taskFinalReviewRequired = taskFinalReviewContract !== undefined;
 
@@ -155,7 +154,7 @@ export function projectCompletionReadiness(
       reason: `Task-final ReviewRound ${round.id} is ${round.status}.`,
       fix: round.status === "pending"
         ? `yui task review retry ${task.id}/${round.id}`
-        : `wait for Reviewer Run on ${round.id} to finish`
+        : `wait for Reviewer Turn on ${round.id} to finish`
     });
   }
 
@@ -171,7 +170,7 @@ export function projectCompletionReadiness(
         taskFinalReviewContract
       ))
       && isSemanticReviewRound(round, {
-          listAgentRuns: () => facts.agentRuns,
+          listTurns: () => facts.turns,
           listReviewFindings: () => facts.reviewFindings,
           listEvents: () => facts.events
         })

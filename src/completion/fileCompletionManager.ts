@@ -16,7 +16,7 @@ import {
   type CompletionStatus
 } from "./completionState.js";
 
-/** FileTaskStore-backed completion port used by the interactive CLI wizard. */
+/** Durable completion port used by the interactive CLI wizard. */
 export class FileCompletionManager implements CompletionPort {
   readonly #store: CompletionStore;
   readonly #env: NodeJS.ProcessEnv;

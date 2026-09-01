@@ -5,7 +5,7 @@ export const TASK_RECORD_RETIRED_EVENT = "task.record-retired";
 export const RETIRABLE_TASK_RECORD_KINDS = [
   "work-item",
   "message",
-  "agent-run"
+  "turn"
 ] as const;
 
 export type RetirableTaskRecordKind = typeof RETIRABLE_TASK_RECORD_KINDS[number];

@@ -22,7 +22,7 @@ import { controllerSocketPath } from "./controllerEndpoint.js";
 import { readHomeFilesystemId } from "./homeFilesystemIdentity.js";
 import { findLiveControllerProcessForHome } from "./controllerProcessIdentity.js";
 import { validateHomeId } from "../repository/homeIdentity.js";
-import { readCompatibleHomeIdentity } from "../storage/compatibleTaskStore.js";
+import { readCurrentHomeIdentity } from "../storage/currentTaskStore.js";
 import { YUI_VERSION, yuiVersionIdentity } from "../version.js";
 import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
 import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
@@ -118,7 +118,7 @@ async function startControllerServerLocked(
   options: ControllerServerOptions = {}
 ): Promise<RunningControllerServer> {
   const discoveryPath = join(home, CONTROLLER_DISCOVERY_PATH);
-  const homeId = validateHomeId(readCompatibleHomeIdentity(home).homeId);
+  const homeId = validateHomeId(readCurrentHomeIdentity(home).homeId);
   const homeFilesystemId = readHomeFilesystemId(home);
   await assertExistingDiscoveryReplaceable(discoveryPath);
   if (findLiveControllerProcessForHome(homeFilesystemId) !== undefined) {
@@ -145,10 +145,7 @@ async function startControllerServerLocked(
   const release = options.release === undefined
     ? detectRunningRelease(fileURLToPath(import.meta.url))
     : options.release;
-  // Issue 01: the Home decides the backend. The receipt reports the truthful
-  // Home-decided backend (SQLite for a layout-7 Home with yui.db, file store
-  // for older layouts) instead of deriving it from YUI_STORE_BACKEND, which is
-  // reserved for tests and explicit recovery commands.
+  // The receipt reports the one current SQLite backend.
   const storageBackend = options.storageBackend
     ?? resolveTaskStoreBackendForHome(home, process.env);
   const workerEnabled = options.workerEnabled

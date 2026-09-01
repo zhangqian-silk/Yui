@@ -65,7 +65,7 @@ const SECRET_VALUE_PATTERN =
 // Word boundary keeps "task-5-…" workspace paths from being mistaken for keys.
 const OPENAI_KEY_PATTERN = /\bsk-[A-Za-z0-9_-]{6,}/gu;
 
-/** A bounded, single-line, secret-redacted launch failure for Run summaries. */
+/** A bounded, single-line, secret-redacted launch failure for Turn summaries. */
 export class RuntimeLaunchFailure extends Error {
   override readonly name = "RuntimeLaunchFailure";
 
@@ -132,7 +132,7 @@ export function formatRuntimeLaunchDiagnostic(
     fields.push(`detail=${JSON.stringify(tail(diagnostic.detail, MAX_DETAIL_CHARS))}`);
   }
   if (diagnostic.hint !== undefined) fields.push(`hint=${JSON.stringify(diagnostic.hint)}`);
-  return `Role Run could not start: ${fields.join(" ")}`;
+  return `Role Turn could not start: ${fields.join(" ")}`;
 }
 
 export function redactLaunchArgument(value: string): string {

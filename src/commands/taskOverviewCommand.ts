@@ -4,15 +4,14 @@ import { usageError } from "../errors/cliError.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import {
-  isRoleRunStalled,
+  isRoleTurnStalled,
   latestStallProgressAt
-} from "../scheduler/roleRunStall.js";
-import type { AgentRun } from "../run/agentRun.js";
+} from "../scheduler/roleTurnStall.js";
+import type { Turn } from "../turn/turn.js";
 import type { RoleAgentSession } from "../executor/agentExecutor.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { Task } from "../task/task.js";
 import { pendingWakeupProjection, type TaskStore } from "../storage/taskStore.js";
-import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
@@ -20,6 +19,7 @@ import {
   type TaskExecutionProjection
 } from "../scheduler/taskExecutionProjection.js";
 import { resolveRuntimeHealth } from "../config/yuiConfig.js";
+import { projectNextAction, type NextAction } from "../task/nextAction.js";
 
 export type TaskListOptions = Readonly<{
   all: boolean;
@@ -41,19 +41,18 @@ export type TaskOverviewLeader = Readonly<{
   summaryStatus: "available" | "missing";
 }>;
 
-export type TaskOverviewRuntimeRun = Readonly<{
+export type TaskOverviewRuntimeTurn = Readonly<{
   id: string;
   roleName: string;
-  status: AgentRun["status"];
-  delivery: "pending" | "delivered";
-  deliveredAt: string | null;
+  status: Turn["status"];
+  runtime: "starting" | "session-active";
   createdAt: string;
   updatedAt: string;
 }>;
 
 export type TaskOverviewRuntime = Readonly<{
-  activeRuns: readonly TaskOverviewRuntimeRun[];
-  activeRunCount: number;
+  activeTurns: readonly TaskOverviewRuntimeTurn[];
+  activeTurnCount: number;
   pendingDeliveryCount: number;
 }>;
 
@@ -64,7 +63,7 @@ export type TaskOverviewAttention = Readonly<{
   owner: "operator";
   summary: string;
   updatedAt: string;
-  runId?: string;
+  turnId?: string;
   roleName?: string;
 }>;
 
@@ -76,7 +75,7 @@ export type TaskOverviewBlocker = Readonly<{
   owner: string;
   action: string;
   summary: string;
-  blockedRefs?: readonly Readonly<{ type: "work-item" | "run"; taskId: string; id: string }>[];
+  blockedRefs?: readonly Readonly<{ type: "work-item" | "turn"; taskId: string; id: string }>[];
 }>;
 
 export type TaskOverviewNext = Readonly<{
@@ -198,7 +197,7 @@ function buildTaskOverviewEntry(
   const workItems = store.listWorkItems(task.id);
   const inputRequests = store.listInputRequests(task.id);
   const openInputRequests = inputRequests.filter((request) => request.status === "open");
-  const agentRuns = store.listAgentRuns(task.id);
+  const turns = store.listTurns(task.id);
   const events = store.listEvents(task.id);
   const leaderFailure = store.getLeaderFailure(task.id);
   const leaderMailbox = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
@@ -212,24 +211,16 @@ function buildTaskOverviewEntry(
   });
   const attention = collectAttention(
     task,
-    agentRuns,
+    turns,
     events,
     leaderFailure
   );
   const blockers = collectBlockers(workItems, openInputRequests, attention);
-  const legacyNext = deriveNextAction(
-    task,
-    brief,
-    workItems,
-    openInputRequests,
-    blockers,
-    pendingWakeup
-  );
   const leader: TaskOverviewLeader = {
     role: "leader",
     roleStatus: leaderRole === null
       ? "missing"
-      : agentRuns.some((run) => run.roleName === "leader" && run.status === "active")
+      : turns.some((run) => run.roleName === "leader" && run.status === "active")
         ? "running"
         : roleSessions.find((session) => session.roleName === "leader")?.status ?? "idle",
     summary: brief?.leaderSummary ?? null,
@@ -239,28 +230,31 @@ function buildTaskOverviewEntry(
     summaryStatus: brief === null ? "missing" : "available"
   };
   const counts = countWorkItems(workItems);
-  const runtimeRuns = agentRuns
+  const runtimeTurns = turns
     .filter((run) => run.status === "active")
-    .map((run): TaskOverviewRuntimeRun => ({
+    .map((run): TaskOverviewRuntimeTurn => ({
       id: run.id,
       roleName: run.roleName,
       status: run.status,
-      delivery: run.deliveredAt === undefined ? "pending" : "delivered",
-      deliveredAt: run.deliveredAt ?? null,
+      runtime: roleSessions.some((session) => (
+        session.roleName === run.roleName
+        && session.agentId === run.effective.agentId
+        && session.status !== "ended"
+      )) ? "session-active" : "starting",
       createdAt: run.createdAt,
       updatedAt: run.updatedAt
     }));
   const runtime: TaskOverviewRuntime = {
-    activeRuns: runtimeRuns,
-    activeRunCount: runtimeRuns.length,
-    pendingDeliveryCount: runtimeRuns.filter((run) => run.delivery === "pending").length
+    activeTurns: runtimeTurns,
+    activeTurnCount: runtimeTurns.length,
+    pendingDeliveryCount: runtimeTurns.filter((run) => run.runtime === "starting").length
   };
   // Fold the execution projection from the facts already read above instead of
   // reading the store a second time for the same unchanged revision.
   const execution = projectTaskExecutionFromFacts({
     task,
     roles,
-    runs: agentRuns,
+    turns,
     workItems,
     inputRequests,
     reviewRounds,
@@ -276,21 +270,20 @@ function buildTaskOverviewEntry(
     now,
     runtimeHealthPolicy
   });
-  const next: TaskOverviewNext | null = execution.status === "stopped"
-    ? {
-        action: execution.action,
-        owner: execution.owner,
-        kind: "execution",
-        summary: execution.summary
-      }
-    : execution.action === "recover-execution"
-      ? {
-        action: execution.action,
-        owner: execution.owner,
-        kind: "execution",
-        summary: execution.summary
-      }
-      : legacyNext;
+  const nextActionFacts = store.readNextActionFacts(task.id);
+  if (nextActionFacts === null) {
+    throw new Error(`Task disappeared while building its overview: ${task.id}.`);
+  }
+  const next = overviewNextAction(
+    task,
+    workItems,
+    execution,
+    projectNextAction({
+      ...nextActionFacts,
+      currentTaskReviewCandidate: null,
+      executionGroups: execution.executionGroups
+    })
+  );
   return {
     ...task,
     brief,
@@ -315,7 +308,7 @@ function buildTaskOverviewEntry(
 
 function collectAttention(
   task: Task,
-  runs: readonly AgentRun[],
+  turns: readonly Turn[],
   events: readonly TaskEvent[],
   failure: LeaderFailure | null
 ): TaskOverviewAttention[] {
@@ -330,22 +323,22 @@ function collectAttention(
       updatedAt: failure.lastFailedAt
     });
   }
-  for (const run of runs) {
+  for (const turn of turns) {
     if (
-      run.roleName !== "leader"
-      || run.status !== "active"
-      || !isRoleRunStalled(events, run.id)
+      turn.roleName !== "leader"
+      || turn.status !== "active"
+      || !isRoleTurnStalled(events, turn.id)
     ) continue;
-    const progressAt = latestStallProgressAt(events, run.id) ?? run.updatedAt;
+    const progressAt = latestStallProgressAt(events, turn.id) ?? turn.updatedAt;
     items.push({
       kind: "leader-stalled",
-      id: `leader-stall:${run.id}:${progressAt}`,
+      id: `leader-stall:${turn.id}:${progressAt}`,
       status: "needs-attention",
       owner: "operator",
-      summary: `Run ${run.id} for ${run.roleName} has no durable progress after ${progressAt}.`,
+      summary: `Turn ${turn.id} for ${turn.roleName} has no durable progress after ${progressAt}.`,
       updatedAt: progressAt,
-      runId: run.id,
-      roleName: run.roleName
+      turnId: turn.id,
+      roleName: turn.roleName
     });
   }
   return items.sort((left, right) => (
@@ -430,71 +423,34 @@ function collectBlockers(
   return blockers;
 }
 
-function deriveNextAction(
+function overviewNextAction(
   task: Task,
-  brief: TaskBrief | null,
   workItems: readonly WorkItem[],
-  openInputRequests: readonly InputRequest[],
-  blockers: readonly TaskOverviewBlocker[],
-  pendingWakeup: PendingWakeup | null
+  execution: TaskExecutionProjection,
+  action: NextAction
 ): TaskOverviewNext | null {
-  const input = openInputRequests[0];
-  if (input !== undefined) {
-    return {
-      action: "answer-input",
-      owner: "user",
-      kind: "input",
-      id: input.id,
-      summary: input.question
-    };
-  }
-  const attention = blockers.find((blocker) => blocker.kind === "attention");
-  if (attention !== undefined) {
-    return {
-      action: attention.action,
-      owner: attention.owner,
-      kind: "attention",
-      id: attention.id,
-      summary: attention.summary
-    };
-  }
-  const workBlocker = blockers.find((blocker) => blocker.kind === "work");
-  if (workBlocker !== undefined) {
-    return {
-      action: workBlocker.action,
-      owner: workBlocker.owner,
-      kind: "work",
-      id: workBlocker.id,
-      summary: workBlocker.summary
-    };
-  }
-  if (pendingWakeup !== null) {
-    return {
-      action: "process-leader-wakeup",
-      owner: "leader",
-      kind: "wakeup",
-      summary: pendingWakeup.reasons.join(", ")
-    };
-  }
-  const pending = workItems.find((item) => item.status === "pending");
-  if (pending !== undefined) {
-    return {
-      action: "start-work-item",
-      owner: pending.assignee ?? "leader",
-      kind: "work",
-      id: pending.id,
-      summary: pending.title
-    };
-  }
-  if (task.status === "active" && brief === null) {
-    return {
-      action: "update-leader-summary",
-      owner: "leader",
-      kind: "summary",
-      summary: "No persisted Task Brief is available."
-    };
-  }
-  return null;
+  if (task.status !== "active" && task.status !== "draft") return null;
+  const primary = action.refs[0];
+  const workItem = action.refs
+    .filter(({ kind }) => kind === "work-item")
+    .map(({ id }) => workItems.find((item) => item.id === id))
+    .find((item): item is WorkItem => item !== undefined);
+  const kind: TaskOverviewNext["kind"] = primary?.kind === "input-request"
+    ? "input"
+    : primary?.kind === "work-item"
+      ? "work"
+      : action.kind.includes("attention") || action.kind.includes("inconsistency")
+        ? "attention"
+        : "execution";
+  return {
+    action: action.kind,
+    owner: action.kind === "resolve-input"
+      ? "user"
+      : workItem?.assignee ?? execution.owner,
+    kind,
+    ...(primary === undefined ? {} : { id: primary.id }),
+    summary: action.reason
+  };
 }
 
 function countWorkItems(items: readonly WorkItem[]): TaskOverviewWorkCounts {

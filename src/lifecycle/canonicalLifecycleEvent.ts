@@ -2,7 +2,7 @@
  * The smallest stable, provider-neutral Yui lifecycle vocabulary.
  *
  * Each phase is a durable semantic fact about a managed Agent generation or the
- * Run whose prompt it carries. Agent Drivers translate native signals into
+ * Turn whose prompt it carries. Agent Drivers translate native signals into
  * these phases; the scheduler and durable fold reason about phases, sources,
  * and evidence — never about provider names.
  */
@@ -53,8 +53,8 @@ export type LifecycleEvidenceLevel =
   | "provider-native-durable";
 
 /**
- * Exact identity fences carried by every canonical event. Run-scoped phases
- * (pushed/accepted/progress/terminal) require `runId`; generation-scoped phases
+ * Exact identity fences carried by every canonical event. Turn-scoped phases
+ * (pushed/accepted/progress/terminal) require `turnId`; generation-scoped phases
  * (host/session/ready) may omit it. `launchId` and `nativeSessionId` fence the
  * external process generation so a stale generation can never rebind a live one.
  */
@@ -63,7 +63,7 @@ export type CanonicalIdentityFence = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: string;
-  runId?: string;
+  turnId?: string;
   nativeSessionId?: string;
   launchId?: string;
   receiptId?: string;
@@ -125,22 +125,22 @@ export function isPreInputReadinessSupported(
  * projection of an already-applied durable fact — the fold adds no second source
  * of truth, it only reads what the consumer already recorded.
  */
-export type CanonicalRunExpectation = Readonly<{
+export type CanonicalTurnExpectation = Readonly<{
   fence: CanonicalIdentityFence;
   /** A provider session-started fact was already applied for this generation. */
   sessionStarted: boolean;
   /** A provider-ready fact was already applied for this generation. */
   ready: boolean;
-  /** A single transport push was already recorded for this Run. */
+  /** A single transport push was already recorded for this Turn. */
   pushed: boolean;
-  /** Provider acceptance was already recorded for this Run. */
+  /** Provider acceptance was already recorded for this Turn. */
   accepted: boolean;
   /** The turn is already terminal. */
   terminal: boolean;
   /**
    * The native session id already bound to this generation, if any. Absent
    * means discovery has not yet bound one: a session-started event may bind it
-   * under the exact launch fence, after which later run-scoped facts must carry
+   * under the exact launch fence, after which later turn-scoped facts must carry
    * and match it.
    */
   boundNativeSessionId?: string;
@@ -172,7 +172,7 @@ export class CanonicalLifecycleError extends Error {
   }
 }
 
-const RUN_SCOPED_PHASES: ReadonlySet<CanonicalLifecyclePhase> = new Set([
+const TURN_SCOPED_PHASES: ReadonlySet<CanonicalLifecyclePhase> = new Set([
   "prompt-pushed",
   "provider-accepted",
   "turn-progress",
@@ -180,10 +180,10 @@ const RUN_SCOPED_PHASES: ReadonlySet<CanonicalLifecyclePhase> = new Set([
 ]);
 
 /**
- * Phases that assert durable provider truth about a Run. Every one must carry
- * the complete run-scoped identity — runId AND the generation fences
+ * Phases that assert durable provider truth about a Turn. Every one must carry
+ * the complete turn-scoped identity — turnId AND the generation fences
  * (nativeSessionId + launchId) AND, where the transport owns it, the receiptId —
- * because a missing or wrong fence must fail closed rather than advance a Run or
+ * because a missing or wrong fence must fail closed rather than advance a Turn or
  * its successor.
  */
 const PROVIDER_TRUTH_PHASES: ReadonlySet<CanonicalLifecyclePhase> = new Set([
@@ -199,7 +199,7 @@ const PROVIDER_TRUTH_PHASES: ReadonlySet<CanonicalLifecyclePhase> = new Set([
  * (acceptance/progress/terminal), so neither a transport/liveness signal nor a
  * shape-only `adapter-mapped` observation can ever forge or terminalize a turn.
  * `adapter-mapped` remains permissible only for the pre-acceptance
- * session-started/ready phases, whose fold never advances Run truth.
+ * session-started/ready phases, whose fold never advances Turn truth.
  */
 const PHASE_EVIDENCE_MATRIX: Readonly<Record<
   CanonicalLifecyclePhase,
@@ -252,11 +252,11 @@ export function createCanonicalLifecycleEvent(
     );
   }
   const fence = normalizeFence(input.fence);
-  if (RUN_SCOPED_PHASES.has(input.phase) && fence.runId === undefined) {
-    throw new CanonicalLifecycleError(`Phase ${input.phase} requires a runId fence.`);
+  if (TURN_SCOPED_PHASES.has(input.phase) && fence.turnId === undefined) {
+    throw new CanonicalLifecycleError(`Phase ${input.phase} requires a turnId fence.`);
   }
   // Provider-truth phases must carry the complete generation fence so a stale or
-  // wrong generation can never advance the Run.
+  // wrong generation can never advance the Turn.
   if (PROVIDER_TRUTH_PHASES.has(input.phase)) {
     if (fence.nativeSessionId === undefined) {
       throw new CanonicalLifecycleError(`Phase ${input.phase} requires a nativeSessionId fence.`);
@@ -315,7 +315,7 @@ export function createCanonicalLifecycleEvent(
  */
 export function foldCanonicalLifecycleEvent(
   event: CanonicalLifecycleEvent,
-  expectation: CanonicalRunExpectation
+  expectation: CanonicalTurnExpectation
 ): CanonicalFoldDecision {
   const identity = matchesFence(expectation, event);
   if (identity !== null) {
@@ -356,7 +356,7 @@ export function foldCanonicalLifecycleEvent(
     case "prompt-pushed":
       if (expectation.terminal) return { outcome: "obsolete", reason: "push-after-terminal" };
       if (expectation.accepted) return { outcome: "obsolete", reason: "push-after-accepted" };
-      // Exactly one push: a repeat for an already-pushed Run is a no-op, never a
+      // Exactly one push: a repeat for an already-pushed Turn is a no-op, never a
       // second Enter.
       if (expectation.pushed) return { outcome: "idempotent", reason: "already-pushed" };
       return { outcome: "mark-pushed" };
@@ -384,7 +384,7 @@ export function foldCanonicalLifecycleEvent(
     case "turn-terminal":
       if (expectation.terminal) return { outcome: "idempotent", reason: "already-terminal" };
       if (expectation.accepted) return { outcome: "advance-terminal" };
-      // A terminal for a pushed-but-unaccepted Run must NOT promote acceptance;
+      // A terminal for a pushed-but-unaccepted Turn must NOT promote acceptance;
       // hold the immutable fact until (or unless) acceptance folds first.
       if (expectation.pushed) return { outcome: "deferred", reason: "terminal-before-accept" };
       return { outcome: "fail-closed", reason: "terminal-without-push" };
@@ -395,16 +395,16 @@ export function foldCanonicalLifecycleEvent(
 }
 
 /**
- * Returns null when the event belongs to the expected generation/Run, or a
- * mismatch reason otherwise. Owner/adapter and run-scoped runId are always
+ * Returns null when the event belongs to the expected generation/Turn, or a
+ * mismatch reason otherwise. Owner/adapter and turn-scoped turnId are always
  * compared. Provider-truth phases (acceptance/progress/terminal) require the
  * COMPLETE generation fence — nativeSessionId, launchId, and (for acceptance)
  * receiptId must be present and equal, so a missing or wrong generation/receipt
- * fails closed rather than advancing a Run or its successor. Where a native id
- * is already bound, every run-scoped fact must match it.
+ * fails closed rather than advancing a Turn or its successor. Where a native id
+ * is already bound, every turn-scoped fact must match it.
  */
 function matchesFence(
-  expectation: CanonicalRunExpectation,
+  expectation: CanonicalTurnExpectation,
   event: CanonicalLifecycleEvent
 ): string | null {
   const expected = expectation.fence;
@@ -415,16 +415,16 @@ function matchesFence(
   if (expected.agentId !== actual.agentId) return "fence-mismatch:agentId";
   if (expected.adapterId !== actual.adapterId) return "fence-mismatch:adapterId";
 
-  // Run-scoped phases must name the exact expected Run.
-  if (RUN_SCOPED_PHASES.has(phase)) {
-    if (expected.runId === undefined) return "fence-mismatch:expected-run-missing";
-    if (actual.runId !== expected.runId) return "fence-mismatch:runId";
+  // Turn-scoped phases must name the exact expected Turn.
+  if (TURN_SCOPED_PHASES.has(phase)) {
+    if (expected.turnId === undefined) return "fence-mismatch:expected-turn-missing";
+    if (actual.turnId !== expected.turnId) return "fence-mismatch:turnId";
   } else if (
-    actual.runId !== undefined
-    && expected.runId !== undefined
-    && actual.runId !== expected.runId
+    actual.turnId !== undefined
+    && expected.turnId !== undefined
+    && actual.turnId !== expected.turnId
   ) {
-    return "fence-mismatch:runId";
+    return "fence-mismatch:turnId";
   }
 
   // Provider-truth phases require the complete, equal generation fence. A
@@ -498,7 +498,7 @@ function normalizeFence(fence: CanonicalIdentityFence): CanonicalIdentityFence {
     roleName,
     agentId,
     adapterId: fence.adapterId,
-    ...(fence.runId === undefined ? {} : { runId: requireFenceText(fence.runId, "runId") }),
+    ...(fence.turnId === undefined ? {} : { turnId: requireFenceText(fence.turnId, "turnId") }),
     ...(fence.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: requireFenceText(fence.nativeSessionId, "nativeSessionId") }),

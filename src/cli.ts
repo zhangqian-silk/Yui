@@ -82,7 +82,6 @@ import {
   failPendingReviewRound,
   preserveReviewRoundWorkspace,
   parseTaskCompletionRequest,
-  parseTaskFinalReviewContractRebindRequest,
   preflightTaskCompletion,
   runTaskCommand,
   normalizedExecutionLanePlan,
@@ -97,7 +96,6 @@ import {
   startTaskExecutionCommand,
   stopTaskExecutionCommand
 } from "./commands/taskExecutionCommands.js";
-import { isCurrentGlobalOperator } from "./commands/taskInputCommands.js";
 import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
 import { runTaskChangeSetCommand } from "./commands/taskChangeSetCommands.js";
 import { runTaskOverlapCommand } from "./commands/taskOverlapCommands.js";
@@ -181,9 +179,9 @@ import {
 } from "./observability/runtimeIdentity.js";
 import { type TaskStore, resolveYuiHome } from "./storage/taskStore.js";
 import {
-  openCompatibleFileTaskStore,
-  validateCompatibleFileTaskStore
-} from "./storage/compatibleTaskStore.js";
+  openCurrentTaskStore,
+  validateCurrentTaskStore
+} from "./storage/currentTaskStore.js";
 import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
 import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
@@ -224,11 +222,7 @@ import {
   extractTaskFinalReviewRequest,
   type TaskFinalReviewContract
 } from "./review/taskFinalReviewContract.js";
-import {
-  prepareTaskFinalReviewContractRebindProof,
-  resolveRecordedTaskFinalReviewContract,
-  type TaskFinalReviewContractRebindProof
-} from "./review/taskFinalReviewContractRebind.js";
+import { resolveRecordedTaskFinalReviewContract } from "./review/taskFinalReviewContractResolution.js";
 import type { TaskReviewCandidate } from "./review/reviewRound.js";
 import { assessDeltaRecheck, type DeltaRecheckPreflight } from "./review/deltaRecheck.js";
 import { isAcceptedTaskReviewBaseline } from "./review/reviewAcceptance.js";
@@ -434,7 +428,7 @@ export async function main(): Promise<void> {
     await ensureFileTaskController(home, { environment: process.env });
     const refresh = await refreshRunningFileTaskControllerEnvironment(
       home,
-      openCompatibleFileTaskStore(home),
+      openCurrentTaskStore(home),
       process.env
     );
     emit(withControllerRefreshWarning(output, refresh, "Agent environment"));
@@ -475,51 +469,10 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "upgrade") {
-    // Mirror doctor/controller: needs a Home but self-manages the schema check,
-    // because upgrade must run against a non-current Home.
-    const externallyQuiesced = process.env.YUI_UPDATE_EXTERNALLY_QUIESCED === "1";
-    const ownsHandover = args.length === 1 && !externallyQuiesced;
-    const externalFenceOwner = externallyQuiesced
-      ? process.env.YUI_UPDATE_HANDOVER_OWNER_PID
-      : undefined;
-    const externalUpgradeFenceOwnerPid = externalFenceOwner === undefined
-      ? undefined
-      : Number(externalFenceOwner);
-    if (
-      externalUpgradeFenceOwnerPid !== undefined
-      && (!Number.isSafeInteger(externalUpgradeFenceOwnerPid)
-        || externalUpgradeFenceOwnerPid < 1)
-    ) {
-      throw runtimeError("Update storage-fence owner PID is invalid.");
-    }
-    const handover = ownsHandover ? acquireHandoverLock(home) : undefined;
-    try {
-      const result = await runUpgradeCommand(
-        args.slice(1),
-        home,
-        externallyQuiesced
-          ? {
-              controllerLifecycle: "externally-quiesced",
-              ...(externalUpgradeFenceOwnerPid === undefined
-                ? {}
-                : { externalUpgradeFenceOwnerPid })
-            }
-          : {}
-      );
-      // Public execute upgrades leave the Home operational even when no
-      // Controller existed before the command. Dry-run and the staged updater's
-      // externally-quiesced preflight must remain read-only/lifecycle-neutral.
-      if (ownsHandover && result.exitCode === 0) {
-        await ensureFileTaskController(home, {
-          environment: process.env,
-          handoverOwnerPid: process.pid
-        });
-      }
-      process.exitCode = result.exitCode;
-      emit(result.output, false, result.data);
-    } finally {
-      handover?.release();
-    }
+    // Admission diagnostic only: never quiesces, repairs, or switches storage.
+    const result = await runUpgradeCommand(args.slice(1), home);
+    process.exitCode = result.exitCode;
+    emit(result.output, false, result.data);
     return;
   }
   if (args[0] === "internal") {
@@ -535,7 +488,7 @@ export async function main(): Promise<void> {
         currentInvocationControlPlane(home)
       );
       emit(
-        `Refreshed ${result.refreshed} legacy Session CLI wrapper(s); `
+        `Refreshed ${result.refreshed} managed Session CLI wrapper(s); `
           + `${result.current} already current, ${result.skipped} skipped.`,
         false,
         result
@@ -571,7 +524,7 @@ export async function main(): Promise<void> {
 
   if (args[0] === "session" && args[1] === "reconcile") {
     const options = parseSessionReconcileOptions(args.slice(2));
-    const store = openCompatibleFileTaskStore(home);
+    const store = openCurrentTaskStore(home);
     const tmux = new TmuxManager(
       resolveTmuxBin(store.getConfig().tmuxBin),
       new NodeCommandExecutor(),
@@ -619,20 +572,9 @@ export async function main(): Promise<void> {
       return;
     }
     if (method === "identity" && args.length === 2) {
-      // Issue 02: the stable, read-only runtime identity receipt. It survives
-      // a Controller stop and answers build ID, package digest, backend, and
-      // worker state without a socket round-trip. When no receipt exists yet
-      // (a Controller that predates this feature), fall back to the
-      // authenticated socket identity so the command stays useful during
-      // rollout step 1.
-      let receipt: RuntimeIdentityReceipt | null = null;
-      try {
-        receipt = readRuntimeIdentity(home);
-      } catch {
-        // A corrupt or stale receipt (for example one written by an older
-        // Controller that predates the launch-identity fields) falls back to
-        // the live socket identity, which always carries the exact argv.
-      }
+      // The receipt survives a Controller stop. If it has never been written,
+      // ask the authenticated live Controller for the same current identity.
+      const receipt: RuntimeIdentityReceipt | null = readRuntimeIdentity(home);
       if (receipt !== null) {
         emit("", false, receipt);
         return;
@@ -703,9 +645,7 @@ export async function main(): Promise<void> {
           false,
           { ...snapshot, identity: { build, storage, runtime, mismatch } }
         );
-        // Exit 5 only on hard contradictions (fail). A needs-repair state
-        // (pseudo-layout-7) is degraded but still readable via the file store,
-        // so it exits 0 with a DEGRADED health line and a precise repair action.
+        // The exact current storage contract fails closed on contradictions.
         if (evaluateStorageHealth(storage).status === "fail") process.exitCode = 5;
         return;
       }
@@ -754,7 +694,7 @@ export async function main(): Promise<void> {
           + "cleanup [--all] | stop | restart."
       );
     }
-    validateCompatibleFileTaskStore(home);
+    validateCurrentTaskStore(home);
     const controllerMethod: "stop" | "restart" = method;
     const updateHandoverOwner = process.env.YUI_UPDATE_HANDOVER_OWNER_PID;
     // A pre-fix updater cannot pass the owner environment variable to the
@@ -790,7 +730,7 @@ export async function main(): Promise<void> {
 
   if (args[0] === "resources") {
     await assertFileTaskControllerStorageCompatible(home);
-    const resourcesStore = openCompatibleFileTaskStore(home);
+    const resourcesStore = openCurrentTaskStore(home);
     const result = await runResourcesCommand(args.slice(1), resourcesStore);
     emit(result.output, false, result.data);
     return;
@@ -804,7 +744,7 @@ export async function main(): Promise<void> {
   const store = verifiedStore !== undefined
     && resolve(verifiedStore.rootDirectory()) === resolve(home)
     ? verifiedStore
-    : openCompatibleFileTaskStore(home);
+    : openCurrentTaskStore(home);
   const catalogs = new AgentConfigurationCatalogService(home, {
     environment: process.env
   });
@@ -1170,9 +1110,7 @@ export async function main(): Promise<void> {
       emit(result.output, false, result.data);
       return;
     }
-    if (resolved[1] === "rebuild"
-      || resolved[1] === "history"
-      || resolved[1] === "replace") {
+    if (resolved[1] === "replace") {
       const result = await runTaskWorkspaceCommand(
         resolved.slice(1),
         store,
@@ -1440,7 +1378,7 @@ export async function main(): Promise<void> {
       const task = item === null ? null : store.getTask(item.taskId);
       // A rejected Candidate starts a new execution iteration. Release every
       // terminal Lane Role runtime before preparing the new Lane workspaces;
-      // durable Runs, Groups, Candidates, and workspace owners remain intact.
+      // durable Turns, Groups, Candidates, and workspace owners remain intact.
       if (item?.status === "failed"
         && currentWorkItemExecutionGroup(item)?.resolution !== undefined) {
         await workspaceCoordinator.cleanupWorkItemRuntime(item.taskId, item.id);
@@ -1451,12 +1389,13 @@ export async function main(): Promise<void> {
       if (item !== null && task !== null) {
         await workspacePreparer.prepareTaskWorkspace(task.id);
       }
-      // Every Project-backed WorkItem needs its own Develop owner before a
-      // Lane can be prepared. The physical preparer creates the symlink view
-      // and stores the exact WorkItem owner before dispatch creates the Run.
+      // A Project-backed Worker WorkItem gets an isolated Develop owner before
+      // its Lane is prepared. A Leader-owned WorkItem intentionally executes
+      // in the Task main worktree and must not enter this isolation path.
       if (item !== null
         && task !== null
         && task.projectBindings.length > 0
+        && item.assignee !== "leader"
         && store.getWorkItemWorkspace(task.id, item.id) === null) {
         await workspaceCoordinator.isolateWorkItem(item.taskId, item.id);
       }
@@ -1544,72 +1483,12 @@ export async function main(): Promise<void> {
         }
       }
     }
-    let taskFinalReviewRebindProof: TaskFinalReviewContractRebindProof | undefined;
-    let taskFinalReviewRebindRequest:
-      | ReturnType<typeof parseTaskFinalReviewContractRebindRequest>
-      | undefined;
-    let releaseTaskFinalReviewHandoverLock: (() => void) | undefined;
-    if (resolved[1] === "review" && resolved[2] === "rebind") {
-      if (!isCurrentGlobalOperator(store, process.env)) {
-        throw usageError(
-          "Task-final Review contract rebind requires the authenticated global Operator session."
-        );
-      }
-      if (exactCurrentControlPlane === undefined) {
-        throw usageError(
-          "Task-final Review contract rebind requires the exact current global Session CLI."
-        );
-      }
-      taskFinalReviewRebindRequest = parseTaskFinalReviewContractRebindRequest(
-        resolved.slice(3)
-      );
-    }
+    let releaseReviewHandoverLock: (() => void) | undefined;
     if ((resolved[1] === "review"
-        && ["request", "force-fresh", "retry", "rebind"].includes(resolved[2] ?? ""))
+        && ["request", "force-fresh", "retry"].includes(resolved[2] ?? ""))
       || resolved[1] === "complete") {
       const handoverLock = acquireHandoverLock(home);
-      releaseTaskFinalReviewHandoverLock = handoverLock.release;
-    }
-    if (taskFinalReviewRebindRequest !== undefined) {
-      const request = taskFinalReviewRebindRequest;
-      try {
-        taskFinalReviewRebindProof = prepareTaskFinalReviewContractRebindProof({
-          home,
-          taskId: request.taskId,
-          fromControlPlaneDigest: request.fromControlPlaneDigest,
-          toControlPlaneDigest: request.toControlPlaneDigest,
-          fromReleaseId: request.fromReleaseId,
-          toReleaseId: request.toReleaseId,
-          currentControlPlane: exactCurrentControlPlane!.descriptor
-        });
-        const workItems = store.listWorkItems(request.taskId);
-        const reviewRounds = store.listReviewRounds(request.taskId);
-        const resolution = resolveRecordedTaskFinalReviewContract(
-          request.taskId,
-          workItems,
-          reviewRounds,
-          store.listEvents(request.taskId)
-        );
-        const activeRound = reviewRounds.find((round) => (
-          (round.scope ?? "work-item") === "task"
-          && (round.status === "pending" || round.status === "running")
-        ));
-        // An exact replay is a true no-op, even when the target Leader is live.
-        // Invalid/stale source tuples also reach the command unchanged so its
-        // transactional diagnosis cannot stop a healthy target runtime.
-        if (resolution?.effective.controlPlaneDigest === request.fromControlPlaneDigest
-          && activeRound === undefined) {
-          // The contract event and wake must never target a Provider
-          // Conversation launched by the source release. Active Runs fail
-          // closed; otherwise stop and retire that runtime under the handover
-          // lock before the transactional event+wake commit.
-          await workspaceCoordinator.cleanupTaskRoleRuntime(request.taskId, "leader");
-        }
-      } catch (error) {
-        releaseTaskFinalReviewHandoverLock!();
-        releaseTaskFinalReviewHandoverLock = undefined;
-        throw error;
-      }
+      releaseReviewHandoverLock = handoverLock.release;
     }
     let candidateMaterialization: Awaited<ReturnType<typeof candidateMaterializationForTaskCommand>>;
     let candidateMaterializationCommitted = false;
@@ -1659,21 +1538,6 @@ export async function main(): Promise<void> {
         store,
         actualTaskReviewCandidate
       );
-      const reviewWorkspaceResult = await reviewWorkspaceResultForTaskCommand(
-        resolved,
-        store,
-        workspacePreparer,
-        process.env
-      );
-      const executionLaneGitSnapshot = await executionLaneGitSnapshotForTaskCommand(
-        resolved,
-        store,
-        workspacePreparer,
-        process.env
-      );
-      const laneSnapshotPreflight = executionLaneGitSnapshot === undefined
-        ? undefined
-        : executionLaneGitSnapshot;
       // Physical preparation may precede the durable write, but Task status,
       // workspace identity/cwd, and ManagedWorkspace ownership are adopted by
       // one transaction. A failed attempt therefore leaves the Task Draft and
@@ -1696,9 +1560,6 @@ export async function main(): Promise<void> {
           ...(taskFinalReviewContract === undefined
             ? {}
             : { taskFinalReviewContract }),
-          ...(taskFinalReviewRebindProof === undefined
-            ? {}
-            : { taskFinalReviewRebindProof }),
           ...(completionSummary === undefined ? {} : { completionSummary }),
           ...(completionPublishedTreeProof === undefined
             ? {}
@@ -1718,8 +1579,6 @@ export async function main(): Promise<void> {
           ...(deltaRecheckPreflight === undefined
             ? {}
             : { deltaRecheckPreflight }),
-          ...(reviewWorkspaceResult === undefined ? {} : { reviewWorkspaceResult }),
-          ...(laneSnapshotPreflight === undefined ? {} : { executionLaneGitSnapshot: laneSnapshotPreflight }),
           ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
         }
       );
@@ -1742,12 +1601,12 @@ export async function main(): Promise<void> {
         let reviewData: unknown;
         const resumesReviewDispatch = (resolved[1] === "review" && resolved[2] === "request")
           || (resolved[1] === "work" && resolved[2] === "review")
-          || (resolved[1] === "run" && resolved[2] === "retry");
+          || (resolved[1] === "turn" && resolved[2] === "retry");
         const reviewDispatchNeeded = requestedRound?.status === "pending"
           || (requestedRound?.status === "running"
             && resumesReviewDispatch
             && persistedRequestedRound?.executionGroup?.lanes.some((lane) => (
-              lane.status === "pending" && lane.runId === undefined
+              lane.status === "pending" && lane.turnId === undefined
             )) === true);
         if (reviewDispatchNeeded) {
           try {
@@ -1820,7 +1679,7 @@ export async function main(): Promise<void> {
                     kind: "started",
                     reviewerRoleName: requestedRound.reviewerRoleName,
                     reviewRoundId: requestedRound.id,
-                    runId: run.id
+                    turnId: run.id
                   },
               reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
               ...(run === null ? {} : { reviewRun: run }),
@@ -1868,7 +1727,7 @@ export async function main(): Promise<void> {
           : { command: result.data, ...reviewData as object });
         return;
       }
-      if (jsonOutput) {
+      if (jsonOutput && result.kind !== "session-stop") {
         throw usageError("Task Role view/takeover requires an interactive terminal.");
       }
       if (result.kind === "session-stop") {
@@ -1999,9 +1858,9 @@ export async function main(): Promise<void> {
       }
       throw error;
     } finally {
-      if (releaseTaskFinalReviewHandoverLock !== undefined) {
-        releaseTaskFinalReviewHandoverLock();
-        releaseTaskFinalReviewHandoverLock = undefined;
+      if (releaseReviewHandoverLock !== undefined) {
+        releaseReviewHandoverLock();
+        releaseReviewHandoverLock = undefined;
       }
     }
   }
@@ -2029,7 +1888,7 @@ export async function main(): Promise<void> {
   }
 
   throw usageError(
-    `Command is not connected to the restored FileTaskStore framework yet: ${resolved[0]}.`,
+    `Command is not connected to the current TaskStore command routing: ${resolved[0]}.`,
     renderCommandHelp(invocation.node, VERSION)
   );
 }
@@ -2055,7 +1914,7 @@ type ManagedTaskControlPlanePreflight = Readonly<{
     descriptor: ExactControlPlaneDescriptor;
   }> | undefined;
   /**
-   * The FileTaskStore instance the exact runtime preflight already opened and
+   * The TaskStore instance the exact runtime preflight already opened and
    * read. A same-Home command reuses it instead of opening a second store, so
    * the unchanged large state is not parsed twice. Its per-instance fingerprint
    * cache still invalidates on any external writer, and mutations keep their
@@ -2073,13 +1932,13 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
   }
   const serializedControl = process.env[YUI_CONTROL_PLANE_DESCRIPTOR];
   const serializedRuntime = process.env[YUI_TASK_RUNTIME_DESCRIPTOR];
-  const exactRuntime = serializedControl !== undefined || serializedRuntime !== undefined;
-  if (process.env.YUI_SESSION_SCOPE === "task" && !exactRuntime) {
+  const exactAgentRuntime = serializedControl !== undefined || serializedRuntime !== undefined;
+  if (process.env.YUI_SESSION_SCOPE === "task" && !exactAgentRuntime) {
     throw new Error(
       "Exact control-plane invocation requires both frozen descriptors in a managed Task runtime."
     );
   }
-  if (!exactRuntime) {
+  if (!exactAgentRuntime) {
     if (exactControlInvocation.digest !== undefined
       || process.env.YUI_SESSION_SCOPE === "global") {
       return await preflightManagedGlobalControlPlane(exactControlInvocation.digest);
@@ -2143,9 +2002,9 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     && process.env.YUI_DRIVER_ID !== undefined
     ? builtinAgentDriverRegistry().require(process.env.YUI_DRIVER_ID)
     : undefined;
-  const verifiedStore = openCompatibleFileTaskStore(control.yuiHome);
+  const verifiedStore = openCurrentTaskStore(control.yuiHome);
   // Runtime Hooks have their own event-aware fence, including the valid case
-  // where a Provider terminal arrives after its Yui Run has yielded and a
+  // where a Provider terminal arrives after its Yui Turn has completed and a
   // later wake is pending. Ordinary managed commands still require the exact
   // current mutable runtime before routing.
   if (runtimeDriverCallback === undefined) {
@@ -2170,8 +2029,7 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
   const recordedContract = resolveRecordedTaskFinalReviewContract(
     runtime.taskId,
     verifiedStore.listWorkItems(runtime.taskId),
-    verifiedStore.listReviewRounds(runtime.taskId),
-    verifiedStore.listEvents(runtime.taskId)
+    verifiedStore.listReviewRounds(runtime.taskId)
   )?.effective;
   if (recordedContract !== undefined
     && recordedContract.reviewerRoleName !== request.reviewerRoleName) {
@@ -2251,7 +2109,7 @@ async function preflightManagedGlobalControlPlane(
   return {
     contract: undefined,
     controlPlane: { digest: commandDigest, descriptor: commandControl },
-    verifiedStore: openCompatibleFileTaskStore(home)
+    verifiedStore: openCurrentTaskStore(home)
   };
 }
 
@@ -2341,13 +2199,13 @@ function cliWorkItemReference(
 
 function cliTaskRecordReference(
   value: string,
-  kind: "agentRun" | "reviewRound",
+  kind: "turn" | "reviewRound",
   environment: NodeJS.ProcessEnv
 ) {
   try {
     return resolveTaskRecordReference(value, {
       kind,
-      label: kind === "agentRun" ? "Agent Run reference" : "ReviewRound reference",
+      label: kind === "turn" ? "Turn reference" : "ReviewRound reference",
       ...(environment.YUI_TASK_ID === undefined
         ? {}
         : { contextTaskId: environment.YUI_TASK_ID })
@@ -2366,8 +2224,6 @@ async function candidateSnapshotForTaskCommand(
 ) {
   if (args[0] !== "task") return undefined;
   const reviewableCandidateCommand = (
-    args[1] === "run" && args[2] === "yield" && args[3] !== undefined
-  ) || (
     args[1] === "work" && args[2] === "update"
     && args[3] !== undefined && args[4] === "done"
   ) || (
@@ -2381,35 +2237,6 @@ async function candidateSnapshotForTaskCommand(
   if (!reviewableCandidateCommand
     || (groupResolve && args.includes("--decision") && args[args.indexOf("--decision") + 1] !== "accept")) {
     return undefined;
-  }
-  if (args[1] === "run" && args[2] === "yield" && args[3] !== undefined) {
-    const reference = cliTaskRecordReference(args[3], "agentRun", environment);
-    const run = store.getAgentRun(reference.taskId, reference.localId);
-    if (run === null || run.purpose !== "execution" || run.workItemId === undefined) {
-      return undefined;
-    }
-    if (run.workspace === undefined) {
-      // Gitless execution has no workspace or Git snapshot to capture. The
-      // command layer still records the yielded Lane/Candidate evidence.
-      return undefined;
-    }
-    // Group-backed Runs yield Lane evidence first; the Leader's later group
-    // resolution performs the one Candidate snapshot after selected Lane
-    // outputs have been materialized into the WorkItem workspace.
-    if (run.executionGroupId !== undefined || run.workspace.owner.type === "execution-lane") {
-      const item = store.getWorkItem(run.taskId, run.workItemId);
-      const group = item === null || run.executionGroupId === undefined
-        ? undefined
-        : workItemExecutionGroupById(item, run.executionGroupId);
-      const fixedSingleLane = group?.strategy.mode === "fixed"
-        && group.strategy.count === 1
-        && group.lanes.length === 1
-        && group.stage === undefined
-        && run.workspace.owner.type === "work-item";
-      if (fixedSingleLane) return preparer.snapshotCandidateWorkspace(run.workspace);
-      return undefined;
-    }
-    return preparer.snapshotCandidateWorkspace(run.workspace);
   }
   if (args[1] === "work" && args[2] === "update"
     && args[3] !== undefined && args[4] === "done") {
@@ -2462,7 +2289,7 @@ async function candidateMaterializationForTaskCommand(
   const selected = args.flatMap((value, index) => value === "--lane" && args[index + 1] !== undefined ? [args[index + 1]!] : []);
   const materializedLaneIds = selected.length === 0
     ? group.lanes
-      .filter((lane) => lane.status === "yielded" || lane.status === "completed")
+      .filter((lane) => lane.status === "completed")
       .map(({ id }) => id)
     : selected;
   if (group.stage?.convergence !== undefined
@@ -2489,21 +2316,21 @@ async function prepareExecutionLaneWorkspacesForCommand(
   environment: NodeJS.ProcessEnv
 ): Promise<PreparedExecutionLaneWorkspaces | undefined> {
   const isDispatch = args[0] === "task" && args[1] === "work" && args[2] === "dispatch" && args[3] !== undefined;
-  const isRetry = args[0] === "task" && args[1] === "run" && args[2] === "retry" && args[3] !== undefined;
+  const isRetry = args[0] === "task" && args[1] === "turn" && args[2] === "retry" && args[3] !== undefined;
   if (!isDispatch && !isRetry) return undefined;
   const itemRef = isDispatch
     ? cliWorkItemReference(args[3]!, environment)
     : null;
   const item = itemRef === null
     ? (() => {
-        const runRef = cliTaskRecordReference(args[3]!, "agentRun", environment);
-        const run = store.getAgentRun(runRef.taskId, runRef.localId);
+        const runRef = cliTaskRecordReference(args[3]!, "turn", environment);
+        const run = store.getTurn(runRef.taskId, runRef.localId);
         return run?.workItemId === undefined ? null : store.getWorkItem(run.taskId, run.workItemId);
       })()
     : store.getWorkItem(itemRef.taskId, itemRef.localId);
   if (item === null) return undefined;
   const retryRun = isRetry
-    ? store.getAgentRun(item.taskId, cliTaskRecordReference(args[3]!, "agentRun", environment).localId)
+    ? store.getTurn(item.taskId, cliTaskRecordReference(args[3]!, "turn", environment).localId)
     : null;
   const currentGroup = currentWorkItemExecutionGroup(item);
   const group = retryRun?.executionGroupId === undefined
@@ -2525,7 +2352,7 @@ async function prepareExecutionLaneWorkspacesForCommand(
     throw usageError(`Invalid execution strategy: ${value}.`);
   })();
   const retryLaneId = isRetry
-    ? store.getAgentRun(item.taskId, cliTaskRecordReference(args[3]!, "agentRun", environment).localId)?.executionLaneId
+    ? store.getTurn(item.taskId, cliTaskRecordReference(args[3]!, "turn", environment).localId)?.executionLaneId
     : undefined;
   const plan = normalizedExecutionLanePlan({
     assignee: item.assignee ?? "",
@@ -2536,7 +2363,7 @@ async function prepareExecutionLaneWorkspacesForCommand(
       ? resolvedExecutionStageRetryGroup(currentGroup)
       : undefined,
     status: item.status,
-    nextGroupId: `execution-group-${store.peekNextAgentRunId(item.taskId)}`,
+    nextGroupId: `execution-group-${store.peekNextTurnId(item.taskId)}`,
     retryLaneId,
     phase: isRetry ? "retry" : "dispatch"
   });
@@ -2555,7 +2382,7 @@ async function prepareExecutionLaneWorkspacesForCommand(
   const adaptive = plan.strategy.mode === "adaptive";
   const needsIsolation = adaptive || laneCount > 1 || (group?.lanes.length ?? 0) > 1;
   if (!needsIsolation) return undefined;
-  const groupId = group?.id ?? `execution-group-${store.peekNextAgentRunId(item.taskId)}`;
+  const groupId = group?.id ?? `execution-group-${store.peekNextTurnId(item.taskId)}`;
   const laneIds = plan.laneIds;
   // A new Group's Lanes are not yet durable, so their worktrees would be
   // unadopted between preparation and the dispatch transaction. Hold ONE
@@ -2717,11 +2544,11 @@ async function actualTaskReviewCandidateForTaskCommand(
     if (round !== null && (round.scope ?? "work-item") === "task") {
       taskId = reference.taskId;
     }
-  } else if (args[1] === "run"
+  } else if (args[1] === "turn"
     && (args[2] === "retry" || args[2] === "settle")
     && args[3] !== undefined) {
-    const reference = cliTaskRecordReference(args[3], "agentRun", environment);
-    const run = store.getAgentRun(reference.taskId, reference.localId);
+    const reference = cliTaskRecordReference(args[3], "turn", environment);
+    const run = store.getTurn(reference.taskId, reference.localId);
     const round = run?.reviewRoundId === undefined
       ? null
       : store.getReviewRound(reference.taskId, run.reviewRoundId);
@@ -2838,62 +2665,6 @@ async function deltaRecheckPreflightForTaskCommand(
     );
   }
   return assessment.preflight;
-}
-
-async function reviewWorkspaceResultForTaskCommand(
-  args: readonly string[],
-  store: TaskStore,
-  preparer: FileTaskWorkspacePreparer,
-  environment: NodeJS.ProcessEnv
-) {
-  if (args[0] !== "task" || args[1] !== "run" || args[2] !== "yield"
-    || args[3] === undefined) return undefined;
-  const reference = cliTaskRecordReference(args[3], "agentRun", environment);
-  const run = store.getAgentRun(reference.taskId, reference.localId);
-  if (run === null || run.purpose !== "review" || run.reviewRoundId === undefined) {
-    return undefined;
-  }
-  return preparer.snapshotReviewRunResult(reference.taskId, run);
-}
-
-async function executionLaneGitSnapshotForTaskCommand(
-  args: readonly string[],
-  store: TaskStore,
-  preparer: FileTaskWorkspacePreparer,
-  environment: NodeJS.ProcessEnv
-) {
-  if (args[0] !== "task" || args[1] !== "run" || args[2] !== "yield"
-    || args[3] === undefined) return undefined;
-  const reference = cliTaskRecordReference(args[3], "agentRun", environment);
-  const run = store.getAgentRun(reference.taskId, reference.localId);
-  if (run === null || run.executionGroupId === undefined
-    || run.executionLaneId === undefined
-    // Review output has a distinct evidence contract: diagnostic work may
-    // remain uncommitted, and snapshotReviewRunResult validates its exact
-    // ReviewRound/Lane owner. It must not also pass the Develop Candidate
-    // snapshot preflight, which requires a clean committed worktree.
-    || run.purpose === "review") {
-    return undefined;
-  }
-  if (run.workspace === undefined) return null;
-  const stored = store.getManagedWorkspace(run.workspace.owner);
-  if (stored === null || !isDeepStrictEqual(stored, run.workspace)) {
-    throw usageError(`Execution Lane managed workspace changed before yield: ${run.id}.`);
-  }
-  // A Gitless fixed(1) Lane runs from the durable Task-owned empty view. It
-  // has no writable Project boundary, so there is no Lane Git snapshot to
-  // freeze; keep the normal Candidate path metadata-only.
-  if (run.workspace.owner.type === "task" && run.workspace.entries.length === 0) {
-    return null;
-  }
-  try {
-    return (await preparer.snapshotExecutionLaneWorkspace(run.workspace)) ?? null;
-  } catch (error) {
-    throw usageError(
-      `Execution Lane Git snapshot preflight failed for ${run.id}: `
-      + `${error instanceof Error ? error.message : String(error)}`
-    );
-  }
 }
 
 function reviewRoundFromCommandData(data: unknown): Readonly<{
@@ -3083,7 +2854,7 @@ async function completionCommand(
   if (args.length > (shell === undefined ? 2 : 3)) {
     throw usageError("Completion usage: yui config completion [bash|zsh|fish]");
   }
-  const store = openCompatibleFileTaskStore(home);
+  const store = openCurrentTaskStore(home);
   const ioHandle = terminalIo();
   try {
     const manager = new FileCompletionManager(store, process.env, resolveCliIdentity(process.env));
@@ -3272,7 +3043,7 @@ function selectionCall(
         : store.listInputRequests(taskId);
       return params.all === true ? requests : requests.filter((request) => request.status === "open");
     }
-    case "task.run.list": return callOptional(reader, "listAgentRuns", [params.taskId]);
+    case "task.turn.list": return callOptional(reader, "listTurns", [params.taskId]);
     case "task.decision.list": return callOptional(reader, "listDecisions", [params.taskId]);
     case "task.milestone.list": return presentSelectionTimes(
       callOptional(reader, "listMilestones", [params.taskId]),
@@ -3312,7 +3083,7 @@ function callOptional(
 }
 
 function readableStore(home: string): TaskStore {
-  return openCompatibleFileTaskStore(home);
+  return openCurrentTaskStore(home);
 }
 
 function completionSelectionPorts(home: string): SelectionPorts {

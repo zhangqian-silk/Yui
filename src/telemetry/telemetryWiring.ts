@@ -2,26 +2,20 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import {
-  resolveRunCap,
+  resolveTurnCap,
   resolveTerminalKeep
 } from "./telemetryConfig.js";
 import { resolveTelemetryEnabled } from "../config/yuiConfig.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 import { SqliteTelemetryStore } from "./sqliteTelemetryStore.js";
 import type { SchedulerTelemetry } from "./telemetryStore.js";
-import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
+import { CURRENT_DATABASE_FILENAME as COMMITTED_DATABASE_FILENAME } from "../storage/currentTaskStore.js";
 
 /**
- * Open the telemetry sidecar for a Home, resolved from the durable Yui
- * config (default `legacy`). Returns null in legacy mode so callers keep the
- * exact master behavior and never touch the database.
- *
- * Telemetry lives in the Home's authoritative `yui.db`. A Home without a
- * database has not reached SQLite storage yet, so dual/bounded mode fails
- * closed at startup with a bounded diagnosis instead of silently creating an
- * empty database (which would corrupt Home classification). Once opened, the
- * store fails isolated: a broken sidecar only increments its dropped counter
- * and never blocks the semantic lane.
+ * Open optional telemetry from the current Home's authoritative `yui.db`.
+ * Disabled telemetry performs no database work. Once opened, telemetry fails
+ * isolated: a broken sink increments its dropped counter without blocking the
+ * semantic lane.
  */
 export function openSchedulerTelemetry(
   home: string,
@@ -33,13 +27,13 @@ export function openSchedulerTelemetry(
   if (!existsSync(dbPath)) {
     throw new Error(
       `telemetryEnabled=true requires SQLite storage, but ${dbPath} does not exist. `
-      + "Migrate this Home to the database backend first (yui upgrade)."
+      + "The current Home is incomplete; preserve it for diagnosis and initialize a new Home."
     );
   }
   const store = new SqliteTelemetryStore(home, {
     mode,
     terminalKeep: resolveTerminalKeep(config.telemetryTerminalKeep),
-    runCap: resolveRunCap(config.telemetryRunCap)
+    turnCap: resolveTurnCap(config.telemetryTurnCap)
   });
   return { mode, sink: store, reader: store, retention: store };
 }

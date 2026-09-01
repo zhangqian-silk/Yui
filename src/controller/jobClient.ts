@@ -2,7 +2,7 @@
  * Client for the Controller's `job.*` socket methods. Leader/Worker code and
  * the CLI request DurableJobs through these functions instead of spawning
  * runners themselves: the Controller is the sole job owner, so a Leader
- * yield, Session replacement, or CLI exit never kills a running job.
+ * Turn completion, Session replacement, or CLI exit never kills a running job.
  */
 import type { JsonValue } from "../core/protocol.js";
 import type { IntegrationJobPort } from "../integration/gitIntegrationService.js";

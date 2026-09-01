@@ -21,18 +21,18 @@ export type TaskMessage = {
    * Machine-readable wake policy for user/operator messages (Issue 05).
    * - `leader`: the message is a directive that should wake the Leader.
    * - `none`: the message is informational context only; it must not wake
-   *   the Leader or create a Leader Run.
+   *   the Leader or create a Leader Turn.
    * Absent on older messages and on role-result/system messages, which keep
    * their existing routing.
    */
   wakePolicy?: "leader" | "none";
-  runId?: string;
+  turnId?: string;
   workItemId?: string;
   createdAt: string;
 };
 
 export type TaskMessageContext = Readonly<{
-  runId?: string;
+  turnId?: string;
   workItemId?: string;
   wakePolicy?: "leader" | "none";
 }>;
@@ -57,9 +57,9 @@ export function createTaskMessage(
     ...(context.wakePolicy === undefined
       ? {}
       : { wakePolicy: context.wakePolicy }),
-    ...(context.runId === undefined
+    ...(context.turnId === undefined
       ? {}
-      : { runId: requireSafeIdentity(context.runId, "Message Run id") }),
+      : { turnId: requireSafeIdentity(context.turnId, "Message Turn id") }),
     ...(context.workItemId === undefined
       ? {}
       : { workItemId: requireSafeIdentity(context.workItemId, "Message Work item id") }),
@@ -89,15 +89,15 @@ export function validateTaskMessage(message: TaskMessage): void {
     && message.kind !== "operator") {
     throw new Error("Message wakePolicy is only valid for user/operator messages.");
   }
-  if (message.runId !== undefined) requireSafeIdentity(message.runId, "Message Run id");
+  if (message.turnId !== undefined) requireSafeIdentity(message.turnId, "Message Turn id");
   if (message.workItemId !== undefined) {
     validateTaskRecordReference({
       taskId: message.taskId,
       localId: message.workItemId
     }, "workItem");
   }
-  if (message.runId !== undefined) {
-    validateTaskRecordReference({ taskId: message.taskId, localId: message.runId }, "agentRun");
+  if (message.turnId !== undefined) {
+    validateTaskRecordReference({ taskId: message.taskId, localId: message.turnId }, "turn");
   }
   if (typeof message.createdAt !== "string" || Number.isNaN(Date.parse(message.createdAt))) {
     throw new Error("Message createdAt is invalid.");

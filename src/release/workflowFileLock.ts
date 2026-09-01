@@ -5,7 +5,7 @@ import { join } from "node:path";
 /**
  * Cross-process mutual exclusion for one workflow's engine runs. Each CLI
  * invocation is a fresh Node process, so an in-process map cannot coordinate
- * across processes; this lock lives under the FileTaskStore root instead.
+ * across processes; this lock lives under the current Home root instead.
  *
  * The lock is a directory created atomically with mkdir(2): its existence is
  * the lock, so a second acquirer fails with EEXIST while the first holds it.

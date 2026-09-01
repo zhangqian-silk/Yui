@@ -114,9 +114,9 @@ export function executionBand(projection, t, locale) {
   head.append(pill(t, "exec.status", projection.status));
   head.append(node("span", "exec-band-owner",
     t("exec.owner." + projection.owner) + " · " + t("exec.action." + projection.action)));
-  if (projection.activeRuns && projection.activeRuns.length > 0) {
+  if (projection.activeTurns && projection.activeTurns.length > 0) {
     head.append(node("span", "exec-band-executors",
-      projection.activeRuns.length + " " + t("exec.executors")));
+      projection.activeTurns.length + " " + t("exec.executors")));
   }
   if (projection.monitoring === "stopped") {
     head.append(node("span", "exec-band-stopped", t("exec.monitoring.stopped")));
@@ -296,7 +296,7 @@ export function candidateList(candidates, t, locale) {
       row.append(node("span", "candidate-summary", candidate.summary));
       const source = candidate.source.type === "direct"
         ? t("candidate.source.direct")
-        : t("candidate.source.run") + " " + candidate.source.runId;
+        : t("candidate.source.turn") + " " + candidate.source.turnId;
       row.append(node("span", "candidate-source", source));
       row.append(node("time", "", formatDateTime(candidate.createdAt, locale)));
       list.append(row);
@@ -478,7 +478,7 @@ export function inputCard(input, _options, t, locale, actions) {
   }
   if (input.requester) {
     top.append(node("span", "input-requester",
-      t("detail.requester") + " · " + input.requester.roleName + " / " + input.requester.runId));
+      t("detail.requester") + " · " + input.requester.roleName + " / " + input.requester.turnId));
   }
   card.append(top);
   card.append(answerActions(input, actions, t));
@@ -611,69 +611,44 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
   return card;
 }
 
-export function runCard(run, t, locale) {
+export function turnCard(turn, t, locale) {
   const card = node("article", "execute-card");
-  card.dataset.status = run.status;
+  card.dataset.status = turn.status;
 
   const idRow = node("div", "execute-id");
-  idRow.append(statusDot(run.status));
-  idRow.append(node("span", "role", run.roleName));
-  idRow.append(node("span", "", run.id));
-  if (run.workItemId) idRow.append(node("span", "", t("detail.workItem") + " · " + run.workItemId));
-  if (run.purpose) idRow.append(chip(t("run.purpose." + run.purpose)));
-  idRow.append(node("time", "", formatDateTime(run.endedAt || run.updatedAt, locale)));
+  idRow.append(statusDot(turn.status));
+  idRow.append(node("span", "role", turn.roleName));
+  idRow.append(node("span", "", turn.id));
+  if (turn.workItemId) idRow.append(node("span", "", t("detail.workItem") + " · " + turn.workItemId));
+  if (turn.purpose) idRow.append(chip(t("turn.purpose." + turn.purpose)));
+  idRow.append(node("time", "", formatDateTime(turn.result?.completedAt || turn.updatedAt, locale)));
   card.append(idRow);
 
-  card.append(richText(t("detail.instruction"), run.assignment?.directive || run.assignment?.action || "-", t, { className: "execute-io", threshold: 320 }));
-  if (run.summary) {
-    card.append(richText(t("detail.outcome"), run.summary, t, { className: "execute-io outcome", threshold: 320 }));
+  const visibleInput = turn.inputs && turn.inputs.length ? turn.inputs[0].input : null;
+  card.append(richText(t("detail.instruction"), visibleInput?.directive || visibleInput?.action || "-", t, { className: "execute-io", threshold: 320 }));
+  if (turn.result?.output) {
+    card.append(richText(t("detail.outcome"), turn.result.output, t, { className: "execute-io outcome", threshold: 320 }));
   }
 
   const foot = node("div", "execute-foot");
   const tags = node("div", "execute-tags");
-  tags.append(chip(t("mode." + run.mode)));
-  if (run.executionGroupId) {
-    tags.append(chip(t("detail.lineage") + " · " + run.executionGroupId
-      + (run.executionLaneId ? "/" + run.executionLaneId : "")));
+  tags.append(chip(t("mode." + turn.mode)));
+  if (turn.executionGroupId) {
+    tags.append(chip(t("detail.lineage") + " · " + turn.executionGroupId
+      + (turn.executionLaneId ? "/" + turn.executionLaneId : "")));
   }
-  const deliveryKey = run.deliveredAt
-    ? "delivery.delivered"
-    : run.pushedAt
-      ? "delivery.pushed"
-      : "delivery.pending";
-  tags.append(chip(t(deliveryKey)));
-  const badge = run.effective ? agentBadge(run.effective) : (run.agentId ? agentBadge(run) : null);
+  const badge = turn.effective ? agentBadge(turn.effective) : (turn.agentId ? agentBadge(turn) : null);
   if (badge) tags.append(badge);
   foot.append(tags);
-  foot.append(pill(t, "run", run.status));
+  foot.append(pill(t, "turn", turn.status));
   card.append(foot);
 
-  if (run.effective) {
+  if (turn.effective) {
     const eff = node("div", "record-meta");
-    eff.append(node("span", "", t("detail.effective") + " · r" + run.effective.sourceDesiredRevision));
-    eff.append(node("span", "", t("detail.profileIntent") + " · " + run.effective.profileAccess));
-    eff.append(node("span", "", t("detail.permission") + " · " + run.effective.permission.strategy));
+    eff.append(node("span", "", t("detail.effective") + " · r" + turn.effective.sourceDesiredRevision));
+    eff.append(node("span", "", t("detail.profileIntent") + " · " + turn.effective.profileAccess));
+    eff.append(node("span", "", t("detail.permission") + " · " + turn.effective.permission.strategy));
     card.append(eff);
-  }
-
-  // Leader Run disposition: the machine-derived outcome of a terminal Leader
-  // Run, plus any structured wait reference.
-  if (run.disposition) {
-    const disposition = node("div", "record-meta");
-    disposition.append(node("span", "", t("run.disposition") + " · " + t("run.disposition." + run.disposition)));
-    if (run.waitReason) {
-      disposition.append(node("span", "", t("run.waitReason") + " · " + run.waitReason.kind
-        + (run.waitReason.ref ? " (" + run.waitReason.ref + ")" : "")));
-    }
-    card.append(disposition);
-  }
-
-  // Idempotent yield receipt on a yielded Run.
-  if (run.yieldReceipt) {
-    const receipt = node("div", "record-meta");
-    receipt.append(node("span", "mono", t("run.yieldReceipt") + " · " + run.yieldReceipt.receiptId));
-    receipt.append(node("time", "", formatDateTime(run.yieldReceipt.committedAt, locale)));
-    card.append(receipt);
   }
 
   return card;
@@ -728,7 +703,7 @@ export function roleCard(role, task, t, locale, actions) {
   headRight.append(pill(t, "role", role.status));
   const open = node("button", "record-open", "");
   open.type = "button";
-  open.append(node("span", "", t("actions.openRun")), node("span", "arrow", "→"));
+  open.append(node("span", "", t("actions.openSession")), node("span", "arrow", "→"));
   open.addEventListener("click", function () {
     if (actions.openTerminal) actions.openTerminal({ scope: "task", taskId: task.id, roleName: role.name });
   });
@@ -861,7 +836,7 @@ export function messageCard(message, t, locale) {
   const meta = node("div", "record-meta");
   meta.append(node("span", "mono", message.id));
   meta.append(node("time", "", formatDateTime(message.createdAt, locale)));
-  if (message.runId) meta.append(node("span", "mono", message.runId + (message.workItemId ? " · " + message.workItemId : "")));
+  if (message.turnId) meta.append(node("span", "mono", message.turnId + (message.workItemId ? " · " + message.workItemId : "")));
   card.append(meta);
 
   card.append(richText(null, message.body, t));

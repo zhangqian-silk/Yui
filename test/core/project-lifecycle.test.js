@@ -8,11 +8,8 @@ import test from "node:test";
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { createProject } from "../../dist/repository/project.js";
-import {
-  createProductionRegistry,
-  runMigration
-} from "../../dist/storage/migration/index.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
+import { inspectStorageSchema } from "../../dist/storage/storageSchema.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
@@ -509,92 +506,26 @@ test("a retired Project refuses every knowledge write while keeping reads", asyn
   assert.ok(proposals.output.length > 0, "the proposals read path must stay open");
 });
 
-test("the production migration upgrades Project v4 records to v5 with active status", () => {
+test("production storage rejects historical record versions", () => {
   const latest = latestStorageVersionState();
-  const source = {
-    layout: latest.layout,
-    aggregate: latest.aggregate,
-    record: { ...latest.record, project: { version: 4, path: latest.record.project.path } }
-  };
-  const v4Project = {
-    schemaVersion: 4,
-    id: "project-1",
-    name: "app",
-    aliases: [],
-    path: "/tmp/app",
-    ownership: "external",
-    stableBranch: "master",
-    developmentBranch: "master",
-    knowledge: [],
-    knowledgeProposals: [],
-    createdAt: now.toISOString(),
-    updatedAt: now.toISOString()
-  };
-  let snapshot = {
-    schemaManifest: { recordVersions: { project: 4 } },
-    state: { projects: { "project-1": v4Project } }
-  };
-  let staged = null;
-  const target = {
-    inspectVersions: () => source,
-    detectLiveRuntime: () => ({ active: false }),
-    readSource: () => snapshot,
-    writeFreshOutput: (next) => { staged = next; },
-    rebuildDerivedState: () => ({ rebuiltEffects: [] }),
-    validateCurrentState: () => ({ checks: [] }),
-    discardFreshOutput: () => { staged = null; },
-    atomicSwitchWithBackup: () => { snapshot = staged; staged = null; return { status: "switched" }; }
-  };
-
-  const report = runMigration({
-    registry: createProductionRegistry(),
-    target,
-    latest,
-    mode: "execute"
-  });
-  assert.equal(report.outcome, "migrated");
-  const migrated = snapshot.state.projects["project-1"];
-  assert.equal(migrated.schemaVersion, 5);
-  assert.equal(migrated.status, "active");
-  assert.equal(migrated.retirement, undefined);
-  assert.equal(snapshot.schemaManifest.recordVersions.project, 5);
-});
-
-test("the production migration enables execution for Task v5 records", () => {
-  const latest = latestStorageVersionState();
-  const source = {
-    layout: latest.layout,
-    aggregate: latest.aggregate,
-    record: { ...latest.record, task: { version: 5, path: latest.record.task.path } }
-  };
-  const current = activateTask(createTask("task-1", "Continue after upgrade", now), now);
-  const { executionGate: _executionGate, ...withoutGate } = current;
-  const v5Task = { ...withoutGate, schemaVersion: 5 };
-  let snapshot = {
-    schemaManifest: { recordVersions: { task: 5 } },
-    state: { tasks: { "task-1": { task: v5Task } } }
-  };
-  let staged = null;
-  const target = {
-    inspectVersions: () => source,
-    detectLiveRuntime: () => ({ active: false }),
-    readSource: () => snapshot,
-    writeFreshOutput: (next) => { staged = next; },
-    rebuildDerivedState: () => ({ rebuiltEffects: [] }),
-    validateCurrentState: () => ({ checks: [] }),
-    discardFreshOutput: () => { staged = null; },
-    atomicSwitchWithBackup: () => { snapshot = staged; staged = null; return { status: "switched" }; }
-  };
-
-  const report = runMigration({
-    registry: createProductionRegistry(),
-    target,
-    latest,
-    mode: "execute"
-  });
-  assert.equal(report.outcome, "migrated");
-  const migrated = snapshot.state.tasks["task-1"].task;
-  assert.equal(migrated.schemaVersion, 6);
-  assert.deepEqual(migrated.executionGate, { state: "enabled" });
-  assert.equal(snapshot.schemaManifest.recordVersions.task, 6);
+  const home = mkdtempSync(join(tmpdir(), "yui-historical-record-"));
+  try {
+    writeFileSync(join(home, "schema.json"), JSON.stringify({
+      schemaVersion: 1,
+      storageVersion: latest.layout,
+      aggregateSchemaVersion: latest.aggregate,
+      recordVersions: {
+        ...Object.fromEntries(Object.entries(latest.record).map(([kind, entry]) => [kind, entry.version])),
+        project: latest.record.project.version - 1
+      },
+      updatedAt: now.toISOString()
+    }));
+    const state = inspectStorageSchema(home);
+    assert.equal(state.status, "unsupported");
+    assert.equal(state.incompatibleComponent, "record");
+    assert.equal(state.recordFamily, "project");
+    assert.equal(state.direction, "older");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

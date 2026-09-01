@@ -11,8 +11,7 @@ import { join } from "node:path";
 /**
  * Per-Project maintenance fence.
  *
- * `project migrate`, Task workspace rebuild, legacy ref archive, and Task
- * archive cleanup are separate CLI processes that all mutate a Project's
+ * `project migrate` and Task archive cleanup are separate CLI processes that mutate a Project's
  * Git repository. Without coordination they can interleave with each other
  * and with the Controller's worktree preparation. The fence is an exclusive
  * directory under the Home's `locks/` area (O_EXCL via mkdir), so it works

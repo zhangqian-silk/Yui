@@ -2,12 +2,11 @@ import type { TaskCompletedBy } from "../task/task.js";
 import { usageError } from "../errors/cliError.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { activeRoleAgentBinding } from "../role/role.js";
-import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
-import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import type { DurableJobCaller } from "../controller/jobControl.js";
+import { managedProviderTurnId } from "../runtime/providerRuntimeIdentity.js";
 
 const LEADER_ROLE = "leader";
-const LEADER_ACTION_RUN_ENV = "YUI_LEADER_ACTION_RUN_ID";
+const LEADER_ACTION_RUN_ENV = "YUI_LEADER_ACTION_TURN_ID";
 const LEADER_ACTION_RECEIPT_ENV = "YUI_LEADER_ACTION_RECEIPT_ID";
 /** rr13: Per-Session DurableJob caller key injected at native Session launch. */
 const JOB_CALLER_KEY_ENV = "YUI_JOB_CALLER_KEY";
@@ -36,7 +35,7 @@ export function taskActor(
   if (
     env.YUI_ROLE !== undefined
     || env.YUI_AGENT_ID !== undefined
-    || env.YUI_RUN_ID !== undefined
+    || env.YUI_TURN_ID !== undefined
     || env.YUI_NATIVE_SESSION_ID !== undefined
   ) {
     throw usageError("Managed Agent identity is incomplete; refusing to infer user authority.");
@@ -48,13 +47,13 @@ export function taskActor(
  * Resolve authority for a recoverable Task-local mutation. A managed Leader
  * does not gain that authority from long-lived process environment alone: the
  * command must carry the exact current Turn assertion and it must still match
- * the durable active Run, receipt, Role binding, native Session, and Home.
+ * the durable active Turn, receipt, Role binding, native Session, and Home.
  * Plain-user and global-Operator behavior remains unchanged.
  */
 export function taskLocalActor(
   store: Pick<
     TaskStore,
-    "getRole" | "getActiveAgentRun" | "getTaskRoleSessionSet"
+    "getRole" | "getActiveTurn" | "getTaskRoleSessionSet"
   >,
   environment: NodeJS.ProcessEnv | undefined,
   taskId: string,
@@ -62,11 +61,9 @@ export function taskLocalActor(
 ): TaskCompletedBy {
   const actor = taskActor(environment, taskId);
   if (actor !== "leader") return actor;
-  const assertion = leaderActionAssertion(environment ?? {});
-  if (assertion === undefined || assertion === "invalid"
-    || taskLeaderActionRunId(store, taskId, environment, yuiHome) === undefined) {
+  if (taskLeaderActionTurnId(store, taskId, environment, yuiHome) === undefined) {
     throw usageError(
-      `Task-local Leader authority requires the exact current-Turn assertion: ${taskId}.`
+      `Task-local Leader authority requires the current Provider Turn: ${taskId}.`
     );
   }
   return actor;
@@ -91,7 +88,7 @@ export function projectActor(environment: NodeJS.ProcessEnv | undefined): Projec
   if (
     env.YUI_ROLE !== undefined
     || env.YUI_AGENT_ID !== undefined
-    || env.YUI_RUN_ID !== undefined
+    || env.YUI_TURN_ID !== undefined
     || env.YUI_NATIVE_SESSION_ID !== undefined
   ) {
     throw usageError("Managed Agent identity is incomplete; refusing to infer user authority.");
@@ -106,8 +103,8 @@ export function projectActor(environment: NodeJS.ProcessEnv | undefined): Projec
  *
  * rr12: The identity is now Controller-verified rather than self-reported:
  * - A managed Task Session (`YUI_SESSION_SCOPE=task`) returns `scope: "task"`
- *   with its Role and Run. For a Leader, the explicit current-Turn Run id is
- *   preferred over a possibly stale `YUI_RUN_ID`.
+ *   with its Role and Turn. For a Leader, the explicit current Turn id is
+ *   preferred over a possibly stale `YUI_TURN_ID`.
  *
  * rr13: A managed Task Session also carries `callerKey` — the
  * `YUI_JOB_CALLER_KEY` injected at its native Session launch. The Controller
@@ -117,7 +114,7 @@ export function projectActor(environment: NodeJS.ProcessEnv | undefined): Projec
  * managed global Agent carries its own durable Session identity.
  *
  * A managed Task Session may only start jobs for its own Task. An incomplete
- * managed identity (role/agent/run/session vars without a scope) is rejected
+ * managed identity (role/agent/Turn/Session vars without a scope) is rejected
  * rather than silently downgraded to user authority.
  */
 export function resolveJobCaller(
@@ -137,14 +134,14 @@ export function resolveJobCaller(
     // Controller boundary.
     const callerKey = env[JOB_CALLER_KEY_ENV];
     if (role === LEADER_ROLE) {
-      // Prefer the explicit current-Turn Run over a possibly stale YUI_RUN_ID.
+      // Prefer the explicit current Turn over a possibly stale YUI_TURN_ID.
       const assertion = leaderActionAssertion(env);
       if (assertion !== undefined && assertion !== "invalid") {
         return {
           scope: "task",
           taskId,
           role,
-          runId: assertion.runId,
+          turnId: assertion.turnId,
           ...(callerKey === undefined ? {} : { callerKey })
         };
       }
@@ -153,7 +150,7 @@ export function resolveJobCaller(
       scope: "task",
       taskId,
       role,
-      ...(env.YUI_RUN_ID === undefined ? {} : { runId: env.YUI_RUN_ID }),
+      ...(env.YUI_TURN_ID === undefined ? {} : { turnId: env.YUI_TURN_ID }),
       ...(callerKey === undefined ? {} : { callerKey })
     };
   }
@@ -170,7 +167,7 @@ export function resolveJobCaller(
   if (
     env.YUI_ROLE !== undefined
     || env.YUI_AGENT_ID !== undefined
-    || env.YUI_RUN_ID !== undefined
+    || env.YUI_TURN_ID !== undefined
     || env.YUI_NATIVE_SESSION_ID !== undefined
   ) {
     throw usageError("Managed Agent identity is incomplete; refusing to infer user authority.");
@@ -179,21 +176,21 @@ export function resolveJobCaller(
 }
 
 /**
- * Resolve an exact current Task Leader Run for event attribution.
+ * Resolve an exact current Task Leader Turn for event attribution.
  *
  * Task commands may be invoked by a managed process whose environment is
- * stale, incomplete, or copied from another Run.  A bare YUI_RUN_ID is never
- * enough: the active durable Run, Role, in-flight receipt, native Session,
+ * stale, incomplete, or copied from another Turn. A bare YUI_TURN_ID is never
+ * enough: the active durable Turn, Role, in-flight receipt, native Session,
  * launch generation, and (when supplied) Home must all agree before an
  * allowlisted lifecycle event can buy a Leader action window.  A fixed native
- * Session may keep an earlier Run/launch in its process environment; in that
+ * Session may keep an earlier Turn/launch in its process environment; in that
  * case the current Leader turn must explicitly carry the exact durable
- * Run/receipt pair through the two command-only assertion variables below.
+ * Turn/receipt pair through the two command-only assertion variables below.
  */
-export function taskLeaderActionRunId(
+export function taskLeaderActionTurnId(
   store: Pick<
     TaskStore,
-    "getRole" | "getActiveAgentRun" | "getTaskRoleSessionSet"
+    "getRole" | "getActiveTurn" | "getTaskRoleSessionSet"
   >,
   taskId: string,
   environment: NodeJS.ProcessEnv | undefined,
@@ -205,13 +202,16 @@ export function taskLeaderActionRunId(
   const environmentAssertion = leaderActionAssertion(env);
   if (environmentAssertion === "invalid") return undefined;
   const explicitAssertion = environmentAssertion === undefined ? undefined : environmentAssertion;
-  const runId = explicitAssertion?.runId ?? identity(env.YUI_RUN_ID);
+  const observedTurnTurnId = managedProviderTurnId(
+    store.getTaskRoleSessionSet(taskId, LEADER_ROLE)?.providerBinding?.turn
+  ) ?? undefined;
+  const turnId = explicitAssertion?.turnId ?? observedTurnTurnId ?? identity(env.YUI_TURN_ID);
   const agentId = identity(env.YUI_AGENT_ID);
   const adapterId = identity(env.YUI_ADAPTER_ID);
   const launchId = identity(env.YUI_LAUNCH_ID);
   const home = identity(env.YUI_HOME);
   if (
-    runId === undefined
+    turnId === undefined
     || agentId === undefined
     || adapterId === undefined
     || launchId === undefined
@@ -226,13 +226,13 @@ export function taskLeaderActionRunId(
   if (yuiHome === undefined && storeHome !== undefined && home !== storeHome) return undefined;
 
   const role = store.getRole(taskId, LEADER_ROLE);
-  const run = store.getActiveAgentRun(taskId, LEADER_ROLE);
+  const run = store.getActiveTurn(taskId, LEADER_ROLE);
   const sessions = store.getTaskRoleSessionSet(taskId, LEADER_ROLE);
   if (
     role === null
     || run === null
     || run.status !== "active"
-    || run.id !== runId
+    || run.id !== turnId
     || run.taskId !== taskId
     || run.roleName !== LEADER_ROLE
     || run.effective.agentId !== agentId
@@ -244,14 +244,7 @@ export function taskLeaderActionRunId(
     || sessions.owner.taskId !== taskId
     || sessions.owner.roleName !== LEADER_ROLE
     || sessions.activeAgentId !== agentId
-    || sessions.inFlight === null
-    || sessions.inFlight.runId !== runId
-    || sessions.inFlight.agentId !== agentId
-    || sessions.inFlight.receiptId !== agentRunDeliveryReceiptId(run)
-  ) return undefined;
-  if (
-    explicitAssertion !== undefined
-    && explicitAssertion.receiptId !== formatAgentRunReceiptId(taskId, runId)
+    || managedProviderTurnId(sessions.providerBinding?.turn) !== turnId
   ) return undefined;
 
   const session = sessions.sessions[agentId];
@@ -272,15 +265,15 @@ export function taskLeaderActionRunId(
 
 function leaderActionAssertion(
   environment: NodeJS.ProcessEnv
-): Readonly<{ runId: string; receiptId: string }> | undefined | "invalid" {
-  const runId = environment[LEADER_ACTION_RUN_ENV];
+): Readonly<{ turnId: string; receiptId: string }> | undefined | "invalid" {
+  const turnId = environment[LEADER_ACTION_RUN_ENV];
   const receiptId = environment[LEADER_ACTION_RECEIPT_ENV];
-  if (runId === undefined && receiptId === undefined) return undefined;
-  const normalizedRunId = identity(runId);
+  if (turnId === undefined && receiptId === undefined) return undefined;
+  const normalizedTurnId = identity(turnId);
   const normalizedReceiptId = identity(receiptId);
-  return normalizedRunId === undefined || normalizedReceiptId === undefined
+  return normalizedTurnId === undefined || normalizedReceiptId === undefined
     ? "invalid"
-    : { runId: normalizedRunId, receiptId: normalizedReceiptId };
+    : { turnId: normalizedTurnId, receiptId: normalizedReceiptId };
 }
 
 function identity(value: unknown): string | undefined {

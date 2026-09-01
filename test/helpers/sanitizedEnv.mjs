@@ -2,7 +2,7 @@
  * Shared test environment helper.
  *
  * Quick Win (EXE-11): test subprocesses must not inherit the managed Session,
- * Run, launch, or control-plane descriptors of the Yui Session that launched
+ * Turn, launch, or control-plane descriptors of the Yui Session that launched
  * the test runner.  A test that needs to verify descriptor handling must
  * inject its own fixture explicitly.
  */
@@ -20,7 +20,7 @@ const MANAGED_RUNTIME_ENV_NAMES = Object.freeze([
   "YUI_ADAPTER_ID",
   "YUI_DRIVER_ID",
   "YUI_WORKSPACE",
-  "YUI_RUN_ID",
+  "YUI_TURN_ID",
   "YUI_LAUNCH_ID",
   "YUI_NATIVE_SESSION_ROOT",
   "YUI_NATIVE_SESSION_ID",
@@ -34,7 +34,7 @@ const MANAGED_RUNTIME_ENV_NAMES = Object.freeze([
   "YUI_WRITABLE_PROJECT_IDS",
   "YUI_CONTEXT_PROJECT_IDS",
   "YUI_WORKSPACE_PROJECTS",
-  "YUI_LEADER_ACTION_RUN_ID",
+  "YUI_LEADER_ACTION_TURN_ID",
   "YUI_LEADER_ACTION_RECEIPT_ID",
   "YUI_JOB_CALLER_KEY"
 ]);

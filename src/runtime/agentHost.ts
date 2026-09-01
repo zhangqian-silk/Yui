@@ -16,8 +16,10 @@ import { isForeignHandoverLockHeld } from "../release/runtimeRelease.js";
 import {
   publishStructuredProviderAccepted,
   publishStructuredProviderActivationTerminal,
+  publishStructuredProviderGoal,
   publishStructuredConversationRecoverability,
   publishStructuredProviderOpened,
+  publishStructuredProviderStarted,
   publishStructuredProviderTerminal
 } from "../controller/structuredProviderObservation.js";
 import {
@@ -31,6 +33,8 @@ import {
   ProviderTurnRejectedError,
   startStructuredProviderSession,
   type StructuredProviderSession,
+  type StructuredProviderGoal,
+  type StructuredProviderTurnStarted,
   type StructuredProviderTurnInput,
   type StructuredProviderTurnTerminal
 } from "./structuredProviderHost.js";
@@ -80,8 +84,18 @@ export type AgentHostSubmitTurnControl = Readonly<{
   type: "submit-turn";
   launchId: string;
   nativeSessionId: string;
-  /** Current durable Run; a reused Host must not inherit its launch-time Run. */
-  runId: string;
+  /** Current durable Turn; a reused Host must not inherit its launch-time Turn. */
+  turnId?: string;
+  authority: ProviderAuthorityFence;
+  turn: StructuredProviderTurnInput;
+}>;
+
+export type AgentHostSteerTurnControl = Readonly<{
+  protocol: typeof AGENT_HOST_CONTROL_PROTOCOL;
+  type: "steer-turn";
+  launchId: string;
+  nativeSessionId: string;
+  nativeTurnId: string;
   authority: ProviderAuthorityFence;
   turn: StructuredProviderTurnInput;
 }>;
@@ -97,6 +111,7 @@ export type AgentHostControl =
   | AgentHostLaunchControl
   | AgentHostStatusControl
   | AgentHostSubmitTurnControl
+  | AgentHostSteerTurnControl
   | AgentHostSetAuthorityControl;
 
 export type AgentHostProviderState =
@@ -166,6 +181,7 @@ export async function runAgentHost(input: Readonly<{
   let snapshot = hostSnapshot("idle");
   let dispatchTail = Promise.resolve();
   let promptHuman = (): void => {};
+  const recentSteerAttempts = new Set<string>();
   await replayExitOutbox(input.home);
 
   const updateSnapshot = (next: AgentHostSnapshot): void => {
@@ -181,6 +197,32 @@ export async function runAgentHost(input: Readonly<{
     authorityHolderId: authority.holderId
   };
 
+  const handleStarted = (
+    started: StructuredProviderTurnStarted,
+    observedPayload: AgentHostLaunchPayload | undefined = sessionPayload
+  ): void => {
+    if (started.clientOwned || observedPayload === undefined) return;
+    updateSnapshot(hostSnapshot("busy", {
+      launchId: observedPayload.launchId,
+      adapterId: observedPayload.providerControl?.adapterId,
+      processInstanceId: session?.processInstanceId,
+      nativeSessionId: started.nativeSessionId,
+      conversationId: started.conversationId,
+      nativeTurnId: started.nativeTurnId,
+      ...authorityFields()
+    }));
+    const directActivationId = activationId ?? observedPayload.launchId;
+    void enqueueSerialized(async () => {
+      await publishStructuredProviderStarted({
+        home: input.home,
+        environment: observedPayload.environment,
+        activationId: directActivationId,
+        started
+      });
+      signalRoleMailbox(input.home, observedPayload);
+    }).catch(() => {});
+  };
+
   const handleTerminal = (terminal: StructuredProviderTurnTerminal): void => {
     if (!terminal.clientOwned) {
       const busyPayload = sessionPayload;
@@ -189,19 +231,29 @@ export async function runAgentHost(input: Readonly<{
         || session === undefined
         || terminal.conversationId !== session.conversationId
       ) return;
-      // Another ordinary client completed a Turn. It never enters Yui's Run
-      // observation path; it only removes backpressure from retained work.
-      if (snapshot.state === "busy") {
-        updateSnapshot(hostSnapshot("idle", {
-          launchId: busyPayload.launchId,
-          adapterId: session.adapterId,
-          processInstanceId: session.processInstanceId,
-          nativeSessionId: session.nativeSessionId,
-          conversationId: session.conversationId,
-          ...authorityFields()
-        }));
-      }
-      signalRoleMailbox(input.home, busyPayload);
+      // A direct Provider client shares the Session but still produces a Yui
+      // Turn audit record. It has no WorkItem ownership and no managed input
+      // fence; the runtime observer records only visible input/output.
+      const directActivationId = activationId ?? busyPayload.launchId;
+      void enqueueSerialized(async () => {
+        await publishStructuredProviderTerminal({
+          home: input.home,
+          environment: busyPayload.environment,
+          activationId: directActivationId,
+          terminal
+        });
+        if (session !== undefined && terminal.conversationId === session.conversationId) {
+          updateSnapshot(hostSnapshot(session.activeTurnId === undefined ? "idle" : "busy", {
+            launchId: busyPayload.launchId,
+            adapterId: session.adapterId,
+            processInstanceId: session.processInstanceId,
+            nativeSessionId: session.nativeSessionId,
+            conversationId: session.conversationId,
+            ...authorityFields()
+          }));
+        }
+        signalRoleMailbox(input.home, busyPayload);
+      }).catch(() => {});
       return;
     }
     const terminalPayload = activeTurnPayload;
@@ -257,6 +309,23 @@ export async function runAgentHost(input: Readonly<{
     }).catch(() => {});
   };
 
+  const handleGoal = (goal: StructuredProviderGoal | null): void => {
+    const currentPayload = activeTurnPayload ?? sessionPayload;
+    const currentSession = session;
+    if (currentPayload === undefined || currentSession === undefined) return;
+    const currentActivationId = activationId ?? currentPayload.launchId;
+    void enqueueSerialized(async () => {
+      await publishStructuredProviderGoal({
+        home: input.home,
+        environment: currentPayload.environment,
+        activationId: currentActivationId,
+        conversationId: currentSession.conversationId,
+        goal
+      });
+      signalRoleMailbox(input.home, currentPayload);
+    }).catch(() => {});
+  };
+
   const reconnectCodexClient = async (
     disconnectedSession: StructuredProviderSession,
     currentPayload: AgentHostLaunchPayload
@@ -296,7 +365,9 @@ export async function runAgentHost(input: Readonly<{
       if (hostStopRequested) return;
       try {
         const started = await startStructuredProviderSession(reconnectPayload, {
-          onTerminal: handleTerminal
+          onStarted: (turn) => handleStarted(turn, currentPayload),
+          onTerminal: handleTerminal,
+          onGoal: handleGoal
         });
         session = started.session;
         sessionPayload = currentPayload;
@@ -324,6 +395,16 @@ export async function runAgentHost(input: Readonly<{
         if (started.recoveredTerminal !== undefined) {
           handleTerminal(started.recoveredTerminal);
         }
+        if (ownedTurn === undefined && started.session.activeTurnId !== undefined) {
+          handleStarted({
+            conversationId: started.session.conversationId,
+            nativeSessionId: started.session.nativeSessionId,
+            nativeTurnId: started.session.activeTurnId,
+            clientOwned: false,
+            observedAt: new Date().toISOString()
+          }, currentPayload);
+        }
+        if (started.goal !== undefined) handleGoal(started.goal);
         return;
       } catch (error) {
         lastError = error;
@@ -427,9 +508,9 @@ export async function runAgentHost(input: Readonly<{
             ? {}
             : { taskId: currentPayload.environment.YUI_TASK_ID }),
           roleName: currentPayload.environment.YUI_ROLE ?? "unknown-role",
-          ...(currentPayload.environment.YUI_RUN_ID === undefined
+          ...(currentPayload.environment.YUI_TURN_ID === undefined
             ? {}
-            : { runId: currentPayload.environment.YUI_RUN_ID }),
+            : { turnId: currentPayload.environment.YUI_TURN_ID }),
           launchId: currentPayload.launchId,
           ...(providerSession.nativeSessionId.length === 0
             ? {}
@@ -501,6 +582,7 @@ export async function runAgentHost(input: Readonly<{
       }),
       ...authorityFields()
     }));
+    let recoveredGoal: StructuredProviderGoal | null | undefined;
     try {
       if (session !== undefined) {
         if (session.adapterId !== providerControl.adapterId
@@ -519,9 +601,14 @@ export async function runAgentHost(input: Readonly<{
           activeTurnAttemptId = providerControl.ownedTurn.attemptId;
           activeNativeTurnId = providerControl.ownedTurn.turnId;
         }
-        const started = await startStructuredProviderSession(next, { onTerminal: handleTerminal });
+        const started = await startStructuredProviderSession(next, {
+          onStarted: (turn) => handleStarted(turn, next),
+          onTerminal: handleTerminal,
+          onGoal: handleGoal
+        });
         session = started.session;
         sessionPayload = next;
+        recoveredGoal = started.goal;
         if (started.session.adapterId === "codex") {
           codexClientAttachedAt = Date.now();
           consecutiveCodexDisconnects = 0;
@@ -529,6 +616,16 @@ export async function runAgentHost(input: Readonly<{
         observeExit(started.session, next);
         if (started.recoveredTerminal !== undefined) {
           handleTerminal(started.recoveredTerminal);
+        }
+        if ((providerControl.kind !== "restore" || providerControl.ownedTurn === undefined)
+          && started.session.activeTurnId !== undefined) {
+          handleStarted({
+            conversationId: started.session.conversationId,
+            nativeSessionId: started.session.nativeSessionId,
+            nativeTurnId: started.session.activeTurnId,
+            clientOwned: false,
+            observedAt: new Date().toISOString()
+          }, next);
         }
       }
       await publishStructuredProviderOpened({
@@ -540,6 +637,15 @@ export async function runAgentHost(input: Readonly<{
         recoverability: conversationRecoverability,
         observedAt: new Date().toISOString()
       });
+      if (recoveredGoal !== undefined) {
+        await publishStructuredProviderGoal({
+          home: input.home,
+          environment: next.environment,
+          activationId: activationId ?? next.launchId,
+          conversationId: session.conversationId,
+          goal: recoveredGoal
+        });
+      }
       const restoredOwnedTurn = providerControl.kind === "restore"
         ? providerControl.ownedTurn
         : undefined;
@@ -623,11 +729,12 @@ export async function runAgentHost(input: Readonly<{
         activeNativeTurnId
       );
     }
+    const { YUI_TURN_ID: _launchTurnId, ...baseEnvironment } = sessionPayload.environment;
     activeTurnPayload = {
       ...sessionPayload,
       environment: {
-        ...sessionPayload.environment,
-        YUI_RUN_ID: request.runId
+        ...baseEnvironment,
+        ...(request.turnId === undefined ? {} : { YUI_TURN_ID: request.turnId })
       }
     };
     activeTurnAttemptId = request.turn.attemptId;
@@ -646,7 +753,7 @@ export async function runAgentHost(input: Readonly<{
       session.nativeSessionId,
       request.authority,
       request.turn.attemptId,
-      request.runId
+      request.turnId
     );
     await beginDurableProviderTurn(input.home, durableTurn);
     let providerAccepted = false;
@@ -657,7 +764,7 @@ export async function runAgentHost(input: Readonly<{
       try {
         await publishStructuredProviderAccepted({
           home: input.home,
-          environment: sessionPayload.environment,
+          environment: activeTurnPayload.environment,
           activationId: activationId ?? sessionPayload.launchId,
           receipt
         });
@@ -719,6 +826,38 @@ export async function runAgentHost(input: Readonly<{
     }
   };
 
+  const steerTurn = async (request: AgentHostSteerTurnControl): Promise<AgentHostSnapshot> => {
+    if (session === undefined || sessionPayload === undefined || activeTurnPayload === undefined) {
+      throw new ProviderTurnRejectedError(
+        "Agent Host has no active Provider Turn to steer.",
+        request.turn.attemptId
+      );
+    }
+    if (request.nativeSessionId !== session.nativeSessionId
+      || request.nativeTurnId !== activeNativeTurnId) {
+      throw new ProviderTurnRejectedError(
+        "Agent Host steer targets a different Provider Turn.",
+        request.turn.attemptId
+      );
+    }
+    if (authority === undefined || !sameProviderAuthorityFence(authority, request.authority)) {
+      throw new Error("Agent Host rejected a stale Provider writer fence.");
+    }
+    if (recentSteerAttempts.has(request.turn.attemptId)) return snapshot;
+    const receipt = await session.steerTurn(request.turn);
+    if (receipt.nativeTurnId !== request.nativeTurnId) {
+      throw new ProviderDeliveryUnknownError(
+        "Provider accepted steer against an unexpected native Turn.",
+        request.turn.attemptId
+      );
+    }
+    recentSteerAttempts.add(request.turn.attemptId);
+    if (recentSteerAttempts.size > 256) {
+      recentSteerAttempts.delete(recentSteerAttempts.values().next().value!);
+    }
+    return snapshot;
+  };
+
   const setAuthority = (request: AgentHostSetAuthorityControl): AgentHostSnapshot => {
     if (session === undefined || request.nativeSessionId !== session.nativeSessionId) {
       throw new Error("Agent Host authority targets a different Provider Conversation.");
@@ -753,6 +892,10 @@ export async function runAgentHost(input: Readonly<{
     }
     if (request.type === "submit-turn") {
       const accepted = await enqueueSerialized(() => submitTurn(request));
+      return controlResult("accepted", accepted);
+    }
+    if (request.type === "steer-turn") {
+      const accepted = await enqueueSerialized(() => steerTurn(request));
       return controlResult("accepted", accepted);
     }
     if (request.type === "set-authority") {
@@ -802,26 +945,13 @@ export async function runAgentHost(input: Readonly<{
         type: "submit-turn" as const,
         launchId: currentPayload.launchId,
         nativeSessionId: currentSession.nativeSessionId,
-        runId: requiredEnvironment(currentPayload.environment.YUI_RUN_ID, "Run id"),
         authority: currentAuthority,
         turn: {
           attemptId,
           boundedText
         }
       };
-      const durableTurn = hostTurnControlParams(
-        currentPayload,
-        currentSession.nativeSessionId,
-        currentAuthority,
-        attemptId
-      );
-      await beginDurableProviderTurn(input.home, durableTurn);
-      try {
-        await submitTurn(turnControl);
-      } catch (error) {
-        await resolveProviderTurnSubmission(input.home, durableTurn, error);
-        throw error;
-      }
+      await submitTurn(turnControl);
       process.stdout.write("Provider accepted the human Turn; waiting for its terminal boundary.\n");
     }).catch((error) => {
       process.stderr.write(`Provider input failed: ${errorText(error)}\n`);
@@ -905,6 +1035,16 @@ export async function sendAgentHostTurnControl(input: Readonly<{
   taskId?: string;
   roleName: string;
   control: AgentHostSubmitTurnControl;
+}>): Promise<AgentHostControlResult> {
+  return await sendAgentHostControl(input);
+}
+
+export async function sendAgentHostSteerControl(input: Readonly<{
+  home: string;
+  scope: string;
+  taskId?: string;
+  roleName: string;
+  control: AgentHostSteerTurnControl;
 }>): Promise<AgentHostControlResult> {
   return await sendAgentHostControl(input);
 }
@@ -1135,10 +1275,13 @@ function validateControl(control: AgentHostControl): AgentHostControl {
     throw new Error("Agent Host control protocol is invalid.");
   }
   if (control.type === "status") return Object.freeze({ ...control });
-  if (control.type === "submit-turn") {
+  if (control.type === "submit-turn" || control.type === "steer-turn") {
     validateLaunchId(control.launchId);
     validateIdentity(control.nativeSessionId, "native Session id");
-    validateIdentity(control.runId, "Run id");
+    if (control.type === "submit-turn" && control.turnId !== undefined) {
+      validateIdentity(control.turnId, "Turn id");
+    }
+    if (control.type === "steer-turn") validateIdentity(control.nativeTurnId, "native Turn id");
     validateProviderAuthorityFence(control.authority);
     validateIdentity(control.turn.attemptId, "Provider input attempt id");
     if (typeof control.turn.boundedText !== "string"
@@ -1268,13 +1411,13 @@ function hostTurnControlParams(
   nativeSessionId: string,
   authority: ProviderAuthorityFence,
   attemptId: string,
-  runId = requiredEnvironment(payload.environment.YUI_RUN_ID, "Run id")
+  turnId?: string
 ): Readonly<Record<string, string | number>> {
   const environment = payload.environment;
   return Object.freeze({
     taskId: requiredEnvironment(environment.YUI_TASK_ID, "Task id"),
     roleName: requiredEnvironment(environment.YUI_ROLE, "Role name"),
-    runId: requiredEnvironment(runId, "Run id"),
+    ...(turnId === undefined ? {} : { turnId: requiredEnvironment(turnId, "Turn id") }),
     agentId: requiredEnvironment(environment.YUI_AGENT_ID, "Agent id"),
     launchId: payload.launchId,
     nativeSessionId: requiredEnvironment(nativeSessionId, "native Session id"),

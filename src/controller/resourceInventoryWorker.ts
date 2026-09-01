@@ -3,7 +3,7 @@
  *
  * Runs the blocking `/proc` scanning of `resourceInventoryLinux` off the main
  * thread. The main thread asks for a scan over a `MessageChannel` port; the
- * worker runs the exact same `scanControllerResourceInventory` the file backend
+ * worker runs the exact same `scanControllerResourceInventory` as the main thread
  * calls directly and posts the inventory back. Because worker threads share the
  * process, the scanner's self-exclusion (`process.pid`, its start identity)
  * keeps excluding the Controller process exactly as on the main thread.

@@ -58,11 +58,6 @@ export type IntegrationQueueGitPort = GitWorkspacePort & {
     fromCommit: string;
     toCommit: string;
   }>) => Promise<readonly string[]>;
-  deletedFilesBetween?: (input: Readonly<{
-    repositoryPath: string;
-    fromCommit: string;
-    toCommit: string;
-  }>) => Promise<readonly string[]>;
 };
 
 export type EnqueueIntegrationQueueOutcome =
@@ -314,7 +309,7 @@ export async function enqueueIntegrationQueueEntry(
   const project = input.store.getProject(input.projectId);
   if (project === null) throw new Error(`Project not found: ${input.projectId}.`);
   const targetRef = input.targetRef
-    ?? changeSet.manifest?.targetRef
+    ?? changeSet.manifest.targetRef
     ?? taskMainBranch(input.store, task.id, input.projectId);
   if (targetRef === undefined) {
     throw new Error(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
@@ -414,7 +409,7 @@ export async function enqueueIntegrationQueueEntry(
         changeSetId: input.changeSetId,
         targetRef: canonicalTargetRef,
         checkCommands: requestedChecks,
-        evidenceRefs: changeSet.manifest?.evidenceRefs ?? []
+        evidenceRefs: changeSet.manifest.evidenceRefs
       }, now());
       // Durable positive exact-SHA evidence on an unchanged target, at the lane
       // head, validates the entry so processing skips its checks.  The process-
@@ -482,7 +477,7 @@ export async function enqueueIntegrationQueueEntry(
         changeSetId: input.changeSetId,
         targetRef: canonicalTargetRef,
         checkCommands: requestedChecks,
-        evidenceRefs: changeSet.manifest?.evidenceRefs ?? []
+        evidenceRefs: changeSet.manifest.evidenceRefs
       }, now());
       tx.saveIntegrationQueueEntry(task.id, queuedEntry);
       return { entry: queuedEntry, outcome: "queued" as const };
@@ -866,7 +861,7 @@ async function evidenceTargetAdvanced(
   if (changeSet === null) return true;
   const ownPaths = new Set([
     ...changeSet.changedPaths,
-    ...(changeSet.manifest?.deletedPaths ?? [])
+    ...changeSet.manifest.deletedPaths
   ]);
   if (delta.some((path) => ownPaths.has(path))) return true;
   // The delta does not touch the entry's own paths, but the entry's gate may
@@ -1181,24 +1176,9 @@ async function findContainedChangeSet(
   targetHead: string
 ): Promise<string | null> {
   if (git.treesAgreeOnPaths === undefined) return null;
-  // A migrated v2 ChangeSet without a manifest has no deletedPaths.  Recover
-  // the actual deletions from git so the containment proof verifies both
-  // sides of a rename: without this, a rename whose destination already
-  // exists on the target would converge even though the source still lives
-  // there.  A ChangeSet with a manifest trusts its declared deletedPaths.
-  let extraDeleted: readonly string[] = [];
-  if (changeSet.manifest === undefined) {
-    if (git.deletedFilesBetween === undefined) return null;
-    extraDeleted = await git.deletedFilesBetween({
-      repositoryPath,
-      fromCommit: changeSet.baseCommit,
-      toCommit: changeSet.headCommit
-    });
-  }
   const paths = [...new Set([
     ...changeSet.changedPaths,
-    ...(changeSet.manifest?.deletedPaths ?? []),
-    ...extraDeleted
+    ...changeSet.manifest.deletedPaths
   ])];
   if (paths.length === 0) return null;
   const agrees = await git.treesAgreeOnPaths({

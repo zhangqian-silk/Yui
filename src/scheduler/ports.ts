@@ -4,13 +4,12 @@ import type { InputRequest } from "../input/inputRequest.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { LeaderFailure } from "./leaderFailure.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
+import type { TurnFailureReason } from "../turn/turn.js";
+import type { TurnInput } from "../context/turnInputContract.js";
 import type {
   MailboxEntityRef,
   MailboxTarget,
-  MailboxLane,
-  DeliveryMode,
-  InputDelivery,
   ProcessingBatch,
   WorkMailbox
 } from "../coordination/workMailbox.js";
@@ -59,7 +58,7 @@ export type SchedulerRole = Readonly<{
   managedWorkspace?: ManagedWorkspace;
 }>;
 
-export type SchedulerAgentRun = AgentRun;
+export type SchedulerTurn = Turn;
 
 export type SchedulerRoleSession = Readonly<{
   agentId: string;
@@ -75,10 +74,10 @@ export type SchedulerRoleSession = Readonly<{
   updatedAt?: string;
 }>;
 
-export type RoleRunStallPersistence = Readonly<{
+export type RoleTurnStallPersistence = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   agentId: string;
   adapterId: string;
   /** Exact Session fact observed by the scan; null is itself a fenced fact. */
@@ -97,7 +96,7 @@ export type RoleRunStallPersistence = Readonly<{
   now: Date;
 }>;
 
-export type SchedulerRunProgress = Readonly<{
+export type SchedulerTurnProgress = Readonly<{
   progressAt: string;
   evidence?: string;
 }>;
@@ -106,7 +105,7 @@ export type SchedulerRunProgress = Readonly<{
 export type SchedulerRoleResourceIdentity = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
@@ -139,7 +138,7 @@ export type SchedulerRoleResourceEntry = Readonly<{
 export type SchedulerRoleResourceInput = Readonly<{
   taskId: string;
   roleName: string;
-  runId?: string;
+  turnId?: string;
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
@@ -147,19 +146,19 @@ export type SchedulerRoleResourceInput = Readonly<{
   progressAt?: string;
 }>;
 
-export type RoleRunProgressPersistence = Readonly<{
+export type RoleTurnProgressPersistence = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   progressAt: string;
   evidence?: string;
   now: Date;
 }>;
 
-export type RoleRunDiagnosticPersistence = Readonly<{
+export type RoleTurnDiagnosticPersistence = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   startedAt: string;
   outcome: "observed" | "observation-error";
   now: Date;
@@ -203,7 +202,7 @@ export type SchedulerReconcileSelection = Readonly<{
 export type LeaderDispatchPersistence = Readonly<{
   task: SchedulerTask;
   role: SchedulerRole;
-  run: SchedulerAgentRun;
+  turn: SchedulerTurn;
   session: SchedulerRoleSession | null;
   wakeup: PendingWakeup;
   /** The TaskWake record id this dispatch will persist (peeked before dispatch). */
@@ -214,6 +213,14 @@ export type LeaderDispatchPersistence = Readonly<{
 }>;
 
 export type LeaderDispatchClaimResult = "claimed" | "busy" | "unavailable" | "state-changed";
+
+export type LeaderSteerPersistence = Readonly<{
+  taskId: string;
+  turnId: string;
+  batchId: string;
+  input: TurnInput;
+  now: Date;
+}>;
 
 export type SchedulerMailboxClaimInput = Readonly<{
   target: MailboxTarget;
@@ -227,67 +234,44 @@ export type SchedulerMailboxClaimResult =
   | Readonly<{ status: "claimed" | "processing"; processing: ProcessingBatch }>
   | Readonly<{ status: "empty" }>;
 
-export type SchedulerInputDeliveryClaimInput = Readonly<{
-  target: Extract<MailboxTarget, { kind: "role" | "operator" }>;
-  attemptId: string;
-  lane: MailboxLane;
-  mode: DeliveryMode;
-  owner: string;
-  now: Date;
-  executionRef: MailboxEntityRef;
-  providerFence: Readonly<{
-    conversationId: string;
-    activationId: string;
-    nativeTurnId?: string;
-  }>;
-}>;
-
-export type SchedulerInputDeliveryClaimResult =
-  | Readonly<{ status: "claimed" | "delivery"; delivery: InputDelivery }>
-  | Readonly<{ status: "busy" }>
-  | Readonly<{ status: "empty" }>;
-
-export type RoleRunDeliveryPersistence = Readonly<{
+export type RoleTurnDeliveryPersistence = Readonly<{
   task: SchedulerTask;
   role: SchedulerRole;
-  run: SchedulerAgentRun;
+  turn: SchedulerTurn;
   session: SchedulerRoleSession | null;
   /** Matching external-process generation, when lifecycle coordination is enabled. */
   launchId?: string;
   now: Date;
 }>;
 
-export type RoleRunDeliveryFailurePersistence = Readonly<{
+export type RoleTurnDeliveryFailurePersistence = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
   adapterId: AgentAdapterId;
-  runId: string;
-  mailboxBatchId: string;
+  turnId: string;
   nativeSessionId?: string;
-  /** Exact external-process generation prepared for this undelivered Run. */
+  /** Exact external-process generation prepared for this undelivered Turn. */
   launchId?: string;
   /** Exact terminal explanation for this conclusively unaccepted delivery. */
   summary?: string;
-  /** Whether the failed delivery also requires the local Host to be stopped. */
-  cleanupRequired?: boolean;
+  failureReason: TurnFailureReason;
   now: Date;
 }>;
 
 /**
- * Per-Run progress facts folded from a Task's event history in one O(events)
- * pass. The stall reconciliation uses these to avoid re-scanning the whole
- * history per Run candidate; absent implementation falls back to per-Run
- * scans.
+ * Per-Turn progress facts folded from a Task's event history in one O(events)
+ * pass. Stall reconciliation reads this current projection instead of
+ * re-scanning history per Turn candidate.
  */
-export type RunProgressFacts = Readonly<{
+export type TurnProgressFacts = Readonly<{
   latestCheckpointAt?: string;
   latestActivityAt?: string;
   latestStall?: Readonly<{ progressAt: string; evidenceKey: string }>;
 }>;
 
 /**
- * FileTaskStore-facing scheduler boundary. The concrete adapter owns the exact
+ * TaskStore-facing scheduler boundary. The concrete adapter owns the exact
  * Role/session-set model and performs each multi-record persistence operation.
  */
 export interface SchedulerStorePort {
@@ -295,7 +279,7 @@ export interface SchedulerStorePort {
   /**
    * Indexed active-Task selection for full Controller reconciliation. Stores
    * that do not expose the projection retain their existing selection path;
-   * production layout-7 storage provides it directly from `tasks_catalog`.
+   * production SQLite storage provides it directly from `tasks_catalog`.
    */
   listActiveTaskIds?(): readonly string[];
   getTask(taskId: string): SchedulerTask | null;
@@ -303,7 +287,7 @@ export interface SchedulerStorePort {
   getTaskWorkspace(taskId: string): ManagedWorkspace | null;
   listRoles(taskId: string): readonly SchedulerRole[];
   getRole(taskId: string, roleName: string): SchedulerRole | null;
-  getActiveAgentRun(taskId: string, roleName: string): SchedulerAgentRun | null;
+  getActiveTurn(taskId: string, roleName: string): SchedulerTurn | null;
   hasOpenInputRequest(taskId: string): boolean;
   listOpenInputRequests(taskIds?: readonly string[]): readonly InputRequest[];
   getInputRequest(taskId: string, inputRequestId: string): InputRequest | null;
@@ -318,7 +302,7 @@ export interface SchedulerStorePort {
   saveRoleHostExitObservation?(input: Readonly<{
     taskId: string;
     roleName: string;
-    runId: string;
+    turnId: string;
     launchId?: string;
     nativeSessionId?: string;
     deadStatus?: number;
@@ -341,32 +325,31 @@ export interface SchedulerStorePort {
    * (Issue 05). Absent implementations fall back to an empty family, which
    * yields a coarser digest; the fail-open rule covers computation errors.
    */
-  listAgentRuns?(taskId: string): readonly SchedulerAgentRun[];
+  listTurns?(taskId: string): readonly SchedulerTurn[];
   listWorkItems?(taskId: string): readonly import("../workItem/workItem.js").WorkItem[];
   listReviewRounds?(taskId: string): readonly import("../review/reviewRound.js").ReviewRound[];
   listIntegrationAttempts?(taskId: string): readonly import("../integration/integrationAttempt.js").IntegrationAttempt[];
   listDurableJobs?(taskId: string): readonly import("../job/durableJob.js").DurableJob[];
   listInputRequests?(taskId: string): readonly import("../input/inputRequest.js").InputRequest[];
   listMessages?(taskId: string): readonly import("../message/message.js").TaskMessage[];
-  /** Optional richer fold of WorkItem/Review/Integration progress for a Run. */
-  getRunDurableProgress?(taskId: string, roleName: string, runId: string): SchedulerRunProgress | null;
+  /** Current fold of WorkItem/Review/Integration progress for a Turn. */
+  getTurnDurableProgress(taskId: string, roleName: string, turnId: string): SchedulerTurnProgress | null;
   /**
-   * Optional one-pass fold of a Task's event history for one Run. When present,
-   * stall reconciliation uses these facts instead of re-scanning the whole
-   * history per candidate. Absent implementation ⇒ per-Run scans.
+   * One-pass fold of a Task's event history for one Turn. Stall reconciliation
+   * reads this projection instead of maintaining a second event-scan path.
    */
-  getRunProgressFacts?(taskId: string, runId: string): RunProgressFacts | undefined;
-  /** Materializes a newly observed related-record fold as one run.progress fact. */
-  recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
+  getTurnProgressFacts(taskId: string, turnId: string): TurnProgressFacts | undefined;
+  /** Materializes a newly observed related-record fold as one turn.progress fact. */
+  recordRoleTurnProgress?(input: RoleTurnProgressPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Closes one coalesced read-only runtime diagnostic window. */
-  recordRoleRunDiagnostic?(input: RoleRunDiagnosticPersistence): "recorded" | "already-recorded" | "state-changed";
+  recordRoleTurnDiagnostic?(input: RoleTurnDiagnosticPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Atomically records one advisory no-progress episode. */
-  recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
+  recordRoleTurnStall?(input: RoleTurnStallPersistence): "raised" | "already-raised" | "state-changed";
   /** Exact durable Provider writer; human/unknown ownership blocks Controller writes. */
   getProviderAuthorityFence?(input: Readonly<{
     taskId: string;
     roleName: string;
-    runId: string;
+    turnId: string;
     agentId: string;
     launchId: string;
     nativeSessionId: string;
@@ -377,8 +360,8 @@ export interface SchedulerStorePort {
     owner: "controller" | "human" | "none" | "unknown";
     holderId?: string;
   }> | null;
-  peekNextAgentRunId(taskId: string): string;
-  /** Freeze the exact authoritative context before claiming a new Leader Run. */
+  peekNextTurnId(taskId: string): string;
+  /** Freeze the exact authoritative context before claiming a new Leader Turn. */
   freezeLeaderContextSnapshot?(
     taskId: string,
     roleName: string,
@@ -397,16 +380,10 @@ export interface SchedulerStorePort {
    */
   listReadyWorkMailboxes?(): readonly WorkMailbox[];
   claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult;
-  claimInputDelivery(input: SchedulerInputDeliveryClaimInput): SchedulerInputDeliveryClaimResult;
-  markInputDeliveryPushed(target: MailboxTarget, attemptId: string, now: Date): boolean;
-  completeInputDelivery(target: MailboxTarget, attemptId: string, now: Date): boolean;
-  releaseInputDelivery(target: MailboxTarget, attemptId: string, now: Date): boolean;
-  resolveInputDeliveryNotAccepted(target: MailboxTarget, attemptId: string, now: Date): boolean;
-  markInputDeliveryUnknown(
+  /** Consumes one exact coalesced wake batch after its Provider Turn is accepted. */
+  consumeWorkMailbox(
     target: MailboxTarget,
-    attemptId: string,
-    reason: string,
-    now: Date
+    expected: Readonly<{ fromSequence: number; toSequence: number }>
   ): boolean;
   completeWorkMailbox(target: MailboxTarget, batchId: string): boolean;
   releaseWorkMailbox(target: MailboxTarget, batchId: string): boolean;
@@ -442,7 +419,7 @@ export interface SchedulerStorePort {
     batchId: string,
     now: Date
   ): boolean;
-  /** Non-stopped native sessions with no active Task Run or lifecycle work. */
+  /** Non-stopped native sessions with no active Task Turn or lifecycle work. */
   listDormantRuntimeOwners?(): readonly DormantRuntimeOwnerCandidate[];
   /**
    * Current non-stopped Role Sessions from a storage-owned hot projection.
@@ -455,7 +432,7 @@ export interface SchedulerStorePort {
   recordAgentError?(input: Readonly<{
     taskId: string;
     roleName: string;
-    runId: string;
+    turnId: string;
     source: AgentErrorSource;
     phase: AgentErrorPhase;
     message: string;
@@ -503,15 +480,15 @@ export interface SchedulerStorePort {
   getTaskWakeEnvelope?(
     taskId: string
   ): import("../context/wakeNotification.js").WakeEnvelope | null;
-  /** Persist the AgentRun, active-run pointer, running Role and active fixed session. */
+  /** Persist the Turn, active-turn pointer, running Role and active fixed session. */
   saveLeaderDispatch(input: LeaderDispatchPersistence): LeaderDispatchClaimResult;
-  /** Persist a fixed session discovered while preparing an undelivered Run. */
-  saveRoleRunPrepared(input: RoleRunDeliveryPersistence): void;
-  /** Persist successful delivery of a Work AgentRun and its fixed session. */
-  saveRoleRunDelivery(input: RoleRunDeliveryPersistence): void;
-  /** Atomically fail one exact prepared Run after conclusive non-delivery. */
-  saveRoleRunDeliveryFailure(
-    input: RoleRunDeliveryFailurePersistence
+  /** Appends an accepted in-Turn Leader steer and completes its claimed wake batch. */
+  saveLeaderSteer(input: LeaderSteerPersistence): LeaderDispatchClaimResult;
+  /** Persist a fixed Session discovered while preparing an undelivered Turn. */
+  saveRoleTurnPrepared(input: RoleTurnDeliveryPersistence): void;
+  /** Atomically fail one exact Turn after a conclusive Provider failure. */
+  saveRoleTurnDeliveryFailure(
+    input: RoleTurnDeliveryFailurePersistence
   ): "failed" | "state-changed";
 }
 
@@ -603,10 +580,10 @@ export type RoleSessionLaunchMode = "new" | "resume";
 
 export type PreparedRoleDelivery = Readonly<{
   deliveryId: string;
-  /** External process generation; distinct from the per-Run delivery id. */
+  /** External process generation; distinct from the per-Turn delivery id. */
   launchId?: string;
-  /** Durable Run identity whose transient preparation this entry serves. */
-  runId?: string;
+  /** Durable Turn identity whose transient preparation this entry serves. */
+  turnId?: string;
   taskId: string;
   roleName: string;
   agentId: string;
@@ -617,8 +594,8 @@ export type PreparedRoleDelivery = Readonly<{
   /**
    * Exact native Session reserved by preparation, when the provider exposes it
    * before readiness. `null` is meaningful for a fresh runtime-discovered
-   * Session (for example Codex); omission preserves older delivery adapters
-   * that do not expose a pre-readiness Session fact.
+   * Session (for example Codex); omission means preparation has not observed a
+   * pre-readiness Session fact.
    */
   session?: SchedulerRoleSession | null;
 }>;
@@ -632,7 +609,7 @@ export type ReadyRoleDelivery = Readonly<{
 /**
  * The Scheduler never reads stdin and never writes terminal bytes itself.
  * A tmux-owned Host implementation launches/resumes the role, establishes the
- * structured Provider control channel, and performs receipt-backed delivery.
+ * structured Provider control channel, and submits idempotent native Turns.
  */
 export interface TmuxDeliveryPort {
   prepareRoleSession(input: Readonly<{
@@ -645,7 +622,7 @@ export interface TmuxDeliveryPort {
     managedWorkspace?: ManagedWorkspace;
     runtimePolicy?: TaskRuntimeLaunchPolicy;
     mode: RoleSessionLaunchMode;
-    runId?: string;
+    turnId?: string;
     nativeSessionId?: string;
     /** Current Host activation that may be reused for this exact Session. */
     hostActivationId?: string;
@@ -654,6 +631,21 @@ export interface TmuxDeliveryPort {
   waitUntilReady(delivery: PreparedRoleDelivery): Promise<ReadyRoleDelivery>;
   sendOnce(input: Readonly<{
     delivery: ReadyRoleDelivery;
+    /** Stable Provider request id. Repeating it must not create another Turn. */
+    receiptId: string;
+    text: string;
+  }>): Promise<
+    "sent" | "already-sent" | "busy" | "rejected" | "delivery-unknown" | "unavailable"
+  >;
+  steerOnce(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    agentId: string;
+    adapterId: string;
+    launchId: string;
+    nativeSessionId: string;
+    nativeTurnId: string;
+    authority: import("../runtime/providerAuthorityFence.js").ProviderAuthorityFence;
     receiptId: string;
     text: string;
   }>): Promise<
@@ -661,12 +653,12 @@ export interface TmuxDeliveryPort {
   >;
   /**
    * Drops transient prepared bindings after authoritative terminal/absence
-   * state. Omitting runId clears every prepared generation for the Role.
+   * state. Omitting turnId clears every prepared generation for the Role.
    */
   forgetPrepared?(input: Readonly<{
     taskId: string;
     roleName: string;
-    runId?: string;
+    turnId?: string;
     launchId?: string;
   }>): void;
   /** Best-effort nudge to an already-running global Operator process. */
@@ -697,7 +689,7 @@ export interface TmuxDeliveryPort {
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
-    runId?: string;
+    turnId?: string;
     launchId?: string;
     progressAt?: string;
   }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]):

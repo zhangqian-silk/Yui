@@ -208,8 +208,8 @@ export function materializeSessionBootstrap(input: Readonly<{
           loadCommand: "\"$YUI_SESSION_CLI\" session context \"$YUI_ROLE\" --json"
         }
       : {
-          loadCommand: "\"$YUI_SESSION_CLI\" task run context \"$YUI_TASK_ID/<run-id>\" --json",
-          expandCommand: "\"$YUI_SESSION_CLI\" task run context expand \"$YUI_TASK_ID/<run-id>\" <ref-id> --store <store> --mode full --json"
+          loadCommand: "\"$YUI_SESSION_CLI\" task turn context \"$YUI_TASK_ID/<turn-id>\" --json",
+          expandCommand: "\"$YUI_SESSION_CLI\" task turn context expand \"$YUI_TASK_ID/<turn-id>\" <ref-id> --store <store> --mode full --json"
         }
   };
   const manifest = Object.freeze({ ...body, digest: digest(body) });

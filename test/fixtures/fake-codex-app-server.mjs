@@ -58,6 +58,10 @@ lines.on("line", (line) => {
     });
     return;
   }
+  if (request.method === "thread/goal/get") {
+    reply(request.id, { goal: null });
+    return;
+  }
   if (request.method !== "turn/start") return;
   if (evidencePath !== undefined) appendFileSync(evidencePath, "turn/start\n");
   if (mode === "unknown") {
@@ -65,7 +69,7 @@ lines.on("line", (line) => {
     return;
   }
   const text = request.params.input?.[0];
-  if (request.params.clientUserMessageId !== "task-1/agentRun/run-1"
+  if (request.params.clientUserMessageId !== "task-1/turn/run-1"
     || text?.text !== "perform the managed work"
     || !Array.isArray(text?.text_elements)) {
     process.stdout.write(`${JSON.stringify({

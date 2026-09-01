@@ -210,19 +210,6 @@ export function requireStorageSchema(rootDir: string): void {
   requireInspectedSchema(inspectStorageSchema(rootDir));
 }
 
-/**
- * Compatible readers may bypass only a record-axis mismatch. Layout,
- * aggregate, syntax, and initialization remain strict.
- */
-export function requireCompatibleStorageSchema(rootDir: string): void {
-  const state = inspectStorageSchema(rootDir);
-  if (state.status === "current") return;
-  if (state.status === "unsupported"
-    && state.incompatibleComponent === "record"
-    && state.direction === "older") return;
-  requireInspectedSchema(state);
-}
-
 /** Persist the current three-axis manifest through the existing atomic-file seam. */
 export function writeCurrentStorageManifest(rootDir: string, now = new Date()): void {
   const recordVersions: Record<string, number> = {};
@@ -275,7 +262,7 @@ function unsupportedVersion(
   if (component === "record" && recordFamily === undefined) {
     return new StorageSchemaError(
       "STORAGE_SCHEMA_UNSUPPORTED",
-      "This Home predates the durable record-version manifest and cannot be opened without explicit introduction migrations."
+      "This Home predates the current record-version manifest. Preserve it for inspection and initialize a new Home."
     );
   }
   const label = component === "layout"

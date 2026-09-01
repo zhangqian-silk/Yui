@@ -107,9 +107,9 @@ export async function runWorkflowCommandAsync(
   // first transition or calls an external system. A run that is killed,
   // crashes, or whose engine rethrows after this point can never leave
   // mutation or effect evidence without an audit record saying the run was
-  // attempted. FileTaskStore transactions are synchronous, so the async
-  // engine run cannot join this transaction; committing the intent first is
-  // what makes the trail crash-safe across the whole run.
+  // attempted. The async engine run cannot join this synchronous transaction;
+  // committing the intent first is
+  // what makes the trail crash-safe across the whole turn.
   const intentNow = clock(options);
   store.transaction((tx) => {
     recordTaskEvent(tx, taskId, "release-workflow.run-started", {

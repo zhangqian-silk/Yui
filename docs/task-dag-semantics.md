@@ -34,7 +34,7 @@
 | 执行投影 | `taskExecutionProjection` 自述为 read-model 词汇（"deliberately not a new [authority]"）；`collectBlockers` 对 pending 且有非 completed 依赖的项产出 "waiting on a dependency" 阻塞（**仅直接依赖，无传递链**）；`failedWork` 使 Task 级投影为 `blocked/work-failed` | `src/scheduler/taskExecutionProjection.ts:23,339-341,710-731` |
 | CLI 投影 | `task overview` 对 pending 项列出非 completed 直接依赖（"waiting on X"）；无 ready 集、无传递根因、无 unreleasable 区分 | `src/commands/taskOverviewCommand.ts:386-397` |
 | UI 投影 | Web 明细仅以 chip 行展示 `dependsOn` 标题列表；无 DAG 图视图 | `src/web/assets/client/components.ts:462-463`；`src/web/assets/client/i18n.ts:57,355` |
-| 输入等待 | `InputRequest.blockedRefs` 可指向 WorkItem 或 Run，也可为空；存储层只校验所列引用存在。现状 `next-action` 对任意 open InputRequest 作 Task 全局门控，**未区分直接目标、Run 归属、空引用或无关分支，也无沿依赖边的传递传播** | `src/input/inputRequest.ts:4-8,41-49`；`src/commands/taskInputCommands.ts:93-104,120-128,453-460`；`src/task/nextAction.ts:110-120`；`src/storage/taskStore.ts:3937` |
+| 输入等待 | `InputRequest.blockedRefs` 可指向 WorkItem 或 Turn，也可为空；存储层只校验所列引用存在。现状 `next-action` 对任意 open InputRequest 作 Task 全局门控，**未区分直接目标、Turn 归属、空引用或无关分支，也无沿依赖边的传递传播** | `src/input/inputRequest.ts:4-8,41-49`；`src/commands/taskInputCommands.ts:93-104,120-128,453-460`；`src/task/nextAction.ts:110-120`；`src/storage/taskStore.ts:3937` |
 
 **结论**：DAG 的存储权威（`dependsOn` + 无环/存在性不变量）已具备；缺的是**释放语义**（边分类与传播矩阵）、**跳过/重定向语义**、**动态修订规则**与**传递式只读投影**。本契约补齐这些语义；调度器实现（拓扑释放、ready 集计算、自动派发）属于后续实现 Task，不在 T1 范围。
 
@@ -42,7 +42,7 @@
 
 1. **唯一权威**：`WorkItem.dependsOn`（含 WorkItem 自身的 `status` 与 `disposition`）。不存在第二套 TaskGraph 存储、缓存或界面侧状态（D-01/D-02/I-1）。
 2. **边方向**：DAG 一律采用“前置项 → 下游项”：`u → v` 当且仅当 `v.dependsOn` 包含 `u`。`dependsOn` 是每个下游节点存储的反向邻接表；根因分析从 `v` 沿入边反向遍历，不能据此改变图的箭头方向。
-3. **投影纯函数**：给定同一持久快照 `(dependsOn, status, disposition, AgentRun.workItemId, open InputRequests)`，投影输出唯一确定，与时间、派发顺序、观察者无关。
+3. **投影纯函数**：给定同一持久快照 `(dependsOn, status, disposition, Turn.workItemId, open InputRequests)`，投影输出唯一确定，与时间、派发顺序、观察者无关。
 4. **表达边界**：DAG 只表达语义与产物依赖；**不表达** Agent、Session、Provider 并发、文件锁或资源配额（属 Layer 2 与 T6 Resource Broker）。
 5. **Task 局部性**：依赖边只在同一 Task 聚合内有效。Yui 无 Task-to-Task 原生依赖字段；跨 Task 依赖只记录在 Description/Brief（如本 Task 的 T0=task-27），不创建伪 WorkItem 依赖。
 6. **AND 语义**：一个 WorkItem 的释放要求**全部**边满足。OR-join 不可表达——需要 OR 的场景由 Leader 用动态修订（§6）或退役建模。
@@ -83,19 +83,19 @@ WorkItem 仍为严格 6 态机（`pending / running / awaiting_acceptance / comp
 每个 open InputRequest 先独立映射为作用域，再把所有作用域取并集；answered / cancelled InputRequest 不参与投影：
 
 1. `blockedRefs` 中的 `work-item:W` 直接门控非终态 W，并沿 W 的 DAG 出边传递到所有非终态下游；其祖先和无关 fan-out 分支不受影响。
-2. `run:R` 若所指 AgentRun 具有 `workItemId=W`，等价于 `work-item:W`。没有 `workItemId` 的 Run（例如 Task 级 Leader Run）映射为 Task 全局门控。
+2. `turn:R` 若所指 Turn 具有 `workItemId=W`，等价于 `work-item:W`。没有 `workItemId` 的 Turn（例如 Task 级 Leader Turn）映射为 Task 全局门控。
 3. `blockedRefs=[]` 表示问题属于 Task 级决议，映射为 Task 全局门控。全局门控作用于 Task 内全部非终态 WorkItem，因此任何 `pending` 项都不得进入 `ready`。
 4. 多个引用取并集；其中任一引用映射为 Task 全局门控时，结果即为全局门控。每个被门控节点仍保留全部 InputRequest 根因，不能因选择第一个请求而丢失其他请求。
-5. 引用已终态 WorkItem，或引用一个归属已终态 WorkItem 的 Run，不重开该 WorkItem，也不沿其出边传播；该 open InputRequest 仍是 Task 完成前必须回答或取消的收敛事项。引用不存在或跨 Task 的记录继续由存储边界拒绝。
+5. 引用已终态 WorkItem，或引用一个归属已终态 WorkItem 的 Turn，不重开该 WorkItem，也不沿其出边传播；该 open InputRequest 仍是 Task 完成前必须回答或取消的收敛事项。引用不存在或跨 Task 的记录继续由存储边界拒绝。
 6. InputRequest 回答或取消后移除对应门控，以最新持久快照完整重算节点和下游；回答/取消本身不把任何依赖边改成 `satisfied`，也不改写 WorkItem 状态。
 
 投影须为每个 `input-waiting` 节点给出可复现的根因链：直接命中为 `W ← InputRequest`；传递命中为 `W ← ... ← U ← InputRequest`；Task 全局门控标记为 `W ← Task InputRequest`。
 
 ### 3.5 确定性与单调性
 
-- 投影只随持久 WorkItem、Run 归属或 InputRequest 状态变化重算；不随时间、不随观察次数变化。
+- 投影只随持久 WorkItem、Turn 归属或 InputRequest 状态变化重算；不随时间、不随观察次数变化。
 - 状态迁移对投影的影响是确定的：`u: failed → running`（重试）使其边 `failed-open → active`；`u: retired`（无替换）使边 `→ dead`；替换完成使链重定向收敛。
-- `ready` 集是调度器的唯一释放输入：现状 `selectOpenWorkItem` 只取第一个 eligible 项（`nextAction.ts:743`）；契约下投影计算**完整 ready 集**，其中的派发顺序是 Leader/策略选择（现状：Leader 手动派发，每 Role 同时一个活跃 Run；未来自动派发与配额属 T6）。
+- `ready` 集是调度器的唯一释放输入：现状 `selectOpenWorkItem` 只取第一个 eligible 项（`nextAction.ts:743`）；契约下投影计算**完整 ready 集**，其中的派发顺序是 Leader/策略选择（现状：Leader 手动派发，每 Role 同时一个活跃 Turn；未来自动派发与配额属 T6）。
 
 ## 4. 释放与传播规则
 
@@ -103,7 +103,7 @@ WorkItem 仍为严格 6 态机（`pending / running / awaiting_acceptance / comp
 
 1. WorkItem 在其全部依赖边 `satisfied` 且没有有效输入门控时进入 `ready`；`ready` 是派生状态，不写回。直接命中的无依赖 pending WorkItem 也必须先解除输入门控，不能利用“边集合为空”进入 `ready`。
 2. 释放是单调事件：一旦进入 `running`，其依赖边不再影响其投影（已释放）。
-3. 扇出示例：A 完成后，B、C、D（均只依赖 A）同时进入 `ready` 集；Leader 决定派发顺序（受每 Role 单活跃 Run 等现状约束）。
+3. 扇出示例：A 完成后，B、C、D（均只依赖 A）同时进入 `ready` 集；Leader 决定派发顺序（受每 Role 单活跃 Turn 等现状约束）。
 4. 汇合示例：E 依赖 A、B、C；只有三者全部 `completed`，E 才 `ready`——无部分释放、无 OR-join。
 
 ### 4.2 阻塞传播（blocked）
@@ -134,7 +134,7 @@ WorkItem 仍为严格 6 态机（`pending / running / awaiting_acceptance / comp
 | `retired --replacement R'` | 跟随替换链（§5.2） | 链终止于 `completed` → 可能 `ready`；否则按链终止态投影 | 无需动作（投影自动重定向）；或显式修订边 |
 | 当前 pending 项被 scoped open InputRequest 直接命中 | — | 全部边已满足时 `blocked (input-waiting)`；否则在原阻塞投影叠加 `input-waiting` | 回答/取消 InputRequest → 移除门控并重算 |
 | 祖先项被 scoped open InputRequest 命中 | 原边分类不变 + `input-waiting` 链 | 原阻塞投影叠加 `input-waiting`；祖先完成前不释放 | 回答/取消后重算祖先及传递下游 |
-| Task 全局 open InputRequest（空引用或无 WorkItem 归属的 Run） | — | 全部非终态项叠加 `input-waiting`；任何 pending 项不得 `ready` | 回答/取消后全 Task 重算 |
+| Task 全局 open InputRequest（空引用或无 WorkItem 归属的 Turn） | — | 全部非终态项叠加 `input-waiting`；任何 pending 项不得 `ready` | 回答/取消后全 Task 重算 |
 | open InputRequest 只引用终态目标 | — | 不改变 DAG 节点或下游投影 | 仍须在 Task 完成前回答/取消 |
 
 **不自动级联**：依赖失败/退役**不自动**使下游失败或取消。下游保持 `pending`，投影显式标出原因；所有解除动作都是 Leader 的显式持久决议。理由：失败是否可恢复、下游是否仍有价值，是语义判断，属 Leader 职责（T0 §0、§3.1）。
@@ -161,7 +161,7 @@ WorkItem 仍为严格 6 态机（`pending / running / awaiting_acceptance / comp
 
 ### 6.1 fan-out 与 fan-in
 
-1. **fan-out**：多个 WorkItem 共享同一（组）已满足依赖时，同时进入 `ready` 集。DAG 不限制扇出宽度；实际并发受 Layer 2 与 Resource Broker 约束（现状：每 Role 一个活跃 Run；T6 统一预算）。
+1. **fan-out**：多个 WorkItem 共享同一（组）已满足依赖时，同时进入 `ready` 集。DAG 不限制扇出宽度；实际并发受 Layer 2 与 Resource Broker 约束（现状：每 Role 一个活跃 Turn；T6 统一预算）。
 2. **fan-in**：多依赖 WorkItem 在全部边 `satisfied` 时一次性释放（AND-join）。汇合点不产出额外状态——`ready` 即是汇合事件。
 3. **菱形**：A → B、A → C、B+C → D。B、C 并行释放；D 等两者都 `completed`。B 失败不影响 C 的释放（边独立分类）；B 被退役且无替换时 D `unreleasable`，C 仍可独立完成。
 4. ** ready 集与派发**：投影产出完整 ready 集；派发顺序与并发度是 Leader 决议（现状）或 Resource Broker 策略（T6）。DAG 语义不规定派发顺序，只规定释放合法性。

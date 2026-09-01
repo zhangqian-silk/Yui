@@ -23,8 +23,9 @@ export type TaskRuntimeTurnCompleted = Readonly<{
   adapterId: string;
   launchId?: string;
   nativeSessionId: string;
-  turnId: string;
-  runId?: string;
+  nativeTurnId: string;
+  turnId?: string;
+  input?: string;
   summary: string;
 }>;
 
@@ -35,7 +36,7 @@ export type GlobalRuntimeTurnCompleted = Readonly<{
   adapterId: string;
   launchId?: string;
   nativeSessionId: string;
-  turnId: string;
+  nativeTurnId: string;
   title?: string;
   summary: string;
 }>;
@@ -70,7 +71,7 @@ export type RuntimeTurnEventObserver = Readonly<{
       taskId: string;
       roleName: string;
       agentId: string;
-      runId?: string;
+      turnId?: string;
       launchId?: string;
       nativeSessionId: string;
       reason: string;
@@ -127,7 +128,7 @@ export type TaskRuntimeAppliedInput = Readonly<{
   adapterId: string;
   launchId?: string;
   nativeSessionId: string;
-  runId?: string;
+  turnId?: string;
 }>;
 
 export type FileRuntimeEventProcessorOptions = Readonly<{
@@ -351,7 +352,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
                 adapterId: this.drivers.require(fence.driverId).adapterId,
                 launchId: fence.launchId,
                 nativeSessionId: fence.nativeSessionId,
-                ...(fence.runId === undefined ? {} : { runId: fence.runId })
+                ...(fence.turnId === undefined ? {} : { turnId: fence.turnId })
               });
             }
           } else if (event.type === "native-turn-completed") {
@@ -362,7 +363,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
               adapterId: event.adapterId,
               ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
               nativeSessionId: event.nativeSessionId,
-              ...(event.runId === undefined ? {} : { runId: event.runId })
+              ...(event.turnId === undefined ? {} : { turnId: event.turnId })
             });
           }
         }
@@ -400,8 +401,8 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         adapterId: event.adapterId,
         ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
         nativeSessionId: event.nativeSessionId,
-        turnId: event.turnId,
-        ...(event.runId === undefined ? {} : { runId: event.runId }),
+        nativeTurnId: event.nativeTurnId,
+        ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
         summary: event.summary
       };
       if (task === null) return "obsolete";
@@ -433,7 +434,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       adapterId: event.adapterId,
       ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
       nativeSessionId: event.nativeSessionId,
-      turnId: event.turnId,
+      nativeTurnId: event.nativeTurnId,
       ...(event.title === undefined ? {} : { title: event.title }),
       summary: event.summary
     };
@@ -455,7 +456,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         taskId: event.taskId,
         roleName: fence.roleName,
         agentId: fence.agentId,
-        ...(fence.runId === undefined ? {} : { runId: fence.runId }),
+        ...(fence.turnId === undefined ? {} : { turnId: fence.turnId }),
         launchId: fence.launchId,
         nativeSessionId: fence.nativeSessionId,
         reason
@@ -471,7 +472,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       taskId: event.taskId,
       roleName: event.roleName,
       agentId: event.agentId,
-      ...(event.runId === undefined ? {} : { runId: event.runId }),
+      ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
       ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
       nativeSessionId: event.nativeSessionId,
       reason
@@ -617,7 +618,7 @@ function progressStreamKey(event: RuntimeObservationInboxEvent): string {
     fence.driverId,
     fence.launchId,
     fence.nativeSessionId ?? null,
-    fence.runId ?? null,
+    fence.turnId ?? null,
     payload.activity,
     isRuntimeTokenEvidence(event.observation) ? "usage" : "signal"
   ]);
@@ -775,7 +776,7 @@ export type AsyncRuntimeTurnEventObserver = Readonly<{
       taskId: string;
       roleName: string;
       agentId: string;
-      runId?: string;
+      turnId?: string;
       launchId?: string;
       nativeSessionId: string;
       reason: string;
@@ -935,7 +936,7 @@ export class AsyncRuntimeEventProcessor {
         adapterId: this.drivers.require(fence.driverId).adapterId,
         launchId: fence.launchId,
         nativeSessionId: fence.nativeSessionId,
-        ...(fence.runId === undefined ? {} : { runId: fence.runId })
+        ...(fence.turnId === undefined ? {} : { turnId: fence.turnId })
       });
     }
     return outcome;
@@ -955,8 +956,8 @@ export class AsyncRuntimeEventProcessor {
         adapterId: event.adapterId,
         ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
         nativeSessionId: event.nativeSessionId,
-        turnId: event.turnId,
-        ...(event.runId === undefined ? {} : { runId: event.runId }),
+        nativeTurnId: event.nativeTurnId,
+        ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
         summary: event.summary
       };
       if (task === null) return "obsolete";
@@ -986,7 +987,7 @@ export class AsyncRuntimeEventProcessor {
         adapterId: event.adapterId,
         ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
         nativeSessionId: event.nativeSessionId,
-        ...(event.runId === undefined ? {} : { runId: event.runId })
+        ...(event.turnId === undefined ? {} : { turnId: event.turnId })
       });
       return "applied";
     }
@@ -997,7 +998,7 @@ export class AsyncRuntimeEventProcessor {
       adapterId: event.adapterId,
       ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
       nativeSessionId: event.nativeSessionId,
-      turnId: event.turnId,
+      nativeTurnId: event.nativeTurnId,
       ...(event.title === undefined ? {} : { title: event.title }),
       summary: event.summary
     };
@@ -1019,7 +1020,7 @@ export class AsyncRuntimeEventProcessor {
         taskId: event.taskId,
         roleName: fence.roleName,
         agentId: fence.agentId,
-        ...(fence.runId === undefined ? {} : { runId: fence.runId }),
+        ...(fence.turnId === undefined ? {} : { turnId: fence.turnId }),
         launchId: fence.launchId,
         nativeSessionId: fence.nativeSessionId,
         reason
@@ -1032,7 +1033,7 @@ export class AsyncRuntimeEventProcessor {
       taskId: event.taskId,
       roleName: event.roleName,
       agentId: event.agentId,
-      ...(event.runId === undefined ? {} : { runId: event.runId }),
+      ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
       ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
       nativeSessionId: event.nativeSessionId,
       reason

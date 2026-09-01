@@ -3,7 +3,7 @@ import { requireIdentity } from "../domain/validation.js";
 export const TASK_RECORD_ID_PREFIXES = {
   workItem: "work-item",
   contextSnapshot: "context-snapshot",
-  agentRun: "agent-run",
+  turn: "turn",
   reviewRound: "review-round",
   reviewFinding: "review-finding",
   changeSet: "change-set",
@@ -38,8 +38,8 @@ export function formatTaskRecordReference(
   return `${reference.taskId}/${reference.localId}`;
 }
 
-export function formatAgentRunReceiptId(taskId: string, runId: string): string {
-  return `agent-run:${formatTaskRecordReference(taskId, runId, "agentRun")}`;
+export function formatTurnReceiptId(taskId: string, turnId: string): string {
+  return `turn:${formatTaskRecordReference(taskId, turnId, "turn")}`;
 }
 
 export function formatInputRequestReceiptId(taskId: string, requestId: string): string {

@@ -23,7 +23,7 @@ import {
   reviewCard,
   richText,
   roleCard,
-  runCard,
+  turnCard,
   sectionHead,
   taskCard,
   translatedStatus,
@@ -182,7 +182,7 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   wrap.append(inbox);
 
   // Tasks whose Task-first projection says they need attention: blocked,
-  // recovering, or in an attention state. This replaces the raw stalled-run
+  // recovering, or in an attention state. This replaces the raw stalled-Turn
   // count with the derived execution status.
   const attentionTasks = (state.tasks || []).filter(function (task) {
     const status = task.executionStatus;
@@ -232,23 +232,23 @@ export function renderError(container, message) {
   container.append(node("div", "error", message));
 }
 
-const RUN_PAGE_SIZE = 12;
+const TURN_PAGE_SIZE = 12;
 const LIST_PAGE_SIZE = 10;
-const RUN_FILTERS = ["all", "active", "yielded", "failed"];
+const TURN_FILTERS = ["all", "active", "completed", "failed"];
 
-function runFilterRow(sortedRuns, t, onChange) {
-  const row = node("div", "filter-row run-filter");
+function turnFilterRow(sortedTurns, t, onChange) {
+  const row = node("div", "filter-row turn-filter");
   const buttons = [];
-  RUN_FILTERS.forEach(function (status) {
+  TURN_FILTERS.forEach(function (status) {
     const count = status === "all"
-      ? sortedRuns.length
-      : sortedRuns.filter(function (run) { return run.status === status; }).length;
+      ? sortedTurns.length
+      : sortedTurns.filter(function (turn) { return turn.status === status; }).length;
     if (status !== "all" && count === 0) return;
     const btn = node("button", "filter-chip");
     btn.type = "button";
     btn.dataset.status = status;
     if (status !== "all") btn.append(node("span", "filter-dot " + status));
-    btn.append(document.createTextNode(status === "all" ? t("status.all") : t("run." + status)));
+    btn.append(document.createTextNode(status === "all" ? t("status.all") : t("turn." + status)));
     btn.append(node("span", "filter-count", String(count)));
     btn.addEventListener("click", function () { onChange(status); });
     buttons.push({ status: status, element: btn });
@@ -333,23 +333,23 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
       attentionBody));
   }
 
-  const stalledRuns = data.runtimeHealth && data.runtimeHealth.needsAttentionRuns
-    ? data.runtimeHealth.needsAttentionRuns
+  const stalledTurns = data.runtimeHealth && data.runtimeHealth.needsAttentionTurns
+    ? data.runtimeHealth.needsAttentionTurns
     : [];
-  if (stalledRuns.length) {
+  if (stalledTurns.length) {
     const runtimeHealthBody = node("div", "section-body");
-    stalledRuns.forEach(function (run) {
+    stalledTurns.forEach(function (turn) {
       const card = node("article", "record-card");
       card.append(
-        node("strong", "", run.roleName + " · " + run.runId),
-        node("p", "record-copy", (run.kind || "workflow-not-progressing") + " · " + (run.classification || "truly-stalled")),
-        node("small", "", t("detail.lastProgress") + " · " + formatDateTime(run.progressAt, locale))
+        node("strong", "", turn.roleName + " · " + turn.turnId),
+        node("p", "record-copy", (turn.kind || "workflow-not-progressing") + " · " + (turn.classification || "truly-stalled")),
+        node("small", "", t("detail.lastProgress") + " · " + formatDateTime(turn.progressAt, locale))
       );
       runtimeHealthBody.append(card);
     });
     scaffold.append(anchorSection(
       "detail-health",
-      sectionHead(t("detail.runtimeHealth"), { count: stalledRuns.length }),
+      sectionHead(t("detail.runtimeHealth"), { count: stalledTurns.length }),
       runtimeHealthBody
     ));
   }
@@ -394,38 +394,38 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
     sectionHead(t("detail.workItems"), { count: data.workItems.length }),
     workBody));
 
-  // 5. Runs (anchor #detail-exec) — execution grid with status filter + paging
+  // 5. Turns (anchor #detail-exec) — execution grid with status filter + paging
   const execWrap = node("div", "section-body");
-  const execBody = node("div", "run-grid");
-  const sortedRuns = data.runs.slice().sort(byNewest);
-  if (!sortedRuns.length) {
-    execBody.append(emptyRow(t, "empty.runs"));
+  const execBody = node("div", "turn-grid");
+  const sortedTurns = data.turns.slice().sort(byNewest);
+  if (!sortedTurns.length) {
+    execBody.append(emptyRow(t, "empty.turns"));
     execWrap.append(execBody);
   } else {
-    let activeRunFilter = "all";
-    const filter = runFilterRow(sortedRuns, t, function (status) {
-      activeRunFilter = status;
+    let activeTurnFilter = "all";
+    const filter = turnFilterRow(sortedTurns, t, function (status) {
+      activeTurnFilter = status;
       filter.sync(status);
-      renderRunGrid();
+      renderTurnGrid();
     });
-    function renderRunGrid() {
+    function renderTurnGrid() {
       clear(execBody);
-      const visible = activeRunFilter === "all"
-        ? sortedRuns
-        : sortedRuns.filter(function (run) { return run.status === activeRunFilter; });
-      pagedList(execBody, visible, RUN_PAGE_SIZE, function (run) {
-        return runCard(run, t, locale);
+      const visible = activeTurnFilter === "all"
+        ? sortedTurns
+        : sortedTurns.filter(function (turn) { return turn.status === activeTurnFilter; });
+      pagedList(execBody, visible, TURN_PAGE_SIZE, function (turn) {
+        return turnCard(turn, t, locale);
       }, t);
     }
-    filter.sync(activeRunFilter);
+    filter.sync(activeTurnFilter);
     execWrap.append(filter.row, execBody);
-    renderRunGrid();
+    renderTurnGrid();
   }
   scaffold.append(anchorSection("detail-exec",
-    sectionHead(t("detail.execution"), { count: data.runs.length }),
+    sectionHead(t("detail.execution"), { count: data.turns.length }),
     execWrap));
 
-  // 5b. Reviews (anchor #detail-reviews) — review rounds for yielded candidates
+  // 5b. Reviews (anchor #detail-reviews) — review rounds for completed candidates
   const reviewBody = node("div", "row-list");
   const sortedRounds = (data.reviewRounds || []).slice().sort(byNewest);
   if (!sortedRounds.length) {

@@ -83,7 +83,7 @@ export const DASHBOARD_HTML = `<!doctype html>
         <button class="tab" type="button" data-target="detail-top" data-i18n="tabs.summary">Summary</button>
         <button class="tab" type="button" data-target="detail-focus" data-i18n="tabs.focus">Focus</button>
         <button class="tab" type="button" data-target="detail-work" data-i18n="tabs.work">Work items</button>
-        <button class="tab" type="button" data-target="detail-exec" data-i18n="tabs.exec">Runs</button>
+        <button class="tab" type="button" data-target="detail-exec" data-i18n="tabs.exec">Turns</button>
         <button class="tab" type="button" data-target="detail-reviews" data-i18n="tabs.reviews">Reviews</button>
         <button class="tab" type="button" data-target="detail-roles" data-i18n="tabs.roles">Roles</button>
         <button class="tab" type="button" data-target="detail-history" data-i18n="tabs.history">History</button>

@@ -30,7 +30,6 @@ export type OverlapSubject = Readonly<{
   baseCommit: string;
   headCommit: string;
   changedPaths: readonly string[];
-  /** Manifest tags; empty for a legacy ChangeSet without a manifest. */
   manifestTags: readonly ChangeSetManifestTag[];
   deletedPaths: readonly string[];
 }>;
@@ -88,8 +87,8 @@ export function overlapSubjectFromChangeSet(changeSet: ChangeSet): OverlapSubjec
     baseCommit: changeSet.baseCommit,
     headCommit: changeSet.headCommit,
     changedPaths: changeSet.changedPaths,
-    manifestTags: changeSet.manifest?.tags ?? [],
-    deletedPaths: changeSet.manifest?.deletedPaths ?? []
+    manifestTags: changeSet.manifest.tags,
+    deletedPaths: changeSet.manifest.deletedPaths
   };
 }
 

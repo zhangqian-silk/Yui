@@ -400,7 +400,7 @@ export class WorkItemChangeSetManager {
    * ReviewRound freezes the candidate it reviewed at `reviewBaseCommit`; when
    * the captured ChangeSet head is that commit, the round's checks are
    * durable evidence for it.  "completed" alone is not a verdict: the
-   * reviewer may have yielded with failed checks (requires-repair), so only a
+   * reviewer may have completed with failed checks (requires-repair), so only a
    * round with an explicit positive verdict — at least one passed check and
    * no failed one — may feed `evidenceRefs`.  The link is by
    * `reviewBaseCommit`, not by `evidenceCommit`: the latter records the exact

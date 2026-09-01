@@ -4,7 +4,7 @@ import type { InputRequest } from "../input/inputRequest.js";
 import { taskMessageAuthorLabel } from "../message/message.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { isRoleRunStalled, latestStallProgressAt } from "../scheduler/roleRunStall.js";
+import { isRoleTurnStalled, latestStallProgressAt } from "../scheduler/roleTurnStall.js";
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import type { WorkItemObservabilityProjection } from "../scheduler/taskObservabilityProjection.js";
 import { projectNextAction } from "../task/nextAction.js";
@@ -58,10 +58,10 @@ export function runTaskContextCommand(
       }))
     ].filter((mailbox): mailbox is NonNullable<typeof mailbox> => mailbox !== null);
     const events = reader.listEvents(task.id);
-    const agentRuns = chronological(operationalTaskRecords(
-      reader.listAgentRuns(task.id),
+    const turns = chronological(operationalTaskRecords(
+      reader.listTurns(task.id),
       events,
-      "agent-run"
+      "turn"
     ));
     const reviewRounds = chronological(reader.listReviewRounds(task.id));
     const reviewConfig = reader.getReviewConfig();
@@ -80,7 +80,7 @@ export function runTaskContextCommand(
         store: reader,
         task,
         roles,
-        runs: agentRuns,
+        turns,
         rounds: reviewRounds,
         reviewConfig,
         currentCandidate: currentTaskReviewCandidate
@@ -94,7 +94,7 @@ export function runTaskContextCommand(
       roleSessionSets,
       coordinationMailboxes,
       workItems,
-      agentRuns,
+      turns,
       reviewRounds,
       changeSets,
       integrations,
@@ -123,7 +123,7 @@ export function runTaskContextCommand(
     roleSessionSets,
     coordinationMailboxes,
     workItems,
-    agentRuns,
+    turns,
     reviewRounds,
     changeSets,
     integrations,
@@ -139,7 +139,7 @@ export function runTaskContextCommand(
   const displayedWorkItems = currentAndRecentWorkItems(workItems);
   const displayedOpenInputRequests = openInputRequests.slice(-RECENT_RECORD_LIMIT);
   const displayedResolvedInputRequests = resolvedInputRequests.slice(-RECENT_RECORD_LIMIT);
-  const displayedActiveRuns = execution.activeRuns;
+  const displayedActiveTurns = execution.activeTurns;
   const executionGroupsById = new Map(execution.executionGroups.map((group) => [
     group.groupId,
     group
@@ -185,12 +185,12 @@ export function runTaskContextCommand(
     `  Attention: ${execution.attention.length === 0
       ? "none"
       : execution.attention.map(({ kind, owner }) => `${kind}/${owner}`).join(", ")}`,
-    `  Active AgentRuns (${displayedActiveRuns.length}):`,
-    ...(displayedActiveRuns.length === 0
+    `  Active Turns (${displayedActiveTurns.length}):`,
+    ...(displayedActiveTurns.length === 0
       ? ["    None."]
-      : displayedActiveRuns.map((run) => (
+      : displayedActiveTurns.map((run) => (
           `    ${run.roleName}: ${run.id} [${run.status}/${run.purpose}; ${
-            run.delivered ? "accepted" : "delivery-pending"
+            `provider-${run.providerSession}`
           }${run.workItemId === undefined ? "" : `; work-item=${run.workItemId}`}${
             run.reviewRoundId === undefined ? "" : `; review-round=${run.reviewRoundId}`
           }${run.executionGroupId === undefined ? "" : `; group=${run.executionGroupId}`}${
@@ -263,7 +263,7 @@ export function runTaskContextCommand(
       ? "none configured"
       : reviewDecision.reviewers.map((reviewer) => (
           `${reviewer.reviewerRoleName}=${reviewer.status}`
-            + `${reviewer.activeRunId === undefined ? "" : `(${reviewer.activeRunId})`}`
+            + `${reviewer.activeTurnId === undefined ? "" : `(${reviewer.activeTurnId})`}`
         )).join(", ")}`,
     `  Accepted baseline: ${reviewDecision.latestAcceptedBaseline === null
       ? "none"
@@ -312,18 +312,18 @@ export function runTaskContextCommand(
       ? ["  None."]
       : roles.flatMap((role) => {
           const binding = role.agentBindings[role.activeAgentId];
-          const activeRun = agentRuns.find((run) => (
+          const activeTurn = turns.find((run) => (
             run.roleName === role.name && run.status === "active"
           ));
           const sessions = roleSessionSets.find((set) => set.owner.roleName === role.name);
           const activeSession = sessions?.sessions[sessions.activeAgentId];
-          const effective = activeRun?.effective ?? activeSession?.effective;
-          const effectiveSource = activeRun === undefined ? "Session" : "Run";
+          const effective = activeTurn?.effective ?? activeSession?.effective;
+          const effectiveSource = activeTurn === undefined ? "Session" : "Turn";
           const creation = [...events].reverse().find((event) => (
             event.type === "role.added" && event.payload.role === role.name
           ));
           return [
-            `  ${role.name} [${activeRun === undefined ? "idle" : "running"}]: ${role.activeAgentId}/${binding.adapterId}`,
+            `  ${role.name} [${activeTurn === undefined ? "idle" : "running"}]: ${role.activeAgentId}/${binding.adapterId}`,
             `    Desired: r${role.launchRevision}; Profile intent: ${role.defaultAccess}; Model: ${binding.config.model ?? "default"}; effort: ${binding.config.effort ?? "default"}; permission: ${binding.config.permission.strategy}`,
             `    Effective: ${effective === undefined
               ? "not started"
@@ -348,8 +348,8 @@ export function runTaskContextCommand(
     ...(displayedWorkItems.length === 0
       ? ["  None."]
       : displayedWorkItems.flatMap((item) => {
-          const itemRuns = agentRuns.filter((run) => run.workItemId === item.id);
-          const latestRun = itemRuns.at(-1);
+          const itemRuns = turns.filter((run) => run.workItemId === item.id);
+          const latestTurn = itemRuns.at(-1);
           return [
             `  ${item.id} [${item.status}]: ${compactText(item.title)}`,
             `    Objective: ${compactText(item.objective)}`,
@@ -375,7 +375,7 @@ export function runTaskContextCommand(
             ...(item.candidates.length === 0
               ? []
               : item.candidates.flatMap((candidate) => [
-                  `    Candidate ${candidate.sequence}: ${candidate.id}${item.status === "awaiting_acceptance" && candidate === item.candidates.at(-1) ? " [current]" : ""} (${candidate.source.type === "run" ? candidate.source.runId : "direct"})`,
+                  `    Candidate ${candidate.sequence}: ${candidate.id}${item.status === "awaiting_acceptance" && candidate === item.candidates.at(-1) ? " [current]" : ""} (${candidate.source.type === "turn" ? candidate.source.turnId : "direct"})`,
                   `      Review policy: ${candidate.reviewPolicy === undefined ? "none" : `${candidate.reviewPolicy.roleName} (${candidate.reviewPolicy.trigger})`}`,
                   `      Task-final contract: ${candidate.taskFinalReviewContract === undefined
                     ? "none"
@@ -385,14 +385,14 @@ export function runTaskContextCommand(
                     : `${candidate.gitSnapshot.reviewBaseCommit} (${candidate.gitSnapshot.projects.length} Projects)`}`,
                   `      Summary: ${compactText(candidate.summary)}`
                 ])),
-            ...(latestRun === undefined
-              ? ["    AgentRuns: none."]
+            ...(latestTurn === undefined
+              ? ["    Turns: none."]
               : [
-                  `    AgentRuns: ${itemRuns.length}; latest ${latestRun.id} [${latestRun.status}] ${latestRun.effective.agentId}/${latestRun.effective.adapterId} · effective r${latestRun.effective.sourceDesiredRevision}/${latestRun.effective.profileAccess}/${latestRun.effective.permission.strategy}`,
-                  `      Assignment: ${latestRun.assignment.action}${latestRun.assignment.directive === undefined ? "" : ` · ${compactText(latestRun.assignment.directive)}`}`,
-                  ...(latestRun.summary === undefined
+                  `    Turns: ${itemRuns.length}; latest ${latestTurn.id} [${latestTurn.status}] ${latestTurn.effective.agentId}/${latestTurn.effective.adapterId} · effective r${latestTurn.effective.sourceDesiredRevision}/${latestTurn.effective.profileAccess}/${latestTurn.effective.permission.strategy}`,
+                  `      Assignment: ${latestTurn.inputs[0]!.input.source.channel}${latestTurn.inputs[0]!.input.directive === undefined ? "" : ` · ${compactText(latestTurn.inputs[0]!.input.directive)}`}`,
+                  ...(latestTurn.result === undefined
                     ? []
-                    : [`      Summary: ${compactText(latestRun.summary)}`])
+                    : [`      Summary: ${compactText(latestTurn.result.output)}`])
                 ]),
             ...renderReviewRounds(reviewRounds.filter(
               (round) => round.workItemId === item.id
@@ -406,26 +406,26 @@ export function runTaskContextCommand(
     ), executionGroupsById),
     "",
     ...recentSection(
-      "AgentRuns",
-      agentRuns,
+      "Turns",
+      turns,
       (run) => [
         `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.effective.agentId}/${run.effective.adapterId}`,
         `    Effective: r${run.effective.sourceDesiredRevision}; Profile intent: ${run.effective.profileAccess}; permission: ${run.effective.permission.strategy}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
-        ...(run.summary === undefined ? [] : [`    Result: ${compactText(run.summary)}`])
+        ...(run.result === undefined ? [] : [`    Result: ${compactText(run.result.output)}`])
       ]
     ),
     "",
     "Runtime health:",
     ...(() => {
-      const stalled = agentRuns.filter((run) => (
-        run.status === "active" && isRoleRunStalled(events, run.id)
+      const stalled = turns.filter((run) => (
+        run.status === "active" && isRoleTurnStalled(events, run.id)
       ));
       return stalled.length === 0
-        ? ["  No needs-attention Runs."]
+        ? ["  No needs-attention Turns."]
         : stalled.flatMap((run) => [
             `  ${run.id} [needs-attention] ${run.roleName}`,
             `    Durable progress: ${formatTimestamp(latestStallProgressAt(events, run.id) ?? run.updatedAt, timeZone)}`,
-            `    Cause: ${latestStallKind(events, run.id)} with no new semantic Run evidence in the stall window`,
+            `    Cause: ${latestStallKind(events, run.id)} with no new semantic Turn evidence in the stall window`,
             "    Next: inspect Task context/Role status; no automatic retry or Session replacement was performed."
           ]);
     })(),
@@ -516,21 +516,20 @@ function renderCoordinationMailbox(
   const target = mailbox.target.kind === "role"
     ? `role/${mailbox.target.roleName}`
     : mailbox.target.kind;
-  const pending = [mailbox.pending.userCorrection, mailbox.pending.normal]
-    .filter((batch): batch is NonNullable<typeof batch> => batch !== null);
+  const pending = mailbox.pending === null ? [] : [mailbox.pending];
   return [
-    `  ${target}: cursor normal=${mailbox.pending.cursors.normal}, correction=${mailbox.pending.cursors.userCorrection}; next=${mailbox.nextSequence}`,
-    `    Delivery: ${mailbox.inputDelivery?.status ?? "none"}; processing: ${mailbox.processing?.batchId ?? "none"}; pending batches: ${pending.length}`,
+    `  ${target}: next=${mailbox.nextSequence}`,
+    `    Processing: ${mailbox.processing?.batchId ?? "none"}; pending batches: ${pending.length}`,
     ...pending.map((batch) => (
       `    Pending ${batch.fromSequence}-${batch.toSequence}: ${batch.reasons.join(", ")} · refs ${batch.refs.map((ref) => `${ref.type}:${ref.id}`).join(", ") || "none"}`
     ))
   ];
 }
 
-function latestStallKind(events: readonly TaskEvent[], runId: string): string {
+function latestStallKind(events: readonly TaskEvent[], turnId: string): string {
   const event = [...events]
-    .filter((candidate) => candidate.type === "run.stalled"
-      && candidate.payload.runId === runId
+    .filter((candidate) => candidate.type === "turn.stalled"
+      && candidate.payload.turnId === turnId
       && candidate.payload.status !== "diagnostic-only")
     .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
   return event?.payload.kind ?? "workflow-not-progressing";
@@ -720,7 +719,7 @@ function renderExecutionGroup(
       const laneHealth = projected?.laneSummaries.find(({ laneId }) => laneId === lane.laneId);
       return [
         `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}${
-          lane.runId === undefined ? "" : `, run ${lane.runId}`
+          lane.turnId === undefined ? "" : `, run ${lane.turnId}`
           }) [${lane.status}${
           laneHealth?.runtimeHealth === undefined ? "" : `/${laneHealth.runtimeHealth}`
           }]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,

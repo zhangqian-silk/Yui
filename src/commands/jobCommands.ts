@@ -27,10 +27,7 @@ type PresentedJob = Readonly<{
   updatedAt: string;
 }>;
 
-/**
- * A compatibility view over the two durable scheduler records. This does not
- * reintroduce the deleted generic Job queue.
- */
+/** Operational view over the two durable scheduler recovery records. */
 export function runJobCommand(
   args: string[],
   store: TaskStore,

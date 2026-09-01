@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { createConfiguredAgent } from "../dist/agent/agent.js";
 import { createTaskBrief } from "../dist/brief/taskBrief.js";
+import { createTurnInput } from "../dist/context/turnInputContract.js";
 import { createDecision, supersedeDecision } from "../dist/decision/decision.js";
 import {
   createExecutionGroup,
@@ -22,21 +23,16 @@ import { createMilestone } from "../dist/milestone/milestone.js";
 import { createProject } from "../dist/repository/project.js";
 import {
   createRole,
-  createRoleAgentBinding,
-  updateRoleStatus
+  createRoleAgentBinding
 } from "../dist/role/role.js";
 import {
-  createAgentRun,
-  failAgentRun,
-  markAgentRunDelivered,
-  withYieldReceipt,
-  yieldAgentRun
-} from "../dist/run/agentRun.js";
-import { createYieldReceipt } from "../dist/run/yieldReceipt.js";
+  completeTurn,
+  createTurn,
+  failTurn
+} from "../dist/turn/turn.js";
 import { recordLeaderFailure } from "../dist/scheduler/leaderFailure.js";
 import { mergePendingWakeup } from "../dist/scheduler/pendingWakeup.js";
-import { ensureStorageSchema } from "../dist/storage/storageSchema.js";
-import { ensureYuiHome, FileTaskStore } from "../dist/storage/taskStore.js";
+import { initializeCurrentTaskStore } from "../dist/storage/currentTaskStore.js";
 import {
   activateTask,
   archiveTask,
@@ -58,10 +54,16 @@ const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const yuiHome = resolve(process.env.YUI_HOME ?? resolve(projectRoot, "output"));
 const at = (value) => new Date(value);
 const COMMIT = "a".repeat(40);
+const seedTurnInput = (directive, workItemId) => createTurnInput({
+  source: {
+    type: "yui",
+    channel: workItemId === undefined ? "leader-wakeup" : "workitem-dispatch"
+  },
+  directive,
+  deltaRefIds: []
+});
 
-ensureYuiHome(yuiHome);
-ensureStorageSchema(yuiHome);
-const store = new FileTaskStore(yuiHome);
+const store = initializeCurrentTaskStore(yuiHome);
 
 if (store.listTasks().length > 0) {
   throw new Error(`Refusing to seed non-empty YUI_HOME: ${yuiHome}`);
@@ -110,7 +112,7 @@ const task5 = archiveTask(retireTask(createTask("task-5", "Retired prototype", a
   summary: "Prototype findings were folded into task-1."
 });
 const task6 = activateTask(createTask("task-6", "Recover failed release worker", at("2026-07-22T04:00:00Z"), {
-  description: "Exercises failed Role, WorkItem, Run, and recovery diagnostics.",
+  description: "Exercises failed Role, WorkItem, Turn, and recovery diagnostics.",
   priority: "high",
   tags: ["recovery", "failure"]
 }), at("2026-07-22T04:10:00Z"));
@@ -119,7 +121,7 @@ store.transaction((writer) => {
   writer.saveConfiguredAgent(codex);
   writer.saveConfiguredAgent(claude);
   writer.saveConfig({
-    schemaVersion: 2,
+    schemaVersion: 5,
     defaultAgent: "codex",
     defaultWorkspace: resolve(yuiHome, "workspace"),
     currentTaskId: "task-1",
@@ -136,7 +138,7 @@ store.transaction((writer) => {
 
   writer.saveTaskBrief("task-1", createTaskBrief({
     objective: "Ship a local dashboard that makes every active thread legible at a glance.",
-    boundaries: ["Read-only Web surface", "Loopback access only", "FileTaskStore remains authoritative"],
+    boundaries: ["Read-only Web surface", "Loopback access only", "SQLite remains authoritative"],
     currentFocus: "Verify responsive layout and task detail states.",
     leaderSummary: "Server, API, filters, details, and release packaging are implemented.",
     updatedBy: "leader"
@@ -150,24 +152,24 @@ store.transaction((writer) => {
   }, at("2026-07-23T07:30:00Z")));
 
   const roles = [
-    updateRoleStatus(createRole("task-1", "leader", [codexBinding, claudeBinding], "codex", resolve(yuiHome, "workspace/task-1/leader"), at("2026-07-18T02:00:00Z"), {
+    createRole("task-1", "leader", [codexBinding, claudeBinding], "codex", resolve(yuiHome, "workspace/task-1/leader"), at("2026-07-18T02:00:00Z"), {
       description: "Owns the dashboard delivery.",
       responsibilities: ["Coordinate work", "Verify release evidence"]
-    }), "running", at("2026-07-23T07:20:00Z")),
-    updateRoleStatus(createRole("task-1", "frontend", [codexBinding], "codex", resolve(yuiHome, "workspace/task-1/frontend"), at("2026-07-18T02:05:00Z"), {
+    }),
+    createRole("task-1", "frontend", [codexBinding], "codex", resolve(yuiHome, "workspace/task-1/frontend"), at("2026-07-18T02:05:00Z"), {
       description: "Builds the responsive dashboard interface.",
       expectedOutput: "Accessible production UI"
-    }), "idle", at("2026-07-23T06:40:00Z")),
-    updateRoleStatus(createRole("task-1", "reviewer", [claudeBinding], "claude", resolve(yuiHome, "workspace/task-1/reviewer"), at("2026-07-18T02:10:00Z")), "detached", at("2026-07-23T06:45:00Z")),
-    updateRoleStatus(createRole("task-2", "leader", [codexBinding], "codex", resolve(yuiHome, "workspace/task-2/leader"), at("2026-07-19T02:30:00Z")), "running", at("2026-07-23T07:35:00Z")),
-    updateRoleStatus(createRole("task-6", "leader", [codexBinding], "codex", resolve(yuiHome, "workspace/task-6/leader"), at("2026-07-22T04:10:00Z")), "failed", at("2026-07-23T05:00:00Z")),
-    updateRoleStatus(createRole("task-6", "release-worker", [claudeBinding], "claude", resolve(yuiHome, "workspace/task-6/release-worker"), at("2026-07-22T04:15:00Z")), "exited", at("2026-07-23T04:55:00Z"))
+    }),
+    createRole("task-1", "reviewer", [claudeBinding], "claude", resolve(yuiHome, "workspace/task-1/reviewer"), at("2026-07-18T02:10:00Z")),
+    createRole("task-2", "leader", [codexBinding], "codex", resolve(yuiHome, "workspace/task-2/leader"), at("2026-07-19T02:30:00Z")),
+    createRole("task-6", "leader", [codexBinding], "codex", resolve(yuiHome, "workspace/task-6/leader"), at("2026-07-22T04:10:00Z")),
+    createRole("task-6", "release-worker", [claudeBinding], "claude", resolve(yuiHome, "workspace/task-6/release-worker"), at("2026-07-22T04:15:00Z"))
   ];
   for (const role of roles) writer.saveRole(role.taskId, role);
 
   // --- Work items with execution groups, candidates, and review rounds ---
 
-  // work-item-1: completed with a yielded run, candidate, and review round.
+  // work-item-1: completed with a Turn result, candidate, and review round.
   const work1 = updateWorkItemStatus(createWorkItem("work-item-1", "task-1", {
     title: "Build HTTP and snapshot API",
     objective: "Serve a read-only dashboard snapshot and task detail over loopback HTTP.",
@@ -190,33 +192,28 @@ store.transaction((writer) => {
   }, at("2026-07-18T03:02:00Z"));
   let work1WithGroup = attachWorkItemExecutionGroup(work1, group1, at("2026-07-18T03:03:00Z"));
   const effective1 = resolveEffectiveLaunch({ role: roles[0], purpose: "execution" });
-  const run1Yielded = yieldAgentRun(markAgentRunDelivered(createAgentRun("agent-run-1", "task-1", "leader", "new", "Implement the HTTP snapshot API.", at("2026-07-18T03:05:00Z"), {
+  const turn1 = completeTurn(createTurn("turn-1", "task-1", "leader", "new", seedTurnInput("Implement the HTTP snapshot API.", "work-item-1"), at("2026-07-18T03:05:00Z"), {
     workItemId: "work-item-1",
     executionGroupId: "exec-group-1",
     executionLaneId: "exec-group-1-lane-1",
     effective: effective1
-  }), at("2026-07-18T03:06:00Z")), "API implemented and focused tests pass.", at("2026-07-22T08:00:00Z"));
-  const receipt1 = createYieldReceipt("task-1", "agent-run-1", {
-    status: "yielded",
-    summary: "API implemented and focused tests pass."
-  }, at("2026-07-22T08:00:00Z"));
-  const run1 = { ...withYieldReceipt(run1Yielded, receipt1), disposition: "progress" };
+  }), "API implemented and focused tests pass.", at("2026-07-22T08:00:00Z"));
   const group1Running = updateExecutionLane(group1, "exec-group-1-lane-1", {
     status: "running",
-    runId: "agent-run-1"
+    turnId: "turn-1"
   }, at("2026-07-18T03:06:00Z"));
   work1WithGroup = updateWorkItemExecutionGroup(work1WithGroup, group1Running, at("2026-07-18T03:07:00Z"));
-  const group1Yielded = recordExecutionLaneResult(group1Running, "exec-group-1-lane-1", {
+  const group1Completed = recordExecutionLaneResult(group1Running, "exec-group-1-lane-1", {
     summary: "API implemented and focused tests pass.",
     findings: [
       { id: "finding-1", severity: "medium", summary: "Snapshot endpoint lacks ETag caching.", status: "open" },
       { id: "finding-2", severity: "low", summary: "Dashboard title could use more contrast.", status: "resolved" }
     ]
-  }, "yielded", at("2026-07-22T08:00:00Z"));
-  const work1Yielded = updateWorkItemExecutionGroup(work1WithGroup, group1Yielded, at("2026-07-22T08:01:00Z"));
-  const work1Candidate = submitWorkItemCandidate(work1Yielded, {
+  }, "completed", at("2026-07-22T08:00:00Z"));
+  const work1Completed = updateWorkItemExecutionGroup(work1WithGroup, group1Completed, at("2026-07-22T08:01:00Z"));
+  const work1Candidate = submitWorkItemCandidate(work1Completed, {
     summary: "API implemented and focused tests pass.",
-    source: { type: "run", runId: "agent-run-1" },
+    source: { type: "turn", turnId: "turn-1" },
     executionGroupId: "exec-group-1",
     executionLaneId: "exec-group-1-lane-1"
   }, at("2026-07-22T08:05:00Z"));
@@ -224,7 +221,7 @@ store.transaction((writer) => {
     "review-round-1", "task-1", "work-item-1", "candidate-1",
     "reviewer", "policy", COMMIT, at("2026-07-22T08:10:00Z")
   );
-  const group1Resolved = resolveExecutionGroup(group1Yielded, {
+  const group1Resolved = resolveExecutionGroup(group1Completed, {
     decision: "accept",
     summary: "API verified; accepting the candidate."
   }, at("2026-07-22T08:15:00Z"));
@@ -255,15 +252,15 @@ store.transaction((writer) => {
   }, at("2026-07-23T06:31:00Z"));
   const work2WithGroup = attachWorkItemExecutionGroup(work2, group2, at("2026-07-23T06:32:00Z"));
   const effective2 = resolveEffectiveLaunch({ role: roles[1], purpose: "execution" });
-  const run2 = markAgentRunDelivered(createAgentRun("agent-run-2", "task-1", "frontend", "resume", "Finish responsive states and overflow handling.", at("2026-07-23T06:30:00Z"), {
+  const turn2 = createTurn("turn-2", "task-1", "frontend", "resume", seedTurnInput("Finish responsive states and overflow handling.", "work-item-2"), at("2026-07-23T06:30:00Z"), {
     workItemId: "work-item-2",
     executionGroupId: "exec-group-2",
     executionLaneId: "exec-group-2-lane-1",
     effective: effective2
-  }), at("2026-07-23T06:31:00Z"));
+  });
   const group2Running = updateExecutionLane(group2, "exec-group-2-lane-1", {
     status: "running",
-    runId: "agent-run-2"
+    turnId: "turn-2"
   }, at("2026-07-23T06:33:00Z"));
   const work2Running = updateWorkItemExecutionGroup(work2WithGroup, group2Running, at("2026-07-23T06:34:00Z"));
 
@@ -317,15 +314,15 @@ store.transaction((writer) => {
   }, at("2026-07-23T04:31:00Z"));
   const work6WithGroup = attachWorkItemExecutionGroup(work6, group6, at("2026-07-23T04:32:00Z"));
   const effective6 = resolveEffectiveLaunch({ role: roles[5], purpose: "execution" });
-  const run3 = failAgentRun(markAgentRunDelivered(createAgentRun("agent-run-3", "task-6", "release-worker", "new", "Publish the verified artifact.", at("2026-07-23T04:30:00Z"), {
+  const turn3 = failTurn(createTurn("turn-3", "task-6", "release-worker", "new", seedTurnInput("Publish the verified artifact.", "work-item-6"), at("2026-07-23T04:30:00Z"), {
     workItemId: "work-item-6",
     executionGroupId: "exec-group-6",
     executionLaneId: "exec-group-6-lane-1",
     effective: effective6
-  }), at("2026-07-23T04:31:00Z")), "Native process exited with status 1.", at("2026-07-23T04:55:00Z"));
+  }), "runtime-failed", "Native process exited with status 1.", at("2026-07-23T04:55:00Z"));
   const group6Running = updateExecutionLane(group6, "exec-group-6-lane-1", {
     status: "running",
-    runId: "agent-run-3"
+    turnId: "turn-3"
   }, at("2026-07-23T04:33:00Z"));
   const group6Failed = recordExecutionLaneResult(group6Running, "exec-group-6-lane-1", {
     summary: "Native process exited with status 1."
@@ -339,24 +336,24 @@ store.transaction((writer) => {
     assignee: "leader"
   }, at("2026-07-23T03:00:00Z"));
 
-  // Phase 1: persist Work Items in their pre-candidate state so Runs and
+  // Phase 1: persist Work Items in their pre-candidate state so Turns and
   // Candidates can reference them through the storage boundary.
-  for (const item of [work1Yielded, work2Running, work3, work4, work5, work6Done, work7]) {
+  for (const item of [work1Completed, work2Running, work3, work4, work5, work6Done, work7]) {
     writer.saveWorkItem(item.taskId, item);
   }
 
-  // Phase 2: persist Runs once their owning Work Items and ExecutionGroups exist.
-  writer.saveAgentRun(run1);
-  writer.saveActiveAgentRun(run2);
-  writer.saveAgentRun(run3);
+  // Phase 2: persist Turns once their owning Work Items and ExecutionGroups exist.
+  writer.saveTurn(turn1);
+  writer.saveActiveTurn(turn2);
+  writer.saveTurn(turn3);
 
-  // task-2 leader run waiting on input (no execution lineage, so no Work Item dependency).
+  // task-2 Leader Turn waiting on input (no execution lineage, so no Work Item dependency).
   const effective4 = resolveEffectiveLaunch({ role: roles[3], purpose: "execution" });
-  const run4 = markAgentRunDelivered(createAgentRun("agent-run-4", "task-2", "leader", "resume", "Wait for explicit operator approval.", at("2026-07-23T07:00:00Z"), {
+  const turn4 = createTurn("turn-4", "task-2", "leader", "resume", seedTurnInput("Wait for explicit operator approval.", "work-item-7"), at("2026-07-23T07:00:00Z"), {
     workItemId: "work-item-7",
     effective: effective4
-  }), at("2026-07-23T07:01:00Z"));
-  writer.saveActiveAgentRun(run4);
+  });
+  writer.saveActiveTurn(turn4);
 
   // Phase 3: advance work-item-1 through candidate submission, resolution, and
   // completion in consecutive revisions (the store requires +1 per save).
@@ -364,14 +361,14 @@ store.transaction((writer) => {
   writer.saveWorkItem(work1Resolved.taskId, work1Resolved);
   writer.saveWorkItem(work1Done.taskId, work1Done);
 
-  // Phase 4: ReviewRound once its Candidate and source Run exist.
+  // Phase 4: ReviewRound once its Candidate and source Turn exist.
   writer.saveReviewRound("task-1", review1);
 
   const requiredInput = createInputRequest("input-1", "task-2", {
     taskId: "task-2",
     roleName: "leader",
     agentId: "codex",
-    runId: "agent-run-4"
+    turnId: "turn-4"
   }, {
     question: "Deploy the verified build to production now?",
     choices: [{ key: "deploy", label: "Deploy now" }, { key: "hold", label: "Hold release" }],
@@ -381,7 +378,7 @@ store.transaction((writer) => {
     taskId: "task-1",
     roleName: "leader",
     agentId: "codex",
-    runId: "agent-run-1"
+    turnId: "turn-1"
   }, {
     question: "Use port 4173 for local dashboard documentation?",
     choices: [{ key: "default", label: "Use 4173" }, { key: "alternate", label: "Use 4180" }],
@@ -392,7 +389,7 @@ store.transaction((writer) => {
     taskId: "task-1",
     roleName: "leader",
     agentId: "codex",
-    runId: "agent-run-1"
+    turnId: "turn-1"
   }, {
     question: "Which visual direction should the dashboard use?",
     choices: [{ key: "control-room", label: "Control room" }, { key: "cards", label: "Card grid" }],
@@ -402,7 +399,7 @@ store.transaction((writer) => {
     taskId: "task-1",
     roleName: "leader",
     agentId: "codex",
-    runId: "agent-run-1"
+    turnId: "turn-1"
   }, {
     question: "Should we add a second persistence layer?",
     choices: [],
@@ -412,23 +409,23 @@ store.transaction((writer) => {
     writer.saveInputRequest(taskId, request);
   }
   writer.saveInputRequest("task-1", answerInputRequest(answeredInput, { choiceKey: "control-room" }, "user", at("2026-07-20T06:20:00Z")));
-  writer.saveInputRequest("task-1", cancelInputRequest(cancelledInput, "The FileTaskStore remains the only authority.", at("2026-07-20T06:25:00Z")));
+  writer.saveInputRequest("task-1", cancelInputRequest(cancelledInput, "SQLite remains the only authority.", at("2026-07-20T06:25:00Z")));
 
   const messages = [
     ["task-1", createTaskMessage("message-1", "task-1", "Please make the dashboard dense, calm, and easy to scan.", "user", { type: "user" }, at("2026-07-18T01:05:00Z"))],
     ["task-1", createTaskMessage("message-2", "task-1", "The dashboard task is active and work has been dispatched.", "operator", { type: "operator" }, at("2026-07-18T02:05:00Z"))],
-    ["task-1", createTaskMessage("message-3", "task-1", "HTTP API implemented; security headers and focused tests pass.", "role-result", { type: "role", roleName: "leader" }, at("2026-07-22T08:00:00Z"), { runId: "agent-run-1", workItemId: "work-item-1" })],
+    ["task-1", createTaskMessage("message-3", "task-1", "HTTP API implemented; security headers and focused tests pass.", "role-result", { type: "role", roleName: "leader" }, at("2026-07-22T08:00:00Z"), { turnId: "turn-1", workItemId: "work-item-1" })],
     ["task-6", createTaskMessage("message-4", "task-6", "Release worker exited; inspect partial artifact before retry.", "system", { type: "system" }, at("2026-07-23T04:56:00Z"))]
   ];
   for (const [taskId, message] of messages) writer.saveMessage(taskId, message);
 
-  const activeDecision = createDecision("decision-1", "task-1", "Keep the Web surface read-only", "Mutations remain explicit CLI operations and FileTaskStore stays authoritative.", at("2026-07-18T04:00:00Z"));
+  const activeDecision = createDecision("decision-1", "task-1", "Keep the Web surface read-only", "Mutations remain explicit CLI operations and SQLite stays authoritative.", at("2026-07-18T04:00:00Z"));
   const oldDecision = createDecision("decision-2", "task-1", "Use a uniform card grid", "An early direction before operational density was tested.", at("2026-07-18T04:10:00Z"));
   writer.saveDecision("task-1", activeDecision);
   writer.saveDecision("task-1", oldDecision);
   writer.saveDecision("task-1", supersedeDecision(oldDecision, "The control-room composition scans better at operational density.", at("2026-07-20T04:00:00Z")));
-  writer.saveMilestone("task-1", createMilestone("milestone-1", "task-1", "Read-only API complete", "Dashboard and task detail endpoints pass HTTP contract tests.", at("2026-07-22T08:05:00Z")));
-  writer.saveMilestone("task-1", createMilestone("milestone-2", "task-1", "Release package verified", "The Web modules are present in the npm dry-run package.", at("2026-07-23T07:10:00Z")));
+  writer.saveMilestone("task-1", createMilestone("milestone-1", "task-1", "Read-only API complete", "Dashboard and task detail endpoints pass HTTP contract tests.", "leader", at("2026-07-22T08:05:00Z")));
+  writer.saveMilestone("task-1", createMilestone("milestone-2", "task-1", "Release package verified", "The Web modules are present in the npm dry-run package.", "leader", at("2026-07-23T07:10:00Z")));
 
   const events = [
     createTaskEvent("event-1", "task-1", "task.created", { taskId: "task-1", title: task1.title }, at("2026-07-18T01:00:00Z")),
@@ -442,3 +439,4 @@ store.transaction((writer) => {
 });
 
 console.log(`Seeded web dashboard at ${yuiHome}`);
+store.close?.();

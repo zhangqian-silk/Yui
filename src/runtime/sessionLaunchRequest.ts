@@ -17,7 +17,7 @@ type SessionLaunchRequestBase = Readonly<{
   effective: EffectiveLaunchSnapshot;
   workspace: string;
   runtimeIsolation?: TaskRuntimeIsolationDescriptor;
-  runId?: string;
+  turnId?: string;
   environment?: Readonly<Record<string, string>>;
 }>;
 
@@ -65,9 +65,9 @@ export function createSessionLaunchRequest(
     effective,
     workspace,
     ...(runtimeIsolation === undefined ? {} : { runtimeIsolation }),
-    ...(input.runId === undefined
+    ...(input.turnId === undefined
       ? {}
-      : { runId: requireSafeIdentity(input.runId, "Run id") }),
+      : { turnId: requireSafeIdentity(input.turnId, "Turn id") }),
     ...(input.environment === undefined
       ? {}
       : { environment: copyEnvironment(input.environment) })

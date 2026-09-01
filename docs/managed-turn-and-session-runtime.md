@@ -1,4 +1,4 @@
-# Managed Run Delivery and Session Recovery
+# Managed Turn and Session Runtime
 
 Status: implemented contract
 
@@ -12,13 +12,14 @@ Each question has one authority:
 
 - Task, WorkItem, Message, Decision, result, Project Knowledge, and managed
   workspace records own durable progress.
-- AgentRun owns Role scheduling and the current delivery intent.
+- Turn owns one Provider execution boundary: every Provider-visible input and
+  the final visible output. It does not copy hidden reasoning or tool traffic.
 - Session owns one stable provider-native conversation identity. Its only
   durable lifecycle is `active` or `ended`; `endReason` distinguishes an
   explicit stop from failure.
 - Host owns one disposable Yui attachment/process activation for a Role and
-  workspace. It is identified by `launchId`, not by AgentRun.
-- Turn owns one immutable provider input attempt and its accepted, running,
+workspace. It is identified by `launchId`, not by Turn.
+- Provider Runtime Binding owns one immutable provider input attempt and its accepted, running,
   waiting, completed, failed, cancelled, or uncertain result.
 
 Readiness and busy state are Host/Turn observations. They are not additional
@@ -39,13 +40,60 @@ Starting or restoring a Session never sends input. Submitting a Turn never
 creates or silently replaces a Session. A terminal Turn is immutable; any
 continuation is another Turn.
 
+The Session is reusable across both Yui-dispatched and direct conversation.
+Every input submitted through Yui has `source.type = yui`; its channel records
+whether it came from a relayed user message, input response, Task/WorkItem
+dispatch, ordinary Leader wake, or forced Leader wake. Input entered directly
+in the Provider UI is `user/direct`. Provider-created Goal continuation is
+`provider/goal-continuation`. These fields are provenance only: none of them
+decides Task or WorkItem completion.
+
+A Turn stores `inputs[]` because a running Provider Turn may receive a forced
+Leader wake as a later input. Its terminal `result` stores the Provider's final
+visible response and exact native identity. Direct Provider Turns are recorded
+in the same history. They do not claim a managed execution lane merely because
+they share the Session.
+
+## Task truth and Leader responsibility
+
+Worker and Reviewer Turns produce evidence and, where applicable, update their
+managed worktree. Their terminal output is stored automatically. Turn terminal
+never means that the WorkItem, Review, or Task is accepted or complete.
+
+The Leader is the only semantic authority that integrates accepted code and
+updates WorkItem or Task truth. This also covers Leader-owned execution: the
+Leader may perform the work itself in the Task worktree and update the durable
+facts before ending its own Turn. A Leader Turn does not self-wake when it ends.
+
+Terminal Worker/Reviewer Turns and other material non-Leader events enter the
+Leader wake batch. The first event opens a one-minute aggregation window; new
+events join the same window without resetting it. If the Leader is still in an
+active Turn after that minute, the batch waits. At ten minutes from the first
+event, Yui steers one forced input into that exact active Leader Turn. The input
+lists the aggregate, states that it waited ten minutes, and instructs the
+Leader to handle the events before resuming its interrupted work.
+
+## Session Goal
+
+Goal is explicit Session-scoped Provider state and may span multiple Turns. It
+is never inferred from a quiet period. Codex exposes the thread Goal API and
+Goal notifications; Claude exposes `active_goal`. While a non-Leader Session
+Goal is active, an individual Turn terminal is recorded but does not yet wake
+the Leader because the Session-level intent is still running. Goal completion,
+pause, block, limit, or clear emits the material event that wakes the Leader.
+The Leader still decides whether durable Task or WorkItem facts change.
+
+No `yield` command participates in this contract. Agent-to-Agent delivery is
+the stored Turn result plus durable wake/event references; the absence of a
+special command cannot redefine whether the Provider Turn ended.
+
 A Host reservation protects only physical Host startup for a Role owner. It
-settles as soon as the Host and Session are known. It never belongs to a Run and
-never remains held while a Turn executes. Therefore a later Run may reuse the
+settles as soon as the Host and Session are known. It never belongs to a Turn and
+never remains held while a Turn executes. Therefore a later Turn may reuse the
 same live Host and Session. If that Host has stopped, restoring the same Session
 creates a new Host activation while retaining the native Session id.
 
-The persisted Run and Turn fences still prevent duplicate input. A
+The stable attempt id and Provider Turn fence prevent duplicate input. A
 `delivery-unknown` input is not replayed automatically because it may already
 exist at the provider. A provider-proven `busy` result is safe to try later
 because the requested Turn was not created.
@@ -75,12 +123,12 @@ The ordinary choices are deliberately small:
 
 | Facts | Useful Agent action |
 | --- | --- |
-| An accepted Turn fails with availability, `429`, capacity, or a recoverable transport error; Session remains usable | Keep Run and Session, restore the same native id if necessary, and submit a new Turn |
+| An accepted Turn fails with availability, `429`, capacity, or a recoverable transport error; Session remains usable | Keep the Session, restore the same native id if necessary, and submit a new Turn |
 | A known Host process is gone; Session remains recoverable | Detach the dead Host before claiming pending work, start one new Host activation, and restore the same native Session id |
-| Session preparation otherwise fails, or the Driver rejects input before acceptance | The exact Run fails once; inspect the error, then explicitly retry the failed Run if another attempt is useful |
+| Session preparation otherwise fails, or the Driver rejects input before acceptance | The exact Turn fails once; inspect the error, then explicitly retry the failed Turn if another attempt is useful |
 | Another native Turn is active | Observe or wait; retain pending delivery |
 | Input delivery is unknown | Inspect native history; do not blindly replay |
-| Driver proves Session missing, ended, expired, or unusable | Settle the exact Run, stop that Role Session/Host, then create the next Run on a new Session |
+| Driver proves Session missing, ended, expired, or unusable | Settle the exact Turn, stop that Role Session/Host, then create the next Turn on a new Session |
 | Error is unclassified | Read the complete raw error and current facts, then choose explicitly |
 
 The read and stop primitives are:
@@ -93,18 +141,18 @@ yui task role session stop <task> <role> --reason "<decision>"
 
 Core never redelivers an input that was not accepted merely because a periodic
 scheduler pass runs again. A Session preparation failure or explicit Turn
-rejection terminalizes the exact Run and routes the error to the responsible
-Agent. For a continuation on an already accepted Run, the exact unaccepted
-error fact itself fences further scheduler attempts for that Run. This makes
+rejection terminalizes the exact Turn and routes the error to the responsible
+Agent. For a continuation on an already accepted Turn, the exact unaccepted
+error fact itself fences further scheduler attempts for that Turn. This makes
 recovery a visible Agent action instead of an implicit launch loop, without a
-second writable recovery status. A `delivery-unknown` Run remains fenced until
+second writable recovery status. A `delivery-unknown` Turn remains fenced until
 native history resolves whether the provider accepted it.
 
 An idle `session stop` terminates only the exact Role Host activation and marks
-that Session ended. It requires the Agent to settle or retire an active Run
-first. The next explicit Run dispatch then starts a new Session. Its Context
+that Session ended. It requires the Agent to settle or retire an active Turn
+first. The next explicit Turn dispatch then starts a new Session. Its Context
 Pack includes the prior error event, so the receiving Agent can see the old
-Agent/adapter, Run, Host activation, native Session and Turn identities, and
+Agent/adapter, Turn, Host activation, native Session and Provider Turn identities, and
 complete raw failure without transcript reconstruction.
 
 There is no fixed number of allowed replacements. Leader or Operator reads the
