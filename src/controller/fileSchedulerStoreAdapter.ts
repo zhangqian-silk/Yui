@@ -1547,9 +1547,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    * the Leader wakeup. A terminal job without its wakeup enqueued is a lost
    * wakeup, so the two writes commit together or not at all.
    *
-   * f6: The wakeup targets the Leader role mailbox (not the Task mailbox)
-   * and also queues a pending wakeup so processLeaderWakeups dispatches
-   * the Leader Turn with the exact job-finished reason.
+   * f6: The wakeup targets the Leader role mailbox (not the Task mailbox).
+   * That mailbox is also the PendingWakeup authority consumed by
+   * processLeaderWakeups, so the signal must be enqueued exactly once.
    */
   transitionDurableJob(
     taskId: string,
@@ -1571,7 +1571,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now,
           [...wakeup.refs]
         );
-        queueLeaderWakeup(store, taskId, wakeup.reason, now);
       }
       return next;
     });
