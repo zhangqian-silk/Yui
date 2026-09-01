@@ -67,42 +67,8 @@ export async function replayRuntimeProcessExitOutbox(
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     });
   }
-
-  // One-generation bridge for observations written by an Agent Host that was
-  // already running before this release. New writers use one immutable file
-  // per observation above, so they never share an append/unlink boundary.
-  for (const name of entries.filter(isLegacyOutboxEntry).sort()) {
-    const path = join(directory, name);
-    let raw: string;
-    try {
-      raw = await readFile(path, "utf8");
-    } catch (error) {
-      // The old writer removes its own append log only after the Controller
-      // acknowledges delivery. If it won that race, there is nothing to replay.
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
-    }
-    // Only consume newline-terminated records. A legacy writer can be between
-    // append bytes and its trailing newline while this snapshot is read.
-    const completeLength = raw.lastIndexOf("\n") + 1;
-    const lines = raw.slice(0, completeLength).split("\n").filter(Boolean);
-    for (const line of lines) {
-      await submit(validateRuntimeProcessExitObservation(
-        JSON.parse(line) as RuntimeProcessExitObservation
-      ));
-    }
-    // Deliberately leave the legacy path in place. A pre-upgrade Agent Host may
-    // already hold an append descriptor for this inode; renaming/unlinking it
-    // would let a later append disappear into an unlinked file. The old writer
-    // removes the path after a successful direct submission. Otherwise the
-    // durable file remains for the next idempotent replay.
-  }
 }
 
 function outboxDirectory(home: string): string {
   return resolve(join(home, "runtime", "agent-host-outbox"));
-}
-
-function isLegacyOutboxEntry(name: string): boolean {
-  return name.endsWith(".jsonl");
 }

@@ -54,8 +54,8 @@ const IRREVERSIBILITY_RANK: Readonly<Record<CapabilityGrantIrreversibility, numb
  * Concurrency guard: prevents two runs of the same workflow from submitting
  * duplicate external effects. Each CLI invocation is a fresh Node process with
  * its own module instance, so an in-process map cannot coordinate across
- * processes. When the store is a FileTaskStore (it exposes its root directory),
- * the guard is a file lock under that root; otherwise (in-memory test stores)
+ * processes. When the store exposes its root directory, the guard is a file
+ * lock under that root; otherwise (in-memory test stores)
  * it falls back to an in-process map. The second run waits for the first to
  * finish, then re-reads the (now-updated) workflow state.
  */
@@ -76,9 +76,9 @@ async function acquireInProcessLock(key: string): Promise<() => void> {
 }
 
 /**
- * The persistence seam the engine needs. FileTaskStore satisfies it. A store
- * that also exposes `rootDirectory()` (FileTaskStore) gets a cross-process
- * file lock; in-memory stores get the in-process guard.
+ * The persistence seam the engine needs. A store that exposes
+ * `rootDirectory()` gets a cross-process file lock; in-memory stores get the
+ * in-process guard.
  */
 export type ReleaseWorkflowEngineStore = Readonly<{
   getReleaseWorkflow(taskId: string, workflowId: string): ReleaseWorkflow | null;
@@ -156,8 +156,8 @@ export type ReleaseWorkflowRunOptions = Readonly<{
  *   crash between the two is healed on resume as described above.
  *
  * Concurrent runs of the same workflow are serialized by a cross-process file
- * lock when the store is a FileTaskStore (each CLI invocation is a fresh
- * process), so a second run cannot submit a duplicate effect.
+ * lock when the store exposes its durable root, so a second CLI process cannot
+ * submit a duplicate effect.
  */
 export async function runReleaseWorkflow(
   store: ReleaseWorkflowEngineStore,
@@ -551,11 +551,7 @@ function grantUseRecognized(
   stepId: string,
   attempt: number
 ): boolean {
-  const reservations = grant.useReservations;
-  if (Array.isArray(reservations)) {
-    return reservations.includes(attemptReservationKey(workflowId, stepId, attempt));
-  }
-  return false;
+  return grant.useReservations.includes(attemptReservationKey(workflowId, stepId, attempt));
 }
 
 /**

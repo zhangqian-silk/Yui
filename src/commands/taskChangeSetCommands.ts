@@ -3,9 +3,7 @@ import type { ChangeSet } from "../integration/changeSet.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 
-/**
- * Read-only ChangeSet inspection, including its optional integration manifest.
- */
+/** Read-only ChangeSet inspection, including its integration manifest. */
 export async function runTaskChangeSetCommand(
   args: readonly string[],
   store: TaskStore
@@ -56,20 +54,16 @@ function renderChangeSet(changeSet: ChangeSet): string {
     ...changeSet.changedPaths.map((path) => `  ${path}`),
     `Created: ${changeSet.createdAt}`
   ];
-  if (changeSet.manifest === undefined) {
-    lines.push("Manifest: -");
-  } else {
-    const manifest = changeSet.manifest;
-    lines.push(
-      "Manifest:",
-      `  Tags: ${manifest.tags.join(", ")}`,
-      `  Deleted paths: ${manifest.deletedPaths.length}`,
-      ...manifest.deletedPaths.map((path) => `    ${path}`),
-      `  Target: ${manifest.targetRef ?? "-"}`,
-      `  Evidence: ${manifest.evidenceRefs.length === 0
-        ? "-"
-        : manifest.evidenceRefs.join(", ")}`
-    );
-  }
+  const manifest = changeSet.manifest;
+  lines.push(
+    "Manifest:",
+    `  Tags: ${manifest.tags.join(", ")}`,
+    `  Deleted paths: ${manifest.deletedPaths.length}`,
+    ...manifest.deletedPaths.map((path) => `    ${path}`),
+    `  Target: ${manifest.targetRef ?? "-"}`,
+    `  Evidence: ${manifest.evidenceRefs.length === 0
+      ? "-"
+      : manifest.evidenceRefs.join(", ")}`
+  );
   return `${lines.join("\n")}\n`;
 }

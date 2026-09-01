@@ -909,19 +909,6 @@ function updateTaskCommand(
   return `Updated task ${result.id}\n`;
 }
 
-/** Compatibility helper for call sites that cannot yet handle foreground enter. */
-export function runTaskOutputCommand(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions = {}
-): string {
-  const execution = runTaskCommand(args, store, options);
-  if (execution.kind !== "output") {
-    throw runtimeError("Task Role foreground runtime control requires the CLI.");
-  }
-  return execution.output;
-}
-
 export function submitOperatorMessage(
   body: string,
   taskId: string | undefined,

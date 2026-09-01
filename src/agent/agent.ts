@@ -8,7 +8,7 @@ export type EnvironmentBinding = Readonly<{
   required: boolean;
 }>;
 
-/** FileTaskStore-safe Agent record. There is deliberately no probe runtime state here. */
+/** Durable Agent configuration. There is deliberately no probe runtime state here. */
 export type ConfiguredAgent = Readonly<{
   schemaVersion: 2;
   id: string;

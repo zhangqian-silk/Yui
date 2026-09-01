@@ -18,7 +18,7 @@ import { CURRENT_DATABASE_FILENAME as COMMITTED_DATABASE_FILENAME } from "../sto
 
 /**
  * Default sidecar implementation: the telemetry tables live inside the Home's
- * authoritative `yui.db` (schema migrations 1 and 5), so a database-only Home
+ * authoritative `yui.db`, so a Home has one durable database
  * has one file to manage, back up, and migrate. The store opens its own
  * connection to that file: the write path is a single serialized writer (the
  * "WAL worker") and stays isolated from the business store's connection.
@@ -28,9 +28,9 @@ import { CURRENT_DATABASE_FILENAME as COMMITTED_DATABASE_FILENAME } from "../sto
  * batches. Queue overflow and database failures increment `dropped` and record
  * a health warning — the semantic lane is never affected.
  *
- * The telemetry tables are maintained by the centralized schema migrations:
- * `telemetry` (migration 1, §4.4) holds the bounded latest-per-key window and
- * `telemetry_aggregate` (migration 5) holds the authoritative per-Turn/generation
+ * The telemetry tables are maintained by the centralized schema baseline:
+ * `telemetry` holds the bounded latest-per-key window and
+ * `telemetry_aggregate` holds the authoritative per-Turn/generation
  * summary, maintained by triggers so it survives window pruning.
  */
 

@@ -31,7 +31,6 @@ import {
   StorageRecordError,
   type TaskStore
 } from "./taskStore.js";
-import { resolveTaskStoreBackendForHome } from "./sqliteStore.js";
 
 // Re-exported for the persistence worker and existing importers.
 export type { SerializedError };
@@ -411,10 +410,9 @@ function isRpcCallOptions(value: unknown): value is RpcCallOptions {
 
 /** Resolve the optional persistence worker for the current SQLite store. */
 export function resolveStoreWorkerEnabledForHome(
-  home: string,
+  _home: string,
   env: NodeJS.ProcessEnv = process.env
 ): boolean {
-  if (resolveTaskStoreBackendForHome(home, env) !== "sqlite") return false;
   const flag = env.YUI_STORE_WORKER?.toLowerCase();
   if (flag === "1" || flag === "true") return true;
   if (flag === "0" || flag === "false") return false;

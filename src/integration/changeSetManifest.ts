@@ -33,9 +33,7 @@ export const CHANGE_SET_MANIFEST_TAGS: readonly ChangeSetManifestTag[] = [
 /**
  * Lightweight integration manifest for one ChangeSet.
  *
- * The manifest is optional metadata: a ChangeSet without one (for example a
- * record written by an older Yui) still integrates.  `tags` and
- * `deletedPaths` are derived from the diff at capture time; `targetRef` is the
+ * `tags` and `deletedPaths` are derived from the diff at capture time; `targetRef` is the
  * intended integration target; `evidenceRefs` point at durable verification
  * evidence (for example `review-round:<id>` or `integration-check:<attempt>`).
  */
@@ -87,7 +85,7 @@ export function validateChangeSetManifest(manifest: ChangeSetManifest): ChangeSe
     "ChangeSet manifest deleted path"
   );
   const evidenceRefs = normalizedUniqueText(
-    manifest.evidenceRefs ?? [],
+    manifest.evidenceRefs,
     "ChangeSet manifest evidence reference"
   );
   return {

@@ -1,7 +1,5 @@
 import type { Role } from "../role/role.js";
 
-export type DispatchContextStore = Readonly<Record<string, never>>;
-
 /** Stable Project references that tell an Agent where Project Policy lives.
  *
  * Policy remains a Yui-maintained Project record (or a configured Project
@@ -31,17 +29,6 @@ export type BuildRoleContextInput = Readonly<{
   }>;
   projectPolicy?: readonly ProjectPolicyReference[];
 }>;
-
-/** Compatibility entry point used by the restored Task workflow. */
-export function compileDispatchInput(
-  _store: DispatchContextStore,
-  taskId: string,
-  role: Role,
-  input: string,
-  workContext: Pick<BuildRoleContextInput, "workItem" | "workspace" | "projectPolicy"> = {}
-): string {
-  return buildRoleContext({ taskId, role, input, ...workContext });
-}
 
 export function buildRoleContext(context: BuildRoleContextInput): string {
   return context.role.name === "leader"

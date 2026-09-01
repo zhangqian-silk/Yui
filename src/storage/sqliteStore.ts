@@ -421,8 +421,8 @@ export class SqliteTaskStore implements TaskStore {
 
   /** Async transaction seam used by queue operations that must inspect Git
    * before committing the durable queue state. The SQLite write transaction
-   * remains open across the awaited callback, matching FileTaskStore's
-   * transactionAsync semantics and preserving the single-writer boundary. */
+   * remains open across the awaited callback, preserving the single-writer
+   * boundary. */
   async transactionAsync<T>(execute: (store: TaskStore) => Promise<T>): Promise<T> {
     if (this.#inTransaction) return execute(this);
     this.#begin();
@@ -3061,28 +3061,8 @@ function validIntegrationQueueTransition(
 /** The product has one storage backend. */
 export type TaskStoreBackend = "sqlite";
 
-/** Options for {@link openTaskStore}. */
+/** Options for the current SQLite Task store. */
 export type TaskStoreOptions = SqliteTaskStoreOptions;
-
-/**
- * Open the current SQLite Task store. The backend remains explicit at
- * composition seams but has only one legal value.
- */
-export function openTaskStore(
-  home: string,
-  _backend: TaskStoreBackend,
-  options?: TaskStoreOptions
-): TaskStore {
-  return new SqliteTaskStore(home, options);
-}
-
-/**
- * Resolve the one current storage backend. Historical environment overrides
- * are intentionally ignored.
- */
-export function resolveTaskStoreBackend(_env: NodeJS.ProcessEnv = process.env): TaskStoreBackend {
-  return "sqlite";
-}
 
 /** The product storage backend is one current SQLite contract. */
 export function resolveTaskStoreBackendForHome(
@@ -3097,8 +3077,7 @@ export function resolveTaskStoreBackendForHome(
  */
 export function openConfiguredTaskStore(
   home: string,
-  options?: TaskStoreOptions,
-  env: NodeJS.ProcessEnv = process.env
+  options?: TaskStoreOptions
 ): TaskStore {
-  return openTaskStore(home, resolveTaskStoreBackendForHome(home, env), options);
+  return new SqliteTaskStore(home, options);
 }

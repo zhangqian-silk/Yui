@@ -937,11 +937,9 @@ export function runExecutionAudit(
       for (const taskId of taskIds) {
         for (const run of store.listTurns(taskId)) {
           if (!inWindow(run.createdAt, options)) continue;
-          const version = String(run.effective.contextProtocolVersion ?? "legacy");
+          const version = String(run.effective.contextProtocolVersion);
           protocolVersions.set(version, (protocolVersions.get(version) ?? 0) + 1);
-          if (run.effective.sessionManifestCompatibilityDigest !== undefined) {
-            manifestDigests.add(run.effective.sessionManifestCompatibilityDigest);
-          }
+          manifestDigests.add(run.effective.sessionManifestCompatibilityDigest);
         }
         for (const event of store.listEvents(taskId)) {
           if (!inWindow(event.createdAt, options)) continue;

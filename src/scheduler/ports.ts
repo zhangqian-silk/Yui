@@ -261,9 +261,8 @@ export type RoleTurnDeliveryFailurePersistence = Readonly<{
 
 /**
  * Per-Turn progress facts folded from a Task's event history in one O(events)
- * pass. The stall reconciliation uses these to avoid re-scanning the whole
- * history per Turn candidate; absent implementation falls back to per-Turn
- * scans.
+ * pass. Stall reconciliation reads this current projection instead of
+ * re-scanning history per Turn candidate.
  */
 export type TurnProgressFacts = Readonly<{
   latestCheckpointAt?: string;
@@ -333,14 +332,13 @@ export interface SchedulerStorePort {
   listDurableJobs?(taskId: string): readonly import("../job/durableJob.js").DurableJob[];
   listInputRequests?(taskId: string): readonly import("../input/inputRequest.js").InputRequest[];
   listMessages?(taskId: string): readonly import("../message/message.js").TaskMessage[];
-  /** Optional richer fold of WorkItem/Review/Integration progress for a Turn. */
-  getTurnDurableProgress?(taskId: string, roleName: string, turnId: string): SchedulerTurnProgress | null;
+  /** Current fold of WorkItem/Review/Integration progress for a Turn. */
+  getTurnDurableProgress(taskId: string, roleName: string, turnId: string): SchedulerTurnProgress | null;
   /**
-   * Optional one-pass fold of a Task's event history for one Turn. When present,
-   * stall reconciliation uses these facts instead of re-scanning the whole
-   * history per candidate. Absent implementation ⇒ per-Turn scans.
+   * One-pass fold of a Task's event history for one Turn. Stall reconciliation
+   * reads this projection instead of maintaining a second event-scan path.
    */
-  getTurnProgressFacts?(taskId: string, turnId: string): TurnProgressFacts | undefined;
+  getTurnProgressFacts(taskId: string, turnId: string): TurnProgressFacts | undefined;
   /** Materializes a newly observed related-record fold as one turn.progress fact. */
   recordRoleTurnProgress?(input: RoleTurnProgressPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Closes one coalesced read-only runtime diagnostic window. */
@@ -596,8 +594,8 @@ export type PreparedRoleDelivery = Readonly<{
   /**
    * Exact native Session reserved by preparation, when the provider exposes it
    * before readiness. `null` is meaningful for a fresh runtime-discovered
-   * Session (for example Codex); omission preserves older delivery adapters
-   * that do not expose a pre-readiness Session fact.
+   * Session (for example Codex); omission means preparation has not observed a
+   * pre-readiness Session fact.
    */
   session?: SchedulerRoleSession | null;
 }>;

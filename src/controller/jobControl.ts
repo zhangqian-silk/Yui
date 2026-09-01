@@ -322,7 +322,7 @@ function validateStartParams(store: TaskStore, params: DurableJobStartParams): v
  * rr13: `job.start`/`job.cancel` caller authorization at the Controller
  * boundary. Every identity claim the Controller can verify from durable state
  * (role and turnId) is replayable by any client in the
- * same Home that reads state.json. The channel itself is therefore not
+ * same authoritative Controller. The channel itself is therefore not
  * authenticated by those claims alone. A non-replayable per-Session caller key
  * closes the gap:
  *
@@ -332,7 +332,7 @@ function validateStartParams(store: TaskStore, params: DurableJobStartParams): v
  * - `task` scope: the caller must present `callerKey` — the
  *   `YUI_JOB_CALLER_KEY` injected at its native Session launch. The Controller
  *   hashes it (SHA-256) and compares against the durable `jobCallerKeyHashes`
- *   map for the caller's Role + Agent. No legacy fallback: an absent hash or a
+ *   map for the caller's Role + Agent. An absent hash or a
  *   mismatched key is UNAUTHORIZED.
  *
  * The existing Turn binding checks run after the key check, so a forged
@@ -408,7 +408,7 @@ function assertCallerAuthorized(
   }
   // rr13: Verify the non-replayable per-Session caller key. The key is injected
   // at native Session launch and never persisted in plaintext; only its SHA-256
-  // hash is durable. A client that reads state.json can see the hash but cannot
+  // hash is durable. A client with database read access can see the hash but cannot
   // recover the key.
   if (caller.callerKey === undefined) {
     throw jobControlError(

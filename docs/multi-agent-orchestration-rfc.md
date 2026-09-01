@@ -66,7 +66,7 @@ Leader 负责语义规划、动态修订和最终决议；Controller 负责确�
 |---|---|
 | `WorkItem.dependsOn` 可作为 Task DAG 唯一权威来源 | **存在**（`workItem.ts:117`，schemaVersion 9），存储层强制无环（`taskStore.ts` `assertAcyclicWorkItems`）；ready = 全部依赖 `completed` 的二元谓词（`nextAction.ts:743-745`）。**无拓扑/分层调度、无独立 WorkItem 自动并行派发**——DAG 引擎是 T1 的新增工作，不是既有能力 |
 | ExecutionGroup/Lane 表达单路/并行、固定/自适应、隔离工作区、结构化结果 | **全部存在**（`executionGroup.ts`）：strategy `fixed`/`adaptive`、Lane 禁共享可写根（强制）、`ExecutionLaneResult` 结构化结果（summary/report/checks/findings/evidence）、`ExecutionResolution` 以 `selectedLaneIds` 汇合。**无 stage/round 字段** |
-| EffectiveLaunchSnapshot 冻结最终启动配置 | **存在**（`effectiveLaunch.ts:33`，schemaVersion 2）：冻结 agent/adapter/model/effort/permission/profileAccess/writeProjectIds/workspace/context(RoleProfile)/sourceDesiredRevision 等；Dispatch 后不可变，运行中进程不被热变更 |
+| EffectiveLaunchSnapshot 冻结最终启动配置 | **存在**（`effectiveLaunch.ts`，schemaVersion 3）：冻结 agent/adapter/model/effort/permission/profileAccess/writeProjectIds/workspace/context(RoleProfile)/sourceDesiredRevision 和 Session Manifest 身份；Dispatch 后不可变，运行中进程不被热变更 |
 | Candidate / ReviewRound / Task-final Review / Integration 主链 | **存在**：Candidate 单槽（仅最新为 current，只能从 running 提交）；ReviewRound 与 Candidate 1:1、冻结 reviewBaseCommit、独占隔离工作区；Task-final 按集成头变化自动排队；IntegrationAttempt 以 CAS 推进目标头，冲突产出报告且 ResolutionDecision 为 Leader 独占 |
 | Turn 审计记录 | **存在**（`turn.ts`）。Turn 是唯一调度权威；Provider 错误记录为标准化事实，由 Leader/Operator 决定在同 Session 提交新 Turn，或显式结束旧 Session 后创建新 Turn/Session。WorkItem 级重试仍派发新 Group；Lane 重启使用新 Turn id。 |
 | 运行健康监控 | **存在 Role/Turn 级**（`roleTurnStall.ts`）：30 分钟无持久进展窗口 + 语义事件进展钟（非文本输出），分类 working/waiting-user/waiting-on-workers/truly-stalled，恢复归 Leader、绝不自动终止——与 I-10 一致。**Lane 级健康是 T7 的扩展** |

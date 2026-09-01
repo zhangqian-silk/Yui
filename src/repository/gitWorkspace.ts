@@ -398,24 +398,6 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   }
 
   /**
-   * Files deleted between two commits.  Uses `--diff-filter=D` so a rename
-   * reports its source path here (and its destination in `changedFilesBetween`),
-   * letting the containment proof verify both sides of a rename.
-   */
-  async deletedFilesBetween(input: Readonly<{
-    repositoryPath: string;
-    fromCommit: string;
-    toCommit: string;
-  }>): Promise<string[]> {
-    const output = await git([
-      "-C", input.repositoryPath,
-      "diff", "--name-only", "--diff-filter=D", "--no-renames",
-      input.fromCommit, input.toCommit
-    ]);
-    return output.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
-  }
-
-  /**
    * Resolve the configured Project branch directly from its remote.  This is
    * deliberately read-only: unlike `refresh`, it never advances the stable
    * Project checkout or changes its refs.

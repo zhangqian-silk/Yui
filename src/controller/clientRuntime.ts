@@ -5,8 +5,7 @@ import {
   callController,
   ControllerClientError,
   readControllerDiscovery,
-  stopOrphanedFileTaskController,
-  stopPreviousFileTaskController
+  stopOrphanedFileTaskController
 } from "../core/controllerClient.js";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import {
@@ -380,11 +379,8 @@ export async function restartFileTaskController(
     previousPid = controllerPid(current);
   } catch (error) {
     if (options.call !== undefined || !isInvalidDiscovery(error)) throw error;
-    // Protocol v3 is the immediately previous released Controller. Keep its
-    // parser and transport confined to this explicit replacement operation;
-    // no ordinary request can fall back to it.
-    const previous = await stopPreviousFileTaskController(home, shutdownTimeoutMs);
-    previousPid = previous.pid;
+    // A malformed current discovery record cannot authorize a protocol call.
+    // Exact process identity below may still fence and stop an orphaned owner.
   }
   if (!controllerRunning(current) && options.call === undefined) {
     const orphan = await stopOrphanedFileTaskController(home, shutdownTimeoutMs);

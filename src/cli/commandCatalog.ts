@@ -1118,7 +1118,7 @@ export const ROOT_COMMAND = buildNode({
     { name: "update", summary: "Install the latest published Yui package globally." },
     {
       name: "upgrade",
-      summary: "Migrate this Home's storage to the current schema.",
+      summary: "Inspect this Home and apply any supported storage upgrade.",
       usage: "yui upgrade [--dry-run]",
       options: ["--dry-run"]
     },

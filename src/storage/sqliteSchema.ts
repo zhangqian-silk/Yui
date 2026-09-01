@@ -29,7 +29,7 @@ export const SQLITE_LAYOUT_VERSION = 8;
 /** The aggregate version of the normalized SQLite schema. */
 export const SQLITE_AGGREGATE_VERSION = 2;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 19;
+export const SQLITE_SCHEMA_VERSION = 1;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -45,7 +45,7 @@ export const TELEMETRY_TURN_CAP = 50_000;
  * This is the direct current baseline for a new Home. Its checksum rejects any
  * database initialized from a different physical contract.
  */
-const MIGRATION_1_SQL = `
+const BASELINE_CORE_SQL = `
 -- Global catalog and coordination (§4.1) -------------------------------------
 
 CREATE TABLE IF NOT EXISTS home_meta (
@@ -185,10 +185,14 @@ CREATE TABLE IF NOT EXISTS mailboxes (
   next_sequence INTEGER NOT NULL,
   processing    TEXT,
   pending       TEXT,
+  recent_dedupe_keys TEXT NOT NULL DEFAULT '[]',
   UNIQUE (target_kind, task_id, role_name)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mailboxes_target_key
   ON mailboxes(target_key);
+CREATE INDEX IF NOT EXISTS idx_mailboxes_ready
+  ON mailboxes(target_key)
+  WHERE processing IS NOT NULL OR json_type(pending) <> 'null';
 
 -- Task-partitioned tables (§4.3). Every task-local read constrains task_id. ----
 
@@ -306,6 +310,9 @@ CREATE TABLE IF NOT EXISTS input_requests (
   PRIMARY KEY (task_id, input_id)
 );
 CREATE INDEX IF NOT EXISTS idx_input_open ON input_requests(task_id, status) WHERE status <> 'resolved';
+CREATE INDEX IF NOT EXISTS idx_input_requests_open_hot
+  ON input_requests(task_id, input_id)
+  WHERE status = 'open';
 
 CREATE TABLE IF NOT EXISTS decisions (
   task_id     TEXT NOT NULL,
@@ -358,20 +365,17 @@ CREATE TABLE IF NOT EXISTS telemetry (
 CREATE INDEX IF NOT EXISTS idx_telemetry_turn ON telemetry(task_id, turn_id);
 `;
 
-/**
- * Migration 2: post-baseline task-scoped record families. This single
- * migration creates the DurableJob, CapabilityGrant, and ReleaseWorkflow
- * tables so a fresh database receives the complete merged schema atomically.
- */
-const MIGRATION_2_SQL = `
+/** Task-scoped execution and release record families. */
+const BASELINE_JOB_AND_RELEASE_SQL = `
 CREATE TABLE IF NOT EXISTS durable_jobs (
-  job_id           TEXT PRIMARY KEY,
+  job_id           TEXT NOT NULL,
   task_id          TEXT NOT NULL,
   idempotency_key  TEXT,
   status           TEXT NOT NULL,
   payload          TEXT NOT NULL,
   created_at       TEXT NOT NULL,
-  updated_at       TEXT NOT NULL
+  updated_at       TEXT NOT NULL,
+  PRIMARY KEY (task_id, job_id)
 );
 CREATE INDEX IF NOT EXISTS idx_durable_jobs_task ON durable_jobs(task_id);
 CREATE INDEX IF NOT EXISTS idx_durable_jobs_status ON durable_jobs(status);
@@ -394,12 +398,8 @@ CREATE TABLE IF NOT EXISTS release_workflows (
 );
 `;
 
-/**
- * Migration 3: Job caller key hashes (task-14, rr13). Durable SHA-256 hashes of
- * the caller key bound to each launched Session, used to fail-closed verify a
- * DurableJob's caller against durable Turn state.
- */
-const MIGRATION_3_SQL = `
+/** Durable caller-key hashes used to verify DurableJob ownership. */
+const BASELINE_JOB_CALLER_SQL = `
 CREATE TABLE IF NOT EXISTS job_caller_key_hashes (
   task_id    TEXT NOT NULL,
   role_name  TEXT NOT NULL,
@@ -411,45 +411,13 @@ CREATE TABLE IF NOT EXISTS job_caller_key_hashes (
 `;
 
 /**
- * Migration 4: DurableJob IDs are Task-local.  Migration 2 accidentally made
- * job_id the global primary key, so two Tasks allocating their first `job-1`
- * could overwrite one another through the upsert path.  Rebuild the table with
- * the actual record identity `(task_id, job_id)` and restore its indexes.
- * The adjacent rebuild keeps the direct baseline's final Task-local identity
- * explicit while each physical step remains checksummed.
- */
-const MIGRATION_4_SQL = `
-CREATE TABLE durable_jobs_v4 (
-  job_id           TEXT NOT NULL,
-  task_id          TEXT NOT NULL,
-  idempotency_key  TEXT,
-  status           TEXT NOT NULL,
-  payload          TEXT NOT NULL,
-  created_at       TEXT NOT NULL,
-  updated_at       TEXT NOT NULL,
-  PRIMARY KEY (task_id, job_id)
-);
-INSERT INTO durable_jobs_v4
-  (job_id, task_id, idempotency_key, status, payload, created_at, updated_at)
-SELECT job_id, task_id, idempotency_key, status, payload, created_at, updated_at
-FROM durable_jobs;
-DROP TABLE durable_jobs;
-ALTER TABLE durable_jobs_v4 RENAME TO durable_jobs;
-CREATE INDEX idx_durable_jobs_task ON durable_jobs(task_id);
-CREATE INDEX idx_durable_jobs_status ON durable_jobs(status);
-CREATE UNIQUE INDEX idx_durable_jobs_idempotency
-  ON durable_jobs(task_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
-`;
-
-/**
- * Migration 5: telemetry aggregate (Issue 09). The `telemetry` table (migration
- * 1, §4.4) stores the bounded latest-per-key progress window; this companion
+ * The `telemetry` table stores the bounded latest-per-key progress window; this companion
  * table holds the authoritative per-Turn/generation summary (count, first/last,
  * max sequence, error count) so aggregates stay accurate after the window is
  * pruned. Triggers maintain it on telemetry INSERT/UPDATE; DELETE intentionally
  * leaves it untouched because pruned rows were still observed.
  */
-const MIGRATION_5_SQL = `
+const BASELINE_TELEMETRY_AGGREGATE_SQL = `
 CREATE TABLE IF NOT EXISTS telemetry_aggregate (
   task_id      TEXT NOT NULL,
   role_name    TEXT NOT NULL,
@@ -501,11 +469,11 @@ END;
 `;
 
 /**
- * Migration 6: Issue 06 ReviewFinding ledger. Cross-Round semantic review
+ * Cross-Round semantic review
  * findings with stable keys and Leader dispositions. Failed execution attempts
  * never create rows; only completed Rounds feed the ledger.
  */
-const MIGRATION_6_SQL = `
+const BASELINE_REVIEW_FINDING_SQL = `
 CREATE TABLE IF NOT EXISTS review_findings (
   task_id     TEXT NOT NULL,
   finding_id  TEXT NOT NULL,
@@ -520,13 +488,13 @@ CREATE INDEX IF NOT EXISTS idx_review_findings_stable_key ON review_findings(tas
 `;
 
 /**
- * Version 5 migration: session owner physical identity records (Issue 03).
+ * Session owner physical identity records.
  *
  * One row per runtime generation, keyed by launch id. The payload column
  * stores the full versioned JSON record; typed columns support the
  * reconciliation queries (task/role lookup, PID liveness).
  */
-const MIGRATION_7_SQL = `
+const BASELINE_SESSION_OWNER_SQL = `
 CREATE TABLE IF NOT EXISTS session_owners (
   launch_id          TEXT PRIMARY KEY,
   scope              TEXT NOT NULL CHECK (scope IN ('task','global')),
@@ -543,14 +511,14 @@ CREATE INDEX IF NOT EXISTS idx_session_owners_task
 `;
 
 /**
- * Migration 8: Resource GC registry (Issue 10).
+ * Resource GC registry.
  *
  * GC-owned table for resource lifecycle records.  The registry is GC's own
  * state — it is not part of the aggregate and never participates in aggregate
  * versioning.  Records are stored as full versioned JSON in `payload`, with
  * typed columns for the fields GC queries (disposition, kind, task_id).
  */
-const MIGRATION_8_SQL = `
+const BASELINE_RESOURCE_REGISTRY_SQL = `
 CREATE TABLE IF NOT EXISTS resource_registry (
   id          TEXT PRIMARY KEY,
   kind        TEXT NOT NULL,
@@ -568,14 +536,14 @@ CREATE INDEX IF NOT EXISTS idx_resource_registry_task
 `;
 
 /**
- * Migration 9: GateArtifact storage (Issue 08). Content-addressed gate
+ * Content-addressed GateArtifact storage. Content-addressed gate
  * evidence records with per-step logs stored as BLOBs. The artifact key is
  * the SHA-256 of the identity tuple (Project + commit + plan digest +
  * toolchain digest + L2 boundary), so the same tuple always maps to one row.
  * Typed columns support the reuse lookup paths (exact-commit L2 search,
  * Project-level prune) without scanning payloads.
  */
-const MIGRATION_9_SQL = `
+const BASELINE_GATE_ARTIFACT_SQL = `
 CREATE TABLE IF NOT EXISTS gate_artifacts (
   key               TEXT PRIMARY KEY,
   project_id        TEXT NOT NULL,
@@ -609,30 +577,8 @@ CREATE TABLE IF NOT EXISTS gate_artifact_logs (
 );
 `;
 
-/**
- * Migration 10: bounded ready-mailbox lookup for the Controller hot path.
- *
- * Empty mailboxes remain durable, but only mailboxes with a
- * processing or pending batch require scheduling.  The partial index contains
- * exactly that unsettled set in target-key order, so the Controller's recovery
- * query is O(log H + ready) instead of scanning every settled mailbox.
- */
-const MIGRATION_10_SQL = `
-CREATE INDEX IF NOT EXISTS idx_mailboxes_ready
-  ON mailboxes(target_key)
-  WHERE processing IS NOT NULL OR pending IS NOT NULL;
-`;
-
-/**
- * Migration 11: bounded current-Session projection for runtime cleanup.
- *
- * RoleSessionSet payloads remain authoritative. This table contains only the
- * current active Agent Session while it is non-stopped, so terminal Session
- * history cannot enlarge Controller cleanup discovery. Runtime writes maintain
- * it in the same transaction as the source payload; the initialization query
- * projects any rows created by earlier baseline steps.
- */
-const MIGRATION_11_SQL = `
+/** Bounded current-Session projection for runtime cleanup. */
+const BASELINE_RUNTIME_SESSION_SQL = `
 CREATE TABLE IF NOT EXISTS runtime_session_candidates (
   scope               TEXT NOT NULL CHECK (scope IN ('task','global')),
   task_id             TEXT NOT NULL,
@@ -641,7 +587,6 @@ CREATE TABLE IF NOT EXISTS runtime_session_candidates (
   adapter_id          TEXT NOT NULL,
   native_session_id   TEXT NOT NULL,
   launch_id           TEXT,
-  status              TEXT NOT NULL CHECK (status IN ('reserved','ready','running','broken')),
   session_updated_at  TEXT NOT NULL,
   cleanup_required    INTEGER NOT NULL CHECK (cleanup_required IN (0,1)),
   PRIMARY KEY (scope, task_id, role_name),
@@ -650,102 +595,21 @@ CREATE TABLE IF NOT EXISTS runtime_session_candidates (
     OR (scope = 'global' AND task_id = '')
   ),
   CHECK (
-    cleanup_required = CASE
-      WHEN status NOT IN ('stopped','broken')
-        AND (status = 'running' OR launch_id IS NOT NULL)
-      THEN 1 ELSE 0
-    END
+    cleanup_required = CASE WHEN launch_id IS NOT NULL THEN 1 ELSE 0 END
   )
 );
 
 CREATE INDEX IF NOT EXISTS idx_runtime_session_cleanup_required
   ON runtime_session_candidates(scope, task_id, role_name)
   WHERE cleanup_required = 1;
-
-INSERT INTO runtime_session_candidates (
-  scope, task_id, role_name, agent_id, adapter_id, native_session_id,
-  launch_id, status, session_updated_at, cleanup_required
-)
-SELECT
-  'task', source.task_id, source.role_name,
-  json_extract(active.value, '$.agentId'),
-  json_extract(active.value, '$.adapterId'),
-  json_extract(active.value, '$.nativeSessionId'),
-  json_extract(active.value, '$.launchId'),
-  json_extract(active.value, '$.status'),
-  json_extract(active.value, '$.updatedAt'),
-  CASE
-    WHEN json_extract(active.value, '$.status') NOT IN ('stopped','broken')
-      AND (
-        json_extract(active.value, '$.status') = 'running'
-        OR json_type(active.value, '$.launchId') = 'text'
-      )
-    THEN 1 ELSE 0
-  END
-FROM role_session_sets AS source
-JOIN json_each(source.payload, '$.sessions') AS active
-  ON active.key = json_extract(source.payload, '$.activeAgentId')
-WHERE json_extract(active.value, '$.status') <> 'stopped';
-
-INSERT INTO runtime_session_candidates (
-  scope, task_id, role_name, agent_id, adapter_id, native_session_id,
-  launch_id, status, session_updated_at, cleanup_required
-)
-SELECT
-  'global', '', source.name,
-  json_extract(active.value, '$.agentId'),
-  json_extract(active.value, '$.adapterId'),
-  json_extract(active.value, '$.nativeSessionId'),
-  json_extract(active.value, '$.launchId'),
-  json_extract(active.value, '$.status'),
-  json_extract(active.value, '$.updatedAt'),
-  CASE
-    WHEN json_extract(active.value, '$.status') NOT IN ('stopped','broken')
-      AND (
-        json_extract(active.value, '$.status') = 'running'
-        OR json_type(active.value, '$.launchId') = 'text'
-      )
-    THEN 1 ELSE 0
-  END
-FROM global_role_session_sets AS source
-JOIN json_each(source.payload, '$.sessions') AS active
-  ON active.key = json_extract(source.payload, '$.activeAgentId')
-WHERE json_extract(active.value, '$.status') <> 'stopped';
 `;
 
 /**
- * Migration 12: bounded open-InputRequest lookup for Controller deadlines.
- *
- * This partial index contains only the live InputRequest set, so deadline
- * arming and targeted auto-resolution never scan terminal request history.
- */
-const MIGRATION_12_SQL = `
-CREATE INDEX IF NOT EXISTS idx_input_requests_open_hot
-  ON input_requests(task_id, input_id)
-  WHERE status = 'open';
-`;
-
-/** Reserved bootstrap step retained only to keep the physical ledger contiguous. */
-const MIGRATION_13_SQL = `SELECT 1;`;
-
-/** Migration 14: WorkMailbox v4 is one coalesced wake hint. */
-const MIGRATION_14_SQL = `
-ALTER TABLE mailboxes ADD COLUMN recent_dedupe_keys TEXT NOT NULL DEFAULT '[]';
-
-DROP INDEX idx_mailboxes_ready;
-CREATE INDEX idx_mailboxes_ready
-  ON mailboxes(target_key)
-  WHERE processing IS NOT NULL OR json_type(pending) <> 'null';
-
-DROP TABLE IF EXISTS mailbox_signals;
-`;
-
-/**
- * Migration 15: Issue 11 external publication evidence. Records are immutable;
+ * External publication evidence. Records are immutable;
  * a corrected MR/PR state appends a superseding record with the same
  * external_key, so only the unsuperseded root is globally unique.
  */
-const MIGRATION_15_SQL = `
+const BASELINE_PUBLICATION_REFERENCE_SQL = `
 CREATE TABLE IF NOT EXISTS publication_references (
   task_id         TEXT NOT NULL,
   publication_id  TEXT NOT NULL,
@@ -777,7 +641,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_references_external_root
   ON publication_references(external_key) WHERE supersedes IS NULL;
 `;
 
-const MIGRATION_16_SQL = `
+const BASELINE_TASK_WAKE_SQL = `
 -- Durable Leader wake ledger (Issue 04 long-term design). A wake is a
 -- notification envelope, not a context dump: the record holds the aggregated
 -- reason tags and the delta window; the Agent reads delta content on demand.
@@ -798,8 +662,8 @@ CREATE TABLE IF NOT EXISTS task_wakes (
 CREATE INDEX IF NOT EXISTS idx_task_wakes_seq ON task_wakes(task_id, seq);
 `;
 
-/** Migration 17: immutable, Task-scoped ContextSnapshot records. */
-const MIGRATION_17_SQL = `
+/** Immutable, Task-scoped ContextSnapshot records. */
+const BASELINE_CONTEXT_SNAPSHOT_SQL = `
 CREATE TABLE IF NOT EXISTS context_snapshots (
   task_id     TEXT NOT NULL,
   snapshot_id TEXT NOT NULL,
@@ -818,65 +682,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_context_snapshots_scope_sequence
   ON context_snapshots(task_id, scope, COALESCE(scope_ref, ''), sequence);
 `;
 
-/**
- * Migration 18: align the current-Session hot projection with Session v4.
- *
- * Session existence now has one lifecycle: active or ended. Ended Sessions do
- * not belong in this bounded projection, so row presence itself means active;
- * the projection carries no independently writable lifecycle status. Host
- * cleanup is derived solely from whether the Session still names a Host
- * activation. Valid earlier live rows are projected into that contract;
- * terminal broken rows disappear with the rest of ended Session history.
- */
-const MIGRATION_18_SQL = `
-DROP INDEX idx_runtime_session_cleanup_required;
-ALTER TABLE runtime_session_candidates RENAME TO runtime_session_candidates_v11;
-
-CREATE TABLE runtime_session_candidates (
-  scope               TEXT NOT NULL CHECK (scope IN ('task','global')),
-  task_id             TEXT NOT NULL,
-  role_name           TEXT NOT NULL,
-  agent_id            TEXT NOT NULL,
-  adapter_id          TEXT NOT NULL,
-  native_session_id   TEXT NOT NULL,
-  launch_id           TEXT,
-  session_updated_at  TEXT NOT NULL,
-  cleanup_required    INTEGER NOT NULL CHECK (cleanup_required IN (0,1)),
-  PRIMARY KEY (scope, task_id, role_name),
-  CHECK (
-    (scope = 'task' AND length(task_id) > 0)
-    OR (scope = 'global' AND task_id = '')
-  ),
-  CHECK (
-    cleanup_required = CASE WHEN launch_id IS NOT NULL THEN 1 ELSE 0 END
-  )
-);
-
-INSERT INTO runtime_session_candidates (
-  scope, task_id, role_name, agent_id, adapter_id, native_session_id,
-  launch_id, session_updated_at, cleanup_required
-)
-SELECT
-  scope, task_id, role_name, agent_id, adapter_id, native_session_id,
-  launch_id, session_updated_at,
-  CASE WHEN launch_id IS NOT NULL THEN 1 ELSE 0 END
-FROM runtime_session_candidates_v11
-WHERE status IN ('reserved','ready','running');
-
-DROP TABLE runtime_session_candidates_v11;
-
-CREATE INDEX idx_runtime_session_cleanup_required
-  ON runtime_session_candidates(scope, task_id, role_name)
-  WHERE cleanup_required = 1;
-`;
-
-/**
- * Migration 19 marks the direct Turn baseline. Earlier checksums are rejected;
- * current Homes never create or rename a superseded run-shaped table or column.
- */
-const MIGRATION_19_SQL = `
-SELECT 19;
-`;
+const MIGRATION_1_SQL = [
+  BASELINE_CORE_SQL,
+  BASELINE_JOB_AND_RELEASE_SQL,
+  BASELINE_JOB_CALLER_SQL,
+  BASELINE_TELEMETRY_AGGREGATE_SQL,
+  BASELINE_REVIEW_FINDING_SQL,
+  BASELINE_SESSION_OWNER_SQL,
+  BASELINE_RESOURCE_REGISTRY_SQL,
+  BASELINE_GATE_ARTIFACT_SQL,
+  BASELINE_RUNTIME_SESSION_SQL,
+  BASELINE_PUBLICATION_REFERENCE_SQL,
+  BASELINE_TASK_WAKE_SQL,
+  BASELINE_CONTEXT_SNAPSHOT_SQL
+].join("\n");
 
 interface Migration {
   version: number;
@@ -885,30 +704,9 @@ interface Migration {
   sql: string;
 }
 
-/**
- * Ordered build steps for the direct current SQLite baseline. Their checksums
- * validate current Homes; they do not admit earlier storage contracts.
- */
+/** Future compatible releases append new migrations after this baseline. */
 const MIGRATIONS: readonly Migration[] = [
-  { version: 1, axis: "layout", sql: MIGRATION_1_SQL },
-  { version: 2, axis: "record", recordKind: "durableJob+capability-grant+release-workflow", sql: MIGRATION_2_SQL },
-  { version: 3, axis: "record", recordKind: "jobCallerKeyHash", sql: MIGRATION_3_SQL },
-  { version: 4, axis: "record", recordKind: "durableJob", sql: MIGRATION_4_SQL },
-  { version: 5, axis: "record", recordKind: "telemetryAggregate", sql: MIGRATION_5_SQL },
-  { version: 6, axis: "record", recordKind: "reviewFinding", sql: MIGRATION_6_SQL },
-  { version: 7, axis: "record", recordKind: "sessionOwner", sql: MIGRATION_7_SQL },
-  { version: 8, axis: "record", recordKind: "resource-registry", sql: MIGRATION_8_SQL },
-  { version: 9, axis: "record", recordKind: "gateArtifact", sql: MIGRATION_9_SQL },
-  { version: 10, axis: "layout", sql: MIGRATION_10_SQL },
-  { version: 11, axis: "layout", sql: MIGRATION_11_SQL },
-  { version: 12, axis: "layout", sql: MIGRATION_12_SQL },
-  { version: 13, axis: "layout", sql: MIGRATION_13_SQL },
-  { version: 14, axis: "record", recordKind: "workMailbox", sql: MIGRATION_14_SQL },
-  { version: 15, axis: "record", recordKind: "publicationReference", sql: MIGRATION_15_SQL },
-  { version: 16, axis: "record", recordKind: "taskWake", sql: MIGRATION_16_SQL },
-  { version: 17, axis: "record", recordKind: "contextSnapshot", sql: MIGRATION_17_SQL },
-  { version: 18, axis: "layout", sql: MIGRATION_18_SQL },
-  { version: 19, axis: "layout", sql: MIGRATION_19_SQL }
+  { version: 1, axis: "layout", sql: MIGRATION_1_SQL }
 ];
 
 /** Current hot-path indexes whose absence would invalidate a current Home. */
@@ -1116,10 +914,7 @@ export type SqliteSchemaMigrationOptions = Readonly<{
   mode: SqliteSchemaMigrationMode;
 }>;
 
-/**
- * Inspect a current database without changing it. Any non-current ledger is an
- * unsupported historical contract, not an upgrade candidate.
- */
+/** Inspect a recognized migration prefix without changing it. */
 export function inspectSqliteSchemaMigrations(
   db: Database.Database
 ): SqliteSchemaMigrationState {
@@ -1128,13 +923,7 @@ export function inspectSqliteSchemaMigrations(
   const pendingVersions = MIGRATIONS
     .filter((migration) => !applied.has(migration.version))
     .map((migration) => migration.version);
-  if (pendingVersions.length > 0) {
-    throw new SqliteSchemaMigrationError(
-      `historical SQLite schema ${applied.size} is unsupported; initialize a new Home`,
-      "admission"
-    );
-  }
-  validateSchemaObjects(db);
+  if (pendingVersions.length === 0) validateSchemaObjects(db);
   const current = MIGRATIONS[applied.size - 1];
   const target = MIGRATIONS.at(-1)!;
   if (current === undefined) {
@@ -1169,9 +958,9 @@ export function migrateSqliteSchema(
     // skipping a later schema/data step.
     const applied = validateAppliedMigrations(db, ledgerWasCreated);
     const pending = MIGRATIONS.filter((migration) => !applied.has(migration.version));
-    if (!ledgerWasCreated && pending.length > 0) {
+    if (!ledgerWasCreated && pending.length > 0 && options.mode === "validate") {
       throw new SqliteSchemaMigrationError(
-        `historical SQLite schema ${applied.size} is unsupported; initialize a new Home`,
+        `SQLite schema ${applied.size} requires an explicit upgrade to ${SQLITE_SCHEMA_VERSION}`,
         "admission"
       );
     }
@@ -1236,6 +1025,7 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "capability_grants",
   "release_workflows",
   "publication_references",
+  "task_wakes",
   "session_owners",
   "runtime_session_candidates",
   "resource_registry",

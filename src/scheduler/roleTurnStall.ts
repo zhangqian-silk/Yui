@@ -265,73 +265,31 @@ export function latestTurnProgressAt(
 
 /**
  * Resolve the exact semantic progress fence shared by resource production and
- * stall consumption for one active Turn. The richer adapter fold remains
- * authoritative when available; the retained Turn progress/activity events are
- * the provider-neutral fallback. Resource evidence carries this value as an
- * exact fence, but never advances it.
+ * stall consumption for one active Turn. Resource evidence carries this value
+ * as an exact fence, but never advances it.
  */
 export function currentRoleTurnProgressAt(
-  store: Readonly<{
-    listEvents?: (taskId: string) => readonly TaskEvent[];
-    getTurnDurableProgress?: SchedulerStorePort["getTurnDurableProgress"];
-    getTurnProgressFacts?: SchedulerStorePort["getTurnProgressFacts"];
-  }>,
+  store: Pick<SchedulerStorePort, "getTurnDurableProgress">,
   taskId: string,
   roleName: string,
-  run: Readonly<{ id: string; createdAt: string }>,
-  events?: readonly TaskEvent[],
-  progressFacts?: TurnProgressFacts
+  run: Readonly<{ id: string; createdAt: string }>
 ): Readonly<{ progressAt: string; evidence?: string }> {
-  let richerProgress: Readonly<{ progressAt: string; evidence?: string }> | null | undefined;
-  try {
-    richerProgress = store.getTurnDurableProgress?.(taskId, roleName, run.id);
-  } catch {
-    // A related-record fold is advisory. The retained Turn/Event fence remains
-    // usable when that optional read is unavailable.
-    richerProgress = undefined;
-  }
-  // The richer fold is authoritative when present; skip the per-candidate
-  // full-history scans that every stall candidate otherwise pays.
-  if (richerProgress !== undefined && richerProgress !== null) {
+  const progress = store.getTurnDurableProgress(taskId, roleName, run.id);
+  if (progress !== null) {
     return {
-      progressAt: richerProgress.progressAt,
-      ...(richerProgress.evidence === undefined
+      progressAt: progress.progressAt,
+      ...(progress.evidence === undefined
         ? {}
-        : { evidence: richerProgress.evidence })
+        : { evidence: progress.evidence })
     };
   }
-  // A present fold port is authoritative even when this Turn has no entry. Do
-  // not evaluate a default history argument or fall back to listEvents in
-  // that case: an absent entry is the folded empty fact.
-  const folded = store.getTurnProgressFacts !== undefined;
-  const foldedFacts = folded
-    ? progressFacts ?? store.getTurnProgressFacts?.(taskId, run.id)
-    : undefined;
-  if (folded) {
-    const fallbackProgressAt = latestDurableProgressAt({
-      startedAt: run.createdAt,
-      latestCheckpointAt: foldedFacts?.latestCheckpointAt,
-      latestActivityAt: foldedFacts?.latestActivityAt
-    });
-    return { progressAt: fallbackProgressAt };
-  }
-  // Legacy ports retain the per-Turn event-history fallback. Resolve the
-  // history only in this branch so fold-backed callers perform zero scans.
-  const history = events ?? store.listEvents?.(taskId) ?? [];
-  const fallbackProgressAt = latestDurableProgressAt({
-    startedAt: run.createdAt,
-    latestCheckpointAt: latestTurnProgressAt(history, run.id),
-    latestActivityAt: latestTurnActivityAt(history, run.id)
-  });
-  return {
-    progressAt: fallbackProgressAt
-  };
+  return { progressAt: run.createdAt };
 }
 
 /**
  * Computes the current semantic progress fence for an exact Turn. The optional
- * related-record readers mirror the adapter's Work/Review/Integration fold;
- * narrow scheduler ports can omit them and still retain Turn/Event evidence.
+ * related-record readers add Work/Review/Integration evidence to the Turn and
+ * event facts used by on-demand projections.
  */
 export function latestTurnDurableProgressAt(
   store: Readonly<{
@@ -374,11 +332,8 @@ export function latestTurnDurableProgressAt(
 ): Readonly<{ progressAt: string; evidence?: string }> | null {
   const run = store.getTurn(taskId, turnId);
   if (run === null || run.taskId !== taskId || run.roleName !== roleName) return null;
-  // The adapter folds checkpoint/activity once per revision. When the fold
-  // port exists, a missing per-Turn entry is an authoritative empty fold: use
-  // its (possibly undefined) values directly and never re-scan the whole
-  // history per candidate. Legacy callers without the port omit precomputed
-  // and keep the per-candidate full-history scans.
+  // Scheduler reconciliation supplies its once-per-revision fold; on-demand
+  // views omit it and compute the same facts from the Task event history.
   const folded = precomputed !== undefined;
   const events = folded ? undefined : store.listEvents(taskId);
   const latestCheckpointAt = folded
@@ -673,15 +628,7 @@ export async function reconcileStalledRoleTurns(
   // reconcile owns the all-active-Turn scan; dirty passes may still route the
   // existing mailbox work without manufacturing another episode.
   if (selection !== undefined && !selection.full) return [];
-  if (
-    (store.getTurnProgressFacts === undefined && store.listEvents === undefined)
-    || store.recordRoleTurnStall === undefined
-  ) return [];
-  // When the fold port exists, a missing per-Turn entry is an authoritative
-  // empty fold: the stall reconciliation must not re-scan the whole history
-  // per candidate. Legacy stores without the port keep the per-candidate
-  // scans.
-  const foldPortPresent = store.getTurnProgressFacts !== undefined;
+  if (store.recordRoleTurnStall === undefined) return [];
   const candidates = selectedActiveSchedulerTasks(store, selection).flatMap((task) => (
     selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
       const run = store.getActiveTurn(task.id, role.name);
@@ -713,16 +660,11 @@ export async function reconcileStalledRoleTurns(
     latestTurnEventTime(diagnosticEvents(task.id), TURN_DIAGNOSTIC_FINISHED_EVENT, run.id)
   ));
   const stallCandidates = cadenceCandidates.filter(({ task, role, run }) => {
-    const progressFacts = foldPortPresent
-      ? store.getTurnProgressFacts?.(task.id, run.id)
-      : undefined;
     const progressAt = currentRoleTurnProgressAt(
       store,
       task.id,
       role.name,
-      run,
-      foldPortPresent ? undefined : diagnosticEvents(task.id),
-      progressFacts
+      run
     ).progressAt;
     return isStallCandidate(
       run,
@@ -871,33 +813,24 @@ export async function reconcileStalledRoleTurns(
       continue;
     }
 
-    // Fold-backed adapters expose an authoritative per-Turn fact, so do not
-    // load the Task history just to satisfy currentRoleTurnProgressAt or its
-    // fallback. Legacy ports retain one history read for these projections.
-    const progressFacts = foldPortPresent
-      ? store.getTurnProgressFacts?.(candidate.task.id, candidate.run.id)
-      : undefined;
-    const events = foldPortPresent
-      ? undefined
-      : store.listEvents?.(candidate.task.id);
+    const progressFacts = store.getTurnProgressFacts(
+      candidate.task.id,
+      candidate.run.id
+    );
     // The Turn creation boundary starts the execution clock; durable workflow
     // facts may advance it independently of Provider transport observations.
     const progress = currentRoleTurnProgressAt(
       store,
       candidate.task.id,
       candidate.role.name,
-      candidate.run,
-      events,
-      progressFacts
+      candidate.run
     );
     const progressAt = progress.progressAt;
     const evaluation = evaluateRoleTurnStall({
       progressAt,
       now,
       windowMs,
-      lastAttentionProgressAt: foldPortPresent
-        ? progressFacts?.latestStall?.progressAt
-        : latestStallProgressAt(events ?? [], candidate.run.id)
+      lastAttentionProgressAt: progressFacts?.latestStall?.progressAt
     });
     const runAgentId = candidate.run.effective.agentId;
     const runAdapterId = candidate.run.effective.adapterId;
@@ -977,9 +910,10 @@ export async function reconcileStalledRoleTurns(
   for (const current of observed.values()) {
     if (current.live !== "present" || !current.stalled || !current.stallCandidate) continue;
     const { candidate, progressAt } = current;
-    const previous = foldPortPresent
-      ? store.getTurnProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
-      : latestStallEvidenceKey(store.listEvents?.(candidate.task.id) ?? [], candidate.run.id);
+    const previous = store.getTurnProgressFacts(
+      candidate.task.id,
+      candidate.run.id
+    )?.latestStall;
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)
@@ -1051,9 +985,10 @@ export async function reconcileStalledRoleTurns(
   for (const current of observed.values()) {
     if (current.live !== "present" || current.stalled || !current.stallCandidate) continue;
     const { candidate, progressAt } = current;
-    const previous = foldPortPresent
-      ? store.getTurnProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
-      : latestStallEvidenceKey(store.listEvents?.(candidate.task.id) ?? [], candidate.run.id);
+    const previous = store.getTurnProgressFacts(
+      candidate.task.id,
+      candidate.run.id
+    )?.latestStall;
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)

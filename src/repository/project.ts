@@ -141,10 +141,7 @@ export type Project = Readonly<{
   /** Present only while `status` is `retired`. */
   retirement?: ProjectRetirement;
   knowledge: readonly ProjectKnowledge[];
-  /**
-   * Leader-proposed Knowledge candidates awaiting an Operator decision. The
-   * v3->v4 compatible normalizer defaults this to an empty list.
-   */
+  /** Leader-proposed Knowledge candidates awaiting an Operator decision. */
   knowledgeProposals: readonly KnowledgeProposal[];
   createdAt: string;
   updatedAt: string;

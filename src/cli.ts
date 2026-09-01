@@ -572,20 +572,9 @@ export async function main(): Promise<void> {
       return;
     }
     if (method === "identity" && args.length === 2) {
-      // Issue 02: the stable, read-only runtime identity receipt. It survives
-      // a Controller stop and answers build ID, package digest, backend, and
-      // worker state without a socket round-trip. When no receipt exists yet
-      // (a Controller that predates this feature), fall back to the
-      // authenticated socket identity so the command stays useful during
-      // rollout step 1.
-      let receipt: RuntimeIdentityReceipt | null = null;
-      try {
-        receipt = readRuntimeIdentity(home);
-      } catch {
-        // A corrupt or stale receipt (for example one written by an older
-        // Controller that predates the launch-identity fields) falls back to
-        // the live socket identity, which always carries the exact argv.
-      }
+      // The receipt survives a Controller stop. If it has never been written,
+      // ask the authenticated live Controller for the same current identity.
+      const receipt: RuntimeIdentityReceipt | null = readRuntimeIdentity(home);
       if (receipt !== null) {
         emit("", false, receipt);
         return;

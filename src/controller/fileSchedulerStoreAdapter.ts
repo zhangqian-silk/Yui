@@ -43,7 +43,7 @@ import {
 } from "../runtime/providerRuntimeIdentity.js";
 import {
   hasRecentTurnId
-} from "../executor/turnCompletion.js";
+} from "../runtime/recentTurnIds.js";
 import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import {
@@ -1856,9 +1856,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       if (allocatedTurnId !== input.turn.id) {
         throw new Error(`Leader Turn allocation changed unexpectedly: ${input.task.id}.`);
       }
-      // SQLite stores the durable Turn row and its active pointer separately;
-      // FileTaskStore happens to persist both from saveActiveTurn. Keep
-      // the adapter contract backend-neutral and make the two writes atomic.
+      // The durable Turn row and its active pointer are separate projections;
+      // keep both writes in the same storage transaction.
       store.saveTurn(input.turn);
       store.saveActiveTurn(input.turn);
       store.saveWorkMailbox(consumePendingBatch(mailbox));

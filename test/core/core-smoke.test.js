@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 
 import {
   claimPending,
@@ -60,6 +61,7 @@ import { projectNextAction } from "../../dist/task/nextAction.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { acquireHandoverLock } from "../../dist/release/runtimeRelease.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
+import * as taskStoreContract from "../../dist/storage/taskStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { initializeCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
@@ -1138,18 +1140,7 @@ test("Task execution stop/start atomically controls scheduler admission", (t) =>
     turnInput("turn-1", task.id, leader.name, "Continue the Task."),
     now,
     {
-      effective: {
-        schemaVersion: 2,
-        sourceDesiredRevision: leader.launchRevision,
-        agentId: binding.agentId,
-        adapterId: "codex",
-        profileAccess: "write",
-        search: false,
-        permission: { strategy: "default" },
-        writeProjectIds: [],
-        workspace: { root: leader.workspace, entries: [] },
-        context: {}
-      }
+      effective: resolveEffectiveLaunch({ role: leader, purpose: "execution" })
     }
   );
   store.saveActiveTurn(activeTurn);
@@ -1253,6 +1244,16 @@ test("production storage exposes only the current contract", () => {
   assert.ok(Object.values(latest.record).every(({ path }) => path.startsWith("sqlite:")));
   assert.equal(latest.record.turn.path, "sqlite:turn");
   assert.equal(latest.record.workMailbox.path, "sqlite:workMailbox");
+  assert.equal(Object.hasOwn(latest.record, "storedTask"), false);
+  assert.equal(Object.hasOwn(latest.record, "activeTurnPointer"), false);
+  for (const retiredExport of [
+    "FileTaskStore",
+    "STORAGE_STATE_FILE",
+    "validateCurrentStorageStateSnapshot",
+    "withStorageWriteLock"
+  ]) {
+    assert.equal(Object.hasOwn(taskStoreContract, retiredExport), false);
+  }
 });
 
 test("a new current Home initializes its SQLite authority exactly once", (t) => {
@@ -1263,6 +1264,15 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
   store.close();
   assert.ok(existsSync(join(home, "schema.json")));
   assert.ok(existsSync(join(home, "yui.db")));
+  const database = new Database(join(home, "yui.db"), { readonly: true });
+  try {
+    assert.deepEqual(
+      database.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
+      [{ version: 1 }]
+    );
+  } finally {
+    database.close();
+  }
 });
 
 test("fresh SQLite telemetry persists and aggregates by Turn", async (t) => {

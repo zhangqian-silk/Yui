@@ -152,12 +152,7 @@ function roleContext(
         : ["perform-global-role-request"]
     },
     sessionManifestPath: environment.YUI_SESSION_MANIFEST,
-    cliCommand: "yui",
-    // Compatibility hint for already-running Sessions. New instructions use
-    // the stable command name and do not bind behavior to this wrapper path.
-    ...(environment.YUI_SESSION_CLI === undefined
-      ? {}
-      : { legacySessionCliPath: environment.YUI_SESSION_CLI })
+    cliCommand: "yui"
   });
   if (options.jsonOutput === true) return `${JSON.stringify(context)}\n`;
   return [

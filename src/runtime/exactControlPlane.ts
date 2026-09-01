@@ -9,12 +9,11 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
-import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
 import {
   yuiVersionIdentity,
   type YuiVersionIdentity
 } from "../version.js";
-import type { FileTaskStore, TaskStore } from "../storage/taskStore.js";
+import type { TaskStore } from "../storage/taskStore.js";
 import {
   hasRuntimeCleanupObligation,
   isRuntimeLaunchReservation,
@@ -75,9 +74,6 @@ export type ExactControlPlanePreflightOptions = Readonly<{
     incompatibleComponent?: "layout" | "aggregate" | "record";
     direction?: "older" | "newer";
   }>;
-  openCurrentStore?: (
-    home: string
-  ) => Pick<FileTaskStore, "getConfig">;
   callController?: (
     home: string,
     method: string,

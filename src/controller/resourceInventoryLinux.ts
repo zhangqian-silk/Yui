@@ -641,8 +641,7 @@ function inspectRuntimeDomain(
     // A current, ordinary YUI_HOME is a real control domain, not a disposable
     // test domain. Keep it visible even when it is currently idle so a stale
     // artifact cannot acquire ephemeral cleanup authority by omission. An
-    // uninitialized temporary directory with no runtime facts remains absent
-    // to preserve the legacy empty-home inventory behavior.
+    // uninitialized temporary directory with no runtime facts remains absent.
     if (
       storageStatus !== "current"
       && processes.length === 0
@@ -863,57 +862,39 @@ function loadHomeState(
       });
     };
 
-    // Layout-7 SQLite owns bounded active-Task and current-Session indexes.
-    // Use those indexes only as selectors, then point-read the authoritative
+    // The current SQLite store owns bounded active-Task and current-Session
+    // indexes. Use them only as selectors, then point-read the authoritative
     // Task/Role/Session/Turn records so an index row cannot bypass ownership
-    // fences. The legacy File store intentionally retains its complete
-    // listTasks fallback because it has no equivalent active selector.
-    const hotStore = store as typeof store & Readonly<{
-      listActiveTaskIds?: () => readonly string[];
-    }>;
-    const indexedTaskIds = hotStore.listActiveTaskIds === undefined
-      ? undefined
-      : [...new Set(hotStore.listActiveTaskIds())].sort(numericCompare);
-    if (indexedTaskIds === undefined) {
-      for (const task of store.listTasks()) {
-        for (const role of [...store.listRoles(task.id)].sort((left, right) => (
-          numericCompare(left.name, right.name)
-        ))) {
-          appendTaskRole(task, role);
-        }
-      }
-    } else {
-      const sessionCandidates = typeof store.listRuntimeSessionCandidates === "function"
-        ? store.listRuntimeSessionCandidates({ scope: "task" })
-        : [];
-      const candidateRoles = new Map<string, Set<string>>();
-      for (const candidate of sessionCandidates) {
-        if (candidate.owner.scope !== "task") continue;
-        const roleNames = candidateRoles.get(candidate.owner.taskId) ?? new Set<string>();
-        roleNames.add(candidate.owner.roleName);
-        candidateRoles.set(candidate.owner.taskId, roleNames);
-      }
-      const activeTaskSet = new Set(indexedTaskIds);
-      const taskIds = [...new Set([
-        ...indexedTaskIds,
-        ...candidateRoles.keys()
-      ])].sort(numericCompare);
-      for (const taskId of taskIds) {
-        const task = store.getTask(taskId);
-        if (task === null) continue;
-        const rolesForTask = activeTaskSet.has(taskId) && task.status === "active"
-          ? store.listRoles(taskId)
-          : [...(candidateRoles.get(taskId) ?? [])]
-            .sort(numericCompare)
-            .flatMap((roleName) => {
-              const role = store.getRole(taskId, roleName);
-              return role === null ? [] : [role];
-            });
-        for (const role of [...rolesForTask].sort((left, right) => (
-          numericCompare(left.name, right.name)
-        ))) {
-          appendTaskRole(task, role);
-        }
+    // fences.
+    const indexedTaskIds = [...new Set(store.listActiveTaskIds())].sort(numericCompare);
+    const sessionCandidates = store.listRuntimeSessionCandidates({ scope: "task" });
+    const candidateRoles = new Map<string, Set<string>>();
+    for (const candidate of sessionCandidates) {
+      if (candidate.owner.scope !== "task") continue;
+      const roleNames = candidateRoles.get(candidate.owner.taskId) ?? new Set<string>();
+      roleNames.add(candidate.owner.roleName);
+      candidateRoles.set(candidate.owner.taskId, roleNames);
+    }
+    const activeTaskSet = new Set(indexedTaskIds);
+    const taskIds = [...new Set([
+      ...indexedTaskIds,
+      ...candidateRoles.keys()
+    ])].sort(numericCompare);
+    for (const taskId of taskIds) {
+      const task = store.getTask(taskId);
+      if (task === null) continue;
+      const rolesForTask = activeTaskSet.has(taskId) && task.status === "active"
+        ? store.listRoles(taskId)
+        : [...(candidateRoles.get(taskId) ?? [])]
+          .sort(numericCompare)
+          .flatMap((roleName) => {
+            const role = store.getRole(taskId, roleName);
+            return role === null ? [] : [role];
+          });
+      for (const role of [...rolesForTask].sort((left, right) => (
+        numericCompare(left.name, right.name)
+      ))) {
+        appendTaskRole(task, role);
       }
     }
     return {

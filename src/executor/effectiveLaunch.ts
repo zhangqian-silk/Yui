@@ -35,7 +35,7 @@ export type EffectiveLaunchWorkspace = Readonly<{
 export type EffectiveLaunchContext = Readonly<RoleProfile>;
 
 type EffectiveLaunchBase = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   sourceDesiredRevision: number;
   agentId: string;
   /** Profile behavior intent captured for this Session; not a provider sandbox. */
@@ -50,10 +50,9 @@ type EffectiveLaunchBase = Readonly<{
   context: EffectiveLaunchContext;
   reviewRoundId?: string;
   reviewBaseCommit?: string;
-  /** Absent only on bounded legacy v0 Sessions. */
-  contextProtocolVersion?: typeof SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION;
+  contextProtocolVersion: typeof SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION;
   /** Stable Role/Skill compatibility identity, not a per-launch resource path digest. */
-  sessionManifestCompatibilityDigest?: string;
+  sessionManifestCompatibilityDigest: string;
 }>;
 
 export type CodexEffectiveLaunchSnapshot = EffectiveLaunchBase & Readonly<{
@@ -257,8 +256,8 @@ function taskSessionCompatibleSnapshot(snapshot: EffectiveLaunchSnapshot): unkno
 export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapshot>(
   snapshot: T
 ): T {
-  if (snapshot.schemaVersion !== 2) {
-    throw new Error("Effective launch snapshot must use schemaVersion 2.");
+  if (snapshot.schemaVersion !== 3) {
+    throw new Error("Effective launch snapshot must use schemaVersion 3.");
   }
   positiveInteger(snapshot.sourceDesiredRevision, "Source desired revision");
   identity(snapshot.agentId, "Effective Agent id");
@@ -287,17 +286,11 @@ export function validateEffectiveLaunchSnapshot<T extends EffectiveLaunchSnapsho
     identity(snapshot.reviewRoundId, "Effective ReviewRound id");
     commit(snapshot.reviewBaseCommit, "Effective review base commit");
   }
-  if (snapshot.contextProtocolVersion !== undefined
-    && snapshot.contextProtocolVersion !== SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION) {
+  if (snapshot.contextProtocolVersion !== SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION) {
     throw new Error("Effective launch context protocol version is unsupported.");
   }
-  if (snapshot.sessionManifestCompatibilityDigest !== undefined
-    && !/^[a-f0-9]{64}$/u.test(snapshot.sessionManifestCompatibilityDigest)) {
+  if (!/^[a-f0-9]{64}$/u.test(snapshot.sessionManifestCompatibilityDigest)) {
     throw new Error("Effective launch Session Manifest compatibility digest is invalid.");
-  }
-  if ((snapshot.contextProtocolVersion === undefined)
-    !== (snapshot.sessionManifestCompatibilityDigest === undefined)) {
-    throw new Error("Effective launch Context protocol compatibility identity is incomplete.");
   }
   validateWorkspace(snapshot.workspace);
   cloneContext(snapshot.context);
@@ -340,8 +333,8 @@ function snapshotFromConfig(input: Readonly<{
   context: EffectiveLaunchContext;
   reviewRoundId?: string;
   reviewBaseCommit?: string;
-  contextProtocolVersion?: typeof SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION;
-  sessionManifestCompatibilityDigest?: string;
+  contextProtocolVersion: typeof SESSION_BOOTSTRAP_MANIFEST_SCHEMA_VERSION;
+  sessionManifestCompatibilityDigest: string;
 }>): EffectiveLaunchSnapshot {
   const config = clone(input.config);
   if (config.permission === undefined) {
@@ -354,7 +347,7 @@ function snapshotFromConfig(input: Readonly<{
         reviewBaseCommit: commit(input.reviewBaseCommit ?? "", "Review base commit")
       };
   const common = {
-    schemaVersion: 2 as const,
+    schemaVersion: 3 as const,
     sourceDesiredRevision: positiveInteger(
       input.sourceDesiredRevision,
       "Source desired revision"
@@ -371,12 +364,8 @@ function snapshotFromConfig(input: Readonly<{
     writeProjectIds: [...input.writeProjectIds],
     workspace: cloneWorkspace(input.workspace),
     context: cloneContext(input.context),
-    ...(input.contextProtocolVersion === undefined
-      ? {}
-      : { contextProtocolVersion: input.contextProtocolVersion }),
-    ...(input.sessionManifestCompatibilityDigest === undefined
-      ? {}
-      : { sessionManifestCompatibilityDigest: input.sessionManifestCompatibilityDigest }),
+    contextProtocolVersion: input.contextProtocolVersion,
+    sessionManifestCompatibilityDigest: input.sessionManifestCompatibilityDigest,
     ...review
   };
   const snapshot: EffectiveLaunchSnapshot = config.adapterId === "codex"

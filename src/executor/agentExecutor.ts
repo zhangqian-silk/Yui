@@ -3,10 +3,8 @@ import { createHash } from "node:crypto";
 import {
   hasRecentTurnId,
   rememberRecentTurnId,
-  validatePendingTurnCompletion,
-  validateRecentTurnIds,
-  type PendingTurnCompletion
-} from "./turnCompletion.js";
+  validateRecentTurnIds
+} from "../runtime/recentTurnIds.js";
 import {
   effectiveLaunchSnapshotsCompatible,
   effectiveLaunchSnapshotsCompatibleForTaskSession,
@@ -616,18 +614,6 @@ export function recordTaskRoleTurnBoundary(
   });
 }
 
-export function recordObservedTaskRoleCompletion(
-  set: TaskRoleSessionSet,
-  completion: PendingTurnCompletion
-): TaskRoleSessionSet {
-  const observed = validatePendingTurnCompletion(completion);
-  return recordTaskRoleTurnBoundary(set, {
-    agentId: observed.agentId,
-    nativeSessionId: observed.nativeSessionId,
-    turnId: observed.turnId
-  }, new Date(observed.observedAt));
-}
-
 export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): TSet {
   const ownerScope = (set as unknown as { owner?: { scope?: unknown } }).owner?.scope;
   rejectUnknownFields(set as unknown as Record<string, unknown>, ownerScope === "global"
@@ -803,28 +789,6 @@ function assertTaskRoleSessionSet(
   if (set.owner.scope !== "task") {
     throw new Error("Turn fences require a Task Role session set.");
   }
-}
-
-function assertCompletionOwner(
-  set: TaskRoleSessionSet,
-  completion: PendingTurnCompletion
-): void {
-  if (completion.taskId !== set.owner.taskId) {
-    throw new Error("Observed Turn Task does not match the Task Role session set.");
-  }
-  if (completion.roleName !== set.owner.roleName) {
-    throw new Error("Observed Turn Role does not match the Task Role session set.");
-  }
-  if (completion.agentId !== set.activeAgentId) {
-    throw new Error("Observed Turn Agent does not match the active Agent.");
-  }
-}
-
-function samePendingTurnCompletion(
-  left: PendingTurnCompletion,
-  right: PendingTurnCompletion
-): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function requireDate(value: Date, label: string): string {

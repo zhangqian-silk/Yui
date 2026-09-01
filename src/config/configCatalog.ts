@@ -1,9 +1,5 @@
 import type { YuiConfig } from "../storage/taskStore.js";
 import { MAX_TURN_CAP } from "../telemetry/telemetryConfig.js";
-import {
-  MAX_CONTEXT_BUDGET_TOKENS,
-  MIN_CONTEXT_BUDGET_TOKENS
-} from "./yuiConfig.js";
 
 export const CONFIG_DOMAINS = ["system", "runtime", "workflow", "resources", "tools"] as const;
 export type ConfigDomain = typeof CONFIG_DOMAINS[number];
@@ -34,7 +30,6 @@ export const CONFIG_DEFINITIONS = Object.freeze([
   { key: "delivery-timeout-seconds", domain: "runtime", property: "deliveryTimeoutSeconds", label: "Delivery timeout", summary: "Total control-plane delivery retry budget, 5-600 seconds (default: 120).", takesEffect: "After the Controller restarts; internal retry cadence remains automatic." },
   { key: "leader-next-action", domain: "workflow", property: "leaderNextActionMode", label: "Leader next-action mode", summary: "Leader next-action mode: display, warn, or enforce (default: display).", takesEffect: "The next Leader next-action projection or gate." },
   { key: "leader-semantic-budget-turns", domain: "workflow", property: "leaderSemanticBudgetTurns", label: "Leader semantic budget", summary: "Consecutive completed Leader turns without durable delivery progress before warning, 1-20 (default: 3).", takesEffect: "The next Leader delivery guard evaluation." },
-  { key: "context-budget", domain: "workflow", property: "contextBudget", label: "Legacy context budget (inactive)", summary: `Compatibility-only soft and hard values in ${MIN_CONTEXT_BUDGET_TOKENS}-${MAX_CONTEXT_BUDGET_TOKENS}; they are parsed but never control Session or workflow behavior.`, takesEffect: "No runtime effect; Session Token metrics are read-only observations." },
   { key: "review", domain: "workflow", property: "review", label: "Review", summary: "Optional global WorkItem review rule: a configured Role plus always, leader, or final trigger and optional finding-ledger behavior. Setup leaves it disabled so the Leader may review directly or delegate selectively.", takesEffect: "The next Candidate snapshot; in-flight Candidates and ReviewRounds keep their policy." },
 
   { key: "resources-gc-mode", domain: "resources", property: "resourcesGcMode", label: "Resources GC mode", summary: "Resource GC mode: report or quarantine (default: report).", takesEffect: "The next resource GC operation." },

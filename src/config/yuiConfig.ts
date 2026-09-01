@@ -235,58 +235,6 @@ export function resolveTmuxHistoryLimit(value?: unknown): number {
   );
 }
 
-/**
- * Compatibility parser for the retired context-budget setting. Existing
- * Homes may retain these values, but no runtime, scheduler, or lifecycle path
- * consumes them. Session Token metrics are an independent read-only view.
- */
-export const DEFAULT_CONTEXT_SOFT_TOKENS = 100_000;
-export const DEFAULT_CONTEXT_HARD_TOKENS = 120_000;
-export const MIN_CONTEXT_BUDGET_TOKENS = 1_000;
-export const MAX_CONTEXT_BUDGET_TOKENS = 1_000_000;
-
-export type ContextBudgetConfig = Readonly<{
-  softTokens?: number;
-  hardTokens?: number;
-}>;
-
-export type ResolvedContextBudget = Readonly<{
-  softTokens: number;
-  hardTokens: number;
-}>;
-
-function resolveContextBudgetToken(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-    throw new TypeError(`${label} must be a safe integer.`);
-  }
-  if (value < MIN_CONTEXT_BUDGET_TOKENS || value > MAX_CONTEXT_BUDGET_TOKENS) {
-    throw new TypeError(
-      `${label} must be between ${MIN_CONTEXT_BUDGET_TOKENS} and ${MAX_CONTEXT_BUDGET_TOKENS}.`
-    );
-  }
-  return value;
-}
-
-export function resolveContextBudget(configured?: unknown): ResolvedContextBudget {
-  if (configured === undefined || configured === null) {
-    return { softTokens: DEFAULT_CONTEXT_SOFT_TOKENS, hardTokens: DEFAULT_CONTEXT_HARD_TOKENS };
-  }
-  if (typeof configured !== "object" || Array.isArray(configured)) {
-    throw new TypeError("contextBudget must be an object.");
-  }
-  const record = configured as Record<string, unknown>;
-  const softTokens = record.softTokens === undefined
-    ? DEFAULT_CONTEXT_SOFT_TOKENS
-    : resolveContextBudgetToken(record.softTokens, "contextBudget.softTokens");
-  const hardTokens = record.hardTokens === undefined
-    ? DEFAULT_CONTEXT_HARD_TOKENS
-    : resolveContextBudgetToken(record.hardTokens, "contextBudget.hardTokens");
-  if (softTokens >= hardTokens) {
-    throw new TypeError("contextBudget.softTokens must be smaller than contextBudget.hardTokens.");
-  }
-  return { softTokens, hardTokens };
-}
-
 function resolveBoundedPositiveInteger(
   value: unknown,
   fallback: number,
