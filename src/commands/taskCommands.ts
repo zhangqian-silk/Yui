@@ -2638,11 +2638,86 @@ function updateWork(
         reviewTrigger: candidatePolicy?.trigger ?? null
       };
     }
-    throw usageError(
-      `Assigned Work Item execution cannot use task work update: ${current.id}. `
-      + "Use dispatch, wait for the Turn result, then let the Task Leader accept or reject it; "
-      + "use task work retire for an explicit Leader retirement."
-    );
+    taskActor(tx, options, task.id);
+    if (status !== "completed" || current.status !== "running") {
+      throw usageError(
+        `Assigned Work Item ${current.id} can only submit a completed direct Turn from running; `
+        + "use dispatch, task turn retry, or task work retire for other transitions."
+      );
+    }
+    if (tx.getActiveTurn(task.id, current.assignee) !== null) {
+      throw usageError(`Work Item main Turn is still active: ${current.id}/${current.assignee}.`);
+    }
+    if (currentWorkItemExecutionGroup(current) !== undefined) {
+      throw usageError(
+        `Replicated Work Item ${current.id} must be synthesized by its main Turn before Candidate submission.`
+      );
+    }
+    const mainTurn = tx.listTurns(task.id).filter((turn) => (
+      turn.purpose === "execution"
+      && turn.workItemId === current.id
+      && turn.roleName === current.assignee
+      && turn.executionGroupId === undefined
+      && turn.executionLaneId === undefined
+      && turn.status === "completed"
+      && turn.result !== undefined
+    )).at(-1);
+    if (mainTurn === undefined) {
+      throw usageError(`Work Item ${current.id} has no completed direct main Turn.`);
+    }
+    if (mainTurn.result === undefined) {
+      throw dataError(`Completed direct main Turn has no result: ${mainTurn.id}.`);
+    }
+    const configuredReview = tx.getReviewConfig();
+    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
+    const candidatePolicy = taskFinalContract === undefined
+      ? workItemReviewConfig(configuredReview)
+      : taskFinalReviewConfig(taskFinalContract);
+    const projectDelivery = task.projectBindings.length > 0
+      && current.writeProjectIds.length > 0;
+    const developWorkspace = tx.getWorkItemWorkspace(task.id, current.id);
+    const exactTaskMainDelivery = taskFinalContract !== undefined
+      && developWorkspace === null;
+    if (projectDelivery && developWorkspace === null && !exactTaskMainDelivery) {
+      throw usageError(
+        `Project-backed Work Item ${current.id} must be isolated before Candidate submission.`
+      );
+    }
+    const updated = submitWorkItemCandidate(current, {
+      summary: mainTurn.result.output,
+      source: { type: "turn", turnId: mainTurn.id },
+      ...(candidatePolicy === null ? {} : { reviewPolicy: candidatePolicy }),
+      ...(taskFinalContract === undefined
+        ? {}
+        : { taskFinalReviewContract: taskFinalContract }),
+      ...(developWorkspace === null ? {} : { workspace: developWorkspace }),
+      ...(options.candidateGitSnapshot === undefined
+        ? {}
+        : { gitSnapshot: options.candidateGitSnapshot }),
+      ...(options.directTaskMainSnapshot === undefined
+        ? {}
+        : { taskMainSnapshot: options.directTaskMainSnapshot })
+    }, now);
+    tx.saveWorkItem(task.id, updated);
+    recordTaskEvent(tx, task.id, "work.updated", {
+      workItemId: updated.id,
+      status: updated.status,
+      summary: summary!,
+      turnId: mainTurn.id,
+      ...leaderActionEventPayload(tx, task.id, options)
+    }, now);
+    enqueueWork(tx, taskMailbox(task.id), "work-updated", now, [
+      workItemRef(task.id, updated.id),
+      turnRef(task.id, mainTurn.id)
+    ]);
+    const reviewDispatch = candidatePolicy?.trigger === "always"
+      ? queueReviewRound(tx, updated, candidatePolicy, "policy", now)
+      : null;
+    return {
+      item: updated,
+      reviewDispatch,
+      reviewTrigger: candidatePolicy?.trigger ?? null
+    };
   });
   notifyMailbox(options.runtime, taskMailbox(result.item.taskId), result.item.taskId);
   if (result.item.status === "awaiting_acceptance" && status === "completed") {
@@ -2694,9 +2769,6 @@ function dispatchWork(
       requestedLaneRoles,
       `execution-group-${tx.peekNextTurnId(task.id)}`
     );
-    if (lanePlan.roles.length === 0) {
-      throw usageError("Direct WorkItem dispatch is not available yet.");
-    }
     const currentGroup = currentWorkItemExecutionGroup(item);
     if (item.status !== "pending" && item.status !== "failed") {
       throw usageError(`Work item ${item.id} cannot be dispatched from ${item.status}.`);
@@ -2738,6 +2810,63 @@ function dispatchWork(
     let workItemForDispatch = item.status === "failed"
       ? retryFailedWorkItem(item, now)
       : item;
+    if (lanePlan.roles.length === 0) {
+      const role = requireRole(tx, task.id, item.assignee);
+      if (tx.getActiveTurn(task.id, role.name) !== null) {
+        throw usageError(`${task.id}/${role.name} already has an active turn.`);
+      }
+      const effective = resolveEffectiveLaunch({
+        role,
+        purpose: "execution",
+        workspace,
+        workItemWriteProjectIds: item.writeProjectIds
+      });
+      const turnId = tx.nextTurnId(task.id);
+      const turn = createTurn(
+        turnId,
+        task.id,
+        role.name,
+        roleAgentSessionResumeMode(
+          tx.getTaskRoleSessionSet(task.id, role.name),
+          effective.agentId,
+          effective
+        ),
+        createTurnInput({
+          source: { type: "yui", channel: "workitem-dispatch" },
+          directive: rawInput,
+          deltaRefIds: []
+        }),
+        now,
+        {
+          workItemId: item.id,
+          workspace,
+          effective
+        }
+      );
+      const snapshot = freezeTurnContextSnapshot(tx, {
+        taskId: task.id,
+        roleName: turn.roleName,
+        purpose: "execution",
+        workItemId: item.id
+      }, now, "controller");
+      const withContext = withTurnContextSnapshot(
+        turn,
+        contextSnapshotRef(snapshot),
+        contextSnapshotDeltaRefIds(tx, snapshot)
+      );
+      if (workItemForDispatch.status !== "running") {
+        workItemForDispatch = updateWorkItemStatus(workItemForDispatch, "running", now);
+      }
+      tx.saveWorkItem(task.id, workItemForDispatch);
+      tx.saveTurn(withContext);
+      tx.saveActiveTurn(withContext);
+      enqueueWork(tx, roleMailbox(task.id, role.name), "turn-dispatched", now, [
+        turnRef(task.id, withContext.id),
+        workItemRef(task.id, item.id)
+      ]);
+      recordTaskEvent(tx, task.id, "turn.dispatched", turnLaunchEventPayload(withContext), now);
+      return { kind: "direct" as const, turns: [withContext] };
+    }
     const groupId = `execution-group-${tx.peekNextTurnId(task.id)}`;
     const assignmentContext = contextSnapshotRef(freezeWorkItemExecutionAssignmentContextSnapshot(tx, {
       taskId: task.id,
@@ -2854,12 +2983,14 @@ function dispatchWork(
       recordTaskEvent(tx, task.id, "turn.dispatched", turnLaunchEventPayload(withContext), now);
       return withContext;
     });
-    return { turns };
+    return { kind: "replicated" as const, turns };
   });
   for (const turn of dispatch.turns) {
     notifyMailbox(options.runtime, roleMailbox(turn.taskId, turn.roleName), turn.taskId);
   }
-  return `Dispatch queued for ${dispatch.turns.length} replicated Lanes\n`;
+  return dispatch.kind === "direct"
+    ? `Direct WorkItem Turn queued as ${dispatch.turns[0]!.id}\n`
+    : `Dispatch queued for ${dispatch.turns.length} replicated Lanes\n`;
 }
 
 

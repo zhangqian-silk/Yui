@@ -682,12 +682,11 @@ export function validateWorkItemCandidate(
     validateCandidateGitSnapshot(candidate.gitSnapshot, candidate.workspace);
   }
   if (candidate.taskMainSnapshot !== undefined) {
-    if (candidate.source.type !== "direct"
-      || candidate.workspace !== undefined
+    if (candidate.workspace !== undefined
       || candidate.gitSnapshot !== undefined
       || candidate.taskFinalReviewContract === undefined) {
       throw new Error(
-        "Task-main Candidate snapshot requires an exact direct metadata-only Candidate."
+        "Task-main Candidate snapshot requires an exact metadata-only Candidate."
       );
     }
     validateDirectTaskMainSnapshot(candidate.taskMainSnapshot);
