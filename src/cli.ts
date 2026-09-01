@@ -1166,6 +1166,7 @@ export async function main(): Promise<void> {
         throw usageError("Task work capture usage: yui task work capture <task>/<work>.");
       }
       const reference = cliWorkItemReference(workItemId, process.env);
+      taskActor(process.env, reference.taskId);
       const changeSets = await new WorkItemChangeSetManager(store).capture(
         reference.taskId,
         reference.localId,

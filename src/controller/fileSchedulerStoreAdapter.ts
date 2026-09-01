@@ -2472,6 +2472,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           try {
             const parsed = parseReviewResultReport(input.summary);
             reviewResult = {
+              summary: parsed.summary,
               report: parsed.report,
               checks: parsed.checks,
               ...(parsed.findings === undefined ? {} : { findings: parsed.findings }),
@@ -2487,7 +2488,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
                 : { deltaReasoning: parsed.deltaReasoning })
             };
           } catch {
-            reviewResult = { report: input.summary, checks: [] };
+            reviewResult = { summary: input.summary, report: input.summary, checks: [] };
           }
         }
         const terminalized = terminalizeExactTaskTurn(store, {
@@ -2541,7 +2542,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         );
         store.saveEvent(input.taskId, event);
         if (terminalTurn.roleName !== "leader"
-          && (providerStatus !== "completed" || !providerGoalContinues(binding.goal))) {
+          && (terminalTurn.status !== "completed" || !providerGoalContinues(binding.goal))) {
           routeRoleEvent(
             store,
             event,

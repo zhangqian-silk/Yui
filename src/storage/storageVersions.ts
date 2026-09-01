@@ -16,4 +16,4 @@
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
 /** Version of the logical aggregates persisted in SQLite. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 22;
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 23;

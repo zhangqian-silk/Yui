@@ -147,14 +147,15 @@ export function freezeTurnContextSnapshot(
 /**
  * Freeze the shared, role-neutral ContextSnapshot anchored by one WorkItem
  * ExecutionAssignment. Turn snapshots remain role-specific; this record is
- * the durable Assignment baseline and derives from a fresh WorkItem snapshot
- * so the Group never depends on ambient latest state.
+ * the durable Assignment baseline and freezes the current WorkItem facts so
+ * the Group never depends on ambient latest state.
  */
 export function freezeWorkItemExecutionAssignmentContextSnapshot(
   store: TaskStore,
   input: Readonly<{
     taskId: string;
     workItemId: string;
+    executionGroupId: string;
   }>,
   now: Date
 ): ContextSnapshot {
@@ -193,28 +194,20 @@ export function freezeWorkItemExecutionAssignmentContextSnapshot(
   ])).values()].sort((left, right) => (
     contextRefIdentity(left.ref).localeCompare(contextRefIdentity(right.ref))
   ));
-  const previousWorkItem = store.listContextSnapshots(task.id)
-    .filter((candidate) => candidate.scope === "workitem"
-      && candidate.scopeRef === workItem.id)
-    .sort((left, right) => left.sequence - right.sequence)
-    .at(-1);
-  const workItemSnapshot = createContextSnapshot({
+  const assignmentSnapshot = createContextSnapshot({
     id: store.nextContextSnapshotId(task.id),
     taskId: task.id,
-    scope: "workitem",
-    scopeRef: workItem.id,
-    sequence: (previousWorkItem?.sequence ?? 0) + 1,
+    scope: "stage",
+    scopeRef: input.executionGroupId,
+    sequence: 1,
     refs: resources.map(({ ref }) => ref),
     resources,
     acceptRefs: [`work-item:${workItem.id}:acceptance`],
-    ...(previousWorkItem === undefined
-      ? {}
-      : { parentRef: contextSnapshotRef(previousWorkItem) }),
     frozenAt: now,
     frozenBy: "controller"
   });
-  store.saveContextSnapshot(workItemSnapshot);
-  return workItemSnapshot;
+  store.saveContextSnapshot(assignmentSnapshot);
+  return assignmentSnapshot;
 }
 
 /**

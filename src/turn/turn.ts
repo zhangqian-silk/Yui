@@ -35,6 +35,28 @@ export type TurnProviderResult = Readonly<{
   status: "completed" | "failed" | "cancelled";
 }>;
 
+export type ProducerTurnResult = Readonly<{
+  schemaVersion: 1;
+  summary: string;
+  report?: string;
+  checks: readonly Readonly<{
+    name: string;
+    outcome: "passed" | "failed" | "skipped";
+    details?: string;
+  }>[];
+  findings: readonly Readonly<{
+    id: string;
+    severity: "low" | "medium" | "high" | "critical";
+    summary: string;
+    status: "open" | "resolved";
+  }>[];
+  evidence: readonly string[];
+  codeRefs: readonly Readonly<{
+    commit: string;
+    projectId?: string;
+  }>[];
+}>;
+
 /**
  * The automatically observed result of one managed Provider Turn. It is owned
  * by Turn; Provider Session state and Task/WorkItem acceptance remain
@@ -45,8 +67,38 @@ export type TurnResult = Readonly<{
   output: string;
   completedAt: string;
   provider?: TurnProviderResult;
+  /** Durable producer evidence; successful WorkItem Lanes point here by Turn id. */
+  producer?: ProducerTurnResult;
   failureReason?: TurnFailureReason;
 }>;
+
+export function createProducerTurnResult(input: Readonly<{
+  summary: string;
+  report?: string;
+  checks?: ProducerTurnResult["checks"];
+  findings?: ProducerTurnResult["findings"];
+  evidence?: readonly string[];
+  evidenceCommit?: string;
+  projectCodeRefs?: readonly Readonly<{ projectId: string; commit: string }>[];
+}>): ProducerTurnResult {
+  const codeRefs: Array<{ commit: string; projectId?: string }> = [
+    ...(input.projectCodeRefs ?? []).map(({ projectId, commit }) => ({ projectId, commit })),
+    ...(input.evidenceCommit === undefined
+      ? []
+      : [{ commit: input.evidenceCommit, projectId: undefined }])
+  ].filter((candidate, index, all) => all.findIndex((entry) => (
+    entry.commit === candidate.commit && entry.projectId === candidate.projectId
+  )) === index);
+  return validateProducerTurnResult({
+    schemaVersion: 1,
+    summary: input.summary,
+    ...(input.report === undefined ? {} : { report: input.report }),
+    checks: [...(input.checks ?? [])],
+    findings: [...(input.findings ?? [])],
+    evidence: [...new Set(input.evidence ?? [])],
+    codeRefs
+  });
+}
 
 export type TurnInputRecord = Readonly<{
   sequence: number;
@@ -55,7 +107,8 @@ export type TurnInputRecord = Readonly<{
 }>;
 
 export type Turn = {
-  schemaVersion: 1;
+  /** v2 adds durable producer evidence to terminal WorkItem Lane Turns. */
+  schemaVersion: 2;
   id: string;
   taskId: string;
   roleName: string;
@@ -100,7 +153,7 @@ export function createTurn(
   const timestamp = now.toISOString();
   const normalizedInput = validateTurnInput(input);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: requireSafeIdentity(id, "Turn id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -196,7 +249,7 @@ export function validateTurn(run: Turn): Turn {
     "createdAt",
     "updatedAt"
   ], "Turn");
-  if (run.schemaVersion !== 1) throw new Error("Turn must use schemaVersion 1.");
+  if (run.schemaVersion !== 2) throw new Error("Turn must use schemaVersion 2.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "turn");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {
@@ -331,6 +384,9 @@ export function validateTurn(run: Turn): Turn {
       if (!isTurnFailureReason(result.failureReason)) {
         throw new Error(`Failed Turn reason is invalid: ${String(result.failureReason)}.`);
       }
+      if (result.producer !== undefined) {
+        throw new Error("A failed Turn cannot carry successful producer evidence.");
+      }
     } else if (result.failureReason !== undefined) {
       throw new Error("A completed Turn cannot carry a failure reason.");
     }
@@ -342,9 +398,10 @@ export function completeTurn(
   run: Turn,
   output: string,
   now: Date,
-  provider?: TurnProviderResult
+  provider?: TurnProviderResult,
+  producer?: ProducerTurnResult
 ): Turn {
-  return finishTurn(run, "completed", output, now, undefined, provider);
+  return finishTurn(run, "completed", output, now, undefined, provider, producer);
 }
 
 export function failTurn(
@@ -370,7 +427,8 @@ function finishTurn(
   output: string,
   now: Date,
   failureReason?: TurnFailureReason,
-  provider?: TurnProviderResult
+  provider?: TurnProviderResult,
+  producer?: ProducerTurnResult
 ): Turn {
   if (run.status !== "active") {
     throw new Error(`Turn is already terminal: ${run.id}.`);
@@ -384,6 +442,7 @@ function finishTurn(
       output: requireResultText(output, "Turn result output"),
       completedAt: timestamp,
       ...(provider === undefined ? {} : { provider: validateTurnProviderResult(provider) }),
+      ...(producer === undefined ? {} : { producer: validateProducerTurnResult(producer) }),
       ...(failureReason === undefined ? {} : { failureReason })
     },
     updatedAt: timestamp,
@@ -398,6 +457,45 @@ function validateTurnResult(result: TurnResult | undefined): TurnResult {
   requireResultText(result.output, "Turn result output");
   requireTimestamp(result.completedAt, "Turn result completedAt");
   if (result.provider !== undefined) validateTurnProviderResult(result.provider);
+  if (result.producer !== undefined) validateProducerTurnResult(result.producer);
+  return result;
+}
+
+function validateProducerTurnResult(result: ProducerTurnResult): ProducerTurnResult {
+  if (result.schemaVersion !== 1) {
+    throw new Error("Producer Turn result must use schemaVersion 1.");
+  }
+  requireText(result.summary, "Producer Turn result summary");
+  if (result.report !== undefined) requireText(result.report, "Producer Turn result report");
+  if (!Array.isArray(result.checks)) throw new Error("Producer Turn result checks are invalid.");
+  for (const check of result.checks) {
+    requireText(check.name, "Producer Turn result check name");
+    if (!["passed", "failed", "skipped"].includes(check.outcome)) {
+      throw new Error("Producer Turn result check outcome is invalid.");
+    }
+    if (check.details !== undefined) requireText(check.details, "Producer Turn result check details");
+  }
+  if (!Array.isArray(result.findings)) throw new Error("Producer Turn result findings are invalid.");
+  for (const finding of result.findings) {
+    requireSafeIdentity(finding.id, "Producer Turn result finding id");
+    if (!["low", "medium", "high", "critical"].includes(finding.severity)
+      || !["open", "resolved"].includes(finding.status)) {
+      throw new Error("Producer Turn result finding is invalid.");
+    }
+    requireText(finding.summary, "Producer Turn result finding summary");
+  }
+  if (!Array.isArray(result.evidence)) throw new Error("Producer Turn result evidence is invalid.");
+  for (const evidence of result.evidence) requireText(evidence, "Producer Turn result evidence");
+  if (new Set(result.evidence).size !== result.evidence.length) {
+    throw new Error("Producer Turn result evidence is duplicated.");
+  }
+  if (!Array.isArray(result.codeRefs)) throw new Error("Producer Turn result code refs are invalid.");
+  for (const ref of result.codeRefs) {
+    if (!/^[0-9a-f]{40}$/u.test(ref.commit)) {
+      throw new Error("Producer Turn result commit is invalid.");
+    }
+    if (ref.projectId !== undefined) requireSafeIdentity(ref.projectId, "Producer Turn result Project id");
+  }
   return result;
 }
 

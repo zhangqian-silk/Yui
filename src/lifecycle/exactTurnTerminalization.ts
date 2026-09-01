@@ -13,6 +13,7 @@ import {
 import { reconcileReviewFindingsAfterReview } from "../review/reviewFindingLedger.js";
 import {
   completeTurn,
+  createProducerTurnResult,
   failTurn,
   type Turn,
   type TurnProviderResult
@@ -184,6 +185,7 @@ export function terminalizeExactTurnReviewRound(
     turn: Turn;
     outcome: Readonly<{ status: "completed" | "failed"; summary: string }>;
     reviewResult?: Readonly<{
+      summary?: string;
       report?: string;
       checks?: readonly ReviewCheck[];
       findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
@@ -304,6 +306,7 @@ export type ExactTurnTerminalizationInput = Readonly<{
     provider?: TurnProviderResult;
   }>;
   reviewResult?: Readonly<{
+    summary?: string;
     report?: string;
     checks?: readonly ReviewCheck[];
     findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
@@ -486,12 +489,49 @@ export function terminalizeExactTaskTurn(
     return obsolete(turn, reviewRoundTerminalization.reason ?? "review-round-mismatch");
   }
 
-  const terminal = input.outcome.status === "completed"
-    ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider)
+  const producer = input.outcome.status === "completed"
+    && turn.purpose === "execution"
+    && turn.workItemId !== undefined
+    && turn.executionGroupId !== undefined
+    && turn.executionLaneId !== undefined
+    ? createProducerTurnResult({
+        summary: input.reviewResult?.summary ?? input.outcome.summary,
+        ...(input.reviewResult?.report === undefined
+          ? {}
+          : { report: input.reviewResult.report }),
+        ...(input.reviewResult?.checks === undefined
+          ? {}
+          : { checks: input.reviewResult.checks }),
+        ...(input.reviewResult?.findings === undefined
+          ? {}
+          : { findings: input.reviewResult.findings }),
+        ...(input.reviewResult?.evidence === undefined
+          ? {}
+          : { evidence: input.reviewResult.evidence }),
+        ...(input.reviewResult?.evidenceCommit === undefined
+          ? {}
+          : { evidenceCommit: input.reviewResult.evidenceCommit }),
+        ...(input.reviewResult?.gitSnapshot === undefined
+          ? {}
+          : {
+              projectCodeRefs: input.reviewResult.gitSnapshot.projects.map((project) => ({
+                projectId: project.projectId,
+                commit: project.headCommit
+              }))
+            })
+      })
+    : undefined;
+  const incompleteProducer = producer !== undefined
+    && turn.effective.writeProjectIds.length > 0
+    && (producer.codeRefs.length === 0 || producer.checks.length === 0);
+  const terminal = input.outcome.status === "completed" && !incompleteProducer
+    ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider, producer)
     : failTurn(
         turn,
-        input.outcome.failureReason ?? "runtime-failed",
-        input.outcome.summary,
+        incompleteProducer ? "missing-result" : input.outcome.failureReason ?? "runtime-failed",
+        incompleteProducer
+          ? "Producer result is missing an immutable code reference or validation check."
+          : input.outcome.summary,
         now,
         input.outcome.provider
       );
@@ -504,10 +544,10 @@ export function terminalizeExactTaskTurn(
       ? undefined
       : workItemExecutionGroupById(item, turn.executionGroupId);
     if (item !== null && group !== undefined) {
-      if (input.outcome.status === "completed" || input.settleFailedExecutionGroup === true) {
+      if (terminal.status === "completed" || input.settleFailedExecutionGroup === true) {
         const grouped = updateWorkItemExecutionLane(group, turn.executionLaneId, {
           currentTurnId: turn.id,
-          ...(input.outcome.status === "completed"
+          ...(terminal.status === "completed"
             ? { successfulTurnId: turn.id, disposition: "succeeded" as const }
             : { disposition: "failed" as const })
         }, now);

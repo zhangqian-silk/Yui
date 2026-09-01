@@ -2870,7 +2870,8 @@ function dispatchWork(
     const groupId = `execution-group-${tx.peekNextTurnId(task.id)}`;
     const assignmentContext = contextSnapshotRef(freezeWorkItemExecutionAssignmentContextSnapshot(tx, {
       taskId: task.id,
-      workItemId: item.id
+      workItemId: item.id,
+      executionGroupId: groupId
     }, now));
     const plans = roles.map((role, index) => {
       const laneId = `${groupId}-lane-${index + 1}`;
@@ -2899,7 +2900,7 @@ function dispatchWork(
       };
     });
     const assignment = createWorkItemExecutionAssignment({
-      input: rawInput,
+      input: replicatedProducerAssignmentInput(rawInput, item.writeProjectIds.length > 0),
       objective: item.objective,
       acceptance: item.acceptance,
       contextSnapshotRef: assignmentContext,
@@ -2991,6 +2992,18 @@ function dispatchWork(
   return dispatch.kind === "direct"
     ? `Direct WorkItem Turn queued as ${dispatch.turns[0]!.id}\n`
     : `Dispatch queued for ${dispatch.turns.length} replicated Lanes\n`;
+}
+
+function replicatedProducerAssignmentInput(input: string, requiresCodeRef: boolean): string {
+  return [
+    input,
+    "",
+    "Return the final result as one JSON object with: summary, checks, findings, evidence, and evidenceCommit.",
+    "checks must list the validation commands and passed/failed/skipped outcomes.",
+    requiresCodeRef
+      ? "evidenceCommit must be the 40-character commit containing this Lane's clean final code."
+      : "For a Gitless or read-only Lane, evidenceCommit may be omitted."
+  ].join("\n");
 }
 
 
@@ -5086,10 +5099,28 @@ function retryTurn(
           || retryLane === undefined))) {
       throw dataError(`Turn ${previous.id} execution lineage no longer matches its Work Item.`);
     }
-    const retryManagedWorkspace = retryLane === undefined
-      ? runWorkspace
-      : options.executionLaneWorkspaces?.get(retryLane.id) ?? previous.workspace ?? runWorkspace;
-    const effective = resolveEffectiveLaunch({
+    const retryManagedWorkspace = retryLane === undefined ? runWorkspace : previous.workspace;
+    if (retryLane !== undefined) {
+      const storedLaneWorkspace = previous.workspace === undefined
+        ? null
+        : tx.getManagedWorkspace(previous.workspace.owner);
+      const writableProjectIds = previous.workspace?.entries
+        .filter(({ access }) => access === "write")
+        .map(({ projectId }) => projectId)
+        .sort();
+      if (previous.workspace === undefined
+        || previous.workspace.owner.type !== "execution-lane"
+        || previous.workspace.owner.executionGroupId !== retryGroup!.id
+        || previous.workspace.owner.executionLaneId !== retryLane.id
+        || previous.workspace.root !== retryLane.workspace.root
+        || !isDeepStrictEqual(previous.effective, retryLane.effective)
+        || !isDeepStrictEqual(writableProjectIds, [...retryLane.workspace.writableProjectIds].sort())
+        || storedLaneWorkspace === null
+        || !isDeepStrictEqual(storedLaneWorkspace, previous.workspace)) {
+        throw dataError(`Turn ${previous.id} Lane workspace is missing or has drifted.`);
+      }
+    }
+    const effective = retryLane?.effective ?? resolveEffectiveLaunch({
       role,
       purpose: "execution",
       ...(retryManagedWorkspace === undefined ? {} : { workspace: retryManagedWorkspace }),
