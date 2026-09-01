@@ -205,7 +205,14 @@ export function materializeSessionBootstrap(input: Readonly<{
     roleProfileRef: { digest: profileDigest, path: roleProfilePath },
     contextProtocol: input.owner.scope === "global"
       ? {
-          loadCommand: "\"$YUI_SESSION_CLI\" session context \"$YUI_ROLE\" --json"
+          // A Global Session may move between Yui's remote TUI and Desktop.
+          // Carry its read entry in the Thread-visible Manifest instead of
+          // depending on the client process that happened to create it.
+          loadCommand: renderGlobalContextCommand(
+            input.controlPlane,
+            home,
+            input.role.name
+          )
         }
       : {
           loadCommand: "\"$YUI_SESSION_CLI\" task turn context \"$YUI_TASK_ID/<turn-id>\" --json",
@@ -227,6 +234,26 @@ export function materializeSessionBootstrap(input: Readonly<{
     roleProfilePath,
     descriptorPath
   });
+}
+
+function renderGlobalContextCommand(
+  controlPlane: ExactControlPlaneDescriptor,
+  home: string,
+  roleName: string
+): string {
+  return [
+    `YUI_HOME=${quoteShellWord(home)}`,
+    quoteShellWord(controlPlane.executable),
+    quoteShellWord(controlPlane.cliEntry),
+    "session",
+    "context",
+    quoteShellWord(roleName),
+    "--json"
+  ].join(" ");
+}
+
+function quoteShellWord(value: string): string {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
 /**

@@ -43,12 +43,11 @@ The pack's authority view and writable Project IDs are hard boundaries. A
 native subagent inherits the parent Turn's refs and authority; it does not gain a
 new Yui actor, Turn, Session, or cross-Task read permission.
 
-For a global Operator or custom GlobalRole Session, load the stable authorized view
-before routing or acting:
-
-```sh
-"$YUI_SESSION_CLI" session context "$YUI_ROLE" --json
-```
+For a global Operator or custom GlobalRole Session, execute the exact
+`contextProtocol.loadCommand` carried by the current Session Manifest before
+routing or acting. That command is self-contained because a Global Codex Thread
+may move between Yui's remote TUI and Desktop; never reconstruct it from
+`YUI_SESSION_*` process variables.
 
 Global context grants no Task implementation workspace. Read a Task only after
 the Operator has routed to its public/task-authorized context command; never

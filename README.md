@@ -781,7 +781,10 @@ TaskRole itself stores identity and desired launch configuration, not runtime
 status; Role status shown by CLI/Web is derived from the active Turn plus
 Session/Driver lifecycle facts.
 
-Global Operator and global Role sessions remain native interactive CLIs:
+Global Operator and global Role sessions remain native interactive CLIs. Codex
+connects that TUI to the default shared App Server, so the same thread can move
+between Yui and Desktop without transferring a rollout writer or losing its
+Global Context entry:
 
 ```sh
 yui session enter <global-role>

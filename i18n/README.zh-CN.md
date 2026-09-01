@@ -519,7 +519,7 @@ yui task role takeover <task-id> <role>
 yui task role release <task-id> <role>
 ```
 
-Codex Role thread 可在 Desktop 中直接查看和操作；Desktop 已有 active Turn 时，Yui 只保留待投递工作并等待，不会失败或重复投递。`view`、`takeover`、`release` 继续作为 Claude 等独立进程 Provider 的人工控制入口。Yui 不写入全局 Hook/config，也不启动、重启或停止共享 daemon；Codex CLI/daemon 故障由 Task 生命周期之外修复。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议。
+Codex Role thread 可在 Desktop 中直接查看和操作；Desktop 已有 active Turn 时，Yui 只保留待投递工作并等待，不会失败或重复投递。`view`、`takeover`、`release` 继续作为 Claude 等独立进程 Provider 的人工控制入口。Yui 不写入全局 Hook/config，也不启动、重启或停止共享 daemon；Codex CLI/daemon 故障由 Task 生命周期之外修复。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议；Yui 在内部将 Codex 的 Global TUI 连接到同一个默认 App Server，用户不能通过 Agent 或 Role 参数覆盖该连接，Session Manifest 自带不依赖启动进程环境的 Global Context 命令，因此同一 thread 可直接切换到 Desktop 继续对话。
 
 当新版本需要离线迁移 Home 时，应等待当前 Turn 完成，然后从普通 shell
 执行 `yui session stop --all`，再重新执行 `yui update`。停止命令会先整体预检：
