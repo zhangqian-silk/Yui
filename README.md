@@ -474,62 +474,35 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "Implement and run focused tests"
 ```
 
-Dispatch remains `single` by default. A Leader can explicitly enable bounded
-multi-route exploration on a fresh WorkItem; each accepted stage advances
-`Plan → Generate → Compare → Synthesize → Verify → Resolve`, and only the
-accepted Resolve stage materializes the existing single Candidate:
+Without `--lane-role`, the assignee performs the WorkItem directly in its main
+workspace. To request independent production attempts over exactly the same
+frozen Assignment, provide at least two distinct Task Roles; one role is
+rejected, roles cannot repeat, and the assignee cannot be a Lane:
 
 ```sh
 yui task work dispatch <task-id>/<work-item-id> \
-  --mode parallel-diverse --max-rounds 2 --stage-max-attempts 2 \
-  --strategy fixed:2 --lane-role critic \
-  --stage-max-tokens 240000 --stage-max-tool-calls 200 \
-  --stage-max-seconds 1800 --stage-quorum 2
-yui task work group resolve <task-id>/<work-item-id> \
-  --decision accept --summary "Plan evidence is sufficient"
+  --input "Implement and run focused tests" \
+  --lane-role producer-a --lane-role producer-b
 ```
 
-Every stage is a new immutable ExecutionGroup. Its ContextSnapshot and selected
-parent Lane results are durable references; `retry` repeats a stage within its
-attempt budget, while `retry` at Resolve begins the next bounded round.
+Each Lane is a recoverable logical slot. A successful Lane points to its
+immutable Producer Turn result; a failed Turn leaves the Lane open and visible
+as `needs-attention`. The Leader retries or explicitly settles that exact Turn:
 
-Each new stage also freezes one Resource Broker contract: behavioral tool-call
-and wall-clock budgets; a display-only token threshold; quorum and deadline; a
-straggler window; and the minimum marginal value for more Lane spend. Omitted
-values reuse the existing context budget and runtime-health windows; stage
-retries share the original cumulative observations and absolute deadline.
-Observed token totals and the configured token threshold are cost context only:
-they never close spend, block admission, suppress scheduling, or stop a Lane.
-Execution, Lane retry, and Reviewer-panel
-admission all count active Lanes at Home, Task, WorkItem, Group, Provider,
-Agent, and model scopes. Capacity pressure keeps the excess Lane durably
-pending instead of failing the Group. Capacity release or deadline arrival
-wakes the Leader through the existing actionability path; rerunning the same
-dispatch resumes the frozen input. Released capacity is reserved for the
-oldest currently admissible waiter, while a Provider- or Agent-blocked queue
-head does not prevent independent scopes from making progress. Provider rate
-limits still use the existing in-place retry window and therefore never fan
-out into sibling failures.
+```sh
+yui task turn retry <task-id>/<failed-turn-id>
+yui task turn settle <task-id>/<failed-turn-id>
+```
 
-The Leader may add `--early-stop <0-100>` to an accepting Group resolution.
-Yui permits it only after quorum and T5's passed Verify/Resolve evidence prove
-sufficiency. It may skip Lanes that never started; active stragglers are
-reported and retained, never killed automatically for cost. If evidence is
-insufficient, behavioral tool-call/wall-clock budget or deadline exhaustion
-blocks the stage for Leader judgment instead of turning thin evidence into
-success.
-
-New exploration histories also freeze the structured candidate-convergence
-contract. Yui appends the exact stage-local JSON shape to every Lane assignment
-and validates selected reports before the Leader can advance: Compare must
-partition duplicate clusters and justify each selected route with a direct
-source, executable check, or frozen artifact; Synthesize uses a claim/evidence
-table for research, a decision matrix for architecture, and one frozen Git
-snapshot for code. Verify must use a Role independent from the selected
-Synthesize author. Only complete criterion evidence can produce `passed` and
-an accepted Resolve Candidate; explicit gaps produce `next-round` and can only
-continue through bounded Resolve `retry`. Votes and derived analysis remain
-reportable context, but never substitute for direct evidence.
+Yui waits until every Lane is settled. At least two successful Producer results
+create one idempotent main Turn for the WorkItem assignee; fewer results fail
+the WorkItem attempt without falling back to a single result. A main Turn retry
+keeps the same source Group and never reruns successful Lanes. Only a successful
+main Turn can become the Candidate used by Review and Integration. `task work
+show`, `task work list`, Task context, and the Web control room derive execution
+shape, recovery targets, synthesis eligibility, main Turn, Candidate provenance,
+next action, and owner from the same persisted facts. Missing facts stay
+`unknown` or `unobserved`; token, duration, and tool-call totals are display-only.
 
 Permission is one adapter-specific enum configuration on each Agent binding:
 `default` follows the provider, `bypass` compiles the provider's supported

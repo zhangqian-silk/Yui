@@ -156,80 +156,63 @@ export function executionBand(projection, t, locale) {
   return band;
 }
 
-// --- Unified execution Group (Lanes + resolution) ---------------------------
-export function executionGroupCard(summary, t, locale) {
+// --- WorkItem execution and recovery -----------------------------------------
+export function workItemExecutionCard(projection, t) {
   const card = node("article", "record-card exec-group");
   const head = node("div", "record-head");
   const titleRow = node("div", "record-title-row");
-  titleRow.append(node("strong", "record-title", summary.groupId));
+  titleRow.append(node("strong", "record-title", t("workExec.title")));
   head.append(titleRow);
   const pills = node("div", "record-pills");
-  pills.append(pill(t, "exec.purpose", summary.purpose));
-  const strategy = summary.strategy.mode === "fixed"
-    ? t("exec.strategy.fixed").replace("{count}", String(summary.strategy.count))
-    : t("exec.strategy.adaptive").replace("{max}", String(summary.strategy.max));
-  pills.append(chip(strategy));
-  if (summary.failedLaneCount > 0) {
-    pills.append(chip(summary.failedLaneCount + " " + t("exec.lanesFailed"), "is-danger"));
-  }
+  pills.append(chip(t("workExec.shape." + projection.shape), "is-active"));
+  pills.append(chip(t("workExec.synthesis." + projection.synthesis.status)));
   head.append(pills);
   card.append(head);
 
-  if (summary.stage) {
-    const stage = node("div", "record-meta execution-stage-meta");
-    stage.append(node("span", "mono", t("detail.stage") + " · " + (summary.stage.stage || "—")));
-    stage.append(node("span", "", t("detail.round") + " · " + String(summary.stage.round)));
-    stage.append(node("span", "", t("detail.stageAttempt") + " · " + String(summary.stage.stageAttempt)));
-    stage.append(chip(t("mode." + summary.stage.mode)));
-    card.append(stage);
-  }
-  if (summary.resources) {
-    const resources = summary.resources;
-    const budget = node("div", "record-meta execution-resource-meta");
-    budget.append(node("span", "", t("detail.cost") + " · "
-      + formatResource(resources.tokens, resources.tokensRemaining, resources.tokensObservable) + " tokens"));
-    budget.append(node("span", "", formatResource(resources.toolCalls, resources.toolCallsRemaining, resources.toolCallsObservable) + " tools"));
-    budget.append(node("span", "", resources.wallClockSeconds + "s"));
-    budget.append(node("span", "", t("detail.quorum") + " · "
-      + resources.usableLaneCount + "/" + (summary.stage.resources?.quorum || "—")));
-    card.append(budget);
+  if (projection.lanes && projection.lanes.length) {
+    const lanes = node("div", "lane-list");
+    projection.lanes.forEach(function (lane) {
+      const row = node("div", "lane-row");
+      row.append(statusDot(lane.status));
+      row.append(node("span", "lane-role", lane.roleName));
+      row.append(node("span", "lane-status", t("workExec.lane." + lane.status)));
+      row.append(node("span", "mono", lane.currentTurnId || t("detail.unobserved")));
+      if (lane.retryTurnId) row.append(chip(t("workExec.retry") + " · " + lane.retryTurnId, "is-danger"));
+      if (lane.settleTurnId) row.append(chip(t("workExec.settle") + " · " + lane.settleTurnId));
+      if (lane.session === "unobserved") row.append(chip(t("detail.unobserved")));
+      lanes.append(row);
+    });
+    card.append(lanes);
   }
 
-  const lanes = node("div", "lane-list");
-  summary.laneSummaries.forEach(function (lane) {
-    const row = node("div", "lane-row");
-    row.append(statusDot(lane.status));
-    row.append(node("span", "lane-role", lane.roleName));
-    row.append(node("span", "lane-status", t("lane." + lane.status)));
-    if (lane.effective) {
-      const config = [lane.effective.adapterId, lane.effective.model, lane.effective.effort]
-        .filter(function (value) { return value; }).join(" · ");
-      if (config) row.append(chip(config));
-    }
-    if (lane.summary) {
-      row.append(node("span", "lane-summary", lane.summary));
-    }
-    if (lane.decision) {
-      row.append(chip(t("resolution." + lane.decision), "is-active"));
-    }
-    lanes.append(row);
-  });
-  card.append(lanes);
+  const facts = node("div", "record-meta execution-resource-meta");
+  facts.append(node("span", "", t("workExec.main") + " · "
+    + (projection.mainTurn.turnId || t("detail.unobserved"))
+    + " [" + t("workExec.mainStatus." + projection.mainTurn.status) + "]"));
+  facts.append(node("span", "", t("workExec.candidate") + " · "
+    + (projection.candidate.candidateId || t("workExec.none"))
+    + " [" + t("workExec.candidateStatus." + projection.candidate.status) + "]"));
+  card.append(facts);
 
-  if (summary.resolution) {
-    const res = node("div", "exec-resolution");
-    res.append(node("span", "exec-resolution-decision",
-      t("resolution." + summary.resolution.decision)));
-    res.append(node("span", "exec-resolution-summary", summary.resolution.summary));
-    res.append(node("time", "", formatDateTime(summary.resolution.decidedAt, locale)));
-    card.append(res);
+  if (projection.candidate.sourceExecutionGroupId) {
+    const provenance = projection.candidate.successfulLaneTurns.map(function (lane) {
+      return lane.laneId + " → " + lane.successfulTurnId;
+    }).join(", ") || t("detail.unobserved");
+    card.append(node("p", "muted mono", (projection.candidate.mainTurnId || t("detail.unobserved"))
+      + " → " + projection.candidate.sourceExecutionGroupId + " → " + provenance));
   }
+
+  const next = node("div", "exec-resolution");
+  next.append(node("span", "exec-resolution-decision", t("workExec.next")));
+  next.append(node("span", "exec-resolution-summary",
+    t("workExec.action." + projection.nextAction.kind)
+      + " · " + t("workExec.owner") + " "
+      + (projection.nextAction.owners.join(", ") || t("workExec.none"))));
+  if (projection.nextAction.targetIds.length) {
+    next.append(node("span", "mono", projection.nextAction.targetIds.join(", ")));
+  }
+  card.append(next);
   return card;
-}
-
-function formatResource(used, remaining, observable) {
-  const value = String(used) + (remaining === undefined ? "" : "/" + String(used + remaining));
-  return observable === false ? value + "*" : value;
 }
 
 export function observabilityMetricCard(observability, t) {
@@ -548,25 +531,20 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
   }
   if (chipCols.childNodes.length) body.append(chipCols);
 
-  // Current execution iteration: the unified Group with its Lanes and the
-  // Leader's resolution when the iteration is settled.
-  if (item.currentExecution) {
-    body.append(executionGroupCard(item.currentExecution, t, locale));
+  if (item.execution) {
+    body.append(workItemExecutionCard(item.execution, t));
   }
 
   if (item.observability) {
     const observability = item.observability;
-    if (observability.executionGroups && observability.executionGroups.length) {
-      observability.executionGroups.forEach(function (group) {
-        if (!item.currentExecution || group.groupId !== item.currentExecution.groupId) {
-          body.append(executionGroupCard(group, t, locale));
-        }
-      });
-    }
     const metrics = node("div", "record-meta work-item-observability");
     metrics.append(node("span", "", t("detail.cost") + " · "
-      + observability.cost.tokens + " tokens"));
-    metrics.append(node("span", "", observability.cost.toolCalls + " tools"));
+      + (observability.cost.tokensObservable
+        ? observability.cost.tokens + " tokens"
+        : t("detail.unobserved"))));
+    metrics.append(node("span", "", observability.cost.toolCallsObservable
+      ? observability.cost.toolCalls + " tools"
+      : t("detail.unobserved")));
     metrics.append(node("span", "", observability.cost.wallClockSeconds + "s"));
     metrics.append(node("span", "", t("detail.contextSnapshots") + " · "
       + observability.context.snapshotCount));
@@ -576,16 +554,6 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
       metrics.append(chip(t("detail.openFindings") + " · " + observability.openFindingCount, "is-danger"));
     }
     body.append(metrics);
-    if (observability.stages && observability.stages.length) {
-      const stages = node("div", "chip-row work-item-stages");
-      observability.stages.forEach(function (stage) {
-        const label = (stage.stage || "single")
-          + (stage.round === undefined ? "" : " #" + stage.round)
-          + (stage.resolution ? " · " + stage.resolution : "");
-        stages.append(chip(label, stage.groupId === observability.currentGroupId ? "is-active" : ""));
-      });
-      body.append(stages);
-    }
   }
 
   // Review candidates submitted for this WorkItem, newest first.

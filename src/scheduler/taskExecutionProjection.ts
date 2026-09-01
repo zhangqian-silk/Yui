@@ -325,7 +325,6 @@ export function projectTaskExecution(
   const observability = buildTaskObservabilityProjection({
     workItems,
     executionGroups: observabilityGroups,
-    groupSummaries,
     turns,
     events,
     contextSnapshots: facts.contextSnapshots,

@@ -20,6 +20,7 @@ import {
 export const WORK_ITEM_EXECUTION_GROUP_SCHEMA_VERSION = 2 as const;
 export const WORK_ITEM_EXECUTION_LANE_SCHEMA_VERSION = 2 as const;
 export const WORK_ITEM_EXECUTION_ASSIGNMENT_SCHEMA_VERSION = 1 as const;
+export const MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS = 2;
 
 export type WorkItemExecutionProjectBase = Readonly<{
   projectId: string;

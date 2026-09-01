@@ -22,11 +22,10 @@ import {
   type WorkItem
 } from "../workItem/workItem.js";
 import {
+  MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS,
   workItemExecutionGroupSettled,
   type WorkItemExecutionGroup
 } from "./workItemExecution.js";
-
-export const MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS = 2;
 
 export type WorkItemSynthesisProducer = Readonly<{
   laneId: string;

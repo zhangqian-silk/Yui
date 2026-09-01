@@ -216,15 +216,19 @@ import {
 import {
   createWorkItemExecutionAssignment,
   createWorkItemExecutionGroup,
+  MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS,
   updateWorkItemExecutionLane,
   workItemExecutionGroupSettled,
   type WorkItemExecutionLaneWorkspace
 } from "../execution/workItemExecution.js";
 import {
-  MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS,
   reconcileWorkItemMainTurns,
   successfulWorkItemSynthesisProducers
 } from "../execution/workItemMainTurn.js";
+import {
+  projectWorkItemExecution,
+  type WorkItemExecutionProjection
+} from "../execution/workItemExecutionProjection.js";
 import {
   planResourceAdmissions,
   resolveResourceBrokerPolicy,
@@ -3360,6 +3364,9 @@ function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecutio
   exactPositionals(args, 1, "Task work list usage: yui task work list <task>.");
   const task = requireTask(store, args[0]);
   const items = store.listWorkItems(task.id);
+  const turns = store.listTurns(task.id);
+  const sessionSets = store.listRoleSessionSets(task.id);
+  const executions = items.map((item) => projectWorkItemExecution(item, turns, sessionSets));
   const rendered = items.length === 0
     ? "No work items found.\n"
     : `${renderTable(
@@ -3368,23 +3375,25 @@ function listWork(args: string[], store: TaskWorkflowStore): TaskCommandExecutio
           { header: "Work", minWidth: 6, maxWidth: 20 },
           { header: "Status", minWidth: 6, maxWidth: 12 },
           { header: "Role", minWidth: 4, maxWidth: 18 },
-          { header: "Write Projects", minWidth: 8, maxWidth: 28 },
+          { header: "Shape", minWidth: 6, maxWidth: 10 },
+          { header: "Execution", minWidth: 12, maxWidth: 42 },
+          { header: "Next / Owner", minWidth: 12, maxWidth: 36 },
           { header: "Title", minWidth: 8, maxWidth: 64 },
-          { header: "Acceptance", minWidth: 10, maxWidth: 16 },
           { header: "Outcome", minWidth: 8, maxWidth: 40 }
         ],
-        items.map((item) => [
+        items.map((item, index) => [
           item.id,
           presentWorkStatus(item.status),
           item.assignee ?? "Leader",
-          item.writeProjectIds.join(", ") || "-",
+          executions[index]!.shape,
+          compactWorkItemExecution(executions[index]!),
+          `${executions[index]!.nextAction.kind} / ${executions[index]!.nextAction.owners.join(",") || "none"}`,
           item.title,
-          String(item.acceptance.length),
           item.outcome ?? "-"
         ]),
         defaultTableWidth()
       )}\n`;
-  return output(rendered, { workItems: items });
+  return output(rendered, { workItems: items, executions });
 }
 
 function showWork(
@@ -3394,6 +3403,11 @@ function showWork(
 ): TaskCommandExecution {
   exactPositionals(args, 1, "Task work show usage: yui task work show <work>.");
   const item = requireWorkItem(store, args[0], options);
+  const execution = projectWorkItemExecution(
+    item,
+    store.listTurns(item.taskId),
+    store.listRoleSessionSets(item.taskId)
+  );
   const replacement = item.disposition?.replacementWorkItemId;
   const rendered = [
     `Work Item: ${item.id}`,
@@ -3404,12 +3418,47 @@ function showWork(
     `Objective: ${item.objective}`,
     `Write Projects: ${item.writeProjectIds.join(", ") || "-"}`,
     `Base Refs: ${item.baseRefs?.map(({ projectId, baseRef }) => `${projectId}=${baseRef}`).join(", ") || "-"}`,
+    ...renderWorkItemExecutionProjection(execution),
     `Acceptance: ${item.acceptance.length === 0 ? "-" : item.acceptance.join("; ")}`,
     `Outcome: ${item.outcome ?? "-"}`,
     `Retirement: ${item.disposition === undefined ? "-" : "retired"}`,
     `Replacement: ${replacement ?? "-"}`
   ].join("\n");
-  return output(`${rendered}\n`, { workItem: item });
+  return output(`${rendered}\n`, { workItem: item, execution });
+}
+
+function compactWorkItemExecution(projection: WorkItemExecutionProjection): string {
+  if (projection.shape === "direct") return `main=${projection.mainTurn.status}`;
+  const counts = projection.laneCounts;
+  return `lanes ${counts.running}/${counts.succeeded}/${counts.needsAttention}/${counts.failed}/${counts.unknown}; ${projection.synthesis.status}`;
+}
+
+function renderWorkItemExecutionProjection(
+  projection: WorkItemExecutionProjection
+): string[] {
+  return [
+    `Execution Shape: ${projection.shape}`,
+    ...(projection.groupId === undefined ? [] : [`Execution Group: ${projection.groupId}`]),
+    ...(projection.lanes.length === 0
+      ? ["Lanes: none"]
+      : [
+          `Lanes: running=${projection.laneCounts.running}, succeeded=${projection.laneCounts.succeeded}, needs-attention=${projection.laneCounts.needsAttention}, failed=${projection.laneCounts.failed}, unknown=${projection.laneCounts.unknown}`,
+          ...projection.lanes.map((lane) => (
+            `  ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}): ${lane.status}; `
+            + `turn=${lane.currentTurnId ?? "unknown"}; session=${lane.session}; `
+            + `retry=${lane.retryTurnId ?? "none"}; settle=${lane.settleTurnId ?? "none"}`
+          ))
+        ]),
+    `Synthesis: ${projection.synthesis.status}; successful=${projection.synthesis.successfulLaneCount}/${projection.synthesis.requiredSuccessfulLaneCount}`,
+    `Main Turn: ${projection.mainTurn.turnId ?? "unobserved"} [${projection.mainTurn.status}]; role=${projection.mainTurn.roleName ?? "unobserved"}; session=${projection.mainTurn.session}; retry=${projection.mainTurn.retryTurnId ?? "none"}`,
+    `Candidate Source: ${projection.candidate.candidateId ?? "none"} [${projection.candidate.status}]; source=${projection.candidate.sourceType ?? "unobserved"}; main=${projection.candidate.mainTurnId ?? "unobserved"}`,
+    ...(projection.candidate.sourceExecutionGroupId === undefined
+      ? []
+      : [
+          `Candidate Provenance: main ${projection.candidate.mainTurnId ?? "unobserved"} -> group ${projection.candidate.sourceExecutionGroupId} -> ${projection.candidate.successfulLaneTurns.map(({ laneId, successfulTurnId }) => `${laneId} -> ${successfulTurnId}`).join(", ") || "unobserved"}`
+        ]),
+    `Next Action: ${projection.nextAction.kind}; owner=${projection.nextAction.owners.join(", ") || "none"}; target=${projection.nextAction.targetIds.join(", ") || "none"}`
+  ];
 }
 
 function reviewWork(

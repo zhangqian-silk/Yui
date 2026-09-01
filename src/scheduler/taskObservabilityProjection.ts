@@ -4,13 +4,11 @@ import type { ExecutionGroup } from "../execution/executionGroup.js";
 import type { WorkItemExecutionGroup } from "../execution/workItemExecution.js";
 import { isDeepStrictEqual } from "node:util";
 import {
-  observedExecutionResourceUsage,
-  type ExecutionStageResourceProjection
+  observedExecutionResourceUsage
 } from "../execution/resourceBroker.js";
 import type { Turn } from "../turn/turn.js";
 import type { SessionTokenMetrics } from "../runtime/sessionTokenMetrics.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
-import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
 
 export type TaskDagNodeStatus =
   | "ready"
@@ -92,21 +90,7 @@ export type WorkItemObservabilityProjection = Readonly<{
   workItemId: string;
   title: string;
   status: WorkItemStatus;
-  currentGroupId?: string;
   groupIds: readonly string[];
-  executionGroups: readonly ExecutionGroupHealthSummary[];
-  stages: readonly Readonly<{
-    groupId: string;
-    mode?: string;
-    stage?: string;
-    round?: number;
-    stageAttempt?: number;
-    laneCount: number;
-    activeLaneCount: number;
-    terminalLaneCount: number;
-    resolution?: string;
-    resources?: ExecutionStageResourceProjection;
-  }>[];
   cost: TaskCostProjection;
   context: TaskContextProjection;
   evidenceCount: number;
@@ -125,7 +109,6 @@ export type TaskObservabilityProjection = Readonly<{
 export type TaskObservabilityInput = Readonly<{
   workItems: readonly WorkItem[];
   executionGroups: readonly ExecutionGroup[];
-  groupSummaries?: readonly ExecutionGroupHealthSummary[];
   turns: readonly Turn[];
   events: readonly TaskEvent[];
   contextSnapshots?: readonly ContextSnapshot[];
@@ -142,41 +125,16 @@ export function buildTaskObservabilityProjection(
   input: TaskObservabilityInput
 ): TaskObservabilityProjection {
   const now = input.now ?? new Date();
-  const summariesById = new Map((input.groupSummaries ?? []).map((summary) => [summary.groupId, summary]));
   const dag = projectDag(input.workItems);
   const workItems = input.workItems.map((item) => {
     const groups = item.executionGroups;
-    const executionGroups = groups.flatMap((group) => {
-      const summary = summariesById.get(group.id);
-      return summary === undefined ? [] : [summary];
-    });
-    const stages = groups.map((group) => {
-      const summary = summariesById.get(group.id);
-      const settled = group.lanes.every(({ disposition }) => disposition !== "open");
-      return Object.freeze({
-        groupId: group.id,
-        mode: "replicated",
-        laneCount: group.lanes.length,
-        activeLaneCount: group.lanes.filter(({ disposition }) => disposition === "open").length,
-        terminalLaneCount: group.lanes.filter(({ disposition }) => disposition !== "open").length,
-        ...(!settled ? {} : {
-          resolution: group.lanes.some(({ disposition }) => disposition === "failed")
-            ? "failed"
-            : "succeeded"
-        }),
-        ...(summary?.resources === undefined ? {} : { resources: summary.resources })
-      });
-    });
     const itemCost = projectWorkItemCost(groups, input.turns, now);
     const itemContext = projectContext(groups, input.turns, input.contextSnapshots);
     return Object.freeze({
       workItemId: item.id,
       title: item.title,
       status: item.status,
-      ...(item.currentExecutionGroupId === undefined ? {} : { currentGroupId: item.currentExecutionGroupId }),
       groupIds: groups.map(({ id }) => id),
-      executionGroups,
-      stages,
       cost: itemCost,
       context: itemContext,
       evidenceCount: 0,

@@ -104,6 +104,10 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .status-dot{width:8px;height:8px;flex:none;border-radius:50%;background:var(--faint);margin-top:4px}
 .status-dot.active{background:var(--active);box-shadow:0 0 8px var(--active)}
 .status-dot.completed{background:var(--success);box-shadow:0 0 8px var(--success)}
+.status-dot.running{background:var(--active);box-shadow:0 0 8px var(--active)}
+.status-dot.succeeded{background:var(--success);box-shadow:0 0 8px var(--success)}
+.status-dot.needs-attention{background:var(--warning);box-shadow:0 0 8px var(--warning)}
+.status-dot.failed{background:var(--danger);box-shadow:0 0 8px var(--danger)}
 .status-dot.draft{background:var(--warning);box-shadow:0 0 8px var(--warning)}
 .status-dot.retired{background:var(--faint)}
 .status-dot.archived{background:var(--faint)}
