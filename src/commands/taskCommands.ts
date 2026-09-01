@@ -221,6 +221,11 @@ import {
   type WorkItemExecutionLaneWorkspace
 } from "../execution/workItemExecution.js";
 import {
+  MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS,
+  reconcileWorkItemMainTurns,
+  successfulWorkItemSynthesisProducers
+} from "../execution/workItemMainTurn.js";
+import {
   planResourceAdmissions,
   resolveResourceBrokerPolicy,
   type ResourceLaneIdentity
@@ -2648,25 +2653,26 @@ function updateWork(
     if (tx.getActiveTurn(task.id, current.assignee) !== null) {
       throw usageError(`Work Item main Turn is still active: ${current.id}/${current.assignee}.`);
     }
-    if (currentWorkItemExecutionGroup(current) !== undefined) {
-      throw usageError(
-        `Replicated Work Item ${current.id} must be synthesized by its main Turn before Candidate submission.`
-      );
-    }
+    const sourceGroup = currentWorkItemExecutionGroup(current);
     const mainTurn = tx.listTurns(task.id).filter((turn) => (
       turn.purpose === "execution"
       && turn.workItemId === current.id
       && turn.roleName === current.assignee
       && turn.executionGroupId === undefined
       && turn.executionLaneId === undefined
+      && turn.sourceExecutionGroupId === sourceGroup?.id
       && turn.status === "completed"
       && turn.result !== undefined
     )).at(-1);
     if (mainTurn === undefined) {
-      throw usageError(`Work Item ${current.id} has no completed direct main Turn.`);
+      throw usageError(
+        sourceGroup === undefined
+          ? `Work Item ${current.id} has no completed direct main Turn.`
+          : `Work Item ${current.id} has no completed main Turn for ExecutionGroup ${sourceGroup.id}.`
+      );
     }
     if (mainTurn.result === undefined) {
-      throw dataError(`Completed direct main Turn has no result: ${mainTurn.id}.`);
+      throw dataError(`Completed WorkItem main Turn has no result: ${mainTurn.id}.`);
     }
     const configuredReview = tx.getReviewConfig();
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
@@ -4574,12 +4580,109 @@ function taskTurnCommand(
   if (command === "show") return showTurn(rest, store, options);
   if (command === "context") return turnContextCommand(rest, store, options);
   if (command === "retry") return retryTurn(rest, store, options);
-  if (command === "settle") return settleStaleFinalReviewTurn(rest, store, options);
+  if (command === "settle") return settleTurn(rest, store, options);
   if (command === "checkpoint") return output(checkpointTurn(rest, store, options));
   if (command === "retire") return retireTurn(rest, store, options);
   throw usageError(command === undefined
     ? "Task turn command is required."
     : `Unknown command: task turn ${command}`);
+}
+
+function settleTurn(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  exactPositionals(args, 1, "Task turn settle usage: yui task turn settle <task>/<turn>.");
+  const previous = store.transaction((tx) => requireTurn(tx, args[0], options));
+  if (previous.purpose === "review") {
+    return settleStaleFinalReviewTurn(args, store, options);
+  }
+  return settleFailedExecutionLaneTurn(previous, store, options);
+}
+
+function settleFailedExecutionLaneTurn(
+  previous: Turn,
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const run = tx.getTurn(previous.taskId, previous.id);
+    if (run === null || run.status !== "failed" || run.purpose !== "execution") {
+      throw usageError(`Turn ${previous.id} is not a failed execution Turn.`);
+    }
+    if (run.workItemId === undefined
+      || run.executionGroupId === undefined
+      || run.executionLaneId === undefined
+      || run.sourceExecutionGroupId !== undefined) {
+      throw usageError(`Turn ${run.id} is not a failed WorkItem Execution Lane Turn.`);
+    }
+    const task = requireTask(tx, run.taskId);
+    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    const actor = taskActor(tx, options, task.id);
+    const item = tx.getWorkItem(task.id, run.workItemId);
+    if (item === null) throw dataError(`Work item not found for Turn ${run.id}: ${run.workItemId}.`);
+    const group = currentWorkItemExecutionGroup(item);
+    if (group === undefined || group.id !== run.executionGroupId) {
+      throw usageError(`Turn ${run.id} no longer belongs to the current ExecutionGroup.`);
+    }
+    const lane = group.lanes.find(({ id }) => id === run.executionLaneId);
+    if (lane === undefined || lane.currentTurnId !== run.id) {
+      throw usageError(`Turn ${run.id} no longer owns its Execution Lane.`);
+    }
+    if (lane.disposition === "failed") {
+      return {
+        turn: run,
+        workItem: item,
+        changed: false,
+        mainTurns: [] as readonly Turn[]
+      } as const;
+    }
+    if (item.status !== "running" || lane.disposition !== "open") {
+      throw usageError(
+        `Turn ${run.id} cannot settle ${item.id}/${group.id}/${lane.id} from `
+        + `${item.status}/${lane.disposition}.`
+      );
+    }
+    if (tx.getActiveExecutionLaneTurn(task.id, group.id, lane.id) !== null) {
+      throw usageError(`Execution Lane still has an active Turn: ${group.id}/${lane.id}.`);
+    }
+    const settledGroup = updateWorkItemExecutionLane(group, lane.id, {
+      currentTurnId: run.id,
+      disposition: "failed"
+    }, now);
+    const settledItem = updateWorkItemExecutionGroup(item, settledGroup, now);
+    tx.saveWorkItem(task.id, settledItem);
+    recordTaskEvent(tx, task.id, "turn.execution-settled", {
+      turnId: run.id,
+      workItemId: item.id,
+      executionGroupId: group.id,
+      executionLaneId: lane.id,
+      settledBy: actor,
+      ...(actor === "leader" ? leaderActionEventPayload(tx, task.id, options) : {})
+    }, now);
+    const reconciliation = reconcileWorkItemMainTurns(tx, task.id, now);
+    return {
+      turn: run,
+      workItem: tx.getWorkItem(task.id, item.id) ?? settledItem,
+      changed: true,
+      mainTurns: reconciliation.createdTurns
+    } as const;
+  });
+  for (const turn of result.mainTurns) {
+    notifyMailbox(options.runtime, roleMailbox(turn.taskId, turn.roleName), turn.taskId);
+  }
+  return output(
+    result.changed
+      ? `Settled failed Execution Lane from Turn ${result.turn.id}\n`
+      : `Failed Execution Lane already settled from Turn ${result.turn.id}\n`,
+    {
+      turn: result.turn,
+      workItem: result.workItem,
+      ...(result.mainTurns.length === 0 ? {} : { mainTurns: result.mainTurns })
+    }
+  );
 }
 
 function retireTurn(
@@ -5048,6 +5151,11 @@ function retryTurn(
     if (previous.workItemId !== undefined && retryItem === null) {
       throw dataError(`Work item not found for Turn ${previous.id}: ${previous.workItemId}.`);
     }
+    const retriesSynthesisMain = previous.sourceExecutionGroupId !== undefined;
+    if (retriesSynthesisMain
+      && (previous.executionGroupId !== undefined || previous.executionLaneId !== undefined)) {
+      throw dataError(`Turn ${previous.id} has conflicting execution lineage.`);
+    }
     const retryLaneBefore = previous.executionLaneId === undefined
       ? undefined
       : retryItem === null || previous.executionGroupId === undefined
@@ -5074,10 +5182,42 @@ function retryTurn(
         `Turn ${previous.id} no longer owns the current failed Execution Lane.`
       );
     }
+    const sourceGroup = !retriesSynthesisMain || retryItem === null
+      ? undefined
+      : workItemExecutionGroupById(retryItem, previous.sourceExecutionGroupId!);
+    const sourceMainTurns = retriesSynthesisMain
+      ? chronologicalTurns(tx.listTurns(task.id).filter((turn) => (
+          turn.purpose === "execution"
+          && turn.workItemId === previous.workItemId
+          && turn.sourceExecutionGroupId === previous.sourceExecutionGroupId
+        )))
+      : [];
+    const exactSourceMain = !retriesSynthesisMain || (
+      retryItem !== null
+      && retryItem.status === "running"
+      && retryItem.assignee === previous.roleName
+      && sourceGroup !== undefined
+      && currentRetryGroup?.id === sourceGroup.id
+      && workItemExecutionGroupSettled(sourceGroup)
+      && successfulWorkItemSynthesisProducers(tx, retryItem, sourceGroup).length
+        >= MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS
+      && sourceMainTurns.at(-1)?.id === previous.id
+    );
+    if (!exactSourceMain) {
+      throw usageError(
+        `Turn ${previous.id} no longer owns the current WorkItem main synthesis.`
+      );
+    }
     const groupedRunningRetry = retryItem?.status === "running"
       && retriesExecutionLane
       && exactCurrentLane;
-    if (retryItem !== null && retryItem.status !== "failed" && !groupedRunningRetry) {
+    const synthesisRunningRetry = retryItem?.status === "running"
+      && retriesSynthesisMain
+      && exactSourceMain;
+    if (retryItem !== null
+      && retryItem.status !== "failed"
+      && !groupedRunningRetry
+      && !synthesisRunningRetry) {
       throw usageError(`Work Item ${retryItem.id} is not retryable from ${retryItem.status}.`);
     }
     const runWorkspace = previous.workspace
@@ -5120,23 +5260,29 @@ function retryTurn(
         throw dataError(`Turn ${previous.id} Lane workspace is missing or has drifted.`);
       }
     }
+    if (retriesSynthesisMain) {
+      const storedMainWorkspace = previous.workspace === undefined
+        ? null
+        : tx.getManagedWorkspace(previous.workspace.owner);
+      const currentMainWorkspace = retryItem?.assignee === "leader"
+        ? tx.getTaskWorkspace(task.id)
+        : retryItem === null
+          ? null
+          : tx.getWorkItemWorkspace(task.id, retryItem.id);
+      if (previous.workspace === undefined
+        || storedMainWorkspace === null
+        || currentMainWorkspace === null
+        || !isDeepStrictEqual(storedMainWorkspace, previous.workspace)
+        || !isDeepStrictEqual(currentMainWorkspace, previous.workspace)) {
+        throw dataError(`Turn ${previous.id} WorkItem main workspace is missing or has drifted.`);
+      }
+    }
     const effective = retryLane?.effective ?? resolveEffectiveLaunch({
       role,
       purpose: "execution",
       ...(retryManagedWorkspace === undefined ? {} : { workspace: retryManagedWorkspace }),
       ...(retryItem === null ? {} : { workItemWriteProjectIds: retryItem.writeProjectIds })
     });
-    const laneWorkspace = retryManagedWorkspace === undefined
-      ? undefined
-      : {
-          root: retryManagedWorkspace.root,
-          writableProjectIds: [...(retryItem?.writeProjectIds ?? [])]
-        };
-    const retryDirective = retryGroup?.assignment.input
-      ?? previous.inputs[0]!.input.directive
-      ?? retryItem?.objective
-      ?? `Retry Turn ${previous.id}.`;
-    const queuedReason: string | undefined = undefined;
     const turnId = tx.nextTurnId(task.id);
     const runningGroup = retryGroup === undefined || retryLane === undefined
       ? undefined
@@ -5163,23 +5309,27 @@ function retryTurn(
         tx.saveWorkItem(task.id, retriedItemWithGroup);
       }
     }
-    const retrySnapshot = freezeTurnContextSnapshot(tx, {
-      taskId: task.id,
-      roleName: role.name,
-      purpose: "execution",
-      ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId })
-    }, now, "controller", retryGroup?.assignment.contextSnapshotRef);
-    const input = createTurnInput({
-      source: {
-        type: "yui",
-        channel: previous.workItemId === undefined ? "task-dispatch" : "workitem-dispatch"
-      },
-      ...(previous.inputs[0]!.input.directive === undefined
-        ? {}
-        : { directive: previous.inputs[0]!.input.directive }),
-      contextSnapshotRef: contextSnapshotRef(retrySnapshot),
-      deltaRefIds: contextSnapshotDeltaRefIds(tx, retrySnapshot)
-    });
+    const input = retriesSynthesisMain
+      ? previous.inputs[0]!.input
+      : (() => {
+          const retrySnapshot = freezeTurnContextSnapshot(tx, {
+            taskId: task.id,
+            roleName: role.name,
+            purpose: "execution",
+            ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId })
+          }, now, "controller", retryGroup?.assignment.contextSnapshotRef);
+          return createTurnInput({
+            source: {
+              type: "yui",
+              channel: previous.workItemId === undefined ? "task-dispatch" : "workitem-dispatch"
+            },
+            ...(previous.inputs[0]!.input.directive === undefined
+              ? {}
+              : { directive: previous.inputs[0]!.input.directive }),
+            contextSnapshotRef: contextSnapshotRef(retrySnapshot),
+            deltaRefIds: contextSnapshotDeltaRefIds(tx, retrySnapshot)
+          });
+        })();
     const created = createTurn(
       turnId!,
       task.id,
@@ -5193,6 +5343,9 @@ function retryTurn(
           executionGroupId: runningGroup.id,
           executionLaneId: retryLane!.id
         }),
+        ...(previous.sourceExecutionGroupId === undefined
+          ? {}
+          : { sourceExecutionGroupId: previous.sourceExecutionGroupId }),
         ...(retryManagedWorkspace === undefined ? {} : { workspace: retryManagedWorkspace }),
         effective
       }
@@ -6825,6 +6978,9 @@ function turnLaunchEventPayload(run: Turn): TaskEventPayload {
           executionGroupId: run.executionGroupId,
           executionLaneId: run.executionLaneId!
         }),
+    ...(run.sourceExecutionGroupId === undefined
+      ? {}
+      : { sourceExecutionGroupId: run.sourceExecutionGroupId }),
     ...(run.reviewRoundId === undefined
       ? {}
       : {

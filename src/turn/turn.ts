@@ -107,8 +107,8 @@ export type TurnInputRecord = Readonly<{
 }>;
 
 export type Turn = {
-  /** v2 adds durable producer evidence to terminal WorkItem Lane Turns. */
-  schemaVersion: 2;
+  /** v3 adds immutable replicated-Group provenance to WorkItem main Turns. */
+  schemaVersion: 3;
   id: string;
   taskId: string;
   roleName: string;
@@ -121,6 +121,8 @@ export type Turn = {
   /** Frozen lineage inside the unified execution Group. */
   executionGroupId?: string;
   executionLaneId?: string;
+  /** The settled replicated Group whose frozen Producer results this main Turn synthesizes. */
+  sourceExecutionGroupId?: string;
   workspace?: ManagedWorkspace;
   /** Immutable actual launch configuration and provenance. */
   effective: EffectiveLaunchSnapshot;
@@ -143,6 +145,7 @@ export function createTurn(
     reviewRoundId?: string;
     executionGroupId?: string;
     executionLaneId?: string;
+    sourceExecutionGroupId?: string;
     workspace?: ManagedWorkspace;
     effective: EffectiveLaunchSnapshot;
   }
@@ -153,7 +156,7 @@ export function createTurn(
   const timestamp = now.toISOString();
   const normalizedInput = validateTurnInput(input);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireSafeIdentity(id, "Turn id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -172,6 +175,14 @@ export function createTurn(
     ...(context.executionLaneId === undefined
       ? {}
       : { executionLaneId: requireSafeIdentity(context.executionLaneId, "ExecutionLane id") }),
+    ...(context.sourceExecutionGroupId === undefined
+      ? {}
+      : {
+          sourceExecutionGroupId: requireSafeIdentity(
+            context.sourceExecutionGroupId,
+            "Source ExecutionGroup id"
+          )
+        }),
     ...(context.workspace === undefined
       ? {}
       : { workspace: validateManagedWorkspace(context.workspace) }),
@@ -242,6 +253,7 @@ export function validateTurn(run: Turn): Turn {
     "reviewRoundId",
     "executionGroupId",
     "executionLaneId",
+    "sourceExecutionGroupId",
     "workspace",
     "effective",
     "status",
@@ -249,7 +261,7 @@ export function validateTurn(run: Turn): Turn {
     "createdAt",
     "updatedAt"
   ], "Turn");
-  if (run.schemaVersion !== 2) throw new Error("Turn must use schemaVersion 2.");
+  if (run.schemaVersion !== 3) throw new Error("Turn must use schemaVersion 3.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "turn");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {
@@ -281,6 +293,15 @@ export function validateTurn(run: Turn): Turn {
   if (run.executionGroupId !== undefined) {
     requireSafeIdentity(run.executionGroupId, "ExecutionGroup id");
     requireSafeIdentity(run.executionLaneId!, "ExecutionLane id");
+  }
+  if (run.sourceExecutionGroupId !== undefined) {
+    requireSafeIdentity(run.sourceExecutionGroupId, "Source ExecutionGroup id");
+    if (run.purpose !== "execution" || run.workItemId === undefined) {
+      throw new Error("A source ExecutionGroup requires a WorkItem execution Turn.");
+    }
+    if (run.executionGroupId !== undefined || run.executionLaneId !== undefined) {
+      throw new Error("A WorkItem main Turn cannot also be an Execution Lane Turn.");
+    }
   }
   if (run.workspace !== undefined) {
     validateManagedWorkspace(run.workspace);
@@ -534,7 +555,10 @@ function turnEnvelopeContext(run: Turn): Parameters<typeof createTurnInputEnvelo
       ...(run.executionGroupId === undefined ? {} : {
         executionGroupId: run.executionGroupId,
         executionLaneId: run.executionLaneId!
-      })
+      }),
+      ...(run.sourceExecutionGroupId === undefined
+        ? {}
+        : { sourceExecutionGroupId: run.sourceExecutionGroupId })
     }
   };
 }

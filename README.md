@@ -891,22 +891,24 @@ Its recovery reconciliation runs every 120 seconds by default. Normal durable st
 
 Automated input is sent only through tmux. Each pass performs one non-blocking process-state readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are woken by canonical Agent Driver terminal observations. A pane-local receipt prevents the same Turn input from being typed twice after a Controller retry.
 
-If a Role process exits without a terminal Provider result, the Controller fails that Turn and running WorkItem and queues the Leader. Recovery failures are exposed through the small Jobs view:
+If a Role process exits without a terminal Provider result, the Controller fails that Turn and queues the Leader. A replicated WorkItem Lane remains open for exact retry or explicit settlement; completed sibling results remain reusable. Recovery failures are exposed through the small Jobs view:
 
 ```sh
 yui jobs list
 yui jobs retry leader-recovery:<task-id>
 yui task reconcile <task-id>
 yui task turn retry <failed-turn-id>
-yui task turn settle <obsolete-failed-review-turn-id>
+yui task turn settle <failed-turn-id>
 ```
 
 `jobs` is not a restored generic queue: it presents durable pending Leader wakes and Leader recovery failures only.
 
-`task turn settle` is a Leader-only repair for one exact failed Reviewer Turn whose
-matching Task-final ReviewRound was stranded running by an older lifecycle. It
-closes only an obsolete frozen candidate, preserves the Turn, Round, workspace,
-and evidence, and never creates a retry Round.
+`task turn settle` records that the Leader will no longer recover the exact
+current failed WorkItem Lane Turn. Only then does the Lane become failed and the
+settled Group become eligible for synthesis when at least two Producer results
+succeeded. The same command retains its narrow repair for an obsolete failed
+Reviewer Turn whose Task-final ReviewRound is stranded on an old frozen
+candidate; that repair never creates a retry Round.
 
 Completion is the reversible execution fence. Archiving is terminal and is accepted only after active work is settled: it stops the Task's tmux session and removes clean managed worktrees. Dirty worktrees keep the Task completed and are preserved for deliberate resolution.
 

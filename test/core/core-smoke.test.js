@@ -452,7 +452,7 @@ test("Turns record provider-visible input without delivery handshake state", () 
   );
   const mailbox = createWorkMailbox({ kind: "role", taskId: "task-1", roleName: role.name });
 
-  assert.equal(run.schemaVersion, 1);
+  assert.equal(run.schemaVersion, 3);
   assert.deepEqual(run.inputs[0].input.source, { type: "yui", channel: "task-dispatch" });
   assert.equal(run.inputs[0].input.directive, "Read the durable Task context and continue.");
   for (const legacyField of ["pushedAt", "deliveredAt", "deliveryReceiptId", "controlRequest"]) {

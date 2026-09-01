@@ -808,7 +808,7 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "settle",
-        summary: "Close an obsolete stranded final Review Turn without requesting a retry Round.",
+        summary: "Explicitly settle a failed WorkItem Lane or an obsolete stranded final Review Turn.",
         usage: "yui task turn settle <task>/<turn>"
       },
       {

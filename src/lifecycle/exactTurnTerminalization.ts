@@ -24,6 +24,7 @@ import {
   type ExecutionLaneGitSnapshot
 } from "../execution/executionGroup.js";
 import { updateWorkItemExecutionLane } from "../execution/workItemExecution.js";
+import { reconcileWorkItemMainTurns } from "../execution/workItemMainTurn.js";
 import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
@@ -405,7 +406,7 @@ export function retireExactActiveTurn(
     turnId: input.turnId,
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
     ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-    settleFailedExecutionGroup: true,
+    ...(current.purpose === "review" ? { settleFailedExecutionGroup: true } : {}),
     outcome: { status: "failed", summary: input.reason, failureReason: "missing-result" }
   };
   const session = sessions?.sessions[input.agentId];
@@ -573,6 +574,7 @@ export function terminalizeExactTaskTurn(
     store.clearActiveTurn(input.taskId, input.roleName);
   }
   settleLaunchReservation(store, sessions, input);
+  reconcileWorkItemMainTurns(store, input.taskId, now);
   return { disposition: "applied", turn: terminal };
 }
 

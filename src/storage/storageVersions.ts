@@ -15,5 +15,5 @@
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Version of the logical aggregates persisted in SQLite. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 23;
+/** Aggregate 24 persists Turn v3 WorkItem main-Group provenance. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 24;
