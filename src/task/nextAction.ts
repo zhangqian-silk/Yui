@@ -43,6 +43,7 @@ import {
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { Task } from "./task.js";
+import { draftWorkItemDependencyIssue } from "./draftPlan.js";
 import {
   currentWorkItemCandidate,
   currentWorkItemExecutionGroup,
@@ -216,6 +217,30 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   }
 
   if (task.status === "draft") {
+    const dependencyIssue = draftWorkItemDependencyIssue(facts.workItems);
+    if (dependencyIssue !== undefined) {
+      const refs = [
+        ref("work-item", dependencyIssue.workItemId),
+        ref("work-item", dependencyIssue.dependencyId)
+      ];
+      return buildAction(facts, {
+        kind: "repair-protocol-inconsistency",
+        reason: dependencyIssue.kind === "cycle"
+          ? `Draft Work Item dependency cycle includes ${dependencyIssue.workItemId}/${dependencyIssue.dependencyId}. Edit the Draft before activation.`
+          : `Draft Work Item ${dependencyIssue.workItemId} depends on ${dependencyIssue.dependencyId}, which is missing or retired. Edit the Draft before activation.`,
+        refs,
+        conflicts: refs,
+        preconditions: [
+          {
+            fact: `Draft dependency ${dependencyIssue.dependencyId} is valid`,
+            satisfied: false,
+            ref: refs[1]
+          }
+        ],
+        recommendedCommand:
+          `yui task work edit ${task.id}/${dependencyIssue.workItemId} --clear-dependencies`
+      });
+    }
     const draftWork = selectOpenWorkItem(facts.workItems);
     if (draftWork.kind === "blocked") {
       const refs = [

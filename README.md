@@ -152,7 +152,7 @@ yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
 yui task message update <task-id>/<message-id> --body-file updated-message.md --wake-policy none
 yui task work edit <task-id>/<work-item-id> --objective "Revised outcome" \
-  --clear-acceptance --accept "New observable criterion"
+  --accept "New observable criterion"
 yui task work retire <task-id>/<work-item-id> --summary "Removed from the current Draft"
 yui task show <task-id>
 yui task context <task-id>

@@ -118,7 +118,7 @@ yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
 yui task message update <task-id>/<message-id> --body-file updated-message.md --wake-policy none
 yui task work edit <task-id>/<work-item-id> --objective "修订后的目标" \
-  --clear-acceptance --accept "新的可观察验收标准"
+  --accept "新的可观察验收标准"
 yui task work retire <task-id>/<work-item-id> --summary "从当前 Draft 中移除"
 yui task show <task-id>
 yui task context <task-id>

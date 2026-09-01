@@ -382,7 +382,6 @@ function collectBlockers(
     if (item.status !== "pending") continue;
     const dependencies = item.dependsOn.filter((dependency) => (
       workById.get(dependency)?.status !== "completed"
-      && workById.get(dependency)?.status !== "retired"
     ));
     if (dependencies.length === 0) continue;
     blockers.push({

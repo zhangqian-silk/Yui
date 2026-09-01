@@ -3978,7 +3978,7 @@ function retireWork(
   exactPositionals(parsed.positionals, 1, usage);
   const workItemId = parsed.positionals[0]!;
   const summary = requiredOption(parsed.options, "--summary");
-  const replacementWorkItemId = parsed.options.get("--replacement");
+  const replacementReference = parsed.options.get("--replacement");
   const now = clock(options);
   const retired = store.transaction((tx) => {
     const item = requireWorkItem(tx, workItemId, options);
@@ -3988,11 +3988,13 @@ function retireWork(
     }
     if (task.status === "draft") assertDraftTaskExecutionFree(tx, task);
     const actor = taskActor(tx, options, task.id);
-    if (replacementWorkItemId !== undefined) {
-      const replacement = requireWorkItem(tx, replacementWorkItemId, options);
+    const replacement = replacementReference === undefined
+      ? undefined
+      : requireWorkItem(tx, replacementReference, options);
+    if (replacement !== undefined) {
       if (replacement.taskId !== task.id) {
         throw usageError(
-          `Replacement Work Item must belong to the same Task: ${replacementWorkItemId}.`
+          `Replacement Work Item must belong to the same Task: ${replacementReference}.`
         );
       }
       if (replacement.id === item.id) {
@@ -4042,16 +4044,16 @@ function retireWork(
     const next = retireWorkItem(item, {
       by: actor,
       summary,
-      ...(replacementWorkItemId === undefined ? {} : { replacementWorkItemId })
+      ...(replacement === undefined ? {} : { replacementWorkItemId: replacement.id })
     }, now);
     if (next !== item) {
       tx.saveWorkItem(task.id, next);
       recordTaskEvent(tx, task.id, "work.retired", {
         workItemId: next.id,
         summary,
-        ...(replacementWorkItemId === undefined
+        ...(replacement === undefined
           ? {}
-          : { replacementWorkItemId }),
+          : { replacementWorkItemId: replacement.id }),
         ...(actor === "leader" ? leaderActionEventPayload(tx, task.id, options) : { retiredBy: actor })
       }, now);
       tx.saveEvent(task.id, createTaskRecordRetirement({

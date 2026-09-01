@@ -10,6 +10,12 @@ type DraftPlanFacts = Readonly<{
   projects: ReadonlyMap<string, Project>;
 }>;
 
+export type DraftWorkItemDependencyIssue = Readonly<{
+  kind: "missing-or-retired" | "cycle";
+  workItemId: string;
+  dependencyId: string;
+}>;
+
 export function assertDraftTaskExecutionFree(store: TaskStore, task: Task): void {
   if (task.status !== "draft") {
     throw new Error(`Task is not a Draft: ${task.id}/${task.status}.`);
@@ -34,7 +40,7 @@ export function validateDraftWorkItemEdit(
   ));
   const facts = draftPlanFacts(store, task, workItems);
   validateWorkItemReferences(facts, candidate);
-  assertAcyclic(facts.workItems.filter(({ status }) => status !== "retired"));
+  assertDraftWorkItemDependencyGraph(facts.workItems, candidate);
 }
 
 export function validateDraftTaskForActivation(store: TaskStore, task: Task): void {
@@ -42,7 +48,47 @@ export function validateDraftTaskForActivation(store: TaskStore, task: Task): vo
   const facts = draftPlanFacts(store, task, store.listWorkItems(task.id));
   const current = facts.workItems.filter(({ status }) => status !== "retired");
   for (const item of current) validateWorkItemReferences(facts, item);
-  assertAcyclic(current);
+  assertDraftWorkItemDependencyGraph(current);
+}
+
+/** Derive the first invalid edge in the current Draft dependency graph. */
+export function draftWorkItemDependencyIssue(
+  workItems: readonly WorkItem[],
+  onlyItem?: WorkItem
+): DraftWorkItemDependencyIssue | undefined {
+  const current = workItems.filter(({ status }) => status !== "retired");
+  const byId = new Map(current.map((item) => [item.id, item] as const));
+  for (const item of onlyItem === undefined ? current : [onlyItem]) {
+    const dependencyId = item.dependsOn.find((id) => !byId.has(id));
+    if (dependencyId !== undefined) {
+      return { kind: "missing-or-retired", workItemId: item.id, dependencyId };
+    }
+  }
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (item: WorkItem): DraftWorkItemDependencyIssue | undefined => {
+    visiting.add(item.id);
+    for (const dependencyId of item.dependsOn) {
+      if (visiting.has(dependencyId)) {
+        return { kind: "cycle", workItemId: item.id, dependencyId };
+      }
+      if (visited.has(dependencyId)) continue;
+      const dependency = byId.get(dependencyId);
+      if (dependency === undefined) continue;
+      const issue = visit(dependency);
+      if (issue !== undefined) return issue;
+    }
+    visiting.delete(item.id);
+    visited.add(item.id);
+    return undefined;
+  };
+  for (const item of current) {
+    if (visited.has(item.id)) continue;
+    const issue = visit(item);
+    if (issue !== undefined) return issue;
+  }
+  return undefined;
 }
 
 function draftPlanFacts(
@@ -70,18 +116,6 @@ function draftPlanFacts(
 }
 
 function validateWorkItemReferences(facts: DraftPlanFacts, item: WorkItem): void {
-  const currentById = new Map(
-    facts.workItems
-      .filter(({ status }) => status !== "retired")
-      .map((candidate) => [candidate.id, candidate] as const)
-  );
-  for (const dependencyId of item.dependsOn) {
-    if (!currentById.has(dependencyId)) {
-      throw new Error(
-        `Work Item dependency is missing or retired: ${item.id}/${dependencyId}.`
-      );
-    }
-  }
   if (item.assignee !== undefined && !facts.roleNames.has(item.assignee)) {
     throw new Error(`Work Item assignee Role not found: ${item.id}/${item.assignee}.`);
   }
@@ -99,25 +133,28 @@ function validateWorkItemReferences(facts: DraftPlanFacts, item: WorkItem): void
   }
 }
 
-function assertAcyclic(workItems: readonly WorkItem[]): void {
-  const byId = new Map(workItems.map((item) => [item.id, item] as const));
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const visit = (id: string): void => {
-    if (visiting.has(id)) throw new Error(`Work Item dependency cycle detected at ${id}.`);
-    if (visited.has(id)) return;
-    const item = byId.get(id);
-    if (item === undefined) return;
-    visiting.add(id);
-    for (const dependencyId of item.dependsOn) visit(dependencyId);
-    visiting.delete(id);
-    visited.add(id);
-  };
-  for (const item of workItems) visit(item.id);
+function assertDraftWorkItemDependencyGraph(
+  workItems: readonly WorkItem[],
+  onlyItem?: WorkItem
+): void {
+  const issue = draftWorkItemDependencyIssue(workItems, onlyItem);
+  if (issue === undefined) return;
+  if (issue.kind === "missing-or-retired") {
+    throw new Error(
+      `Work Item dependency is missing or retired: ${issue.workItemId}/${issue.dependencyId}.`
+    );
+  }
+  throw new Error(
+    `Work Item dependency cycle detected: ${issue.workItemId}/${issue.dependencyId}.`
+  );
 }
 
 function firstDraftExecutionFact(store: TaskStore, task: Task): string | undefined {
   if (task.workspaceIdentity !== undefined || task.cwd !== undefined) return "Task workspace";
+  const hostOwner = store.listSessionOwners().find(({ owner }) => (
+    owner.scope === "task" && owner.taskId === task.id
+  ));
+  if (hostOwner !== undefined) return `Host owner (${hostOwner.launchId})`;
   if (store.listTurns(task.id).length > 0) return "Turn";
   if (store.listRoleSessionSets(task.id).length > 0) return "Role Session";
   if (store.listDurableJobs(task.id).length > 0) return "DurableJob";
