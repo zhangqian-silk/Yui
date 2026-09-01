@@ -484,11 +484,9 @@ function collectAuthorizedContext(
     if (view === "worker") {
       for (const dependencyId of item.dependsOn) {
         const dependency = store.getWorkItem(task.id, dependencyId);
-        if (dependency === null
-          || (dependency.status !== "completed" && dependency.status !== "retired")) {
+        if (dependency === null || dependency.status !== "completed") {
           throw new Error(`Turn WorkItem dependency is not accepted: ${dependencyId}.`);
         }
-        if (dependency.status === "retired") continue;
         result.push(materialize("L3", "accepted-work-item", dependency.id, dependency));
       }
     }

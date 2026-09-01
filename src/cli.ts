@@ -3036,6 +3036,7 @@ function selectionCall(
     case "task.role.list": return callOptional(reader, "listRoles", [params.taskId]);
     case "task.role.show": return callOptional(reader, "getRole", [params.taskId, params.roleName]);
     case "task.work.list": return callOptional(reader, "listWorkItems", [params.taskId]);
+    case "task.message.list": return callOptional(reader, "listMessages", [params.taskId]);
     case "task.input.list": {
       const taskId = typeof params.taskId === "string" ? params.taskId : undefined;
       const requests = taskId === undefined

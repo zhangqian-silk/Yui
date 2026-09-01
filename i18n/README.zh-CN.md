@@ -116,10 +116,22 @@ yui task create "修复 CSV 转义" --project app --type bugfix
 yui task create "交付 CSV 导出" --project app --type feature
 yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
+yui task message update <task-id>/<message-id> --body-file updated-message.md --wake-policy none
+yui task work edit <task-id>/<work-item-id> --objective "修订后的目标" \
+  --clear-acceptance --accept "新的可观察验收标准"
+yui task work retire <task-id>/<work-item-id> --summary "从当前 Draft 中移除"
 yui task show <task-id>
 yui task context <task-id>
 yui task activate <task-id>
 ```
+
+Draft 只保存规划记录和 Project 绑定，不采用可写 managed Workspace。Message
+与 WorkItem 编辑只替换显式指定的可变字段，记录 ID 和审计历史保持不变；重复
+选项表示整体替换，对应 `--clear-*` 显式表示空集合。retired 记录继续保留在历史
+视图中，但退出当前 Draft。retired WorkItem 不满足依赖，也不会通过可选
+replacement 自动重定向下游；激活前必须修正剩余 Draft。所有 Draft-only 编辑和
+retire 都不创建、停止或清理运行时资源；`task activate` 会在采用任何 Workspace
+之前校验当前依赖图、Role 和 Project scope。
 
 Task type 描述需求意图，不选择执行协议。软件 Project 通常使用 `bugfix` 或
 `feature`：bugfix 由 Leader 在 Task main 独立、快速完成；如果范围扩大到需要

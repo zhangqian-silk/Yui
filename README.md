@@ -150,6 +150,10 @@ yui task create "Fix CSV escaping" --project app --type bugfix
 yui task create "Ship CSV export" --project app --type feature
 yui task update <task-id> --priority high --tags release,csv --due-at 2026-08-01T00:00:00Z
 yui task update <task-id> --clear-priority --clear-tags --clear-due-at
+yui task message update <task-id>/<message-id> --body-file updated-message.md --wake-policy none
+yui task work edit <task-id>/<work-item-id> --objective "Revised outcome" \
+  --clear-acceptance --accept "New observable criterion"
+yui task work retire <task-id>/<work-item-id> --summary "Removed from the current Draft"
 yui task show <task-id>
 yui task context <task-id>
 yui task activate <task-id>
@@ -160,6 +164,15 @@ writable managed Workspace. `task activate` prepares every bound Project first,
 then commits the Task's `active` status and Task-owned Workspace together. A
 preparation or consistency failure leaves the Task Draft and reports the
 workspace diagnosis instead of exposing a partially adopted execution root.
+Draft Message and WorkItem edits replace only the named mutable fields while
+preserving record identity and audit history. Repeated options replace the
+whole collection; matching `--clear-*` flags make an empty collection explicit.
+Retired records remain visible in history but leave the current Draft. A
+retired WorkItem never satisfies a dependency and does not redirect downstream
+dependencies through its optional replacement; fix the remaining Draft before
+activation. These Draft-only mutations do not create, stop, or clean runtime
+resources, and activation validates the current dependency graph, Roles, and
+Project scope before any Workspace is adopted.
 
 Task type describes intent rather than selecting an execution protocol.
 Software Projects use `bugfix` or `feature`: a bugfix is Leader-owned; if it

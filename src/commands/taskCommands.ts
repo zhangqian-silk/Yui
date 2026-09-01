@@ -24,6 +24,7 @@ import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event
 import {
   createTaskRecordRetirement,
   isTaskRecordRetired,
+  operationalTaskRecords,
   taskRecordRetirement
 } from "../task/taskRecordRetirement.js";
 import {
@@ -1095,12 +1096,16 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const verifiedMergedPublications = publications.filter((reference) => (
     reference.state === "merged" && reference.verification === "verified"
   )).length;
+  const currentMessageCount = operationalTaskRecords(messages, events, "message").length;
+  const currentWorkItemCount = work.filter(({ status }) => status !== "retired").length;
   const counts = {
     messages: messages.length,
+    currentMessages: currentMessageCount,
     decisions: decisions.length,
     milestones: milestones.length,
     events: events.length,
     workItems: work.length,
+    currentWorkItems: currentWorkItemCount,
     turns: store.listTurns(task.id).length,
     changeSets: changeSets.length,
     integrations: integrations.length,
@@ -1137,11 +1142,13 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
         ]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
     `Messages: ${counts.messages}`,
+    `Current messages: ${currentMessageCount}`,
     `Brief: ${brief === null ? "no" : "yes"}`,
     `Decisions: ${counts.decisions}`,
     `Milestones: ${counts.milestones}`,
     `Events: ${counts.events}`,
     `Work items: ${counts.workItems}`,
+    `Current work items: ${currentWorkItemCount}`,
     `Turns: ${counts.turns}`,
     `ChangeSets: ${counts.changeSets}`,
     `Integration Attempts: ${counts.integrations}`,
@@ -7717,8 +7724,7 @@ function assertWorkItemDependenciesCompleted(
 ): void {
   for (const dependencyId of item.dependsOn) {
     const dependency = store.getWorkItem(item.taskId, dependencyId);
-    if (dependency === null
-      || (dependency.status !== "completed" && dependency.status !== "retired")) {
+    if (dependency === null || dependency.status !== "completed") {
       throw usageError(`Work Item dependency is not completed: ${dependencyId}.`);
     }
   }

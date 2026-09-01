@@ -831,6 +831,7 @@ export function messageCard(message, t, locale) {
   titleRow.append(node("strong", "record-title", messageAuthor(message, t)));
   head.append(titleRow);
   if (message.kind) head.append(pill(t, "messageKind", message.kind));
+  if (message.status) head.append(pill(t, "status", message.status));
   card.append(head);
 
   const meta = node("div", "record-meta");
